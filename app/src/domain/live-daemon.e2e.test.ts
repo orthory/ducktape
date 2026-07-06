@@ -28,7 +28,6 @@ import {
   postMessage,
   thread,
 } from "./chat-client";
-import { createTask, listTasks, updateStatus } from "./tasks-client";
 import { remoteTransport } from "./transport";
 import type { BlockEvent, NodeTransport } from "./transport";
 
@@ -182,18 +181,6 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
     expect(t!.replies).toHaveLength(1);
     expect(blocksText(t!.replies[0].head.blocks)).toBe("a threaded reply");
     expect(authorName(t!.replies[0].head.author)).toBe("jess");
-  });
-
-  it("drives the tasks flow end to end: create, list, update", async () => {
-    await createTask(transport, { taskId: "t1", title: "ship the e2e suite" });
-    let tasks = await listTasks(transport);
-    const created = tasks.find((t) => t.id === "t1");
-    expect(created?.title).toBe("ship the e2e suite");
-    expect(created?.status).toBe("open");
-
-    await updateStatus(transport, { taskId: "t1", status: "done" });
-    tasks = await listTasks(transport);
-    expect(tasks.find((t) => t.id === "t1")?.status).toBe("done");
   });
 
   it("streams committed blocks over the websocket", async () => {

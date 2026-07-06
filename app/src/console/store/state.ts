@@ -5,27 +5,21 @@
 
 import type { AgentRecord } from "../../domain/agent-client";
 import type { PendingRun, WatchView } from "../../domain/runs-client";
-import type { Rule } from "../../domain/automations-client";
 import type {
   Channel,
   ChatSearchHit,
   ChatThread,
   MessageView,
 } from "../../domain/chat-client";
-import type { Block, DocSearchHit } from "../../domain/document-client";
 import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
-import type { Notification } from "../../domain/inbox-client";
-import type { BoardCounts, Job } from "../../domain/jobs-client";
 import type {
-  FileStat,
-  Generation,
-  GrepHit,
-  LsEntry,
-} from "../../domain/memory-client";
-import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
-import type { Task, TaskStatus } from "../../domain/tasks-client";
-import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
+  PageBlock,
+  PageMeta,
+  PageSearchHit,
+  TargetThreads,
+} from "../../domain/pages-client";
+import type { BlockRecord, NodeStatus } from "../../domain/transport";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
@@ -34,13 +28,24 @@ import type { PhaseReport, Workspace } from "../../domain/workspace-client";
  *  side confers authority — it is purely which surfaces the rail shows. */
 export type ViewMode = "user" | "operator";
 
+/** The ephemeral voice-huddle slice. Lives OUTSIDE ConsoleSnapshot (like
+ *  telemetry): the roster is committed consensus state on the channel, but
+ *  whether THIS client is in a live audio session — and its mic/connection
+ *  state — is per-client and never re-projected from the node. `channelId` is
+ *  the channel we're huddling in (null = not in a huddle). */
+export interface VoiceSlice {
+  channelId: string | null;
+  muted: boolean;
+  status: "idle" | "connecting" | "live" | "error";
+}
+
 /** One search round-trip across the modules that ship materialized views —
- *  chat, docs, and pages searched with the same text, results grouped. */
+ *  chat and docs (the `pages` module) searched with the same text, grouped.
+ *  `docs` holds the page-block hits — pages is the console's docs surface. */
 export interface SearchResults {
   query: string;
   chat: ChatSearchHit[];
-  docs: DocSearchHit[];
-  pages: PageSearchHit[];
+  docs: PageSearchHit[];
 }
 
 // ── State shape ─────────────────────────────────────────
@@ -70,9 +75,9 @@ export interface ConsoleState {
   /** hex(user key bytes) → display name, from the `profiles` module; threaded
    *  into author rendering so messages show chosen names, not hex handles. */
   authorNames: Record<string, string>;
-
-  // ── Tasks ──
-  tasks: Task[];
+  /** This client's live voice-huddle session — ephemeral, never in the
+   *  committed snapshot (see VoiceSlice). */
+  voice: VoiceSlice;
 
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
@@ -91,17 +96,7 @@ export interface ConsoleState {
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
   forgeHead: string | null;
 
-  // ── Documents ──
-  /** Every known doc id, enumerated from the document module's index
-   *  (ListDocs) and re-queried per block. These are "/"-delimited PATHS; the
-   *  view derives a folder tree from them. */
-  docIds: string[];
-  /** The doc whose blocks are loaded, or null when none is open. */
-  activeDoc: string | null;
-  /** Ordered blocks of the active doc (re-queried per block / on open). */
-  activeDocBlocks: Block[];
-
-  // ── Pages (block-tree notebook over the `pages` module) ──
+  // ── Docs (block-tree notebook over the `pages` module) ──
   /** Every page (id + live title), from ListPages, re-queried per block.
    *  Empty when the node predates the pages module. */
   pages: PageMeta[];
@@ -110,63 +105,49 @@ export interface ConsoleState {
   /** Preorder blocks of the active page — root first — re-queried per block /
    *  on open. The view derives depth/indent from the parent links. */
   activePageBlocks: PageBlock[];
+  /** Ordered ids of the open document tabs. `activePage` is the active tab.
+   *  Persisted (loadDocTabs) and reconciled against the live enumeration. */
+  openTabs: string[];
+  /** Comment threads for the open page's blocks + the page itself, grouped by
+   *  target. Loaded on page open and after any comment op. Not per-block
+   *  snapshot state. */
+  pageThreads: TargetThreads[];
 
   // ── Agents ──
   /** Every registered agent, re-queried per block like tasks. */
   agents: AgentRecord[];
+  /** Distinct executor tags announced network-wide (the `capability` registry),
+   *  sorted. Feeds the agent view's "Runs on" picker; empty when no host has
+   *  announced or the node predates the module (best-effort in the snapshot). */
+  capabilities: string[];
   /** Every channel watch and its turn policy. */
   watches: WatchView[];
   /** In-flight runs (dispatches awaiting delivery), newest-first. terminal
    *  history lives in the dispatch module, not here. */
   pendingRuns: PendingRun[];
 
-  // ── Inbox ──
-  /** This member's notification queue (List for the local author identity),
-   *  ascending by seq, re-queried per block. */
-  inbox: Notification[];
-  /** Unread count for the local member — feeds the nav badge. */
-  inboxUnread: number;
-
-  // ── Jobs (consensus work board) ──
-  /** Every job on the board, re-queried per block. */
-  jobs: Job[];
-  /** Per-status census of the board, or null when the module is absent. */
-  jobCounts: BoardCounts | null;
-
-  // ── Automations (event-triggered rules) ──
-  /** Every rule, re-queried per block; empty when the module is absent. */
-  rules: Rule[];
-
-  // ── Memory (agent filesystem workspace) ──
-  /** The directory being browsed (canonical absolute path; "/" is the root). */
-  memoryPath: string;
-  /** Entries directly under `memoryPath` (child dirs + files), re-queried per
-   *  block like the doc index. */
-  memoryEntries: LsEntry[];
-  /** The file opened in the viewer (its stat + a loaded generation), or null. */
-  memoryOpen: { stat: FileStat; generation: Generation } | null;
-  /** Active grep hits, or null when no search is running. */
-  memoryMatches: GrepHit[] | null;
-
   // ── Search (cross-module reads over the node's derived index) ──
-  /** The last search's results, or null before any search ran. Query-driven
-   *  like `memoryMatches` — never part of the per-block snapshot. */
+  /** The last search's results, or null before any search ran. Query-driven —
+   *  never part of the per-block snapshot. */
   search: SearchResults | null;
-  /** A search round-trip is in flight (three module views fan out). */
+  /** A search round-trip is in flight (the module views fan out). */
   searchPending: boolean;
+  /** The ⌘K command-palette search overlay is open. Global UI, not per-block. */
+  searchOpen: boolean;
 
   // ── Files (content-addressed manifests) ──
   /** Every file manifest (List, prefix ""), re-queried per block. */
   files: Manifest[];
 
-  /** Recent per-block node telemetry, oldest-first (the view renders newest
-   *  first). Node-local observability — never re-queried from committed state;
-   *  backfilled from the node's ring on connect, then followed live over ws. */
-  telemetry: TelemetryFrame[];
+  /** The newest finalized height seen on the ws block stream — updated
+   *  UNGATED (unlike the refresh the same stream drives, which is held while
+   *  an op is in flight), so the console always knows the chain moved. Null
+   *  until the first frame on this connection. */
+  lastBlock: number | null;
 
   /** Recent NON-EMPTY blocks, oldest-first (the explorer renders newest
-   *  first). Node-local observability like telemetry — re-pulled from the
-   *  node's ring on every refresh; empty on a node without the surface. */
+   *  first). Node-local observability — re-pulled from the node's ring on
+   *  every refresh; empty on a node without the surface. */
   blocks: BlockRecord[];
 
   /** Height the explorer should open on next render — the finalization-mark
@@ -231,6 +212,49 @@ export const saveViewMode = (mode: ViewMode): void => {
   }
 };
 
+// ── Doc tab persistence ─────────────────────────────────
+//
+// The open Docs tabs survive restart as a single id list; on load they are
+// filtered against the live page enumeration (a stale id from another workspace
+// simply drops), so no per-workspace keying is needed.
+const DOC_TABS_KEY = "ducktape.docTabs";
+
+export const loadDocTabs = (): string[] => {
+  try {
+    const raw = localStorage.getItem(DOC_TABS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+};
+
+export const saveDocTabs = (tabs: string[]): void => {
+  try {
+    localStorage.setItem(DOC_TABS_KEY, JSON.stringify(tabs));
+  } catch {
+    // persistence is best-effort; a failed write just doesn't survive restart.
+  }
+};
+
+/** Append `id` if absent (order preserved). */
+export const addTab = (tabs: string[], id: string): string[] =>
+  tabs.includes(id) ? tabs : [...tabs, id];
+
+/** Remove `id`; if it was active, pick the following neighbor (else previous,
+ *  else null) as the next active tab. */
+export const removeTab = (
+  tabs: string[],
+  active: string | null,
+  id: string,
+): { tabs: string[]; active: string | null } => {
+  const idx = tabs.indexOf(id);
+  const next = tabs.filter((t) => t !== id);
+  if (active !== id) return { tabs: next, active };
+  const neighbor = next[idx] ?? next[idx - 1] ?? null;
+  return { tabs: next, active: neighbor };
+};
+
 // ── Remote node persistence ─────────────────────────────
 //
 // The last remote node url the user dialed, so the desktop app reconnects to it
@@ -280,33 +304,25 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     authorNames: {},
-    tasks: [],
+    voice: { channelId: null, muted: false, status: "idle" },
     members: [],
     observers: [],
     proposals: [],
     forgeHead: null,
-    docIds: [],
-    activeDoc: null,
-    activeDocBlocks: [],
     pages: [],
     activePage: null,
     activePageBlocks: [],
+    openTabs: loadDocTabs(),
+    pageThreads: [],
     agents: [],
+    capabilities: [],
     watches: [],
     pendingRuns: [],
-    inbox: [],
-    inboxUnread: 0,
-    jobs: [],
-    jobCounts: null,
-    rules: [],
-    memoryPath: "/",
-    memoryEntries: [],
-    memoryOpen: null,
-    memoryMatches: null,
     search: null,
     searchPending: false,
+    searchOpen: false,
     files: [],
-    telemetry: [],
+    lastBlock: null,
     blocks: [],
     explorerFocus: null,
     ops: {},
@@ -325,7 +341,6 @@ export interface ConsoleSnapshot {
   connected: boolean;
   status: NodeStatus | null;
   channels: Channel[];
-  tasks: Task[];
   members: string[];
   observers: string[];
   proposals: ProposalView[];
@@ -333,31 +348,22 @@ export interface ConsoleSnapshot {
   activeChannel: string | null;
   messages: MessageView[];
   authorNames: Record<string, string>;
-  docIds: string[];
-  activeDocBlocks: Block[];
   pages: PageMeta[];
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
+  capabilities: string[];
   watches: WatchView[];
   pendingRuns: PendingRun[];
-  inbox: Notification[];
-  inboxUnread: number;
-  jobs: Job[];
-  jobCounts: BoardCounts | null;
-  rules: Rule[];
-  memoryEntries: LsEntry[];
   files: Manifest[];
   blocks: BlockRecord[];
 }
 
 /** Project a committed node snapshot onto store data fields. Global UI,
- *  workspace/onboarding, and error state are intentionally left untouched.
- *  `docIds` now comes from the node's enumeration index, so it IS projected. */
+ *  workspace/onboarding, and error state are intentionally left untouched. */
 export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> => ({
   connected: snapshot.connected,
   status: snapshot.status,
   channels: snapshot.channels,
-  tasks: snapshot.tasks,
   members: snapshot.members,
   observers: snapshot.observers,
   proposals: snapshot.proposals,
@@ -365,19 +371,12 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   activeChannel: snapshot.activeChannel,
   messages: snapshot.messages,
   authorNames: snapshot.authorNames,
-  docIds: snapshot.docIds,
-  activeDocBlocks: snapshot.activeDocBlocks,
   pages: snapshot.pages,
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,
+  capabilities: snapshot.capabilities,
   watches: snapshot.watches,
   pendingRuns: snapshot.pendingRuns,
-  inbox: snapshot.inbox,
-  inboxUnread: snapshot.inboxUnread,
-  jobs: snapshot.jobs,
-  jobCounts: snapshot.jobCounts,
-  rules: snapshot.rules,
-  memoryEntries: snapshot.memoryEntries,
   files: snapshot.files,
   blocks: snapshot.blocks,
 });
@@ -392,32 +391,3 @@ export const channelIdOf = (name: string): string =>
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
 
-/** A doc id from user input: a "/"-delimited PATH where each segment is slugged
- *  (lowercase, dash-separated, wire-safe) and empty segments are dropped. So
- *  "Projects / Launch Plan" and "projects/launch-plan" name the same document,
- *  and the leading/trailing slashes never survive. Path structure is what the
- *  view turns into a folder tree. */
-export const docIdOf = (raw: string): string =>
-  raw
-    .toLowerCase()
-    .split("/")
-    .map((segment) =>
-      segment
-        .trim()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/(^-|-$)/g, ""),
-    )
-    .filter((segment) => segment.length > 0)
-    .join("/");
-
-/** The task lifecycle is a one-way lane; Done stays Done. */
-export const nextTaskStatus = (status: TaskStatus): TaskStatus => {
-  switch (status) {
-    case "open":
-      return "in_progress";
-    case "in_progress":
-      return "done";
-    case "done":
-      return "done";
-  }
-};

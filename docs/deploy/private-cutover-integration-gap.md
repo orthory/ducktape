@@ -15,8 +15,8 @@ analysis) lives in git.
   `reachability` orchestrator crate: per-epoch record gossip → signed
   advertisements → `MeshView::verify` → pairwise handshakes → one
   `apply_tunnel_plans` per epoch, with `NatResolver`
-  (STUN/rendezvous/punch/relay via the coordinator) resolving each peer's
-  UDP endpoint.
+  (STUN/rendezvous/punch via the coordinator; no relay — a failed punch is
+  terminal) resolving each peer's UDP endpoint.
 
 **Transitive gossip.** Reachability-plane messages no longer assume pairwise
 transport: records/adverts flood with nonce dedup, handshake messages fan to
@@ -54,7 +54,7 @@ registered-but-absent node costs consensus nothing.
    `invite-accept` registers it standby.
 3. The joiner syncs, announces online, activates; the reachability plane
    brings up its tunnels (gossip relayed through the ingress link, WireGuard
-   punched/relayed via the coordinator); the mesh dials its overlay ULA.
+   punched via the coordinator's rendezvous); the mesh dials its overlay ULA.
 4. The ingress can die: mesh traffic rides the tunnels.
 
 ## Cold restart (shipped)
@@ -99,6 +99,7 @@ activation cutover, not seconds after.
    carry no inviter-signed token; a compromised coordinator can deny service
    (never substitute keys — records pin WireGuard keys under the owner's
    ed25519 signature). The token design remains open.
-2. **Relay-bind caveat.** A coordinator behind `0.0.0.0` must advertise a
-   routable relay IP — `run_coordinator_advertised` exists; operator guidance
-   in [`coordinator.md`](coordinator.md).
+
+(The former item 2 — the relay-bind caveat — dissolved when the DERP-style
+relay was removed on 2026-07-06: a wildcard-bound coordinator is now fully
+functional, since every answer derives from the datagram's observed source.)

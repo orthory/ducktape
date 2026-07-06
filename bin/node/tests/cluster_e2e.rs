@@ -319,6 +319,36 @@ fn cluster_lifecycle() {
             .is_some_and(|ops| !ops.is_empty()),
         "an applied block carries its dispatch trace: {submitted}"
     );
+    // 8c-bis. the metrics plane: the drain that applied the held submit folded
+    // it into the validator's `ducktape_*` Prometheus series BEFORE the held
+    // reply returned, so /metrics must already report a recorded block apply —
+    // count, apply-latency histogram samples, and the dispatch counter labeled
+    // with the submitted module. (this endpoint served only commonware runtime
+    // series until the validator learned to record its own blocks.)
+    let (code, exposition) = cluster.http_text(0, "/metrics");
+    assert_eq!(code, 200, "metrics scrape failed:\n{exposition}");
+    let blocks_total = exposition
+        .lines()
+        .find(|l| l.starts_with("ducktape_blocks_total"))
+        .and_then(|l| l.split_whitespace().last())
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or_else(|| panic!("no ducktape_blocks_total sample:\n{exposition}"));
+    assert!(
+        blocks_total >= 1.0,
+        "the applied block was recorded: ducktape_blocks_total={blocks_total}"
+    );
+    assert!(
+        exposition
+            .lines()
+            .any(|l| l.starts_with("ducktape_block_apply_latency_seconds_count")
+                && l.split_whitespace().last() != Some("0")),
+        "the apply-latency histogram observed the block:\n{exposition}"
+    );
+    assert!(
+        exposition.contains("ducktape_dispatch_total")
+            && exposition.contains("module=\"directory\""),
+        "the dispatch counter carries the submitted module label:\n{exposition}"
+    );
     // 8d. the record's op hash is a real content address: staging at the
     // drain keys the committed payload bytes by sha256, so the blob lane
     // must serve the exact submitted payload back under that digest.

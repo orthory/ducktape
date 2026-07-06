@@ -4,12 +4,6 @@ import type { CSSProperties, ReactNode } from "react";
 // source, trimmed to the icons this console uses.
 const PATHS: Record<string, ReactNode> = {
   chat: <path d="M5 7a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-6l-4 3.5V14H7a2 2 0 0 1-2-2z" />,
-  tasks: (
-    <>
-      <path d="M12 3.4l6.6 2.3v5c0 4.2-2.8 7-6.6 8.5-3.8-1.5-6.6-4.3-6.6-8.5v-5z" />
-      <path d="M9.2 11.7l2 2 3.6-3.8" />
-    </>
-  ),
   members: (
     <>
       <circle cx="10" cy="8" r="3" />
@@ -47,8 +41,15 @@ const PATHS: Record<string, ReactNode> = {
   close: <path d="M6 6l12 12M18 6L6 18" />,
   plus: <path d="M12 5v14M5 12h14" />,
   check: <path d="M5 12.5l4 4 10-10" />,
+  edit: (
+    <>
+      <path d="M4.5 19.5l.8-3.6L15.2 6l2.8 2.8-9.9 9.9z" />
+      <path d="M13.7 7.5l2.8 2.8" />
+    </>
+  ),
   chevronRight: <path d="M9 6l6 6-6 6" />,
   hash: <path d="M9 4L7 20M17 4l-2 16M5 9h15M4 15h15" />,
+  metrics: <path d="M6 20v-7M12 20V6M18 20v-4M4 20h16" />,
   forge: (
     <>
       <path d="M6 4.5v9" />
@@ -80,14 +81,12 @@ const PATHS: Record<string, ReactNode> = {
       <circle cx="14.4" cy="13.3" r="1" />
     </>
   ),
-  telemetry: <path d="M3 12.5h3.5l2-5.5 3 12 2.5-8.5 1.5 2h4.5" />,
-  approvals: (
+  governance: (
     <>
       <circle cx="12" cy="12" r="8" />
       <path d="M8.5 12.2l2.4 2.4 4.6-4.8" />
     </>
   ),
-  folder: <path d="M4 6.5a1.5 1.5 0 0 1 1.5-1.5h3.2l1.8 2h7A1.5 1.5 0 0 1 20 8.5v8a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 16.5z" />,
   refresh: (
     <>
       <path d="M5.5 9.2A7 7 0 0 1 18 6.6l1.5 1.6" />
@@ -96,35 +95,10 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M4.5 20v-4h4" />
     </>
   ),
-  inbox: (
-    <>
-      <path d="M4 13.5l2.6-7A2 2 0 0 1 8.5 5h7a2 2 0 0 1 1.9 1.5l2.6 7" />
-      <path d="M4 13.5V17a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3.5h-5l-1.2 2h-3.6L9 13.5z" />
-    </>
-  ),
   files: (
     <>
       <path d="M5 5.5A1.5 1.5 0 0 1 6.5 4H10l2 2.2h5.5A1.5 1.5 0 0 1 19 7.7V10" />
       <path d="M3.7 12.2A1.2 1.2 0 0 1 4.9 11h14.2a1.2 1.2 0 0 1 1.18 1.46l-1.1 6A1.5 1.5 0 0 1 17.7 20H6.3a1.5 1.5 0 0 1-1.48-1.24z" />
-    </>
-  ),
-  memory: (
-    <>
-      <rect x="7" y="4.5" width="10" height="15" rx="2" />
-      <path d="M9.5 8.3h5M9.5 11.5h5M9.5 14.7h3" />
-      <path d="M5 7.5v3M5 13.5v3" />
-    </>
-  ),
-  jobs: (
-    <>
-      <rect x="4.5" y="7" width="15" height="12" rx="2" />
-      <path d="M9 7V5.6A1.6 1.6 0 0 1 10.6 4h2.8A1.6 1.6 0 0 1 15 5.6V7" />
-      <path d="M4.5 12h15M12 11v2" />
-    </>
-  ),
-  automations: (
-    <>
-      <path d="M13 3l-8 9.5h5l-1 8.5 8-9.5h-5z" />
     </>
   ),
 };

@@ -1,6 +1,15 @@
 # Telemetry System — Design
 
-Status: Phase 1 implemented (this PR). Phase 2 specified, deferred.
+Status: **SUPERSEDED (2026-07-06).** The frame plane (`TelemetryFrame` /
+`TelemetryRing` / `GET /v1/telemetry` / `WsFrame::Telemetry` / the console
+Telemetry view) was removed: its dispatch trace duplicated the explorer
+(`GET /v1/blocks`, the durable block index), its `events` were always empty,
+and `consensus_time == height` on the validator lane. What survives is the
+Prometheus plane — the shared `noded::NodeMetrics` (`ducktape_*` series behind
+`GET /metrics`), now recorded by BOTH the embedded daemon (at submit) and the
+consensus validator (at drain), carrying the per-block apply latency this spec
+introduced. Phase 2 (the on-consensus telemetry module) remains unbuilt and
+unaffected.
 Date: 2026-07-04
 
 ## Summary

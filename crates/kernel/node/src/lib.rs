@@ -633,6 +633,12 @@ pub struct DrainedOp {
     /// the block's dispatch trace, in drain order — empty for a rejected
     /// frame (a deterministic no-op leaves no trace).
     pub dispatches: Vec<host::DispatchRecord>,
+    /// node-local wall-clock cost of applying this block, in microseconds —
+    /// the ONE non-deterministic field. measured in THIS effectful node layer
+    /// (never inside the clock-free host) and fed only into node-local metrics
+    /// (the apply-latency histogram), so it can never enter consensus. differs
+    /// per node.
+    pub latency_us: u64,
 }
 
 /// the durable outcome of one drained frame — everything a recovery journal
@@ -1092,7 +1098,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // surface each finalized block's effects for the reactor's worker
             // driver. a rejected op yields no outcome (deterministic no-op) and so
             // contributes no effects — same on every validator.
-            match self.host.submit_at(ctx, msg).await {
+            let started = std::time::Instant::now();
+            let result = self.host.submit_at(ctx, msg).await;
+            // node-local apply cost — the metrics plane's one non-consensus
+            // signal, timed HERE in the effectful node layer (never inside the
+            // clock-free host). tight span: no `.await` between start and stop.
+            let latency_us = started.elapsed().as_micros() as u64;
+            match result {
                 Ok(outcome) => {
                     self.effects.extend(outcome.effects);
                     self.drained.push(DrainedFrame {
@@ -1105,6 +1117,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                             target: op_target,
                             payload: op_payload,
                             dispatches: outcome.dispatches,
+                            latency_us,
                         }),
                     });
                     self.seal(height, Disposition::Applied).await?;
@@ -1134,6 +1147,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                             target: op_target,
                             payload: op_payload,
                             dispatches: Vec::new(),
+                            latency_us,
                         }),
                     });
                     self.seal(height, Disposition::Rejected).await?;

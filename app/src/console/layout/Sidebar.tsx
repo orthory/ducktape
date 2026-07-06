@@ -127,8 +127,6 @@ export function Sidebar() {
 
       {rail.map((mod) => {
         const active = state.screen === mod.id;
-        // The inbox nav carries an unread badge from the committed queue count.
-        const badge = mod.id === "inbox" ? state.inboxUnread : 0;
         return (
           <button
             key={mod.id}
@@ -149,29 +147,6 @@ export function Sidebar() {
           >
             <span style={{ position: "relative", display: "flex" }}>
               <Icon name={mod.nav.icon} size={19} color={navIc(active)} />
-              {badge > 0 ? (
-                <span
-                  aria-label={`${badge} unread`}
-                  style={{
-                    position: "absolute",
-                    top: -5,
-                    right: -8,
-                    minWidth: 15,
-                    height: 15,
-                    padding: "0 4px",
-                    boxSizing: "border-box",
-                    borderRadius: 999,
-                    background: color.red,
-                    color: color.paper,
-                    font: `700 9px ${font.mono}`,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                  }}
-                >
-                  {badge > 99 ? "99+" : badge}
-                </span>
-              ) : null}
             </span>
             <span style={{ font: `600 9.5px ${font.sans}`, color: navFg(active) }}>
               {mod.nav.label}

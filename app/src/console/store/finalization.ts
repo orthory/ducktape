@@ -52,12 +52,18 @@ export const opKey = {
    *  carries it in `head.message_id`, so the row matches after refresh too). */
   message: (channelId: string, messageId: string) =>
     `chat/${channelId}/id/${messageId}`,
-  /** An op on an EXISTING message (edit/delete/reaction) — keyed by seq. */
+  /** An op on an EXISTING message (edit/delete) — keyed by seq. Reactions are
+   *  deliberately NOT keyed here: they use `reaction()` so a reaction submit
+   *  never paints a finalization mark on the message body it targets. */
   messageSeq: (channelId: string, seq: number) => `chat/${channelId}/seq/${seq}`,
-  task: (taskId: string) => `task/${taskId}`,
+  /** A reaction toggle — its own key so `opForMessage` never picks it up (the
+   *  reaction chip is its own optimistic feedback). */
+  reaction: (channelId: string, seq: number, emoji: string) =>
+    `chat/${channelId}/seq/${seq}/react/${emoji}`,
+  /** A join/leave of a channel's voice huddle — keyed by channel so the pill's
+   *  optimistic roster change carries a finalization record. */
+  huddle: (channelId: string) => `chat/huddle/${channelId}`,
   forgeHead: () => "forge/head",
-  doc: (docId: string) => `doc/${docId}`,
-  docBlock: (docId: string, blockId: string) => `doc/${docId}/block/${blockId}`,
   page: (pageId: string) => `page/${pageId}`,
   /** Page block ids are module-global — no page qualifier needed. */
   pageBlock: (blockId: string) => `page-block/${blockId}`,
@@ -69,12 +75,11 @@ export const opKey = {
   runRequest: (agentId: string) => `agent/run-request/${agentId}`,
   jobWorker: () => "agent/job-worker",
   proposal: (proposalId: string) => `governance/${proposalId}`,
-  /** The local member's inbox controls (mark-read / clear / deliver). */
-  inbox: () => "inbox/self",
-  job: (jobId: string) => `job/${jobId}`,
-  rule: (ruleId: string) => `rule/${ruleId}`,
-  memory: (path: string) => `memory/${path}`,
   file: (fileId: string) => `file/${fileId}`,
+  /** A comment write (edit/delete) — keyed by the comment id. */
+  comment: (commentId: string) => `comment/${commentId}`,
+  /** A thread write (add first comment / reply / resolve) — keyed by thread. */
+  commentThread: (threadId: string) => `comment-thread/${threadId}`,
 };
 
 // ── Ledger transitions (pure) ───────────────────────────

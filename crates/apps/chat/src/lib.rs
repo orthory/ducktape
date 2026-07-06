@@ -21,6 +21,11 @@ mod interface;
 pub use interface::*;
 // the derived-tier materialized view; registered only by serving binaries.
 pub mod index;
+// the real-time voice media engine (Opus over the data plane's datagram
+// class). Off-consensus: it touches no qmdb and no app-hash — the chat
+// module's consensus state (channels, membership) is what will drive its
+// admission and channel→flow derivation. Kept as a self-contained submodule.
+pub mod voice;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
@@ -433,6 +438,7 @@ where
             post_policy,
             hooks: Vec::new(),
             pinned: Vec::new(),
+            huddle: Vec::new(),
         };
         let mut index = self.channel_index().await?;
         index.insert(channel_id.clone());
@@ -814,6 +820,81 @@ where
         )
     }
 
+    /// join (or start) the channel's huddle. only external users may — the
+    /// roster is a room of people, so module/system origins are rejected —
+    /// and members-only channels gate exactly like posting. re-joining with
+    /// the same node key stages nothing (idempotent, byte-identical op log).
+    async fn stage_join_huddle(
+        &mut self,
+        author: AuthorRef,
+        channel_id: &str,
+        node: Vec<u8>,
+        now: u64,
+    ) -> Result<(), Error> {
+        Self::validate_non_empty("channel_id", channel_id)?;
+        let AuthorRef::User(user) = &author else {
+            return Err(Error::Module(
+                "only external users may join a huddle".into(),
+            ));
+        };
+        if node.len() != HUDDLE_NODE_KEY_BYTES {
+            return Err(Error::Module(format!(
+                "huddle node key must be {HUDDLE_NODE_KEY_BYTES} bytes, got {}",
+                node.len()
+            )));
+        }
+        let mut channel = self.require_channel(channel_id).await?;
+        self.check_post_policy(&channel, &author).await?;
+        if let Some(existing) = channel.huddle.iter_mut().find(|m| &m.user == user) {
+            if existing.node == node {
+                return Ok(());
+            }
+            existing.node = node;
+        } else {
+            if channel.huddle.len() >= MAX_HUDDLE_MEMBERS {
+                return Err(Error::Module(format!("huddle is full: {channel_id}")));
+            }
+            channel.huddle.push(HuddleMember {
+                user: user.clone(),
+                node,
+                joined_at: now,
+            });
+        }
+        self.store_bounded(
+            channel_key(channel_id),
+            &channel,
+            MAX_CHANNEL_RECORD_BYTES,
+            "channel",
+        )
+    }
+
+    /// leave the channel's huddle. absent participation is a deterministic
+    /// no-op; the last leaver empties the roster (= the huddle ends).
+    async fn stage_leave_huddle(
+        &mut self,
+        author: AuthorRef,
+        channel_id: &str,
+    ) -> Result<(), Error> {
+        Self::validate_non_empty("channel_id", channel_id)?;
+        let AuthorRef::User(user) = &author else {
+            return Err(Error::Module(
+                "only external users may leave a huddle".into(),
+            ));
+        };
+        let mut channel = self.require_channel(channel_id).await?;
+        let before = channel.huddle.len();
+        channel.huddle.retain(|m| &m.user != user);
+        if channel.huddle.len() == before {
+            return Ok(());
+        }
+        self.store_bounded(
+            channel_key(channel_id),
+            &channel,
+            MAX_CHANNEL_RECORD_BYTES,
+            "channel",
+        )
+    }
+
     // ---- query assembly ------------------------------------------------------
 
     async fn reactions(&self, channel_id: &str, seq: u64) -> Result<Vec<ReactionSummary>, Error> {
@@ -1185,6 +1266,12 @@ where
                 user,
                 member,
             } => self.stage_membership(&channel_id, user, member).await,
+            ChatMsg::JoinHuddle { channel_id, node } => {
+                self.stage_join_huddle(author, &channel_id, node, now).await
+            }
+            ChatMsg::LeaveHuddle { channel_id } => {
+                self.stage_leave_huddle(author, &channel_id).await
+            }
         }
     }
 

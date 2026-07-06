@@ -203,6 +203,38 @@ describe("MembersView", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("lets this node rename itself inline, but offers no rename for peers", () => {
+    const { spies } = renderMembers();
+
+    // Exactly one rename control — the local node's own row.
+    const renameButtons = screen.getAllByRole("button", { name: /rename yourself/i });
+    expect(renameButtons).toHaveLength(1);
+
+    fireEvent.click(renameButtons[0]);
+    const input = screen.getByLabelText("Edit your display name");
+    // seeded with the current profile name.
+    expect(input).toHaveValue("Founder Rae");
+
+    fireEvent.change(input, { target: { value: "  Rae the Founder  " } });
+    fireEvent.click(screen.getByRole("button", { name: /save display name/i }));
+    // trimmed and written through the origin-gated profiles action.
+    expect(spies.setDisplayName).toHaveBeenCalledWith("Rae the Founder");
+  });
+
+  it("discards an inline rename on Escape without writing", () => {
+    const { spies } = renderMembers();
+
+    fireEvent.click(screen.getByRole("button", { name: /rename yourself/i }));
+    const input = screen.getByLabelText("Edit your display name");
+    fireEvent.change(input, { target: { value: "Nope" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(screen.queryByLabelText("Edit your display name")).not.toBeInTheDocument();
+    expect(spies.setDisplayName?.mock.calls ?? []).toHaveLength(0);
+    // the original name is back on the row.
+    expect(screen.getByText("Founder Rae")).toBeInTheDocument();
+  });
+
   it("keeps observers out of the Validators filter but in All", () => {
     renderMembers({
       observers: [observerKey],

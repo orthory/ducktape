@@ -68,6 +68,7 @@ use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of
 
 mod config;
 mod lobby;
+mod voice;
 use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
 
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
@@ -171,6 +172,11 @@ const CHANNEL_LOBBY: u64 = 5;
 /// EVERY mode — an unregistered channel is a protocol violation that kills
 /// the sender's connection — and black-holed where the plane does not run.
 const CHANNEL_REACHABILITY: u64 = 6;
+/// the voice channel: huddle audio datagrams between members (`chat::voice`
+/// media frames inside data-plane datagrams — the `voice` module's mesh
+/// transport arm). registered in EVERY mode like the lanes above; only the
+/// validator path runs the hub that consumes it, every other mode black-holes.
+const CHANNEL_VOICE: u64 = 7;
 /// while parked and un-admitted, re-announce every N park-loop attempts
 /// (attempts tick ~2s apart, so this is roughly every 10s) — often enough to
 /// survive member restarts (the request queue is in-memory), quiet enough to
@@ -3865,7 +3871,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
     // there was a silent no-op). reaching them is the reachability plane's
     // job: gossip relays through whatever mesh links exist, the nat client
-    // hole-punches/relays the WireGuard path through the coordinator, and
+    // rendezvouses via the coordinator and hole-punches the WireGuard path, and
     // once tunnels apply the mesh dials the target's advertised overlay
     // address over the tunnel (the target sets `advertised = "overlay"`).
     // what still needs a TCP foothold is the gossip itself: with ZERO
@@ -3935,12 +3941,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // is fatal-with-remedy rather than a silent no-index run: the tier is
     // rebuildable, so the fix is always "delete <storage>/index".
     let index = noded::open_index_store(&storage, &MODULE_IDS)?;
+    // the voice hub's session lane: /v1/voice/ws handlers ask for huddle
+    // audio sessions here. created up front because the app-surface thread
+    // starts before the mesh exists; only the validator path below spawns the
+    // hub that drains it — on every other path the receiver just drops and
+    // the route answers with a refusal.
+    let (voice_lane, voice_requests) = tokio::sync::mpsc::channel::<noded::VoiceSessionRequest>(8);
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
     let http_handle = http_handle
         .with_forge_repo(storage.join("forge-repo"))
-        .with_index_store(index.clone());
+        .with_index_store(index.clone())
+        .with_voice(voice_lane);
     let blobs = http_handle.blob_handle();
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
@@ -3987,11 +4000,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
+        // the validator's own `ducktape_*` Prometheus series, registered on the
+        // SAME runtime registry `context.encode()` (GET /metrics) serves — the
+        // drain loop below folds each applied block in (height, count, apply
+        // latency, per-module dispatch counters), so the networked node reports
+        // the series the local daemon does and one Grafana board reads both.
+        let metrics = noded::NodeMetrics::register(&context);
+
         // the authorized MESH set, SORTED — what discovery tracks. the
         // consensus scheme uses the (possibly smaller) validator set derived
         // from committed valset state after the recovery boot below.
         let mesh_participants: Set<ed25519::PublicKey> =
             Set::try_from(peers.clone()).expect("authorized peer set has no duplicates");
+
+        // this node's mesh identity, as served on /v1/status — clients stamp
+        // it into peer-routed ops (chat's JoinHuddle.node).
+        let status_public_key = hex_bytes(signer.public_key().as_ref());
 
         // the statesync source a --sync-only joiner pulls from: only
         // validators serve the channel, so the candidate must be a validator
@@ -4085,6 +4109,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 let (_tx, mut rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
                 context
                     .child("blackhole_reachability")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
+            // the voice lane: a sync-only observer serves no huddle audio,
+            // but the channel must exist — black-hole. dropping the session
+            // lane makes /v1/voice/ws refuse instead of hang (this branch
+            // never reaches the validator hub below).
+            drop(voice_requests);
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_voice")
                     .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
             }
             network.start();
@@ -4241,6 +4276,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     }
                 }
             };
+            // the voice lane: a parked joiner serves no huddle audio, but the
+            // channel must exist — black-hole. dropping the session lane makes
+            // /v1/voice/ws refuse instead of hang (this branch always ends in
+            // the promotion reboot, never the validator hub below).
+            drop(voice_requests);
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_voice")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
             // the lobby lane: where this parked node announces its key. member
             // replies are drained by a printer task — purely informational.
             let (mut lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
@@ -4482,6 +4528,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                             app_hash,
                                             height,
                                             modules,
+                                            public_key: status_public_key.clone(),
                                         });
                                     }
                                     noded::NodeCommand::Metrics { reply } => {
@@ -5108,6 +5155,36 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // as the derived lobby identity); this member verifies each announce
         // against the invite token it carries and RECORDS it for approval.
         let (mut lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
+
+        // the voice lane + hub: huddle audio between members. the hub runs on
+        // its OWN plain-tokio OS thread (the reachability/app-surface split
+        // exactly); these two pumps are its only mesh coupling — outbound
+        // datagrams fan out addressed to roster node keys, inbound receipts
+        // arrive stamped with the mesh-authenticated sender.
+        {
+            let (mut voice_p2p_tx, mut voice_p2p_rx) =
+                network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
+            let (mut voice_egress, voice_ingress) = voice::spawn_hub(voice_requests);
+            context.child("voice_egress").spawn(move |_ctx| async move {
+                while let Some((to, frame)) = voice_egress.recv().await {
+                    let Ok(key) = ed25519::PublicKey::decode(&to[..]) else {
+                        continue;
+                    };
+                    // offline/rate-limited recipients drop the frame — voice
+                    // retries nothing, the receiver's jitter buffer fills gaps.
+                    let _ = voice_p2p_tx.send(Recipients::One(key), IoBuf::from(frame), false);
+                }
+            });
+            context.child("voice_ingress").spawn(move |_ctx| async move {
+                while let Ok((peer, bytes)) = voice_p2p_rx.recv().await {
+                    let mut raw = [0u8; 32];
+                    raw.copy_from_slice(peer.as_ref());
+                    // a full hub lane sheds the frame (late audio is dead
+                    // audio); the plane's per-flow accounting covers the rest.
+                    let _ = voice_ingress.try_send((raw, bytes.into()));
+                }
+            });
+        }
 
         // the reachability lane + the staged WireGuard plane. the channel is
         // registered unconditionally (an unregistered channel is a protocol
@@ -5849,6 +5926,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut last_reach_view: Option<u64> = None;
         // throttle for the pending-cutover nop pusher below.
         let mut last_nop = std::time::Instant::now();
+        // dev override (`make dev` sets DUCKTAPE_DISABLE_HEARTBEAT): keep an idle
+        // dev chain quiet — no nop blocks — so every committed block is real
+        // activity and the journal/logs carry no idle churn. NEVER set this on a
+        // multi-node or upgrade-driving network: the heartbeat is what ticks an
+        // idle chain across a pending cutover and keeps the console height
+        // visibly live.
+        let heartbeat_disabled = std::env::var_os("DUCKTAPE_DISABLE_HEARTBEAT").is_some();
         // throttle for the saga crank pump below.
         let mut last_crank = std::time::Instant::now();
         // throttle for the dispatch delivery-nudge pump below.
@@ -6050,6 +6134,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             (node::Disposition::Applied, Some(op)) => &op.dispatches,
                             _ => &[],
                         };
+                        // metrics: fold the block into the validator's
+                        // `ducktape_*` Prometheus series (GET /metrics). an
+                        // APPLIED block records fully — count, this node's
+                        // apply latency, per-module dispatch counters; a
+                        // REJECTED frame (a deterministic no-op — the idle
+                        // heartbeat nop lands here) only follows the height
+                        // gauge, so it never pollutes the block series.
+                        match (&d.disposition, &d.op) {
+                            (node::Disposition::Applied, Some(op)) => {
+                                metrics.record_block(d.height, op.latency_us, dispatches);
+                            }
+                            _ => metrics.record_height(d.height),
+                        }
                         let record = match &d.op {
                             Some(op) if op.target != NOP_TARGET => {
                                 let disposition = match d.disposition {
@@ -6137,9 +6234,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     }
                     // publish each newly-applied boundary to ws subscribers
                     // (send only errs when nobody is subscribed — fine). the
-                    // validator serves block frames only — telemetry frames come
-                    // from the local `noded` daemon, which owns the dispatch
-                    // trace this finalized-boundary seam does not carry.
+                    // drain loop above already folded each block into the
+                    // metrics series; this tip seam carries the ws block
+                    // summary only — it fires once per drain.
                     if let Some(f) = node.finalized() {
                         if last_published != Some(f.height) {
                             let _ = http_events.send(noded::WsFrame::Block(noded::BlockSummary {
@@ -6493,7 +6590,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // it is alone. the reset stays inside the taken branch: when the
                     // gate skips, the timer stays elapsed, so the first tick after
                     // the queue drains injects the next nop immediately.
-                    if last_nop.elapsed() >= HEARTBEAT_INTERVAL
+                    if !heartbeat_disabled
+                        && last_nop.elapsed() >= HEARTBEAT_INTERVAL
                         && node.orderer().pending_len() == 0
                     {
                         last_nop = std::time::Instant::now();
@@ -6935,12 +7033,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 app_hash: hex(&node.app_hash()),
                                 height: node.finalized().map(|f| f.height).unwrap_or(0),
                                 modules,
+                                public_key: status_public_key.clone(),
                             });
                         }
                         noded::NodeCommand::Metrics { reply } => {
-                            // the validator serves commonware's runtime registry;
-                            // the `ducktape_*` block series are the local daemon's
-                            // (noded's) surface, not wired into this consensus path.
+                            // one registry: commonware's runtime series plus the
+                            // `ducktape_*` block series the drain loop records.
                             let _ = reply.send(context.encode());
                         }
                     }

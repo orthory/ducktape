@@ -4,12 +4,13 @@
 // bubble and no color-coding by author; only consecutive-same-author
 // grouping (via `groupStart`) distinguishes rows.
 
-import { useEffect, useState } from "react";
+import { useContext, useEffect, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
 import { authorName } from "../../../domain/chat-client";
 import type { AuthorNames, AuthorRef, ChatBlock, MessageView, Span } from "../../../domain/chat-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
+import { ConsoleContext } from "../../store/context";
 import type { OpRecord } from "../../store/finalization";
 import { authorKey, hasReacted, isAgentAuthor, isWallClock } from "./chat-helpers";
 import { blocksToInput } from "./chat-input";
@@ -70,6 +71,16 @@ function RefGlyph({ size = 13 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
       <path d="M8 4.5h8a2 2 0 0 1 2 2v13l-6-3-6 3v-13a2 2 0 0 1 2-2z" />
+    </svg>
+  );
+}
+
+function ExplorerGlyph({ size = 13 }: { size?: number }) {
+  // A block/cube — "open this message's block in the explorer".
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 3.4l7 4v9l-7 4-7-4v-9z" />
+      <path d="M12 3.4v17M5 7.4l7 4 7-4" />
     </svg>
   );
 }
@@ -388,10 +399,10 @@ function EditBox({
         value={draft}
         onChange={(event) => onChange(event.target.value)}
         onKeyDown={(event) => {
-          if (event.key === "Escape") {
+          if (event.key === "Escape" && !event.nativeEvent.isComposing) {
             event.preventDefault();
             onCancel();
-          } else if (event.key === "Enter" && !event.shiftKey) {
+          } else if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
             event.preventDefault();
             onSave();
           }
@@ -609,6 +620,7 @@ function OverflowMenu({
   onReplyInThread,
   copyLinkValue,
   copyRefValue,
+  onOpenExplorer,
   threadable,
   canModify,
   onStartEdit,
@@ -618,6 +630,8 @@ function OverflowMenu({
   onReplyInThread: () => void;
   copyLinkValue: string;
   copyRefValue: string;
+  /** Present only when this row's op resolved a finalized inclusion height. */
+  onOpenExplorer?: () => void;
   threadable: boolean;
   canModify: boolean;
   onStartEdit: () => void;
@@ -667,6 +681,16 @@ function OverflowMenu({
       )}
       <CopyMenuRow label="Copy link" icon={<LinkGlyph size={13} />} value={copyLinkValue} onDone={onClose} />
       <CopyMenuRow label="Copy reference" icon={<RefGlyph size={13} />} value={copyRefValue} onDone={onClose} />
+      {onOpenExplorer && (
+        <MenuRow
+          label="Open in explorer"
+          icon={<ExplorerGlyph size={13} />}
+          onClick={() => {
+            onOpenExplorer();
+            onClose();
+          }}
+        />
+      )}
       {canModify && (
         <>
           <div style={{ height: 1, background: color.borderSoft, margin: "4px 6px" }} />
@@ -827,6 +851,17 @@ export function MessageItem({
   // A message we authored can be edited/deleted — the module rejects the write
   // from anyone else, so the affordances are hidden rather than shown-and-failing.
   const canModify = !deleted && authorKey(message.head.author) === selfKey;
+  // A committed chat message needs no per-row "confirmed" badge — every message
+  // is on-chain by definition, so a persistent checkmark is pure noise. Show the
+  // mark ONLY while a write is in flight (the pulsing dot) or if it FAILED (the
+  // cross); the settled state falls through to the plain gutter/header. The
+  // explorer deep-link moves to the overflow menu instead of a tiny clickable ✓.
+  const store = useContext(ConsoleContext);
+  const liveOp = op && op.phase !== "finalized" ? op : undefined;
+  const explorerHeight =
+    store && op?.phase === "finalized" && op.height !== undefined ? op.height : null;
+  const openInExplorer =
+    explorerHeight === null ? undefined : () => store?.actions.openExplorerAt(explorerHeight);
   const [editing, setEditing] = useState(false);
   const [editDraft, setEditDraft] = useState("");
   const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -855,7 +890,7 @@ export function MessageItem({
       style={{
         borderRadius: 9,
         padding: `${groupStart ? 7 : 1}px 8px`,
-        margin: `${groupStart ? 3 : 0}px -8px 0`,
+        margin: `${groupStart ? 8 : 0}px -8px 0`,
         width: "calc(100% + 16px)",
         maxWidth: "calc(100% + 16px)",
         boxSizing: "border-box",
@@ -867,11 +902,11 @@ export function MessageItem({
       <div style={{ width: 30, flexShrink: 0, display: "flex", justifyContent: "center", paddingTop: 1 }}>
         {groupStart ? (
           <Avatar author={message.head.author} name={author} size={30} />
-        ) : op ? (
-          // a grouped row has no meta line — its mark takes the time gutter
-          // (and must stay hoverable, so it outranks the hover timestamp)
+        ) : liveOp ? (
+          // a grouped row has no meta line — an in-flight/failed mark takes the
+          // time gutter (and must stay hoverable, so it outranks the hover time)
           <span style={{ marginTop: 4 }}>
-            <FinalizationMark op={op} />
+            <FinalizationMark op={liveOp} />
           </span>
         ) : hovered ? (
           <span style={{ font: `400 10px ${font.mono}`, color: color.muted2, marginTop: 4 }}>
@@ -903,7 +938,7 @@ export function MessageItem({
             {message.head.edited_at !== null && (
               <span style={{ font: `400 10px ${font.sans}`, color: color.muted2 }}>(edited)</span>
             )}
-            <FinalizationMark op={op} />
+            <FinalizationMark op={liveOp} />
           </div>
         )}
         <div
@@ -941,7 +976,10 @@ export function MessageItem({
             message={message}
             selfKey={selfKey}
             onReact={onReact}
-            onAddReaction={() => setPickerOpen(true)}
+            onAddReaction={() => {
+              onMenuToggle(false);
+              setPickerOpen(true);
+            }}
           />
         )}
         {!deleted && !editing && threadable && replyCount > 0 && (
@@ -972,6 +1010,7 @@ export function MessageItem({
           onReplyInThread={onOpenThread}
           copyLinkValue={linkRef}
           copyRefValue={refRef}
+          onOpenExplorer={openInExplorer}
           threadable={threadable}
           canModify={canModify}
           onStartEdit={startEdit}

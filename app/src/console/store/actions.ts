@@ -1,28 +1,24 @@
 import type { Dispatch } from "react";
 
 import * as agentClient from "../../domain/agent-client";
-import * as automationsClient from "../../domain/automations-client";
-import type { Action as RuleAction, Trigger } from "../../domain/automations-client";
 import * as chatClient from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
-import * as documentClient from "../../domain/document-client";
-import type { BlockKind } from "../../domain/document-client";
 import * as filesClient from "../../domain/files-client";
 import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
-import * as inboxClient from "../../domain/inbox-client";
-import * as jobsClient from "../../domain/jobs-client";
-import * as memoryClient from "../../domain/memory-client";
-import type { Meta } from "../../domain/memory-client";
 import * as pagesClient from "../../domain/pages-client";
-import type { BlockKind as PageBlockKind } from "../../domain/pages-client";
+import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
-import * as tasksClient from "../../domain/tasks-client";
+import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
 import * as bootstrap from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
+import { voiceSocketUrl } from "../../domain/transport";
+import { createVoiceSession, huddleRecipients } from "../../domain/voice-session";
+import type { VoiceSession, VoiceStatus } from "../../domain/voice-session";
+import { keyBytes } from "../../domain/chat-client";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
@@ -34,10 +30,11 @@ import type { Action } from "./reducer";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
 import {
+  addTab,
   channelIdOf,
   clearRemoteUrl,
-  docIdOf,
-  nextTaskStatus,
+  removeTab,
+  saveDocTabs,
   saveRemoteUrl,
   saveViewMode,
 } from "./state";
@@ -88,35 +85,43 @@ export interface ConsoleActions {
    *  that emoji yet, removes it if we have. Refreshes the open thread panel
    *  too, since its replies are a separate snapshot from `state.messages`. */
   toggleReaction(seq: number, emoji: string): void;
-  addTask(title: string): void;
-  advanceTask(taskId: string): void;
+
+  // ── Huddle (voice over the chat channel's roster) ──
+  /** Join a channel's voice huddle: leave any current huddle first (leave op +
+   *  stop the old session), submit join_huddle carrying this node's key, start
+   *  the audio session, and push the current roster as the fan-out set. No-op
+   *  when the daemon can't do voice (no status.publicKey) or we're already in
+   *  this channel's huddle. */
+  joinHuddle(channelId: string): void;
+  /** Leave the active huddle: stop the audio session, clear the voice slice,
+   *  and submit leave_huddle for the channel. */
+  leaveHuddle(): void;
+  /** Mute / unmute the mic — stops forwarding captured frames without dropping
+   *  the track, so unmute is instant. */
+  setHuddleMuted(muted: boolean): void;
+  /** Recompute the live session's fan-out set from the active channel's roster
+   *  and push it. Called by the provider whenever a refresh lands a new
+   *  snapshot while a huddle is active; a no-op when not huddling. */
+  syncHuddleRecipients(): void;
+
   commitForge(params: { path: string; content: string; message: string }): void;
 
-  // ── Documents (block store over the `document` module) ──
-  /** Re-query the module's enumeration index into `state.docIds` (the tree). */
-  listDocs(): void;
-  /** Create a doc at a "/"-delimited path (CreateDoc, idempotent) and open it.
-   *  The refresh after the write re-enumerates the index, so the new path
-   *  appears in the tree. */
-  createDoc(docId: string): void;
-  /** Open a doc by path, loading its blocks (like selectChannel). */
-  openDoc(docId: string): void;
-  /** Append/insert a fresh block into the active doc (id generated here). */
-  insertBlock(params: { after: string | null; kind: BlockKind; text: string }): void;
-  /** Replace a block's text in the active doc. */
-  updateBlock(params: { blockId: string; text: string }): void;
-  /** Remove a block from the active doc. */
-  removeBlock(blockId: string): void;
-  /** Move a block within the active doc (see the `after` rule). */
-  moveBlock(params: { blockId: string; after: string | null }): void;
-
-  // ── Pages (block-tree notebook over the `pages` module) ──
+  // ── Docs (block-tree notebook over the `pages` module) ──
   /** Re-query the page enumeration into `state.pages`. */
   listPages(): void;
   /** Create a page (root block id minted here) and open it. */
   createPage(title: string): void;
-  /** Open a page, loading its preorder block tree (like openDoc). */
+  /** Create an untitled page (optionally nested under `parent`) and open it —
+   *  the instant Notion-style new-page flow. `parent` null == top level. */
+  createChildPage(parent: string | null): void;
+  /** Re-nest a page under a (possibly new) parent, or to top level with null. */
+  setPageParent(params: { pageId: string; parent: string | null }): void;
+  /** Delete a page (root + subtree; child pages promote up). */
+  deletePage(pageId: string): void;
+  /** Open a page, loading its preorder block tree and comment threads. */
   openPage(pageId: string): void;
+  /** Close a document tab; activates a neighbor if it was active. */
+  closeTab(pageId: string): void;
   /** Insert a block into the active page. The VIEW mints the id (it drives
    *  focus to the new block, so it must know the id before the round-trip). */
   insertPageBlock(params: {
@@ -140,6 +145,19 @@ export interface ConsoleActions {
   }): void;
   /** Remove a block and its whole subtree. */
   removePageBlock(blockId: string): void;
+
+  // ── Comments (threads over the `comments` module) ──
+  /** Load the open page's comment threads (page + every visible block). */
+  loadPageThreads(): void;
+  /** Add a comment: opens a new thread when `threadId` is omitted (a fresh id
+   *  is minted), else appends to that thread. `target` is a block or page id. */
+  addComment(params: { threadId?: string; target: string; text: string }): void;
+  /** Edit own comment text. */
+  editComment(params: { commentId: string; text: string }): void;
+  /** Tombstone own comment (removes the thread if it was the last live one). */
+  deleteComment(commentId: string): void;
+  /** Toggle a thread's resolved state. */
+  resolveThread(params: { threadId: string; resolved: boolean }): void;
 
   // ── Agents (collaboration loop over the `agent` module) ──
   /** Upload the prompt text to the blob store, then RegisterAgent with the
@@ -184,66 +202,16 @@ export interface ConsoleActions {
   /** Tally and settle a decidable proposal (anyone may trigger it). */
   executeProposal(proposalId: string): void;
 
-  // ── Inbox (per-member notification queue over the `inbox` module) ──
-  /** Mark every notification in the local member's queue read (idempotent). */
-  markInboxRead(): void;
-  /** Mark every item up to and including `seq` read. */
-  markInboxReadTo(seq: number): void;
-  /** Delete every notification in the local member's queue (up to the latest). */
-  clearInbox(): void;
-  /** Enqueue a notification (module follow-ups are the primary writers, but the
-   *  console can self-deliver or notify another member). */
-  deliverNotification(params: { member: string; kind: string; body: string }): void;
-
-  // ── Jobs (consensus work board over the `jobs` module) ──
-  /** Post a new job (id generated here). */
-  submitJob(params: { kind: string; spec: string }): void;
-  /** Claim a Pending job under a view-count lease. */
-  claimJob(params: { jobId: string; leaseViews: number }): void;
-  /** Report a result on a job this node is processing. */
-  finalizeJob(params: { jobId: string; ok: boolean; payload: string }): void;
-  /** Hand a Processing job back to Pending. */
-  releaseJob(jobId: string): void;
-  /** Permissionless requeue of a Processing job whose lease expired. */
-  reclaimJob(jobId: string): void;
-  /** Cancel a still-Pending job (submitter only). */
-  cancelJob(jobId: string): void;
-  /** Remove a terminal job's record entirely (submitter only). */
-  pruneJob(jobId: string): void;
-
-  // ── Automations (event-triggered rules over the `automations` module) ──
-  /** Create a rule pairing a trigger with an action. */
-  createRule(params: { ruleId: string; trigger: Trigger; action: RuleAction }): void;
-  /** Enable or disable a rule without deleting it. */
-  setRuleEnabled(ruleId: string, enabled: boolean): void;
-  /** Delete a rule. */
-  deleteRule(ruleId: string): void;
-
-  // ── Memory (agent filesystem over the `memory` module) ──
-  /** Browse a directory: list its entries and make it the active path. */
-  browseMemory(path: string): void;
-  /** Open a file into the viewer, loading its latest (or a specific) generation. */
-  openMemoryFile(params: { path: string; generation?: number | null }): void;
-  /** Close the open file. */
-  closeMemoryFile(): void;
-  /** Write-once publish of an inline document at `path`, then refresh the tree. */
-  publishMemory(params: { path: string; text: string; meta?: Meta }): void;
-  /** Delete a memory file (all live generations). */
-  deleteMemory(path: string): void;
-  /** Run a case-sensitive substring search under `prefix`; results land in
-   *  `state.memoryMatches`. */
-  searchMemory(params: { prefix: string; pattern: string }): void;
-  /** Clear the active search. */
-  clearMemorySearch(): void;
-
   // ── Search (cross-module, over the node's derived-index views) ──
-  /** Search chat, docs, and pages with one text: the three modules'
-   *  materialized views fan out concurrently and land grouped in
-   *  `state.search`. A node without the index tier contributes empty groups
-   *  rather than failing the search. */
+  /** Search chat + docs with one text: the two modules' materialized views
+   *  fan out concurrently and land grouped in `state.search`. A node without
+   *  the index tier contributes empty groups rather than failing the search. */
   runSearch(text: string): void;
   /** Drop the last search's results. */
   clearSearch(): void;
+  /** Open / close the ⌘K command-palette search overlay. */
+  openSearch(): void;
+  closeSearch(): void;
 
   // ── Files (content-addressed manifests over the `files` module) ──
   /** Chunk + stage a file's bytes into the blob store, then commit its manifest. */
@@ -261,6 +229,9 @@ export interface ConsoleActions {
   stopNode(): void;
   /** Re-spawn / re-adopt the managed daemon after a stop (desktop only). */
   startNode(): void;
+  /** Scrape + parse the node's `/metrics`. Null when no node is resolved or the
+   *  scrape fails — best-effort, for the poll-driven Metrics view. */
+  readMetrics(): Promise<NodeMetrics | null>;
   dismissError(): void;
 
   // ── Onboarding / workspaces (desktop only) ──
@@ -337,6 +308,73 @@ export function createActions({
   const update = (fn: (state: ConsoleState) => Partial<ConsoleState>) =>
     dispatch({ type: "update", fn });
 
+  // Monotonic token gating the async search fan-out: each runSearch/clearSearch
+  // bumps it, and a resolving fan-out only writes results if its token is still
+  // current — so a slow or out-of-order response can never clobber a newer
+  // query's results (or repopulate a cleared palette).
+  let searchToken = 0;
+
+  // The live voice session (the browser audio graph + ws), or null when not in
+  // a huddle. Ephemeral and per-client — it lives here, not in state; the
+  // `voice` slice mirrors only its status for the ui.
+  let voice: VoiceSession | null = null;
+
+  /** Our own node key hex — the fan-out set excludes it. Empty on a daemon
+   *  that can't do voice. */
+  const selfNodeHex = (): string => getState().status?.publicKey ?? "";
+
+  // The last fan-out set pushed into the live session — refresh() lands a new
+  // channels array every block, so pushes are deduped by value here rather
+  // than by effect identity upstream.
+  let lastRecipients: string | null = null;
+
+  /** Recompute + push the fan-out set for `channelId` (default: the active
+   *  huddle) into the live session. No-op when not huddling or unchanged. */
+  const pushRecipients = (channelId = getState().voice.channelId): void => {
+    if (!voice || !channelId) return;
+    const channel = getState().channels.find((c) => c.id === channelId);
+    const recipients = huddleRecipients(channel?.huddle ?? [], selfNodeHex());
+    const fingerprint = recipients.join(",");
+    if (fingerprint === lastRecipients) return;
+    lastRecipients = fingerprint;
+    voice.setRecipients(recipients);
+  };
+
+  /** Stop + drop the live audio session (no consensus write). Idempotent. */
+  const stopVoice = (): void => {
+    voice?.stop();
+    voice = null;
+    lastRecipients = null;
+  };
+
+  // Session lifecycle → the voice slice. Any terminal end reconciles the
+  // consensus roster (submit leave) so peers never keep showing a dead
+  // participant: 'closed' (the session was replaced) clears the slice
+  // entirely; 'error' (hub refusal, socket failure, mic denial) keeps the dock
+  // up in its error state so the failure is visible — Leave dismisses it.
+  const onVoiceStatus = (status: VoiceStatus): void => {
+    if (status === "closed" || status === "error") {
+      const channelId = getState().voice.channelId;
+      stopVoice();
+      if (channelId) submitLeaveHuddle(channelId);
+      if (status === "closed") {
+        patch({ voice: { channelId: null, muted: false, status: "idle" } });
+      } else {
+        update((prev) => ({ voice: { ...prev.voice, status: "error" } }));
+      }
+      return;
+    }
+    update((prev) => ({ voice: { ...prev.voice, status } }));
+  };
+
+  /** Submit a leave_huddle for `channelId` with the optimistic roster prune. */
+  const submitLeaveHuddle = (channelId: string) =>
+    submitTracked(
+      opKey.huddle(channelId),
+      (live) => chatClient.leaveHuddle(live, { channelId, origin: getState().author }),
+      (prev) => optimistic.huddleLeft(prev, channelId, selfNodeHex()),
+    );
+
   // The one write path: apply the op's PRECONFIRMED render immediately (the
   // optimistic projection plus a pending ledger record under the entity's
   // key), submit, then settle the record from the node's receipt — finalized
@@ -400,39 +438,80 @@ export function createActions({
       .catch(fail);
   };
 
-  // the single entry point into a doc: make it active and load its blocks.
-  // Every path into a doc (new-doc, a tree click) goes here — like
-  // enterChannel. The known-doc set is the node's index (state.docIds), not a
-  // local registry, so entering a doc no longer writes any list — it just
-  // focuses the reader on `docId`.
-  const enterDoc = (rawId: string) => {
+  // load the comment threads for the open page (the page id + every visible
+  // block id) in one batch; refreshed on open and after any comment op.
+  const loadPageThreads = (blocksOverride?: PageBlock[]): Promise<void> => {
+    // `blocks` is passed by callers that JUST fetched the tree, because
+    // getState().activePageBlocks lags a dispatch (stateRef updates on render);
+    // reading it here would ship only the page target and miss every block.
     const live = getNode();
-    const docId = docIdOf(rawId);
-    if (!live || !docId) return;
-    patch({
-      activeDoc: docId,
-      activeDocBlocks: [],
-    });
-    Promise.resolve()
-      .then(() => documentClient.getDoc(live, docId))
-      .then((blocks) => patch({ activeDocBlocks: blocks ?? [] }))
+    const page = getState().activePage;
+    if (!live || !page) {
+      patch({ pageThreads: [] });
+      return Promise.resolve();
+    }
+    const blocks = blocksOverride ?? getState().activePageBlocks;
+    const targets = [page, ...blocks.map((b) => b.id)];
+    // the module rejects a ThreadsForTargets over MAX_QUERY_TARGETS (512), so a
+    // large page must chunk its targets across several queries.
+    const CHUNK = 512;
+    const batches: string[][] = [];
+    for (let i = 0; i < targets.length; i += CHUNK) batches.push(targets.slice(i, i + CHUNK));
+    return Promise.all(batches.map((b) => pagesClient.threadsForTargets(live, { targets: b })))
+      .then((results) => patch({ pageThreads: results.flat() }))
       .catch(fail);
   };
 
-  // the single entry point into a page: make it active and load its preorder
-  // block tree — every path into a page (new-page, a rail click) goes here,
-  // mirroring enterDoc.
+  // load the active page's block tree + its comment threads (threads keyed off
+  // the freshly-fetched blocks, not the lagging store copy). shared by every
+  // activation path; does NOT touch the tab list.
+  const loadActivePage = (pageId: string) => {
+    const live = getNode();
+    if (!live) return;
+    Promise.resolve()
+      .then(() => pagesClient.getPage(live, pageId))
+      .then((blocks) => {
+        patch({ activePageBlocks: blocks ?? [] });
+        return loadPageThreads(blocks ?? []);
+      })
+      .catch(fail);
+  };
+
+  // the single entry point into a page: make it active (opening a tab), then
+  // load its tree + threads — every path into a page (new-page, a rail click,
+  // a tab click) goes here.
   const enterPage = (pageId: string) => {
     const live = getNode();
     if (!live || !pageId) return;
+    const tabs = addTab(getState().openTabs, pageId);
+    saveDocTabs(tabs);
     patch({
       activePage: pageId,
       activePageBlocks: [],
+      openTabs: tabs,
+      pageThreads: [],
     });
-    Promise.resolve()
-      .then(() => pagesClient.getPage(live, pageId))
-      .then((blocks) => patch({ activePageBlocks: blocks ?? [] }))
-      .catch(fail);
+    loadActivePage(pageId);
+  };
+
+  // close a document tab; if it was active, activate a neighbor (loading its
+  // tree) so the editor never lands on a closed page. Activation here patches
+  // the already-reduced tab list directly — it must NOT go through enterPage,
+  // whose addTab(getState().openTabs, …) reads the stale pre-close list and
+  // would re-stage the just-closed id.
+  const closeTabLocal = (pageId: string) => {
+    const { tabs, active } = removeTab(getState().openTabs, getState().activePage, pageId);
+    saveDocTabs(tabs);
+    if (active && active !== getState().activePage) {
+      patch({ openTabs: tabs, activePage: active, activePageBlocks: [], pageThreads: [] });
+      loadActivePage(active);
+      return;
+    }
+    patch({
+      openTabs: tabs,
+      activePage: active,
+      ...(active ? {} : { activePageBlocks: [], pageThreads: [] }),
+    });
   };
 
   // Connect the app to a workspace's node: select it (Rust spawns/adopts),
@@ -444,6 +523,13 @@ export function createActions({
     // Choosing a local workspace supersedes any remembered remote — it becomes
     // what we reconnect to on next launch.
     clearRemoteUrl();
+    // Tear the old node down BEFORE clearing its projections, so its block
+    // subscription can't fire a straggler frame into the just-cleared state
+    // during the async selectWorkspace/waitUntilUp window that follows
+    // (mirrors connectRemote). Without this teardown-first order, an old-node
+    // block would re-set lastBlock right after the clear — the exact
+    // staleness this clear prevents.
+    setNode(null);
     patch({
       workspace: target,
       needsOnboarding: false,
@@ -452,6 +538,11 @@ export function createActions({
       // switching targets clears it so it can never fire on the wrong one.
       forgetNeedsForce: false,
       inviteBlob: null,
+      // per-node observability belonging to the workspace we're leaving; the
+      // node effect re-hydrates blocks and re-follows the block stream once
+      // the new node is set below.
+      lastBlock: null,
+      blocks: [],
     });
     return Promise.resolve()
       .then(() => ws.selectWorkspace(target.id))
@@ -545,6 +636,13 @@ export function createActions({
 
     setAccent: (accent) => patch({ accent }),
     setAuthor: (author) => patch({ author }),
+
+    readMetrics: () => {
+      const live = getNode();
+      return live
+        ? live.metrics().then(parseMetrics).catch(() => null)
+        : Promise.resolve(null);
+    },
 
     // Keep the local author identity (still the web-origin string) AND submit
     // SetName so the chosen name propagates: it's origin-gated, so passing our
@@ -718,7 +816,7 @@ export function createActions({
             author.user.every((byte, i) => byte === selfBytes[i]),
         );
       submitTracked(
-        opKey.messageSeq(channelId, seq),
+        opKey.reaction(channelId, seq, emoji),
         (live) =>
           mine
             ? chatClient.removeReaction(live, { channelId, seq, emoji, origin })
@@ -740,27 +838,68 @@ export function createActions({
       });
     },
 
-    addTask: (title) => {
-      const clean = title.trim();
-      if (!clean) return;
-      const taskId = crypto.randomUUID();
-      submitTracked(
-        opKey.task(taskId),
-        (live) => tasksClient.createTask(live, { taskId, title: clean }),
-        (prev) => optimistic.taskAdded(prev, { taskId, title: clean, at: Date.now() }),
-      );
+    // ── Huddle ──
+    joinHuddle: (channelId) => {
+      const state = getState();
+      const publicKey = state.status?.publicKey;
+      const nodeUrl = state.nodeUrl;
+      // no voice identity (legacy daemon) or no resolved node → nothing to do.
+      if (!publicKey || !nodeUrl || !channelId) return;
+      const active = state.voice.channelId;
+      if (active === channelId) return; // already in this huddle
+      // switching huddles: the server replaces the session, so leave the old on
+      // consensus and stop its audio before starting the new one.
+      if (active) submitLeaveHuddle(active);
+      stopVoice();
+      // submit the join carrying our node key bytes; optimistically add us to
+      // the roster so the pill/dock react instantly.
+      const node = keyBytes(publicKey);
+      void submitTracked(
+        opKey.huddle(channelId),
+        (live) => chatClient.joinHuddle(live, { channelId, node, origin: getState().author }),
+        (prev) =>
+          optimistic.huddleJoined(prev, {
+            channelId,
+            node,
+            author: prev.author,
+            at: Math.floor(Date.now() / 1000),
+          }),
+      ).then(() => {
+        // consensus refused the join (members-only, roster full): the audio
+        // session must not keep streaming into a huddle we are not in.
+        const settled = getState();
+        if (
+          settled.ops[opKey.huddle(channelId)]?.phase === "failed" &&
+          settled.voice.channelId === channelId
+        ) {
+          stopVoice();
+          update((prev) => ({ voice: { ...prev.voice, status: "error" } }));
+        }
+      });
+      // start the audio session and reflect "connecting"; push whatever roster
+      // we already know (others may be huddling), self excluded. joins start
+      // MUTED — joining a room must never be a hot-mic moment; unmuting is the
+      // deliberate act.
+      voice = createVoiceSession(onVoiceStatus);
+      voice.setMuted(true);
+      patch({ voice: { channelId, muted: true, status: "connecting" } });
+      voice.start(voiceSocketUrl(nodeUrl, channelId));
+      pushRecipients(channelId);
     },
 
-    advanceTask: (taskId) => {
-      const task = getState().tasks.find((t) => t.id === taskId);
-      if (!task || task.status === "done") return;
-      const status = nextTaskStatus(task.status);
-      submitTracked(
-        opKey.task(taskId),
-        (live) => tasksClient.updateStatus(live, { taskId, status }),
-        (prev) => optimistic.taskAdvanced(prev, taskId, status),
-      );
+    leaveHuddle: () => {
+      const channelId = getState().voice.channelId;
+      stopVoice();
+      patch({ voice: { channelId: null, muted: false, status: "idle" } });
+      if (channelId) submitLeaveHuddle(channelId);
     },
+
+    setHuddleMuted: (muted) => {
+      voice?.setMuted(muted);
+      update((prev) => ({ voice: { ...prev.voice, muted } }));
+    },
+
+    syncHuddleRecipients: () => pushRecipients(),
 
     commitForge: (params) => {
       if (!params.path.trim() || params.content.length === 0) return;
@@ -774,73 +913,7 @@ export function createActions({
       );
     },
 
-    // ── Documents ──
-    listDocs: () => {
-      const live = getNode();
-      if (!live) return;
-      Promise.resolve()
-        .then(() => documentClient.listDocs(live))
-        .then((docIds) => patch({ docIds }))
-        .catch(fail);
-    },
-
-    openDoc: enterDoc,
-
-    createDoc: (rawId) => {
-      const docId = docIdOf(rawId);
-      if (!docId) return;
-      // CreateDoc is idempotent and REQUIRED before any block op; the refresh
-      // re-enumerates the index so the new path shows in the tree, then open
-      // it (loads blocks), mirroring createChannel.
-      submitTracked(
-        opKey.doc(docId),
-        (live) => documentClient.createDoc(live, { docId }),
-        (prev) => optimistic.docCreated(prev, docId),
-      ).then(() => enterDoc(docId));
-    },
-
-    insertBlock: ({ after, kind, text }) => {
-      const docId = getState().activeDoc;
-      if (!docId) return;
-      const block = { id: crypto.randomUUID(), kind, text };
-      submitTracked(
-        opKey.docBlock(docId, block.id),
-        (live) => documentClient.insertBlock(live, { docId, after, block }),
-        (prev) => optimistic.docBlockInserted(prev, { after, block }),
-      );
-    },
-
-    updateBlock: ({ blockId, text }) => {
-      const docId = getState().activeDoc;
-      if (!docId) return;
-      submitTracked(
-        opKey.docBlock(docId, blockId),
-        (live) => documentClient.updateBlock(live, { docId, blockId, text }),
-        (prev) => optimistic.docBlockUpdated(prev, blockId, text),
-      );
-    },
-
-    removeBlock: (blockId) => {
-      const docId = getState().activeDoc;
-      if (!docId) return;
-      submitTracked(
-        opKey.docBlock(docId, blockId),
-        (live) => documentClient.removeBlock(live, { docId, blockId }),
-        (prev) => optimistic.docBlockRemoved(prev, blockId),
-      );
-    },
-
-    moveBlock: ({ blockId, after }) => {
-      const docId = getState().activeDoc;
-      if (!docId) return;
-      submitTracked(
-        opKey.docBlock(docId, blockId),
-        (live) => documentClient.moveBlock(live, { docId, blockId, after }),
-        (prev) => optimistic.docBlockMoved(prev, { blockId, after }),
-      );
-    },
-
-    // ── Pages ──
+    // ── Docs ──
     listPages: () => {
       const live = getNode();
       if (!live) return;
@@ -851,18 +924,81 @@ export function createActions({
     },
 
     openPage: enterPage,
+    closeTab: closeTabLocal,
 
-    createPage: (title) => {
-      const clean = title.trim();
-      if (!clean) return;
-      // the page root's block id — minted here like task/job ids; the refresh
-      // re-enumerates ListPages so the rail shows it, then open it.
+    // create a page (optionally nested under `parent`) with an EMPTY title and
+    // open it — the doc title input is where naming happens (Notion-style
+    // instant page). `parent` null == top level.
+    createChildPage: (parent: string | null) => {
       const pageId = crypto.randomUUID();
       submitTracked(
         opKey.page(pageId),
-        (live) => pagesClient.createPage(live, { pageId, title: clean }),
-        (prev) => optimistic.pageCreated(prev, { pageId, title: clean }),
+        (live) => pagesClient.createPage(live, { pageId, title: "", parent }),
+        (prev) => optimistic.pageCreated(prev, { pageId, title: "", parent }),
       ).then(() => enterPage(pageId));
+    },
+
+    // kept for programmatic/test callers that pass a title.
+    createPage: (title) => {
+      const pageId = crypto.randomUUID();
+      submitTracked(
+        opKey.page(pageId),
+        (live) => pagesClient.createPage(live, { pageId, title: title.trim() }),
+        (prev) => optimistic.pageCreated(prev, { pageId, title: title.trim() }),
+      ).then(() => enterPage(pageId));
+    },
+
+    setPageParent: ({ pageId, parent }) => {
+      submitTracked(opKey.page(pageId), (live) =>
+        pagesClient.setPageParent(live, { pageId, parent }),
+      );
+    },
+
+    deletePage: (pageId) => {
+      if (!pageId) return;
+      submitTracked(opKey.page(pageId), (live) => pagesClient.deletePage(live, pageId))
+        .then(() => {
+          const live = getNode();
+          if (live) pagesClient.listPages(live).then((pages) => patch({ pages })).catch(fail);
+        })
+        .catch(fail);
+      // close its tab immediately (optimistic UX).
+      closeTabLocal(pageId);
+    },
+
+    // ── Comments ──
+    loadPageThreads: () => {
+      void loadPageThreads();
+    },
+
+    addComment: ({ threadId, target, text }) => {
+      const clean = text.trim();
+      if (!clean) return;
+      const tid = threadId ?? crypto.randomUUID();
+      const commentId = crypto.randomUUID();
+      submitTracked(opKey.commentThread(tid), (live) =>
+        pagesClient.addComment(live, { threadId: tid, commentId, target, text: clean }),
+      ).then(() => loadPageThreads());
+    },
+
+    editComment: ({ commentId, text }) => {
+      const clean = text.trim();
+      if (!clean) return;
+      submitTracked(opKey.comment(commentId), (live) =>
+        pagesClient.editComment(live, { commentId, text: clean }),
+      ).then(() => loadPageThreads());
+    },
+
+    deleteComment: (commentId) => {
+      submitTracked(opKey.comment(commentId), (live) =>
+        pagesClient.deleteComment(live, commentId),
+      ).then(() => loadPageThreads());
+    },
+
+    resolveThread: ({ threadId, resolved }) => {
+      submitTracked(opKey.commentThread(threadId), (live) =>
+        pagesClient.resolveThread(live, { threadId, resolved }),
+      ).then(() => loadPageThreads());
     },
 
     insertPageBlock: ({ blockId, parent, after, kind, text }) => {
@@ -1085,274 +1221,44 @@ export function createActions({
       );
     },
 
-    // ── Inbox ──
-    // The local member's queue is keyed by the author identity; mark/clear act on
-    // the highest seq currently loaded, so "mark all read" needs no per-item loop.
-    markInboxRead: () => {
-      const items = getState().inbox;
-      if (items.length === 0) return;
-      const upToSeq = items[items.length - 1].seq;
-      submitTracked(
-        opKey.inbox(),
-        (live) => inboxClient.markRead(live, { member: getState().author, upToSeq }),
-        (prev) => optimistic.inboxReadTo(prev, upToSeq),
-      );
-    },
-
-    markInboxReadTo: (seq) => {
-      submitTracked(
-        opKey.inbox(),
-        (live) => inboxClient.markRead(live, { member: getState().author, upToSeq: seq }),
-        (prev) => optimistic.inboxReadTo(prev, seq),
-      );
-    },
-
-    clearInbox: () => {
-      const items = getState().inbox;
-      if (items.length === 0) return;
-      const upToSeq = items[items.length - 1].seq;
-      submitTracked(
-        opKey.inbox(),
-        (live) => inboxClient.clear(live, { member: getState().author, upToSeq }),
-        (prev) => optimistic.inboxCleared(prev, upToSeq),
-      );
-    },
-
-    deliverNotification: ({ member, kind, body }) => {
-      if (!member.trim() || !kind.trim()) return;
-      submitTracked(opKey.inbox(), (live) =>
-        inboxClient.deliver(live, { member: member.trim(), kind: kind.trim(), body }),
-      );
-    },
-
-    // ── Jobs ──
-    // Identity-gated ops (cancel/prune by submitter; finalize/release by
-    // claimant) all ride the daemon's default identity — origin is omitted — so
-    // submitter and claimant stay consistent for this node's own jobs.
-    submitJob: ({ kind, spec }) => {
-      const cleanKind = kind.trim();
-      if (!cleanKind) return;
-      const jobId = crypto.randomUUID();
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.submitJob(live, { jobId, kind: cleanKind, spec }),
-        (prev) =>
-          optimistic.jobAdded(prev, {
-            job_id: jobId,
-            kind: cleanKind,
-            spec,
-            // the module stamps the REAL submitter from the block origin; the
-            // refresh replaces these placeholders with committed truth.
-            submitter: prev.author,
-            status: "pending",
-            attempt: 0,
-            claim: null,
-            result: null,
-            created_at_height: prev.status?.height ?? 0,
-            updated_at_height: prev.status?.height ?? 0,
-          }),
-      );
-    },
-
-    claimJob: ({ jobId, leaseViews }) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.claimJob(live, { jobId, leaseViews }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "processing" }),
-      );
-    },
-
-    finalizeJob: ({ jobId, ok, payload }) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.finalizeJob(live, { jobId, ok, payload }),
-        (prev) =>
-          optimistic.jobPatched(prev, jobId, {
-            status: ok ? "done" : "failed",
-            result: { ok, payload },
-          }),
-      );
-    },
-
-    releaseJob: (jobId) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.releaseJob(live, { jobId }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "pending", claim: null }),
-      );
-    },
-
-    reclaimJob: (jobId) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.reclaimJob(live, { jobId }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "pending", claim: null }),
-      );
-    },
-
-    cancelJob: (jobId) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.cancelJob(live, { jobId }),
-        (prev) => optimistic.jobPatched(prev, jobId, { status: "cancelled" }),
-      );
-    },
-
-    pruneJob: (jobId) => {
-      if (!jobId) return;
-      submitTracked(
-        opKey.job(jobId),
-        (live) => jobsClient.pruneJob(live, { jobId }),
-        (prev) => optimistic.jobRemoved(prev, jobId),
-      );
-    },
-
-    // ── Automations ──
-    createRule: ({ ruleId, trigger, action }) => {
-      const id = ruleId.trim();
-      if (!id) return;
-      submitTracked(
-        opKey.rule(id),
-        (live) => automationsClient.createRule(live, { ruleId: id, trigger, action }),
-        (prev) =>
-          optimistic.ruleAdded(prev, {
-            rule_id: id,
-            enabled: true,
-            trigger,
-            action,
-            created_at: Date.now(),
-            fire_count: 0,
-          }),
-      );
-    },
-
-    setRuleEnabled: (ruleId, enabled) => {
-      if (!ruleId) return;
-      submitTracked(
-        opKey.rule(ruleId),
-        (live) => automationsClient.setEnabled(live, { ruleId, enabled }),
-        (prev) => optimistic.rulePatched(prev, ruleId, { enabled }),
-      );
-    },
-
-    deleteRule: (ruleId) => {
-      if (!ruleId) return;
-      submitTracked(
-        opKey.rule(ruleId),
-        (live) => automationsClient.deleteRule(live, ruleId),
-        (prev) => optimistic.ruleRemoved(prev, ruleId),
-      );
-    },
-
-    // ── Memory ──
-    browseMemory: (path) => {
-      const live = getNode();
-      const dir = path || "/";
-      if (!live) return;
-      // set the active dir immediately (so refresh re-lists it), clear the open
-      // file + any search, then list eagerly for a snappy transition.
-      patch({ memoryPath: dir, memoryOpen: null, memoryMatches: null });
-      Promise.resolve()
-        .then(() => memoryClient.ls(live, { path: dir }))
-        .then((memoryEntries) => patch({ memoryEntries }))
-        .catch(fail);
-    },
-
-    openMemoryFile: ({ path, generation }) => {
-      const live = getNode();
-      if (!live || !path) return;
-      Promise.resolve()
-        .then(() =>
-          Promise.all([
-            memoryClient.stat(live, path),
-            memoryClient.read(live, { path, generation: generation ?? null }),
-          ]),
-        )
-        .then(([stat, gen]) =>
-          patch({ memoryOpen: stat && gen ? { stat, generation: gen } : null }),
-        )
-        .catch(fail);
-    },
-
-    closeMemoryFile: () => patch({ memoryOpen: null }),
-
-    publishMemory: ({ path, text, meta }) => {
-      const p = path.trim();
-      if (!p) return;
-      submitTracked(
-        opKey.memory(p),
-        (live) =>
-          memoryClient.publish(live, { path: p, body: memoryClient.inlineBody(text), meta }),
-        (prev) => optimistic.memoryPublished(prev, { path: p, bodyLen: text.length, meta }),
-      ).then(() => {
-        const live = getNode();
-        if (!live) return;
-        // reflect the new generation in the open viewer if it is this file.
-        if (getState().memoryOpen?.stat.path === p) {
-          return Promise.all([
-            memoryClient.stat(live, p),
-            memoryClient.read(live, { path: p, generation: null }),
-          ])
-            .then(([stat, gen]) =>
-              patch({ memoryOpen: stat && gen ? { stat, generation: gen } : null }),
-            )
-            .catch(fail);
-        }
-      });
-    },
-
-    deleteMemory: (path) => {
-      if (!path) return;
-      submitTracked(
-        opKey.memory(path),
-        (live) => memoryClient.remove(live, path),
-        (prev) => optimistic.memoryRemoved(prev, path),
-      ).then(() => {
-        if (getState().memoryOpen?.stat.path === path) patch({ memoryOpen: null });
-      });
-    },
-
-    searchMemory: ({ prefix, pattern }) => {
-      const live = getNode();
-      if (!live || !pattern) return;
-      Promise.resolve()
-        .then(() => memoryClient.grep(live, { prefix: prefix || "/", pattern }))
-        .then((memoryMatches) => patch({ memoryMatches }))
-        .catch(fail);
-    },
-
-    clearMemorySearch: () => patch({ memoryMatches: null }),
-
     // ── Search (derived-index views) ──
     runSearch: (text) => {
       const live = getNode();
       const query = text.trim();
       if (!live || !query) return;
+      const token = ++searchToken;
       patch({ searchPending: true });
       // per-module tolerance (deliberate granular catches): an older node
       // without the index tier 404s a view; that module contributes an empty
       // group instead of sinking the whole search.
       const tolerant = <T,>(read: Promise<T[]>): Promise<T[]> => read.catch(() => []);
+      // `docs` == the pages module's block hits — pages is the docs surface.
       Promise.resolve()
         .then(() =>
           Promise.all([
             tolerant(chatClient.searchMessages(live, { text: query })),
-            tolerant(documentClient.searchBlocks(live, { text: query })),
             tolerant(pagesClient.searchPageBlocks(live, { text: query })),
           ]),
         )
-        .then(([chat, docs, pages]) =>
-          patch({ search: { query, chat, docs, pages }, searchPending: false }),
-        )
-        .catch(fail);
+        .then(([chat, docs]) => {
+          if (token !== searchToken) return; // a newer query superseded this one
+          patch({ search: { query, chat, docs }, searchPending: false });
+        })
+        .catch((err) => {
+          if (token !== searchToken) return;
+          patch({ searchPending: false });
+          fail(err);
+        });
     },
 
-    clearSearch: () => patch({ search: null, searchPending: false }),
+    clearSearch: () => {
+      searchToken += 1; // supersede any in-flight fan-out so it can't repopulate
+      patch({ search: null, searchPending: false });
+    },
+
+    openSearch: () => patch({ searchOpen: true }),
+
+    closeSearch: () => patch({ searchOpen: false }),
 
     // ── Files ──
     uploadFile: ({ name, mime, bytes }) => {
@@ -1463,25 +1369,12 @@ export function createActions({
         activeChannel: null,
         activeThread: null,
         authorNames: {},
-        tasks: [],
-        docIds: [],
-        activeDoc: null,
-        activeDocBlocks: [],
         pages: [],
         activePage: null,
         activePageBlocks: [],
         agents: [],
         watches: [],
         pendingRuns: [],
-        inbox: [],
-        inboxUnread: 0,
-        jobs: [],
-        jobCounts: null,
-        rules: [],
-        memoryPath: "/",
-        memoryEntries: [],
-        memoryOpen: null,
-        memoryMatches: null,
         files: [],
         ops: {},
         onboardingPhase: null,
@@ -1501,33 +1394,25 @@ export function createActions({
         workspace: null,
         connected: false,
         status: null,
+        // per-node observability: the live chain tip and the node's own
+        // durable block history. clear them on a node switch so the new
+        // node's explorer never shows the previous node's rows.
+        lastBlock: null,
+        blocks: [],
         channels: [],
         messages: [],
         activeChannel: null,
         activeThread: null,
         authorNames: {},
-        tasks: [],
         members: [],
         proposals: [],
         forgeHead: null,
-        docIds: [],
-        activeDoc: null,
-        activeDocBlocks: [],
         pages: [],
         activePage: null,
         activePageBlocks: [],
         agents: [],
         watches: [],
         pendingRuns: [],
-        inbox: [],
-        inboxUnread: 0,
-        jobs: [],
-        jobCounts: null,
-        rules: [],
-        memoryPath: "/",
-        memoryEntries: [],
-        memoryOpen: null,
-        memoryMatches: null,
         files: [],
         ops: {},
         onboardingPhase: null,
@@ -1627,10 +1512,6 @@ export function createActions({
             activeChannel: null,
             activeThread: null,
             authorNames: {},
-            tasks: [],
-            docIds: [],
-            activeDoc: null,
-            activeDocBlocks: [],
             pages: [],
             activePage: null,
             activePageBlocks: [],

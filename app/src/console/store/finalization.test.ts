@@ -16,11 +16,11 @@ import type { OpLedger } from "./finalization";
 describe("the op ledger", () => {
   it("begins pending, then finalizes with the receipt's inclusion facts", () => {
     let ops: OpLedger = {};
-    ops = beginOp(ops, opKey.task("t1"), 1_000);
-    expect(ops["task/t1"]).toMatchObject({ phase: "pending", startedAt: 1_000 });
+    ops = beginOp(ops, opKey.file("t1"), 1_000);
+    expect(ops["file/t1"]).toMatchObject({ phase: "pending", startedAt: 1_000 });
 
-    ops = finalizeOp(ops, opKey.task("t1"), { height: 42, opHash: "ab".repeat(32) });
-    expect(ops["task/t1"]).toMatchObject({
+    ops = finalizeOp(ops, opKey.file("t1"), { height: 42, opHash: "ab".repeat(32) });
+    expect(ops["file/t1"]).toMatchObject({
       phase: "finalized",
       height: 42,
       opHash: "ab".repeat(32),
@@ -28,45 +28,45 @@ describe("the op ledger", () => {
   });
 
   it("finalizes without inclusion facts when the write resolved unshaped", () => {
-    let ops = beginOp({}, opKey.task("t1"), 0);
-    ops = finalizeOp(ops, opKey.task("t1"), receiptOf("not a receipt"));
-    expect(ops["task/t1"].phase).toBe("finalized");
-    expect(ops["task/t1"].height).toBeUndefined();
+    let ops = beginOp({}, opKey.file("t1"), 0);
+    ops = finalizeOp(ops, opKey.file("t1"), receiptOf("not a receipt"));
+    expect(ops["file/t1"].phase).toBe("finalized");
+    expect(ops["file/t1"].height).toBeUndefined();
   });
 
   it("records the rejection on failure", () => {
-    let ops = beginOp({}, opKey.task("t1"), 0);
-    ops = failOp(ops, opKey.task("t1"), "chat: empty author");
-    expect(ops["task/t1"]).toMatchObject({
+    let ops = beginOp({}, opKey.file("t1"), 0);
+    ops = failOp(ops, opKey.file("t1"), "chat: empty author");
+    expect(ops["file/t1"]).toMatchObject({
       phase: "failed",
       error: "chat: empty author",
     });
   });
 
   it("a re-submit on the same entity key supersedes the settled record", () => {
-    let ops = beginOp({}, opKey.task("t1"), 0);
-    ops = finalizeOp(ops, opKey.task("t1"), { height: 7 });
-    ops = beginOp(ops, opKey.task("t1"), 5_000);
-    expect(ops["task/t1"]).toMatchObject({ phase: "pending", startedAt: 5_000 });
+    let ops = beginOp({}, opKey.file("t1"), 0);
+    ops = finalizeOp(ops, opKey.file("t1"), { height: 7 });
+    ops = beginOp(ops, opKey.file("t1"), 5_000);
+    expect(ops["file/t1"]).toMatchObject({ phase: "pending", startedAt: 5_000 });
   });
 
   it("prunes oldest settled records past the cap, never pendings", () => {
     let ops: OpLedger = {};
     for (let i = 0; i < 512; i += 1) {
-      ops = beginOp(ops, `task/settled-${i}`, i);
-      ops = finalizeOp(ops, `task/settled-${i}`, { height: i });
+      ops = beginOp(ops, `file/settled-${i}`, i);
+      ops = finalizeOp(ops, `file/settled-${i}`, { height: i });
     }
-    ops = beginOp(ops, "task/in-flight", 999);
+    ops = beginOp(ops, "file/in-flight", 999);
     expect(Object.keys(ops)).toHaveLength(512);
-    expect(ops["task/settled-0"]).toBeUndefined();
-    expect(ops["task/in-flight"].phase).toBe("pending");
+    expect(ops["file/settled-0"]).toBeUndefined();
+    expect(ops["file/in-flight"].phase).toBe("pending");
   });
 
   it("gates refreshes only while a pending is fresh", () => {
-    const ops = beginOp({}, opKey.task("t1"), 1_000);
+    const ops = beginOp({}, opKey.file("t1"), 1_000);
     expect(hasFreshPending(ops, 1_000 + OP_STALE_MS - 1)).toBe(true);
     expect(hasFreshPending(ops, 1_000 + OP_STALE_MS)).toBe(false);
-    expect(hasFreshPending(finalizeOp(ops, opKey.task("t1"), { height: 1 }), 1_001)).toBe(
+    expect(hasFreshPending(finalizeOp(ops, opKey.file("t1"), { height: 1 }), 1_001)).toBe(
       false,
     );
   });

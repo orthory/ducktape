@@ -14,18 +14,12 @@ import {
 import type { ReactNode } from "react";
 
 import * as agentClient from "../../domain/agent-client";
-import * as automationsClient from "../../domain/automations-client";
+import * as capabilityClient from "../../domain/capability-client";
 import * as chatClient from "../../domain/chat-client";
-import * as documentClient from "../../domain/document-client";
-import type { Block } from "../../domain/document-client";
 import * as filesClient from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import type { ProposalView } from "../../domain/governance-client";
-import * as inboxClient from "../../domain/inbox-client";
-import * as jobsClient from "../../domain/jobs-client";
-import type { BoardCounts } from "../../domain/jobs-client";
-import * as memoryClient from "../../domain/memory-client";
 import * as pagesClient from "../../domain/pages-client";
 import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import {
@@ -34,7 +28,6 @@ import {
 } from "../../domain/node-bootstrap";
 import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
-import * as tasksClient from "../../domain/tasks-client";
 import * as valsetClient from "../../domain/valset-client";
 import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
@@ -46,14 +39,11 @@ import {
   applySnapshot,
   createInitialState,
   loadRemoteUrl,
+  saveDocTabs,
 } from "./state";
 
 export type { ConsoleActions } from "./actions";
 export type { ConsoleContextValue } from "./context";
-
-/** How many recent telemetry frames the console keeps in memory (the node's
- *  ring holds more; this bounds the live view's buffer). */
-const TELEMETRY_KEEP = 200;
 
 /** How many recent non-empty blocks the explorer pulls per refresh. */
 const BLOCKS_KEEP = 200;
@@ -94,21 +84,13 @@ export function DucktapeProvider({
   const refresh = useCallback(() => {
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
-    // enumerate the doc index (the browse tree) and re-query the open doc's
-    // blocks (null when none is open) alongside the other projections; the
-    // pages slice refreshes the same way (enumeration + the open page's tree).
-    const activeDoc = stateRef.current.activeDoc;
+    // the pages (docs) slice refreshes by enumeration + the open page's tree.
     const activePage = stateRef.current.activePage;
-    // the inbox is per-member; the console keys "my" queue by the local author
-    // identity, and memory browsing re-lists whatever dir is open.
-    const member = stateRef.current.author;
-    const memoryPath = stateRef.current.memoryPath;
     return Promise.resolve()
       .then(() =>
         Promise.all([
           live.status(),
           chatClient.channels(live),
-          tasksClient.listTasks(live),
           // valset only exists on the NETWORKED node (the local daemon has no
           // validator set) — best-effort like governance below, so a local
           // node reads as "no members" instead of never connecting.
@@ -121,12 +103,9 @@ export function DucktapeProvider({
           // rather than failing the whole refresh.
           governanceClient.proposals(live).catch((): ProposalView[] => []),
           forgeClient.head(live),
-          documentClient.listDocs(live),
-          activeDoc
-            ? documentClient.getDoc(live, activeDoc)
-            : Promise.resolve<Block[] | null>(null),
-          // pages is newer than some reachable nodes: best-effort, so a node
-          // without the module reads as "no pages", never a failed refresh.
+          // pages (the docs surface) is newer than some reachable nodes:
+          // best-effort, so a node without it reads as "no docs", never a
+          // failed refresh.
           pagesClient.listPages(live).catch((): PageMeta[] => []),
           activePage
             ? pagesClient
@@ -134,49 +113,40 @@ export function DucktapeProvider({
                 .catch((): PageBlock[] | null => null)
             : Promise.resolve<PageBlock[] | null>(null),
           agentClient.agents(live),
+          // the executor registry — best-effort like governance/files above, so
+          // a node without the capability module reads as "no executors" (the
+          // "Runs on" picker degrades to a text field) rather than a failed
+          // refresh.
+          capabilityClient.capabilities(live).catch((): string[] => []),
           runsClient.watches(live),
           // newest-first for the timeline; the wire orders by dispatch id.
           runsClient
             .pendingRuns(live)
             .then((list) => [...list].sort((a, b) => b.created_at - a.created_at)),
           profilesClient.allProfiles(live, { from: 0, limit: 256 }),
-          // ── unexposed-until-now modules — every one best-effort so a node
-          //    that does not register the module reads as "empty", never a
-          //    failed refresh (same contract as governance above). ──
-          inboxClient.list(live, { member }).catch(() => []),
-          inboxClient.unread(live, member).catch(() => 0),
-          jobsClient.listJobs(live, {}).catch(() => []),
-          jobsClient.counts(live).catch((): BoardCounts | null => null),
-          automationsClient.listRules(live).catch(() => []),
-          memoryClient.ls(live, { path: memoryPath }).catch(() => []),
+          // files is best-effort so a node that does not register the module
+          // reads as "empty", never a failed refresh (same contract as
+          // governance above).
           filesClient.list(live, {}).catch(() => []),
-          // the explorer's ring pull — best-effort like telemetry, so a node
-          // without /v1/blocks reads as "no blocks yet".
+          // the explorer's ring pull — best-effort, so a node without
+          // /v1/blocks reads as "no blocks yet".
           live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
         ]),
       )
       .then(([
         status,
         channels,
-        tasks,
         validators,
         observerKeys,
         proposals,
         forgeHead,
-        docIds,
-        docBlocks,
         pages,
         pageBlocks,
         agents,
+        capabilities,
         watches,
         pendingRuns,
         profiles,
-        inbox,
-        inboxUnread,
-        jobs,
-        jobCounts,
-        rules,
-        memoryEntries,
         files,
         blocks,
       ]) => {
@@ -192,39 +162,53 @@ export function DucktapeProvider({
           current && channels.some((c) => c.id === current)
             ? current
             : (channels[0]?.id ?? null);
+        // reconcile doc tabs against the live enumeration: a tab whose page no
+        // longer exists (deleted here or elsewhere) drops, and a now-dead
+        // active page falls back to the first surviving tab. CRITICAL: only
+        // reconcile when we actually got an enumeration — `listPages` is
+        // best-effort (`.catch(() => [])`), and an empty result may be a
+        // transient failure (node busy, module absent). Evicting open tabs on
+        // that would blank the editor mid-edit, so an empty result is a no-op.
+        const prevTabs = stateRef.current.openTabs;
+        const prevActive = stateRef.current.activePage;
+        let openTabs = prevTabs;
+        let activePage = prevActive;
+        if (pages.length > 0) {
+          const liveIds = new Set(pages.map((p) => p.id));
+          openTabs = prevTabs.filter((id) => liveIds.has(id));
+          if (openTabs.length !== prevTabs.length) saveDocTabs(openTabs);
+          activePage =
+            prevActive && liveIds.has(prevActive) ? prevActive : (openTabs[0] ?? null);
+        }
         return Promise.resolve()
           .then(() => (active ? chatClient.latestMessages(live, active) : []))
           .then((messages) =>
             dispatch({
               type: "patch",
-              patch: applySnapshot({
-                connected: true,
-                status,
-                channels,
-                tasks,
-                members,
-                observers,
-                proposals,
-                forgeHead,
-                activeChannel: active,
-                messages,
-                authorNames,
-                docIds,
-                activeDocBlocks: docBlocks ?? [],
-                pages,
-                activePageBlocks: pageBlocks ?? [],
-                agents,
-                watches,
-                pendingRuns,
-                inbox,
-                inboxUnread,
-                jobs,
-                jobCounts,
-                rules,
-                memoryEntries,
-                files,
-                blocks,
-              }),
+              patch: {
+                ...applySnapshot({
+                  connected: true,
+                  status,
+                  channels,
+                  members,
+                  observers,
+                  proposals,
+                  forgeHead,
+                  activeChannel: active,
+                  messages,
+                  authorNames,
+                  pages,
+                  activePageBlocks: pageBlocks ?? [],
+                  agents,
+                  capabilities,
+                  watches,
+                  pendingRuns,
+                  files,
+                  blocks,
+                }),
+                openTabs,
+                activePage,
+              },
             }),
           );
       })
@@ -305,32 +289,22 @@ export function DucktapeProvider({
     };
   }, [transport, actions, fail]);
 
-  // 2. Hydrate once the node is resolved, then follow the block stream and the
-  //    node-local telemetry stream (backfilled from the ring, then live). The
-  //    telemetry updaters stay pure (StrictMode double-invokes them): they append
-  //    idempotently and dedupe on the strictly-increasing block height.
+  // 2. Hydrate once the node is resolved, then follow the block stream. The
+  //    lastBlock updater stays pure (StrictMode double-invokes it): it only
+  //    moves forward on the strictly-increasing block height.
   useEffect(() => {
     if (!node) return;
     refresh();
 
-    // Backfill recent telemetry, then keep any newer live frames layered on top.
-    node
-      .telemetry(TELEMETRY_KEEP)
-      .then((frames) =>
-        dispatch({
-          type: "update",
-          fn: (prev) => {
-            const cutoff = frames.length ? frames[frames.length - 1].height : -1;
-            const newer = prev.telemetry.filter((f) => f.height > cutoff);
-            return { telemetry: [...frames, ...newer].slice(-TELEMETRY_KEEP) };
-          },
-        }),
-      )
-      .catch(() => {
-        /* telemetry is best-effort observability; a miss just leaves it empty */
+    const offBlock = node.onBlock((block) => {
+      // The live chain tip, UNGATED — recorded before the pending gate below,
+      // so the console always knows the chain moved even while an op of ours
+      // is in flight (a seam duplicate or reconnect replay never moves it back).
+      dispatch({
+        type: "update",
+        fn: (prev) =>
+          block.height > (prev.lastBlock ?? -1) ? { lastBlock: block.height } : {},
       });
-
-    const offBlock = node.onBlock(() => {
       // A block landing while one of OUR ops is still in flight would re-query
       // state that predates the op and clobber its preconfirmed projection —
       // and the op's own completion refresh follows immediately anyway. Stale
@@ -338,21 +312,7 @@ export function DucktapeProvider({
       if (hasFreshPending(stateRef.current.ops, Date.now())) return;
       refresh();
     });
-    const offTelemetry = node.onTelemetry((frame) => {
-      dispatch({
-        type: "update",
-        fn: (prev) => {
-          const last = prev.telemetry[prev.telemetry.length - 1];
-          // Heights strictly increase; drop a seam duplicate or a reconnect replay.
-          if (last && frame.height <= last.height) return {};
-          return { telemetry: [...prev.telemetry, frame].slice(-TELEMETRY_KEEP) };
-        },
-      });
-    });
-    return () => {
-      offBlock();
-      offTelemetry();
-    };
+    return offBlock;
   }, [node, refresh]);
 
   // 2b. Liveness heartbeat — the "no running node" detection AND recovery. The
@@ -386,13 +346,48 @@ export function DucktapeProvider({
     return () => clearInterval(timer);
   }, [node, state.needsOnboarding, state.onboardingPhase, refresh]);
 
+  // 2c. Keep a live huddle's voice fan-out in step with the consensus roster:
+  //     every refresh that lands a new channel snapshot may add/remove members,
+  //     so re-derive the recipient set and push it into the audio session. A
+  //     no-op when not huddling; the push itself dedupes by value (refresh
+  //     patches a fresh channels array every block).
+  useEffect(() => {
+    actions.syncHuddleRecipients();
+  }, [state.channels, state.voice.channelId, actions]);
+
+  // 2d. Best-effort roster reconciliation on the way out: quitting or
+  //     reloading mid-huddle can't run the normal leave path, so fire a
+  //     keepalive leave_huddle beacon — otherwise peers keep showing a
+  //     participant whose client is gone (the roster has no TTL).
+  useEffect(() => {
+    const channelId = state.voice.channelId;
+    const url = state.nodeUrl;
+    if (!channelId || !url) return;
+    const origin = state.author;
+    const leaveOnHide = () => {
+      const body = new Blob(
+        [
+          JSON.stringify({
+            target: "chat",
+            payload: { leave_huddle: { channel_id: channelId } },
+            origin,
+          }),
+        ],
+        { type: "application/json" },
+      );
+      navigator.sendBeacon(`${url.replace(/\/$/, "")}/v1/submit`, body);
+    };
+    window.addEventListener("pagehide", leaveOnHide);
+    return () => window.removeEventListener("pagehide", leaveOnHide);
+  }, [state.voice.channelId, state.nodeUrl, state.author]);
+
   // 3. Reflect the accent into the css var the theme reads.
   useEffect(() => {
     document.documentElement.style.setProperty("--accent", state.accent);
   }, [state.accent]);
 
-  // 4. Drop any open doc when the node url resolves or changes — a different
-  //    node has different documents. `docIds` (the browse tree) is re-enumerated
+  // 4. Drop any open page (doc) when the node url resolves or changes — a
+  //    different node has different docs. The page enumeration is re-queried
   //    from the new node's index by `refresh`, so it isn't seeded here.
   useEffect(() => {
     const url = state.nodeUrl;
@@ -400,9 +395,6 @@ export function DucktapeProvider({
     dispatch({
       type: "patch",
       patch: {
-        docIds: [],
-        activeDoc: null,
-        activeDocBlocks: [],
         pages: [],
         activePage: null,
         activePageBlocks: [],

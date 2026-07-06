@@ -1,4 +1,4 @@
-// Approvals — the operator-facing surface over the `governance` module. Lists
+// Governance — the operator-facing surface over the `governance` module. Lists
 // every proposal (GovQuery::Proposals, projected into state.proposals per block)
 // with its action, status, proposer, and running tally, and drives the three
 // member-gated writes: Propose (a Signal), Vote (approve / reject), and Execute
@@ -414,7 +414,7 @@ function ProposeForm({
       }}
     >
       <div style={{ ...sectionLabel, display: "flex", alignItems: "center", gap: 7 }}>
-        <Icon name="approvals" size={13} color={color.muted2} />
+        <Icon name="governance" size={13} color={color.muted2} />
         OPEN A PROPOSAL
       </div>
 
@@ -493,7 +493,7 @@ function EmptyState({ filter }: { filter: FilterId }) {
   const label = FILTER_TABS.find((tab) => tab.id === filter)?.label.toLowerCase() ?? "proposals";
   return (
     <div style={{ padding: "36px 12px", textAlign: "center", color: color.muted2 }}>
-      <Icon name="approvals" size={26} color={color.iconIdle} />
+      <Icon name="governance" size={26} color={color.iconIdle} />
       <div style={{ marginTop: 10, font: `500 12.5px ${font.sans}` }}>
         No {filter === "all" ? "" : `${label} `}proposals to show.
       </div>
@@ -530,7 +530,7 @@ export function GovernanceView() {
 
   return (
     <div
-      data-screen-label="Approvals"
+      data-screen-label="Governance"
       style={{
         flex: 1,
         minWidth: 0,
@@ -554,7 +554,7 @@ export function GovernanceView() {
           }}
         >
           <span style={{ font: `600 16px ${font.sans}`, color: color.dark }}>
-            Approvals
+            Governance
           </span>
           <span style={{ font: `400 13px ${font.mono}`, color: color.muted2 }}>
             {openCount} open · {rows.length}

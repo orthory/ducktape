@@ -797,6 +797,13 @@ impl Cluster {
         http_request(self.http_ports[idx], method, path, body)
     }
 
+    /// GET a raw TEXT body from node `idx`'s app surface — for non-json
+    /// responses like the Prometheus `/metrics` exposition, which the
+    /// json-parsing [`Self::http`] twin would flatten to `Null`.
+    pub fn http_text(&self, idx: usize, path: &str) -> (u16, String) {
+        http_text_request(self.http_ports[idx], path)
+    }
+
     /// every running node's log tail — the panic payload that makes a stalled
     /// mesh diagnosable from a CI failure alone.
     pub fn all_log_tails(&self, lines: usize) -> String {
@@ -875,6 +882,33 @@ pub fn http_request(
         .and_then(|b| serde_json::from_str(b.trim()).ok())
         .unwrap_or(serde_json::Value::Null);
     (status, payload)
+}
+
+/// GET a raw TEXT body from an app-surface port — the non-json twin of
+/// [`http_request`], for bodies like the Prometheus `/metrics` exposition.
+pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
+    use std::io::Read as _;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("app-surface connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("app-surface read timeout");
+    let req =
+        format!("GET {path} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).expect("app-surface write");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("app-surface read");
+    let text = String::from_utf8_lossy(&raw);
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    (status, body)
 }
 
 /// poll `probe` every 300ms until it returns `Some`, or panic with `what`

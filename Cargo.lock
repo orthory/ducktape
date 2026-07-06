@@ -839,14 +839,17 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
+ "data-plane",
  "host",
  "indexer",
+ "opus-rs",
  "sdk",
  "serde",
  "serde_json",
  "statesync",
  "tagging",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -1771,6 +1774,16 @@ name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+
+[[package]]
+name = "data-plane"
+version = "0.1.0"
+dependencies = [
+ "data-plane",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+]
 
 [[package]]
 name = "dbus"
@@ -4036,6 +4049,7 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "consensus",
+ "data-plane",
  "directory",
  "dispatch",
  "dispatch-oracle",
@@ -4533,6 +4547,12 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "opus-rs"
+version = "0.1.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1cc978697f3ada0ad98b323b9d85e85c6b08d478830148636c19b6d5f2ac9b85"
 
 [[package]]
 name = "p256"
@@ -6038,6 +6058,7 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
+ "data-plane",
  "futures",
  "host",
  "indexer",
@@ -6045,6 +6066,7 @@ dependencies = [
  "sdk",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -6506,7 +6528,7 @@ dependencies = [
  "serde_with",
  "swift-rs",
  "thiserror 2.0.18",
- "toml 0.9.12+spec-1.1.0",
+ "toml 1.1.2+spec-1.1.0",
  "url",
  "urlpattern",
  "uuid",
@@ -6531,7 +6553,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -8200,7 +8222,6 @@ version = "0.1.0"
 dependencies = [
  "commonware-cryptography",
  "defguard_wireguard_rs",
- "nat-traversal",
  "wireguard-upgrade",
 ]
 

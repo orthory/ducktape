@@ -9,6 +9,33 @@ import { DucktapeProvider } from "./DucktapeProvider";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
 
+// Switching nodes dials a new one via node-bootstrap. Mock only connectRemote
+// so the switch lands on a benign, empty node (its status rejects → the "no
+// running node" surface) with no real network — enough to prove the previous
+// node's chain tip/blocks are dropped, not carried across.
+vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../domain/node-bootstrap")>();
+  const emptyNode: NodeTransport = {
+    submit: vi.fn().mockResolvedValue({ height: 0, appHash: "00".repeat(32) }),
+    query: vi.fn().mockResolvedValue({}),
+    view: vi.fn().mockResolvedValue({ hits: [] }),
+    putBlob: vi.fn().mockResolvedValue("00".repeat(32)),
+    getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
+    status: vi.fn().mockRejectedValue(new Error("empty test node")),
+    metrics: vi.fn().mockResolvedValue(""),
+    blocks: vi.fn().mockResolvedValue([]),
+    onBlock: vi.fn(() => () => {}),
+  };
+  return {
+    ...actual,
+    connectRemote: vi.fn((httpUrl: string) => ({
+      transport: emptyNode,
+      url: httpUrl,
+      managed: false,
+    })),
+  };
+});
+
 // ── Fake node ───────────────────────────────────────────
 
 const GENERAL_MESSAGE = {
@@ -98,13 +125,7 @@ const makeFakeNode = () => {
         }
         return Promise.resolve({ validators: [[0xde, 0xad, 0xbe, 0xef]] });
       }
-      if (target === "document") {
-        // refresh now enumerates the doc index (ListDocs) and, when a doc is
-        // open, re-reads its blocks (GetDoc) — answer both so refresh resolves.
-        if (query === "list_docs") return Promise.resolve({ doc_list: [] });
-        return Promise.resolve({ doc: null });
-      }
-      return Promise.resolve({ tasks: [] });
+      return Promise.resolve({});
     }),
     view: vi.fn().mockResolvedValue({ hits: [] }),
     putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
@@ -115,13 +136,12 @@ const makeFakeNode = () => {
       height: 1,
       modules: [{ id: "chat", root: "cc".repeat(32) }],
     }),
+    metrics: vi.fn().mockResolvedValue(""),
     onBlock: vi.fn((listener: (block: BlockEvent) => void) => {
       blockListeners.add(listener);
       return () => blockListeners.delete(listener);
     }),
-    telemetry: vi.fn().mockResolvedValue([]),
     blocks: vi.fn().mockResolvedValue([]),
-    onTelemetry: vi.fn(() => () => {}),
   };
   const finalize = (block: BlockEvent) =>
     blockListeners.forEach((notify) => notify(block));
@@ -314,6 +334,46 @@ describe("DucktapeProvider", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Regression: the live chain tip and the node's own durable block history
+  // are per-node — both must be dropped on a node switch, or the new node's
+  // explorer shows the previous node's rows (and its tip) as if current.
+  it("drops the previous node's chain tip and blocks when switching nodes", async () => {
+    const { transport, finalize } = makeFakeNode();
+    // node 1 has durable block history AND a live block stream, so the switch
+    // must zero BOTH (blocks 1→0, lastBlock 7→null).
+    vi.mocked(transport.blocks).mockResolvedValue([
+      {
+        height: 7,
+        hash: "aa".repeat(32),
+        commitHash: "bb".repeat(32),
+        proposer: "cc".repeat(32),
+        disposition: "applied",
+        target: "chat",
+        operations: [],
+        payload: "{}",
+        opHash: "dd".repeat(32),
+      },
+    ]);
+    renderConsole(transport);
+    await waitFor(() => {
+      expect(screen.getByTestId("connected").textContent).toBe("true");
+      expect(capturedState!.blocks.length).toBe(1);
+    });
+
+    // node 1's ws stream lands a block → the ungated tip follows it.
+    await act(async () => {
+      finalize({ height: 7, appHash: "bb".repeat(32) });
+    });
+    expect(capturedState!.lastBlock).toBe(7);
+
+    // switch to another node → the previous node's rows/tip must not linger.
+    await act(async () => {
+      capturedActions!.connectRemote("http://127.0.0.1:9999");
+    });
+    expect(capturedState!.lastBlock).toBeNull();
+    expect(capturedState!.blocks.length).toBe(0);
   });
 
   it("commitForge submits a Commit msg and hydrates the new HEAD", async () => {

@@ -19,8 +19,6 @@ pub enum Msg {
     LookupResponse { key: NodeKey, reflexive: Option<SocketAddr> },
     PunchSync { peer: NodeKey, peer_reflexive: SocketAddr },
     Punch { from: NodeKey },
-    RelayRequest { peer: NodeKey },
-    RelayGrant { session: u64, relay: SocketAddr },
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -42,8 +40,9 @@ const TAG_LOOKUP: u8 = 4;
 const TAG_LOOKUP_RESP: u8 = 5;
 const TAG_PUNCH_SYNC: u8 = 6;
 const TAG_PUNCH: u8 = 7;
-const TAG_RELAY_REQ: u8 = 8;
-const TAG_RELAY_GRANT: u8 = 9;
+// Tags 8 and 9 carried the retired DERP-style relay messages
+// (RelayRequest/RelayGrant). They stay reserved so a stale peer speaking the
+// old protocol decodes as BadTag here instead of aliasing a future message.
 const TAG_READVERTISE: u8 = 10;
 
 fn put_key(out: &mut Vec<u8>, k: &NodeKey) {
@@ -164,15 +163,6 @@ impl Msg {
                 out.push(TAG_PUNCH);
                 put_key(&mut out, from);
             }
-            Msg::RelayRequest { peer } => {
-                out.push(TAG_RELAY_REQ);
-                put_key(&mut out, peer);
-            }
-            Msg::RelayGrant { session, relay } => {
-                out.push(TAG_RELAY_GRANT);
-                put_u64(&mut out, *session);
-                put_addr(&mut out, relay);
-            }
         }
         out
     }
@@ -201,8 +191,6 @@ impl Msg {
                 peer_reflexive: r.addr()?,
             },
             TAG_PUNCH => Msg::Punch { from: r.key()? },
-            TAG_RELAY_REQ => Msg::RelayRequest { peer: r.key()? },
-            TAG_RELAY_GRANT => Msg::RelayGrant { session: r.u64()?, relay: r.addr()? },
             other => return Err(WireError::BadTag(other)),
         };
         // Reject oversized/malformed datagrams that decode a valid prefix but
@@ -236,8 +224,6 @@ mod tests {
             Msg::LookupResponse { key: NodeKey([7u8; 32]), reflexive: None },
             Msg::PunchSync { peer: NodeKey([8u8; 32]), peer_reflexive: addr(9, 7000) },
             Msg::Punch { from: NodeKey([10u8; 32]) },
-            Msg::RelayRequest { peer: NodeKey([11u8; 32]) },
-            Msg::RelayGrant { session: 0x0102_0304_0506_0708, relay: addr(12, 51820) },
         ];
         for m in cases {
             let bytes = m.encode();
@@ -250,6 +236,23 @@ mod tests {
     fn short_buffer_is_error() {
         assert_eq!(Msg::decode(&[]), Err(WireError::Short));
         assert_eq!(Msg::decode(&[0xff]), Err(WireError::BadTag(0xff)));
+    }
+
+    #[test]
+    fn retired_relay_tags_are_rejected_not_aliased() {
+        // Tags 8/9 were the DERP-style RelayRequest/RelayGrant. A stale peer
+        // still speaking the old protocol must get a clean BadTag, and the
+        // tags must never be reassigned to a new message shape.
+        let mut relay_req = vec![8u8];
+        relay_req.extend_from_slice(&[0x11; 32]);
+        assert_eq!(Msg::decode(&relay_req), Err(WireError::BadTag(8)));
+
+        let mut relay_grant = vec![9u8];
+        relay_grant.extend_from_slice(&42u64.to_be_bytes());
+        relay_grant.push(4);
+        relay_grant.extend_from_slice(&[192, 0, 2, 1]);
+        relay_grant.extend_from_slice(&4000u16.to_be_bytes());
+        assert_eq!(Msg::decode(&relay_grant), Err(WireError::BadTag(9)));
     }
 
     #[test]
@@ -273,17 +276,6 @@ mod tests {
         let back = Msg::decode(&m.encode()).expect("decode");
         assert_eq!(m, back);
         // Trailing garbage after a Readvertise is rejected like any other message.
-        let mut bytes = m.encode();
-        bytes.push(0xff);
-        assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
-    }
-
-    #[test]
-    fn relay_grant_carries_session_and_addr() {
-        let m = Msg::RelayGrant { session: 42, relay: addr(3, 4000) };
-        let back = Msg::decode(&m.encode()).expect("decode");
-        assert_eq!(m, back);
-        // Trailing garbage after a RelayGrant is still rejected.
         let mut bytes = m.encode();
         bytes.push(0xff);
         assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
