@@ -22,7 +22,8 @@ fn chat_msg(payload: ChatMsg) -> Msg {
 }
 
 fn as_user(byte: u8) -> BlockContext {
-    BlockContext { protocol_version: 0,
+    BlockContext {
+        protocol_version: 0,
         height: 0,
         consensus_time: 0,
         origin: Origin::External(vec![byte; 32]),

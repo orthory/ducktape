@@ -272,7 +272,10 @@ impl ModuleIndexer for ChatIndex {
                 put_row_and_toks(out, &row)
             }
             ChatMsg::EditMessage {
-                channel_id, seq, blocks, ..
+                channel_id,
+                seq,
+                blocks,
+                ..
             } => {
                 // absent row == the message predates this index; nothing to
                 // retokenize (see the module doc's pre-index caveat).
@@ -332,15 +335,15 @@ impl ModuleIndexer for ChatIndex {
                     search::intersect_prefix(reader, "tok/", &tokens, DEFAULT_POSTING_CAP)?
                         .into_iter()
                         .filter_map(|hit| serde_json::from_slice(&hit.value).ok())
-                        .filter(|r: &TokRef| {
-                            channel_id.as_ref().is_none_or(|c| &r.channel_id == c)
-                        })
+                        .filter(|r: &TokRef| channel_id.as_ref().is_none_or(|c| &r.channel_id == c))
                         .collect();
                 // newest first; (channel, seq) tiebreak for a stable order.
                 refs.sort_by(|a, b| {
                     (b.time, &b.channel_id, b.seq).cmp(&(a.time, &a.channel_id, a.seq))
                 });
-                let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, MAX_SEARCH_LIMIT);
+                let limit = limit
+                    .unwrap_or(DEFAULT_SEARCH_LIMIT)
+                    .clamp(1, MAX_SEARCH_LIMIT);
                 let mut hits = Vec::new();
                 for r in refs.into_iter().take(limit) {
                     if let Some(bytes) = reader.get(msg_key(&r.channel_id, r.seq).as_bytes())? {
@@ -377,7 +380,10 @@ impl ModuleIndexer for ChatIndex {
             other => return Err(Error::State(format!("Channels answered {other:?}"))),
         };
         for channel in channels {
-            out.put(seq_key(&channel.id), channel.head_seq.to_be_bytes().to_vec())?;
+            out.put(
+                seq_key(&channel.id),
+                channel.head_seq.to_be_bytes().to_vec(),
+            )?;
             let mut from_seq = 1u64;
             while from_seq <= channel.head_seq {
                 let reply = state
@@ -515,7 +521,10 @@ mod tests {
         apply(&store, 1, vec![post("g", "m1", "alpha beta gamma")]);
         apply(&store, 2, vec![post("g", "m2", "alpha delta")]);
 
-        let hits = search(&store, serde_json::json!({"search": {"text": "alpha beta"}}));
+        let hits = search(
+            &store,
+            serde_json::json!({"search": {"text": "alpha beta"}}),
+        );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].message_id, "m1");
     }
@@ -579,15 +588,26 @@ mod tests {
     #[test]
     fn user_author_renders_binary_key_as_hex_not_garbage() {
         // a raw ed25519-style key: 32 bytes that are NOT printable utf-8.
-        let key: Vec<u8> = (0u8..32).map(|i| i.wrapping_mul(37).wrapping_add(0x80)).collect();
+        let key: Vec<u8> = (0u8..32)
+            .map(|i| i.wrapping_mul(37).wrapping_add(0x80))
+            .collect();
         let rendered = author_from_ref(&AuthorRef::User(key.clone()));
         let handle = rendered.strip_prefix("user:").expect("user-tagged");
-        assert!(!handle.contains('\u{FFFD}'), "no lossy replacement chars: {handle:?}");
-        assert!(handle.chars().all(|c| !c.is_control()), "no control chars: {handle:?}");
+        assert!(
+            !handle.contains('\u{FFFD}'),
+            "no lossy replacement chars: {handle:?}"
+        );
+        assert!(
+            handle.chars().all(|c| !c.is_control()),
+            "no control chars: {handle:?}"
+        );
         // it is the hex of the key bytes.
         assert_eq!(handle, indexer::user_handle(&key));
         // a printable claimed name (embedded daemon) still passes through.
-        assert_eq!(author_from_ref(&AuthorRef::User(b"jess".to_vec())), "user:jess");
+        assert_eq!(
+            author_from_ref(&AuthorRef::User(b"jess".to_vec())),
+            "user:jess"
+        );
     }
 
     #[test]
@@ -754,14 +774,64 @@ mod tests {
         let state = CanonicalChat {
             channels: vec![canonical_channel("g", 3), canonical_channel("q", 1)],
             views: vec![
-                canonical_view("g", 1, 3, "m1", AuthorRef::User(b"jess".to_vec()), "hello fluent world", 1_001, 0, false),
-                canonical_view("g", 2, 3, "m2", AuthorRef::Agent { module: "agent".into(), agent_id: "helper".into() }, "fluent chatter", 1_002, 0, false),
-                canonical_view("g", 3, 3, "m3", AuthorRef::User(b"eddy".to_vec()), "revised phrasing", 1_003, 2, false),
-                canonical_view("q", 1, 1, "m4", AuthorRef::User(b"jess".to_vec()), "was deleted", 1_004, 0, true),
+                canonical_view(
+                    "g",
+                    1,
+                    3,
+                    "m1",
+                    AuthorRef::User(b"jess".to_vec()),
+                    "hello fluent world",
+                    1_001,
+                    0,
+                    false,
+                ),
+                canonical_view(
+                    "g",
+                    2,
+                    3,
+                    "m2",
+                    AuthorRef::Agent {
+                        module: "agent".into(),
+                        agent_id: "helper".into(),
+                    },
+                    "fluent chatter",
+                    1_002,
+                    0,
+                    false,
+                ),
+                canonical_view(
+                    "g",
+                    3,
+                    3,
+                    "m3",
+                    AuthorRef::User(b"eddy".to_vec()),
+                    "revised phrasing",
+                    1_003,
+                    2,
+                    false,
+                ),
+                canonical_view(
+                    "q",
+                    1,
+                    1,
+                    "m4",
+                    AuthorRef::User(b"jess".to_vec()),
+                    "was deleted",
+                    1_004,
+                    0,
+                    true,
+                ),
             ],
         };
         store
-            .rebuild_module("chat", &state, indexer::RebuildMeta { height: 50, time: 0 })
+            .rebuild_module(
+                "chat",
+                &state,
+                indexer::RebuildMeta {
+                    height: 50,
+                    time: 0,
+                },
+            )
             .await
             .expect("rebuild");
 

@@ -22,7 +22,8 @@ struct TestCtx {
 impl TestCtx {
     fn with_origin(consensus_time: u64, origin: Origin) -> Self {
         Self {
-            env: sdk::Env { protocol_version: 0,
+            env: sdk::Env {
+                protocol_version: 0,
                 height: 0,
                 consensus_time,
                 origin,
@@ -1146,6 +1147,102 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
     });
 }
 
+// hook hygiene: a MODULE origin may only (un)register ITSELF — the payload
+// module_id must equal the emitter, so no module can wire (or unwire) another
+// module behind the operator's back. external (operator) origins keep the
+// any-registered-module wiring automations depends on.
+#[test]
+fn module_origin_hooks_are_self_only() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        module
+            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        let as_module = |m: &str| Origin::Module(m.to_string());
+
+        // a module origin may not register a DIFFERENT module.
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(11, as_module("automations")).knowing("agent"),
+                &module_msg(ChatMsg::RegisterHook {
+                    channel_id: "general".into(),
+                    module_id: "agent".into(),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Module(_)));
+        module.abort_block().await.unwrap();
+
+        // self-registration passes.
+        module
+            .execute(
+                &mut TestCtx::with_origin(12, as_module("agent")).knowing("agent"),
+                &module_msg(ChatMsg::RegisterHook {
+                    channel_id: "general".into(),
+                    module_id: "agent".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // a module origin may not UNregister a different module either.
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(13, as_module("automations")),
+                &module_msg(ChatMsg::UnregisterHook {
+                    channel_id: "general".into(),
+                    module_id: "agent".into(),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Module(_)));
+        module.abort_block().await.unwrap();
+
+        // external operator wiring is untouched: register another module …
+        module
+            .execute(
+                &mut TestCtx::with_origin(14, user(1)).knowing("automations"),
+                &module_msg(ChatMsg::RegisterHook {
+                    channel_id: "general".into(),
+                    module_id: "automations".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        // … and externally unregister a module someone else registered.
+        module
+            .execute(
+                &mut TestCtx::with_origin(15, user(1)),
+                &module_msg(ChatMsg::UnregisterHook {
+                    channel_id: "general".into(),
+                    module_id: "agent".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // module self-UNregistration passes too.
+        module
+            .execute(
+                &mut TestCtx::with_origin(16, as_module("automations")),
+                &module_msg(ChatMsg::UnregisterHook {
+                    channel_id: "general".into(),
+                    module_id: "automations".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+    });
+}
+
 #[test]
 fn duplicate_message_ids_are_rejected_globally() {
     deterministic::Runner::default().start(|context| async move {
@@ -1405,11 +1502,17 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
             node: vec![node_byte; 32],
         };
         module
-            .execute(&mut TestCtx::with_origin(20, user(1)), &module_msg(join(0xa1)))
+            .execute(
+                &mut TestCtx::with_origin(20, user(1)),
+                &module_msg(join(0xa1)),
+            )
             .await
             .unwrap();
         module
-            .execute(&mut TestCtx::with_origin(21, user(2)), &module_msg(join(0xa2)))
+            .execute(
+                &mut TestCtx::with_origin(21, user(2)),
+                &module_msg(join(0xa2)),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1434,7 +1537,10 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         // re-join with the same node key is idempotent: root unchanged.
         let settled = module.root();
         module
-            .execute(&mut TestCtx::with_origin(30, user(1)), &module_msg(join(0xa1)))
+            .execute(
+                &mut TestCtx::with_origin(30, user(1)),
+                &module_msg(join(0xa1)),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1443,7 +1549,10 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         // re-join with a NEW node key re-routes without duplicating the entry
         // or resetting join order.
         module
-            .execute(&mut TestCtx::with_origin(31, user(1)), &module_msg(join(0xb1)))
+            .execute(
+                &mut TestCtx::with_origin(31, user(1)),
+                &module_msg(join(0xb1)),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1602,7 +1711,10 @@ fn huddle_join_gates_on_members_only_policy_like_posting() {
         };
         // a non-member is turned away exactly like a non-member post.
         let err = module
-            .execute(&mut TestCtx::with_origin(20, user(2)), &module_msg(join.clone()))
+            .execute(
+                &mut TestCtx::with_origin(20, user(2)),
+                &module_msg(join.clone()),
+            )
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("members-only"));
