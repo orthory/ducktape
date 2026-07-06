@@ -41,6 +41,14 @@
 //! never collide with a still-pinned generation of its deleted predecessor. only
 //! once a path is fully forgotten (deleted with nothing retained) does a fresh
 //! publish restart at generation 1.
+//!
+//! ## read visibility
+//!
+//! external queries serve COMMITTED state only. host-routed reads — another
+//! module's `Ctx::query` during a block — serve STAGED-over-committed state
+//! (the pages convention), so a same-block follow-up consumer observes the
+//! publishes that preceded it in the block; outside a block the two views are
+//! identical (no staged overlay exists).
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -105,6 +113,13 @@ impl Memory {
             self.pending = Some(self.committed.clone());
         }
         self.pending.as_mut().expect("just populated")
+    }
+
+    /// the staged-over-committed view: pending if this block already wrote,
+    /// else committed. what a same-block `Ctx::query` observes (see
+    /// [`Module::query_with`] below).
+    fn store(&self) -> &Store {
+        self.pending.as_ref().unwrap_or(&self.committed)
     }
 
     // ---- mutations (staged) ------------------------------------------------
@@ -335,6 +350,34 @@ impl Memory {
         // absent watch = deterministic no-op (chat's unregister-hook semantics).
         self.store_mut().watches.remove(&(prefix, module_id));
         Ok(())
+    }
+
+    // ---- reads ---------------------------------------------------------------
+
+    /// answer one [`MemoryQuery`] against `store` — the shared body behind
+    /// [`Module::query`] (committed) and [`Module::query_with`]
+    /// (staged-over-committed).
+    fn answer(store: &Store, req: &[u8]) -> Result<Vec<u8>, Error> {
+        let reply = match decode_query(req).map_err(Error::Module)? {
+            MemoryQuery::Ls { path, limit } => MemoryReply::Ls(store.ls(&path, limit)?),
+            MemoryQuery::Stat { path } => MemoryReply::Stat(store.stat(&path)?),
+            MemoryQuery::Read {
+                path,
+                generation,
+                snapshot,
+            } => MemoryReply::Read(store.read(&path, generation, snapshot)?),
+            MemoryQuery::Find {
+                prefix,
+                meta_filter,
+                limit,
+            } => MemoryReply::Find(store.find(&prefix, &meta_filter, limit)),
+            MemoryQuery::Grep {
+                prefix,
+                pattern,
+                limit,
+            } => MemoryReply::Grep(store.grep(&prefix, &pattern, limit)),
+        };
+        Ok(encode_reply(&reply))
     }
 
     // ---- root / snapshot / install -----------------------------------------
@@ -763,27 +806,20 @@ impl Module for Memory {
         }
     }
 
+    /// external reads serve COMMITTED state only.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let reply = match decode_query(req).map_err(Error::Module)? {
-            MemoryQuery::Ls { path, limit } => MemoryReply::Ls(self.committed.ls(&path, limit)?),
-            MemoryQuery::Stat { path } => MemoryReply::Stat(self.committed.stat(&path)?),
-            MemoryQuery::Read {
-                path,
-                generation,
-                snapshot,
-            } => MemoryReply::Read(self.committed.read(&path, generation, snapshot)?),
-            MemoryQuery::Find {
-                prefix,
-                meta_filter,
-                limit,
-            } => MemoryReply::Find(self.committed.find(&prefix, &meta_filter, limit)),
-            MemoryQuery::Grep {
-                prefix,
-                pattern,
-                limit,
-            } => MemoryReply::Grep(self.committed.grep(&prefix, &pattern, limit)),
-        };
-        Ok(encode_reply(&reply))
+        Self::answer(&self.committed, req)
+    }
+
+    /// host-routed reads (a sibling module's `Ctx::query` during dispatch)
+    /// serve STAGED-over-committed state — the pages convention — so a
+    /// same-block follow-up consumer can observe the very publishes that
+    /// preceded it in the block (e.g. a package harness pinning the prompt
+    /// generation its install seeds landed on). outside a block the staged
+    /// overlay does not exist, so external reads through this lane are
+    /// byte-identical to [`Module::query`].
+    async fn query_with(&self, _ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
+        Self::answer(self.store(), req)
     }
 
     async fn commit_block(&mut self) -> Result<(), Error> {

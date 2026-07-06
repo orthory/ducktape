@@ -55,6 +55,21 @@ impl Ctx for TestCtx {
     async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
         match target {
             "jobs" => Ok(jobs::encode_reply(&jobs::JobsReply::Job(None))),
+            // the staged prompt seed the install arm pins (fresh path: gen 1).
+            "memory" => match memory::decode_query(req).map_err(Error::Module)? {
+                memory::MemoryQuery::Stat { path } => Ok(memory::encode_reply(
+                    &memory::MemoryReply::Stat(Some(memory::FileStat {
+                        path,
+                        latest_generation: 1,
+                        generations: 1,
+                        latest_meta: memory::Meta::new(),
+                        latest_author: "package".into(),
+                        latest_published_at_height: 1,
+                        body_len: 0,
+                    })),
+                )),
+                other => Err(Error::Module(format!("unexpected query: {other:?}"))),
+            },
             "pages" => {
                 let reply = match pages::decode_query(req).map_err(Error::Module)? {
                     pages::PageQuery::GetBlock { block_id } => {

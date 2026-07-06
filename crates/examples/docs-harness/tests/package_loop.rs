@@ -187,6 +187,60 @@ fn install_covers_the_adr_install_checklist() {
     });
 }
 
+#[test]
+fn a_squatted_prompt_path_cannot_brick_the_pin() {
+    PackageTestBed::run(docs_modules(), |mut bed| async move {
+        // the squat: junk pre-published at the PREDICTABLE seed path, taking
+        // generation 1 before the package ever installs.
+        bed.submit(
+            alice(),
+            "memory",
+            memory::encode_msg(&memory::MemoryMsg::Publish {
+                path: PROMPT_PATH.into(),
+                body: memory::PublishBody::Inline("squatted junk".into()),
+                meta: memory::Meta::new(),
+            }),
+        )
+        .await
+        .expect("the squat commits");
+
+        // install: the seed lands at generation 2 and the agent's PromptRef
+        // must pin THAT — pinning an assumed generation 1 would fail every
+        // run with pin-mismatch forever (agents are harness-owned; no repair).
+        let report = install(&mut bed).await;
+        report.assert_active();
+        assert_eq!(
+            report.prompts[0].generation, 2,
+            "the seed rode above the squat"
+        );
+        let prompt = report.agents[0].prompt.as_ref().expect("prompt pinned");
+        assert_eq!(prompt.target, format!("{PROMPT_PATH}@2"));
+
+        // and a scripted run resolves the SEEDED content (pin match): the
+        // guarded edit lands, which requires the composed prompt to have
+        // hashed to the registered pin.
+        seed_page(&mut bed).await;
+        comment(&mut bed, "t1", "c1", "@docs.editor please tighten this").await;
+        bed.oracle_response_json(&json!({
+            "reply_blocks": [],
+            "actions": [
+                {"action_id": "a1", "tag": ACTION_BLOCK_UPDATE_TEXT,
+                 "payload": {"block_id": "b1", "expected_hash": DRAFT_HASH,
+                             "text": "A crisp intro."}},
+            ],
+        }))
+        .await
+        .expect("oracle block commits");
+        bed.deliver().await.expect("delivery block commits");
+        assert_eq!(block_text(&bed, "b1").await, "A crisp intro.");
+        bed.assert_job_status(
+            &docs_harness::engagement_job_id(AGENT, "c1"),
+            jobs::JobStatus::Done,
+        )
+        .await;
+    });
+}
+
 // ---- engagement -----------------------------------------------------------------
 
 #[test]

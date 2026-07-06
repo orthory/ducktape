@@ -38,7 +38,8 @@ struct TestCtx {
 impl TestCtx {
     fn with_origin(height: u64, origin: Origin) -> Self {
         Self {
-            env: sdk::Env { protocol_version: 0,
+            env: sdk::Env {
+                protocol_version: 0,
                 height,
                 consensus_time: 0,
                 origin,
@@ -275,7 +276,8 @@ fn add_manifest(file_id: &str, bytes: &[u8]) -> FilesMsg {
 }
 
 fn block_ctx(height: u64) -> BlockContext {
-    BlockContext { protocol_version: 0,
+    BlockContext {
+        protocol_version: 0,
         height,
         consensus_time: height,
         origin: Origin::System,
@@ -1666,6 +1668,62 @@ fn root_changes_only_after_commit_and_abort_leaves_no_trace() {
 }
 
 #[test]
+fn same_block_reads_serve_staged_over_committed_external_reads_committed_only() {
+    block_on(async {
+        let mut module = Memory::new(MEMORY, FILES);
+
+        // gen 1 committed in an earlier block.
+        module
+            .execute(&mut TestCtx::at(1), &module_msg(publish("/doc", "v1")))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // gen 2 staged, not yet committed.
+        module
+            .execute(&mut TestCtx::at(2), &module_msg(publish("/doc", "v2")))
+            .await
+            .unwrap();
+
+        // external reads (Module::query) stay committed-only.
+        assert_eq!(stat_of(&module, "/doc").await.unwrap().latest_generation, 1);
+
+        // host-routed same-block reads (Module::query_with) see the staged
+        // publish — what lets a same-block follow-up consumer (e.g. a package
+        // harness pinning its just-seeded prompt) observe the real generation.
+        let staged = module
+            .query_with(
+                &TestCtx::at(2),
+                &encode_query(&MemoryQuery::Stat {
+                    path: "/doc".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        match decode_reply(&staged).unwrap() {
+            MemoryReply::Stat(Some(stat)) => assert_eq!(stat.latest_generation, 2),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+
+        // an abort takes the staged view back with it: both lanes agree again.
+        module.abort_block().await.unwrap();
+        let after_abort = module
+            .query_with(
+                &TestCtx::at(3),
+                &encode_query(&MemoryQuery::Stat {
+                    path: "/doc".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        match decode_reply(&after_abort).unwrap() {
+            MemoryReply::Stat(Some(stat)) => assert_eq!(stat.latest_generation, 1),
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    });
+}
+
+#[test]
 fn snapshot_install_round_trips_and_rejects_tampering() {
     block_on(async {
         let mut source = Memory::new(MEMORY, FILES);
@@ -1971,7 +2029,8 @@ fn failed_watch_follow_up_aborts_the_publish_atomically() {
             Box::new(ExplodingWatcher),
         ])
         .expect("genesis");
-        let ctx_at = |height| BlockContext { protocol_version: 0,
+        let ctx_at = |height| BlockContext {
+            protocol_version: 0,
             height,
             consensus_time: height,
             origin: Origin::External(b"tester".to_vec()),

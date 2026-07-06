@@ -42,14 +42,19 @@
 //! ## prompt generation pin
 //!
 //! the install block publishes each prompt seed into memory BEFORE this
-//! module's install arm runs, but queries observe committed state only — so
-//! the harness pins generation 1, the committed generation a FRESH package
-//! path lands on (the dummy-harness convention).
+//! module's install arm runs, and memory serves same-block queries
+//! staged-over-committed — so the install arm asks memory for each seed
+//! path's ACTUAL latest generation and pins THAT. assuming generation 1
+//! instead would hand anyone who pre-publishes junk at the predictable path
+//! a permanent brick: the seed would land at generation 2 while the agent
+//! pins 1, and every run would fail pin-mismatch with no repair path (the
+//! agents are harness-owned and the package id stays claimed).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use agent::{AgentMsg, PromptRef, RENDERER_MEMORY_GENERATION, encode_msg as agent_encode_msg};
 use jobs::{JobsMsg, JobsQuery, JobsReply, encode_msg as jobs_encode_msg};
+use memory::{MemoryQuery, MemoryReply, encode_query as memory_encode_query};
 use package::{
     HarnessMsg, InstallSpec, PackageActionMsg, PackageActionQuery, PackageActionReply, PackageMsg,
     decode_action_msg, decode_action_query, decode_harness_msg, encode_action_reply,
@@ -64,10 +69,6 @@ use sha2::{Digest, Sha256};
 
 mod interface;
 pub use interface::*;
-
-/// the memory generation a fresh package prompt path commits at (see the
-/// module docs on the pin assumption).
-const FIRST_GENERATION: u64 = 1;
 
 // ---- state -----------------------------------------------------------------------
 
@@ -194,7 +195,7 @@ impl DocsHarness {
 
     // ---- the harness contract (origin == package module) ----------------------
 
-    fn install(
+    async fn install(
         &mut self,
         ctx: &mut dyn Ctx,
         package: String,
@@ -230,7 +231,9 @@ impl DocsHarness {
         }
 
         // register each agent seed FROM THIS MODULE'S ORIGIN (harness-owned),
-        // its prompt pinned to the seed path at the fresh generation.
+        // its prompt pinned to the generation the seed ACTUALLY landed on —
+        // never an assumed generation 1, which a path squatter could displace
+        // (see the module docs on the prompt generation pin).
         for seed in &spec.agents {
             let prompt = spec
                 .prompts
@@ -239,6 +242,7 @@ impl DocsHarness {
                 .ok_or_else(|| {
                     Error::Module(format!("agent prompt is not seeded: {}", seed.agent_id))
                 })?;
+            let generation = self.seeded_generation(&*ctx, &prompt.path).await?;
             ctx.emit_msg(Msg {
                 target: self.agent.clone(),
                 payload: agent_encode_msg(&AgentMsg::RegisterAgent {
@@ -247,7 +251,7 @@ impl DocsHarness {
                     capability: seed.capability.clone(),
                     prompt: Some(PromptRef {
                         module: self.memory.clone(),
-                        target: format!("{}@{FIRST_GENERATION}", prompt.path),
+                        target: format!("{}@{generation}", prompt.path),
                         renderer: RENDERER_MEMORY_GENERATION.into(),
                         sha256: prompt.sha256.clone(),
                     }),
@@ -277,6 +281,31 @@ impl DocsHarness {
             payload: package_encode_msg(&PackageMsg::MarkActive { package }),
         });
         Ok(())
+    }
+
+    /// the generation the just-staged prompt seed landed on. the package
+    /// module publishes every seed BEFORE this install arm runs in the same
+    /// block, and memory serves same-block queries staged-over-committed, so
+    /// the path's live latest IS the seed — whatever a squatter parked at
+    /// older generations. a missing stat means the seed never preceded us:
+    /// a wiring bug, and the install arm MAY fail (it rides the installer's
+    /// own block).
+    async fn seeded_generation(&self, ctx: &dyn Ctx, path: &str) -> Result<u64, Error> {
+        let reply = ctx
+            .query(
+                &self.memory,
+                &memory_encode_query(&MemoryQuery::Stat { path: path.into() }),
+            )
+            .await
+            .map_err(|e| Error::Module(format!("memory stat of the prompt seed failed: {e}")))?;
+        match memory::decode_reply(&reply) {
+            Ok(MemoryReply::Stat(Some(stat))) => Ok(stat.latest_generation),
+            Ok(MemoryReply::Stat(None)) => Err(Error::Module(format!(
+                "prompt seed is not staged in memory: {path}"
+            ))),
+            Ok(other) => Err(Error::Module(format!("unexpected memory reply: {other:?}"))),
+            Err(e) => Err(Error::Module(e)),
+        }
     }
 
     /// the shared lifecycle transition: check the recorded package + expected
@@ -910,7 +939,9 @@ impl Module for DocsHarness {
         // rejection below: it is never acted on.
         if origin == Origin::Module(self.package.clone()) {
             return match decode_harness_msg(&msg.payload).map_err(Error::Module)? {
-                HarnessMsg::InstallPackage { package, spec } => self.install(ctx, package, spec),
+                HarnessMsg::InstallPackage { package, spec } => {
+                    self.install(ctx, package, spec).await
+                }
                 HarnessMsg::SuspendPackage { package } => self.suspend(ctx, package),
                 HarnessMsg::ResumePackage { package } => self.resume(ctx, package),
                 HarnessMsg::UnplugPackage { package } => self.unplug(ctx, package),
@@ -1029,6 +1060,9 @@ mod tests {
         emitted: Vec<Msg>,
         events: Vec<String>,
         job_taken: bool,
+        /// the latest generation the canned memory Stat reports for any
+        /// prompt path (what the staged seed publish landed on).
+        prompt_generation: u64,
     }
 
     impl TestCtx {
@@ -1044,6 +1078,7 @@ mod tests {
                 emitted: Vec::new(),
                 events: Vec::new(),
                 job_taken: false,
+                prompt_generation: 1,
             }
         }
 
@@ -1130,6 +1165,21 @@ mod tests {
                         other => return Err(Error::Module(format!("unexpected query: {other:?}"))),
                     };
                     Ok(pages::encode_reply(&reply))
+                }
+                "memory" => {
+                    let reply = match memory::decode_query(req).map_err(Error::Module)? {
+                        MemoryQuery::Stat { path } => MemoryReply::Stat(Some(memory::FileStat {
+                            path,
+                            latest_generation: self.prompt_generation,
+                            generations: 1,
+                            latest_meta: memory::Meta::new(),
+                            latest_author: "package".into(),
+                            latest_published_at_height: 1,
+                            body_len: 0,
+                        })),
+                        other => return Err(Error::Module(format!("unexpected query: {other:?}"))),
+                    };
+                    Ok(memory::encode_reply(&reply))
                 }
                 other => Err(Error::UnknownModule(other.into())),
             }
@@ -1349,6 +1399,33 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn install_pins_the_staged_seed_generation_not_an_assumed_first() {
+        // a squatter pre-published junk at the predictable prompt path, so
+        // the staged seed landed at generation 3 — the PromptRef must pin 3,
+        // or every future run fails pin-mismatch forever.
+        let mut m = module();
+        let mut ctx = TestCtx::at(package_origin());
+        ctx.prompt_generation = 3;
+        exec(
+            &mut m,
+            &mut ctx,
+            encode_harness_msg(&HarnessMsg::InstallPackage {
+                package: PKG.into(),
+                spec: spec(),
+            }),
+        )
+        .unwrap();
+        match agent::decode_msg(&ctx.emitted[1].payload).unwrap() {
+            AgentMsg::RegisterAgent { prompt, .. } => {
+                let prompt = prompt.expect("prompt pinned");
+                assert_eq!(prompt.target, format!("{PROMPT_PATH}@3"));
+                assert_eq!(prompt.sha256, Sha256::digest(b"# Docs Editor\n").to_vec());
+            }
+            other => panic!("expected RegisterAgent, got {other:?}"),
+        }
     }
 
     #[test]
