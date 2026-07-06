@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "pages.block.update_text",
+  "description": "Replace the text of a single page block, optionally guarded by the block's expected prior hash so a concurrent edit aborts the write.",
+  "type": "object",
+  "properties": {
+    "page_id": {
+      "type": "string",
+      "description": "The page that owns the block."
+    },
+    "block_id": {
+      "type": "string",
+      "description": "The block to rewrite."
+    },
+    "text": {
+      "type": "string",
+      "maxLength": 65536,
+      "description": "The new block text."
+    },
+    "expected_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Optional guard: the block's prior content hash. A mismatch records a failure instead of overwriting."
+    }
+  },
+  "required": ["page_id", "block_id", "text"],
+  "additionalProperties": false
+}
