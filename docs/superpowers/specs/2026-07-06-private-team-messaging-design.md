@@ -4,26 +4,36 @@ Date: 2026-07-06 · Status: proposed design of record for making the chat
 surface *secure private team messaging* for members of the same private
 network.
 
+**The requirement, precisely: private means private from the other network
+members.** A conversation's content must be readable by its participants and
+by no one else — including every other member node in the same private
+network, each of which replicates the full consensus state. The network
+perimeter (WireGuard, E2E-encrypted mesh, no third-party services) is
+necessary but is NOT the read barrier; the read barrier must be
+cryptographic, because state replication hands every member node every byte.
+
 The team's messaging already runs on consensus (`crates/apps/chat`) inside a
 private network whose transport, identity, and membership story is strong
-(`2026-07-05-private-cutover-coordinator-design.md`). What is missing is the
-privacy layer on top: today every byte of every channel is plaintext in
-replicated state, readable by any member node, the read path is completely
-ungated, channel membership and hooks are writable by **any** origin, and
-there are no DMs and no channel owners. This design closes that gap in the
-repo's established trust idiom (the vaults model: crypto is the read barrier,
-consensus is the write-integrity barrier) without inventing new planes.
+(`2026-07-05-private-cutover-coordinator-design.md`). What is missing is
+exactly the insider-privacy layer: today every byte of every channel is
+plaintext in replicated state, readable by any member node, the read path is
+completely ungated, channel membership and hooks are writable by **any**
+origin, and there are no DMs and no channel owners. This design closes that
+gap in the repo's established trust idiom (the vaults model: crypto is the
+read barrier, consensus is the write-integrity barrier) without inventing
+new planes.
 
 ## What already holds (and this design leans on)
 
-- **Transport privacy.** The control mesh is commonware
+- **Transport privacy (the perimeter).** The control mesh is commonware
   `authenticated::discovery` — ed25519-key-authenticated, end-to-end
   encrypted TCP. The WireGuard data plane binds an X25519 tunnel key to the
   member's ed25519 identity via signed endpoint records
   (`crates/system/wireguard-upgrade/src/lib.rs:277-283`). The coordinator is
-  rendezvous-only and never on a data path. **No third-party service ever
-  carries or stores message data** — that is the headline "private" property
-  and it is already true.
+  rendezvous-only and never on a data path. No third-party service ever
+  carries or stores message data. This perimeter is already true — and it
+  says nothing about privacy *between* members, which is what this design
+  adds.
 - **Authorship integrity.** On the real node lane every submit is an
   ed25519-signed op frame under the workspace key; a claimed origin cannot
   ride a signed frame (`bin/node/src/main.rs:6929-6945`). Chat derives
@@ -75,18 +85,22 @@ the metadata boundary).
 
 **A. Governance hardening only (no crypto).** Add owners, gate membership
 and hooks, add a `Private` visibility that hides channels from non-member
-queries. Cheap, immediately shippable — but "private" channels would be
-curtains, not locks: any member node reads the plaintext state directly.
-Honest only as a UX tier, not a security tier.
+queries. Cheap, immediately shippable — but it **fails the stated
+requirement outright**: any member node reads the plaintext state directly,
+so "private" channels would be curtains, not locks. Kept only as the
+prerequisite governance slice inside B, never as a shippable definition of
+"private".
 
 **B. A + encrypted lanes (vaults pattern) — recommended.** Private channels
 and DMs store **opaque ciphertext** in consensus state; members encrypt to a
-per-channel epoch key wrapped per-recipient with X25519 envelopes. The
-on-chain member list is recipient bookkeeping and write-integrity (exactly
-`crates/apps/vaults/src/interface.rs`'s documented trust model); the
-envelope is the read barrier. Consensus keeps doing what it's good at
-(ordering, durability, late-join sync, unforgeable authorship); crypto does
-the only thing consensus cannot: confidentiality against replicas.
+per-channel epoch key wrapped per-recipient with X25519 envelopes. A
+non-participant member node holds the ciphertext (it replicates state) and
+can never open it. The on-chain member list is recipient bookkeeping and
+write-integrity (exactly `crates/apps/vaults/src/interface.rs`'s documented
+trust model); the envelope is the read barrier. Consensus keeps doing what
+it's good at (ordering, durability, late-join sync, unforgeable authorship);
+crypto does the only thing consensus cannot: confidentiality against
+replicas.
 
 **C. Off-consensus messaging over the data plane.** `crates/system/data-plane`
 is designed for exactly this shape (consensus-derived `AdmissionPolicy`,
@@ -127,7 +141,11 @@ The `Channel` record gains, all serde-defaulted for state compatibility:
 - `owners: Vec<Vec<u8>>` — creator becomes first owner (vaults pattern).
   New ops `AddOwner`/`RemoveOwner`, owner-gated; the last owner cannot be
   removed.
-- `visibility: Public | Private` — set at create, immutable.
+- `visibility: Public | Private` — set at create, immutable. **Private is
+  the default** in the app's create flow and in every new-surface path
+  (DMs are always private); a Public channel — plaintext, team-wide,
+  agent/hook-capable — is the explicit, deliberate exception, not the norm.
+  Pre-existing channels keep their public behavior.
 - **Owner-gating of the existing un-gated surface:** `SetMembership`,
   `RegisterHook`, `UnregisterHook` (and pinning when it lands) now require an
   owner origin. This closes gap 3 for *all* channels, public included.
@@ -219,7 +237,9 @@ member's cryptographic agent, exactly as it already is for authorship.
 
 ### 5. App surface
 
-- Channel create dialog: a Private toggle (visibility is immutable after).
+- Channel create dialog: visibility choice, **defaulting to Private**
+  (immutable after create); Public is the explicit opt-out with a "readable
+  by every network member, enables agents/hooks/search" explainer.
 - A member roster view sourced from valset + profiles (key, name, has
   messaging key) — doubles as the DM launcher.
 - Private channels and DMs render with a lock affordance; sealed bodies are
@@ -238,11 +258,18 @@ member's cryptographic agent, exactly as it already is for authorship.
   the 256 KiB record bound → cap private-channel membership at 1024 and
   epochs at 256 (removals per channel). Sealed `ct` rides the existing
   64 KiB message-head bound.
-- **Structure stays plaintext.** Sequences, threading, reaction emoji +
-  reactors, membership, and timing of private channels are visible to member
-  nodes (they replicate the state). Only bodies are sealed. Encrypting
-  structure buys little inside a team boundary and costs the module its
-  deterministic bookkeeping — rejected for v1.
+- **Structure stays plaintext — the honest metadata boundary.** Sequences,
+  threading, reaction emoji + reactors, membership lists, message sizes and
+  timing of private channels are visible to member nodes (they replicate the
+  state); the deterministic DM id even reveals *which pair* is talking.
+  Content is sealed; participation is not. Hiding participation on-consensus
+  is not honestly achievable: the module needs plaintext member sets to gate
+  writes deterministically, and with a small enumerable roster any hashed
+  or committed membership is trivially brute-forced. If who-talks-to-whom
+  must ever be hidden from other members, that conversation has to leave
+  replicated state entirely — the off-consensus data-plane path (approach C)
+  is the seam for that follow-on, at the cost of history/sync. Stated as a
+  scoped, deliberate trade for v1.
 - **Hooks, mentions, agents, search.** Sealed bodies cannot be parsed by
   modules: private channels get **no hook fan-out, no mention routing, no
   agent triggers, no indexer/search** in v1. `RegisterHook` is rejected on
@@ -299,14 +326,20 @@ Each slice is a PR into `dev` per the repo's branching rules.
 
 ## Vetoable calls (flagged, defaulted, not blocking)
 
-1. **Scope:** full B (encrypted lanes) vs stopping at slice 1 governance.
-   Default: full B — governance-only "private" is dishonest as security.
-2. **Epoch keys, not MLS** — no per-message FS. Default: epoch keys.
-3. **Crypto in the node, not the webview** (keys never in JS). Default: node.
-4. **Public channels stay plaintext** so hooks/agents/search keep working;
-   private channels lose those in v1. Default: yes.
-5. **New members read history** (all epochs wrapped on add). Default: yes —
+1. **Epoch keys, not MLS** — no per-message FS. Default: epoch keys.
+2. **Crypto in the node, not the webview** (keys never in JS). Default: node.
+3. **Public channels remain available** (plaintext, explicit opt-in at
+   create) so hooks/agents/search have a home; private is the default and
+   loses those in v1. Default: yes.
+4. **New members read history** (all epochs wrapped on add). Default: yes —
    Slack semantics; flip to current-epoch-only is a one-line policy change.
+5. **Participation metadata visible to member nodes in v1** (content sealed,
+   who/when/where not — see the metadata boundary above). Default: accept
+   for v1; the data-plane follow-on is the escape hatch if this ever becomes
+   load-bearing.
+
+(Not vetoable downward: shipping governance-only and calling it "private" —
+that fails the requirement this design exists for.)
 
 ## Code anchors
 
