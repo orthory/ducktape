@@ -68,6 +68,7 @@ use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of
 
 mod config;
 mod lobby;
+mod statesync_plane;
 mod voice;
 use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
 
@@ -4617,8 +4618,30 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 );
                 std::process::exit(1);
             };
-            let client =
-                P2pSyncClient::new(context.child("sync_client"), sync_tx, sync_rx, server_peer);
+            // the joiner's sync client: the mesh path always works; with the
+            // statesync plane enabled, requests PREFER an overlay stream to
+            // the source and fall back on transport failure — the plane binds
+            // lazily once the invite tunnel brings the interface up.
+            let mesh_client =
+                P2pSyncClient::new(context.child("sync_client"), sync_tx, sync_rx, server_peer.clone());
+            let client = {
+                let plane_slot: statesync_plane::PlaneSlot =
+                    std::sync::Arc::new(std::sync::OnceLock::new());
+                if statesync_plane::enabled() && wireguard_listen.is_some() {
+                    let book = statesync_plane::OverlayBook::new(
+                        String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+                    );
+                    book.set_peers(peers.iter());
+                    statesync_plane::spawn_bring_up(
+                        label.clone(),
+                        book,
+                        signer.public_key(),
+                        std::sync::Arc::clone(&plane_slot),
+                        None,
+                    );
+                }
+                statesync_plane::PlaneFallbackClient::new(plane_slot, &server_peer, mesh_client)
+            };
 
             // the announce, built once: this key + the invite token + the
             // proof-of-possession binding them. re-sent (round-robin over the
@@ -5586,7 +5609,28 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 );
                 std::process::exit(1);
             };
-            let client = BootP2pSyncClient::new(sync_tx, sync_rx, server_peer);
+            // like the parked joiner's client: prefer the plane (lazy bind —
+            // the promotion reboot restores its tunnels from disk) and fall
+            // back to the mesh path on transport failure.
+            let mesh_client = BootP2pSyncClient::new(sync_tx, sync_rx, server_peer.clone());
+            let client = {
+                let plane_slot: statesync_plane::PlaneSlot =
+                    std::sync::Arc::new(std::sync::OnceLock::new());
+                if statesync_plane::enabled() && wireguard_listen.is_some() {
+                    let book = statesync_plane::OverlayBook::new(
+                        String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+                    );
+                    book.set_peers(peers.iter());
+                    statesync_plane::spawn_bring_up(
+                        label.clone(),
+                        book,
+                        signer.public_key(),
+                        std::sync::Arc::clone(&plane_slot),
+                        None,
+                    );
+                }
+                statesync_plane::PlaneFallbackClient::new(plane_slot, &server_peer, mesh_client)
+            };
             let mut attempts = 0usize;
             loop {
                 attempts += 1;
@@ -5850,7 +5894,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     }
                 }
             }
-            match client.into_parts() {
+            match client.into_inner().into_parts() {
                 Ok((tx, rx)) => {
                     sync_tx = tx;
                     sync_rx = rx;
@@ -5949,25 +5993,49 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // future between ticks is lossless, whereas dropping the p2p receiver's
         // actor-backed `recv()` future mid-flight could eat a delivered
         // message. bounded + drop-on-full: clients time out and retry, so a
-        // flood degrades to retries instead of unbounded memory.
+        // flood degrades to retries instead of unbounded memory. the queue
+        // carries BOTH statesync carriers — mesh rpc frames and data-plane
+        // request streams — so one serve arm answers both.
         let (bridge_tx, mut sync_ingress) =
-            futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
-        context.child("sync_ingress").spawn(move |_ctx| {
-            let mut receiver = sync_rx;
-            let mut bridge_tx = bridge_tx;
-            async move {
-                loop {
-                    match receiver.recv().await {
-                        Ok((peer, msg)) => {
-                            let bytes: Vec<u8> = msg.into();
-                            // full bridge = flood pressure: drop; clients retry.
-                            let _ = bridge_tx.try_send((peer, bytes));
+            futures::channel::mpsc::channel::<statesync_plane::SyncJob>(64);
+        {
+            let mut bridge_tx = bridge_tx.clone();
+            context.child("sync_ingress").spawn(move |_ctx| {
+                let mut receiver = sync_rx;
+                async move {
+                    loop {
+                        match receiver.recv().await {
+                            Ok((peer, msg)) => {
+                                let bytes: Vec<u8> = msg.into();
+                                // full bridge = flood pressure: drop; clients retry.
+                                let _ = bridge_tx
+                                    .try_send(statesync_plane::SyncJob::Mesh(peer, bytes));
+                            }
+                            Err(_) => return, // network shutdown — nothing to serve.
                         }
-                        Err(_) => return, // network shutdown — nothing to serve.
                     }
                 }
-            }
+            });
+        }
+        // statesync's per-use data plane (env-gated, default off): the same
+        // requests over overlay stream sockets, accepted into the same queue.
+        // the address book doubles as admission — members + standbys of the
+        // tracked view, updated at every cutover re-track below.
+        let sync_plane_book = statesync_plane::enabled().then(|| {
+            let book = statesync_plane::OverlayBook::new(
+                String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+            );
+            book.set_peers(initial_member_keys.iter().chain(initial_observer_keys.iter()));
+            statesync_plane::spawn_bring_up(
+                label.clone(),
+                std::sync::Arc::clone(&book),
+                signer.public_key(),
+                std::sync::Arc::new(std::sync::OnceLock::new()),
+                Some(bridge_tx.clone()),
+            );
+            book
         });
+        drop(bridge_tx);
         // the lobby lane rides the same bridge pattern: announces are consumed
         // by the pump between drains. drop-on-full is doubly safe here — a
         // parked joiner re-announces every few seconds anyway.
@@ -6766,6 +6834,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // index = epoch, strictly increasing across
                             // cutovers.
                             mesh_oracle.track(plan.epoch(), mesh_at(plan.valset().transport_members()));
+                            // the statesync plane serves (and admits) exactly
+                            // who the mesh tracks — follow the re-track.
+                            if let Some(book) = &sync_plane_book {
+                                book.set_peers(plan.valset().transport_members().iter());
+                            }
                             // the reachability plane retunnels for the new
                             // member set the moment transport admits it —
                             // with the epoch's observer tier as the pre-warm
@@ -7420,15 +7493,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     }
                 }
                 msg = sync_ingress.next() => {
-                    let Some((peer, bytes)) = msg else {
+                    let Some(job) = msg else {
                         // the ingress task ended (network shutdown) — nothing
                         // left to serve; keep draining consensus regardless.
                         continue;
                     };
-                    let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
-                        continue; // malformed rpc envelope: drop, never crash.
+                    // both carriers land here: mesh frames ride an rpc
+                    // envelope (multiplexed channel — the id correlates);
+                    // a plane stream IS its own correlation and reply path.
+                    let (reply_to, rpc_id, body) = match job {
+                        statesync_plane::SyncJob::Mesh(peer, bytes) => {
+                            let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                                continue; // malformed rpc envelope: drop, never crash.
+                            };
+                            (statesync_plane::SyncReplyTo::Mesh(peer), rpc_id, body.to_vec())
+                        }
+                        statesync_plane::SyncJob::Plane(stream, req) => {
+                            (statesync_plane::SyncReplyTo::Plane(stream), 0, req)
+                        }
                     };
-                    let resp = match statesync::decode_request(body) {
+                    let resp = match statesync::decode_request(&body) {
                         Ok(statesync::SyncRequest::Frames {
                             after_height,
                             up_to_height,
@@ -7521,11 +7605,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             format!("bad request frame: {e}"),
                         )),
                     };
-                    let _ = sync_tx.send(
-                        Recipients::One(peer),
-                        IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
-                        false,
-                    );
+                    match reply_to {
+                        statesync_plane::SyncReplyTo::Mesh(peer) => {
+                            let _ = sync_tx.send(
+                                Recipients::One(peer),
+                                IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
+                                false,
+                            );
+                        }
+                        statesync_plane::SyncReplyTo::Plane(mut stream) => {
+                            // one request per stream: write the response and
+                            // drop — the close is the client's completion.
+                            let _ =
+                                statesync::dataplane::write_frame(&mut stream, &resp).await;
+                        }
+                    }
                 }
             }
         }
