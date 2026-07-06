@@ -410,7 +410,10 @@ impl DocsHarness {
                                 target: target.clone(),
                                 thread_id: thread_id.clone(),
                                 comment_id: comment_id.clone(),
-                                text: text.clone(),
+                                // a bounded excerpt, NEVER the full comment: a
+                                // near-cap comment would push the spec past
+                                // the jobs cap and abort the commenter's block.
+                                text: engagement_excerpt(&text),
                             }),
                         }),
                     });
@@ -1543,6 +1546,41 @@ mod tests {
         exec(&mut m, &mut squat, comment_event("c3", "@docs.editor go")).unwrap();
         assert!(squat.emitted.is_empty());
         assert!(squat.events.iter().any(|e| e.contains("already taken")));
+    }
+
+    #[test]
+    fn a_near_cap_comment_mints_one_bounded_job_and_never_aborts() {
+        let mut m = module();
+        installed(&mut m);
+
+        // a comment near pages' 64 KiB cap, escape-heavy on purpose: embedded
+        // verbatim, its JSON escaping alone would push the encoded spec past
+        // the jobs board's 64 KiB spec cap and make Submit abort the
+        // COMMENTER's block — the intake arm must bound the excerpt instead.
+        let mut text = String::from("@docs.editor tighten this ");
+        text.push_str(&"\"".repeat(pages::MAX_COMMENT_TEXT_BYTES - text.len()));
+        assert_eq!(text.len(), pages::MAX_COMMENT_TEXT_BYTES);
+
+        let mut ctx = TestCtx::at(Origin::Module("pages".into()));
+        exec(&mut m, &mut ctx, comment_event("c-big", &text))
+            .expect("the no-fail intake must not abort on a near-cap comment");
+        assert_eq!(ctx.emitted.len(), 1, "exactly one job minted");
+        match jobs::decode_msg(&ctx.emitted[0].payload).unwrap() {
+            JobsMsg::Submit { job_id, spec, .. } => {
+                assert_eq!(job_id, engagement_job_id(AGENT, "c-big"));
+                assert!(
+                    spec.len() <= jobs::MAX_SPEC,
+                    "the encoded spec ({} bytes) must fit the jobs cap",
+                    spec.len()
+                );
+                let spec = decode_engagement_spec(&spec).expect("spec decodes");
+                assert!(spec.text.len() <= MAX_COMMENT_TEXT_BYTES);
+                assert!(text.starts_with(&spec.text), "the excerpt is a prefix");
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+        commit(&mut m);
+        assert_eq!(m.committed.minted.len(), 1, "the block committed the key");
     }
 
     #[test]

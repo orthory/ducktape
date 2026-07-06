@@ -93,6 +93,14 @@ pub fn engagement_job_id(agent_id: &str, comment_id: &str) -> String {
 
 /// the spec a minted `agent/<agent_id>` job carries: where the mention lives,
 /// as one serde_json object (deterministic field order — struct order).
+///
+/// `text` is a bounded EXCERPT of the mentioning comment (at most
+/// [`MAX_COMMENT_TEXT_BYTES`], cut at a char boundary — see
+/// [`engagement_excerpt`]), never the full text: pages allows comments up to
+/// its own 64 KiB cap, and a full near-cap (or escape-heavy) copy could push
+/// the encoded spec past the jobs board's spec cap — aborting the COMMENTER's
+/// block from the no-fail intake arm. the agent reads the full comment from
+/// pages at run time via `comment_id`; the excerpt is orientation, not truth.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct EngagementSpec {
     pub page_id: String,
@@ -100,6 +108,20 @@ pub struct EngagementSpec {
     pub thread_id: String,
     pub comment_id: String,
     pub text: String,
+}
+
+/// the bounded excerpt an [`EngagementSpec`] carries: the comment's leading
+/// bytes up to [`MAX_COMMENT_TEXT_BYTES`], cut back to the nearest char
+/// boundary so the excerpt stays valid utf-8.
+pub fn engagement_excerpt(text: &str) -> String {
+    if text.len() <= MAX_COMMENT_TEXT_BYTES {
+        return text.to_owned();
+    }
+    let mut end = MAX_COMMENT_TEXT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 pub fn encode_engagement_spec(s: &EngagementSpec) -> String {
@@ -205,6 +227,25 @@ mod interface_tests {
         let rc: RunContext =
             serde_json::from_str(r#"{"run_id":"r1","agent_id":"a","package":"later"}"#).unwrap();
         assert_eq!(rc.run_id, "r1");
+    }
+
+    #[test]
+    fn engagement_excerpts_are_bounded_and_char_clean() {
+        // under the cap: verbatim.
+        let short = "hello @docs.editor";
+        assert_eq!(engagement_excerpt(short), short);
+        // exactly at the cap: verbatim.
+        let exact = "a".repeat(MAX_COMMENT_TEXT_BYTES);
+        assert_eq!(engagement_excerpt(&exact), exact);
+        // past the cap with 3-byte chars: 4096 % 3 == 1, so the raw cut would
+        // split a char — the excerpt backs off to the nearest boundary.
+        let long = "한".repeat(MAX_COMMENT_TEXT_BYTES);
+        let cut = engagement_excerpt(&long);
+        assert_eq!(
+            cut.len(),
+            MAX_COMMENT_TEXT_BYTES - MAX_COMMENT_TEXT_BYTES % 3
+        );
+        assert!(long.starts_with(&cut));
     }
 
     #[test]

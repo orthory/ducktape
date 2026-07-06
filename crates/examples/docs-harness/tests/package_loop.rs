@@ -222,6 +222,26 @@ fn a_mention_mints_exactly_one_job_with_idempotent_redelivery() {
 }
 
 #[test]
+fn a_near_cap_comment_mints_one_job_and_the_block_commits() {
+    PackageTestBed::run(docs_modules(), |mut bed| async move {
+        install(&mut bed).await;
+        seed_page(&mut bed).await;
+
+        // a mention comment near pages' 64 KiB cap, escape-heavy on purpose:
+        // embedded verbatim in the job spec, its JSON escaping alone would
+        // blow the jobs board's 64 KiB spec cap and abort the COMMENTER's
+        // block from the no-fail intake arm. the bounded excerpt keeps the
+        // Submit within the cap — the block commits and one job mints.
+        let mut text = String::from("@docs.editor tighten this ");
+        text.push_str(&"\"".repeat(pages::MAX_COMMENT_TEXT_BYTES - text.len()));
+        assert_eq!(text.len(), pages::MAX_COMMENT_TEXT_BYTES);
+        comment(&mut bed, "t1", "c1", &text).await; // panics if the block aborts
+        bed.assert_job_count(&kind(), 1).await;
+        bed.assert_pending_run_for_agent(AGENT, true).await;
+    });
+}
+
+#[test]
 fn malformed_page_events_are_no_op_observations() {
     PackageTestBed::run(docs_modules(), |mut bed| async move {
         install(&mut bed).await;
