@@ -71,7 +71,10 @@ pub fn unhex(s: &str) -> Result<Vec<u8>, String> {
 
 /// load the identity at `path`, or generate one there from OS randomness.
 /// returns the signer and whether it was freshly generated. written 0600 on
-/// unix — it is the node's (and for now the user's) whole identity.
+/// unix — this is the NODE's identity (mesh/valset/frame-signing key) only.
+/// the user's identity is a separate keypair held by the app
+/// (`~/.ducktape/user.key`) and bound to this node's key through the
+/// `identity` module (`crates/system/identity`); this file never holds it.
 pub fn load_or_generate_identity(path: &Path) -> Result<(ed25519::PrivateKey, bool), String> {
     if path.exists() {
         return load_identity(path).map(|k| (k, false));
@@ -115,6 +118,42 @@ pub fn load_identity(path: &Path) -> Result<ed25519::PrivateKey, String> {
     let raw = unhex(text.trim()).map_err(|e| format!("{path:?}: {e}"))?;
     ed25519::PrivateKey::decode(raw.as_slice())
         .map_err(|e| format!("{path:?} is not an ed25519 secret: {e}"))
+}
+
+/// mint a bind certificate: the USER key's signature over
+/// [`identity::bind_preimage`] in the [`identity::IDENTITY_BIND_NS`] domain --
+/// the consent artifact `IdentityMsg::BindNode` carries as `user_sig`. chain-
+/// and nonce-scoped, so a certificate can never replay across networks or
+/// after an unbind bumps the nonce.
+pub fn mint_bind_cert(
+    user: &ed25519::PrivateKey,
+    chain_id: &str,
+    node_pub: &[u8],
+    nonce: u64,
+) -> Vec<u8> {
+    user.sign(
+        identity::IDENTITY_BIND_NS,
+        &identity::bind_preimage(chain_id, node_pub, nonce),
+    )
+    .as_ref()
+    .to_vec()
+}
+
+/// mint an unbind certificate (same shape as [`mint_bind_cert`], but signed
+/// over [`identity::unbind_preimage`] in the [`identity::IDENTITY_UNBIND_NS`]
+/// domain -- the consent artifact `IdentityMsg::UnbindNode` carries).
+pub fn mint_unbind_cert(
+    user: &ed25519::PrivateKey,
+    chain_id: &str,
+    node_pub: &[u8],
+    nonce: u64,
+) -> Vec<u8> {
+    user.sign(
+        identity::IDENTITY_UNBIND_NS,
+        &identity::unbind_preimage(chain_id, node_pub, nonce),
+    )
+    .as_ref()
+    .to_vec()
 }
 
 /// mint a chain-id: the human-readable name plus a short salt, so two
@@ -1280,6 +1319,15 @@ pub struct Resolved {
     pub label: String,
     /// the chain-id (network shape) or legacy namespace bytes.
     pub namespace: Vec<u8>,
+    /// this network's chain id — the descriptor's own `chain_id` field (network
+    /// shape) or the raw configured namespace (dev shape, which has no
+    /// fingerprint appended). NOT `namespace`: the network shape's `namespace`
+    /// is `genesis_namespace()`, i.e. `chain_id@fingerprint` — a DIFFERENT
+    /// string. This is the exact string the desktop app records as
+    /// `Workspace.chain_id` (the `init` verb's last stdout line), so modules
+    /// that must agree with the app on "this network's id" (e.g. `identity`'s
+    /// certificate domain separation) use this field, never `namespace`.
+    pub chain_id: String,
     /// the authorized mesh set (unsorted here; the caller builds the ordered
     /// Set discovery tracks).
     pub mesh: Vec<ed25519::PublicKey>,
@@ -1432,6 +1480,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
         namespace: descriptor.genesis_namespace().into_bytes(),
+        chain_id: descriptor.chain_id.clone(),
         signer,
         mesh,
         validators,
@@ -1598,6 +1647,9 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
+        // the dev shape's namespace carries no fingerprint suffix (unlike the
+        // network shape's `genesis_namespace()`), so it IS the chain id here.
+        chain_id: namespace.clone(),
         namespace: namespace.into_bytes(),
         mesh,
         validators,
@@ -1690,6 +1742,124 @@ mod tests {
             "an existing identity is reused, never clobbered"
         );
         assert_eq!(a.public_key(), b.public_key());
+    }
+
+    // ---- user-key bind/unbind certificates ---------------------------------
+
+    #[test]
+    fn mint_bind_cert_verifies_against_module_preimage() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(1);
+        let node_pub = [9u8; 32];
+        let cert = mint_bind_cert(&user, "chain-a", &node_pub, 0);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage = identity::bind_preimage("chain-a", &node_pub, 0);
+        assert!(user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage, &sig));
+    }
+
+    #[test]
+    fn mint_bind_cert_is_chain_scoped() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(1);
+        let node_pub = [9u8; 32];
+        let cert = mint_bind_cert(&user, "chain-a", &node_pub, 0);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        // a cert minted for chain-a must NOT verify against chain-b's preimage.
+        let preimage_b = identity::bind_preimage("chain-b", &node_pub, 0);
+        assert!(!user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage_b, &sig));
+    }
+
+    #[test]
+    fn mint_bind_cert_does_not_verify_under_unbind_namespace() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(1);
+        let node_pub = [9u8; 32];
+        let cert = mint_bind_cert(&user, "chain-a", &node_pub, 0);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage = identity::bind_preimage("chain-a", &node_pub, 0);
+        // signed under IDENTITY_BIND_NS -- must NOT verify under the unbind ns.
+        assert!(!user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage, &sig));
+    }
+
+    #[test]
+    fn mint_unbind_cert_verifies_against_module_preimage() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(2);
+        let node_pub = [11u8; 32];
+        let cert = mint_unbind_cert(&user, "chain-a", &node_pub, 3);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage = identity::unbind_preimage("chain-a", &node_pub, 3);
+        assert!(user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage, &sig));
+    }
+
+    #[test]
+    fn mint_unbind_cert_is_chain_scoped() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(2);
+        let node_pub = [11u8; 32];
+        let cert = mint_unbind_cert(&user, "chain-a", &node_pub, 3);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage_b = identity::unbind_preimage("chain-b", &node_pub, 3);
+        assert!(!user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage_b, &sig));
+    }
+
+    #[test]
+    fn mint_unbind_cert_does_not_verify_under_bind_namespace() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(2);
+        let node_pub = [11u8; 32];
+        let cert = mint_unbind_cert(&user, "chain-a", &node_pub, 3);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage = identity::unbind_preimage("chain-a", &node_pub, 3);
+        // signed under IDENTITY_UNBIND_NS -- must NOT verify under the bind ns.
+        assert!(!user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage, &sig));
+    }
+
+    /// mirrors exactly what `cmd_user_sign_bind`/`cmd_user_sign_unbind` build,
+    /// so this is a stand-in for hand-verifying the CLI's JSON output: encode
+    /// through `identity::encode_msg`, decode through `identity::decode_msg`,
+    /// and check the message the module actually consumes round-trips.
+    #[test]
+    fn user_sign_messages_round_trip_through_identity_codec() {
+        let user = ed25519::PrivateKey::from_seed(3);
+        let node_pub = [42u8; 32];
+
+        let bind_sig = mint_bind_cert(&user, "test@abc", &node_pub, 0);
+        let bind_msg = identity::IdentityMsg::BindNode {
+            user_key: user.public_key().as_ref().to_vec(),
+            user_sig: bind_sig,
+        };
+        let encoded = identity::encode_msg(&bind_msg);
+        // the wire contract: a single utf-8 JSON line, decodable as-is.
+        assert_eq!(String::from_utf8(encoded.clone()).unwrap().lines().count(), 1);
+        assert_eq!(identity::decode_msg(&encoded).unwrap(), bind_msg);
+
+        let unbind_sig = mint_unbind_cert(&user, "test@abc", &node_pub, 1);
+        let unbind_msg = identity::IdentityMsg::UnbindNode {
+            node_key: node_pub.to_vec(),
+            user_sig: unbind_sig,
+        };
+        let encoded = identity::encode_msg(&unbind_msg);
+        assert_eq!(String::from_utf8(encoded.clone()).unwrap().lines().count(), 1);
+        assert_eq!(identity::decode_msg(&encoded).unwrap(), unbind_msg);
     }
 
     #[test]

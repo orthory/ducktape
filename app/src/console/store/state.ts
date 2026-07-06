@@ -84,8 +84,14 @@ export interface ConsoleState {
   messages: MessageView[];
   activeThread: ChatThread | null;
   /** hex(user key bytes) → display name, from the `profiles` module; threaded
-   *  into author rendering so messages show chosen names, not hex handles. */
+   *  into author rendering so messages show chosen names, not hex handles.
+   *  OVERLAID by `identity`'s per-user display name for every node it binds —
+   *  see DucktapeProvider's snapshot build. */
   authorNames: Record<string, string>;
+  /** hex(node key bytes) → its owning user, from the `identity` module — the
+   *  node/user split's resolver: `name` is that user's chosen display name
+   *  (null if unset), already folded into `authorNames` when present. */
+  nodeUsers: Record<string, { userKey: string; name: string | null }>;
   /** This client's live voice-huddle session — ephemeral, never in the
    *  committed snapshot (see VoiceSlice). */
   voice: VoiceSlice;
@@ -326,6 +332,7 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     authorNames: {},
+    nodeUsers: {},
     voice: {
       channelId: null,
       muted: false,
@@ -381,6 +388,7 @@ export interface ConsoleSnapshot {
   activeChannel: string | null;
   messages: MessageView[];
   authorNames: Record<string, string>;
+  nodeUsers: Record<string, { userKey: string; name: string | null }>;
   pages: PageMeta[];
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
@@ -406,6 +414,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   activeChannel: snapshot.activeChannel,
   messages: snapshot.messages,
   authorNames: snapshot.authorNames,
+  nodeUsers: snapshot.nodeUsers,
   pages: snapshot.pages,
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,

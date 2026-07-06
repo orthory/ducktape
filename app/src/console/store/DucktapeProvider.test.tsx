@@ -120,6 +120,9 @@ const makeFakeNode = () => {
       if (target === "profiles") {
         return Promise.resolve({ profiles: [] });
       }
+      if (target === "identity") {
+        return Promise.resolve({ users: [] });
+      }
       if (target === "valset") {
         if (query === "observers") {
           return Promise.resolve({ observers: [[0xfe, 0xed]] });

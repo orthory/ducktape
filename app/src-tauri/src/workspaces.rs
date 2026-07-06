@@ -91,8 +91,10 @@ pub struct PhaseReport {
 
 // ── Path + registry io ──────────────────────────────────
 
-/// `~/.ducktape` — the registry root. created on demand.
-fn root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+/// `~/.ducktape` — the registry root. created on demand. `pub(crate)` so
+/// [`crate::user_identity`] can locate `user.key` as a sibling of `workspaces/`
+/// without duplicating this lookup.
+pub(crate) fn root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let home = app
         .path()
         .home_dir()
@@ -197,7 +199,9 @@ fn reserved_ports(reg: &Registry) -> Vec<u16> {
 /// run a `ducktape-node` onboarding verb to completion and return its stdout
 /// (trimmed). the verbs print the datum (chain-id, pubkey, invite blob) to
 /// stdout and human guidance to stderr; a non-zero exit surfaces stderr.
-fn run_verb(node_bin: &Path, args: &[&str]) -> Result<String, String> {
+/// `pub(crate)` so [`crate::user_identity`] drives the `user-key`/
+/// `user-sign-bind`/`user-sign-unbind` verbs the same way.
+pub(crate) fn run_verb(node_bin: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new(node_bin)
         .args(args)
         .output()
@@ -219,8 +223,9 @@ fn run_verb(node_bin: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// the last non-empty line of a verb's stdout — the datum (verbs may print a
-/// trailing summary line; the payload is always last).
-fn last_line(stdout: &str) -> String {
+/// trailing summary line; the payload is always last). `pub(crate)` — shared
+/// with [`crate::user_identity`].
+pub(crate) fn last_line(stdout: &str) -> String {
     stdout
         .lines()
         .map(str::trim)

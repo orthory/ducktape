@@ -1,0 +1,23 @@
+[package]
+name = "identity"
+edition.workspace = true
+version.workspace = true
+
+# the user->nodes binding registry as replicated state: one USER (an ed25519
+# keypair held by the person, app-side) owns many NODES (each a mesh/valset
+# identity). depends only on sdk + valset wire types (to member-gate binds) +
+# commonware-cryptography (to verify user certificates deterministically).
+[dependencies]
+sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+valset = { workspace = true }
+commonware-cryptography = { workspace = true }
+# required for the PublicKey/Signature-from-bytes api (DecodeExt) -- same
+# reason valset depends on it.
+commonware-codec = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"
