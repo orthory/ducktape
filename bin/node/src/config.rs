@@ -1207,12 +1207,32 @@ pub fn choose_sync_source<A>(
     validators: &[ed25519::PublicKey],
     me: &ed25519::PublicKey,
 ) -> Option<ed25519::PublicKey> {
-    bootstrappers
+    sync_source_candidates(bootstrappers, validators, me)
+        .into_iter()
+        .next()
+}
+
+/// EVERY candidate statesync source, ordered: bootstrap-hinted validators
+/// first (a dial path is already configured), then the remaining validators.
+/// the rotating client fails over down this list — any validator can serve,
+/// because every payload verifies against consensus-agreed roots.
+pub fn sync_source_candidates<A>(
+    bootstrappers: &[(ed25519::PublicKey, A)],
+    validators: &[ed25519::PublicKey],
+    me: &ed25519::PublicKey,
+) -> Vec<ed25519::PublicKey> {
+    let mut out: Vec<ed25519::PublicKey> = bootstrappers
         .iter()
         .map(|(k, _)| k)
-        .find(|k| *k != me && validators.contains(k))
-        .or_else(|| validators.iter().find(|k| *k != me))
+        .filter(|k| *k != me && validators.contains(k))
         .cloned()
+        .collect();
+    for k in validators {
+        if k != me && !out.contains(k) {
+            out.push(k.clone());
+        }
+    }
+    out
 }
 
 // ============================================================================

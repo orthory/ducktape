@@ -4182,8 +4182,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // validators serve the channel, so the candidate must be a validator
         // that is not us (a non-validator hint or our own key would be
         // retried forever — discovery never connects a node to itself).
-        let sync_source =
-            config::choose_sync_source(&sync_candidates, &validators, &signer.public_key());
+        let sync_sources =
+            config::sync_source_candidates(&sync_candidates, &validators, &signer.public_key());
+        let sync_source = sync_sources.first().cloned();
 
         // the real encrypted TCP mesh. `local` is the dev preset (allows private
         // ips). MUST be the real tokio runtime — discovery live-locks under the
@@ -4293,18 +4294,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
             network.start();
 
-            let Some(server_peer) = sync_source else {
+            if sync_sources.is_empty() {
                 eprintln!(
                     "[node {label}] no statesync source: no validator other than this node \
                      is available to serve (only validators answer the statesync channel)"
                 );
                 std::process::exit(1);
-            };
-            let client = P2pSyncClient::new(
+            }
+            // rotate across every validator that can serve — the payloads
+            // verify against consensus roots, so source choice is pure
+            // availability.
+            let client = P2pSyncClient::with_sources(
                 context.child("sync_client"),
                 sync_tx,
                 sync_rx,
-                server_peer,
+                sync_sources.clone(),
             );
 
             // the mesh takes a moment to connect, and the server only serves
@@ -4618,12 +4622,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 );
                 std::process::exit(1);
             };
-            // the joiner's sync client: the mesh path always works; with the
+            // the joiner's sync client: the mesh path always works and
+            // ROTATES across every validator that can serve; with the
             // statesync plane enabled, requests PREFER an overlay stream to
-            // the source and fall back on transport failure — the plane binds
-            // lazily once the invite tunnel brings the interface up.
-            let mesh_client =
-                P2pSyncClient::new(context.child("sync_client"), sync_tx, sync_rx, server_peer.clone());
+            // the primary source and fall back on transport failure — the
+            // plane binds lazily once the invite tunnel brings the interface
+            // up.
+            let mesh_client = P2pSyncClient::with_sources(
+                context.child("sync_client"),
+                sync_tx,
+                sync_rx,
+                sync_sources.clone(),
+            );
             let client = {
                 let plane_slot: statesync_plane::PlaneSlot =
                     std::sync::Arc::new(std::sync::OnceLock::new());
