@@ -29,7 +29,8 @@ members = [
     "crates/system/wireguard-effect",
     "crates/system/nat-traversal",
     "crates/system/reachability",
-    "crates/system/saga", 
+    "crates/system/data-plane",
+    "crates/system/saga",
     "crates/system/capability", 
     "crates/system/dispatch", 
     "crates/system/dispatch-oracle",
@@ -139,3 +140,4 @@ wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
 wireguard-effect = { path = "crates/system/wireguard-effect" }
 nat-traversal = { path = "crates/system/nat-traversal" }
 reachability = { path = "crates/system/reachability" }
+data-plane = { path = "crates/system/data-plane" }
