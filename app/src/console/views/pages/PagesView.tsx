@@ -52,15 +52,15 @@ const sectionLabelStyle: CSSProperties = {
 /** Per-kind typography for the block textarea. */
 function kindFont(kind: BlockKind): string {
   switch (kind) {
-    case "Heading1":
+    case "heading1":
       return `650 24px/1.25 ${font.sans}`;
-    case "Heading2":
+    case "heading2":
       return `650 19px/1.3 ${font.sans}`;
-    case "Heading3":
+    case "heading3":
       return `600 16px/1.35 ${font.sans}`;
-    case "Code":
+    case "code":
       return `400 12.5px/1.55 ${font.mono}`;
-    case "Quote":
+    case "quote":
       return `400 14.5px/1.6 ${font.sans}`;
     default:
       return `400 14.5px/1.6 ${font.sans}`;
@@ -69,23 +69,23 @@ function kindFont(kind: BlockKind): string {
 
 function kindPlaceholder(kind: BlockKind): string {
   switch (kind) {
-    case "Heading1":
-    case "Heading2":
-    case "Heading3":
-      return "Heading";
-    case "Todo":
+    case "heading1":
+    case "heading2":
+    case "heading3":
+      return "heading";
+    case "todo":
       return "To-do";
-    case "Bulleted":
-    case "Numbered":
+    case "bulleted":
+    case "numbered":
       return "List item";
-    case "Toggle":
-      return "Toggle";
-    case "Quote":
-      return "Quote";
-    case "Code":
+    case "toggle":
+      return "toggle";
+    case "quote":
+      return "quote";
+    case "code":
       return "code";
-    case "Callout":
-      return "Callout";
+    case "callout":
+      return "callout";
     default:
       return "Type '/' for commands";
   }
@@ -217,7 +217,7 @@ function BlockRow({
   }, [draft, block.kind]);
 
   const slashOpen =
-    draft.startsWith("/") && !slashDismissed && block.kind !== "Code";
+    draft.startsWith("/") && !slashDismissed && block.kind !== "code";
   const slashQuery = slashOpen ? draft.slice(1) : "";
   const slashOptions = filterSlashKinds(slashQuery);
 
@@ -239,11 +239,11 @@ function BlockRow({
     }
     // markdown prefixes convert only a plain paragraph — conversions never
     // chain, so "# " typed into a heading stays literal text.
-    if (block.kind === "Paragraph") {
+    if (block.kind === "paragraph") {
       const shortcut = shortcutFor(next);
       if (shortcut) {
         handlers.setKind(block.id, shortcut.kind);
-        if (shortcut.kind === "Divider") {
+        if (shortcut.kind === "divider") {
           handlers.commitText(block.id, "");
           setDraft("");
         } else {
@@ -285,8 +285,8 @@ function BlockRow({
       event.preventDefault();
       // an empty list item exits the list instead of continuing it.
       if (draft.trim() === "" && continuationKind(block.kind) === block.kind
-          && block.kind !== "Paragraph") {
-        handlers.setKind(block.id, "Paragraph");
+          && block.kind !== "paragraph") {
+        handlers.setKind(block.id, "paragraph");
         return;
       }
       maybeCommit();
@@ -336,21 +336,21 @@ function BlockRow({
     }
   };
 
-  const code = block.kind === "Code";
-  const quote = block.kind === "Quote";
-  const callout = block.kind === "Callout";
-  const todoDone = block.kind === "Todo" && block.checked;
+  const code = block.kind === "code";
+  const quote = block.kind === "quote";
+  const callout = block.kind === "callout";
+  const todoDone = block.kind === "todo" && block.checked;
   const blockNumber = index + 1;
 
   // the left gutter marker per kind (bullet, number, checkbox, chevron).
   const marker: ReactNode =
-    block.kind === "Bulleted" ? (
+    block.kind === "bulleted" ? (
       <span style={{ font: `700 14px ${font.sans}`, color: color.muted3 }}>•</span>
-    ) : block.kind === "Numbered" ? (
+    ) : block.kind === "numbered" ? (
       <span style={{ font: `500 12.5px ${font.mono}`, color: color.muted3 }}>
         {row.listIndex ?? 1}.
       </span>
-    ) : block.kind === "Todo" ? (
+    ) : block.kind === "todo" ? (
       <button
         type="button"
         aria-label={`${block.checked ? "Uncheck" : "Check"} to-do block ${blockNumber}`}
@@ -371,7 +371,7 @@ function BlockRow({
       >
         {block.checked ? <Icon name="check" size={10} strokeWidth={2.4} /> : null}
       </button>
-    ) : block.kind === "Toggle" ? (
+    ) : block.kind === "toggle" ? (
       <button
         type="button"
         aria-label={`${expanded ? "Collapse" : "Expand"} toggle block ${blockNumber}`}
@@ -398,7 +398,7 @@ function BlockRow({
     ) : null;
 
   const content =
-    block.kind === "Divider" ? (
+    block.kind === "divider" ? (
       <div
         aria-label={`Divider block ${blockNumber}`}
         style={{ padding: "10px 0" }}
@@ -477,7 +477,7 @@ function BlockRow({
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
-          paddingTop: block.kind === "Heading1" ? 6 : block.kind === "Heading2" ? 3 : 0,
+          paddingTop: block.kind === "heading1" ? 6 : block.kind === "heading2" ? 3 : 0,
         }}
       >
         {marker}
@@ -834,7 +834,7 @@ export function PagesView() {
       blockId,
       parent: root.id,
       after: root.children[root.children.length - 1] ?? null,
-      kind: "Paragraph",
+      kind: "paragraph",
       text: "",
     });
     setFocusId(blockId);

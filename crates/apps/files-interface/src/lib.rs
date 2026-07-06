@@ -68,6 +68,7 @@ pub struct Manifest {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum FilesMsg {
     /// register a manifest. the module computes `digest` and `owner`; the
     /// submitter supplies only the identity, shape, and chunk list.
@@ -84,12 +85,14 @@ pub enum FilesMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum FilesQuery {
     Stat { file_id: String },
     List { prefix: String, limit: u64 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum FilesReply {
     Stat(Option<Manifest>),
     List(Vec<Manifest>),
@@ -98,6 +101,7 @@ pub enum FilesReply {
 /// the off-consensus chunk-serve request. the module answers this from its
 /// node-local blob store, outside any block.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum FilesSyncReq {
     GetChunk { digest: DigestHex },
 }
@@ -107,6 +111,7 @@ pub enum FilesSyncReq {
 /// committed in a manifest before trusting them — a dishonest server can flip a
 /// byte, but the receiver detects it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum FilesSyncResp {
     Chunk { present: bool, bytes: Vec<u8> },
 }

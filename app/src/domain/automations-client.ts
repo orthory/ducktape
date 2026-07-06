@@ -5,7 +5,7 @@
 // the app only defines, toggles, deletes, and inspects them.
 //
 // Trigger/Action/*Msg/*Query are externally-tagged serde enums, so each crosses
-// the wire as a single-key object (`{ MessagePosted: {...} }`) — the discriminated
+// the wire as a single-key object (`{ message_posted: {...} }`) — the discriminated
 // unions below mirror that shape verbatim. camelCase params in, verbatim wire out,
 // pure functions over an injected NodeTransport.
 
@@ -17,7 +17,7 @@ import { replyVariant } from "./wire";
 /** What makes a rule fire. Every `null` field is a wildcard. */
 export type Trigger =
   | {
-      MessagePosted: {
+      message_posted: {
         /** exact channel id, or null for any channel */
         channel_id: string | null;
         /** substring tested against each mention's display form, or null */
@@ -27,7 +27,7 @@ export type Trigger =
       };
     }
   | {
-      MemoryPublished: {
+      memory_published: {
         /** a memory subtree prefix (segment-aware), or null for any path */
         prefix: string | null;
         /** matches `event.meta["kind"]`, or null */
@@ -39,10 +39,10 @@ export type Trigger =
 
 /** What a firing rule does. */
 export type Action =
-  | { PostMessage: { channel_id: string; template: string } }
-  | { CreateTask: { task_id_prefix: string; title_template: string } }
+  | { post_message: { channel_id: string; template: string } }
+  | { create_task: { task_id_prefix: string; title_template: string } }
   | {
-      DeliverInbox: {
+      deliver_inbox: {
         member_template: string;
         kind: string;
         body_template: string;
@@ -75,8 +75,8 @@ const TARGET = "automations";
 
 /** The kinds a Trigger/Action can take — small helpers so the view builder does
  *  not hand-assemble wire objects. */
-export type TriggerKind = "MessagePosted" | "MemoryPublished";
-export type ActionKind = "PostMessage" | "CreateTask" | "DeliverInbox";
+export type TriggerKind = "message_posted" | "memory_published";
+export type ActionKind = "post_message" | "create_task" | "deliver_inbox";
 
 // ── Msgs (writes) ───────────────────────────────────────
 
@@ -85,7 +85,7 @@ export const createRule = (
   params: { ruleId: string; trigger: Trigger; action: Action },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    CreateRule: {
+    create_rule: {
       rule_id: params.ruleId,
       trigger: params.trigger,
       action: params.action,
@@ -97,29 +97,29 @@ export const setEnabled = (
   params: { ruleId: string; enabled: boolean },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    SetEnabled: { rule_id: params.ruleId, enabled: params.enabled },
+    set_enabled: { rule_id: params.ruleId, enabled: params.enabled },
   });
 
 export const deleteRule = (
   transport: NodeTransport,
   ruleId: string,
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { DeleteRule: { rule_id: ruleId } });
+  transport.submit(TARGET, { delete_rule: { rule_id: ruleId } });
 
 // ── Queries (reads over committed state) ────────────────
 
 export const listRules = (transport: NodeTransport): Promise<Rule[]> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, "ListRules"))
-    .then((reply) => replyVariant<Rule[]>(reply, "Rules"));
+    .then(() => transport.query(TARGET, "list_rules"))
+    .then((reply) => replyVariant<Rule[]>(reply, "rules"));
 
 export const getRule = (
   transport: NodeTransport,
   ruleId: string,
 ): Promise<Rule | null> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, { GetRule: { rule_id: ruleId } }))
-    .then((reply) => replyVariant<Rule | null>(reply, "Rule"));
+    .then(() => transport.query(TARGET, { get_rule: { rule_id: ruleId } }))
+    .then((reply) => replyVariant<Rule | null>(reply, "rule"));
 
 /** The most recent `limit` run-history records for `ruleId`, oldest-first. */
 export const runHistory = (
@@ -129,7 +129,7 @@ export const runHistory = (
   Promise.resolve()
     .then(() =>
       transport.query(TARGET, {
-        RunHistory: { rule_id: params.ruleId, limit: params.limit },
+        run_history: { rule_id: params.ruleId, limit: params.limit },
       }),
     )
-    .then((reply) => replyVariant<RunRecord[]>(reply, "History"));
+    .then((reply) => replyVariant<RunRecord[]>(reply, "history"));

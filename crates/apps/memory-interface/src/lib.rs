@@ -126,6 +126,7 @@ pub struct FileStat {
 /// one entry returned by [`MemoryQuery::Ls`]: an implicit child directory, or a
 /// file with its [`FileStat`]. sorted by path within the reply.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum LsEntry {
     /// an implicit directory directly under the listed path. `path` is the full
     /// absolute directory path (no trailing slash).
@@ -135,6 +136,7 @@ pub enum LsEntry {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryMsg {
     /// write-once publish: assigns `generation = latest + 1` (1 for a new file)
     /// atomically and appends an immutable generation. inline body/meta caps are
@@ -177,6 +179,7 @@ pub enum MemoryMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryQuery {
     /// entries directly under `path` (child dirs + files), sorted by path, up
     /// to `limit` (clamped to [`MAX_QUERY_LIMIT`]).
@@ -223,6 +226,7 @@ pub struct GrepHit {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryReply {
     Ls(Vec<LsEntry>),
     Stat(Option<FileStat>),
@@ -234,6 +238,7 @@ pub enum MemoryReply {
 /// the watch notification payload: one follow-up [`sdk::Msg`]-shaped dispatch
 /// per matching watcher module, emitted in the same block as the publish (P2).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryEvent {
     Published {
         path: String,

@@ -11,7 +11,7 @@ import { replyVariant } from "./wire";
 
 // ── Wire types (Block records + DocReply payloads, verbatim) ─
 
-export type BlockKind = "Paragraph" | "Heading" | "Code";
+export type BlockKind = "paragraph" | "heading" | "code";
 
 export interface Block {
   id: string;
@@ -31,14 +31,14 @@ export const createDoc = (
   transport: NodeTransport,
   params: { docId: string },
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { CreateDoc: { doc_id: params.docId } });
+  transport.submit(TARGET, { create_doc: { doc_id: params.docId } });
 
 export const insertBlock = (
   transport: NodeTransport,
   params: { docId: string; after: string | null; block: Block },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    InsertBlock: {
+    insert_block: {
       doc_id: params.docId,
       after: params.after,
       block: params.block,
@@ -50,7 +50,7 @@ export const updateBlock = (
   params: { docId: string; blockId: string; text: string },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    UpdateBlock: {
+    update_block: {
       doc_id: params.docId,
       block_id: params.blockId,
       text: params.text,
@@ -62,7 +62,7 @@ export const removeBlock = (
   params: { docId: string; blockId: string },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    RemoveBlock: { doc_id: params.docId, block_id: params.blockId },
+    remove_block: { doc_id: params.docId, block_id: params.blockId },
   });
 
 export const moveBlock = (
@@ -70,7 +70,7 @@ export const moveBlock = (
   params: { docId: string; blockId: string; after: string | null },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    MoveBlock: {
+    move_block: {
       doc_id: params.docId,
       block_id: params.blockId,
       after: params.after,
@@ -85,8 +85,8 @@ export const getDoc = (
   docId: string,
 ): Promise<Block[] | null> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, { GetDoc: { doc_id: docId } }))
-    .then((reply) => replyVariant<Block[] | null>(reply, "Doc"));
+    .then(() => transport.query(TARGET, { get_doc: { doc_id: docId } }))
+    .then((reply) => replyVariant<Block[] | null>(reply, "doc"));
 
 /** A single block by id, or null when the doc or block is absent. */
 export const getBlock = (
@@ -96,17 +96,17 @@ export const getBlock = (
   Promise.resolve()
     .then(() =>
       transport.query(TARGET, {
-        GetBlock: { doc_id: params.docId, block_id: params.blockId },
+        get_block: { doc_id: params.docId, block_id: params.blockId },
       }),
     )
-    .then((reply) => replyVariant<Block | null>(reply, "Block"));
+    .then((reply) => replyVariant<Block | null>(reply, "block"));
 
 /** Every known doc id, sorted — the module's enumeration index. The console
  *  derives its folder tree from these "/"-delimited path ids. */
 export const listDocs = (transport: NodeTransport): Promise<string[]> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, "ListDocs"))
-    .then((reply) => replyVariant<string[]>(reply, "DocList"));
+    .then(() => transport.query(TARGET, "list_docs"))
+    .then((reply) => replyVariant<string[]>(reply, "doc_list"));
 
 // ── Materialized view (the module's derived-index endpoint) ──
 

@@ -413,11 +413,11 @@ export const docIdOf = (raw: string): string =>
 /** The task lifecycle is a one-way lane; Done stays Done. */
 export const nextTaskStatus = (status: TaskStatus): TaskStatus => {
   switch (status) {
-    case "Open":
-      return "InProgress";
-    case "InProgress":
-      return "Done";
-    case "Done":
-      return "Done";
+    case "open":
+      return "in_progress";
+    case "in_progress":
+      return "done";
+    case "done":
+      return "done";
   }
 };

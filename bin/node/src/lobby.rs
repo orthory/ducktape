@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{INVITE_NONCE_LEN, InviteToken};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum LobbyMsg {
     /// "this key asks to join, invited by `issuer`" — the token's fields plus
     /// the joiner key and its proof-of-possession, all raw bytes.

@@ -8,7 +8,7 @@ import { replyVariant } from "./wire";
 
 // ── Wire types (TaskReply payloads, verbatim) ───────────
 
-export type TaskStatus = "Open" | "InProgress" | "Done";
+export type TaskStatus = "open" | "in_progress" | "done";
 
 export interface Task {
   id: string;
@@ -27,7 +27,7 @@ export const createTask = (
   params: { taskId: string; title: string },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    CreateTask: { task_id: params.taskId, title: params.title },
+    create_task: { task_id: params.taskId, title: params.title },
   });
 
 export const updateStatus = (
@@ -35,12 +35,12 @@ export const updateStatus = (
   params: { taskId: string; status: TaskStatus },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    UpdateStatus: { task_id: params.taskId, status: params.status },
+    update_status: { task_id: params.taskId, status: params.status },
   });
 
 // ── Queries (reads) ─────────────────────────────────────
 
 export const listTasks = (transport: NodeTransport): Promise<Task[]> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, "List"))
-    .then((reply) => replyVariant<Task[]>(reply, "Tasks"));
+    .then(() => transport.query(TARGET, "list"))
+    .then((reply) => replyVariant<Task[]>(reply, "tasks"));

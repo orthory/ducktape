@@ -70,6 +70,7 @@ pub const MAX_CAPABILITY_BYTES: usize = 64;
 /// `sdk::Origin` itself is neither `Ord` nor serializable, so this type is the
 /// wire/state form.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
 pub enum SagaOrigin {
     /// an external submitter, identified by (e.g.) an ed25519 id.
     External(Vec<u8>),
@@ -81,6 +82,7 @@ pub enum SagaOrigin {
 
 /// ops targeting the saga module.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum SagaMsg {
     /// start a saga running the async work described by `spec`. a duplicate
     /// `saga_id` (staged or committed) is a deterministic no-op. `reply_to`
@@ -175,6 +177,7 @@ pub struct WorkerRequest {
 /// ordered op resolves it into one of the four terminal states — the ledger
 /// only advances via ordered ops, never node-local.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum SagaStatus {
     Pending,
     Done,
@@ -193,6 +196,7 @@ impl SagaStatus {
 /// how a saga ended — the callback's verdict, mirroring the terminal
 /// [`SagaStatus`] and carrying its payload.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum SagaOutcome {
     /// the agreed oracle result.
     Done(Vec<u8>),
@@ -216,6 +220,7 @@ pub struct SagaCallback {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum SagaQuery {
     Get {
         saga_id: SagaId,
@@ -228,6 +233,7 @@ pub enum SagaQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum SagaReply {
     Saga(Option<SagaView>),
     NextExpiry(Option<u64>),

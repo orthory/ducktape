@@ -106,7 +106,7 @@ export const addManifest = (
   },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    AddManifest: {
+    add_manifest: {
       file_id: params.fileId,
       name: params.name,
       mime: params.mime,
@@ -123,7 +123,7 @@ export const removeManifest = (
   transport: NodeTransport,
   fileId: string,
 ): Promise<BlockEvent> =>
-  transport.submit(TARGET, { RemoveManifest: { file_id: fileId } });
+  transport.submit(TARGET, { remove_manifest: { file_id: fileId } });
 
 // ── Queries (reads over committed state) ────────────────
 
@@ -132,8 +132,8 @@ export const stat = (
   fileId: string,
 ): Promise<Manifest | null> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, { Stat: { file_id: fileId } }))
-    .then((reply) => replyVariant<Manifest | null>(reply, "Stat"));
+    .then(() => transport.query(TARGET, { stat: { file_id: fileId } }))
+    .then((reply) => replyVariant<Manifest | null>(reply, "stat"));
 
 /** Manifests whose file_id starts with `prefix`, at most `limit` (clamped). */
 export const list = (
@@ -143,10 +143,10 @@ export const list = (
   Promise.resolve()
     .then(() =>
       transport.query(TARGET, {
-        List: { prefix: params.prefix ?? "", limit: params.limit ?? MAX_LIST_LIMIT },
+        list: { prefix: params.prefix ?? "", limit: params.limit ?? MAX_LIST_LIMIT },
       }),
     )
-    .then((reply) => replyVariant<Manifest[]>(reply, "List"));
+    .then((reply) => replyVariant<Manifest[]>(reply, "list"));
 
 // ── Upload / download (chunk plane over putBlob / getBlob) ─
 

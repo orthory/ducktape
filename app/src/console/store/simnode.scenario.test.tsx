@@ -52,7 +52,7 @@ function Probe() {
 }
 
 const peerChannel = (id: string, name: string) => ({
-  CreateChannel: { channel_id: id, name, post_policy: "Open" },
+  create_channel: { channel_id: id, name, post_policy: "open" },
 });
 
 describe.skipIf(!bin)("provider scenarios against the sim node", () => {
@@ -100,7 +100,7 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
     async () => {
       const { sim } = await boot();
 
-      act(() => capturedActions!.createChannel("General", "Open"));
+      act(() => capturedActions!.createChannel("General", "open"));
 
       // the optimistic projection landed before any block exists...
       await waitFor(() =>
@@ -143,7 +143,7 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       const { sim } = await boot();
 
       // park our write — it stays pending for the whole scenario.
-      act(() => capturedActions!.createChannel("Mine", "Open"));
+      act(() => capturedActions!.createChannel("Mine", "open"));
       await waitFor(async () => expect((await sim.state()).held).toBe(1));
 
       // a concurrent writer's block lands. telemetry frames are ungated, so
@@ -181,7 +181,7 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
     async () => {
       const { sim, transport } = await boot({ persona: "networked" });
 
-      act(() => capturedActions!.createChannel("General", "Open"));
+      act(() => capturedActions!.createChannel("General", "open"));
       await waitFor(async () => expect((await sim.state()).held).toBe(1));
       await sim.step();
 
@@ -206,9 +206,9 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       // payload bytes back through the same transport the app uses.
       const bytes = await transport.getBlob(record.opHash!);
       const payload = JSON.parse(new TextDecoder().decode(bytes)) as {
-        CreateChannel: { channel_id: string };
+        create_channel: { channel_id: string };
       };
-      expect(payload.CreateChannel.channel_id).toBe(
+      expect(payload.create_channel.channel_id).toBe(
         capturedState!.channels[0]!.id,
       );
 
@@ -232,10 +232,10 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       await sim.peerBlock(
         "chat",
         {
-          PostMessage: {
+          post_message: {
             channel_id: "general",
             message_id: "m-rival",
-            blocks: [{ Paragraph: [{ text: "rival wrote this", marks: [] }] }],
+            blocks: [{ paragraph: [{ text: "rival wrote this", marks: [] }] }],
             thread: null,
             as_agent: null,
           },
@@ -297,13 +297,13 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
 
       await submitStepped(
         "chat",
-        { CreateChannel: { channel_id: "general", name: "General", post_policy: "Open" } },
+        { create_channel: { channel_id: "general", name: "General", post_policy: "open" } },
         "owner",
       );
       await submitStepped(
         "agent",
         {
-          RegisterAgent: {
+          register_agent: {
             agent_id: "quackbot",
             display_name: "Quackbot",
             capability: "echo",
@@ -316,22 +316,22 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       );
       await submitStepped(
         "runs",
-        { WatchChannel: { channel_id: "general", policy: "Mention" } },
+        { watch_channel: { channel_id: "general", policy: "mention" } },
         "owner",
       );
       await submitStepped(
         "chat",
         {
-          PostMessage: {
+          post_message: {
             channel_id: "general",
             message_id: "m1",
             blocks: [
               {
-                Paragraph: [
+                paragraph: [
                   { text: "hey ", marks: [] },
                   {
                     text: "@quackbot",
-                    marks: [{ Mention: { Agent: { module: "runs", agent_id: "quackbot" } } }],
+                    marks: [{ mention: { agent: { module: "runs", agent_id: "quackbot" } } }],
                   },
                   { text: " can you handle this?", marks: [] },
                 ],
@@ -375,7 +375,7 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
     async () => {
       const { sim } = await boot({ persona: "networked" }, <ExplorerView />);
 
-      act(() => capturedActions!.createChannel("General", "Open"));
+      act(() => capturedActions!.createChannel("General", "open"));
       await waitFor(async () => expect((await sim.state()).held).toBe(1));
       await sim.step();
       await waitFor(() => expect(capturedState!.blocks.length).toBe(1));

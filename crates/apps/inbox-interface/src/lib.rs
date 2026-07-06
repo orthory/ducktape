@@ -52,6 +52,7 @@ pub struct Notification {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum InboxMsg {
     /// enqueue a notification for `member`. accepted from ANY origin: module
     /// follow-ups are the primary writers, but an external submitter may
@@ -70,6 +71,7 @@ pub enum InboxMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum InboxQuery {
     /// items for `member`, ascending by seq starting at `from_seq`, at most
     /// `limit` (clamped to [`MAX_QUERY_LIMIT`]).
@@ -83,6 +85,7 @@ pub enum InboxQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum InboxReply {
     Items(Vec<Notification>),
     UnreadCount(u64),

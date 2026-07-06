@@ -30,8 +30,8 @@ function LockGlyph({ size = 11 }: { size?: number }) {
 // A segmented Open / Members-only toggle for a channel's post policy.
 function PolicyToggle({ value, onChange }: { value: PostPolicy; onChange: (policy: PostPolicy) => void }) {
   const options: { key: PostPolicy; label: string; hint: string }[] = [
-    { key: "Open", label: "Open", hint: "Any member of the workspace can post" },
-    { key: "MembersOnly", label: "Members", hint: "Only channel members can post" },
+    { key: "open", label: "Open", hint: "Any member of the workspace can post" },
+    { key: "members_only", label: "Members", hint: "Only channel members can post" },
   ];
   return (
     <div style={{ display: "flex", gap: 3, background: color.sunken, borderRadius: radius.sm, padding: 3 }}>
@@ -69,14 +69,14 @@ function PolicyToggle({ value, onChange }: { value: PostPolicy; onChange: (polic
 function ChannelRail() {
   const { state, actions } = useDucktape();
   const [draft, setDraft] = useState("");
-  const [policy, setPolicy] = useState<PostPolicy>("Open");
+  const [policy, setPolicy] = useState<PostPolicy>("open");
   const [creating, setCreating] = useState(false);
 
   const create = (event: FormEvent) => {
     event.preventDefault();
     if (draft.trim()) actions.createChannel(draft, policy);
     setDraft("");
-    setPolicy("Open");
+    setPolicy("open");
     setCreating(false);
   };
 
@@ -206,7 +206,7 @@ function ChannelRail() {
 function EmptyChannelState() {
   const { state, actions } = useDucktape();
   const [draft, setDraft] = useState("");
-  const [policy, setPolicy] = useState<PostPolicy>("Open");
+  const [policy, setPolicy] = useState<PostPolicy>("open");
   const hasChannels = state.channels.length > 0;
 
   const create = (event: FormEvent) => {
@@ -372,7 +372,7 @@ export function ChatView() {
               · {rootMessageCount} {rootMessageCount === 1 ? "message" : "messages"}
             </span>
           )}
-          {channel?.post_policy === "MembersOnly" && (
+          {channel?.post_policy === "members_only" && (
             <span
               title="Only channel members can post"
               style={{

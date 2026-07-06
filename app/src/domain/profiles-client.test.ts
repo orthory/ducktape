@@ -27,7 +27,7 @@ describe("profile msgs", () => {
     await setName(transport, { displayName: "jess", origin: "jess" });
     expect(transport.submit).toHaveBeenCalledWith(
       "profiles",
-      { SetName: { display_name: "jess" } },
+      { set_name: { display_name: "jess" } },
       "jess",
     );
   });
@@ -38,25 +38,25 @@ describe("profile queries", () => {
     const wire: Profile[] = [
       { key: [1, 2, 3], display_name: "jess", updated_at: 1 },
     ];
-    const transport = stubTransport({ Profiles: wire });
+    const transport = stubTransport({ profiles: wire });
     await expect(allProfiles(transport)).resolves.toEqual(wire);
     expect(transport.query).toHaveBeenCalledWith("profiles", {
-      All: { from: 0, limit: 256 },
+      all: { from: 0, limit: 256 },
     });
   });
 
   it("passes explicit from/limit through", async () => {
-    const transport = stubTransport({ Profiles: [] });
+    const transport = stubTransport({ profiles: [] });
     await allProfiles(transport, { from: 10, limit: 5 });
     expect(transport.query).toHaveBeenCalledWith("profiles", {
-      All: { from: 10, limit: 5 },
+      all: { from: 10, limit: 5 },
     });
   });
 
   it("throws on a mismatched reply variant", async () => {
-    const transport = stubTransport({ Tasks: [] });
+    const transport = stubTransport({ tasks: [] });
     await expect(allProfiles(transport)).rejects.toThrow(
-      "unexpected module reply: wanted Profiles",
+      "unexpected module reply: wanted profiles",
     );
   });
 });

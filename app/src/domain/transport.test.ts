@@ -52,7 +52,7 @@ describe("remoteTransport", () => {
 
     const transport = remoteTransport("http://node.example:8844/");
     const block = await transport.submit("chat", {
-      CreateChannel: { channel_id: "general", name: "General" },
+      create_channel: { channel_id: "general", name: "General" },
     });
 
     expect(block).toEqual({ height: 4, appHash: "ab".repeat(32) });
@@ -60,7 +60,7 @@ describe("remoteTransport", () => {
     expect(url).toBe("http://node.example:8844/v1/submit");
     expect(JSON.parse(String(init.body))).toEqual({
       target: "chat",
-      payload: { CreateChannel: { channel_id: "general", name: "General" } },
+      payload: { create_channel: { channel_id: "general", name: "General" } },
     });
   });
 
@@ -80,13 +80,13 @@ describe("remoteTransport", () => {
 
   it("queries over POST /v1/query and returns the raw reply", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
-      jsonResponse(200, { Tasks: [] }),
+      jsonResponse(200, { tasks: [] }),
     );
     vi.stubGlobal("fetch", fetchMock);
 
     const transport = remoteTransport("http://node.example:8844");
-    await expect(transport.query("tasks", "List")).resolves.toEqual({
-      Tasks: [],
+    await expect(transport.query("tasks", "list")).resolves.toEqual({
+      tasks: [],
     });
   });
 

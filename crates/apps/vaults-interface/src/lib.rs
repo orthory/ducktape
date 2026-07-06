@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum VaultMsg {
     /// create a vault; the (verified) submitter becomes its first owner and
     /// first reader.
@@ -75,6 +76,7 @@ pub struct VaultView {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum VaultQuery {
     /// every vault's metadata view.
     Vaults,
@@ -85,6 +87,7 @@ pub enum VaultQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum VaultReply {
     Vaults(Vec<VaultView>),
     Vault(Option<VaultView>),

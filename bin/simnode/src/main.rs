@@ -125,7 +125,7 @@ const RECEIPT_BODY_CAP: usize = 64 * 1024;
 // ── Wire shapes of the /sim control lane ────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 enum Persona {
     Local,
     Networked,

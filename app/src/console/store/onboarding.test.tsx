@@ -102,7 +102,7 @@ describe("desktop onboarding", () => {
       vi.fn((url: string) =>
         String(url).endsWith("/v1/status")
           ? Promise.resolve(jsonResponse(200, status))
-          : Promise.resolve(jsonResponse(200, { Channels: [] })),
+          : Promise.resolve(jsonResponse(200, { channels: [] })),
       ),
     );
 
@@ -246,7 +246,7 @@ describe("onboarding gate — remote node", () => {
     const fetchMock = vi.fn((url: string) =>
       String(url).endsWith("/v1/status")
         ? Promise.resolve(jsonResponse(200, status))
-        : Promise.resolve(jsonResponse(200, { Channels: [] })),
+        : Promise.resolve(jsonResponse(200, { channels: [] })),
     );
     vi.stubGlobal("fetch", fetchMock);
 
@@ -301,7 +301,7 @@ describe("onboarding gate — remote node", () => {
       vi.fn((url: string) =>
         String(url).endsWith("/v1/status")
           ? Promise.resolve(jsonResponse(200, status))
-          : Promise.resolve(jsonResponse(200, { Channels: [] })),
+          : Promise.resolve(jsonResponse(200, { channels: [] })),
       ),
     );
 

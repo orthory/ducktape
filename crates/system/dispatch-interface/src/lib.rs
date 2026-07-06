@@ -58,6 +58,7 @@ pub const WORK_SPEC_KIND: &str = "dispatch-work-v1";
 
 /// where a recipe's runs are assigned.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Routing {
     /// each attempt is rendezvous-assigned over the capability's announced
     /// providers (saga's default capability assignment).
@@ -70,6 +71,7 @@ pub enum Routing {
 /// DETERMINISTICALLY by the dispatch module before any delivery. a closed set
 /// on purpose: each name is a checkable rule, not a config-described guess.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputContract {
     /// any byte string (size-capped). the receiver interprets.
     Text,
@@ -105,6 +107,7 @@ pub struct Recipe {
 /// where a dispatch is in its lifecycle. every transition is an ordered op;
 /// `Delivered` is terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DispatchStatus {
     /// the saga carrying the work, awaited for its callback.
     AwaitingResult { saga_id: String },
@@ -159,6 +162,7 @@ pub struct ResultEvent {
 // ---- ops -----------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DispatchMsg {
     /// register a recipe under the submitter's origin. a duplicate
     /// `recipe_id` is an error.
@@ -215,6 +219,7 @@ pub enum DispatchMsg {
 // ---- queries --------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DispatchQuery {
     Recipes,
     Recipe {
@@ -231,6 +236,7 @@ pub enum DispatchQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DispatchReply {
     Recipes(Vec<Recipe>),
     Recipe(Option<Recipe>),

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 /// what a passing proposal DOES.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum GovAction {
     /// admit a validator: emits `ValsetMsg::Join { key }` on execution.
     AddValidator { key: Vec<u8> },
@@ -46,6 +47,7 @@ pub enum GovAction {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum GovMsg {
     /// open a proposal. the submitter (verified frame origin) must be a
     /// CURRENT valset member; the voting deadline is
@@ -66,6 +68,7 @@ pub enum GovMsg {
 
 /// a proposal's lifecycle. `Open` accepts votes; the rest are terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ProposalStatus {
     Open,
     Passed,
@@ -86,6 +89,7 @@ pub struct ProposalView {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum GovQuery {
     /// every proposal, sorted by id.
     Proposals,
@@ -94,6 +98,7 @@ pub enum GovQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum GovReply {
     Proposals(Vec<ProposalView>),
     Proposal(Option<ProposalView>),

@@ -35,23 +35,23 @@ describe("runs msgs", () => {
 
     await watchChannel(transport, {
       channelId: "general",
-      policy: "Mention",
+      policy: "mention",
       origin: "operator",
     });
     expect(transport.submit).toHaveBeenCalledWith(
       "runs",
-      { WatchChannel: { channel_id: "general", policy: "Mention" } },
+      { watch_channel: { channel_id: "general", policy: "mention" } },
       "operator",
     );
 
     await watchChannel(transport, {
       channelId: "general",
-      policy: { Assigned: "helper" },
+      policy: { assigned: "helper" },
       origin: "operator",
     });
     expect(transport.submit).toHaveBeenCalledWith(
       "runs",
-      { WatchChannel: { channel_id: "general", policy: { Assigned: "helper" } } },
+      { watch_channel: { channel_id: "general", policy: { assigned: "helper" } } },
       "operator",
     );
   });
@@ -62,7 +62,7 @@ describe("runs msgs", () => {
     await unwatchChannel(transport, { channelId: "general", origin: "operator" });
     expect(transport.submit).toHaveBeenCalledWith(
       "runs",
-      { UnwatchChannel: { channel_id: "general" } },
+      { unwatch_channel: { channel_id: "general" } },
       "operator",
     );
 
@@ -74,14 +74,14 @@ describe("runs msgs", () => {
     });
     expect(transport.submit).toHaveBeenCalledWith(
       "runs",
-      { RequestRun: { agent_id: "helper", channel_id: "general", anchor_seq: 12 } },
+      { request_run: { agent_id: "helper", channel_id: "general", anchor_seq: 12 } },
       "operator",
     );
 
     await cancelRun(transport, { runId: "run-1", origin: "operator" });
     expect(transport.submit).toHaveBeenCalledWith(
       "runs",
-      { CancelRun: { run_id: "run-1" } },
+      { cancel_run: { run_id: "run-1" } },
       "operator",
     );
   });
@@ -91,7 +91,7 @@ describe("runs msgs", () => {
     await enableJobWorker(transport, { enabled: true, origin: "operator" });
     expect(transport.submit).toHaveBeenCalledWith(
       "runs",
-      { EnableJobWorker: { enabled: true } },
+      { enable_job_worker: { enabled: true } },
       "operator",
     );
   });
@@ -108,18 +108,18 @@ describe("runs queries", () => {
       thread_root: null,
       job_id: null,
       job_claim_height: 0,
-      requester: { External: [1] },
+      requester: { external: [1] },
       created_at: 1,
     };
-    const transport = stubTransport({ PendingRuns: [view] });
+    const transport = stubTransport({ pending_runs: [view] });
     await expect(pendingRuns(transport)).resolves.toEqual([view]);
-    expect(transport.query).toHaveBeenCalledWith("runs", "PendingRuns");
+    expect(transport.query).toHaveBeenCalledWith("runs", "pending_runs");
   });
 
   it("sends the bare string Watches and decodes the watches", async () => {
-    const watch: WatchView = { channel_id: "general", policy: "All" };
-    const transport = stubTransport({ Watches: [watch] });
+    const watch: WatchView = { channel_id: "general", policy: "all" };
+    const transport = stubTransport({ watches: [watch] });
     await expect(watches(transport)).resolves.toEqual([watch]);
-    expect(transport.query).toHaveBeenCalledWith("runs", "Watches");
+    expect(transport.query).toHaveBeenCalledWith("runs", "watches");
   });
 });

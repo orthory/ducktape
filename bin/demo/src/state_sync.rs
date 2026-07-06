@@ -98,6 +98,7 @@ impl StateSyncPeerId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MeshRole {
     Validator,
     Bootnode,
@@ -162,12 +163,14 @@ impl From<StateSyncRoot> for StateRoot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StateSyncKind {
     Snapshot,
     QmdbTarget,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StateSyncPayload {
     Snapshot(Vec<u8>),
     QmdbTarget(Vec<u8>),

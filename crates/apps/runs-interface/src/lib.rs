@@ -25,6 +25,7 @@ pub const DEFAULT_RUNS_TARGET: &str = "runs";
 
 /// how a watched channel selects which agents a user post engages.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnPolicy {
     /// agents whose `AuthorRef::Agent` ref appears in the post's mentions.
     Mention,
@@ -81,6 +82,7 @@ pub struct PendingRun {
 // ---- ops ----------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum RunsMsg {
     /// watch a channel under `policy` AND subscribe on the tagging plane —
     /// one atomic block (P2), so the watch and the subscription cannot drift.
@@ -111,6 +113,7 @@ pub enum RunsMsg {
 // ---- queries ------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum RunsQuery {
     /// every in-flight correlation entry, ascending by dispatch id. bounded:
     /// entries prune on delivery, and every dispatch has a deadline.
@@ -119,6 +122,7 @@ pub enum RunsQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum RunsReply {
     PendingRuns(Vec<PendingRun>),
     Watches(Vec<WatchView>),

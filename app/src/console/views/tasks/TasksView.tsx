@@ -12,27 +12,27 @@ import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 
-const STATUS_ORDER: TaskStatus[] = ["Open", "InProgress", "Done"];
+const STATUS_ORDER: TaskStatus[] = ["open", "in_progress", "done"];
 
 const STATUS_PILLS: Record<
   TaskStatus,
   { label: string; countLabel: string; text: string; bg: string; border: string }
 > = {
-  Open: {
+  open: {
     label: "Open",
     countLabel: "open",
     text: color.green,
     bg: "#eef5f0",
     border: "#cfe3d7",
   },
-  InProgress: {
+  in_progress: {
     label: "In progress",
     countLabel: "in progress",
     text: color.amber,
     bg: "#fbf4e6",
     border: "#ecdcae",
   },
-  Done: {
+  done: {
     label: "Done",
     countLabel: "done",
     text: color.purple,
@@ -70,11 +70,11 @@ const countFor = (tasks: Task[], status: TaskStatus): number =>
 
 const advanceCopy = (task: Task): { label: string; ariaLabel: string } => {
   switch (task.status) {
-    case "Open":
+    case "open":
       return { label: "Start", ariaLabel: `Start ${task.title}` };
-    case "InProgress":
+    case "in_progress":
       return { label: "Mark done", ariaLabel: `Mark ${task.title} done` };
-    case "Done":
+    case "done":
       return { label: "Complete", ariaLabel: `${task.title} complete` };
   }
 };
@@ -196,7 +196,7 @@ function TaskRow({
 }) {
   const pending = op?.phase === "pending";
   const [hover, setHover] = useState(false);
-  const done = task.status === "Done";
+  const done = task.status === "done";
   const pill = STATUS_PILLS[task.status];
 
   return (
@@ -369,7 +369,7 @@ export function TasksView() {
   const advance = (taskId: string) => {
     if (!writable) return;
     const task = state.tasks.find((item) => item.id === taskId);
-    if (!task || task.status === "Done") return;
+    if (!task || task.status === "done") return;
     actions.advanceTask(taskId);
   };
 

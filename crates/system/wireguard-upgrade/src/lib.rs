@@ -114,6 +114,7 @@ pub struct X25519PublicKey(pub [u8; 32]);
 pub struct SignatureBytes(pub Vec<u8>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Transport {
     Tcp,
     Udp,
@@ -212,6 +213,7 @@ impl PortPolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MeshCapability {
     Bootnode,
     Relay,

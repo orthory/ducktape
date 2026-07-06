@@ -12,10 +12,10 @@ export const GROUP_WINDOW_MS = 5 * 60_000;
 
 /** A stable string key for an AuthorRef, comparable with `===`. */
 export const authorKey = (author: AuthorRef): string => {
-  if (author === "System") return "system";
-  if ("User" in author) return `user:${author.User.join(",")}`;
-  if ("Agent" in author) return `agent:${author.Agent.module}/${author.Agent.agent_id}`;
-  return `module:${author.Module}`;
+  if (author === "system") return "system";
+  if ("user" in author) return `user:${author.user.join(",")}`;
+  if ("agent" in author) return `agent:${author.agent.module}/${author.agent.agent_id}`;
+  return `module:${author.module}`;
 };
 
 export const isAgentAuthor = (author: AuthorRef): boolean =>

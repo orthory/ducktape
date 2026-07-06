@@ -18,7 +18,7 @@ export const commit = (
   transport.submit(
     TARGET,
     {
-      Commit: {
+      commit: {
         path: params.path,
         content: params.content,
         message: params.message,
@@ -34,5 +34,5 @@ export const commit = (
  *  sha256 of the oid's raw bytes. */
 export const head = (transport: NodeTransport): Promise<string | null> =>
   Promise.resolve()
-    .then(() => transport.query(TARGET, "Head"))
-    .then((reply) => replyVariant<string | null>(reply, "Head"));
+    .then(() => transport.query(TARGET, "head"))
+    .then((reply) => replyVariant<string | null>(reply, "head"));

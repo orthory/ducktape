@@ -7,7 +7,7 @@ import type { ConsoleActions } from "../../store/actions";
 import { createInitialState, type ConsoleState } from "../../store/state";
 import { ChatView } from "./ChatView";
 
-const userAuthor = { User: Array.from(new TextEncoder().encode("operator")) };
+const userAuthor = { user: Array.from(new TextEncoder().encode("operator")) };
 
 const message = (
   seq: number,
@@ -43,7 +43,7 @@ const stateWithMessages = (messages: MessageView[]): ConsoleState => ({
       name: "general",
       created_at: 1,
       head_seq: messages.length,
-      post_policy: "Open",
+      post_policy: "open",
       hooks: [],
       pinned: [],
     },
@@ -71,8 +71,8 @@ describe("ChatView layout", () => {
       <ConsoleContext.Provider
         value={{
           state: stateWithMessages([
-            message(1, [{ Paragraph: [{ text: longUrl, marks: [] }] }]),
-            message(2, [{ Code: { lang: "ts", text: longCode } }]),
+            message(1, [{ paragraph: [{ text: longUrl, marks: [] }] }]),
+            message(2, [{ code: { lang: "ts", text: longCode } }]),
           ]),
           actions: noopActions,
         }}

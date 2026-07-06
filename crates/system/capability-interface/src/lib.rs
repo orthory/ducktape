@@ -42,6 +42,7 @@ pub fn validate_tag(tag: &str) -> Result<(), String> {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum CapabilityMsg {
     /// declaratively replace the submitter's announced capability set. the
     /// announced node is the SUBMIT ORIGIN's external key — a node can only
@@ -52,6 +53,7 @@ pub enum CapabilityMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum CapabilityQuery {
     /// every node that announced `capability`, sorted by key.
     Providers { capability: String },
@@ -62,6 +64,7 @@ pub enum CapabilityQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum CapabilityReply {
     Providers(Vec<Vec<u8>>),
     Node(Vec<String>),
