@@ -242,8 +242,16 @@ use crate::auth::{Authenticator, CoordCap};
 
 /// An authenticated wrapper around one request `Msg`, carrying the per-request
 /// authenticator. Wire tag 11. Only the four request shapes are wrappable.
+///
+/// `caller` is the authenticating identity — the key whose signer produced the
+/// PoP. The coordinator authenticates THIS key, not the inner message's key:
+/// for a `Lookup { key: peer }` the inner key is the peer being resolved, while
+/// `caller` is the (different) node doing the resolving. Authenticating the
+/// caller is what makes a cross-peer lookup possible; the inner key is only
+/// cross-checked against `caller` for the self-ops (see the coordinator).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuthRequest {
+    pub caller: NodeKey,
     pub inner: Msg,
     pub auth: Authenticator,
 }
@@ -258,8 +266,9 @@ fn put_pubkey(out: &mut Vec<u8>, p: &commonware_cryptography::ed25519::PublicKey
 
 impl AuthRequest {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(256);
+        let mut out = Vec::with_capacity(288);
         out.push(TAG_AUTH_REQUEST);
+        put_key(&mut out, &self.caller); // authenticating identity
         out.extend_from_slice(&self.inner.encode()); // inner tag + body
         put_u64(&mut out, self.auth.timestamp);
         put_sig(&mut out, &self.auth.pop_sig);
@@ -281,6 +290,7 @@ impl AuthRequest {
         if tag != TAG_AUTH_REQUEST {
             return Err(WireError::BadTag(tag));
         }
+        let caller = r.key()?;
         let inner = Msg::read(&mut r)?;
         if !inner.is_request() {
             return Err(WireError::NotARequest);
@@ -299,7 +309,7 @@ impl AuthRequest {
         if r.pos != buf.len() {
             return Err(WireError::Trailing);
         }
-        Ok(AuthRequest { inner, auth: Authenticator { timestamp, pop_sig, cap } })
+        Ok(AuthRequest { caller, inner, auth: Authenticator { timestamp, pop_sig, cap } })
     }
 }
 
@@ -402,7 +412,9 @@ mod tests {
             // With and without a cap.
             for cap in [None, Some(mint_coord_cap(&g, subject, 9_999_999))] {
                 let auth = sign_authenticator(&node, &inner.encode(), 1234, cap);
-                let req = AuthRequest { inner: inner.clone(), auth };
+                // caller is the authenticating identity — for a cross-peer
+                // Lookup it deliberately differs from the inner key.
+                let req = AuthRequest { caller: subject, inner: inner.clone(), auth };
                 let bytes = req.encode();
                 let back = AuthRequest::decode(&bytes).expect("decode");
                 assert_eq!(req, back);
@@ -418,7 +430,7 @@ mod tests {
         // Hand-encode an envelope whose inner is a RESPONSE (LookupResponse).
         let inner = Msg::LookupResponse { key: NodeKey([1u8; 32]), reflexive: None };
         let auth = sign_authenticator(&node, &inner.encode(), 1, None);
-        let bytes = AuthRequest { inner, auth }.encode();
+        let bytes = AuthRequest { caller: NodeKey([9u8; 32]), inner, auth }.encode();
         assert_eq!(AuthRequest::decode(&bytes), Err(WireError::NotARequest));
     }
 
@@ -429,11 +441,11 @@ mod tests {
         let node = ed25519::PrivateKey::from_seed(1);
         let inner = Msg::Register { key: NodeKey([2u8; 32]) };
         let auth = sign_authenticator(&node, &inner.encode(), 1, None);
-        let mut bytes = AuthRequest { inner, auth }.encode();
+        let mut bytes = AuthRequest { caller: NodeKey([2u8; 32]), inner, auth }.encode();
         bytes.push(0xff);
         assert_eq!(AuthRequest::decode(&bytes), Err(WireError::Trailing));
         // A tag-11 envelope must NOT decode as a bare Msg.
-        let clean = AuthRequest { inner: Msg::Register { key: NodeKey([2u8; 32]) },
+        let clean = AuthRequest { caller: NodeKey([2u8; 32]), inner: Msg::Register { key: NodeKey([2u8; 32]) },
             auth: sign_authenticator(&node, &Msg::Register { key: NodeKey([2u8; 32]) }.encode(), 1, None) }.encode();
         assert_eq!(Msg::decode(&clean), Err(WireError::BadTag(11)));
     }

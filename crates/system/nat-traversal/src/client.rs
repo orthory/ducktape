@@ -55,8 +55,13 @@ impl NatClient {
     fn authed(&self, inner: Msg) -> Vec<u8> {
         match &self.signer {
             Some(signer) => {
+                // The caller is THIS node's identity: the PoP is signed with
+                // `self.signer` (whose public key is `self.key`), and the
+                // coordinator verifies it against `caller`. For a cross-peer
+                // `Lookup { key: peer }` the inner key is the peer, but the
+                // authenticated principal is still this caller.
                 let auth = sign_authenticator(signer, &inner.encode(), now_secs(), self.cap.clone());
-                AuthRequest { inner, auth }.encode()
+                AuthRequest { caller: self.key, inner, auth }.encode()
             }
             None => inner.encode(),
         }
@@ -237,7 +242,8 @@ impl NatClient {
 /// peer traffic.
 pub async fn run_coordinator(sock: UdpSocket, policy: AuthPolicy) {
     let mut coord = Coordinator::with_policy(policy);
-    // Big enough for an AuthRequest with a cap (~219 bytes worst case).
+    // Big enough for an AuthRequest with a cap (~251 bytes worst case: the
+    // 32-byte caller field plus the inner request, authenticator, and cap).
     let mut buf = [0u8; 512];
     loop {
         let (n, from) = match sock.recv_from(&mut buf).await {
@@ -310,6 +316,54 @@ mod tests {
         outsider.register().await.unwrap(); // dropped by handle_legacy
         let miss = timeout(Duration::from_millis(500), outsider.lookup(NodeKey([0xcd; 32]))).await;
         assert!(miss.is_err() || miss.unwrap().is_err(), "unauthenticated register never created a mapping");
+    }
+
+    #[tokio::test]
+    async fn cross_peer_authenticated_lookup_and_punch_under_private_policy() {
+        // The core rendezvous path: two AUTHORIZED nodes A and B (each holding a
+        // genesis-minted cap) register, then A looks up B's DIFFERENT key and a
+        // simultaneous-open punch completes. This is the previously-impossible
+        // path — the coordinator authenticates the CALLER (A), not the looked-up
+        // key (B), so A's PoP (signed with A's own key) validates.
+        use crate::auth::{mint_coord_cap, AuthPolicy};
+        use commonware_cryptography::{ed25519, Signer as _};
+
+        let g = ed25519::PrivateKey::from_seed(700);
+        let policy = AuthPolicy::Private { genesis_set: vec![g.public_key()] };
+
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        tokio::spawn(run_coordinator(coord_sock, policy));
+
+        let a_signer = ed25519::PrivateKey::from_seed(701);
+        let b_signer = ed25519::PrivateKey::from_seed(702);
+        let a_key = { let mut k=[0u8;32]; k.copy_from_slice(a_signer.public_key().as_ref()); NodeKey(k) };
+        let b_key = { let mut k=[0u8;32]; k.copy_from_slice(b_signer.public_key().as_ref()); NodeKey(k) };
+        let a_cap = mint_coord_cap(&g, a_key, crate::auth::now_secs() + 3600);
+        let b_cap = mint_coord_cap(&g, b_key, crate::auth::now_secs() + 3600);
+
+        let a = NatClient::bind_multi_auth(a_key, vec![coord_addr], a_signer, Some(a_cap)).await.unwrap();
+        let b = NatClient::bind_multi_auth(b_key, vec![coord_addr], b_signer, Some(b_cap)).await.unwrap();
+        a.register().await.unwrap();
+        b.register().await.unwrap();
+
+        // A resolves B's reflexive via a CROSS-PEER Lookup. Under the OLD code
+        // (authenticate the looked-up key) A's PoP is verified against B's key
+        // and fails BadPop, so this Lookup is silently dropped and the lookup
+        // times out. Under the fix it resolves B's mapping.
+        let b_reflexive = timeout(Duration::from_secs(2), a.lookup(b_key))
+            .await
+            .expect("cross-peer lookup must not time out")
+            .expect("A resolves B");
+        assert_eq!(b_reflexive.port(), b.local_addr().await.unwrap().port());
+
+        // The fan-out PunchSync reached B (the coordinator told B where to punch
+        // A). B learns A's reflexive from that unsolicited PunchSync.
+        let a_reflexive = timeout(Duration::from_secs(2), b.recv_punch_sync())
+            .await
+            .expect("B receives the fan-out PunchSync")
+            .expect("punch sync");
+        assert_eq!(a_reflexive.port(), a.local_addr().await.unwrap().port());
     }
 
     #[tokio::test]

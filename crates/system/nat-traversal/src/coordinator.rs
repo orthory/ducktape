@@ -50,12 +50,24 @@ impl Coordinator {
         req: AuthRequest,
         now: u64,
     ) -> Vec<(SocketAddr, Msg)> {
-        let Some(subject) = req.inner.subject_key() else {
+        // Only request shapes are wrappable; a non-request inner is malformed.
+        let Some(inner_subject) = req.inner.subject_key() else {
             self.rejects += 1;
             return Vec::new();
         };
-        match verify_request(&self.policy, now, self.window, subject, &req.inner.encode(), &req.auth) {
-            Ok(()) => self.handle(from, req.inner),
+        // Anti-poisoning: for the SELF-ops (BindRequest/Register/Readvertise) the
+        // inner key IS the acting node, so it must equal the authenticated
+        // caller — otherwise an admitted member could register or re-advertise
+        // ANOTHER node's key. A `Lookup` has no such constraint: a member looks
+        // up a DIFFERENT peer, so its inner key is expected to differ.
+        let is_self_op = !matches!(req.inner, Msg::Lookup { .. });
+        if is_self_op && inner_subject != req.caller {
+            self.rejects += 1;
+            return Vec::new();
+        }
+        // Authenticate the CALLER (the PoP-signing identity), not the inner key.
+        match verify_request(&self.policy, now, self.window, req.caller, &req.inner.encode(), &req.auth) {
+            Ok(()) => self.handle_with_caller(from, req.inner, Some(req.caller)),
             Err(_) => {
                 self.rejects += 1;
                 Vec::new()
@@ -75,7 +87,24 @@ impl Coordinator {
     }
 
     /// Handle one datagram observed from `from`; return datagrams to send.
+    /// The legacy/unauthenticated path — the caller identity is unknown, so a
+    /// `Lookup`'s PunchSync fan-out reverse-maps the source (see
+    /// [`Self::handle_with_caller`]).
     pub fn handle(&mut self, from: SocketAddr, msg: Msg) -> Vec<(SocketAddr, Msg)> {
+        self.handle_with_caller(from, msg, None)
+    }
+
+    /// The pure handler. `caller`, when `Some`, is the AUTHENTICATED requesting
+    /// identity — used for a `Lookup`'s peer-directed `PunchSync` so the passive
+    /// side learns the caller's real key even before the caller has registered.
+    /// When `None` (legacy path) the caller key is reverse-mapped from the
+    /// datagram source, falling back to a zero key.
+    fn handle_with_caller(
+        &mut self,
+        from: SocketAddr,
+        msg: Msg,
+        caller: Option<NodeKey>,
+    ) -> Vec<(SocketAddr, Msg)> {
         match msg {
             Msg::BindRequest { .. } => {
                 vec![(from, Msg::BindResponse { reflexive: from })]
@@ -99,10 +128,14 @@ impl Coordinator {
                 let target = self.adverts.current(key);
                 let mut out = vec![(from, Msg::LookupResponse { key, reflexive: target })];
                 if let Some(peer_addr) = target {
-                    // Find the caller's own key by reverse-mapping its source;
-                    // fall back to a zero key if it never registered (still lets
-                    // the target learn the caller's reflexive to punch back).
-                    let caller_key = self.adverts.key_for_src(from).unwrap_or(NodeKey([0u8; 32]));
+                    // The caller's key for the peer-directed PunchSync: the
+                    // AUTHENTICATED caller when we have one, else reverse-map the
+                    // datagram source (legacy path), falling back to a zero key
+                    // if it never registered (the target still learns the
+                    // caller's reflexive to punch back).
+                    let caller_key = caller
+                        .or_else(|| self.adverts.key_for_src(from))
+                        .unwrap_or(NodeKey([0u8; 32]));
                     out.push((from, Msg::PunchSync { peer: key, peer_reflexive: peer_addr }));
                     out.push((peer_addr, Msg::PunchSync { peer: caller_key, peer_reflexive: from }));
                 }
@@ -257,12 +290,13 @@ mod tests {
         let reg = Msg::Register { key: subject };
         let cap = mint_coord_cap(&g, subject, now + 3600);
         let auth = sign_authenticator(&node, &reg.encode(), now, Some(cap));
-        let out = c.handle_auth(src, AuthRequest { inner: reg, auth }, now);
+        let out = c.handle_auth(src, AuthRequest { caller: subject, inner: reg, auth }, now);
         assert!(out.is_empty());
-        // A lookup from the same authorized node resolves it.
+        // A lookup from the same authorized node resolves it. The caller is the
+        // authenticated principal; here it looks up its OWN key.
         let lk = Msg::Lookup { key: subject };
         let lauth = sign_authenticator(&node, &lk.encode(), now, Some(mint_coord_cap(&g, subject, now + 3600)));
-        let out = c.handle_auth(src, AuthRequest { inner: lk, auth: lauth }, now);
+        let out = c.handle_auth(src, AuthRequest { caller: subject, inner: lk, auth: lauth }, now);
         assert!(out.iter().any(|(_, m)| matches!(m, Msg::LookupResponse { reflexive: Some(_), .. })));
 
         // Unauthorized: outsider (no cap) -> dropped, no mapping, reject counted.
@@ -273,18 +307,96 @@ mod tests {
         let before = c.rejects();
         let oreg = Msg::Register { key: osub };
         let oauth = sign_authenticator(&outsider, &oreg.encode(), now, None);
-        let out = c.handle_auth(addr(2, 2222), AuthRequest { inner: oreg, auth: oauth }, now);
+        let out = c.handle_auth(addr(2, 2222), AuthRequest { caller: osub, inner: oreg, auth: oauth }, now);
         assert!(out.is_empty());
         assert_eq!(c.rejects(), before + 1);
         // The outsider's key never entered the book: an AUTHORIZED lookup for it
-        // resolves to None (the dropped register created no mapping). Because a
-        // Lookup's `subject_key()` is the LOOKED-UP key, its PoP must be signed
-        // by that key and admitted for it — so the outsider self-signs a lookup
-        // of its own key under a genesis cap.
+        // resolves to None (the dropped register created no mapping). The
+        // outsider here holds a genesis cap, so it authenticates as the caller
+        // and looks up its own (unregistered) key.
         let lk = Msg::Lookup { key: osub };
         let lauth = sign_authenticator(&outsider, &lk.encode(), now, Some(mint_coord_cap(&g, osub, now + 3600)));
-        let out = c.handle_auth(src, AuthRequest { inner: lk, auth: lauth }, now);
+        let out = c.handle_auth(src, AuthRequest { caller: osub, inner: lk, auth: lauth }, now);
         assert!(out.iter().any(|(_, m)| matches!(m, Msg::LookupResponse { reflexive: None, .. })));
+    }
+
+    #[test]
+    fn cross_peer_lookup_authenticates_the_caller_and_fans_out() {
+        // The previously-impossible path: caller A (admitted) looks up a
+        // DIFFERENT peer B. Authentication is against A's key (the caller), so
+        // A's PoP — signed with A's own key — validates, and the coordinator
+        // returns B's mapping plus a PunchSync fan-out carrying A's REAL key.
+        use crate::auth::{sign_authenticator, mint_coord_cap, now_secs, AuthPolicy};
+        use crate::AuthRequest;
+        use commonware_cryptography::{ed25519, Signer as _};
+
+        let g = ed25519::PrivateKey::from_seed(300);
+        let a = ed25519::PrivateKey::from_seed(301);
+        let b = ed25519::PrivateKey::from_seed(302);
+        let a_key = { let mut k = [0u8; 32]; k.copy_from_slice(a.public_key().as_ref()); NodeKey(k) };
+        let b_key = { let mut k = [0u8; 32]; k.copy_from_slice(b.public_key().as_ref()); NodeKey(k) };
+        let now = now_secs();
+
+        let mut c = Coordinator::with_policy(AuthPolicy::Private { genesis_set: vec![g.public_key()] });
+        let a_src = addr(1, 1111);
+        let b_src = addr(2, 2222);
+
+        // Both register (self-ops, caller == inner key).
+        let a_reg = Msg::Register { key: a_key };
+        let a_auth = sign_authenticator(&a, &a_reg.encode(), now, Some(mint_coord_cap(&g, a_key, now + 3600)));
+        assert!(c.handle_auth(a_src, AuthRequest { caller: a_key, inner: a_reg, auth: a_auth }, now).is_empty());
+        let b_reg = Msg::Register { key: b_key };
+        let b_auth = sign_authenticator(&b, &b_reg.encode(), now, Some(mint_coord_cap(&g, b_key, now + 3600)));
+        assert!(c.handle_auth(b_src, AuthRequest { caller: b_key, inner: b_reg, auth: b_auth }, now).is_empty());
+
+        // A looks up B: inner key is B, caller (and PoP signer) is A.
+        let lk = Msg::Lookup { key: b_key };
+        let lauth = sign_authenticator(&a, &lk.encode(), now, Some(mint_coord_cap(&g, a_key, now + 3600)));
+        let out = c.handle_auth(a_src, AuthRequest { caller: a_key, inner: lk, auth: lauth }, now);
+        // A receives B's reflexive and its own PunchSync toward B.
+        assert!(out.contains(&(a_src, Msg::LookupResponse { key: b_key, reflexive: Some(b_src) })));
+        assert!(out.contains(&(a_src, Msg::PunchSync { peer: b_key, peer_reflexive: b_src })));
+        // The peer-directed fan-out to B carries A's AUTHENTICATED key, not a
+        // reverse-mapped or zero key.
+        assert!(out.contains(&(b_src, Msg::PunchSync { peer: a_key, peer_reflexive: a_src })));
+    }
+
+    #[test]
+    fn anti_poisoning_rejects_self_op_with_mismatched_caller() {
+        // A member cannot register or re-advertise ANOTHER node's key: for a
+        // self-op the inner key must equal the authenticated caller, so an
+        // AuthRequest whose caller differs from the inner Register key is
+        // rejected and the reject counter increments.
+        use crate::auth::{sign_authenticator, mint_coord_cap, now_secs, AuthPolicy};
+        use crate::AuthRequest;
+        use commonware_cryptography::{ed25519, Signer as _};
+
+        let g = ed25519::PrivateKey::from_seed(400);
+        let attacker = ed25519::PrivateKey::from_seed(401);
+        let attacker_key = { let mut k = [0u8; 32]; k.copy_from_slice(attacker.public_key().as_ref()); NodeKey(k) };
+        let victim_key = { let mut k = [0u8; 32]; k.copy_from_slice(ed25519::PrivateKey::from_seed(402).public_key().as_ref()); NodeKey(k) };
+        let now = now_secs();
+
+        let mut c = Coordinator::with_policy(AuthPolicy::Private { genesis_set: vec![g.public_key()] });
+        let src = addr(1, 1111);
+        let before = c.rejects();
+
+        // Attacker (validly admitted for its OWN key) tries to Register the
+        // victim's key. The PoP verifies against the caller, but the inner key
+        // is the victim's — a self-op mismatch, rejected before dispatch.
+        let reg = Msg::Register { key: victim_key };
+        let auth = sign_authenticator(&attacker, &reg.encode(), now, Some(mint_coord_cap(&g, attacker_key, now + 3600)));
+        let out = c.handle_auth(src, AuthRequest { caller: attacker_key, inner: reg, auth }, now);
+        assert!(out.is_empty());
+        assert_eq!(c.rejects(), before + 1, "self-op with mismatched caller is rejected");
+
+        // The victim's key never entered the book: an authenticated self-lookup
+        // by the attacker for the victim's key resolves to None (no mapping was
+        // poisoned into existence).
+        let lk = Msg::Lookup { key: victim_key };
+        let lauth = sign_authenticator(&attacker, &lk.encode(), now, Some(mint_coord_cap(&g, attacker_key, now + 3600)));
+        let out = c.handle_auth(src, AuthRequest { caller: attacker_key, inner: lk, auth: lauth }, now);
+        assert!(out.iter().any(|(_, m)| matches!(m, Msg::LookupResponse { key, reflexive: None } if *key == victim_key)));
     }
 
     #[test]

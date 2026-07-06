@@ -543,15 +543,11 @@ fn node_key_of(pk: &commonware_cryptography::ed25519::PublicKey) -> NodeKey {
 /// self-subject (PoP proves possession of the requesting key), so the gate
 /// passes and the reflexive is discovered.
 ///
-/// NOTE on scope: this asserts admission at the bind boundary rather than a
-/// full end-to-end punch. Under ANY authenticating policy the committed
-/// coordinator authenticates a `Lookup` against the LOOKED-UP peer's key
-/// (`Msg::subject_key()` returns the target of a `Lookup`), but the requester
-/// signs the PoP with its OWN key — so a cross-peer lookup can never satisfy
-/// PoP and the rendezvous/punch cannot complete. Only self-subject requests
-/// (`BindRequest`/`Register`/`Readvertise`) authenticate. See the task report's
-/// concern: hole-punch rendezvous under a private/public-PoP coordinator needs
-/// a Tasks-1..6 follow-up (authenticate the Lookup under the CALLER's key).
+/// Scope: this asserts admission at the bind boundary. The full cross-peer
+/// rendezvous/punch under a private coordinator is proven by
+/// [`private_coordinator_cross_peer_punch`] below — the coordinator
+/// authenticates the request CALLER (its PoP-signing identity), so a `Lookup`
+/// for a DIFFERENT peer's key authenticates fine and the hole-punch completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn private_coordinator_admits_authenticated_bind() {
     let g = PrivateKey::from_seed(500);
@@ -643,6 +639,52 @@ async fn private_coordinator_denies_uncredentialed_bind() {
         "a genesis member binds against the same coordinator: {:?}",
         ok.err()
     );
+}
+
+/// The full cross-peer rendezvous under a REAL private (genesis-gated)
+/// coordinator: two authorized nodes A and B (each holding a genesis-minted
+/// cap) bind + register, then A resolves B's DIFFERENT key and B resolves A's,
+/// and both simultaneous-open punches complete over loopback. Under the OLD
+/// code the coordinator authenticated a `Lookup` against the LOOKED-UP key, so
+/// A's PoP (signed with A's own key) failed against B's key and the lookup was
+/// silently dropped — this resolve timed out. Authenticating the CALLER fixes
+/// it: the core rendezvous path works under a private coordinator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_coordinator_cross_peer_punch() {
+    let g = PrivateKey::from_seed(700);
+    let a_signer = PrivateKey::from_seed(701);
+    let b_signer = PrivateKey::from_seed(702);
+    let policy = nat_traversal::AuthPolicy::Private {
+        genesis_set: vec![g.public_key()],
+    };
+
+    let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let coord_addr = coord_sock.local_addr().unwrap();
+    tokio::spawn(nat_traversal::run_coordinator(coord_sock, policy));
+
+    let a_key = node_key_of(&a_signer.public_key());
+    let b_key = node_key_of(&b_signer.public_key());
+    let a_cap = nat_traversal::mint_coord_cap(&g, a_key, nat_traversal::now_secs() + 3600);
+    let b_cap = nat_traversal::mint_coord_cap(&g, b_key, nat_traversal::now_secs() + 3600);
+
+    let mut a = reachability::NatResolver::bind(a_key, vec![coord_addr], Some((a_signer, Some(a_cap))))
+        .await
+        .expect("A's authenticated bind is admitted");
+    let mut b = reachability::NatResolver::bind(b_key, vec![coord_addr], Some((b_signer, Some(b_cap))))
+        .await
+        .expect("B's authenticated bind is admitted");
+    assert!(a.reflexive().is_some() && b.reflexive().is_some());
+
+    // Cross-peer resolve on both sides: A looks up B's key, B looks up A's.
+    let dummy: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let (ra, rb) = tokio::join!(a.resolve(b_key, dummy), b.resolve(a_key, dummy));
+    match (ra.unwrap(), rb.unwrap()) {
+        (Resolution::Punched(to_b), Resolution::Punched(to_a)) => {
+            assert_eq!(to_b, b.reflexive().unwrap());
+            assert_eq!(to_a, a.reflexive().unwrap());
+        }
+        other => panic!("expected punched/punched under a private coordinator, got {other:?}"),
+    }
 }
 
 /// An empty coordinator set degrades to pass-through resolution.
