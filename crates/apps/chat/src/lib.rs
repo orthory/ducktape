@@ -26,6 +26,10 @@ pub mod index;
 // module's consensus state (channels, membership) is what will drive its
 // admission and channel→flow derivation. Kept as a self-contained submodule.
 pub mod voice;
+// the video call media wire (frame fragmentation/reassembly + call control)
+// over the data plane's Service::Video / Service::Voice flows. Off-consensus
+// like `voice`, for the same reason: consensus never carries media.
+pub mod video;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
