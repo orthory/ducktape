@@ -68,7 +68,6 @@ Create `crates/system/nat-traversal/src/auth.rs` with the full implementation AN
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_cryptography::PrivateKeyExt as _;
 
     fn key(seed: u64) -> ed25519::PrivateKey {
         ed25519::PrivateKey::from_seed(seed)
@@ -380,7 +379,7 @@ pub fn verify_request(
 }
 ```
 
-> Note: `ed25519::PrivateKey::from_seed` and the `PrivateKeyExt`/`PrivateKeyExt as _` import used in tests come from `commonware_cryptography`. If the exact path differs in this workspace version, mirror how other tests in `bin/node/src/config.rs` construct test keys (search `from_seed`/`PrivateKey::` there) and adjust the import — the production code above does not depend on it.
+> Note (confirmed in Task 1): test keys are `ed25519::PrivateKey::from_seed(n)`. `from_seed` and `public_key()` are default methods on the `Signer` trait — there is NO `PrivateKeyExt` in this workspace's `commonware-cryptography` (2026.5.0). A test module therefore needs `Signer` in scope (via `use super::*` when the module already imports it, or `use commonware_cryptography::Signer as _;`). Production code depends on no test-only helper.
 
 - [ ] **Step 4: Wire the module in `lib.rs`**
 
@@ -396,7 +395,7 @@ pub use auth::{
 - [ ] **Step 5: Run tests and verify green**
 
 Run: `cargo test -p nat-traversal auth::`
-Expected: PASS (8 tests). Then `cargo clippy -p nat-traversal --all-targets -- -D warnings` clean.
+Expected: PASS (8 tests). Then `cargo clippy -p nat-traversal --all-targets --features simnat -- -D warnings` clean.
 
 - [ ] **Step 6: Commit**
 
@@ -427,7 +426,7 @@ Add to the `#[cfg(test)] mod tests` in `wire.rs`:
 #[test]
 fn auth_request_roundtrips_for_every_request_shape() {
     use crate::auth::{sign_authenticator, mint_coord_cap};
-    use commonware_cryptography::{ed25519, PrivateKeyExt as _, Signer as _};
+    use commonware_cryptography::{ed25519, Signer as _};
 
     let node = ed25519::PrivateKey::from_seed(1);
     let g = ed25519::PrivateKey::from_seed(2);
@@ -456,7 +455,7 @@ fn auth_request_roundtrips_for_every_request_shape() {
 #[test]
 fn auth_request_rejects_response_inner() {
     use crate::auth::sign_authenticator;
-    use commonware_cryptography::{ed25519, PrivateKeyExt as _};
+    use commonware_cryptography::{ed25519, Signer as _};
     let node = ed25519::PrivateKey::from_seed(1);
     // Hand-encode an envelope whose inner is a RESPONSE (LookupResponse).
     let inner = Msg::LookupResponse { key: NodeKey([1u8; 32]), reflexive: None };
@@ -468,7 +467,7 @@ fn auth_request_rejects_response_inner() {
 #[test]
 fn auth_request_rejects_trailing_and_bare_msg_decode_rejects_tag_11() {
     use crate::auth::sign_authenticator;
-    use commonware_cryptography::{ed25519, PrivateKeyExt as _};
+    use commonware_cryptography::{ed25519, Signer as _};
     let node = ed25519::PrivateKey::from_seed(1);
     let inner = Msg::Register { key: NodeKey([2u8; 32]) };
     let auth = sign_authenticator(&node, &inner.encode(), 1, None);
@@ -654,7 +653,7 @@ Re-export in `lib.rs`: add `AuthRequest` to the `pub use wire::{...}` line.
 - [ ] **Step 6: Run tests and verify green**
 
 Run: `cargo test -p nat-traversal wire::`
-Expected: PASS (existing wire tests + 3 new). Then `cargo clippy -p nat-traversal --all-targets -- -D warnings` clean.
+Expected: PASS (existing wire tests + 3 new). Then `cargo clippy -p nat-traversal --all-targets --features simnat -- -D warnings` clean.
 
 - [ ] **Step 7: Commit**
 
@@ -683,7 +682,7 @@ Add to `coordinator.rs` tests:
 fn private_policy_admits_authorized_register_and_lookup_but_drops_unauthorized() {
     use crate::auth::{sign_authenticator, mint_coord_cap, now_secs, AuthPolicy};
     use crate::AuthRequest;
-    use commonware_cryptography::{ed25519, PrivateKeyExt as _, Signer as _};
+    use commonware_cryptography::{ed25519, Signer as _};
 
     let g = ed25519::PrivateKey::from_seed(100);
     let node = ed25519::PrivateKey::from_seed(200);
@@ -843,7 +842,7 @@ Keep the existing `handle` and `readvertise` methods as-is (do NOT delete the `#
 - [ ] **Step 4: Run tests and verify green**
 
 Run: `cargo test -p nat-traversal coordinator::`
-Expected: PASS (existing coordinator tests + 2 new). `cargo clippy -p nat-traversal --all-targets -- -D warnings` clean.
+Expected: PASS (existing coordinator tests + 2 new). `cargo clippy -p nat-traversal --all-targets --features simnat -- -D warnings` clean.
 
 - [ ] **Step 5: Commit**
 
@@ -874,7 +873,7 @@ Add to `client.rs` tests:
 #[tokio::test]
 async fn authorized_client_rendezvous_under_private_policy_but_unauthorized_is_dropped() {
     use crate::auth::{mint_coord_cap, AuthPolicy};
-    use commonware_cryptography::{ed25519, PrivateKeyExt as _, Signer as _};
+    use commonware_cryptography::{ed25519, Signer as _};
 
     let g = ed25519::PrivateKey::from_seed(100);
     let policy = AuthPolicy::Private { genesis_set: vec![g.public_key()] };
@@ -1022,7 +1021,7 @@ Also update `crates/system/reachability/tests/orchestrator_e2e.rs` (search `run_
 
 - [ ] **Step 6: Run tests and verify green**
 
-Run: `cargo test -p nat-traversal` then `cargo test -p reachability` (or the workspace subset that compiles the e2e). Expected: PASS. `cargo clippy -p nat-traversal --all-targets -- -D warnings` clean.
+Run: `cargo test -p nat-traversal` then `cargo test -p reachability` (or the workspace subset that compiles the e2e). Expected: PASS. `cargo clippy -p nat-traversal --all-targets --features simnat -- -D warnings` clean.
 
 - [ ] **Step 7: Commit**
 
@@ -1054,7 +1053,7 @@ Add to `config.rs` tests:
 #[test]
 fn coord_cap_roundtrips_through_pack_and_files() {
     use nat_traversal::{mint_coord_cap, NodeKey};
-    use commonware_cryptography::{ed25519, PrivateKeyExt as _};
+    use commonware_cryptography::{ed25519, Signer as _};
     let g = ed25519::PrivateKey::from_seed(7);
     let subject = NodeKey([0x11; 32]);
     let cap = mint_coord_cap(&g, subject, 4_000_000);
