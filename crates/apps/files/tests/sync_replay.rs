@@ -30,8 +30,8 @@ use base64::engine::general_purpose::STANDARD;
 use files::objects::{EntryKind, FileObj, SnapshotObj, TreeEntry, TreeObj, object_id};
 use files::{
     CHUNK_SIZE, Change, Content, FilesMsg, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp, Fs,
-    Kind, MemStore, ObjectId, ObjectStore as _, Refs, decode_sync_resp, encode_msg, encode_putblob,
-    encode_query, encode_sync_req, from_hex_32, to_hex,
+    Kind, MAX_SYNC_IDS, MemStore, ObjectId, ObjectStore as _, Refs, decode_sync_resp, encode_msg,
+    encode_putblob, encode_query, encode_sync_req, from_hex_32, to_hex,
 };
 use sdk::{Module as _, Origin, StateRoot};
 
@@ -351,6 +351,35 @@ fn install_rejects_wrong_root_tampered_object_and_never_livelocks() {
     let second = target.missing_objects(64).expect("missing 2");
     assert!(!first.is_empty(), "roots are missing on a fresh target");
     assert_eq!(first, second, "missing list is stable — no livelock");
+}
+
+// ---- test 2b: serve_sync robustness guards ------------------------------------
+//
+// both guards reject the WHOLE request — never a partial or padded reply — so a
+// buggy (or hostile) fetch client hears a loud error instead of silently losing
+// ids. driven at the `Fs` seam, where the guards live.
+
+#[test]
+fn serve_sync_rejects_oversized_request() {
+    let fs = Fs::new(MemStore::new(), Refs::default());
+    // MAX_SYNC_IDS is fine; one past it rejects, even with well-formed hex ids.
+    let ids = vec!["00".repeat(32); MAX_SYNC_IDS + 1];
+    let err = fs.serve_sync(FilesSyncReq::GetObjects { ids }).unwrap_err();
+    assert!(err.contains("too many ids"), "got: {err}");
+}
+
+#[test]
+fn serve_sync_rejects_non_hex_id_without_partial_reply() {
+    let mut store = MemStore::new();
+    // a genuinely PRESENT object rides along with the malformed id, proving the
+    // reject is all-or-nothing: the valid id is not answered either.
+    let present = store.put(Kind::Chunk, b"present-bytes").unwrap();
+    let fs = Fs::new(store, Refs::default());
+    let ids = vec![to_hex(&present), "zz".repeat(32)];
+    let result = fs.serve_sync(FilesSyncReq::GetObjects { ids });
+    // Err carries no Objects payload at all — the error IS the whole reply.
+    let err = result.unwrap_err();
+    assert!(err.contains("sync id is not hex"), "got: {err}");
 }
 
 // ---- test 3: replay is idempotent (deterministic op stream) ------------------
