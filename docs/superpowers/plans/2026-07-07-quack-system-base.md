@@ -308,16 +308,75 @@ pub struct RequestedAction { pub action_id: String, pub tag: String, pub payload
 
 ---
 
-### Task W6: `feat/quack-docs-harness` — reference package + e2e proof + CLI `package test` (after W1,W2,W4,W5)
+### Task W6a: `feat/quack-harness` — the Quack package test framework (after W1,W2,W5)
+
+**Files:**
+- Create: `crates/testing/quack-harness/Cargo.toml`, `src/lib.rs`, `src/testbed.rs`,
+  `src/golden.rs`, `src/assert.rs`, `tests/framework.rs`
+- Modify: root `Cargo.toml` (workspace member `crates/testing/quack-harness`)
+
+**Interfaces (Consumes):** `quack::{Capsule, PackageManifest}` (W1),
+`package::interface::{InstallSpec, PackageMsg, PackageQuery, HarnessMsg,
+PackageActionQuery/Reply/Msg}` (W2), open actions (W5), platform module crates.
+**Produces (design doc D9a):**
+```rust
+pub struct PackageTestBed { /* Host + module ids + pending oracle state */ }
+impl PackageTestBed {
+    pub async fn genesis(extra_modules: Vec<Box<dyn sdk::Module>>) -> Result<Self, HarnessError>; // standard platform set (package, memory, pages, chat, tasks, tagging, saga, capability, dispatch, jobs, agent, runs) + extras
+    pub async fn submit(&mut self, origin: sdk::Origin, target: &str, payload: Vec<u8>) -> Result<SubmitOutcome, HarnessError>;
+    pub async fn install_capsule(&mut self, capsule: &quack::Capsule, id_map: &BTreeMap<String, String>, installer: sdk::Origin) -> Result<InstallReport, HarnessError>; // manifest -> InstallSpec (same mapping the CLI does) -> PackageMsg::Install
+    pub async fn oracle_reply(&mut self, text: &str) -> Result<(), HarnessError>;  // canned provider answer for the next pending dispatch (collaboration_loop's oracle-as-op pattern)
+    pub async fn query_json(&mut self, target: &str, req: serde_json::Value) -> Result<serde_json::Value, HarnessError>;
+    pub async fn run_golden(&mut self, fixture: &GoldenFixture) -> Result<GoldenReport, HarnessError>;
+    pub async fn snapshot_roundtrip_all(&mut self) -> Result<(), HarnessError>;    // every module: snapshot/serve-sync -> fresh install -> identical root
+}
+pub struct InstallReport { pub status: String, pub prompts: Vec<(String, u64, Vec<u8>)>, pub agents: Vec<String>, pub routes: Vec<(String, String)> }
+#[derive(serde::Deserialize)] pub struct GoldenFixture { pub steps: Vec<GoldenStep> } // parsed from harness/golden.json in the capsule
+#[derive(serde::Deserialize)] #[serde(tag = "step", rename_all = "snake_case")]
+pub enum GoldenStep {
+    Submit { origin: String /* "external:<hex>" | "module:<id>" */, target: String, payload: serde_json::Value },
+    Oracle { text: String },
+    ExpectJob { kind: String },
+    ExpectQuery { target: String, req: serde_json::Value, expect: serde_json::Value },
+    ExpectFailureRow { module: String, contains: String },
+    SnapshotRoundtrip,
+}
+```
+Assertion kit (in `assert.rs`, used by `run_golden` and directly by package tests):
+prompt seeded with expected hash+generation; agent registered with owner ==
+harness module; tag routed to owner; exactly-one-job for an engagement;
+unauthorized/malformed action mutated nothing + recorded failure; suspend stops
+job minting; unplug removed routes/hooks + tombstoned agents + preserved data.
+
+- [ ] **Step 1:** Failing `tests/framework.rs` against a minimal in-test dummy
+  package: a tiny dummy harness module defined inside the test crate (handles
+  `HarnessMsg`, registers one agent, owns one `dummy.echo` action tag that
+  Probe-accepts and Apply-writes into `memory`), a hand-built two-module capsule
+  dir fixture under `tests/fixtures/dummy/` — prove genesis, install_capsule
+  (report matches), oracle_reply drives one run end-to-end, run_golden executes
+  every GoldenStep kind (incl. a failing ExpectQuery producing a diff-shaped
+  error), snapshot_roundtrip_all passes.
+- [ ] **Step 2:** `cargo test -p quack-harness` → fails.
+- [ ] **Step 3:** Implement testbed.rs (Host::genesis wiring copied from
+  collaboration_loop's setup), golden.rs, assert.rs to green.
+- [ ] **Step 4:** fmt/clippy for the crate; `cargo check --workspace`; commit per
+  green cycle.
+
+---
+
+### Task W6b: `feat/quack-docs-harness` — reference package + e2e proof + CLI `package test` (after W6a)
 
 **Files:**
 - Create: `crates/examples/docs-harness/Cargo.toml`, `src/lib.rs`, `src/interface.rs`,
   `tests/package_loop.rs`, `tests/snapshot_round_trip.rs`
 - Modify: `packages/docs/quack.toml` + `packages/docs/harness/golden.json`
   (fixtures aligned with the real wire shapes)
-- Modify: `bin/node/src/package.rs` (`package test`: verify + run golden harness via
-  a native catalog `fn native_modules(spec) -> Vec<Box<dyn Module>>`), `bin/node/Cargo.toml`
-  (+dep docs-harness)
+- Modify: `bin/node/src/package.rs` (`package test`: verify digests/signature, then
+  `quack_harness::PackageTestBed::genesis(native_catalog(&manifest))` +
+  `install_capsule` + `run_golden` on the capsule's `harness/golden.json`; the
+  native catalog maps known logical module ids to in-binary constructors — v1
+  knows the docs package's modules), `bin/node/Cargo.toml` (+deps docs-harness,
+  quack-harness)
 - Modify: root `Cargo.toml` member
 
 **Interfaces (Consumes):** everything above. Behavior per design D9:
@@ -337,11 +396,11 @@ idempotent `JobsMsg::Submit{kind:"agent/docs.editor"}`; Probe/Apply for
   block / adds the comment / resolves the thread; malformed Apply records an error
   row and returns Ok.
 - [ ] **Step 2:** Implement to green (`cargo test -p docs-harness`).
-- [ ] **Step 3:** `tests/package_loop.rs` (Host::genesis with package, memory,
-  pages, tagging, saga, capability, dispatch, jobs, agent, runs, tasks, chat,
-  docs-harness + canned oracle from collaboration_loop): drive
-  `PackageMsg::Install` built from `packages/docs/` via `quack` → assert ADR
-  harness checklist: prompts seeded with expected hashes; agent registered
+- [ ] **Step 3:** `tests/package_loop.rs` written against
+  `quack_harness::PackageTestBed` (genesis with docs-harness as the extra module,
+  `install_capsule` from `packages/docs/`, `oracle_reply` for provider turns,
+  assertion kit + `run_golden` on `packages/docs/harness/golden.json`) → assert
+  the ADR harness checklist: prompts seeded with expected hashes; agent registered
   harness-owned; routes owned by docs-harness; mention → one job; canned oracle
   output with `pages.block.update_text` edits the intended block; unauthorized
   action mutates nothing + records failure; malformed page event no-ops; suspend
@@ -382,7 +441,8 @@ idempotent `JobsMsg::Submit{kind:"agent/docs.editor"}`; Probe/Apply for
 ### Task W8: Integration — merge train, epic verification, PR
 
 - [ ] Merge order into epic: W1 → W2 → W3 → W4 (waves can land as each goes green;
-  resolve `bin/node/src/main.rs` dispatch/genesis overlaps at merge) → W5 → W6 → W7.
+  resolve `bin/node/src/main.rs` dispatch/genesis overlaps at merge) → W5 → W6a →
+  W6b → W7.
 - [ ] After each merge: `cargo test --workspace` in the epic worktree.
 - [ ] Final: fmt/clippy/workspace tests + `bin/demo` joiner test + app typecheck +
   docs build; `/code-review` pass on the epic diff; fix findings.

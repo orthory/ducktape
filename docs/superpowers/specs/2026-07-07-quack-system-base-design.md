@@ -267,6 +267,48 @@ Tombstoned agents never engage, never claim jobs, and cannot be resumed
   register itself** (`module_id == emitter`). `SetMembership` is explicitly out of
   scope here (private-messaging ADR owns it).
 
+### D9a. Package test framework: `quack-harness`
+
+Testing is a first-class primitive of the system base, not a per-package
+afterthought: the ADR requires every package with agents or actions to ship
+deterministic harness tests that a recipient can run before activation. The
+framework that makes that cheap is its own crate, `crates/testing/quack-harness`
+(a new `testing/` workspace group: it must depend on app/system module crates,
+so it cannot live under `kernel/`; it is not a consensus module, so it does not
+belong under `system/`).
+
+What it provides:
+
+- **`PackageTestBed`** — an in-process `Host::genesis` builder with the standard
+  platform set (package, memory, pages, chat, tasks, tagging, saga, capability,
+  dispatch, jobs, agent, runs) plus caller-supplied package modules; ordered-op
+  submission with real origins; the canned-oracle worker loop from
+  `collaboration_loop.rs` so provider output is scripted data, never a live LLM.
+- **Install driving** — build an `InstallSpec` from a `quack::Capsule` + logical→
+  concrete id map (the same mapping the CLI does), submit it, and return an
+  install report (row status, seeded prompt generations + hashes, registered
+  agents + owners, routes).
+- **The ADR assertion kit** — reusable assertions for the harness checklist:
+  prompts seeded with expected hashes; agents registered from harness origin;
+  action tags resolve to the owner; an engagement event mints exactly one job;
+  a scripted provider action mutates the intended target; unauthorized/malformed
+  actions mutate nothing and record failure; suspend stops new jobs while
+  preserving user data; unplug removes routes/hooks and tombstones agents;
+  every module's snapshot/state-sync round-trip reproduces its root.
+- **Golden fixtures** — `harness/golden.json` in the capsule is a scripted step
+  list the framework executes: `submit` (an op as origin+target+payload),
+  `oracle` (canned provider reply for the next pending dispatch), `expect_job`,
+  `expect_query` (query a module, compare canonical JSON), `expect_run`,
+  `expect_failure_row`, `snapshot_roundtrip`. Deterministic by construction: no
+  wall clock, no randomness, agreed time steps with each block.
+
+Consumers: package authors' crate tests (the reference `docs-harness` tests are
+written against the framework), the CLI (`ducktape-node package test` = verify +
+run the capsule's golden fixture against the binary's native module catalog),
+and CI. When Wasm loading lands, the same framework runs third-party capsules
+without a recompile; v1 executes packages whose modules exist in the native
+catalog.
+
 ### D9. Reference package: `docs-harness`
 
 `crates/examples/docs-harness` — module id `docs-harness`, snapshot-bytes substrate.
@@ -334,7 +376,8 @@ Owns the ADR's worked example end-to-end:
 | `feat/quack-promptref` | D5+D7 agent/runs + snapshot suites + TS mirrors | — |
 | `feat/quack-pages-events` | D8 pages events + chat hook gating | — |
 | `feat/quack-open-actions` | D6 runs routing + tasks owner + collaboration_loop | package-module, promptref |
-| `feat/quack-docs-harness` | D9 reference package + package_loop e2e + CLI `package test` | all above |
+| `feat/quack-harness` | D9a `crates/testing/quack-harness` test framework (testbed, install driver, assertion kit, golden runner) | manifest, package-module, open-actions |
+| `feat/quack-docs-harness` | D9 reference package proven via quack-harness + CLI `package test` | all above |
 | `feat/quack-surface` | D10 ModuleStatus/ModulesView + docs en/ko | package-module |
 
 Wave 1 = the four independent branches in parallel; wave 2 = open-actions; wave 3 =
