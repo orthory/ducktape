@@ -752,9 +752,12 @@ export function createActions({
           }),
       );
       // start the audio session and reflect "connecting"; push whatever roster
-      // we already know (others may be huddling), self excluded.
+      // we already know (others may be huddling), self excluded. joins start
+      // MUTED — joining a room must never be a hot-mic moment; unmuting is the
+      // deliberate act.
       voice = createVoiceSession(onVoiceStatus);
-      patch({ voice: { channelId, muted: false, status: "connecting" } });
+      voice.setMuted(true);
+      patch({ voice: { channelId, muted: true, status: "connecting" } });
       voice.start(voiceSocketUrl(nodeUrl, channelId));
       pushRecipients(channelId);
     },

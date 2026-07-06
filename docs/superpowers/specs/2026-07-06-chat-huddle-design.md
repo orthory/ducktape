@@ -93,6 +93,8 @@ existing native voice engine (`chat::voice` — Opus, jitter, mixer, PR #172).
   MembersView `Avatar` pattern), mic mute toggle, leave button, connecting/live
   status dot. Inline styles + `theme/tokens`, chat-local glyphs per
   `MessageItem.tsx` precedent.
+- **Join muted by default** (user directive): entering a huddle is never a
+  hot-mic moment — the mic starts muted and unmuting is the deliberate act.
 - **Audio plumbing** (`app/src/domain/voice-session.ts`): `getUserMedia`
   (mono, echoCancellation) → `AudioContext({sampleRate: 48000})` →
   capture `AudioWorklet` accumulating 960-sample i16 frames → WS binary; WS
