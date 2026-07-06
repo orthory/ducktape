@@ -163,7 +163,8 @@ const DRAIN_TICK: Duration = Duration::from_millis(100);
 /// SIGNED (its own identity key is the frame origin — authorship) to one
 /// current validator, which takes consensus custody (`submit_frame`) and
 /// answers with the frame's fate when it drains. the last free static slot
-/// below CHANNEL_STATE_SYNC; engine banks start at 8. registered in EVERY
+/// below CHANNEL_STATE_SYNC; engine banks start at 9 (statics run 3–8).
+/// registered in EVERY
 /// mode like the lanes above — validators serve, observers speak, sync-only
 /// black-holes.
 const CHANNEL_SUBMIT_RELAY: u64 = 3;
@@ -4110,6 +4111,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
+            // the submit-relay lane: a sync-only observer holds no standing,
+            // relays no writes, and answers nothing — but an unregistered
+            // channel kills the sender, so black-hole.
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_submit_relay")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
             // the lobby lane: a sync-only observer never announces or answers,
             // but an unregistered channel is a protocol violation — black-hole.
             {
@@ -4318,6 +4328,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     .child("blackhole_video")
                     .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
             }
+            // the submit-relay lane: once observer standing lands, writes leave
+            // here — this node signs its own frames and a validator takes
+            // custody. replies (the frame's consensus fate) come back on the
+            // same lane. bound `mut` because the serve window's relay helper
+            // sends on `relay_tx`; `relay_rx` is bridged into the serve window
+            // below (a torn-down select must never drop its `recv()` mid-flight).
+            let (mut relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
             // the lobby lane: where this parked node announces its key. member
             // replies are drained by a printer task — purely informational.
             let (mut lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
@@ -4429,6 +4446,90 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         .into()
                 }
             };
+            // relay a caller's op: sign with THIS node's identity (the frame
+            // origin — chat authorship, status.publicKey), bump+persist the seq
+            // BEFORE building the frame (a crash between persist and send costs
+            // one seq number, never a reuse), ship to one current validator
+            // round-robin. Err is immediate — nothing is held on it, and
+            // `relay_round` advances only on an actual send attempt.
+            fn relay_submit_frame<S: P2pSender<PublicKey = ed25519::PublicKey>>(
+                signer: &ed25519::PrivateKey,
+                relay_seq_file: &std::path::Path,
+                relay_seq: &mut u64,
+                relay_round: &mut usize,
+                targets: &[ed25519::PublicKey],
+                relay_tx: &mut S,
+                target: String,
+                payload: Vec<u8>,
+            ) -> Result<node::FrameId, String> {
+                if targets.is_empty() {
+                    return Err("no validator known yet — the manifest poll has not landed".into());
+                }
+                *relay_seq += 1;
+                if let Err(e) = std::fs::write(relay_seq_file, relay_seq.to_string()) {
+                    // persist FAILED before any send: surface it and hold nothing
+                    // (a wedged disk must not silently reuse a seq into the mesh).
+                    return Err(format!("cannot persist the submit seq: {e}"));
+                }
+                let frame = node::encode_frame(signer, *relay_seq, &Msg { target, payload });
+                let id = node::frame_id(&frame);
+                let target_v = targets[*relay_round % targets.len()].clone();
+                *relay_round += 1;
+                let sent = relay_tx.send(
+                    Recipients::One(target_v),
+                    IoBuf::from(relay::encode_msg(&relay::RelayMsg::Submit { frame })),
+                    false,
+                );
+                if sent.is_empty() {
+                    return Err("validator unreachable — retry shortly".into());
+                }
+                Ok(id)
+            }
+            // the caller's held reply for a relayed submit, keyed by the frame's
+            // content address. either surface may hold: the rpc bridge sender or
+            // the app-surface oneshot. swept on the serve-window tick with the
+            // validator's own SUBMIT_HOLD budget (the rpc bridge times out at
+            // that same 10s — a sweep race there reads as a stuck node, same as
+            // on a validator).
+            enum RelayHold {
+                Rpc(std::sync::mpsc::Sender<RpcReply>),
+                Http(futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>),
+            }
+            let mut pending_relayed: std::collections::HashMap<
+                node::FrameId,
+                (RelayHold, std::time::Instant),
+            > = std::collections::HashMap::new();
+            let mut relay_round = 0usize;
+            // this origin's next frame seq, persisted so restarts keep climbing
+            // (a lost file restarts at 0 — kernel-safe: distinct digests both
+            // apply; per-origin nonces are the documented roadmap item).
+            let relay_seq_file = storage_for_sync.join("relay-submit-seq");
+            let mut relay_seq: u64 = std::fs::read_to_string(&relay_seq_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            // bridge the relay lane ONCE, before the park loop: the serve
+            // window's select is torn down every 2s tick, and dropping the p2p
+            // receiver's actor-backed `recv()` mid-flight could eat a delivered
+            // reply. a bounded drop-on-full mpsc survives the tick losslessly;
+            // a dropped reply degrades to the caller's honest SUBMIT_HOLD sweep.
+            let (relay_bridge_tx, mut relay_ingress) =
+                futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
+            context.child("relay_replies").spawn(move |_ctx| {
+                let mut receiver = relay_rx;
+                let mut bridge_tx = relay_bridge_tx;
+                async move {
+                    loop {
+                        match receiver.recv().await {
+                            Ok((peer, msg)) => {
+                                let bytes: Vec<u8> = msg.into();
+                                let _ = bridge_tx.try_send((peer, bytes));
+                            }
+                            Err(_) => return, // network shutdown — nothing to serve.
+                        }
+                    }
+                }
+            });
             let (boundary, host, floor) = loop {
                 attempt += 1;
                 if attempt > 900 && !observer_standing {
@@ -4456,10 +4557,49 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             job = rpc_ingress.next() => {
                                 let Some((req, reply)) = job else { continue };
                                 let resp = match req {
-                                    RpcRequest::Submit { .. } => RpcReply::err(
-                                        "this node is not a validator: observer standing \
-                                         serves reads only — submit ops via a validator",
-                                    ),
+                                    // WITH standing AND a pre-synced boundary, a
+                                    // write leaves here: sign it, relay to a
+                                    // validator, HOLD this caller's reply keyed by
+                                    // the frame id (answered on the relay Reply arm
+                                    // or the sweep). the refusal stays for the
+                                    // un-standing / not-yet-serving cases.
+                                    RpcRequest::Submit { target, payload_hex } => {
+                                        if !observer_standing || serving.is_none() {
+                                            RpcReply::err(not_serving(observer_standing))
+                                        } else {
+                                            match unhex(&payload_hex) {
+                                                Ok(payload) => match relay_submit_frame(
+                                                    &signer,
+                                                    &relay_seq_file,
+                                                    &mut relay_seq,
+                                                    &mut relay_round,
+                                                    &announce_targets,
+                                                    &mut relay_tx,
+                                                    target,
+                                                    payload,
+                                                ) {
+                                                    Ok(id) => {
+                                                        pending_relayed.insert(
+                                                            id,
+                                                            (
+                                                                RelayHold::Rpc(reply.clone()),
+                                                                std::time::Instant::now()
+                                                                    + SUBMIT_HOLD,
+                                                            ),
+                                                        );
+                                                        // held — answered by the relay
+                                                        // Reply or the sweep; skip the
+                                                        // shared tail send below.
+                                                        continue;
+                                                    }
+                                                    Err(e) => RpcReply::err(e),
+                                                },
+                                                Err(e) => {
+                                                    RpcReply::err(format!("bad payload_hex: {e}"))
+                                                }
+                                            }
+                                        }
+                                    }
                                     RpcRequest::Query { target, req_hex } => match &serving {
                                         Some((_, host)) => match unhex(&req_hex) {
                                             Ok(req_bytes) => {
@@ -4515,12 +4655,50 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             cmd = http_ingress.next() => {
                                 let Some(cmd) = cmd else { continue };
                                 match cmd {
-                                    noded::NodeCommand::Submit { reply, .. } => {
-                                        let _ = reply.send(Err(
-                                            "this node is not a validator: observer standing \
-                                             serves reads only — submit ops via a validator"
-                                                .into(),
-                                        ));
+                                    // `origin` is the caller's CLAIMED submitter — but
+                                    // this lane signs frames with THIS node's identity
+                                    // (authorship = status.publicKey), so it is ignored.
+                                    // WITH standing AND a boundary, relay and HOLD the
+                                    // oneshot keyed by the frame id; otherwise refuse.
+                                    noded::NodeCommand::Submit {
+                                        target,
+                                        payload,
+                                        origin: _,
+                                        reply,
+                                    } => {
+                                        if !observer_standing || serving.is_none() {
+                                            let _ =
+                                                reply.send(Err(not_serving(observer_standing)));
+                                        } else {
+                                            match relay_submit_frame(
+                                                &signer,
+                                                &relay_seq_file,
+                                                &mut relay_seq,
+                                                &mut relay_round,
+                                                &announce_targets,
+                                                &mut relay_tx,
+                                                target,
+                                                payload,
+                                            ) {
+                                                // move the oneshot into the hold on
+                                                // success, use it for the error on
+                                                // failure — mutually exclusive, so one
+                                                // reply is guaranteed on every path.
+                                                Ok(id) => {
+                                                    pending_relayed.insert(
+                                                        id,
+                                                        (
+                                                            RelayHold::Http(reply),
+                                                            std::time::Instant::now()
+                                                                + SUBMIT_HOLD,
+                                                        ),
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    let _ = reply.send(Err(e));
+                                                }
+                                            }
+                                        }
                                     }
                                     noded::NodeCommand::Query { target, req, reply } => {
                                         let result = match &serving {
@@ -4567,7 +4745,78 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     }
                                 }
                             }
+                            // a validator's answer for a frame we relayed: match it
+                            // to the held caller by frame id and release the reply.
+                            // an unknown id (already swept, or a stray) drops.
+                            answer = relay_ingress.next() => {
+                                let Some((_peer, bytes)) = answer else { continue };
+                                let Ok(relay::RelayMsg::Reply { frame_id, outcome }) =
+                                    relay::decode_msg(&bytes)
+                                else {
+                                    continue; // junk or a stray Submit at an observer — drop.
+                                };
+                                let Some((hold, _)) = pending_relayed.remove(&frame_id) else {
+                                    continue;
+                                };
+                                match (hold, outcome) {
+                                    (RelayHold::Rpc(tx), relay::RelayOutcome::Applied { .. }) => {
+                                        let _ = tx.send(RpcReply::ok());
+                                    }
+                                    (RelayHold::Rpc(tx), relay::RelayOutcome::Rejected { detail })
+                                    | (
+                                        RelayHold::Rpc(tx),
+                                        relay::RelayOutcome::Refused { detail },
+                                    ) => {
+                                        let _ = tx.send(RpcReply::err(detail));
+                                    }
+                                    (
+                                        RelayHold::Http(tx),
+                                        relay::RelayOutcome::Applied { height, app_hash },
+                                    ) => {
+                                        let _ = tx.send(Ok(noded::BlockSummary {
+                                            height,
+                                            app_hash,
+                                        }));
+                                    }
+                                    (
+                                        RelayHold::Http(tx),
+                                        relay::RelayOutcome::Rejected { detail },
+                                    )
+                                    | (
+                                        RelayHold::Http(tx),
+                                        relay::RelayOutcome::Refused { detail },
+                                    ) => {
+                                        let _ = tx.send(Err(detail));
+                                    }
+                                }
+                            }
                             _ = tick => break,
+                        }
+                    }
+                }
+                // expire relay holds the mesh never answered. the op may still
+                // land — the app re-queries on block events, same contract as a
+                // validator hold. budget is SUBMIT_HOLD (the rpc bridge caps at
+                // that same 10s, so a sweep race reads as a stuck node either way).
+                if !pending_relayed.is_empty() {
+                    let now = std::time::Instant::now();
+                    let expired: Vec<node::FrameId> = pending_relayed
+                        .iter()
+                        .filter(|(_, (_, deadline))| *deadline <= now)
+                        .map(|(k, _)| *k)
+                        .collect();
+                    for k in expired {
+                        if let Some((hold, _)) = pending_relayed.remove(&k) {
+                            let detail =
+                                "timed out awaiting the relay answer — re-query on the next block";
+                            match hold {
+                                RelayHold::Rpc(tx) => {
+                                    let _ = tx.send(RpcReply::err(detail));
+                                }
+                                RelayHold::Http(tx) => {
+                                    let _ = tx.send(Err(detail.into()));
+                                }
+                            }
                         }
                     }
                 }

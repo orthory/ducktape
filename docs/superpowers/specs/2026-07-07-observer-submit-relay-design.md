@@ -150,9 +150,14 @@ the validator path serves it). Replace both write refusals:
 - On `RelayMsg::Reply`: resolve the slot — `Applied` maps to `RpcReply::ok()`
   / `Ok(BlockSummary{height, app_hash})`; `Rejected`/`Refused` map to the
   error path verbatim.
-- Expiry: swept on the serve-window tick with a `SUBMIT_HOLD + 5s` budget
-  (relay adds a hop); the message mirrors the validator's truthful timeout —
-  the op may still land, clients re-query on block events.
+- Expiry: swept on the serve-window tick with the `SUBMIT_HOLD` budget — the
+  validator's own hold, not a longer one. A larger budget buys nothing: the
+  rpc bridge (`spawn_rpc_listener`) caps every request at 10s = `SUBMIT_HOLD`,
+  so a hold that outlives the caller's own timeout only leaks memory. A sweep
+  that races the bridge's timeout reads as a stuck node — exactly as it does
+  on a validator, the same accepted behavior. The message mirrors the
+  validator's truthful timeout — the op may still land, clients re-query on
+  block events.
 - v1 keeps ONE target per submit (no auto-retry): a byte-identical re-send is
   safe (digest gate) but the client's re-submit already provides it. The
   round-robin spreads load across validators between submits.
