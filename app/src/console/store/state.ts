@@ -20,6 +20,7 @@ import type {
   TargetThreads,
 } from "../../domain/pages-client";
 import type { BlockRecord, NodeStatus } from "../../domain/transport";
+import type { VoiceError } from "../../domain/voice-session";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
@@ -37,6 +38,11 @@ export interface VoiceSlice {
   channelId: string | null;
   muted: boolean;
   status: "idle" | "connecting" | "live" | "error";
+  /** Why `status` is "error" — picks the dock's message. Null otherwise. */
+  error: VoiceError | null;
+  /** The huddle lives in its own desktop window right now — the in-app card
+   *  yields to it (desktop only; see store/huddle-window.ts). */
+  popped: boolean;
   /** Local camera state (ephemeral, beaconed to peers — never consensus). */
   cameraOn: boolean;
   /** Per-peer ephemeral call state from 1 Hz beacons, keyed by NODE hex.
@@ -130,6 +136,13 @@ export interface ConsoleState {
   /** In-flight runs (dispatches awaiting delivery), newest-first. terminal
    *  history lives in the dispatch module, not here. */
   pendingRuns: PendingRun[];
+  /** hex node key -> the executor tags that node announced (the `capability`
+   *  registry, kept per-node instead of flattened). Members view shows what
+   *  each member runs; empty when nothing is announced. */
+  capabilitiesByNode: Map<string, string[]>;
+  /** run_id -> hex node key currently executing it (the saga assignee, via the
+   *  dispatch read facade). Only in-flight runs appear; empty otherwise. */
+  runAssignee: Map<string, string>;
 
   // ── Search (cross-module reads over the node's derived index) ──
   /** The last search's results, or null before any search ran. Query-driven —
@@ -181,6 +194,10 @@ export interface ConsoleState {
    *  down/bricked) — reveal the force-forget override so a workspace whose node
    *  can never start is still removable. Cleared on any fresh forget attempt. */
   forgetNeedsForce: boolean;
+  /** The picker-row counterpart of `forgetNeedsForce`: the id of the workspace
+   *  whose guarded delete couldn't confirm its node left the valset, so its row
+   *  offers the force override. Null when no delete is awaiting escalation. */
+  deleteNeedsForce: string | null;
   /** A joiner's live park→promote phase while its node is not yet a ready
    *  validator; null on the founder/member path and once the node answers. */
   onboardingPhase: PhaseReport | null;
@@ -309,7 +326,15 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     authorNames: {},
-    voice: { channelId: null, muted: false, status: "idle", cameraOn: false, peers: {} },
+    voice: {
+      channelId: null,
+      muted: false,
+      status: "idle",
+      error: null,
+      popped: false,
+      cameraOn: false,
+      peers: {},
+    },
     members: [],
     observers: [],
     proposals: [],
@@ -323,6 +348,8 @@ export const createInitialState = (): ConsoleState => {
     capabilities: [],
     watches: [],
     pendingRuns: [],
+    capabilitiesByNode: new Map(),
+    runAssignee: new Map(),
     search: null,
     searchPending: false,
     searchOpen: false,
@@ -337,6 +364,7 @@ export const createInitialState = (): ConsoleState => {
     needsOnboarding: false,
     onboardingBusy: false,
     forgetNeedsForce: false,
+    deleteNeedsForce: null,
     onboardingPhase: null,
     inviteBlob: null,
   };
@@ -359,6 +387,8 @@ export interface ConsoleSnapshot {
   capabilities: string[];
   watches: WatchView[];
   pendingRuns: PendingRun[];
+  capabilitiesByNode: Map<string, string[]>;
+  runAssignee: Map<string, string>;
   files: Manifest[];
   blocks: BlockRecord[];
 }
@@ -382,6 +412,8 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   capabilities: snapshot.capabilities,
   watches: snapshot.watches,
   pendingRuns: snapshot.pendingRuns,
+  capabilitiesByNode: snapshot.capabilitiesByNode,
+  runAssignee: snapshot.runAssignee,
   files: snapshot.files,
   blocks: snapshot.blocks,
 });

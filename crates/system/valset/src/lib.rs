@@ -7,15 +7,13 @@
 //! governance (who may join) and stake-weighted shares (voting power) are
 //! DEFERRED — this module only replicates *membership*.
 //!
-//! ## observers (staged admission, protocol >= 3)
+//! ## observers (staged admission)
 //!
 //! an OBSERVER holds mesh + statesync standing but no quorum seat — the tier
 //! a joiner syncs in before promotion, so the consensus set only ever gains a
 //! caught-up validator. [`ValsetMsg::Grant`] / [`ValsetMsg::Revoke`] manage
 //! the set; a [`ValsetMsg::Join`] on a current observer PROMOTES it (adds the
-//! validator, removes the observer, one block). both new ops REJECT below
-//! protocol version 3 — byte-for-byte the outcome an older binary's
-//! unknown-variant decode produces, so a mixed-binary net cannot fork on them.
+//! validator, removes the observer, one block).
 //!
 //! ## root/snapshot compatibility
 //!
@@ -54,11 +52,6 @@ use sha2::{Digest, Sha256};
 
 /// a 32-byte ed25519 public key encoding.
 const KEY_LEN: usize = 32;
-
-/// the protocol version that introduces the observer tier. `Grant`/`Revoke`
-/// reject below it — the same deterministic reject an older binary's
-/// unknown-variant decode produces, so mixed-binary nets cannot fork.
-const OBSERVER_VERSION: u32 = 3;
 
 pub struct Valset {
     id: ModuleId,
@@ -373,14 +366,6 @@ impl Module for Valset {
                 self.stage_remove(key);
             }
             ValsetMsg::Grant { key } => {
-                // the observer tier exists from protocol 3: rejecting below it
-                // is byte-for-byte what an older binary's unknown-variant
-                // decode does, so a mixed-binary net cannot fork on a Grant.
-                if ctx.env().protocol_version < OBSERVER_VERSION {
-                    return Err(Error::Module(format!(
-                        "observer grants require protocol version {OBSERVER_VERSION}"
-                    )));
-                }
                 Self::validate_key(&key)?;
                 // a validator already holds every observer capability; a
                 // second standing would only smear the promote/demote edges.
@@ -393,11 +378,6 @@ impl Module for Valset {
                 self.pending_observers.insert(key, true);
             }
             ValsetMsg::Revoke { key } => {
-                if ctx.env().protocol_version < OBSERVER_VERSION {
-                    return Err(Error::Module(format!(
-                        "observer revokes require protocol version {OBSERVER_VERSION}"
-                    )));
-                }
                 self.pending_observers.insert(key, false);
             }
         }
@@ -458,8 +438,7 @@ mod tests {
         fn new() -> Self {
             Self::at_version(0)
         }
-        /// a ctx whose block runs at `protocol_version` — the observer ops
-        /// gate on it, so their tests need a v3 block.
+        /// a ctx whose block runs at `protocol_version`.
         fn at_version(protocol_version: u32) -> Self {
             Self {
                 env: sdk::Env {
@@ -847,26 +826,26 @@ mod tests {
     // ---- observers (staged admission) --------------------------------------
 
     #[test]
-    fn observer_ops_reject_below_protocol_v3() {
-        // the version gate IS the mixed-binary fork guard: below v3 a new
-        // binary must land exactly where an old binary's unknown-variant
-        // decode lands — deterministic reject, no state, root untouched.
+    fn observer_ops_apply_at_any_protocol_version() {
+        // version gating is disregarded: Grant/Revoke apply regardless of the
+        // block's protocol_version, so observer admission works on a freshly
+        // founded (v0) network with no upgrade. before this change these ops
+        // rejected below protocol version 3.
         let mut v = Valset::new("valset");
         let mut ctx = TestCtx::new(); // protocol_version 0
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
-        let before = v.root();
 
-        for msg in [grant(&valid_key(2)), revoke(&valid_key(2))] {
-            let err = futures::executor::block_on(v.execute(&mut ctx, &msg)).unwrap_err();
-            assert!(
-                matches!(err, Error::Module(ref m) if m.contains("protocol version 3")),
-                "got {err:?}"
-            );
-        }
+        // grant lands at v0 and confers observer standing.
+        let obs = valid_key(2);
+        futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
-        assert_eq!(v.root(), before, "a gated op leaves the root byte-identical");
-        assert!(observers(&v).is_empty());
+        assert_eq!(observers(&v), vec![obs.clone()], "grant applied at protocol_version 0");
+
+        // revoke lands at v0 and clears it.
+        futures::executor::block_on(v.execute(&mut ctx, &revoke(&obs))).unwrap();
+        futures::executor::block_on(v.commit_block()).unwrap();
+        assert!(observers(&v).is_empty(), "revoke applied at protocol_version 0");
     }
 
     #[test]

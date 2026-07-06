@@ -92,8 +92,10 @@ fn network_shape_joiner_parks_until_promote() {
 ///      post-re-grant write becomes readable through its surface);
 ///   7. `promote` then seats a WARM validator through the normal path.
 ///
-/// observer ops are protocol-v3-gated, so the leg first drives the upgrade
-/// ceremony to v3 on the solo founder (schedule → auto-signal → activate).
+/// observer ops are no longer version-gated, so admission works at v0; this
+/// leg still runs the v3 upgrade ceremony first (schedule → auto-signal →
+/// activate) as incidental upgrade-path coverage, not as a precondition for
+/// the observer grant below.
 #[test]
 fn staged_admission_observer_presyncs_then_promotes_warm() {
     use directory::{DirMsg, DirQuery, DirReply};

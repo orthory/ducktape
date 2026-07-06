@@ -275,7 +275,10 @@ export function ModulesView() {
               style={{
                 marginTop: 11,
                 display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
+                // auto-fill (not auto-fit) keeps empty tracks so every category
+                // section shares the same column count and card width; sparse
+                // sections leave trailing space instead of stretching cards wide.
+                gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
                 gap: 10,
               }}
             >

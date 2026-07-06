@@ -16,6 +16,11 @@ export const FRAME_SAMPLES = 960;
 /** A huddle session's lifecycle, mirrored into the ui's voice slice. */
 export type VoiceStatus = "connecting" | "live" | "error" | "closed";
 
+/** Why a session failed — which message the dock shows. `mic-*` come from the
+ *  capture graph (getUserMedia/worklet), `connection` from the call ws, and
+ *  `refused` from a consensus join rejection (assigned by the caller). */
+export type VoiceError = "mic-denied" | "mic-missing" | "mic-failed" | "connection" | "refused";
+
 // ── Pure helpers (tested) ───────────────────────────────
 
 /** Float32 [-1,1] samples → Int16 little-endian PCM, clamped. A fresh exact-fit
@@ -51,4 +56,23 @@ export const huddleRecipients = (
   return Array.from(
     new Set(huddle.map((m) => keyHex(m.node)).filter((hex) => hex !== self)),
   );
+};
+
+/** Classify a capture-graph failure by DOMException name. macOS never
+ *  re-prompts once mic access is denied, so `mic-denied` must send the user to
+ *  System Settings — a generic "failed" would leave them retrying into a wall. */
+export const voiceErrorOf = (name: string): VoiceError => {
+  switch (name) {
+    case "NotAllowedError":
+    case "SecurityError":
+    case "PermissionDeniedError":
+      return "mic-denied";
+    case "NotFoundError":
+    case "DevicesNotFoundError":
+    case "OverconstrainedError":
+    case "NotReadableError":
+      return "mic-missing";
+    default:
+      return "mic-failed";
+  }
 };

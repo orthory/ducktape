@@ -35,10 +35,10 @@ import {
   encodeCapturedVideo,
   decodeServerFrame,
 } from "./call-frames";
-import { SAMPLE_RATE, floatToPcm16, pcm16ToFloat } from "./voice-session";
-import type { VoiceStatus } from "./voice-session";
+import { SAMPLE_RATE, floatToPcm16, pcm16ToFloat, voiceErrorOf } from "./voice-session";
+import type { VoiceStatus, VoiceError } from "./voice-session";
 
-export type { VoiceStatus };
+export type { VoiceStatus, VoiceError };
 
 /** The tile grid renders at most this many peers (roster order, plus our own
  *  self preview); a larger huddle still works, its extra tiles just aren't
@@ -62,7 +62,7 @@ const MIN_BITRATE_KBPS = 300;
 const MAX_BITRATE_KBPS = 1200;
 
 export type CallEvent =
-  | { kind: "status"; status: VoiceStatus }
+  | { kind: "status"; status: VoiceStatus; error?: VoiceError }
   | { kind: "peerBeacon"; peer: string; muted: boolean; cameraOn: boolean; atMs: number };
 
 export interface CallSession {
@@ -127,9 +127,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   // suppress the browser's follow-up close, so the caller keeps a visible error
   // state instead of having it wiped by 'closed'.
   let failed = false;
-  const setStatus = (next: VoiceStatus) => {
+  const setStatus = (next: VoiceStatus, error?: VoiceError) => {
     status = next;
-    onEvent({ kind: "status", status: next });
+    onEvent({ kind: "status", status: next, error });
   };
   // the first inbound frame that proves the hub is live promotes us out of
   // 'connecting'; anything after error/closed is left alone.
@@ -388,7 +388,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     // then close). Only a refusal while still connecting; once live, ignore.
     if (status !== "live") {
       failed = true;
-      setStatus("error");
+      setStatus("error", "connection");
     }
   };
 
@@ -439,7 +439,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     ws.onerror = () => {
       if (stopped) return;
       failed = true;
-      setStatus("error");
+      setStatus("error", "connection");
     };
   };
 
@@ -489,8 +489,10 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
 
         openSocket(wsUrl);
       })
-      .catch(() => {
-        if (!stopped) setStatus("error");
+      .catch((err: unknown) => {
+        // classify the capture-graph failure (getUserMedia / worklet) so the
+        // dock can say WHY — mic denied vs missing vs a generic setup failure.
+        if (!stopped) setStatus("error", voiceErrorOf(err instanceof DOMException ? err.name : ""));
       });
   };
 

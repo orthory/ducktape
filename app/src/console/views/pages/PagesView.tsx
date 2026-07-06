@@ -796,6 +796,43 @@ export function PagesView() {
     }
   }, [rows, focusId]);
 
+  // Docs-scoped keyboard shortcuts. This listener is registered only while the
+  // Docs screen is mounted, so it never leaks into other modules:
+  //   ⌘/Ctrl + ⇧ + [ / ]   previous / next tab (cycles, wraps at the ends)
+  //   ⌘/Ctrl + T or N       new top-level page
+  //   ⌘/Ctrl + W            deliberately NOT handled — it must fall through to
+  //                         the window (close-to-tray), never close a doc tab.
+  // Bracket keys are matched on `event.code` (physical key), so the shift-
+  // produced "{"/"}" characters don't matter.
+  useEffect(() => {
+    // DocumentEventMap["keydown"] is the DOM KeyboardEvent; the bare name is
+    // shadowed here by React's KeyboardEvent import used above in BlockRow.
+    const onKey = (event: DocumentEventMap["keydown"]) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+
+      if (
+        event.shiftKey &&
+        (event.code === "BracketRight" || event.code === "BracketLeft")
+      ) {
+        const tabs = state.openTabs;
+        if (tabs.length === 0) return;
+        event.preventDefault();
+        const step = event.code === "BracketRight" ? 1 : -1;
+        const current = state.activePage ? tabs.indexOf(state.activePage) : -1;
+        const base = current === -1 ? 0 : current;
+        actions.openPage(tabs[(base + step + tabs.length) % tabs.length]);
+        return;
+      }
+
+      if (!event.shiftKey && (event.code === "KeyT" || event.code === "KeyN")) {
+        event.preventDefault();
+        actions.createChildPage(null);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [actions, state.openTabs, state.activePage]);
+
   const insertAfterRow = (row: Row, kind: BlockKind) => {
     if (!row.block.parent) return;
     const blockId = crypto.randomUUID();

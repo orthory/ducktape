@@ -22,6 +22,9 @@ export function DocTabs({
     <div
       role="tablist"
       aria-label="Open documents"
+      // `no-scrollbar` keeps the strip scrollable (many tabs overflow and can be
+      // wheeled through) while hiding the global 10px scrollbar chrome.
+      className="no-scrollbar"
       style={{
         display: "flex",
         alignItems: "stretch",

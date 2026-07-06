@@ -56,6 +56,15 @@ button:focus-visible,
   background-clip: content-box;
 }
 
+/* Scrollable, but with no visible scrollbar chrome — the doc tab strip still
+   scrolls (wheel/trackpad/keyboard) yet never paints the global 10px bar. */
+.no-scrollbar {
+  scrollbar-width: none; /* Firefox / standards */
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none; /* WebKit / WebKitGTK */
+}
+
 @keyframes msgIn {
   from {
     opacity: 0;

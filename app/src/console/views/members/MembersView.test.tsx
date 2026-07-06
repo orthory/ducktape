@@ -249,4 +249,13 @@ describe("MembersView", () => {
     fireEvent.click(screen.getByRole("button", { name: "All" }));
     expect(screen.getByText("Olive Observer")).toBeInTheDocument();
   });
+
+  it("shows each node's announced capabilities as chips", () => {
+    renderMembers({
+      capabilitiesByNode: new Map([[peerKey, ["codex", "claude"]]]),
+    });
+    // The peer announced two executors — both render as chips on its row.
+    expect(screen.getByText("codex")).toBeInTheDocument();
+    expect(screen.getByText("claude")).toBeInTheDocument();
+  });
 });

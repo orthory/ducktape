@@ -173,7 +173,15 @@ function TitleBar() {
         </div>
       </div>
 
-      <SearchBar />
+      {/* search opens the ⌘K palette over a connected console — with the
+          onboarding gate up or a join in flight there is nothing to search,
+          so the affordance hides (an empty middle cell keeps the grid's two
+          1fr halves, and thus the bar's centering, intact). */}
+      {state.needsOnboarding || state.onboardingPhase ? (
+        <div data-tauri-drag-region />
+      ) : (
+        <SearchBar />
+      )}
 
       <div
         data-tauri-drag-region

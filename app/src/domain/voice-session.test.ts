@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { keyBytes, keyHex } from "./chat-client";
 import type { HuddleMember } from "./chat-client";
 import { callSocketUrl } from "./transport";
-import { FRAME_SAMPLES, floatToPcm16, huddleRecipients, pcm16ToFloat } from "./voice-session";
+import { FRAME_SAMPLES, floatToPcm16, huddleRecipients, pcm16ToFloat, voiceErrorOf } from "./voice-session";
 
 describe("pcm conversion", () => {
   it("round-trips Float32 → Int16 → Float32 within one quantization step", () => {
@@ -73,5 +73,25 @@ describe("callSocketUrl", () => {
     expect(callSocketUrl("https://node.example:9000/", "a b")).toBe(
       "wss://node.example:9000/v1/call/ws?channel=a%20b",
     );
+  });
+});
+
+describe("voiceErrorOf", () => {
+  it("maps permission denials to mic-denied", () => {
+    expect(voiceErrorOf("NotAllowedError")).toBe("mic-denied");
+    expect(voiceErrorOf("SecurityError")).toBe("mic-denied");
+    expect(voiceErrorOf("PermissionDeniedError")).toBe("mic-denied");
+  });
+
+  it("maps absent or unusable devices to mic-missing", () => {
+    expect(voiceErrorOf("NotFoundError")).toBe("mic-missing");
+    expect(voiceErrorOf("DevicesNotFoundError")).toBe("mic-missing");
+    expect(voiceErrorOf("OverconstrainedError")).toBe("mic-missing");
+    expect(voiceErrorOf("NotReadableError")).toBe("mic-missing");
+  });
+
+  it("maps anything else to mic-failed", () => {
+    expect(voiceErrorOf("AbortError")).toBe("mic-failed");
+    expect(voiceErrorOf("")).toBe("mic-failed");
   });
 });

@@ -16,6 +16,7 @@ import type { ReactNode } from "react";
 import * as agentClient from "../../domain/agent-client";
 import * as capabilityClient from "../../domain/capability-client";
 import * as chatClient from "../../domain/chat-client";
+import * as dispatchClient from "../../domain/dispatch-client";
 import * as filesClient from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
@@ -34,6 +35,14 @@ import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
 import { hasFreshPending } from "./finalization";
+import {
+  HUDDLE_CLOSED_EVENT,
+  HUDDLE_CMD_EVENT,
+  HUDDLE_STATE_EVENT,
+  applyHuddleWindowCmd,
+  buildHuddleWindowState,
+} from "./huddle-window";
+import type { HuddleWindowCmd } from "./huddle-window";
 import { reducer } from "./reducer";
 import {
   applySnapshot,
@@ -118,6 +127,11 @@ export function DucktapeProvider({
           // "Runs on" picker degrades to a text field) rather than a failed
           // refresh.
           capabilityClient.capabilities(live).catch((): string[] => []),
+          // the same registry, kept per-node so a member row can show what it
+          // runs — best-effort like everything else in the snapshot.
+          capabilityClient
+            .capabilitiesByNode(live)
+            .catch((): Map<string, string[]> => new Map()),
           runsClient.watches(live),
           // newest-first for the timeline; the wire orders by dispatch id.
           runsClient
@@ -144,6 +158,7 @@ export function DucktapeProvider({
         pageBlocks,
         agents,
         capabilities,
+        capabilitiesByNode,
         watches,
         pendingRuns,
         profiles,
@@ -180,37 +195,55 @@ export function DucktapeProvider({
           activePage =
             prevActive && liveIds.has(prevActive) ? prevActive : (openTabs[0] ?? null);
         }
-        return Promise.resolve()
-          .then(() => (active ? chatClient.latestMessages(live, active) : []))
-          .then((messages) =>
-            dispatch({
-              type: "patch",
-              patch: {
-                ...applySnapshot({
-                  connected: true,
-                  status,
-                  channels,
-                  members,
-                  observers,
-                  proposals,
-                  forgeHead,
-                  activeChannel: active,
-                  messages,
-                  authorNames,
-                  pages,
-                  activePageBlocks: pageBlocks ?? [],
-                  agents,
-                  capabilities,
-                  watches,
-                  pendingRuns,
-                  files,
-                  blocks,
-                }),
-                openTabs,
-                activePage,
-              },
-            }),
-          );
+        return Promise.all([
+          active ? chatClient.latestMessages(live, active) : [],
+          // one dispatch read per in-flight run → its executor node. bounded by
+          // pendingRuns.length; each is best-effort so one miss never fails the
+          // refresh.
+          Promise.all(
+            pendingRuns.map((run) =>
+              dispatchClient
+                .dispatch(live, { dispatchId: run.dispatch_id })
+                .then(
+                  (view) =>
+                    [run.run_id, dispatchClient.assigneeHex(view)] as const,
+                )
+                .catch(() => [run.run_id, null] as const),
+            ),
+          ),
+        ]).then(([messages, assigneePairs]) => {
+          const runAssignee = new Map<string, string>();
+          for (const [runId, hex] of assigneePairs) if (hex) runAssignee.set(runId, hex);
+          return dispatch({
+            type: "patch",
+            patch: {
+              ...applySnapshot({
+                connected: true,
+                status,
+                channels,
+                members,
+                observers,
+                proposals,
+                forgeHead,
+                activeChannel: active,
+                messages,
+                authorNames,
+                pages,
+                activePageBlocks: pageBlocks ?? [],
+                agents,
+                capabilities,
+                capabilitiesByNode,
+                watches,
+                pendingRuns,
+                runAssignee,
+                files,
+                blocks,
+              }),
+              openTabs,
+              activePage,
+            },
+          });
+        });
       })
       .catch((err) => {
         dispatch({ type: "patch", patch: { connected: false } });
@@ -380,6 +413,66 @@ export function DucktapeProvider({
     window.addEventListener("pagehide", leaveOnHide);
     return () => window.removeEventListener("pagehide", leaveOnHide);
   }, [state.voice.channelId, state.nodeUrl, state.author]);
+
+  // 2e. Huddle pop-out bridge, sender half (desktop): while the huddle window
+  //     is open, mirror the session's display state to it. A fingerprint
+  //     dedupes the per-block channels churn. Protocol: store/huddle-window.ts.
+  const huddleStateFp = useRef("");
+  useEffect(() => {
+    if (!state.voice.popped || !isTauri()) return;
+    const snapshot = buildHuddleWindowState(state.voice, state.channels, state.authorNames);
+    if (!snapshot) return;
+    const fp = JSON.stringify(snapshot);
+    if (fp === huddleStateFp.current) return;
+    huddleStateFp.current = fp;
+    void import("@tauri-apps/api/event")
+      .then(({ emit }) => emit(HUDDLE_STATE_EVENT, snapshot))
+      .catch(() => {});
+  }, [state.voice, state.channels, state.authorNames]);
+
+  // 2f. ...and the receiver half: apply the window's commands to the store,
+  //     replay state on its ready handshake, and re-mount the in-app card when
+  //     Rust reports the window destroyed. Also closes a stale window left
+  //     over from a previous main-window life — the ephemeral session it
+  //     mirrored died with the reload.
+  useEffect(() => {
+    if (!isTauri()) return;
+    actions.popInHuddle();
+    const unlisteners: Array<() => void> = [];
+    let cancelled = false;
+    const hold = (un: () => void) => {
+      if (cancelled) un();
+      else unlisteners.push(un);
+    };
+    void import("@tauri-apps/api/event")
+      .then(({ listen, emit }) =>
+        Promise.all([
+          listen(HUDDLE_CMD_EVENT, (event) => {
+            const cmd = event.payload as HuddleWindowCmd;
+            const current = stateRef.current;
+            if (cmd.op === "ready") {
+              const snapshot = buildHuddleWindowState(
+                current.voice,
+                current.channels,
+                current.authorNames,
+              );
+              if (snapshot) void emit(HUDDLE_STATE_EVENT, snapshot);
+              return;
+            }
+            applyHuddleWindowCmd(cmd, actions, current.voice.channelId);
+          }),
+          listen(HUDDLE_CLOSED_EVENT, () => actions.popInHuddle()),
+        ]),
+      )
+      .then((uns) => uns.forEach(hold))
+      .catch(() => {
+        // event API unavailable (non-tauri / test stub) — the bridge no-ops.
+      });
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((un) => un());
+    };
+  }, [actions]);
 
   // 3. Reflect the accent into the css var the theme reads.
   useEffect(() => {

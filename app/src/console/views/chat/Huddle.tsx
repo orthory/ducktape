@@ -2,9 +2,9 @@
 // to join/leave, a rail indicator on channels with a live huddle, and the
 // bottom-left dock for the session you're in. All roster reads come from
 // `channel.huddle` (committed consensus state); whether WE are in a live audio
-// session comes from the ephemeral `voice` slice. Styling is inline + tokens,
-// matching the rest of the chat surface. Every affordance is hidden when the
-// daemon can't do voice (no status.publicKey).
+// session comes from the ephemeral `voice` slice. The card body itself lives in
+// HuddleCard.tsx, shared with the popped-out huddle window. Every affordance is
+// hidden when the daemon can't do voice (no status.publicKey).
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
@@ -12,11 +12,14 @@ import type { CSSProperties } from "react";
 import { MAX_VIDEO_PARTICIPANTS } from "../../../domain/call-session";
 import { authorName, keyHex } from "../../../domain/chat-client";
 import type { Channel, HuddleMember } from "../../../domain/chat-client";
+import { isTauri } from "../../../domain/node-bootstrap";
+import { buildHuddleWindowState } from "../../store/huddle-window";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "./HoverButton";
+import { HuddleCard } from "./HuddleCard";
 
-// ── Local glyphs (Icon.tsx isn't ours to extend — same pattern as MessageItem) ──
+// ── Local glyph (Icon.tsx isn't ours to extend — same pattern as MessageItem) ──
 
 function HeadphonesGlyph({ size = 14 }: { size?: number }) {
   return (
@@ -80,55 +83,6 @@ function ParticipantAvatar({ name, size, ring }: { name: string; size: number; r
     >
       {initialsOf(name)}
     </span>
-  );
-}
-
-/** An overlapping pile of participant initials, capped with a "+N" chip. */
-function AvatarPile({
-  huddle,
-  names,
-  size = 24,
-  ring = color.sidebar,
-  max = 5,
-}: {
-  huddle: HuddleMember[];
-  names: Record<string, string>;
-  size?: number;
-  ring?: string;
-  max?: number;
-}) {
-  const shown = huddle.slice(0, max);
-  const extra = huddle.length - shown.length;
-  return (
-    <div style={{ display: "flex", alignItems: "center" }}>
-      {shown.map((member, i) => (
-        // keyed by USER, not node: two users huddling from one daemon share a
-        // node key, while the roster is unique per user.
-        <span key={keyHex(member.user)} style={{ marginLeft: i === 0 ? 0 : -8, zIndex: shown.length - i }}>
-          <ParticipantAvatar name={memberName(member, names)} size={size} ring={ring} />
-        </span>
-      ))}
-      {extra > 0 && (
-        <span
-          style={{
-            marginLeft: -8,
-            width: size,
-            height: size,
-            borderRadius: "50%",
-            background: color.sunken,
-            color: color.muted3,
-            border: `2px solid ${ring}`,
-            boxSizing: "border-box",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            font: `600 ${size <= 24 ? 9.5 : 11}px ${font.sans}`,
-          }}
-        >
-          +{extra}
-        </span>
-      )}
-    </div>
   );
 }
 
@@ -395,18 +349,13 @@ function TileGrid({
 
 // ── Bottom-left dock ─────────────────────────────────────
 
-const STATUS_DOT: Record<string, { color: string; pulse: boolean }> = {
-  connecting: { color: color.amber, pulse: true },
-  live: { color: color.green, pulse: false },
-  error: { color: color.red, pulse: false },
-  idle: { color: color.muted2, pulse: false },
-};
-
 /** The persistent session card, docked at the foot of the channel rail while
- *  we're in a huddle: an optional video-tile grid, then the status/roster
- *  header, then the camera/mute/leave controls. Thin wrapper so the card (and
- *  its per-session state — sessionStartMs, the staleness tick) mounts fresh on
- *  each join, keyed by channel. */
+ *  we're in a huddle: an optional video-tile grid over the shared HuddleCard
+ *  (status/roster header + mute/leave), plus the main-window camera toggle.
+ *  Yields entirely to the popped-out huddle window (voice.popped), which
+ *  mirrors the same HuddleCard as an audio remote (no tiles/camera there). Thin
+ *  wrapper so the card and its per-session state (sessionStartMs, the staleness
+ *  tick) mount fresh on each join, keyed by channel. */
 export function HuddleDock() {
   const { state } = useDucktape();
   if (!state.voice.channelId) return null;
@@ -419,7 +368,6 @@ function HuddleDockCard() {
 
   const channel = state.channels.find((c) => c.id === voice.channelId);
   const roster = channel?.huddle ?? [];
-  const dot = STATUS_DOT[voice.status] ?? STATUS_DOT.idle;
   const live = voice.status === "live";
   // WebKitGTK has no WebCodecs: hide the camera control (audio-only) and hint on
   // the dock why. The store caps video the same way, so mirror its cap here.
@@ -445,6 +393,17 @@ function HuddleDockCard() {
     return () => clearInterval(id);
   }, [showTiles]);
 
+  // Yield to the popped-out window (it mirrors the same HuddleCard as an audio
+  // remote). Every hook above runs first, so this early return is rules-of-hooks
+  // safe. The card body (status dot, participant pile, mute/leave, error+Retry)
+  // is the shared HuddleCard; the tile grid + camera toggle are composed around
+  // it below and live ONLY in this main-window dock, never the popped window.
+  if (!voice.channelId || voice.popped) return null;
+
+  const card = buildHuddleWindowState(voice, state.channels, state.authorNames);
+  if (!card) return null;
+  const channelId = voice.channelId;
+
   return (
     <div
       title={canVideo ? undefined : "Video needs a Chromium-based window"}
@@ -456,61 +415,39 @@ function HuddleDockCard() {
         background: color.paper,
         border: `1px solid ${color.borderStrong}`,
         boxShadow: "0 1px 2px rgba(40,38,34,.05)",
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
       }}
     >
       {showTiles && (
-        <TileGrid
-          roster={roster}
-          selfHex={selfHex}
-          cameraOn={voice.cameraOn}
-          names={state.authorNames}
-          sessionStartMs={sessionStartMs}
-        />
+        <div style={{ marginBottom: 8 }}>
+          <TileGrid
+            roster={roster}
+            selfHex={selfHex}
+            cameraOn={voice.cameraOn}
+            names={state.authorNames}
+            sessionStartMs={sessionStartMs}
+          />
+        </div>
       )}
 
-      <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-        <span
-          aria-label={voice.status}
-          style={{
-            width: 8,
-            height: 8,
-            borderRadius: "50%",
-            background: dot.color,
-            flexShrink: 0,
-            animation: dot.pulse ? "ik-pulse 1s ease-in-out infinite" : undefined,
-          }}
-        />
-        <span
-          style={{
-            flex: 1,
-            minWidth: 0,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            font: `600 12.5px ${font.sans}`,
-            color: color.ink,
-          }}
-        >
-          #{channel?.name ?? voice.channelId}
-        </span>
-        <span style={{ font: `500 10.5px ${font.sans}`, color: color.muted2, flexShrink: 0 }}>
-          {voice.status === "connecting" ? "connecting…" : `${roster.length}`}
-        </span>
-      </div>
+      <HuddleCard
+        channelName={card.channelName}
+        status={card.status}
+        error={card.error}
+        muted={card.muted}
+        participants={card.participants}
+        ring={color.paper}
+        pileMax={2}
+        onSetMuted={(muted) => actions.setHuddleMuted(muted)}
+        onLeave={() => actions.leaveHuddle()}
+        onRetry={() => actions.joinHuddle(channelId)}
+        onPopOut={isTauri() ? () => actions.popOutHuddle() : undefined}
+      />
 
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          {roster.length > 0 ? (
-            <AvatarPile huddle={roster} names={state.authorNames} size={24} ring={color.paper} />
-          ) : (
-            <span style={{ font: `400 11px ${font.sans}`, color: color.muted2 }}>Just you</span>
-          )}
-        </div>
-
-        {canVideo && (
+      {/* Camera toggle lives in the dock next to the card (never forked into
+          HuddleCard, so the popped window keeps rendering it unmodified as an
+          audio remote). Same gating as before: capability + live + cap-8. */}
+      {canVideo && (
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
           <HoverButton
             onClick={() => actions.setCamera(!voice.cameraOn)}
             title={
@@ -536,45 +473,8 @@ function HuddleDockCard() {
           >
             <CameraGlyph size={15} off={!voice.cameraOn} />
           </HoverButton>
-        )}
-
-        <HoverButton
-          onClick={() => actions.setHuddleMuted(!voice.muted)}
-          title={voice.muted ? "Unmute" : "Mute"}
-          disabled={!live}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            width: 30,
-            height: 28,
-            borderRadius: radius.sm,
-            border: `1px solid ${voice.muted ? color.dangerBorder : color.borderSoft}`,
-            background: voice.muted ? color.dangerSoft : live ? color.dark : color.sunken,
-            color: voice.muted ? color.danger : live ? color.onDark : color.muted2,
-          }}
-          hoverStyle={{ filter: "brightness(1.05)" }}
-        >
-          <MicGlyph size={15} muted={voice.muted} />
-        </HoverButton>
-
-        <HoverButton
-          onClick={() => actions.leaveHuddle()}
-          title="Leave huddle"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            padding: "6px 11px",
-            borderRadius: radius.sm,
-            background: color.danger,
-            color: "#fff",
-            font: `600 11.5px ${font.sans}`,
-          }}
-          hoverStyle={{ filter: "brightness(1.06)" }}
-        >
-          Leave
-        </HoverButton>
-      </div>
+        </div>
+      )}
     </div>
   );
 }

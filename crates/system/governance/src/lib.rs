@@ -47,12 +47,6 @@ use valset::{
 /// horizon. views advance about once per finalized op, so this is generous.
 const MAX_VOTING_PERIOD: u64 = 1_000_000_000;
 
-/// the protocol version that introduces the observer tier — keep in lockstep
-/// with the valset module's `OBSERVER_VERSION` (valset re-gates its Grant/
-/// Revoke on the same value; the interface crates are types-only, so the
-/// constant lives in each enforcing module).
-const OBSERVER_VERSION: u32 = 3;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Proposal {
     action: GovAction,
@@ -264,17 +258,6 @@ impl Governance {
                     "membership key must be a 32-byte ed25519 public key".into(),
                 ));
             }
-        }
-        // observer actions exist from protocol 3: rejecting the PROPOSE below
-        // it lands exactly where an older binary lands (its GovMsg decode
-        // fails on the unknown variant), so a mixed-binary net cannot even
-        // open a proposal it would later fork on.
-        if let GovAction::AddObserver { .. } | GovAction::RemoveObserver { .. } = &action
-            && ctx.env().protocol_version < OBSERVER_VERSION
-        {
-            return Err(Error::Module(format!(
-                "observer proposals require protocol version {OBSERVER_VERSION}"
-            )));
         }
         // upgrade authorizations must name a non-empty upgrade — an unnamed
         // proposal can never match a real pending, so reject it at the door.
