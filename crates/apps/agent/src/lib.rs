@@ -8,14 +8,15 @@
 //! that ACTS on agents (engagement, composition, dispatch, response
 //! delivery) lives in the runs module, which reads this registry by query.
 //!
-//! the one seam left is the registry hook: a registration (and a capability
-//! change) emits an [`AgentEvent`] follow-up to a genesis-configured hook
-//! target — the runs module — which answers by registering/retuning the
-//! agent's dispatch-plane recipe IN THE SAME BLOCK. if the recipe cannot
-//! land (a squatted id), that follow-up errors, the block aborts, and the
-//! staged record vanishes with it: the agent and its recipe stay one atomic
-//! unit (P2) without this crate referencing the dispatch plane. the hook
-//! target is an opaque module id — config, not a reference.
+//! the one seam left is the registry hook: a registration, a capability
+//! change, and a tombstone each emit an [`AgentEvent`] follow-up to a
+//! genesis-configured hook target — the runs module — which answers by
+//! registering/retuning/removing the agent's dispatch-plane recipe IN THE
+//! SAME BLOCK. if the recipe cannot land (a squatted id), that follow-up
+//! errors, the block aborts, and the staged record vanishes with it: the
+//! agent and its recipe stay one atomic unit (P2) without this crate
+//! referencing the dispatch plane. the hook target is an opaque module id —
+//! config, not a reference.
 //!
 //! ## execute routing
 //!
