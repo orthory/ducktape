@@ -21,6 +21,7 @@ import * as filesClient from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import type { ProposalView } from "../../domain/governance-client";
+import * as identityClient from "../../domain/identity-client";
 import * as pagesClient from "../../domain/pages-client";
 import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import {
@@ -141,6 +142,7 @@ export function DucktapeProvider({
             .pendingRuns(live)
             .then((list) => [...list].sort((a, b) => b.created_at - a.created_at)),
           profilesClient.allProfiles(live, { from: 0, limit: 256 }),
+          identityClient.allUsers(live, { from: 0, limit: 256 }),
           // files is best-effort so a node that does not register the module
           // reads as "empty", never a failed refresh (same contract as
           // governance above).
@@ -165,14 +167,28 @@ export function DucktapeProvider({
         watches,
         pendingRuns,
         profiles,
+        users,
         files,
         blocks,
       ]) => {
         // Profile.key is the origin bytes — the same bytes AuthorRef::User
         // carries — so hex(key) is exactly authorName's AuthorNames key.
-        const authorNames = Object.fromEntries(
+        // identity's per-user display name OVERLAYS profiles for every node
+        // that user binds — bound-user identity wins over the node's own
+        // origin-set profile, since the node/user split makes the user the
+        // durable identity and the node just its hardware.
+        const authorNames: Record<string, string> = Object.fromEntries(
           profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
         );
+        const nodeUsers: Record<string, { userKey: string; name: string | null }> = {};
+        for (const u of users) {
+          const userKey = chatClient.keyHex(u.user_key);
+          for (const node of u.nodes) {
+            const nodeHex = chatClient.keyHex(node);
+            nodeUsers[nodeHex] = { userKey, name: u.display_name };
+            if (u.display_name) authorNames[nodeHex] = u.display_name;
+          }
+        }
         const members = validators.map(valsetClient.validatorHex);
         const observers = observerKeys.map(valsetClient.validatorHex);
         const current = stateRef.current.activeChannel;
@@ -245,6 +261,7 @@ export function DucktapeProvider({
                 activeChannel: active,
                 messages,
                 authorNames,
+                nodeUsers,
                 pages: holdPages ? stateRef.current.pages : pages,
                 activePageBlocks: holdPages
                   ? stateRef.current.activePageBlocks
