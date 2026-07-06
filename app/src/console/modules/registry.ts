@@ -18,9 +18,9 @@ import { TelemetryView } from "../views/telemetry/TelemetryView";
 import type { AppModule, NavSection } from "./module-def";
 
 // The sidebar's view-mode toggle partitions these into two rails:
-//   USER          — the participant apps (chat, tasks, docs, forge, agents)
-//   NODE OPERATOR — the node/network surfaces (members, approvals, modules,
-//                   node, telemetry)
+//   USER          — the participant apps (chat, docs, files, forge, agents)
+//   NODE OPERATOR — the node/network surfaces (members, governance, modules,
+//                   node, telemetry, explorer)
 // `order` is a sort key WITHIN a section, so the two rails number from 0
 // independently.
 export const MODULES: AppModule[] = [
@@ -33,7 +33,7 @@ export const MODULES: AppModule[] = [
   { id: "agent", nav: { icon: "agent", label: "Agents", order: 8, section: "user" }, Screen: AgentView },
   // ── Node operator surfaces ──
   { id: "members", nav: { icon: "members", label: "Members", order: 0, section: "operator" }, Screen: MembersView },
-  { id: "governance", nav: { icon: "approvals", label: "Approvals", order: 1, section: "operator" }, Screen: GovernanceView },
+  { id: "governance", nav: { icon: "governance", label: "Governance", order: 1, section: "operator" }, Screen: GovernanceView },
   { id: "jobs", nav: { icon: "jobs", label: "Jobs", order: 2, section: "operator" }, Screen: JobsView },
   { id: "automations", nav: { icon: "automations", label: "Autos", order: 3, section: "operator" }, Screen: AutomationsView },
   { id: "modules", nav: { icon: "modules", label: "Modules", order: 4, section: "operator" }, Screen: ModulesView },
