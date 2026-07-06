@@ -4,6 +4,13 @@
 **Date:** 2026-07-06
 **Surface:** `crates/apps/pages`, new `crates/apps/comments`, `app/src/console/views/pages`, `app/src/domain`, `app/src/console/store`
 
+> **Update (implementation):** comments were folded **into the `pages` module**
+> (not a separate `crates/apps/comments` crate). A comment target is always a pages
+> block/page, so threads live in the same qmdb under reserved NUL-prefixed keys and
+> state-sync with blocks. Ops (`AddComment`/`EditComment`/`DeleteComment`/
+> `ResolveThread`) and queries (`ThreadsForTargets`/`CommentThread`) are part of the
+> pages wire; a comment anchors to a bare `target` id (no `{module,target}`).
+
 ## Goal
 
 Turn the Docs surface from a developer-facing block-tree debugger into a Notion-grade
