@@ -15,6 +15,7 @@ mod daemon;
 mod forge_git;
 mod huddle;
 mod tray;
+mod user_identity;
 mod workspaces;
 
 fn main() {
@@ -35,6 +36,9 @@ fn main() {
             workspaces::workspace_forget,
             workspaces::workspace_select,
             workspaces::workspace_phase,
+            user_identity::user_identity_status,
+            user_identity::user_sign_bind,
+            user_identity::user_sign_unbind,
             forge_git::forge_head,
             forge_git::forge_log,
             forge_git::forge_tree,
