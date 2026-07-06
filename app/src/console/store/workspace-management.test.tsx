@@ -77,6 +77,20 @@ afterEach(() => {
   actions = null;
 });
 
+/** A stubbed node surface: /v1/status answers with `pubkey` as the node's
+ *  identity, the valset query answers `valset`, everything else is generic. */
+const nodeFetch = (valset: { validators: number[][] }, pubkey = "ab12") =>
+  vi.fn((url: string, init?: RequestInit) => {
+    const u = String(url);
+    if (u.endsWith("/v1/status")) return Promise.resolve(jsonResponse(200, status(pubkey)));
+    if (u.endsWith("/v1/query")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { target?: string };
+      if (body.target === "valset") return Promise.resolve(jsonResponse(200, valset));
+      return Promise.resolve(jsonResponse(200, { channels: [] }));
+    }
+    return Promise.resolve(jsonResponse(200, { channels: [] }));
+  });
+
 /** Boot the provider to the raised gate with `list` in the registry and no
  *  active workspace; `handlers` overlay per-command invoke behavior. */
 const bootGate = async (
@@ -153,14 +167,8 @@ describe("selecting a not-admitted workspace from the picker", () => {
       workspace_phase: () => ({ phase: "promoted", detail: "validator at epoch 1" }),
       workspace_select: () => ({ id: "g", httpUrl: "http://127.0.0.1:9002" }),
     });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn((url: string) =>
-        String(url).endsWith("/v1/status")
-          ? Promise.resolve(jsonResponse(200, status("ab12")))
-          : Promise.resolve(jsonResponse(200, { channels: [] })),
-      ),
-    );
+    // its valset carries our key — the node genuinely promoted.
+    vi.stubGlobal("fetch", nodeFetch({ validators: [[0xab, 0x12]] }));
 
     await act(async () => {
       actions!.selectWorkspace("g");
@@ -175,6 +183,36 @@ describe("selecting a not-admitted workspace from the picker", () => {
 });
 
 describe("join flow", () => {
+  it("keeps the waiting room up while a PARKED node serves its surface", async () => {
+    // parked joiners DO serve http/rpc (newer node builds): a merely-answering
+    // /v1/status must not open the console on a not-admitted workspace. Only
+    // valset membership proves readiness.
+    const guest = workspace({
+      id: "g",
+      name: "Guest",
+      founder: false,
+      member: false,
+      pubkey: "ab12",
+      ports: { listen: 1, http: 9002, rpc: 3 },
+    });
+    await bootGate([], {
+      workspace_join: () => guest,
+      workspace_select: () => ({ id: "g", httpUrl: "http://127.0.0.1:9002" }),
+      workspace_phase: () => ({ phase: "parked", detail: "awaiting admission" }),
+    });
+    // the parked node's surface answers — but its valset does NOT contain us.
+    vi.stubGlobal("fetch", nodeFetch({ validators: [[0xff, 0x99]] }));
+
+    await act(async () => {
+      actions!.joinWorkspace("Guest", "ducktape-invite-v2:blob");
+    });
+
+    // still in the waiting room — the console never opened on the parked node.
+    expect(screen.getByTestId("gate").textContent).toBe("false");
+    expect(screen.getByTestId("phase").textContent).toBe("parked");
+    expect(screen.getByTestId("ws").textContent).toBe("Guest");
+  });
+
   it("seeds the waiting-room phase synchronously — the console never flashes", async () => {
     const guest = workspace({ id: "g", name: "Guest", founder: false, member: false });
     await bootGate([], {

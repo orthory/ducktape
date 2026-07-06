@@ -19,6 +19,7 @@ import { voiceSocketUrl } from "../../domain/transport";
 import { createVoiceSession, huddleRecipients } from "../../domain/voice-session";
 import type { VoiceSession, VoiceStatus } from "../../domain/voice-session";
 import { keyBytes } from "../../domain/chat-client";
+import * as valsetClient from "../../domain/valset-client";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
@@ -598,28 +599,47 @@ export function createActions({
             });
           });
         }
-        // joiner: the node parks (no surface) until a member admits it and
-        // the epoch cuts over; it then promotes, reboots as a validator, and
-        // its surface starts answering. Poll the phase until that happens.
+        // joiner: the node parks until a member admits it and the epoch cuts
+        // over; it then promotes into the validator set. Poll until that
+        // happens. NOTE a parked joiner may well serve its http surface
+        // (newer node builds do) — a mere status answer is NOT admission, so
+        // adoption additionally requires OUR key in the committed valset.
+        const park = (): Promise<void> =>
+          ws.workspacePhase(target.id).then((report) => {
+            if (stale()) return;
+            patch({ onboardingPhase: report });
+            if (report.phase === "fatal") {
+              fail(report.detail ?? "the node failed to join");
+              return;
+            }
+            return wait(JOIN_POLL_MS).then(tick);
+          });
         const tick = (): Promise<void> => {
           if (stale()) return Promise.resolve();
           return transport.status().then(
             (s) => {
               if (stale()) return;
               if (!identityMatches(s.publicKey)) return rejectImpostor();
-              patch({ onboardingPhase: null });
-              setNode(transport);
+              return valsetClient
+                .validators(transport)
+                .then(
+                  (keys) =>
+                    keys.some(
+                      (key) =>
+                        valsetClient.validatorHex(key).toLowerCase() ===
+                        target.pubkey.toLowerCase(),
+                    ),
+                  // an unreadable valset proves nothing — keep waiting.
+                  () => false,
+                )
+                .then((seated) => {
+                  if (stale()) return;
+                  if (!seated) return park();
+                  patch({ onboardingPhase: null });
+                  setNode(transport);
+                });
             },
-            () =>
-              ws.workspacePhase(target.id).then((report) => {
-                if (stale()) return;
-                patch({ onboardingPhase: report });
-                if (report.phase === "fatal") {
-                  fail(report.detail ?? "the node failed to join");
-                  return;
-                }
-                return wait(JOIN_POLL_MS).then(tick);
-              }),
+            () => park(),
           );
         };
         return tick();
