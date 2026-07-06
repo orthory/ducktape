@@ -10,8 +10,7 @@
 use agent::AgentModule;
 use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentQuery, AgentReply, AgentStatus,
-    PROMPT_HASH_LEN, PromptRef, RENDERER_MEMORY_GENERATION, decode_reply, encode_msg,
-    encode_query,
+    PROMPT_HASH_LEN, PromptRef, RENDERER_MEMORY_GENERATION, decode_reply, encode_msg, encode_query,
 };
 use futures::executor::block_on;
 use saga::SagaOrigin;

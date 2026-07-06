@@ -5420,6 +5420,7 @@ dependencies = [
  "futures",
  "host",
  "jobs",
+ "memory",
  "saga",
  "sdk",
  "serde",

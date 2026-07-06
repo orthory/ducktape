@@ -432,8 +432,7 @@ impl AgentModule {
     fn validate_actions(actions: Vec<String>) -> Result<BTreeSet<String>, Error> {
         let mut set = BTreeSet::new();
         for action in actions {
-            validate_tag(&action)
-                .map_err(|e| Error::Module(format!("invalid action tag: {e}")))?;
+            validate_tag(&action).map_err(|e| Error::Module(format!("invalid action tag: {e}")))?;
             set.insert(action);
         }
         Ok(set)
@@ -749,8 +748,7 @@ impl Module for AgentModule {
 mod tests {
     use super::*;
     use crate::{
-        ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg,
-        encode_query,
+        ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg, encode_query,
     };
     use futures::executor::block_on;
     use sdk::{Effect, Env};
@@ -1432,7 +1430,9 @@ mod tests {
         let run = || {
             let mut m = module();
             for (i, (origin, op)) in ops.iter().enumerate() {
-                let mut ctx = CaptureCtx::new().at(i as u64 + 1).from_origin(origin.clone());
+                let mut ctx = CaptureCtx::new()
+                    .at(i as u64 + 1)
+                    .from_origin(origin.clone());
                 exec(&mut m, &mut ctx, &admin(op)).unwrap();
                 commit(&mut m);
             }
@@ -1447,7 +1447,12 @@ mod tests {
     fn snapshots_install_only_under_their_own_root() {
         let mut m = module();
         let mut ctx = CaptureCtx::new().at(1).from_origin(user(9));
-        exec(&mut m, &mut ctx, &admin(&register("alpha", &[ACTION_CHAT_POST]))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&register("alpha", &[ACTION_CHAT_POST])),
+        )
+        .unwrap();
         exec(&mut m, &mut ctx, &admin(&register("beta", &[]))).unwrap();
         commit(&mut m);
 

@@ -242,9 +242,15 @@ pub enum AgentMsg {
 #[serde(rename_all = "snake_case")]
 pub enum AgentEvent {
     /// a new agent landed; the hook registers its recipe.
-    Registered { agent_id: String, capability: String },
+    Registered {
+        agent_id: String,
+        capability: String,
+    },
     /// an existing agent's capability changed; the hook retunes its recipe.
-    CapabilityChanged { agent_id: String, capability: String },
+    CapabilityChanged {
+        agent_id: String,
+        capability: String,
+    },
     /// an agent was retired for good; the hook removes its recipe.
     Tombstoned { agent_id: String },
 }
