@@ -5853,6 +5853,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut last_reach_view: Option<u64> = None;
         // throttle for the pending-cutover nop pusher below.
         let mut last_nop = std::time::Instant::now();
+        // dev override (`make dev` sets DUCKTAPE_DISABLE_HEARTBEAT): keep an idle
+        // dev chain quiet — no nop blocks — so telemetry shows every block (all
+        // real activity) and idle honestly reads as empty, with no nop churn in
+        // the ring. NEVER set this on a multi-node or upgrade-driving network:
+        // the heartbeat is what ticks an idle chain across a pending cutover and
+        // keeps the console height visibly live.
+        let heartbeat_disabled = std::env::var_os("DUCKTAPE_DISABLE_HEARTBEAT").is_some();
         // throttle for the saga crank pump below.
         let mut last_crank = std::time::Instant::now();
         // throttle for the dispatch delivery-nudge pump below.
@@ -6528,7 +6535,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // it is alone. the reset stays inside the taken branch: when the
                     // gate skips, the timer stays elapsed, so the first tick after
                     // the queue drains injects the next nop immediately.
-                    if last_nop.elapsed() >= HEARTBEAT_INTERVAL
+                    if !heartbeat_disabled
+                        && last_nop.elapsed() >= HEARTBEAT_INTERVAL
                         && node.orderer().pending_len() == 0
                     {
                         last_nop = std::time::Instant::now();

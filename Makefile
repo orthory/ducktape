@@ -8,9 +8,16 @@ CARGO ?= cargo
 BUN ?= bun
 APP_DEST ?= /Applications
 
-.PHONY: all node web app sidecar install install-node install-app test clean
+.PHONY: all dev node web app sidecar install install-node install-app test clean
 
 all: node web
+
+## dev loop: the desktop app + a HOT-RELOADING node. runs `tauri dev` (frontend
+## hot-reload) and watches the Rust tree — on any node/kernel change it rebuilds
+## ducktape-node and restarts the running node in place, which the app re-adopts.
+## see ops/dev.sh. (stop any already-running `tauri dev` first — it owns :1430.)
+dev:
+	@bash ops/dev.sh
 
 ## release build of the networked node (serves the app surface)
 node:
