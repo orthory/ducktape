@@ -597,7 +597,7 @@ function PageRail({
           <Icon name="pages" size={14} strokeWidth={1.7} />
         </span>
         <div style={{ minWidth: 0 }}>
-          <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>Pages</div>
+          <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>Docs</div>
           <div style={{ marginTop: 1, font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
             block trees
           </div>
@@ -922,7 +922,7 @@ export function PagesView() {
 
   return (
     <div
-      data-screen-label="Pages"
+      data-screen-label="Docs"
       style={{
         flex: 1,
         minWidth: 0,
@@ -954,7 +954,7 @@ export function PagesView() {
             background: color.paper,
           }}
         >
-          <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>Pages</div>
+          <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>Docs</div>
           {root ? (
             <>
               <div
