@@ -177,6 +177,11 @@ const CHANNEL_REACHABILITY: u64 = 6;
 /// transport arm). registered in EVERY mode like the lanes above; only the
 /// validator path runs the hub that consumes it, every other mode black-holes.
 const CHANNEL_VOICE: u64 = 7;
+/// the video channel: camera-frame fragments between huddle members
+/// (`chat::video` fragments inside data-plane datagrams). its own lane so
+/// keyframe bursts never queue ahead of voice, with its own per-peer quota
+/// sized for the top of the rate ladder plus keyframe bursts.
+const CHANNEL_VIDEO: u64 = 8;
 /// while parked and un-admitted, re-announce every N park-loop attempts
 /// (attempts tick ~2s apart, so this is roughly every 10s) — often enough to
 /// survive member restarts (the request queue is in-memory), quiet enough to
@@ -230,9 +235,10 @@ const SUBMIT_HOLD: Duration = Duration::from_secs(10);
 /// eager payload-relay lane, and the payload FETCH lane (the lazy catch-up
 /// backstop — a validator that missed the one-shot relay gossip for a
 /// finalized op fetches its bytes by digest instead of wedging its apply
-/// prefix forever). starts at 8, clear of the statesync channel.
+/// prefix forever). starts at 9, clear of the fixed discovery channels
+/// (statesync 4, lobby 5, reachability 6, voice 7, video 8).
 fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
-    let base = 8 + epoch * 5;
+    let base = 9 + epoch * 5;
     (base, base + 1, base + 2, base + 3, base + 4)
 }
 
@@ -4122,6 +4128,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     .child("blackhole_voice")
                     .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
             }
+            // the video lane: a sync-only observer serves no huddle video, but
+            // the channel must exist — black-hole.
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_VIDEO, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_video")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
             network.start();
 
             let Some(server_peer) = sync_source else {
@@ -4285,6 +4299,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 let (_tx, mut rx) = network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
                 context
                     .child("blackhole_voice")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
+            // the video lane: a parked joiner serves no huddle video, but the
+            // channel must exist — black-hole.
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_VIDEO, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_video")
                     .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
             }
             // the lobby lane: where this parked node announces its key. member
@@ -5164,7 +5186,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         {
             let (mut voice_p2p_tx, mut voice_p2p_rx) =
                 network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
-            let (mut voice_egress, voice_ingress) = voice::spawn_hub(voice_requests);
+            // video's own per-peer quota: 512 × 1372 B ≈ 5.6 Mbps — the
+            // 1200 kbps ladder top (~112 fragments/s) plus keyframe bursts.
+            // its own lane so a keyframe burst can't queue ahead of voice.
+            let video_quota = Quota::per_second(NZU32!(512));
+            let (mut video_p2p_tx, mut video_p2p_rx) =
+                network.register(CHANNEL_VIDEO, video_quota, MAX_BACKLOG);
+            let (mut voice_egress, mut video_egress, media_ingress) =
+                voice::spawn_hub(voice_requests);
             context.child("voice_egress").spawn(move |_ctx| async move {
                 while let Some((to, frame)) = voice_egress.recv().await {
                     let Ok(key) = ed25519::PublicKey::decode(&to[..]) else {
@@ -5175,6 +5204,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let _ = voice_p2p_tx.send(Recipients::One(key), IoBuf::from(frame), false);
                 }
             });
+            let voice_ingress = media_ingress.clone();
             context.child("voice_ingress").spawn(move |_ctx| async move {
                 while let Ok((peer, bytes)) = voice_p2p_rx.recv().await {
                     let mut raw = [0u8; 32];
@@ -5182,6 +5212,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // a full hub lane sheds the frame (late audio is dead
                     // audio); the plane's per-flow accounting covers the rest.
                     let _ = voice_ingress.try_send((raw, bytes.into()));
+                }
+            });
+            context.child("video_egress").spawn(move |_ctx| async move {
+                while let Some((to, frame)) = video_egress.recv().await {
+                    let Ok(key) = ed25519::PublicKey::decode(&to[..]) else {
+                        continue;
+                    };
+                    // offline/rate-limited recipients drop the fragment — video
+                    // retries nothing, the next keyframe renders the gap.
+                    let _ = video_p2p_tx.send(Recipients::One(key), IoBuf::from(frame), false);
+                }
+            });
+            let video_ingress = media_ingress.clone();
+            context.child("video_ingress").spawn(move |_ctx| async move {
+                while let Ok((peer, bytes)) = video_p2p_rx.recv().await {
+                    let mut raw = [0u8; 32];
+                    raw.copy_from_slice(peer.as_ref());
+                    // a full hub lane sheds the fragment; the reassembler asks
+                    // the sender for a keyframe when a frame dies incomplete.
+                    let _ = video_ingress.try_send((raw, bytes.into()));
                 }
             });
         }
