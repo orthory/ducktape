@@ -35,6 +35,7 @@ import {
   sectionForScreen,
 } from "../modules/registry";
 import type { Action } from "./reducer";
+import { autoBindUserIdentity } from "./auto-bind";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
 import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
@@ -651,6 +652,17 @@ export function createActions({
           `still running on this port; quit it and try again.`,
       );
     };
+    // Adopt a node that just proved it's this workspace's own: clear the
+    // onboarding phase, hand it to the store, and — best-effort, desktop-only
+    // — offer this machine's user key to bind it (Task 8). Fire-and-forget:
+    // a failed bind is invisible here by design (auto-bind.ts never throws)
+    // and the provider's per-block refresh already re-reads the identity
+    // module, so a successful bind surfaces on its own on the next block.
+    const adopt = (transport: NodeTransport): void => {
+      patch({ onboardingPhase: null });
+      setNode(transport);
+      autoBindUserIdentity(transport, target).catch(() => {});
+    };
     return Promise.resolve()
       .then(() => ws.selectWorkspace(target.id))
       .then((sel) => {
@@ -664,8 +676,7 @@ export function createActions({
             return transport.status().then((s) => {
               if (stale()) return;
               if (!identityMatches(s.publicKey)) return rejectImpostor();
-              patch({ onboardingPhase: null });
-              setNode(transport);
+              adopt(transport);
             });
           });
         }
@@ -705,8 +716,7 @@ export function createActions({
                 .then((seated) => {
                   if (stale()) return;
                   if (!seated) return park();
-                  patch({ onboardingPhase: null });
-                  setNode(transport);
+                  adopt(transport);
                 });
             },
             () => park(),
