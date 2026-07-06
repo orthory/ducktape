@@ -3946,14 +3946,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // starts before the mesh exists; only the validator path below spawns the
     // hub that drains it — on every other path the receiver just drops and
     // the route answers with a refusal.
-    let (voice_lane, voice_requests) = tokio::sync::mpsc::channel::<noded::VoiceSessionRequest>(8);
+    let (voice_lane, voice_requests) = tokio::sync::mpsc::channel::<noded::CallSessionRequest>(8);
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
     let http_handle = http_handle
         .with_forge_repo(storage.join("forge-repo"))
         .with_index_store(index.clone())
-        .with_voice(voice_lane);
+        .with_call(voice_lane);
     let blobs = http_handle.blob_handle();
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)

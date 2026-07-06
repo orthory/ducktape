@@ -351,17 +351,72 @@ pub struct QueryRequest {
     pub query: serde_json::Value,
 }
 
-// ---- the voice lane ---------------------------------------------------------
+// ---- the call lane ----------------------------------------------------------
 // the webview end of a huddle: GET /v1/voice/ws?channel=<id> upgrades to a
 // binary pcm socket (one 20 ms mono 48 kHz frame per message, i16 LE — see
-// `chat::voice::FRAME_SAMPLES`). the handler asks the node's voice hub for a
+// `chat::voice::FRAME_SAMPLES`). the handler asks the node's call hub for a
 // session over the request lane below; a binary client frame is one captured
 // mic frame, a binary server frame is one mixed playout frame, and text frames
 // carry json control (`VoiceControl`). the hub side lives with the mesh (only
 // the p2p validator runs one); a daemon without a hub answers 503.
+//
+// a call session carries audio, camera video, and call control together: the
+// audio ends are the huddle's voice, the video ends fragment/reassemble
+// encoded camera frames over `Service::Video`, and the control ends carry
+// keyframe requests, presence beacons, and rate hints (see `chat::video`).
+// video/control are consumed by the WebRTC gateway (Task 6); the voice
+// websocket only wires the audio ends today.
 
-/// one live huddle session's channel ends, hub → websocket handler.
-pub struct VoiceSession {
+/// one captured, encoded camera frame handed webview → hub for fan-out. the
+/// hub fragments `data` across `Service::Video` datagrams; `frame_no` is the
+/// hub's own monotone counter, so only the frame's own fields ride here.
+pub struct CapturedVideo {
+    /// this frame is a decoder sync point (a full keyframe, not a delta).
+    pub keyframe: bool,
+    /// capture timestamp in ms (opaque to the hub; echoed to the far webview).
+    pub ts_ms: u32,
+    /// the encoded (VP8) frame bytes.
+    pub data: Vec<u8>,
+}
+
+/// one reassembled camera frame handed hub → webview, tagged with the mesh-
+/// authenticated sender so the webview routes it to the right tile.
+pub struct PeerVideo {
+    /// the sending peer's raw ed25519 node key.
+    pub peer: [u8; 32],
+    pub keyframe: bool,
+    pub ts_ms: u32,
+    /// the reassembled encoded (VP8) frame bytes.
+    pub data: Vec<u8>,
+}
+
+/// call-control the WEBVIEW asks the hub to act on (webview → hub).
+pub enum CallControlIn {
+    /// our local presence/state, pushed immediately AND repeated at 1 Hz as
+    /// this session's beacon to every recipient.
+    Beacon { muted: bool, camera_on: bool },
+    /// our decoder lost `peer`'s stream — ask `peer` for a fresh keyframe.
+    KeyframeRequest { peer: [u8; 32] },
+}
+
+/// call-control the hub surfaces to the WEBVIEW (hub → webview).
+pub enum CallControlOut {
+    /// a peer's receiver asked us to send it a fresh keyframe — the webview
+    /// tells its encoder to emit one (rate-limited to ≤1 Hz by the hub).
+    KeyframeRequest,
+    /// a peer's 1 Hz presence beacon — drives the tile's mute/camera badges.
+    PeerBeacon {
+        peer: [u8; 32],
+        muted: bool,
+        camera_on: bool,
+    },
+    /// the effective outbound bitrate cap (min of every peer's hint) — the
+    /// webview retargets its encoder. emitted only when the value changes.
+    RateHint { max_kbps: u32 },
+}
+
+/// one live huddle session's channel ends, hub ↔ websocket handler / gateway.
+pub struct CallSession {
     /// captured mic frames, exactly [`chat::voice::FRAME_SAMPLES`] samples each.
     pub pcm_in: tokio::sync::mpsc::Sender<Vec<i16>>,
     /// mixed playout frames at the 20 ms tick, same shape.
@@ -369,17 +424,25 @@ pub struct VoiceSession {
     /// where this session's frames fan out: the huddle roster's node keys
     /// (raw ed25519 bytes), steered by the client as consensus state changes.
     pub recipients: tokio::sync::watch::Sender<Vec<[u8; 32]>>,
+    /// captured camera frames webview → hub (fragmented onto `Service::Video`).
+    pub video_in: tokio::sync::mpsc::Sender<CapturedVideo>,
+    /// reassembled peer camera frames hub → webview.
+    pub video_out: tokio::sync::mpsc::Receiver<PeerVideo>,
+    /// call-control webview → hub (local beacon, keyframe asks).
+    pub control_in: tokio::sync::mpsc::Sender<CallControlIn>,
+    /// call-control hub → webview (peer beacons, keyframe kicks, rate hints).
+    pub control_out: tokio::sync::mpsc::Receiver<CallControlOut>,
 }
 
-/// a websocket handler's ask: open (or replace) the voice session for a
+/// a websocket handler's ask: open (or replace) the call session for a
 /// channel. the hub replies with the session's ends or a refusal string.
-pub struct VoiceSessionRequest {
+pub struct CallSessionRequest {
     pub channel_id: String,
-    pub reply: tokio::sync::oneshot::Sender<Result<VoiceSession, String>>,
+    pub reply: tokio::sync::oneshot::Sender<Result<CallSession, String>>,
 }
 
-/// the request lane into the voice hub.
-pub type VoiceLane = tokio::sync::mpsc::Sender<VoiceSessionRequest>;
+/// the request lane into the call hub.
+pub type CallLane = tokio::sync::mpsc::Sender<CallSessionRequest>;
 
 /// client → server control messages on the voice socket (text frames).
 #[derive(Debug, Deserialize)]
@@ -452,9 +515,9 @@ pub struct NodeHandle {
     /// whose embedder configured no index (the router tests' fake actor) —
     /// index routes answer 503 there.
     index: Option<Arc<indexer::IndexStore>>,
-    /// the voice hub's session-request lane. `None` on daemons without a mesh
+    /// the call hub's session-request lane. `None` on daemons without a mesh
     /// (the embedded daemon, router tests) — `/v1/voice/ws` answers 503 there.
-    voice: Option<VoiceLane>,
+    call: Option<CallLane>,
 }
 
 impl NodeHandle {
@@ -476,7 +539,7 @@ impl NodeHandle {
             blobs: files::BlobHandle::default(),
             forge_repo: None,
             index: None,
-            voice: None,
+            call: None,
         };
         (handle, cmd_rx, event_tx)
     }
@@ -498,11 +561,11 @@ impl NodeHandle {
         self
     }
 
-    /// point this handle at a voice hub's session-request lane so
-    /// `/v1/voice/ws` can open huddle audio sessions. only the p2p validator
-    /// wires one — it owns the mesh the audio rides.
-    pub fn with_voice(mut self, voice: VoiceLane) -> Self {
-        self.voice = Some(voice);
+    /// point this handle at a call hub's session-request lane so
+    /// `/v1/voice/ws` can open huddle sessions. only the p2p validator
+    /// wires one — it owns the mesh the audio/video rides.
+    pub fn with_call(mut self, call: CallLane) -> Self {
+        self.call = Some(call);
         self
     }
 
@@ -1765,7 +1828,7 @@ async fn voice_ws(
     Query(params): Query<VoiceParams>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let Some(voice) = handle.voice.clone() else {
+    let Some(voice) = handle.call.clone() else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "voice is not available on this node (no mesh voice hub)",
@@ -1782,9 +1845,9 @@ async fn voice_ws(
 /// frames flow back as binary, and text frames steer the fan-out set. either
 /// side closing ends the session — dropping the ends is the teardown signal
 /// the hub watches.
-async fn voice_session(mut socket: WebSocket, voice: VoiceLane, channel_id: String) {
+async fn voice_session(mut socket: WebSocket, voice: CallLane, channel_id: String) {
     let (reply, opened) = tokio::sync::oneshot::channel();
-    let request = VoiceSessionRequest {
+    let request = CallSessionRequest {
         channel_id,
         reply,
     };
@@ -1811,10 +1874,13 @@ async fn voice_session(mut socket: WebSocket, voice: VoiceLane, channel_id: Stri
             return;
         }
     };
-    let VoiceSession {
+    // Task 6 replaces this endpoint with the WebRTC gateway that also pumps
+    // the video/control ends; today's audio-only voice socket ignores them.
+    let CallSession {
         pcm_in,
         mut mixed_out,
         recipients,
+        ..
     } = session;
     loop {
         tokio::select! {
