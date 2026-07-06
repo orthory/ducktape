@@ -1389,3 +1389,239 @@ fn two_instances_replaying_the_same_ops_produce_identical_roots() {
         assert_ne!(left.root(), StateRoot::ZERO);
     });
 }
+
+#[test]
+fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        module
+            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        let join = |node_byte: u8| ChatMsg::JoinHuddle {
+            channel_id: "general".into(),
+            node: vec![node_byte; 32],
+        };
+        module
+            .execute(&mut TestCtx::with_origin(20, user(1)), &module_msg(join(0xa1)))
+            .await
+            .unwrap();
+        module
+            .execute(&mut TestCtx::with_origin(21, user(2)), &module_msg(join(0xa2)))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.huddle.len(), 2);
+        assert_eq!(channel.huddle[0].user, vec![1u8; 32]);
+        assert_eq!(channel.huddle[0].node, vec![0xa1; 32]);
+        assert_eq!(channel.huddle[0].joined_at, 20);
+        assert_eq!(channel.huddle[1].user, vec![2u8; 32]);
+        assert_eq!(channel.huddle[1].joined_at, 21);
+
+        // re-join with the same node key is idempotent: root unchanged.
+        let settled = module.root();
+        module
+            .execute(&mut TestCtx::with_origin(30, user(1)), &module_msg(join(0xa1)))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        assert_eq!(module.root(), settled, "duplicate join must stage nothing");
+
+        // re-join with a NEW node key re-routes without duplicating the entry
+        // or resetting join order.
+        module
+            .execute(&mut TestCtx::with_origin(31, user(1)), &module_msg(join(0xb1)))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.huddle.len(), 2);
+        assert_eq!(channel.huddle[0].user, vec![1u8; 32]);
+        assert_eq!(channel.huddle[0].node, vec![0xb1; 32]);
+        assert_eq!(channel.huddle[0].joined_at, 20, "rejoin keeps join order");
+
+        // leave removes exactly the leaver; the last leave empties the roster.
+        module
+            .execute(
+                &mut TestCtx::with_origin(40, user(1)),
+                &module_msg(ChatMsg::LeaveHuddle {
+                    channel_id: "general".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.huddle.len(), 1);
+        assert_eq!(channel.huddle[0].user, vec![2u8; 32]);
+
+        // leaving while not in the huddle is a deterministic no-op.
+        let settled = module.root();
+        module
+            .execute(
+                &mut TestCtx::with_origin(41, user(3)),
+                &module_msg(ChatMsg::LeaveHuddle {
+                    channel_id: "general".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        assert_eq!(module.root(), settled, "absent leave must stage nothing");
+    });
+}
+
+#[test]
+fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        module
+            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // module and system origins are not people — rejected.
+        for origin in [Origin::Module("agent".into()), Origin::System] {
+            let err = module
+                .execute(
+                    &mut TestCtx::with_origin(20, origin),
+                    &module_msg(ChatMsg::JoinHuddle {
+                        channel_id: "general".into(),
+                        node: vec![0xaa; 32],
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{err:?}").contains("external users"));
+        }
+
+        // a node key that is not raw ed25519 bytes is rejected.
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(20, user(1)),
+                &module_msg(ChatMsg::JoinHuddle {
+                    channel_id: "general".into(),
+                    node: vec![0xaa; 31],
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("32 bytes"));
+
+        // the roster cap rejects the 33rd participant.
+        for i in 0..chat::MAX_HUDDLE_MEMBERS {
+            module
+                .execute(
+                    &mut TestCtx::with_origin(20, user(i as u8)),
+                    &module_msg(ChatMsg::JoinHuddle {
+                        channel_id: "general".into(),
+                        node: vec![i as u8; 32],
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(20, user(200)),
+                &module_msg(ChatMsg::JoinHuddle {
+                    channel_id: "general".into(),
+                    node: vec![0xcc; 32],
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("full"));
+        module.abort_block().await.unwrap();
+    });
+}
+
+#[test]
+fn huddle_join_gates_on_members_only_policy_like_posting() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+        module
+            .execute(
+                &mut TestCtx::at(10),
+                &module_msg(ChatMsg::CreateChannel {
+                    channel_id: "core".into(),
+                    name: "CORE".into(),
+                    post_policy: PostPolicy::MembersOnly,
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut TestCtx::at(10),
+                &module_msg(ChatMsg::SetMembership {
+                    channel_id: "core".into(),
+                    user: vec![1u8; 32],
+                    member: true,
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        let join = ChatMsg::JoinHuddle {
+            channel_id: "core".into(),
+            node: vec![0xaa; 32],
+        };
+        // a non-member is turned away exactly like a non-member post.
+        let err = module
+            .execute(&mut TestCtx::with_origin(20, user(2)), &module_msg(join.clone()))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("members-only"));
+        // the member joins fine.
+        module
+            .execute(&mut TestCtx::with_origin(20, user(1)), &module_msg(join))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "core".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.huddle.len(), 1);
+    });
+}
