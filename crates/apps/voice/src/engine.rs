@@ -9,6 +9,7 @@
 //! a saturating sum of whatever each lane's jitter buffer decided.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -211,21 +212,20 @@ async fn pump<T: DataPlaneTransport>(
             continue;
         };
         let mut lanes = lanes.lock().expect("lanes lock");
-        if !lanes.contains_key(&peer) {
-            let Ok(decoder) = VoiceDecoder::new() else {
-                malformed.fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            lanes.insert(
-                peer,
-                Lane {
+        let lane = match lanes.entry(peer) {
+            Entry::Occupied(existing) => existing.into_mut(),
+            Entry::Vacant(vacant) => {
+                let Ok(decoder) = VoiceDecoder::new() else {
+                    malformed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                vacant.insert(Lane {
                     jitter: jitter_factory(),
                     decoder,
                     decode_errors: 0,
-                },
-            );
-        }
-        let lane = lanes.get_mut(&peer).expect("lane just ensured");
+                })
+            }
+        };
         lane.jitter.insert(header.seq, payload.to_vec());
     }
 }
