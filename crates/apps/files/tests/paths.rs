@@ -102,3 +102,25 @@ fn canonical_and_authority_table() {
     assert!(check_authority("system", &seg("/etc/passwd")).is_ok());
     assert!(check_authority("system", &seg("/")).is_ok());
 }
+
+/// hygiene: every rejection out of the pure path layer carries the uniform
+/// `files: ` module prefix — these strings surface verbatim through commit
+/// rejections, so they must read like every other files error.
+#[test]
+fn path_errors_carry_the_files_prefix() {
+    let seg = |p: &str| canonical(p).unwrap();
+    for err in [
+        canonical("shared/x").unwrap_err(),
+        canonical("/shared//x").unwrap_err(),
+        canonical("/shared/cafe\u{0301}").unwrap_err(),
+        canonical("/shared/a\0b").unwrap_err(),
+        canonical(&format!("/shared/{}", "x".repeat(256))).unwrap_err(),
+        canonical(&format!("/shared{}", "/d".repeat(128))).unwrap_err(),
+        check_authority("ext:bb", &seg("/home/ext:aa/x")).unwrap_err(),
+        check_authority("ext:aa", &seg("/home")).unwrap_err(),
+        check_authority("ext:aa", &seg("/shared")).unwrap_err(),
+        check_authority("ext:aa", &seg("/etc/passwd")).unwrap_err(),
+    ] {
+        assert!(err.starts_with("files: "), "unprefixed path error: {err}");
+    }
+}

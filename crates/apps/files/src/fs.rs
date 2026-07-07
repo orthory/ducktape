@@ -278,10 +278,10 @@ impl<S: ObjectStore> Fs<S> {
         // whole block in production, so this never leaves the sweep half-applied;
         // the direct-execute tests likewise keep earlier same-block stages.)
         if bytes.is_empty() {
-            return Err("chunk must not be empty".into());
+            return Err("files: chunk must not be empty".into());
         }
         if bytes.len() as u64 > CHUNK_SIZE {
-            return Err("chunk exceeds CHUNK_SIZE".into());
+            return Err("files: chunk exceeds CHUNK_SIZE".into());
         }
 
         let digest = object_id(Kind::Chunk, bytes);
@@ -328,7 +328,7 @@ impl<S: ObjectStore> Fs<S> {
             return Err("files: staging entry quota exceeded".into());
         }
         if used.saturating_add(len) > quota {
-            return Err("staging quota exceeded".into());
+            return Err("files: staging quota exceeded".into());
         }
 
         // stage: the entry makes the chunk gc-reachable (task 13 marks staging
@@ -731,7 +731,7 @@ impl<S: ObjectStore> Fs<S> {
         if kind == Kind::File {
             let file = FileObj::decode(body)?;
             verify_file_shape(file.size, file.chunks.len())
-                .map_err(|_| "ingest: file object size/chunk shape invalid".to_string())?;
+                .map_err(|_| "files: ingest file object size/chunk shape invalid".to_string())?;
         }
         self.store.put(kind, body)?;
         Ok(())
