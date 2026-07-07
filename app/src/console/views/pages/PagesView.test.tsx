@@ -413,3 +413,34 @@ describe("floating comment card", () => {
     expect(screen.queryByRole("button", { name: /copy link to block/i })).toBeNull();
   });
 });
+
+describe("endless canvas", () => {
+  const appended = expect.objectContaining({
+    parent: "p1",
+    after: "b",
+    kind: "paragraph",
+    text: "",
+  });
+
+  it("appends a block on mousedown of Add a block — before blur can commit", () => {
+    const { spies } = renderPagesView();
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Add a block" }));
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(appended);
+  });
+
+  it("appends a block when the canvas below the content is pressed", () => {
+    const { spies } = renderPagesView();
+    fireEvent.mouseDown(screen.getByTestId("page-canvas-filler"));
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(appended);
+  });
+
+  it("has no canvas filler without an open page", () => {
+    renderPagesView({ activePage: null, activePageBlocks: [], openTabs: [] });
+    expect(screen.queryByTestId("page-canvas-filler")).toBeNull();
+  });
+
+  it("drops the bordered page card — the scroll surface itself is paper", () => {
+    renderPagesView();
+    expect(screen.getByTestId("doc-scroll")).toHaveStyle({ background: "#ffffff" });
+  });
+});

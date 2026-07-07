@@ -12,7 +12,7 @@ import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Icon } from "../../components/Icon";
 import { opKey } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius } from "../../theme/tokens";
 import {
   EDIT_BOUNDARY_MS,
   buildRows,
@@ -378,12 +378,14 @@ export function PagesView() {
             </header>
 
             <div
+              data-testid="doc-scroll"
               style={{
                 flex: 1,
                 minHeight: 0,
+                display: "flex",
+                flexDirection: "column",
                 overflowY: "auto",
-                background: color.sidebar,
-                padding: root ? "22px 26px" : 0,
+                background: color.paper,
               }}
             >
               {!root ? (
@@ -424,17 +426,15 @@ export function PagesView() {
                   </div>
                 </div>
               ) : (
+                // the Notion-style endless canvas: a plain centered column on
+                // the paper, no card chrome, and a click-to-append filler
+                // below so the page has no visible bottom end.
                 <div
                   style={{
+                    width: "100%",
                     maxWidth: 820,
                     margin: "0 auto",
-                    minHeight: "100%",
-                    border: `1px solid ${color.border}`,
-                    borderRadius: radius.lg,
-                    background: color.paper,
-                    boxShadow: shadow.card,
-                    overflow: "visible",
-                    padding: "36px 44px 44px",
+                    padding: "36px 44px 0",
                     boxSizing: "border-box",
                   }}
                 >
@@ -487,7 +487,13 @@ export function PagesView() {
                   <button
                     type="button"
                     aria-label="Add a block"
-                    onClick={appendBlock}
+                    // mousedown, not click: pressing while a block is focused
+                    // must append BEFORE the blur commit re-renders the tree
+                    // out from under the click (same dodge as the SlashMenu).
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      appendBlock();
+                    }}
                     style={{
                       all: "unset",
                       cursor: "text",
@@ -496,7 +502,7 @@ export function PagesView() {
                       gap: 8,
                       width: "100%",
                       boxSizing: "border-box",
-                      padding: "8px 0 24px 28px",
+                      padding: "8px 0 8px 28px",
                       color: color.muted2,
                       font: `400 13px ${font.sans}`,
                     }}
@@ -506,6 +512,17 @@ export function PagesView() {
                   </button>
                 </div>
               )}
+              {root ? (
+                <div
+                  data-testid="page-canvas-filler"
+                  aria-hidden="true"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    appendBlock();
+                  }}
+                  style={{ flex: 1, minHeight: "40vh", cursor: "text" }}
+                />
+              ) : null}
             </div>
           </div>
 
