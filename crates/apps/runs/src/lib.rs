@@ -1731,7 +1731,21 @@ impl RunsModule {
                 "agent_id": entry.agent_id,
             }))
             .expect("run context serializes");
+            // `action_id` is the correlation key breadcrumbs and the owner's
+            // Apply follow-up are keyed on — a response that reuses one id
+            // twice makes that correlation ambiguous even though each action
+            // is otherwise independently gated. dedupe up front: first
+            // occurrence wins, every later duplicate drops before it ever
+            // reaches tag/grant/route/probe.
+            let mut seen_action_ids = BTreeSet::new();
             for action in std::mem::take(&mut response.actions) {
+                if !seen_action_ids.insert(action.action_id.clone()) {
+                    dropped.push(format!(
+                        "action {} dropped: duplicate action_id, first occurrence kept",
+                        action.action_id
+                    ));
+                    continue;
+                }
                 if let Err(e) = validate_tag(&action.tag) {
                     dropped.push(format!("action {} dropped: {e}", action.action_id));
                     continue;
@@ -2398,6 +2412,27 @@ mod tests {
                 memory::Generation {
                     generation,
                     body: Body::Inline(text.into()),
+                    meta: BTreeMap::new(),
+                    author: "ext:09".into(),
+                    published_at_height: 1,
+                },
+            );
+            self
+        }
+        /// a canned memory file whose body is a files-manifest REFERENCE,
+        /// never inline — the only way to exercise `resolve_prompt`'s
+        /// non-`Body::Inline` failure branch (a registered prompt is
+        /// required to resolve to inline content).
+        fn with_memory_file_ref(mut self, path: &str, generation: u64) -> Self {
+            self.memory_files.insert(
+                path.into(),
+                memory::Generation {
+                    generation,
+                    body: Body::File {
+                        file_id: "f1".into(),
+                        digest: "0".repeat(64),
+                        size: 4,
+                    },
                     meta: BTreeMap::new(),
                     author: "ext:09".into(),
                     published_at_height: 1,
@@ -3350,6 +3385,50 @@ mod tests {
     }
 
     #[test]
+    fn a_non_inline_prompt_source_skips_the_run_never_the_block() {
+        // `resolve_prompt` requires the resolved generation's body to be
+        // `Body::Inline` (the ADR rule: only content it can hash and compare
+        // to the registered pin may ever reach a model). a `Body::File`
+        // generation — a large body pinned by reference to the files
+        // manifest — must hit that branch, not the pin-mismatch one.
+        let mut registry = registry(&[("bot1", &[ACTION_CHAT_POST])]);
+        pin_prompt(
+            &mut registry,
+            "bot1",
+            "/agents/prompts/bot1",
+            2,
+            pin("irrelevant — the body never reaches the hash check"),
+        );
+        let mut m = watched(TurnPolicy::Mention, &registry);
+
+        let mut ctx = CaptureCtx::new()
+            .at(3)
+            .from_tagging()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(3))
+            .with_memory_file_ref("/agents/prompts/bot1", 2);
+        exec(
+            &mut m,
+            &mut ctx,
+            &engagement("general", 3, vec![agent_tag("bot1")]),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert!(
+            ctx.dispatch_msgs().is_empty(),
+            "no dispatch on a non-inline source"
+        );
+        assert_eq!(get_pending(&m, &run_id_for("general", 3, "bot1")), None);
+        let crumbs = breadcrumbs(&ctx);
+        assert!(
+            crumbs
+                .iter()
+                .any(|b| b.contains("prompt source is not inline")),
+            "the failed run leaves a breadcrumb naming the non-inline branch: {crumbs:?}"
+        );
+    }
+
+    #[test]
     fn a_job_run_prepends_the_registered_prompt_and_skips_on_a_bad_pin() {
         let text = "You are DUCK, the job worker.";
         let mut registry = registry(&[("duck", &[ACTION_TASKS_CREATE])]);
@@ -4032,11 +4111,54 @@ mod tests {
 
     #[test]
     fn in_batch_conflicts_ride_to_the_owner_as_its_late_conflict_case() {
-        // two creates of ONE id in the same response: each probe sees only
+        // two creates of ONE TASK id in the same response (distinct
+        // action_ids — this pins the tasks-level conflict, not the
+        // action_id-dedup case covered separately): each probe sees only
         // staged-or-committed state (not its sibling), so both are accepted
         // and both Apply follow-ups are emitted — the owner's no-fail Apply
         // arm breadcrumbs the second (asserted in the tasks crate's suite).
         let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .from_dispatch()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        let actions = vec![
+            RequestedAction {
+                action_id: "a-fresh-1".into(),
+                tag: ACTION_TASKS_CREATE.into(),
+                payload: json!({"task_id": "fresh", "title": "one"}),
+            },
+            RequestedAction {
+                action_id: "a-fresh-2".into(),
+                tag: ACTION_TASKS_CREATE.into(),
+                payload: json!({"task_id": "fresh", "title": "two"}),
+            },
+        ];
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(response(&["ok"], actions))),
+        )
+        .unwrap();
+        assert_eq!(ctx.apply_msgs("tasks").len(), 2);
+        commit(&mut m);
+        assert_eq!(get_pending(&m, &run_id), None);
+    }
+
+    #[test]
+    fn a_sibling_create_then_update_of_the_same_id_drops_the_update() {
+        // pinning the documented sibling-invisibility semantics (design D6):
+        // an owner's probe sees staged-or-committed state only, NEVER its
+        // sibling actions from this same response. [create t1, update t1] —
+        // t1 does not exist yet when update's probe runs (create is only a
+        // queued Apply follow-up, not yet committed), so the create lands
+        // and the update drops with its own breadcrumb.
+        let (mut m, registry, run_id) = awaiting_run(&[
+            ACTION_CHAT_POST,
+            ACTION_TASKS_CREATE,
+            ACTION_TASKS_UPDATE_STATUS,
+        ]);
         let mut ctx = CaptureCtx::new()
             .at(8)
             .from_dispatch()
@@ -4048,15 +4170,107 @@ mod tests {
             &result_event(
                 &run_id,
                 Ok(response(
-                    &["ok"],
-                    vec![create_action("fresh", "one"), create_action("fresh", "two")],
+                    &["on it"],
+                    vec![
+                        create_action("t1", "ship it"),
+                        update_action("t1", "in_progress"),
+                    ],
                 )),
             ),
         )
         .unwrap();
-        assert_eq!(ctx.apply_msgs("tasks").len(), 2);
+        assert_eq!(ctx.chat_msgs().len(), 1, "the granted reply still posts");
+        assert_eq!(
+            ctx.apply_msgs("tasks"),
+            vec![PackageActionMsg::Apply {
+                action_id: "a-t1".into(),
+                tag: ACTION_TASKS_CREATE.into(),
+                payload: serde_json::to_vec(&json!({"task_id": "t1", "title": "ship it"}))
+                    .expect("payload"),
+                run_context: serde_json::to_vec(&json!({"run_id": run_id, "agent_id": "bot"}))
+                    .expect("run context"),
+            }],
+            "only the create rides to the owner; the sibling update never does"
+        );
+        let crumbs = breadcrumbs(&ctx);
+        assert!(
+            crumbs
+                .iter()
+                .any(|b| b.contains("action u-t1 dropped") && b.contains("unknown task: t1")),
+            "the update drops because its sibling create is not yet committed: {crumbs:?}"
+        );
+        assert!(
+            crumbs.iter().any(|b| b.contains("dropped 1/2")),
+            "the drop count rides a summary crumb: {crumbs:?}"
+        );
         commit(&mut m);
-        assert_eq!(get_pending(&m, &run_id), None);
+        assert_eq!(get_pending(&m, &run_id), None, "the delivered entry pruned");
+    }
+
+    #[test]
+    fn duplicate_action_ids_in_one_response_dedupe_first_occurrence_wins() {
+        // each duplicate `action_id` is independently gated (no security
+        // hole), but breadcrumbs/correlation keyed on `action_id` become
+        // ambiguous once two actions in the same response share one. the
+        // first occurrence wins; every later duplicate drops with its own
+        // breadcrumb, whether or not it would otherwise have been accepted.
+        let (mut m, registry, run_id) = awaiting_run(&[
+            ACTION_CHAT_POST,
+            ACTION_TASKS_CREATE,
+            ACTION_TASKS_UPDATE_STATUS,
+        ]);
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .from_dispatch()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        let actions = vec![
+            RequestedAction {
+                action_id: "dup-1".into(),
+                tag: ACTION_TASKS_CREATE.into(),
+                payload: json!({"task_id": "t1", "title": "first"}),
+            },
+            // a second, unrelated action reusing the SAME action_id — even
+            // though it targets a different task and would itself have been
+            // accepted, the id collision drops it.
+            RequestedAction {
+                action_id: "dup-1".into(),
+                tag: ACTION_TASKS_CREATE.into(),
+                payload: json!({"task_id": "t2", "title": "second"}),
+            },
+        ];
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(response(&["ok"], actions))),
+        )
+        .unwrap();
+        assert_eq!(ctx.chat_msgs().len(), 1, "the granted reply still posts");
+        assert_eq!(
+            ctx.apply_msgs("tasks"),
+            vec![PackageActionMsg::Apply {
+                action_id: "dup-1".into(),
+                tag: ACTION_TASKS_CREATE.into(),
+                payload: serde_json::to_vec(&json!({"task_id": "t1", "title": "first"}))
+                    .expect("payload"),
+                run_context: serde_json::to_vec(&json!({"run_id": run_id, "agent_id": "bot"}))
+                    .expect("run context"),
+            }],
+            "only the FIRST dup-1 occurrence rides to the owner"
+        );
+        let crumbs = breadcrumbs(&ctx);
+        assert!(
+            crumbs
+                .iter()
+                .any(|b| b.contains("action dup-1 dropped") && b.contains("duplicate action_id")),
+            "the later duplicate drops with its own breadcrumb: {crumbs:?}"
+        );
+        assert!(
+            crumbs.iter().any(|b| b.contains("dropped 1/2")),
+            "the drop count rides a summary crumb: {crumbs:?}"
+        );
+        commit(&mut m);
+        assert_eq!(get_pending(&m, &run_id), None, "the delivered entry pruned");
     }
 
     #[test]

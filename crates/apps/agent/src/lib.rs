@@ -413,10 +413,17 @@ impl AgentModule {
             )));
         }
         if prompt.renderer == RENDERER_MEMORY_GENERATION {
-            let parsed = prompt
-                .target
-                .rsplit_once('@')
-                .filter(|(path, generation)| !path.is_empty() && generation.parse::<u64>().is_ok());
+            // `u64::from_str` accepts non-canonical encodings like `"+3"` or
+            // `"007"` — distinct committed strings that would resolve to the
+            // SAME generation number at compose time. require the parsed
+            // value to round-trip byte-for-byte back to the input so every
+            // generation has exactly one committed spelling.
+            let parsed = prompt.target.rsplit_once('@').filter(|(path, generation)| {
+                !path.is_empty()
+                    && generation
+                        .parse::<u64>()
+                        .is_ok_and(|n| n.to_string() == *generation)
+            });
             if parsed.is_none() {
                 return Err(Error::Module(format!(
                     "prompt target must be \"<path>@<generation>\": {}",
@@ -1233,6 +1240,73 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Module(reason) if reason.contains("prompt source module")));
         abort(&mut m);
+    }
+
+    #[test]
+    fn register_rejects_non_canonical_generation_strings() {
+        // `"+3"` and `"007"` both parse via `u64::from_str`, but they are
+        // non-canonical encodings of the SAME generation number as `"3"` /
+        // `"7"` — two distinct committed strings that would resolve
+        // identically at compose time. reject anything whose parsed value
+        // doesn't round-trip byte-for-byte back to the input.
+        let mut m = module();
+        let root0 = m.root();
+        for target in ["/agents/prompts/bot@+3", "/agents/prompts/bot@007"] {
+            let mut ctx = CaptureCtx::new().from_origin(user(9));
+            let err = exec(
+                &mut m,
+                &mut ctx,
+                &admin(&register_with_prompt(
+                    "a",
+                    PromptRef {
+                        target: target.into(),
+                        ..prompt_ref()
+                    },
+                )),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, Error::Module(reason) if reason.contains("<path>@<generation>")),
+                "{target}: {err:?}"
+            );
+            abort(&mut m);
+            assert_eq!(
+                m.root(),
+                root0,
+                "a rejected register leaves no trace: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn register_accepts_canonical_generation_strings_including_the_zero_boundary() {
+        // "0" is the one string whose own leading zero IS canonical — it
+        // must round-trip and be accepted, alongside an ordinary canonical
+        // value.
+        let mut m = module();
+        for (agent_id, target) in [
+            ("a-zero", "/agents/prompts/bot@0"),
+            ("a-three", "/agents/prompts/bot@3"),
+        ] {
+            let mut ctx = CaptureCtx::new().from_origin(user(9));
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&register_with_prompt(
+                    agent_id,
+                    PromptRef {
+                        target: target.into(),
+                        ..prompt_ref()
+                    },
+                )),
+            )
+            .unwrap();
+            commit(&mut m);
+            assert_eq!(
+                get_agent(&m, agent_id).unwrap().prompt.unwrap().target,
+                target
+            );
+        }
     }
 
     #[test]

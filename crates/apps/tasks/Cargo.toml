@@ -18,4 +18,3 @@ futures = "0.3"
 host = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
-serde_json = { workspace = true }
