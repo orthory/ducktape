@@ -65,9 +65,10 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const PARAMS_LEN: usize = 12; // m_kib, t, p as LE u32
 const SEED_LEN: usize = 32;
+const PUBKEY_LEN: usize = 32;
 const TAG_LEN: usize = 16;
 const CIPHERTEXT_LEN: usize = SEED_LEN + TAG_LEN;
-const BLOB_LEN: usize = SALT_LEN + PARAMS_LEN + NONCE_LEN + SEED_LEN + CIPHERTEXT_LEN;
+const BLOB_LEN: usize = SALT_LEN + PARAMS_LEN + NONCE_LEN + PUBKEY_LEN + CIPHERTEXT_LEN;
 
 /// argon2id defaults for freshly-sealed files; encoded explicitly per-file
 /// (not hardcoded at open time) so a future default bump doesn't strand
@@ -75,6 +76,19 @@ const BLOB_LEN: usize = SALT_LEN + PARAMS_LEN + NONCE_LEN + SEED_LEN + CIPHERTEX
 const DEFAULT_M_KIB: u32 = 65536;
 const DEFAULT_T_COST: u32 = 3;
 const DEFAULT_P_COST: u32 = 1;
+
+/// sanity bounds on the params a file may DECLARE. argon2 0.5's
+/// `Params::new` only enforces minimums, so without these a
+/// corrupted/tampered params field could request terabytes of memory or
+/// billions of passes BEFORE the AEAD check — a DoS instead of the promised
+/// clean error. wide enough for any plausible future default bump (up to
+/// 1 GiB / 64 passes / 8 lanes), narrow enough that the worst accepted
+/// derivation stays interactive-scale. checked at parse time (the file's
+/// declared params) AND at seal time (so a future `DEFAULT_*` bump beyond
+/// them fails loudly in tests instead of minting unopenable files).
+const M_KIB_RANGE: std::ops::RangeInclusive<u32> = 8_192..=1_048_576;
+const T_COST_RANGE: std::ops::RangeInclusive<u32> = 1..=64;
+const P_COST_RANGE: std::ops::RangeInclusive<u32> = 1..=8;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -104,6 +118,28 @@ pub struct EncryptedUserKey {
 // ============================================================================
 // crypto primitives
 // ============================================================================
+
+/// reject argon2 params outside [`M_KIB_RANGE`]/[`T_COST_RANGE`]/
+/// [`P_COST_RANGE`] — see those constants for why this must happen before
+/// any derivation is attempted.
+fn check_params(m_kib: u32, t_cost: u32, p_cost: u32) -> Result<(), String> {
+    if !M_KIB_RANGE.contains(&m_kib)
+        || !T_COST_RANGE.contains(&t_cost)
+        || !P_COST_RANGE.contains(&p_cost)
+    {
+        return Err(format!(
+            "argon2 params out of range: m={m_kib} KiB, t={t_cost}, p={p_cost} \
+             (accepted: m in {}..={}, t in {}..={}, p in {}..={})",
+            M_KIB_RANGE.start(),
+            M_KIB_RANGE.end(),
+            T_COST_RANGE.start(),
+            T_COST_RANGE.end(),
+            P_COST_RANGE.start(),
+            P_COST_RANGE.end(),
+        ));
+    }
+    Ok(())
+}
 
 /// argon2id(password, salt) -> a 32-byte KEK, zeroized on drop.
 fn derive_kek(
@@ -148,11 +184,15 @@ fn parse_v2(line: &str) -> Result<EncryptedUserKey, String> {
     off += 4;
     let p_cost = u32::from_le_bytes(blob[off..off + 4].try_into().expect("4 bytes"));
     off += 4;
+    // bound the DECLARED params before anything downstream can act on them
+    // (a parse failure, same class as a malformed length — never a
+    // derivation attempt).
+    check_params(m_kib, t_cost, p_cost)?;
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(&blob[off..off + NONCE_LEN]);
     off += NONCE_LEN;
-    let pubkey = blob[off..off + SEED_LEN].to_vec();
-    off += SEED_LEN;
+    let pubkey = blob[off..off + PUBKEY_LEN].to_vec();
+    off += PUBKEY_LEN;
     let ciphertext = blob[off..off + CIPHERTEXT_LEN].to_vec();
 
     Ok(EncryptedUserKey {
@@ -170,51 +210,70 @@ fn parse_v2(line: &str) -> Result<EncryptedUserKey, String> {
 /// declared version prefix) as associated data. split out from
 /// [`open_user_key`] so the AAD-binding property (a blob sealed under one
 /// prefix must not open under another) is directly testable.
-fn decrypt_seed(enc: &EncryptedUserKey, password: &str, aad: &[u8]) -> Result<[u8; 32], String> {
+///
+/// zeroization boundary: every buffer THIS module holds the seed in (the
+/// AEAD's plaintext `Vec` and the returned array) is `Zeroizing` — scrubbed
+/// on drop. once the caller feeds the bytes into
+/// `ed25519::PrivateKey::decode`, the copy inside commonware's type is
+/// theirs; its internal hygiene is out of our hands.
+fn decrypt_seed(
+    enc: &EncryptedUserKey,
+    password: &str,
+    aad: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, String> {
     let kek = derive_kek(password, &enc.salt, enc.m_kib, enc.t_cost, enc.p_cost)?;
     let cipher = XChaCha20Poly1305::new_from_slice(kek.as_slice())
         .map_err(|e| format!("bad KEK length: {e}"))?;
     let nonce = XNonce::from_slice(&enc.nonce);
-    let plaintext = cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: &enc.ciphertext,
-                aad,
-            },
-        )
-        .map_err(|_| WRONG_PASSWORD_ERR.to_string())?;
-    plaintext
-        .try_into()
-        .map_err(|_| WRONG_PASSWORD_ERR.to_string())
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &enc.ciphertext,
+                    aad,
+                },
+            )
+            .map_err(|_| WRONG_PASSWORD_ERR.to_string())?,
+    );
+    if plaintext.len() != SEED_LEN {
+        return Err(WRONG_PASSWORD_ERR.to_string());
+    }
+    let mut seed = Zeroizing::new([0u8; SEED_LEN]);
+    seed.copy_from_slice(&plaintext);
+    Ok(seed)
 }
 
 // ============================================================================
 // public API
 // ============================================================================
 
-/// encrypt `seed` under `password` (argon2id defaults + fresh random
-/// salt/nonce) and return the full v2 line, ready to write to disk.
-pub fn seal_user_key(seed: &[u8; 32], password: &str) -> Result<String, String> {
+/// the deterministic sealing core: encrypt `seed` under `password` with an
+/// EXPLICIT salt/nonce/params. [`seal_user_key`] is the production entry
+/// (random salt/nonce, `DEFAULT_*` params); this core exists so tests can
+/// pin the exact wire bytes (golden vector, field offsets) independently of
+/// the encoder's RNG.
+fn seal_with(
+    seed: &[u8; 32],
+    password: &str,
+    salt: &[u8; SALT_LEN],
+    nonce_bytes: &[u8; NONCE_LEN],
+    m_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> Result<String, String> {
+    // the same bounds parse_v2 enforces — sealing outside them would mint a
+    // file that can never be opened (a future DEFAULT_* bump beyond the
+    // ranges fails loudly here, in tests, instead of in the field).
+    check_params(m_kib, t_cost, p_cost)?;
     let signer = ed25519::PrivateKey::decode(seed.as_slice())
         .map_err(|e| format!("seed is not a valid ed25519 secret: {e}"))?;
     let pubkey = signer.public_key().as_ref().to_vec();
 
-    let mut salt = [0u8; SALT_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-
-    let kek = derive_kek(
-        password,
-        &salt,
-        DEFAULT_M_KIB,
-        DEFAULT_T_COST,
-        DEFAULT_P_COST,
-    )?;
+    let kek = derive_kek(password, salt, m_kib, t_cost, p_cost)?;
     let cipher = XChaCha20Poly1305::new_from_slice(kek.as_slice())
         .map_err(|e| format!("bad KEK length: {e}"))?;
-    let nonce = XNonce::from_slice(&nonce_bytes);
+    let nonce = XNonce::from_slice(nonce_bytes);
     let ciphertext = cipher
         .encrypt(
             nonce,
@@ -226,11 +285,11 @@ pub fn seal_user_key(seed: &[u8; 32], password: &str) -> Result<String, String> 
         .map_err(|e| format!("encryption failed: {e}"))?;
 
     let mut blob = Vec::with_capacity(BLOB_LEN);
-    blob.extend_from_slice(&salt);
-    blob.extend_from_slice(&DEFAULT_M_KIB.to_le_bytes());
-    blob.extend_from_slice(&DEFAULT_T_COST.to_le_bytes());
-    blob.extend_from_slice(&DEFAULT_P_COST.to_le_bytes());
-    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(salt);
+    blob.extend_from_slice(&m_kib.to_le_bytes());
+    blob.extend_from_slice(&t_cost.to_le_bytes());
+    blob.extend_from_slice(&p_cost.to_le_bytes());
+    blob.extend_from_slice(nonce_bytes);
     blob.extend_from_slice(&pubkey);
     blob.extend_from_slice(&ciphertext);
     debug_assert_eq!(blob.len(), BLOB_LEN);
@@ -238,15 +297,40 @@ pub fn seal_user_key(seed: &[u8; 32], password: &str) -> Result<String, String> 
     Ok(format!("{USER_KEY_V2_PREFIX}{}", B64.encode(blob)))
 }
 
+/// encrypt `seed` under `password` (argon2id defaults + fresh random
+/// salt/nonce) and return the full v2 line, ready to write to disk.
+pub fn seal_user_key(seed: &[u8; 32], password: &str) -> Result<String, String> {
+    let mut salt = [0u8; SALT_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    seal_with(
+        seed,
+        password,
+        &salt,
+        &nonce_bytes,
+        DEFAULT_M_KIB,
+        DEFAULT_T_COST,
+        DEFAULT_P_COST,
+    )
+}
+
 /// decrypt a v2 line under `password`, returning the seed as a ready-to-use
 /// signer. any AEAD failure (wrong password OR a tampered/corrupted file —
 /// the two are indistinguishable) returns the exact string
-/// `"corrupt or wrong password"`.
+/// `"corrupt or wrong password"`, as does a clear-pubkey field that doesn't
+/// match the decrypted seed (the pubkey rides OUTSIDE the AEAD — only the
+/// prefix is AAD — so a swapped pubkey wouldn't otherwise be caught, and a
+/// caller trusting the parsed `EncryptedUserKey::pubkey` could be lied to).
 pub fn open_user_key(line: &str, password: &str) -> Result<ed25519::PrivateKey, String> {
     let enc = parse_v2(line)?;
     let seed = decrypt_seed(&enc, password, USER_KEY_V2_PREFIX.as_bytes())?;
-    ed25519::PrivateKey::decode(seed.as_slice())
-        .map_err(|e| format!("decrypted seed is not a valid ed25519 secret: {e}"))
+    let key = ed25519::PrivateKey::decode(seed.as_slice())
+        .map_err(|e| format!("decrypted seed is not a valid ed25519 secret: {e}"))?;
+    if key.public_key().as_ref() != enc.pubkey.as_slice() {
+        return Err(WRONG_PASSWORD_ERR.to_string());
+    }
+    Ok(key)
 }
 
 /// sniff `path`'s contents: a v2 line (encrypted), a bare 64-hex seed (v1,
@@ -371,6 +455,17 @@ mod tests {
             .read_to_string(&mut s)
             .unwrap();
         s
+    }
+
+    /// re-splice the argon2 params field of a sealed v2 line (offsets per
+    /// the wire spec: three LE u32s right after the 16-byte salt).
+    fn respliced_params(line: &str, m_kib: u32, t_cost: u32, p_cost: u32) -> String {
+        let body = line.strip_prefix(USER_KEY_V2_PREFIX).unwrap();
+        let mut blob = B64.decode(body).unwrap();
+        blob[SALT_LEN..SALT_LEN + 4].copy_from_slice(&m_kib.to_le_bytes());
+        blob[SALT_LEN + 4..SALT_LEN + 8].copy_from_slice(&t_cost.to_le_bytes());
+        blob[SALT_LEN + 8..SALT_LEN + 12].copy_from_slice(&p_cost.to_le_bytes());
+        format!("{USER_KEY_V2_PREFIX}{}", B64.encode(blob))
     }
 
     #[test]
@@ -529,6 +624,136 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("user.key")]);
+    }
+
+    #[test]
+    fn parse_rejects_out_of_range_argon2_params() {
+        let line = seal_user_key(&[12u8; 32], "pw").unwrap();
+        // oversized memory must be rejected at PARSE time, before any argon2
+        // attempt — u32::MAX KiB would be a ~4 TiB allocation (instant DoS,
+        // or an abort on infallible-alloc failure), not a clean error.
+        assert!(parse_v2(&respliced_params(&line, u32::MAX, 3, 1)).is_err());
+        // below the floor (8 MiB)
+        assert!(parse_v2(&respliced_params(&line, 8_191, 3, 1)).is_err());
+        // zero / oversized passes
+        assert!(parse_v2(&respliced_params(&line, 65_536, 0, 1)).is_err());
+        assert!(parse_v2(&respliced_params(&line, 65_536, 65, 1)).is_err());
+        // zero / oversized parallelism
+        assert!(parse_v2(&respliced_params(&line, 65_536, 3, 0)).is_err());
+        assert!(parse_v2(&respliced_params(&line, 65_536, 3, 9)).is_err());
+        // open_user_key surfaces the same rejection (it parses first, so it
+        // never reaches derivation). NOTE: keep this AFTER the parse asserts
+        // above — if the bounds regress, they fail the test before this line
+        // can attempt the 4 TiB derivation.
+        assert!(open_user_key(&respliced_params(&line, u32::MAX, 3, 1), "pw").is_err());
+    }
+
+    #[test]
+    fn parse_accepts_boundary_argon2_params() {
+        let line = seal_user_key(&[13u8; 32], "pw").unwrap();
+        // both ends of every accepted range parse cleanly (decryption would
+        // still fail — splicing params changes the KEK — but that's the
+        // AEAD's job, not the parser's).
+        assert!(parse_v2(&respliced_params(&line, 8_192, 1, 1)).is_ok());
+        assert!(parse_v2(&respliced_params(&line, 1_048_576, 64, 8)).is_ok());
+    }
+
+    #[test]
+    fn open_with_swapped_pubkey_fails_with_exact_message() {
+        // the clear pubkey field is NOT covered by the AEAD (only the prefix
+        // is AAD), so a swapped pubkey must be caught by the post-decrypt
+        // cross-check against the decrypted seed's derived pubkey.
+        let seed = [10u8; 32];
+        let line = seal_user_key(&seed, "pw").unwrap();
+        let other = ed25519::PrivateKey::decode([11u8; 32].as_slice())
+            .unwrap()
+            .public_key();
+        let body = line.strip_prefix(USER_KEY_V2_PREFIX).unwrap();
+        let mut blob = B64.decode(body).unwrap();
+        let start = SALT_LEN + PARAMS_LEN + NONCE_LEN;
+        blob[start..start + PUBKEY_LEN].copy_from_slice(other.as_ref());
+        let swapped = format!("{USER_KEY_V2_PREFIX}{}", B64.encode(blob));
+        let err = open_user_key(&swapped, "pw").unwrap_err();
+        assert_eq!(err, "corrupt or wrong password");
+    }
+
+    #[test]
+    fn golden_vector_pins_wire_format() {
+        // the full v2 line for a fixed seed/password/salt/nonce/params. this
+        // pins EVERYTHING at once — argon2id KDF output, XChaCha ciphertext,
+        // field order, LE param encoding, base64 alphabet (url-safe, no
+        // pad), and the prefix — independently of the encoder. if this test
+        // breaks, existing user.key files in the field can no longer be
+        // opened: that is a consensus-grade compat break, not a test to
+        // "fix" by re-pinning.
+        let seed = [7u8; 32];
+        let salt = [0xA1u8; SALT_LEN];
+        let nonce = [0xB2u8; NONCE_LEN];
+        let line = seal_with(&seed, "correct horse", &salt, &nonce, 65_536, 3, 1).unwrap();
+        assert_eq!(
+            line,
+            "ducktape-user-key-v2:oaGhoaGhoaGhoaGhoaGhoQAAAQADAAAAAQAAALKysrKysrKysrKysrKysrKy\
+             srKysrKysupKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs-WYt2Z5Ws4TMsmxhtzpnlBqRi2VR\
+             UEmVhQ-Q-_HPf4sq32atxpNTFbA0YVrPCwgU"
+        );
+        // and the pinned line opens with the right password.
+        let key = open_user_key(&line, "correct horse").unwrap();
+        let expected = ed25519::PrivateKey::decode(seed.as_slice()).unwrap();
+        assert_eq!(key.public_key(), expected.public_key());
+    }
+
+    #[test]
+    fn wire_offsets_match_spec() {
+        // slice the decoded payload at the SPEC's byte offsets (literals,
+        // not the module's consts) and assert each field lands where
+        // parse_v2 reads it: salt 0..16, params 16..28 (three LE u32),
+        // nonce 28..52, pubkey 52..84, ciphertext 84..132.
+        let seed = [14u8; 32];
+        let salt = [0xC3u8; SALT_LEN];
+        let nonce = [0xD4u8; NONCE_LEN];
+        let line = seal_with(&seed, "pw", &salt, &nonce, 65_536, 3, 1).unwrap();
+        let blob = B64
+            .decode(line.strip_prefix(USER_KEY_V2_PREFIX).unwrap())
+            .unwrap();
+        assert_eq!(blob.len(), 132);
+        assert_eq!(&blob[0..16], &salt);
+        assert_eq!(u32::from_le_bytes(blob[16..20].try_into().unwrap()), 65_536);
+        assert_eq!(u32::from_le_bytes(blob[20..24].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(blob[24..28].try_into().unwrap()), 1);
+        assert_eq!(&blob[28..52], &nonce);
+        let expected_pub = ed25519::PrivateKey::decode(seed.as_slice())
+            .unwrap()
+            .public_key();
+        assert_eq!(&blob[52..84], expected_pub.as_ref());
+
+        // parse_v2 reads each field from exactly these offsets.
+        let enc = parse_v2(&line).unwrap();
+        assert_eq!(enc.salt, salt);
+        assert_eq!(enc.m_kib, 65_536);
+        assert_eq!(enc.t_cost, 3);
+        assert_eq!(enc.p_cost, 1);
+        assert_eq!(enc.nonce, nonce);
+        assert_eq!(enc.pubkey, expected_pub.as_ref().to_vec());
+        assert_eq!(enc.ciphertext, blob[84..132].to_vec());
+    }
+
+    #[test]
+    fn open_honors_params_encoded_in_file() {
+        // a file sealed with NON-default params must open: proves the
+        // decrypt path derives with the file's encoded params, not
+        // DEFAULT_* (a misread would fail decryption here).
+        let seed = [15u8; 32];
+        let salt = [0xE5u8; SALT_LEN];
+        let nonce = [0xF6u8; NONCE_LEN];
+        let line = seal_with(&seed, "pw", &salt, &nonce, 8_192, 1, 1).unwrap();
+        let key = open_user_key(&line, "pw").unwrap();
+        let expected = ed25519::PrivateKey::decode(seed.as_slice()).unwrap();
+        assert_eq!(key.public_key(), expected.public_key());
+        // and the exact-error contract holds on this path too.
+        assert_eq!(
+            open_user_key(&line, "wrong").unwrap_err(),
+            "corrupt or wrong password"
+        );
     }
 
     #[cfg(unix)]
