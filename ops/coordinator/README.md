@@ -11,7 +11,8 @@ is untrusted by design** — see
 - **`ducktape-coordinator.service`** — hardened systemd unit (DynamicUser,
   empty capability set, read-only filesystem, UDP-only address families).
 - **`coordinator.env.example`** — the single operator-edited line, the bind
-  address. **Not a secret**; the coordinator has none.
+  address, plus optional auth-mode args. **Not a secret**; the coordinator has
+  none.
 - **`Dockerfile`** — multi-stage, distroless `cc-debian12:nonroot` runtime.
 
 ## systemd (bare VPS)
@@ -19,7 +20,7 @@ is untrusted by design** — see
 ```sh
 cargo build --release -p coordinator-bin
 sudo install -m 0755 target/release/coordinator /usr/local/bin/ducktape-coordinator
-sudo install -D -m 0644 ops/coordinator/coordinator.env.example /etc/ducktape/coordinator.env  # edit the bind addr
+sudo install -D -m 0644 ops/coordinator/coordinator.env.example /etc/ducktape/coordinator.env  # edit bind/auth mode
 sudo cp ops/coordinator/ducktape-coordinator.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now ducktape-coordinator
 ```
@@ -30,6 +31,12 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ducktape-coordinator
 docker build -f ops/coordinator/Dockerfile -t ducktape-coordinator .
 docker run --rm -p 3478:3478/udp ducktape-coordinator
 ```
+
+Auth modes:
+
+- default: public proof-of-possession (`COORDINATOR_ARGS=`).
+- private: `COORDINATOR_ARGS=--genesis-set /etc/ducktape/network.toml`.
+- local/dev legacy: `COORDINATOR_ARGS=--allow-anonymous`.
 
 A `--listen 0.0.0.0:3478` wildcard bind is fully functional on a single-IP
 host: every answer derives from the datagram's observed source. On a

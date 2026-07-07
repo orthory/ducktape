@@ -13,7 +13,7 @@ BIN_DEST ?= $(HOME)/.cargo/bin
 
 UNAME_S := $(shell uname -s)
 
-.PHONY: all dev dogfood-forge node web app sidecar install install-node install-app test clean
+.PHONY: all dev dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app test clean
 
 all: node web
 
@@ -33,6 +33,14 @@ dogfood-forge:
 ## release build of the networked node (serves the app surface)
 node:
 	$(CARGO) build --release -p node-bin
+
+## release build of the untrusted UDP coordinator
+coordinator:
+	$(CARGO) build --release -p coordinator-bin
+
+## coordinator-only verification gate: CLI/policy tests + live UDP smoke
+coordinator-smoke:
+	$(CARGO) test -p coordinator-bin
 
 ## stage the daemon as the desktop app's sidecar (app/src-tauri/binaries)
 sidecar: app/node_modules
@@ -66,6 +74,12 @@ install: install-node install-app
 ## ducktape-node -> ~/.cargo/bin
 install-node:
 	$(CARGO) install --path bin/node --locked
+
+## coordinator -> ~/.cargo/bin/ducktape-coordinator
+install-coordinator:
+	$(CARGO) build --release -p coordinator-bin
+	mkdir -p "$(BIN_DEST)"
+	install -m 755 target/release/coordinator "$(BIN_DEST)/ducktape-coordinator"
 
 ## macOS: Ducktape.app -> $(APP_DEST); Linux: ducktape -> $(BIN_DEST),
 ## alongside install-node's ducktape-node so the app's sidecar resolution

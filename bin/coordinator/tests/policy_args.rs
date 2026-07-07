@@ -4,7 +4,7 @@
 use coordinator_bin::select_policy;
 use nat_traversal::AuthPolicy;
 
-use commonware_cryptography::{ed25519, Signer as _};
+use commonware_cryptography::{Signer as _, ed25519};
 
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -96,8 +96,12 @@ fn genesis_set_with_no_value_is_a_hard_error_not_a_downgrade() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
     // `--genesis-set` immediately followed by another flag is likewise valueless.
-    let err = select_policy(&["--genesis-set".into(), "--listen".into(), "0.0.0.0:1".into()])
-        .unwrap_err();
+    let err = select_policy(&[
+        "--genesis-set".into(),
+        "--listen".into(),
+        "0.0.0.0:1".into(),
+    ])
+    .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
 

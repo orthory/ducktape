@@ -5,7 +5,7 @@ non-validator reachability helper** that lets two NAT'd validators find each
 other and hole-punch a direct path. It is rendezvous-only: it never carries
 peer traffic (the DERP-style ciphertext relay was removed 2026-07-06). This is
 the operator-facing companion to the design of record,
-[Private Cutover — Coordinator](superpowers/specs/2026-07-05-private-cutover-coordinator-design.md).
+[Private Cutover — Coordinator](../superpowers/specs/2026-07-05-private-cutover-coordinator-design.md).
 Read that for the *why* (the trust model, the reachability plane, the epic
 roadmap). This document is the *how*.
 
@@ -72,9 +72,23 @@ discards any reply that does not come from the exact address it dialed — so a
 coordinator answering from the "wrong" IP looks healthy while every client
 times out.
 
-No TCP listener. No config file. No disk. No secret. `--listen` is the only flag
-the binary parses; on bind it prints `coordinator listening on <addr>` to
-stderr, then serves.
+No TCP listener. No disk. No secret. On bind it prints
+`coordinator listening on <addr>` to stderr, then serves.
+
+## Auth modes
+
+The coordinator is keyless in every mode:
+
+- **Default public mode** — no auth flag. Requests must carry proof of
+  possession for the node key they claim.
+- **Private mode** — `--genesis-set <network.toml>`. The coordinator reads only
+  the public `validators = [...]` keys from that descriptor and admits genesis
+  validators or holder-presented caps rooted in that set.
+- **Legacy development mode** — `--allow-anonymous`. This disables proof of
+  possession and is for local smoke testing only.
+
+Malformed `--listen` and malformed/value-less `--genesis-set` are hard errors,
+not silent fallbacks to a weaker policy.
 
 ## Deploy A — systemd (bare VPS)
 
@@ -88,6 +102,10 @@ sudo install -m 0755 target/release/coordinator /usr/local/bin/ducktape-coordina
 # 3. Install the env file and the hardened unit.
 sudo install -D -m 0644 ops/coordinator/coordinator.env.example /etc/ducktape/coordinator.env
 sudo cp ops/coordinator/ducktape-coordinator.service /etc/systemd/system/
+
+# Optional: edit /etc/ducktape/coordinator.env to choose a bind address and auth
+# mode. Leave COORDINATOR_ARGS empty for default public proof-of-possession, or
+# use: COORDINATOR_ARGS=--genesis-set /etc/ducktape/network.toml
 
 # 4. Start it.
 sudo systemctl daemon-reload
@@ -122,6 +140,15 @@ docker run \
   --restart unless-stopped \
   -p 3478:3478/udp \
   ducktape-coordinator
+```
+
+For private mode in Docker, append the auth args after the image name:
+
+```sh
+docker run --cap-drop=ALL --security-opt no-new-privileges --read-only \
+  -p 3478:3478/udp \
+  -v /etc/ducktape/network.toml:/etc/ducktape/network.toml:ro \
+  ducktape-coordinator --listen 0.0.0.0:3478 --genesis-set /etc/ducktape/network.toml
 ```
 
 The image is multi-stage: a `rust:1.96-bookworm` build stage compiles exactly
