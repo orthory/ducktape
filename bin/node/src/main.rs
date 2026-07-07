@@ -876,17 +876,12 @@ async fn restore_host(
 /// module: the statesync possession driver owns the loop + the full-possession
 /// gate, this owns the duckfs `serve_sync` wire (refs image + `GetObjects`).
 ///
-/// SCRATCH-NAMESPACE NOTE (deferred): unlike the qmdb modules — whose
-/// `sync_from` lands under an ATTEMPT-scoped runtime child (`sync_scratch_a{n}`)
-/// so a failed join's partial store never occupies the canonical namespace —
-/// `files` syncs straight into the CANONICAL `duckfs_dir`. wiring an
-/// attempt-scoped scratch dir for a plain filesystem odb would need a scratch
-/// path threaded through every sync call site plus a promote-on-success rename
-/// under live `DiskStore`/`DiskRefs` handles — a large, not-small change, so it
-/// is deferred. this is correctness-safe: a failed join NEVER goes live (the
-/// final app-hash check gates promotion), and a retry self-heals because every
-/// object is content-addressed and the refs image is verify-then-replace, so a
-/// re-`open` over the same dir converges rather than forking.
+/// SCRATCH NAMESPACE (#219): like the qmdb modules — whose `sync_from` lands
+/// under an ATTEMPT-scoped runtime child (`{name}_scratch_a{n}`) — the module
+/// this adapter wraps is opened over `files::SyncScratch`'s attempt-scoped
+/// scratch dir, NEVER the canonical `duckfs_dir`. the canonical dir is written
+/// only by the verified promotion after `sync_all_modules`' composite app-hash
+/// gate, so a failed join leaves it byte-untouched.
 struct FilesOdb<'a>(&'a mut Files);
 
 impl statesync::ObjectFetch for FilesOdb<'_> {
@@ -1106,9 +1101,14 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     // joiner's odb is EMPTY, so install the boundary refs (root-verified) at the
     // sync-target height and then loop GetObjects to full object possession —
     // the snapshot lane would leave this node refs-only (every file listed, not
-    // one byte readable).
-    let mut files =
-        Files::open("files", duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
+    // one byte readable). the sync lands in an ATTEMPT-scoped scratch dir
+    // (`duckfs_scratch_a{attempt}`, mirroring the qmdb scratch namespaces);
+    // the canonical `duckfs_dir` is written only by the verified promotion
+    // after the composite app-hash gate below (#219).
+    let files_scratch = files::SyncScratch::prepare(duckfs_dir, attempt)
+        .map_err(|e| format!("duckfs scratch: {e}"))?;
+    let mut files = Files::open("files", files_scratch.dir().to_path_buf())
+        .map_err(|e| format!("duckfs open: {e}"))?;
     let files_root = entry_root("files")?;
     let files_lane = statesync::ClientModuleLane::new(client.clone(), manifest.boundary_id());
     statesync::sync_object_possession(
@@ -1207,6 +1207,31 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     if host.app_hash() != manifest.app_hash {
         return Err(format!(
             "composed {} != manifest {}",
+            hex(&host.app_hash()),
+            hex(&manifest.app_hash)
+        ));
+    }
+    // the composite gate passed — promote files' scratch into the canonical
+    // `duckfs_dir` (verify-then-replace refs + content-addressed object merge,
+    // gated on the exact files root this composition certified) and swap the
+    // registry onto a canonical-backed module. the returned host must run in
+    // place over the canonical dir: the post-reboot full-sync fallback keeps
+    // it live without a reboot, and a joiner's promotion reboot re-opens the
+    // same dir. on any error the host is discarded and the retry re-syncs —
+    // an already-promoted canonical dir is verified state, never damage.
+    files_scratch
+        .promote(files_root.0)
+        .map_err(|e| format!("duckfs promote: {e}"))?;
+    host.register(Box::new(
+        Files::open("files", duckfs_dir.to_path_buf())
+            .map_err(|e| format!("duckfs reopen: {e}"))?,
+    ));
+    // re-realize the boundary version over the swapped registry (idempotent),
+    // then re-check THE property against the canonical-backed composition.
+    host.set_active_version(manifest.current_version);
+    if host.app_hash() != manifest.app_hash {
+        return Err(format!(
+            "canonical duckfs reopen composed {} != manifest {}",
             hex(&host.app_hash()),
             hex(&manifest.app_hash)
         ));
@@ -4228,6 +4253,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         };
         let forge_repo = storage_for_sync.join("forge-repo");
         let duckfs_dir = storage_for_sync.join("duckfs");
+        // boot sweep (#219): no sync attempt is in flight yet, so any leftover
+        // `duckfs_scratch_a*` dir (a crashed attempt, or a promoted scratch
+        // whose final removal was interrupted) is safe to remove. best-effort.
+        files::SyncScratch::sweep_stale(&duckfs_dir);
 
         // ---- the JOINER: park on the mesh, sync a boundary that includes
         // this key, fabricate the equivalent recovery checkpoint, reboot ----
