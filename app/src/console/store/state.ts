@@ -273,6 +273,29 @@ export interface ConsoleState {
 
 export const DEFAULT_ACCENT = "#a05a3c";
 
+// ── Accent persistence ──────────────────────────────────
+//
+// The chosen accent survives restarts. Values are validated as #rrggbb on
+// load so a corrupt/foreign string can never reach inline styles.
+const ACCENT_KEY = "ducktape.accent";
+
+export const loadAccent = (): string => {
+  try {
+    const raw = localStorage.getItem(ACCENT_KEY);
+    return raw && /^#[0-9a-f]{6}$/i.test(raw) ? raw : DEFAULT_ACCENT;
+  } catch {
+    return DEFAULT_ACCENT; // storage unavailable (private mode / quota)
+  }
+};
+
+export const saveAccent = (accent: string): void => {
+  try {
+    localStorage.setItem(ACCENT_KEY, accent);
+  } catch {
+    // persistence is best-effort; a failed write just doesn't survive restart.
+  }
+};
+
 // ── View-mode persistence ───────────────────────────────
 //
 // The chosen rail survives restarts. The screen itself is NOT persisted, so on
@@ -381,7 +404,7 @@ export const createInitialState = (): ConsoleState => {
   return {
     screen: viewMode === "operator" ? DEFAULT_OPERATOR_SCREEN : DEFAULT_USER_SCREEN,
     viewMode,
-    accent: DEFAULT_ACCENT,
+    accent: loadAccent(),
     author: "operator",
     connected: false,
     nodeUrl: null,

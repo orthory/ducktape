@@ -44,6 +44,7 @@ import {
   channelIdOf,
   clearRemoteUrl,
   removeTab,
+  saveAccent,
   saveDocTabs,
   saveRemoteUrl,
   saveViewMode,
@@ -835,7 +836,10 @@ export function createActions({
       });
     },
 
-    setAccent: (accent) => patch({ accent }),
+    setAccent: (accent) => {
+      saveAccent(accent);
+      patch({ accent });
+    },
     setAuthor: (author) => patch({ author }),
 
     readMetrics: () => {
