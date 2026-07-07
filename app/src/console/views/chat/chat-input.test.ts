@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { blocksToInput, parseMessageInput } from "./chat-input";
+import type { AuthorRef } from "../../../domain/chat-client";
+import { blocksToInput, parseMessageInput, type MentionResolver } from "./chat-input";
 
 describe("parseMessageInput", () => {
   it("keeps plain text as a single paragraph", () => {
@@ -85,6 +86,73 @@ describe("parseMessageInput", () => {
       "divider",
       { paragraph: [{ text: "after", marks: [] }] },
     ]);
+  });
+});
+
+describe("parseMessageInput mentions", () => {
+  const quackbot: AuthorRef = { agent: { module: "runs", agent_id: "quackbot" } };
+  const resolver: MentionResolver = new Map([["quackbot", quackbot]]);
+
+  it("marks a resolved @token with the exact runs-module mention shape", () => {
+    expect(parseMessageInput("hey @quackbot can you handle this?", resolver)).toEqual([
+      {
+        paragraph: [
+          { text: "hey ", marks: [] },
+          {
+            text: "@quackbot",
+            marks: [{ mention: { agent: { module: "runs", agent_id: "quackbot" } } }],
+          },
+          { text: " can you handle this?", marks: [] },
+        ],
+      },
+    ]);
+  });
+
+  it("marks a mention at the start of the message and in quotes", () => {
+    expect(parseMessageInput("@quackbot go", resolver)).toEqual([
+      {
+        paragraph: [
+          { text: "@quackbot", marks: [{ mention: quackbot }] },
+          { text: " go", marks: [] },
+        ],
+      },
+    ]);
+    expect(parseMessageInput("> @quackbot said so", resolver)).toEqual([
+      {
+        quote: [
+          { text: "@quackbot", marks: [{ mention: quackbot }] },
+          { text: " said so", marks: [] },
+        ],
+      },
+    ]);
+  });
+
+  it("leaves unknown @tokens as plain text", () => {
+    expect(parseMessageInput("hey @nobody around?", resolver)).toEqual([
+      { paragraph: [{ text: "hey @nobody around?", marks: [] }] },
+    ]);
+  });
+
+  it("ignores @tokens mid-word and inside code fences", () => {
+    expect(parseMessageInput("mail a@quackbot now", resolver)).toEqual([
+      { paragraph: [{ text: "mail a@quackbot now", marks: [] }] },
+    ]);
+    expect(parseMessageInput("```\n@quackbot\n```", resolver)).toEqual([
+      { code: { lang: null, text: "@quackbot" } },
+    ]);
+  });
+
+  it("is inert without a resolver (the pre-mention behavior)", () => {
+    expect(parseMessageInput("hey @quackbot")).toEqual([
+      { paragraph: [{ text: "hey @quackbot", marks: [] }] },
+    ]);
+  });
+
+  it("round-trips a mention through blocksToInput and a re-parse", () => {
+    const blocks = parseMessageInput("hey @quackbot **now**", resolver);
+    const text = blocksToInput(blocks);
+    expect(text).toBe("hey @quackbot **now**");
+    expect(parseMessageInput(text, resolver)).toEqual(blocks);
   });
 });
 

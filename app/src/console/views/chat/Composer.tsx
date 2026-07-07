@@ -4,12 +4,15 @@
 // panel's reply box never touches the main channel's in-progress draft,
 // since they're just two separate component instances).
 
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
 
 import { Icon } from "../../components/Icon";
 import type { IconName } from "../../components/Icon";
+import { ConsoleContext } from "../../store/context";
 import { HoverButton } from "./HoverButton";
+import { MentionMenu } from "./MentionMenu";
+import { insertMention, mentionCandidates, mentionTokenAt } from "./mention";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 
 const DEFAULT_MAX_HEIGHT = 168;
@@ -71,6 +74,43 @@ export function Composer({
   const [focused, setFocused] = useState(false);
   // Caret range to restore after a toolbar edit re-renders the controlled value.
   const pendingSelection = useRef<[number, number] | null>(null);
+
+  // ── @mention typeahead ──
+  // The composer is shared (main lane + thread panel), so the agent roster
+  // comes from context here rather than threading a prop through both callers.
+  // Context may be absent in bare component tests — then no menu, no crash.
+  const store = useContext(ConsoleContext);
+  const agents = store?.state.agents ?? [];
+  const [caret, setCaret] = useState(0);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  // The token.start the user Escaped out of — that token stays dismissed
+  // until it's gone (mirrors the Pages slash menu's `slashDismissed`).
+  const [mentionDismissedAt, setMentionDismissedAt] = useState<number | null>(null);
+
+  const mentionToken = mentionTokenAt(value, caret);
+  const menuCandidates =
+    mentionToken !== null && mentionToken.start !== mentionDismissedAt
+      ? mentionCandidates(agents, mentionToken.query)
+      : [];
+  const menuOpen = menuCandidates.length > 0;
+
+  const handleChange = (next: string, nextCaret: number) => {
+    setCaret(nextCaret);
+    const nextToken = mentionTokenAt(next, nextCaret);
+    if (nextToken) setMentionIndex(0);
+    if (!nextToken || nextToken.start !== mentionDismissedAt) setMentionDismissedAt(null);
+    onChange(next);
+  };
+
+  const pickMention = (agentId: string) => {
+    if (!mentionToken) return;
+    const el = ref.current;
+    const next = insertMention(value, mentionToken, el?.selectionStart ?? caret, agentId);
+    pendingSelection.current = [next.caret, next.caret];
+    setCaret(next.caret);
+    setMentionIndex(0);
+    onChange(next.text);
+  };
 
   // Auto-grow: reset to `auto` first so shrinking (deleting text) is picked
   // up too, then clamp to `maxHeight` — past that the textarea scrolls
@@ -151,6 +191,33 @@ export function Composer({
   const canSend = value.trim().length > 0;
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    // An open mention menu owns the navigation keys; Enter/Tab pick instead of
+    // sending. IME guard as below — committing a candidate must not pick.
+    if (menuOpen && !event.nativeEvent.isComposing) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setMentionIndex((i) => (i + 1) % menuCandidates.length);
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setMentionIndex((i) => (i - 1 + menuCandidates.length) % menuCandidates.length);
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        pickMention(menuCandidates[Math.min(mentionIndex, menuCandidates.length - 1)]!.agent_id);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        // stopPropagation: the ThreadPanel closes on a bubbled Escape — with
+        // the menu open, Escape means "dismiss the menu", not "close the thread".
+        event.stopPropagation();
+        setMentionDismissedAt(mentionToken?.start ?? null);
+        return;
+      }
+    }
     // Ignore Enter while an IME composition is active — pressing Enter to commit
     // a Korean / Japanese / Chinese candidate must NOT also send the message.
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
@@ -183,30 +250,40 @@ export function Composer({
           minWidth: 0,
         }}
       >
-        <textarea
-          ref={ref}
-          autoFocus={autoFocus}
-          rows={1}
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-          onKeyDown={handleKeyDown}
-          onFocus={() => setFocused(true)}
-          onBlur={() => setFocused(false)}
-          placeholder={placeholder}
-          style={{
-            width: "100%",
-            minWidth: 0,
-            resize: "none",
-            display: "block",
-            font: `400 13.5px ${font.sans}`,
-            color: color.ink,
-            lineHeight: 1.5,
-            padding: 0,
-            maxHeight,
-            overflowY: "auto",
-            overflowWrap: "break-word",
-          }}
-        />
+        <div style={{ position: "relative", minWidth: 0 }}>
+          {menuOpen && (
+            <MentionMenu
+              candidates={menuCandidates}
+              activeIndex={Math.min(mentionIndex, menuCandidates.length - 1)}
+              onPick={pickMention}
+            />
+          )}
+          <textarea
+            ref={ref}
+            autoFocus={autoFocus}
+            rows={1}
+            value={value}
+            onChange={(event) => handleChange(event.target.value, event.target.selectionStart)}
+            onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+            onKeyDown={handleKeyDown}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
+            placeholder={placeholder}
+            style={{
+              width: "100%",
+              minWidth: 0,
+              resize: "none",
+              display: "block",
+              font: `400 13.5px ${font.sans}`,
+              color: color.ink,
+              lineHeight: 1.5,
+              padding: 0,
+              maxHeight,
+              overflowY: "auto",
+              overflowWrap: "break-word",
+            }}
+          />
+        </div>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 1, minWidth: 0 }}>
             <FmtButton title="Bold  **text**" label="B" onClick={() => wrap("**", "**", "bold")} />

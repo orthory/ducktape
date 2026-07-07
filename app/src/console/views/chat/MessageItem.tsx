@@ -12,6 +12,7 @@ import type { AuthorNames, AuthorRef, ChatBlock, MessageView, Span } from "../..
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { ConsoleContext } from "../../store/context";
 import type { OpRecord } from "../../store/finalization";
+import { AskAgentButton } from "./AskAgentButton";
 import { authorKey, hasReacted, isAgentAuthor, isWallClock } from "./chat-helpers";
 import { blocksToInput } from "./chat-input";
 import { EmojiPicker } from "./EmojiPicker";
@@ -777,12 +778,16 @@ function OverflowMenu({
 }
 
 function HoverBar({
+  channelId,
+  seq,
   onQuickReact,
   onOpenPicker,
   onOpenThread,
   onMoreToggle,
   threadable,
 }: {
+  channelId: string;
+  seq: number;
   onQuickReact: (emoji: string) => void;
   onOpenPicker: () => void;
   onOpenThread: () => void;
@@ -838,6 +843,7 @@ function HoverBar({
         <AddReactGlyph size={15} />
       </HoverButton>
       <div style={{ width: 1, height: 16, background: color.borderSoft, margin: "0 2px" }} />
+      <AskAgentButton channelId={channelId} seq={seq} style={btnStyle} />
       {threadable && (
         <HoverButton
           title="Reply in thread"
@@ -1052,6 +1058,8 @@ export function MessageItem({
       </div>
       {showBar && (
         <HoverBar
+          channelId={message.channel_id}
+          seq={message.seq}
           onQuickReact={onReact}
           onOpenPicker={() => {
             onMenuToggle(false);
