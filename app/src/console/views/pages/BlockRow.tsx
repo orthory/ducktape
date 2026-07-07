@@ -166,7 +166,7 @@ export interface RowHandlers {
   toggleCollapse(blockId: string): void;
   focusRelative(row: Row, delta: -1 | 1): void;
   registerInput(blockId: string, el: HTMLTextAreaElement | null): void;
-  openComments(blockId: string): void;
+  openComments(blockId: string, anchor: { x: number; y: number }): void;
 }
 
 export function BlockRow({
@@ -523,7 +523,10 @@ export function BlockRow({
             type="button"
             aria-label={`Comment on block ${blockNumber}`}
             title={threadCount > 0 ? `${threadCount} comment thread(s)` : "Comment"}
-            onClick={() => handlers.openComments(block.id)}
+            onClick={(event) => {
+              const rect = event.currentTarget.getBoundingClientRect();
+              handlers.openComments(block.id, { x: rect.left, y: rect.bottom });
+            }}
             style={{
               all: "unset",
               cursor: "pointer",
@@ -538,29 +541,6 @@ export function BlockRow({
           >
             <Icon name="chat" size={12} strokeWidth={1.8} />
             {threadCount > 0 ? threadCount : null}
-          </button>
-        ) : null}
-        {hover ? (
-          <button
-            type="button"
-            aria-label={`Copy link to block ${blockNumber}`}
-            title="Copy block link"
-            onClick={() => {
-              void navigator.clipboard?.writeText(block.id);
-            }}
-            style={{
-              all: "unset",
-              cursor: "pointer",
-              width: 20,
-              height: 20,
-              borderRadius: 5,
-              color: color.muted2,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}
-          >
-            <Icon name="hash" size={11} />
           </button>
         ) : null}
         {hover ? (

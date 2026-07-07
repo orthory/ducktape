@@ -338,24 +338,78 @@ describe("Pages keyboard shortcuts & tab strip", () => {
     expect(strip.className).toContain("no-scrollbar");
   });
 
-  it("writes a page comment through the panel composer (no window.prompt)", () => {
+});
+
+describe("floating comment card", () => {
+  const threadsOn = (target: string) => [
+    {
+      target,
+      threads: [
+        {
+          thread: {
+            id: "t1",
+            target,
+            opener: { user: [1] },
+            created_at: 1,
+            resolved: false,
+            resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [
+            {
+              id: "c1",
+              thread_id: "t1",
+              author: { user: [1] },
+              text: "a note",
+              created_at: 1,
+              edited_at: null,
+              deleted: false,
+            },
+          ],
+        },
+      ],
+    },
+  ] as ConsoleState["pageThreads"];
+
+  it("opens a floating card on the block comment button — never the panel", () => {
+    renderPagesView({ pageThreads: threadsOn("a") });
+    fireEvent.click(screen.getByRole("button", { name: "Comment on block 1" }));
+    screen.getByRole("dialog", { name: "Comments on this block" });
+    expect(screen.queryByRole("complementary", { name: "Comments" })).toBeNull();
+  });
+
+  it("writes a page comment through the header card; Escape dismisses it", () => {
     const { spies } = renderPagesView();
 
     fireEvent.click(screen.getByRole("button", { name: "Comment on page" }));
-    // the panel opens with the composer aimed at the page.
-    screen.getByRole("form", { name: "New comment on this page" });
+    const dialog = screen.getByRole("dialog", { name: "Comments on this page" });
+    expect(screen.queryByRole("complementary", { name: "Comments" })).toBeNull();
 
-    fireEvent.change(screen.getByLabelText("New comment text"), {
+    // an uncommented page opens straight into the composer.
+    fireEvent.change(within(dialog).getByLabelText("New comment text"), {
       target: { value: "ship checklist looks thin" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Add comment" }));
-
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add comment" }));
     expect(spies.addComment).toHaveBeenCalledWith({
       target: "p1",
       text: "ship checklist looks thin",
     });
-    // submit dismisses the composer; the panel itself stays open.
-    expect(screen.queryByRole("form", { name: "New comment on this page" })).toBeNull();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Comments on this page" })).toBeNull();
+  });
+
+  it("still opens the aside panel from the header Comments toggle", () => {
+    renderPagesView();
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
     screen.getByRole("complementary", { name: "Comments" });
+    expect(screen.queryByRole("dialog", { name: /comments on/i })).toBeNull();
+  });
+
+  it("hover reveals the comment affordance but no copy-block-link", () => {
+    renderPagesView();
+    fireEvent.mouseOver(screen.getByLabelText("Edit paragraph block 1"));
+    screen.getByRole("button", { name: "Comment on block 1" });
+    expect(screen.queryByRole("button", { name: /copy link to block/i })).toBeNull();
   });
 });

@@ -25,6 +25,8 @@ import {
 import type { Row } from "./pages-model";
 import { BlockRow } from "./BlockRow";
 import type { RowHandlers } from "./BlockRow";
+import { CommentCard } from "./CommentCard";
+import type { CommentAnchor } from "./CommentCard";
 import { DocTabs } from "./DocTabs";
 import { PageRail } from "./PageRail";
 import { CommentsPanel } from "./CommentsPanel";
@@ -40,10 +42,15 @@ export function PagesView() {
   const [focusId, setFocusId] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
   const [pendingPageDelete, setPendingPageDelete] = useState<string | null>(null);
-  // target (block id or page id) the new-thread composer is aimed at; null
-  // hides the composer. WKWebView has no window.prompt, so composing lives
-  // in the panel as a real element.
-  const [composerTarget, setComposerTarget] = useState<string | null>(null);
+  // the floating comment card's aim: ONE target (a block id or the page id),
+  // the label naming it, and the viewport anchor of the affordance that
+  // opened it. Null = no card. The aside panel stays as the all-threads
+  // overview behind the header toggle; composing happens in the card.
+  const [commentCard, setCommentCard] = useState<{
+    target: string;
+    label: string;
+    anchor: CommentAnchor;
+  } | null>(null);
   const inputs = useRef(new Map<string, HTMLTextAreaElement>());
   const titleRef = useRef<HTMLInputElement | null>(null);
   const titleFocusedRef = useRef(false);
@@ -78,10 +85,10 @@ export function PagesView() {
   // onto another.
   useEffect(() => setTitleDraft(root?.text ?? ""), [root?.id]);
 
-  // load comment threads when the active page changes; a composer aimed at
-  // the previous page's blocks must not survive the switch.
+  // load comment threads when the active page changes; a card aimed at the
+  // previous page's blocks must not survive the switch.
   useEffect(() => {
-    setComposerTarget(null);
+    setCommentCard(null);
     actions.loadPageThreads();
   }, [actions, state.activePage]);
 
@@ -184,16 +191,26 @@ export function PagesView() {
     setPendingPageDelete(id);
   };
 
-  const openBlockComments = (blockId: string) => {
-    setPanelOpen(true);
-    const has = state.pageThreads.some((g) => g.target === blockId && g.threads.length > 0);
-    setComposerTarget(has ? null : blockId);
+  const openBlockComments = (blockId: string, anchor: CommentAnchor) => {
+    setCommentCard({ target: blockId, label: "this block", anchor });
   };
 
-  const commentOnPage = () => {
+  const commentOnPage = (anchor: CommentAnchor) => {
     if (!state.activePage) return;
-    setPanelOpen(true);
-    setComposerTarget(state.activePage);
+    setCommentCard({ target: state.activePage, label: "this page", anchor });
+  };
+
+  // a reply must carry the THREAD's target (a block id or the page id) — the
+  // module rejects an append whose target differs from the thread's. Never
+  // assume the page here. Shared by the card and the panel.
+  const replyToThread = (threadId: string, text: string) => {
+    const target =
+      state.pageThreads
+        .flatMap((g) => g.threads)
+        .find((v) => v.thread.id === threadId)?.thread.target ??
+      state.activePage ??
+      "";
+    actions.addComment({ threadId, target, text });
   };
 
   const handlers: RowHandlers = {
@@ -331,7 +348,10 @@ export function PagesView() {
                     <button
                       type="button"
                       aria-label="Comment on page"
-                      onClick={commentOnPage}
+                      onClick={(event) => {
+                        const rect = event.currentTarget.getBoundingClientRect();
+                        commentOnPage({ x: rect.left, y: rect.bottom });
+                      }}
                       style={headerBtn}
                     >
                       <Icon name="chat" size={13} strokeWidth={1.8} /> Comment
@@ -340,10 +360,7 @@ export function PagesView() {
                       type="button"
                       aria-label={panelOpen ? "Hide comments" : "Show comments"}
                       aria-pressed={panelOpen}
-                      onClick={() => {
-                        if (panelOpen) setComposerTarget(null);
-                        setPanelOpen((o) => !o);
-                      }}
+                      onClick={() => setPanelOpen((o) => !o)}
                       style={{
                         ...headerBtn,
                         background: panelOpen ? color.hover : color.paper,
@@ -496,35 +513,11 @@ export function PagesView() {
             <CommentsPanel
               threads={state.pageThreads}
               authorNames={state.authorNames}
-              composer={
-                composerTarget
-                  ? {
-                      target: composerTarget,
-                      label: composerTarget === state.activePage ? "this page" : "this block",
-                    }
-                  : null
-              }
-              onClose={() => {
-                setPanelOpen(false);
-                setComposerTarget(null);
-              }}
-              onSubmitNew={(target, text) => {
-                actions.addComment({ target, text });
-                setComposerTarget(null);
-              }}
-              onCancelNew={() => setComposerTarget(null)}
-              onReply={(threadId, text) => {
-                // a reply must carry the THREAD's target (a block id or the
-                // page id) — the module rejects an append whose target differs
-                // from the thread's. Never assume the page here.
-                const target =
-                  state.pageThreads
-                    .flatMap((g) => g.threads)
-                    .find((v) => v.thread.id === threadId)?.thread.target ??
-                  state.activePage ??
-                  "";
-                actions.addComment({ threadId, target, text });
-              }}
+              composer={null}
+              onClose={() => setPanelOpen(false)}
+              onSubmitNew={(target, text) => actions.addComment({ target, text })}
+              onCancelNew={() => {}}
+              onReply={replyToThread}
               onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
               onEdit={(commentId, text) => actions.editComment({ commentId, text })}
               onDelete={(commentId) => actions.deleteComment(commentId)}
@@ -532,6 +525,23 @@ export function PagesView() {
           ) : null}
         </div>
       </main>
+      {commentCard ? (
+        <CommentCard
+          target={commentCard.target}
+          label={commentCard.label}
+          anchor={commentCard.anchor}
+          threads={
+            state.pageThreads.find((g) => g.target === commentCard.target)?.threads ?? []
+          }
+          authorNames={state.authorNames}
+          onClose={() => setCommentCard(null)}
+          onSubmitNew={(target, text) => actions.addComment({ target, text })}
+          onReply={replyToThread}
+          onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
+          onEdit={(commentId, text) => actions.editComment({ commentId, text })}
+          onDelete={(commentId) => actions.deleteComment(commentId)}
+        />
+      ) : null}
       {pendingPageDelete && (
         <ConfirmDialog
           title={`Delete ${pendingPageDeleteTitle}?`}
