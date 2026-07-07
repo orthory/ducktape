@@ -306,13 +306,26 @@ const PUNCH_TRIES: usize = 3;
 /// `KEEPALIVE_SECONDS` — different plane, different socket.
 pub const RENDEZVOUS_KEEPALIVE: Duration = Duration::from_secs(25);
 
+/// How every coordinator request is presented: `Some((signer, cap))`
+/// authenticates each request with a proof-of-possession over `signer`
+/// (whose public key MUST match the resolver's node key), carrying `cap`
+/// for a private (genesis-gated) coordinator or `None` for a public
+/// PoP-only one; `None` sends bare requests — the legacy unauthenticated
+/// dev path for fully-open coordinators.
+pub type CoordinatorAuth = Option<(
+    commonware_cryptography::ed25519::PrivateKey,
+    Option<nat_traversal::CoordCap>,
+)>;
+
 /// The production resolver: a handle to the rendezvous PUMP task that owns
-/// the `NatClient`. The pump answers unsolicited `PunchSync` fan-outs while
-/// this node is otherwise idle (the passive half of somebody else's punch —
-/// previously those datagrams were eaten by whichever blocking recv happened
-/// to poll, so a punch only completed when both sides resolved
-/// simultaneously), re-advertises on a keepalive interval, and serves
-/// `resolve()` commands. With NO coordinators configured every resolution is
+/// the `NatClient`'s receive side. The pump answers unsolicited `PunchSync`
+/// fan-outs while this node is otherwise idle (the passive half of somebody
+/// else's punch — previously those datagrams were eaten by whichever
+/// blocking recv happened to poll, so a punch only completed when both sides
+/// resolved simultaneously) and serves `resolve()` commands; a separate
+/// SEND-ONLY task keepalive-readvertises on the same socket, so a long run
+/// of busy resolves can never starve the keepalive past the coordinator's
+/// registration TTL. With NO coordinators configured every resolution is
 /// `Advertised` and no task is spawned.
 pub struct NatResolver {
     commands: Option<tokio::sync::mpsc::Sender<ResolveCmd>>,
@@ -329,21 +342,10 @@ impl NatResolver {
     /// (failing over across the coordinator hints), register, and spawn the
     /// pump. `key` is this node's identity bytes (`binding::node_key`). An
     /// empty coordinator set yields the pass-through resolver.
-    ///
-    /// `auth` gates how every coordinator request is presented:
-    /// - `Some((signer, cap))` authenticates each request with a
-    ///   proof-of-possession over `signer` (whose public key MUST match `key`),
-    ///   carrying `cap` for a private (genesis-gated) coordinator or `None` for
-    ///   a public PoP-only one.
-    /// - `None` sends bare requests — the legacy unauthenticated dev path for
-    ///   fully-open coordinators.
     pub async fn bind(
         key: NodeKey,
         coordinators: Vec<SocketAddr>,
-        auth: Option<(
-            commonware_cryptography::ed25519::PrivateKey,
-            Option<nat_traversal::CoordCap>,
-        )>,
+        auth: CoordinatorAuth,
     ) -> std::io::Result<Self> {
         Self::bind_with_keepalive(key, coordinators, auth, RENDEZVOUS_KEEPALIVE).await
     }
@@ -352,10 +354,7 @@ impl NatResolver {
     pub async fn bind_with_keepalive(
         key: NodeKey,
         coordinators: Vec<SocketAddr>,
-        auth: Option<(
-            commonware_cryptography::ed25519::PrivateKey,
-            Option<nat_traversal::CoordCap>,
-        )>,
+        auth: CoordinatorAuth,
         keepalive: Duration,
     ) -> std::io::Result<Self> {
         if coordinators.is_empty() {
@@ -374,8 +373,19 @@ impl NatResolver {
             .discover_reflexive_failover(COORD_STEP_TIMEOUT)
             .await?;
         client.register().await?;
+        let client = std::sync::Arc::new(client);
+        // The keepalive is SEND-ONLY (readvertise never touches the recv
+        // side), so it runs as its own task on the shared socket: the same
+        // socket keeps the same NAT pinhole and coordinator mapping, while a
+        // resolve() that runs for its full budget can no longer delay the
+        // keepalive past the registration TTL. It holds a Weak handle and
+        // exits within one interval of the pump dropping the client.
+        tokio::spawn(rendezvous_keepalive(
+            std::sync::Arc::downgrade(&client),
+            keepalive,
+        ));
         let (commands, rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(rendezvous_pump(client, rx, keepalive));
+        tokio::spawn(rendezvous_pump(client, rx));
         Ok(Self {
             commands: Some(commands),
             reflexive: Some(reflexive),
@@ -408,24 +418,40 @@ impl EndpointResolver for NatResolver {
     }
 }
 
-/// The pump body: single owner of the rendezvous socket's receive side, so
-/// every datagram reaches ONE dispatch point instead of whichever blocking
-/// recv was polling. Three duties — serve `resolve()` commands, answer
-/// unsolicited `PunchSync` while idle, and keepalive-readvertise.
-async fn rendezvous_pump(
-    client: NatClient,
-    mut commands: tokio::sync::mpsc::Receiver<ResolveCmd>,
-    keepalive: Duration,
-) {
+/// The keepalive body: a SEND-ONLY loop on the shared rendezvous socket.
+/// Readvertise nonces are wall-clock-seeded so a REBOOTED node's first
+/// keepalive strictly supersedes every nonce its previous life published —
+/// otherwise the coordinator would keep answering lookups with the dead
+/// pre-reboot mapping (for up to the TTL) while rejecting the fresh adverts
+/// as stale replays. Exits within one interval of the pump releasing the
+/// client (the `Weak` stops upgrading).
+async fn rendezvous_keepalive(client: std::sync::Weak<NatClient>, keepalive: Duration) {
     let mut tick = tokio::time::interval(keepalive);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await; // an interval's first tick fires immediately — consume it.
-    // Readvertise nonces are wall-clock-seeded so a REBOOTED node's first
-    // keepalive strictly supersedes every nonce its previous life published —
-    // otherwise the coordinator would keep answering lookups with the dead
-    // pre-reboot mapping (for up to the TTL) while rejecting the fresh
-    // adverts as stale replays.
     let mut nonce = nat_traversal::now_secs();
+    loop {
+        tick.tick().await;
+        let Some(client) = client.upgrade() else {
+            return;
+        };
+        nonce = nonce.max(nat_traversal::now_secs()) + 1;
+        let _ = client.readvertise(nonce).await;
+    }
+}
+
+/// The pump body: single owner of the rendezvous socket's RECEIVE side, so
+/// every datagram reaches ONE dispatch point instead of whichever blocking
+/// recv was polling. Two duties — serve `resolve()` commands and answer
+/// unsolicited `PunchSync` while idle. (The keepalive is deliberately NOT a
+/// third select arm: a resolve() runs its full budget inside one arm, and a
+/// sequential burst of dead-peer resolves — an epoch cutover with a dozen
+/// unreachable peers — would starve an in-loop tick past the registration
+/// TTL. It lives in [`rendezvous_keepalive`] on the shared socket instead.)
+async fn rendezvous_pump(
+    client: std::sync::Arc<NatClient>,
+    mut commands: tokio::sync::mpsc::Receiver<ResolveCmd>,
+) {
     loop {
         tokio::select! {
             cmd = commands.recv() => {
@@ -441,12 +467,17 @@ async fn rendezvous_pump(
                     let _ = client.send_punch_to(peer_reflexive).await;
                 }
                 Ok(_) => {}
-                Err(_) => return, // socket gone — the plane restarts with the node.
+                Err(_) => {
+                    // A transient recv error (interface flap, ENOBUFS) must
+                    // not kill rendezvous for the rest of the process — the
+                    // old per-call clients isolated failures to one resolve,
+                    // and the pump must not be weaker. Back off briefly so a
+                    // persistently-broken socket cannot spin the loop hot;
+                    // if it IS permanently dead, every resolve() surfaces
+                    // its own error exactly like the pre-pump code did.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
             },
-            _ = tick.tick() => {
-                nonce = nonce.max(nat_traversal::now_secs()) + 1;
-                let _ = client.readvertise(nonce).await;
-            }
         }
     }
 }
@@ -2592,6 +2623,73 @@ mod tests {
                 miss.is_err() || miss.unwrap().is_err(),
                 "X registered once, sent no keepalives, and must have expired"
             );
+        }
+
+        #[tokio::test]
+        async fn keepalives_survive_a_busy_resolve() {
+            // The keepalive lives on its own send-only task, so a resolve()
+            // that runs its full budget cannot starve it past the TTL. Rig: a
+            // 1s-TTL coordinator; X is registered (its test task readvertises
+            // every 300ms) but SILENT — it never punches — so A's resolve
+            // grinds through all its tries (~4s of continuous pump busyness,
+            // several times the TTL). Under an in-pump keepalive tick, A's
+            // registration would expire mid-resolve; with the split task it
+            // must survive.
+            let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let coord_addr = coord_sock.local_addr().unwrap();
+            let coordinator = nat_traversal::Coordinator::with_policy_and_ttl(
+                nat_traversal::AuthPolicy::Open { require_pop: false },
+                1,
+            );
+            tokio::spawn(nat_traversal::run_coordinator_with(coord_sock, coordinator));
+
+            let a_key = binding::node_key(ValidatorIdentity([0x1a; 32]));
+            let x_key = binding::node_key(ValidatorIdentity([0x1f; 32]));
+            let mut a = NatResolver::bind_with_keepalive(
+                a_key,
+                vec![coord_addr],
+                None,
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap();
+            // X: a raw client (answers nothing) kept registered by a test task.
+            let x = std::sync::Arc::new(
+                nat_traversal::NatClient::bind(x_key, coord_addr)
+                    .await
+                    .unwrap(),
+            );
+            x.register().await.unwrap();
+            let x_keepalive = x.clone();
+            tokio::spawn(async move {
+                let mut nonce = 0u64;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    nonce += 1;
+                    let _ = x_keepalive.readvertise(nonce).await;
+                }
+            });
+
+            // The busy resolve: X resolves but never punches back, so this
+            // fails only after every try's punch window closes.
+            let advertised: SocketAddr = "203.0.113.9:1".parse().unwrap();
+            let err = a
+                .resolve(x_key, advertised)
+                .await
+                .expect_err("a silent peer cannot be punched");
+            assert!(err.contains("hole-punch failed"), "unexpected error: {err}");
+
+            // A's own registration survived the busy window.
+            let probe = nat_traversal::NatClient::bind(
+                binding::node_key(ValidatorIdentity([0x11; 32])),
+                coord_addr,
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), probe.lookup(a_key))
+                .await
+                .expect("bounded")
+                .expect("keepalives must survive a busy resolve");
         }
 
         #[tokio::test]

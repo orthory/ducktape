@@ -94,18 +94,23 @@ impl AdvertBook {
             // Already superseded past the boot baseline AND still alive: a
             // nonce-0 Register is stale by construction and cannot roll it back.
             Some(prev) if prev.nonce > 0 && !self.expired(prev, now) => {}
-            _ => {
-                self.evict_if_full(&key, now);
-                self.latest.insert(
-                    key,
-                    ReflexiveAdvert {
-                        reflexive: src,
-                        nonce: 0,
-                        last_seen: now,
-                    },
-                );
-            }
+            _ => self.insert_fresh(key, src, 0, now),
         }
+    }
+
+    /// The one accepted-advert write path (`observe` and `readvertise` both
+    /// end here): reclaim space if needed, then store the advert with its
+    /// life restarted at `now`.
+    fn insert_fresh(&mut self, key: NodeKey, src: SocketAddr, nonce: u64, now: u64) {
+        self.evict_if_full(&key, now);
+        self.latest.insert(
+            key,
+            ReflexiveAdvert {
+                reflexive: src,
+                nonce,
+                last_seen: now,
+            },
+        );
     }
 
     /// Before inserting a NEW key at the cap, reclaim an expired corpse if one
@@ -150,15 +155,7 @@ impl AdvertBook {
         match self.latest.get(&key) {
             Some(prev) if nonce <= prev.nonce && !self.expired(prev, now) => AdvertOutcome::Stale,
             _ => {
-                self.evict_if_full(&key, now);
-                self.latest.insert(
-                    key,
-                    ReflexiveAdvert {
-                        reflexive: src,
-                        nonce,
-                        last_seen: now,
-                    },
-                );
+                self.insert_fresh(key, src, nonce, now);
                 AdvertOutcome::Superseded
             }
         }
