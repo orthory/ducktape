@@ -252,13 +252,15 @@ describe("SettingsView", () => {
     expect(screen.queryByText("DEVICES")).not.toBeInTheDocument();
   });
 
-  it("renders the machine user key once user_identity_status resolves (desktop)", async () => {
+  it("renders the machine user key from identityState()'s pubkey (desktop)", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status")
-        return Promise.resolve({ pubkey: "cd34".repeat(16) });
       if (cmd === "user_identity_state")
-        return Promise.resolve({ state: "absent", mnemonicConfirmed: true });
+        return Promise.resolve({
+          state: "unlocked",
+          pubkey: "cd34".repeat(16),
+          mnemonicConfirmed: true,
+        });
       throw new Error(`unexpected invoke ${cmd}`);
     });
 
@@ -268,15 +270,41 @@ describe("SettingsView", () => {
     expect(
       screen.getByText(shortKey("cd34".repeat(16))),
     ).toBeInTheDocument();
+    // No legacy user_identity_status call — the row is driven entirely by
+    // identityState(), which the v2/encrypted-file bug this guards against
+    // never was: the legacy verb errors on a v2 file.
+    expect(invokeMock).not.toHaveBeenCalledWith("user_identity_status");
   });
 
-  it("surfaces the user_identity_status error string on failure (corrupt user.key)", async () => {
+  it("locked with a pubkey shows the short pubkey, not a FATAL string", async () => {
+    // Regression: the legacy user_identity_status path shelled the GENERATE
+    // verb, which errors on a v2/encrypted key file — rendering a raw error
+    // string in this row for every encrypted identity. identityState()
+    // carries the pubkey in the clear even while locked, so the row must
+    // show the short key here, never an error.
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status")
-        return Promise.reject("user.key exists but is corrupt (bad hex)");
       if (cmd === "user_identity_state")
-        return Promise.resolve({ state: "absent", mnemonicConfirmed: true });
+        return Promise.resolve({
+          state: "locked",
+          pubkey: "cd34".repeat(16),
+          mnemonicConfirmed: true,
+        });
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+
+    renderSettings();
+
+    expect(await screen.findByText("User key")).toBeInTheDocument();
+    expect(screen.getByText(shortKey("cd34".repeat(16)))).toBeInTheDocument();
+    expect(screen.queryByText(/fatal/i)).not.toBeInTheDocument();
+  });
+
+  it("surfaces the identityState() error string on failure (corrupt user.key)", async () => {
+    markTauri();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_state")
+        return Promise.reject("user.key exists but is corrupt (bad hex)");
       throw new Error(`unexpected invoke ${cmd}`);
     });
 
@@ -287,7 +315,7 @@ describe("SettingsView", () => {
     ).toBeInTheDocument();
   });
 
-  it("never calls user_identity_status on the web build (no tauri shell)", async () => {
+  it("never invokes any identity command on the web build (no tauri shell)", async () => {
     renderSettings();
 
     // Give any stray microtask a chance to run before asserting the negative.
@@ -319,8 +347,6 @@ describe("SettingsView — identity custody controls", () => {
     extra: Record<string, unknown> = {},
   ) => {
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status")
-        return Promise.reject("no legacy status wired for this test");
       if (cmd === "user_identity_state")
         return Promise.resolve({ state, pubkey: "ab12", mnemonicConfirmed: true });
       if (cmd in extra) return extra[cmd] as Promise<unknown>;
@@ -397,7 +423,6 @@ describe("SettingsView — identity custody controls", () => {
     markTauri();
     let stateCalls = 0;
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status") return Promise.reject("n/a");
       if (cmd === "user_identity_state") {
         stateCalls += 1;
         return Promise.resolve(
@@ -430,7 +455,6 @@ describe("SettingsView — identity custody controls", () => {
   it("shows an inline error on a wrong unlock password without re-fetching state", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status") return Promise.reject("n/a");
       if (cmd === "user_identity_state")
         return Promise.resolve({ state: "locked", pubkey: "ab12", mnemonicConfirmed: true });
       if (cmd === "user_identity_unlock") return Promise.reject(new Error("wrong password"));
@@ -454,7 +478,6 @@ describe("SettingsView — identity custody controls", () => {
     markTauri();
     let stateCalls = 0;
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status") return Promise.reject("n/a");
       if (cmd === "user_identity_state") {
         stateCalls += 1;
         return Promise.resolve(
@@ -479,7 +502,6 @@ describe("SettingsView — identity custody controls", () => {
   it("reveal always re-prompts for a password even when already unlocked, and hides on Done", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status") return Promise.reject("n/a");
       if (cmd === "user_identity_state")
         return Promise.resolve({ state: "unlocked", pubkey: "ab12", mnemonicConfirmed: true });
       if (cmd === "user_identity_reveal")
@@ -522,7 +544,6 @@ describe("SettingsView — identity custody controls", () => {
     // rule entirely.
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status") return Promise.reject("n/a");
       if (cmd === "user_identity_state")
         return Promise.resolve({ state: "locked", pubkey: "ab12", mnemonicConfirmed: true });
       if (cmd === "user_identity_reveal")
@@ -560,7 +581,6 @@ describe("SettingsView — identity custody controls", () => {
   it("reveal on a plaintext identity skips the password prompt entirely", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status") return Promise.reject("n/a");
       if (cmd === "user_identity_state")
         return Promise.resolve({ state: "plaintext", pubkey: "ab12", mnemonicConfirmed: true });
       if (cmd === "user_identity_reveal")
@@ -587,7 +607,6 @@ describe("SettingsView — identity custody controls", () => {
     markTauri();
     let stateCalls = 0;
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status") return Promise.reject("n/a");
       if (cmd === "user_identity_state") {
         stateCalls += 1;
         return Promise.resolve(

@@ -13,11 +13,7 @@ import {
   revealMnemonic,
   unlockIdentity,
 } from "../../../domain/user-identity-client";
-import {
-  isDesktop,
-  LIVE_JOIN_SUPPORTED,
-  userIdentityStatus,
-} from "../../../domain/workspace-client";
+import { isDesktop, LIVE_JOIN_SUPPORTED } from "../../../domain/workspace-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { opKey } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
@@ -571,10 +567,11 @@ function NetworkSection() {
 // (a web build has no local node key at all — degrade by omitting the whole
 // section rather than showing a false "Not linked").
 // The machine user key lives outside the node entirely (`~/.ducktape/user.key`,
-// desktop-only) — read it via user_identity_status rather than the store, and
-// keep it local state so a corrupt-key error (the file is never overwritten
-// silently — this is the operator's only signal) surfaces right here without
-// touching the console-wide error banner.
+// desktop-only) — derived from identityState()'s pubkey (below) rather than a
+// separate legacy fetch, so the row renders even while locked (v2/encrypted
+// keys carry their pubkey in the clear). A corrupt-key error (the file is
+// never overwritten silently — this is the operator's only signal) surfaces
+// right here without touching the console-wide error banner.
 type UserKeyStatus = { pubkey: string } | { error: string };
 
 /** Which inline custody form/grid (if any) is currently expanded below its
@@ -601,13 +598,19 @@ function CustodyPanel({ children, last }: { children: ReactNode; last?: boolean 
 function DevicesSection() {
   const { state } = useDucktape();
   const workspace = state.workspace;
-  const [userKey, setUserKey] = useState<UserKeyStatus | null>(null);
   // The custody state machine (locked/unlocked/plaintext/absent), driven by
-  // identityState() — a sibling fetch to userIdentityStatus above: that one
-  // is the legacy pubkey-only status, this is the richer lock-state report
-  // Task 6's rows are built from. Never derived from any cached mnemonic or
-  // password — every mutator below re-fetches fresh on success.
+  // identityState() — Task 6's rows are built from this, AND (below) the
+  // "User key" row's pubkey: a v2/encrypted key still carries its pubkey in
+  // the clear, so this single fetch covers both, even while locked. Never
+  // derived from any cached mnemonic or password — every mutator below
+  // re-fetches fresh on success.
   const [identity, setIdentity] = useState<IdentityStateReport | null>(null);
+  // Set only when the identityState() fetch itself rejects (a corrupt/
+  // unreadable user.key — the file is never overwritten silently, so this is
+  // the operator's only signal). Surfaced in the "User key" row; the custody
+  // block below just stays absent on a failed fetch (not spec'd for
+  // Settings — no second error banner).
+  const [identityFetchError, setIdentityFetchError] = useState<string | null>(null);
   const [panel, setPanel] = useState<CustodyPanelKind>("none");
   const [busy, setBusy] = useState(false);
   const [identityError, setIdentityError] = useState<string | null>(null);
@@ -616,21 +619,6 @@ function DevicesSection() {
   // persisted anywhere else.
   const [mnemonic, setMnemonic] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!workspace || !isDesktop()) return;
-    let alive = true;
-    userIdentityStatus()
-      .then((identity) => {
-        if (alive) setUserKey({ pubkey: identity.pubkey });
-      })
-      .catch((err: unknown) => {
-        if (alive) setUserKey({ error: String(err) });
-      });
-    return () => {
-      alive = false;
-    };
-  }, [workspace]);
-
   // Routed through an extra microtask hop so a synchronous throw inside
   // identityState() (a malformed mock, a bad IPC binding) rejects this
   // promise instead of escaping the effect uncaught.
@@ -638,7 +626,10 @@ function DevicesSection() {
     () =>
       Promise.resolve()
         .then(() => identityState())
-        .then(setIdentity)
+        .then((report) => {
+          setIdentity(report);
+          setIdentityFetchError(null);
+        })
         .catch(() => {}),
     [],
   );
@@ -649,12 +640,12 @@ function DevicesSection() {
     Promise.resolve()
       .then(() => identityState())
       .then((report) => {
-        if (alive) setIdentity(report);
+        if (!alive) return;
+        setIdentity(report);
+        setIdentityFetchError(null);
       })
-      .catch(() => {
-        // Not spec'd for Settings: the User key row above already surfaces
-        // user-key file problems, so a failed custody fetch just leaves the
-        // custody block absent rather than adding a second error banner.
+      .catch((err: unknown) => {
+        if (alive) setIdentityFetchError(String(err));
       });
     return () => {
       alive = false;
@@ -679,9 +670,9 @@ function DevicesSection() {
   // The async continuations below setState without an alive/mounted guard on
   // purpose: React 18+ makes setState on an unmounted component a silent
   // no-op (the old warning is gone), and threading a mounted-ref through
-  // every .then/.catch/.finally here buys nothing but noise. The two mount
-  // effects keep their alive flags only because they predate this block and
-  // guard a state pair that renders immediately.
+  // every .then/.catch/.finally here buys nothing but noise. The mount
+  // effect above keeps its alive flag only because it predates this block
+  // and guards a state pair that renders immediately.
   const handleUnlock = (password: string) => {
     setBusy(true);
     setIdentityError(null);
@@ -762,6 +753,15 @@ function DevicesSection() {
         .filter(([key, user]) => key !== nodeKeyNorm && user.userKey === bound.userKey)
         .map(([key]) => key)
     : [];
+  // Driven by identityState()'s pubkey rather than the legacy user_identity_status
+  // (which shells the GENERATE verb and errors on a v2/encrypted file) — this
+  // works whether the identity is plaintext, locked, or unlocked. A fetch
+  // rejection (corrupt/unreadable file) still surfaces here, in red.
+  const userKey: UserKeyStatus | null = identity?.pubkey
+    ? { pubkey: identity.pubkey }
+    : identityFetchError
+      ? { error: identityFetchError }
+      : null;
   const showUserKey = userKey !== null;
   // "absent" (no user.key yet) renders exactly like non-desktop: no custody
   // rows at all — the identity gate is what's supposed to create one first.

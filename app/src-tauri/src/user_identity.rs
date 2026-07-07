@@ -212,23 +212,35 @@ fn parse_init_output(stdout: &str) -> Result<(String, String), String> {
 
 // ── Commands ────────────────────────────────────────────
 
-/// ensure `~/.ducktape/user.key` exists and report this machine's user pubkey.
-/// `user-key` creates the file (hex ed25519 seed, 0600) only if it is absent;
-/// otherwise it just reads the existing one back — so this is idempotent and
-/// safe to call on every launch.
+/// report this machine's user pubkey, LEGACY shape (pubkey-only, no
+/// state/lock info) — kept for the Settings "User key" row's backward compat
+/// and any external caller still on this shape.
 ///
-/// LEGACY: kept working unchanged for compat; the app moves to
-/// [`user_identity_state`] for the identity gate.
+/// Re-pointed at `user-key status` (never `--out`/GENERATE): the GENERATE verb
+/// errors on a v2 (encrypted) key file, which used to make this command FATAL
+/// for every encrypted identity — silently breaking auto-bind and rendering a
+/// raw error string in Settings. `status` reads back `absent | plaintext <pub>
+/// | encrypted <pub>` regardless of format, via the same [`parse_key_status`]
+/// helper [`user_identity_state`] uses. `absent` has no pubkey to report, so
+/// it errors here — nothing in the app calls this on an absent key anymore
+/// (the identity gate guarantees a key exists before the console, and this
+/// command's callers have moved to [`user_identity_state`]).
 #[tauri::command]
 pub fn user_identity_status(app: tauri::AppHandle) -> Result<UserIdentity, String> {
     let node_bin = crate::daemon::resolve_node_bin()?;
     let out = run_verb(
         &node_bin,
-        &["user-key", "--out", &user_key_path(&app)?.to_string_lossy()],
+        &[
+            "user-key",
+            "status",
+            "--key",
+            &user_key_path(&app)?.to_string_lossy(),
+        ],
     )?;
-    Ok(UserIdentity {
-        pubkey: last_line(&out),
-    })
+    let (_state, pubkey) = parse_key_status(&last_line(&out))?;
+    pubkey
+        .map(|pubkey| UserIdentity { pubkey })
+        .ok_or_else(|| "no user identity".to_string())
 }
 
 /// the identity gate's state machine input: `user-key status` (never touches
@@ -366,7 +378,12 @@ pub fn user_identity_reveal(
 
 /// migrate a legacy plaintext identity to encrypted (v2): `user-key encrypt`
 /// rewrites the file in place and prints the (unchanged) pubkey. caches
-/// `password` on success, same as create/unlock.
+/// `password` on success, same as create/unlock. marks `mnemonic_confirmed`
+/// true, same as [`user_identity_restore`]: a legacy key predates the
+/// shown-once mnemonic ceremony entirely, so there is no confirm step this
+/// user could ever complete -- forcing the create-flow's confirm loop on
+/// someone who just secured a pre-existing identity would trap them behind a
+/// gate with no way through.
 #[tauri::command]
 pub fn user_identity_encrypt(
     app: tauri::AppHandle,
@@ -386,6 +403,7 @@ pub fn user_identity_encrypt(
     )?;
     let pubkey = last_line(&out);
     cache_store(&password);
+    crate::workspaces::set_mnemonic_confirmed(&app)?;
     Ok(IdentityPubkey { pubkey })
 }
 

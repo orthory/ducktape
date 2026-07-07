@@ -15,7 +15,11 @@
 // A create that was interrupted before the mnemonic was confirmed resumes at
 // the mnemonic/confirm step on relaunch (locked or unlocked, mnemonicConfirmed
 // false) — password re-entry then `revealMnemonic`, since a fresh mount never
-// still holds the mnemonic in component state.
+// still holds the mnemonic in component state. Same "skip for now" escape as
+// the locked screen: this resume step is still a hard requirement to type a
+// password (possibly forgotten) into, so it must not be able to trap someone
+// out of the console forever — skipping just means the gate re-offers next
+// launch, same as an unconfirmed mnemonic always has.
 //
 // The card chrome, password form, mnemonic grid, and confirm-words step live
 // in the sibling IdentityGateForms.tsx (this file passed the ~400-line split
@@ -332,7 +336,7 @@ function LockedScreen({ onDone, onSkip }: { onDone: () => void; onSkip: () => vo
 
 type ResumeStep = "password" | "grid" | "confirm";
 
-function ResumeScreen({ onDone }: { onDone: () => void }) {
+function ResumeScreen({ onDone, onSkip }: { onDone: () => void; onSkip: () => void }) {
   const [step, setStep] = useState<ResumeStep>("password");
   const [mnemonic, setMnemonic] = useState("");
   const [busy, setBusy] = useState(false);
@@ -361,6 +365,12 @@ function ResumeScreen({ onDone }: { onDone: () => void }) {
               .finally(() => setBusy(false));
           }}
         />
+        {/* Same escape hatch as LockedScreen: a forgotten password must not
+            trap this device behind the gate forever — the unconfirmed flag
+            just means the gate re-offers this resume step next launch. */}
+        <button onClick={onSkip} style={linkButtonStyle}>
+          Skip for now
+        </button>
       </GateCard>
     );
   }
@@ -406,6 +416,7 @@ export function IdentityGate({ children }: { children: ReactNode }) {
   const [bootError, setBootError] = useState<string | null>(null);
   const [dismissedPlaintext, setDismissedPlaintext] = useState(false);
   const [skippedUnlock, setSkippedUnlock] = useState(false);
+  const [skippedResume, setSkippedResume] = useState(false);
 
   const refresh = useCallback(() => {
     if (!desktop) return Promise.resolve();
@@ -448,7 +459,8 @@ export function IdentityGate({ children }: { children: ReactNode }) {
   // locked or unlocked from here — an interrupted create resumes first,
   // regardless of which of those two the session cache landed on.
   if (!report.mnemonicConfirmed) {
-    return <ResumeScreen onDone={refresh} />;
+    if (skippedResume) return <>{children}</>;
+    return <ResumeScreen onDone={refresh} onSkip={() => setSkippedResume(true)} />;
   }
 
   if (report.state === "locked") {

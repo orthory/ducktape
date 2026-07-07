@@ -534,6 +534,12 @@ describe("identity gate — plaintext (legacy) flow", () => {
 
   it("secure flow sets a password (encryptLegacy) then offers to reveal the phrase", async () => {
     markTauri();
+    // mnemonicConfirmed: true post-encrypt is real backend behavior, not just
+    // a convenient mock: `user_identity_encrypt` now sets the registry flag
+    // itself (mirroring `user_identity_restore`) — a legacy key predates the
+    // shown-once mnemonic ceremony, so there is no confirm step to force here.
+    // Before that fix this mock was aspirational (the real command left the
+    // flag false, which would have routed this user into ResumeScreen next).
     identityStateMock
       .mockResolvedValueOnce({ state: "plaintext", pubkey: "ab12", mnemonicConfirmed: true })
       .mockResolvedValue({ state: "unlocked", pubkey: "ab12", mnemonicConfirmed: true });
@@ -612,5 +618,31 @@ describe("identity gate — create-flow resume", () => {
     // mnemonic now confirmed but the encrypted key is still locked — the
     // normal unlock screen takes over rather than the console.
     expect(await screen.findByText("Unlock your identity")).toBeInTheDocument();
+  });
+
+  it("skip for now proceeds straight to the console without confirming", async () => {
+    // Same escape hatch as the locked screen: this resume step still demands
+    // a password (possibly forgotten) before the console renders, so it must
+    // not be a hard trap — skipping just means the gate re-offers next
+    // launch, same as any other unconfirmed mnemonic.
+    markTauri();
+    identityStateMock.mockResolvedValue({
+      state: "locked",
+      pubkey: "ab12",
+      mnemonicConfirmed: false,
+    });
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Confirm your recovery phrase");
+    fireEvent.click(screen.getByText("Skip for now"));
+
+    expect(await screen.findByTestId("console")).toBeInTheDocument();
+    expect(confirmMnemonicMock).not.toHaveBeenCalled();
+    expect(revealMnemonicMock).not.toHaveBeenCalled();
   });
 });

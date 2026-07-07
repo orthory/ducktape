@@ -31,7 +31,7 @@ export const autoBindUserIdentity = (
   if (!isTauri()) return Promise.resolve("skipped");
 
   return identityState()
-    .then(({ state }) => {
+    .then(({ state, pubkey: userKey }) => {
       // Only a readable key can sign a bind. An absent key has nothing to
       // offer yet; an encrypted-and-locked key needs a password this
       // fire-and-forget call never has — signing would just fail with
@@ -44,10 +44,12 @@ export const autoBindUserIdentity = (
 
       return userOf(transport, workspace.pubkey).then((bound) => {
         if (bound) return "already" as const;
-        return invoke<{ pubkey: string }>("user_identity_status")
-          .then(({ pubkey: userKey }) =>
-            getUser(transport, userKey).then((user) => user?.nonce ?? 0),
-          )
+        // Belt-and-suspenders: "unlocked"/"plaintext" always carry a pubkey
+        // in the clear (v2 files included), so this should never trip in
+        // practice. No pubkey means nothing to sign a bind with, either way.
+        if (!userKey) return "failed" as const;
+        return getUser(transport, userKey)
+          .then((user) => user?.nonce ?? 0)
           .then((nonce) =>
             invoke<string>("user_sign_bind", {
               chainId: workspace.chainId,
