@@ -6,6 +6,11 @@
 
 import type { BlockKind, PageBlock } from "../../../domain/pages-client";
 
+/** A pause this long while typing is one edit boundary — one consensus op.
+ *  Shared by the block rows and the title input; exported for the tests that
+ *  drive the boundary timer. */
+export const EDIT_BOUNDARY_MS = 700;
+
 /** One visible editor row: a non-root block plus its render facts. */
 export interface Row {
   block: PageBlock;
