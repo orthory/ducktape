@@ -17,6 +17,15 @@
 //!   reachability orchestrator, epoch cutover, standby pre-warm, and cold
 //!   restart drive this backend exactly as they drive the TUN one.
 //!
+//! and two consumer-facing faces over the stack (ADR phase 2), both fed by
+//! the effect's published [`stack::StackSlot`]:
+//!
+//! - [`seam`] — the commonware-runtime face: the `Virtual` arm of the
+//!   crate-level connection wrappers, carrying the control mesh's overlay
+//!   dials and binds.
+//! - [`factory`] — the data-plane face: [`VirtualSocketFactory`], minting
+//!   `OverlaySockets`' UDP/TCP endpoints for the per-use planes.
+//!
 //! no TUN, no privilege, no external binaries, no host mutation: everything
 //! here is ordinary process state. wire compatibility with tun-mode nodes is
 //! by construction — same Noise handshake, same keys, same wire format,
@@ -24,10 +33,13 @@
 
 pub mod device;
 pub mod effect;
+pub mod factory;
+pub mod seam;
 pub mod sockets;
 pub mod stack;
 
 pub use device::{PeerConfig, WgDevice};
 pub use effect::{UserspaceEffectError, UserspaceWireGuardEffect};
+pub use factory::VirtualSocketFactory;
 pub use sockets::{VirtualTcpListener, VirtualTcpStream, VirtualUdpSocket};
-pub use stack::VirtualStack;
+pub use stack::{StackSlot, VirtualStack};
