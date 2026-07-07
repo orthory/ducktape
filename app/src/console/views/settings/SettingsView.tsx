@@ -2,9 +2,17 @@
 // view stays wired only to the console store facade: views read
 // useDucktape() -> { state, actions } and never reach around it.
 
-import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type CSSProperties, type ReactNode } from "react";
 
 import { normalizeKey, shortKey } from "../../../domain/names";
+import type { IdentityStateReport } from "../../../domain/user-identity-client";
+import {
+  encryptLegacy,
+  identityState,
+  lockIdentity,
+  revealMnemonic,
+  unlockIdentity,
+} from "../../../domain/user-identity-client";
 import {
   isDesktop,
   LIVE_JOIN_SUPPORTED,
@@ -14,6 +22,7 @@ import { FinalizationMark } from "../../components/FinalizationMark";
 import { opKey } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
+import { MnemonicGrid, PasswordForm, errMessage } from "../onboarding/IdentityGateForms";
 import { Toggle } from "./Toggle";
 
 const ACCENTS = [
@@ -568,10 +577,43 @@ function NetworkSection() {
 // touching the console-wide error banner.
 type UserKeyStatus = { pubkey: string } | { error: string };
 
+/** Which inline custody form/grid (if any) is currently expanded below its
+ *  trigger row. Mutually exclusive — only one of unlock/set-password/reveal
+ *  is ever mid-flow at a time. */
+type CustodyPanelKind = "none" | "unlock" | "setPassword" | "reveal";
+
+/** An inline expando block under a custody trigger row — same visual family
+ *  as NetworkSection's InviteBlob (sunken background, its own padding). */
+function CustodyPanel({ children, last }: { children: ReactNode; last?: boolean }) {
+  return (
+    <div
+      style={{
+        padding: "10px 15px 13px",
+        borderBottom: last ? undefined : `1px solid ${color.borderSoft}`,
+        background: color.sunken,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
 function DevicesSection() {
   const { state } = useDucktape();
   const workspace = state.workspace;
   const [userKey, setUserKey] = useState<UserKeyStatus | null>(null);
+  // The custody state machine (locked/unlocked/plaintext/absent), driven by
+  // identityState() — a sibling fetch to userIdentityStatus above: that one
+  // is the legacy pubkey-only status, this is the richer lock-state report
+  // Task 6's rows are built from. Never derived from any cached mnemonic or
+  // password — every mutator below re-fetches fresh on success.
+  const [identity, setIdentity] = useState<IdentityStateReport | null>(null);
+  const [panel, setPanel] = useState<CustodyPanelKind>("none");
+  const [busy, setBusy] = useState(false);
+  const [identityError, setIdentityError] = useState<string | null>(null);
+  // The just-revealed mnemonic, held only long enough to render the grid —
+  // cleared on "Done" (or panel close) and never persisted anywhere else.
+  const [mnemonic, setMnemonic] = useState<string | null>(null);
 
   useEffect(() => {
     if (!workspace || !isDesktop()) return;
@@ -588,6 +630,109 @@ function DevicesSection() {
     };
   }, [workspace]);
 
+  // Routed through an extra microtask hop so a synchronous throw inside
+  // identityState() (a malformed mock, a bad IPC binding) rejects this
+  // promise instead of escaping the effect uncaught.
+  const refreshIdentityState = useCallback(
+    () =>
+      Promise.resolve()
+        .then(() => identityState())
+        .then(setIdentity)
+        .catch(() => {}),
+    [],
+  );
+
+  useEffect(() => {
+    if (!workspace || !isDesktop()) return;
+    let alive = true;
+    Promise.resolve()
+      .then(() => identityState())
+      .then((report) => {
+        if (alive) setIdentity(report);
+      })
+      .catch(() => {
+        // Not spec'd for Settings: the User key row above already surfaces
+        // user-key file problems, so a failed custody fetch just leaves the
+        // custody block absent rather than adding a second error banner.
+      });
+    return () => {
+      alive = false;
+    };
+  }, [workspace]);
+
+  const closeCustodyPanel = () => {
+    setPanel("none");
+    setIdentityError(null);
+    setMnemonic(null);
+  };
+
+  const handleUnlock = (password: string) => {
+    setBusy(true);
+    setIdentityError(null);
+    unlockIdentity(password)
+      .then(() => {
+        closeCustodyPanel();
+        return refreshIdentityState();
+      })
+      .catch((err) => setIdentityError(errMessage(err)))
+      .finally(() => setBusy(false));
+  };
+
+  const handleLock = () => {
+    setBusy(true);
+    setIdentityError(null);
+    lockIdentity()
+      .then(() => {
+        closeCustodyPanel();
+        return refreshIdentityState();
+      })
+      .catch((err) => setIdentityError(errMessage(err)))
+      .finally(() => setBusy(false));
+  };
+
+  const handleSetPassword = (password: string) => {
+    setBusy(true);
+    setIdentityError(null);
+    encryptLegacy(password)
+      .then(() => {
+        closeCustodyPanel();
+        return refreshIdentityState();
+      })
+      .catch((err) => setIdentityError(errMessage(err)))
+      .finally(() => setBusy(false));
+  };
+
+  // Plaintext has no password to verify — the underlying verb tolerates an
+  // empty one for a legacy key — so this reveals straight through with no
+  // prompt. Locked/unlocked ALWAYS re-prompt: revealMnemonic never consults
+  // the session cache by design, so neither does this button — the mnemonic
+  // is only ever set here, fresh, from that call's own resolution.
+  const handleRevealClick = () => {
+    if (!identity) return;
+    setIdentityError(null);
+    if (identity.state === "plaintext") {
+      setBusy(true);
+      revealMnemonic("")
+        .then((revealed) => {
+          setMnemonic(revealed.mnemonic);
+          setPanel("reveal");
+        })
+        .catch((err) => setIdentityError(errMessage(err)))
+        .finally(() => setBusy(false));
+      return;
+    }
+    setPanel("reveal");
+  };
+
+  const handleRevealSubmit = (password: string) => {
+    setBusy(true);
+    setIdentityError(null);
+    revealMnemonic(password)
+      .then((revealed) => setMnemonic(revealed.mnemonic))
+      .catch((err) => setIdentityError(errMessage(err)))
+      .finally(() => setBusy(false));
+  };
+
   if (!workspace) return null;
 
   const nodeKeyNorm = normalizeKey(workspace.pubkey);
@@ -600,6 +745,9 @@ function DevicesSection() {
         .map(([key]) => key)
     : [];
   const showUserKey = userKey !== null;
+  // "absent" (no user.key yet) renders exactly like non-desktop: no custody
+  // rows at all — the identity gate is what's supposed to create one first.
+  const showCustody = identity !== null && identity.state !== "absent";
 
   return (
     <>
@@ -611,7 +759,7 @@ function DevicesSection() {
         />
         <InfoRow
           label="Bind state"
-          last={otherNodes.length === 0 && !showUserKey}
+          last={otherNodes.length === 0 && !showUserKey && !showCustody}
           value={
             <span style={monoValue}>
               {bound ? `Linked to ${bound.name ?? shortKey(bound.userKey)}` : "Not linked"}
@@ -621,7 +769,7 @@ function DevicesSection() {
         {otherNodes.length > 0 ? (
           <InfoRow
             label="Other devices"
-            last={!showUserKey}
+            last={!showUserKey && !showCustody}
             value={
               <span style={monoValue}>
                 {otherNodes.map((key) => shortKey(key)).join(", ")}
@@ -632,13 +780,166 @@ function DevicesSection() {
         {userKey ? (
           <InfoRow
             label="User key"
-            last
+            last={!showCustody}
             value={
               <span style={"pubkey" in userKey ? monoValue : { ...monoValue, color: color.red }}>
                 {"pubkey" in userKey ? shortKey(userKey.pubkey) : userKey.error}
               </span>
             }
           />
+        ) : null}
+        {showCustody && identity ? (
+          <>
+            <InfoRow
+              label="Identity lock"
+              value={
+                <span style={monoValue}>
+                  {identity.state === "locked"
+                    ? "Locked"
+                    : identity.state === "unlocked"
+                      ? "Unlocked"
+                      : "Not password-protected"}
+                </span>
+              }
+            />
+            {identity.state === "locked" && (
+              <ControlRow
+                title="Unlock identity"
+                desc="Verify your password to use this identity for signing this session."
+                control={
+                  panel === "unlock" ? (
+                    <HoverButton
+                      ariaLabel="Cancel unlock"
+                      onClick={closeCustodyPanel}
+                      hoverBg={color.titlebar}
+                      style={outlineButton}
+                    >
+                      Cancel
+                    </HoverButton>
+                  ) : (
+                    <HoverButton
+                      onClick={() => {
+                        setIdentityError(null);
+                        setPanel("unlock");
+                      }}
+                      hoverBg={color.titlebar}
+                      style={outlineButton}
+                    >
+                      Unlock
+                    </HoverButton>
+                  )
+                }
+              />
+            )}
+            {panel === "unlock" && (
+              <CustodyPanel>
+                <PasswordForm
+                  mode="confirm"
+                  busy={busy}
+                  error={identityError}
+                  submitLabel={busy ? "Unlocking…" : "Unlock"}
+                  onSubmit={handleUnlock}
+                />
+              </CustodyPanel>
+            )}
+            {identity.state === "unlocked" && (
+              <ControlRow
+                title="Lock identity"
+                desc="Drop the cached password — the next signing action needs it again."
+                control={
+                  <HoverButton
+                    onClick={handleLock}
+                    hoverBg={color.titlebar}
+                    disabled={busy}
+                    style={outlineButton}
+                  >
+                    {busy ? "Locking…" : "Lock"}
+                  </HoverButton>
+                }
+              />
+            )}
+            {identity.state === "plaintext" && (
+              <ControlRow
+                title="Set a password"
+                desc="Encrypt this identity key at rest so a stolen device can't sign as you."
+                control={
+                  panel === "setPassword" ? (
+                    <HoverButton
+                      ariaLabel="Cancel set password"
+                      onClick={closeCustodyPanel}
+                      hoverBg={color.titlebar}
+                      style={outlineButton}
+                    >
+                      Cancel
+                    </HoverButton>
+                  ) : (
+                    <HoverButton
+                      onClick={() => {
+                        setIdentityError(null);
+                        setPanel("setPassword");
+                      }}
+                      hoverBg="#38362e"
+                      style={darkButton}
+                    >
+                      Set password
+                    </HoverButton>
+                  )
+                }
+              />
+            )}
+            {panel === "setPassword" && (
+              <CustodyPanel>
+                <PasswordForm
+                  mode="set"
+                  busy={busy}
+                  error={identityError}
+                  submitLabel={busy ? "Securing…" : "Set password"}
+                  onSubmit={handleSetPassword}
+                />
+              </CustodyPanel>
+            )}
+            <ControlRow
+              title="Recovery phrase"
+              desc="View your 24-word backup phrase. Always requires your password."
+              last={panel !== "reveal"}
+              control={
+                panel === "reveal" ? (
+                  <HoverButton
+                    ariaLabel="Cancel reveal"
+                    onClick={closeCustodyPanel}
+                    hoverBg={color.titlebar}
+                    style={outlineButton}
+                  >
+                    Cancel
+                  </HoverButton>
+                ) : (
+                  <HoverButton
+                    onClick={handleRevealClick}
+                    hoverBg={color.titlebar}
+                    disabled={busy}
+                    style={outlineButton}
+                  >
+                    Reveal recovery phrase
+                  </HoverButton>
+                )
+              }
+            />
+            {panel === "reveal" && (
+              <CustodyPanel last>
+                {mnemonic ? (
+                  <MnemonicGrid mnemonic={mnemonic} onContinue={closeCustodyPanel} continueLabel="Done" />
+                ) : (
+                  <PasswordForm
+                    mode="confirm"
+                    busy={busy}
+                    error={identityError}
+                    submitLabel={busy ? "Revealing…" : "Reveal"}
+                    onSubmit={handleRevealSubmit}
+                  />
+                )}
+              </CustodyPanel>
+            )}
+          </>
         ) : null}
       </GroupCard>
     </>

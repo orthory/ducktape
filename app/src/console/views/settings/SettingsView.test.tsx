@@ -1,16 +1,19 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
+import { BIP39_ENGLISH_WORDLIST } from "../../../domain/bip39-wordlist";
 import { shortKey } from "../../../domain/names";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
 import type { Workspace } from "../../../domain/workspace-client";
 import { SettingsView } from "./SettingsView";
+
+const TEST_MNEMONIC = BIP39_ENGLISH_WORDLIST.slice(0, 24).join(" ");
 
 const markTauri = () => {
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
@@ -254,6 +257,8 @@ describe("SettingsView", () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_status")
         return Promise.resolve({ pubkey: "cd34".repeat(16) });
+      if (cmd === "user_identity_state")
+        return Promise.resolve({ state: "absent", mnemonicConfirmed: true });
       throw new Error(`unexpected invoke ${cmd}`);
     });
 
@@ -270,6 +275,8 @@ describe("SettingsView", () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_status")
         return Promise.reject("user.key exists but is corrupt (bad hex)");
+      if (cmd === "user_identity_state")
+        return Promise.resolve({ state: "absent", mnemonicConfirmed: true });
       throw new Error(`unexpected invoke ${cmd}`);
     });
 
@@ -287,6 +294,11 @@ describe("SettingsView", () => {
     await Promise.resolve();
     expect(invokeMock).not.toHaveBeenCalled();
     expect(screen.queryByText("User key")).not.toBeInTheDocument();
+    // Same for the custody state fetch: no user_identity_state call, no rows.
+    expect(screen.queryByText("Identity lock")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /reveal recovery phrase/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("disables Request leave for a solo validator (can't remove the last one)", () => {
@@ -298,5 +310,271 @@ describe("SettingsView", () => {
     expect(requestLeave).toBeDisabled();
     // Forget is still available for a solo network.
     expect(screen.getByRole("button", { name: /forget workspace/i })).toBeEnabled();
+  });
+});
+
+describe("SettingsView — identity custody controls", () => {
+  const mockIdentity = (
+    state: "absent" | "plaintext" | "locked" | "unlocked",
+    extra: Record<string, unknown> = {},
+  ) => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_status")
+        return Promise.reject("no legacy status wired for this test");
+      if (cmd === "user_identity_state")
+        return Promise.resolve({ state, pubkey: "ab12", mnemonicConfirmed: true });
+      if (cmd in extra) return extra[cmd] as Promise<unknown>;
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+  };
+
+  it("locked: shows the Locked row plus Unlock and Reveal, no Lock/Set password", async () => {
+    markTauri();
+    mockIdentity("locked");
+    renderSettings();
+
+    expect(await screen.findByText("Locked")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^unlock$/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /reveal recovery phrase/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^lock$/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^set password$/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("unlocked: shows the Unlocked row plus Lock and Reveal, no Unlock/Set password", async () => {
+    markTauri();
+    mockIdentity("unlocked");
+    renderSettings();
+
+    expect(await screen.findByText("Unlocked")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^lock$/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /reveal recovery phrase/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^unlock$/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^set password$/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("plaintext: shows the not-password-protected row plus Set password and Reveal", async () => {
+    markTauri();
+    mockIdentity("plaintext");
+    renderSettings();
+
+    expect(await screen.findByText("Not password-protected")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^set password$/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /reveal recovery phrase/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^unlock$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^lock$/i })).not.toBeInTheDocument();
+  });
+
+  it("absent: renders no custody rows at all", async () => {
+    markTauri();
+    mockIdentity("absent");
+    renderSettings();
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("user_identity_state"),
+    );
+    expect(screen.queryByText("Identity lock")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^unlock$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^lock$/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^set password$/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /reveal recovery phrase/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("unlocks via the inline password form and re-fetches state", async () => {
+    markTauri();
+    let stateCalls = 0;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_status") return Promise.reject("n/a");
+      if (cmd === "user_identity_state") {
+        stateCalls += 1;
+        return Promise.resolve(
+          stateCalls === 1
+            ? { state: "locked", pubkey: "ab12", mnemonicConfirmed: true }
+            : { state: "unlocked", pubkey: "ab12", mnemonicConfirmed: true },
+        );
+      }
+      if (cmd === "user_identity_unlock") return Promise.resolve({ pubkey: "ab12" });
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+
+    renderSettings();
+
+    await screen.findByText("Locked");
+    fireEvent.click(screen.getByRole("button", { name: /^unlock$/i }));
+
+    const passwordInput = await screen.findByPlaceholderText("Password");
+    fireEvent.change(passwordInput, { target: { value: "correct horse battery" } });
+    fireEvent.click(screen.getByRole("button", { name: /^unlock$/i }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("user_identity_unlock", {
+        password: "correct horse battery",
+      }),
+    );
+    expect(await screen.findByText("Unlocked")).toBeInTheDocument();
+  });
+
+  it("shows an inline error on a wrong unlock password without re-fetching state", async () => {
+    markTauri();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_status") return Promise.reject("n/a");
+      if (cmd === "user_identity_state")
+        return Promise.resolve({ state: "locked", pubkey: "ab12", mnemonicConfirmed: true });
+      if (cmd === "user_identity_unlock") return Promise.reject(new Error("wrong password"));
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+
+    renderSettings();
+
+    await screen.findByText("Locked");
+    fireEvent.click(screen.getByRole("button", { name: /^unlock$/i }));
+    fireEvent.change(await screen.findByPlaceholderText("Password"), {
+      target: { value: "nope" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^unlock$/i }));
+
+    expect(await screen.findByText("wrong password")).toBeInTheDocument();
+    expect(screen.getByText("Locked")).toBeInTheDocument();
+  });
+
+  it("locks via the Lock button and re-fetches state", async () => {
+    markTauri();
+    let stateCalls = 0;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_status") return Promise.reject("n/a");
+      if (cmd === "user_identity_state") {
+        stateCalls += 1;
+        return Promise.resolve(
+          stateCalls === 1
+            ? { state: "unlocked", pubkey: "ab12", mnemonicConfirmed: true }
+            : { state: "locked", pubkey: "ab12", mnemonicConfirmed: true },
+        );
+      }
+      if (cmd === "user_identity_lock") return Promise.resolve(undefined);
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+
+    renderSettings();
+
+    await screen.findByText("Unlocked");
+    fireEvent.click(screen.getByRole("button", { name: /^lock$/i }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("user_identity_lock"));
+    expect(await screen.findByText("Locked")).toBeInTheDocument();
+  });
+
+  it("reveal always re-prompts for a password even when already unlocked, and hides on Done", async () => {
+    markTauri();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_status") return Promise.reject("n/a");
+      if (cmd === "user_identity_state")
+        return Promise.resolve({ state: "unlocked", pubkey: "ab12", mnemonicConfirmed: true });
+      if (cmd === "user_identity_reveal")
+        return Promise.resolve({ mnemonic: TEST_MNEMONIC });
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+
+    renderSettings();
+
+    await screen.findByText("Unlocked");
+    // No password form until the user asks to reveal.
+    expect(screen.queryByPlaceholderText("Password")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /reveal recovery phrase/i }));
+
+    const passwordInput = await screen.findByPlaceholderText("Password");
+    expect(invokeMock).not.toHaveBeenCalledWith("user_identity_reveal", expect.anything());
+    fireEvent.change(passwordInput, { target: { value: "correct horse battery" } });
+    fireEvent.click(screen.getByRole("button", { name: /^reveal$/i }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("user_identity_reveal", {
+        password: "correct horse battery",
+      }),
+    );
+    expect(await screen.findByText("abandon")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^done$/i }));
+    expect(screen.queryByText("abandon")).not.toBeInTheDocument();
+    // Back to the trigger, not a cached grid — a second reveal needs a fresh password again.
+    expect(
+      screen.getByRole("button", { name: /reveal recovery phrase/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("reveal on a plaintext identity skips the password prompt entirely", async () => {
+    markTauri();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_status") return Promise.reject("n/a");
+      if (cmd === "user_identity_state")
+        return Promise.resolve({ state: "plaintext", pubkey: "ab12", mnemonicConfirmed: true });
+      if (cmd === "user_identity_reveal")
+        return Promise.resolve({ mnemonic: TEST_MNEMONIC });
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+
+    renderSettings();
+
+    await screen.findByText("Not password-protected");
+    fireEvent.click(screen.getByRole("button", { name: /reveal recovery phrase/i }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("user_identity_reveal", { password: "" }),
+    );
+    expect(screen.queryByPlaceholderText("Password")).not.toBeInTheDocument();
+    expect(await screen.findByText("abandon")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^done$/i }));
+    expect(screen.queryByText("abandon")).not.toBeInTheDocument();
+  });
+
+  it("sets a password on a plaintext identity via encryptLegacy, then re-fetches to Unlocked", async () => {
+    markTauri();
+    let stateCalls = 0;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_status") return Promise.reject("n/a");
+      if (cmd === "user_identity_state") {
+        stateCalls += 1;
+        return Promise.resolve(
+          stateCalls === 1
+            ? { state: "plaintext", pubkey: "ab12", mnemonicConfirmed: true }
+            : { state: "unlocked", pubkey: "ab12", mnemonicConfirmed: true },
+        );
+      }
+      if (cmd === "user_identity_encrypt") return Promise.resolve({ pubkey: "ab12" });
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+
+    renderSettings();
+
+    await screen.findByText("Not password-protected");
+    fireEvent.click(screen.getByRole("button", { name: /^set password$/i }));
+
+    fireEvent.change(await screen.findByPlaceholderText("Password (min 8 characters)"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Confirm password"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^set password$/i }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("user_identity_encrypt", {
+        password: "correct horse battery",
+      }),
+    );
+    expect(await screen.findByText("Unlocked")).toBeInTheDocument();
   });
 });
