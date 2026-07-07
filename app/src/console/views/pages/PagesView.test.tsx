@@ -319,14 +319,24 @@ describe("Pages keyboard shortcuts & tab strip", () => {
     expect(spies.createChildPage).toHaveBeenNthCalledWith(2, null);
   });
 
-  it("leaves ⌘W to the window — it never closes a doc tab or creates a page", () => {
+  it("closes the active doc tab on ⌘W and Ctrl+W", () => {
     const { spies } = withTabs();
     fireEvent.keyDown(document, { code: "KeyW", metaKey: true });
-    expect(spies.closeTab).not.toHaveBeenCalled();
+    expect(spies.closeTab).toHaveBeenLastCalledWith("p1");
+    fireEvent.keyDown(document, { code: "KeyW", ctrlKey: true });
+    expect(spies.closeTab).toHaveBeenCalledTimes(2);
     expect(spies.openPage).not.toHaveBeenCalled();
-    // createChildPage is spied lazily on first access; ⌘W must never reach it,
-    // so the spy stays undefined (and if present, uncalled).
-    if (spies.createChildPage) expect(spies.createChildPage).not.toHaveBeenCalled();
+  });
+
+  it("⌘W with no open doc falls through to the window untouched", () => {
+    const { spies } = renderPagesView({
+      activePage: null,
+      activePageBlocks: [],
+      openTabs: [],
+    });
+    fireEvent.keyDown(document, { code: "KeyW", metaKey: true });
+    // closeTab is spied lazily on first access; ⌘W must never reach it.
+    if (spies.closeTab) expect(spies.closeTab).not.toHaveBeenCalled();
   });
 
   it("keeps the tab strip scrollable but hides the scrollbar chrome", () => {

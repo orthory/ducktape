@@ -113,8 +113,9 @@ export function PagesView() {
   // Docs screen is mounted, so it never leaks into other modules:
   //   ⌘/Ctrl + ⇧ + [ / ]   previous / next tab (cycles, wraps at the ends)
   //   ⌘/Ctrl + T or N       new top-level page
-  //   ⌘/Ctrl + W            deliberately NOT handled — it must fall through to
-  //                         the window (close-to-tray), never close a doc tab.
+  //   ⌘/Ctrl + W            close the active doc tab — browser muscle memory.
+  //                         With no doc open it falls through to the window
+  //                         untouched (close-to-tray).
   // Bracket keys are matched on `event.code` (physical key), so the shift-
   // produced "{"/"}" characters don't matter.
   useEffect(() => {
@@ -132,6 +133,13 @@ export function PagesView() {
         const current = state.activePage ? tabs.indexOf(state.activePage) : -1;
         const base = current === -1 ? 0 : current;
         actions.openPage(tabs[(base + step + tabs.length) % tabs.length]);
+        return;
+      }
+
+      if (!event.shiftKey && event.code === "KeyW") {
+        if (!state.activePage) return;
+        event.preventDefault();
+        actions.closeTab(state.activePage);
         return;
       }
 
