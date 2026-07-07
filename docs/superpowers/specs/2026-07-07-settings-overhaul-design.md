@@ -88,10 +88,6 @@ card — module-side affordance, not settings duplication.
   state init reads it back (validated as a `#rrggbb` hex, falling back to
   `DEFAULT_ACCENT`), mirroring the existing `ducktape.viewMode` pattern in
   `state.ts`.
-- **Shared role helper:** extract one role-presentation helper (tier label +
-  colors from `{founder, member}`) into
-  `app/src/console/lib/workspace-role.ts` and use it from Settings and
-  StatusView (MembersView adoption optional if its variant matches).
 
 ## File layout (mono-file mandate)
 
@@ -130,6 +126,11 @@ stored value) falls back silently to the default.
 
 ## Out of scope
 
+- Unifying the three `workspaceRole` helpers (Settings badge chip, StatusView
+  status card, MembersView header pill): each renders a genuinely different
+  shape from the same two booleans — a shared helper would be forced
+  indirection for ~3 shared lines. After the slim, Settings' copy shrinks to
+  the identity-card badge only.
 - Modules-view ↔ Node-view Merkle-root duplication (informational, both
   operator surfaces; separate concern).
 - Any tabbed/sub-nav Settings shell (unneeded at five compact sections).
