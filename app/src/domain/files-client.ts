@@ -1,216 +1,321 @@
 // Typed client for the node's `files` module — the TS mirror of
-// `crates/apps/files-interface`. A Manifest is the CONSENSUS truth about a file:
-// its identity, size, and ordered chunk digests. The chunk BYTES never enter
-// consensus — they live in the node's content-addressed blob store (the same one
-// `putBlob`/`getBlob` speak) and are verified by the receiver against the
-// committed digests.
+// `crates/apps/files` (duckfs: a consensus-replicated, copy-on-write,
+// content-addressed FILESYSTEM, not a flat manifest table). Paths are absolute
+// ("/" is the root; every path starts with "/"), the tree is snapshot-versioned,
+// and a write is an atomic multi-path `Commit` with per-path CAS against a base
+// snapshot.
 //
-// Upload = chunk locally, `putBlob` each chunk (which returns sha256(bytes) hex
-// == the chunk digest), then `AddManifest` with the digest list; the module
-// computes the whole-file `digest` and origin-derived `owner`. Download = `Stat`
-// the manifest, `getBlob` each chunk, `verifyChunk` it, concatenate.
+// Upload = inline for small files (b64 inside the commit op, ≤256 KiB total),
+// else chunk at 1 MiB and `filesStage` each (the digest comes back from the
+// node — the client computes nothing consensus-critical) then reference the
+// digests in a `Commit`. Download = `readAll` (page `read` to eof). Directory
+// browse = `ls` (name-ordered, cursor-paged). refs + diff have no dedicated
+// route yet and ride the generic `query` lane.
 //
-// camelCase params in, verbatim serde wire out, pure fns over a NodeTransport.
+// The wire shapes live in transport.ts (one home for the whole files plane, next
+// to BlockRecord); this file re-exports them and layers the operations + the
+// consensus caps on top. Everything is a pure function over a NodeTransport.
 
 import type { BlockEvent, NodeTransport } from "./transport";
 import { replyVariant } from "./wire";
 
-// ── Write-time caps (consensus constants, mirrored for pre-validation) ─
+export type {
+  FileEntry,
+  FileEntryKind,
+  FileSnapshot,
+  FileRefs,
+  FileDiffEntry,
+  FileDiffKind,
+  FileContent,
+  FileChange,
+  FilePage,
+  FileReadRange,
+} from "./transport";
+import type {
+  FileChange,
+  FileContent,
+  FileDiffEntry,
+  FileEntry,
+  FilePage,
+  FileRefs,
+  FileSnapshot,
+} from "./transport";
 
-export const MAX_FILE_ID_BYTES = 256;
-export const MAX_NAME_BYTES = 512;
-export const MAX_MIME_BYTES = 128;
-export const MIN_CHUNK_SIZE = 4 * 1024;
-export const MAX_CHUNK_SIZE = 4 * 1024 * 1024;
-export const MAX_CHUNKS = 4096;
-export const MAX_LIST_LIMIT = 256;
+// ── Consensus caps (mirrored from crates/apps/files/src/wire.rs) ──────
+//
+// These are the module's execute-time rejection bounds; the client mirrors the
+// load-bearing ones for pre-validation and chunk planning. wire.rs is the source
+// of truth — keep these in step with it.
 
-// ── Wire types (verbatim serde shapes) ──────────────────
-
-/** A content-addressed file manifest — the consensus commitment to one file. */
-export interface Manifest {
-  file_id: string;
-  name: string;
-  mime: string;
-  size: number;
-  chunk_size: number;
-  /** per-chunk sha256 digests, in file order (64-char lowercase hex) */
-  chunks: string[];
-  /** whole-file commitment: sha256 over the concatenated chunk digest RAW bytes.
-   *  A digest-of-digests, computed by the module — never trusted alone (use
-   *  verifyChunk per chunk). */
-  digest: string;
-  /** origin-derived owner, set by the module */
-  owner: string;
-  created_at_height: number;
-}
+/** Fixed chunk size for large files (`CHUNK_SIZE`) and the per-stage body cap. */
+export const CHUNK_SIZE = 1024 * 1024;
+/** Total inline bytes a single commit may carry (`MAX_INLINE_COMMIT_BYTES`);
+ *  a file at or under it rides inside the commit op instead of being staged. */
+export const MAX_INLINE_COMMIT_BYTES = 256 * 1024;
+/** Per-`read` byte ceiling (`MAX_READ_BYTES`) — the paging step for `readAll`. */
+export const MAX_READ_BYTES = 1024 * 1024;
+/** Default listing/query page size (`MAX_PAGE`). */
+export const MAX_PAGE = 256;
+/** Absolute path byte cap (`MAX_PATH_BYTES`). */
+export const MAX_PATH_BYTES = 4096;
+/** Single path-segment name byte cap (`MAX_NAME_BYTES`). */
+export const MAX_NAME_BYTES = 255;
+/** Changes per commit (`MAX_CHANGES_PER_COMMIT`). */
+export const MAX_CHANGES_PER_COMMIT = 4096;
+/** Commit-message byte cap (`MAX_MESSAGE_BYTES`). */
+export const MAX_MESSAGE_BYTES = 4096;
 
 const TARGET = "files";
 
-// ── sha256 + chunk verification (mirror of the Rust helpers) ─
+// ── base64 (browser-safe, chunked so a large file doesn't blow the arg cap) ─
 
-/** sha256(bytes) as 64-char lowercase hex — the DigestHex rendering. */
-export const digestHex = async (bytes: Uint8Array<ArrayBuffer>): Promise<string> => {
-  const buf = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(buf))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-};
+const B64_CHUNK = 0x8000;
 
-/** The exact byte length a manifest implies for chunk `index`: `chunk_size` for
- *  every chunk except the last, and `size - (n-1)*chunk_size` for the last. */
-export const expectedChunkLen = (manifest: Manifest, index: number): number => {
-  const n = manifest.chunks.length;
-  if (index === n - 1) return manifest.size - (n - 1) * manifest.chunk_size;
-  return manifest.chunk_size;
-};
-
-/** Receiver-side verification of one fetched chunk against a committed manifest.
- *  Checks BOTH the digest AND the exact implied length — a digest match alone is
- *  not sufficient (a manifest can commit sha256("") for a chunk while claiming a
- *  non-zero size). Rejects (throws) on any mismatch. */
-export const verifyChunk = async (
-  manifest: Manifest,
-  index: number,
-  bytes: Uint8Array<ArrayBuffer>,
-): Promise<void> => {
-  const n = manifest.chunks.length;
-  if (index >= n) throw new Error(`chunk index ${index} out of range (${n} chunks)`);
-  const expected = expectedChunkLen(manifest, index);
-  if (bytes.length !== expected) {
-    throw new Error(
-      `chunk ${index} length mismatch: manifest implies ${expected} bytes, got ${bytes.length}`,
-    );
+/** Uint8Array → standard base64. Chunked through `String.fromCharCode` so a
+ *  multi-hundred-KiB inline body never exceeds the apply-spread arg limit. */
+export const bytesToBase64 = (bytes: Uint8Array): string => {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += B64_CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + B64_CHUNK));
   }
-  const got = await digestHex(bytes);
-  if (got !== manifest.chunks[index]) {
-    throw new Error(
-      `chunk ${index} digest mismatch: committed ${manifest.chunks[index]}, got ${got}`,
-    );
-  }
+  return btoa(binary);
 };
 
-// ── Msgs (writes) ───────────────────────────────────────
+/** base64 → Uint8Array (ArrayBuffer-backed). The inverse of `bytesToBase64`,
+ *  used to decode a `read` range's `b64` back to bytes. */
+export const base64ToBytes = (b64: string): Uint8Array<ArrayBuffer> => {
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+  return out;
+};
 
-/** Register a manifest. The submitter supplies only identity, shape, and the
- *  chunk digest list; the module computes `digest` and `owner`. */
-export const addManifest = (
+// ── Path helpers ────────────────────────────────────────
+
+/** The last segment of an absolute path (the file/dir name); "/" → "". */
+export const basename = (path: string): string => {
+  const trimmed = path.replace(/\/+$/, "");
+  const slash = trimmed.lastIndexOf("/");
+  return slash < 0 ? trimmed : trimmed.slice(slash + 1);
+};
+
+/** Join a directory path and a child name into one absolute path. The root "/"
+ *  never doubles its slash. */
+export const joinPath = (dir: string, name: string): string =>
+  dir === "/" ? `/${name}` : `${dir.replace(/\/+$/, "")}/${name}`;
+
+// ── Reads ───────────────────────────────────────────────
+
+/** One page of a directory's entries in name order (GET /v1/files/ls). Echo the
+ *  returned `next` as the following call's `after` to page. */
+export const ls = (
   transport: NodeTransport,
-  params: {
-    fileId: string;
-    name: string;
-    mime: string;
-    size: number;
-    chunkSize: number;
-    chunks: string[];
-  },
-): Promise<BlockEvent> =>
-  transport.submit(TARGET, {
-    add_manifest: {
-      file_id: params.fileId,
-      name: params.name,
-      mime: params.mime,
-      size: params.size,
-      chunk_size: params.chunkSize,
-      chunks: params.chunks,
-    },
-  });
+  params: { path: string; snapshot?: string; after?: string; limit?: number },
+): Promise<FilePage> => transport.filesLs(params);
 
-/** Remove a manifest. Owner-gated: only the stored owner origin may remove, so
- *  the caller must submit under the SAME identity that added it (the console
- *  omits `origin`, so both ride the daemon's default identity). */
-export const removeManifest = (
-  transport: NodeTransport,
-  fileId: string,
-): Promise<BlockEvent> =>
-  transport.submit(TARGET, { remove_manifest: { file_id: fileId } });
-
-// ── Queries (reads over committed state) ────────────────
-
+/** The entry at `path` (kind/size/exec/object/meta), or null when absent. */
 export const stat = (
   transport: NodeTransport,
-  fileId: string,
-): Promise<Manifest | null> =>
-  Promise.resolve()
-    .then(() => transport.query(TARGET, { stat: { file_id: fileId } }))
-    .then((reply) => replyVariant<Manifest | null>(reply, "stat"));
+  params: { path: string; snapshot?: string },
+): Promise<FileEntry | null> => transport.filesStat(params);
 
-/** Manifests whose file_id starts with `prefix`, at most `limit` (clamped). */
-export const list = (
+/** A byte range of a file (base64 + eof). `len` is clamped to MAX_READ_BYTES. */
+export const read = (
   transport: NodeTransport,
-  params: { prefix?: string; limit?: number },
-): Promise<Manifest[]> =>
+  params: { path: string; snapshot?: string; offset?: number; len?: number },
+): Promise<{ b64: string; eof: boolean }> => transport.filesRead(params);
+
+/** Reassemble a whole file by paging `read` at MAX_READ_BYTES until eof. Returns
+ *  the concatenated bytes; a page that yields nothing without signalling eof
+ *  breaks the loop rather than spinning forever. */
+export const readAll = async (
+  transport: NodeTransport,
+  params: { path: string; snapshot?: string },
+): Promise<Uint8Array<ArrayBuffer>> => {
+  const parts: Uint8Array[] = [];
+  let offset = 0;
+  for (;;) {
+    const range = await transport.filesRead({
+      path: params.path,
+      snapshot: params.snapshot,
+      offset,
+      len: MAX_READ_BYTES,
+    });
+    const bytes = base64ToBytes(range.b64);
+    if (bytes.length > 0) {
+      parts.push(bytes);
+      offset += bytes.length;
+    }
+    if (range.eof || bytes.length === 0) break;
+  }
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let cursor = 0;
+  for (const part of parts) {
+    out.set(part, cursor);
+    cursor += part.length;
+  }
+  return out;
+};
+
+/** The bounded commit history, newest-first (GET /v1/files/history). */
+export const history = (
+  transport: NodeTransport,
+  params: { limit?: number } = {},
+): Promise<FileSnapshot[]> => transport.filesHistory(params);
+
+/** The refs image — live head, named pins, window length. Over the generic
+ *  query lane (no dedicated route): reply `{ refs: {...} }`. */
+export const refs = (transport: NodeTransport): Promise<FileRefs> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, { refs: {} }))
+    .then((reply) => replyVariant<FileRefs>(reply, "refs"));
+
+/** The path-level diff between two snapshots under an optional prefix. Over the
+ *  generic query lane: reply `{ diff: [...] }`. */
+export const diff = (
+  transport: NodeTransport,
+  params: { from: string; to: string; prefix?: string },
+): Promise<FileDiffEntry[]> =>
   Promise.resolve()
     .then(() =>
       transport.query(TARGET, {
-        list: { prefix: params.prefix ?? "", limit: params.limit ?? MAX_LIST_LIMIT },
+        diff: { from: params.from, to: params.to, prefix: params.prefix ?? "" },
       }),
     )
-    .then((reply) => replyVariant<Manifest[]>(reply, "list"));
+    .then((reply) => replyVariant<FileDiffEntry[]>(reply, "diff"));
 
-// ── Upload / download (chunk plane over putBlob / getBlob) ─
+/** Paths under a raw path prefix, in full-path order (used for the global file
+ *  index that feeds search). Over the generic query lane: reply
+ *  `{ find: { entries, next } }`. */
+export const find = (
+  transport: NodeTransport,
+  params: { prefix?: string; snapshot?: string; after?: string; limit?: number } = {},
+): Promise<FilePage> =>
+  Promise.resolve()
+    .then(() =>
+      transport.query(TARGET, {
+        find: {
+          prefix: params.prefix ?? "/",
+          snapshot: params.snapshot ?? null,
+          after: params.after ?? null,
+          limit: params.limit ?? MAX_PAGE,
+        },
+      }),
+    )
+    .then((reply) => replyVariant<FilePage>(reply, "find"));
 
-/** Pick a chunk size in [MIN_CHUNK_SIZE, MAX_CHUNK_SIZE] that keeps the chunk
- *  count within MAX_CHUNKS for `size` bytes. Starts at 256 KiB and grows by
- *  doubling until the count fits. */
-export const planChunkSize = (size: number): number => {
-  let chunkSize = 256 * 1024;
-  if (chunkSize < MIN_CHUNK_SIZE) chunkSize = MIN_CHUNK_SIZE;
-  while (chunkSize < MAX_CHUNK_SIZE && Math.ceil(size / chunkSize) > MAX_CHUNKS) {
-    chunkSize = Math.min(chunkSize * 2, MAX_CHUNK_SIZE);
+// ── Writes ──────────────────────────────────────────────
+
+/** Stage one chunk's raw bytes and return its object-id digest (64-hex). The
+ *  digest is the node's — the client trusts it and never recomputes. */
+export const stage = (
+  transport: NodeTransport,
+  bytes: Uint8Array<ArrayBuffer>,
+): Promise<string> => transport.filesStage(bytes).then((r) => r.digest);
+
+/** Commit an atomic change set against a base snapshot. `baseSnapshot` null is
+ *  the empty tree (a first commit); the per-path CAS checks the changed paths
+ *  against the live head. */
+export const commit = (
+  transport: NodeTransport,
+  params: { baseSnapshot: string | null; message: string; changes: FileChange[] },
+): Promise<BlockEvent> =>
+  transport.filesCommit({
+    base_snapshot: params.baseSnapshot,
+    message: params.message,
+    changes: params.changes,
+  });
+
+/** Resolve the base snapshot for a write: the caller's explicit choice (which
+ *  may legitimately be null), else the live head read from refs. Reading head
+ *  here keeps CAS tight — the commit checks the changed path against a base that
+ *  is current as of submit. */
+const resolveBase = async (
+  transport: NodeTransport,
+  explicit: string | null | undefined,
+): Promise<string | null> =>
+  explicit !== undefined ? explicit : (await refs(transport)).head;
+
+/** Build a file's Content: inline for small files, else stage each 1 MiB chunk
+ *  and reference the returned digests (in order). `onProgress(staged, total)`
+ *  reports staged-chunk progress. */
+const buildContent = async (
+  transport: NodeTransport,
+  bytes: Uint8Array<ArrayBuffer>,
+  onProgress?: (staged: number, total: number) => void,
+): Promise<FileContent> => {
+  if (bytes.length <= MAX_INLINE_COMMIT_BYTES) {
+    return { inline: { b64: bytesToBase64(bytes) } };
   }
-  return chunkSize;
+  const total = Math.ceil(bytes.length / CHUNK_SIZE);
+  const chunks: string[] = [];
+  for (let i = 0; i < total; i += 1) {
+    const start = i * CHUNK_SIZE;
+    // a fresh ArrayBuffer-backed slice so the fetch body is a plain buffer.
+    const slice = bytes.slice(start, Math.min(start + CHUNK_SIZE, bytes.length));
+    chunks.push(await stage(transport, slice));
+    onProgress?.(i + 1, total);
+  }
+  return { chunks: { size: bytes.length, chunks } };
 };
 
-/** Stage a file's bytes into the node's blob store and commit its manifest.
- *  Chunks locally, `putBlob`s each chunk (whose returned sha256 IS the chunk
- *  digest), then `AddManifest`. `onProgress` (0..1) reports staging progress. */
+/** Upload a file into the tree at `path`: stage its chunks (or inline it), then
+ *  Commit a `put`. Resolves to the committing block. */
 export const uploadFile = async (
   transport: NodeTransport,
   params: {
-    fileId: string;
-    name: string;
-    mime: string;
+    path: string;
     bytes: Uint8Array<ArrayBuffer>;
-    chunkSize?: number;
-    onProgress?: (fraction: number) => void;
+    exec?: boolean;
+    meta?: Record<string, string>;
+    message?: string;
+    /** Explicit base snapshot; omit to resolve the live head automatically. */
+    baseSnapshot?: string | null;
+    onProgress?: (staged: number, total: number) => void;
   },
 ): Promise<BlockEvent> => {
-  const size = params.bytes.length;
-  const chunkSize = params.chunkSize ?? planChunkSize(size);
-  const count = size === 0 ? 0 : Math.ceil(size / chunkSize);
-  const chunks: string[] = [];
-  for (let i = 0; i < count; i += 1) {
-    const start = i * chunkSize;
-    // a fresh ArrayBuffer-backed copy so the fetch body is a plain buffer
-    const slice = params.bytes.slice(start, Math.min(start + chunkSize, size));
-    const digest = await transport.putBlob(slice);
-    chunks.push(digest);
-    params.onProgress?.((i + 1) / count);
-  }
-  return addManifest(transport, {
-    fileId: params.fileId,
-    name: params.name,
-    mime: params.mime,
-    size,
-    chunkSize,
-    chunks,
+  const [base, content] = await Promise.all([
+    resolveBase(transport, params.baseSnapshot),
+    buildContent(transport, params.bytes, params.onProgress),
+  ]);
+  const change: FileChange = {
+    put: {
+      path: params.path,
+      exec: params.exec ?? false,
+      meta: params.meta ?? {},
+      content,
+    },
+  };
+  return commit(transport, {
+    baseSnapshot: base,
+    message: params.message ?? `upload ${basename(params.path)}`,
+    changes: [change],
   });
 };
 
-/** Reassemble a file's bytes from the blob store, verifying every chunk against
- *  the committed manifest before trusting it. */
-export const downloadFile = async (
+/** Remove the entry at `path` (file, symlink, or whole subtree). */
+export const deletePath = async (
   transport: NodeTransport,
-  manifest: Manifest,
-): Promise<Uint8Array<ArrayBuffer>> => {
-  const out = new Uint8Array(manifest.size);
-  let offset = 0;
-  for (let i = 0; i < manifest.chunks.length; i += 1) {
-    const bytes = await transport.getBlob(manifest.chunks[i]);
-    await verifyChunk(manifest, i, bytes);
-    out.set(bytes, offset);
-    offset += bytes.length;
-  }
-  return out;
+  params: { path: string; message?: string; baseSnapshot?: string | null },
+): Promise<BlockEvent> => {
+  const base = await resolveBase(transport, params.baseSnapshot);
+  return commit(transport, {
+    baseSnapshot: base,
+    message: params.message ?? `rm ${params.path}`,
+    changes: [{ rm: { path: params.path } }],
+  });
+};
+
+/** Create a directory at `path` (its parents must already exist). */
+export const mkdir = async (
+  transport: NodeTransport,
+  params: { path: string; message?: string; baseSnapshot?: string | null },
+): Promise<BlockEvent> => {
+  const base = await resolveBase(transport, params.baseSnapshot);
+  return commit(transport, {
+    baseSnapshot: base,
+    message: params.message ?? `mkdir ${params.path}`,
+    changes: [{ mkdir: { path: params.path } }],
+  });
 };

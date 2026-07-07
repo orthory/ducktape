@@ -82,7 +82,7 @@ afterEach(() => {
 });
 
 describe("SettingsView", () => {
-  it("renders the workspace settings and preserves the existing actions", () => {
+  it("renders the slimmed workspace card and preserves the existing actions", () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
@@ -90,11 +90,24 @@ describe("SettingsView", () => {
     });
     const { spies } = renderSettings();
 
-    expect(screen.getByText("NETWORK")).toBeInTheDocument();
+    // Workspace facts that still live here.
+    expect(screen.getByText("WORKSPACE")).toBeInTheDocument();
     expect(screen.getByText("Acme Research")).toBeInTheDocument();
-    expect(screen.getByText("~/.ducktape/workspaces/acme-research")).toBeInTheDocument();
-    expect(screen.getByText(/p2p 7420/i)).toBeInTheDocument();
-    expect(screen.getByText(/member validator/i)).toBeInTheDocument();
+    expect(screen.getByText("acme#abcd1234")).toBeInTheDocument();
+
+    // Everything a module view owns is gone from Settings: ops facts belong
+    // to the Node view, invite/admit to Members.
+    expect(screen.queryByText("NETWORK")).not.toBeInTheDocument();
+    expect(screen.queryByText(/~\/\.ducktape\/workspaces/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/p2p 7420/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/quorum threshold/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("Node role")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /reveal invite/i }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/joiner pubkey/i)).not.toBeInTheDocument();
+    // The daemon toggle moved to the Node view with the rest of the ops surface.
+    expect(screen.queryByText("Local node")).not.toBeInTheDocument();
 
     expect(screen.getByText("YOUR IDENTITY")).toBeInTheDocument();
     expect(screen.getByText(/abcdef012345/)).toBeInTheDocument();
@@ -113,6 +126,16 @@ describe("SettingsView", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /workspaces/i }));
     expect(spies.newWorkspace).toHaveBeenCalled();
+  });
+
+  it("links into the module views that own membership and the daemon", () => {
+    const { spies } = renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: /open members/i }));
+    expect(spies.setScreen).toHaveBeenCalledWith("members");
+
+    fireEvent.click(screen.getByRole("button", { name: /open node/i }));
+    expect(spies.setScreen).toHaveBeenCalledWith("status");
   });
 
   it("requests an on-chain leave that keeps the node running, without tearing down", () => {
