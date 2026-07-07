@@ -19,7 +19,7 @@ Wants=network-online.target
 # dial (replies from a wildcard socket egress with the route-chosen source IP,
 # which clients reject). This file holds NO secret; the coordinator has none.
 EnvironmentFile=/etc/ducktape/coordinator.env
-ExecStart=/usr/local/bin/ducktape-coordinator --listen ${COORDINATOR_LISTEN}
+ExecStart=/usr/local/bin/ducktape-coordinator --listen ${COORDINATOR_LISTEN} $COORDINATOR_ARGS
 Restart=always
 RestartSec=2
 
