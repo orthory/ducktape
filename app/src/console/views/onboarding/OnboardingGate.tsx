@@ -192,7 +192,6 @@ export function OnboardingGate() {
                   placeholder="http://192.168.1.50:8844"
                   onChange={(event) => setUrl(event.target.value)}
                   onKeyDown={(event) => event.key === "Enter" && submit()}
-                  autoComplete="off"
                   autoCapitalize="off"
                   spellCheck={false}
                   style={{ ...inputStyle, font: `500 11.5px ${font.mono}` }}

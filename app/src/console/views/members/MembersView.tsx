@@ -873,7 +873,6 @@ function AdminActions({
                 <input
                   aria-label="Joiner public key"
                   name="joiner-public-key"
-                  autoComplete="off"
                   spellCheck={false}
                   value={joinerKey}
                   placeholder="Paste joiner public key…"
@@ -1284,7 +1283,6 @@ export function MembersView() {
             <input
               aria-label="Search members"
               name="member-search"
-              autoComplete="off"
               spellCheck={false}
               value={query}
               placeholder="Search name or key…"

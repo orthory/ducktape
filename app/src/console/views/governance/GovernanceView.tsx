@@ -443,7 +443,6 @@ function ProposeForm({
               <input
                 aria-label="Proposal text"
                 name="proposal-text"
-                autoComplete="off"
                 spellCheck
                 value={text}
                 placeholder="Describe what the set should signal…"
