@@ -110,19 +110,23 @@ fn missing_node_address_is_a_clear_error() {
     );
 }
 
+/// without the `fuse` feature the mount verb is recognized but names the exact
+/// rebuild rather than mounting — so a default build never pulls in libfuse.
+/// (with `--features fuse`, mounting is exercised for real in `fuse_e2e.rs`.)
+#[cfg(not(feature = "fuse"))]
 #[test]
-fn mount_is_a_reserved_phase_4_stub() {
+fn mount_without_the_feature_names_the_rebuild() {
     let h = Harness::start();
 
     let out = h
         .cli_bare(&["mount", "x", "y"])
         .output()
         .expect("run mount");
-    assert!(!out.status.success(), "the mount stub fails");
+    assert!(!out.status.success(), "mount without the feature fails");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.to_lowercase().contains("phase 4"),
-        "mount points at phase 4: {stderr}"
+        stderr.contains("fuse"),
+        "mount names the --features fuse rebuild: {stderr}"
     );
 }
 
