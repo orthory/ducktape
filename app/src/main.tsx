@@ -16,6 +16,7 @@ import { DucktapeConsole } from "./console/DucktapeConsole";
 import { HuddleWindow } from "./console/views/huddle/HuddleWindow";
 import { TrayPopover } from "./console/views/tray/TrayPopover";
 import { ErrorBoundary } from "./console/layout/ErrorBoundary";
+import { installAutocompleteDefault } from "./console/dom/suppress-autocomplete";
 
 // Auxiliary windows pick their surface via `?view=`: the frameless menu-bar
 // popover (macOS, `view=tray`) and the popped-out huddle card (`view=huddle`).
@@ -35,6 +36,11 @@ if (import.meta.env.DEV) {
     new WebviewAgentInstrumentation({ windowLabel: getCurrentWindow().label }).install();
   })().catch(() => {});
 }
+
+// No autocomplete/history dropdown on inputs by default — see the module. Runs
+// before render so the observer is live for every field React mounts. Applies
+// to whichever surface this window is (console / tray / huddle).
+installAutocompleteDefault();
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
