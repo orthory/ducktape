@@ -75,6 +75,25 @@ struct RouteRow {
     schema_hash: Option<Vec<u8>>,
 }
 
+impl RouteRow {
+    /// whether this route currently resolves through
+    /// [`PackageQuery::ActionOwner`]: a builtin (`package: None`) route always
+    /// does; an installed route does only while its package row is `Active`.
+    /// this centralizes the suspend guarantee in the registry itself — an
+    /// owner module that forgets to self-gate on phase can no longer serve a
+    /// suspended or still-installing package's actions. owner modules should
+    /// keep self-gating too (defense in depth), but this is now the backstop.
+    fn is_live(&self, store: &Store) -> bool {
+        match &self.package {
+            None => true,
+            Some(package) => store
+                .packages
+                .get(package)
+                .is_some_and(|row| row.status == PackageStatus::Active),
+        }
+    }
+}
+
 /// the committed (or staged) state. cloning this is how a block stages: the
 /// pending copy is mutated during `execute`; `commit_block` promotes it and
 /// `abort_block` drops it, leaving `root()` byte-identical.
@@ -199,6 +218,30 @@ impl PackageModule {
         // tagged for workspace discovery), then the harness install hand-off.
         // the harness's ack (`MarkActive`) closes the loop; any failure along
         // the chain aborts the whole block, so a partial install cannot land.
+        //
+        // KNOWN DoS SHAPE (squat-to-cap, documented not gated — see decision
+        // in task #207): prompt paths are predictable — a manifest fixes them
+        // (typically `/packages/<package>/...`) before the package is ever
+        // installed, and memory has no per-path ACL, so anyone can publish to
+        // a path this install will later target. an attacker who front-runs a
+        // known-upcoming package id and drives one of its prompt paths to
+        // `memory::MAX_GENERATIONS_PER_PATH` live generations makes every
+        // future `Install` naming that path fail here: the `memory::Publish`
+        // follow-up rejects with "generation cap reached", which — atomicity
+        // being host-lent — aborts the WHOLE block, so the install lands
+        // nowhere (clean failure, no partial row, no trace; the same
+        // structural guarantee `validate_spec` gives the rest of the spec).
+        // recovery does not need a privileged actor: memory's `Delete` is
+        // equally unauthenticated, so anyone (typically the would-be
+        // installer) can `MemoryMsg::Delete` the squatted path — this frees
+        // its live head, so the next `Install` attempt starts a fresh
+        // generation range under the cap — and reinstall. a persistent
+        // attacker can re-squat after every delete, so this is a nuisance
+        // DoS on a specific predictable path, not a one-shot break; there is
+        // no trivially-cheap, obviously-correct rejection for it (that would
+        // mean the registry policing an entire OTHER module's namespace by
+        // path convention alone), so it is documented here rather than
+        // gated.
         for prompt in &spec.prompts {
             let meta: memory::Meta = [
                 ("kind".to_string(), "prompt".to_string()),
@@ -225,10 +268,14 @@ impl PackageModule {
     fn mark_active(&mut self, ctx: &mut dyn Ctx, package: String) -> Result<(), Error> {
         let height = ctx.env().height;
         let origin = ctx.env().origin.clone();
-        let store = self.store_mut();
-        let row = store
+        // gate BEFORE touching `store_mut()`: a rejected op must leave no
+        // trace, including the clone `store_mut()` takes on a block's first
+        // write — reading the immutable `store()` view here means an unknown
+        // package or a bad origin never stages a (no-op) pending copy.
+        let row = self
+            .store()
             .packages
-            .get_mut(&package)
+            .get(&package)
             .ok_or_else(|| Error::Module(format!("unknown package: {package}")))?;
         // ONLY the recorded harness's module origin may activate — the ack
         // proves the harness's install arm ran in this very block.
@@ -243,6 +290,8 @@ impl PackageModule {
                 "package {package} is not installing"
             )));
         }
+        let store = self.store_mut();
+        let row = store.packages.get_mut(&package).expect("checked above");
         row.status = PackageStatus::Active;
         row.updated_at = height;
         Ok(())
@@ -260,12 +309,16 @@ impl PackageModule {
     ) -> Result<ModuleId, Error> {
         let height = ctx.env().height;
         let origin = ctx.env().origin.clone();
-        let store = self.store_mut();
-        let row = store
-            .packages
-            .get_mut(package)
-            .ok_or_else(|| Error::Module(format!("unknown package: {package}")))?;
         let caller = canonical_origin(&origin);
+        // gate BEFORE touching `store_mut()` (same discipline as
+        // `mark_active`): read the immutable `store()` view first so a
+        // rejected op — unknown package, wrong caller, wrong status — never
+        // stages a (no-op) pending clone.
+        let row = self
+            .store()
+            .packages
+            .get(package)
+            .ok_or_else(|| Error::Module(format!("unknown package: {package}")))?;
         // the empty external origin can never match: install rejects it, so
         // no recorded installer is ever the empty key.
         if caller != row.installer && origin != Origin::Module(row.harness.clone()) {
@@ -279,6 +332,8 @@ impl PackageModule {
                 row.status
             )));
         }
+        let store = self.store_mut();
+        let row = store.packages.get_mut(package).expect("checked above");
         row.status = to;
         row.updated_at = height;
         Ok(row.harness.clone())
@@ -313,13 +368,21 @@ impl PackageModule {
     }
 
     fn unplug(&mut self, ctx: &mut dyn Ctx, package: String) -> Result<(), Error> {
-        // suspended packages unplug too — unplug is the terminal op from any
-        // live status (an Installing row can't be reached here: its block
-        // either activated it or aborted).
+        // unplug is the terminal op from any status a row can actually be
+        // observed in, INCLUDING `Installing`: v1's install choreography acks
+        // `MarkActive` in the same block, but a future harness (a no-fail
+        // intake, or a wasm harness that can silently drop its InstallPackage
+        // follow-up) could leave a row wedged in `Installing` forever with no
+        // other recovery — `Suspend`/`Resume` both require a status this row
+        // never reaches. allowing Unplug here is the escape hatch.
         let harness = self.lifecycle_op(
             ctx,
             &package,
-            &[PackageStatus::Active, PackageStatus::Suspended],
+            &[
+                PackageStatus::Installing,
+                PackageStatus::Active,
+                PackageStatus::Suspended,
+            ],
             PackageStatus::Inactive,
         )?;
         // remove the package's runtime entry points (its routes); the row
@@ -358,7 +421,18 @@ impl PackageModule {
         if StateRoot(h.finalize().into()) != expected {
             return Err(Error::Module("snapshot root mismatch".into()));
         }
-        self.committed = Store::decode(bytes)?;
+        // the genesis-seeded builtin set: no execute path ever adds, renames,
+        // or removes a `package: None` route, so THIS module's own current
+        // committed view of it is exactly the genesis truth strict decode
+        // checks the incoming bytes against (see `Store::decode`).
+        let builtin_routes: BTreeMap<String, String> = self
+            .committed
+            .routes
+            .iter()
+            .filter(|(_, route)| route.package.is_none())
+            .map(|(tag, route)| (tag.clone(), route.owner.clone()))
+            .collect();
+        self.committed = Store::decode(bytes, &self.id, &builtin_routes)?;
         self.pending = None;
         Ok(())
     }
@@ -633,7 +707,18 @@ impl Store {
     /// live row and one of its bound modules (unplug removes routes with the
     /// tombstone). anything else is rejected — an honest validator can never
     /// have committed it.
-    fn decode(bytes: &[u8]) -> Result<Store, Error> {
+    ///
+    /// two more execute-unreachable shapes are rejected here: no row may bind
+    /// `own_id` (the registry's own module id — `validate_spec` refuses this
+    /// at install time so it can never be committed either), and every
+    /// `package: None` route must be exactly one of `builtin_routes` (tag AND
+    /// owner) — no execute path ever adds, renames, or drops a builtin route,
+    /// so the `None`-routed set can never legitimately differ from genesis.
+    fn decode(
+        bytes: &[u8],
+        own_id: &str,
+        builtin_routes: &BTreeMap<String, String>,
+    ) -> Result<Store, Error> {
         let mut off = 0usize;
         let mut store = Store::default();
 
@@ -682,6 +767,15 @@ impl Store {
                 if module_id.is_empty() || module_id.len() > MAX_MODULE_ID_BYTES {
                     return Err(Error::Module("snapshot module id is invalid".into()));
                 }
+                // `validate_spec` refuses a binding that names the registry
+                // itself (a HarnessMsg looped back here would be mis-decoded
+                // as a PackageMsg and poison the block), so no committed row
+                // ever carries one.
+                if module_id == own_id {
+                    return Err(Error::Module(
+                        "snapshot binding names the registry's own module id".into(),
+                    ));
+                }
                 modules.insert(logical, module_id);
             }
             let harness = read_string(bytes, &mut off)?;
@@ -719,6 +813,11 @@ impl Store {
         if route_count > MAX_ROUTES as u64 {
             return Err(Error::Module("snapshot route count exceeds cap".into()));
         }
+        // every `package: None` route seen must be a genesis builtin (tag AND
+        // owner); the count check after the loop (against
+        // `builtin_routes.len()`) then forces exact set equality, since tags
+        // are already unique and strictly ascending.
+        let mut builtin_route_count: usize = 0;
         for _ in 0..route_count {
             let tag = read_string(bytes, &mut off)?;
             validate_tag(&tag).map_err(Error::Module)?;
@@ -736,7 +835,20 @@ impl Store {
                 return Err(Error::Module("snapshot route owner is invalid".into()));
             }
             let package = match read_byte(bytes, &mut off)? {
-                0 => None,
+                0 => {
+                    // no execute path ever inserts a package-less route
+                    // beyond genesis, so it must be exactly one of the
+                    // registry's own builtins (this module's committed view
+                    // of them, per `PackageModule::install`) — not merely
+                    // some plausible-looking tag/owner pair.
+                    if builtin_routes.get(&tag) != Some(&owner) {
+                        return Err(Error::Module(
+                            "snapshot route is package-less but not a genesis builtin".into(),
+                        ));
+                    }
+                    builtin_route_count += 1;
+                    None
+                }
                 1 => {
                     let package = read_string(bytes, &mut off)?;
                     // a package route exists only between install and unplug:
@@ -783,6 +895,11 @@ impl Store {
                 },
             );
         }
+        if builtin_route_count != builtin_routes.len() {
+            return Err(Error::Module(
+                "snapshot builtin route set does not match genesis".into(),
+            ));
+        }
 
         if off != bytes.len() {
             return Err(Error::Module("snapshot has trailing bytes".into()));
@@ -823,9 +940,13 @@ impl Module for PackageModule {
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         let store = &self.committed;
         let reply = match decode_query(req).map_err(Error::Module)? {
-            PackageQuery::ActionOwner { tag } => {
-                PackageReply::Owner(store.routes.get(&tag).map(|r| r.owner.clone()))
-            }
+            PackageQuery::ActionOwner { tag } => PackageReply::Owner(
+                store
+                    .routes
+                    .get(&tag)
+                    .filter(|route| route.is_live(store))
+                    .map(|route| route.owner.clone()),
+            ),
             PackageQuery::Get { package } => PackageReply::Package(
                 store
                     .packages
@@ -978,4 +1099,102 @@ fn read_bytes(bytes: &[u8], off: &mut usize) -> Result<Vec<u8>, Error> {
 fn read_string(bytes: &[u8], off: &mut usize) -> Result<String, Error> {
     String::from_utf8(read_bytes(bytes, off)?)
         .map_err(|_| Error::Module("snapshot string is not utf-8".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    //! white-box tests that reach `PackageModule::pending` directly — the
+    //! "a rejected op leaves no trace" property `mark_active`/`lifecycle_op`
+    //! now keep structurally (gate on the immutable `store()` view, take the
+    //! mutable staged copy only once the op is known to proceed) is otherwise
+    //! unobservable from outside the crate: every public read (`query`) always
+    //! serves `committed`, and `commit_block`/`abort_block` are indifferent to
+    //! whether `pending` held `None` or a no-op clone of `committed`. these
+    //! tests assert the structural fact directly rather than not at all.
+    use super::*;
+    use futures::executor::block_on;
+
+    struct Ctx0 {
+        env: sdk::Env,
+    }
+
+    impl Ctx0 {
+        fn new(origin: Origin) -> Self {
+            Self {
+                env: sdk::Env {
+                    protocol_version: 0,
+                    height: 1,
+                    consensus_time: 1,
+                    origin,
+                    me: "package".into(),
+                },
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Ctx for Ctx0 {
+        fn env(&self) -> &sdk::Env {
+            &self.env
+        }
+        fn module_root(&self, _target: &str) -> Option<StateRoot> {
+            None
+        }
+        async fn query(&self, target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
+            Err(Error::UnknownModule(target.into()))
+        }
+        fn emit_msg(&mut self, _msg: Msg) {}
+        fn emit_event(&mut self, _ev: sdk::Event) {}
+        fn request_effect(&mut self, _eff: sdk::Effect) {}
+    }
+
+    fn exec(m: &mut PackageModule, ctx: &mut Ctx0, op: &PackageMsg) -> Result<(), Error> {
+        let msg = Msg {
+            target: "package".into(),
+            payload: encode_msg(op),
+        };
+        block_on(m.execute(ctx, &msg))
+    }
+
+    #[test]
+    fn rejected_mark_active_never_stages_a_pending_clone() {
+        let mut m = PackageModule::new("package", "memory", Vec::new());
+        let mut ctx = Ctx0::new(Origin::Module("nobody".into()));
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &PackageMsg::MarkActive {
+                package: "ghost".into(),
+            },
+        );
+        assert!(err.is_err(), "an unknown package must reject");
+        assert!(
+            m.pending.is_none(),
+            "a rejected MarkActive must never clone committed into pending"
+        );
+    }
+
+    #[test]
+    fn rejected_lifecycle_op_never_stages_a_pending_clone() {
+        let mut m = PackageModule::new("package", "memory", Vec::new());
+        let mut ctx = Ctx0::new(Origin::External(b"nobody".to_vec()));
+        for op in [
+            PackageMsg::Suspend {
+                package: "ghost".into(),
+            },
+            PackageMsg::Resume {
+                package: "ghost".into(),
+            },
+            PackageMsg::Unplug {
+                package: "ghost".into(),
+            },
+        ] {
+            let err = exec(&mut m, &mut ctx, &op);
+            assert!(err.is_err(), "{op:?} on an unknown package must reject");
+            assert!(
+                m.pending.is_none(),
+                "a rejected {op:?} must never clone committed into pending"
+            );
+        }
+    }
 }

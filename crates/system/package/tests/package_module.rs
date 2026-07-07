@@ -255,12 +255,13 @@ fn install_stages_row_and_routes_and_emits_seeds_then_harness_msg() {
     assert_eq!(view.installed_at, 5);
     assert_eq!(view.updated_at, 5);
 
-    // the routes: both spec tags resolve to the OWNER MODULE id.
-    assert_eq!(action_owner(&m, "pages.comment.add"), Some(HARNESS.into()));
-    assert_eq!(
-        action_owner(&m, "pages.block.update_text"),
-        Some(HARNESS.into())
-    );
+    // the routes: staged and inventoried under the owner module either way,
+    // but NOT yet live — the row is still Installing, so the registry itself
+    // withholds resolution until MarkActive (requirement: registry-side
+    // route liveness). `RoutesForOwner` is an inventory query (unaffected);
+    // `ActionOwner` is the live-resolution one that now gates on `Active`.
+    assert_eq!(action_owner(&m, "pages.comment.add"), None);
+    assert_eq!(action_owner(&m, "pages.block.update_text"), None);
     assert_eq!(
         routes_for(&m, HARNESS),
         vec![
@@ -366,6 +367,29 @@ fn install_rejects_a_duplicate_package_id() {
     again.engagements.clear();
     let mut ctx = TestCtx::installing(2, installer());
     assert!(exec(&mut m, &mut ctx, &PackageMsg::Install(again)).is_err());
+}
+
+#[test]
+fn install_rejects_a_same_block_duplicate_package_id() {
+    // two installs of the SAME package id in the SAME block, with no commit
+    // between them: the second must see the first's STAGED (uncommitted)
+    // row — `validate_spec` reads `store()`, which is pending-if-present —
+    // and collide, exactly like the cross-block case.
+    let mut m = module();
+    let mut ctx = TestCtx::installing(1, installer());
+    exec(&mut m, &mut ctx, &PackageMsg::Install(spec())).unwrap();
+    assert!(
+        exec(&mut m, &mut ctx, &PackageMsg::Install(spec())).is_err(),
+        "a same-block second install of the same id must collide"
+    );
+    commit(&mut m);
+    // exactly one row landed, from the first install only.
+    let view = get(&m, PKG).expect("the first install's row");
+    assert_eq!(view.status, PackageStatus::Installing);
+    match query(&m, &PackageQuery::List) {
+        PackageReply::Packages(list) => assert_eq!(list.len(), 1),
+        other => panic!("unexpected reply: {other:?}"),
+    }
 }
 
 /// one labelled way to break an otherwise-valid spec.
@@ -527,8 +551,13 @@ fn suspend_and_resume_flip_status_and_emit_the_harness_msgs() {
         }
     );
 
-    // suspended routes stay registered (suspend disables activity, not audit).
-    assert_eq!(action_owner(&m, "pages.comment.add"), Some(HARNESS.into()));
+    // the route entry itself stays registered (suspend disables activity,
+    // not audit) — `RoutesForOwner` still lists it — but `ActionOwner` no
+    // longer resolves it while suspended: the registry enforces the suspend
+    // guarantee itself now, rather than trusting every owner module to
+    // self-gate on phase.
+    assert_eq!(action_owner(&m, "pages.comment.add"), None);
+    assert!(routes_for(&m, HARNESS).contains(&"pages.comment.add".to_string()));
     // re-suspending a suspended package rejects.
     let mut again = TestCtx::with_origin(3, installer());
     assert!(
@@ -561,6 +590,8 @@ fn suspend_and_resume_flip_status_and_emit_the_harness_msgs() {
             package: PKG.into()
         }
     );
+    // Active again: the route resolves once more.
+    assert_eq!(action_owner(&m, "pages.comment.add"), Some(HARNESS.into()));
 
     // resuming an already-active package rejects.
     let mut again = TestCtx::with_origin(4, installer());
@@ -634,7 +665,176 @@ fn unplug_tombstones_the_row_and_removes_only_its_routes() {
     assert!(exec(&mut m, &mut ctx, &PackageMsg::Install(spec())).is_err());
 }
 
+#[test]
+fn unplug_recovers_a_row_wedged_in_installing() {
+    // a future no-fail intake / wasm harness could silently drop its
+    // `InstallPackage` follow-up and never send `MarkActive`, wedging the row
+    // in `Installing` forever — `Suspend` (requires Active) and `Resume`
+    // (requires Suspended) both refuse it. `Unplug` is the escape hatch.
+    let mut m = module();
+    let mut ctx = TestCtx::installing(1, installer());
+    exec(&mut m, &mut ctx, &PackageMsg::Install(spec())).unwrap();
+    commit(&mut m);
+    assert_eq!(get(&m, PKG).unwrap().status, PackageStatus::Installing);
+
+    // Suspend/Resume both still refuse an Installing row.
+    let mut wrong = TestCtx::with_origin(2, installer());
+    assert!(
+        exec(
+            &mut m,
+            &mut wrong,
+            &PackageMsg::Suspend {
+                package: PKG.into()
+            }
+        )
+        .is_err()
+    );
+    let mut wrong = TestCtx::with_origin(2, installer());
+    assert!(
+        exec(
+            &mut m,
+            &mut wrong,
+            &PackageMsg::Resume {
+                package: PKG.into()
+            }
+        )
+        .is_err()
+    );
+
+    // Unplug succeeds from Installing: tombstoned, routes gone.
+    let mut ctx = TestCtx::with_origin(2, installer());
+    exec(
+        &mut m,
+        &mut ctx,
+        &PackageMsg::Unplug {
+            package: PKG.into(),
+        },
+    )
+    .unwrap();
+    commit(&mut m);
+    let view = get(&m, PKG).expect("tombstone preserved");
+    assert_eq!(view.status, PackageStatus::Inactive);
+    assert_eq!(action_owner(&m, "pages.comment.add"), None);
+    assert!(routes_for(&m, HARNESS).is_empty());
+}
+
+#[test]
+fn empty_external_origin_never_authorizes_a_lifecycle_op() {
+    // the empty pre-consensus external key can never be a recorded installer
+    // (install rejects it), and it is not the harness origin either — so it
+    // must never authorize Suspend/Resume/Unplug, even by accident.
+    let empty = Origin::External(Vec::new());
+
+    let mut m = module();
+    installed_active(&mut m);
+    let mut ctx = TestCtx::with_origin(2, empty.clone());
+    assert!(
+        exec(
+            &mut m,
+            &mut ctx,
+            &PackageMsg::Suspend {
+                package: PKG.into()
+            }
+        )
+        .is_err(),
+        "the empty external origin must not suspend"
+    );
+
+    let mut suspended = module();
+    installed_active(&mut suspended);
+    let mut ctx = TestCtx::with_origin(2, installer());
+    exec(
+        &mut suspended,
+        &mut ctx,
+        &PackageMsg::Suspend {
+            package: PKG.into(),
+        },
+    )
+    .unwrap();
+    commit(&mut suspended);
+    let mut ctx = TestCtx::with_origin(3, empty.clone());
+    assert!(
+        exec(
+            &mut suspended,
+            &mut ctx,
+            &PackageMsg::Resume {
+                package: PKG.into()
+            }
+        )
+        .is_err(),
+        "the empty external origin must not resume"
+    );
+
+    let mut ctx = TestCtx::with_origin(3, empty);
+    assert!(
+        exec(
+            &mut suspended,
+            &mut ctx,
+            &PackageMsg::Unplug {
+                package: PKG.into()
+            }
+        )
+        .is_err(),
+        "the empty external origin must not unplug"
+    );
+}
+
 // ---- queries ----------------------------------------------------------------
+
+#[test]
+fn action_owner_only_resolves_active_rows_and_always_resolves_builtins() {
+    let mut m = module();
+    // builtins resolve before any install exists.
+    assert_eq!(action_owner(&m, "tasks.create"), Some("tasks".into()));
+
+    // Installing: staged and routed, but not yet LIVE.
+    let mut ctx = TestCtx::installing(1, installer());
+    exec(&mut m, &mut ctx, &PackageMsg::Install(spec())).unwrap();
+    commit(&mut m);
+    assert_eq!(get(&m, PKG).unwrap().status, PackageStatus::Installing);
+    assert_eq!(action_owner(&m, "pages.comment.add"), None);
+    assert_eq!(action_owner(&m, "tasks.create"), Some("tasks".into()));
+
+    // Active: now it resolves.
+    let mut ack = TestCtx::with_origin(1, harness_origin());
+    exec(
+        &mut m,
+        &mut ack,
+        &PackageMsg::MarkActive {
+            package: PKG.into(),
+        },
+    )
+    .unwrap();
+    commit(&mut m);
+    assert_eq!(action_owner(&m, "pages.comment.add"), Some(HARNESS.into()));
+
+    // Suspended: withheld again.
+    let mut suspend = TestCtx::with_origin(2, installer());
+    exec(
+        &mut m,
+        &mut suspend,
+        &PackageMsg::Suspend {
+            package: PKG.into(),
+        },
+    )
+    .unwrap();
+    commit(&mut m);
+    assert_eq!(action_owner(&m, "pages.comment.add"), None);
+    assert_eq!(action_owner(&m, "tasks.create"), Some("tasks".into()));
+
+    // Resumed: resolves once more, and the builtin never wavered.
+    let mut resume = TestCtx::with_origin(3, installer());
+    exec(
+        &mut m,
+        &mut resume,
+        &PackageMsg::Resume {
+            package: PKG.into(),
+        },
+    )
+    .unwrap();
+    commit(&mut m);
+    assert_eq!(action_owner(&m, "pages.comment.add"), Some(HARNESS.into()));
+}
 
 #[test]
 fn action_owner_resolves_builtin_and_installed_tags() {

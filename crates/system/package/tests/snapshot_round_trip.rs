@@ -42,6 +42,11 @@ impl TestCtx {
                 "notes-harness".into(),
                 "old-harness".into(),
                 "hmod".into(),
+                // 7 bytes, matching "package" (this module's own id, `me`
+                // above) — a strict-decode test splices this placeholder to
+                // the registry's own id in place, without touching any
+                // length prefix.
+                "hmodxyz".into(),
             ],
         }
     }
@@ -508,4 +513,116 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     let mut dst = bare_module();
     dst.install(&snap, good_root).unwrap();
     assert_eq!(dst.root(), good_root);
+}
+
+#[test]
+fn snapshot_rejects_a_row_binding_the_registrys_own_id() {
+    // "hmodxyz" is 7 bytes, matching "package" (this module's own id in
+    // every `TestCtx` here) — the same length lets us splice the STRING
+    // CONTENT of an otherwise-legitimate install in place, without touching
+    // any length prefix or shifting a single downstream offset.
+    let placeholder = "hmodxyz";
+    assert_eq!(placeholder.len(), "package".len());
+
+    let mut m = bare_module();
+    exec(
+        &mut m,
+        TestCtx::new(0, Origin::External(vec![5])),
+        &PackageMsg::Install(spec("a", placeholder, &[], false)),
+    );
+    commit(&mut m);
+    let snap = m.snapshot();
+
+    // splice EVERY occurrence of the placeholder — the binding's module id
+    // and the row's separate `harness` field both name it — to the
+    // registry's own id. `validate_spec` refuses a binding naming the
+    // registry itself at install time (a HarnessMsg looped back here would
+    // be mis-decoded as a PackageMsg and poison the block), so no honest
+    // validator ever commits this shape; strict decode must refuse it too.
+    let mut bad = snap.clone();
+    let needle = placeholder.as_bytes();
+    let mut i = 0;
+    let mut replaced = 0;
+    while i + needle.len() <= bad.len() {
+        if &bad[i..i + needle.len()] == needle {
+            bad[i..i + needle.len()].copy_from_slice(b"package");
+            replaced += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    assert_eq!(
+        replaced, 2,
+        "expected exactly the binding's module id and the harness field"
+    );
+
+    let empty_root = bare_module().root();
+    let mut dst = bare_module();
+    let err = dst
+        .install(&bad, colluding_root(&bad))
+        .expect_err("a row binding the registry's own id must be rejected");
+    assert!(matches!(err, Error::Module(_)));
+    assert_eq!(
+        dst.root(),
+        empty_root,
+        "the rejection must not move the root"
+    );
+
+    // the untouched snapshot still installs fine.
+    let mut dst = bare_module();
+    dst.install(&snap, m.root()).unwrap();
+    assert_eq!(dst.root(), m.root());
+}
+
+#[test]
+fn snapshot_rejects_a_package_less_route_beyond_the_genesis_seed() {
+    // a hand-built one-route-row stream: zero packages, one route — the
+    // package/schema discriminant bytes here are always 0 (None): a
+    // package-less route can only ever be a genesis builtin.
+    let route = |tag: &str, owner: &str| {
+        let mut out = Vec::new();
+        push_str(&mut out, tag);
+        push_str(&mut out, owner);
+        out.push(0); // package: None
+        out.push(0); // schema: None
+        out
+    };
+    let zero_packages_one_route = |route_row: &[u8]| {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u64.to_le_bytes()); // packages count
+        out.extend_from_slice(&1u64.to_le_bytes()); // routes count
+        out.extend_from_slice(route_row);
+        out
+    };
+
+    // `dst`'s own genesis builtins are exactly {tasks.create, tasks.update_
+    // status} -> "tasks" (from `module()`) — nothing else may ever appear as
+    // a `package: None` route, whether the tag is foreign or the owner is
+    // wrong for a real builtin tag.
+    for (bytes, what) in [
+        (
+            zero_packages_one_route(&route("zzz.ghost", "tasks")),
+            "a tag that is not a genesis builtin",
+        ),
+        (
+            zero_packages_one_route(&route("tasks.create", "ghost-own")),
+            "a known builtin tag with the wrong owner",
+        ),
+    ] {
+        let empty_root = module().root();
+        let mut dst = module();
+        let err = dst
+            .install(&bytes, colluding_root(&bytes))
+            .expect_err(&format!("{what} must be rejected"));
+        assert!(matches!(err, Error::Module(_)), "{what} must be rejected");
+        assert_eq!(dst.root(), empty_root, "{what} must not move the root");
+    }
+
+    // the real genesis-only state (no packages, both real builtins, nothing
+    // extra) still installs fine under the same decode path.
+    let src = module();
+    let mut dst = module();
+    dst.install(&src.snapshot(), src.root()).unwrap();
+    assert_eq!(dst.root(), src.root());
 }
