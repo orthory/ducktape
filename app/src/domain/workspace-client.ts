@@ -79,6 +79,21 @@ export interface JoinRequest {
 /** The registry is desktop-only; the web build never calls these. */
 export const isDesktop = (): boolean => isTauri();
 
+// ── User identity (Settings > Devices) ──────────────────
+
+/** This machine's user identity (`~/.ducktape/user.key`) — a sibling of the
+ *  workspace registry, not part of it: this key is shared across every
+ *  workspace rather than scoped to one. Rejects with the underlying node
+ *  verb's error string when the key file exists but is corrupt — that file is
+ *  never overwritten silently, so the error is the operator's only signal
+ *  (surfaced verbatim in Settings > Devices). */
+export interface UserIdentity {
+  pubkey: string;
+}
+
+export const userIdentityStatus = (): Promise<UserIdentity> =>
+  invoke<UserIdentity>("user_identity_status");
+
 // Live join/admit — joining a RUNNING network (post-genesis, network shape) and
 // admitting a joiner into it. The node's live-admission path landed in PR #77:
 // config.rs now resolves an un-admitted network-shape key as a pending joiner

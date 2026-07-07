@@ -93,6 +93,7 @@ use files::Files;
 use forge::Forge;
 use governance::Governance;
 use host::Host;
+use identity::Identity;
 use inbox::Inbox;
 use jobs::Jobs;
 use kv::Kv;
@@ -200,7 +201,7 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 22] = [
+const MODULE_IDS: [&str; 23] = [
     "kv",
     "pages",
     "chat",
@@ -215,6 +216,7 @@ const MODULE_IDS: [&str; 22] = [
     "tasks",
     "vaults",
     "profiles",
+    "identity",
     "inbox",
     "directory",
     "automations",
@@ -613,6 +615,7 @@ async fn genesis_host(
     forge_repo: &std::path::Path,
     genesis_validators: &[ed25519::PublicKey],
     blobs: files::BlobHandle,
+    chain_id: &str,
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
@@ -670,6 +673,13 @@ async fn genesis_host(
         // the origin-gated display-name registry: each verified submit origin
         // may set its own name, so the ui can resolve authors to names.
         Box::new(Profiles::new("profiles")),
+        // the deterministic user->nodes binding registry: certificates are
+        // chain-scoped (this network's chain id), member-gated binds via valset.
+        Box::new(Identity::new(
+            "identity",
+            Some("valset".into()),
+            chain_id.to_string(),
+        )),
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
         Box::new(Inbox::new("inbox")),
@@ -716,6 +726,7 @@ async fn restore_host(
     forge_repo: &std::path::Path,
     manifest: &Manifest,
     blobs: files::BlobHandle,
+    chain_id: &str,
 ) -> Result<Host, String> {
     let kv = Kv::init(context.child("kv"), "kv").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
@@ -801,6 +812,12 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("profiles install: {e}"))?;
 
+    let mut identity = Identity::new("identity", Some("valset".into()), chain_id.to_string());
+    let (bytes, root) = snapshot_of("identity")?;
+    identity
+        .install(bytes, root)
+        .map_err(|e| format!("identity install: {e}"))?;
+
     let mut inbox = Inbox::new("inbox");
     let (bytes, root) = snapshot_of("inbox")?;
     inbox
@@ -871,6 +888,7 @@ async fn restore_host(
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
+        Box::new(identity),
         Box::new(inbox),
         Box::new(files),
         Box::new(memory),
@@ -897,6 +915,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     manifest: &statesync::Manifest,
     forge_repo: &std::path::Path,
     attempt: usize,
+    chain_id: &str,
 ) -> Result<Host, String> {
     let entry_root = |module: &str| -> Result<StateRoot, String> {
         Ok(manifest
@@ -1045,6 +1064,12 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("profiles install: {e}"))?;
 
+    let (bytes, root) = snapshot_of("identity").await?;
+    let mut identity = Identity::new("identity", Some("valset".into()), chain_id.to_string());
+    identity
+        .install(&bytes, root)
+        .map_err(|e| format!("identity install: {e}"))?;
+
     let (bytes, root) = snapshot_of("inbox").await?;
     let mut inbox = Inbox::new("inbox");
     inbox
@@ -1127,6 +1152,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
+        Box::new(identity),
         Box::new(inbox),
         Box::new(files),
         Box::new(memory),
@@ -2305,6 +2331,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("keygen") => return cmd_keygen(&args[1..]),
+        Some("user-key") => return cmd_user_key(&args[1..]),
+        Some("user-sign-bind") => return cmd_user_sign_bind(&args[1..]),
+        Some("user-sign-unbind") => return cmd_user_sign_unbind(&args[1..]),
         Some("init") => return cmd_init(&args[1..]),
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
@@ -2333,7 +2362,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
-                     keygen|init|invite|admit|invite-accept|promote|observer-remove|\
+                     keygen|user-key|user-sign-bind|user-sign-unbind|init|invite|admit|\
+                     invite-accept|promote|observer-remove|\
                      join-requests|member-remove|member-leave|member-status|join|\
                      upgrade-status — or \
                      --config <path> | -n/--network <chain id> [--sync-only])"
@@ -2427,6 +2457,114 @@ fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "{} identity at {}",
         if generated { "generated" } else { "reusing" },
         out.display()
+    );
+    Ok(())
+}
+
+/// `user-key [--out <path>]` — generate (or reuse) a persisted ed25519 USER
+/// identity: the human's app-side keypair (distinct from `keygen`'s per-node
+/// identity), a bare hex ed25519 seed file under the same load-or-generate
+/// discipline. pubkey on stdout (scriptable — the desktop shell's `run_verb`
+/// takes the LAST stdout line as the value), provenance on stderr.
+fn cmd_user_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let out = PathBuf::from(flags.get("out").map(String::as_str).unwrap_or("user.key"));
+    let (key, generated) = config::load_or_generate_identity(&out)?;
+    println!("{}", hex_bytes(key.public_key().as_ref()));
+    eprintln!(
+        "{} user identity at {}",
+        if generated { "generated" } else { "reusing" },
+        out.display()
+    );
+    Ok(())
+}
+
+/// `user-sign-bind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
+/// — mint a bind certificate binding `node-pub` to the user identity at
+/// `--key` (generated there if absent), at `chain-id`/`nonce`, and print the
+/// ready-to-submit `IdentityMsg::BindNode` JSON as the last (only) stdout
+/// line. `user_key` rides the payload — the node being bound is the verified
+/// submit ORIGIN, never a payload field; the module resolves it from the rpc
+/// transport, not from this CLI.
+fn cmd_user_sign_bind(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use identity::{IdentityMsg, encode_msg};
+
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-sign-bind needs --key <path>")?);
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-sign-bind needs --chain-id <id>")?;
+    let node_pub_hex = flags
+        .get("node-pub")
+        .ok_or("user-sign-bind needs --node-pub <hex>")?;
+    let node_pub = config::decode_key(node_pub_hex)?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-sign-bind needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+
+    let (user, generated) = config::load_or_generate_identity(&key_path)?;
+    if generated {
+        eprintln!("generated user identity at {}", key_path.display());
+    }
+    let user_sig = config::mint_bind_cert(&user, chain_id, node_pub.as_ref(), nonce);
+    let msg = IdentityMsg::BindNode {
+        user_key: user.public_key().as_ref().to_vec(),
+        user_sig,
+    };
+    println!(
+        "{}",
+        String::from_utf8(encode_msg(&msg)).expect("json is utf-8")
+    );
+    Ok(())
+}
+
+/// `user-sign-unbind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
+/// — mint an unbind certificate evicting `node-pub` from the user identity at
+/// `--key`, and print the ready-to-submit `IdentityMsg::UnbindNode` JSON as
+/// the last stdout line. `node_key` (not `user_key`) rides the payload:
+/// unbind carries no origin restriction — a surviving device evicts a lost
+/// one by naming it directly, identified via the existing binding.
+fn cmd_user_sign_unbind(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use identity::{IdentityMsg, encode_msg};
+
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-sign-unbind needs --key <path>")?);
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-sign-unbind needs --chain-id <id>")?;
+    let node_pub_hex = flags
+        .get("node-pub")
+        .ok_or("user-sign-unbind needs --node-pub <hex>")?;
+    let node_pub = config::decode_key(node_pub_hex)?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-sign-unbind needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+
+    let (user, generated) = config::load_or_generate_identity(&key_path)?;
+    if generated {
+        eprintln!("generated user identity at {}", key_path.display());
+    }
+    let user_sig = config::mint_unbind_cert(&user, chain_id, node_pub.as_ref(), nonce);
+    let msg = IdentityMsg::UnbindNode {
+        node_key: node_pub.as_ref().to_vec(),
+        user_sig,
+    };
+    println!(
+        "{}",
+        String::from_utf8(encode_msg(&msg)).expect("json is utf-8")
     );
     Ok(())
 }
@@ -3765,6 +3903,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         signer,
         label,
         namespace,
+        // the descriptor's own chain-id (network shape) or the raw dev-shape
+        // namespace — NOT `namespace` below, which is `genesis_namespace()`
+        // (chain_id@fingerprint) on the network shape. this is the string the
+        // desktop app records as `Workspace.chain_id`; threaded into
+        // `identity`'s certificate domain separation.
+        chain_id: identity_chain_id,
         mesh: peers,
         validators,
         bootstrappers,
@@ -4219,7 +4363,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // disk, so every store opens under its canonical module id) and
             // print the greppable line the demo script asserts on.
             let forge_repo = storage_for_sync.join("forge-repo");
-            match sync_all_modules(&context, &client, &manifest, &forge_repo, 0).await {
+            match sync_all_modules(
+                &context,
+                &client,
+                &manifest,
+                &forge_repo,
+                0,
+                &identity_chain_id,
+            )
+            .await
+            {
                 Ok(host) => {
                     println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
                 }
@@ -4756,8 +4909,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // handle may exist. reads queue in the serve window
                             // until the fresh host lands.
                             serving = None;
-                            match sync_all_modules(&context, &client, &m, &forge_repo, attempt)
-                                .await
+                            match sync_all_modules(
+                                &context,
+                                &client,
+                                &m,
+                                &forge_repo,
+                                attempt,
+                                &identity_chain_id,
+                            )
+                            .await
                             {
                                 Ok(host) => {
                                     let root = host.app_hash();
@@ -4847,7 +5007,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // a promoted observer stops serving: drop the served host
                 // before the promotion sync reopens the same partitions.
                 serving = None;
-                match sync_all_modules(&context, &client, &m, &forge_repo, attempt).await {
+                match sync_all_modules(
+                    &context,
+                    &client,
+                    &m,
+                    &forge_repo,
+                    attempt,
+                    &identity_chain_id,
+                )
+                .await
+                {
                     Ok(host) => {
                         let latest = match fetch_manifest(&client).await {
                             Ok(latest) => latest,
@@ -5037,7 +5206,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     std::process::exit(1);
                 }
-                let host = genesis_host(&context, &forge_repo, &validators, blobs.clone()).await;
+                let host = genesis_host(
+                    &context,
+                    &forge_repo,
+                    &validators,
+                    blobs.clone(),
+                    &identity_chain_id,
+                )
+                .await;
                 let pos = recovery.oplog_pos().await;
                 let genesis_participants: Vec<Vec<u8>> =
                     validators.iter().map(|k| k.as_ref().to_vec()).collect();
@@ -5084,7 +5260,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     std::process::exit(1);
                 }
-                let restored = restore_host(&context, &forge_repo, &manifest, blobs.clone()).await;
+                let restored = restore_host(
+                    &context,
+                    &forge_repo,
+                    &manifest,
+                    blobs.clone(),
+                    &identity_chain_id,
+                )
+                .await;
                 let mut host = match restored {
                     Ok(h) => h,
                     Err(e) => {
@@ -5522,6 +5705,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             &target,
                             &forge_repo,
                             10_000 + attempts,
+                            &identity_chain_id,
                         )
                         .await
                         {

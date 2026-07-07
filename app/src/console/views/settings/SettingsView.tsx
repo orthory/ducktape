@@ -2,10 +2,14 @@
 // view stays wired only to the console store facade: views read
 // useDucktape() -> { state, actions } and never reach around it.
 
-import { useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 
-import { normalizeKey } from "../../../domain/names";
-import { LIVE_JOIN_SUPPORTED } from "../../../domain/workspace-client";
+import { normalizeKey, shortKey } from "../../../domain/names";
+import {
+  isDesktop,
+  LIVE_JOIN_SUPPORTED,
+  userIdentityStatus,
+} from "../../../domain/workspace-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { opKey } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
@@ -553,6 +557,94 @@ function NetworkSection() {
   );
 }
 
+// Desktop-only: the bind state lives in `state.nodeUsers`, keyed by node hex,
+// which only carries a real entry once a workspace node key exists to look up
+// (a web build has no local node key at all — degrade by omitting the whole
+// section rather than showing a false "Not linked").
+// The machine user key lives outside the node entirely (`~/.ducktape/user.key`,
+// desktop-only) — read it via user_identity_status rather than the store, and
+// keep it local state so a corrupt-key error (the file is never overwritten
+// silently — this is the operator's only signal) surfaces right here without
+// touching the console-wide error banner.
+type UserKeyStatus = { pubkey: string } | { error: string };
+
+function DevicesSection() {
+  const { state } = useDucktape();
+  const workspace = state.workspace;
+  const [userKey, setUserKey] = useState<UserKeyStatus | null>(null);
+
+  useEffect(() => {
+    if (!workspace || !isDesktop()) return;
+    let alive = true;
+    userIdentityStatus()
+      .then((identity) => {
+        if (alive) setUserKey({ pubkey: identity.pubkey });
+      })
+      .catch((err: unknown) => {
+        if (alive) setUserKey({ error: String(err) });
+      });
+    return () => {
+      alive = false;
+    };
+  }, [workspace]);
+
+  if (!workspace) return null;
+
+  const nodeKeyNorm = normalizeKey(workspace.pubkey);
+  const bound = state.nodeUsers[nodeKeyNorm];
+  // This user's OTHER bound nodes — every nodeUsers entry sharing the same
+  // userKey, excluding this device itself.
+  const otherNodes = bound
+    ? Object.entries(state.nodeUsers)
+        .filter(([key, user]) => key !== nodeKeyNorm && user.userKey === bound.userKey)
+        .map(([key]) => key)
+    : [];
+  const showUserKey = userKey !== null;
+
+  return (
+    <>
+      <SectionLabel>DEVICES</SectionLabel>
+      <GroupCard>
+        <InfoRow
+          label="This device"
+          value={<span style={monoValue}>{shortKey(workspace.pubkey)}</span>}
+        />
+        <InfoRow
+          label="Bind state"
+          last={otherNodes.length === 0 && !showUserKey}
+          value={
+            <span style={monoValue}>
+              {bound ? `Linked to ${bound.name ?? shortKey(bound.userKey)}` : "Not linked"}
+            </span>
+          }
+        />
+        {otherNodes.length > 0 ? (
+          <InfoRow
+            label="Other devices"
+            last={!showUserKey}
+            value={
+              <span style={monoValue}>
+                {otherNodes.map((key) => shortKey(key)).join(", ")}
+              </span>
+            }
+          />
+        ) : null}
+        {userKey ? (
+          <InfoRow
+            label="User key"
+            last
+            value={
+              <span style={"pubkey" in userKey ? monoValue : { ...monoValue, color: color.red }}>
+                {"pubkey" in userKey ? shortKey(userKey.pubkey) : userKey.error}
+              </span>
+            }
+          />
+        ) : null}
+      </GroupCard>
+    </>
+  );
+}
+
 function PreferencesSection() {
   const { state, actions } = useDucktape();
   return (
@@ -818,6 +910,8 @@ export function SettingsView() {
 
         <SectionLabel>YOUR IDENTITY</SectionLabel>
         <IdentityCard />
+
+        <DevicesSection />
 
         <PreferencesSection />
         <DangerZone />

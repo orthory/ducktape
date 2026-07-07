@@ -7,6 +7,8 @@ import * as filesClient from "../../domain/files-client";
 import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
+import * as identityClient from "../../domain/identity-client";
+import { normalizeKey } from "../../domain/names";
 import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
@@ -35,6 +37,7 @@ import {
   sectionForScreen,
 } from "../modules/registry";
 import type { Action } from "./reducer";
+import { autoBindUserIdentity } from "./auto-bind";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
 import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
@@ -661,6 +664,17 @@ export function createActions({
           `still running on this port; quit it and try again.`,
       );
     };
+    // Adopt a node that just proved it's this workspace's own: clear the
+    // onboarding phase, hand it to the store, and — best-effort, desktop-only
+    // — offer this machine's user key to bind it (Task 8). Fire-and-forget:
+    // a failed bind is invisible here by design (auto-bind.ts never throws)
+    // and the provider's per-block refresh already re-reads the identity
+    // module, so a successful bind surfaces on its own on the next block.
+    const adopt = (transport: NodeTransport): void => {
+      patch({ onboardingPhase: null });
+      setNode(transport);
+      autoBindUserIdentity(transport, target).catch(() => {});
+    };
     return Promise.resolve()
       .then(() => ws.selectWorkspace(target.id))
       .then((sel) => {
@@ -674,8 +688,7 @@ export function createActions({
             return transport.status().then((s) => {
               if (stale()) return;
               if (!identityMatches(s.publicKey)) return rejectImpostor();
-              patch({ onboardingPhase: null });
-              setNode(transport);
+              adopt(transport);
             });
           });
         }
@@ -715,8 +728,7 @@ export function createActions({
                 .then((seated) => {
                   if (stale()) return;
                   if (!seated) return park();
-                  patch({ onboardingPhase: null });
-                  setNode(transport);
+                  adopt(transport);
                 });
             },
             () => park(),
@@ -819,13 +831,25 @@ export function createActions({
     },
 
     // Keep the local author identity (still the web-origin string) AND submit
-    // SetName so the chosen name propagates: it's origin-gated, so passing our
-    // origin sets our OWN profile only. Refresh re-reads authorNames.
+    // a name write so the chosen name propagates: it's origin-gated, so
+    // passing our origin only ever writes OUR OWN name. Once this node is
+    // bound to a user (state.nodeUsers has it), the durable identity is the
+    // USER, not the node — so the write goes through identity's SetUserName
+    // instead of profiles' SetName, the same way MembersView's inline
+    // self-rename (canRename row, also wired to this action) picks up the
+    // bound-vs-unbound distinction for free. An unbound node keeps the
+    // original profiles path unchanged. Refresh re-reads authorNames/nodeUsers.
     setDisplayName: (name) => {
-      const origin = getState().author;
+      const current = getState();
+      const origin = current.author;
+      const nodeKeyNorm = normalizeKey(current.workspace?.pubkey);
+      const bound = nodeKeyNorm ? current.nodeUsers[nodeKeyNorm] : undefined;
       submitTracked(
         opKey.profile(),
-        (live) => profilesClient.setName(live, { displayName: name, origin }),
+        (live) =>
+          bound
+            ? identityClient.setUserName(live, { displayName: name, origin })
+            : profilesClient.setName(live, { displayName: name, origin }),
         () => ({ author: name }),
       );
     },

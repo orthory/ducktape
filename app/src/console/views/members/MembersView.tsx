@@ -158,6 +158,89 @@ function makeMembers(
   ];
 }
 
+/** A run of node rows that share a bound user, within one tier. Sections
+ *  (validators/observers) never merge — see groupMembersByUser. */
+interface MemberGroup {
+  key: string;
+  userKey: string;
+  name: string;
+  members: MemberVM[];
+}
+
+type MemberItem =
+  | { kind: "member"; member: MemberVM }
+  | { kind: "group"; group: MemberGroup };
+
+/** Fold rows onto one header per (tier, bound user) — keyed on tier so a user
+ *  with nodes in BOTH the validator and observer tiers gets a separate header
+ *  in each (the tiers are disjoint valset standings, never merged). An
+ *  unbound key passes through untouched, in place, with no group wrapper.
+ *  A bound group with exactly ONE node also collapses flat: post auto-bind
+ *  most users are single-device, and the row's authorNames-resolved label
+ *  already carries the user name (the provider overlays it), so a header
+ *  would only repeat the name directly above its own row. */
+function groupMembersByUser(
+  members: MemberVM[],
+  nodeUsers: Record<string, { userKey: string; name: string | null }>,
+): MemberItem[] {
+  const items: MemberItem[] = [];
+  const groups = new Map<string, MemberGroup>();
+  for (const member of members) {
+    const bound = nodeUsers[member.keyNorm];
+    if (!bound) {
+      items.push({ kind: "member", member });
+      continue;
+    }
+    const groupKey = `${member.tier}:${bound.userKey}`;
+    let group = groups.get(groupKey);
+    if (!group) {
+      group = {
+        key: groupKey,
+        userKey: bound.userKey,
+        name: bound.name ?? shortKey(bound.userKey),
+        members: [],
+      };
+      groups.set(groupKey, group);
+      items.push({ kind: "group", group });
+    }
+    group.members.push(member);
+  }
+  return items.map((item) =>
+    item.kind === "group" && item.group.members.length === 1
+      ? { kind: "member", member: item.group.members[0] }
+      : item,
+  );
+}
+
+/** A grouped node row labels by its DEVICE key: the header above it already
+ *  carries the who (the user), so the row carries the which-device. Copy,
+ *  never mutate — the detail pane and search both read the original VM. */
+const asDeviceRow = (member: MemberVM): MemberVM => ({
+  ...member,
+  displayName: member.shortKey,
+  initials: initialsOf(member.shortKey),
+});
+
+function MemberGroupHeader({ group }: { group: MemberGroup }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        padding: "9px 14px 3px",
+      }}
+    >
+      <span style={{ font: `600 11.5px ${font.sans}`, color: color.inkSoft }}>
+        {group.name}
+      </span>
+      <span style={{ font: `500 9.5px ${font.mono}`, color: color.muted2 }}>
+        {group.members.length} device{group.members.length === 1 ? "" : "s"}
+      </span>
+    </div>
+  );
+}
+
 function roleForFilter(member: MemberVM, filter: FilterId): boolean {
   switch (filter) {
     case "all":
@@ -1030,6 +1113,10 @@ export function MembersView() {
     ? rows.find((member) => member.keyNorm === normalizeKey(selectedKey)) ?? null
     : null;
   const canAdmin = Boolean(state.workspace?.founder || state.workspace?.member);
+  const groupedRows = useMemo(
+    () => groupMembersByUser(visibleRows, state.nodeUsers),
+    [visibleRows, state.nodeUsers],
+  );
 
   // Pending join requests live on THIS member's node (delivered over the lobby
   // channel), read via the desktop registry — poll while the admin surface is
@@ -1102,6 +1189,25 @@ export function MembersView() {
       setSelectedKey(null);
     }
   };
+
+  // Shared row renderer — a group's nested rows and a standalone row get the
+  // exact same per-node affordances (promote/demote/remove/rename), only the
+  // wrapper around them differs.
+  const renderMemberRow = (member: MemberVM) => (
+    <MemberRow
+      key={member.keyNorm || member.key}
+      member={member}
+      selected={selected?.keyNorm === member.keyNorm}
+      onOpen={() => setSelectedKey(member.key)}
+      canRemove={canAdmin && !member.isLocal && member.tier === "validator"}
+      onRemove={() => requestRemove(member)}
+      canGovernObserver={canAdmin && member.tier === "observer"}
+      onPromote={() => requestPromote(member)}
+      onRevoke={() => requestRevoke(member)}
+      canRename={member.isLocal}
+      onRename={actions.setDisplayName}
+    />
+  );
 
   return (
     <div
@@ -1226,21 +1332,20 @@ export function MembersView() {
                 boxShadow: shadow.card,
               }}
             >
-              {visibleRows.map((member) => (
-                <MemberRow
-                  key={member.keyNorm || member.key}
-                  member={member}
-                  selected={selected?.keyNorm === member.keyNorm}
-                  onOpen={() => setSelectedKey(member.key)}
-                  canRemove={canAdmin && !member.isLocal && member.tier === "validator"}
-                  onRemove={() => requestRemove(member)}
-                  canGovernObserver={canAdmin && member.tier === "observer"}
-                  onPromote={() => requestPromote(member)}
-                  onRevoke={() => requestRevoke(member)}
-                  canRename={member.isLocal}
-                  onRename={actions.setDisplayName}
-                />
-              ))}
+              {groupedRows.map((item) =>
+                item.kind === "member" ? (
+                  renderMemberRow(item.member)
+                ) : (
+                  <div key={item.group.key}>
+                    <MemberGroupHeader group={item.group} />
+                    <div style={{ paddingLeft: 14 }}>
+                      {item.group.members.map((member) =>
+                        renderMemberRow(asDeviceRow(member)),
+                      )}
+                    </div>
+                  </div>
+                ),
+              )}
             </div>
           )}
         </div>
