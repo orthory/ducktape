@@ -14,6 +14,7 @@
 mod daemon;
 mod forge_git;
 mod huddle;
+mod menu;
 mod tray;
 mod user_identity;
 mod workspaces;
@@ -59,9 +60,11 @@ fn main() {
             huddle::huddle_pop_out,
             huddle::huddle_pop_in,
         ])
-        // Menu-bar icon + popover (macOS only; a no-op on other platforms).
+        // Menu-bar icon + popover, and an app menu with no Cmd+W Close
+        // Window so the webview owns the key (macOS only; no-ops elsewhere).
         .setup(|app| {
             tray::init(app.handle())?;
+            menu::install(app)?;
             Ok(())
         });
 
