@@ -249,6 +249,19 @@ export interface ConsoleActions {
   openSearch(): void;
   closeSearch(): void;
 
+  // ── Chat tags (the chat index's derived #tag view) ──
+  /** Filter the active channel by a #tag (leading `#` optional — the display
+   *  form as clicked): runs the chat index's tagSearch and shows its hits
+   *  instead of the live message slice until cleared. Channel-scoped, so a
+   *  channel switch clears it. */
+  setTagFilter(tag: string): void;
+  /** Drop the tag filter and return to the live view. */
+  clearTagFilter(): void;
+  /** Load the active channel's tag catalog into `state.channelTags` for the
+   *  header's tag dropdown. Best-effort: a node without the index tier just
+   *  leaves the list empty. */
+  loadChannelTags(): void;
+
   // ── Files (content-addressed manifests over the `files` module) ──
   /** Chunk + stage a file's bytes into the blob store, then commit its manifest. */
   uploadFile(params: { name: string; mime: string; bytes: Uint8Array<ArrayBuffer> }): void;
@@ -361,6 +374,10 @@ export function createActions({
   // current — so a slow or out-of-order response can never clobber a newer
   // query's results (or repopulate a cleared palette).
   let searchToken = 0;
+
+  // The tag filter's own token, same discipline: setTagFilter/clearTagFilter
+  // (and a channel switch) bump it so a stale tagSearch can't land.
+  let tagToken = 0;
 
   // The live call session (the browser audio graph + camera + ws), or null when
   // not in a huddle. Ephemeral and per-client — it lives here, not in state;
@@ -492,14 +509,20 @@ export function createActions({
       });
   };
 
-  // switching channels means: new active channel, thread panel closed, and
-  // THAT channel's messages loaded — every path into a channel goes here
+  // switching channels means: new active channel, thread panel closed, any
+  // channel-scoped tag filter/catalog dropped, and THAT channel's messages
+  // loaded — every path into a channel goes here
   const enterChannel = (channelId: string) => {
     const live = getNode();
     if (!live) return;
+    tagToken += 1; // supersede any in-flight tagSearch so it can't repopulate
     patch({
       activeChannel: channelId,
       activeThread: null,
+      tagFilter: null,
+      tagHits: [],
+      tagHitsPending: false,
+      channelTags: [],
     });
     Promise.resolve()
       .then(() => chatClient.latestMessages(live, channelId))
@@ -1519,6 +1542,47 @@ export function createActions({
     openSearch: () => patch({ searchOpen: true }),
 
     closeSearch: () => patch({ searchOpen: false }),
+
+    // ── Chat tags (derived-index view) ──
+    setTagFilter: (tag) => {
+      const live = getNode();
+      // keep the as-typed display form for the bar; the node normalizes.
+      const clean = tag.trim().replace(/^#+/, "");
+      const channelId = getState().activeChannel;
+      if (!live || !clean) return;
+      const token = ++tagToken;
+      patch({ tagFilter: { tag: clean, channelId }, tagHits: [], tagHitsPending: true });
+      chatClient
+        .tagSearch(live, { tag: clean, channelId: channelId ?? undefined, limit: 100 })
+        .then((hits) => {
+          if (token !== tagToken) return; // superseded by a newer filter/clear
+          patch({ tagHits: hits, tagHitsPending: false });
+        })
+        .catch((err) => {
+          if (token !== tagToken) return;
+          patch({ tagHitsPending: false });
+          fail(err);
+        });
+    },
+
+    clearTagFilter: () => {
+      tagToken += 1; // supersede any in-flight tagSearch so it can't repopulate
+      patch({ tagFilter: null, tagHits: [], tagHitsPending: false });
+    },
+
+    loadChannelTags: () => {
+      const live = getNode();
+      const channelId = getState().activeChannel;
+      if (!live || !channelId) return;
+      chatClient
+        .tags(live, { channelId, limit: 20 })
+        .then((rows) => {
+          // only land on the channel the load was asked for.
+          if (getState().activeChannel === channelId) patch({ channelTags: rows });
+        })
+        // best-effort: an older node without the index tier 404s the view.
+        .catch(() => {});
+    },
 
     // ── Files ──
     uploadFile: ({ name, mime, bytes }) => {

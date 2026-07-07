@@ -350,6 +350,8 @@ export interface ChatSearchHit {
   deleted: boolean;
   edited: boolean;
   thread?: number;
+  /** Normalized #tag labels the head carries (absent when untagged). */
+  tags?: string[];
 }
 
 /** Full-text search over message heads, newest first — served by the node's
@@ -362,6 +364,44 @@ export const searchMessages = (
     .then(() =>
       transport.view(TARGET, {
         search: { text: params.text, channelId: params.channelId, limit: params.limit },
+      }),
+    )
+    .then((reply) => replyVariant<ChatSearchHit[]>(reply, "hits"));
+
+/** One row of the tag catalog: a normalized label, how many live messages
+ *  carry it in the asked scope, and the newest such message's seq. */
+export interface ChatTagRow {
+  tag: string;
+  count: number;
+  lastSeq: number;
+}
+
+/** The tag catalog — a channel's live #tags ordered by count desc then tag
+ *  asc (no channelId aggregates the whole workspace). Served by the same
+ *  node-local derived index as `searchMessages`. */
+export const tags = (
+  transport: NodeTransport,
+  params: { channelId?: string; limit?: number } = {},
+): Promise<ChatTagRow[]> =>
+  Promise.resolve()
+    .then(() =>
+      transport.view(TARGET, {
+        tags: { channelId: params.channelId, limit: params.limit },
+      }),
+    )
+    .then((reply) => replyVariant<ChatTagRow[]>(reply, "tags"));
+
+/** Every live message carrying one exact #tag, newest first. The node
+ *  normalizes the queried tag (NFC + lowercase, leading `#` stripped), so an
+ *  as-typed display form can be passed straight through. */
+export const tagSearch = (
+  transport: NodeTransport,
+  params: { tag: string; channelId?: string; limit?: number },
+): Promise<ChatSearchHit[]> =>
+  Promise.resolve()
+    .then(() =>
+      transport.view(TARGET, {
+        tagSearch: { tag: params.tag, channelId: params.channelId, limit: params.limit },
       }),
     )
     .then((reply) => replyVariant<ChatSearchHit[]>(reply, "hits"));
