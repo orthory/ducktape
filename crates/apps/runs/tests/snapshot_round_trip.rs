@@ -62,7 +62,6 @@ impl TestCtx {
                 display_name: agent_id.to_uppercase(),
                 capability: "model-1".into(),
                 prompt_hash: vec![7u8; 32],
-                prompt_doc: None,
                 allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
                 status: AgentStatus::Active,
                 created_at: 0,
@@ -168,7 +167,6 @@ fn module() -> RunsModule {
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-        None,
     )
 }
 

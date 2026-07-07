@@ -21,6 +21,7 @@ import * as filesClient from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import type { ProposalView } from "../../domain/governance-client";
+import * as identityClient from "../../domain/identity-client";
 import * as pagesClient from "../../domain/pages-client";
 import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import {
@@ -34,7 +35,7 @@ import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
-import { hasFreshPending } from "./finalization";
+import { hasFreshPending, pageSnapshotSuperseded } from "./finalization";
 import {
   HUDDLE_CLOSED_EVENT,
   HUDDLE_CMD_EVENT,
@@ -94,7 +95,10 @@ export function DucktapeProvider({
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
     // the pages (docs) slice refreshes by enumeration + the open page's tree.
-    const activePage = stateRef.current.activePage;
+    const fetchedPage = stateRef.current.activePage;
+    // ops submitted at or after this instant cannot be in the snapshot the
+    // queries below return — pageSnapshotSuperseded keys off it at apply time.
+    const fetchStartedAt = Date.now();
     return Promise.resolve()
       .then(() =>
         Promise.all([
@@ -104,9 +108,9 @@ export function DucktapeProvider({
           // validator set) — best-effort like governance below, so a local
           // node reads as "no members" instead of never connecting.
           valsetClient.validators(live).catch((): number[][] => []),
-          // the observer tier (staged admission) — same best-effort contract:
-          // a pre-observer node (protocol < 3) reads as "no observers".
-          valsetClient.observers(live).catch((): number[][] => []),
+          // the resident tier (staged admission) — same best-effort contract:
+          // a pre-resident node (protocol < 3) reads as "no residents".
+          valsetClient.residents(live).catch((): number[][] => []),
           // governance is a first-class operator surface but best-effort in the
           // snapshot: a node/build without it just reads as "no proposals"
           // rather than failing the whole refresh.
@@ -116,9 +120,9 @@ export function DucktapeProvider({
           // best-effort, so a node without it reads as "no docs", never a
           // failed refresh.
           pagesClient.listPages(live).catch((): PageMeta[] => []),
-          activePage
+          fetchedPage
             ? pagesClient
-                .getPage(live, activePage)
+                .getPage(live, fetchedPage)
                 .catch((): PageBlock[] | null => null)
             : Promise.resolve<PageBlock[] | null>(null),
           agentClient.agents(live),
@@ -138,6 +142,13 @@ export function DucktapeProvider({
             .pendingRuns(live)
             .then((list) => [...list].sort((a, b) => b.created_at - a.created_at)),
           profilesClient.allProfiles(live, { from: 0, limit: 256 }),
+          // identity is newer than some reachable nodes (any pre-identity
+          // network, e.g. the web build's node) — best-effort like pages
+          // above, so the overlay just degrades to profiles' names instead
+          // of failing the whole refresh.
+          identityClient
+            .allUsers(live, { from: 0, limit: 256 })
+            .catch((): identityClient.UserView[] => []),
           // files is best-effort so a node that does not register the module
           // reads as "empty", never a failed refresh (same contract as
           // governance above).
@@ -151,7 +162,7 @@ export function DucktapeProvider({
         status,
         channels,
         validators,
-        observerKeys,
+        residentKeys,
         proposals,
         forgeHead,
         pages,
@@ -162,21 +173,47 @@ export function DucktapeProvider({
         watches,
         pendingRuns,
         profiles,
+        users,
         files,
         blocks,
       ]) => {
         // Profile.key is the origin bytes — the same bytes AuthorRef::User
         // carries — so hex(key) is exactly authorName's AuthorNames key.
-        const authorNames = Object.fromEntries(
+        // identity's per-user display name OVERLAYS profiles for every node
+        // that user binds — bound-user identity wins over the node's own
+        // origin-set profile, since the node/user split makes the user the
+        // durable identity and the node just its hardware.
+        const authorNames: Record<string, string> = Object.fromEntries(
           profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
         );
+        const nodeUsers: Record<string, { userKey: string; name: string | null }> = {};
+        for (const u of users) {
+          const userKey = chatClient.keyHex(u.user_key);
+          for (const node of u.nodes) {
+            const nodeHex = chatClient.keyHex(node);
+            nodeUsers[nodeHex] = { userKey, name: u.display_name };
+            if (u.display_name) authorNames[nodeHex] = u.display_name;
+          }
+        }
         const members = validators.map(valsetClient.validatorHex);
-        const observers = observerKeys.map(valsetClient.validatorHex);
+        const residents = residentKeys.map(valsetClient.validatorHex);
         const current = stateRef.current.activeChannel;
         const active =
           current && channels.some((c) => c.id === current)
             ? current
             : (channels[0]?.id ?? null);
+        // A pages snapshot that predates a page op must not be applied: it
+        // would clobber the op's preconfirmed projection — an optimistically
+        // inserted block unmounts (dropping the focused textarea with it) and
+        // just-committed text reverts until the op finalizes. The block
+        // stream's hasFreshPending gate covers stream refreshes; this covers
+        // the completion refresh of an EARLIER op that settles while a later
+        // one is still in flight, and a snapshot raced by an op submitted
+        // mid-fetch. A snapshot for a page we've since navigated away from is
+        // equally stale. Held slices converge on the last op's own refresh.
+        const holdPages =
+          stateRef.current.activePage !== fetchedPage ||
+          pageSnapshotSuperseded(stateRef.current.ops, fetchStartedAt, Date.now());
         // reconcile doc tabs against the live enumeration: a tab whose page no
         // longer exists (deleted here or elsewhere) drops, and a now-dead
         // active page falls back to the first surviving tab. CRITICAL: only
@@ -184,11 +221,13 @@ export function DucktapeProvider({
         // best-effort (`.catch(() => [])`), and an empty result may be a
         // transient failure (node busy, module absent). Evicting open tabs on
         // that would blank the editor mid-edit, so an empty result is a no-op.
+        // A held (superseded) enumeration is equally untrustworthy for
+        // eviction, so it is a no-op too.
         const prevTabs = stateRef.current.openTabs;
         const prevActive = stateRef.current.activePage;
         let openTabs = prevTabs;
         let activePage = prevActive;
-        if (pages.length > 0) {
+        if (!holdPages && pages.length > 0) {
           const liveIds = new Set(pages.map((p) => p.id));
           openTabs = prevTabs.filter((id) => liveIds.has(id));
           if (openTabs.length !== prevTabs.length) saveDocTabs(openTabs);
@@ -222,14 +261,17 @@ export function DucktapeProvider({
                 status,
                 channels,
                 members,
-                observers,
+                residents,
                 proposals,
                 forgeHead,
                 activeChannel: active,
                 messages,
                 authorNames,
-                pages,
-                activePageBlocks: pageBlocks ?? [],
+                nodeUsers,
+                pages: holdPages ? stateRef.current.pages : pages,
+                activePageBlocks: holdPages
+                  ? stateRef.current.activePageBlocks
+                  : (pageBlocks ?? []),
                 agents,
                 capabilities,
                 capabilitiesByNode,
@@ -309,7 +351,14 @@ export function DucktapeProvider({
         return actions.connectActive(active);
       })
       .catch((err) => {
-        if (!cancelled) fail(err);
+        if (cancelled) return;
+        // A failed boot resolution (corrupt/locked ~/.ducktape registry,
+        // permissions, a concurrent instance holding a lock) used to drop to a
+        // hollow, disconnected shell with a toast that then vanished — no
+        // workspace list, no way forward. Land on the onboarding gate, the
+        // actionable front door, with the error shown, never an empty console.
+        dispatch({ type: "patch", patch: { needsOnboarding: true } });
+        fail(err);
       });
     // Reset the guard on cleanup so StrictMode's mount→unmount→remount re-runs
     // the boot: without this the first mount's async resolve is cancelled while
@@ -363,15 +412,46 @@ export function DucktapeProvider({
     if (state.needsOnboarding || state.onboardingPhase) return;
     const beat = () =>
       node.status().then(
-        () => {
-          // up: only pay for a full refresh on the down→up edge; while already
-          //     connected the block stream keeps projections fresh.
-          if (!stateRef.current.connected) refresh();
+        (s) => {
+          // Recovery identity re-check: a foreign / different-build node could
+          // have grabbed the reused port while ours was down (only the INITIAL
+          // adopt used to verify this). Adopting it would silently show another
+          // node's state. Guarded to when we know both keys (managed workspace).
+          const expected = stateRef.current.workspace?.pubkey;
+          const got = s.publicKey;
+          if (expected && got && got.toLowerCase() !== expected.toLowerCase()) {
+            if (stateRef.current.connected || !stateRef.current.connectionDown?.impostor) {
+              dispatch({
+                type: "patch",
+                patch: {
+                  connected: false,
+                  connectionDown: {
+                    reason:
+                      "a different node is now answering this workspace's port — not reconnecting",
+                    impostor: true,
+                  },
+                },
+              });
+            }
+            return;
+          }
+          // Healthy: on the down→up edge clear the banner and re-hydrate; while
+          // already connected the block stream keeps projections fresh.
+          if (!stateRef.current.connected || stateRef.current.connectionDown) {
+            dispatch({ type: "patch", patch: { connectionDown: null } });
+            refresh();
+          }
         },
-        () => {
-          // unreachable: surface it once; the next beats keep trying to recover.
-          if (stateRef.current.connected) {
-            dispatch({ type: "patch", patch: { connected: false } });
+        (err: unknown) => {
+          // Unreachable: surface the REAL reason in a persistent reconnecting
+          // banner and keep this loop trying to recover. Patch only on the
+          // down-edge to avoid a re-render every beat.
+          if (stateRef.current.connected || !stateRef.current.connectionDown) {
+            const reason = err instanceof Error ? err.message : String(err);
+            dispatch({
+              type: "patch",
+              patch: { connected: false, connectionDown: { reason } },
+            });
           }
         },
       );

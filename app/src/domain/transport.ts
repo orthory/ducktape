@@ -155,38 +155,101 @@ interface WsBlockFrame {
 
 type WsFrame = WsBlockFrame;
 
-const RECONNECT_DELAY_MS = 2_000;
+// ── Error classification + bounded fetch ────────────────
 
-const postJson = <T>(url: string, body: unknown): Promise<T> =>
-  Promise.resolve()
-    .then(() =>
-      fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      }),
-    )
-    .then(async (res) => {
-      if (res.ok) return (await res.json()) as T;
-      const detail = await res
-        .json()
-        .then((payload) => String((payload as { error?: string }).error ?? ""))
-        .catch(() => "");
-      throw new Error(detail || `node replied ${res.status}`);
-    });
+/** Why a node call failed — the UI (and waitUntilUp) branch on this instead of
+ *  treating every failure identically as "down". `refused`: nothing answered
+ *  (not listening yet / CSP-blocked). `timeout`: the node accepted the
+ *  connection but never replied within the deadline — the old "10s" bound was a
+ *  lie, no fetch had one, so a wedged node hung the UI far longer. `httpError`:
+ *  it answered non-2xx (the node IS up, and erroring). `badBody`: it answered
+ *  2xx with an unparseable / non-ducktape body. */
+export type NodeErrorKind = "refused" | "timeout" | "httpError" | "badBody";
+
+export class NodeError extends Error {
+  readonly kind: NodeErrorKind;
+  readonly status?: number;
+  constructor(kind: NodeErrorKind, message: string, status?: number) {
+    super(message);
+    this.name = "NodeError";
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+const STATUS_TIMEOUT_MS = 6_000; // the liveness probe must be bounded
+const CALL_TIMEOUT_MS = 30_000; // submit/query may wait on a commit — looser
+
+/** fetch with a per-attempt deadline: a node that accepts the TCP connection
+ *  but never answers can no longer hang forever. An abort becomes a `timeout`
+ *  NodeError; any other network failure (connection refused, CSP block) becomes
+ *  `refused`. */
+const fetchDeadline = (
+  url: string,
+  init?: RequestInit,
+  timeoutMs: number = CALL_TIMEOUT_MS,
+): Promise<Response> => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...init, signal: controller.signal })
+    .catch((err: unknown) => {
+      if (controller.signal.aborted) {
+        throw new NodeError(
+          "timeout",
+          `the node accepted the connection but did not answer within ${timeoutMs}ms`,
+        );
+      }
+      throw new NodeError(
+        "refused",
+        `could not reach the node (${err instanceof Error ? err.message : String(err)})`,
+      );
+    })
+    .finally(() => clearTimeout(timer));
+};
+
+/** A Response's error body — the node's json `{error}` or capped text — for the
+ *  message, instead of discarding it behind a bare status code. */
+const errorDetail = async (res: Response): Promise<string> => {
+  const body = await res.text().catch(() => "");
+  if (!body) return "";
+  try {
+    return String((JSON.parse(body) as { error?: string }).error ?? body).slice(0, 300);
+  } catch {
+    return body.slice(0, 300);
+  }
+};
+
+const RECONNECT_BASE_MS = 1_000;
+const RECONNECT_CAP_MS = 30_000;
+
+const postJson = async <T>(url: string, body: unknown): Promise<T> => {
+  const res = await fetchDeadline(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw new NodeError("httpError", (await errorDetail(res)) || `node replied ${res.status}`, res.status);
+  }
+  try {
+    return (await res.json()) as T;
+  } catch {
+    throw new NodeError("badBody", `${url} returned an invalid or empty response`);
+  }
+};
 
 /** A node base url in its websocket form: trailing slash stripped, http→ws
- *  scheme swap — the ONE derivation both the block stream and the voice
+ *  scheme swap — the ONE derivation both the block stream and the call
  *  socket dial through. */
 const wsBase = (baseUrl: string): string =>
   baseUrl.replace(/\/$/, "").replace(/^http/, "ws");
 
-/** The voice websocket url for a channel on the node at `baseUrl` — same
- *  host/port as the daemon's http/ws surface. The audio session
- *  (voice-session.ts) dials this; kept here because this is where the base
- *  url and its ws form live. */
-export const voiceSocketUrl = (baseUrl: string, channel: string): string =>
-  `${wsBase(baseUrl)}/v1/voice/ws?channel=${encodeURIComponent(channel)}`;
+/** The call websocket url for a channel on the node at `baseUrl` — same
+ *  host/port as the daemon's http/ws surface. The huddle session
+ *  (call-session.ts) dials this typed socket (audio + camera video + control);
+ *  kept here because this is where the base url and its ws form live. */
+export const callSocketUrl = (baseUrl: string, channel: string): string =>
+  `${wsBase(baseUrl)}/v1/call/ws?channel=${encodeURIComponent(channel)}`;
 
 export const remoteTransport = (baseUrl: string): NodeTransport => {
   const base = baseUrl.replace(/\/$/, "");
@@ -197,13 +260,22 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
   const blockListeners = new Set<(block: BlockEvent) => void>();
   const hasSubscribers = (): boolean => blockListeners.size > 0;
   let socket: WebSocket | null = null;
+  let retries = 0;
 
   const connect = (): void => {
     if (socket || !hasSubscribers()) return;
     const ws = new WebSocket(wsUrl);
     socket = ws;
+    ws.onopen = () => {
+      retries = 0; // a clean connection resets the backoff
+    };
     ws.onmessage = (event) => {
-      const frame = JSON.parse(String(event.data)) as WsFrame;
+      let frame: WsFrame;
+      try {
+        frame = JSON.parse(String(event.data)) as WsFrame;
+      } catch {
+        return; // a malformed / non-json frame is a no-op, not an uncaught throw
+      }
       switch (frame.type) {
         case "block": {
           const block = { height: frame.height, appHash: frame.appHash };
@@ -216,7 +288,12 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
     };
     ws.onclose = () => {
       socket = null;
-      if (hasSubscribers()) setTimeout(connect, RECONNECT_DELAY_MS);
+      if (!hasSubscribers()) return;
+      // exponential backoff (capped) + jitter, instead of the blind 2s retry
+      // loop that spammed the console every 2s forever against a dead node.
+      const backoff = Math.min(RECONNECT_CAP_MS, RECONNECT_BASE_MS * 2 ** retries);
+      retries += 1;
+      setTimeout(connect, backoff * (0.5 + Math.random() * 0.5));
     };
     ws.onerror = () => ws.close();
   };
@@ -270,37 +347,45 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
             .catch(() => "");
           throw new Error(detail || `node replied ${res.status}`);
         }),
-    status: () =>
-      Promise.resolve()
-        .then(() => fetch(`${base}/v1/status`))
-        .then((res) => {
-          if (!res.ok) throw new Error(`node replied ${res.status}`);
-          return res.json() as Promise<NodeStatus>;
-        }),
+    status: async () => {
+      const res = await fetchDeadline(`${base}/v1/status`, undefined, STATUS_TIMEOUT_MS);
+      if (!res.ok) throw new NodeError("httpError", `node replied ${res.status}`, res.status);
+      let parsed: NodeStatus;
+      try {
+        parsed = (await res.json()) as NodeStatus;
+      } catch {
+        throw new NodeError("badBody", "/v1/status returned an invalid response");
+      }
+      // shape check: a non-ducktape process that answers 200 on this port must
+      // not read as a healthy node — "connecting" to it makes everything
+      // downstream fail confusingly (see NodeStatus).
+      if (
+        typeof parsed.version !== "string" ||
+        typeof parsed.height !== "number" ||
+        typeof parsed.appHash !== "string"
+      ) {
+        throw new NodeError("badBody", "the process answering this port is not a ducktape node");
+      }
+      return parsed;
+    },
     // OpenMetrics text exposition (not json, not under /v1) — the scrape body.
-    metrics: () =>
-      Promise.resolve()
-        .then(() => fetch(`${base}/metrics`))
-        .then((res) => {
-          if (!res.ok) throw new Error(`node replied ${res.status}`);
-          return res.text();
-        }),
-    blocks: (limit) =>
-      Promise.resolve()
-        .then(() =>
-          fetch(
-            limit === undefined
-              ? `${base}/v1/blocks`
-              : `${base}/v1/blocks?limit=${limit}`,
-          ),
-        )
-        .then((res) => {
-          if (!res.ok) throw new Error(`node replied ${res.status}`);
-          return res.json() as Promise<{ blocks?: BlockRecord[] }>;
-        })
-        // best-effort observability: a node without a blocks surface (or a
-        // malformed body) reads as "no blocks", not an error.
-        .then((body) => body.blocks ?? []),
+    metrics: async () => {
+      const res = await fetchDeadline(`${base}/metrics`, undefined, STATUS_TIMEOUT_MS);
+      if (!res.ok) throw new NodeError("httpError", `node replied ${res.status}`, res.status);
+      return res.text();
+    },
+    blocks: async (limit) => {
+      const res = await fetchDeadline(
+        limit === undefined ? `${base}/v1/blocks` : `${base}/v1/blocks?limit=${limit}`,
+        undefined,
+        STATUS_TIMEOUT_MS,
+      );
+      if (!res.ok) throw new NodeError("httpError", `node replied ${res.status}`, res.status);
+      // best-effort observability: a node without a blocks surface (or a
+      // malformed body) reads as "no blocks", not an error.
+      const body = (await res.json().catch(() => ({}))) as { blocks?: BlockRecord[] };
+      return body.blocks ?? [];
+    },
     onBlock: (listener) => {
       blockListeners.add(listener);
       connect();

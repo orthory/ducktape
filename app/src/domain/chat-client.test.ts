@@ -16,6 +16,7 @@ import {
   leaveHuddle,
   postMessage,
   searchMessages,
+  sweepHuddle,
   thread,
 } from "./chat-client";
 import type { MessageView } from "./chat-client";
@@ -131,6 +132,17 @@ describe("huddle msgs", () => {
     expect(transport.submit).toHaveBeenCalledWith(
       "chat",
       { leave_huddle: { channel_id: "general" } },
+      "jess",
+    );
+  });
+
+  it("encodes SweepHuddle with the target user bytes and stamps the origin", async () => {
+    const transport = stubTransport();
+    const user = Array.from(new TextEncoder().encode("stale"));
+    await sweepHuddle(transport, { channelId: "general", user, origin: "jess" });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "chat",
+      { sweep_huddle: { channel_id: "general", user } },
       "jess",
     );
   });

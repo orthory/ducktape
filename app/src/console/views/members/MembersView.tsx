@@ -1,8 +1,8 @@
 // Membership directory over the committed `valset` module — BOTH tiers:
-// validators (the consensus quorum) and observers (staged admission — mesh +
+// validators (the consensus quorum) and residents (staged admission — mesh +
 // statesync standing, no quorum seat). Approving a join request grants
-// observer standing; the deliberate second step, Promote, seats the warm
-// observer as a validator, and Revoke drops its standing (its node parks
+// resident standing; the deliberate second step, Promote, seats the warm
+// resident as a validator, and Revoke drops its standing (its node parks
 // again). The node exposes the keys plus profile display names;
 // liveness/presence is intentionally shown as unavailable until the backing
 // data exists.
@@ -47,10 +47,10 @@ interface MemberVM {
   initials: string;
   shortKey: string;
   /** Which valset tier the key sits in — the tiers never overlap. */
-  tier: "validator" | "observer";
-  role: "genesis validator" | "member validator" | "validator" | "observer";
-  kind: "validator key" | "observer key";
-  status: "in validator set" | "observer standing";
+  tier: "validator" | "resident";
+  role: "genesis validator" | "member validator" | "validator" | "resident";
+  kind: "validator key" | "resident key";
+  status: "in validator set" | "resident standing";
   isFounder: boolean;
   isLocal: boolean;
   searchText: string;
@@ -68,7 +68,7 @@ const FILTER_TABS: ReadonlyArray<{ id: FilterId; label: string }> = [
 const STATUS_PILLS = {
   validator: { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7" },
   // amber: standing granted but not seated — the warming, in-between tier.
-  observer: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
+  resident: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
   genesis: { text: color.onDark, bg: color.dark, border: color.dark },
   local: { text: color.accentAlt2, bg: "#eef5f0", border: "#cfe3d7" },
   muted: { text: color.muted3, bg: color.paper, border: color.borderStrong },
@@ -113,7 +113,7 @@ const MAX_NAME_LEN = 64;
 
 function makeMembers(
   members: string[],
-  observers: string[],
+  residents: string[],
   authorNames: Record<string, string>,
   workspace: { pubkey: string; founder: boolean; member: boolean } | null,
   capabilitiesByNode: Map<string, string[]>,
@@ -123,11 +123,11 @@ function makeMembers(
     const keyNorm = normalizeKey(key);
     const profileName = displayNameForKey(key, authorNames);
     const isLocal = sameKey(key, localKey);
-    // A founder is by definition seated — observer standing never applies.
+    // A founder is by definition seated — resident standing never applies.
     const isFounder = Boolean(workspace?.founder && isLocal);
     const role =
-      tier === "observer"
-        ? "observer"
+      tier === "resident"
+        ? "resident"
         : isFounder
           ? "genesis validator"
           : isLocal && workspace?.member
@@ -143,19 +143,102 @@ function makeMembers(
       shortKey: shortKey(key),
       tier,
       role,
-      kind: tier === "observer" ? "observer key" : "validator key",
-      status: tier === "observer" ? "observer standing" : "in validator set",
+      kind: tier === "resident" ? "resident key" : "validator key",
+      status: tier === "resident" ? "resident standing" : "in validator set",
       isFounder,
       isLocal,
       searchText: `${displayName} ${key} ${role}`.toLowerCase(),
       capabilities: capabilitiesByNode.get(keyNorm) ?? [],
     };
   };
-  // Validators first (the seated quorum), then the warming observer tier.
+  // Validators first (the seated quorum), then the warming resident tier.
   return [
     ...members.map((key) => toVM(key, "validator")),
-    ...observers.map((key) => toVM(key, "observer")),
+    ...residents.map((key) => toVM(key, "resident")),
   ];
+}
+
+/** A run of node rows that share a bound user, within one tier. Sections
+ *  (validators/residents) never merge — see groupMembersByUser. */
+interface MemberGroup {
+  key: string;
+  userKey: string;
+  name: string;
+  members: MemberVM[];
+}
+
+type MemberItem =
+  | { kind: "member"; member: MemberVM }
+  | { kind: "group"; group: MemberGroup };
+
+/** Fold rows onto one header per (tier, bound user) — keyed on tier so a user
+ *  with nodes in BOTH the validator and resident tiers gets a separate header
+ *  in each (the tiers are disjoint valset standings, never merged). An
+ *  unbound key passes through untouched, in place, with no group wrapper.
+ *  A bound group with exactly ONE node also collapses flat: post auto-bind
+ *  most users are single-device, and the row's authorNames-resolved label
+ *  already carries the user name (the provider overlays it), so a header
+ *  would only repeat the name directly above its own row. */
+function groupMembersByUser(
+  members: MemberVM[],
+  nodeUsers: Record<string, { userKey: string; name: string | null }>,
+): MemberItem[] {
+  const items: MemberItem[] = [];
+  const groups = new Map<string, MemberGroup>();
+  for (const member of members) {
+    const bound = nodeUsers[member.keyNorm];
+    if (!bound) {
+      items.push({ kind: "member", member });
+      continue;
+    }
+    const groupKey = `${member.tier}:${bound.userKey}`;
+    let group = groups.get(groupKey);
+    if (!group) {
+      group = {
+        key: groupKey,
+        userKey: bound.userKey,
+        name: bound.name ?? shortKey(bound.userKey),
+        members: [],
+      };
+      groups.set(groupKey, group);
+      items.push({ kind: "group", group });
+    }
+    group.members.push(member);
+  }
+  return items.map((item) =>
+    item.kind === "group" && item.group.members.length === 1
+      ? { kind: "member", member: item.group.members[0] }
+      : item,
+  );
+}
+
+/** A grouped node row labels by its DEVICE key: the header above it already
+ *  carries the who (the user), so the row carries the which-device. Copy,
+ *  never mutate — the detail pane and search both read the original VM. */
+const asDeviceRow = (member: MemberVM): MemberVM => ({
+  ...member,
+  displayName: member.shortKey,
+  initials: initialsOf(member.shortKey),
+});
+
+function MemberGroupHeader({ group }: { group: MemberGroup }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        padding: "9px 14px 3px",
+      }}
+    >
+      <span style={{ font: `600 11.5px ${font.sans}`, color: color.inkSoft }}>
+        {group.name}
+      </span>
+      <span style={{ font: `500 9.5px ${font.mono}`, color: color.muted2 }}>
+        {group.members.length} device{group.members.length === 1 ? "" : "s"}
+      </span>
+    </div>
+  );
 }
 
 function roleForFilter(member: MemberVM, filter: FilterId): boolean {
@@ -305,7 +388,7 @@ function MemberRow({
   onOpen,
   canRemove,
   onRemove,
-  canGovernObserver,
+  canGovernResident,
   onPromote,
   onRevoke,
   canRename,
@@ -317,8 +400,8 @@ function MemberRow({
   /** Show the removal control for this row (admin, and not this node itself). */
   canRemove: boolean;
   onRemove: () => void;
-  /** Show the observer controls for this row (admin, observer-tier row). */
-  canGovernObserver: boolean;
+  /** Show the resident controls for this row (admin, resident-tier row). */
+  canGovernResident: boolean;
   onPromote: () => void;
   onRevoke: () => void;
   /** Show the rename control for this row — the local node's own entry, the
@@ -501,8 +584,8 @@ function MemberRow({
           {member.isFounder ? (
             <Pill label="Genesis" pill={STATUS_PILLS.genesis} mono title={GENESIS_TOOLTIP} />
           ) : null}
-          {member.tier === "observer" ? (
-            <Pill label="Observer" pill={STATUS_PILLS.observer} />
+          {member.tier === "resident" ? (
+            <Pill label="Resident" pill={STATUS_PILLS.resident} />
           ) : (
             <Pill label="Validator" pill={STATUS_PILLS.validator} />
           )}
@@ -522,7 +605,7 @@ function MemberRow({
           </HoverButton>
         </div>
       ) : null}
-      {canGovernObserver ? (
+      {canGovernResident ? (
         <div style={{ flexShrink: 0, paddingRight: 12, display: "flex", gap: 7 }}>
           <HoverButton
             variant="dark"
@@ -534,7 +617,7 @@ function MemberRow({
           </HoverButton>
           <HoverButton
             variant="outline"
-            ariaLabel={`Revoke observer standing from ${member.displayName}`}
+            ariaLabel={`Revoke resident standing from ${member.displayName}`}
             onClick={onRevoke}
           >
             <Icon name="close" size={13} />
@@ -578,9 +661,10 @@ function EmptyState({ filter }: { filter: FilterId }) {
   );
 }
 
-/** One parked joiner's delivered request: who asks, who invited, one-click
- *  approve. Approval routes through the SAME governance ballot as the manual
- *  paste box — this list only removes the copy/paste. */
+/** One joining node's in-flight redemption: who is joining, who invited it.
+ *  Invites redeem automatically (minting was the approval), so rows clear on
+ *  their own once standing lands — the button forces the manual ballot as a
+ *  fallback (a token-less join, or a network mid-upgrade). */
 function PendingJoinRequests({
   requests,
   onApprove,
@@ -608,13 +692,14 @@ function PendingJoinRequests({
         }}
       >
         <div style={{ font: `600 12.5px ${font.sans}`, color: color.inkSoft }}>
-          Pending Join Requests
+          Joining Nodes
         </div>
         <span style={{ font: `500 11px ${font.mono}`, color: color.muted2 }}>
           {requests.length}
         </span>
         <span style={{ marginLeft: "auto", font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
-          Approving grants observer standing by majority ballot — Promote seats it in the quorum.
+          Invites redeem automatically into resident standing; rows clear once it lands. Approve
+          forces the ballot manually.
         </span>
       </div>
       {requests.map((request) => (
@@ -950,8 +1035,8 @@ function MemberDetailPane({
               marginTop: 7,
             }}
           >
-            {member.tier === "observer" ? (
-              <Pill label="Observer standing" pill={STATUS_PILLS.observer} />
+            {member.tier === "resident" ? (
+              <Pill label="Resident standing" pill={STATUS_PILLS.resident} />
             ) : (
               <Pill label="In validator set" pill={STATUS_PILLS.validator} />
             )}
@@ -1003,7 +1088,7 @@ export function MembersView() {
     () =>
       makeMembers(
         state.members,
-        state.observers,
+        state.residents,
         state.authorNames,
         state.workspace,
         state.capabilitiesByNode,
@@ -1012,7 +1097,7 @@ export function MembersView() {
       state.authorNames,
       state.capabilitiesByNode,
       state.members,
-      state.observers,
+      state.residents,
       state.workspace,
     ],
   );
@@ -1030,6 +1115,10 @@ export function MembersView() {
     ? rows.find((member) => member.keyNorm === normalizeKey(selectedKey)) ?? null
     : null;
   const canAdmin = Boolean(state.workspace?.founder || state.workspace?.member);
+  const groupedRows = useMemo(
+    () => groupMembersByUser(visibleRows, state.nodeUsers),
+    [visibleRows, state.nodeUsers],
+  );
 
   // Pending join requests live on THIS member's node (delivered over the lobby
   // channel), read via the desktop registry — poll while the admin surface is
@@ -1082,7 +1171,7 @@ export function MembersView() {
         `This opens an AddValidator proposal and casts THIS node's yes-ballot. ` +
         `It only takes effect once a strict majority of members (n / 2 + 1) ` +
         `approve — every other member must run the same promotion. The ` +
-        `pre-synced observer then joins the quorum at the next epoch cutover.`,
+        `pre-synced resident then joins the quorum at the next epoch cutover.`,
     );
     if (!ok) return;
     actions.promoteMember(member.key);
@@ -1090,18 +1179,37 @@ export function MembersView() {
 
   const requestRevoke = (member: MemberVM): void => {
     const ok = window.confirm(
-      `Revoke observer standing from ${member.displayName}?\n\n` +
-        `This opens a RemoveObserver proposal and casts THIS node's yes-ballot. ` +
+      `Revoke resident standing from ${member.displayName}?\n\n` +
+        `This opens a RemoveResident proposal and casts THIS node's yes-ballot. ` +
         `Once a strict majority of members approve, the key drops off the mesh ` +
         `at the next epoch cutover and its node parks again — approving a new ` +
         `join request re-grants.`,
     );
     if (!ok) return;
-    actions.removeObserver(member.key);
+    actions.removeResident(member.key);
     if (selectedKey && normalizeKey(selectedKey) === member.keyNorm) {
       setSelectedKey(null);
     }
   };
+
+  // Shared row renderer — a group's nested rows and a standalone row get the
+  // exact same per-node affordances (promote/demote/remove/rename), only the
+  // wrapper around them differs.
+  const renderMemberRow = (member: MemberVM) => (
+    <MemberRow
+      key={member.keyNorm || member.key}
+      member={member}
+      selected={selected?.keyNorm === member.keyNorm}
+      onOpen={() => setSelectedKey(member.key)}
+      canRemove={canAdmin && !member.isLocal && member.tier === "validator"}
+      onRemove={() => requestRemove(member)}
+      canGovernResident={canAdmin && member.tier === "resident"}
+      onPromote={() => requestPromote(member)}
+      onRevoke={() => requestRevoke(member)}
+      canRename={member.isLocal}
+      onRename={actions.setDisplayName}
+    />
+  );
 
   return (
     <div
@@ -1226,21 +1334,20 @@ export function MembersView() {
                 boxShadow: shadow.card,
               }}
             >
-              {visibleRows.map((member) => (
-                <MemberRow
-                  key={member.keyNorm || member.key}
-                  member={member}
-                  selected={selected?.keyNorm === member.keyNorm}
-                  onOpen={() => setSelectedKey(member.key)}
-                  canRemove={canAdmin && !member.isLocal && member.tier === "validator"}
-                  onRemove={() => requestRemove(member)}
-                  canGovernObserver={canAdmin && member.tier === "observer"}
-                  onPromote={() => requestPromote(member)}
-                  onRevoke={() => requestRevoke(member)}
-                  canRename={member.isLocal}
-                  onRename={actions.setDisplayName}
-                />
-              ))}
+              {groupedRows.map((item) =>
+                item.kind === "member" ? (
+                  renderMemberRow(item.member)
+                ) : (
+                  <div key={item.group.key}>
+                    <MemberGroupHeader group={item.group} />
+                    <div style={{ paddingLeft: 14 }}>
+                      {item.group.members.map((member) =>
+                        renderMemberRow(asDeviceRow(member)),
+                      )}
+                    </div>
+                  </div>
+                ),
+              )}
             </div>
           )}
         </div>

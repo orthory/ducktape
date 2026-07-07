@@ -17,9 +17,11 @@ upgrade = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# the invite capability (token + join-proof verification) is governance's own
+# admission surface: minted by a member, redeemed in-consensus by `Redeem`.
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
 
 [dev-dependencies]
 host = { workspace = true }
 futures = "0.3"
-commonware-cryptography = { workspace = true }
-commonware-codec = { workspace = true }

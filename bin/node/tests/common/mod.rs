@@ -174,21 +174,17 @@ impl NetworkShapeCluster {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// the token-less invite: the joiner's pubkey travels out-of-band and no
-    /// lobby announce happens — the pre-token manual flow, kept working.
-    pub fn invite_manual(&self) -> String {
-        let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
-            .args(["invite", "--manual", "--config"])
-            .arg(cfg)
-            .output()
-            .expect("run invite --manual");
-        assert!(
-            out.status.success(),
-            "invite --manual failed:\n{}",
-            command_output(&out)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    /// a MANUAL-flow join: every invite is tokened now (mint is the
+    /// admission), so the manual path is made by joining normally and then
+    /// dropping the stored credential — the node parks with no announce and
+    /// admission stays a member verb, which is exactly what the staged
+    /// admission tests exercise.
+    pub fn join_friend_manual(&self, invite: &str) -> String {
+        let key = self.join_friend(invite);
+        for stale in ["invite.token", "invite-wireguard.toml"] {
+            let _ = std::fs::remove_file(self.friend_dir.join(stale));
+        }
+        key
     }
 
     /// the founder's verified join-request queue, parsed from the
@@ -347,7 +343,7 @@ impl NetworkShapeCluster {
     }
 
     /// drive a membership ceremony verb (`promote`, `invite-accept`,
-    /// `observer-remove`) against node 0's running rpc, from node 0's config.
+    /// `resident-remove`) against node 0's running rpc, from node 0's config.
     pub fn run_membership_verb(&self, verb: &str, pubkey_hex: &str) -> (bool, String) {
         let cfg = self.config_file(0);
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
@@ -508,7 +504,7 @@ impl Cluster {
     }
 
     /// remove node `idx`'s storage directory — a killed slot reused as a
-    /// FRESH observer (the sync-only rebuild) must not inherit the previous
+    /// FRESH resident (the sync-only rebuild) must not inherit the previous
     /// occupant's state or index locks.
     pub fn wipe_storage(&self, idx: usize) {
         let id = self.peer_ids[idx];

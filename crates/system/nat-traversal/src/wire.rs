@@ -31,6 +31,10 @@ pub enum WireError {
     BadAddr,
     #[error("trailing bytes after message")]
     Trailing,
+    #[error("bad crypto encoding")]
+    BadCrypto,
+    #[error("auth envelope inner is not a request")]
+    NotARequest,
 }
 
 const TAG_BIND_REQ: u8 = 1;
@@ -44,6 +48,7 @@ const TAG_PUNCH: u8 = 7;
 // (RelayRequest/RelayGrant). They stay reserved so a stale peer speaking the
 // old protocol decodes as BadTag here instead of aliasing a future message.
 const TAG_READVERTISE: u8 = 10;
+const TAG_AUTH_REQUEST: u8 = 11;
 
 fn put_key(out: &mut Vec<u8>, k: &NodeKey) {
     out.extend_from_slice(&k.0);
@@ -116,6 +121,16 @@ impl<'a> Reader<'a> {
         let port = u16::from_be_bytes([p[0], p[1]]);
         Ok(SocketAddr::new(ip, port))
     }
+    fn sig(&mut self) -> Result<commonware_cryptography::ed25519::Signature, WireError> {
+        use commonware_codec::DecodeExt as _;
+        let s = self.take(64)?;
+        commonware_cryptography::ed25519::Signature::decode(s).map_err(|_| WireError::BadCrypto)
+    }
+    fn pubkey(&mut self) -> Result<commonware_cryptography::ed25519::PublicKey, WireError> {
+        use commonware_codec::DecodeExt as _;
+        let s = self.take(32)?;
+        commonware_cryptography::ed25519::PublicKey::decode(s).map_err(|_| WireError::BadCrypto)
+    }
 }
 
 impl Msg {
@@ -167,8 +182,34 @@ impl Msg {
         out
     }
 
+    /// The claimed identity of a client→coordinator *request*, if this is one.
+    pub fn subject_key(&self) -> Option<NodeKey> {
+        match self {
+            Msg::BindRequest { from } => Some(*from),
+            Msg::Register { key } | Msg::Readvertise { key, .. } | Msg::Lookup { key } => Some(*key),
+            _ => None,
+        }
+    }
+
+    pub fn is_request(&self) -> bool {
+        self.subject_key().is_some()
+    }
+
     pub fn decode(buf: &[u8]) -> Result<Msg, WireError> {
         let mut r = Reader::new(buf);
+        let msg = Msg::read(&mut r)?;
+        // Reject oversized/malformed datagrams that decode a valid prefix but
+        // carry trailing garbage: a well-formed message consumes the whole
+        // buffer, nothing more.
+        if r.pos != buf.len() {
+            return Err(WireError::Trailing);
+        }
+        Ok(msg)
+    }
+
+    /// Read exactly one message (tag + body) from `r`, WITHOUT the
+    /// whole-buffer check — used both by `decode` and the auth envelope.
+    fn read(r: &mut Reader) -> Result<Msg, WireError> {
         let tag = r.take(1)?[0];
         let msg = match tag {
             TAG_BIND_REQ => Msg::BindRequest { from: r.key()? },
@@ -193,13 +234,82 @@ impl Msg {
             TAG_PUNCH => Msg::Punch { from: r.key()? },
             other => return Err(WireError::BadTag(other)),
         };
-        // Reject oversized/malformed datagrams that decode a valid prefix but
-        // carry trailing garbage: a well-formed message consumes the whole
-        // buffer, nothing more.
+        Ok(msg)
+    }
+}
+
+use crate::auth::{Authenticator, CoordCap};
+
+/// An authenticated wrapper around one request `Msg`, carrying the per-request
+/// authenticator. Wire tag 11. Only the four request shapes are wrappable.
+///
+/// `caller` is the authenticating identity — the key whose signer produced the
+/// PoP. The coordinator authenticates THIS key, not the inner message's key:
+/// for a `Lookup { key: peer }` the inner key is the peer being resolved, while
+/// `caller` is the (different) node doing the resolving. Authenticating the
+/// caller is what makes a cross-peer lookup possible; the inner key is only
+/// cross-checked against `caller` for the self-ops (see the coordinator).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthRequest {
+    pub caller: NodeKey,
+    pub inner: Msg,
+    pub auth: Authenticator,
+}
+
+fn put_sig(out: &mut Vec<u8>, s: &commonware_cryptography::ed25519::Signature) {
+    use commonware_codec::Encode as _;
+    out.extend_from_slice(s.encode().as_ref());
+}
+fn put_pubkey(out: &mut Vec<u8>, p: &commonware_cryptography::ed25519::PublicKey) {
+    out.extend_from_slice(p.as_ref());
+}
+
+impl AuthRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(288);
+        out.push(TAG_AUTH_REQUEST);
+        put_key(&mut out, &self.caller); // authenticating identity
+        out.extend_from_slice(&self.inner.encode()); // inner tag + body
+        put_u64(&mut out, self.auth.timestamp);
+        put_sig(&mut out, &self.auth.pop_sig);
+        match &self.auth.cap {
+            None => out.push(0),
+            Some(cap) => {
+                out.push(1);
+                put_pubkey(&mut out, &cap.issuer);
+                put_u64(&mut out, cap.not_after);
+                put_sig(&mut out, &cap.issuer_sig);
+            }
+        }
+        out
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<AuthRequest, WireError> {
+        let mut r = Reader::new(buf);
+        let tag = r.take(1)?[0];
+        if tag != TAG_AUTH_REQUEST {
+            return Err(WireError::BadTag(tag));
+        }
+        let caller = r.key()?;
+        let inner = Msg::read(&mut r)?;
+        if !inner.is_request() {
+            return Err(WireError::NotARequest);
+        }
+        let timestamp = r.u64()?;
+        let pop_sig = r.sig()?;
+        let cap = match r.take(1)?[0] {
+            0 => None,
+            1 => Some(CoordCap {
+                issuer: r.pubkey()?,
+                not_after: r.u64()?,
+                issuer_sig: r.sig()?,
+            }),
+            _ => return Err(WireError::BadCrypto),
+        };
         if r.pos != buf.len() {
             return Err(WireError::Trailing);
         }
-        Ok(msg)
+        Ok(AuthRequest { caller, inner, auth: Authenticator { timestamp, pop_sig, cap } })
     }
 }
 
@@ -279,5 +389,64 @@ mod tests {
         let mut bytes = m.encode();
         bytes.push(0xff);
         assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
+    }
+
+    #[test]
+    fn auth_request_roundtrips_for_every_request_shape() {
+        use crate::auth::{sign_authenticator, mint_coord_cap};
+        use commonware_cryptography::{ed25519, Signer as _};
+
+        let node = ed25519::PrivateKey::from_seed(1);
+        let g = ed25519::PrivateKey::from_seed(2);
+        let mut subject = [0u8; 32];
+        subject.copy_from_slice(node.public_key().as_ref());
+        let subject = NodeKey(subject);
+
+        let inners = vec![
+            Msg::BindRequest { from: subject },
+            Msg::Register { key: subject },
+            Msg::Readvertise { key: subject, nonce: 42 },
+            Msg::Lookup { key: NodeKey([7u8; 32]) },
+        ];
+        for inner in inners {
+            // With and without a cap.
+            for cap in [None, Some(mint_coord_cap(&g, subject, 9_999_999))] {
+                let auth = sign_authenticator(&node, &inner.encode(), 1234, cap);
+                // caller is the authenticating identity — for a cross-peer
+                // Lookup it deliberately differs from the inner key.
+                let req = AuthRequest { caller: subject, inner: inner.clone(), auth };
+                let bytes = req.encode();
+                let back = AuthRequest::decode(&bytes).expect("decode");
+                assert_eq!(req, back);
+            }
+        }
+    }
+
+    #[test]
+    fn auth_request_rejects_response_inner() {
+        use crate::auth::sign_authenticator;
+        use commonware_cryptography::{ed25519, Signer as _};
+        let node = ed25519::PrivateKey::from_seed(1);
+        // Hand-encode an envelope whose inner is a RESPONSE (LookupResponse).
+        let inner = Msg::LookupResponse { key: NodeKey([1u8; 32]), reflexive: None };
+        let auth = sign_authenticator(&node, &inner.encode(), 1, None);
+        let bytes = AuthRequest { caller: NodeKey([9u8; 32]), inner, auth }.encode();
+        assert_eq!(AuthRequest::decode(&bytes), Err(WireError::NotARequest));
+    }
+
+    #[test]
+    fn auth_request_rejects_trailing_and_bare_msg_decode_rejects_tag_11() {
+        use crate::auth::sign_authenticator;
+        use commonware_cryptography::{ed25519, Signer as _};
+        let node = ed25519::PrivateKey::from_seed(1);
+        let inner = Msg::Register { key: NodeKey([2u8; 32]) };
+        let auth = sign_authenticator(&node, &inner.encode(), 1, None);
+        let mut bytes = AuthRequest { caller: NodeKey([2u8; 32]), inner, auth }.encode();
+        bytes.push(0xff);
+        assert_eq!(AuthRequest::decode(&bytes), Err(WireError::Trailing));
+        // A tag-11 envelope must NOT decode as a bare Msg.
+        let clean = AuthRequest { caller: NodeKey([2u8; 32]), inner: Msg::Register { key: NodeKey([2u8; 32]) },
+            auth: sign_authenticator(&node, &Msg::Register { key: NodeKey([2u8; 32]) }.encode(), 1, None) }.encode();
+        assert_eq!(Msg::decode(&clean), Err(WireError::BadTag(11)));
     }
 }

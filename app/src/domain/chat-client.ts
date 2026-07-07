@@ -282,6 +282,20 @@ export const leaveHuddle = (
     params.origin,
   );
 
+/** Evict a (stale) huddle member — consensus cleanup for a client that died
+ *  without leaving (its beacons went silent). Keyed by the member's submitter
+ *  identity bytes (`user`), not its mesh node key; the module gates it
+ *  members-only like posting. Authorship comes from `origin`. */
+export const sweepHuddle = (
+  transport: NodeTransport,
+  params: { channelId: string; user: number[]; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { sweep_huddle: { channel_id: params.channelId, user: params.user } },
+    params.origin,
+  );
+
 // ── Queries (reads over committed state) ────────────────
 
 export const channels = (transport: NodeTransport): Promise<Channel[]> =>

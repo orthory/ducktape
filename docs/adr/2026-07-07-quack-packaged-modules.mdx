@@ -50,9 +50,11 @@ product distribution unit around it.
 docs.quack
 |-- quack.toml
 |-- modules/
-|   `-- pages.wasm
+|   |-- pages.wasm
+|   `-- docs-harness.wasm
 |-- wit/
-|   `-- pages.wit
+|   |-- pages.wit
+|   `-- docs-harness.wit
 |-- prompts/
 |   |-- docs-editor.md
 |   |-- docs-brainstorm.md
@@ -80,6 +82,11 @@ schema = 1
 package = "org.ducktape.docs"
 version = "0.1.0"
 
+[requires]
+protocol_min = 1
+modules = ["agent", "runs", "jobs", "dispatch", "capability"]
+capabilities = ["codex"]
+
 [[modules]]
 logical = "pages"
 default_id = "pages"
@@ -87,10 +94,27 @@ artifact = "modules/pages.wasm"
 abi = "wit/pages.wit"
 hash = "sha256:..."
 
+[[modules]]
+logical = "docs-harness"
+default_id = "docs-harness"
+artifact = "modules/docs-harness.wasm"
+abi = "wit/docs-harness.wit"
+hash = "sha256:..."
+
 [[prompts]]
 logical = "docs_editor_prompt"
 path = "prompts/docs-editor.md"
 hash = "sha256:..."
+
+[[actions]]
+tag = "pages.comment.add"
+owner = "docs-harness"
+schema = "actions/pages.comment.add.schema.json"
+
+[[actions]]
+tag = "pages.block.update_text"
+owner = "docs-harness"
+schema = "actions/pages.block.update_text.schema.json"
 
 [[agents]]
 id = "docs.editor"
@@ -99,6 +123,12 @@ prompt = "docs_editor_prompt"
 capability = "codex"
 actions = ["pages.comment.add", "pages.block.update_text"]
 status = "active"
+
+[[engagements]]
+source = "pages"
+event = "comment_added"
+agent = "docs.editor"
+policy = "mention_or_assigned"
 
 [install]
 register_modules = true
@@ -117,6 +147,31 @@ pending_runs = "drain"
 user_data = "preserve"
 package_state = "tombstone"
 ```
+
+## Package Boundary
+
+Quack contains deterministic product resources:
+
+- Wasm module artifacts and their ABI/hash metadata;
+- consensus seed instructions, including prompt refs and package config;
+- package-owned agent definitions;
+- package action schemas and their owner module;
+- UI metadata or bundles;
+- harness fixtures and golden outputs;
+- lifecycle policy for install, suspend, unplug, and audit.
+
+Quack does **not** contain host-local execution resources:
+
+- capability provider specs;
+- model/API credentials;
+- local binaries or install scripts;
+- operator policy for sandbox flags, model selection, or provider timeouts.
+
+Capability tags in a package are requirements, not executors. A recipient maps
+or accepts those tags, installs any local provider specs it trusts, and lets its
+node announce the resulting capabilities through the existing `capability`
+module. This keeps "what the product needs" in the portable package and "how
+this machine runs it" in local operator policy.
 
 ## Lifecycle Standard
 
@@ -167,6 +222,19 @@ them.
 Quack packages may include dedicated agents, but package-specific behavior must
 live in a deterministic harness module, not in a host-local executor.
 
+An included agent is a **skillset**, not only an `AgentRecord`:
+
+- prompt content plus a consensus hash pin;
+- required capability tag;
+- allowed action tags;
+- engagement rules owned by the package;
+- deterministic fixtures that prove expected behavior.
+
+The harness owns package agents by registering them from module origin during
+install. That lets package lifecycle operations pause, resume, or retune those
+agents without pretending to be a human user. The registry still records the
+agent; the harness owns the package's reason for that agent to exist.
+
 For Docs:
 
 1. `pages` emits comment/page events to `docs-harness`.
@@ -181,10 +249,71 @@ For Docs:
 The harness owns Docs semantics. `runs` remains the execution adapter, and
 `agent` remains the registry.
 
+## Action Routing Standard
+
+Package actions are open tags routed to an owner module. The model asks for an
+action as data. The owning deterministic module decides whether that action is
+valid and translates it into real module writes.
+
+The minimal package action contract is:
+
+```rust
+pub enum PackageActionQuery {
+    Probe {
+        action_id: String,
+        tag: String,
+        payload: Vec<u8>,
+        run_context: Vec<u8>,
+    },
+}
+
+pub enum PackageActionReply {
+    Accepted,
+    Rejected { reason: String },
+}
+
+pub enum PackageActionMsg {
+    Apply {
+        action_id: String,
+        tag: String,
+        payload: Vec<u8>,
+        run_context: Vec<u8>,
+    },
+}
+```
+
+`runs` validates the agent grant, looks up the action owner from installed
+package state, probes the owner module, and emits only accepted `Apply`
+messages. The owner checks schema, target existence, size caps, authorship
+rules, idempotency, and conflict policy. `Apply` arms that ride a dispatch
+delivery block should be no-fail: a late conflict records an action failure
+rather than poisoning the delivery block.
+
+For Docs, example actions are:
+
+- `pages.comment.add`: add or reply to a comment thread;
+- `pages.block.update_text`: edit a block, optionally guarded by an expected
+  prior hash;
+- `pages.block.insert_after`: insert generated content at a deterministic
+  position;
+- `pages.thread.resolve`: resolve or reopen a thread.
+
+The harness, not the LLM and not `runs`, turns those package actions into
+`PageMsg` follow-ups.
+
 ## Sharing Standard
 
-Fresh networks can install a Quack package at genesis. Existing networks need a
-coordinated upgrade path if the package introduces new module code or ABI:
+Fresh networks can install a Quack package at genesis:
+
+1. inspect the `.quack` manifest, signatures, and hashes;
+2. map logical ids to concrete genesis module ids;
+3. map or accept capability tags;
+4. run the package harness with local fake providers;
+5. include package modules, seed state, agent registrations, action routes,
+   hooks, and jobs-worker wiring in genesis.
+
+Existing networks need a coordinated upgrade path if the package introduces new
+module code or ABI:
 
 1. operators audit the `.quack` manifest and hashes;
 2. the Wasm/runtime or node binary supports the package artifact;
@@ -202,6 +331,31 @@ Package export has two modes:
 Host-local provider specs, API keys, credentials, uncommitted index data, and
 unverified blob bodies are never part of a Quack export.
 
+## Harness Requirements
+
+Every Quack package that includes agents or actions must ship deterministic
+harness tests. The recipient runs them before activation, and governance can
+attach their outputs to the package proposal.
+
+For Docs, the harness must prove at least:
+
+- install seeds prompt records and registers package agents with expected
+  hashes;
+- action tags resolve to `docs-harness` as owner;
+- a comment mentioning `docs.editor` creates exactly one `agent/docs.editor`
+  job;
+- fake provider output requesting `pages.block.update_text` edits the intended
+  block;
+- unauthorized or malformed actions mutate nothing and record failure;
+- malformed page events are no-op observations, not block aborts;
+- suspend stops new jobs while preserving pages and comments;
+- unplug removes hooks/action routes and pauses agents while preserving user
+  data by default;
+- package module snapshots/state sync reproduce the same roots.
+
+The fake provider used by the harness is local test configuration. It is not
+installed as a real network capability.
+
 ## Consequences
 
 - Quack is intentionally not "just Wasm". It is the portable app/product unit.
@@ -216,6 +370,12 @@ unverified blob bodies are never part of a Quack export.
   into real module writes.
 - The package manager must be able to inspect, test, install, suspend, unplug,
   and audit packages. A plain artifact loader is insufficient.
+- Agent action grants must become open package action tags, not a fixed
+  platform enum. Built-in task actions can be represented as built-in action
+  specs; package actions use the same route/probe/apply shape.
+- Prompt refs must generalize beyond the current hash-only prompt pin and any
+  single module source. A package prompt is consensus content plus a hash pin,
+  regardless of whether it lives in `memory`, `pages`, or a package seed module.
 
 ## Non-Decisions
 
@@ -227,3 +387,6 @@ unverified blob bodies are never part of a Quack export.
   standard.
 - The exact Wasm ABI is not fixed here. This ADR only requires that the ABI hash
   be package-visible and verified before activation.
+- The exact package action registry location is not fixed here. It may be a
+  system module or package-install state, but the runtime contract is
+  tag-to-owner routing plus probe/apply.
