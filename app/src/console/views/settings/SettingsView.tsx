@@ -612,7 +612,8 @@ function DevicesSection() {
   const [busy, setBusy] = useState(false);
   const [identityError, setIdentityError] = useState<string | null>(null);
   // The just-revealed mnemonic, held only long enough to render the grid —
-  // cleared on "Done" (or panel close) and never persisted anywhere else.
+  // cleared on EVERY panel transition (see transitionPanel below) and never
+  // persisted anywhere else.
   const [mnemonic, setMnemonic] = useState<string | null>(null);
 
   useEffect(() => {
@@ -660,12 +661,27 @@ function DevicesSection() {
     };
   }, [workspace]);
 
-  const closeCustodyPanel = () => {
-    setPanel("none");
+  // EVERY panel change routes through here so a revealed mnemonic can never
+  // survive a panel transition: switching away from reveal drops it, and
+  // re-opening reveal always starts back at the password step (the plaintext
+  // path re-sets it fresh from its own revealMnemonic resolution AFTER this
+  // clear runs, inside the same handler). A bare setPanel anywhere else would
+  // let a stale grid render with no re-prompt — the exact "reveal always
+  // re-prompts" violation the spec forbids.
+  const transitionPanel = (next: CustodyPanelKind) => {
+    setPanel(next);
     setIdentityError(null);
     setMnemonic(null);
   };
 
+  const closeCustodyPanel = () => transitionPanel("none");
+
+  // The async continuations below setState without an alive/mounted guard on
+  // purpose: React 18+ makes setState on an unmounted component a silent
+  // no-op (the old warning is gone), and threading a mounted-ref through
+  // every .then/.catch/.finally here buys nothing but noise. The two mount
+  // effects keep their alive flags only because they predate this block and
+  // guard a state pair that renders immediately.
   const handleUnlock = (password: string) => {
     setBusy(true);
     setIdentityError(null);
@@ -714,14 +730,16 @@ function DevicesSection() {
       setBusy(true);
       revealMnemonic("")
         .then((revealed) => {
+          // Order matters: the transition's clear runs first, then the fresh
+          // value from THIS resolution lands — never a stale copy.
+          transitionPanel("reveal");
           setMnemonic(revealed.mnemonic);
-          setPanel("reveal");
         })
         .catch((err) => setIdentityError(errMessage(err)))
         .finally(() => setBusy(false));
       return;
     }
-    setPanel("reveal");
+    transitionPanel("reveal");
   };
 
   const handleRevealSubmit = (password: string) => {
@@ -812,17 +830,16 @@ function DevicesSection() {
                       ariaLabel="Cancel unlock"
                       onClick={closeCustodyPanel}
                       hoverBg={color.titlebar}
+                      disabled={busy}
                       style={outlineButton}
                     >
                       Cancel
                     </HoverButton>
                   ) : (
                     <HoverButton
-                      onClick={() => {
-                        setIdentityError(null);
-                        setPanel("unlock");
-                      }}
+                      onClick={() => transitionPanel("unlock")}
                       hoverBg={color.titlebar}
+                      disabled={busy}
                       style={outlineButton}
                     >
                       Unlock
@@ -868,17 +885,16 @@ function DevicesSection() {
                       ariaLabel="Cancel set password"
                       onClick={closeCustodyPanel}
                       hoverBg={color.titlebar}
+                      disabled={busy}
                       style={outlineButton}
                     >
                       Cancel
                     </HoverButton>
                   ) : (
                     <HoverButton
-                      onClick={() => {
-                        setIdentityError(null);
-                        setPanel("setPassword");
-                      }}
+                      onClick={() => transitionPanel("setPassword")}
                       hoverBg="#38362e"
+                      disabled={busy}
                       style={darkButton}
                     >
                       Set password
@@ -908,6 +924,7 @@ function DevicesSection() {
                     ariaLabel="Cancel reveal"
                     onClick={closeCustodyPanel}
                     hoverBg={color.titlebar}
+                    disabled={busy}
                     style={outlineButton}
                   >
                     Cancel

@@ -514,6 +514,49 @@ describe("SettingsView — identity custody controls", () => {
     ).toBeInTheDocument();
   });
 
+  it("re-opening reveal after switching panels re-prompts — never a stale grid", async () => {
+    // Regression: reveal → grid shown → switch to the Unlock panel (NOT the
+    // reveal panel's own Cancel/Done) → open reveal again. Every panel
+    // transition must drop the revealed mnemonic, so the second open lands on
+    // the password form — a stale grid here would bypass the always-re-prompt
+    // rule entirely.
+    markTauri();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_status") return Promise.reject("n/a");
+      if (cmd === "user_identity_state")
+        return Promise.resolve({ state: "locked", pubkey: "ab12", mnemonicConfirmed: true });
+      if (cmd === "user_identity_reveal")
+        return Promise.resolve({ mnemonic: TEST_MNEMONIC });
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+
+    renderSettings();
+
+    await screen.findByText("Locked");
+
+    // First reveal: password prompt → grid.
+    fireEvent.click(screen.getByRole("button", { name: /reveal recovery phrase/i }));
+    fireEvent.change(await screen.findByPlaceholderText("Password"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^reveal$/i }));
+    expect(await screen.findByText("abandon")).toBeInTheDocument();
+
+    // Sidestep the reveal panel's Cancel/Done: switch panels via the Unlock
+    // trigger instead. The grid must not survive the transition.
+    fireEvent.click(screen.getByRole("button", { name: /^unlock$/i }));
+    expect(screen.queryByText("abandon")).not.toBeInTheDocument();
+
+    // Re-open reveal: the password form renders, the grid does not, and no
+    // reveal call fired without a fresh password.
+    fireEvent.click(screen.getByRole("button", { name: /reveal recovery phrase/i }));
+    expect(await screen.findByPlaceholderText("Password")).toBeInTheDocument();
+    expect(screen.queryByText("abandon")).not.toBeInTheDocument();
+    expect(
+      invokeMock.mock.calls.filter(([cmd]) => cmd === "user_identity_reveal"),
+    ).toHaveLength(1); // only the first, password-backed reveal ever fired
+  });
+
   it("reveal on a plaintext identity skips the password prompt entirely", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
