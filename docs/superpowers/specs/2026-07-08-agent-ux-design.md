@@ -32,8 +32,7 @@ Three UX failures in the agent flow:
 - Human-user @mentions in the typeahead: follow-up, not this build (only
   `AuthorRef::Agent` mentions drive engagement; renderer already handles the
   rest).
-- Agent spawning/run-execution overhaul (session continuity, multi-turn,
-  workspaces): scoped separately with the user.
+- Live-progress streaming of runs into chat (user explicitly deferred it).
 
 ## WS-A — Mention → response (chat frontend)
 
@@ -105,6 +104,67 @@ the existing register/update payloads. No RPC changes.
   `RegisterAgentForm.tsx`, `AgentEditForm.tsx`, `RunsOnPicker.tsx` (WS-B),
   `WatchesPanel.tsx`, `RunsTimeline.tsx`. Behavior-preserving except the two
   deliberate changes (picker, form removal).
+
+## WS-D — Spawning overhaul (user-approved scope: prompt fix + thread
+continuity + agentic workspaces/tools)
+
+**Found bug:** `runs::render_payload` embeds only `DEFAULT_PROMPT`; no host
+code resolves `prompt_hash`, so every agent's registered prompt is silently
+ignored. **Found gap:** failed runs never surface in chat (saga Err lands in
+the Activity tab only).
+
+**Keystone: a structured run envelope.** The runs module (consensus) stops
+flattening everything into one string and composes a JSON envelope — still
+deterministic bytes, still committed as ordered state, still ≤
+`MAX_PAYLOAD_BYTES`:
+
+```json
+{ "ducktape_run": 2,
+  "agent_id": "…",
+  "prompt_hash": "<64-hex or null>",
+  "thread_key": "<channel_id>#<thread_root-or-anchor seq>",
+  "instructions": "<DEFAULT_PROMPT — used only when prompt_hash is null>",
+  "contract": "<STRICT_OUTPUT_INSTRUCTION>",
+  "conversation": "<rendered transcript block>" }
+```
+
+The host-side worker (dispatch-oracle / capability-host) detects the envelope
+(legacy flat strings still pass through verbatim — mixed in-flight ops across
+an upgrade keep working) and assembles the final model input:
+`resolved-prompt-or-instructions + contract + conversation`.
+Auditability holds: consensus commits the content **hash**; the blob is
+content-addressed, so the exact prompt bytes stay verifiable. Blob resolution
+failure → loud run failure (never a silent fallback to the generic prompt).
+
+**D1 (consensus side, `crates/apps/runs`):**
+- `render_payload`/`render_job_payload` → envelope composition (with
+  `prompt_hash` + `thread_key` from run entry state).
+- Failure surfacing: on a saga `Err` outcome, `on_result_event` posts a
+  threaded reply as the agent — `⚠ <display_name> failed: <sanitized excerpt>`
+  — instead of dying silently (dedup via the existing
+  `reply_message_id(run_id)` idempotency).
+
+**D2 (host side, `capability-host` + `dispatch-oracle` + `bin/node`,
+sequenced after WS-B lands in the same files):**
+- `Provider::run` gains a `RunContext { agent_id, thread_key, prompt: Option<resolved> }`
+  (worker resolves `prompt_hash` from the node blob store before invoking).
+- **Workspaces:** per-agent persistent workdir
+  `<data>/agent-workspaces/<agent_id>/` replaces the empty scratch dir.
+  Spec opt-in `[workspace] mode = "persistent"`; set for codex + claude.
+- **Tools:** codex specs move `--sandbox read-only` → `--sandbox
+  workspace-write`; claude specs drop `--max-turns 1` and add
+  `--permission-mode acceptEdits` (edits confined to the workspace cwd; bash
+  stays denied in v1). Output contract unchanged — the final message must
+  still be the strict JSON.
+- **Thread continuity:** spec gains `[session]` — capture the provider session
+  id from the run output (claude JSON `session_id`; codex JSONL session
+  event, tolerant parse) into a host-local store
+  `<data>/agent-sessions/<agent_id>/<sha256(thread_key)>`; subsequent runs
+  with the same key resume: claude appends `--resume <id>`, codex swaps to
+  the spec's `resume_args` (documented single `{session_id}` slot — host-local
+  plumbing, NOT the removed consensus model routing). Missing/stale session →
+  cold start (also the cross-node fallback: sessions are assignee-local by
+  design).
 
 ## Testing
 
