@@ -11,10 +11,13 @@ version.workspace = true
 async-trait = { workspace = true }
 capability-host = { workspace = true }
 dispatch = { workspace = true }
+# the pool's spawn/deliver seams are boxed futures; the semaphore caps
+# concurrent provider runs (tokio::sync is runtime-agnostic).
+futures = "0.3"
 reactor = { workspace = true }
 saga = { workspace = true }
 sdk = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
-futures = "0.3"
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

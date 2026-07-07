@@ -908,6 +908,279 @@ fn metrics_endpoint_exposes_ducktape_and_runtime_series() {
 }
 
 // ============================================================================
+// off-loop oracle execution: REAL script-backed providers through the full
+// capability-host path, proving the daemon's command loop no longer awaits
+// provider execution — the fix for the status heartbeat starving (and the
+// desktop "reconnecting" banner) during long agent runs.
+// ============================================================================
+
+/// stage one script-backed capability provider for a spawned daemon: an
+/// operator spec dir with a single `text`-format spec whose `detect.env`
+/// points at `body`'s script. returns the daemon env that provides the tag —
+/// including detect overrides that HIDE the embedded executor specs, so a dev
+/// box with a real `claude`/`codex` on PATH runs these tests identically to CI.
+fn stage_script_provider(root: &Path, tag: &str, body: &str) -> Vec<(String, String)> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let spec_dir = root.join("specs");
+    std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
+    let script = root.join(format!("{tag}.sh"));
+    std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("write provider script");
+    let mut perms = std::fs::metadata(&script).expect("script metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod provider script");
+
+    let env_var = format!(
+        "DUCKTAPE_TEST_{}_BIN",
+        tag.replace(['-', '.'], "_").to_uppercase()
+    );
+    std::fs::write(
+        spec_dir.join(format!("{tag}.toml")),
+        format!(
+            "spec = 1\n\
+             [capability]\n\
+             tag = \"{tag}\"\n\
+             description = \"daemon e2e script executor\"\n\
+             [detect]\n\
+             bin = \"{tag}-nonexistent-cli\"\n\
+             env = \"{env_var}\"\n\
+             [invoke]\n\
+             args = []\n\
+             prompt = \"stdin\"\n\
+             timeout_secs = 60\n\
+             [output]\n\
+             format = \"text\"\n"
+        ),
+    )
+    .expect("write provider spec");
+
+    let missing = root.join("missing-executor");
+    vec![
+        (
+            "DUCKTAPE_CAPABILITY_DIR".into(),
+            spec_dir.display().to_string(),
+        ),
+        (env_var, script.display().to_string()),
+        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
+        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
+    ]
+}
+
+/// channel + registered agent + mention watch: the client-side trigger stack
+/// for one agent run in `channel`.
+fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "create_channel": { "channel_id": channel, "name": channel, "post_policy": "open" }
+        }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+    let (code, block) = daemon.submit(
+        "agent",
+        serde_json::json!({
+            "register_agent": {
+                "agent_id": agent_id,
+                "display_name": agent_id,
+                "capability": tag,
+                "prompt_hash": vec![7u8; 32],
+                "allowed_actions": ["chat.post"]
+            }
+        }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "register agent failed: {block}");
+    let (code, block) = daemon.submit(
+        "runs",
+        serde_json::json!({
+            "watch_channel": { "channel_id": channel, "policy": "mention" }
+        }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "watch channel failed: {block}");
+}
+
+/// the plain texts of `channel`'s agent-authored replies.
+fn agent_replies(daemon: &Daemon, channel: &str) -> Vec<String> {
+    let reply = daemon.query(
+        "chat",
+        serde_json::json!({ "messages_latest": { "channel_id": channel, "limit": 32 } }),
+    );
+    reply["messages"]
+        .as_array()
+        .expect("Messages reply")
+        .iter()
+        .filter(|m| m["head"]["author"].get("agent").is_some())
+        .map(|m| {
+            m["head"]["blocks"][0]["paragraph"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+fn pending_run_count(daemon: &Daemon) -> usize {
+    let pending = daemon.query("runs", serde_json::json!("pending_runs"));
+    pending["pending_runs"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+/// poll `probe` until it returns Some, panicking past `budget`.
+fn poll_until<T>(what: &str, budget: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(v) = probe() {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// THE HEADLINE FIX, asserted directly: submit a run whose provider sleeps,
+/// then Status and Query answer BEFORE the run completes. on the pre-fix
+/// inline path the mention's submit itself blocked through provider
+/// execution AND delivery, so "submit returned, reply not posted yet" was
+/// unreachable — this test is red there without any wall-clock assertion.
+#[test]
+fn status_answers_while_a_slow_run_is_in_flight() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
+    let env = stage_script_provider(
+        fixtures.path(),
+        "slow-quack",
+        "cat > /dev/null\nsleep 6\nprintf 'slow answer\\n'",
+    );
+    let daemon = Daemon::spawn_inner(storage.path(), false, &env);
+    arm_agent(&daemon, "general", "sloth", "slow-quack");
+
+    let (code, block) = daemon.submit("chat", post_mention("general", "m1", "sloth"), Some("eddy"));
+    assert_eq!(code, 200, "mention post failed: {block}");
+
+    // the provider is asleep for ~6s. the daemon answers NOW:
+    let status = daemon.status();
+    assert!(status["height"].as_u64().is_some(), "status is live: {status}");
+    assert_eq!(
+        pending_run_count(&daemon),
+        1,
+        "the run is in flight while status answered"
+    );
+    assert!(
+        agent_replies(&daemon, "general").is_empty(),
+        "status/query answered BEFORE the run completed"
+    );
+
+    // ... and the run still lands: the result re-enters as a submit, the
+    // mailbox delivers next block, the reply posts, the pending entry prunes.
+    poll_until("the slow run's reply to post", Duration::from_secs(30), || {
+        let replies = agent_replies(&daemon, "general");
+        (!replies.is_empty()).then_some(replies)
+    });
+    assert_eq!(agent_replies(&daemon, "general"), ["slow answer"]);
+    poll_until("the pending entry to prune", Duration::from_secs(30), || {
+        (pending_run_count(&daemon) == 0).then_some(())
+    });
+}
+
+/// two slow runs execute CONCURRENTLY: the second child starts while the
+/// first is still asleep — the in-flight log carries start,start before any
+/// end. on the pre-fix path the second mention's submit queued behind the
+/// first run, so the log serialized (start,end,start,end).
+#[test]
+fn two_slow_runs_overlap() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
+    let log = fixtures.path().join("exec.log");
+    let env = stage_script_provider(
+        fixtures.path(),
+        "slow-pair",
+        &format!(
+            "cat > /dev/null\n\
+             echo start >> {log}\n\
+             sleep 3\n\
+             echo end >> {log}\n\
+             printf 'done\\n'",
+            log = log.display()
+        ),
+    );
+    let daemon = Daemon::spawn_inner(storage.path(), false, &env);
+    // two channels, one agent each: two independent runs.
+    arm_agent(&daemon, "left", "pair-a", "slow-pair");
+    arm_agent(&daemon, "right", "pair-b", "slow-pair");
+
+    let (code, block) = daemon.submit("chat", post_mention("left", "m1", "pair-a"), Some("eddy"));
+    assert_eq!(code, 200, "first mention failed: {block}");
+    let (code, block) = daemon.submit("chat", post_mention("right", "m2", "pair-b"), Some("eddy"));
+    assert_eq!(code, 200, "second mention failed: {block}");
+
+    for channel in ["left", "right"] {
+        poll_until("both slow runs to reply", Duration::from_secs(30), || {
+            let replies = agent_replies(&daemon, channel);
+            (!replies.is_empty()).then_some(())
+        });
+    }
+    let lines: Vec<String> = std::fs::read_to_string(&log)
+        .expect("exec log written")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines[..2],
+        ["start", "start"],
+        "both children started before either finished — the runs overlapped: {lines:?}"
+    );
+    assert_eq!(lines.len(), 4, "two complete executions: {lines:?}");
+}
+
+/// the failure path is unchanged: a provider that exits non-zero still
+/// produces the failure OracleResult, the saga burns its attempts, the
+/// failed delivery prunes the pending entry without posting a reply — and
+/// the daemon answers throughout.
+#[test]
+fn a_failing_provider_still_fails_the_run_cleanly() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
+    let log = fixtures.path().join("exec.log");
+    let env = stage_script_provider(
+        fixtures.path(),
+        "kaboom",
+        &format!(
+            "cat > /dev/null\n\
+             echo ran >> {log}\n\
+             echo 'provider exploded' >&2\n\
+             exit 3",
+            log = log.display()
+        ),
+    );
+    let daemon = Daemon::spawn_inner(storage.path(), false, &env);
+    arm_agent(&daemon, "general", "boomer", "kaboom");
+
+    let (code, block) = daemon.submit("chat", post_mention("general", "m1", "boomer"), Some("eddy"));
+    assert_eq!(code, 200, "mention post failed: {block}");
+
+    // the terminal failure delivers (that is what prunes the entry) — the
+    // saga's retry cycle ran through the pool to completion.
+    poll_until("the failed run to prune", Duration::from_secs(30), || {
+        (pending_run_count(&daemon) == 0).then_some(())
+    });
+    assert!(
+        agent_replies(&daemon, "general").is_empty(),
+        "a failed run posts no reply"
+    );
+    let executions = std::fs::read_to_string(&log)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    assert!(
+        executions >= 1,
+        "the provider actually ran (got {executions} executions)"
+    );
+    daemon.status(); // still alive, still answering.
+}
+
+// ============================================================================
 // git smart-HTTP receive-pack: REAL `git push` against the daemon's /forge lane.
 //
 // this is the make-or-break gate for the git-http bridge: a stock `git` client
