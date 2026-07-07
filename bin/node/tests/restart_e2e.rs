@@ -543,3 +543,108 @@ fn solo_validator_duckfs_bytes_survive_crash() {
         || files_stat(&cluster, 0, "/shared/c").map(|_| ()),
     );
 }
+
+#[test]
+fn solo_validator_duckfs_survives_multi_block_history_crash_at_default_cadence() {
+    let _guard = common::serial();
+    // the sibling to `solo_validator_duckfs_bytes_survive_crash`, at the SHIPPED
+    // checkpoint cadence instead of the `checkpoint_blocks = 1` workaround. duckfs
+    // commits to disk per block while the checkpoint persists only periodically
+    // (DEFAULT_CHECKPOINT_BLOCKS = 32), so several commits since genesis leave the
+    // disk substrate MANY blocks ahead of the single genesis checkpoint. before
+    // the recovery forward-scan fix this SIGKILL bricked boot with `Error::Torn`;
+    // now recovery seeds each disk module's durable floor from the LATEST sealed
+    // post-root it exactly matches and replays only strictly above it. no
+    // `checkpoint_blocks` override — the default cadence IS the point.
+    let mut cluster = Cluster::new(&[0], &[0]);
+    cluster.spawn(0);
+    cluster.wait_marker(0, "genesis app_hash=", Duration::from_secs(30));
+
+    // THREE sequential duckfs commits — three per-block-durable disk blocks past
+    // the genesis checkpoint (the multi-block history the review flagged). paths
+    // sit under `/shared/**`, the publicly-writable root (see files/src/paths.rs).
+    cluster.submit(
+        0,
+        "files",
+        &files_encode_msg(&FilesMsg::Commit {
+            base_snapshot: None,
+            message: "h1".into(),
+            changes: vec![put_inline("/shared/hist/a", b"one")],
+        }),
+    );
+    let s1 = poll_until("commit 1 head", Duration::from_secs(30), || {
+        files_stat(&cluster, 0, "/shared/hist/a").and_then(|_| files_head(&cluster, 0))
+    });
+    cluster.submit(
+        0,
+        "files",
+        &files_encode_msg(&FilesMsg::Commit {
+            base_snapshot: Some(s1.clone()),
+            message: "h2".into(),
+            changes: vec![put_inline("/shared/hist/b", b"two")],
+        }),
+    );
+    let s2 = poll_until("commit 2 head", Duration::from_secs(30), || {
+        files_stat(&cluster, 0, "/shared/hist/b").and_then(|_| files_head(&cluster, 0))
+    });
+    cluster.submit(
+        0,
+        "files",
+        &files_encode_msg(&FilesMsg::Commit {
+            base_snapshot: Some(s2.clone()),
+            message: "h3".into(),
+            changes: vec![put_inline("/shared/hist/c", b"three")],
+        }),
+    );
+    poll_until("commit 3 to finalize", Duration::from_secs(30), || {
+        files_stat(&cluster, 0, "/shared/hist/c").map(|_| ())
+    });
+
+    let app_hash_before = cluster.status(0)["app_hash"]
+        .as_str()
+        .expect("status app_hash")
+        .to_string();
+
+    // ---- crash: SIGKILL, no goodbye — the disk is 3 blocks past the checkpoint.
+    cluster.kill(0);
+    cluster.spawn(0);
+    let recovered = cluster.wait_marker(0, "recovered app_hash=", Duration::from_secs(30));
+    let recovered_hash = recovered.split_whitespace().next().expect("recovered hash");
+    assert_eq!(
+        recovered_hash, app_hash_before,
+        "a disk substrate several blocks ahead of the checkpoint must recover \
+         byte-identically at the DEFAULT cadence (no checkpoint_blocks=1 crutch)"
+    );
+    assert!(
+        cluster.marker(0, "genesis app_hash=").is_none(),
+        "recovery must not re-run genesis"
+    );
+
+    // every historical block's bytes came back from disk.
+    assert_eq!(
+        files_read(&cluster, 0, "/shared/hist/a", 0, 64).as_deref(),
+        Some(b"one".as_ref())
+    );
+    assert_eq!(
+        files_read(&cluster, 0, "/shared/hist/b", 0, 64).as_deref(),
+        Some(b"two".as_ref())
+    );
+    assert_eq!(
+        files_read(&cluster, 0, "/shared/hist/c", 0, 64).as_deref(),
+        Some(b"three".as_ref())
+    );
+
+    // and consensus resumed over the reopened journal.
+    cluster.submit(
+        0,
+        "files",
+        &files_encode_msg(&FilesMsg::Commit {
+            base_snapshot: files_head(&cluster, 0),
+            message: "post".into(),
+            changes: vec![put_inline("/shared/hist/d", b"four")],
+        }),
+    );
+    poll_until("post-crash commit to finalize", Duration::from_secs(30), || {
+        files_stat(&cluster, 0, "/shared/hist/d").map(|_| ())
+    });
+}
