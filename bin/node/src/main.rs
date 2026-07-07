@@ -68,6 +68,7 @@ use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of
 
 mod config;
 mod lobby;
+mod userkey;
 mod voice;
 use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
 
