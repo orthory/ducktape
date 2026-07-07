@@ -9,9 +9,15 @@
 // the store keeps only a flat Find projection for the command palette.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ChangeEvent, FormEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react";
+import type {
+  ChangeEvent,
+  DragEvent as ReactDragEvent,
+  FormEvent,
+  MouseEvent as ReactMouseEvent,
+  ReactNode,
+} from "react";
 
-import { deletePath, joinPath, ls, mkdir, refs, uploadFile } from "../../../domain/files-client";
+import { deletePath, joinPath, ls, mkdir, readAll, refs, uploadFile } from "../../../domain/files-client";
 import type { FileEntry } from "../../../domain/files-client";
 import { Icon, type IconName } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
@@ -35,6 +41,14 @@ interface ContextMenuState {
   entry: FileEntry | null;
 }
 
+interface DirectoryColumn {
+  path: string;
+  entries: FileEntry[];
+  cursor: string | null;
+  loading: boolean;
+  error: string | null;
+}
+
 /** dirs before files, then case-insensitive by name — a stable browse order on
  *  top of the module's raw name-order page. */
 const sortEntries = (entries: FileEntry[]): FileEntry[] =>
@@ -45,6 +59,27 @@ const sortEntries = (entries: FileEntry[]): FileEntry[] =>
 
 const writeTargetDir = (dir: string): string => (dir === "/" ? DEFAULT_DIR : dir);
 const basename = (path: string): string => path.split("/").pop() || path;
+const makeDirectoryColumn = (path: string): DirectoryColumn => ({
+  path,
+  entries: [],
+  cursor: null,
+  loading: true,
+  error: null,
+});
+const parentDir = (path: string): string => {
+  const trimmed = path.replace(/\/+$/, "");
+  const slash = trimmed.lastIndexOf("/");
+  return slash <= 0 ? "/" : trimmed.slice(0, slash);
+};
+const columnPathsFor = (path: string): string[] => {
+  if (path === "/") return ["/"];
+  const segments = path.replace(/^\/+|\/+$/g, "").split("/").filter(Boolean);
+  let acc = "";
+  return segments.map((segment) => {
+    acc += `/${segment}`;
+    return acc;
+  });
+};
 
 function CenterState({ title, detail, muted }: { title: string; detail: string; muted?: boolean }) {
   return (
@@ -171,11 +206,15 @@ function EntryRow({
   selected,
   onOpen,
   onContextMenu,
+  onPrepareDownload,
+  onDragStart,
 }: {
   entry: FileEntry;
   selected: boolean;
   onOpen: () => void;
   onContextMenu: (event: ReactMouseEvent<HTMLButtonElement>) => void;
+  onPrepareDownload: () => void;
+  onDragStart: (event: ReactDragEvent<HTMLButtonElement>) => void;
 }) {
   const [hover, setHover] = useState(false);
   const isDir = entry.kind === "dir";
@@ -184,8 +223,15 @@ function EntryRow({
     <button
       type="button"
       aria-label={`${isDir ? "Open folder" : "Open file"} ${name}`}
+      draggable={!isDir}
       onClick={onOpen}
       onContextMenu={onContextMenu}
+      onMouseDown={() => {
+        if (!isDir) onPrepareDownload();
+      }}
+      onDragStart={(event) => {
+        if (!isDir) onDragStart(event);
+      }}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
@@ -238,6 +284,125 @@ function EntryRow({
       </span>
       {isDir && <Icon name="chevronRight" size={14} strokeWidth={1.9} color={color.muted2} />}
     </button>
+  );
+}
+
+function DirectoryColumnView({
+  column,
+  selectedPath,
+  childPath,
+  onOpen,
+  onContextMenu,
+  onLoadMore,
+  onPrepareDownload,
+  onFileDragStart,
+  onDragOverFiles,
+  onDropFiles,
+}: {
+  column: DirectoryColumn;
+  selectedPath: string | null;
+  childPath: string | null;
+  onOpen: (entry: FileEntry) => void;
+  onContextMenu: (
+    event: ReactMouseEvent<HTMLButtonElement | HTMLElement>,
+    entry: FileEntry | null,
+  ) => void;
+  onLoadMore: (path: string) => void;
+  onPrepareDownload: (entry: FileEntry) => void;
+  onFileDragStart: (event: ReactDragEvent<HTMLButtonElement>, entry: FileEntry) => void;
+  onDragOverFiles: (event: ReactDragEvent<HTMLElement>, path: string) => void;
+  onDropFiles: (event: ReactDragEvent<HTMLElement>, path: string) => void;
+}) {
+  const rows = sortEntries(column.entries);
+  const label = column.path === "/" ? "root" : basename(column.path);
+
+  return (
+    <section
+      role="region"
+      aria-label={`Column ${column.path}`}
+      onContextMenu={(event) => onContextMenu(event, null)}
+      onDragOver={(event) => onDragOverFiles(event, column.path)}
+      onDrop={(event) => onDropFiles(event, column.path)}
+      style={{
+        width: 286,
+        flex: "0 0 286px",
+        minHeight: 0,
+        display: "flex",
+        flexDirection: "column",
+        borderRight: `1px solid ${color.borderSoft}`,
+        background: color.paper,
+      }}
+    >
+      <div
+        style={{
+          height: 38,
+          flexShrink: 0,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "0 12px",
+          borderBottom: `1px solid ${color.borderSoft}`,
+          background: color.sunken,
+        }}
+      >
+        <Icon name="modules" size={13} strokeWidth={1.8} color={color.muted3} />
+        <span
+          title={column.path}
+          style={{
+            minWidth: 0,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            font: `700 12px ${font.sans}`,
+            color: color.ink,
+          }}
+        >
+          {label}
+        </span>
+      </div>
+
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+        {column.loading ? (
+          <CenterState title="Loading…" detail="Reading this directory." muted />
+        ) : column.error ? (
+          <CenterState title="Could not read folder" detail={column.error} muted />
+        ) : rows.length === 0 ? (
+          <CenterState title="Empty directory" detail="Nothing here." muted />
+        ) : (
+          <>
+            {rows.map((entry) => (
+              <EntryRow
+                key={entry.path}
+                entry={entry}
+                selected={selectedPath === entry.path || childPath === entry.path}
+                onOpen={() => onOpen(entry)}
+                onContextMenu={(event) => onContextMenu(event, entry)}
+                onPrepareDownload={() => onPrepareDownload(entry)}
+                onDragStart={(event) => onFileDragStart(event, entry)}
+              />
+            ))}
+            {column.cursor && (
+              <button
+                type="button"
+                onClick={() => onLoadMore(column.path)}
+                style={{
+                  all: "unset",
+                  boxSizing: "border-box",
+                  width: "100%",
+                  cursor: "pointer",
+                  textAlign: "center",
+                  padding: "10px 0",
+                  font: `600 11.5px ${font.sans}`,
+                  color: color.muted,
+                }}
+              >
+                Load more
+              </button>
+            )}
+          </>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -578,14 +743,13 @@ function DeleteEntryDialog({
 export function FilesView() {
   const { state, transport } = useDucktape();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const dragDownloadUrls = useRef<Map<string, string>>(new Map());
+  const dragDownloadRequests = useRef<Set<string>>(new Set());
 
-  const [dir, setDir] = useState(DEFAULT_DIR);
+  const [columns, setColumns] = useState<DirectoryColumn[]>([makeDirectoryColumn(DEFAULT_DIR)]);
   const [snapshot, setSnapshot] = useState<string | null>(null);
   const [head, setHead] = useState<string | null>(null);
-  const [entries, setEntries] = useState<FileEntry[]>([]);
-  const [cursor, setCursor] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [selected, setSelected] = useState<FileEntry | null>(null);
   const [upload, setUpload] = useState<UploadState | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -600,6 +764,25 @@ export function FilesView() {
   const backed = Boolean(state.status?.modules.some((m) => m.id === "files"));
   const readOnly = snapshot !== null;
   const bumpReload = useCallback(() => setReloadToken((n) => n + 1), []);
+  const dir = columns[columns.length - 1]?.path ?? DEFAULT_DIR;
+  const error = actionError ?? columns.find((column) => column.error)?.error ?? null;
+  const columnKey = columns.map((column) => column.path).join("\0");
+  const dragDownloadKey = (entry: FileEntry): string => `${snapshot ?? "live"}:${entry.path}`;
+
+  useEffect(
+    () => () => {
+      dragDownloadUrls.current.forEach((url) => URL.revokeObjectURL?.(url));
+      dragDownloadUrls.current.clear();
+      dragDownloadRequests.current.clear();
+    },
+    [],
+  );
+
+  useEffect(() => {
+    dragDownloadUrls.current.forEach((url) => URL.revokeObjectURL?.(url));
+    dragDownloadUrls.current.clear();
+    dragDownloadRequests.current.clear();
+  }, [snapshot, transport]);
 
   // Track the live head for the history panel's diff base.
   useEffect(() => {
@@ -613,61 +796,92 @@ export function FilesView() {
     };
   }, [transport, reloadToken]);
 
-  // Page the current directory. A fresh live network may not have /shared yet;
-  // keep that as an empty writeable default instead of drifting writes to root.
+  // Page each visible browser column. A fresh live network may not have /shared
+  // yet; keep that as an empty writeable default instead of drifting writes to root.
   useEffect(() => {
     if (!transport) return;
     let alive = true;
-    setLoading(true);
-    setError(null);
-    ls(transport, { path: dir, snapshot: snapshot ?? undefined })
-      .then((page) => {
-        if (!alive) return;
-        setEntries(page.entries);
-        setCursor(page.next);
-        setLoading(false);
-      })
-      .catch((err) => {
-        if (!alive) return;
-        if (dir === DEFAULT_DIR && snapshot === null) {
-          setEntries([]);
-          setCursor(null);
-          setLoading(false);
-          return;
-        }
-        if (dir !== "/") {
-          setDir("/");
-          return;
-        }
-        setEntries([]);
-        setCursor(null);
-        setError(errMsg(err));
-        setLoading(false);
-      });
+    const paths = columns.map((column) => column.path);
+
+    setColumns((prev) =>
+      prev.map((column) =>
+        paths.includes(column.path) ? { ...column, loading: true, error: null } : column,
+      ),
+    );
+
+    paths.forEach((path) => {
+      ls(transport, { path, snapshot: snapshot ?? undefined })
+        .then((page) => {
+          if (!alive) return;
+          setColumns((prev) =>
+            prev.map((column) =>
+              column.path === path
+                ? { ...column, entries: page.entries, cursor: page.next, loading: false, error: null }
+                : column,
+            ),
+          );
+        })
+        .catch((err) => {
+          if (!alive) return;
+          setColumns((prev) =>
+            prev.map((column) => {
+              if (column.path !== path) return column;
+              if (path === DEFAULT_DIR && snapshot === null) {
+                return { ...column, entries: [], cursor: null, loading: false, error: null };
+              }
+              return { ...column, entries: [], cursor: null, loading: false, error: errMsg(err) };
+            }),
+          );
+        });
+    });
+
     return () => {
       alive = false;
     };
-  }, [transport, dir, snapshot, reloadToken]);
+  }, [transport, columnKey, snapshot, reloadToken]);
 
   const navigate = (path: string) => {
     setContextMenu(null);
     setSelected(null);
-    setDir(path);
+    setColumns((prev) =>
+      columnPathsFor(path).map(
+        (columnPath) => prev.find((column) => column.path === columnPath) ?? makeDirectoryColumn(columnPath),
+      ),
+    );
   };
 
   const selectSnapshot = (id: string | null) => {
     setSelected(null);
     setSnapshot(id);
+    setColumns((prev) =>
+      prev.map((column) => ({
+        ...column,
+        entries: [],
+        cursor: null,
+        loading: true,
+        error: null,
+      })),
+    );
   };
 
-  const loadMore = () => {
+  const loadMore = (path: string) => {
+    const cursor = columns.find((column) => column.path === path)?.cursor ?? null;
     if (!transport || !cursor) return;
-    ls(transport, { path: dir, snapshot: snapshot ?? undefined, after: cursor })
+    ls(transport, { path, snapshot: snapshot ?? undefined, after: cursor })
       .then((page) => {
-        setEntries((prev) => [...prev, ...page.entries]);
-        setCursor(page.next);
+        setColumns((prev) =>
+          prev.map((column) =>
+            column.path === path
+              ? { ...column, entries: [...column.entries, ...page.entries], cursor: page.next, error: null }
+              : column,
+          ),
+        );
       })
-      .catch((err) => setError(errMsg(err)));
+      .catch((err) =>
+        setColumns((prev) =>
+          prev.map((column) => (column.path === path ? { ...column, error: errMsg(err) } : column)),
+        ),
+      );
   };
 
   const openEntry = (entry: FileEntry) => {
@@ -675,6 +889,11 @@ export function FilesView() {
     if (entry.kind === "dir") {
       navigate(entry.path);
     } else {
+      setColumns((prev) =>
+        columnPathsFor(parentDir(entry.path)).map(
+          (columnPath) => prev.find((column) => column.path === columnPath) ?? makeDirectoryColumn(columnPath),
+        ),
+      );
       setSelected(entry);
     }
   };
@@ -704,26 +923,83 @@ export function FilesView() {
     bumpReload();
   };
 
-  const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
-    const input = event.target;
-    const file = input.files?.[0] ?? null;
-    input.value = "";
-    if (!file || !transport || readOnly) return;
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    setError(null);
-    setUpload({ name: file.name, staged: 0, total: 0 });
+  const uploadBrowserFiles = async (files: File[], targetDir: string) => {
+    if (!transport || readOnly || files.length === 0) return;
+    setActionError(null);
     try {
-      await uploadFile(transport, {
-        path: joinPath(writeTargetDir(dir), file.name),
-        bytes,
-        meta: file.type ? { mime: file.type } : {},
-        onProgress: (staged, total) => setUpload({ name: file.name, staged, total }),
-      });
+      for (const file of files) {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        setUpload({ name: file.name, staged: 0, total: 0 });
+        await uploadFile(transport, {
+          path: joinPath(writeTargetDir(targetDir), file.name),
+          bytes,
+          meta: file.type ? { mime: file.type } : {},
+          onProgress: (staged, total) => setUpload({ name: file.name, staged, total }),
+        });
+      }
       setUpload(null);
       bumpReload();
     } catch (err) {
       setUpload(null);
-      setError(errMsg(err));
+      setActionError(errMsg(err));
+    }
+  };
+
+  const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.target;
+    const file = input.files?.[0] ?? null;
+    input.value = "";
+    if (!file) return;
+    await uploadBrowserFiles([file], dir);
+  };
+
+  const hasDroppedFiles = (event: ReactDragEvent<HTMLElement>): boolean =>
+    Array.from(event.dataTransfer.types ?? []).includes("Files") || event.dataTransfer.files.length > 0;
+
+  const handleColumnDragOver = (event: ReactDragEvent<HTMLElement>) => {
+    if (!transport || readOnly || !backed || !hasDroppedFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+  };
+
+  const handleColumnDrop = (event: ReactDragEvent<HTMLElement>, targetDir: string) => {
+    if (!transport || readOnly || !backed || !hasDroppedFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+    void uploadBrowserFiles(Array.from(event.dataTransfer.files), targetDir);
+  };
+
+  const prepareDragDownload = (entry: FileEntry) => {
+    if (!transport || entry.kind !== "file" || typeof URL.createObjectURL !== "function") return;
+    const key = dragDownloadKey(entry);
+    if (dragDownloadUrls.current.has(key) || dragDownloadRequests.current.has(key)) return;
+    dragDownloadRequests.current.add(key);
+    readAll(transport, { path: entry.path, snapshot: snapshot ?? undefined })
+      .then((bytes) => {
+        const mime = entry.meta.mime || "application/octet-stream";
+        const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+        const previous = dragDownloadUrls.current.get(key);
+        if (previous) URL.revokeObjectURL?.(previous);
+        dragDownloadUrls.current.set(key, url);
+      })
+      .catch((err) => setActionError(errMsg(err)))
+      .finally(() => dragDownloadRequests.current.delete(key));
+  };
+
+  const handleFileDragStart = (event: ReactDragEvent<HTMLButtonElement>, entry: FileEntry) => {
+    if (entry.kind !== "file") return;
+    const name = basename(entry.path);
+    const mime = entry.meta.mime || "application/octet-stream";
+    const downloadUrl = dragDownloadUrls.current.get(dragDownloadKey(entry));
+    event.dataTransfer.effectAllowed = "copy";
+    event.dataTransfer.setData("application/x-ducktape-file-path", entry.path);
+    event.dataTransfer.setData("text/plain", entry.path);
+    if (downloadUrl) {
+      event.dataTransfer.setData("DownloadURL", `${mime}:${name}:${downloadUrl}`);
+    } else {
+      prepareDragDownload(entry);
     }
   };
 
@@ -732,7 +1008,7 @@ export function FilesView() {
     if (!transport || readOnly) return;
     const name = newFolderName.trim();
     if (!name) return;
-    setError(null);
+    setActionError(null);
     setCreatingFolder(true);
     try {
       await mkdir(transport, { path: joinPath(writeTargetDir(dir), name) });
@@ -740,7 +1016,7 @@ export function FilesView() {
       setNewFolderName("");
       bumpReload();
     } catch (err) {
-      setError(errMsg(err));
+      setActionError(errMsg(err));
     } finally {
       setCreatingFolder(false);
     }
@@ -752,10 +1028,18 @@ export function FilesView() {
     try {
       await deletePath(transport, { path: entry.path });
       setSelected((current) => (current?.path === entry.path ? null : current));
+      if (entry.kind === "dir") {
+        setColumns((prev) => {
+          const next = prev.filter(
+            (column) => column.path !== entry.path && !column.path.startsWith(`${entry.path}/`),
+          );
+          return next.length > 0 ? next : [makeDirectoryColumn(parentDir(entry.path))];
+        });
+      }
       setDeleteTarget(null);
       bumpReload();
     } catch (err) {
-      setError(errMsg(err));
+      setActionError(errMsg(err));
     } finally {
       setDeleting(false);
     }
@@ -765,8 +1049,6 @@ export function FilesView() {
     if (!selected) return;
     await deleteEntry(selected);
   };
-
-  const rows = sortEntries(entries);
 
   return (
     <div
@@ -838,7 +1120,10 @@ export function FilesView() {
           <div
             onContextMenu={(event) => openContextMenu(event, null)}
             style={{
-              minHeight: "100%",
+              height: "100%",
+              minHeight: 360,
+              display: "flex",
+              flexDirection: "column",
               borderRadius: radius.lg,
               border: `1px solid ${color.border}`,
               background: color.paper,
@@ -890,64 +1175,46 @@ export function FilesView() {
                   </div>
                 )}
 
-                {loading ? (
-                  <CenterState title="Loading…" detail="Reading this directory." muted />
-                ) : rows.length === 0 ? (
-                  <CenterState
-                    title="Empty directory"
-                    detail={
-                      readOnly
-                        ? "Nothing here in this snapshot."
-                        : "Nothing here yet — upload a file or create a folder."
-                    }
-                  />
-                ) : (
-                  <>
-                    {rows.map((entry) => (
-                      <EntryRow
-                        key={entry.path}
-                        entry={entry}
-                        selected={selected?.path === entry.path}
-                        onOpen={() => openEntry(entry)}
-                        onContextMenu={(event) => openContextMenu(event, entry)}
-                      />
-                    ))}
-                    {cursor && (
-                      <button
-                        type="button"
-                        onClick={loadMore}
-                        style={{
-                          all: "unset",
-                          boxSizing: "border-box",
-                          width: "100%",
-                          cursor: "pointer",
-                          textAlign: "center",
-                          padding: "10px 0",
-                          font: `600 11.5px ${font.sans}`,
-                          color: color.muted,
-                        }}
-                      >
-                        Load more
-                      </button>
-                    )}
-                  </>
-                )}
+                <div
+                  style={{
+                    flex: 1,
+                    minHeight: 0,
+                    display: "flex",
+                    overflowX: "auto",
+                    overflowY: "hidden",
+                  }}
+                >
+                  {columns.map((column, index) => (
+                    <DirectoryColumnView
+                      key={column.path}
+                      column={column}
+                      selectedPath={selected?.path ?? null}
+                      childPath={columns[index + 1]?.path ?? null}
+                      onOpen={openEntry}
+                      onContextMenu={openContextMenu}
+                      onLoadMore={loadMore}
+                      onPrepareDownload={prepareDragDownload}
+                      onFileDragStart={handleFileDragStart}
+                      onDragOverFiles={handleColumnDragOver}
+                      onDropFiles={handleColumnDrop}
+                    />
+                  ))}
+                  {selected && transport && (
+                    <FilePreview
+                      transport={transport}
+                      entry={selected}
+                      snapshot={snapshot}
+                      readOnly={readOnly}
+                      deleting={deleting}
+                      onClose={() => setSelected(null)}
+                      onDelete={handleDelete}
+                    />
+                  )}
+                </div>
               </>
             )}
           </div>
         </div>
-
-        {selected && transport && (
-          <FilePreview
-            transport={transport}
-            entry={selected}
-            snapshot={snapshot}
-            readOnly={readOnly}
-            deleting={deleting}
-            onClose={() => setSelected(null)}
-            onDelete={handleDelete}
-          />
-        )}
 
         {contextMenu && (
           <FilesContextMenu

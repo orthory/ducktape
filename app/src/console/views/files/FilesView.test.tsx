@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { FileEntry, FilePage } from "../../../domain/files-client";
@@ -108,6 +108,22 @@ describe("FilesView", () => {
     );
   });
 
+  it("opens folders as adjacent browser columns without replacing the parent column", async () => {
+    const transport = makeTransport();
+    renderView(transport);
+
+    const sharedColumn = await screen.findByRole("region", { name: /column \/shared/i });
+    expect(within(sharedColumn).getByText("docs")).toBeInTheDocument();
+    expect(within(sharedColumn).getByText("readme.md")).toBeInTheDocument();
+
+    fireEvent.click(within(sharedColumn).getByRole("button", { name: /open folder docs/i }));
+
+    const docsColumn = await screen.findByRole("region", { name: /column \/shared\/docs/i });
+    expect(within(docsColumn).getByText("plan.md")).toBeInTheDocument();
+    expect(within(sharedColumn).getByText("readme.md")).toBeInTheDocument();
+    expect(transport.filesLs).toHaveBeenCalledWith(expect.objectContaining({ path: "/shared/docs" }));
+  });
+
   it("opens a file panel with a text preview and a download control", async () => {
     const transport = makeTransport({
       filesRead: vi.fn().mockResolvedValue({ b64: btoa("hello duckfs"), eof: true }),
@@ -136,6 +152,67 @@ describe("FilesView", () => {
     expect(body.changes[0].put.path).toBe("/shared/notes.txt");
     // a small file is inlined, never staged.
     expect(transport.filesStage).not.toHaveBeenCalled();
+  });
+
+  it("uploads files dropped onto a browser column into that column's directory", async () => {
+    const transport = makeTransport();
+    renderView(transport);
+    const sharedColumn = await screen.findByRole("region", { name: /column \/shared/i });
+
+    const file = new File(["drop me"], "drop.txt", { type: "text/plain" });
+    Object.defineProperty(file, "arrayBuffer", {
+      value: () => Promise.resolve(new TextEncoder().encode("drop me").buffer),
+    });
+
+    fireEvent.drop(sharedColumn, {
+      dataTransfer: { files: [file], types: ["Files"], dropEffect: "copy" },
+    });
+
+    await waitFor(() => expect(transport.filesCommit).toHaveBeenCalled());
+    const body = (transport.filesCommit as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(body.changes[0].put.path).toBe("/shared/drop.txt");
+  });
+
+  it("marks file rows as draggable download sources", async () => {
+    const originalCreateObjectURL = URL.createObjectURL;
+    const originalRevokeObjectURL = URL.revokeObjectURL;
+    const createObjectURL = vi.fn(() => "blob:readme");
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectURL });
+    const transport = makeTransport({
+      filesRead: vi.fn().mockResolvedValue({ b64: btoa("readme body"), eof: true }),
+    });
+    try {
+      renderView(transport);
+      const fileRow = await screen.findByRole("button", { name: /open file readme\.md/i });
+
+      fireEvent.mouseDown(fileRow);
+      await waitFor(() => expect(createObjectURL).toHaveBeenCalled());
+
+      const dataTransfer = { setData: vi.fn(), effectAllowed: "none" };
+      fireEvent.dragStart(fileRow, { dataTransfer });
+
+      expect(dataTransfer.effectAllowed).toBe("copy");
+      expect(dataTransfer.setData).toHaveBeenCalledWith(
+        "application/x-ducktape-file-path",
+        "/shared/readme.md",
+      );
+      expect(dataTransfer.setData).toHaveBeenCalledWith("text/plain", "/shared/readme.md");
+      expect(dataTransfer.setData).toHaveBeenCalledWith(
+        "DownloadURL",
+        "text/plain:readme.md:blob:readme",
+      );
+    } finally {
+      Object.defineProperty(URL, "createObjectURL", {
+        configurable: true,
+        value: originalCreateObjectURL,
+      });
+      Object.defineProperty(URL, "revokeObjectURL", {
+        configurable: true,
+        value: originalRevokeObjectURL,
+      });
+    }
   });
 
   it("creates new folders through an in-app dialog", async () => {
