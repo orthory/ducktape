@@ -267,7 +267,11 @@ mod tests {
         fn capability(&self) -> &str {
             "alpha"
         }
-        async fn run(&self, prompt: &str) -> Result<String, String> {
+        async fn run(
+            &self,
+            prompt: &str,
+            _ctx: &capability_host::RunContext,
+        ) -> Result<String, String> {
             self.executions.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
             Ok(format!("answer to: {prompt}"))

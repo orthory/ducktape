@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
-use dispatch_oracle::{DeliverFn, DispatchPool, SpawnFn};
+use dispatch_oracle::{BlobResolver, DeliverFn, DispatchPool, SpawnFn};
 use futures::SinkExt as _;
 use sdk::Msg;
 
@@ -26,10 +26,15 @@ const ORACLE_RESULT_LANE: usize = 64;
 /// runs as supervised children of `context` and hands completed results back
 /// over the returned receiver. the caller owns the receiver as a select-loop
 /// ingress arm and submits each `Msg` through the normal signed submit path.
+///
+/// `blobs` is the node-local content-addressed store the app surface's
+/// putBlob lane feeds — the read path run-envelope prompt pins resolve
+/// through (an agent's registered prompt lives there under its sha256).
 pub(crate) fn build<C>(
     context: &C,
     providers: capability_host::ProviderSet,
     node_key: Vec<u8>,
+    blobs: blobstore::BlobHandle,
 ) -> (
     Box<dyn reactor::Worker>,
     futures::channel::mpsc::Receiver<Msg>,
@@ -58,6 +63,16 @@ where
         })
     });
 
-    let pool = DispatchPool::new(Arc::new(providers), node_key, spawn, deliver);
+    // prompt resolution: a synchronous in-memory read behind the pool's
+    // async seam. `None` (blob absent on this node) fails the run loudly in
+    // the worker — never a silent fallback to the generic instructions.
+    let resolver: BlobResolver = Arc::new(move |digest: &[u8; 32]| {
+        let blobs = blobs.clone();
+        let digest = *digest;
+        Box::pin(async move { blobs.get_chunk(&digest) })
+    });
+
+    let pool =
+        DispatchPool::new(Arc::new(providers), node_key, spawn, deliver).with_resolver(resolver);
     (Box::new(pool), rx)
 }

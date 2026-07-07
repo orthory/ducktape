@@ -56,7 +56,9 @@ use std::path::Path;
 use capability::validate_tag;
 use serde::Deserialize;
 
+use crate::session::{self, SessionSpec};
 use crate::variants::{self, RawVariant};
+use crate::workspace::{self, WorkspaceMode};
 
 /// the one spec format version this build understands. parsing rejects any
 /// other value loudly — an operator on a newer format gets "unsupported spec
@@ -96,6 +98,12 @@ pub struct CapabilitySpec {
     pub timeout_secs: u64,
     /// which named stdout parser extracts the assistant's final text.
     pub output: OutputFormat,
+    /// the child's working-directory policy — scratch unless the spec's
+    /// `[workspace]` opts into per-agent persistence (see [`crate::workspace`]).
+    pub workspace: WorkspaceMode,
+    /// optional `[session]` thread-continuity plumbing — host-local capture
+    /// and resume of the executor's own session id (see [`crate::session`]).
+    pub session: Option<SessionSpec>,
 }
 
 /// how the prompt is delivered to the child process.
@@ -133,6 +141,12 @@ struct RawSpec {
     detect: RawDetect,
     invoke: RawInvoke,
     output: RawOutput,
+    /// optional `[workspace]` — validated in [`crate::workspace`].
+    #[serde(default)]
+    workspace: Option<workspace::RawWorkspace>,
+    /// optional `[session]` — validated in [`crate::session`].
+    #[serde(default)]
+    session: Option<session::RawSession>,
     /// optional `[[variants]]` — finer tags expanded at load time, validated
     /// in [`crate::variants`].
     #[serde(default)]
@@ -247,6 +261,17 @@ impl CapabilitySpec {
                 ));
             }
         };
+        // scratch is expressed by OMITTING [workspace] — no redundant
+        // "scratch" spelling exists to drift from the default.
+        let workspace = raw
+            .workspace
+            .map(|w| workspace::parse_workspace(&w, origin))
+            .transpose()?
+            .unwrap_or_default();
+        let session = raw
+            .session
+            .map(|s| session::parse_session(&s, origin))
+            .transpose()?;
         Ok((
             Self {
                 tag,
@@ -257,6 +282,8 @@ impl CapabilitySpec {
                 prompt,
                 timeout_secs: raw.invoke.timeout_secs,
                 output,
+                workspace,
+                session,
             },
             raw.variants,
         ))
@@ -424,6 +451,73 @@ format = "text"
         let stale = format!("{}\n[models]\npatterns = [\"*\"]\n", spec_toml("ok"));
         let err = CapabilitySpec::parse(&stale, "t").unwrap_err();
         assert!(err.contains("not a valid spec"), "got {err:?}");
+    }
+
+    #[test]
+    fn workspace_and_session_sections_parse_and_default_off() {
+        // absent sections keep the v1 posture: scratch dir, no sessions.
+        let plain = CapabilitySpec::parse(&spec_toml("ok"), "t").unwrap();
+        assert_eq!(plain.workspace, crate::WorkspaceMode::Scratch);
+        assert_eq!(plain.session, None);
+
+        let full = format!(
+            r#"{}
+[workspace]
+mode = "persistent"
+[session]
+capture = "json-result-field:session_id"
+resume_args_append = ["--resume", "{{session_id}}"]
+"#,
+            spec_toml("ok")
+        );
+        let spec = CapabilitySpec::parse(&full, "t").unwrap();
+        assert_eq!(spec.workspace, crate::WorkspaceMode::Persistent);
+        let session = spec.session.expect("session parsed");
+        assert_eq!(
+            session.capture,
+            crate::SessionCapture::JsonResultField("session_id".into())
+        );
+        assert_eq!(
+            session.resume,
+            crate::ResumeArgv::Append(vec!["--resume".into(), "{session_id}".into()])
+        );
+    }
+
+    #[test]
+    fn workspace_and_session_sections_fail_loud_on_unknown_or_bad_fields() {
+        let base = spec_toml("ok");
+        for (extra, expect) in [
+            // an unknown workspace mode and a typo'd field are both loud.
+            ("[workspace]\nmode = \"shared\"\n", "not supported"),
+            ("[workspace]\nmodes = \"persistent\"\n", "not a valid spec"),
+            (
+                "[workspace]\nmode = \"persistent\"\nroot = \"/x\"\n",
+                "not a valid spec",
+            ),
+            // session: unknown capture, unknown field, no/both resume styles,
+            // and a slot-less resume argv.
+            (
+                "[session]\ncapture = \"csv\"\nresume_args = [\"{session_id}\"]\n",
+                "not a known mode",
+            ),
+            (
+                "[session]\ncapture = \"jsonl-events\"\nresume = [\"x\"]\n",
+                "not a valid spec",
+            ),
+            ("[session]\ncapture = \"jsonl-events\"\n", "exactly one"),
+            (
+                "[session]\ncapture = \"jsonl-events\"\nresume_args = [\"{session_id}\"]\nresume_args_append = [\"x\"]\n",
+                "exactly one",
+            ),
+            (
+                "[session]\ncapture = \"jsonl-events\"\nresume_args = [\"resume\"]\n",
+                "{session_id}",
+            ),
+        ] {
+            let toml = format!("{base}\n{extra}");
+            let err = CapabilitySpec::parse(&toml, "t").unwrap_err();
+            assert!(err.contains(expect), "wanted {expect:?} in {err:?}");
+        }
     }
 
     #[test]

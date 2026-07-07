@@ -166,6 +166,10 @@ fn run_node(
 ) {
     // forge_repo is derived by the caller (shared with the http upload-pack lane).
     let duckfs_dir = storage.join("duckfs");
+    // per-agent host state under the same storage root: persistent executor
+    // workspaces + session files (DUCKTAPE_AGENT_WORKSPACES / _SESSIONS
+    // override — see capability-host). host-local only, never consensus.
+    let agent_dirs = capability_host::AgentDirs::under(&storage);
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
@@ -247,7 +251,8 @@ fn run_node(
         // Submit command on `oracle_cmds`, so this serial command loop
         // never awaits a provider and Query/Status stay responsive while
         // runs are in flight.
-        let workers = oracle_pool::oracle_workers(&context, oracle_cmds);
+        let workers =
+            oracle_pool::oracle_workers(&context, oracle_cmds, blobs.clone(), agent_dirs);
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would
         // re-use indexed heights — every new block silently skipped.

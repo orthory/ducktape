@@ -61,10 +61,12 @@ in the same trust class as a shell profile or a systemd unit:
   interpretation** — no placeholders, no quoting, no expansion. The prompt
   reaches the child only via stdin, so job content cannot inject flags or
   commands.
-- The child process runs **fenced**: an empty scratch working directory (never
-  the node's data dir), one-shot non-interactive mode, and whatever sandbox
-  flags the spec's argv encodes. Fence flags live in the spec — audit them
-  when you audit the spec.
+- The child process runs **fenced**: a working directory the spec's
+  `[workspace]` policy picks — an empty scratch dir by default, or a
+  per-agent persistent dir under the host's agent-workspaces root (never the
+  node's data dir itself) — non-interactive mode, and whatever sandbox flags
+  the spec's argv encodes. Fence flags live in the spec — audit them when you
+  audit the spec.
 
 **BYO auth is the point.** The node never reads, writes, or refreshes any
 credential file. If the executor needs a login or an API key in *its* config,
@@ -167,6 +169,8 @@ format = "text"
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `spec` | integer | yes | must be `1` |
+| `[workspace]` | table | no | per-agent persistent working directory — see [Workspace](#workspace--a-persistent-per-agent-working-directory) |
+| `[session]` | table | no | thread-continuity capture/resume — see [Session](#session--thread-continuity) |
 | `[[variants]]` | array of tables | no | load-time expansion into finer tags — see [Variants](#variants--one-file-a-family-of-finer-tags) |
 
 Unknown fields **anywhere** in the file are rejected — a typo (or a field
@@ -200,6 +204,91 @@ being silently ignored.
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `format` | string | yes | `"jsonl-events"` \| `"json-result"` \| `"text"` |
+
+### `[workspace]`
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `mode` | string | yes (when the section is present) | must be `"persistent"`; omit the whole section for the scratch default |
+
+### `[session]`
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `capture` | string | yes | `"jsonl-events"` \| `"json-result-field:<field>"` |
+| `resume_args` | string array | exactly one of the two | FULL replacement resume argv; must carry the `{session_id}` slot |
+| `resume_args_append` | string array | exactly one of the two | appended to the spec's own `args`; must carry the `{session_id}` slot |
+
+---
+
+## Workspace — a persistent per-agent working directory
+
+The v1 fence ran every provider child in an **empty scratch directory**. An
+agentic run wants the opposite: a stable directory the executor can read and
+write across runs, so work accumulates instead of vanishing per invocation.
+
+```toml
+[workspace]
+mode = "persistent"
+```
+
+With `persistent`, a run that carries an agent identity (composed by the
+runs module's envelope — legacy envelope-less runs carry none) executes in
+`<data>/agent-workspaces/<agent_id>/`, created on demand. Everything else —
+no `[workspace]` section, a legacy run, an embedder that wired no workspaces
+root — keeps the scratch fence unchanged. The child still never sees the
+node's data directory itself, and the agent id is defensively rejected as a
+path component if it carries separators or traversal tokens.
+
+The workspaces root is host policy: the node binaries derive it from their
+data dir; `DUCKTAPE_AGENT_WORKSPACES` overrides it. Host-local state, never
+consensus — two nodes running the same agent have independent workspaces.
+
+---
+
+## Session — thread continuity
+
+Agentic CLIs keep their own conversation state keyed by a **session id**.
+`[session]` teaches the host to capture that id from a successful run's
+stdout and to resume it on the next run of the same conversation thread:
+
+```toml
+[session]
+capture = "jsonl-events"                        # or "json-result-field:session_id"
+resume_args = ["exec", "resume", "{session_id}", "--json", "-"]
+# or, for flag-style CLIs:
+# resume_args_append = ["--resume", "{session_id}"]
+```
+
+- **capture** — how the id is read: `"jsonl-events"` scans the event stream
+  (`thread.started`.`thread_id`, a top-level `session_id`, or the older
+  `session_configured` envelope); `"json-result-field:<field>"` reads the
+  named string field of the single result object. Capture is **tolerant**:
+  no id in the output means no session is stored — never an error.
+- **resume** — how a stored id becomes the next invocation's argv. `resume_args`
+  REPLACES the argv wholesale (for CLIs where resuming is a subcommand);
+  `resume_args_append` appends to the spec's own `args` (for flag-style
+  resuming — every variant keeps its model/effort pins for free). Exactly one
+  of the two, and it must use the `{session_id}` slot.
+
+`{session_id}` is the **one substitution in the whole format**, filled
+host-side with an id the executor itself minted (validated: short, printable,
+space-free) — job content can never reach argv. This is host-local plumbing,
+NOT the removed dispatch-time model routing: nothing here touches consensus,
+and every tag still resolves to fixed argv shapes known at load time.
+
+Mechanics (all host-local):
+
+- Session ids live in `<data>/agent-sessions/<agent_id>/<sha256(thread_key)>`
+  (`DUCKTAPE_AGENT_SESSIONS` overrides the root). The thread key is hashed,
+  so any key content is filesystem-safe.
+- A **stale session degrades to a cold start**: if the resumed invocation
+  fails, the session file is deleted and the run retries ONCE cold before
+  reporting failure. Store writes are best-effort (a failure warns and costs
+  continuity, never the answer).
+- Sessions are **assignee-local by design**: another node executing the same
+  thread's next run finds no session file and starts cold — correct, because
+  the run envelope carries the full transcript either way.
 
 ---
 
@@ -239,11 +328,16 @@ Each entry:
 |---|---|---|---|
 | `suffix` | string | yes | `<model>_<effort>`, each side `[a-z0-9.-]+` (so exactly one `_`) |
 | `args` | string array | yes | the variant's **full** argv — verbatim, complete, never merged with or derived from the parent's args |
+| `resume_args` | string array | no | FULL replacement for the inherited `[session]` resume argv (`{session_id}` slot required; parent must declare `[session]`) |
 
-A variant **inherits** `bin`, `env`, `prompt`, `timeout_secs`, `output` (and
-`description`) from the parent spec; `args` is its own, whole, and literal.
-There is no field merging and no placeholder substitution — the "argv is
-literal" invariant holds per tag.
+A variant **inherits** `bin`, `env`, `prompt`, `timeout_secs`, `output`,
+`[workspace]`, and `[session]` (and `description`) from the parent spec;
+`args` is its own, whole, and literal. There is no field merging and no
+placeholder substitution — the "argv is literal" invariant holds per tag.
+The one nuance is subcommand-style resuming: an inherited `resume_args`
+replacement cannot carry a per-variant model flag, so a variant may declare
+its own `resume_args` (the embedded codex family does; append-style families
+like claude never need to — the appended flags ride each variant's own args).
 
 **The tag grammar.** A composed tag is `{provider}_{model}_{effort}` and
 splits into **exactly three segments on `_`** — the contract the desktop
@@ -336,6 +430,8 @@ if the tunings follow the `provider_model_effort` grammar.
 | `DUCKTAPE_CAPABILITY_DIR` | operator spec directory (explicit; missing dir = boot error) |
 | *(per spec)* `[detect].env` | each spec may name its own explicit-binary override var — see the embedded specs for theirs |
 | `DUCKTAPE_PROVIDER_TIMEOUT_SECS` | overrides **every** spec's `timeout_secs` at once |
+| `DUCKTAPE_AGENT_WORKSPACES` | overrides the persistent-workspaces root (default `<data>/agent-workspaces`) |
+| `DUCKTAPE_AGENT_SESSIONS` | overrides the session-store root (default `<data>/agent-sessions`) |
 
 ---
 
@@ -353,4 +449,6 @@ removed within v1 as a pre-release flag day: files that still carry them fail
 loudly at boot with an unknown-field error, never a silent behavior change.
 `[[variants]]` was likewise added within v1 pre-release — a build older than
 it rejects a file carrying variants loudly as an unknown field, never
-misreading it as a single-tag spec.)
+misreading it as a single-tag spec. `[workspace]` and `[session]` follow the
+same pre-release precedent: an older build rejects a file carrying them as
+unknown fields rather than silently running scratch-and-cold.)

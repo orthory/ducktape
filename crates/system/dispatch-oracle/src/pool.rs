@@ -74,6 +74,10 @@ pub struct DispatchPool {
     /// process for the same paid call. pruned when the attempt's result has
     /// been handed to the delivery lane.
     inflight: Arc<Mutex<HashSet<AttemptKey>>>,
+    /// blob reads for envelope prompt resolution — injected by the embedding
+    /// binary like spawn/deliver, so the pool stays storage-agnostic. `None`
+    /// fails prompt-pinned envelopes loudly (see [`crate::envelope::prepare`]).
+    resolver: Option<crate::BlobResolver>,
 }
 
 impl DispatchPool {
@@ -108,7 +112,16 @@ impl DispatchPool {
             deliver,
             semaphore: Arc::new(Semaphore::new(limit.max(1))),
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            resolver: None,
         }
+    }
+
+    /// wire the node-local blob read path envelope prompts resolve through.
+    /// a builder (not a constructor arm) so existing embedders and tests
+    /// keep compiling; without it, prompt-pinned envelopes fail loudly.
+    pub fn with_resolver(mut self, resolver: crate::BlobResolver) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
 
     /// how many attempts are executing (or queued for the semaphore) right
@@ -124,6 +137,7 @@ impl DispatchPool {
         let deliver = self.deliver.clone();
         let semaphore = self.semaphore.clone();
         let inflight = self.inflight.clone();
+        let resolver = self.resolver.clone();
         (self.spawn)(Box::pin(async move {
             // over-cap runs queue HERE, on their own task.
             let _permit = semaphore
@@ -134,11 +148,18 @@ impl DispatchPool {
             // capability resolves, and a provider surface is immutable for
             // the process lifetime — this is just how the borrow crosses.
             let outcome = match providers.resolve(&job.capability) {
-                Ok(provider) => provider
-                    .run(&job.input)
-                    .await
-                    .map(String::into_bytes)
-                    .map_err(clean_error),
+                // the envelope step runs on the spawned task too — prompt
+                // resolution is a blob read, not host-loop work. its errors
+                // are the run's result: a saga Err, never a silent fallback.
+                Ok(provider) => match crate::envelope::prepare(&job.input, resolver.as_ref()).await
+                {
+                    Ok((input, ctx)) => provider
+                        .run(&input, &ctx)
+                        .await
+                        .map(String::into_bytes)
+                        .map_err(clean_error),
+                    Err(e) => Err(clean_error(e)),
+                },
                 Err(e) => Err(clean_error(e)),
             };
             // error/timeout results are submitted like any other: the saga
@@ -211,14 +232,16 @@ format = "text"
         .expect("mock spec parses")
     }
 
-    /// a provider that records concurrency (current + peak) and executions,
-    /// then sleeps — the observable stand-in for a slow CLI.
+    /// a provider that records concurrency (current + peak), executions, and
+    /// the last (input, ctx) it saw, then sleeps — the observable stand-in
+    /// for a slow CLI.
     struct SlowProvider {
         tag: String,
         delay: Duration,
         executions: Arc<AtomicUsize>,
         current: Arc<AtomicUsize>,
         peak: Arc<AtomicUsize>,
+        last_run: Arc<Mutex<Option<(String, capability_host::RunContext)>>>,
         fail: bool,
     }
 
@@ -227,8 +250,13 @@ format = "text"
         fn capability(&self) -> &str {
             &self.tag
         }
-        async fn run(&self, prompt: &str) -> Result<String, String> {
+        async fn run(
+            &self,
+            prompt: &str,
+            ctx: &capability_host::RunContext,
+        ) -> Result<String, String> {
             self.executions.fetch_add(1, Ordering::SeqCst);
+            *self.last_run.lock().unwrap() = Some((prompt.to_string(), ctx.clone()));
             let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
@@ -244,25 +272,35 @@ format = "text"
     struct Probes {
         executions: Arc<AtomicUsize>,
         peak: Arc<AtomicUsize>,
+        last_run: Arc<Mutex<Option<(String, capability_host::RunContext)>>>,
     }
 
     fn slow_providers(delay: Duration, fail: bool) -> (Arc<ProviderSet>, Probes) {
         let executions = Arc::new(AtomicUsize::new(0));
         let current = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
+        let last_run = Arc::new(Mutex::new(None));
         let provider = SlowProvider {
             tag: "alpha".into(),
             delay,
             executions: executions.clone(),
             current,
             peak: peak.clone(),
+            last_run: last_run.clone(),
             fail,
         };
         let providers = Arc::new(ProviderSet::assemble(
             capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
             vec![Box::new(provider)],
         ));
-        (providers, Probes { executions, peak })
+        (
+            providers,
+            Probes {
+                executions,
+                peak,
+                last_run,
+            },
+        )
     }
 
     /// a pool wired to tokio::spawn with an unbounded result lane — the
@@ -287,7 +325,12 @@ format = "text"
         )
     }
 
-    fn effect_for(saga_id: &str, attempt: u32, assignee: Option<&[u8]>) -> Effect {
+    fn effect_with_payload(
+        saga_id: &str,
+        attempt: u32,
+        assignee: Option<&[u8]>,
+        payload: &[u8],
+    ) -> Effect {
         Effect(encode_worker_request(&WorkerRequest {
             saga_id: saga_id.into(),
             attempt,
@@ -295,11 +338,15 @@ format = "text"
                 kind: WORK_SPEC_KIND.into(),
                 dispatch_id: "d1".into(),
                 capability: "alpha".into(),
-                payload: b"the entire input".to_vec(),
+                payload: payload.to_vec(),
             }),
             deadline: None,
             assignee: assignee.map(|a| a.to_vec()),
         }))
+    }
+
+    fn effect_for(saga_id: &str, attempt: u32, assignee: Option<&[u8]>) -> Effect {
+        effect_with_payload(saga_id, attempt, assignee, b"the entire input")
     }
 
     async fn next_result(
@@ -440,6 +487,92 @@ format = "text"
         while pool.in_flight() > 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    fn envelope_payload(prompt_hash: Option<&str>) -> Vec<u8> {
+        serde_json::json!({
+            "ducktape_run": 2,
+            "agent_id": "bot",
+            "prompt_hash": prompt_hash,
+            "thread_key": "general#7",
+            "instructions": "GENERIC",
+            "contract": "CONTRACT",
+            "conversation": "CONVERSATION",
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn envelope_payloads_reach_the_provider_assembled_with_run_context() {
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
+        let (pool, mut rx) = pool_with(providers, 4);
+
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &envelope_payload(None));
+        pool.run(&eff).await.unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+        assert_eq!(
+            outcome.unwrap(),
+            b"answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION".to_vec(),
+            "assembly order: prompt-or-instructions, contract, conversation"
+        );
+        let (input, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
+        assert!(!input.contains("ducktape_run"), "the provider never sees envelope JSON");
+        assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
+        assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
+    }
+
+    #[tokio::test]
+    async fn a_wired_resolver_feeds_the_agents_real_prompt() {
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<Msg>();
+        let spawn: SpawnFn = Box::new(|fut| {
+            tokio::spawn(fut);
+        });
+        let deliver: DeliverFn = Arc::new(move |msg| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.unbounded_send(msg);
+            })
+        });
+        let resolver: crate::BlobResolver = Arc::new(|digest: &[u8; 32]| {
+            let hit = (*digest == [7u8; 32]).then(|| b"You are Bot.".to_vec());
+            Box::pin(async move { hit })
+        });
+        let pool = DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, 4)
+            .with_resolver(resolver);
+
+        let hex = "07".repeat(32);
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &envelope_payload(Some(&hex)));
+        pool.run(&eff).await.unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+        assert_eq!(
+            outcome.unwrap(),
+            b"answer to: You are Bot.\n\nCONTRACT\n\nCONVERSATION".to_vec(),
+            "the registered prompt replaces the generic instructions"
+        );
+        let (input, _) = probes.last_run.lock().unwrap().clone().unwrap();
+        assert!(!input.contains("GENERIC"), "no silent generic fallback: {input:?}");
+    }
+
+    #[tokio::test]
+    async fn a_prompt_pinned_envelope_without_a_resolver_fails_the_saga_loudly() {
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
+        let (pool, mut rx) = pool_with(providers, 4); // no with_resolver
+
+        let hex = "07".repeat(32);
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &envelope_payload(Some(&hex)));
+        pool.run(&eff).await.unwrap();
+        let (saga_id, attempt, outcome) = next_result(&mut rx).await;
+        assert_eq!((saga_id.as_str(), attempt), ("s1", 0));
+        let err = outcome.unwrap_err();
+        assert!(err.contains("no blob resolver"), "got: {err}");
+        assert!(err.contains("bot"), "names the agent: {err}");
+        assert_eq!(
+            probes.executions.load(Ordering::SeqCst),
+            0,
+            "the provider is never invoked on a failed resolution"
+        );
     }
 
     /// the pool's gate is the shared one: announcements claim (Accept) or

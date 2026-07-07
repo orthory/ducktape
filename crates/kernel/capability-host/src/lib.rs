@@ -22,10 +22,14 @@
 //! nothing is inferred from model names.
 //!
 //! the CLIs are agentic, not plain inference endpoints, so a provider runs
-//! them fenced: non-interactive one-shot mode, most-restricted sandbox flags
-//! (as encoded in the spec's argv), and an empty scratch working directory —
-//! the child never sees the node's data directory. the fence is what turns
-//! "orchestrate a coding agent" into "use it as a text oracle".
+//! them fenced: non-interactive mode, the sandbox flags encoded in the spec's
+//! argv, and a working directory the spec's `[workspace]` policy picks — an
+//! empty scratch dir by default, or a stable per-agent workspace under the
+//! host's agent-workspaces root when the spec opts in (see [`workspace`]).
+//! either way the child never sees the node's data directory itself. the
+//! spec's `[session]` policy adds host-local thread continuity on top (see
+//! [`session`]): capture the CLI's own session id, resume it for the next
+//! run of the same thread.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -36,9 +40,25 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt as _;
 
+mod session;
 mod spec;
 mod variants;
+mod workspace;
+pub use session::{ResumeArgv, SessionCapture, SessionSpec};
 pub use spec::{CapabilitySpec, OutputFormat, PromptMode, SpecSet, builtin_specs};
+pub use workspace::WorkspaceMode;
+
+/// per-run, host-local context riding beside the prompt: which agent is
+/// running and which conversation thread the run continues. populated by the
+/// worker from the run envelope; legacy envelope-less runs pass
+/// [`RunContext::default`] and behave exactly as before. NEVER consensus
+/// data — providers only use it to pick a workspace dir and a session slot
+/// on this machine.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunContext {
+    pub agent_id: Option<String>,
+    pub thread_key: Option<String>,
+}
 
 /// a machine-local executor for one capability tag. implementations do real
 /// I/O (spawn processes); nothing consensus-side may ever hold one. the
@@ -59,7 +79,9 @@ pub trait Provider: Send + Sync {
     /// cannot drift apart.
     fn capability(&self) -> &str;
     /// run one prompt to completion and return the assistant's final text.
-    async fn run(&self, prompt: &str) -> Result<String, String>;
+    /// `ctx` is host-local run identity (see [`RunContext`]) — implementations
+    /// that predate workspaces/sessions may simply ignore it.
+    async fn run(&self, prompt: &str, ctx: &RunContext) -> Result<String, String>;
 }
 
 /// the host's provider surface: every LOADED spec (for routing — an
@@ -134,16 +156,55 @@ impl ProviderSet {
     }
 }
 
+/// the host-wired roots for per-agent state (see [`workspace`] and
+/// [`session`]): where persistent agent workspaces and session files live.
+/// binaries derive both from their data dir ([`AgentDirs::under`]);
+/// `DUCKTAPE_AGENT_WORKSPACES` / `DUCKTAPE_AGENT_SESSIONS` override either
+/// (the `DUCKTAPE_PROVIDER_TIMEOUT_SECS` precedent). an absent root simply
+/// disables the feature it serves — embedders that never wire one keep the
+/// v1 scratch-and-cold behavior.
+#[derive(Debug, Clone, Default)]
+pub struct AgentDirs {
+    pub workspaces_root: Option<PathBuf>,
+    pub sessions_root: Option<PathBuf>,
+}
+
+impl AgentDirs {
+    /// the binaries' convention: both roots under one data dir.
+    pub fn under(data_dir: &Path) -> Self {
+        Self {
+            workspaces_root: Some(data_dir.join("agent-workspaces")),
+            sessions_root: Some(data_dir.join("agent-sessions")),
+        }
+    }
+
+    /// apply the env overrides — injected like every other env access here,
+    /// so tests never mutate process state.
+    fn resolved(self, env: &dyn Fn(&str) -> Option<OsString>) -> Self {
+        let over = |key: &str, wired: Option<PathBuf>| env(key).map(PathBuf::from).or(wired);
+        Self {
+            workspaces_root: over("DUCKTAPE_AGENT_WORKSPACES", self.workspaces_root),
+            sessions_root: over("DUCKTAPE_AGENT_SESSIONS", self.sessions_root),
+        }
+    }
+}
+
 /// a [`Provider`] that interprets one [`CapabilitySpec`] against one resolved
 /// binary: spawn `bin` with the spec's literal argv, feed the prompt on
 /// stdin, parse stdout with the spec's named format.
 pub struct CliProvider {
     spec: CapabilitySpec,
     bin: PathBuf,
-    /// the child's working directory — an empty scratch dir, never the node's
-    /// data directory, so an agentic CLI has nothing to wander into.
+    /// the child's DEFAULT working directory — an empty scratch dir, never
+    /// the node's data directory, so an agentic CLI has nothing to wander
+    /// into. a spec's `[workspace] mode = "persistent"` swaps this for a
+    /// per-agent dir under `dirs.workspaces_root` when the run carries an
+    /// agent id.
     workdir: PathBuf,
     timeout: Duration,
+    /// host-wired roots for persistent workspaces and session files; both
+    /// default absent (scratch + cold runs).
+    dirs: AgentDirs,
 }
 
 impl CliProvider {
@@ -161,6 +222,7 @@ impl CliProvider {
             bin,
             workdir,
             timeout,
+            dirs: AgentDirs::default(),
         }
     }
 
@@ -174,13 +236,20 @@ impl CliProvider {
         self
     }
 
-    fn command(&self) -> tokio::process::Command {
+    pub fn with_agent_dirs(mut self, dirs: AgentDirs) -> Self {
+        self.dirs = dirs;
+        self
+    }
+
+    fn command(&self, args: &[String], workdir: &Path) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.bin);
-        // argv straight from the spec, fully literal. args are passed
-        // verbatim to exec — never shell-interpreted, so nothing in a job
-        // can inject flags or commands.
-        cmd.args(self.spec.args.iter());
-        cmd.current_dir(&self.workdir)
+        // argv straight from the spec, fully literal (the resume path's
+        // {session_id} slot is substituted host-side BEFORE this point, with
+        // an id the executor itself minted — never job content). args are
+        // passed verbatim to exec — never shell-interpreted, so nothing in a
+        // job can inject flags or commands.
+        cmd.args(args.iter());
+        cmd.current_dir(workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -189,19 +258,63 @@ impl CliProvider {
             .kill_on_drop(true);
         cmd
     }
-}
 
-#[async_trait::async_trait]
-impl Provider for CliProvider {
-    fn capability(&self) -> &str {
-        &self.spec.tag
+    /// where this run's child executes: the per-agent persistent workspace
+    /// when the spec opts in AND the run names an agent AND the host wired a
+    /// root — the scratch default otherwise. the agent id is defensively
+    /// checked as a path component even though registry caps bound it.
+    fn workdir_for(&self, ctx: &RunContext) -> Result<PathBuf, String> {
+        if self.spec.workspace == WorkspaceMode::Persistent
+            && let (Some(root), Some(agent_id)) = (&self.dirs.workspaces_root, &ctx.agent_id)
+        {
+            workspace::safe_path_component(agent_id)?;
+            return Ok(root.join(agent_id));
+        }
+        Ok(self.workdir.clone())
     }
 
-    async fn run(&self, prompt: &str) -> Result<String, String> {
-        std::fs::create_dir_all(&self.workdir)
-            .map_err(|e| format!("provider scratch dir {}: {e}", self.workdir.display()))?;
+    /// the session slot for this run — `Some` only when the spec opts into
+    /// `[session]`, the run carries both continuity coordinates, and the
+    /// host wired a sessions root. anything less runs cold, by design.
+    fn session_store<'a>(
+        &'a self,
+        ctx: &'a RunContext,
+    ) -> Result<Option<(&'a SessionSpec, session::SessionStore<'a>)>, String> {
+        let Some(session) = &self.spec.session else {
+            return Ok(None);
+        };
+        let (Some(root), Some(agent_id), Some(thread_key)) =
+            (&self.dirs.sessions_root, &ctx.agent_id, &ctx.thread_key)
+        else {
+            return Ok(None);
+        };
+        workspace::safe_path_component(agent_id)?;
+        Ok(Some((
+            session,
+            session::SessionStore::new(root, agent_id, thread_key),
+        )))
+    }
+}
+
+/// one finished invocation: the parsed answer plus the raw stdout the
+/// session capture reads (the session id is a sibling of the answer in the
+/// CLI's output, not part of it).
+struct Invocation {
+    text: String,
+    stdout: String,
+}
+
+impl CliProvider {
+    /// one child process, start to parsed answer, with an explicit argv and
+    /// working directory — the shared engine under the cold and resume paths.
+    async fn invoke(
+        &self,
+        prompt: &str,
+        args: &[String],
+        workdir: &Path,
+    ) -> Result<Invocation, String> {
         let mut child = self
-            .command()
+            .command(args, workdir)
             .spawn()
             .map_err(|e| format!("spawn {} failed: {e}", self.bin.display()))?;
         let mut stdin = child
@@ -250,12 +363,58 @@ impl Provider for CliProvider {
                 self.bin.display()
             ));
         }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        match self.spec.output {
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let text = match self.spec.output {
             OutputFormat::JsonlEvents => parse_jsonl_events(&stdout),
             OutputFormat::JsonResult => parse_json_result(&stdout),
             OutputFormat::Text => parse_text_output(&stdout),
+        }?;
+        Ok(Invocation { text, stdout })
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for CliProvider {
+    fn capability(&self) -> &str {
+        &self.spec.tag
+    }
+
+    async fn run(&self, prompt: &str, ctx: &RunContext) -> Result<String, String> {
+        let workdir = self.workdir_for(ctx)?;
+        std::fs::create_dir_all(&workdir)
+            .map_err(|e| format!("provider workdir {}: {e}", workdir.display()))?;
+
+        let Some((session, store)) = self.session_store(ctx)? else {
+            // no session plumbing for this run: one cold invocation.
+            return Ok(self.invoke(prompt, &self.spec.args, &workdir).await?.text);
+        };
+
+        if let Some(session_id) = store.load() {
+            let argv = session::resume_argv(&self.spec.args, &session.resume, &session_id);
+            match self.invoke(prompt, &argv, &workdir).await {
+                Ok(run) => {
+                    // re-capture on success: a CLI that rotates ids on
+                    // resume stays resumable next time.
+                    store.store_captured(&session.capture, &run.stdout);
+                    return Ok(run.text);
+                }
+                Err(e) => {
+                    // a stale/expired session must degrade to a cold start,
+                    // never break the agent: forget it and retry ONCE below.
+                    // (if the failure was not the session's fault, the cold
+                    // retry fails the same way and that error is reported.)
+                    eprintln!(
+                        "[capability-host] {}: resumed session {session_id} failed ({e}); \
+                         retrying cold",
+                        self.spec.tag
+                    );
+                    store.forget();
+                }
+            }
         }
+        let run = self.invoke(prompt, &self.spec.args, &workdir).await?;
+        store.store_captured(&session.capture, &run.stdout);
+        Ok(run.text)
     }
 }
 
@@ -367,7 +526,19 @@ fn excerpt(s: &str) -> String {
 /// absent capability), else the first executable `detect.bin` on `PATH`.
 /// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` overrides every spec's timeout at once.
 /// what discovery finds is exactly what the node announces.
+///
+/// this arity wires NO agent roots: persistent workspaces and sessions stay
+/// off (beyond env overrides) — the embedder-with-no-data-dir default. node
+/// binaries call [`discover_with_dirs`] with their data dir instead.
 pub fn discover() -> Result<ProviderSet, String> {
+    discover_with_dirs(AgentDirs::default())
+}
+
+/// [`discover`] with host-wired per-agent roots (see [`AgentDirs`]) — the
+/// binaries pass `AgentDirs::under(<data dir>)`. `DUCKTAPE_AGENT_WORKSPACES`
+/// and `DUCKTAPE_AGENT_SESSIONS` override the wired roots, following the
+/// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` precedent.
+pub fn discover_with_dirs(dirs: AgentDirs) -> Result<ProviderSet, String> {
     let specs = SpecSet::load(operator_spec_dir().as_deref())?;
     let timeout = std::env::var("DUCKTAPE_PROVIDER_TIMEOUT_SECS")
         .ok()
@@ -378,6 +549,7 @@ pub fn discover() -> Result<ProviderSet, String> {
         std::env::var_os("PATH"),
         &|k| std::env::var_os(k),
         timeout,
+        dirs.resolved(&|k| std::env::var_os(k)),
     ))
 }
 
@@ -406,6 +578,7 @@ fn discover_with(
     path: Option<OsString>,
     env: &dyn Fn(&str) -> Option<OsString>,
     global_timeout: Option<Duration>,
+    dirs: AgentDirs,
 ) -> ProviderSet {
     let mut groups: BTreeMap<(&str, Option<&str>), Vec<&CapabilitySpec>> = BTreeMap::new();
     for spec in specs.iter() {
@@ -420,7 +593,8 @@ fn discover_with(
             continue;
         };
         for spec in group {
-            let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone());
+            let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone())
+                .with_agent_dirs(dirs.clone());
             if let Some(t) = global_timeout {
                 provider = provider.with_timeout(t);
             }
@@ -568,6 +742,7 @@ format = "{format}"
             Some(dir.clone().into_os_string()),
             &no_env,
             None,
+            AgentDirs::default(),
         );
         assert_eq!(set.capabilities(), vec!["alpha"], "only the installed one");
         assert!(set.find("alpha").is_some());
@@ -587,6 +762,7 @@ format = "{format}"
             Some(dir.into_os_string()),
             &no_env,
             None,
+            AgentDirs::default(),
         );
         assert_eq!(set.capabilities(), vec!["alpha", "beta"], "sorted tag list");
     }
@@ -616,7 +792,13 @@ format = "text"
         let real = fake_cli(&dir, "my-alpha", "exit 0");
         let real_os = real.into_os_string();
         let env = move |k: &str| (k == "MOCK_ALPHA_BIN").then(|| real_os.clone());
-        let set = discover_with(SpecSet::from_specs(vec![spec.clone()]), None, &env, None);
+        let set = discover_with(
+            SpecSet::from_specs(vec![spec.clone()]),
+            None,
+            &env,
+            None,
+            AgentDirs::default(),
+        );
         assert_eq!(set.capabilities(), vec!["alpha"]);
 
         // ... and a dangling override is absent, not a silent PATH fallback.
@@ -628,6 +810,7 @@ format = "text"
             Some(dir.into_os_string()),
             &env,
             None,
+            AgentDirs::default(),
         );
         assert!(
             set.find("alpha").is_none(),
@@ -677,6 +860,7 @@ format = "text"
             None,
             &env,
             None,
+            AgentDirs::default(),
         );
         assert_eq!(
             set.capabilities(),
@@ -698,6 +882,7 @@ format = "text"
             Some(dir.into_os_string()),
             &no_env,
             None,
+            AgentDirs::default(),
         );
         assert!(set.find("alpha").is_none(), "mode 644 is not executable");
     }
@@ -724,7 +909,13 @@ format = "text"
         )
         .unwrap();
         let specs = SpecSet::from_specs(vec![custom]);
-        let set = discover_with(specs, Some(dir.into_os_string()), &no_env, None);
+        let set = discover_with(
+            specs,
+            Some(dir.into_os_string()),
+            &no_env,
+            None,
+            AgentDirs::default(),
+        );
         assert_eq!(set.capabilities(), vec!["myllm"]);
     }
 
@@ -742,6 +933,7 @@ format = "text"
             Some(dir.into_os_string()),
             &no_env,
             None,
+            AgentDirs::default(),
         );
 
         // an installed capability resolves to its provider.
@@ -778,7 +970,7 @@ echo "not json"
 printf '{"type":"item.completed","item":{"type":"agent_message","text":"echo: %s"}}\n' "$prompt""#,
         );
         let p = mock_provider("events", "jsonl-events", bin, "jsonl-run-wd");
-        let text = p.run("ping").await.unwrap();
+        let text = p.run("ping", &RunContext::default()).await.unwrap();
         assert_eq!(text, "echo: ping", "prompt fed on stdin, text parsed back");
     }
 
@@ -793,7 +985,7 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"first"}}
 printf '{"type":"item.completed","item":{"item_type":"agent_message","text":"second"}}\n'"#,
         );
         let p = mock_provider("events", "jsonl-events", bin, "jsonl-last-wd");
-        assert_eq!(p.run("x").await.unwrap(), "second");
+        assert_eq!(p.run("x", &RunContext::default()).await.unwrap(), "second");
     }
 
     #[tokio::test]
@@ -806,7 +998,7 @@ printf '{"type":"item.completed","item":{"item_type":"agent_message","text":"sec
 printf '{"type":"result","subtype":"success","is_error":false,"result":"pong"}\n'"#,
         );
         let p = mock_provider("result", "json-result", bin, "result-run-wd");
-        assert_eq!(p.run("ping").await.unwrap(), "pong");
+        assert_eq!(p.run("ping", &RunContext::default()).await.unwrap(), "pong");
     }
 
     #[tokio::test]
@@ -819,7 +1011,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"pong"}\n
 printf '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"boom"}\n'"#,
         );
         let p = mock_provider("result", "json-result", bin, "result-err-wd");
-        let err = p.run("ping").await.unwrap_err();
+        let err = p.run("ping", &RunContext::default()).await.unwrap_err();
         assert!(err.contains("error result"), "got: {err}");
     }
 
@@ -828,12 +1020,12 @@ printf '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"b
         let dir = scratch("text-run");
         let bin = fake_cli(&dir, "plain", "cat > /dev/null\necho '  the answer  '");
         let p = mock_provider("plain", "text", bin, "text-run-wd");
-        assert_eq!(p.run("q").await.unwrap(), "the answer");
+        assert_eq!(p.run("q", &RunContext::default()).await.unwrap(), "the answer");
 
         // "ran fine, said nothing" is a broken executor, not an answer.
         let silent = fake_cli(&dir, "silent", "cat > /dev/null");
         let p = mock_provider("silent", "text", silent, "text-silent-wd");
-        let err = p.run("q").await.unwrap_err();
+        let err = p.run("q", &RunContext::default()).await.unwrap_err();
         assert!(err.contains("no output"), "got: {err}");
     }
 
@@ -867,7 +1059,7 @@ echo "arg=$1""#,
         // run via sh_provider: the script becomes $0 and the spec's
         // untouched args follow, so "{model}" still arrives as $1.
         let p = sh_provider(spec, bin, "arg-verbatim-wd");
-        assert_eq!(p.run("q").await.unwrap(), "arg={model}", "argv is literal");
+        assert_eq!(p.run("q", &RunContext::default()).await.unwrap(), "arg={model}", "argv is literal");
     }
 
     #[tokio::test]
@@ -875,7 +1067,7 @@ echo "arg=$1""#,
         let dir = scratch("cli-fail");
         let bin = fake_cli(&dir, "flaky", "cat > /dev/null\necho 'auth missing' >&2\nexit 3");
         let p = mock_provider("flaky", "text", bin, "cli-fail-wd");
-        let err = p.run("x").await.unwrap_err();
+        let err = p.run("x", &RunContext::default()).await.unwrap_err();
         assert!(err.contains("auth missing"), "stderr in error: {err}");
         assert!(err.contains("exited with"), "status in error: {err}");
     }
@@ -890,7 +1082,7 @@ echo "arg=$1""#,
 printf '{"type":"turn.completed"}\n'"#,
         );
         let p = mock_provider("events", "jsonl-events", bin, "no-message-wd");
-        let err = p.run("x").await.unwrap_err();
+        let err = p.run("x", &RunContext::default()).await.unwrap_err();
         assert!(err.contains("no agent message"), "got: {err}");
     }
 
@@ -900,7 +1092,7 @@ printf '{"type":"turn.completed"}\n'"#,
         let bin = fake_cli(&dir, "sleeper", "sleep 30");
         let p = mock_provider("sleeper", "text", bin, "hang-wd")
             .with_timeout(Duration::from_millis(200));
-        let err = p.run("x").await.unwrap_err();
+        let err = p.run("x", &RunContext::default()).await.unwrap_err();
         assert!(err.contains("timed out"), "got: {err}");
     }
 
@@ -918,7 +1110,7 @@ cat > /dev/null"#,
         let p = mock_provider("events", "jsonl-events", bin, "big-prompt-wd")
             .with_timeout(Duration::from_secs(10));
         let big = "x".repeat(256 * 1024);
-        assert_eq!(p.run(&big).await.unwrap(), "ok");
+        assert_eq!(p.run(&big, &RunContext::default()).await.unwrap(), "ok");
     }
 
     #[test]
@@ -950,7 +1142,269 @@ format = "text"
             Some(dir.into_os_string()),
             &no_env,
             Some(Duration::from_secs(7)),
+            AgentDirs::default(),
         );
         assert_eq!(set.capabilities(), vec!["slowpoke"], "override plumbed without error");
+    }
+
+    // ---- workspaces and sessions ----------------------------------------------
+
+    fn agent_ctx(agent: &str, thread: &str) -> RunContext {
+        RunContext {
+            agent_id: Some(agent.into()),
+            thread_key: Some(thread.into()),
+        }
+    }
+
+    /// a persistent-workspace spec around an arbitrary mock CLI; args stay
+    /// empty so sh_provider's script-prepend keeps working.
+    fn persistent_spec(tag: &str) -> CapabilitySpec {
+        CapabilitySpec::parse(
+            &format!(
+                r#"
+spec = 1
+[capability]
+tag = "{tag}"
+[detect]
+bin = "{tag}"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+[workspace]
+mode = "persistent"
+"#
+            ),
+            "test",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn persistent_workspaces_pin_the_cwd_per_agent_and_default_to_scratch() {
+        let dir = scratch("workspace-cwd");
+        // the fake prints its own cwd — the observable workdir selection.
+        let bin = fake_cli(&dir, "wd", "cat > /dev/null\npwd");
+        let root = scratch("workspace-cwd-root");
+        let p = sh_provider(persistent_spec("wd"), bin, "workspace-cwd-scratch")
+            .with_agent_dirs(AgentDirs {
+                workspaces_root: Some(root.clone()),
+                sessions_root: None,
+            });
+
+        // an agent-carrying run lands in <root>/<agent_id>, created on demand.
+        let cwd = p.run("q", &agent_ctx("bot", "t#1")).await.unwrap();
+        let expected = root.join("bot");
+        assert!(expected.is_dir(), "the workspace dir is created on demand");
+        assert_eq!(
+            PathBuf::from(&cwd),
+            expected.canonicalize().unwrap(),
+            "the child ran in the agent's persistent workspace"
+        );
+
+        // a second agent gets its own dir; a context-less (legacy) run stays
+        // in the scratch dir even though the spec says persistent.
+        let other = p.run("q", &agent_ctx("other", "t#1")).await.unwrap();
+        assert_eq!(PathBuf::from(other), root.join("other").canonicalize().unwrap());
+        let legacy = p.run("q", &RunContext::default()).await.unwrap();
+        assert_eq!(
+            PathBuf::from(legacy),
+            scratch("workspace-cwd-scratch").canonicalize().unwrap(),
+            "no agent id = the scratch fence, unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_ids_with_separators_or_traversal_fail_the_run() {
+        let dir = scratch("workspace-defense");
+        let bin = fake_cli(&dir, "wd", "cat > /dev/null\npwd");
+        let root = scratch("workspace-defense-root");
+        let p = sh_provider(persistent_spec("wd"), bin, "workspace-defense-scratch")
+            .with_agent_dirs(AgentDirs {
+                workspaces_root: Some(root),
+                sessions_root: None,
+            });
+        for bad in ["../escape", "a/b", ".."] {
+            let err = p.run("q", &agent_ctx(bad, "t#1")).await.unwrap_err();
+            assert!(
+                err.contains("path") || err.contains("component"),
+                "agent id {bad:?} must fail the run by name, got {err:?}"
+            );
+        }
+    }
+
+    /// a session-enabled mock spec: jsonl output, append-style resume. args
+    /// stay empty for sh_provider, so the resume argv is
+    /// `[script, "--resume", <id>]` and the script branches on `$1`.
+    fn session_spec(tag: &str) -> CapabilitySpec {
+        CapabilitySpec::parse(
+            &format!(
+                r#"
+spec = 1
+[capability]
+tag = "{tag}"
+[detect]
+bin = "{tag}"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "jsonl-events"
+[session]
+capture = "jsonl-events"
+resume_args_append = ["--resume", "{{session_id}}"]
+"#
+            ),
+            "test",
+        )
+        .unwrap()
+    }
+
+    /// the one session file under `<root>/<agent>` — asserts exactly one slot.
+    fn sole_session_id(root: &Path, agent: &str) -> Option<String> {
+        let dir = root.join(agent);
+        if !dir.is_dir() {
+            return None;
+        }
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(files.len() <= 1, "one thread key = one session slot");
+        let file = files.pop()?;
+        Some(std::fs::read_to_string(file).unwrap().trim().to_string())
+    }
+
+    #[tokio::test]
+    async fn sessions_capture_then_resume_with_the_stored_id() {
+        let dir = scratch("session-flow");
+        let bin = fake_cli(
+            &dir,
+            "sess",
+            r#"cat > /dev/null
+if [ "$1" = "--resume" ]; then
+  printf '{"type":"item.completed","item":{"type":"agent_message","text":"resumed:%s"}}\n' "$2"
+else
+  printf '{"type":"thread.started","thread_id":"sid-1"}\n'
+  printf '{"type":"item.completed","item":{"type":"agent_message","text":"cold"}}\n'
+fi"#,
+        );
+        let sessions = scratch("session-flow-store");
+        let p = sh_provider(session_spec("sess"), bin, "session-flow-wd").with_agent_dirs(
+            AgentDirs {
+                workspaces_root: None,
+                sessions_root: Some(sessions.clone()),
+            },
+        );
+
+        // cold first run: answers cold, captures and stores the id.
+        let ctx = agent_ctx("bot", "general#7");
+        assert_eq!(p.run("q", &ctx).await.unwrap(), "cold");
+        assert_eq!(sole_session_id(&sessions, "bot").as_deref(), Some("sid-1"));
+
+        // second run of the SAME thread resumes with the substituted id.
+        assert_eq!(p.run("q", &ctx).await.unwrap(), "resumed:sid-1");
+
+        // a different thread key starts cold — its own slot.
+        assert_eq!(p.run("q", &agent_ctx("bot", "general#8")).await.unwrap(), "cold");
+
+        // a context-less legacy run has no session identity: cold, no store
+        // beyond the two thread slots.
+        assert_eq!(p.run("q", &RunContext::default()).await.unwrap(), "cold");
+    }
+
+    #[tokio::test]
+    async fn a_stale_session_degrades_to_one_cold_retry_and_reprimes() {
+        let dir = scratch("session-stale");
+        // resume attempts leave a marker in the cwd and FAIL; cold runs
+        // succeed and mint a fresh id — the expired-session shape.
+        let bin = fake_cli(
+            &dir,
+            "sess",
+            r#"cat > /dev/null
+if [ "$1" = "--resume" ]; then
+  echo "$2" >> resume-attempts
+  echo "session expired" >&2
+  exit 3
+fi
+printf '{"type":"thread.started","thread_id":"sid-fresh"}\n'
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"cold-answer"}}\n'"#,
+        );
+        let sessions = scratch("session-stale-store");
+        let wd = scratch("session-stale-wd");
+        let p = sh_provider(session_spec("sess"), bin, "session-stale-wd").with_agent_dirs(
+            AgentDirs {
+                workspaces_root: None,
+                sessions_root: Some(sessions.clone()),
+            },
+        );
+
+        // seed a stale id directly — the state a dead executor session leaves.
+        let ctx = agent_ctx("bot", "general#7");
+        std::fs::create_dir_all(sessions.join("bot")).unwrap();
+        session::SessionStore::new(&sessions, "bot", "general#7")
+            .store_captured(&SessionCapture::JsonlEvents, "{\"session_id\":\"sid-stale\"}");
+        assert_eq!(sole_session_id(&sessions, "bot").as_deref(), Some("sid-stale"));
+
+        // the run still answers (cold retry), and the slot re-primes with
+        // the fresh id the retry captured.
+        assert_eq!(p.run("q", &ctx).await.unwrap(), "cold-answer");
+        let attempts = std::fs::read_to_string(wd.join("resume-attempts")).unwrap();
+        assert_eq!(attempts, "sid-stale\n", "exactly ONE resume attempt, with the stale id");
+        assert_eq!(sole_session_id(&sessions, "bot").as_deref(), Some("sid-fresh"));
+    }
+
+    #[tokio::test]
+    async fn a_run_without_a_captured_id_stores_nothing() {
+        let dir = scratch("session-nocapture");
+        let bin = fake_cli(
+            &dir,
+            "sess",
+            r#"cat > /dev/null
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\n'"#,
+        );
+        let sessions = scratch("session-nocapture-store");
+        let p = sh_provider(session_spec("sess"), bin, "session-nocapture-wd").with_agent_dirs(
+            AgentDirs {
+                workspaces_root: None,
+                sessions_root: Some(sessions.clone()),
+            },
+        );
+        assert_eq!(p.run("q", &agent_ctx("bot", "k")).await.unwrap(), "fine");
+        assert_eq!(
+            sole_session_id(&sessions, "bot"),
+            None,
+            "no id in the output = no store, and the answer is unaffected"
+        );
+    }
+
+    #[test]
+    fn agent_dir_env_overrides_win_over_wired_roots() {
+        let wired = AgentDirs::under(Path::new("/data"));
+        assert_eq!(
+            wired.workspaces_root.as_deref(),
+            Some(Path::new("/data/agent-workspaces"))
+        );
+        assert_eq!(
+            wired.sessions_root.as_deref(),
+            Some(Path::new("/data/agent-sessions"))
+        );
+
+        // injected env, no process-state mutation (the discover_with rule).
+        let env = |k: &str| {
+            (k == "DUCKTAPE_AGENT_WORKSPACES").then(|| OsString::from("/elsewhere/ws"))
+        };
+        let resolved = wired.resolved(&env);
+        assert_eq!(
+            resolved.workspaces_root.as_deref(),
+            Some(Path::new("/elsewhere/ws")),
+            "the env override wins"
+        );
+        assert_eq!(
+            resolved.sessions_root.as_deref(),
+            Some(Path::new("/data/agent-sessions")),
+            "an unset override leaves the wired root"
+        );
     }
 }
