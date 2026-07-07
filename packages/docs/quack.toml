@@ -31,13 +31,13 @@ hash = "sha256:3402716938239813b336ad21b312832dc0c86ce8645da90e94d075fc39b7cca3"
 tag = "pages.comment.add"
 owner = "docs-harness"
 schema = "actions/pages.comment.add.schema.json"
-schema_hash = "sha256:214faa630ea4074d630b97818255a69565b4f76bd0924adca9724511fef80614"
+schema_hash = "sha256:eb2c88fcbd92994bcbad06e5f069e7aeab17b80e587c873769f9001df97e0886"
 
 [[actions]]
 tag = "pages.block.update_text"
 owner = "docs-harness"
 schema = "actions/pages.block.update_text.schema.json"
-schema_hash = "sha256:4bcb4bb285e3de579242392f7b0385e648eae00bd0f0552094dc5583b81eee02"
+schema_hash = "sha256:97aa79d2826f5ba656ae15cdcbe6ffc8d63fb62da0046e62bdca195fa5e31a67"
 
 [[actions]]
 tag = "pages.thread.resolve"

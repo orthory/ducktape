@@ -16,7 +16,8 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 4096,
-      "description": "The comment body."
+      "description": "The comment body.",
+      "$comment": "maxLength counts Unicode code points (JSON Schema semantics); the docs-harness module enforces MAX_COMMENT_TEXT_BYTES (4096 UTF-8 bytes) instead. Multi-byte text can pass this schema check and still be rejected by the module — the module is the stricter, authoritative bound, and that rejection is a clean probe reject, not a bug."
     }
   },
   "required": ["target", "text"],

@@ -294,6 +294,20 @@ impl DocsHarness {
 
     /// land one error row (bounded, oldest evicted) + its breadcrumb — the
     /// committed half of "mutate nothing, record failure".
+    ///
+    /// STRICT-DECODER VS STAGEABLE-STATE INVARIANT: `tag` is stored VERBATIM
+    /// here, un-revalidated at this module's boundary — an empty tag is
+    /// representable in the `PackageActionMsg::Apply` wire shape (e.g. the
+    /// `other => Err(...)` "does not own action tag" arm in
+    /// `validate_action` would happily format one into a `FailureRow`) and
+    /// would fail `Store::decode`'s stricter reject-empty-tag check
+    /// (state.rs) on a snapshot round-trip. that state is never actually
+    /// staged in a live network: `runs` validates every oracle-supplied
+    /// action tag's shape (rejecting empty/malformed ones) before it is ever
+    /// allowed to become an Apply this arm could see (crates/apps/runs/src/
+    /// lib.rs, the open-action pipeline) — so this arm is composition-safe
+    /// by upstream validation, not because it independently enforces what
+    /// the decoder later demands.
     fn record_failure(&mut self, ctx: &mut dyn Ctx, action_id: &str, tag: &str, reason: String) {
         self.breadcrumb(ctx, format!("action {action_id} ({tag}) dropped: {reason}"));
         let failures = &mut self.store_mut().failures;

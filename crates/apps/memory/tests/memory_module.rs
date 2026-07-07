@@ -1668,7 +1668,7 @@ fn root_changes_only_after_commit_and_abort_leaves_no_trace() {
 }
 
 #[test]
-fn same_block_reads_serve_staged_over_committed_external_reads_committed_only() {
+fn query_with_serves_staged_over_committed_while_the_bare_query_primitive_stays_committed_only() {
     block_on(async {
         let mut module = Memory::new(MEMORY, FILES);
 
@@ -1685,12 +1685,18 @@ fn same_block_reads_serve_staged_over_committed_external_reads_committed_only() 
             .await
             .unwrap();
 
-        // external reads (Module::query) stay committed-only.
+        // `Module::query` (exercised here via `stat_of`, which calls it
+        // directly on the bare module) is the committed-only read primitive.
+        // NO host lane calls it: the host always routes both an external
+        // read and a same-block host-routed read through `query_with` below
+        // — this assertion covers the primitive itself, not a lane the host
+        // actually uses.
         assert_eq!(stat_of(&module, "/doc").await.unwrap().latest_generation, 1);
 
-        // host-routed same-block reads (Module::query_with) see the staged
-        // publish — what lets a same-block follow-up consumer (e.g. a package
-        // harness pinning its just-seeded prompt) observe the real generation.
+        // `Module::query_with` is what the host always calls. same-block
+        // host-routed reads see the staged publish — what lets a same-block
+        // follow-up consumer (e.g. a package harness pinning its
+        // just-seeded prompt) observe the real generation.
         let staged = module
             .query_with(
                 &TestCtx::at(2),

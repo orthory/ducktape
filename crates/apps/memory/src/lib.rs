@@ -44,11 +44,14 @@
 //!
 //! ## read visibility
 //!
-//! external queries serve COMMITTED state only. host-routed reads — another
-//! module's `Ctx::query` during a block — serve STAGED-over-committed state
+//! external queries observe COMMITTED state only. host-routed reads — another
+//! module's `Ctx::query` during a block — observe STAGED-over-committed state
 //! (the pages convention), so a same-block follow-up consumer observes the
 //! publishes that preceded it in the block; outside a block the two views are
-//! identical (no staged overlay exists).
+//! identical (no staged overlay exists). the host routes BOTH kinds of read
+//! through [`Module::query_with`] (see its doc comment) — [`Module::query`]
+//! is a committed-only primitive no host lane calls directly, kept for a
+//! caller holding a bare `&Memory` outside any host.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -806,18 +809,27 @@ impl Module for Memory {
         }
     }
 
-    /// external reads serve COMMITTED state only.
+    /// the COMMITTED-only read primitive. NO host lane calls this directly —
+    /// the host always routes reads through [`Module::query_with`] below,
+    /// both for a genuinely external read (`Host::query`, outside any block)
+    /// and for a same-block host-routed read (a sibling module's
+    /// `Ctx::query` during dispatch). `query_with` does not even delegate to
+    /// this method (each answers `Self::answer` against its own view) — this
+    /// is production-dead as a distinct code path, kept as the committed-lane
+    /// primitive for a caller holding a bare `&Memory` outside any host
+    /// (tests, tooling).
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         Self::answer(&self.committed, req)
     }
 
-    /// host-routed reads (a sibling module's `Ctx::query` during dispatch)
-    /// serve STAGED-over-committed state — the pages convention — so a
-    /// same-block follow-up consumer can observe the very publishes that
-    /// preceded it in the block (e.g. a package harness pinning the prompt
-    /// generation its install seeds landed on). outside a block the staged
-    /// overlay does not exist, so external reads through this lane are
-    /// byte-identical to [`Module::query`].
+    /// the read lane every host caller actually goes through: STAGED-over-
+    /// committed state — the pages convention — so a same-block follow-up
+    /// consumer can observe the very publishes that preceded it in the block
+    /// (e.g. a package harness pinning the prompt generation its install
+    /// seeds landed on). outside a block the staged overlay does not exist
+    /// (`store()` falls back to committed), so a genuinely external read
+    /// answers identically to [`Module::query`] above — it just never
+    /// reaches it: the host calls this method either way.
     async fn query_with(&self, _ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
         Self::answer(self.store(), req)
     }

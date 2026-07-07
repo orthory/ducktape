@@ -194,6 +194,22 @@ impl Store {
             let action_id = read_string(bytes, &mut off)?;
             let tag = read_string(bytes, &mut off)?;
             let reason = read_string(bytes, &mut off)?;
+            // STRICT-DECODER VS STAGEABLE-STATE INVARIANT: this rejects an
+            // empty `tag`, but `record_failure` (actions.rs) stages whatever
+            // tag a `PackageActionMsg::Apply` carries, un-revalidated at THIS
+            // module's boundary — an empty tag IS representable in the wire
+            // shape and would fail this exact check on a snapshot round-trip.
+            // that state is never actually reached in a live network: `runs`
+            // calls `validate_tag` (rejecting empty/malformed tags) on every
+            // oracle-supplied action tag BEFORE it is ever allowed to become
+            // an Apply (crates/apps/runs/src/lib.rs, the open-action
+            // pipeline), and `package`'s install-time validation guarantees
+            // every ROUTED tag an agent can be granted is non-empty too — so
+            // composition-safety here rests on runs/package validating
+            // upstream, not on this decoder matching everything the arm
+            // could theoretically stage. `reason` is never empty either
+            // (every `record_failure` caller passes a non-empty formatted
+            // message), so only `tag` carries this discrepancy.
             if tag.is_empty() || reason.is_empty() {
                 return Err(Error::Module("snapshot failure row is invalid".into()));
             }

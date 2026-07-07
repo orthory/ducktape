@@ -315,6 +315,33 @@ mod tests {
     }
 
     #[test]
+    fn install_fails_when_the_seeded_prompt_is_not_staged_in_memory() {
+        // a Stat miss means the seed publish never preceded this install arm
+        // in the block — a wiring bug the install must surface, not paper
+        // over with an assumed generation.
+        let mut m = module();
+        let mut ctx = TestCtx::at(package_origin());
+        ctx.memory_stat_missing = true;
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            encode_harness_msg(&HarnessMsg::InstallPackage {
+                package: PKG.into(),
+                spec: spec(),
+            }),
+        )
+        .expect_err("install must fail when the prompt seed never landed in memory");
+        assert!(
+            err.to_string().contains("prompt seed is not staged in memory"),
+            "{err}"
+        );
+        // nothing installs: a retried install (once the wiring bug is fixed)
+        // must not find a half-installed package blocking it.
+        commit(&mut m);
+        assert_eq!(m.committed.installed, None, "no state landed");
+    }
+
+    #[test]
     fn install_rejects_an_engagement_source_that_is_not_the_wired_pages_module() {
         let mut m = module();
         let mut bad = spec();

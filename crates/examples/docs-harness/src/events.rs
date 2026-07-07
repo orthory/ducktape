@@ -191,6 +191,44 @@ mod tests {
     }
 
     #[test]
+    fn mention_matching_is_a_case_sensitive_byte_substring() {
+        // the policy is `text.contains(&format!("@{agent_id}"))` — a plain
+        // byte substring check, with NO word-boundary and NO case folding.
+        // pin both discriminating cases in one test.
+        let mut m = module();
+        installed(&mut m);
+
+        // "x@docs.editorial" contains the exact bytes "@docs.editor" as a
+        // substring (just not word-bounded) — the policy mints on it anyway.
+        let mut hit = TestCtx::at(Origin::Module("pages".into()));
+        exec(
+            &mut m,
+            &mut hit,
+            comment_event("c-substr", "x@docs.editorial, thanks"),
+        )
+        .unwrap();
+        assert_eq!(
+            hit.emitted.len(),
+            1,
+            "a superstring match still mints (no word-boundary check)"
+        );
+
+        // "@DOCS.EDITOR" differs from "@docs.editor" only in case — a
+        // case-sensitive byte match must NOT mint on it.
+        let mut miss = TestCtx::at(Origin::Module("pages".into()));
+        exec(
+            &mut m,
+            &mut miss,
+            comment_event("c-case", "@DOCS.EDITOR please"),
+        )
+        .unwrap();
+        assert!(
+            miss.emitted.is_empty(),
+            "a differently-cased mention must not mint"
+        );
+    }
+
+    #[test]
     fn a_near_cap_comment_mints_one_bounded_job_and_never_aborts() {
         let mut m = module();
         installed(&mut m);

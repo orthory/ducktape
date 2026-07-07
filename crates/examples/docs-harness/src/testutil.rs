@@ -39,6 +39,9 @@ pub(crate) struct TestCtx {
     /// the latest generation the canned memory Stat reports for any
     /// prompt path (what the staged seed publish landed on).
     pub(crate) prompt_generation: u64,
+    /// force the canned memory Stat to report a miss (`Stat(None)`) — the
+    /// install arm's "the seed never preceded us" branch.
+    pub(crate) memory_stat_missing: bool,
     /// a comment id squatted in pages (GetComment answers Some for it).
     pub(crate) squatted_comment: Option<String>,
 }
@@ -57,6 +60,7 @@ impl TestCtx {
             events: Vec::new(),
             job_taken: false,
             prompt_generation: 1,
+            memory_stat_missing: false,
             squatted_comment: None,
         }
     }
@@ -166,15 +170,17 @@ impl Ctx for TestCtx {
             }
             "memory" => {
                 let reply = match memory::decode_query(req).map_err(Error::Module)? {
-                    MemoryQuery::Stat { path } => MemoryReply::Stat(Some(memory::FileStat {
-                        path,
-                        latest_generation: self.prompt_generation,
-                        generations: 1,
-                        latest_meta: memory::Meta::new(),
-                        latest_author: "package".into(),
-                        latest_published_at_height: 1,
-                        body_len: 0,
-                    })),
+                    MemoryQuery::Stat { path } => {
+                        MemoryReply::Stat((!self.memory_stat_missing).then(|| memory::FileStat {
+                            path,
+                            latest_generation: self.prompt_generation,
+                            generations: 1,
+                            latest_meta: memory::Meta::new(),
+                            latest_author: "package".into(),
+                            latest_published_at_height: 1,
+                            body_len: 0,
+                        }))
+                    }
                     other => return Err(Error::Module(format!("unexpected query: {other:?}"))),
                 };
                 Ok(memory::encode_reply(&reply))

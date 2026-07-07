@@ -143,6 +143,19 @@ fn test_rejects_a_tampered_package_before_running_any_step() {
         !out.status.success(),
         "test must fail on a tampered package"
     );
+    // the digest check runs BEFORE the golden replay: the failure must name
+    // the tampered file, and stdout must show no step (not even the
+    // "digests  ok" preamble) ever ran.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("DigestMismatch") && stderr.contains("prompts/docs-editor.md"),
+        "the error must name the digest/tamper failure, got stderr:\n{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.is_empty(),
+        "no step (or the verification preamble) may have run, got stdout:\n{stdout}"
+    );
 }
 
 #[test]
