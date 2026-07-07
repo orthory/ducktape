@@ -402,13 +402,11 @@ fn solo_validator_duckfs_bytes_survive_crash() {
 
     // (2) a file whose bytes are STAGED as a chunk object via putblob and then
     // referenced by digest in a `Content::Chunks` commit — the odb-object byte
-    // path (a full CHUNK_SIZE multi-chunk file cannot ride the op path: the first
-    // chunk would be 1 MiB, over the p2p MAX_MESSAGE_SIZE op cap, so the true
-    // multi-CHUNK graph stays covered by the in-process resolver test). same-
-    // origin submits finalize in seq order, so the putblob is durable before the
-    // commit that references it executes. (128 KiB: a real, multi-page odb object,
-    // kept well under the p2p MAX_MESSAGE_SIZE op cap — the op expands ~3.5x on the
-    // transport, so ~290 KiB is the practical per-op content ceiling.)
+    // path. 128 KiB is a real, multi-page odb object that keeps THIS test about
+    // restart recovery, not payload size; the full-CHUNK_SIZE multi-chunk graph
+    // over the op path is large_file_e2e's job (#215: the binary frame codec
+    // carries a 1 MiB chunk whole). same-origin submits finalize in seq order,
+    // so the putblob is durable before the commit that references it executes.
     let chunk = pattern(128 * 1024);
     let chunk_size = chunk.len() as u64;
     cluster.submit(0, "files", &encode_putblob(&chunk));

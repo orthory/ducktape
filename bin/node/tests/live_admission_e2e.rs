@@ -195,12 +195,11 @@ fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
     });
 
     // (2) a file whose bytes are STAGED as a chunk object via putblob and
-    // referenced by digest in a Chunks commit — the odb-object path (a full
-    // CHUNK_SIZE multi-chunk file's first chunk would be 1 MiB, over the p2p
-    // MAX_MESSAGE_SIZE op cap, so the >1-CHUNK graph stays covered in-process by
-    // duckfs_resolver). same-origin submits finalize in seq order. (128 KiB is a
-    // real, multi-page odb object under the p2p MAX_MESSAGE_SIZE op cap — the op
-    // expands ~3.5x on the transport, so ~290 KiB is the practical per-op ceiling.)
+    // referenced by digest in a Chunks commit — the odb-object path. 128 KiB is
+    // a real, multi-page odb object that keeps THIS test about admission, not
+    // payload size; the full-CHUNK_SIZE multi-chunk graph over the op path is
+    // large_file_e2e's job (#215: the binary frame codec carries a 1 MiB chunk
+    // whole). same-origin submits finalize in seq order.
     let chunk = df_pattern(128 * 1024);
     let chunk_size = chunk.len() as u64;
     cluster.submit(0, "files", &encode_putblob(&chunk));

@@ -61,6 +61,18 @@ pub const MAX_PAGE: u64 = 256;
 /// ids"). one batch is a page of ids, so it mirrors [`MAX_PAGE`]; the fetch loop
 /// pages through larger missing sets a batch at a time.
 pub const MAX_SYNC_IDS: usize = MAX_PAGE as usize;
+/// ceiling on one encoded `GetObjects` reply (1.5 MiB). a batch may name up to
+/// [`MAX_SYNC_IDS`] objects, and each can be a full [`CHUNK_SIZE`] chunk that
+/// base64 inflates ~4/3x — unbudgeted, one reply could reach ~350 MiB, far past
+/// the p2p message cap the reply must ride under (which the sender ASSERTS on).
+/// `serve_sync` stops filling a reply at this budget and marks the remainder
+/// absent; the possession driver's missing-walk re-requests them next round, so
+/// a truncated page is progress, never an error. sized so the LARGEST single
+/// object (one full chunk, ~1.4 MiB as base64 + envelope) always fits — the
+/// first present object is served unconditionally, keeping every round's
+/// `landed >= 1` invariant intact. bin/node compile-asserts this stays under
+/// its `MAX_MESSAGE_SIZE` with rpc-envelope headroom.
+pub const MAX_SYNC_REPLY_BYTES: usize = 3 << 19;
 pub const MAX_READ_BYTES: u64 = 1024 * 1024;
 pub const MAX_GREP_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_GREP_LINE_BYTES: usize = 256;

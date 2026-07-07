@@ -144,10 +144,17 @@ const NUDGE_INTERVAL: Duration = Duration::from_secs(2);
 /// post-reboot catch-up should close the reboot gap, not chase a live chain
 /// forever. any tiny lag left after this cap is handled by the normal engine.
 const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
-/// max wire message size we accept on a channel (1 MiB) — generous for the small
-/// json frames + BFT metadata, and the statesync chunk size (256 KiB) plus
-/// framing stays far below it.
-const MAX_MESSAGE_SIZE: u32 = 1 << 20;
+/// max wire message size we accept on a channel (2 MiB). the tallest honest
+/// messages are (a) an op frame carrying a full 1 MiB duckfs chunk — capped at
+/// `node::MAX_FRAME_BYTES` by the submit-boundary guard, then gossiped raw on
+/// the payload channel and served (plus a small rpc envelope) on the fetch and
+/// statesync lanes — and (b) a `GetObjects` sync reply page, capped at
+/// `files::MAX_SYNC_REPLY_BYTES` (base64 wraps each 1 MiB object ~4/3x). the
+/// asserts below pin both caps under this one, envelope headroom included:
+/// commonware's sender ASSERTS on this cap, so "over" is a panic, not an error.
+const MAX_MESSAGE_SIZE: u32 = 1 << 21;
+const _: () = assert!(MAX_MESSAGE_SIZE as usize >= node::MAX_FRAME_BYTES + 1024);
+const _: () = assert!(MAX_MESSAGE_SIZE as usize >= files::MAX_SYNC_REPLY_BYTES + 1024);
 /// inbound backlog before a channel applies receive backpressure.
 const MAX_BACKLOG: usize = 128;
 /// pump drain cadence: how often the pump applies finalized frames (and runs

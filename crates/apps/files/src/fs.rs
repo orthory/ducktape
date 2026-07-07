@@ -21,7 +21,7 @@ use crate::wire::{
     HISTORY_WINDOW, MAX_CHANGES_PER_COMMIT, MAX_CHUNKS_PER_FILE, MAX_GREP_SCAN_BYTES,
     MAX_INLINE_COMMIT_BYTES, MAX_MESSAGE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES,
     MAX_META_VALUE_BYTES, MAX_PIN_NAME_BYTES, MAX_PINS, MAX_STAGING_ENTRIES,
-    MAX_STAGING_ENTRIES_PER_OWNER, MAX_SYMLINK_TARGET_BYTES, MAX_SYNC_IDS,
+    MAX_STAGING_ENTRIES_PER_OWNER, MAX_SYMLINK_TARGET_BYTES, MAX_SYNC_IDS, MAX_SYNC_REPLY_BYTES,
     MAX_WATCH_MODULE_ID_BYTES, MAX_WATCHES, STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, SyncObject,
     from_hex_32, to_hex,
 };
@@ -620,27 +620,51 @@ impl<S: ObjectStore> Fs<S> {
                     return Err("files: too many ids".into());
                 }
                 let mut out = Vec::with_capacity(ids.len());
+                // the reply BYTE budget (see [`MAX_SYNC_REPLY_BYTES`]): a full
+                // batch of 1 MiB chunks would encode ~350 MiB, far over the p2p
+                // message cap the reply rides under (whose sender ASSERTS on
+                // size). once the budget is spent the rest of the batch comes
+                // back "absent" — the possession driver re-requests whatever is
+                // still missing next round, so a truncated page is progress,
+                // never a lie about possession. the FIRST present object is
+                // served unconditionally: every round then lands at least one
+                // object, keeping the driver's anti-livelock invariant
+                // ("landed == 0" means pruned) intact.
+                let mut spent = 0usize;
+                let mut served = 0usize;
                 for hex in &ids {
                     // one bad id rejects the batch — the same all-or-nothing
                     // strictness the object/refs codecs use, so a caller can never
                     // silently drop a mistyped id as a phantom "absent".
                     let id =
                         from_hex_32(hex).ok_or_else(|| "files: sync id is not hex".to_string())?;
+                    // re-render the id so the reply is canonical lowercase hex
+                    // regardless of how the request framed it.
+                    let absent = SyncObject {
+                        id: to_hex(&id),
+                        present: false,
+                        kind: 0,
+                        b64: String::new(),
+                    };
                     match self.store.get(&id)? {
-                        Some((kind, body)) => out.push(SyncObject {
-                            // re-render the id so the reply is canonical lowercase
-                            // hex regardless of how the request framed it.
-                            id: to_hex(&id),
-                            present: true,
-                            kind: kind.tag(),
-                            b64: STANDARD.encode(&body),
-                        }),
-                        None => out.push(SyncObject {
-                            id: to_hex(&id),
-                            present: false,
-                            kind: 0,
-                            b64: String::new(),
-                        }),
+                        Some((kind, body)) => {
+                            let b64 = STANDARD.encode(&body);
+                            // hex id + base64 body + the fixed json fields.
+                            let cost = 64 + b64.len() + 48;
+                            if served > 0 && spent + cost > MAX_SYNC_REPLY_BYTES {
+                                out.push(absent);
+                                continue;
+                            }
+                            spent += cost;
+                            served += 1;
+                            out.push(SyncObject {
+                                id: to_hex(&id),
+                                present: true,
+                                kind: kind.tag(),
+                                b64,
+                            });
+                        }
+                        None => out.push(absent),
                     }
                 }
                 Ok(FilesSyncResp::Objects(out))

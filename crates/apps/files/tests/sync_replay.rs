@@ -248,10 +248,14 @@ fn two_nodes_sync_to_full_possession() {
                 )
             })
             .collect();
-        assert_eq!(
-            batch.len(),
-            missing.len(),
-            "source serves every requested object from its committed odb"
+        // the source holds every requested object, but a reply is BYTE-BUDGETED
+        // (MAX_SYNC_REPLY_BYTES): full 1 MiB chunks page across rounds, so the
+        // contract is progress-per-round — at least one object always lands and
+        // the truncated tail is re-requested by the next missing walk — never
+        // all-in-one-message (which the p2p cap could not carry).
+        assert!(
+            !batch.is_empty(),
+            "every round serves at least one object (progress, no livelock)"
         );
         target.ingest_objects(&batch).expect("ingest batch");
     }
@@ -368,6 +372,69 @@ fn serve_sync_rejects_oversized_request() {
     let ids = vec!["00".repeat(32); MAX_SYNC_IDS + 1];
     let err = fs.serve_sync(FilesSyncReq::GetObjects { ids }).unwrap_err();
     assert!(err.contains("too many ids"), "got: {err}");
+}
+
+#[test]
+fn serve_sync_pages_a_reply_past_the_byte_budget() {
+    // a batch of full-CHUNK_SIZE objects whose combined base64 blows
+    // MAX_SYNC_REPLY_BYTES: the reply must serve a prefix (at least one) and
+    // answer the remainder "absent" — never one over-cap message the p2p
+    // sender would assert on, and never zero served (the driver reads
+    // landed == 0 as "pruned").
+    let mut store = MemStore::new();
+    let chunk = CHUNK_SIZE as usize;
+    let ids: Vec<String> = (0u8..4)
+        .map(|i| {
+            let body: Vec<u8> = (0..chunk).map(|j| (j % 251) as u8 ^ i).collect();
+            to_hex(&store.put(Kind::Chunk, &body).unwrap())
+        })
+        .collect();
+    let fs = Fs::new(store, Refs::default());
+    let resp = fs
+        .serve_sync(FilesSyncReq::GetObjects { ids: ids.clone() })
+        .expect("serve");
+    let FilesSyncResp::Objects(objs) = resp else {
+        panic!("expected an objects reply");
+    };
+    // order and 1:1 id correspondence hold across the truncation.
+    assert_eq!(objs.len(), ids.len(), "one entry per requested id");
+    for (obj, id) in objs.iter().zip(&ids) {
+        assert_eq!(&obj.id, id, "reply order matches request order");
+    }
+    let served = objs.iter().filter(|o| o.present).count();
+    assert!(served >= 1, "at least one object always lands");
+    assert!(
+        served < ids.len(),
+        "a 4 MiB batch cannot fit the {}-byte budget in one page",
+        files::MAX_SYNC_REPLY_BYTES
+    );
+    // the served prefix stays under the budget.
+    let spent: usize = objs
+        .iter()
+        .filter(|o| o.present)
+        .map(|o| 64 + o.b64.len() + 48)
+        .sum();
+    assert!(
+        spent <= files::MAX_SYNC_REPLY_BYTES,
+        "served page ({spent} bytes) must fit the budget"
+    );
+    // truncation marks present-on-disk objects absent — a re-request of the
+    // tail serves them (progress across rounds, no livelock).
+    let tail: Vec<String> = objs
+        .iter()
+        .filter(|o| !o.present)
+        .map(|o| o.id.clone())
+        .collect();
+    let FilesSyncResp::Objects(retry) = fs
+        .serve_sync(FilesSyncReq::GetObjects { ids: tail })
+        .expect("serve tail")
+    else {
+        panic!("expected an objects reply");
+    };
+    assert!(
+        retry.iter().any(|o| o.present),
+        "the truncated tail is served on the next round"
+    );
 }
 
 #[test]

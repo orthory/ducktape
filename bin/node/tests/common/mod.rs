@@ -747,18 +747,24 @@ impl Cluster {
     /// submit an op via node `idx`'s rpc and assert the lane accepted it
     /// (accepted != finalized — follow with a query poll).
     pub fn submit(&self, idx: usize, target: &str, payload: &[u8]) {
-        let reply = self.rpc(
+        let reply = self.try_submit(idx, target, payload);
+        assert_eq!(
+            reply["ok"], true,
+            "submit to {target} via node idx {idx} rejected: {reply}"
+        );
+    }
+
+    /// submit an op via node `idx`'s rpc and return the raw reply — for tests
+    /// that assert a submit is REJECTED (cleanly, with the node still live).
+    pub fn try_submit(&self, idx: usize, target: &str, payload: &[u8]) -> serde_json::Value {
+        self.rpc(
             idx,
             serde_json::json!({
                 "cmd": "submit",
                 "target": target,
                 "payload_hex": hex(payload),
             }),
-        );
-        assert_eq!(
-            reply["ok"], true,
-            "submit to {target} via node idx {idx} rejected: {reply}"
-        );
+        )
     }
 
     /// query a module through node `idx`'s rpc. `None` on a module error —
