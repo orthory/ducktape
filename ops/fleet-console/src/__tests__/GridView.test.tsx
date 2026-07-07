@@ -55,6 +55,42 @@ describe("GridView", () => {
     expect(screen.getByText("↓1")).toBeInTheDocument();
   });
 
+  it("surfaces agent observe readiness separately from the VNC screen", () => {
+    const agentNode = node({
+      agent: {
+        appId: "com.ducktape.app",
+        runtimeDir: "/tmp/fleet/feat-qa-multiwindow",
+        endpointPath:
+          "/tmp/fleet/feat-qa-multiwindow/tauri-agent/com.ducktape.app/endpoint.json",
+        endpointReady: true,
+        observe: {
+          protocol: "tauri-agent-observe-ndjson",
+          cwd: ".claude/worktrees/feat+qa-multiwindow",
+          env: {
+            XDG_RUNTIME_DIR: "/tmp/fleet/feat-qa-multiwindow",
+          },
+          argv: [
+            "app/scripts/tauri-agent",
+            "observe",
+            "--app",
+            "com.ducktape.app",
+            "--format",
+            "ndjson",
+          ],
+        },
+      },
+    } as Partial<FleetNode>);
+
+    render(
+      <GridView
+        nodes={[agentNode]}
+        onOpen={() => {}}
+      />,
+    );
+
+    expect(screen.getByText("agent ready")).toBeInTheDocument();
+  });
+
   it("shows a not-running placeholder for down worktrees and no connect role", () => {
     render(
       <GridView

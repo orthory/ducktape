@@ -340,6 +340,194 @@ async fn peer_replace_switches_traffic_atomically() {
     );
 }
 
+// ── ADR phase 3: the shared underlay + the mesh listener's virtual leg ──
+
+/// the node wiring's shared underlay socket: WireGuard traffic and the NAT
+/// bypass lane demux off ONE socket — tunnel datagrams reach the device
+/// while everything else (the punch protocol) lands on the bypass, sends go
+/// out from the same 5-tuple, and the lane survives an interface rebuild
+/// (what keeps the coordinator mapping warm while a tunnel is re-applied).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_underlay_demuxes_nat_bypass_alongside_tunnel_traffic() {
+    use overlay_net::userspace::{StackSlot, UnderlaySocket};
+
+    let underlay =
+        UnderlaySocket::bind(&tokio::runtime::Handle::current(), 0).expect("bind underlay");
+    let mut bypass = underlay.take_bypass().expect("bypass lane");
+    let mut a = Node {
+        effect: UserspaceWireGuardEffect::with_shared_underlay(
+            tokio::runtime::Handle::current(),
+            StackSlot::new(),
+            underlay.clone(),
+        ),
+        secret: Key::new(defguard_boringtun_secret(0x17)),
+        ula: ula(0xa),
+        endpoint: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+    };
+    a.effect.create_interface().expect("create");
+    a.effect
+        .apply(&config(&a, 0, Vec::new()))
+        .expect("first apply attaches to the shared underlay");
+    let bound = a.effect.local_underlay_addr().expect("underlay bound");
+    assert_eq!(
+        bound.port(),
+        underlay.local_addr().expect("local").port(),
+        "the effect rides the injected socket, not one of its own"
+    );
+    a.endpoint.set_port(bound.port());
+
+    // tunnel traffic flows over the shared socket.
+    let mut b = stand_up(0x28, 0xb);
+    peer_up(&mut a, &mut b);
+    tokio::time::timeout(Duration::from_secs(10), udp_round_trip(&a, &b, b"shared"))
+        .await
+        .expect("echo across the shared underlay");
+
+    // a NAT-protocol datagram to the SAME port lands on the bypass lane
+    // (tag 7 = Punch: never a valid WireGuard header), with its true source.
+    let scratch = tokio::net::UdpSocket::bind("[::1]:0")
+        .await
+        .expect("scratch");
+    let punch: Vec<u8> = std::iter::once(7u8).chain([0x5au8; 32]).collect();
+    scratch
+        .send_to(&punch, a.endpoint)
+        .await
+        .expect("send punch-shaped datagram");
+    let (datagram, src) = tokio::time::timeout(Duration::from_secs(5), bypass.recv())
+        .await
+        .expect("bypass within deadline")
+        .expect("bypass lane open");
+    assert_eq!(datagram, punch, "the non-WG datagram demuxed to the bypass");
+    assert_eq!(
+        src.port(),
+        scratch.local_addr().expect("scratch addr").port(),
+        "with its real source"
+    );
+
+    // the reply path: a send from the underlay's sender originates from the
+    // tunnel's own port — the property the punch shares the socket FOR.
+    underlay
+        .sender()
+        .send_to(b"pong", src)
+        .await
+        .expect("send from the shared socket");
+    let mut buf = [0u8; 16];
+    let (len, from) = tokio::time::timeout(Duration::from_secs(5), scratch.recv_from(&mut buf))
+        .await
+        .expect("reply within deadline")
+        .expect("recv reply");
+    assert_eq!(&buf[..len], b"pong");
+    assert_eq!(
+        from.port(),
+        a.endpoint.port(),
+        "the reply came from the WireGuard port"
+    );
+
+    // an interface rebuild (remove → create → apply) keeps the SAME socket:
+    // the bypass lane still delivers while and after the tunnel cycles.
+    a.effect.remove_interface().expect("remove");
+    scratch
+        .send_to(&punch, a.endpoint)
+        .await
+        .expect("send with the interface down");
+    let (datagram, _) = tokio::time::timeout(Duration::from_secs(5), bypass.recv())
+        .await
+        .expect("bypass while down")
+        .expect("lane open");
+    assert_eq!(datagram, punch, "the lane outlives the interface");
+
+    a.effect.create_interface().expect("re-create");
+    let a_port = a.endpoint.port();
+    let peers_for_a = vec![peer_entry(&b, Some(b.endpoint))];
+    a.effect
+        .apply(&config(&a, a_port, peers_for_a))
+        .expect("re-apply on the shared socket");
+    // the rebuilt device needs a fresh session (the old one died with it).
+    a.effect
+        .device()
+        .expect("device")
+        .initiate_handshake(b.ula, true)
+        .await
+        .expect("re-handshake");
+    tokio::time::timeout(Duration::from_secs(10), udp_round_trip(&a, &b, b"reborn"))
+        .await
+        .expect("echo after the rebuild");
+}
+
+/// the mesh listener's virtual leg (the seam's `Dual` bind, ADR phase 3):
+/// lazily binds at the node's own ULA once a stack exists, accepts
+/// tunnel-carried connections, and re-binds across an interface rebuild —
+/// the inbound path an OS listener on `[::]` can never see in socket mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lazy_virtual_leg_accepts_across_rebuilds() {
+    use overlay_net::userspace::seam::LazyVirtualListener;
+
+    let (mut a, mut b) = (stand_up(0x37, 0xa), stand_up(0x48, 0xb));
+    peer_up(&mut a, &mut b);
+
+    const MESH_PORT: u16 = 9666;
+    let leg = LazyVirtualListener::new(b.effect.stack_slot(), MESH_PORT);
+
+    let a_ula = a.ula;
+    let round = |mut leg: LazyVirtualListener,
+                 stack_a: std::sync::Arc<overlay_net::userspace::VirtualStack>,
+                 b_ula: Ipv6Addr,
+                 payload: &'static [u8]| async move {
+        let accept = tokio::spawn(async move {
+            let (remote, mut sink, mut stream) = leg.accept().await;
+            assert_eq!(remote.ip(), IpAddr::V6(a_ula), "authenticated by a's /128");
+            let got = stream.recv(payload.len()).await.expect("recv");
+            sink.send(got).await.expect("echo");
+            // hold the halves until the dialer has read the echo.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            leg
+        });
+        let mut stream = stack_a
+            .connect_tcp(SocketAddr::new(IpAddr::V6(b_ula), MESH_PORT))
+            .await
+            .expect("dial b's mesh port through the tunnel");
+        stream.write_all(payload).await.expect("write");
+        stream.flush().await.expect("flush");
+        let mut echo = vec![0u8; payload.len()];
+        stream.read_exact(&mut echo).await.expect("read echo");
+        assert_eq!(&echo, payload);
+        accept.await.expect("accept task")
+    };
+
+    let stack_a = a.effect.stack().expect("a stack");
+    let leg = tokio::time::timeout(
+        Duration::from_secs(10),
+        round(leg, stack_a.clone(), b.ula, b"leg one"),
+    )
+    .await
+    .expect("first accept within deadline");
+
+    // rebuild b's interface: the slot serves a NEW stack; the SAME leg must
+    // notice and re-bind, then accept again.
+    let b_port = b.endpoint.port();
+    b.effect.remove_interface().expect("remove");
+    b.effect.create_interface().expect("re-create");
+    let peers_for_b = vec![peer_entry(&a, None)];
+    b.effect
+        .apply(&config(&b, b_port, peers_for_b))
+        .expect("re-apply");
+    // b's rebuilt device holds no session with a — force a fresh handshake
+    // from a's (surviving) side before dialing through the tunnel.
+    a.effect
+        .device()
+        .expect("a device")
+        .initiate_handshake(b.ula, true)
+        .await
+        .expect("re-handshake");
+
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        round(leg, stack_a, b.ula, b"leg two"),
+    )
+    .await
+    .expect("second accept within deadline — the leg re-bound on the new stack");
+}
+
 // ── ADR phase 2: the consumer faces over the pair ───────
 
 /// the overlay seam's `Virtual` arm: a commonware `Network` bind and dial on

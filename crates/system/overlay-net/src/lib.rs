@@ -273,6 +273,22 @@ impl<E: Network> Network for OverlayContext<E> {
     type Listener = OverlayListener<E::Listener>;
 
     async fn bind(&self, socket: SocketAddr) -> Result<Self::Listener, Error> {
+        // socket mode's mesh listener (ADR phase 3): an unspecified-address
+        // bind means "accept from anywhere" — but a tunnel-carried inbound
+        // connection terminates in the virtual stack, which the OS listener
+        // can never see. so the wildcard bind carries BOTH: the OS socket
+        // for the underlay, plus a lazy virtual leg at the node's own ULA
+        // on the same port (lazy: the stack exists only while a tunnel is
+        // applied, and is replaced on interface rebuilds).
+        if let OverlayBackend::Userspace(slot) = &self.backend
+            && socket.ip().is_unspecified()
+        {
+            let os = self.inner.bind(socket).await?;
+            return Ok(OverlayListener::Dual(
+                os,
+                userspace::seam::LazyVirtualListener::new(slot.clone(), socket.port()),
+            ));
+        }
         if !self.router.is_overlay(&socket) {
             return Ok(OverlayListener::Os(self.inner.bind(socket).await?));
         }
@@ -313,6 +329,9 @@ impl<E: Network> Network for OverlayContext<E> {
 pub enum OverlayListener<L> {
     Os(L),
     Virtual(userspace::seam::VirtualListener),
+    /// socket mode's wildcard bind: the OS listener for the underlay AND the
+    /// lazy virtual leg at the node's own ULA (see [`Network::bind`] above).
+    Dual(L, userspace::seam::LazyVirtualListener),
 }
 
 impl<L: Listener> Listener for OverlayListener<L> {
@@ -333,6 +352,19 @@ impl<L: Listener> Listener for OverlayListener<L> {
                     OverlayStream::Virtual(stream),
                 ))
             }
+            // both arms are cancel-safe (tokio accept; poll-based slot scan),
+            // so whichever loses the race abandons no connection state.
+            Self::Dual(os, virt) => tokio::select! {
+                accepted = os.accept() => {
+                    let (addr, sink, stream) = accepted?;
+                    Ok((addr, OverlaySink::Os(sink), OverlayStream::Os(stream)))
+                }
+                (addr, sink, stream) = virt.accept() => Ok((
+                    addr,
+                    OverlaySink::Virtual(sink),
+                    OverlayStream::Virtual(stream),
+                )),
+            },
         }
     }
 
@@ -340,6 +372,7 @@ impl<L: Listener> Listener for OverlayListener<L> {
         match self {
             Self::Os(listener) => listener.local_addr(),
             Self::Virtual(listener) => listener.local_addr(),
+            Self::Dual(os, _) => os.local_addr(),
         }
     }
 }
@@ -387,7 +420,9 @@ mod tests {
     /// a fixture /48: fd + 5 arbitrary hash bytes, the shape
     /// `ula_v6_prefix` mints.
     fn fixture_prefix() -> Ipv6Addr {
-        Ipv6Addr::from([0xfd, 0xa2, 0x8a, 0xd3, 0xea, 0xee, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        Ipv6Addr::from([
+            0xfd, 0xa2, 0x8a, 0xd3, 0xea, 0xee, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
     }
 
     #[test]

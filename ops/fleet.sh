@@ -212,7 +212,7 @@ up_web(){
 emit_json(){
   MAIN_ROOT="$MAIN_ROOT" BASE_BRANCH="$BASE_BRANCH" TSIP="$TSIP" WEB_PORT="$WEB_PORT" \
   DISP_BASE="$DISP_BASE" VITE_BASE="$VITE_BASE" VNC_BASE="$VNC_BASE" \
-  STATE="$STATE" DIST="$DIST" \
+  STATE="$STATE" DIST="$DIST" TAURI_AGENT_APP_ID="com.ducktape.app" \
   python3 - <<'PY'
 import json, os, socket, subprocess, datetime, re
 env = os.environ
@@ -220,6 +220,7 @@ main, base = env["MAIN_ROOT"], env["BASE_BRANCH"]
 tsip, web = env["TSIP"], int(env["WEB_PORT"])
 disp_b, vite_b, vnc_b = int(env["DISP_BASE"]), int(env["VITE_BASE"]), int(env["VNC_BASE"])
 state, dist = env["STATE"], env["DIST"]
+agent_app_id = env["TAURI_AGENT_APP_ID"]
 
 def slug(s): return re.sub(r"-+","-", re.sub(r"[^a-z0-9]","-", s.lower())).strip("-")
 def sh(*a):
@@ -270,11 +271,29 @@ for w in wts:
     if wid in slots:
         slot = slots[wid]
         vnc = vnc_b + slot
+        runtime_dir = os.path.join(state, wid)
+        endpoint = os.path.join(runtime_dir, "tauri-agent", agent_app_id, "endpoint.json")
         node.update({"slot": slot, "display": f":{disp_b+slot}", "vncPort": vnc,
-                     "token": wid})
+                     "token": wid,
+                     "agent": {
+                         "appId": agent_app_id,
+                         "runtimeDir": runtime_dir,
+                         "endpointPath": endpoint,
+                         "endpointReady": os.path.exists(endpoint),
+                         "observe": {
+                             "protocol": "tauri-agent-observe-ndjson",
+                             "cwd": os.path.relpath(path, main),
+                             "env": {"XDG_RUNTIME_DIR": runtime_dir},
+                             "argv": [
+                                 "app/scripts/tauri-agent",
+                                 "observe",
+                                 "--app", agent_app_id,
+                                 "--format", "ndjson",
+                             ],
+                         },
+                     }})
         # "up" means the APP is live (its endpoint registry exists) AND reachable
         # over VNC — a bare x11vnc on an empty Xvfb is not "up".
-        endpoint = os.path.join(state, wid, "tauri-agent", "com.ducktape.app", "endpoint.json")
         if os.path.exists(endpoint) and port_open(vnc): node["status"] = "up"
         elif os.path.isfile(os.path.join(state, wid, "tauri.log")): node["status"] = "building"
         else: node["status"] = "down"

@@ -79,6 +79,82 @@ pub(crate) fn split(stream: VirtualTcpStream) -> (VirtualSink, VirtualStream) {
     )
 }
 
+/// how often the lazy leg re-checks the slot: for the stack to (re)appear
+/// while the tunnel is down, and for a live stack having been REPLACED under
+/// a pending accept (a rebuilt backend aborts the old stack's poll task, so
+/// a future parked on its wakers would otherwise pend forever).
+const LEG_POLL: Duration = Duration::from_secs(1);
+
+/// the virtual half of socket mode's mesh listener (ADR phase 3): a lazy
+/// TCP acceptor at the node's own ULA on a fixed port.
+///
+/// the mesh binds its listener once, at node start, on the UNSPECIFIED
+/// address — but in socket mode a tunnel-carried inbound connection
+/// terminates in the virtual stack, which the OS listener can never see, so
+/// the seam's bind adds this leg alongside it ([`crate::OverlayListener`]'s
+/// `Dual` arm). "lazy" because the stack does not exist until the first
+/// `apply` (and is replaced on interface rebuilds): the leg (re)binds
+/// whenever the [`StackSlot`] serves a stack it is not yet listening on,
+/// and simply pends while the tunnel is down.
+pub struct LazyVirtualListener {
+    slot: StackSlot,
+    port: u16,
+    /// the live leg, tagged with the stack it bound on so a rebuild
+    /// (different `Arc`) is detected and re-bound.
+    leg: Option<(std::sync::Arc<super::stack::VirtualStack>, VirtualListener)>,
+}
+
+impl LazyVirtualListener {
+    pub fn new(slot: StackSlot, port: u16) -> Self {
+        Self {
+            slot,
+            port,
+            leg: None,
+        }
+    }
+
+    /// accept the next tunnel-carried connection. never fails permanently:
+    /// a down tunnel or a mid-rebuild window is time, not an error — exactly
+    /// the OS listener's posture toward a link being down.
+    pub async fn accept(&mut self) -> (SocketAddr, VirtualSink, VirtualStream) {
+        loop {
+            let Some(stack) = self.slot.get() else {
+                self.leg = None;
+                tokio::time::sleep(LEG_POLL).await;
+                continue;
+            };
+            let stale = match &self.leg {
+                Some((bound_on, _)) => !std::sync::Arc::ptr_eq(bound_on, &stack),
+                None => true,
+            };
+            if stale {
+                match stack.listen_tcp(self.port, LISTEN_BACKLOG) {
+                    Ok(listener) => self.leg = Some((stack, VirtualListener(listener))),
+                    // the port is briefly still held (a replaced stack's
+                    // teardown) — retry on the poll cadence.
+                    Err(_) => {
+                        self.leg = None;
+                        tokio::time::sleep(LEG_POLL).await;
+                        continue;
+                    }
+                }
+            }
+            let Some((_, listener)) = self.leg.as_mut() else {
+                continue;
+            };
+            // bounded wait so a stack replaced UNDER this accept (whose
+            // wakers will never fire again) is re-detected on the next pass;
+            // the accept itself is poll-based over pre-armed slots, so a
+            // timed-out attempt abandons no connection state.
+            match timeout(LEG_POLL, listener.accept()).await {
+                Ok(Ok(conn)) => return conn,
+                Ok(Err(_)) => self.leg = None,
+                Err(_elapsed) => {}
+            }
+        }
+    }
+}
+
 /// a virtual TCP acceptor under the seam's `Listener` contract.
 pub struct VirtualListener(VirtualTcpListener);
 
@@ -119,7 +195,7 @@ impl VirtualSink {
         self.state = SinkState::Closed;
     }
 
-    pub(crate) async fn send(&mut self, bufs: impl Into<IoBufs> + Send) -> Result<(), Error> {
+    pub async fn send(&mut self, bufs: impl Into<IoBufs> + Send) -> Result<(), Error> {
         match self.state {
             SinkState::Open => {}
             SinkState::Sending => {
@@ -167,7 +243,7 @@ pub struct VirtualStream {
 }
 
 impl VirtualStream {
-    pub(crate) async fn recv(&mut self, len: usize) -> Result<IoBufs, Error> {
+    pub async fn recv(&mut self, len: usize) -> Result<IoBufs, Error> {
         if self.poisoned {
             return Err(Error::Closed);
         }
