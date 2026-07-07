@@ -16,7 +16,7 @@
 //! `MeshView::verify`'s all-members rule says it must; the previous epoch's
 //! tunnels stay up meanwhile.
 //!
-//! STANDBY identities (the valset observer tier — registered, quorum-exempt
+//! STANDBY identities (the valset resident tier — registered, quorum-exempt
 //! keys awaiting activation) ride a separate pre-warm layer with the
 //! opposite trade: never versioned, never handshaked, applied LIVE. A
 //! standby's owner-signed `EndpointRecord` for the current epoch installs a
@@ -121,13 +121,23 @@ pub struct MeshEpochEvent {
     /// The epoch's consensus members' ed25519 public keys, this node
     /// included. Order is irrelevant — every derived commitment sorts.
     pub members: Vec<ed25519::PublicKey>,
-    /// The epoch's STANDBY identities (the valset observer tier): registered
+    /// The epoch's STANDBY identities (the valset resident tier): registered
     /// keys the pre-warm layer tunnels toward ahead of their activation.
     /// Never part of the epoch's `ActiveValidatorSet` — a standby that never
     /// shows up costs the epoch nothing.
     pub standbys: Vec<ed25519::PublicKey>,
     /// The consensus view at the cutover; the freshness clock for expiries.
     pub current_view: u64,
+}
+
+/// The apply outcome an [`ReachabilityCommand::InstallInvitePeer`] caller
+/// awaits — wrapped so the command enum keeps its `Debug`.
+pub struct InstallReply(pub tokio::sync::oneshot::Sender<Result<(), String>>);
+
+impl std::fmt::Debug for InstallReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InstallReply")
+    }
 }
 
 /// Node -> orchestrator.
@@ -137,6 +147,27 @@ pub enum ReachabilityCommand {
     /// retarget SUPERSEDES any epoch still assembling — tear down in-flight
     /// state and start over.
     Retarget(MeshEpochEvent),
+    /// Install a JOIN-WINDOW tunnel peer, live and epoch-independent: the
+    /// invite layer. The node has already authenticated the request (the
+    /// invite blob's envelope on the joiner side; the token-verified intro
+    /// datagram on the inviter side) — the orchestrator only merges the peer
+    /// onto the interface. Invite peers are the WEAKEST layer: an epoch's
+    /// validated plan or a standby's signed record for the same identity
+    /// supersedes them, and the entry dissolves once one exists.
+    InstallInvitePeer {
+        /// The counterparty's ed25519 identity (its overlay ULA derives from
+        /// this).
+        peer: ed25519::PublicKey,
+        /// The counterparty's X25519 WireGuard key.
+        wireguard_public_key: wireguard_upgrade::X25519PublicKey,
+        /// Where to dial it: the blob's advertised endpoint on the joiner
+        /// side; the intro datagram's observed source on the inviter side
+        /// (WireGuard roams to the authenticated initiation either way).
+        endpoint: SocketAddr,
+        /// Resolved with the apply outcome (the inviter acks the intro only
+        /// after the peer is really on the interface).
+        reply: InstallReply,
+    },
     /// A reachability-channel message arrived from a mesh peer.
     Deliver {
         from: ed25519::PublicKey,
@@ -211,6 +242,12 @@ pub enum ReachabilityEvent {
         epoch: u64,
         interface: String,
         peers: usize,
+    },
+    /// A join-window invite peer merged onto the interface (see
+    /// [`ReachabilityCommand::InstallInvitePeer`]).
+    InvitePeerInstalled {
+        peer: ed25519::PublicKey,
+        interface: String,
     },
 }
 
@@ -538,6 +575,11 @@ struct Driver<'a, E, R> {
     /// first `Retarget` (boot). Later retargets are live cutovers with a
     /// working transport — restoring over them would tear down good tunnels.
     restore_tried: bool,
+    /// JOIN-WINDOW peers (see `ReachabilityCommand::InstallInvitePeer`):
+    /// epoch-independent, merged into every apply as the weakest layer (an
+    /// entry never overrides a validated plan or a pre-warm record for the
+    /// same identity, and dissolves once one exists).
+    invite_peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig>,
 }
 
 /// Drive the reachability plane until `Shutdown` (clean exit) or a channel
@@ -590,10 +632,21 @@ where
         interface_live: false,
         base_peers: None,
         restore_tried: false,
+        invite_peers: BTreeMap::new(),
     };
     while let Some(command) = commands.recv().await {
         match command {
             ReachabilityCommand::Retarget(event) => driver.retarget(event).await?,
+            ReachabilityCommand::InstallInvitePeer {
+                peer,
+                wireguard_public_key,
+                endpoint,
+                reply,
+            } => {
+                driver
+                    .install_invite_peer(peer, wireguard_public_key, endpoint, reply)
+                    .await?
+            }
             ReachabilityCommand::Deliver { from, bytes } => driver.deliver(from, bytes).await?,
             ReachabilityCommand::ViewTick(view) => driver.view = driver.view.max(view),
             ReachabilityCommand::Nudge => driver.nudge().await?,
@@ -869,7 +922,12 @@ where
             .identity_allowed_ips(self.me)
             .expect("the plane's overlay is ula_v6, which derives view-free");
         let peer_count = peers.len();
-        let parts: Vec<PeerTunnelConfig> = peers.values().cloned().collect();
+        // the join-window invite layer rides the restore apply too (a node
+        // rebooting mid-window keeps its invite tunnel), but never enters
+        // the restored BASE below — the base is the persisted mesh only.
+        let mut applied = peers.clone();
+        self.merge_invite_layer(&mut applied);
+        let parts: Vec<PeerTunnelConfig> = applied.values().cloned().collect();
         match apply_peer_tunnels(
             &mut self.effect,
             self.interface.clone(),
@@ -1632,6 +1690,7 @@ where
             merged.extend(state.prewarm_peers.clone());
             merged.remove(&self.me);
             let prewarm_count = state.prewarm_peers.len();
+            self.merge_invite_layer(&mut merged);
             if self.interface_live {
                 let _ = self.effect.remove_interface();
                 self.interface_live = false;
@@ -1816,6 +1875,100 @@ where
     /// standby with nothing applied yet brings its interface up here (its
     /// interface exists purely for pre-warm). A member whose epoch is still
     /// assembling holds off — its one epoch apply merges the pre-warm set.
+    /// Merge the join-window invite layer into an assembled peer map: an
+    /// invite peer never overrides an entry the stronger layers (validated
+    /// plans, restored mesh, pre-warm records) already carry — and once one
+    /// exists for the same identity, the invite entry has served its purpose
+    /// and dissolves.
+    fn merge_invite_layer(&mut self, merged: &mut BTreeMap<ValidatorIdentity, PeerTunnelConfig>) {
+        self.invite_peers.retain(|id, _| !merged.contains_key(id));
+        for (id, cfg) in &self.invite_peers {
+            merged.entry(*id).or_insert_with(|| cfg.clone());
+        }
+    }
+
+    /// Install a join-window tunnel peer (node-authenticated; see the
+    /// command doc) and re-apply the interface — the invite layer's own
+    /// `sync_prewarm` analogue, usable BEFORE any epoch exists.
+    async fn install_invite_peer(
+        &mut self,
+        peer: ed25519::PublicKey,
+        wireguard_public_key: wireguard_upgrade::X25519PublicKey,
+        endpoint: SocketAddr,
+        reply: InstallReply,
+    ) -> Result<(), ReachabilityError> {
+        let identity = binding::identity_of(&peer);
+        if identity == self.me {
+            let _ = reply.0.send(Err("refusing an invite tunnel to self".into()));
+            return Ok(());
+        }
+        let allowed_ips = self
+            .overlay
+            .identity_allowed_ips(identity)
+            .expect("the plane's overlay is ula_v6, which derives view-free");
+        self.invite_peers.insert(identity, PeerTunnelConfig {
+            wireguard_public_key,
+            endpoint,
+            allowed_ips,
+            keepalive_seconds: Some(KEEPALIVE_SECONDS),
+        });
+
+        let mut merged = self.base_peers.clone().unwrap_or_default();
+        if let Some(state) = &self.state {
+            merged.extend(state.prewarm_peers.clone());
+        }
+        self.merge_invite_layer(&mut merged);
+        merged.remove(&self.me);
+        let peers: Vec<PeerTunnelConfig> = merged.values().cloned().collect();
+        let local_interface_ips = self
+            .overlay
+            .identity_allowed_ips(self.me)
+            .expect("the plane's overlay is ula_v6, which derives view-free");
+        let outcome = if self.interface_live {
+            update_peer_tunnels(
+                &mut self.effect,
+                self.interface.clone(),
+                self.keypair.private_key_base64(),
+                self.config.wireguard_listen,
+                &local_interface_ips,
+                &peers,
+            )
+        } else {
+            apply_peer_tunnels(
+                &mut self.effect,
+                self.interface.clone(),
+                self.keypair.private_key_base64(),
+                self.config.wireguard_listen,
+                &local_interface_ips,
+                &peers,
+            )
+            .inspect(|()| {
+                self.interface_live = true;
+                // the interface is now live over an empty base — later
+                // merges reconfigure instead of re-creating.
+                if self.base_peers.is_none() {
+                    self.base_peers = Some(BTreeMap::new());
+                }
+            })
+        };
+        match outcome {
+            Ok(()) => {
+                let _ = reply.0.send(Ok(()));
+                self.emit(ReachabilityEvent::InvitePeerInstalled {
+                    peer,
+                    interface: self.interface.clone(),
+                })
+                .await
+            }
+            Err(err) => {
+                // the interface keeps whatever configuration it had; the
+                // caller decides whether to retry.
+                let _ = reply.0.send(Err(format!("{err:?}")));
+                Ok(())
+            }
+        }
+    }
+
     async fn sync_prewarm(&mut self) -> Result<(), ReachabilityError> {
         let state = self.state.as_ref().expect("pre-warm inside an epoch");
         if state.prewarm_peers.is_empty() {
@@ -1829,6 +1982,7 @@ where
             (None, Role::Member) => return Ok(()),
         };
         merged.extend(state.prewarm_peers.clone());
+        self.merge_invite_layer(&mut merged);
         // the pre-warm layer never carries a tunnel to this node itself
         // (records filter by owner class), but a restored base may still
         // hold an entry for an identity that since became us — impossible

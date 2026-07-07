@@ -1,12 +1,22 @@
 # Validator Onboarding — Invites, Join Requests, Approval
 
+> **SUPERSEDED (2026-07-07): the approval step is gone.** Minting an invite
+> IS the admission decision: a joiner redeems its single-use token
+> automatically (governance `Redeem`), comes up as a full node, and only the
+> quorum seat (`promote`) remains a deliberate member act. Invites are also
+> tunnel-first — the blob carries the inviter's WireGuard bootstrap, and the
+> join rides the VPN before any p2p. The current recipe lives in
+> [deploy/private-cutover-integration-gap.md](deploy/private-cutover-integration-gap.md);
+> the approval mechanics below (`invite-accept`, join-request queues) survive
+> only as the manual fallback for token-less joins.
+
 How a new node joins a running Ducktape network, what the invite token does
 (and deliberately does not do), and the consensus constraints every operator
 should know before growing the validator set.
 
 For the historical analysis of the pre-token flow see
 [invitation-protocol-deep-dive.md](invitation-protocol-deep-dive.md); this
-document describes the current protocol.
+document describes the pre-redemption protocol.
 
 ## The flow at a glance
 
@@ -71,6 +81,15 @@ the proof and, later, consensus) and speaks on the dedicated lobby channel.
 The lobby identity authenticates nothing and is meant to be public to the
 network's invitees. Anyone holding a descriptor can connect with it; without a
 valid token their messages are dropped on receipt.
+
+A key granted **resident standing** (a member's `invite-accept`) climbs one
+rung further: its node follows finalized boundaries, serves reads locally, and
+**writes through its own surface**. A submit against the resident's surface is
+signed with the node's identity key and relayed over the mesh to a current
+validator, which takes consensus custody and answers with the op's finalized
+fate — authorship is the resident's key, never the relaying validator's.
+Standing to write is not membership: member-gated modules (governance among
+them) still reject a non-member origin deterministically.
 
 ## Consensus reality: no voting power, and what that means
 

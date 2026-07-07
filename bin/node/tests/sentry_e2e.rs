@@ -141,13 +141,13 @@ fn joiner_enters_through_a_sentry() {
     // sentry; it must PARK until admitted. an UNINVITED key is (correctly)
     // rejected by node 0's p2p bouncer BEFORE admission — node 0 does not yet
     // track it — so the pre-admission parked state is genuinely
-    // "parked: not yet admitted (...); retrying", matched by the generic
-    // "parked:" prefix exactly as the sibling invite_e2e does. (the joiner
+    // "joining: redemption not landed yet (...); retrying", matched by the
+    // generic "joining:" prefix exactly as the sibling invite_e2e does. (the joiner
     // cannot reach node 0 until `promote` (direct admission) runs, fronted; the
     // sentry is what carries the sync + votes AFTER admission.)
     let joiner = cluster.spawn_joiner(1);
-    cluster.wait_marker(joiner, "joiner mode: parking", Duration::from_secs(60));
-    cluster.wait_marker(joiner, "parked:", Duration::from_secs(60));
+    cluster.wait_marker(joiner, "joiner mode:", Duration::from_secs(60));
+    cluster.wait_marker(joiner, "joining:", Duration::from_secs(60));
 
     // one command on the founder admits the friend.
     let friend_hex = hex(&Cluster::identity(1));

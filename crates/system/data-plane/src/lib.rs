@@ -64,6 +64,32 @@ pub enum Service {
     Video = 3,
 }
 
+impl Service {
+    /// The well-known overlay port a service's STREAM listener binds (see
+    /// `docs/adr/2026-07-07-per-use-data-plane.mdx`): planes are per-use, so
+    /// the service registry doubles as the port registry — two planes can
+    /// never collide on a bind, and both ends derive the dial port with no
+    /// signaling. Fixed ports are safe because every plane binds a specific
+    /// member `/128`, never a wildcard. Wire-stable — never renumber.
+    pub const fn overlay_stream_port(self) -> u16 {
+        match self {
+            Service::StateSync => 45801,
+            Service::Voice => 45802,
+            Service::Video => 45803,
+        }
+    }
+
+    /// The well-known overlay port for the service's DATAGRAM socket — the
+    /// stream port's sibling range, same registry discipline.
+    pub const fn overlay_datagram_port(self) -> u16 {
+        match self {
+            Service::StateSync => 45901,
+            Service::Voice => 45902,
+            Service::Video => 45903,
+        }
+    }
+}
+
 impl TryFrom<u8> for Service {
     type Error = u8;
 

@@ -694,16 +694,16 @@ pub fn workspace_demote(app: tauri::AppHandle, id: String, pubkey: String) -> Re
     .map(|_| ())
 }
 
-/// promote an observer into the consensus quorum by pubkey: drive the
+/// promote a resident into the consensus quorum by pubkey: drive the
 /// governance AddValidator through THIS running member node's local rpc. the
 /// second, deliberate step of staged admission — [`workspace_admit`] grants
-/// observer standing; this seats the (pre-synced, warm) key as a validator at
+/// resident standing; this seats the (pre-synced, warm) key as a validator at
 /// the next epoch cutover. same majority ceremony as every membership change.
 #[tauri::command]
 pub fn workspace_promote(app: tauri::AppHandle, id: String, pubkey: String) -> Result<(), String> {
     let pubkey = pubkey.trim().to_string();
     if pubkey.is_empty() {
-        return Err("provide the observer's public key to promote".into());
+        return Err("provide the resident's public key to promote".into());
     }
     let node_bin = crate::daemon::resolve_node_bin()?;
     let reg = load_registry(&app)?;
@@ -716,20 +716,20 @@ pub fn workspace_promote(app: tauri::AppHandle, id: String, pubkey: String) -> R
     .map(|_| ())
 }
 
-/// revoke observer standing by pubkey: drive the governance RemoveObserver
+/// revoke resident standing by pubkey: drive the governance RemoveResident
 /// through THIS running member node's local rpc. the undo of
 /// [`workspace_admit`] — the key drops off the mesh at the next epoch cutover
 /// and its node parks again; re-granting is another admit. a seated validator
 /// is [`workspace_demote`]'s job (the tiers never overlap).
 #[tauri::command]
-pub fn workspace_observer_remove(
+pub fn workspace_resident_remove(
     app: tauri::AppHandle,
     id: String,
     pubkey: String,
 ) -> Result<(), String> {
     let pubkey = pubkey.trim().to_string();
     if pubkey.is_empty() {
-        return Err("provide the observer's public key to revoke".into());
+        return Err("provide the resident's public key to revoke".into());
     }
     let node_bin = crate::daemon::resolve_node_bin()?;
     let reg = load_registry(&app)?;
@@ -737,7 +737,7 @@ pub fn workspace_observer_remove(
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
     run_verb(
         &node_bin,
-        &["observer-remove", &pubkey, "--config", &cfg.to_string_lossy()],
+        &["resident-remove", &pubkey, "--config", &cfg.to_string_lossy()],
     )
     .map(|_| ())
 }
@@ -1135,14 +1135,16 @@ pub fn user_identity_confirm_mnemonic(app: tauri::AppHandle) -> Result<(), Strin
 fn classify(log: &str) -> PhaseReport {
     // (phase, marker substring). the strings are a contract with
     // bin/node/src/main.rs (asserted by bin/node/tests/invite_e2e.rs).
+    // "parked" is the phase id the webview already maps; since auto-
+    // redemption the underlying markers read "joining:" (no member approval
+    // step — the invite redeems itself).
     const MARKERS: &[(&str, &str)] = &[
-        ("parked", "joiner mode: parking"),
-        ("parked", "parked:"),
+        ("parked", "joiner mode:"),
+        ("parked", "joining:"),
         ("admitted", "admitted at epoch"),
         ("synced", "synced app_hash="),
         ("promoted", "promoted:"),
         ("fatal", "FATAL"),
-        ("fatal", "not admitted after"),
         // a raw Rust panic on boot ("thread 'main' panicked at …") prints no
         // node marker — catch it so a crashed node stops reading as "starting".
         ("fatal", "panicked at"),
@@ -1448,11 +1450,11 @@ mod tests {
 
     #[test]
     fn classify_parked_holds_until_admitted() {
-        let log = "[node ab] joiner mode: parking on the mesh\n\
-                   [node ab] parked: awaiting admission (epoch 0 has 1 validators)\n";
+        let log = "[node ab] joiner mode: announcing this key with the invite token\n\
+                   [node ab] joining: awaiting redemption (epoch 0 has 1 validators)\n";
         let r = classify(log);
         assert_eq!(r.phase, "parked");
-        assert!(r.detail.unwrap().contains("awaiting admission"));
+        assert!(r.detail.unwrap().contains("awaiting redemption"));
     }
 
     #[test]
@@ -1464,9 +1466,9 @@ mod tests {
     fn classify_recovers_from_a_stale_fatal() {
         // an old fatal, then a restart that reparks and promotes on the same
         // appended log — the latest line wins, not the scariest one.
-        let log = "[node ab] FATAL: still not admitted after 900 attempts\n\
-                   [node ab] joiner mode: parking on the mesh\n\
-                   [node ab] parked: awaiting admission (epoch 0 has 1 validators)\n\
+        let log = "[node ab] FATAL: still no standing after 900 attempts\n\
+                   [node ab] joiner mode: announcing this key with the invite token\n\
+                   [node ab] joining: awaiting redemption (epoch 0 has 1 validators)\n\
                    [node ab] promoted: validator at epoch 1 boundary 4 — rebooting\n";
         assert_eq!(classify(log).phase, "promoted");
     }

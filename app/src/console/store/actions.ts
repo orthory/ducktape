@@ -287,14 +287,14 @@ export interface ConsoleActions {
   /** Fetch the active workspace's invite blob into state for sharing. */
   revealInvite(): void;
   /** Admit a joiner by pubkey through the active (member) workspace — grants
-   *  OBSERVER standing (staged admission's first step); promote seats it. */
+   *  RESIDENT standing (staged admission's first step); promote seats it. */
   admitMember(pubkey: string): void;
-  /** Promote an observer into the consensus quorum by pubkey — staged
-   *  admission's second step, once the observer's node is warm. */
+  /** Promote a resident into the consensus quorum by pubkey — staged
+   *  admission's second step, once the resident's node is warm. */
   promoteMember(pubkey: string): void;
-  /** Revoke a key's observer standing — the undo of admitMember; its node
+  /** Revoke a key's resident standing — the undo of admitMember; its node
    *  parks again and another admit re-grants. */
-  removeObserver(pubkey: string): void;
+  removeResident(pubkey: string): void;
   /** Open a removal proposal for a validator by pubkey and cast this node's
    *  yes-ballot; the removal takes effect only once a strict majority approve. */
   demoteMember(pubkey: string): void;
@@ -1769,11 +1769,11 @@ export function createActions({
         .catch(fail);
     },
 
-    removeObserver: (pubkey) => {
+    removeResident: (pubkey) => {
       const target = getState().workspace;
       if (!target || !pubkey.trim()) return;
       Promise.resolve()
-        .then(() => ws.removeObserver(target.id, pubkey.trim()))
+        .then(() => ws.removeResident(target.id, pubkey.trim()))
         .then(() => refresh())
         .catch(fail);
     },

@@ -690,7 +690,7 @@ pub trait BlockSink {
     fn seal(&mut self, seal: &BlockSeal) -> impl std::future::Future<Output = Result<(), Error>>;
     /// durably record an epoch cutover: the new epoch, its app-height base,
     /// the ENGINE PARTICIPANT SET it was spawned over, and the epoch's
-    /// OBSERVER set (raw public-key bytes). the sets ride the record because
+    /// RESIDENT set (raw public-key bytes). the sets ride the record because
     /// a restart must respawn the engine (and re-track the mesh) with the
     /// EPOCH'S sets — the instantaneous valset projection may already include
     /// a change awaiting the next cutover.
@@ -699,7 +699,7 @@ pub trait BlockSink {
         epoch: u64,
         view_base: u64,
         participants: &[Vec<u8>],
-        observers: &[Vec<u8>],
+        residents: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), Error>>;
 }
 
@@ -728,7 +728,7 @@ impl BlockSink for NullSink {
         _epoch: u64,
         _view_base: u64,
         _participants: &[Vec<u8>],
-        _observers: &[Vec<u8>],
+        _residents: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), Error>> {
         async { Ok(()) }
     }
@@ -903,9 +903,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         epoch: u64,
         view_base: u64,
         participants: &[Vec<u8>],
-        observers: &[Vec<u8>],
+        residents: &[Vec<u8>],
     ) -> Result<usize, Error> {
-        self.sink.cutover(epoch, view_base, participants, observers).await?;
+        self.sink.cutover(epoch, view_base, participants, residents).await?;
         self.orderer = orderer;
         self.view_base = view_base;
         self.last_engine_view = None;
@@ -960,6 +960,18 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         msg: Msg,
     ) -> Result<FrameId, Error> {
         let frame = encode_frame(signer, seq, &msg);
+        self.submit_frame(frame).await
+    }
+
+    /// take custody of an ALREADY-SIGNED frame (the relay entry point: a
+    /// resident signs with its own identity key, a validator injects). the
+    /// signature is verified BEFORE anything is pinned — junk from the wire
+    /// must never enter the durable store or the orderer. custody semantics
+    /// are identical to [`OrderedNode::submit`]: pin, propose, track
+    /// outstanding (the cutover carry and the exactly-once digest gate treat
+    /// a relayed frame exactly like a local one).
+    pub async fn submit_frame(&mut self, frame: Vec<u8>) -> Result<FrameId, Error> {
+        decode_frame(&frame)?;
         let id = frame_id(&frame);
         // durably pin the bytes BEFORE the orderer may propose their digest:
         // once the engine journals a finalization, these bytes are the only
@@ -972,6 +984,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         // errored submit is reported to the caller, who retries — tracking
         // it would double the op when the retry lands and a cutover carries
         // the failed original too.
+        let (_, seq) = frame_origin_seq(&frame).expect("decode_frame verified the envelope");
         self.outstanding.insert(id, (seq, frame));
         Ok(id)
     }

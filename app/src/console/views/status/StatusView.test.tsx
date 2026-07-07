@@ -29,7 +29,7 @@ const status = {
 };
 
 const PEER_B = "11".repeat(32);
-const OBSERVER_C = "22".repeat(32);
+const RESIDENT_C = "22".repeat(32);
 
 const block = (
   height: number,
@@ -88,14 +88,14 @@ describe("StatusView", () => {
       value: { writeText },
     });
 
-    renderStatus({ members: [workspace.pubkey, PEER_B], observers: [OBSERVER_C] });
+    renderStatus({ members: [workspace.pubkey, PEER_B], residents: [RESIDENT_C] });
 
     expect(screen.getByText("Synced")).toBeInTheDocument();
     expect(screen.getByText(/member · validator/i)).toBeInTheDocument();
     expect(screen.getByText("42")).toBeInTheDocument();
     // The network cards now report real, fetched counts rather than stubs.
     expect(screen.getByText("VALIDATORS")).toBeInTheDocument();
-    expect(screen.getByText("OBSERVERS")).toBeInTheDocument();
+    expect(screen.getByText("RESIDENTS")).toBeInTheDocument();
     expect(screen.getByText("CADENCE")).toBeInTheDocument();
     expect(screen.getByText("COMMIT HEALTH")).toBeInTheDocument();
 
@@ -110,7 +110,7 @@ describe("StatusView", () => {
   it("lists connections with derived liveness on the Connections tab", () => {
     renderStatus({
       members: [workspace.pubkey, PEER_B],
-      observers: [OBSERVER_C],
+      residents: [RESIDENT_C],
       authorNames: { [PEER_B]: "beacon" },
       // PEER_B led the two recent blocks; self led none.
       blocks: [block(41, PEER_B), block(42, PEER_B)],
@@ -125,15 +125,15 @@ describe("StatusView", () => {
     expect(screen.getByText("this node")).toBeInTheDocument();
 
     // A validator that verifiably proposed recent blocks reads as leading;
-    // the local validator that led nothing reads as quiet; observers as statesync.
+    // the local validator that led nothing reads as quiet; residents as statesync.
     expect(screen.getByText("leading")).toBeInTheDocument();
     expect(screen.getByText("quiet")).toBeInTheDocument();
     expect(screen.getByText("statesync")).toBeInTheDocument();
     expect(screen.getByText(/led #42/)).toBeInTheDocument();
 
-    // Observer tier is disjoint from the quorum and labelled as such.
+    // Resident tier is disjoint from the quorum and labelled as such.
     expect(screen.getAllByText("validator").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText("observer")).toBeInTheDocument();
+    expect(screen.getByText("resident")).toBeInTheDocument();
   });
 
   it("shows a real validator-vs-guest capability matrix", () => {

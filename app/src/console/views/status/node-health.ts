@@ -1,9 +1,9 @@
 // Pure derivations for the Node view's connection + health surfaces. Everything
 // here composes signals THIS node already commits — the valset roster
-// (validators/observers), the recent finalized-block ring, and the capability
+// (validators/residents), the recent finalized-block ring, and the capability
 // registry — into an operational read of the mesh. No signal is invented: peer
 // liveness is derived strictly from which validator VERIFIABLY proposed recent
-// blocks (the frame's signer), and observers — which hold no quorum seat and so
+// blocks (the frame's signer), and residents — which hold no quorum seat and so
 // never propose — are reported as statesync standing, not as "offline".
 
 import { displayNameForKey, normalizeKey, sameKey, shortKey } from "../../../domain/names";
@@ -57,7 +57,7 @@ export function proposalWindow(blocks: readonly BlockRecord[]): ProposalWindow {
 
 // ── Peer roster (the node's connection list) ────────────────
 
-export type PeerTier = "validator" | "observer";
+export type PeerTier = "validator" | "resident";
 
 /** One row of the node's connection list — a valset member seen through this
  *  node's operational lens (identity + derived liveness + announced work). */
@@ -68,7 +68,7 @@ export interface PeerVM {
   shortKey: string;
   initials: string;
   /** Which valset tier: seated quorum (`validator`) or warming statesync
-   *  standing (`observer`). The tiers never overlap. */
+   *  standing (`resident`). The tiers never overlap. */
   tier: PeerTier;
   /** This is the local node's own validator identity. */
   isSelf: boolean;
@@ -79,7 +79,7 @@ export interface PeerVM {
   /** Executor tags this node announced to the capability registry. */
   capabilities: string[];
   /** Recent-proposal activity, or null when it proposed nothing in the window
-   *  (every observer, plus any validator that hasn't led lately). */
+   *  (every resident, plus any validator that hasn't led lately). */
   activity: ProposerActivity | null;
   /** Fraction of window proposals this peer led, 0..1 (0 without activity). */
   share: number;
@@ -87,7 +87,7 @@ export interface PeerVM {
 
 export interface BuildPeersInput {
   members: readonly string[];
-  observers: readonly string[];
+  residents: readonly string[];
   authorNames: Record<string, string>;
   workspace: { pubkey: string; founder: boolean } | null;
   capabilitiesByNode: Map<string, string[]>;
@@ -106,7 +106,7 @@ export function initialsOf(name: string): string {
 }
 
 /** Build the peer roster: validators first (self pinned, then busiest
- *  proposers, then by name), then observers (self pinned, then by name). */
+ *  proposers, then by name), then residents (self pinned, then by name). */
 export function buildPeers(input: BuildPeersInput): PeerVM[] {
   const localKey = input.workspace?.pubkey ?? null;
   const total = input.window.total;
@@ -138,7 +138,7 @@ export function buildPeers(input: BuildPeersInput): PeerVM[] {
 
   return [
     ...input.members.map((key) => toVM(key, "validator")).sort(rank),
-    ...input.observers.map((key) => toVM(key, "observer")).sort(rank),
+    ...input.residents.map((key) => toVM(key, "resident")).sort(rank),
   ];
 }
 
