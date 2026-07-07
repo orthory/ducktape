@@ -5838,7 +5838,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // boot: the discovered tag set is BOTH what the worker can run and
             // what this node announces, so a resident announce can never claim
             // more than the host provides; a broken operator spec is a boot
-            // error, not a silently dropped executor.
+            // error, not a silently dropped executor. execution is OFF-LOOP —
+            // the same DispatchPool wiring the validator runs: the gate is
+            // inline, the provider CLI runs on spawned children, completed
+            // results come back over `resident_oracle_results` and are
+            // drained by the park loop's pump pass, so a minutes-long run
+            // never stalls the serve window, boundary follow, or promotion
+            // detection.
             let resident_provider_set = capability_host::discover()
                 .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
             let resident_capabilities = resident_provider_set.capabilities();
@@ -5846,10 +5852,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 me_bytes.clone(),
                 resident_capabilities,
             );
-            let mut resident_dispatch = resident_dispatch::ResidentDispatch::new(
-                DispatchWorker::new(resident_provider_set, me_bytes.clone()),
-                me_bytes.clone(),
-            );
+            let (resident_pool, mut resident_oracle_results) =
+                oracle_pool::build(&context, resident_provider_set, me_bytes.clone());
+            let mut resident_dispatch =
+                resident_dispatch::ResidentDispatch::new(resident_pool, me_bytes.clone());
             let (boundary, host, floor) = loop {
                 attempt += 1;
                 if attempt > 900 && !resident_standing {
@@ -6412,7 +6418,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                             // DISPATCH EXECUTION (resident tier): serve the
                             // saga attempts leased to this key, so an announced
-                            // resident never stalls an assignment.
+                            // resident never stalls an assignment. completed
+                            // off-loop runs are drained FIRST (they become due
+                            // relay sends in this same pass); the tick itself
+                            // only gates and spawns — it never awaits a
+                            // provider.
+                            while let Ok(msg) = resident_oracle_results.try_recv() {
+                                resident_dispatch.completed(msg);
+                            }
                             for (key, msg) in resident_dispatch.tick(host, now).await {
                                 match relay_submit_frame(
                                     &signer,
