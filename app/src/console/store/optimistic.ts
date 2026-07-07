@@ -360,12 +360,3 @@ export const runCancelled = (
   // which prunes the entry node-side a block later — mirror that prune.
   pendingRuns: prev.pendingRuns.filter((r) => r.run_id !== runId),
 });
-
-// ── Files ───────────────────────────────────────────────
-
-export const fileRemoved = (
-  prev: ConsoleState,
-  fileId: string,
-): Partial<ConsoleState> => ({
-  files: prev.files.filter((m) => m.file_id !== fileId),
-});

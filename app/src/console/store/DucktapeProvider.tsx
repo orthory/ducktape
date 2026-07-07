@@ -18,6 +18,7 @@ import * as capabilityClient from "../../domain/capability-client";
 import * as chatClient from "../../domain/chat-client";
 import * as dispatchClient from "../../domain/dispatch-client";
 import * as filesClient from "../../domain/files-client";
+import type { FileEntry } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import type { ProposalView } from "../../domain/governance-client";
@@ -151,8 +152,12 @@ export function DucktapeProvider({
             .catch((): identityClient.UserView[] => []),
           // files is best-effort so a node that does not register the module
           // reads as "empty", never a failed refresh (same contract as
-          // governance above).
-          filesClient.list(live, {}).catch(() => []),
+          // governance above). Find under the tree root gives a flat file index
+          // for the command palette; the files browser pages the tree itself.
+          filesClient
+            .find(live, { prefix: "/" })
+            .then((page) => page.entries.filter((e) => e.kind === "file"))
+            .catch((): FileEntry[] => []),
           // the explorer's ring pull — best-effort, so a node without
           // /v1/blocks reads as "no blocks yet".
           live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
@@ -603,8 +608,8 @@ export function DucktapeProvider({
   }, []);
 
   const value = useMemo<ConsoleContextValue>(
-    () => ({ state, actions }),
-    [state, actions],
+    () => ({ state, actions, transport: node }),
+    [state, actions, node],
   );
   return <ConsoleContext.Provider value={value}>{children}</ConsoleContext.Provider>;
 }
