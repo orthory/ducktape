@@ -1,9 +1,9 @@
 // The Node view's Connections tab — this node's operational read of the mesh it
 // participates in. Rows are the committed valset roster (validators + the
-// warming observer tier), but seen through the node's lens: each validator's
+// warming resident tier), but seen through the node's lens: each validator's
 // liveness is DERIVED from which blocks it verifiably proposed in the recent
 // ring, so a leader that's been quiet reads as quiet — honestly — rather than
-// the roster's flat "presence unavailable". Observers hold no quorum seat and
+// the roster's flat "presence unavailable". Residents hold no quorum seat and
 // never propose, so they carry statesync standing, not a fabricated liveness.
 
 import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
@@ -12,12 +12,12 @@ import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { buildPeers, proposalWindow, type PeerVM } from "./node-health";
 
-type FilterId = "all" | "validators" | "observers" | "active";
+type FilterId = "all" | "validators" | "residents" | "active";
 
 const FILTERS: ReadonlyArray<{ id: FilterId; label: string }> = [
   { id: "all", label: "All" },
   { id: "validators", label: "Validators" },
-  { id: "observers", label: "Observers" },
+  { id: "residents", label: "Residents" },
   { id: "active", label: "Leading" },
 ];
 
@@ -37,11 +37,11 @@ const copyText = (text: string): void => {
 type Liveness = { dot: string; label: string; note: string };
 
 function livenessOf(peer: PeerVM, windowTotal: number): Liveness {
-  if (peer.tier === "observer") {
+  if (peer.tier === "resident") {
     return {
       dot: color.blue,
       label: "statesync",
-      note: "observer standing · no quorum seat",
+      note: "resident standing · no quorum seat",
     };
   }
   if (peer.activity) {
@@ -92,7 +92,7 @@ function RolePill({ peer }: { peer: PeerVM }) {
     ? { text: color.onDark, bg: color.dark, border: color.dark, label: "genesis" }
     : peer.tier === "validator"
       ? { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7", label: "validator" }
-      : { text: color.amber, bg: "#fbf4e6", border: "#ecdcae", label: "observer" };
+      : { text: color.amber, bg: "#fbf4e6", border: "#ecdcae", label: "resident" };
   return (
     <span
       style={{
@@ -313,25 +313,25 @@ export function PeersTab() {
     () =>
       buildPeers({
         members: state.members,
-        observers: state.observers,
+        residents: state.residents,
         authorNames: state.authorNames,
         workspace: state.workspace,
         capabilitiesByNode: state.capabilitiesByNode,
         window,
       }),
-    [state.members, state.observers, state.authorNames, state.workspace, state.capabilitiesByNode, window],
+    [state.members, state.residents, state.authorNames, state.workspace, state.capabilitiesByNode, window],
   );
 
   const validatorCount = state.members.length;
-  const observerCount = state.observers.length;
+  const residentCount = state.residents.length;
   const activeCount = peers.reduce((n, p) => n + (p.activity ? 1 : 0), 0);
 
   const visible = peers.filter((p) => {
     switch (filter) {
       case "validators":
         return p.tier === "validator";
-      case "observers":
-        return p.tier === "observer";
+      case "residents":
+        return p.tier === "resident";
       case "active":
         return Boolean(p.activity);
       default:
@@ -350,9 +350,9 @@ export function PeersTab() {
     <>
       <SectionLabelRow>CONNECTIONS</SectionLabelRow>
       <div style={{ marginTop: 9, display: "flex", gap: 9, flexWrap: "wrap" }}>
-        <CountChip label="Peers" value={validatorCount + observerCount} />
+        <CountChip label="Peers" value={validatorCount + residentCount} />
         <CountChip label="Validators" value={validatorCount} tint="#5f9e74" />
-        <CountChip label="Observers" value={observerCount} tint={color.amber} />
+        <CountChip label="Residents" value={residentCount} tint={color.amber} />
         <CountChip label="Leading" value={activeCount} tint={color.dark} />
       </div>
 
@@ -426,8 +426,8 @@ function EmptyState({ connected, filter }: { connected: boolean; filter: FilterI
     ? "Not connected — the connection roster loads from the node's valset once it's reachable."
     : filter === "active"
       ? "No validator has led a block in the recent ring yet."
-      : filter === "observers"
-        ? "No observers — no workspace is warming into the set right now."
+      : filter === "residents"
+        ? "No residents — no workspace is warming into the set right now."
         : "No members reported by this node's valset.";
   return (
     <div

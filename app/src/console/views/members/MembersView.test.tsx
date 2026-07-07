@@ -11,7 +11,7 @@ import { MembersView } from "./MembersView";
 const localKey = "a".repeat(64);
 const peerKey = "b".repeat(64);
 const joinerKey = "c".repeat(64);
-const observerKey = "d".repeat(64);
+const residentKey = "d".repeat(64);
 
 const workspace: Workspace = {
   id: "acme-research",
@@ -158,49 +158,49 @@ describe("MembersView", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("renders observer standing with confirmed promote and revoke actions", () => {
+  it("renders resident standing with confirmed promote and revoke actions", () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const { spies } = renderMembers({
-      observers: [observerKey],
+      residents: [residentKey],
       authorNames: {
         [localKey]: "Founder Rae",
         [peerKey]: "Ben Validator",
-        [observerKey]: "Olive Observer",
+        [residentKey]: "Olive Resident",
       },
     });
 
-    expect(screen.getByText("Olive Observer")).toBeInTheDocument();
-    expect(screen.getByText("Observer")).toBeInTheDocument();
-    // Observer rows govern standing, not a quorum seat — no removal control.
+    expect(screen.getByText("Olive Resident")).toBeInTheDocument();
+    expect(screen.getByText("Resident")).toBeInTheDocument();
+    // Resident rows govern standing, not a quorum seat — no removal control.
     expect(
-      screen.queryByRole("button", { name: /remove Olive Observer from validator set/i }),
+      screen.queryByRole("button", { name: /remove Olive Resident from validator set/i }),
     ).not.toBeInTheDocument();
 
     fireEvent.click(
-      screen.getByRole("button", { name: /promote Olive Observer into the validator set/i }),
+      screen.getByRole("button", { name: /promote Olive Resident into the validator set/i }),
     );
     expect(confirm).toHaveBeenCalledOnce();
-    expect(spies.promoteMember).toHaveBeenCalledWith(observerKey);
+    expect(spies.promoteMember).toHaveBeenCalledWith(residentKey);
 
     fireEvent.click(
-      screen.getByRole("button", { name: /revoke observer standing from Olive Observer/i }),
+      screen.getByRole("button", { name: /revoke resident standing from Olive Resident/i }),
     );
-    expect(spies.removeObserver).toHaveBeenCalledWith(observerKey);
+    expect(spies.removeResident).toHaveBeenCalledWith(residentKey);
 
     confirm.mockRestore();
   });
 
-  it("hides the observer controls when this workspace cannot administer", () => {
+  it("hides the resident controls when this workspace cannot administer", () => {
     renderMembers({
-      observers: [observerKey],
+      residents: [residentKey],
       workspace: { ...workspace, founder: false, member: false },
     });
-    expect(screen.getByText("Observer")).toBeInTheDocument();
+    expect(screen.getByText("Resident")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /promote/i }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /revoke observer standing/i }),
+      screen.queryByRole("button", { name: /revoke resident standing/i }),
     ).not.toBeInTheDocument();
   });
 
@@ -236,19 +236,19 @@ describe("MembersView", () => {
     expect(screen.getByText("Founder Rae")).toBeInTheDocument();
   });
 
-  it("keeps observers out of the Validators filter but in All", () => {
+  it("keeps residents out of the Validators filter but in All", () => {
     renderMembers({
-      observers: [observerKey],
+      residents: [residentKey],
       authorNames: {
-        [observerKey]: "Olive Observer",
+        [residentKey]: "Olive Resident",
       },
     });
 
     fireEvent.click(screen.getByRole("button", { name: "Validators" }));
-    expect(screen.queryByText("Olive Observer")).not.toBeInTheDocument();
+    expect(screen.queryByText("Olive Resident")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "All" }));
-    expect(screen.getByText("Olive Observer")).toBeInTheDocument();
+    expect(screen.getByText("Olive Resident")).toBeInTheDocument();
   });
 
   it("groups a multi-device user under one header with device-key rows, collapsing single-device users flat", () => {

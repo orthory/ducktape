@@ -16,7 +16,7 @@
 //! `MeshView::verify`'s all-members rule says it must; the previous epoch's
 //! tunnels stay up meanwhile.
 //!
-//! STANDBY identities (the valset observer tier — registered, quorum-exempt
+//! STANDBY identities (the valset resident tier — registered, quorum-exempt
 //! keys awaiting activation) ride a separate pre-warm layer with the
 //! opposite trade: never versioned, never handshaked, applied LIVE. A
 //! standby's owner-signed `EndpointRecord` for the current epoch installs a
@@ -121,7 +121,7 @@ pub struct MeshEpochEvent {
     /// The epoch's consensus members' ed25519 public keys, this node
     /// included. Order is irrelevant — every derived commitment sorts.
     pub members: Vec<ed25519::PublicKey>,
-    /// The epoch's STANDBY identities (the valset observer tier): registered
+    /// The epoch's STANDBY identities (the valset resident tier): registered
     /// keys the pre-warm layer tunnels toward ahead of their activation.
     /// Never part of the epoch's `ActiveValidatorSet` — a standby that never
     /// shows up costs the epoch nothing.

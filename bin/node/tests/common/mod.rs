@@ -347,7 +347,7 @@ impl NetworkShapeCluster {
     }
 
     /// drive a membership ceremony verb (`promote`, `invite-accept`,
-    /// `observer-remove`) against node 0's running rpc, from node 0's config.
+    /// `resident-remove`) against node 0's running rpc, from node 0's config.
     pub fn run_membership_verb(&self, verb: &str, pubkey_hex: &str) -> (bool, String) {
         let cfg = self.config_file(0);
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
@@ -508,7 +508,7 @@ impl Cluster {
     }
 
     /// remove node `idx`'s storage directory — a killed slot reused as a
-    /// FRESH observer (the sync-only rebuild) must not inherit the previous
+    /// FRESH resident (the sync-only rebuild) must not inherit the previous
     /// occupant's state or index locks.
     pub fn wipe_storage(&self, idx: usize) {
         let id = self.peer_ids[idx];

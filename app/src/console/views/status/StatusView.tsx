@@ -865,7 +865,7 @@ function OverviewTab() {
       >
         <StatCard label="HEIGHT" value={numberValue(state.status?.height)} />
         <StatCard label="VALIDATORS" value={numberValue(state.members.length)} hint="consensus quorum" />
-        <StatCard label="OBSERVERS" value={numberValue(state.observers.length)} hint="statesync tier" />
+        <StatCard label="RESIDENTS" value={numberValue(state.residents.length)} hint="statesync tier" />
         <StatCard label="CADENCE" value={cadenceValue} hint={cadenceHint} />
       </div>
 

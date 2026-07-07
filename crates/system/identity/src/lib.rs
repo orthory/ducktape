@@ -15,7 +15,7 @@
 //! reflects COMMITTED `users` only (the index is derived, so it is excluded).
 //!
 //! `BindNode` is additionally member-gated when constructed with a valset id:
-//! the submitting node must be a current validator OR observer (queried live
+//! the submitting node must be a current validator OR resident (queried live
 //! via [`Ctx::query`]) -- without a valset (the single-node daemon has none)
 //! any external key may bind. `UnbindNode` carries NO member gate and NO
 //! origin restriction beyond "external": it is the recovery path a surviving
@@ -63,7 +63,7 @@ struct UserRecord {
 pub struct Identity {
     id: ModuleId,
     /// the valset module consulted to gate `BindNode` to current members
-    /// (validators UNION observers); `None` runs ungated (the single-node
+    /// (validators UNION residents); `None` runs ungated (the single-node
     /// daemon carries no valset).
     valset_id: Option<ModuleId>,
     /// this network's chain id -- folded into every signed preimage so a
@@ -106,7 +106,7 @@ impl Identity {
         }
     }
 
-    /// the CURRENT validator set UNION observer set, both queried live from
+    /// the CURRENT validator set UNION resident set, both queried live from
     /// the valset module's staged-over-committed projection -- a bind is
     /// admitted for either standing.
     async fn members(&self, ctx: &dyn Ctx, valset_id: &str) -> Result<BTreeSet<Vec<u8>>, Error> {
@@ -123,20 +123,20 @@ impl Identity {
                 )));
             }
         };
-        let observers = match valset_decode_reply(
-            &ctx.query(valset_id, &valset_encode_query(&ValsetQuery::Observers))
+        let residents = match valset_decode_reply(
+            &ctx.query(valset_id, &valset_encode_query(&ValsetQuery::Residents))
                 .await?,
         )
         .map_err(Error::Module)?
         {
-            ValsetReply::Observers(o) => o,
+            ValsetReply::Residents(o) => o,
             other => {
                 return Err(Error::Module(format!(
-                    "valset answered an Observers query with {other:?}"
+                    "valset answered an Residents query with {other:?}"
                 )));
             }
         };
-        Ok(validators.into_iter().chain(observers).collect())
+        Ok(validators.into_iter().chain(residents).collect())
     }
 
     // ---- merged (pending-over-committed) view -------------------------------
@@ -457,12 +457,12 @@ impl Module for Identity {
                 let pubkey = PublicKey::decode(user_key.as_slice())
                     .map_err(|_| Error::Module("bind user_key is not a valid ed25519 key".into()))?;
 
-                // 2. member gate: validators UNION observers, only when configured.
+                // 2. member gate: validators UNION residents, only when configured.
                 if let Some(valset_id) = self.valset_id.clone() {
                     let members = self.members(&*ctx, &valset_id).await?;
                     if !members.contains(&origin) {
                         return Err(Error::Module(
-                            "bind origin is not a network member or observer".into(),
+                            "bind origin is not a network member or resident".into(),
                         ));
                     }
                 }
@@ -626,12 +626,12 @@ mod tests {
     use commonware_cryptography::{Signer as _, ed25519};
 
     /// a minimal Ctx: origin-configurable, and (optionally) answers BOTH the
-    /// valset Validators and Observers queries so the member gate is
+    /// valset Validators and Residents queries so the member gate is
     /// testable for either standing.
     struct TestCtx {
         env: sdk::Env,
         members: Option<Vec<Vec<u8>>>,
-        observers: Option<Vec<Vec<u8>>>,
+        residents: Option<Vec<Vec<u8>>>,
     }
     impl TestCtx {
         fn external(key: &[u8]) -> Self {
@@ -647,20 +647,20 @@ mod tests {
                     me: "identity".into(),
                 },
                 members: None,
-                observers: None,
+                residents: None,
             }
         }
-        fn gated(key: &[u8], validators: Vec<Vec<u8>>, observers: Vec<Vec<u8>>) -> Self {
+        fn gated(key: &[u8], validators: Vec<Vec<u8>>, residents: Vec<Vec<u8>>) -> Self {
             let mut ctx = Self::external(key);
             ctx.members = Some(validators);
-            ctx.observers = Some(observers);
+            ctx.residents = Some(residents);
             ctx
         }
         fn with_members(key: &[u8], members: Vec<Vec<u8>>) -> Self {
             Self::gated(key, members, Vec::new())
         }
-        fn with_observers(key: &[u8], observers: Vec<Vec<u8>>) -> Self {
-            Self::gated(key, Vec::new(), observers)
+        fn with_residents(key: &[u8], residents: Vec<Vec<u8>>) -> Self {
+            Self::gated(key, Vec::new(), residents)
         }
     }
     #[async_trait::async_trait(?Send)]
@@ -676,12 +676,12 @@ mod tests {
                 return Err(Error::QueryUnsupported);
             }
             let q = valset::decode_query(r).map_err(Error::Module)?;
-            match (q, &self.members, &self.observers) {
+            match (q, &self.members, &self.residents) {
                 (valset::ValsetQuery::Validators, Some(m), _) => {
                     Ok(valset::encode_reply(&valset::ValsetReply::Validators(m.clone())))
                 }
-                (valset::ValsetQuery::Observers, _, Some(o)) => {
-                    Ok(valset::encode_reply(&valset::ValsetReply::Observers(o.clone())))
+                (valset::ValsetQuery::Residents, _, Some(o)) => {
+                    Ok(valset::encode_reply(&valset::ValsetReply::Residents(o.clone())))
                 }
                 _ => Err(Error::QueryUnsupported),
             }
@@ -899,18 +899,18 @@ mod tests {
         let u = user();
         let node = vec![8u8; 32];
         let other_member = vec![9u8; 32];
-        // `node` is neither a validator nor an observer.
+        // `node` is neither a validator nor an resident.
         let mut ctx = TestCtx::with_members(&node, vec![other_member]);
 
         let err = futures::executor::block_on(id.execute(&mut ctx, &bind_msg(&u, CHAIN, &node, 0)))
             .unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m == "bind origin is not a network member or observer"),
+            matches!(err, Error::Module(ref m) if m == "bind origin is not a network member or resident"),
             "got {err:?}"
         );
 
-        // an OBSERVER-only origin passes the gate too.
-        let mut ctx = TestCtx::with_observers(&node, vec![node.clone()]);
+        // an RESIDENT-only origin passes the gate too.
+        let mut ctx = TestCtx::with_residents(&node, vec![node.clone()]);
         futures::executor::block_on(id.execute(&mut ctx, &bind_msg(&u, CHAIN, &node, 0))).unwrap();
     }
 
@@ -919,7 +919,7 @@ mod tests {
         let mut id = Identity::new("identity", None, CHAIN.into());
         let u = user();
         let node = vec![10u8; 32];
-        // no members/observers configured at all: an ungated module must
+        // no members/residents configured at all: an ungated module must
         // never call ctx.query, so this must succeed regardless.
         let mut ctx = TestCtx::external(&node);
         futures::executor::block_on(id.execute(&mut ctx, &bind_msg(&u, CHAIN, &node, 0))).unwrap();

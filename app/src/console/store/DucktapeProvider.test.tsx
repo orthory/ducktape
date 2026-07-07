@@ -124,8 +124,8 @@ const makeFakeNode = () => {
         return Promise.resolve({ users: [] });
       }
       if (target === "valset") {
-        if (query === "observers") {
-          return Promise.resolve({ observers: [[0xfe, 0xed]] });
+        if (query === "residents") {
+          return Promise.resolve({ residents: [[0xfe, 0xed]] });
         }
         return Promise.resolve({ validators: [[0xde, 0xad, 0xbe, 0xef]] });
       }
@@ -168,7 +168,7 @@ function Probe() {
       <span data-testid="forge">{state.forgeHead ?? "unborn"}</span>
       <span data-testid="members">{state.members.length}</span>
       <span data-testid="member-keys">{state.members.join(",")}</span>
-      <span data-testid="observer-keys">{state.observers.join(",")}</span>
+      <span data-testid="resident-keys">{state.residents.join(",")}</span>
       <span data-testid="connected">{String(state.connected)}</span>
     </div>
   );
@@ -206,14 +206,14 @@ describe("DucktapeProvider", () => {
     expect(transport.query).toHaveBeenCalledWith("valset", "validators");
   });
 
-  it("hydrates observer standing from valset", async () => {
+  it("hydrates resident standing from valset", async () => {
     const { transport } = makeFakeNode();
     renderConsole(transport);
 
     await waitFor(() => {
-      expect(screen.getByTestId("observer-keys").textContent).toBe("feed");
+      expect(screen.getByTestId("resident-keys").textContent).toBe("feed");
     });
-    expect(transport.query).toHaveBeenCalledWith("valset", "observers");
+    expect(transport.query).toHaveBeenCalledWith("valset", "residents");
   });
 
   it("sendMessage posts a paragraph block with the author as submit origin", async () => {

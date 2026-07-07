@@ -643,16 +643,16 @@ pub fn workspace_demote(app: tauri::AppHandle, id: String, pubkey: String) -> Re
     .map(|_| ())
 }
 
-/// promote an observer into the consensus quorum by pubkey: drive the
+/// promote a resident into the consensus quorum by pubkey: drive the
 /// governance AddValidator through THIS running member node's local rpc. the
 /// second, deliberate step of staged admission — [`workspace_admit`] grants
-/// observer standing; this seats the (pre-synced, warm) key as a validator at
+/// resident standing; this seats the (pre-synced, warm) key as a validator at
 /// the next epoch cutover. same majority ceremony as every membership change.
 #[tauri::command]
 pub fn workspace_promote(app: tauri::AppHandle, id: String, pubkey: String) -> Result<(), String> {
     let pubkey = pubkey.trim().to_string();
     if pubkey.is_empty() {
-        return Err("provide the observer's public key to promote".into());
+        return Err("provide the resident's public key to promote".into());
     }
     let node_bin = crate::daemon::resolve_node_bin()?;
     let reg = load_registry(&app)?;
@@ -665,20 +665,20 @@ pub fn workspace_promote(app: tauri::AppHandle, id: String, pubkey: String) -> R
     .map(|_| ())
 }
 
-/// revoke observer standing by pubkey: drive the governance RemoveObserver
+/// revoke resident standing by pubkey: drive the governance RemoveResident
 /// through THIS running member node's local rpc. the undo of
 /// [`workspace_admit`] — the key drops off the mesh at the next epoch cutover
 /// and its node parks again; re-granting is another admit. a seated validator
 /// is [`workspace_demote`]'s job (the tiers never overlap).
 #[tauri::command]
-pub fn workspace_observer_remove(
+pub fn workspace_resident_remove(
     app: tauri::AppHandle,
     id: String,
     pubkey: String,
 ) -> Result<(), String> {
     let pubkey = pubkey.trim().to_string();
     if pubkey.is_empty() {
-        return Err("provide the observer's public key to revoke".into());
+        return Err("provide the resident's public key to revoke".into());
     }
     let node_bin = crate::daemon::resolve_node_bin()?;
     let reg = load_registry(&app)?;
@@ -686,7 +686,7 @@ pub fn workspace_observer_remove(
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
     run_verb(
         &node_bin,
-        &["observer-remove", &pubkey, "--config", &cfg.to_string_lossy()],
+        &["resident-remove", &pubkey, "--config", &cfg.to_string_lossy()],
     )
     .map(|_| ())
 }

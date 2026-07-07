@@ -64,12 +64,12 @@ describe("buildPeers", () => {
     capabilitiesByNode: new Map<string, string[]>(),
   };
 
-  it("derives validator liveness from the proposal window and observers get none", () => {
+  it("derives validator liveness from the proposal window and residents get none", () => {
     const window = proposalWindow([block(5, KEY_A), block(6, KEY_A), block(7, KEY_B)]);
     const peers = buildPeers({
       ...base,
       members: [KEY_A, KEY_B],
-      observers: [KEY_C],
+      residents: [KEY_C],
       workspace: null,
       window,
     });
@@ -82,18 +82,18 @@ describe("buildPeers", () => {
     expect(a.activity).toEqual({ count: 2, lastHeight: 6 });
     expect(a.share).toBeCloseTo(2 / 3);
     expect(b.activity).toEqual({ count: 1, lastHeight: 7 });
-    // observer: no quorum seat → never proposes → no derived liveness.
-    expect(c.tier).toBe("observer");
+    // resident: no quorum seat → never proposes → no derived liveness.
+    expect(c.tier).toBe("resident");
     expect(c.activity).toBeNull();
     expect(c.share).toBe(0);
   });
 
-  it("orders validators by self, then share desc, then name; observers after", () => {
+  it("orders validators by self, then share desc, then name; residents after", () => {
     const window = proposalWindow([block(1, KEY_B), block(2, KEY_B), block(3, KEY_A)]);
     const peers = buildPeers({
       ...base,
       members: [KEY_A, KEY_B], // A listed first but B leads more
-      observers: [KEY_C],
+      residents: [KEY_C],
       workspace: { pubkey: KEY_A, founder: true }, // A is self → pinned first
       window,
     });
@@ -108,7 +108,7 @@ describe("buildPeers", () => {
     const peers = buildPeers({
       ...base,
       members: [KEY_A, KEY_B],
-      observers: [],
+      residents: [],
       workspace: { pubkey: KEY_A, founder: false }, // self is a plain member
       window: proposalWindow([]),
     });
@@ -120,7 +120,7 @@ describe("buildPeers", () => {
       authorNames: { [KEY_A]: "genesis-node" },
       capabilitiesByNode: new Map([[KEY_A, ["gpu", "oracle"]]]),
       members: [KEY_A],
-      observers: [],
+      residents: [],
       workspace: null,
       window: proposalWindow([]),
     });
