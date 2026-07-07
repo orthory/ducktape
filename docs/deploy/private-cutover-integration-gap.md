@@ -117,6 +117,24 @@ connectivity from disk before the new epoch's phase-A assembly replaces it
 with the verified mesh. Result: a joiner's tunnels exist BEFORE its
 activation cutover, not seconds after.
 
+## Rendezvous hardening (shipped 2026-07-07)
+
+The rendezvous plane now holds up over real time and real NATs, three ways.
+Coordinator registrations EXPIRE (`REGISTRATION_TTL_SECS`, 120 s): an expired
+key resolves to an honest `None` and receives no `PunchSync` toward its dead
+pinhole, and the nonce anti-rollback guard yields for corpses so a rebooted
+node re-registers cleanly. Nodes hold their mapping with a keepalive
+`Readvertise` every `RENDEZVOUS_KEEPALIVE` (25 s) from the resolver's pump
+task — the same datagram keeps the NAT pinhole open, and its wall-clock-seeded
+nonce supersedes the node's own pre-reboot mapping. And the punch no longer
+needs both sides to resolve simultaneously: the pump answers
+coordinator-vouched `PunchSync` fan-outs while the node is otherwise idle, and
+the active side re-`Lookup`s on every punch retry (each one re-fans the sync),
+so one-sided resolution completes against an idle-but-alive peer. What still
+moves with the userspace-overlay ADR's phase 3 is the punched-pinhole ↔
+WireGuard-socket alignment (the punch must originate from the plane's own UDP
+socket) and reflexive-bearing endpoint advertisements.
+
 ## What remains (this seam's follow-ons)
 
 1. **Coordinator-auth (§3.5 of the original doc).** The join window's first

@@ -53,6 +53,16 @@ provides two services on that one socket:
 - **STUN reflexive** — answers a `BindRequest` with the peer's observed
   public `ip:port` so it can learn its own NAT-mapped address.
 
+Registrations have a lifetime: a `register`/`readvertise` mapping expires
+`REGISTRATION_TTL_SECS` (120 s) after the last accepted advert; an expired key
+resolves to `None` and receives no `PunchSync` (its NAT pinhole is long dead
+anyway). Live nodes hold their mapping with a 25 s keepalive `Readvertise`
+(`reachability::RENDEZVOUS_KEEPALIVE`), which doubles as the NAT-pinhole
+keepalive. The book heals itself across coordinator restarts — the same
+keepalives re-register everyone within one interval (their nonces are
+wall-clock-seeded, so a rebooted node supersedes its own stale mapping instead
+of being rejected as a replay).
+
 Everything it answers derives from the **observed source** of the datagram, so
 a wildcard `--listen 0.0.0.0:3478` bind is fully functional on a single-IP
 host. **Multi-homed caveat:** on a box with more than one routable IP, bind the
