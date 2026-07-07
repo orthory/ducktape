@@ -15,6 +15,9 @@
 //! - `tok/{token}/{channel}/{seq:016x}` — one posting per (token, message),
 //!   value = [`TokRef`]. postings of a tombstoned/retokenized head are
 //!   deleted in the same fold, so search never surfaces stale text.
+//! - `tag/{label}/{channel}/{rseq}` and `tagcat/{channel}/{label}` — the
+//!   hashtag postings and per-channel tag catalog (see [`tags`]), maintained
+//!   by the same fold with the same tombstone/re-fold discipline.
 //!
 //! caveat (shared by every mapper): the view reflects ops applied SINCE the
 //! index existed. enabling an index against storage with prior chat history
@@ -40,6 +43,9 @@ use indexer::{
 };
 use serde::{Deserialize, Serialize};
 
+mod tags;
+pub use tags::{MAX_TAG_CHARS, MAX_TAGS_PER_MESSAGE, TagRow};
+
 /// default and max page size for search results.
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 100;
@@ -62,6 +68,12 @@ pub struct MsgRow {
     pub edited: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread: Option<u64>,
+    /// the head's normalized tag labels (appearance order, ≤ 16) — stored so
+    /// an edit/delete can diff/clear exactly what this head indexed (the flat
+    /// `text` can't re-derive them: it folds code blocks in). tombstones
+    /// carry none, like their empty text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// a token posting's value: enough to rank (time) and fetch the row.
@@ -87,13 +99,34 @@ pub enum ChatViewQuery {
         #[serde(default)]
         limit: Option<usize>,
     },
+    /// the tag catalog: `{"tags": {"channelId": "...", "limit": 20}}`. no
+    /// channel aggregates every channel per label.
+    #[serde(rename_all = "camelCase")]
+    Tags {
+        #[serde(default)]
+        channel_id: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// live messages carrying one exact tag, newest first:
+    /// `{"tagSearch": {"tag": "rust", "channelId": "...", "limit": 20}}`.
+    #[serde(rename_all = "camelCase")]
+    TagSearch {
+        tag: String,
+        #[serde(default)]
+        channel_id: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
 }
 
-/// chat's view replies: `{"hits": [<MsgRow>…]}`, newest first.
+/// chat's view replies: `{"hits": [<MsgRow>…]}` newest first, or
+/// `{"tags": [<TagRow>…]}` count-ordered.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChatViewReply {
     Hits(Vec<MsgRow>),
+    Tags(Vec<TagRow>),
 }
 
 /// the chat mapper. register with the module's genesis id.
@@ -198,8 +231,9 @@ fn read_row(ctx: &ApplyCtx, key: &str) -> Result<Option<MsgRow>> {
 }
 
 /// every entry one head state materializes to — the row plus one posting per
-/// token (a tombstone's empty text yields none). fold and rebuild both write
-/// THROUGH this, so the two paths produce byte-identical rows.
+/// token and per tag label (a tombstone's empty text and tag set yield none).
+/// fold and rebuild both write THROUGH this, so the two paths produce
+/// byte-identical rows.
 fn row_entries(row: &MsgRow) -> Result<Vec<(String, Vec<u8>)>> {
     let mut entries = vec![(
         msg_key(&row.channel_id, row.seq),
@@ -214,6 +248,12 @@ fn row_entries(row: &MsgRow) -> Result<Vec<(String, Vec<u8>)>> {
     .map_err(|e| Error::Mapper(e.to_string()))?;
     for token in search::tokens(&row.text) {
         entries.push((tok_key(&token, &row.channel_id, row.seq), tok_ref.clone()));
+    }
+    for label in &row.tags {
+        entries.push((
+            tags::tag_key(label, &row.channel_id, row.seq),
+            tok_ref.clone(),
+        ));
     }
     Ok(entries)
 }
@@ -267,12 +307,17 @@ impl ModuleIndexer for ChatIndex {
                     deleted: false,
                     edited: false,
                     thread,
+                    tags: tags::labels(&blocks),
                     channel_id,
                 };
+                tags::fold_catalog(ctx, out, &row.channel_id, &[], &row.tags)?;
                 put_row_and_toks(out, &row)
             }
             ChatMsg::EditMessage {
-                channel_id, seq, blocks, ..
+                channel_id,
+                seq,
+                blocks,
+                ..
             } => {
                 // absent row == the message predates this index; nothing to
                 // retokenize (see the module doc's pre-index caveat).
@@ -282,10 +327,15 @@ impl ModuleIndexer for ChatIndex {
                 if row.deleted {
                     return Ok(());
                 }
-                // delete BEFORE re-putting: tokens shared by the old and new
-                // text stage a delete then a put, and the last action wins.
+                // delete BEFORE re-putting: tokens/tags shared by the old and
+                // new text stage a delete then a put, and the last action
+                // wins. the catalog moves by the old/new tag-set DIFF.
                 delete_toks(out, &row);
+                tags::delete_postings(out, &row);
+                let new_tags = tags::labels(&blocks);
+                tags::fold_catalog(ctx, out, &row.channel_id, &row.tags, &new_tags)?;
                 row.text = plain_text(&blocks);
+                row.tags = new_tags;
                 row.edited = true;
                 put_row_and_toks(out, &row)
             }
@@ -294,8 +344,11 @@ impl ModuleIndexer for ChatIndex {
                     return Ok(());
                 };
                 delete_toks(out, &row);
+                tags::delete_postings(out, &row);
+                tags::fold_catalog(ctx, out, &row.channel_id, &row.tags, &[])?;
                 row.deleted = true;
                 row.text = String::new();
+                row.tags = Vec::new();
                 put_row_and_toks(out, &row)
             }
             // channel records, reactions, hooks, membership, and huddle
@@ -332,15 +385,15 @@ impl ModuleIndexer for ChatIndex {
                     search::intersect_prefix(reader, "tok/", &tokens, DEFAULT_POSTING_CAP)?
                         .into_iter()
                         .filter_map(|hit| serde_json::from_slice(&hit.value).ok())
-                        .filter(|r: &TokRef| {
-                            channel_id.as_ref().is_none_or(|c| &r.channel_id == c)
-                        })
+                        .filter(|r: &TokRef| channel_id.as_ref().is_none_or(|c| &r.channel_id == c))
                         .collect();
                 // newest first; (channel, seq) tiebreak for a stable order.
                 refs.sort_by(|a, b| {
                     (b.time, &b.channel_id, b.seq).cmp(&(a.time, &a.channel_id, a.seq))
                 });
-                let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, MAX_SEARCH_LIMIT);
+                let limit = limit
+                    .unwrap_or(DEFAULT_SEARCH_LIMIT)
+                    .clamp(1, MAX_SEARCH_LIMIT);
                 let mut hits = Vec::new();
                 for r in refs.into_iter().take(limit) {
                     if let Some(bytes) = reader.get(msg_key(&r.channel_id, r.seq).as_bytes())? {
@@ -349,6 +402,20 @@ impl ModuleIndexer for ChatIndex {
                         hits.push(row);
                     }
                 }
+                serde_json::to_vec(&ChatViewReply::Hits(hits))
+                    .map_err(|e| Error::View(e.to_string()))
+            }
+            ChatViewQuery::Tags { channel_id, limit } => {
+                let rows = tags::serve_tags(reader, channel_id, limit)?;
+                serde_json::to_vec(&ChatViewReply::Tags(rows))
+                    .map_err(|e| Error::View(e.to_string()))
+            }
+            ChatViewQuery::TagSearch {
+                tag,
+                channel_id,
+                limit,
+            } => {
+                let hits = tags::serve_tag_search(reader, &tag, channel_id, limit)?;
                 serde_json::to_vec(&ChatViewReply::Hits(hits))
                     .map_err(|e| Error::View(e.to_string()))
             }
@@ -377,7 +444,14 @@ impl ModuleIndexer for ChatIndex {
             other => return Err(Error::State(format!("Channels answered {other:?}"))),
         };
         for channel in channels {
-            out.put(seq_key(&channel.id), channel.head_seq.to_be_bytes().to_vec())?;
+            out.put(
+                seq_key(&channel.id),
+                channel.head_seq.to_be_bytes().to_vec(),
+            )?;
+            // the channel's tag catalog re-accumulates from the live heads —
+            // count-only, exactly what the fold maintains incrementally.
+            let mut tag_counts: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
             let mut from_seq = 1u64;
             while from_seq <= channel.head_seq {
                 let reply = state
@@ -411,8 +485,9 @@ impl ModuleIndexer for ChatIndex {
                         author: author_from_ref(&head.author),
                         height: meta.height,
                         time: head.created_at,
-                        // mirror the fold's tombstone exactly: empty text (so
-                        // no postings), whatever skeleton the head kept.
+                        // mirror the fold's tombstone exactly: empty text and
+                        // tag set (so no postings), whatever skeleton the
+                        // head kept.
                         text: if head.deleted {
                             String::new()
                         } else {
@@ -421,16 +496,33 @@ impl ModuleIndexer for ChatIndex {
                         deleted: head.deleted,
                         edited: head.rev > 0,
                         thread: head.thread,
+                        tags: if head.deleted {
+                            Vec::new()
+                        } else {
+                            tags::labels(&head.blocks)
+                        },
                     };
+                    for label in &row.tags {
+                        *tag_counts.entry(label.clone()).or_insert(0) += 1;
+                    }
                     for (key, value) in row_entries(&row)? {
                         out.put(key, value)?;
                     }
                 }
             }
+            for (label, count) in tag_counts {
+                out.put(
+                    tags::catalog_key(&channel.id, &label),
+                    tags::encode_catalog(count)?,
+                )?;
+            }
         }
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tag_tests;
 
 #[cfg(test)]
 mod tests {
@@ -479,6 +571,7 @@ mod tests {
             .expect("view");
         match serde_json::from_slice(&bytes).expect("reply decodes") {
             ChatViewReply::Hits(hits) => hits,
+            other => panic!("expected hits, got {other:?}"),
         }
     }
 
@@ -515,7 +608,10 @@ mod tests {
         apply(&store, 1, vec![post("g", "m1", "alpha beta gamma")]);
         apply(&store, 2, vec![post("g", "m2", "alpha delta")]);
 
-        let hits = search(&store, serde_json::json!({"search": {"text": "alpha beta"}}));
+        let hits = search(
+            &store,
+            serde_json::json!({"search": {"text": "alpha beta"}}),
+        );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].message_id, "m1");
     }
@@ -579,15 +675,26 @@ mod tests {
     #[test]
     fn user_author_renders_binary_key_as_hex_not_garbage() {
         // a raw ed25519-style key: 32 bytes that are NOT printable utf-8.
-        let key: Vec<u8> = (0u8..32).map(|i| i.wrapping_mul(37).wrapping_add(0x80)).collect();
+        let key: Vec<u8> = (0u8..32)
+            .map(|i| i.wrapping_mul(37).wrapping_add(0x80))
+            .collect();
         let rendered = author_from_ref(&AuthorRef::User(key.clone()));
         let handle = rendered.strip_prefix("user:").expect("user-tagged");
-        assert!(!handle.contains('\u{FFFD}'), "no lossy replacement chars: {handle:?}");
-        assert!(handle.chars().all(|c| !c.is_control()), "no control chars: {handle:?}");
+        assert!(
+            !handle.contains('\u{FFFD}'),
+            "no lossy replacement chars: {handle:?}"
+        );
+        assert!(
+            handle.chars().all(|c| !c.is_control()),
+            "no control chars: {handle:?}"
+        );
         // it is the hex of the key bytes.
         assert_eq!(handle, indexer::user_handle(&key));
         // a printable claimed name (embedded daemon) still passes through.
-        assert_eq!(author_from_ref(&AuthorRef::User(b"jess".to_vec())), "user:jess");
+        assert_eq!(
+            author_from_ref(&AuthorRef::User(b"jess".to_vec())),
+            "user:jess"
+        );
     }
 
     #[test]
@@ -754,14 +861,64 @@ mod tests {
         let state = CanonicalChat {
             channels: vec![canonical_channel("g", 3), canonical_channel("q", 1)],
             views: vec![
-                canonical_view("g", 1, 3, "m1", AuthorRef::User(b"jess".to_vec()), "hello fluent world", 1_001, 0, false),
-                canonical_view("g", 2, 3, "m2", AuthorRef::Agent { module: "agent".into(), agent_id: "helper".into() }, "fluent chatter", 1_002, 0, false),
-                canonical_view("g", 3, 3, "m3", AuthorRef::User(b"eddy".to_vec()), "revised phrasing", 1_003, 2, false),
-                canonical_view("q", 1, 1, "m4", AuthorRef::User(b"jess".to_vec()), "was deleted", 1_004, 0, true),
+                canonical_view(
+                    "g",
+                    1,
+                    3,
+                    "m1",
+                    AuthorRef::User(b"jess".to_vec()),
+                    "hello fluent world",
+                    1_001,
+                    0,
+                    false,
+                ),
+                canonical_view(
+                    "g",
+                    2,
+                    3,
+                    "m2",
+                    AuthorRef::Agent {
+                        module: "agent".into(),
+                        agent_id: "helper".into(),
+                    },
+                    "fluent chatter",
+                    1_002,
+                    0,
+                    false,
+                ),
+                canonical_view(
+                    "g",
+                    3,
+                    3,
+                    "m3",
+                    AuthorRef::User(b"eddy".to_vec()),
+                    "revised phrasing",
+                    1_003,
+                    2,
+                    false,
+                ),
+                canonical_view(
+                    "q",
+                    1,
+                    1,
+                    "m4",
+                    AuthorRef::User(b"jess".to_vec()),
+                    "was deleted",
+                    1_004,
+                    0,
+                    true,
+                ),
             ],
         };
         store
-            .rebuild_module("chat", &state, indexer::RebuildMeta { height: 50, time: 0 })
+            .rebuild_module(
+                "chat",
+                &state,
+                indexer::RebuildMeta {
+                    height: 50,
+                    time: 0,
+                },
+            )
             .await
             .expect("rebuild");
 

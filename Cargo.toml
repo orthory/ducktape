@@ -99,6 +99,9 @@ base64 = "0.22"
 # argon2id KEK derivation, and XChaCha20-Poly1305 AEAD. zeroize scrubs the
 # derived key on drop.
 bip39 = "2"
+# chat's derived tag index normalizes hashtag labels to NFC (already in-tree
+# transitively via bip39; pinned here for the chat crate's direct use).
+unicode-normalization = "0.1"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = "1"

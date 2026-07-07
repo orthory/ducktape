@@ -78,6 +78,7 @@ export function MessageList({
   onReact,
   onEdit,
   onDelete,
+  onTagClick,
 }: {
   channelName: string;
   /** Every sequence of the active channel (roots + replies + tombstones) —
@@ -99,6 +100,8 @@ export function MessageList({
   onReact: (seq: number, emoji: string) => void;
   onEdit: (seq: number, text: string) => void;
   onDelete: (seq: number) => void;
+  /** Body #tags become click-to-filter (tag passed without the `#`). */
+  onTagClick?: (tag: string) => void;
 }) {
   const roots = messages.filter((m) => m.head.thread === null);
   const rows = buildStreamRows(roots);
@@ -155,6 +158,7 @@ export function MessageList({
                 onReact={(emoji) => onReact(message.seq, emoji)}
                 onEdit={(text) => onEdit(message.seq, text)}
                 onDelete={() => onDelete(message.seq)}
+                onTagClick={onTagClick}
                 op={opForMessage(ops, message)}
               />
             </div>

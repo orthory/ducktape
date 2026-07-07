@@ -61,13 +61,13 @@ use commonware_runtime::{Clock, IoBuf, Metrics, Quota, Runner, Spawner, Supervis
 use commonware_utils::{NZU32, ordered::Set};
 use dispatch::DispatchModule;
 use tagging::TaggingModule;
-use dispatch_oracle::DispatchWorker;
 use futures::{FutureExt as _, StreamExt as _};
 
 use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
 
 mod config;
 mod lobby;
+mod oracle_pool;
 mod relay;
 mod resident_announce;
 mod resident_dispatch;
@@ -7808,12 +7808,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let providers = capability_host::discover()
             .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
         let my_capabilities = providers.capabilities();
-        let workers: Vec<Box<dyn reactor::Worker>> = vec![Box::new(DispatchWorker::new(
+        // OFF-LOOP execution: the pool gates effects inline (lease check —
+        // WorkerRequests leased to another node's key are skipped, not
+        // double-run — under this node's submit key) but runs the provider
+        // CLI on spawned background tasks; completed results come back over
+        // `oracle_results` (an ingress arm below) and re-enter the ordered
+        // lane as ordinary signed submits, so a minutes-long run never
+        // stalls the drain/rpc/heartbeat arms of this loop.
+        let (oracle_worker, mut oracle_results) = oracle_pool::build(
+            &context,
             providers,
-            // this node's submit key: WorkerRequests leased to another
-            // node's key are skipped, not double-run.
             signer.public_key().as_ref().to_vec(),
-        ))];
+        );
+        let workers: Vec<Box<dyn reactor::Worker>> = vec![oracle_worker];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains
         // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
         // this binary can execute. survives restart/late-join (state-driven, not a
@@ -8815,6 +8822,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     };
                     let _ = reply.send(resp);
+                }
+                result = oracle_results.next() => {
+                    // a completed off-loop provider run: its OracleResult op
+                    // re-enters the ordered lane as an ordinary signed
+                    // submit — the oracle-as-op, unchanged; only WHERE the
+                    // provider ran moved.
+                    let Some(msg) = result else { continue };
+                    let seq = next_seq;
+                    next_seq += 1;
+                    if let Err(e) = node.submit(&signer, seq, msg).await {
+                        eprintln!("[node {label}] oracle result submit failed: {e}");
+                    }
                 }
                 announce = lobby_ingress.next() => {
                     let Some((peer, bytes)) = announce else { continue };
