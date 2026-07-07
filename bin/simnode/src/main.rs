@@ -391,7 +391,9 @@ fn run_sim(
             Some("jobs".into()),
         );
         let pages = Pages::init(context.child("pages"), "pages").await;
-        let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
+        let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
+            .expect("forge init")
+            .with_chat("chat");
         let files = Files::open("files", duckfs_dir).expect("duckfs open");
         let profiles = Profiles::new("profiles");
         // the deterministic user->nodes binding registry — no valset, no chain

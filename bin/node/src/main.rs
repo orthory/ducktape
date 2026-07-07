@@ -666,7 +666,9 @@ async fn genesis_host(
         .with_tagging("tagging");
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
-    let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs).expect("forge init");
+    let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
+        .expect("forge init")
+        .with_chat("chat");
     let mut valset = Valset::new("valset");
     // genesis-seed the validator set from config — deterministic and identical
     // on every node, so membership is IN consensus state from block zero (the
@@ -772,7 +774,8 @@ async fn restore_host(
         .with_tagging("tagging");
     // forge shares the blob plane (see genesis_host) for Push materialization.
     let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
-        .map_err(|e| format!("forge: {e}"))?;
+        .map_err(|e| format!("forge: {e}"))?
+        .with_chat("chat");
     // establish the checkpoint boundary's dual-path branch selector so the
     // restored forge `root()` matches at any block the replay SKIPS (disk already
     // held it) before the first replayed block re-derives it per height. the
@@ -1218,8 +1221,9 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("automations install: {e}"))?;
 
     let (bytes, root) = snapshot_of("forge").await?;
-    let mut forge =
-        Forge::init("forge", forge_repo.to_path_buf()).map_err(|e| format!("forge init: {e}"))?;
+    let mut forge = Forge::init("forge", forge_repo.to_path_buf())
+        .map_err(|e| format!("forge init: {e}"))?
+        .with_chat("chat");
     // set the dual-path branch selector to the SERVED boundary version BEFORE
     // install: `Forge::install` (and `root()`) branch on `active_version`, so a
     // joiner installing a post-H snapshot must select the boundary's format or the
