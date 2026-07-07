@@ -138,6 +138,29 @@ describe("FilesView", () => {
     expect(transport.filesStage).not.toHaveBeenCalled();
   });
 
+  it("creates new folders under /shared even before /shared exists", async () => {
+    const transport = makeTransport({
+      filesLs: vi.fn(({ path }: { path: string }) =>
+        path === "/shared"
+          ? Promise.reject(new Error("missing"))
+          : Promise.resolve({ entries: [], next: null }),
+      ),
+    });
+    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue("docs");
+    try {
+      renderView(transport);
+      await screen.findByText("Empty directory");
+
+      fireEvent.click(screen.getByRole("button", { name: /new folder/i }));
+
+      await waitFor(() => expect(transport.filesCommit).toHaveBeenCalled());
+      const body = (transport.filesCommit as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(body.changes).toEqual([{ mkdir: { path: "/shared/docs" } }]);
+    } finally {
+      promptSpy.mockRestore();
+    }
+  });
+
   it("deletes the open file after a two-step confirm", async () => {
     const transport = makeTransport();
     renderView(transport);

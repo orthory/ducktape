@@ -26,6 +26,8 @@ use serde::Deserialize;
 use crate::actor_api::ActorNodeApi;
 use crate::{NodeHandle, error_response};
 
+const MANAGED_WORKSPACE_ROOT: &str = "/shared/workspaces";
+
 /// per-workspace commit serialization. keyed by id, each value a mutex two
 /// commits on the same workspace contend on; disjoint workspaces never wait.
 /// state is on disk, so this map is the ONLY in-memory workspace state — a
@@ -64,6 +66,43 @@ fn valid_slug(id: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
+fn managed_prefix(id: &str, suffix: &[String]) -> String {
+    let mut prefix = format!("{MANAGED_WORKSPACE_ROOT}/{id}");
+    for seg in suffix {
+        prefix.push('/');
+        prefix.push_str(seg);
+    }
+    prefix
+}
+
+/// resolve the caller's workspace vocabulary into the duckfs namespace recorded
+/// in `.duckfs/index.json`. `/workspace` is intentionally local to this RPC: it
+/// maps to an id-scoped managed prefix, so a job can edit its returned disk dir
+/// without knowing the module's writable roots. explicit `/shared...` is still
+/// accepted for the older CLI/e2e contract.
+fn checkout_prefix(id: &str, requested: &str) -> Result<String, String> {
+    let trimmed = requested.trim().trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        return Ok(managed_prefix(id, &[]));
+    }
+
+    let absolute = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    let segs = files::paths::canonical(&absolute)
+        .map_err(|e| format!("duckfs workspace prefix is invalid: {e}"))?;
+    match segs.first().map(String::as_str) {
+        Some("workspace") => Ok(managed_prefix(id, &segs[1..])),
+        Some("shared") => Ok(format!("/{}", segs.join("/"))),
+        _ => Err(
+            "duckfs workspace prefix must be /workspace (managed) or /shared (explicit)"
+                .to_string(),
+        ),
+    }
+}
+
 /// the 503 a node without a configured workspace root answers with (the router
 /// tests' fake handle, and any daemon that never injected the root).
 fn unconfigured() -> Response {
@@ -76,8 +115,11 @@ fn unconfigured() -> Response {
 /// the POST /v1/fs/workspaces body.
 #[derive(Debug, Deserialize)]
 pub struct CreateBody {
-    /// the duckfs subtree to check out (e.g. `/shared/job1`).
-    pub prefix: String,
+    /// the duckfs subtree to check out. omitted/empty/`/workspace` means the
+    /// daemon chooses an id-scoped managed namespace for this local workspace;
+    /// explicit `/shared...` remains available for legacy callers.
+    #[serde(default)]
+    pub prefix: Option<String>,
     /// an explicit snapshot to check out at; omitted/`null` = the committed head
     /// (`None` head = an empty checkout).
     #[serde(default)]
@@ -98,7 +140,10 @@ pub(crate) async fn create_workspace(
     let dir = root.join(&id);
     let path_str = dir.display().to_string();
     let api = ActorNodeApi::new(handle.clone());
-    let prefix = body.prefix;
+    let prefix = match checkout_prefix(&id, body.prefix.as_deref().unwrap_or("/workspace")) {
+        Ok(prefix) => prefix,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, &err),
+    };
     let snapshot = body.snapshot;
     let result = tokio::task::spawn_blocking(move || {
         // a managed checkout records no node url — its commits ride the actor
@@ -111,6 +156,7 @@ pub(crate) async fn create_workspace(
         Ok(Ok(index)) => Json(serde_json::json!({
             "id": id,
             "path": path_str,
+            "prefix": index.prefix,
             "snapshot": index.base_snapshot,
         }))
         .into_response(),

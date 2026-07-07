@@ -20,8 +20,7 @@ import { FilePreview } from "./FilePreview";
 import { errMsg, humanBytes } from "./files-format";
 import { HistoryPanel } from "./HistoryPanel";
 
-/** Where the browser opens (and where uploads land) by default; falls back to
- *  the root when a fresh network has no /shared yet. */
+/** Where the browser opens and where root-level writes land by default. */
 const DEFAULT_DIR = "/shared";
 
 interface UploadState {
@@ -37,6 +36,8 @@ const sortEntries = (entries: FileEntry[]): FileEntry[] =>
     if (a.kind !== b.kind) return a.kind === "dir" ? -1 : b.kind === "dir" ? 1 : 0;
     return a.path.localeCompare(b.path);
   });
+
+const writeTargetDir = (dir: string): string => (dir === "/" ? DEFAULT_DIR : dir);
 
 function CenterState({ title, detail, muted }: { title: string; detail: string; muted?: boolean }) {
   return (
@@ -263,9 +264,8 @@ export function FilesView() {
     };
   }, [transport, reloadToken]);
 
-  // Page the current directory. A missing dir (a fresh network has no /shared,
-  // or the dir was removed / is absent in the browsed snapshot) falls back to
-  // the root, which always lists (empty on a fresh filesystem).
+  // Page the current directory. A fresh live network may not have /shared yet;
+  // keep that as an empty writeable default instead of drifting writes to root.
   useEffect(() => {
     if (!transport) return;
     let alive = true;
@@ -280,6 +280,12 @@ export function FilesView() {
       })
       .catch((err) => {
         if (!alive) return;
+        if (dir === DEFAULT_DIR && snapshot === null) {
+          setEntries([]);
+          setCursor(null);
+          setLoading(false);
+          return;
+        }
         if (dir !== "/") {
           setDir("/");
           return;
@@ -324,7 +330,7 @@ export function FilesView() {
     setUpload({ name: file.name, staged: 0, total: 0 });
     try {
       await uploadFile(transport, {
-        path: joinPath(dir, file.name),
+        path: joinPath(writeTargetDir(dir), file.name),
         bytes,
         meta: file.type ? { mime: file.type } : {},
         onProgress: (staged, total) => setUpload({ name: file.name, staged, total }),
@@ -343,7 +349,7 @@ export function FilesView() {
     if (!name) return;
     setError(null);
     try {
-      await mkdir(transport, { path: joinPath(dir, name) });
+      await mkdir(transport, { path: joinPath(writeTargetDir(dir), name) });
       bumpReload();
     } catch (err) {
       setError(errMsg(err));

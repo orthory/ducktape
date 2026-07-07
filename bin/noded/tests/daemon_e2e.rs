@@ -1844,6 +1844,50 @@ fn duckfs_engine_round_trips_and_reports_conflict_through_http_node() {
 // ============================================================================
 
 #[test]
+fn duckfs_workspace_rpc_maps_workspace_prefix_into_managed_namespace() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    // `/workspace` is the caller's local sandbox vocabulary. The workspace RPC
+    // owns the duckfs namespace choice; it must not persist `/workspace` into
+    // the .duckfs index and let commit fail later with the module's authority
+    // error ("files: path is outside /home and /shared").
+    let (code, ws) = daemon.request(
+        "POST",
+        "/v1/fs/workspaces",
+        Some(&serde_json::json!({ "prefix": "/workspace" })),
+    );
+    assert_eq!(code, 200, "create managed workspace failed: {ws}");
+    let id = ws["id"].as_str().expect("workspace id").to_string();
+    let path = ws["path"].as_str().expect("workspace path").to_string();
+
+    std::fs::write(std::path::Path::new(&path).join("hello.txt"), b"inside").unwrap();
+    let (code, done) = daemon.request(
+        "POST",
+        &format!("/v1/fs/workspaces/{id}/commit"),
+        Some(&serde_json::json!({ "message": "commit managed workspace" })),
+    );
+    assert_eq!(
+        code, 200,
+        "workspace commit should use a managed duckfs prefix: {done}"
+    );
+
+    let index = duckfs_client::index::Index::load(std::path::Path::new(&path)).unwrap();
+    assert!(
+        index.prefix.starts_with("/shared/workspaces/"),
+        "the managed checkout records an internal writable prefix, got {}",
+        index.prefix
+    );
+    let read_path = format!("{}/hello.txt", index.prefix);
+    let (code, read) = daemon.request("GET", &format!("/v1/files/read?path={read_path}"), None);
+    assert_eq!(code, 200, "read committed managed workspace file: {read}");
+    let bytes = STANDARD
+        .decode(read["b64"].as_str().expect("b64").as_bytes())
+        .expect("decode b64");
+    assert_eq!(bytes, b"inside");
+}
+
+#[test]
 fn duckfs_workspace_rpc_lifecycle_and_conflict() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
