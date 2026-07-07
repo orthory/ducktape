@@ -8,3 +8,5 @@ docs/pages.gen.ts
 app/dist/
 app/src-tauri/gen/
 app/src-tauri/binaries/
+ops/wg-smoke/*.log
+ops/wg-smoke/node*/

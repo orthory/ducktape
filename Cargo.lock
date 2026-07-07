@@ -4604,6 +4604,7 @@ name = "overlay-net"
 version = "0.1.0"
 dependencies = [
  "commonware-runtime",
+ "data-plane",
  "defguard_boringtun",
  "defguard_wireguard_rs",
  "governor",

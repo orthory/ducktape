@@ -33,9 +33,7 @@ use smoltcp::wire::{HardwareAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
-use super::sockets::{
-    VirtualTcpListener, VirtualTcpStream, VirtualUdpSocket, addr_to_endpoint,
-};
+use super::sockets::{VirtualTcpListener, VirtualTcpStream, VirtualUdpSocket, addr_to_endpoint};
 
 /// the tunnel MTU: the conventional WireGuard value (1500 minus WG overhead),
 /// matching what the TUN path configures — so a socket-mode node never emits
@@ -192,6 +190,43 @@ pub(super) struct StackShared {
 impl StackShared {
     pub(super) fn lock(&self) -> MutexGuard<'_, StackState> {
         self.state.lock().expect("stack lock poisoned")
+    }
+}
+
+/// how many pre-armed listening slots a seam- or factory-minted TCP
+/// listener keeps: the bound on connections that can complete a handshake
+/// before `accept` collects them. each slot carries its TCP buffers eagerly
+/// (2 × 256 KiB), so this is also a per-listener memory commitment (~4 MiB).
+pub(crate) const LISTEN_BACKLOG: usize = 8;
+
+/// the publishable handle to the live [`VirtualStack`] — what the overlay
+/// seam and the data-plane socket factory route through. the effect layer
+/// owns the writes: it publishes on the `apply` that stands a backend up,
+/// re-publishes on an interface-replacing rebuild, and clears on
+/// `remove_interface`. consumers read PER OPERATION (every dial/bind), so a
+/// rebuilt backend serves new connections without any consumer re-wiring —
+/// exactly the property epoch cutover needs. an empty slot means the tunnel
+/// is not up, which callers surface as the same "interface down" failure the
+/// TUN path yields.
+#[derive(Clone, Default)]
+pub struct StackSlot(Arc<std::sync::RwLock<Option<Arc<VirtualStack>>>>);
+
+impl StackSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// the live stack, if the backend is up.
+    pub fn get(&self) -> Option<Arc<VirtualStack>> {
+        self.0.read().expect("stack slot lock poisoned").clone()
+    }
+
+    pub(super) fn publish(&self, stack: Arc<VirtualStack>) {
+        *self.0.write().expect("stack slot lock poisoned") = Some(stack);
+    }
+
+    pub(super) fn clear(&self) {
+        *self.0.write().expect("stack slot lock poisoned") = None;
     }
 }
 
@@ -414,9 +449,7 @@ async fn poll_loop(shared: Arc<StackShared>, mut from_device: mpsc::Receiver<Vec
         let delay = {
             let mut state = shared.lock();
             let now = state.now();
-            let StackState {
-                iface, sockets, ..
-            } = &mut *state;
+            let StackState { iface, sockets, .. } = &mut *state;
             iface
                 .poll_delay(now, sockets)
                 .map(|d| Duration::from_micros(d.total_micros()))

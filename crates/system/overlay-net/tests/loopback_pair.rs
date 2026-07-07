@@ -3,7 +3,9 @@
 //! through the `WireGuardEffect` boundary — handshake, datagram echo through
 //! the virtual stack, TCP dial/listen through the tunnel, forced rekey,
 //! session preservation across an identical re-apply, and the atomic peer
-//! replace.
+//! replace. plus the phase-2 consumer faces over the same pair: the overlay
+//! seam's `Virtual` arm (a commonware `Network` dial/bind terminating in the
+//! virtual stacks) and data-plane's `VirtualSocketFactory`.
 //!
 //! everything here runs unprivileged: no TUN, no CAP_NET_ADMIN, no external
 //! binaries — the property the whole ADR exists to win.
@@ -167,7 +169,10 @@ async fn tcp_dial_listen_echo() {
             .connect_tcp(SocketAddr::new(IpAddr::V6(b_ula), 8443))
             .await
             .expect("dial through the tunnel");
-        stream.write_all(b"hello over wireguard").await.expect("write");
+        stream
+            .write_all(b"hello over wireguard")
+            .await
+            .expect("write");
         stream.flush().await.expect("flush");
         let mut echo = vec![0u8; 20];
         stream.read_exact(&mut echo).await.expect("read echo");
@@ -333,4 +338,196 @@ async fn peer_replace_switches_traffic_atomically() {
         silent.await.is_err(),
         "the replaced peer must receive nothing from a"
     );
+}
+
+// ── ADR phase 2: the consumer faces over the pair ───────
+
+/// the overlay seam's `Virtual` arm: a commonware `Network` bind and dial on
+/// overlay ULAs terminate in the virtual stacks and carry bytes both ways
+/// through the tunnel — the exact path the control mesh rides in socket
+/// mode. also proves the down-tunnel contract: an empty slot refuses the
+/// dial the way a downed TUN interface would.
+#[test]
+fn seam_virtual_arm_carries_overlay_connections() {
+    use commonware_runtime::{
+        Listener as _, Network as _, Runner as _, Sink as _, Stream as _, Supervisor as _,
+    };
+    use overlay_net::userspace::StackSlot;
+    use overlay_net::{OverlayBackend, OverlayContext, OverlayRouter};
+
+    let executor = commonware_runtime::tokio::Runner::default();
+    executor.start(|context| async move {
+        let (mut a, mut b) = (stand_up(0xc1, 0xa), stand_up(0xd2, 0xb));
+        peer_up(&mut a, &mut b);
+
+        // the /48 the pair's fixture ULAs live in — what the node derives
+        // from the chain namespace.
+        let router = OverlayRouter::for_prefix48(ula(0));
+        let downed_inner = context.child("downed");
+        let ctx_a = OverlayContext::with_backend(
+            context.child("a"),
+            router,
+            OverlayBackend::Userspace(a.effect.stack_slot()),
+        );
+        let ctx_b = OverlayContext::with_backend(
+            context,
+            router,
+            OverlayBackend::Userspace(b.effect.stack_slot()),
+        );
+
+        // a context whose tunnel is not up refuses overlay dials loudly.
+        let downed = OverlayContext::with_backend(
+            downed_inner,
+            router,
+            OverlayBackend::Userspace(StackSlot::new()),
+        );
+        assert!(
+            downed
+                .dial(SocketAddr::new(IpAddr::V6(b.ula), 9443))
+                .await
+                .is_err(),
+            "an empty slot is a downed tunnel — the dial must fail"
+        );
+
+        let mut listener = ctx_b
+            .bind(SocketAddr::new(IpAddr::V6(b.ula), 9443))
+            .await
+            .expect("bind b's ULA through the seam");
+        // binding an address the virtual host does not own is refused.
+        assert!(
+            ctx_b
+                .bind(SocketAddr::new(IpAddr::V6(a.ula), 9444))
+                .await
+                .is_err(),
+            "the virtual host owns exactly one /128"
+        );
+
+        let a_ula = a.ula;
+        let accept = async move {
+            let (remote, mut sink, mut stream) = listener.accept().await.expect("accept");
+            assert_eq!(
+                remote.ip(),
+                IpAddr::V6(a_ula),
+                "accepted connection authenticated by a's overlay /128"
+            );
+            let got = stream.recv(5).await.expect("recv request");
+            sink.send(got).await.expect("send echo");
+            // hold the halves until the dialer has read the echo.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        let dial = async {
+            let (mut sink, mut stream) = ctx_a
+                .dial(SocketAddr::new(IpAddr::V6(b.ula), 9443))
+                .await
+                .expect("dial through the seam");
+            sink.send(&b"seam!"[..]).await.expect("send request");
+            stream.recv(5).await.expect("recv echo")
+        };
+        let (echo, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(dial, accept)
+        })
+        .await
+        .expect("round trip within deadline");
+        assert_eq!(echo.coalesce().as_ref(), b"seam!");
+    });
+}
+
+/// data-plane's socket seam over the virtual stack: `VirtualSocketFactory`
+/// mints the plane's UDP and stream endpoints, enforcing the `/128` bind
+/// invariant, and carries a datagram echo plus a stream echo through the
+/// tunnel — the surface statesync's per-use plane consumes in socket mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socket_factory_serves_the_data_plane_surface() {
+    use data_plane::SocketFactory as _;
+    use overlay_net::userspace::{StackSlot, VirtualSocketFactory};
+
+    let (mut a, mut b) = (stand_up(0xe1, 0xa), stand_up(0xf2, 0xb));
+    peer_up(&mut a, &mut b);
+
+    let factory_a = VirtualSocketFactory::new(a.effect.stack_slot());
+    let factory_b = VirtualSocketFactory::new(b.effect.stack_slot());
+
+    // tunnel-down and wrong-address binds surface as io errors (the node's
+    // bring-up retry loop absorbs the former; the latter is a loud bug).
+    assert!(
+        VirtualSocketFactory::new(StackSlot::new())
+            .bind_udp(SocketAddr::new(IpAddr::V6(a.ula), 0))
+            .await
+            .is_err(),
+        "an empty slot is the interface not being up"
+    );
+    assert!(
+        factory_a
+            .bind_udp(SocketAddr::new(IpAddr::V6(b.ula), 0))
+            .await
+            .is_err(),
+        "the factory refuses binds off the node's own /128"
+    );
+
+    // datagram: a → b and the echo back, through factory-minted sockets.
+    let udp_a = factory_a
+        .bind_udp(SocketAddr::new(IpAddr::V6(a.ula), 0))
+        .await
+        .expect("bind a udp");
+    let udp_b = factory_b
+        .bind_udp(SocketAddr::new(IpAddr::V6(b.ula), ECHO_PORT))
+        .await
+        .expect("bind b udp");
+    let round_trip = async {
+        udp_a
+            .send_to(b"plane", SocketAddr::new(IpAddr::V6(b.ula), ECHO_PORT))
+            .await
+            .expect("send a→b");
+        let mut buf = [0u8; 2048];
+        let (len, from) = udp_b.recv_from(&mut buf).await.expect("recv at b");
+        assert_eq!(&buf[..len], b"plane");
+        assert_eq!(from.ip(), IpAddr::V6(a.ula), "source is a's /128");
+        udp_b.send_to(&buf[..len], from).await.expect("echo b→a");
+        let (len, from) = udp_a.recv_from(&mut buf).await.expect("recv at a");
+        assert_eq!(&buf[..len], b"plane");
+        assert_eq!(from.ip(), IpAddr::V6(b.ula), "echo source is b's /128");
+    };
+    tokio::time::timeout(Duration::from_secs(10), round_trip)
+        .await
+        .expect("datagram round trip within deadline");
+
+    // stream: a dials from its /128, b accepts, bytes echo both ways.
+    let listener = factory_b
+        .bind_listener(SocketAddr::new(IpAddr::V6(b.ula), 8555))
+        .await
+        .expect("bind b listener");
+    assert_eq!(
+        listener.local_addr().expect("local addr"),
+        SocketAddr::new(IpAddr::V6(b.ula), 8555)
+    );
+    let dial = async {
+        let mut stream = factory_a
+            .dial_from(IpAddr::V6(a.ula), SocketAddr::new(IpAddr::V6(b.ula), 8555))
+            .await
+            .expect("dial through the factory");
+        stream.write_all(b"stream-plane").await.expect("write");
+        stream.flush().await.expect("flush");
+        let mut echo = vec![0u8; 12];
+        stream.read_exact(&mut echo).await.expect("read echo");
+        echo
+    };
+    let accept = async {
+        let (mut stream, remote) = listener.accept().await.expect("accept");
+        assert_eq!(
+            remote.ip(),
+            IpAddr::V6(a.ula),
+            "accepted stream authenticated by a's overlay /128"
+        );
+        let mut request = vec![0u8; 12];
+        stream.read_exact(&mut request).await.expect("read");
+        stream.write_all(&request).await.expect("write back");
+        stream.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let (echo, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(dial, accept)
+    })
+    .await
+    .expect("stream round trip within deadline");
+    assert_eq!(&echo, b"stream-plane");
 }

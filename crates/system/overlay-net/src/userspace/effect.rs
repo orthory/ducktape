@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use wireguard_effect::WireGuardEffect;
 
 use super::device::{PeerConfig, WgDevice};
-use super::stack::VirtualStack;
+use super::stack::{StackSlot, VirtualStack};
 
 /// the chain overlay's on-link scope: member `/128`s live in the chain's ULA
 /// `/48` (`ula_v6_prefix`), and inside the tunnel that whole `/48` IS the
@@ -140,11 +140,25 @@ pub struct UserspaceWireGuardEffect {
     /// `Some` between `create_interface` and `remove_interface`; the inner
     /// backend is `Some` from the first successful `apply`.
     live: Option<Option<Backend>>,
+    /// the seam's handle to the live stack (ADR phase 2): published on the
+    /// `apply` that stands a backend up, cleared whenever the backend drops.
+    slot: StackSlot,
 }
 
 impl UserspaceWireGuardEffect {
     pub fn new(handle: tokio::runtime::Handle) -> Self {
-        Self { handle, live: None }
+        Self {
+            handle,
+            live: None,
+            slot: StackSlot::new(),
+        }
+    }
+
+    /// the publishable stack handle the overlay seam ([`crate::OverlayBackend`])
+    /// and the data-plane factory ([`super::VirtualSocketFactory`]) consume.
+    /// tracks this effect's backend across rebuilds for the effect's lifetime.
+    pub fn stack_slot(&self) -> StackSlot {
+        self.slot.clone()
     }
 
     /// the virtual host, for the seam's socket surface (and the loopback
@@ -166,7 +180,6 @@ impl UserspaceWireGuardEffect {
     pub fn local_underlay_addr(&self) -> Option<SocketAddr> {
         self.device()?.local_underlay_addr().ok()
     }
-
 }
 
 fn build_backend(
@@ -222,7 +235,9 @@ fn bind_underlay(port: u16) -> Result<std::net::UdpSocket, UserspaceEffectError>
             Err(err) => return Err(UserspaceEffectError::Bind(err)),
         }
     }
-    Err(UserspaceEffectError::Bind(last.expect("retried only on AddrInUse")))
+    Err(UserspaceEffectError::Bind(
+        last.expect("retried only on AddrInUse"),
+    ))
 }
 
 impl WireGuardEffect for UserspaceWireGuardEffect {
@@ -237,23 +252,25 @@ impl WireGuardEffect for UserspaceWireGuardEffect {
     }
 
     fn apply(&mut self, config: &InterfaceConfiguration) -> Result<(), Self::Error> {
-        let Some(slot) = self.live.as_mut() else {
+        let Some(live) = self.live.as_mut() else {
             return Err(UserspaceEffectError::NotCreated);
         };
         let parsed = parse_config(config)?;
 
         // a changed listen port or identity key is an interface replacement,
         // not a reconfiguration: rebuild the backend. (drop first, so a
-        // same-port rebind does not race the old socket.) port 0 on a
-        // re-apply means "any" and never forces a rebuild.
-        if slot.as_ref().is_some_and(|backend| {
+        // same-port rebind does not race the old socket; clear the published
+        // stack with it — until the rebuild lands, the tunnel is down.)
+        // port 0 on a re-apply means "any" and never forces a rebuild.
+        if live.as_ref().is_some_and(|backend| {
             (parsed.port != 0 && backend.port != parsed.port)
                 || backend.private_key != parsed.private_key
         }) {
-            *slot = None;
+            self.slot.clear();
+            *live = None;
         }
 
-        match slot {
+        match live {
             Some(backend) => {
                 backend.device.replace_peers(&parsed.peers);
                 backend
@@ -263,7 +280,8 @@ impl WireGuardEffect for UserspaceWireGuardEffect {
             None => {
                 let backend = build_backend(&self.handle, &parsed)?;
                 backend.device.replace_peers(&parsed.peers);
-                *slot = Some(backend);
+                self.slot.publish(backend.stack.clone());
+                *live = Some(backend);
             }
         }
         Ok(())
@@ -273,6 +291,7 @@ impl WireGuardEffect for UserspaceWireGuardEffect {
         if self.live.take().is_none() {
             return Err(UserspaceEffectError::NotCreated);
         }
+        self.slot.clear();
         // dropping the backend aborts the pumps and closes the socket —
         // there is no host state (no device node, no routes, no DNS) to
         // clean up, which is the point of this backend.

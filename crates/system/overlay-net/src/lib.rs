@@ -10,14 +10,15 @@
 //! (see [`OverlayRouter`]) go to the active overlay backend, everything else
 //! passes straight through to the OS.
 //!
-//! today's only backend is the TUN pass-through ([`tun`]): the kernel routes
-//! overlay ULAs through the WireGuard interface, so the backend's answer IS
-//! the OS socket and behavior is bit-identical to routing nothing at all.
-//! the point of carving the seam anyway is that the p2p dialer never
-//! `connect()`s an overlay ULA on a raw OS socket AS AN ASSUMPTION again —
-//! the userspace (TUN-less) backend lands behind exactly this boundary, as a
-//! second arm of the [`OverlayListener`]/[`OverlaySink`]/[`OverlayStream`]
-//! wrappers, without touching any consumer.
+//! two backends live behind the boundary ([`OverlayBackend`]):
+//!
+//! - the TUN pass-through ([`tun`]): the kernel routes overlay ULAs through
+//!   the WireGuard interface, so the backend's answer IS the OS socket and
+//!   behavior is bit-identical to routing nothing at all.
+//! - the userspace backend (ADR phases 1–2, [`userspace`]): overlay
+//!   connections terminate in the in-process smoltcp host, carried as the
+//!   `Virtual` arm of the [`OverlayListener`]/[`OverlaySink`]/
+//!   [`OverlayStream`] wrappers — no TUN, no privilege, no consumer changes.
 //!
 //! the wrapper survives the supervision tree BY CONSTRUCTION: `spawn`,
 //! `child`, `shared`, `dedicated`, and `with_attribute` all re-wrap the fresh
@@ -35,6 +36,8 @@ use commonware_runtime::{
 
 mod tun;
 pub mod userspace;
+
+use userspace::StackSlot;
 
 // ── Routing ─────────────────────────────────────────────
 
@@ -74,6 +77,24 @@ impl OverlayRouter {
     }
 }
 
+// ── Backend selection ───────────────────────────────────
+
+/// where overlay-routed connections terminate — the per-node backend choice
+/// the ADR's `wireguard_effect = socket | tun` config resolves to.
+#[derive(Clone)]
+pub enum OverlayBackend {
+    /// TUN pass-through: the kernel routes overlay ULAs through the
+    /// WireGuard interface, so overlay connections ride ordinary OS sockets.
+    Tun,
+    /// userspace: overlay connections terminate in the in-process virtual
+    /// stack. the slot is published by `UserspaceWireGuardEffect` when its
+    /// backend stands up and read here per dial/bind, so an interface
+    /// replace (epoch cutover) needs no context rewiring; while it is empty
+    /// the tunnel is down and overlay dials/binds fail, exactly as they
+    /// would on a downed TUN interface.
+    Userspace(StackSlot),
+}
+
 // ── The wrapper context ─────────────────────────────────
 
 /// a runtime context that routes network calls by address and delegates
@@ -83,11 +104,21 @@ impl OverlayRouter {
 pub struct OverlayContext<E> {
     inner: E,
     router: OverlayRouter,
+    backend: OverlayBackend,
 }
 
 impl<E> OverlayContext<E> {
+    /// the TUN-backed context — every shipped caller's arm.
     pub fn new(inner: E, router: OverlayRouter) -> Self {
-        Self { inner, router }
+        Self::with_backend(inner, router, OverlayBackend::Tun)
+    }
+
+    pub fn with_backend(inner: E, router: OverlayRouter, backend: OverlayBackend) -> Self {
+        Self {
+            inner,
+            router,
+            backend,
+        }
     }
 }
 
@@ -100,6 +131,7 @@ impl<E: Supervisor> Supervisor for OverlayContext<E> {
         Self {
             inner: self.inner.child(label),
             router: self.router,
+            backend: self.backend.clone(),
         }
     }
 
@@ -107,6 +139,7 @@ impl<E: Supervisor> Supervisor for OverlayContext<E> {
         Self {
             inner: self.inner.with_attribute(key, value),
             router: self.router,
+            backend: self.backend,
         }
     }
 }
@@ -116,6 +149,7 @@ impl<E: Spawner> Spawner for OverlayContext<E> {
         Self {
             inner: self.inner.shared(blocking),
             router: self.router,
+            backend: self.backend,
         }
     }
 
@@ -123,6 +157,7 @@ impl<E: Spawner> Spawner for OverlayContext<E> {
         Self {
             inner: self.inner.dedicated(),
             router: self.router,
+            backend: self.backend,
         }
     }
 
@@ -136,8 +171,14 @@ impl<E: Spawner> Spawner for OverlayContext<E> {
         // RE-WRAP the fresh context the runtime hands the task: this is the
         // line that keeps the seam alive inside spawned dialer tasks.
         let router = self.router;
-        self.inner
-            .spawn(move |inner| f(Self { inner, router }))
+        let backend = self.backend;
+        self.inner.spawn(move |inner| {
+            f(Self {
+                inner,
+                router,
+                backend,
+            })
+        })
     }
 
     fn stop(
@@ -232,34 +273,46 @@ impl<E: Network> Network for OverlayContext<E> {
     type Listener = OverlayListener<E::Listener>;
 
     async fn bind(&self, socket: SocketAddr) -> Result<Self::Listener, Error> {
-        let listener = if self.router.is_overlay(&socket) {
-            tun::bind(&self.inner, socket).await?
-        } else {
-            self.inner.bind(socket).await?
-        };
-        Ok(OverlayListener::Os(listener))
+        if !self.router.is_overlay(&socket) {
+            return Ok(OverlayListener::Os(self.inner.bind(socket).await?));
+        }
+        match &self.backend {
+            OverlayBackend::Tun => Ok(OverlayListener::Os(tun::bind(&self.inner, socket).await?)),
+            OverlayBackend::Userspace(slot) => Ok(OverlayListener::Virtual(
+                userspace::seam::bind(slot, socket).await?,
+            )),
+        }
     }
 
     async fn dial(&self, socket: SocketAddr) -> Result<(SinkOf<Self>, StreamOf<Self>), Error> {
-        let (sink, stream) = if self.router.is_overlay(&socket) {
-            tun::dial(&self.inner, socket).await?
-        } else {
-            self.inner.dial(socket).await?
-        };
-        Ok((OverlaySink::Os(sink), OverlayStream::Os(stream)))
+        if !self.router.is_overlay(&socket) {
+            let (sink, stream) = self.inner.dial(socket).await?;
+            return Ok((OverlaySink::Os(sink), OverlayStream::Os(stream)));
+        }
+        match &self.backend {
+            OverlayBackend::Tun => {
+                let (sink, stream) = tun::dial(&self.inner, socket).await?;
+                Ok((OverlaySink::Os(sink), OverlayStream::Os(stream)))
+            }
+            OverlayBackend::Userspace(slot) => {
+                let (sink, stream) = userspace::seam::dial(slot, socket).await?;
+                Ok((OverlaySink::Virtual(sink), OverlayStream::Virtual(stream)))
+            }
+        }
     }
 }
 
 // ── Connection wrappers ─────────────────────────────────
 //
-// single-variant today: every connection is carried by an OS socket, whether
-// it was routed (overlay, via the TUN backend) or passed through. the enums
-// exist so the userspace backend adds a `Virtual` arm WITHOUT changing
-// `OverlayContext`'s associated types — consumers only ever see these
-// wrappers, so phase 1 never touches them.
+// two arms: `Os` carries an OS socket (passed through, or overlay in TUN
+// mode), `Virtual` carries a connection terminating in the userspace
+// backend's smoltcp host. the enums are what let the backend vary WITHOUT
+// changing `OverlayContext`'s associated types — consumers only ever see
+// these wrappers.
 
 pub enum OverlayListener<L> {
     Os(L),
+    Virtual(userspace::seam::VirtualListener),
 }
 
 impl<L: Listener> Listener for OverlayListener<L> {
@@ -272,42 +325,56 @@ impl<L: Listener> Listener for OverlayListener<L> {
                 let (addr, sink, stream) = listener.accept().await?;
                 Ok((addr, OverlaySink::Os(sink), OverlayStream::Os(stream)))
             }
+            Self::Virtual(listener) => {
+                let (addr, sink, stream) = listener.accept().await?;
+                Ok((
+                    addr,
+                    OverlaySink::Virtual(sink),
+                    OverlayStream::Virtual(stream),
+                ))
+            }
         }
     }
 
     fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
         match self {
             Self::Os(listener) => listener.local_addr(),
+            Self::Virtual(listener) => listener.local_addr(),
         }
     }
 }
 
 pub enum OverlaySink<S> {
     Os(S),
+    Virtual(userspace::seam::VirtualSink),
 }
 
 impl<S: Sink> Sink for OverlaySink<S> {
     async fn send(&mut self, bufs: impl Into<IoBufs> + Send) -> Result<(), Error> {
         match self {
             Self::Os(sink) => sink.send(bufs).await,
+            Self::Virtual(sink) => sink.send(bufs).await,
         }
     }
 }
 
 pub enum OverlayStream<S> {
     Os(S),
+    Virtual(userspace::seam::VirtualStream),
 }
 
 impl<S: Stream> Stream for OverlayStream<S> {
     async fn recv(&mut self, len: usize) -> Result<IoBufs, Error> {
         match self {
             Self::Os(stream) => stream.recv(len).await,
+            Self::Virtual(stream) => stream.recv(len).await,
         }
     }
 
     fn peek(&self, max_len: usize) -> &[u8] {
         match self {
             Self::Os(stream) => stream.peek(max_len),
+            Self::Virtual(stream) => stream.peek(max_len),
         }
     }
 }
