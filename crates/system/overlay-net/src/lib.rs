@@ -34,6 +34,7 @@ use commonware_runtime::{
 };
 
 mod tun;
+pub mod userspace;
 
 // ── Routing ─────────────────────────────────────────────
 

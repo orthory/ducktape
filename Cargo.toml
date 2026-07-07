@@ -92,6 +92,20 @@ commonware-parallel = "2026.5.0"
 commonware-utils = "2026.5.0"
 commonware-actor = "2026.5.0"
 defguard_wireguard_rs = "0.10.0"
+# the userspace overlay backend (overlay-net/userspace): the SAME BoringTun
+# core the TUN path already runs (defguard_wireguard_rs's fork), used sans-io
+# (`noise::Tunn`, no device layer) — wire compat between socket-mode and
+# tun-mode nodes is by construction, not by hope. version pinned to the one
+# defguard_wireguard_rs 0.10 resolves, so both paths share one build of the
+# crypto core.
+defguard_boringtun = "0.6.5"
+# the userspace backend's virtual host: a TUN-less TCP/UDP stack terminating
+# at the node's overlay ULA, entirely in-process. `medium-ip` because the
+# tunnel carries raw IP (WireGuard has no link layer), `async` for the
+# waker-based socket surface.
+smoltcp = { version = "0.13", default-features = false, features = [
+    "std", "medium-ip", "proto-ipv6", "socket-udp", "socket-tcp", "async",
+] }
 # the node's own WireGuard identity is X25519 (WireGuard's curve, not the
 # ed25519 signer's); static_secrets because the key persists across boots.
 x25519-dalek = { version = "2", features = ["static_secrets"] }

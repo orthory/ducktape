@@ -11,3 +11,22 @@ commonware-runtime = { workspace = true }
 # a different semver-major here would be a different trait.
 governor = { workspace = true }
 rand_core = { workspace = true }
+
+# ── the userspace backend (ADR phase 1) ─────────────────
+# the sans-io WireGuard core: one `noise::Tunn` per peer — the same BoringTun
+# build the TUN path runs inside defguard's device layer.
+defguard_boringtun = { workspace = true }
+# `InterfaceConfiguration`/`Peer` — the shape `WireGuardEffect::apply` takes;
+# types only, the device layer stays unused here.
+defguard_wireguard_rs = { workspace = true }
+# the `WireGuardEffect` trait this backend implements (ADR: the orchestration
+# boundary does not move).
+wireguard-effect = { workspace = true }
+# the virtual host terminating TCP/UDP at the node's overlay ULA.
+smoltcp = { workspace = true }
+# the pumps: underlay UDP, timer driver, and the async socket surface —
+# tokio to match data-plane's transport arm (the factory this backend feeds).
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "io-util", "net"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
