@@ -150,6 +150,12 @@ impl ModuleNode {
     pub fn head(&self) -> Option<String> {
         self.refs().expect("refs").head
     }
+
+    /// shrink the module's bounded history window so a GC'd-base conflict can be
+    /// driven with a few commits (the `#[doc(hidden)]` module test seam).
+    pub fn set_history_window(&self, n: usize) {
+        self.files.borrow_mut().set_history_window_for_tests(n);
+    }
 }
 
 fn map_err(e: Error) -> ApiError {

@@ -6,26 +6,36 @@
 //! speed) and probed twice: once to skip chunks already present (dedup + resume),
 //! and again immediately before submit as TTL insurance. a `"files: chunk not
 //! available"` rejection (a chunk expired between probe and submit) re-stages and
-//! retries the commit once. conflict handling lands in a later slice.
+//! retries the commit once. a CAS conflict auto-rebases disjoint upstream work or
+//! surfaces a structured [`ConflictReport`] — never a silent merge.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use files::{MAX_PAGE, MAX_SYNC_IDS, to_hex};
+use files::{Change, MAX_PAGE, MAX_SYNC_IDS, to_hex};
 
-use crate::api::{ApiError, CommitReceipt, NodeApi};
+use crate::api::{ApiError, CommitReceipt, ConflictReport, NodeApi};
 use crate::chunk::{chunk_ids, file_object_id};
 use crate::index::{EntryKind, Index, IndexEntry, IndexError};
 use crate::plan::{Plan, PlanError, plan};
 use crate::scan::{ScanKind, disk_path, scan};
 use crate::status::{Status, status};
 
+/// the conflict strings the engine keys on — verbatim from the module (`fs.rs`),
+/// arriving through the http 400 envelope untouched.
+const CONFLICT_PREFIX: &str = "files: conflict:";
+const BASE_NOT_RESOLVABLE: &str = "files: base snapshot not resolvable";
+
+/// bound the auto-rebase: after this many disjoint rebases the head is clearly
+/// churning under us, so stop and report rather than spin.
+const MAX_REBASE_ATTEMPTS: usize = 3;
+
 /// what a successful commit produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitSummary {
     pub snapshot: String,
     pub height: u64,
-    /// whether the engine auto-rebased onto a newer head (a later slice sets this).
+    /// whether the engine auto-rebased onto a newer head before this commit landed.
     pub rebased: bool,
 }
 
@@ -37,6 +47,11 @@ pub enum CommitError {
     Index(#[from] IndexError),
     #[error("duckfs: nothing to commit (the working copy is clean)")]
     Nothing,
+    /// an overlapping (or unrebasable) conflict — no silent merge. carries the
+    /// structured report the CLI/RPC surface. boxed to keep the common `Ok` /
+    /// small-`Err` `Result` cheap (clippy `result_large_err`).
+    #[error("duckfs: commit conflict ({} clashing path(s)); {}", .0.clashing.len(), .0.remedy)]
+    Conflict(Box<ConflictReport>),
     /// a module rejection (the verbatim `"files: ..."` string).
     #[error("{0}")]
     Rejected(String),
@@ -70,16 +85,141 @@ pub fn commit(api: &dyn NodeApi, dir: &Path, message: &str) -> Result<CommitSumm
     ensure_staged(api, &planned.blobs)?;
     ensure_staged(api, &planned.blobs)?;
 
-    let base = index.base_snapshot.clone();
-    let receipt = submit(api, base.as_deref(), message, &planned)?;
+    let (receipt, rebased) = submit_with_rebase(api, &index, message, &planned)?;
 
     let snapshot = resolve_snapshot(api, receipt.height)?;
     rebuild_index(&index, &st, dir, &snapshot)?;
     Ok(CommitSummary {
         snapshot,
         height: receipt.height,
-        rebased: false,
+        rebased,
     })
+}
+
+/// submit the commit, handling CAS conflicts: on `"files: conflict:"` refetch the
+/// head, diff base→head, and auto-rebase (resubmit with `base = head`) ONLY when
+/// the upstream change set is disjoint from ours — never a silent merge. an
+/// overlapping conflict, an exhausted rebase budget, or a diff that itself rejects
+/// (oversized/unresolvable) all fail safe with a structured [`ConflictReport`]. a
+/// GC'd base (`"files: base snapshot not resolvable"`) reports a re-checkout
+/// remedy without attempting a rebase.
+fn submit_with_rebase(
+    api: &dyn NodeApi,
+    index: &Index,
+    message: &str,
+    planned: &Plan,
+) -> Result<(CommitReceipt, bool), CommitError> {
+    let ours = change_paths(&planned.changes);
+    let mut base = index.base_snapshot.clone();
+    let mut rebased = false;
+
+    for _ in 0..=MAX_REBASE_ATTEMPTS {
+        match submit(api, base.as_deref(), message, planned) {
+            Ok(receipt) => return Ok((receipt, rebased)),
+            Err(CommitError::Rejected(m)) if m.contains(BASE_NOT_RESOLVABLE) => {
+                // the base fell out of the 1024-window: no rebase can recover it,
+                // the client must re-checkout onto the current head.
+                return Err(CommitError::Conflict(Box::new(ConflictReport {
+                    base: index.base_snapshot.clone(),
+                    head: api.refs().ok().and_then(|r| r.head),
+                    ours: sorted(&ours),
+                    theirs: Vec::new(),
+                    clashing: Vec::new(),
+                    remedy: "the base snapshot has been garbage-collected out of the \
+                             history window; re-checkout to rebase onto the current head"
+                        .into(),
+                })));
+            }
+            Err(CommitError::Rejected(m)) if m.contains(CONFLICT_PREFIX) => {
+                let head = api.refs()?.head;
+                // without both a base to diff FROM and a head to diff TO, there is
+                // nothing to rebase against — a genuine conflict.
+                let (Some(base_id), Some(head_id)) = (index.base_snapshot.clone(), head.clone())
+                else {
+                    return Err(overlap_report(&index.base_snapshot, head, &ours, &ours));
+                };
+                // a diff that itself rejects (oversized/unresolvable) → fail safe.
+                let theirs: BTreeSet<String> = match api.diff(&base_id, &head_id, &index.prefix) {
+                    Ok(entries) => entries.into_iter().map(|e| e.path).collect(),
+                    Err(_) => return Err(overlap_report(&index.base_snapshot, head, &ours, &ours)),
+                };
+                let clashing: BTreeSet<String> = ours.intersection(&theirs).cloned().collect();
+                if clashing.is_empty() {
+                    // disjoint upstream work: rebase onto the new head and retry.
+                    base = Some(head_id);
+                    rebased = true;
+                    continue;
+                }
+                return Err(CommitError::Conflict(Box::new(ConflictReport {
+                    base: index.base_snapshot.clone(),
+                    head,
+                    ours: sorted(&ours),
+                    theirs: sorted(&theirs),
+                    clashing: sorted(&clashing),
+                    remedy: "overlapping edits on the same path(s); re-checkout, \
+                             reapply your changes, and commit again"
+                        .into(),
+                })));
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
+    // the rebase budget is exhausted: head kept moving under us.
+    Err(CommitError::Conflict(Box::new(ConflictReport {
+        base: index.base_snapshot.clone(),
+        head: api.refs().ok().and_then(|r| r.head),
+        ours: sorted(&ours),
+        theirs: Vec::new(),
+        clashing: Vec::new(),
+        remedy: "the head kept advancing across repeated rebases; re-checkout and \
+                 commit again"
+            .into(),
+    })))
+}
+
+/// build an overlap conflict report (used when there is no base/head to diff, or
+/// the diff itself failed — fail safe: treat every touched path as clashing).
+fn overlap_report(
+    base: &Option<String>,
+    head: Option<String>,
+    ours: &BTreeSet<String>,
+    clashing: &BTreeSet<String>,
+) -> CommitError {
+    CommitError::Conflict(Box::new(ConflictReport {
+        base: base.clone(),
+        head,
+        ours: sorted(ours),
+        theirs: Vec::new(),
+        clashing: sorted(clashing),
+        remedy: "a concurrent change touches your path(s) and could not be \
+                 auto-rebased; re-checkout, reapply, and commit again"
+            .into(),
+    }))
+}
+
+/// the set of paths a commit's changes touch — the "ours" side of a conflict.
+fn change_paths(changes: &[Change]) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    for change in changes {
+        match change {
+            Change::Put { path, .. }
+            | Change::Mkdir { path }
+            | Change::Rm { path }
+            | Change::Symlink { path, .. } => {
+                set.insert(path.clone());
+            }
+            Change::Mv { from, to } => {
+                set.insert(from.clone());
+                set.insert(to.clone());
+            }
+        }
+    }
+    set
+}
+
+fn sorted(set: &BTreeSet<String>) -> Vec<String> {
+    set.iter().cloned().collect()
 }
 
 /// probe every chunk digest in ≤256-id batches and stage any the cluster lacks,
