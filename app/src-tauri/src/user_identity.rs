@@ -161,6 +161,11 @@ fn user_key_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
 /// <hex>` -- this maps `encrypted` to the app-facing `"locked"`, which
 /// [`user_identity_state`] upgrades to `"unlocked"` when the session cache
 /// holds this file's password.
+///
+/// the mismatch error is SHAPE-ONLY, never content: this only fires when the
+/// verb contract has already broken (wrong binary, garbled stdout), which is
+/// exactly when we can no longer assume the line is secret-free — and every
+/// `Err(String)` here crosses IPC to the frontend.
 fn parse_key_status(line: &str) -> Result<(&'static str, Option<String>), String> {
     let line = line.trim();
     if line == "absent" {
@@ -172,7 +177,10 @@ fn parse_key_status(line: &str) -> Result<(&'static str, Option<String>), String
     if let Some(pubkey) = line.strip_prefix("encrypted ") {
         return Ok(("locked", Some(pubkey.trim().to_string())));
     }
-    Err(format!("unrecognized user-key status line: {line:?}"))
+    Err(format!(
+        "unrecognized user-key status output ({} chars)",
+        line.chars().count()
+    ))
 }
 
 /// split a multi-line verb stdout into non-empty, trimmed lines, in order.
@@ -182,6 +190,24 @@ fn value_lines(stdout: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect()
+}
+
+/// split `user-key init`'s stdout into its `(mnemonic, pubkey)` line pair.
+/// a pure helper pulled out of [`user_identity_create`] so the mismatch arm
+/// is unit-testable. the error is COUNTS-ONLY, never content: in exactly the
+/// malformed-stdout case this guards against, the captured lines may well
+/// CONTAIN THE MNEMONIC, and `Err(String)` crosses IPC to the frontend —
+/// interpolating `{lines:?}` here would ship the recovery phrase into
+/// whatever error toast/log the app renders.
+fn parse_init_output(stdout: &str) -> Result<(String, String), String> {
+    let lines = value_lines(stdout);
+    match lines.as_slice() {
+        [mnemonic, pubkey] => Ok((mnemonic.to_string(), pubkey.to_string())),
+        other => Err(format!(
+            "user-key init: expected mnemonic + pubkey lines, got {} line(s)",
+            other.len()
+        )),
+    }
 }
 
 // ── Commands ────────────────────────────────────────────
@@ -256,20 +282,9 @@ pub fn user_identity_create(
         ],
         &[&password],
     )?;
-    let lines = value_lines(&out);
-    let (mnemonic, pubkey) = match lines.as_slice() {
-        [mnemonic, pubkey] => (*mnemonic, *pubkey),
-        _ => {
-            return Err(format!(
-                "user-key init: expected mnemonic + pubkey lines, got {lines:?}"
-            ));
-        }
-    };
+    let (mnemonic, pubkey) = parse_init_output(&out)?;
     cache_store(&password);
-    Ok(IdentityCreated {
-        pubkey: pubkey.to_string(),
-        mnemonic: mnemonic.to_string(),
-    })
+    Ok(IdentityCreated { pubkey, mnemonic })
 }
 
 /// restore an identity from its 24-word mnemonic: `user-key restore` derives
@@ -503,14 +518,47 @@ mod tests {
     }
 
     #[test]
-    fn parse_key_status_rejects_garbage() {
+    fn parse_key_status_rejects_garbage_without_echoing_it() {
         assert!(parse_key_status("").is_err());
-        assert!(parse_key_status("corrupt").is_err());
+        // the mismatch error must be shape-only: a broken verb contract is
+        // exactly when the line can no longer be assumed secret-free, and
+        // this Err(String) crosses IPC to the frontend.
+        let err = parse_key_status("corrupt hunter2-secret").unwrap_err();
+        assert!(
+            !err.contains("hunter2"),
+            "error echoed stdout content: {err}"
+        );
     }
 
     #[test]
     fn value_lines_drops_blank_lines_and_trims() {
         assert_eq!(value_lines("  one \n\n two\n"), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn parse_init_output_splits_mnemonic_then_pubkey() {
+        let (mnemonic, pubkey) = parse_init_output("word word word\n\ndeadbeef\n").unwrap();
+        assert_eq!(mnemonic, "word word word");
+        assert_eq!(pubkey, "deadbeef");
+    }
+
+    #[test]
+    fn parse_init_output_mismatch_reports_counts_never_content() {
+        // one line, three lines, zero lines: all rejected — and the error
+        // must NEVER quote the lines, which in this failure mode may contain
+        // the mnemonic (the Err crosses IPC to the frontend).
+        for (stdout, want_count) in [
+            ("abandon ability able mnemonic-words", "1 line(s)"),
+            ("extra\nabandon ability able\ndeadbeef", "3 line(s)"),
+            ("", "0 line(s)"),
+        ] {
+            let err = parse_init_output(stdout).unwrap_err();
+            assert!(err.contains(want_count), "want {want_count:?} in: {err}");
+            assert!(
+                !err.contains("abandon") && !err.contains("deadbeef"),
+                "error echoed stdout content: {err}"
+            );
+        }
     }
 
     #[test]
