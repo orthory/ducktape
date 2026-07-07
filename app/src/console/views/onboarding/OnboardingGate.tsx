@@ -196,7 +196,7 @@ export function OnboardingGate() {
             }}
           >
             Joining a running network is temporarily unavailable. Found a new
-            network to get started, and invite others from Settings.
+            network to get started, and invite others from the Members view.
           </div>
         ) : (
           <>
