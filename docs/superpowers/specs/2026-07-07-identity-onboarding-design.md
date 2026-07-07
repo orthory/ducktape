@@ -199,3 +199,20 @@ Settings additions (Devices section): lock state row, Unlock button,
    reveal always re-prompts.
 6. Deferred: change-password verb, device labels/naming, QR/cross-device
    mnemonic transport, unlock rate-limiting, OS-keychain integration.
+
+## As-built amendments
+
+1. `PasswordForm` ships two modes, `"set"` and `"confirm"` — there is no
+   `"enter"` mode. `RestoreFlow` validates the 24 words client-side (count,
+   wordlist membership) only once `PasswordForm`'s own set/confirm policy
+   passes, so no Tauri call fires until both the password and the words are
+   locally well-formed; the no-client-call-until-valid invariant holds.
+2. The identity gate (`IdentityGate.tsx`) self-fetches its boot state via a
+   local `useEffect` + `useState` calling `user_identity_state()` directly —
+   it does not live in the console store and does not re-fetch on Settings
+   custody changes within the same session. Settings' own custody panel
+   fetches and refreshes its own copy independently.
+3. `autoBindUserIdentity` maps every non-"unlocked"/non-"plaintext" state —
+   including "absent" — to its `"locked"` result. Auto-bind is fire-and-forget
+   or a no-standing identity; the mapping is inert (no identity, nothing to
+   bind) rather than a distinct code path.

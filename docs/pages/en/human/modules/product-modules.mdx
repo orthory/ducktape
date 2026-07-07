@@ -227,6 +227,20 @@ other: the genesis app-hash moves, so an already-running network needs a
 coordinated rebuild — a lockstep upgrade across every validator, not a rolling
 one — to adopt it.
 
+The module stores keys; custody of the user key itself is a desktop-app
+concern layered on top (`bin/node`'s `user-key` verbs; see
+`docs/superpowers/specs/2026-07-07-identity-onboarding-design.md`). The
+24-word mnemonic is an entropy-preserving, identity-preserving encoding of the
+raw ed25519 seed, so it recovers the identity exactly rather than deriving a
+new one. The password is local-encryption only — argon2id wraps a key that
+encrypts the seed at rest with XChaCha20-Poly1305 — and never enters key
+derivation, so a forgotten password just means restoring from the mnemonic
+and setting a new one. Node keys deliberately get neither treatment: they
+stay plaintext and disposable, because consensus signs with a node key on
+every view and a boot must never block on a password prompt; unbind-and-rejoin
+is the recovery story for a lost or compromised device, and OS full-disk
+encryption is the documented answer for at-rest protection of the node key.
+
 ## Interface Shape
 
 Interface crates encode and decode module-specific payloads while the host
