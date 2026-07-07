@@ -22,7 +22,8 @@ serde_json = { workspace = true }
 toml = "0.8"
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 
-# dev-only debug bridge: a local unix socket the app/scripts/tauri-debug.mjs
-# helper drives (screenshot / execute_js / input). registration is cfg-gated to
-# debug + desktop in main.rs so a release runtime never opens the socket.
-tauri-plugin-mcp = { git = "https://github.com/P3GLEG/tauri-plugin-mcp" }
+# dev-only debug bridge: the tauri-agent debugger plugin the app/scripts/tauri-agent
+# CLI / tauri-agent MCP server drive (semantic tree / input / DOM-SVG shot / logs).
+# registration is cfg-gated to debug + desktop in main.rs so a release runtime
+# registers nothing; vendored as a submodule under third_party/.
+tauri-plugin-agent = { path = "../../third_party/tauri-agent-plugin" }
