@@ -56,7 +56,9 @@ pub fn canonical(path: &str) -> Result<Vec<String>, String> {
     }
     // depth is the number of segments; the byte cap already bounds the count.
     if segments.len() > MAX_DEPTH {
-        return Err(format!("files: path exceeds the maximum depth of {MAX_DEPTH}"));
+        return Err(format!(
+            "files: path exceeds the maximum depth of {MAX_DEPTH}"
+        ));
     }
     Ok(segments)
 }
@@ -80,7 +82,9 @@ pub fn check_authority(owner: &str, segments: &[String]) -> Result<(), String> {
                 if o == owner {
                     Ok(())
                 } else {
-                    Err(format!("files: actor '{owner}' is not the home owner '{o}'"))
+                    Err(format!(
+                        "files: actor '{owner}' is not the home owner '{o}'"
+                    ))
                 }
             }
             // `/home` or `/home/<o>` on their own: writing the home root rejects.

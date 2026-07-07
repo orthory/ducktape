@@ -119,7 +119,8 @@ impl ObjectStore for DiskStore {
             return Ok(id);
         }
         let subdir = self.dir.join(&hex[..2]);
-        std::fs::create_dir_all(&subdir).map_err(|e| format!("files: odb put {hex}: mkdir: {e}"))?;
+        std::fs::create_dir_all(&subdir)
+            .map_err(|e| format!("files: odb put {hex}: mkdir: {e}"))?;
         // tmp lives in the destination subdir so the rename below is same-dir
         // (and therefore atomic). the full hex keeps the tmp name unique.
         let tmp = subdir.join(format!("{hex}.tmp"));
@@ -159,8 +160,8 @@ impl ObjectStore for DiskStore {
         let (tag, body) = raw
             .split_first()
             .ok_or_else(|| format!("files: odb get {hex}: object file is empty"))?;
-        let kind =
-            Kind::from_u8(*tag).ok_or_else(|| format!("files: odb get {hex}: unknown kind tag {tag}"))?;
+        let kind = Kind::from_u8(*tag)
+            .ok_or_else(|| format!("files: odb get {hex}: unknown kind tag {tag}"))?;
         // re-derive and verify: the disk is untrusted, so a bit-flip must surface
         // as an error rather than return wrong bytes under a trusted id.
         if object_id(kind, body) != *id {
@@ -280,7 +281,8 @@ impl DiskRefs {
     /// open over the module data dir, creating it if absent (the refs file and
     /// its tmp are written here, and the dir is fsync'd on save).
     pub fn open(dir: PathBuf) -> Result<Self, String> {
-        std::fs::create_dir_all(&dir).map_err(|e| format!("files: refs open {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("files: refs open {}: {e}", dir.display()))?;
         Ok(Self { dir })
     }
 
@@ -348,8 +350,8 @@ impl RefsStore for DiskRefs {
         let tmp = self.dir.join("refs.tmp");
         // scope the file so it is closed before the rename on every platform.
         {
-            let mut f =
-                std::fs::File::create(&tmp).map_err(|e| format!("files: refs save: create tmp: {e}"))?;
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| format!("files: refs save: create tmp: {e}"))?;
             f.write_all(&buf)
                 .map_err(|e| format!("files: refs save: write tmp: {e}"))?;
             // the bytes must be durable before the rename publishes them.

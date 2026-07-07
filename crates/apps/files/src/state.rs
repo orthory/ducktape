@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use sha2::{Digest as _, Sha256};
 
+use crate::codec::{Reader, push_string, push_u32};
 use crate::objects::ObjectId;
 use crate::wire::{HISTORY_WINDOW, MAX_PINS, MAX_STAGING_ENTRIES, MAX_WATCHES};
 
@@ -125,32 +126,32 @@ pub fn encode_refs(r: &Refs) -> Vec<u8> {
 
 /// strict decode of an [`encode_refs`] image; anything non-canonical rejects.
 pub fn decode_refs(bytes: &[u8]) -> Result<Refs, String> {
-    let mut off = 0usize;
+    let mut r = Reader::new("refs image", bytes);
 
-    let head = if read_bool(bytes, &mut off)? {
-        Some(read_bytes32(bytes, &mut off)?)
+    let head = if r.boolean()? {
+        Some(r.bytes32()?)
     } else {
         None
     };
 
-    let window_count = read_u32(bytes, &mut off)? as usize;
+    let window_count = r.u32()? as usize;
     if window_count > HISTORY_WINDOW {
         return Err("files: refs window count over cap".into());
     }
     let mut window = VecDeque::new();
     for _ in 0..window_count {
-        window.push_back(read_bytes32(bytes, &mut off)?);
+        window.push_back(r.bytes32()?);
     }
 
-    let pin_count = read_u32(bytes, &mut off)? as usize;
+    let pin_count = r.u32()? as usize;
     if pin_count > MAX_PINS {
         return Err("files: refs pin count over cap".into());
     }
     let mut pins: BTreeMap<String, PinEntry> = BTreeMap::new();
     for _ in 0..pin_count {
-        let name = read_string(bytes, &mut off)?;
-        let snapshot = read_bytes32(bytes, &mut off)?;
-        let owner = read_string(bytes, &mut off)?;
+        let name = r.string()?;
+        let snapshot = r.bytes32()?;
+        let owner = r.string()?;
         // strictly ascending names keep the image canonical: no duplicate and no
         // reordered pair can produce a second valid preimage of the same refs.
         if pins
@@ -162,16 +163,16 @@ pub fn decode_refs(bytes: &[u8]) -> Result<Refs, String> {
         pins.insert(name, PinEntry { snapshot, owner });
     }
 
-    let staging_count = read_u32(bytes, &mut off)? as usize;
+    let staging_count = r.u32()? as usize;
     if staging_count > MAX_STAGING_ENTRIES {
         return Err("files: refs staging count over cap".into());
     }
     let mut staging: BTreeMap<ObjectId, Staged> = BTreeMap::new();
     for _ in 0..staging_count {
-        let digest = read_bytes32(bytes, &mut off)?;
-        let owner = read_string(bytes, &mut off)?;
-        let len = read_u64(bytes, &mut off)?;
-        let expires_at = read_u64(bytes, &mut off)?;
+        let digest = r.bytes32()?;
+        let owner = r.string()?;
+        let len = r.u64()?;
+        let expires_at = r.u64()?;
         if staging
             .last_key_value()
             .is_some_and(|(last, _)| last >= &digest)
@@ -188,15 +189,15 @@ pub fn decode_refs(bytes: &[u8]) -> Result<Refs, String> {
         );
     }
 
-    let watch_count = read_u32(bytes, &mut off)? as usize;
+    let watch_count = r.u32()? as usize;
     if watch_count > MAX_WATCHES {
         return Err("files: refs watch count over cap".into());
     }
     let mut watches: BTreeSet<(String, String)> = BTreeSet::new();
     let mut last_watch: Option<(String, String)> = None;
     for _ in 0..watch_count {
-        let prefix = read_string(bytes, &mut off)?;
-        let module_id = read_string(bytes, &mut off)?;
+        let prefix = r.string()?;
+        let module_id = r.string()?;
         let entry = (prefix, module_id);
         if last_watch.as_ref().is_some_and(|last| last >= &entry) {
             return Err("files: refs watches not strictly ascending".into());
@@ -205,7 +206,7 @@ pub fn decode_refs(bytes: &[u8]) -> Result<Refs, String> {
         watches.insert(entry);
     }
 
-    finish(bytes, off)?;
+    r.finish()?;
     Ok(Refs {
         head,
         window,
@@ -223,75 +224,5 @@ pub fn root_bytes(r: &Refs) -> [u8; 32] {
     h.finalize().into()
 }
 
-// ---- canonical codec helpers ------------------------------------------------
-//
-// deliberately private copies of the objects.rs cursor helpers: keeping them
-// local keeps `state.rs` self-contained (the codec contract lives beside the
-// type it serializes) and avoids widening the objects.rs API surface just to
-// share a handful of one-line readers. every read advances a cursor and
-// bounds-checks against the input; `finish` rejects unconsumed trailing bytes.
-
-fn push_string(out: &mut Vec<u8>, value: &str) {
-    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
-    out.extend_from_slice(value.as_bytes());
-}
-
-fn push_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-/// every byte must be accounted for — a decode that stops short saw trailing
-/// bytes and is not canonical.
-fn finish(bytes: &[u8], off: usize) -> Result<(), String> {
-    if off != bytes.len() {
-        return Err("files: refs image has trailing bytes".into());
-    }
-    Ok(())
-}
-
-fn read_array<const N: usize>(bytes: &[u8], off: &mut usize) -> Result<[u8; N], String> {
-    let end = off
-        .checked_add(N)
-        .filter(|&end| end <= bytes.len())
-        .ok_or_else(|| "files: refs image truncated".to_string())?;
-    let mut buf = [0u8; N];
-    buf.copy_from_slice(&bytes[*off..end]);
-    *off = end;
-    Ok(buf)
-}
-
-fn read_u64(bytes: &[u8], off: &mut usize) -> Result<u64, String> {
-    Ok(u64::from_le_bytes(read_array::<8>(bytes, off)?))
-}
-
-fn read_u32(bytes: &[u8], off: &mut usize) -> Result<u32, String> {
-    Ok(u32::from_le_bytes(read_array::<4>(bytes, off)?))
-}
-
-fn read_bytes32(bytes: &[u8], off: &mut usize) -> Result<[u8; 32], String> {
-    read_array::<32>(bytes, off)
-}
-
-/// a single-byte boolean; only 0 and 1 are canonical, any other byte rejects.
-fn read_bool(bytes: &[u8], off: &mut usize) -> Result<bool, String> {
-    match read_array::<1>(bytes, off)?[0] {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err("files: refs head flag is not a 0/1 byte".into()),
-    }
-}
-
-/// a `u64` length prefix followed by exactly that many utf-8 bytes; the length
-/// is bounded by the remaining input before any allocation.
-fn read_string(bytes: &[u8], off: &mut usize) -> Result<String, String> {
-    let len = read_u64(bytes, off)?;
-    let len = usize::try_from(len).map_err(|_| "files: refs image truncated".to_string())?;
-    let end = off
-        .checked_add(len)
-        .filter(|&end| end <= bytes.len())
-        .ok_or_else(|| "files: refs image truncated".to_string())?;
-    let value = std::str::from_utf8(&bytes[*off..end])
-        .map_err(|_| "files: refs string is not utf-8".to_string())?;
-    *off = end;
-    Ok(value.to_owned())
-}
+// the cursor codec (push helpers + the strict [`Reader`]) is shared with
+// `objects.rs` via `crate::codec` — one grammar, two frames, zero drift.
