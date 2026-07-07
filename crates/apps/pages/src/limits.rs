@@ -10,16 +10,20 @@ use crate::{MAX_ID_BYTES, PageError};
 /// reject an op whose `ids` include one over [`MAX_ID_BYTES`], before any
 /// storage touch.
 ///
-/// called with every id `apply` NAMES for the op — not only the ones it
-/// mints. a reference to an id already committed elsewhere (a `parent`, an
-/// `after` sibling anchor, an append's existing `thread_id`, …) is guaranteed
-/// to already conform: this is a flag-day cap on an unmerged module, so
-/// nothing in the store predates it. checking a reference again costs
-/// nothing and keeps the invariant simple to state and to audit: every
-/// string an op calls an id is `<= MAX_ID_BYTES`, full stop — rather than a
-/// second, narrower list of exactly which fields are "new" this op (a
-/// distinction `apply`'s per-variant match would have to get right for every
-/// current AND future [`crate::PageMsg`] arm).
+/// called with the `named` list `apply` builds per [`crate::PageMsg`] arm —
+/// newly-minted ids (a `CreatePage`'s `page_id`, an `InsertBlock`'s
+/// `block.id`, …) AND references to ids already committed elsewhere (an
+/// `InsertBlock`'s `parent`, an append's existing `thread_id`, …). a
+/// reference is guaranteed to already conform — this is a flag-day cap on an
+/// unmerged module, so nothing in the store predates it — but checking it
+/// again costs nothing and keeps the invariant simple to state and to audit:
+/// every id in `named` is `<= MAX_ID_BYTES`, rather than a second, narrower
+/// list of exactly which fields are "new" this op (a distinction `apply`'s
+/// per-variant match would have to get right for every current AND future
+/// arm). fields a variant elides from `named` entirely — e.g. `InsertBlock`'s
+/// `after` — are never independently stored; they're only matched against a
+/// parent's existing children (or rejected as [`crate::PageError::AnchorNotFound`]),
+/// so skipping them here is safe, not an oversight.
 pub(crate) fn check_id_len(ids: &[&str]) -> Result<(), PageError> {
     if ids.iter().any(|id| id.len() > MAX_ID_BYTES) {
         return Err(PageError::IdTooLong);

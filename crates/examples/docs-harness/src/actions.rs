@@ -341,6 +341,14 @@ fn parse_sha256_field(field: &str) -> Option<Vec<u8>> {
 
 // ---- the action-owner contract tests ---------------------------------------------
 
+// This inline test module pushes the file past the ~600-line soft cap; the
+// production code above is ~343 lines. The tests stay inline (rather than an
+// external `tests/` file) because they drive `validate_action`/`apply_action`/
+// `record_failure`/`parse_sha256_field` — all private to this module — through
+// shared local helpers (`probe`, `rejects`, `hex`) plus the `crate::testutil`
+// fixtures; splitting them out would force those items to widen their
+// visibility (or duplicate the harness plumbing), breaking the "tests call
+// the exact private probe/apply path production code calls" invariant.
 #[cfg(test)]
 mod tests {
     use super::*;

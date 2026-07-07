@@ -81,6 +81,7 @@ must be mapped to actual module ids during install.
 schema = 1
 package = "org.ducktape.docs"
 version = "0.1.0"
+golden = "sha256:..."
 
 [requires]
 protocol_min = 1
@@ -110,11 +111,13 @@ hash = "sha256:..."
 tag = "pages.comment.add"
 owner = "docs-harness"
 schema = "actions/pages.comment.add.schema.json"
+schema_hash = "sha256:..."
 
 [[actions]]
 tag = "pages.block.update_text"
 owner = "docs-harness"
 schema = "actions/pages.block.update_text.schema.json"
+schema_hash = "sha256:..."
 
 [[agents]]
 id = "docs.editor"
@@ -147,6 +150,14 @@ pending_runs = "drain"
 user_data = "preserve"
 package_state = "tombstone"
 ```
+
+Every declared action schema and the harness's `golden.json` proof are
+digest-pinned in the manifest, the same way module artifacts and prompts are:
+an action with a `schema` but no `schema_hash` fails `validate`, and a capsule
+that ships `harness/golden.json` must pin it via the top-level `golden` field.
+That closes the gap where a valid signature could still cover a swapped
+schema or a trivially-passing harness. `ducktape-node package build
+--emit-hashes` computes these pins from the capsule contents.
 
 ## Package Boundary
 
