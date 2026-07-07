@@ -148,7 +148,7 @@ fn test_rejects_a_tampered_package_before_running_any_step() {
     // "digests  ok" preamble) ever ran.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("DigestMismatch") && stderr.contains("prompts/docs-editor.md"),
+        stderr.contains("digest mismatch") && stderr.contains("prompts/docs-editor.md"),
         "the error must name the digest/tamper failure, got stderr:\n{stderr}"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
