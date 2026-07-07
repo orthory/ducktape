@@ -213,9 +213,9 @@ export interface NodeTransport {
   /**
    * Read raw bytes back out of the node's content-addressed blob store by their
    * sha256 `digest` (64 lowercase hex) — the GET counterpart to `putBlob`. This
-   * is how the files module's chunks are fetched for reassembly; the caller MUST
-   * still `verifyChunk` the bytes against a committed manifest before trusting
-   * them. Rejects when the digest is absent (the node replies 404).
+   * is the node-local op-receipt store (a submit's `opHash` bytes); it is NOT
+   * the duckfs chunk plane (that rides `filesStage`/`filesRead`). Rejects when
+   * the digest is absent (the node replies 404).
    */
   getBlob(digest: string): Promise<Uint8Array<ArrayBuffer>>;
 
