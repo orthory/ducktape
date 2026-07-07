@@ -663,6 +663,28 @@ pub struct DrainedFrame {
     /// decode: a frame discarded at the cutover ceiling (dropped before
     /// decoding) or one whose decode/signature check failed.
     pub op: Option<DrainedOp>,
+    /// node-local, NON-CONSENSUS: why a [`Disposition::Rejected`] frame was
+    /// rejected — the module's VERBATIM error string (so a submitter's held
+    /// reply can string-match it, e.g. duckfs-client keys on the module's
+    /// `"files: conflict:"` prefix), or a short reason for a decode/signature
+    /// failure. `None` for an applied or discarded frame. this rides ONLY the
+    /// in-memory record: a rejection is a deterministic no-op that every honest
+    /// validator computes identically, but the reason is pure observability and
+    /// NEVER enters the seal, the WAL, or any hashed root.
+    pub reason: Option<String>,
+}
+
+/// the verbatim, submitter-facing string for a deterministic rejection.
+/// [`sdk::Error::Module`] surfaces its raw string UNWRAPPED — the duckfs-client
+/// engine string-matches the module's `"files: conflict:"` prefix on the FRONT
+/// of the reply detail, so no `op rejected:` / `Module(..)` wrapper may precede
+/// it. every other rejection kind uses its `Display`. node-local observability
+/// only: this string is never journaled, sealed, or hashed.
+fn reject_reason(e: &sdk::Error) -> String {
+    match e {
+        sdk::Error::Module(m) => m.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// the decoded contents of one drained frame: authenticated authorship, the
@@ -1113,6 +1135,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         disposition: Disposition::Discarded,
                         app_hash: self.host.app_hash(),
                         op: None,
+                        reason: None,
                     });
                     continue;
                 }
@@ -1138,6 +1161,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     disposition: Disposition::Rejected,
                     app_hash: self.host.app_hash(),
                     op: None,
+                    // node-local observability only; the seal below stays
+                    // byte-identical to the applied/rejected cases.
+                    reason: Some("frame decode/signature check failed".to_string()),
                 });
                 self.seal(height, Disposition::Rejected).await?;
                 last_sealed_view = Some(view);
@@ -1191,6 +1217,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                             dispatches: outcome.dispatches,
                             latency_us,
                         }),
+                        reason: None,
                     });
                     self.seal(height, Disposition::Applied).await?;
                     last_sealed_view = Some(view);
@@ -1208,7 +1235,14 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         }
                     }
                 }
-                Err(host::SubmitError::Rejected(_)) => {
+                Err(host::SubmitError::Rejected(e)) => {
+                    // capture the module's VERBATIM rejection string for the
+                    // in-memory DrainedFrame — a submitter's held reply carries
+                    // it (e.g. duckfs's "files: conflict: <path> ..."). the seal
+                    // below and everything journaled/hashed stay byte-identical:
+                    // a rejection is a deterministic no-op and the reason is
+                    // node-local observability, never consensus state.
+                    let reason = reject_reason(&e);
                     self.drained.push(DrainedFrame {
                         id,
                         height,
@@ -1221,6 +1255,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                             dispatches: Vec::new(),
                             latency_us,
                         }),
+                        reason: Some(reason),
                     });
                     self.seal(height, Disposition::Rejected).await?;
                     last_sealed_view = Some(view);
