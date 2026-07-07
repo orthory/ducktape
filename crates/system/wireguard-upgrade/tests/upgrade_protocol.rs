@@ -48,7 +48,7 @@ fn record_for(
         validator_identity: id(signer),
         wireguard_public_key: wg,
         control_endpoint: endpoint([1, 1, 1, wg_addr[3]], 443, Transport::Tcp, &policy),
-        wireguard_endpoint: endpoint(wg_addr, 51820, Transport::Udp, &policy),
+        wireguard_endpoint: Some(endpoint(wg_addr, 51820, Transport::Udp, &policy)),
         capabilities: vec![MeshCapability::Bootnode, MeshCapability::Relay],
         expires_at_view: 50,
         nonce,
@@ -214,7 +214,7 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
                 &set,
                 &view,
                 id(&b),
-                view.record(id(&b)).unwrap().wireguard_endpoint,
+                view.record(id(&b)).unwrap().wireguard_endpoint.unwrap(),
                 4,
             )),
             keepalive_seconds: Some(25),
@@ -313,7 +313,7 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
 
     let mut bad_request = request.clone();
     bad_request.fields.initiator_wireguard_endpoint =
-        endpoint([8, 8, 8, 99], 51820, Transport::Udp, &policy);
+        Some(endpoint([8, 8, 8, 99], 51820, Transport::Udp, &policy));
     let mut fresh_cache = ReplayCache::default();
     assert!(
         validate_upgrade(
@@ -409,7 +409,7 @@ fn valid_plan_builds_defguard_peer_config() {
                 &set,
                 &view,
                 id(&b),
-                view.record(id(&b)).unwrap().wireguard_endpoint,
+                view.record(id(&b)).unwrap().wireguard_endpoint.unwrap(),
                 4,
             )),
             keepalive_seconds: Some(25),
@@ -441,7 +441,7 @@ fn valid_plan_builds_defguard_peer_config() {
     .unwrap();
 
     let peer = DefguardPeerConfig::from_plan(&plan);
-    assert_eq!(peer.peer.endpoint, Some(plan.peer_endpoint().socket_addr()));
+    assert_eq!(peer.peer.endpoint, plan.peer_endpoint().map(|e| e.socket_addr()));
     assert_eq!(peer.allowed_ips, plan.allowed_ips());
 
     let interface = DefguardInterfaceConfig::from_plan(
@@ -683,11 +683,62 @@ fn record_check_mirrors_the_per_record_view_rules() {
         allow_private_ip: true,
     };
     let private_wg = EndpointRecord {
-        wireguard_endpoint: endpoint([10, 0, 0, 9], 51820, Transport::Udp, &open),
+        wireguard_endpoint: Some(endpoint([10, 0, 0, 9], 51820, Transport::Udp, &open)),
         ..good.clone()
     };
     assert!(matches!(
         private_wg.check(&policy, 10).unwrap_err(),
         UpgradeError::InvalidEndpoint(_)
     ));
+}
+
+#[test]
+fn an_endpoint_less_record_signs_verifies_and_stays_wire_compatible() {
+    // the NAT'd-joiner shape: a record advertising NO WireGuard endpoint.
+    // it must (a) pass the per-record checks (there is no endpoint to
+    // policy-check), (b) sign and verify, (c) omit the field on the JSON
+    // wire, and (d) leave endpoint-FUL records exactly as they were — an
+    // old-wire record (field present, no Option wrapper) still decodes.
+    let a = PrivateKey::from_seed(1);
+    let policy = prod_policy();
+    let set = active_set(id(&a), id(&PrivateKey::from_seed(2)));
+    let endpoint_less = EndpointRecord {
+        wireguard_endpoint: None,
+        ..record_for(&a, &set, [8, 8, 8, 10], xkey(1), 1)
+    };
+
+    endpoint_less
+        .check(&policy, 10)
+        .expect("no endpoint means nothing to policy-check");
+
+    let signed = SignedEndpointRecord::sign(endpoint_less.clone(), &a);
+    signed.verify().expect("owner signature verifies");
+
+    // None omits the field entirely — an endpoint-ful record's JSON is
+    // byte-identical to the pre-Option wire.
+    let json = serde_json::to_string(&endpoint_less).unwrap();
+    assert!(
+        !json.contains("wireguard_endpoint"),
+        "None must be absent on the wire: {json}"
+    );
+    let round: EndpointRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(round, endpoint_less);
+
+    // the legacy wire shape (field present) decodes as Some — old records
+    // from an un-upgraded peer keep working.
+    let with_endpoint = record_for(&a, &set, [8, 8, 8, 10], xkey(1), 1);
+    let legacy_json = serde_json::to_string(&with_endpoint).unwrap();
+    assert!(legacy_json.contains("wireguard_endpoint"), "{legacy_json}");
+    let legacy: EndpointRecord = serde_json::from_str(&legacy_json).unwrap();
+    assert_eq!(legacy.wireguard_endpoint, with_endpoint.wireguard_endpoint);
+
+    // and the two SIGNING encodings can never collide: flipping the same
+    // record between None and Some changes its signature domain bytes.
+    let signed_some = SignedEndpointRecord::sign(with_endpoint, &a);
+    let mut forged = signed_some.clone();
+    forged.record.wireguard_endpoint = None;
+    assert!(
+        forged.verify().is_err(),
+        "a stripped endpoint must break the owner signature"
+    );
 }

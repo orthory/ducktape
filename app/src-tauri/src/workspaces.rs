@@ -487,9 +487,11 @@ pub fn workspace_create(app: tauri::AppHandle, name: String) -> Result<Workspace
     fs::create_dir_all(&dir).map_err(|err| format!("create {dir:?}: {err}"))?;
     let ports = allocate_ports(&reserved_ports(&reg))?;
 
-    // bind the mesh listener on every interface so an invited peer can actually
+    // bind the mesh listener dual-stack ([::] accepts BOTH families on a
+    // default dual-stack host — 0.0.0.0 could never accept the v6 overlay-ULA
+    // dials that ride WireGuard tunnels) so an invited peer can actually
     // reach it; advertise the address they should dial (never loopback).
-    let listen = format!("0.0.0.0:{}", ports.listen);
+    let listen = format!("[::]:{}", ports.listen);
     let advertised = advertised_addr(ports.listen);
     let http = format!("127.0.0.1:{}", ports.http);
     let rpc = format!("127.0.0.1:{}", ports.rpc);
@@ -565,10 +567,14 @@ pub fn workspace_join(
     fs::create_dir_all(&dir).map_err(|err| format!("create {dir:?}: {err}"))?;
     let ports = allocate_ports(&reserved_ports(&reg))?;
 
-    // bind on every interface + advertise the dialable address (never loopback),
-    // matching `workspace_create` so this joiner is itself reachable once admitted.
-    let listen = format!("0.0.0.0:{}", ports.listen);
-    let advertised = advertised_addr(ports.listen);
+    // bind dual-stack, but pass NO --advertised and NO --listen: a joiner
+    // needs zero reachability config. `cmd_join` picks the right defaults per
+    // invite shape (a WG invite: `[::]` mesh listen + advertised "overlay",
+    // dialable over the tunnel) — a guessed public IP here would override
+    // that and gossip an unreachable address that poisons working routes.
+    // only the ports stay ours so the registry's per-workspace allocation
+    // holds: listen rides --listen with the unspecified host.
+    let listen = format!("[::]:{}", ports.listen);
     let http = format!("127.0.0.1:{}", ports.http);
     let rpc = format!("127.0.0.1:{}", ports.rpc);
     let dir_s = dir.to_string_lossy().to_string();
@@ -582,8 +588,6 @@ pub fn workspace_join(
             &dir_s,
             "--listen",
             &listen,
-            "--advertised",
-            &advertised,
             "--http",
             &http,
             "--rpc",

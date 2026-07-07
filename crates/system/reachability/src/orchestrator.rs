@@ -92,8 +92,14 @@ pub struct ReachabilityConfig {
     /// Where the X25519 keypair lives (beside `identity.key`);
     /// `keys::WireGuardKeypair::load_or_generate` runs against this path.
     pub wireguard_key_file: PathBuf,
-    /// The node's own advertised WireGuard UDP endpoint.
-    pub wireguard_listen: Endpoint,
+    /// The local WireGuard UDP bind port — always needed to bring the
+    /// interface up, independent of whether an endpoint is advertised.
+    pub wireguard_port: u16,
+    /// The node's own advertised WireGuard UDP endpoint — `None` for an
+    /// endpoint-less (NAT'd) node: it advertises no address, installs every
+    /// peer FROM the records, and initiates; peers install it without an
+    /// endpoint and WireGuard roams to its authenticated initiation.
+    pub wireguard_advertised: Option<Endpoint>,
     /// The node's own advertised control-mesh endpoint.
     pub control_endpoint: Endpoint,
     /// Rendezvous coordinators (from `Resolved.coordinated`), possibly none:
@@ -939,7 +945,7 @@ where
                 validator_identity: self.me,
                 wireguard_public_key: self.keypair.public_key(),
                 control_endpoint: self.config.control_endpoint,
-                wireguard_endpoint: self.config.wireguard_listen,
+                wireguard_endpoint: self.config.wireguard_advertised,
                 capabilities: vec![],
                 expires_at_view: self.view + ADVERT_TTL_VIEWS,
                 // the epoch's first signed nonce; the counter below starts
@@ -1051,24 +1057,30 @@ where
         }
         let mut peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig> = BTreeMap::new();
         for record in &records {
-            let advertised = record.wireguard_endpoint.socket_addr();
-            let endpoint = match self
-                .resolver
-                .resolve(binding::node_key(record.validator_identity), advertised)
-                .await
-            {
-                Ok(Resolution::Advertised) => advertised,
-                Ok(Resolution::Punched(addr)) => addr,
-                Err(reason) => {
-                    // same contract as live assembly: the peer rides its
-                    // advertised endpoint and the failure is surfaced.
-                    self.emit(ReachabilityEvent::PeerFailed {
-                        peer: member_pk_of[&record.validator_identity].clone(),
-                        reason: format!("restore endpoint resolution: {reason}"),
-                    })
-                    .await?;
-                    advertised
-                }
+            // an endpoint-less record installs without an endpoint (nothing
+            // to resolve): that peer initiates and WireGuard roams to it.
+            let endpoint = match record.wireguard_endpoint.map(|e| e.socket_addr()) {
+                None => None,
+                Some(advertised) => Some(
+                    match self
+                        .resolver
+                        .resolve(binding::node_key(record.validator_identity), advertised)
+                        .await
+                    {
+                        Ok(Resolution::Advertised) => advertised,
+                        Ok(Resolution::Punched(addr)) => addr,
+                        Err(reason) => {
+                            // same contract as live assembly: the peer rides its
+                            // advertised endpoint and the failure is surfaced.
+                            self.emit(ReachabilityEvent::PeerFailed {
+                                peer: member_pk_of[&record.validator_identity].clone(),
+                                reason: format!("restore endpoint resolution: {reason}"),
+                            })
+                            .await?;
+                            advertised
+                        }
+                    },
+                ),
             };
             let allowed_ips = self
                 .overlay
@@ -1099,7 +1111,7 @@ where
             &mut self.effect,
             self.interface.clone(),
             self.keypair.private_key_base64(),
-            self.config.wireguard_listen,
+            self.config.wireguard_port,
             &local_interface_ips,
             &parts,
         ) {
@@ -1558,8 +1570,11 @@ where
         } else if via == owner {
             state.routes.remove(&owner);
         }
-        let advertised = signed.record.wireguard_endpoint.socket_addr();
-        let endpoint = self.resolve_prewarm_endpoint(owner, advertised).await?;
+        // endpoint-less standby: install without an endpoint — it initiates.
+        let endpoint = match signed.record.wireguard_endpoint.map(|e| e.socket_addr()) {
+            None => None,
+            Some(advertised) => Some(self.resolve_prewarm_endpoint(owner, advertised).await?),
+        };
         let allowed_ips = self
             .overlay
             .identity_allowed_ips(owner)
@@ -1768,8 +1783,11 @@ where
             _ => {}
         }
         state.prewarm_nonces.insert(owner, record.nonce);
-        let advertised = record.wireguard_endpoint.socket_addr();
-        let endpoint = self.resolve_prewarm_endpoint(owner, advertised).await?;
+        // endpoint-less member record: install without an endpoint — it initiates.
+        let endpoint = match record.wireguard_endpoint.map(|e| e.socket_addr()) {
+            None => None,
+            Some(advertised) => Some(self.resolve_prewarm_endpoint(owner, advertised).await?),
+        };
         let allowed_ips = self
             .overlay
             .identity_allowed_ips(owner)
@@ -1891,7 +1909,7 @@ where
                     &mut self.effect,
                     self.interface.clone(),
                     self.keypair.private_key_base64(),
-                    self.config.wireguard_listen,
+                    self.config.wireguard_port,
                     &local_interface_ips,
                     &peers,
                 ) {
@@ -1964,7 +1982,7 @@ where
                 initiator_identity: self.me,
                 responder_identity: peer,
                 initiator_wireguard_public_key: self.keypair.public_key(),
-                initiator_wireguard_endpoint: self.config.wireguard_listen,
+                initiator_wireguard_endpoint: self.config.wireguard_advertised,
                 requested_allowed_ips: self.overlay.allowed_ips_for(view, peer)?,
                 port_policy_hash: self.config.port_policy.hash(),
                 expires_at_view: self.view + HANDSHAKE_TTL_VIEWS,
@@ -1991,7 +2009,11 @@ where
             .view_state
             .as_ref()
             .and_then(|view| view.record(peer))
-            .map(|record| record.wireguard_endpoint.socket_addr());
+            .and_then(|record| record.wireguard_endpoint)
+            .map(|endpoint| endpoint.socket_addr());
+        // no record, or an endpoint-less peer: nothing to resolve or dial —
+        // the tunnel entry is installed without an endpoint and the peer's
+        // own initiation completes it.
         let Some(advertised) = advertised else {
             return Ok(());
         };
@@ -2096,7 +2118,8 @@ where
             identity,
             PeerTunnelConfig {
                 wireguard_public_key,
-                endpoint,
+                // the intro datagram's observed source — always concrete.
+                endpoint: Some(endpoint),
                 allowed_ips,
                 keepalive_seconds: Some(KEEPALIVE_SECONDS),
             },
@@ -2118,7 +2141,7 @@ where
                 &mut self.effect,
                 self.interface.clone(),
                 self.keypair.private_key_base64(),
-                self.config.wireguard_listen,
+                self.config.wireguard_port,
                 &local_interface_ips,
                 &peers,
             )
@@ -2127,7 +2150,7 @@ where
                 &mut self.effect,
                 self.interface.clone(),
                 self.keypair.private_key_base64(),
-                self.config.wireguard_listen,
+                self.config.wireguard_port,
                 &local_interface_ips,
                 &peers,
             )
@@ -2187,7 +2210,7 @@ where
                 &mut self.effect,
                 self.interface.clone(),
                 self.keypair.private_key_base64(),
-                self.config.wireguard_listen,
+                self.config.wireguard_port,
                 &local_interface_ips,
                 &peers,
             )
@@ -2196,7 +2219,7 @@ where
                 &mut self.effect,
                 self.interface.clone(),
                 self.keypair.private_key_base64(),
-                self.config.wireguard_listen,
+                self.config.wireguard_port,
                 &local_interface_ips,
                 &peers,
             )
@@ -2300,7 +2323,7 @@ where
             responder_identity: self.me,
             initiator_identity: sender,
             responder_wireguard_public_key: self.keypair.public_key(),
-            responder_wireguard_endpoint: self.config.wireguard_listen,
+            responder_wireguard_endpoint: self.config.wireguard_advertised,
             accepted_allowed_ips: self.overlay.allowed_ips_for(view, sender)?,
             relay_candidates: vec![],
             direct_dial_failure: None,

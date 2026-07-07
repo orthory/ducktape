@@ -799,7 +799,8 @@ function AdminActions({
                   Invite a Member
                 </div>
                 <div style={{ marginTop: 2, font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
-                  Reveal the workspace invite blob for sharing.
+                  Reveal the workspace invite blob for sharing. One invite admits one
+                  person — mint a fresh one per member.
                 </div>
               </div>
               <div style={{ marginLeft: "auto", flexShrink: 0 }}>
