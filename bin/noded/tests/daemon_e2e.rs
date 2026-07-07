@@ -19,7 +19,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest as _, Sha256};
 
-
 /// a running daemon, killed on drop so failures never leak an orphan (the
 /// REAL orphan lifecycle — outliving a client — is the desktop shell's
 /// contract with a detached spawn; this harness owns its child instead).
@@ -266,8 +265,7 @@ impl Daemon {
     /// a refusal leaves the connection open (keep-alive), so the read is
     /// timeout-bounded instead of read-to-close.
     fn ws_upgrade_refusal(&self, path: &str) -> (u16, String) {
-        let mut stream =
-            TcpStream::connect(("127.0.0.1", self.port)).expect("daemon reachable");
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("daemon reachable");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout");
@@ -352,10 +350,7 @@ fn call_ws_without_a_hub_refuses_with_a_reason() {
 
     let (status, raw) = daemon.ws_upgrade_refusal("/v1/call/ws?channel=general");
     assert_eq!(status, 503, "no call hub → refused at upgrade: {raw}");
-    assert!(
-        raw.contains("no mesh call hub"),
-        "refusal says WHY: {raw}"
-    );
+    assert!(raw.contains("no mesh call hub"), "refusal says WHY: {raw}");
 
     let (status, _raw) = daemon.ws_upgrade_refusal("/v1/voice/ws?channel=general");
     assert_eq!(status, 404, "the old voice route is unrouted, not refused");
@@ -873,6 +868,16 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
         .expect("appHash")
         .to_string();
 
+    // refs on a fresh module: no head (the empty filesystem) and an empty window,
+    // the base state the checkout engine starts from.
+    let (code, refs0) = daemon.request("GET", "/v1/files/refs", None);
+    assert_eq!(code, 200, "empty refs failed: {refs0}");
+    assert!(
+        refs0["head"].is_null(),
+        "no head before any commit: {refs0}"
+    );
+    assert_eq!(refs0["window_len"], 0, "empty window before any commit");
+
     // a duckfs chunk digest is the chunk object id: sha256 over the chunk kind
     // tag byte (0x00) followed by the bytes — what the module stages under and a
     // commit references. the stage endpoint returns it; we recompute it here to
@@ -1011,6 +1016,75 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
     let snaps = hist["snapshots"].as_array().expect("snapshots array");
     assert_eq!(snaps.len(), 1, "one commit lands in history: {hist}");
     assert_eq!(snaps[0]["message"], "seed duckfs");
+    let seed_snapshot = snaps[0]["id"]
+        .as_str()
+        .expect("seed snapshot id")
+        .to_string();
+
+    // ---- refs: head advanced from None (checked empty above) to the seed
+    // snapshot, and the window now holds one commit ----
+    let (code, refs) = daemon.request("GET", "/v1/files/refs", None);
+    assert_eq!(code, 200, "refs failed: {refs}");
+    assert_eq!(
+        refs["head"].as_str(),
+        Some(seed_snapshot.as_str()),
+        "refs head is the seed snapshot: {refs}"
+    );
+    assert_eq!(refs["window_len"], 1, "one commit in the window");
+
+    // ---- has-chunks flips false -> true across a stage; order is preserved ----
+    let chunk_c: Vec<u8> = (0..32u32).map(|i| (i * 3 + 1) as u8).collect();
+    let digest_c = chunk_digest(&chunk_c);
+    let (code, probe) =
+        daemon.request("GET", &format!("/v1/files/has-chunks?ids={digest_c}"), None);
+    assert_eq!(code, 200, "has-chunks failed: {probe}");
+    assert_eq!(
+        probe["present"],
+        serde_json::json!([false]),
+        "an unstaged chunk is absent: {probe}"
+    );
+    let (code, _) = daemon.request_bytes("POST", "/v1/files/stage", &chunk_c);
+    assert_eq!(code, 200, "stage c failed");
+    let absent = "22".repeat(32);
+    let (code, probe) = daemon.request(
+        "GET",
+        &format!("/v1/files/has-chunks?ids={digest_c},{absent}"),
+        None,
+    );
+    assert_eq!(code, 200, "has-chunks re-probe failed: {probe}");
+    assert_eq!(
+        probe["present"],
+        serde_json::json!([true, false]),
+        "the staged chunk flips present, request order intact: {probe}"
+    );
+
+    // ---- diff between the seed snapshot and a follow-up edit ----
+    let commit2 = serde_json::json!({
+        "base_snapshot": seed_snapshot,
+        "message": "edit hello",
+        "changes": [
+            { "put": { "path": "/shared/hello.txt", "exec": false,
+                "content": { "inline": { "b64": STANDARD.encode(b"HELLO AGAIN") } } } },
+        ],
+    });
+    let (code, block2) = daemon.request("POST", "/v1/files/commit", Some(&commit2));
+    assert_eq!(code, 200, "second commit failed: {block2}");
+    let (code, refs2) = daemon.request("GET", "/v1/files/refs", None);
+    assert_eq!(code, 200, "refs2 failed: {refs2}");
+    let head2 = refs2["head"].as_str().expect("head2 set").to_string();
+    let (code, diff) = daemon.request(
+        "GET",
+        &format!("/v1/files/diff?from={seed_snapshot}&to={head2}&prefix=/shared"),
+        None,
+    );
+    assert_eq!(code, 200, "diff failed: {diff}");
+    let entries = diff["entries"].as_array().expect("diff entries array");
+    assert_eq!(entries.len(), 1, "exactly one path changed: {diff}");
+    assert_eq!(entries[0]["path"], "/shared/hello.txt");
+    assert_eq!(
+        entries[0]["kind"], "modified",
+        "the edited file is modified"
+    );
 
     // ---- a rejected op is a clean 4xx carrying the error, not a 500/panic ----
     // a commit referencing a never-staged chunk digest: the module cannot
@@ -1117,7 +1191,9 @@ fn stage_script_provider(root: &Path, tag: &str, body: &str) -> Vec<(String, Str
     std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
     let script = root.join(format!("{tag}.sh"));
     std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("write provider script");
-    let mut perms = std::fs::metadata(&script).expect("script metadata").permissions();
+    let mut perms = std::fs::metadata(&script)
+        .expect("script metadata")
+        .permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).expect("chmod provider script");
 
@@ -1254,7 +1330,10 @@ fn status_answers_while_a_slow_run_is_in_flight() {
 
     // the provider is asleep for ~6s. the daemon answers NOW:
     let status = daemon.status();
-    assert!(status["height"].as_u64().is_some(), "status is live: {status}");
+    assert!(
+        status["height"].as_u64().is_some(),
+        "status is live: {status}"
+    );
     assert_eq!(
         pending_run_count(&daemon),
         1,
@@ -1267,14 +1346,20 @@ fn status_answers_while_a_slow_run_is_in_flight() {
 
     // ... and the run still lands: the result re-enters as a submit, the
     // mailbox delivers next block, the reply posts, the pending entry prunes.
-    poll_until("the slow run's reply to post", Duration::from_secs(30), || {
-        let replies = agent_replies(&daemon, "general");
-        (!replies.is_empty()).then_some(replies)
-    });
+    poll_until(
+        "the slow run's reply to post",
+        Duration::from_secs(30),
+        || {
+            let replies = agent_replies(&daemon, "general");
+            (!replies.is_empty()).then_some(replies)
+        },
+    );
     assert_eq!(agent_replies(&daemon, "general"), ["slow answer"]);
-    poll_until("the pending entry to prune", Duration::from_secs(30), || {
-        (pending_run_count(&daemon) == 0).then_some(())
-    });
+    poll_until(
+        "the pending entry to prune",
+        Duration::from_secs(30),
+        || (pending_run_count(&daemon) == 0).then_some(()),
+    );
 }
 
 /// two slow runs execute CONCURRENTLY: the second child starts while the
@@ -1350,7 +1435,11 @@ fn a_failing_provider_still_fails_the_run_cleanly() {
     let daemon = Daemon::spawn_inner(storage.path(), false, &env);
     arm_agent(&daemon, "general", "boomer", "kaboom");
 
-    let (code, block) = daemon.submit("chat", post_mention("general", "m1", "boomer"), Some("eddy"));
+    let (code, block) = daemon.submit(
+        "chat",
+        post_mention("general", "m1", "boomer"),
+        Some("eddy"),
+    );
     assert_eq!(code, 200, "mention post failed: {block}");
 
     // the terminal failure delivers (that is what prunes the entry) — the

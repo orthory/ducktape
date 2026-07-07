@@ -716,6 +716,10 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/files/find", get(files_find))
         .route("/v1/files/grep", get(files_grep))
         .route("/v1/files/history", get(files_history))
+        // the read/probe surface the checkout/commit engine drives.
+        .route("/v1/files/refs", get(files_refs))
+        .route("/v1/files/diff", get(files_diff))
+        .route("/v1/files/has-chunks", get(files_has_chunks))
         .route("/forge/{repo}/info/refs", get(git_info_refs))
         // git smart-HTTP: forge is a full push+fetch remote over one route pair.
         //   `git push  http://<node>/forge/<repo> main` — receive-pack (push)

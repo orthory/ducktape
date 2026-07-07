@@ -396,3 +396,75 @@ pub(crate) async fn files_history(
         Err(resp) => resp,
     }
 }
+
+/// GET /v1/files/refs — the committed refs summary: `{head, pins, window_len}`.
+/// the checkout/commit engine reads this to resolve the head snapshot and drive
+/// per-path CAS against it.
+pub(crate) async fn files_refs(State(handle): State<NodeHandle>) -> Response {
+    match files_query(&handle, &FilesQuery::Refs {}).await {
+        Ok(FilesReply::Refs(info)) => Json(info).into_response(),
+        Ok(_) => wrong_reply(),
+        Err(resp) => resp,
+    }
+}
+
+/// query params for GET /v1/files/diff. `from`/`to` are snapshot ids the module
+/// resolves against its committed window; `prefix` narrows the walk.
+#[derive(Debug, Deserialize)]
+pub struct DiffParams {
+    pub from: String,
+    pub to: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
+/// GET /v1/files/diff?from=&to=&prefix= — the Added/Removed/Modified leaves
+/// between two committed snapshots, as `{"entries": [DiffEntry]}`. the engine's
+/// auto-rebase reads this to decide whether upstream touched our paths.
+pub(crate) async fn files_diff(
+    State(handle): State<NodeHandle>,
+    Query(p): Query<DiffParams>,
+) -> Response {
+    let q = FilesQuery::Diff {
+        from: p.from,
+        to: p.to,
+        prefix: p.prefix.unwrap_or_default(),
+    };
+    match files_query(&handle, &q).await {
+        Ok(FilesReply::Diff(entries)) => {
+            Json(serde_json::json!({ "entries": entries })).into_response()
+        }
+        Ok(_) => wrong_reply(),
+        Err(resp) => resp,
+    }
+}
+
+/// query params for GET /v1/files/has-chunks.
+#[derive(Debug, Deserialize)]
+pub struct HasChunksParams {
+    /// comma-separated 64-hex chunk ids; empty means an empty batch.
+    #[serde(default)]
+    pub ids: String,
+}
+
+/// GET /v1/files/has-chunks?ids=<comma-separated hex> — the client staging probe:
+/// `{"present": [bool]}` in request order. an over-cap batch (>256) or a non-hex
+/// id passes the module's rejection straight through as a 400 — the engine treats
+/// the reply as advisory and the commit re-validates regardless.
+pub(crate) async fn files_has_chunks(
+    State(handle): State<NodeHandle>,
+    Query(p): Query<HasChunksParams>,
+) -> Response {
+    let ids: Vec<String> = if p.ids.is_empty() {
+        Vec::new()
+    } else {
+        p.ids.split(',').map(|s| s.to_string()).collect()
+    };
+    match files_query(&handle, &FilesQuery::HasChunks { ids }).await {
+        Ok(FilesReply::HasChunks { present }) => {
+            Json(serde_json::json!({ "present": present })).into_response()
+        }
+        Ok(_) => wrong_reply(),
+        Err(resp) => resp,
+    }
+}
