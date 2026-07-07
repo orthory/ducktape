@@ -13,7 +13,9 @@
 
 mod daemon;
 mod forge_git;
+mod huddle;
 mod tray;
+mod user_identity;
 mod workspaces;
 
 fn main() {
@@ -28,12 +30,25 @@ fn main() {
             workspaces::workspace_join_requests,
             workspaces::workspace_admit,
             workspaces::workspace_promote,
-            workspaces::workspace_observer_remove,
+            workspaces::workspace_resident_remove,
             workspaces::workspace_demote,
             workspaces::workspace_request_leave,
             workspaces::workspace_forget,
             workspaces::workspace_select,
             workspaces::workspace_phase,
+            workspaces::workspace_log_tail,
+            workspaces::user_identity_confirm_mnemonic,
+            user_identity::user_identity_status,
+            user_identity::user_identity_state,
+            user_identity::user_identity_create,
+            user_identity::user_identity_restore,
+            user_identity::user_identity_unlock,
+            user_identity::user_identity_reveal,
+            user_identity::user_identity_encrypt,
+            user_identity::user_identity_lock,
+            user_identity::user_sign_bind,
+            user_identity::user_sign_unbind,
+            forge_git::forge_list_repos,
             forge_git::forge_head,
             forge_git::forge_log,
             forge_git::forge_tree,
@@ -41,6 +56,8 @@ fn main() {
             forge_git::forge_diff,
             tray::tray_open_console,
             tray::tray_quit,
+            huddle::huddle_pop_out,
+            huddle::huddle_pop_in,
         ])
         // Menu-bar icon + popover (macOS only; a no-op on other platforms).
         .setup(|app| {

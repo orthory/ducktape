@@ -146,13 +146,11 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       act(() => capturedActions!.createChannel("Mine", "open"));
       await waitFor(async () => expect((await sim.state()).held).toBe(1));
 
-      // a concurrent writer's block lands. telemetry frames are ungated, so
-      // their arrival proves the ws delivered — then the gate must have held:
+      // a concurrent writer's block lands. the ws chain tip is ungated, so
+      // its advance proves the ws delivered — then the gate must have held:
       // no refresh, so the rival's committed channel stays invisible.
       await sim.peerBlock("chat", peerChannel("rival-1", "Rival 1"));
-      await waitFor(() =>
-        expect(capturedState!.telemetry.some((f) => f.height === 1)).toBe(true),
-      );
+      await waitFor(() => expect(capturedState!.lastBlock).toBe(1));
       expect(capturedState!.channels.some((c) => c.id === "rival-1")).toBe(false);
       expect(capturedState!.channels.some((c) => c.name === "Mine")).toBe(true);
 
@@ -308,7 +306,6 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
             display_name: "Quackbot",
             capability: "echo",
             prompt_hash: Array(32).fill(7),
-            prompt_doc: null,
             allowed_actions: ["chat.post"],
           },
         },
@@ -358,9 +355,7 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
 
       // the follow-up's height reaches the app over the ws stream ONLY —
       // no submit receipt ever carries it, and no op record claims it.
-      await waitFor(() =>
-        expect(capturedState!.telemetry.some((f) => f.height === 5)).toBe(true),
-      );
+      await waitFor(() => expect(capturedState!.lastBlock).toBe(5));
       await waitFor(() => expect(capturedState!.status?.height).toBe(5));
       expect(receipts.some((r) => r.height === 5)).toBe(false);
       expect(

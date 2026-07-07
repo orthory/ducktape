@@ -216,7 +216,7 @@ fn cluster_lifecycle() {
     // widens the quorum to 4. node 3 boots as a parked joiner, sees itself
     // in the participant set at the boundary, syncs, and promotes.
     cluster.spawn(3);
-    cluster.wait_marker(3, "joiner mode: parking", Duration::from_secs(60));
+    cluster.wait_marker(3, "joiner mode:", Duration::from_secs(60));
 
     // 7. ADMISSION CUTOVER. finalized views only advance with ops, so push
     // fillers through the boundary. fillers go through the raw rpc and
@@ -319,41 +319,35 @@ fn cluster_lifecycle() {
             .is_some_and(|ops| !ops.is_empty()),
         "an applied block carries its dispatch trace: {submitted}"
     );
-    // 8c-bis. the telemetry plane: applying that same non-empty block pushes a
-    // per-block frame into node 0's in-memory ring (GET /v1/telemetry) and over
-    // the ws stream — the dispatch trace decorated with this node's apply
-    // latency. it read {"frames":[]} forever until the validator learned to
-    // emit; the heartbeat nops are filtered exactly like the explorer's rows,
-    // so the two planes render the SAME dispatch trace for the block.
-    let telem = poll_until("held submit's telemetry frame on node 0", FINALIZE, || {
-        let (code, body) = cluster.http(0, "GET", "/v1/telemetry", None);
-        if code != 200 {
-            return None;
-        }
-        body["frames"]
-            .as_array()?
-            .iter()
-            .find(|f| f["height"] == block["height"])
-            .cloned()
-    });
+    // 8c-bis. the metrics plane: the drain that applied the held submit folded
+    // it into the validator's `ducktape_*` Prometheus series BEFORE the held
+    // reply returned, so /metrics must already report a recorded block apply —
+    // count, apply-latency histogram samples, and the dispatch counter labeled
+    // with the submitted module. (this endpoint served only commonware runtime
+    // series until the validator learned to record its own blocks.)
+    let (code, exposition) = cluster.http_text(0, "/metrics");
+    assert_eq!(code, 200, "metrics scrape failed:\n{exposition}");
+    let blocks_total = exposition
+        .lines()
+        .find(|l| l.starts_with("ducktape_blocks_total"))
+        .and_then(|l| l.split_whitespace().last())
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or_else(|| panic!("no ducktape_blocks_total sample:\n{exposition}"));
     assert!(
-        telem["dispatches"]
-            .as_array()
-            .is_some_and(|d| !d.is_empty()),
-        "the telemetry frame carries the block's dispatch trace: {telem}"
-    );
-    assert_eq!(
-        telem["dispatches"].as_array().map(Vec::len),
-        submitted["operations"].as_array().map(Vec::len),
-        "telemetry and the explorer render the same dispatch trace for the block"
-    );
-    assert_eq!(
-        telem["consensusTime"], block["height"],
-        "this validator lane stamps consensus_time = height: {telem}"
+        blocks_total >= 1.0,
+        "the applied block was recorded: ducktape_blocks_total={blocks_total}"
     );
     assert!(
-        telem["latencyUs"].as_u64().is_some(),
-        "the frame carries this node's apply latency as a u64: {telem}"
+        exposition
+            .lines()
+            .any(|l| l.starts_with("ducktape_block_apply_latency_seconds_count")
+                && l.split_whitespace().last() != Some("0")),
+        "the apply-latency histogram observed the block:\n{exposition}"
+    );
+    assert!(
+        exposition.contains("ducktape_dispatch_total")
+            && exposition.contains("module=\"directory\""),
+        "the dispatch counter carries the submitted module label:\n{exposition}"
     );
     // 8d. the record's op hash is a real content address: staging at the
     // drain keys the committed payload bytes by sha256, so the blob lane
@@ -402,7 +396,7 @@ fn cluster_lifecycle() {
 
     // 10. the sync-only joiner rebuilds EVERY module over the statesync
     // channel from node 0 and must compose the identical app-hash. node 3's
-    // slot is reused as a FRESH observer: kill the promoted validator
+    // slot is reused as a FRESH resident: kill the promoted validator
     // (quorum(4) = 3 keeps the network live — nops move heights, not state,
     // so the step-9 boundary hash stands) and wipe its state.
     cluster.kill(3);

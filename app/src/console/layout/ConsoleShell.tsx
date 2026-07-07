@@ -7,9 +7,11 @@ import { useEffect } from "react";
 import { moduleById } from "../modules/registry";
 import { useDucktape } from "../store/use-ducktape";
 import { color, font } from "../theme/tokens";
+import { HuddleDock } from "../views/chat/Huddle";
 import { SearchModal } from "../views/search/SearchModal";
 import { SettingsView } from "../views/settings/SettingsView";
-import { Sidebar } from "./Sidebar";
+import { CHANNEL_RAIL_WIDTH } from "../views/chat/ChatView";
+import { Sidebar, SIDEBAR_ICON_RAIL_WIDTH } from "./Sidebar";
 
 function resolveScreen(screen: string) {
   if (screen === "settings") return SettingsView;
@@ -85,6 +87,21 @@ export function ConsoleShell() {
       <Sidebar />
       <div style={{ flex: 1, minWidth: 0, display: "flex" }}>
         <Screen />
+      </div>
+      {/* the live-huddle session card floats above EVERY screen — a hot mic
+          must never lose its mute/leave controls to navigation. Sized to sit
+          INSIDE the chat screen's channel rail (the dock's own 8px margins
+          inset the card within this span). */}
+      <div
+        style={{
+          position: "absolute",
+          left: SIDEBAR_ICON_RAIL_WIDTH,
+          bottom: 6,
+          width: CHANNEL_RAIL_WIDTH,
+          zIndex: 25,
+        }}
+      >
+        <HuddleDock />
       </div>
       <ErrorStrip />
       {state.searchOpen && <SearchModal />}

@@ -41,8 +41,35 @@ const PATHS: Record<string, ReactNode> = {
   close: <path d="M6 6l12 12M18 6L6 18" />,
   plus: <path d="M12 5v14M5 12h14" />,
   check: <path d="M5 12.5l4 4 10-10" />,
+  code: (
+    <>
+      <path d="M9 18l-6-6 6-6" />
+      <path d="M15 6l6 6-6 6" />
+    </>
+  ),
+  edit: (
+    <>
+      <path d="M4.5 19.5l.8-3.6L15.2 6l2.8 2.8-9.9 9.9z" />
+      <path d="M13.7 7.5l2.8 2.8" />
+    </>
+  ),
+  divider: <path d="M5 12h14" />,
+  link: (
+    <>
+      <path d="M9.5 14.5l5-5" />
+      <path d="M11 7.4l1.4-1.4a4 4 0 0 1 5.7 5.7l-1.4 1.4" />
+      <path d="M13 16.6l-1.4 1.4a4 4 0 0 1-5.7-5.7l1.4-1.4" />
+    </>
+  ),
+  quote: (
+    <>
+      <path d="M8 9h4v7H6v-5.2A5 5 0 0 1 10.8 6" />
+      <path d="M17 9h4v7h-6v-5.2A5 5 0 0 1 19.8 6" />
+    </>
+  ),
   chevronRight: <path d="M9 6l6 6-6 6" />,
   hash: <path d="M9 4L7 20M17 4l-2 16M5 9h15M4 15h15" />,
+  metrics: <path d="M6 20v-7M12 20V6M18 20v-4M4 20h16" />,
   forge: (
     <>
       <path d="M6 4.5v9" />
@@ -74,7 +101,6 @@ const PATHS: Record<string, ReactNode> = {
       <circle cx="14.4" cy="13.3" r="1" />
     </>
   ),
-  telemetry: <path d="M3 12.5h3.5l2-5.5 3 12 2.5-8.5 1.5 2h4.5" />,
   governance: (
     <>
       <circle cx="12" cy="12" r="8" />
@@ -93,6 +119,20 @@ const PATHS: Record<string, ReactNode> = {
     <>
       <path d="M5 5.5A1.5 1.5 0 0 1 6.5 4H10l2 2.2h5.5A1.5 1.5 0 0 1 19 7.7V10" />
       <path d="M3.7 12.2A1.2 1.2 0 0 1 4.9 11h14.2a1.2 1.2 0 0 1 1.18 1.46l-1.1 6A1.5 1.5 0 0 1 17.7 20H6.3a1.5 1.5 0 0 1-1.48-1.24z" />
+    </>
+  ),
+  // file-type glyphs for the forge tree (see views/forge/file-icons.ts)
+  braces: (
+    <>
+      <path d="M9 4.5c-1.8 0-1.8 2.6-1.8 3.75 0 1.5-1.7 1.75-1.7 1.75s1.7.25 1.7 1.75c0 1.15 0 3.75 1.8 3.75" transform="translate(0 2)" />
+      <path d="M15 4.5c1.8 0 1.8 2.6 1.8 3.75 0 1.5 1.7 1.75 1.7 1.75s-1.7.25-1.7 1.75c0 1.15 0 3.75-1.8 3.75" transform="translate(0 2)" />
+    </>
+  ),
+  image: (
+    <>
+      <rect x="4" y="5" width="16" height="14" rx="2" />
+      <circle cx="9" cy="10" r="1.5" />
+      <path d="M4.5 17.5l4.5-4 3 2.5 3.2-3.2L19.5 16" />
     </>
   ),
 };

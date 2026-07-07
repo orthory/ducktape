@@ -13,8 +13,8 @@ sim = []
 [dependencies]
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "io-util"] }
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "io-util", "net"] }
 
 [dev-dependencies]
 data-plane = { workspace = true, features = ["sim"] }
-tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "io-util", "test-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "sync", "macros", "io-util", "net", "test-util"] }

@@ -53,36 +53,47 @@ const desktopInvoke = <T>(command: string, args?: Record<string, unknown>): Prom
   return invoke<T>(command, args);
 };
 
-export const forgeHead = (): Promise<string | null> =>
-  desktopInvoke<string | null>("forge_head");
+/** One repo the node materialized under its forge base — its real on-disk name. */
+interface RepoMeta {
+  name: string;
+  head: string | null;
+}
 
-export const forgeRepoInfo = (): Promise<RepoInfo> =>
-  forgeHead().then((head) => ({
-    id: "ducktape",
-    name: "ducktape",
-    branch: "main",
-    defaultBranch: "main",
-    head,
-    browsable: head !== null,
-  }));
-
+/** Every repo the node has on disk, by its real name — no hardcoded identity. */
 export const forgeListRepos = (): Promise<RepoInfo[]> =>
-  forgeRepoInfo().then((repo) => [repo]);
+  desktopInvoke<RepoMeta[]>("forge_list_repos").then((repos) =>
+    repos.map((repo) => ({
+      id: repo.name,
+      name: repo.name,
+      branch: "main",
+      defaultBranch: "main",
+      head: repo.head,
+      browsable: repo.head !== null,
+    })),
+  );
 
-export const forgeLog = (limit = 24): Promise<CommitInfo[]> =>
-  desktopInvoke<CommitInfo[]>("forge_log", { limit });
+export const forgeHead = (repo: string): Promise<string | null> =>
+  desktopInvoke<string | null>("forge_head", { repo });
 
-export const forgeTree = (path = ""): Promise<TreeEntry[]> =>
-  desktopInvoke<TreeEntry[]>("forge_tree", { path });
+/** Commit log of a repo's main, newest first. Omit `limit` for the full history. */
+export const forgeLog = (repo: string, limit?: number): Promise<CommitInfo[]> =>
+  desktopInvoke<CommitInfo[]>("forge_log", { repo, limit: limit ?? null });
 
-export const forgeReadFile = (path: string): Promise<string | null> =>
-  desktopInvoke<string | null>("forge_read_file", { path });
+export const forgeTree = (repo: string, path = ""): Promise<TreeEntry[]> =>
+  desktopInvoke<TreeEntry[]>("forge_tree", { repo, path });
 
-export const forgeDiff = (params: {
-  from?: string | null;
-  to?: string | null;
-}): Promise<FileDiff[]> =>
+export const forgeReadFile = (repo: string, path: string): Promise<string | null> =>
+  desktopInvoke<string | null>("forge_read_file", { repo, path });
+
+export const forgeDiff = (
+  repo: string,
+  params: {
+    from?: string | null;
+    to?: string | null;
+  },
+): Promise<FileDiff[]> =>
   desktopInvoke<FileDiff[]>("forge_diff", {
+    repo,
     from: params.from ?? null,
     to: params.to ?? null,
   });

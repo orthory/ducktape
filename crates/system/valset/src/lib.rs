@@ -1,4 +1,4 @@
-//! the ed25519 membership registry as replicated state: validators + observers.
+//! the ed25519 membership registry as replicated state: validators + residents.
 //!
 //! a validator is a 32-byte ed25519 public key. anyone holding a WELL-FORMED
 //! ed25519 key may [`ValsetMsg::Join`] the set — no authorization, no gating,
@@ -7,20 +7,18 @@
 //! governance (who may join) and stake-weighted shares (voting power) are
 //! DEFERRED — this module only replicates *membership*.
 //!
-//! ## observers (staged admission, protocol >= 3)
+//! ## residents (staged admission)
 //!
-//! an OBSERVER holds mesh + statesync standing but no quorum seat — the tier
+//! a RESIDENT holds mesh + statesync standing but no quorum seat — the tier
 //! a joiner syncs in before promotion, so the consensus set only ever gains a
 //! caught-up validator. [`ValsetMsg::Grant`] / [`ValsetMsg::Revoke`] manage
-//! the set; a [`ValsetMsg::Join`] on a current observer PROMOTES it (adds the
-//! validator, removes the observer, one block). both new ops REJECT below
-//! protocol version 3 — byte-for-byte the outcome an older binary's
-//! unknown-variant decode produces, so a mixed-binary net cannot fork on them.
+//! the set; a [`ValsetMsg::Join`] on a current resident PROMOTES it (adds the
+//! validator, removes the resident, one block).
 //!
 //! ## root/snapshot compatibility
 //!
-//! the root preimage and snapshot append the observer section ONLY when the
-//! observer set is non-empty: every pre-observer state (and every state that
+//! the root preimage and snapshot append the resident section ONLY when the
+//! resident set is non-empty: every pre-resident state (and every state that
 //! never grants) keeps its exact historical root and snapshot bytes — no
 //! migration, no dual-path root.
 //!
@@ -55,11 +53,6 @@ use sha2::{Digest, Sha256};
 /// a 32-byte ed25519 public key encoding.
 const KEY_LEN: usize = 32;
 
-/// the protocol version that introduces the observer tier. `Grant`/`Revoke`
-/// reject below it — the same deterministic reject an older binary's
-/// unknown-variant decode produces, so mixed-binary nets cannot fork.
-const OBSERVER_VERSION: u32 = 3;
-
 pub struct Valset {
     id: ModuleId,
     /// committed membership — what `root()` and the app-hash commit to.
@@ -68,13 +61,13 @@ pub struct Valset {
     /// `false` == staged remove. read ahead of `validators` (read-your-writes),
     /// merged into committed state (and `root()`) only on `commit_block`.
     pending: BTreeMap<Vec<u8>, bool>,
-    /// committed OBSERVER standing (mesh + statesync, no quorum seat). folded
+    /// committed RESIDENT standing (mesh + statesync, no quorum seat). folded
     /// into `root()`/`snapshot()` only when non-empty — see the module doc's
     /// compatibility note.
-    observers: BTreeSet<Vec<u8>>,
-    /// observer changes staged during the current block, same discipline as
+    residents: BTreeSet<Vec<u8>>,
+    /// resident changes staged during the current block, same discipline as
     /// `pending`.
-    pending_observers: BTreeMap<Vec<u8>, bool>,
+    pending_residents: BTreeMap<Vec<u8>, bool>,
 }
 
 impl Valset {
@@ -83,8 +76,8 @@ impl Valset {
             id: id.into(),
             validators: BTreeSet::new(),
             pending: BTreeMap::new(),
-            observers: BTreeSet::new(),
-            pending_observers: BTreeMap::new(),
+            residents: BTreeSet::new(),
+            pending_residents: BTreeMap::new(),
         }
     }
 
@@ -126,19 +119,19 @@ impl Valset {
         Self::overlay(&self.validators, &self.pending)
     }
 
-    /// the COMMITTED membership pair — `(validators, observers)`, sorted.
+    /// the COMMITTED membership pair — `(validators, residents)`, sorted.
     /// the post-install/rebuild witness (both classes must survive a sync
     /// byte-for-byte); reads inside a block use the staged projections.
     pub fn membership(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         (
             self.validators.iter().cloned().collect(),
-            self.observers.iter().cloned().collect(),
+            self.residents.iter().cloned().collect(),
         )
     }
 
-    /// the committed observer set with this block's staged changes applied.
-    fn effective_observers(&self) -> Vec<Vec<u8>> {
-        Self::overlay(&self.observers, &self.pending_observers)
+    /// the committed resident set with this block's staged changes applied.
+    fn effective_residents(&self) -> Vec<Vec<u8>> {
+        Self::overlay(&self.residents, &self.pending_residents)
     }
 
     /// committed-plus-staged projection shared by both sets.
@@ -161,10 +154,10 @@ impl Valset {
 
     /// canonical bytes of the COMMITTED state — exactly the byte stream `root()`
     /// hashes: the validator section (count u64-le, then per sorted key its len
-    /// u64-le + key bytes), then — ONLY when the observer set is non-empty — the
-    /// observer section in the same shape. the conditional append is the
-    /// compatibility invariant: with no observers this is byte-for-byte the
-    /// historical validators-only stream, so every pre-observer state keeps its
+    /// u64-le + key bytes), then — ONLY when the resident set is non-empty — the
+    /// resident section in the same shape. the conditional append is the
+    /// compatibility invariant: with no residents this is byte-for-byte the
+    /// historical validators-only stream, so every pre-resident state keeps its
     /// exact root. so for non-empty state `sha256(snapshot()) == root()`; fully
     /// empty state snapshots to a lone zero count (root still `ZERO`, unhashed).
     /// pending is deliberately excluded — a snapshot ships what consensus
@@ -172,7 +165,7 @@ impl Valset {
     pub fn snapshot(&self) -> Vec<u8> {
         let sized = |set: &BTreeSet<Vec<u8>>| 8 + set.iter().map(|k| 8 + k.len()).sum::<usize>();
         let mut out = Vec::with_capacity(
-            sized(&self.validators) + if self.observers.is_empty() { 0 } else { sized(&self.observers) },
+            sized(&self.validators) + if self.residents.is_empty() { 0 } else { sized(&self.residents) },
         );
         let section = |out: &mut Vec<u8>, set: &BTreeSet<Vec<u8>>| {
             out.extend_from_slice(&(set.len() as u64).to_le_bytes());
@@ -182,8 +175,8 @@ impl Valset {
             }
         };
         section(&mut out, &self.validators);
-        if !self.observers.is_empty() {
-            section(&mut out, &self.observers);
+        if !self.residents.is_empty() {
+            section(&mut out, &self.residents);
         }
         out
     }
@@ -195,22 +188,22 @@ impl Valset {
     /// success clears pending — staged changes belong to the state being
     /// replaced, not the state being adopted.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (validators, observers) = Self::decode_snapshot(bytes)?;
-        let root = Self::root_of(&validators, &observers);
+        let (validators, residents) = Self::decode_snapshot(bytes)?;
+        let root = Self::root_of(&validators, &residents);
         if root != expected {
             return Err(Error::Module(format!(
                 "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
             )));
         }
         self.validators = validators;
-        self.observers = observers;
+        self.residents = residents;
         self.pending.clear();
-        self.pending_observers.clear();
+        self.pending_residents.clear();
         Ok(())
     }
 
     /// strict decode of UNTRUSTED snapshot bytes (a byzantine peer serves them):
-    /// the validator section, then an OPTIONAL observer section (present iff
+    /// the validator section, then an OPTIONAL resident section (present iff
     /// bytes remain — the encoder omits it when empty, and an explicit empty
     /// section is rejected so a given state has exactly one valid encoding).
     /// the count and every key length are checked against the remaining buffer
@@ -263,18 +256,18 @@ impl Valset {
 
         let mut buf = bytes;
         let validators = take_section(&mut buf)?;
-        let observers = if buf.is_empty() {
+        let residents = if buf.is_empty() {
             BTreeSet::new()
         } else {
-            let observers = take_section(&mut buf)?;
-            if observers.is_empty() {
-                // the encoder omits an empty observer section — an explicit
+            let residents = take_section(&mut buf)?;
+            if residents.is_empty() {
+                // the encoder omits an empty resident section — an explicit
                 // zero count would be a second encoding of the same state.
                 return Err(Error::Module(
-                    "snapshot carries an explicit empty observer section".into(),
+                    "snapshot carries an explicit empty resident section".into(),
                 ));
             }
-            observers
+            residents
         };
         if !buf.is_empty() {
             return Err(Error::Module(format!(
@@ -282,15 +275,15 @@ impl Valset {
                 buf.len()
             )));
         }
-        Ok((validators, observers))
+        Ok((validators, residents))
     }
 
     /// the state-based commitment: `ZERO` when both sets are empty, else sha256
-    /// over exactly the bytes `snapshot` emits (observer section only when
+    /// over exactly the bytes `snapshot` emits (resident section only when
     /// non-empty — the compatibility invariant). shared by `root()` (committed
     /// state) and `install` (a decoded candidate), so the two can never drift.
-    fn root_of(validators: &BTreeSet<Vec<u8>>, observers: &BTreeSet<Vec<u8>>) -> StateRoot {
-        if validators.is_empty() && observers.is_empty() {
+    fn root_of(validators: &BTreeSet<Vec<u8>>, residents: &BTreeSet<Vec<u8>>) -> StateRoot {
+        if validators.is_empty() && residents.is_empty() {
             return StateRoot::ZERO;
         }
         let mut h = Sha256::new();
@@ -302,8 +295,8 @@ impl Valset {
             }
         };
         section(validators);
-        if !observers.is_empty() {
-            section(observers);
+        if !residents.is_empty() {
+            section(residents);
         }
         StateRoot(h.finalize().into())
     }
@@ -316,12 +309,12 @@ impl Module for Valset {
     }
 
     /// state-based commitment over the COMMITTED state: a length-prefixed
-    /// sha256 over the sorted validators (plus the observer section only when
+    /// sha256 over the sorted validators (plus the resident section only when
     /// non-empty). order-independent (BTreeSet) and idempotent. fully empty
     /// state reports `ZERO` — an empty/uninitialized module (matching the sdk
     /// `StateRoot::ZERO` doc and forge's unborn-repo root).
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.validators, &self.observers)
+        Self::root_of(&self.validators, &self.residents)
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -346,11 +339,11 @@ impl Module for Valset {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             ValsetMsg::Join { key } => {
                 Self::validate_key(&key)?;
-                // PROMOTION: a joining observer leaves the observer tier in
+                // PROMOTION: a joining resident leaves the resident tier in
                 // the same block — one boundary carries the whole transition,
                 // and the transport union never double-counts the key.
-                if self.effective_observers().contains(&key) {
-                    self.pending_observers.insert(key.clone(), false);
+                if self.effective_residents().contains(&key) {
+                    self.pending_residents.insert(key.clone(), false);
                 }
                 self.stage_add(key);
             }
@@ -373,32 +366,19 @@ impl Module for Valset {
                 self.stage_remove(key);
             }
             ValsetMsg::Grant { key } => {
-                // the observer tier exists from protocol 3: rejecting below it
-                // is byte-for-byte what an older binary's unknown-variant
-                // decode does, so a mixed-binary net cannot fork on a Grant.
-                if ctx.env().protocol_version < OBSERVER_VERSION {
-                    return Err(Error::Module(format!(
-                        "observer grants require protocol version {OBSERVER_VERSION}"
-                    )));
-                }
                 Self::validate_key(&key)?;
-                // a validator already holds every observer capability; a
+                // a validator already holds every resident capability; a
                 // second standing would only smear the promote/demote edges.
                 if self.effective().contains(&key) {
                     return Err(Error::Module(
-                        "key is a current validator — observer standing is the pre-promotion tier"
+                        "key is a current validator — resident standing is the pre-promotion tier"
                             .into(),
                     ));
                 }
-                self.pending_observers.insert(key, true);
+                self.pending_residents.insert(key, true);
             }
             ValsetMsg::Revoke { key } => {
-                if ctx.env().protocol_version < OBSERVER_VERSION {
-                    return Err(Error::Module(format!(
-                        "observer revokes require protocol version {OBSERVER_VERSION}"
-                    )));
-                }
-                self.pending_observers.insert(key, false);
+                self.pending_residents.insert(key, false);
             }
         }
         Ok(())
@@ -408,8 +388,8 @@ impl Module for Valset {
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             ValsetQuery::Validators => Ok(encode_reply(&ValsetReply::Validators(self.effective()))),
-            ValsetQuery::Observers => Ok(encode_reply(&ValsetReply::Observers(
-                self.effective_observers(),
+            ValsetQuery::Residents => Ok(encode_reply(&ValsetReply::Residents(
+                self.effective_residents(),
             ))),
         }
     }
@@ -424,11 +404,11 @@ impl Module for Valset {
                 self.validators.remove(&k);
             }
         }
-        for (k, present) in std::mem::take(&mut self.pending_observers) {
+        for (k, present) in std::mem::take(&mut self.pending_residents) {
             if present {
-                self.observers.insert(k);
+                self.residents.insert(k);
             } else {
-                self.observers.remove(&k);
+                self.residents.remove(&k);
             }
         }
         Ok(())
@@ -438,7 +418,7 @@ impl Module for Valset {
     /// unchanged, so a failed block leaves no trace.
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.pending.clear();
-        self.pending_observers.clear();
+        self.pending_residents.clear();
         Ok(())
     }
 }
@@ -458,8 +438,7 @@ mod tests {
         fn new() -> Self {
             Self::at_version(0)
         }
-        /// a ctx whose block runs at `protocol_version` — the observer ops
-        /// gate on it, so their tests need a v3 block.
+        /// a ctx whose block runs at `protocol_version`.
         fn at_version(protocol_version: u32) -> Self {
             Self {
                 env: sdk::Env {
@@ -516,12 +495,12 @@ mod tests {
             other => panic!("expected Validators, got {other:?}"),
         }
     }
-    fn observers(v: &Valset) -> Vec<Vec<u8>> {
+    fn residents(v: &Valset) -> Vec<Vec<u8>> {
         let reply =
-            futures::executor::block_on(v.query(&encode_query(&ValsetQuery::Observers))).unwrap();
+            futures::executor::block_on(v.query(&encode_query(&ValsetQuery::Residents))).unwrap();
         match crate::decode_reply(&reply).unwrap() {
-            ValsetReply::Observers(list) => list,
-            other => panic!("expected Observers, got {other:?}"),
+            ValsetReply::Residents(list) => list,
+            other => panic!("expected Residents, got {other:?}"),
         }
     }
     fn grant(key: &[u8]) -> Msg {
@@ -844,36 +823,36 @@ mod tests {
         assert!(validators(&dst).is_empty());
     }
 
-    // ---- observers (staged admission) --------------------------------------
+    // ---- residents (staged admission) --------------------------------------
 
     #[test]
-    fn observer_ops_reject_below_protocol_v3() {
-        // the version gate IS the mixed-binary fork guard: below v3 a new
-        // binary must land exactly where an old binary's unknown-variant
-        // decode lands — deterministic reject, no state, root untouched.
+    fn resident_ops_apply_at_any_protocol_version() {
+        // version gating is disregarded: Grant/Revoke apply regardless of the
+        // block's protocol_version, so resident admission works on a freshly
+        // founded (v0) network with no upgrade. before this change these ops
+        // rejected below protocol version 3.
         let mut v = Valset::new("valset");
         let mut ctx = TestCtx::new(); // protocol_version 0
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
-        let before = v.root();
 
-        for msg in [grant(&valid_key(2)), revoke(&valid_key(2))] {
-            let err = futures::executor::block_on(v.execute(&mut ctx, &msg)).unwrap_err();
-            assert!(
-                matches!(err, Error::Module(ref m) if m.contains("protocol version 3")),
-                "got {err:?}"
-            );
-        }
+        // grant lands at v0 and confers resident standing.
+        let obs = valid_key(2);
+        futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
-        assert_eq!(v.root(), before, "a gated op leaves the root byte-identical");
-        assert!(observers(&v).is_empty());
+        assert_eq!(residents(&v), vec![obs.clone()], "grant applied at protocol_version 0");
+
+        // revoke lands at v0 and clears it.
+        futures::executor::block_on(v.execute(&mut ctx, &revoke(&obs))).unwrap();
+        futures::executor::block_on(v.commit_block()).unwrap();
+        assert!(residents(&v).is_empty(), "revoke applied at protocol_version 0");
     }
 
     #[test]
-    fn grant_folds_the_root_only_while_observers_exist() {
+    fn grant_folds_the_root_only_while_residents_exist() {
         // the compatibility invariant end to end: a validators-only state
         // keeps its exact historical root; granting moves it; revoking the
-        // last observer returns it BYTE-IDENTICAL to the validators-only root.
+        // last resident returns it BYTE-IDENTICAL to the validators-only root.
         let mut v = Valset::new("valset");
         let mut ctx = TestCtx::at_version(3);
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
@@ -884,7 +863,7 @@ mod tests {
         let obs = valid_key(2);
         futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
         assert_eq!(v.root(), validators_only, "root reflects committed only");
-        assert_eq!(observers(&v), vec![obs.clone()], "read-your-writes");
+        assert_eq!(residents(&v), vec![obs.clone()], "read-your-writes");
         futures::executor::block_on(v.commit_block()).unwrap();
         assert_ne!(v.root(), validators_only, "a committed grant moves the root");
 
@@ -893,7 +872,7 @@ mod tests {
         assert_eq!(
             v.root(),
             validators_only,
-            "revoking the last observer restores the exact validators-only root"
+            "revoking the last resident restores the exact validators-only root"
         );
         assert_eq!(
             v.snapshot(),
@@ -903,21 +882,21 @@ mod tests {
     }
 
     #[test]
-    fn join_promotes_an_observer_out_of_the_tier() {
+    fn join_promotes_a_resident_out_of_the_tier() {
         let mut v = Valset::new("valset");
         let mut ctx = TestCtx::at_version(3);
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
         let obs = valid_key(2);
         futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
-        assert_eq!(observers(&v), vec![obs.clone()]);
+        assert_eq!(residents(&v), vec![obs.clone()]);
 
         // the promotion: ONE Join both seats the validator and clears the
-        // observer standing, in the same block.
+        // resident standing, in the same block.
         futures::executor::block_on(v.execute(&mut ctx, &join(&obs))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
         assert!(validators(&v).contains(&obs), "promoted into the quorum");
-        assert!(observers(&v).is_empty(), "and out of the observer tier");
+        assert!(residents(&v).is_empty(), "and out of the resident tier");
     }
 
     #[test]
@@ -933,11 +912,11 @@ mod tests {
             matches!(err, Error::Module(ref m) if m.contains("current validator")),
             "got {err:?}"
         );
-        assert!(observers(&v).is_empty());
+        assert!(residents(&v).is_empty());
     }
 
     #[test]
-    fn snapshot_with_observers_round_trips_and_rejects_forgeries() {
+    fn snapshot_with_residents_round_trips_and_rejects_forgeries() {
         let mut src = Valset::new("valset");
         let mut ctx = TestCtx::at_version(3);
         futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
@@ -945,7 +924,7 @@ mod tests {
         futures::executor::block_on(src.commit_block()).unwrap();
         let src_root = src.root();
 
-        // the snapshot stays the exact root preimage with observers present.
+        // the snapshot stays the exact root preimage with residents present.
         let bytes = src.snapshot();
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         assert_eq!(StateRoot(digest), src_root, "sha256(snapshot()) == root()");
@@ -954,9 +933,9 @@ mod tests {
         dst.install(&bytes, src_root).unwrap();
         assert_eq!(dst.root(), src_root);
         assert_eq!(validators(&dst), validators(&src));
-        assert_eq!(observers(&dst), observers(&src));
+        assert_eq!(residents(&dst), residents(&src));
 
-        // an EXPLICIT empty observer section is a second encoding of a
+        // an EXPLICIT empty resident section is a second encoding of a
         // validators-only state — reject it (single-encoding invariant).
         let mut two_encodings = Valset::new("valset");
         let mut c2 = TestCtx::new();
@@ -966,7 +945,7 @@ mod tests {
         padded.extend_from_slice(&0u64.to_le_bytes());
         let err = dst.install(&padded, two_encodings.root()).unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("empty observer section")),
+            matches!(err, Error::Module(ref m) if m.contains("empty resident section")),
             "got {err:?}"
         );
     }

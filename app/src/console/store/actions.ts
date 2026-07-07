@@ -7,13 +7,28 @@ import * as filesClient from "../../domain/files-client";
 import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
+import * as identityClient from "../../domain/identity-client";
+import { normalizeKey } from "../../domain/names";
 import * as pagesClient from "../../domain/pages-client";
-import type { BlockKind as PageBlockKind } from "../../domain/pages-client";
+import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
+import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
 import * as bootstrap from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
+import { callSocketUrl } from "../../domain/transport";
+// Task 7 moved the huddle session to call-session (typed /v1/call/ws + audio +
+// camera video + control on one socket); this store drives it via CallEvent.
+import {
+  createCallSession,
+  supportsVideoCalls,
+  MAX_VIDEO_PARTICIPANTS,
+} from "../../domain/call-session";
+import type { CallSession, CallEvent } from "../../domain/call-session";
+import { huddleRecipients } from "../../domain/voice-session";
+import { keyBytes, keyHex } from "../../domain/chat-client";
+import * as valsetClient from "../../domain/valset-client";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
@@ -22,11 +37,16 @@ import {
   sectionForScreen,
 } from "../modules/registry";
 import type { Action } from "./reducer";
+import { autoBindUserIdentity } from "./auto-bind";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
+import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
 import {
+  addTab,
   channelIdOf,
   clearRemoteUrl,
+  removeTab,
+  saveDocTabs,
   saveRemoteUrl,
   saveViewMode,
 } from "./state";
@@ -77,6 +97,49 @@ export interface ConsoleActions {
    *  that emoji yet, removes it if we have. Refreshes the open thread panel
    *  too, since its replies are a separate snapshot from `state.messages`. */
   toggleReaction(seq: number, emoji: string): void;
+
+  // ── Huddle (voice over the chat channel's roster) ──
+  /** Join a channel's voice huddle: leave any current huddle first (leave op +
+   *  stop the old session), submit join_huddle carrying this node's key, start
+   *  the audio session, and push the current roster as the fan-out set. No-op
+   *  when the daemon can't do voice (no status.publicKey) or we're already in
+   *  this channel's huddle — except an errored session, where re-join retries. */
+  joinHuddle(channelId: string): void;
+  /** Leave the active huddle: stop the audio session, clear the voice slice,
+   *  and submit leave_huddle for the channel. */
+  leaveHuddle(): void;
+  /** Mute / unmute the mic — stops forwarding captured frames without dropping
+   *  the track, so unmute is instant. */
+  setHuddleMuted(muted: boolean): void;
+  /** Recompute the live session's fan-out set from the active channel's roster
+   *  and push it. Called by the provider whenever a refresh lands a new
+   *  snapshot while a huddle is active; a no-op when not huddling. */
+  syncHuddleRecipients(): void;
+  /** Turn the local camera on / off in the active huddle — acquires + encodes
+   *  (or tears down) camera video on the live session and beacons the change to
+   *  peers. Guarded: no-op with no session, on a runtime that can't do video,
+   *  or when the roster already EXCEEDS the video cap (audio-only past it). */
+  setCamera(on: boolean): void;
+  /** Whether this runtime can do video calls — WebKitGTK can't (no WebCodecs),
+   *  its Chromium companion window can. Drives the camera control's enablement. */
+  videoSupported(): boolean;
+  /** Evict a stale huddle member (one whose beacons went silent) from the
+   *  channel roster on consensus — the cleanup for a client that died without
+   *  leaving. Keyed by the target's submitter identity bytes, not its node. */
+  sweepHuddle(channelId: string, user: number[]): void;
+  /** The live call session (audio graph + camera + ws), or null when not
+   *  huddling — so video tiles can bind their canvas / preview element to it.
+   *  Ephemeral and per-client, exactly like the session itself. */
+  getCallSession(): CallSession | null;
+  /** Pop the huddle out into its own desktop window (Tauri only) — the in-app
+   *  card yields while the window is open. No-op when not in a huddle. The
+   *  popped window is an AUDIO remote (mute/leave/retry); the camera toggle and
+   *  video tiles stay in the main-window dock, reached by popping back in. */
+  popOutHuddle(): void;
+  /** Return the huddle to the in-app card, closing the window. Also invoked
+   *  when Rust reports the window destroyed (any way it dies). */
+  popInHuddle(): void;
+
   commitForge(params: { path: string; content: string; message: string }): void;
 
   // ── Docs (block-tree notebook over the `pages` module) ──
@@ -84,8 +147,17 @@ export interface ConsoleActions {
   listPages(): void;
   /** Create a page (root block id minted here) and open it. */
   createPage(title: string): void;
-  /** Open a page, loading its preorder block tree. */
+  /** Create an untitled page (optionally nested under `parent`) and open it —
+   *  the instant Notion-style new-page flow. `parent` null == top level. */
+  createChildPage(parent: string | null): void;
+  /** Re-nest a page under a (possibly new) parent, or to top level with null. */
+  setPageParent(params: { pageId: string; parent: string | null }): void;
+  /** Delete a page (root + subtree; child pages promote up). */
+  deletePage(pageId: string): void;
+  /** Open a page, loading its preorder block tree and comment threads. */
   openPage(pageId: string): void;
+  /** Close a document tab; activates a neighbor if it was active. */
+  closeTab(pageId: string): void;
   /** Insert a block into the active page. The VIEW mints the id (it drives
    *  focus to the new block, so it must know the id before the round-trip). */
   insertPageBlock(params: {
@@ -109,6 +181,19 @@ export interface ConsoleActions {
   }): void;
   /** Remove a block and its whole subtree. */
   removePageBlock(blockId: string): void;
+
+  // ── Comments (threads over the `comments` module) ──
+  /** Load the open page's comment threads (page + every visible block). */
+  loadPageThreads(): void;
+  /** Add a comment: opens a new thread when `threadId` is omitted (a fresh id
+   *  is minted), else appends to that thread. `target` is a block or page id. */
+  addComment(params: { threadId?: string; target: string; text: string }): void;
+  /** Edit own comment text. */
+  editComment(params: { commentId: string; text: string }): void;
+  /** Tombstone own comment (removes the thread if it was the last live one). */
+  deleteComment(commentId: string): void;
+  /** Toggle a thread's resolved state. */
+  resolveThread(params: { threadId: string; resolved: boolean }): void;
 
   // ── Agents (collaboration loop over the `agent` module) ──
   /** Upload the prompt text to the blob store, then RegisterAgent with the
@@ -180,6 +265,13 @@ export interface ConsoleActions {
   stopNode(): void;
   /** Re-spawn / re-adopt the managed daemon after a stop (desktop only). */
   startNode(): void;
+  /** Retry connecting the SAME workspace after a boot failure (from the
+   *  "Node failed to start" surface). Idempotent — re-runs connectActive
+   *  against the existing workspace, never re-minting one. */
+  retryConnect(): void;
+  /** Scrape + parse the node's `/metrics`. Null when no node is resolved or the
+   *  scrape fails — best-effort, for the poll-driven Metrics view. */
+  readMetrics(): Promise<NodeMetrics | null>;
   dismissError(): void;
 
   // ── Onboarding / workspaces (desktop only) ──
@@ -195,14 +287,14 @@ export interface ConsoleActions {
   /** Fetch the active workspace's invite blob into state for sharing. */
   revealInvite(): void;
   /** Admit a joiner by pubkey through the active (member) workspace — grants
-   *  OBSERVER standing (staged admission's first step); promote seats it. */
+   *  RESIDENT standing (staged admission's first step); promote seats it. */
   admitMember(pubkey: string): void;
-  /** Promote an observer into the consensus quorum by pubkey — staged
-   *  admission's second step, once the observer's node is warm. */
+  /** Promote a resident into the consensus quorum by pubkey — staged
+   *  admission's second step, once the resident's node is warm. */
   promoteMember(pubkey: string): void;
-  /** Revoke a key's observer standing — the undo of admitMember; its node
+  /** Revoke a key's resident standing — the undo of admitMember; its node
    *  parks again and another admit re-grants. */
-  removeObserver(pubkey: string): void;
+  removeResident(pubkey: string): void;
   /** Open a removal proposal for a validator by pubkey and cast this node's
    *  yes-ballot; the removal takes effect only once a strict majority approve. */
   demoteMember(pubkey: string): void;
@@ -220,6 +312,14 @@ export interface ConsoleActions {
    *  call again with `force` to override that uncertainty (the backend still
    *  refuses to force-tear-down a reachable, provably-live multi-member node). */
   forgetWorkspace(force?: boolean): void;
+  /** Delete a workspace BY ID from the picker: stop its node and remove its
+   *  directory + registry entry (the same guarded backend as forgetWorkspace,
+   *  so a live multi-member validator is refused). Deleting the active
+   *  workspace tears down and falls back like forgetWorkspace; deleting any
+   *  other only drops it from the list. A refused delete that couldn't confirm
+   *  the node left its valset flags `state.deleteNeedsForce` with this id —
+   *  call again with `force` to override that uncertainty. */
+  deleteWorkspace(id: string, force?: boolean): void;
   /** Open the onboarding gate to add or switch workspaces (keeps the active
    *  one running underneath). */
   newWorkspace(): void;
@@ -261,6 +361,105 @@ export function createActions({
   // current — so a slow or out-of-order response can never clobber a newer
   // query's results (or repopulate a cleared palette).
   let searchToken = 0;
+
+  // The live call session (the browser audio graph + camera + ws), or null when
+  // not in a huddle. Ephemeral and per-client — it lives here, not in state;
+  // the `voice` slice mirrors only its status + camera/peer beacons for the ui.
+  let voice: CallSession | null = null;
+
+  /** Our own node key hex — the fan-out set excludes it. Empty on a daemon
+   *  that can't do voice. */
+  const selfNodeHex = (): string => getState().status?.publicKey ?? "";
+
+  // The last fan-out set pushed into the live session — refresh() lands a new
+  // channels array every block, so pushes are deduped by value here rather
+  // than by effect identity upstream.
+  let lastRecipients: string | null = null;
+
+  /** Recompute + push the fan-out set for `channelId` (default: the active
+   *  huddle) into the live session. No-op when not huddling or unchanged. */
+  const pushRecipients = (channelId = getState().voice.channelId): void => {
+    if (!voice || !channelId) return;
+    const channel = getState().channels.find((c) => c.id === channelId);
+    const recipients = huddleRecipients(channel?.huddle ?? [], selfNodeHex());
+    const fingerprint = recipients.join(",");
+    if (fingerprint === lastRecipients) return;
+    lastRecipients = fingerprint;
+    voice.setRecipients(recipients);
+  };
+
+  /** Stop + drop the live audio session (no consensus write). Idempotent. */
+  const stopVoice = (): void => {
+    voice?.stop();
+    voice = null;
+    lastRecipients = null;
+  };
+
+  // Session events → the voice slice. A `peerBeacon` merges that peer's latest
+  // ephemeral call state (keyed by its already-lowercase node hex) into the
+  // slice. A `status` event drives lifecycle: any terminal end reconciles the
+  // consensus roster (submit leave) so peers never keep showing a dead
+  // participant, and clears local camera/peer state (the session is gone) —
+  // 'closed' (the session was replaced) clears the slice entirely (and closes
+  // the popped-out window); 'error' (hub refusal, socket failure, mic denial)
+  // keeps the dock up in its error state so the failure is visible — the status
+  // event carries WHY (error), which the slice mirrors for the dock's message.
+  // Leave dismisses it.
+  const onCallEvent = (event: CallEvent): void => {
+    if (event.kind === "peerBeacon") {
+      update((prev) => ({
+        voice: {
+          ...prev.voice,
+          peers: {
+            ...prev.voice.peers,
+            [event.peer]: { muted: event.muted, cameraOn: event.cameraOn, atMs: event.atMs },
+          },
+        },
+      }));
+      return;
+    }
+    const status = event.status;
+    const error = event.error;
+    if (status === "closed" || status === "error") {
+      const channelId = getState().voice.channelId;
+      stopVoice();
+      if (channelId) submitLeaveHuddle(channelId);
+      if (status === "closed") {
+        closeHuddleWindow();
+        patch({
+          voice: {
+            channelId: null,
+            muted: false,
+            status: "idle",
+            error: null,
+            popped: false,
+            cameraOn: false,
+            peers: {},
+          },
+        });
+      } else {
+        update((prev) => ({
+          voice: {
+            ...prev.voice,
+            status: "error",
+            error: error ?? "connection",
+            cameraOn: false,
+            peers: {},
+          },
+        }));
+      }
+      return;
+    }
+    update((prev) => ({ voice: { ...prev.voice, status, error: null } }));
+  };
+
+  /** Submit a leave_huddle for `channelId` with the optimistic roster prune. */
+  const submitLeaveHuddle = (channelId: string) =>
+    submitTracked(
+      opKey.huddle(channelId),
+      (live) => chatClient.leaveHuddle(live, { channelId, origin: getState().author }),
+      (prev) => optimistic.huddleLeft(prev, channelId, selfNodeHex()),
+    );
 
   // The one write path: apply the op's PRECONFIRMED render immediately (the
   // optimistic projection plus a pending ledger record under the entity's
@@ -325,19 +524,80 @@ export function createActions({
       .catch(fail);
   };
 
-  // the single entry point into a page: make it active and load its preorder
-  // block tree — every path into a page (new-page, a rail click) goes here.
+  // load the comment threads for the open page (the page id + every visible
+  // block id) in one batch; refreshed on open and after any comment op.
+  const loadPageThreads = (blocksOverride?: PageBlock[]): Promise<void> => {
+    // `blocks` is passed by callers that JUST fetched the tree, because
+    // getState().activePageBlocks lags a dispatch (stateRef updates on render);
+    // reading it here would ship only the page target and miss every block.
+    const live = getNode();
+    const page = getState().activePage;
+    if (!live || !page) {
+      patch({ pageThreads: [] });
+      return Promise.resolve();
+    }
+    const blocks = blocksOverride ?? getState().activePageBlocks;
+    const targets = [page, ...blocks.map((b) => b.id)];
+    // the module rejects a ThreadsForTargets over MAX_QUERY_TARGETS (512), so a
+    // large page must chunk its targets across several queries.
+    const CHUNK = 512;
+    const batches: string[][] = [];
+    for (let i = 0; i < targets.length; i += CHUNK) batches.push(targets.slice(i, i + CHUNK));
+    return Promise.all(batches.map((b) => pagesClient.threadsForTargets(live, { targets: b })))
+      .then((results) => patch({ pageThreads: results.flat() }))
+      .catch(fail);
+  };
+
+  // load the active page's block tree + its comment threads (threads keyed off
+  // the freshly-fetched blocks, not the lagging store copy). shared by every
+  // activation path; does NOT touch the tab list.
+  const loadActivePage = (pageId: string) => {
+    const live = getNode();
+    if (!live) return;
+    Promise.resolve()
+      .then(() => pagesClient.getPage(live, pageId))
+      .then((blocks) => {
+        patch({ activePageBlocks: blocks ?? [] });
+        return loadPageThreads(blocks ?? []);
+      })
+      .catch(fail);
+  };
+
+  // the single entry point into a page: make it active (opening a tab), then
+  // load its tree + threads — every path into a page (new-page, a rail click,
+  // a tab click) goes here.
   const enterPage = (pageId: string) => {
     const live = getNode();
     if (!live || !pageId) return;
+    const tabs = addTab(getState().openTabs, pageId);
+    saveDocTabs(tabs);
     patch({
       activePage: pageId,
       activePageBlocks: [],
+      openTabs: tabs,
+      pageThreads: [],
     });
-    Promise.resolve()
-      .then(() => pagesClient.getPage(live, pageId))
-      .then((blocks) => patch({ activePageBlocks: blocks ?? [] }))
-      .catch(fail);
+    loadActivePage(pageId);
+  };
+
+  // close a document tab; if it was active, activate a neighbor (loading its
+  // tree) so the editor never lands on a closed page. Activation here patches
+  // the already-reduced tab list directly — it must NOT go through enterPage,
+  // whose addTab(getState().openTabs, …) reads the stale pre-close list and
+  // would re-stage the just-closed id.
+  const closeTabLocal = (pageId: string) => {
+    const { tabs, active } = removeTab(getState().openTabs, getState().activePage, pageId);
+    saveDocTabs(tabs);
+    if (active && active !== getState().activePage) {
+      patch({ openTabs: tabs, activePage: active, activePageBlocks: [], pageThreads: [] });
+      loadActivePage(active);
+      return;
+    }
+    patch({
+      openTabs: tabs,
+      activePage: active,
+      ...(active ? {} : { activePageBlocks: [], pageThreads: [] }),
+    });
   };
 
   // Connect the app to a workspace's node: select it (Rust spawns/adopts),
@@ -349,27 +609,72 @@ export function createActions({
     // Choosing a local workspace supersedes any remembered remote — it becomes
     // what we reconnect to on next launch.
     clearRemoteUrl();
-    // Tear the old node down BEFORE clearing its projections, so its block /
-    // telemetry subscriptions can't fire a straggler frame into the just-cleared
-    // arrays during the async selectWorkspace/waitUntilUp window that follows
+    // Tear the old node down BEFORE clearing its projections, so its block
+    // subscription can't fire a straggler frame into the just-cleared state
+    // during the async selectWorkspace/waitUntilUp window that follows
     // (mirrors connectRemote). Without this teardown-first order, an old-node
-    // frame lands in the cleared telemetry and the backfill's retain-prev keeps
-    // it atop the NEW node's timeline — the exact staleness this clear prevents.
+    // block would re-set lastBlock right after the clear — the exact
+    // staleness this clear prevents.
     setNode(null);
     patch({
       workspace: target,
       needsOnboarding: false,
       onboardingBusy: false,
-      // a force-forget offer is scoped to the workspace it was raised for;
-      // switching targets clears it so it can never fire on the wrong one.
+      // a force-forget/delete offer is scoped to the workspace it was raised
+      // for; switching targets clears it so it can never fire on the wrong one.
       forgetNeedsForce: false,
+      deleteNeedsForce: null,
       inviteBlob: null,
+      // a fresh connect/retry starts from a clean slate — clear any prior boot
+      // failure, mid-session-down banner, and error so a stale reason can't
+      // linger over the new attempt.
+      bootError: null,
+      connectionDown: null,
+      error: null,
       // per-node observability belonging to the workspace we're leaving; the
-      // node effect re-hydrates blocks and re-backfills telemetry once the new
-      // node is set below.
-      telemetry: [],
+      // node effect re-hydrates blocks and re-follows the block stream once
+      // the new node is set below.
+      lastBlock: null,
       blocks: [],
+      // a non-member target parks first: seed the waiting-room phase NOW so
+      // the console shell (still holding the previous workspace's residual
+      // projections) can never flash during the async select/poll below.
+      onboardingPhase: target.member ? null : { phase: "starting", detail: null },
     });
+    // Adopt the answering node ONLY once it proves it is THIS workspace's
+    // node: /v1/status carries the node's identity key and the registry
+    // records the workspace's. A recycled port can be held by something else
+    // (say, a zombie node of a forgotten workspace) — adopting that would
+    // silently open another workspace's data. An absent key on either side
+    // (an older node build) trusts the port, as before.
+    const identityMatches = (got: string | undefined): boolean =>
+      !got || !target.pubkey || got.toLowerCase() === target.pubkey.toLowerCase();
+    const rejectImpostor = (): void => {
+      patch({
+        workspace: null,
+        nodeUrl: null,
+        managed: false,
+        needsOnboarding: true,
+        onboardingPhase: null,
+        onboardingBusy: false,
+      });
+      fail(
+        `the process answering on "${target.name}"'s node port reports a ` +
+          `different node identity — not connecting. Another node is likely ` +
+          `still running on this port; quit it and try again.`,
+      );
+    };
+    // Adopt a node that just proved it's this workspace's own: clear the
+    // onboarding phase, hand it to the store, and — best-effort, desktop-only
+    // — offer this machine's user key to bind it (Task 8). Fire-and-forget:
+    // a failed bind is invisible here by design (auto-bind.ts never throws)
+    // and the provider's per-block refresh already re-reads the identity
+    // module, so a successful bind surfaces on its own on the next block.
+    const adopt = (transport: NodeTransport): void => {
+      patch({ onboardingPhase: null });
+      setNode(transport);
+      autoBindUserIdentity(transport, target).catch(() => {});
+    };
     return Promise.resolve()
       .then(() => ws.selectWorkspace(target.id))
       .then((sel) => {
@@ -380,40 +685,95 @@ export function createActions({
           // founder / already-admitted member: the surface comes up promptly.
           return bootstrap.waitUntilUp(transport).then(() => {
             if (stale()) return;
-            patch({ onboardingPhase: null });
-            setNode(transport);
+            return transport.status().then((s) => {
+              if (stale()) return;
+              if (!identityMatches(s.publicKey)) return rejectImpostor();
+              adopt(transport);
+            });
           });
         }
-        // joiner: the node parks (no surface) until a member admits it and
-        // the epoch cuts over; it then promotes, reboots as a validator, and
-        // its surface starts answering. Poll the phase until that happens.
+        // joiner: the node parks until a member admits it and the epoch cuts
+        // over; it then promotes into the validator set. Poll until that
+        // happens. NOTE a parked joiner may well serve its http surface
+        // (newer node builds do) — a mere status answer is NOT admission, so
+        // adoption additionally requires OUR key in the committed valset.
+        const park = (): Promise<void> =>
+          ws.workspacePhase(target.id).then((report) => {
+            if (stale()) return;
+            patch({ onboardingPhase: report });
+            if (report.phase === "fatal") {
+              fail(report.detail ?? "the node failed to join");
+              return;
+            }
+            return wait(JOIN_POLL_MS).then(tick);
+          });
         const tick = (): Promise<void> => {
           if (stale()) return Promise.resolve();
           return transport.status().then(
-            () => {
+            (s) => {
               if (stale()) return;
-              patch({ onboardingPhase: null });
-              setNode(transport);
+              if (!identityMatches(s.publicKey)) return rejectImpostor();
+              return valsetClient
+                .validators(transport)
+                .then(
+                  (keys) =>
+                    keys.some(
+                      (key) =>
+                        valsetClient.validatorHex(key).toLowerCase() ===
+                        target.pubkey.toLowerCase(),
+                    ),
+                  // an unreadable valset proves nothing — keep waiting.
+                  () => false,
+                )
+                .then((seated) => {
+                  if (stale()) return;
+                  if (!seated) return park();
+                  adopt(transport);
+                });
             },
-            () =>
-              ws.workspacePhase(target.id).then((report) => {
-                if (stale()) return;
-                patch({ onboardingPhase: report });
-                if (report.phase === "fatal") {
-                  fail(report.detail ?? "the node failed to join");
-                  return;
-                }
-                return wait(JOIN_POLL_MS).then(tick);
-              }),
+            () => park(),
           );
         };
         return tick();
       })
       .catch((err) => {
-        if (!stale()) {
-          patch({ onboardingBusy: false });
-          fail(err);
-        }
+        if (stale()) return;
+        patch({ onboardingBusy: false });
+        const reason =
+          typeof err === "object" && err && "message" in err
+            ? String((err as { message?: unknown }).message)
+            : String(err);
+        // Best-effort: pull the node's daemon.log so even a plain "did not come
+        // up" boot timeout carries the real reason the node wrote to disk (bind
+        // conflict, bad config, panic) — the file nothing in the UI used to read.
+        Promise.resolve()
+          .then(() => ws.workspaceLogTail(target.id))
+          .then(
+            (log): { path: string | null; tail: string } => ({ path: log.path, tail: log.tail }),
+            () => ({ path: null, tail: "" }),
+          )
+          .then((log) => {
+            if (stale()) return;
+            if (target.member) {
+              // member/founder: route to the dedicated "Node failed to start"
+              // body with the reason, the log, and an idempotent Retry — never
+              // a hollow disconnected console whose toast then vanishes.
+              patch({
+                bootError: {
+                  workspaceId: target.id,
+                  reason,
+                  logPath: log.path,
+                  logTail: log.tail,
+                },
+              });
+            } else {
+              // joiner: surface it IN the waiting room as a fatal phase instead
+              // of leaving the "ask a member to approve" spinner up over a node
+              // that never started.
+              patch({ onboardingPhase: { phase: "fatal", detail: reason } });
+            }
+            fail(reason);
+          });
       });
   };
 
@@ -463,14 +823,33 @@ export function createActions({
     setAccent: (accent) => patch({ accent }),
     setAuthor: (author) => patch({ author }),
 
+    readMetrics: () => {
+      const live = getNode();
+      return live
+        ? live.metrics().then(parseMetrics).catch(() => null)
+        : Promise.resolve(null);
+    },
+
     // Keep the local author identity (still the web-origin string) AND submit
-    // SetName so the chosen name propagates: it's origin-gated, so passing our
-    // origin sets our OWN profile only. Refresh re-reads authorNames.
+    // a name write so the chosen name propagates: it's origin-gated, so
+    // passing our origin only ever writes OUR OWN name. Once this node is
+    // bound to a user (state.nodeUsers has it), the durable identity is the
+    // USER, not the node — so the write goes through identity's SetUserName
+    // instead of profiles' SetName, the same way MembersView's inline
+    // self-rename (canRename row, also wired to this action) picks up the
+    // bound-vs-unbound distinction for free. An unbound node keeps the
+    // original profiles path unchanged. Refresh re-reads authorNames/nodeUsers.
     setDisplayName: (name) => {
-      const origin = getState().author;
+      const current = getState();
+      const origin = current.author;
+      const nodeKeyNorm = normalizeKey(current.workspace?.pubkey);
+      const bound = nodeKeyNorm ? current.nodeUsers[nodeKeyNorm] : undefined;
       submitTracked(
         opKey.profile(),
-        (live) => profilesClient.setName(live, { displayName: name, origin }),
+        (live) =>
+          bound
+            ? identityClient.setUserName(live, { displayName: name, origin })
+            : profilesClient.setName(live, { displayName: name, origin }),
         () => ({ author: name }),
       );
     },
@@ -657,6 +1036,131 @@ export function createActions({
       });
     },
 
+    // ── Huddle ──
+    joinHuddle: (channelId) => {
+      const state = getState();
+      const publicKey = state.status?.publicKey;
+      const nodeUrl = state.nodeUrl;
+      // no voice identity (legacy daemon) or no resolved node → nothing to do.
+      if (!publicKey || !nodeUrl || !channelId) return;
+      const active = state.voice.channelId;
+      // already in this huddle — unless it errored, where re-join is the retry.
+      if (active === channelId && state.voice.status !== "error") return;
+      // switching huddles: the server replaces the session, so leave the old on
+      // consensus and stop its audio before starting the new one. An errored
+      // session already left (onCallEvent reconciled the roster) — skip it.
+      if (active && active !== channelId) submitLeaveHuddle(active);
+      stopVoice();
+      // submit the join carrying our node key bytes; optimistically add us to
+      // the roster so the pill/dock react instantly.
+      const node = keyBytes(publicKey);
+      void submitTracked(
+        opKey.huddle(channelId),
+        (live) => chatClient.joinHuddle(live, { channelId, node, origin: getState().author }),
+        (prev) =>
+          optimistic.huddleJoined(prev, {
+            channelId,
+            node,
+            author: prev.author,
+            at: Math.floor(Date.now() / 1000),
+          }),
+      ).then(() => {
+        // consensus refused the join (members-only, roster full): the audio
+        // session must not keep streaming into a huddle we are not in.
+        const settled = getState();
+        if (
+          settled.ops[opKey.huddle(channelId)]?.phase === "failed" &&
+          settled.voice.channelId === channelId
+        ) {
+          stopVoice();
+          // the session is gone — camera/beacon state must not outlive it.
+          update((prev) => ({
+            voice: { ...prev.voice, status: "error", error: "refused", cameraOn: false, peers: {} },
+          }));
+        }
+      });
+      // start the audio session and reflect "connecting"; push whatever roster
+      // we already know (others may be huddling), self excluded. joins start
+      // MUTED — joining a room must never be a hot-mic moment; unmuting is the
+      // deliberate act.
+      voice = createCallSession(onCallEvent);
+      voice.setMuted(true);
+      // a retry from the popped window must keep it popped — spread, don't reset;
+      // camera/peer state resets since this is a fresh session.
+      update((prev) => ({
+        voice: {
+          ...prev.voice,
+          channelId,
+          muted: true,
+          status: "connecting",
+          error: null,
+          cameraOn: false,
+          peers: {},
+        },
+      }));
+      voice.start(callSocketUrl(nodeUrl, channelId));
+      pushRecipients(channelId);
+    },
+
+    leaveHuddle: () => {
+      const channelId = getState().voice.channelId;
+      stopVoice();
+      closeHuddleWindow();
+      patch({
+        voice: {
+          channelId: null,
+          muted: false,
+          status: "idle",
+          error: null,
+          popped: false,
+          cameraOn: false,
+          peers: {},
+        },
+      });
+      if (channelId) submitLeaveHuddle(channelId);
+    },
+
+    setHuddleMuted: (muted) => {
+      voice?.setMuted(muted);
+      update((prev) => ({ voice: { ...prev.voice, muted } }));
+    },
+
+    syncHuddleRecipients: () => pushRecipients(),
+
+    setCamera: (on) => {
+      if (!voice) return;
+      if (on && !supportsVideoCalls()) return; // capability-gated UI should prevent this
+      const channel = getState().channels.find((c) => c.id === getState().voice.channelId);
+      // block turning the camera on once the roster EXCEEDS the video cap — the
+      // grid can't render more tiles, so those huddles stay audio-only.
+      if (on && (channel?.huddle?.length ?? 0) > MAX_VIDEO_PARTICIPANTS) return;
+      voice.setCamera(on);
+      update((prev) => ({ voice: { ...prev.voice, cameraOn: on } }));
+    },
+
+    videoSupported: () => supportsVideoCalls(),
+
+    sweepHuddle: (channelId, user) => {
+      submitTracked(
+        opKey.huddle(channelId),
+        (live) => chatClient.sweepHuddle(live, { channelId, user, origin: getState().author }),
+        (prev) => optimistic.huddleSwept(prev, channelId, keyHex(user)),
+      );
+    },
+
+    getCallSession: () => voice,
+
+    popOutHuddle: () => {
+      if (!getState().voice.channelId) return;
+      openHuddleWindow();
+      update((prev) => ({ voice: { ...prev.voice, popped: true } }));
+    },
+
+    popInHuddle: () => {
+      closeHuddleWindow();
+      update((prev) => ({ voice: { ...prev.voice, popped: false } }));
+    },
+
     commitForge: (params) => {
       if (!params.path.trim() || params.content.length === 0) return;
       submitTracked(opKey.forgeHead(), (live) =>
@@ -680,18 +1184,81 @@ export function createActions({
     },
 
     openPage: enterPage,
+    closeTab: closeTabLocal,
 
-    createPage: (title) => {
-      const clean = title.trim();
-      if (!clean) return;
-      // the page root's block id — minted here like task/job ids; the refresh
-      // re-enumerates ListPages so the rail shows it, then open it.
+    // create a page (optionally nested under `parent`) with an EMPTY title and
+    // open it — the doc title input is where naming happens (Notion-style
+    // instant page). `parent` null == top level.
+    createChildPage: (parent: string | null) => {
       const pageId = crypto.randomUUID();
       submitTracked(
         opKey.page(pageId),
-        (live) => pagesClient.createPage(live, { pageId, title: clean }),
-        (prev) => optimistic.pageCreated(prev, { pageId, title: clean }),
+        (live) => pagesClient.createPage(live, { pageId, title: "", parent }),
+        (prev) => optimistic.pageCreated(prev, { pageId, title: "", parent }),
       ).then(() => enterPage(pageId));
+    },
+
+    // kept for programmatic/test callers that pass a title.
+    createPage: (title) => {
+      const pageId = crypto.randomUUID();
+      submitTracked(
+        opKey.page(pageId),
+        (live) => pagesClient.createPage(live, { pageId, title: title.trim() }),
+        (prev) => optimistic.pageCreated(prev, { pageId, title: title.trim() }),
+      ).then(() => enterPage(pageId));
+    },
+
+    setPageParent: ({ pageId, parent }) => {
+      submitTracked(opKey.page(pageId), (live) =>
+        pagesClient.setPageParent(live, { pageId, parent }),
+      );
+    },
+
+    deletePage: (pageId) => {
+      if (!pageId) return;
+      submitTracked(opKey.page(pageId), (live) => pagesClient.deletePage(live, pageId))
+        .then(() => {
+          const live = getNode();
+          if (live) pagesClient.listPages(live).then((pages) => patch({ pages })).catch(fail);
+        })
+        .catch(fail);
+      // close its tab immediately (optimistic UX).
+      closeTabLocal(pageId);
+    },
+
+    // ── Comments ──
+    loadPageThreads: () => {
+      void loadPageThreads();
+    },
+
+    addComment: ({ threadId, target, text }) => {
+      const clean = text.trim();
+      if (!clean) return;
+      const tid = threadId ?? crypto.randomUUID();
+      const commentId = crypto.randomUUID();
+      submitTracked(opKey.commentThread(tid), (live) =>
+        pagesClient.addComment(live, { threadId: tid, commentId, target, text: clean }),
+      ).then(() => loadPageThreads());
+    },
+
+    editComment: ({ commentId, text }) => {
+      const clean = text.trim();
+      if (!clean) return;
+      submitTracked(opKey.comment(commentId), (live) =>
+        pagesClient.editComment(live, { commentId, text: clean }),
+      ).then(() => loadPageThreads());
+    },
+
+    deleteComment: (commentId) => {
+      submitTracked(opKey.comment(commentId), (live) =>
+        pagesClient.deleteComment(live, commentId),
+      ).then(() => loadPageThreads());
+    },
+
+    resolveThread: ({ threadId, resolved }) => {
+      submitTracked(opKey.commentThread(threadId), (live) =>
+        pagesClient.resolveThread(live, { threadId, resolved }),
+      ).then(() => loadPageThreads());
     },
 
     insertPageBlock: ({ blockId, parent, after, kind, text }) => {
@@ -1014,6 +1581,21 @@ export function createActions({
 
     dismissError: () => patch({ error: null }),
 
+    retryConnect: () => {
+      const st = getState();
+      const id = st.bootError?.workspaceId ?? st.workspace?.id ?? null;
+      const target =
+        (id ? st.workspaces.find((w) => w.id === id) : undefined) ?? st.workspace ?? null;
+      if (!target) {
+        // nothing to reconnect to — fall back to the front door.
+        patch({ bootError: null, needsOnboarding: true });
+        return;
+      }
+      // connectActive clears bootError/error at the start; re-drive the SAME
+      // workspace (idempotent — never mints a new one).
+      connectActive(target).catch(fail);
+    },
+
     // ── Onboarding / workspaces ──
     createWorkspace: (name) => {
       if (!name.trim()) return;
@@ -1051,28 +1633,64 @@ export function createActions({
 
     selectWorkspace: (id) => {
       const target = getState().workspaces.find((w) => w.id === id);
-      if (!target || target.id === getState().workspace?.id) return;
-      // drop the old node + its projections so the switch shows no stale state.
-      setNode(null);
-      patch({
-        connected: false,
-        status: null,
-        channels: [],
-        messages: [],
-        activeChannel: null,
-        activeThread: null,
-        authorNames: {},
-        pages: [],
-        activePage: null,
-        activePageBlocks: [],
-        agents: [],
-        watches: [],
-        pendingRuns: [],
-        files: [],
-        ops: {},
-        onboardingPhase: null,
-      });
-      connectActive(target).catch(fail);
+      if (!target) return;
+      // re-clicking the current MEMBER workspace is a no-op; a current
+      // NON-member one falls through to the admission check below — its honest
+      // "not admitted yet" error beats a silent nothing (and a genuinely
+      // progressing one just re-runs the idempotent connect).
+      if (target.id === getState().workspace?.id && target.member) return;
+      const enter = (): void => {
+        // drop the old node + its projections so the switch shows no stale state.
+        setNode(null);
+        patch({
+          connected: false,
+          status: null,
+          channels: [],
+          messages: [],
+          activeChannel: null,
+          activeThread: null,
+          authorNames: {},
+          pages: [],
+          activePage: null,
+          activePageBlocks: [],
+          agents: [],
+          watches: [],
+          pendingRuns: [],
+          files: [],
+          ops: {},
+          onboardingPhase: null,
+        });
+        connectActive(target).catch(fail);
+      };
+      if (target.member) {
+        enter();
+        return;
+      }
+      // A non-member workspace can't serve the console — its node parks until a
+      // member admits it. Entering it from the picker would only strand the
+      // user in the waiting room, so refuse a parked/never-started/fatal one
+      // with the honest status and STAY PUT (no registry repoint, no spawn).
+      // Admission that is actually progressing (admitted/synced/promoted — the
+      // node was seen mid-onboarding) proceeds: promoted connects straight, the
+      // rest resume the waiting room the join flow opened.
+      Promise.resolve()
+        .then(() => ws.workspacePhase(target.id))
+        .then((report) => {
+          if (report.phase === "fatal") {
+            fail(report.detail ?? `"${target.name}" failed to join its network`);
+            return;
+          }
+          if (report.phase === "parked" || report.phase === "starting") {
+            fail(
+              `"${target.name}" hasn't been admitted to its network yet — its ` +
+                `node parks until a member approves it. Ask a member to admit ` +
+                `you (rejoin with a fresh invite), or delete this workspace.`,
+            );
+            return;
+          }
+          enter();
+        })
+        .catch(fail);
     },
 
     connectRemote: (rawUrl) => {
@@ -1087,11 +1705,10 @@ export function createActions({
         workspace: null,
         connected: false,
         status: null,
-        // per-node observability: the live telemetry stream and the node's own
-        // durable block history. clear them on a node switch so the new node's
-        // timeline/explorer never shows the previous node's rows (the telemetry
-        // backfill retains prior frames when the new node returns none).
-        telemetry: [],
+        // per-node observability: the live chain tip and the node's own
+        // durable block history. clear them on a node switch so the new
+        // node's explorer never shows the previous node's rows.
+        lastBlock: null,
         blocks: [],
         channels: [],
         messages: [],
@@ -1152,11 +1769,11 @@ export function createActions({
         .catch(fail);
     },
 
-    removeObserver: (pubkey) => {
+    removeResident: (pubkey) => {
       const target = getState().workspace;
       if (!target || !pubkey.trim()) return;
       Promise.resolve()
-        .then(() => ws.removeObserver(target.id, pubkey.trim()))
+        .then(() => ws.removeResident(target.id, pubkey.trim()))
         .then(() => refresh())
         .catch(fail);
     },
@@ -1243,7 +1860,63 @@ export function createActions({
         });
     },
 
-    newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null }),
+    deleteWorkspace: (id, force = false) => {
+      const target = getState().workspaces.find((w) => w.id === id);
+      if (!target) return;
+      patch({ error: null, deleteNeedsForce: null });
+      // Same guarded backend as forgetWorkspace — refused while the node is
+      // still a current validator of a set of two-or-more. Only touch local
+      // state once the backend has actually forgotten it.
+      Promise.resolve()
+        .then(() => ws.forgetWorkspace(target.id, force))
+        .then((next) => {
+          const wasActive = getState().workspace?.id === target.id;
+          update((prev) => ({
+            workspaces: prev.workspaces.filter((w) => w.id !== target.id),
+          }));
+          // Deleting a workspace we're not connected to only drops its row —
+          // the registry's active pointer and the live connection are untouched.
+          if (!wasActive) return;
+          // Deleted the active one: drop the live node + its projections
+          // (mirrors forgetWorkspace), then repoint or fall back to the gate.
+          setNode(null);
+          patch({
+            connected: false,
+            status: null,
+            channels: [],
+            messages: [],
+            activeChannel: null,
+            activeThread: null,
+            authorNames: {},
+            pages: [],
+            activePage: null,
+            activePageBlocks: [],
+            agents: [],
+            watches: [],
+            pendingRuns: [],
+            ops: {},
+            onboardingPhase: null,
+            inviteBlob: null,
+          });
+          if (next) return connectActive(next);
+          patch({
+            workspace: null,
+            needsOnboarding: true,
+            onboardingBusy: false,
+            managed: false,
+            nodeUrl: null,
+          });
+        })
+        .catch((err) => {
+          // The forgetWorkspace escalation contract, scoped to this row: an
+          // unconfirmable node reveals the force override for exactly this
+          // workspace; a force attempt that still fails does not re-reveal.
+          patch({ deleteNeedsForce: force ? null : target.id });
+          fail(err);
+        });
+    },
+
+    newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null, bootError: null }),
 
     dismissOnboarding: () =>
       // Closable when there's a connection to return to — a local workspace or a

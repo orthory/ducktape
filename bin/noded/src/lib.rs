@@ -21,9 +21,8 @@
 
 pub mod blobs;
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -33,6 +32,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
 use files::objects::object_id;
 use files::{
     CHUNK_SIZE, Change, FilesMsg, FilesQuery, FilesReply, Kind, MAX_PAGE, MAX_READ_BYTES,
@@ -71,31 +71,6 @@ pub struct SubmitReceipt {
     pub op_hash: String,
 }
 
-/// how many recent telemetry frames the daemon retains for `GET /v1/telemetry`.
-/// a client connecting mid-stream pulls this backfill, then follows the ws.
-pub const TELEMETRY_RING_CAP: usize = 256;
-
-/// the observability record for one finalized block: the host's DETERMINISTIC
-/// dispatch trace decorated with this node's WALL-CLOCK apply latency. rides the
-/// ws stream (`WsFrame::Telemetry`) and is buffered in the [`TelemetryRing`] for
-/// `GET /v1/telemetry`. keyed by `(height, source)` — the same space the future
-/// on-consensus telemetry module will use, so the two planes correlate.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TelemetryFrame {
-    pub height: u64,
-    /// the block's AGREED logical clock (from the block context) — identical on
-    /// every node. NOT this node's wall clock.
-    pub consensus_time: u64,
-    /// node-local cost of applying this block, in microseconds. the ONE
-    /// non-deterministic field: it differs per node and never enters consensus.
-    pub latency_us: u64,
-    /// one entry per module dispatched this block, in drain (causal) order.
-    pub dispatches: Vec<DispatchInfo>,
-    /// observability events modules emitted during the block, in dispatch order.
-    pub events: Vec<TelemetryEvent>,
-}
-
 /// one dispatch in a block's drain — the wire twin of `host::DispatchRecord`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,43 +84,6 @@ pub struct DispatchInfo {
     pub emitted_msgs: usize,
     /// observability `Event`s this dispatch emitted.
     pub emitted_events: usize,
-}
-
-/// one observability event a module emitted (`Ctx::emit_event`).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TelemetryEvent {
-    /// the module that emitted it.
-    pub source: String,
-    /// best-effort UTF-8 preview of the (module-defined) payload, capped. binary
-    /// payloads render lossily; no module emits events yet, so this is forward
-    /// wiring for when they do.
-    pub payload: String,
-}
-
-/// a bounded, shared ring of the most recent telemetry frames. the node actor
-/// pushes from its own thread; the http layer reads from the server runtime, so
-/// it is an `Arc<Mutex>` — frames are plain data, cheap to clone out under the
-/// lock. drops oldest at [`TELEMETRY_RING_CAP`].
-#[derive(Clone, Default)]
-pub struct TelemetryRing(Arc<Mutex<VecDeque<TelemetryFrame>>>);
-
-impl TelemetryRing {
-    /// append a frame, evicting the oldest once the cap is reached.
-    pub fn push(&self, frame: TelemetryFrame) {
-        let mut ring = self.0.lock().expect("telemetry ring poisoned");
-        if ring.len() == TELEMETRY_RING_CAP {
-            ring.pop_front();
-        }
-        ring.push_back(frame);
-    }
-
-    /// the most recent `limit` frames, oldest-first (`None` → all buffered).
-    pub fn recent(&self, limit: Option<usize>) -> Vec<TelemetryFrame> {
-        let ring = self.0.lock().expect("telemetry ring poisoned");
-        let take = limit.map_or(ring.len(), |n| n.min(ring.len()));
-        ring.iter().skip(ring.len() - take).cloned().collect()
-    }
 }
 
 /// how many recent blocks `GET /v1/blocks` serves when the caller names no
@@ -207,9 +145,8 @@ pub struct BlockRecord {
 
 /// the explorer's wire rendering of one dispatch. `Origin::External` renders
 /// as plain `"external"`: the block-level `proposer` field already carries
-/// the key, and raw ed25519 bytes are not utf-8 (telemetry's
-/// `external:<name>` convention assumes the embedded daemon's readable
-/// names).
+/// the key, and raw ed25519 bytes are not utf-8 (the `external:<name>`
+/// convention assumes the embedded daemon's readable names).
 impl From<&host::DispatchRecord> for DispatchInfo {
     fn from(record: &host::DispatchRecord) -> Self {
         DispatchInfo {
@@ -236,6 +173,108 @@ pub fn payload_preview(payload: &[u8]) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// node metrics: the `ducktape_*` Prometheus series behind GET /metrics.
+// shared by every binary serving this surface — the embedded daemon folds a
+// block in at submit, the consensus validator at drain — so one Grafana board
+// reads them all.
+// ---------------------------------------------------------------------------
+
+/// histogram buckets for block apply latency, in SECONDS (Prometheus
+/// convention). ~100µs to ~1s — the range one local block apply falls in.
+const LATENCY_BUCKETS: [f64; 13] = [
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+];
+
+/// labels for the per-dispatch counter. kept LOW-CARDINALITY: `module` is the
+/// bounded registered set; `origin` is the trigger KIND only — never the
+/// specific submitter name or emitter id.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DispatchLabels {
+    module: String,
+    origin: String,
+}
+
+/// the low-cardinality trigger KIND of a dispatch origin — the metrics label.
+fn origin_kind(origin: &sdk::Origin) -> &'static str {
+    match origin {
+        sdk::Origin::External(_) => "external",
+        sdk::Origin::Module(_) => "module",
+        sdk::Origin::System => "system",
+    }
+}
+
+/// the node's own Prometheus series, registered INTO commonware's runtime
+/// registry so one `context.encode()` (GET /metrics) serves runtime + app
+/// metrics together. each `Registered` handle is retained for the process life;
+/// updates go through its `Deref` to the underlying metric.
+pub struct NodeMetrics {
+    block_height: Registered<raw::Gauge>,
+    blocks_total: Registered<raw::Counter>,
+    apply_latency: Registered<raw::Histogram>,
+    dispatch_total: Registered<raw::Family<DispatchLabels, raw::Counter>>,
+}
+
+impl NodeMetrics {
+    /// register the `ducktape_*` series on the runtime context (root context, so
+    /// names carry no child prefix).
+    pub fn register<C: commonware_runtime::Metrics>(context: &C) -> Self {
+        Self {
+            block_height: context.gauge(
+                "ducktape_block_height",
+                "latest committed local block height",
+            ),
+            // NB: the registry appends the OpenMetrics `_total` suffix to a
+            // counter, so the exposed names are `ducktape_blocks_total` and
+            // `ducktape_dispatch_total{…}` — DON'T put `_total` in the name here
+            // or it doubles.
+            blocks_total: context.counter(
+                "ducktape_blocks",
+                "committed local blocks since daemon start",
+            ),
+            apply_latency: context.histogram(
+                "ducktape_block_apply_latency_seconds",
+                "node-local wall-clock cost of applying one block",
+                LATENCY_BUCKETS.into_iter(),
+            ),
+            dispatch_total: context.family(
+                "ducktape_dispatch",
+                "module dispatches, by module and trigger-origin kind",
+            ),
+        }
+    }
+
+    /// fold one applied block into the series: height, count, this node's
+    /// wall-clock apply latency, and the per-module dispatch counters.
+    pub fn record_block(
+        &self,
+        height: u64,
+        latency_us: u64,
+        dispatches: &[host::DispatchRecord],
+    ) {
+        self.block_height.set(height as i64);
+        self.blocks_total.inc();
+        // microseconds → seconds for the Prometheus convention.
+        self.apply_latency.observe(latency_us as f64 / 1_000_000.0);
+        for d in dispatches {
+            self.dispatch_total
+                .get_or_create(&DispatchLabels {
+                    module: d.module.clone(),
+                    origin: origin_kind(&d.origin).to_string(),
+                })
+                .inc();
+        }
+    }
+
+    /// follow the committed height WITHOUT recording a block apply — the
+    /// validator lane calls this for rejected frames (a deterministic no-op
+    /// advances the height but is not a sample worth the block series; the
+    /// idle heartbeat nop lands here, so it never pollutes the histogram).
+    pub fn record_height(&self, height: u64) {
+        self.block_height.set(height as i64);
+    }
+}
+
 /// encode a [`BlockRecord`] as its stored index row ([`indexer::BlockOps::record`]).
 /// both binaries feed rows through this one seam so `GET /v1/blocks` reads a
 /// single shape regardless of which lane wrote it.
@@ -252,6 +291,11 @@ pub struct NodeStatus {
     pub app_hash: String,
     pub height: u64,
     pub modules: Vec<ModuleStatus>,
+    /// this node's mesh identity (hex ed25519 key) — what a client stamps
+    /// into ops that route peer traffic to it (chat's `JoinHuddle.node`).
+    /// empty on daemons with no mesh identity (the embedded local daemon).
+    #[serde(default)]
+    pub public_key: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -282,7 +326,7 @@ impl ModuleCategory {
     /// or unknown module always groups sensibly rather than breaking the view.
     pub fn of(id: &str) -> Self {
         match id {
-            "chat" | "tasks" | "inbox" | "document" | "pages" => Self::Workspace,
+            "chat" | "tasks" | "inbox" | "pages" => Self::Workspace,
             "forge" | "agent" => Self::Developer,
             "automations" | "jobs" => Self::Automation,
             _ => Self::System,
@@ -314,13 +358,147 @@ pub struct QueryRequest {
     pub query: serde_json::Value,
 }
 
+// ---- the call lane ----------------------------------------------------------
+// the webview end of a huddle: GET /v1/call/ws?channel=<id> upgrades to a
+// typed socket that carries the huddle's audio, camera video, and call control
+// together. the handler asks the node's call hub for a session over the request
+// lane below; a daemon without a hub answers 503, and every refusal path says
+// WHY as one text frame before closing.
+//
+// binary frames are tagged by their first byte (`WS_TAG_*`):
+//   audio `[0x01][1920 B pcm]` — both directions; one 20 ms mono 48 kHz frame
+//     (960 × i16 LE, exactly `PCM_FRAME_BYTES` after the tag — see
+//     `chat::voice::FRAME_SAMPLES`). client→server is a captured mic frame,
+//     server→client a mixed playout frame.
+//   video — client→server `[0x02][flags u8][ts_ms u32 LE][vp8 chunk]` captured
+//     camera; server→client `[0x03][flags u8][ts_ms u32 LE][peer 32 raw]
+//     [vp8 chunk]` a reassembled peer frame. `flags` bit 0 (`WS_FLAG_KEYFRAME`)
+//     marks a decoder sync point. little-endian on THIS leg (browser
+//     `DataView`-friendly); the mesh leg stays big-endian.
+// text frames are json control: client→server `CallClientControl` (recipients /
+// beacon / keyframeRequest), server→client `CallServerControl` (keyframeRequest
+// / peerBeacon / rateHint).
+//
+// the hub side lives with the mesh (only the p2p validator runs one): it
+// fragments/reassembles the video ends over `Service::Video` and routes control
+// (keyframe kicks, presence beacons, rate hints — see `chat::video`).
+
+/// one captured, encoded camera frame handed webview → hub for fan-out. the
+/// hub fragments `data` across `Service::Video` datagrams; `frame_no` is the
+/// hub's own monotone counter, so only the frame's own fields ride here.
+pub struct CapturedVideo {
+    /// this frame is a decoder sync point (a full keyframe, not a delta).
+    pub keyframe: bool,
+    /// capture timestamp in ms (opaque to the hub; echoed to the far webview).
+    pub ts_ms: u32,
+    /// the encoded (VP8) frame bytes.
+    pub data: Vec<u8>,
+}
+
+/// one reassembled camera frame handed hub → webview, tagged with the mesh-
+/// authenticated sender so the webview routes it to the right tile.
+pub struct PeerVideo {
+    /// the sending peer's raw ed25519 node key.
+    pub peer: [u8; 32],
+    pub keyframe: bool,
+    pub ts_ms: u32,
+    /// the reassembled encoded (VP8) frame bytes.
+    pub data: Vec<u8>,
+}
+
+/// call-control the WEBVIEW asks the hub to act on (webview → hub).
+pub enum CallControlIn {
+    /// our local presence/state, pushed immediately AND repeated at 1 Hz as
+    /// this session's beacon to every recipient.
+    Beacon { muted: bool, camera_on: bool },
+    /// our decoder lost `peer`'s stream — ask `peer` for a fresh keyframe.
+    KeyframeRequest { peer: [u8; 32] },
+}
+
+/// call-control the hub surfaces to the WEBVIEW (hub → webview).
+pub enum CallControlOut {
+    /// a peer's receiver asked us to send it a fresh keyframe — the webview
+    /// tells its encoder to emit one (rate-limited to ≤1 Hz by the hub).
+    KeyframeRequest,
+    /// a peer's 1 Hz presence beacon — drives the tile's mute/camera badges.
+    PeerBeacon {
+        peer: [u8; 32],
+        muted: bool,
+        camera_on: bool,
+    },
+    /// the effective outbound bitrate cap (min of every peer's hint) — the
+    /// webview retargets its encoder. emitted only when the value changes.
+    RateHint { max_kbps: u32 },
+}
+
+/// one live huddle session's channel ends, hub ↔ websocket handler / gateway.
+pub struct CallSession {
+    /// captured mic frames, exactly [`chat::voice::FRAME_SAMPLES`] samples each.
+    pub pcm_in: tokio::sync::mpsc::Sender<Vec<i16>>,
+    /// mixed playout frames at the 20 ms tick, same shape.
+    pub mixed_out: tokio::sync::mpsc::Receiver<Vec<i16>>,
+    /// where this session's frames fan out: the huddle roster's node keys
+    /// (raw ed25519 bytes), steered by the client as consensus state changes.
+    pub recipients: tokio::sync::watch::Sender<Vec<[u8; 32]>>,
+    /// captured camera frames webview → hub (fragmented onto `Service::Video`).
+    pub video_in: tokio::sync::mpsc::Sender<CapturedVideo>,
+    /// reassembled peer camera frames hub → webview.
+    pub video_out: tokio::sync::mpsc::Receiver<PeerVideo>,
+    /// call-control webview → hub (local beacon, keyframe asks).
+    pub control_in: tokio::sync::mpsc::Sender<CallControlIn>,
+    /// call-control hub → webview (peer beacons, keyframe kicks, rate hints).
+    pub control_out: tokio::sync::mpsc::Receiver<CallControlOut>,
+}
+
+/// a websocket handler's ask: open (or replace) the call session for a
+/// channel. the hub replies with the session's ends or a refusal string.
+pub struct CallSessionRequest {
+    pub channel_id: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<CallSession, String>>,
+}
+
+/// the request lane into the call hub.
+pub type CallLane = tokio::sync::mpsc::Sender<CallSessionRequest>;
+
+/// binary ws frame tags on /v1/call/ws (first byte).
+const WS_TAG_AUDIO: u8 = 0x01;
+const WS_TAG_VIDEO_CAPTURED: u8 = 0x02; // client → server
+const WS_TAG_VIDEO_PEER: u8 = 0x03; // server → client
+const WS_VIDEO_CAPTURED_HEADER: usize = 6; // tag + flags + ts_ms
+const WS_VIDEO_PEER_HEADER: usize = 38; // tag + flags + ts_ms + peer key
+const WS_FLAG_KEYFRAME: u8 = 0b0000_0001;
+
+/// client → server control messages on the call socket (text frames).
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum CallClientControl {
+    /// replace the fan-out set with these hex node keys (self excluded —
+    /// the client tracks the consensus huddle roster).
+    Recipients { peers: Vec<String> },
+    /// this client's ephemeral state; the hub beacons it to peers at 1 Hz.
+    Beacon { muted: bool, camera_on: bool },
+    /// the decoder lost sync with `peer` — ask it for a keyframe.
+    KeyframeRequest { peer: String },
+}
+
+/// server → client control messages on the call socket (text frames).
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum CallServerControl {
+    /// a peer lost sync with US: encode the next frame as a keyframe.
+    KeyframeRequest,
+    /// a peer's 1 Hz beacon (ephemeral presence/state — never consensus).
+    PeerBeacon { peer: String, muted: bool, camera_on: bool },
+    /// send at no more than this (min across peers' loss reports).
+    RateHint { max_kbps: u32 },
+}
+
 /// a ws frame. tagged so the stream can grow beyond block events without
 /// breaking subscribers — clients switch on `type` and ignore unknown kinds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WsFrame {
     Block(BlockSummary),
-    Telemetry(TelemetryFrame),
 }
 
 /// a request to the actor that owns the host. replies cross the channel as
@@ -362,10 +540,6 @@ pub struct NodeHandle {
     /// node-local by design (never consensus state, never an op), so the http
     /// handlers read/write this store directly.
     blobs: crate::blobs::BlobHandle,
-    /// recent per-block telemetry. like `blobs`, this is node-local and never
-    /// crosses the actor command lane: the actor pushes into it as blocks
-    /// commit, `GET /v1/telemetry` reads it directly.
-    telemetry: TelemetryRing,
     /// the forge module's on-disk repo base dir (`<storage>/<forge subdir>`);
     /// each named repo lives at `<forge_repo>/<name>` as a real libgit2 repo.
     /// threaded in so the git upload-pack (clone/fetch) handler can open a repo
@@ -375,12 +549,15 @@ pub struct NodeHandle {
     /// makes upload-pack a clean 500 there rather than a panic.
     forge_repo: Option<PathBuf>,
     /// the per-module derived index (fluent31-backed read models). node-local
-    /// like `blobs`/`telemetry`: the actor is the one WRITER as blocks commit;
+    /// like `blobs`: the actor is the one WRITER as blocks commit;
     /// the `/v1/index/*` handlers read it directly through MVCC snapshots, so
     /// an index scan never crosses the actor command lane. `None` on a handle
     /// whose embedder configured no index (the router tests' fake actor) —
     /// index routes answer 503 there.
     index: Option<Arc<indexer::IndexStore>>,
+    /// the call hub's session-request lane. `None` on daemons without a mesh
+    /// (the embedded daemon, router tests) — `/v1/call/ws` answers 503 there.
+    call: Option<CallLane>,
 }
 
 impl NodeHandle {
@@ -400,9 +577,9 @@ impl NodeHandle {
             events: event_tx.clone(),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             blobs: crate::blobs::BlobHandle::default(),
-            telemetry: TelemetryRing::default(),
             forge_repo: None,
             index: None,
+            call: None,
         };
         (handle, cmd_rx, event_tx)
     }
@@ -424,17 +601,19 @@ impl NodeHandle {
         self
     }
 
+    /// point this handle at a call hub's session-request lane so
+    /// `/v1/call/ws` can open huddle sessions. only the p2p validator
+    /// wires one — it owns the mesh the audio/video rides.
+    pub fn with_call(mut self, call: CallLane) -> Self {
+        self.call = Some(call);
+        self
+    }
+
     /// the blob store this surface serves. the daemon hands clones to forge
     /// (push packfiles) and its block loop (op receipts) so http uploads land
     /// exactly where those consumers read.
     pub fn blob_handle(&self) -> crate::blobs::BlobHandle {
         self.blobs.clone()
-    }
-
-    /// the telemetry ring this surface serves. the daemon actor pushes a frame
-    /// into a clone of it as each block commits; `GET /v1/telemetry` reads here.
-    pub fn telemetry_ring(&self) -> TelemetryRing {
-        self.telemetry.clone()
     }
 
     /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
@@ -479,7 +658,6 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/submit", post(submit))
         .route("/v1/query", post(query))
         .route("/v1/status", get(status))
-        .route("/v1/telemetry", get(telemetry))
         .route("/v1/blocks", get(blocks))
         // the derived read-model tier: snapshot reads of the per-module
         // fluent31 indexes the actor materializes as blocks commit.
@@ -493,6 +671,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/metrics", get(metrics))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/ws", get(ws))
+        .route("/v1/call/ws", get(call_ws))
         .route(
             "/v1/files/blob",
             // one receipt per request; the json routes keep axum's (smaller)
@@ -620,27 +799,6 @@ async fn status(State(handle): State<NodeHandle>) -> Response {
     }
 }
 
-/// query params for `GET /v1/telemetry`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TelemetryParams {
-    /// cap the response to the most recent N frames (default: all buffered).
-    pub limit: Option<usize>,
-}
-
-/// GET /v1/telemetry — recent per-block telemetry, oldest-first: `{"frames":[…]}`.
-///
-/// reads the node-local ring directly (no actor round-trip — the actor never
-/// blocks on an http read). a client connecting mid-stream backfills here, then
-/// follows `WsFrame::Telemetry` on `/v1/ws` for live frames.
-async fn telemetry(
-    State(handle): State<NodeHandle>,
-    Query(params): Query<TelemetryParams>,
-) -> Response {
-    let frames = handle.telemetry.recent(params.limit);
-    Json(serde_json::json!({ "frames": frames })).into_response()
-}
-
 // ---------------------------------------------------------------------------
 // the derived-index tier: shared construction + from-state rebuild triggers.
 // noded and the consensus validator (bin/node) both reuse this router, so
@@ -662,7 +820,6 @@ pub fn open_index_store<S: AsRef<str>>(
                 store
                     .with_indexer(Box::new(chat::index::ChatIndex::new("chat")))
                     .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
-                    .with_indexer(Box::new(document::index::DocumentIndex::new("document")))
                     .with_indexer(Box::new(pages::index::PagesIndex::new("pages"))),
             )
         })
@@ -675,16 +832,15 @@ pub fn open_index_store<S: AsRef<str>>(
 }
 
 /// flatten a dispatch origin into the index's plain origin tag: external
-/// submitter identities render lossily as utf-8, exactly what the mappers'
-/// author rendering assumes — on BOTH lanes. the validator's key-byte
-/// identities render the same way, because a mapper's from-state rebuild
-/// re-renders authors from canonical state with this exact convention
-/// (see `chat::index` `author_from_ref`): folded and rebuilt rows must match
-/// byte-for-byte. hex-keyed identity belongs to the explorer row's
-/// `proposer`, not the index op rows.
+/// submitter identities render via [`indexer::user_handle`] — printable claimed
+/// names pass through, raw ed25519 pubkeys become hex (never the lossy `�`
+/// boxes a plain utf-8 decode leaves). the same convention drives a mapper's
+/// from-state rebuild (see `chat::index` `author_from_ref`), so folded and
+/// rebuilt rows match byte-for-byte on BOTH lanes. hex-keyed identity belongs
+/// to the explorer row's `proposer`, not the index op rows.
 pub fn index_origin(origin: &sdk::Origin) -> indexer::OriginTag {
     match origin {
-        sdk::Origin::External(id) => indexer::OriginTag::external(String::from_utf8_lossy(id)),
+        sdk::Origin::External(id) => indexer::OriginTag::external(indexer::user_handle(id)),
         sdk::Origin::Module(id) => indexer::OriginTag::module(id.clone()),
         sdk::Origin::System => indexer::OriginTag::system(),
     }
@@ -772,7 +928,7 @@ pub async fn rebuild_stale_modules(
 }
 
 // ---------------------------------------------------------------------------
-// the derived-index read lane. like the blob and telemetry lanes these
+// the derived-index read lane. like the blob lane these
 // handlers never cross the actor: the store is `Send + Sync` and every read
 // runs at its own MVCC snapshot, concurrent with the actor's block writes.
 // ---------------------------------------------------------------------------
@@ -2062,57 +2218,185 @@ async fn stream_frames(mut socket: WebSocket, mut frames: broadcast::Receiver<Ws
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CallParams {
+    channel: String,
+}
+
+/// one pcm sample is an i16 — two wire bytes, little endian.
+const PCM_FRAME_BYTES: usize = chat::voice::FRAME_SAMPLES * 2;
+
+async fn call_ws(
+    State(handle): State<NodeHandle>,
+    Query(params): Query<CallParams>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Some(call) = handle.call.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "calls are not available on this node (no mesh call hub)",
+        );
+    };
+    if params.channel.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "channel must not be empty");
+    }
+    upgrade.on_upgrade(move |socket| call_session(socket, call, params.channel))
+}
+
+/// pump one huddle's audio, camera video, and call control between the webview
+/// websocket and the hub session. binary client frames are tag-dispatched:
+/// `0x01` audio → `pcm_in`, `0x02` captured video → `video_in`; the hub's
+/// `mixed_out`/`video_out`/`control_out` ends flow back as tagged binary + json
+/// text. text client frames steer fan-out and carry beacons/keyframe asks.
+/// either side closing ends the session — dropping the ends is the teardown
+/// signal the hub watches.
+async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String) {
+    let (reply, opened) = tokio::sync::oneshot::channel();
+    let request = CallSessionRequest {
+        channel_id,
+        reply,
+    };
+    // every refusal path says WHY as a text frame before closing — the client
+    // surfaces it as a session error instead of a silent no-op.
+    const NO_HUB: &str = "calls are not available on this node (no live call hub)";
+    let session = match call.send(request).await {
+        Ok(()) => match opened.await {
+            Ok(Ok(session)) => session,
+            Ok(Err(refusal)) => {
+                let _ = socket.send(Message::Text(refusal.into())).await;
+                return;
+            }
+            Err(_) => {
+                // hub dropped the reply — shutting down.
+                let _ = socket.send(Message::Text(NO_HUB.into())).await;
+                return;
+            }
+        },
+        Err(_) => {
+            // the request lane is closed: a mode that never runs a hub
+            // (parked joiner, sync-only observer) or a dead hub thread.
+            let _ = socket.send(Message::Text(NO_HUB.into())).await;
+            return;
+        }
+    };
+    let CallSession {
+        pcm_in,
+        mut mixed_out,
+        recipients,
+        video_in,
+        mut video_out,
+        control_in,
+        mut control_out,
+    } = session;
+    loop {
+        tokio::select! {
+            inbound = socket.recv() => match inbound {
+                Some(Ok(Message::Binary(bytes))) => match bytes.first() {
+                    Some(&WS_TAG_AUDIO) if bytes.len() == 1 + PCM_FRAME_BYTES => {
+                        let frame: Vec<i16> = bytes[1..]
+                            .chunks_exact(2)
+                            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+                            .collect();
+                        // full lane = the hub is behind; late audio is dead
+                        // audio, so drop the frame rather than backpressure.
+                        let _ = pcm_in.try_send(frame);
+                    }
+                    Some(&WS_TAG_VIDEO_CAPTURED)
+                        if bytes.len() > WS_VIDEO_CAPTURED_HEADER =>
+                    {
+                        let _ = video_in.try_send(CapturedVideo {
+                            keyframe: bytes[1] & WS_FLAG_KEYFRAME != 0,
+                            ts_ms: u32::from_le_bytes(
+                                bytes[2..6].try_into().expect("4 bytes"),
+                            ),
+                            data: bytes[WS_VIDEO_CAPTURED_HEADER..].to_vec(),
+                        });
+                    }
+                    _ => {} // unknown/short frame — drop, stay alive
+                },
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<CallClientControl>(&text) {
+                        Ok(CallClientControl::Recipients { peers }) => {
+                            let keys: Vec<[u8; 32]> = peers
+                                .iter()
+                                .filter_map(|hex| files::from_hex_32(hex))
+                                .collect();
+                            let _ = recipients.send(keys);
+                        }
+                        Ok(CallClientControl::Beacon { muted, camera_on }) => {
+                            let _ = control_in
+                                .try_send(CallControlIn::Beacon { muted, camera_on });
+                        }
+                        Ok(CallClientControl::KeyframeRequest { peer }) => {
+                            if let Some(key) = files::from_hex_32(&peer) {
+                                let _ = control_in
+                                    .try_send(CallControlIn::KeyframeRequest { peer: key });
+                            }
+                        }
+                        Err(_) => {} // unknown control — ignore, stay alive
+                    }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+            mixed = mixed_out.recv() => match mixed {
+                Some(frame) => {
+                    let mut bytes = Vec::with_capacity(1 + frame.len() * 2);
+                    bytes.push(WS_TAG_AUDIO);
+                    for sample in frame {
+                        bytes.extend_from_slice(&sample.to_le_bytes());
+                    }
+                    if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                        break;
+                    }
+                }
+                None => break, // the hub ended the session (replaced by a newer join).
+            },
+            video = video_out.recv() => match video {
+                Some(frame) => {
+                    let mut bytes =
+                        Vec::with_capacity(WS_VIDEO_PEER_HEADER + frame.data.len());
+                    bytes.push(WS_TAG_VIDEO_PEER);
+                    bytes.push(if frame.keyframe { WS_FLAG_KEYFRAME } else { 0 });
+                    bytes.extend_from_slice(&frame.ts_ms.to_le_bytes());
+                    bytes.extend_from_slice(&frame.peer);
+                    bytes.extend_from_slice(&frame.data);
+                    if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+            control = control_out.recv() => match control {
+                Some(out) => {
+                    let message = match out {
+                        CallControlOut::KeyframeRequest => CallServerControl::KeyframeRequest,
+                        CallControlOut::PeerBeacon { peer, muted, camera_on } => {
+                            CallServerControl::PeerBeacon {
+                                peer: hex_bytes(&peer),
+                                muted,
+                                camera_on,
+                            }
+                        }
+                        CallControlOut::RateHint { max_kbps } => {
+                            CallServerControl::RateHint { max_kbps }
+                        }
+                    };
+                    let text = serde_json::to_string(&message).expect("serializable control");
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn frame(height: u64) -> TelemetryFrame {
-        TelemetryFrame {
-            height,
-            consensus_time: 0,
-            latency_us: 0,
-            dispatches: Vec::new(),
-            events: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn ring_evicts_oldest_at_cap_and_recent_returns_newest_tail() {
-        let ring = TelemetryRing::default();
-        // fill two past the cap: the oldest two fall out, the newest survive.
-        for h in 0..(TELEMETRY_RING_CAP as u64 + 2) {
-            ring.push(frame(h));
-        }
-        let all = ring.recent(None);
-        assert_eq!(
-            all.len(),
-            TELEMETRY_RING_CAP,
-            "buffer holds exactly the cap"
-        );
-        assert_eq!(all.first().unwrap().height, 2, "oldest two evicted");
-        assert_eq!(
-            all.last().unwrap().height,
-            TELEMETRY_RING_CAP as u64 + 1,
-            "newest retained, oldest-first ordering"
-        );
-
-        // recent(limit) returns the newest `limit`, still oldest-first.
-        let tail: Vec<u64> = ring.recent(Some(3)).iter().map(|f| f.height).collect();
-        assert_eq!(
-            tail,
-            vec![
-                TELEMETRY_RING_CAP as u64 - 1,
-                TELEMETRY_RING_CAP as u64,
-                TELEMETRY_RING_CAP as u64 + 1,
-            ],
-        );
-
-        // a limit past the buffer size just returns everything.
-        assert_eq!(
-            ring.recent(Some(TELEMETRY_RING_CAP + 100)).len(),
-            TELEMETRY_RING_CAP,
-        );
-    }
 
     /// the explorer row round-trips through its stored index encoding — the
     /// one seam both binaries write and `GET /v1/blocks` reads.
@@ -2155,7 +2439,7 @@ mod tests {
     #[test]
     fn module_categories_group_the_genesis_set() {
         use ModuleCategory::*;
-        for id in ["chat", "tasks", "inbox", "document", "pages"] {
+        for id in ["chat", "tasks", "inbox", "pages"] {
             assert_eq!(ModuleCategory::of(id), Workspace, "{id}");
         }
         for id in ["forge", "agent"] {
@@ -2171,6 +2455,7 @@ mod tests {
             "files",
             "saga",
             "profiles",
+            "identity",
             "kv",
             "valset",
             "governance",

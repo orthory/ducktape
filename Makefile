@@ -1,14 +1,19 @@
 # ducktape build + install entry points.
 #
 # `make install` builds the networked node and the desktop app, installs
-# ducktape-node into ~/.cargo/bin, and places Ducktape.app in /Applications.
-# individual targets below for the pieces.
+# ducktape-node into ~/.cargo/bin, and installs the app — on macOS
+# Ducktape.app into /Applications, on Linux the plain `ducktape` binary
+# into ~/.cargo/bin (next to ducktape-node, which the app resolves as a
+# sibling of its own executable). individual targets below for the pieces.
 
 CARGO ?= cargo
 BUN ?= bun
 APP_DEST ?= /Applications
+BIN_DEST ?= $(HOME)/.cargo/bin
 
-.PHONY: all dev node web app sidecar install install-node install-app test clean
+UNAME_S := $(shell uname -s)
+
+.PHONY: all dev dogfood-forge node web app sidecar install install-node install-app test clean
 
 all: node web
 
@@ -18,6 +23,12 @@ all: node web
 ## see ops/dev.sh. (stop any already-running `tauri dev` first — it owns :1430.)
 dev:
 	@bash ops/dev.sh
+
+## dogfood: host ducktape's own source in the local dev node's forge module.
+## registers a static `ducktape-dev` git remote at the node's forge endpoint and
+## pushes `main` (needs a running dev node — `make dev`). see ops/dogfood-forge.sh.
+dogfood-forge:
+	@bash ops/dogfood-forge.sh
 
 ## release build of the networked node (serves the app surface)
 node:
@@ -31,13 +42,24 @@ sidecar: app/node_modules
 web: app/node_modules
 	cd app && $(BUN) run build
 
-## desktop bundle (.app + .dmg under target/release/bundle) — stages the
-## sidecar itself via beforeBuildCommand
+## desktop build — stages the sidecar itself via beforeBuildCommand. on macOS
+## a bundle (.app + .dmg under target/release/bundle); on Linux the plain
+## binary at target/release/ducktape-desktop (--no-bundle: install-app wants
+## only the binary, and no deb/rpm/appimage packagers are needed).
+ifeq ($(UNAME_S),Darwin)
 app: app/node_modules
 	cd app && $(BUN) run tauri build
+else
+app: app/node_modules
+	cd app && $(BUN) run tauri build --no-bundle
+endif
 
-app/node_modules:
+# re-run bun install whenever the manifest or lockfile changes, not just when
+# node_modules is absent; the touch keeps the dir newer than its prerequisites
+# (bun does not reliably update the dir mtime when nothing needs fetching).
+app/node_modules: app/package.json app/bun.lock
 	cd app && $(BUN) install
+	touch app/node_modules
 
 install: install-node install-app
 
@@ -45,12 +67,22 @@ install: install-node install-app
 install-node:
 	$(CARGO) install --path bin/node --locked
 
-## Ducktape.app -> $(APP_DEST)
+## macOS: Ducktape.app -> $(APP_DEST); Linux: ducktape -> $(BIN_DEST),
+## alongside install-node's ducktape-node so the app's sidecar resolution
+## (a `ducktape-node` sibling of its own executable) finds it.
+ifeq ($(UNAME_S),Darwin)
 install-app: app
 	mkdir -p "$(APP_DEST)"
 	rm -rf "$(APP_DEST)/Ducktape.app"
 	cp -R target/release/bundle/macos/Ducktape.app "$(APP_DEST)/"
 	@echo "installed $(APP_DEST)/Ducktape.app"
+else
+install-app: app
+	mkdir -p "$(BIN_DEST)"
+	install -m 755 target/release/ducktape-desktop "$(BIN_DEST)/ducktape"
+	@echo "installed $(BIN_DEST)/ducktape"
+	bash ops/install-desktop-entry.sh "$(BIN_DEST)/ducktape"
+endif
 
 ## the full LOCAL verification gate (no hosted CI by design — run this before
 ## every push): the rust workspace including the process-level e2e suites

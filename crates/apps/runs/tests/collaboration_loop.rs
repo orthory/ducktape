@@ -147,7 +147,6 @@ fn register_quackbot(actions: Vec<String>) -> Msg {
             display_name: "Quackbot".into(),
             capability: "mock-llm-1".into(),
             prompt_hash: vec![7u8; 32],
-            prompt_doc: None,
             allowed_actions: actions,
         }),
     }
@@ -226,7 +225,6 @@ async fn genesis(context: deterministic::Context) -> Host {
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-            None,
         )),
         Box::new(Tasks::new("tasks")),
         Box::new(Jobs::new("jobs")),
@@ -386,7 +384,6 @@ fn register_duck() -> Msg {
             display_name: "Duck".into(),
             capability: "mock-llm-1".into(),
             prompt_hash: vec![9u8; 32],
-            prompt_doc: None,
             allowed_actions: vec![ACTION_TASKS_CREATE.into()],
         }),
     }

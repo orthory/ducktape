@@ -1,11 +1,11 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { PageBlock } from "../../../domain/pages-client";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
-import { PagesView } from "./PagesView";
+import { EDIT_BOUNDARY_MS, PagesView } from "./PagesView";
 
 const makeActions = () => {
   const spies: Record<string, (...args: unknown[]) => void> = {};
@@ -38,23 +38,24 @@ const PAGE: PageBlock[] = [
 ];
 
 const renderPagesView = (patch: Partial<ConsoleState> = {}) => {
-  const state = {
+  const stateOf = (p: Partial<ConsoleState>) => ({
     ...createInitialState(),
     pages: [
-      { id: "p1", title: "Launch plan" },
-      { id: "p2", title: "Retro" },
+      { id: "p1", title: "Launch plan", parent: null },
+      { id: "p2", title: "Retro", parent: null },
     ],
     activePage: "p1",
     activePageBlocks: PAGE,
-    ...patch,
-  };
+    ...p,
+  });
   const { actions, spies } = makeActions();
-  render(
-    <ConsoleContext.Provider value={{ state, actions }}>
+  const view = (p: Partial<ConsoleState>) => (
+    <ConsoleContext.Provider value={{ state: stateOf(p), actions }}>
       <PagesView />
-    </ConsoleContext.Provider>,
+    </ConsoleContext.Provider>
   );
-  return { spies };
+  const { rerender } = render(view(patch));
+  return { spies, rerender: (p: Partial<ConsoleState>) => rerender(view(p)) };
 };
 
 describe("PagesView", () => {
@@ -66,17 +67,37 @@ describe("PagesView", () => {
     expect(spies.listPages).toHaveBeenCalledTimes(2);
   });
 
-  it("creates a page from the rail form and opens one from the list", () => {
+  it("creates an untitled page from the New page button and opens one from the tree", () => {
     const { spies } = renderPagesView();
 
-    fireEvent.change(screen.getByLabelText("New page title"), {
-      target: { value: "Architecture" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Create page" }));
-    expect(spies.createPage).toHaveBeenCalledWith("Architecture");
+    // the "New page title" form is gone — a single button creates instantly.
+    expect(screen.queryByLabelText("New page title")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "New page" }));
+    expect(spies.createChildPage).toHaveBeenCalledWith(null);
 
     fireEvent.click(screen.getByRole("button", { name: "Open Retro" }));
     expect(spies.openPage).toHaveBeenCalledWith("p2");
+  });
+
+  it("drops the block-id/count clutter — no permanent hash chip, no block counter", () => {
+    renderPagesView();
+    // the copy-link affordance only appears on hover, never as steady chrome.
+    expect(screen.queryByRole("button", { name: /copy link to block/i })).toBeNull();
+    // the header is a breadcrumb, not an "N blocks" counter.
+    expect(screen.queryByText(/^\d+ blocks?$/)).toBeNull();
+  });
+
+  it("shows the placeholder only on the focused empty block", () => {
+    renderPagesView({
+      activePageBlocks: [
+        blockOf({ id: "p1", parent: null, kind: "page", text: "T", children: ["e"] }),
+        blockOf({ id: "e", text: "" }),
+      ],
+    });
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    expect(area.placeholder).toBe("");
+    fireEvent.focus(area);
+    expect(area.placeholder).toBe("Write, or press '/' for commands");
   });
 
   it("renders the tree as labelled editors with the title on the root", () => {
@@ -140,5 +161,179 @@ describe("PagesView", () => {
       key: "Backspace",
     });
     expect(spies.removePageBlock).toHaveBeenCalledWith("empty");
+  });
+});
+
+describe("edit boundaries & draft protection", () => {
+  it("a typing pause commits one update op without leaving the block", () => {
+    vi.useFakeTimers();
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1");
+    fireEvent.focus(area);
+    fireEvent.change(area, { target: { value: "First draft, extended" } });
+
+    // no boundary yet: mid-typing must not flow an op per keystroke. (spies
+    // materialize lazily on first action call, so absence == never called.)
+    if (spies.updatePageBlockText) {
+      expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+    }
+    act(() => {
+      vi.advanceTimersByTime(EDIT_BOUNDARY_MS);
+    });
+    expect(spies.updatePageBlockText).toHaveBeenCalledTimes(1);
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({
+      blockId: "a",
+      text: "First draft, extended",
+    });
+    vi.useRealTimers();
+  });
+
+  it("an open slash menu is a command in progress — no boundary commit", () => {
+    vi.useFakeTimers();
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1");
+    fireEvent.focus(area);
+    fireEvent.change(area, { target: { value: "/head" } });
+    act(() => {
+      vi.advanceTimersByTime(EDIT_BOUNDARY_MS * 2);
+    });
+    // lazily-materialized spy: absent means the action was never reached.
+    if (spies.updatePageBlockText) {
+      expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+    }
+    vi.useRealTimers();
+  });
+
+  it("a snapshot landing mid-edit never clobbers the focused draft", () => {
+    const { spies, rerender } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1");
+    fireEvent.focus(area);
+    fireEvent.change(area, { target: { value: "my live draft" } });
+
+    // an earlier op's completion refresh lands a snapshot that predates the
+    // edit — the focused block keeps its draft.
+    rerender({
+      activePageBlocks: PAGE.map((b) =>
+        b.id === "a" ? { ...b, text: "stale committed" } : b,
+      ),
+    });
+    expect(area).toHaveValue("my live draft");
+
+    // blur commits the draft as usual…
+    fireEvent.blur(area);
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({
+      blockId: "a",
+      text: "my live draft",
+    });
+
+    // …and once unfocused, committed truth is adopted again.
+    rerender({
+      activePageBlocks: PAGE.map((b) =>
+        b.id === "a" ? { ...b, text: "peer edit" } : b,
+      ),
+    });
+    expect(area).toHaveValue("peer edit");
+  });
+
+  it("the title shares the contract: focused draft survives, page switch resets", () => {
+    const { rerender } = renderPagesView();
+    const title = screen.getByLabelText("Page title");
+    fireEvent.focus(title);
+    fireEvent.change(title, { target: { value: "Launch plan v2" } });
+
+    rerender({
+      activePageBlocks: PAGE.map((b) =>
+        b.id === "p1" ? { ...b, text: "Launch plan" } : b,
+      ),
+    });
+    expect(title).toHaveValue("Launch plan v2");
+
+    // switching pages resets the draft even while the input is focused — a
+    // draft never crosses pages.
+    rerender({
+      activePage: "p2",
+      activePageBlocks: [
+        blockOf({ id: "p2", parent: null, page: "p2", kind: "page", text: "Retro", children: [] }),
+      ],
+    });
+    expect(screen.getByLabelText("Page title")).toHaveValue("Retro");
+  });
+});
+
+describe("Pages keyboard shortcuts & tab strip", () => {
+  const withTabs = (patch: Partial<ConsoleState> = {}) =>
+    renderPagesView({ openTabs: ["p1", "p2", "p3"], activePage: "p1", ...patch });
+
+  it("cycles to the next tab on ⌘⇧]", () => {
+    const { spies } = withTabs();
+    fireEvent.keyDown(document, { code: "BracketRight", metaKey: true, shiftKey: true });
+    expect(spies.openPage).toHaveBeenLastCalledWith("p2");
+  });
+
+  it("wraps from the last tab back to the first on ⌘⇧]", () => {
+    const { spies } = withTabs({ activePage: "p3" });
+    fireEvent.keyDown(document, { code: "BracketRight", metaKey: true, shiftKey: true });
+    expect(spies.openPage).toHaveBeenLastCalledWith("p1");
+  });
+
+  it("cycles to the previous tab on ⌘⇧[ (wrapping past the first to the last)", () => {
+    const { spies } = withTabs();
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, shiftKey: true });
+    expect(spies.openPage).toHaveBeenLastCalledWith("p3");
+  });
+
+  it("accepts Ctrl as well as ⌘ for tab cycling", () => {
+    const { spies } = withTabs();
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, shiftKey: true });
+    expect(spies.openPage).toHaveBeenLastCalledWith("p2");
+  });
+
+  it("creates a new top-level page on ⌘T and ⌘N", () => {
+    const { spies } = withTabs();
+    fireEvent.keyDown(document, { code: "KeyT", metaKey: true });
+    fireEvent.keyDown(document, { code: "KeyN", metaKey: true });
+    expect(spies.createChildPage).toHaveBeenCalledTimes(2);
+    expect(spies.createChildPage).toHaveBeenNthCalledWith(1, null);
+    expect(spies.createChildPage).toHaveBeenNthCalledWith(2, null);
+  });
+
+  it("leaves ⌘W to the window — it never closes a doc tab or creates a page", () => {
+    const { spies } = withTabs();
+    fireEvent.keyDown(document, { code: "KeyW", metaKey: true });
+    expect(spies.closeTab).not.toHaveBeenCalled();
+    expect(spies.openPage).not.toHaveBeenCalled();
+    // createChildPage is spied lazily on first access; ⌘W must never reach it,
+    // so the spy stays undefined (and if present, uncalled).
+    if (spies.createChildPage) expect(spies.createChildPage).not.toHaveBeenCalled();
+  });
+
+  it("keeps the tab strip scrollable but hides the scrollbar chrome", () => {
+    withTabs();
+    const strip = screen.getByRole("tablist", { name: "Open pages" });
+    // scroll is retained (overflow-x auto) …
+    expect(strip).toHaveStyle({ overflowX: "auto" });
+    // … while the .no-scrollbar utility suppresses the global 10px bar.
+    expect(strip.className).toContain("no-scrollbar");
+  });
+
+  it("writes a page comment through the panel composer (no window.prompt)", () => {
+    const { spies } = renderPagesView();
+
+    fireEvent.click(screen.getByRole("button", { name: "Comment on page" }));
+    // the panel opens with the composer aimed at the page.
+    screen.getByRole("form", { name: "New comment on this page" });
+
+    fireEvent.change(screen.getByLabelText("New comment text"), {
+      target: { value: "ship checklist looks thin" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add comment" }));
+
+    expect(spies.addComment).toHaveBeenCalledWith({
+      target: "p1",
+      text: "ship checklist looks thin",
+    });
+    // submit dismisses the composer; the panel itself stays open.
+    expect(screen.queryByRole("form", { name: "New comment on this page" })).toBeNull();
+    screen.getByRole("complementary", { name: "Comments" });
   });
 });

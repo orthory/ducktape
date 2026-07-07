@@ -15,6 +15,7 @@ import { color, font, radius } from "../../theme/tokens";
 import { selfAuthorKeyOf } from "./chat-helpers";
 import { Composer } from "./Composer";
 import { HoverButton } from "./HoverButton";
+import { HuddleHeaderButton, HuddleRailBadge } from "./Huddle";
 import { MessageList } from "./MessageList";
 import { ThreadPanel } from "./ThreadPanel";
 
@@ -66,6 +67,10 @@ function PolicyToggle({ value, onChange }: { value: PostPolicy; onChange: (polic
 
 // ── Channel rail ────────────────────────────────────────
 
+/** The channel rail's fixed width — ConsoleShell sizes the floating huddle
+ *  dock to sit inside this rail, so the two must agree. */
+export const CHANNEL_RAIL_WIDTH = 200;
+
 function ChannelRail() {
   const { state, actions } = useDucktape();
   const [draft, setDraft] = useState("");
@@ -83,7 +88,7 @@ function ChannelRail() {
   return (
     <div
       style={{
-        width: 200,
+        width: CHANNEL_RAIL_WIDTH,
         flexShrink: 0,
         borderRight: `1px solid ${color.borderSoft}`,
         background: color.sidebar,
@@ -188,6 +193,7 @@ function ChannelRail() {
               <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {channel.name}
               </span>
+              <HuddleRailBadge channel={channel} />
             </button>
           );
         })}
@@ -392,6 +398,7 @@ export function ChatView() {
               <LockGlyph size={10} /> Members only
             </span>
           )}
+          {channel && <HuddleHeaderButton channel={channel} />}
         </div>
 
         {channel ? (

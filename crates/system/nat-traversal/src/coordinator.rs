@@ -1,36 +1,30 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use crate::advert::{AdvertBook, AdvertOutcome};
+use crate::auth::{verify_request, AuthPolicy, DEFAULT_FRESHNESS_WINDOW_SECS};
+use crate::AuthRequest;
 use crate::{Msg, NodeKey};
-
-/// Which side of an unordered relay pair a caller is. The pair is stored in
-/// canonical (byte-sorted) key order; `A` is the smaller key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Side {
-    A,
-    B,
-}
-
-struct RelaySession {
-    a: NodeKey,
-    b: NodeKey,
-    last_activity: u64,
-}
-
-fn canonical_pair(x: NodeKey, y: NodeKey) -> (NodeKey, NodeKey) {
-    if x.0 <= y.0 { (x, y) } else { (y, x) }
-}
 
 /// The untrusted entry helper. Maps a node key to the reflexive address the
 /// coordinator observed for it, and brokers a simultaneous-open. Holds no key
-/// material, no plaintext, no mesh authority.
-#[derive(Default)]
+/// material, no plaintext, no mesh authority — and never carries peer traffic:
+/// rendezvous only, no relay.
 pub struct Coordinator {
     adverts: AdvertBook,
-    relay_by_pair: HashMap<(NodeKey, NodeKey), u64>,
-    relay_sessions: HashMap<u64, RelaySession>,
-    next_session: u64,
+    policy: AuthPolicy,
+    window: u64,
+    rejects: u64,
+}
+
+impl Default for Coordinator {
+    fn default() -> Self {
+        Self {
+            adverts: AdvertBook::default(),
+            policy: AuthPolicy::default(), // fully-open
+            window: DEFAULT_FRESHNESS_WINDOW_SECS,
+            rejects: 0,
+        }
+    }
 }
 
 impl Coordinator {
@@ -38,8 +32,79 @@ impl Coordinator {
         Self::default()
     }
 
+    /// Construct with an explicit authorization policy.
+    pub fn with_policy(policy: AuthPolicy) -> Self {
+        Self { policy, ..Self::default() }
+    }
+
+    /// Count of requests dropped by the auth gate (observability).
+    pub fn rejects(&self) -> u64 {
+        self.rejects
+    }
+
+    /// Authenticate then handle one authenticated request. `now` is wall-clock
+    /// seconds. A failed authenticator produces NO reply and bumps the counter.
+    pub fn handle_auth(
+        &mut self,
+        from: SocketAddr,
+        req: AuthRequest,
+        now: u64,
+    ) -> Vec<(SocketAddr, Msg)> {
+        // Only request shapes are wrappable; a non-request inner is malformed.
+        let Some(inner_subject) = req.inner.subject_key() else {
+            self.rejects += 1;
+            return Vec::new();
+        };
+        // Anti-poisoning: for the SELF-ops (BindRequest/Register/Readvertise) the
+        // inner key IS the acting node, so it must equal the authenticated
+        // caller — otherwise an admitted member could register or re-advertise
+        // ANOTHER node's key. A `Lookup` has no such constraint: a member looks
+        // up a DIFFERENT peer, so its inner key is expected to differ.
+        let is_self_op = !matches!(req.inner, Msg::Lookup { .. });
+        if is_self_op && inner_subject != req.caller {
+            self.rejects += 1;
+            return Vec::new();
+        }
+        // Authenticate the CALLER (the PoP-signing identity), not the inner key.
+        match verify_request(&self.policy, now, self.window, req.caller, &req.inner.encode(), &req.auth) {
+            Ok(()) => self.handle_with_caller(from, req.inner, Some(req.caller)),
+            Err(_) => {
+                self.rejects += 1;
+                Vec::new()
+            }
+        }
+    }
+
+    /// Handle a legacy (unauthenticated) request. Accepted ONLY under the
+    /// fully-open policy; any auth-requiring policy drops it.
+    pub fn handle_legacy(&mut self, from: SocketAddr, msg: Msg) -> Vec<(SocketAddr, Msg)> {
+        if matches!(self.policy, AuthPolicy::Open { require_pop: false }) {
+            self.handle(from, msg)
+        } else {
+            self.rejects += 1;
+            Vec::new()
+        }
+    }
+
     /// Handle one datagram observed from `from`; return datagrams to send.
+    /// The legacy/unauthenticated path — the caller identity is unknown, so a
+    /// `Lookup`'s PunchSync fan-out reverse-maps the source (see
+    /// [`Self::handle_with_caller`]).
     pub fn handle(&mut self, from: SocketAddr, msg: Msg) -> Vec<(SocketAddr, Msg)> {
+        self.handle_with_caller(from, msg, None)
+    }
+
+    /// The pure handler. `caller`, when `Some`, is the AUTHENTICATED requesting
+    /// identity — used for a `Lookup`'s peer-directed `PunchSync` so the passive
+    /// side learns the caller's real key even before the caller has registered.
+    /// When `None` (legacy path) the caller key is reverse-mapped from the
+    /// datagram source, falling back to a zero key.
+    fn handle_with_caller(
+        &mut self,
+        from: SocketAddr,
+        msg: Msg,
+        caller: Option<NodeKey>,
+    ) -> Vec<(SocketAddr, Msg)> {
         match msg {
             Msg::BindRequest { .. } => {
                 vec![(from, Msg::BindResponse { reflexive: from })]
@@ -63,62 +128,27 @@ impl Coordinator {
                 let target = self.adverts.current(key);
                 let mut out = vec![(from, Msg::LookupResponse { key, reflexive: target })];
                 if let Some(peer_addr) = target {
-                    // Find the caller's own key by reverse-mapping its source;
-                    // fall back to a zero key if it never registered (still lets
-                    // the target learn the caller's reflexive to punch back).
-                    let caller_key = self.adverts.key_for_src(from).unwrap_or(NodeKey([0u8; 32]));
+                    // The caller's key for the peer-directed PunchSync: the
+                    // AUTHENTICATED caller when we have one, else reverse-map the
+                    // datagram source (legacy path), falling back to a zero key
+                    // if it never registered (the target still learns the
+                    // caller's reflexive to punch back).
+                    let caller_key = caller
+                        .or_else(|| self.adverts.key_for_src(from))
+                        .unwrap_or(NodeKey([0u8; 32]));
                     out.push((from, Msg::PunchSync { peer: key, peer_reflexive: peer_addr }));
                     out.push((peer_addr, Msg::PunchSync { peer: caller_key, peer_reflexive: from }));
                 }
                 out
             }
             // The coordinator never routes these through `handle`:
-            // BindResponse/LookupResponse/PunchSync/Punch are node-directed;
-            // RelayRequest is intercepted by the async loop (it must bind
-            // sockets); RelayGrant is node-directed. Ignore defensively.
+            // BindResponse/LookupResponse/PunchSync/Punch are node-directed.
+            // Ignore defensively.
             Msg::BindResponse { .. }
             | Msg::LookupResponse { .. }
             | Msg::PunchSync { .. }
-            | Msg::Punch { .. }
-            | Msg::RelayRequest { .. }
-            | Msg::RelayGrant { .. } => Vec::new(),
+            | Msg::Punch { .. } => Vec::new(),
         }
-    }
-
-    /// Reachability-plane relay allocation. Given the caller's observed source
-    /// and the peer key it wants to relay to, return the shared session id for
-    /// the unordered `{caller, peer}` pair and which side the caller is. The
-    /// caller must have registered (so its source can be bound to its key),
-    /// else `None`.
-    ///
-    /// This is deliberately NOT the wireguard-upgrade validator relay: it never
-    /// produces a `ValidatorIdentity` or a `DirectDialFailureEvidence` and
-    /// carries no consensus authority. It holds only public `NodeKey`s and a
-    /// session id.
-    pub fn request_relay(
-        &mut self,
-        caller_src: SocketAddr,
-        peer: NodeKey,
-        now: u64,
-    ) -> Option<(u64, Side)> {
-        let caller = self.adverts.key_for_src(caller_src)?;
-        let (a, b) = canonical_pair(caller, peer);
-        let session = match self.relay_by_pair.get(&(a, b)) {
-            Some(&s) => s,
-            None => {
-                let s = self.next_session;
-                self.next_session = self.next_session.wrapping_add(1);
-                self.relay_by_pair.insert((a, b), s);
-                s
-            }
-        };
-        let entry = self
-            .relay_sessions
-            .entry(session)
-            .or_insert(RelaySession { a, b, last_activity: now });
-        entry.last_activity = now;
-        let side = if caller == a { Side::A } else { Side::B };
-        Some((session, side))
     }
 
     /// Reachability-plane rebind re-advertisement. A node whose NAT rebound
@@ -126,41 +156,9 @@ impl Coordinator {
     /// under a strictly-higher `nonce` to supersede its stale reflexive; an
     /// equal-or-lower nonce is rejected as stale (a replay cannot clobber the
     /// fresh mapping). After a `Superseded`, a peer's `Lookup` resolves the new
-    /// reflexive. This never touches relay/validator state.
+    /// reflexive.
     pub fn readvertise(&mut self, key: NodeKey, src: SocketAddr, nonce: u64) -> AdvertOutcome {
         self.adverts.readvertise(key, src, nonce)
-    }
-
-    /// Reclaim a single relay session by id: drop it from both `relay_sessions`
-    /// and the `relay_by_pair` index. After this, a later `request_relay` for
-    /// the same unordered pair allocates a FRESH session id (so the async
-    /// coordinator re-binds live relay sockets) instead of handing back a
-    /// torn-down one. Idempotent: releasing an unknown id is a no-op.
-    pub fn release_relay(&mut self, session: u64) {
-        if let Some(s) = self.relay_sessions.remove(&session) {
-            self.relay_by_pair.remove(&(s.a, s.b));
-        }
-    }
-
-    /// Number of live relay sessions. Lets tests assert the idle prune keeps
-    /// relay state bounded. (Public; not dead code in a plain build.)
-    pub fn relay_session_count(&self) -> usize {
-        self.relay_sessions.len()
-    }
-
-    /// Drop relay sessions idle longer than `idle_ticks`. Keeps relay state
-    /// bounded: a session with no traffic is torn down so the coordinator never
-    /// accumulates unbounded `SocketAddr` pairs.
-    pub fn prune_relays(&mut self, now: u64, idle_ticks: u64) {
-        let expired: Vec<u64> = self
-            .relay_sessions
-            .iter()
-            .filter(|(_, s)| now.saturating_sub(s.last_activity) > idle_ticks)
-            .map(|(&id, _)| id)
-            .collect();
-        for id in expired {
-            self.release_relay(id);
-        }
     }
 }
 
@@ -273,74 +271,159 @@ mod tests {
     }
 
     #[test]
-    fn relay_request_allocates_one_session_per_unordered_pair() {
-        let mut c = Coordinator::new();
+    fn private_policy_admits_authorized_register_and_lookup_but_drops_unauthorized() {
+        use crate::auth::{sign_authenticator, mint_coord_cap, now_secs, AuthPolicy};
+        use crate::AuthRequest;
+        use commonware_cryptography::{ed25519, Signer as _};
+
+        let g = ed25519::PrivateKey::from_seed(100);
+        let node = ed25519::PrivateKey::from_seed(200);
+        let mut nb = [0u8; 32];
+        nb.copy_from_slice(node.public_key().as_ref());
+        let subject = NodeKey(nb);
+        let now = now_secs();
+
+        let mut c = Coordinator::with_policy(AuthPolicy::Private { genesis_set: vec![g.public_key()] });
+        let src = addr(1, 1111);
+
+        // Authorized: joiner with a valid genesis cap registers -> mapping created.
+        let reg = Msg::Register { key: subject };
+        let cap = mint_coord_cap(&g, subject, now + 3600);
+        let auth = sign_authenticator(&node, &reg.encode(), now, Some(cap));
+        let out = c.handle_auth(src, AuthRequest { caller: subject, inner: reg, auth }, now);
+        assert!(out.is_empty());
+        // A lookup from the same authorized node resolves it. The caller is the
+        // authenticated principal; here it looks up its OWN key.
+        let lk = Msg::Lookup { key: subject };
+        let lauth = sign_authenticator(&node, &lk.encode(), now, Some(mint_coord_cap(&g, subject, now + 3600)));
+        let out = c.handle_auth(src, AuthRequest { caller: subject, inner: lk, auth: lauth }, now);
+        assert!(out.iter().any(|(_, m)| matches!(m, Msg::LookupResponse { reflexive: Some(_), .. })));
+
+        // Unauthorized: outsider (no cap) -> dropped, no mapping, reject counted.
+        let outsider = ed25519::PrivateKey::from_seed(201);
+        let mut ob = [0u8; 32];
+        ob.copy_from_slice(outsider.public_key().as_ref());
+        let osub = NodeKey(ob);
+        let before = c.rejects();
+        let oreg = Msg::Register { key: osub };
+        let oauth = sign_authenticator(&outsider, &oreg.encode(), now, None);
+        let out = c.handle_auth(addr(2, 2222), AuthRequest { caller: osub, inner: oreg, auth: oauth }, now);
+        assert!(out.is_empty());
+        assert_eq!(c.rejects(), before + 1);
+        // The outsider's key never entered the book: an AUTHORIZED lookup for it
+        // resolves to None (the dropped register created no mapping). The
+        // outsider here holds a genesis cap, so it authenticates as the caller
+        // and looks up its own (unregistered) key.
+        let lk = Msg::Lookup { key: osub };
+        let lauth = sign_authenticator(&outsider, &lk.encode(), now, Some(mint_coord_cap(&g, osub, now + 3600)));
+        let out = c.handle_auth(src, AuthRequest { caller: osub, inner: lk, auth: lauth }, now);
+        assert!(out.iter().any(|(_, m)| matches!(m, Msg::LookupResponse { reflexive: None, .. })));
+    }
+
+    #[test]
+    fn cross_peer_lookup_authenticates_the_caller_and_fans_out() {
+        // The previously-impossible path: caller A (admitted) looks up a
+        // DIFFERENT peer B. Authentication is against A's key (the caller), so
+        // A's PoP — signed with A's own key — validates, and the coordinator
+        // returns B's mapping plus a PunchSync fan-out carrying A's REAL key.
+        use crate::auth::{sign_authenticator, mint_coord_cap, now_secs, AuthPolicy};
+        use crate::AuthRequest;
+        use commonware_cryptography::{ed25519, Signer as _};
+
+        let g = ed25519::PrivateKey::from_seed(300);
+        let a = ed25519::PrivateKey::from_seed(301);
+        let b = ed25519::PrivateKey::from_seed(302);
+        let a_key = { let mut k = [0u8; 32]; k.copy_from_slice(a.public_key().as_ref()); NodeKey(k) };
+        let b_key = { let mut k = [0u8; 32]; k.copy_from_slice(b.public_key().as_ref()); NodeKey(k) };
+        let now = now_secs();
+
+        let mut c = Coordinator::with_policy(AuthPolicy::Private { genesis_set: vec![g.public_key()] });
         let a_src = addr(1, 1111);
         let b_src = addr(2, 2222);
-        let a = NodeKey([0xaa; 32]);
-        let b = NodeKey([0xbb; 32]);
-        c.handle(a_src, Msg::Register { key: a });
-        c.handle(b_src, Msg::Register { key: b });
 
-        let (s_a, side_a) = c.request_relay(a_src, b, 0).expect("a side");
-        let (s_b, side_b) = c.request_relay(b_src, a, 0).expect("b side");
-        // Same unordered pair -> one shared session, opposite sides.
-        assert_eq!(s_a, s_b);
-        assert_ne!(side_a, side_b);
+        // Both register (self-ops, caller == inner key).
+        let a_reg = Msg::Register { key: a_key };
+        let a_auth = sign_authenticator(&a, &a_reg.encode(), now, Some(mint_coord_cap(&g, a_key, now + 3600)));
+        assert!(c.handle_auth(a_src, AuthRequest { caller: a_key, inner: a_reg, auth: a_auth }, now).is_empty());
+        let b_reg = Msg::Register { key: b_key };
+        let b_auth = sign_authenticator(&b, &b_reg.encode(), now, Some(mint_coord_cap(&g, b_key, now + 3600)));
+        assert!(c.handle_auth(b_src, AuthRequest { caller: b_key, inner: b_reg, auth: b_auth }, now).is_empty());
+
+        // A looks up B: inner key is B, caller (and PoP signer) is A.
+        let lk = Msg::Lookup { key: b_key };
+        let lauth = sign_authenticator(&a, &lk.encode(), now, Some(mint_coord_cap(&g, a_key, now + 3600)));
+        let out = c.handle_auth(a_src, AuthRequest { caller: a_key, inner: lk, auth: lauth }, now);
+        // A receives B's reflexive and its own PunchSync toward B.
+        assert!(out.contains(&(a_src, Msg::LookupResponse { key: b_key, reflexive: Some(b_src) })));
+        assert!(out.contains(&(a_src, Msg::PunchSync { peer: b_key, peer_reflexive: b_src })));
+        // The peer-directed fan-out to B carries A's AUTHENTICATED key, not a
+        // reverse-mapped or zero key.
+        assert!(out.contains(&(b_src, Msg::PunchSync { peer: a_key, peer_reflexive: a_src })));
     }
 
     #[test]
-    fn relay_request_without_registration_is_none() {
-        let mut c = Coordinator::new();
-        let stranger = addr(9, 9999);
-        assert!(c.request_relay(stranger, NodeKey([0xbb; 32]), 0).is_none());
+    fn anti_poisoning_rejects_self_op_with_mismatched_caller() {
+        // A member cannot register or re-advertise ANOTHER node's key: for a
+        // self-op the inner key must equal the authenticated caller, so an
+        // AuthRequest whose caller differs from the inner Register key is
+        // rejected and the reject counter increments.
+        use crate::auth::{sign_authenticator, mint_coord_cap, now_secs, AuthPolicy};
+        use crate::AuthRequest;
+        use commonware_cryptography::{ed25519, Signer as _};
+
+        let g = ed25519::PrivateKey::from_seed(400);
+        let attacker = ed25519::PrivateKey::from_seed(401);
+        let attacker_key = { let mut k = [0u8; 32]; k.copy_from_slice(attacker.public_key().as_ref()); NodeKey(k) };
+        let victim_key = { let mut k = [0u8; 32]; k.copy_from_slice(ed25519::PrivateKey::from_seed(402).public_key().as_ref()); NodeKey(k) };
+        let now = now_secs();
+
+        let mut c = Coordinator::with_policy(AuthPolicy::Private { genesis_set: vec![g.public_key()] });
+        let src = addr(1, 1111);
+        let before = c.rejects();
+
+        // Attacker (validly admitted for its OWN key) tries to Register the
+        // victim's key. The PoP verifies against the caller, but the inner key
+        // is the victim's — a self-op mismatch, rejected before dispatch.
+        let reg = Msg::Register { key: victim_key };
+        let auth = sign_authenticator(&attacker, &reg.encode(), now, Some(mint_coord_cap(&g, attacker_key, now + 3600)));
+        let out = c.handle_auth(src, AuthRequest { caller: attacker_key, inner: reg, auth }, now);
+        assert!(out.is_empty());
+        assert_eq!(c.rejects(), before + 1, "self-op with mismatched caller is rejected");
+
+        // The victim's key never entered the book: an authenticated self-lookup
+        // by the attacker for the victim's key resolves to None (no mapping was
+        // poisoned into existence).
+        let lk = Msg::Lookup { key: victim_key };
+        let lauth = sign_authenticator(&attacker, &lk.encode(), now, Some(mint_coord_cap(&g, attacker_key, now + 3600)));
+        let out = c.handle_auth(src, AuthRequest { caller: attacker_key, inner: lk, auth: lauth }, now);
+        assert!(out.iter().any(|(_, m)| matches!(m, Msg::LookupResponse { key, reflexive: None } if *key == victim_key)));
     }
 
     #[test]
-    fn release_relay_reclaims_session_so_re_request_allocates_a_fresh_id() {
-        let mut c = Coordinator::new();
-        let a_src = addr(1, 1111);
-        let a = NodeKey([0xaa; 32]);
-        let b = NodeKey([0xbb; 32]);
-        c.handle(a_src, Msg::Register { key: a });
+    fn legacy_unauthenticated_request_rejected_unless_fully_open() {
+        use crate::auth::AuthPolicy;
+        let key = NodeKey([1u8; 32]);
 
-        let (s0, _) = c.request_relay(a_src, b, 0).expect("session");
-        // The torn-down splice's session is reclaimed by id.
-        c.release_relay(s0);
-        // Re-requesting the same unordered pair must NOT reuse the reclaimed id
-        // (which the async coordinator maps to a dead relay port); it allocates
-        // a fresh session so a live splice is bound.
-        let (s1, _) = c.request_relay(a_src, b, 0).expect("session");
-        assert_ne!(s0, s1);
-        // Releasing an unknown id is a harmless no-op.
-        c.release_relay(9_999);
-    }
+        // Fully-open: a bare Register is accepted (mapping created, nothing rejected).
+        let mut open = Coordinator::new(); // Open { require_pop: false }
+        assert!(open.handle_legacy(addr(1, 1111), Msg::Register { key }).is_empty());
+        assert_eq!(open.rejects(), 0, "fully-open never rejects");
+        let out = open.handle_legacy(addr(2, 2222), Msg::Lookup { key });
+        assert!(
+            out.iter().any(|(_, m)| matches!(m, Msg::LookupResponse { reflexive: Some(_), .. })),
+            "the bare Register created a mapping under fully-open"
+        );
 
-    #[test]
-    fn prune_relays_returns_state_to_zero_bounded() {
-        let mut c = Coordinator::new();
-        let a_src = addr(1, 1111);
-        let a = NodeKey([0xaa; 32]);
-        let b = NodeKey([0xbb; 32]);
-        c.handle(a_src, Msg::Register { key: a });
-        let _ = c.request_relay(a_src, b, 0).expect("session");
-        assert_eq!(c.relay_session_count(), 1);
-        c.prune_relays(100, 10);
-        assert_eq!(c.relay_session_count(), 0, "idle prune bounds relay state");
-    }
-
-    #[test]
-    fn prune_relays_drops_idle_sessions() {
-        let mut c = Coordinator::new();
-        let a_src = addr(1, 1111);
-        let a = NodeKey([0xaa; 32]);
-        let b = NodeKey([0xbb; 32]);
-        c.handle(a_src, Msg::Register { key: a });
-
-        let (s0, _) = c.request_relay(a_src, b, 0).expect("session");
-        c.prune_relays(100, 10); // idle 100 > 10 -> gone
-        // A fresh request re-allocates a NEW session id (the old one was pruned).
-        let (s1, _) = c.request_relay(a_src, b, 200).expect("session");
-        assert_ne!(s0, s1);
+        // require_pop: a bare, unauthenticated Register is dropped and counted.
+        let mut gated = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
+        let before = gated.rejects();
+        assert!(gated.handle_legacy(addr(1, 1111), Msg::Register { key }).is_empty());
+        assert_eq!(gated.rejects(), before + 1);
+        // No mapping was created: a lookup for the same key resolves to None.
+        let out = gated.handle_legacy(addr(2, 2222), Msg::Lookup { key });
+        // (The lookup is itself a legacy request, also dropped under require_pop —
+        // so it too returns empty; the reject counter is the load-bearing assertion.)
+        assert!(out.is_empty());
+        assert_eq!(gated.rejects(), before + 2);
     }
 }

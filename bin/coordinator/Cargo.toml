@@ -3,6 +3,10 @@ name = "coordinator-bin"
 edition.workspace = true
 version.workspace = true
 
+[lib]
+name = "coordinator_bin"
+path = "src/lib.rs"
+
 [[bin]]
 name = "coordinator"
 path = "src/main.rs"
@@ -10,7 +14,14 @@ path = "src/main.rs"
 [dependencies]
 nat-traversal = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
+# reading the PUBLIC genesis valset out of network.toml (--genesis-set). No
+# secret, no node-crate dependency: a local GenesisPin struct + hex decode.
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
+serde = { workspace = true }
+toml = "0.8"
 
 [dev-dependencies]
-nat-traversal = { workspace = true, features = ["simnat"] }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "process", "io-util"] }
+commonware-cryptography = { workspace = true }
+tempfile = "3"

@@ -15,8 +15,8 @@ analysis) lives in git.
   `reachability` orchestrator crate: per-epoch record gossip → signed
   advertisements → `MeshView::verify` → pairwise handshakes → one
   `apply_tunnel_plans` per epoch, with `NatResolver`
-  (STUN/rendezvous/punch/relay via the coordinator) resolving each peer's
-  UDP endpoint.
+  (STUN/rendezvous/punch via the coordinator; no relay — a failed punch is
+  terminal) resolving each peer's UDP endpoint.
 
 **Transitive gossip.** Reachability-plane messages no longer assume pairwise
 transport: records/adverts flood with nonce dedup, handshake messages fan to
@@ -45,17 +45,41 @@ signature; any active member relays the proof as `ValsetMsg::Online`
 (re-verified in-module), and the activation cutover widens the quorum. A
 registered-but-absent node costs consensus nothing.
 
-## The join recipe (coordinated-only invite + ephemeral ingress)
+## The join recipe (tunnel-first invite — no TCP ingress at all)
 
-1. Inviter mints `coordinated:<key>@<coordinator>#<coord_key>` plus one
-   throwaway `fronted:` hint (any TCP ingress that reaches it — the join
-   window only).
-2. Joiner parks through the ingress, delivers its key over the lobby;
-   `invite-accept` registers it standby.
-3. The joiner syncs, announces online, activates; the reachability plane
-   brings up its tunnels (gossip relayed through the ingress link, WireGuard
-   punched/relayed via the coordinator); the mesh dials its overlay ULA.
-4. The ingress can die: mesh traffic rides the tunnels.
+The throwaway `fronted:` TCP hint is gone: the invite blob IS the VPN
+credential, and the join window's carrier is the invite tunnel itself.
+
+1. A member runs `invite`: the signed blob carries the network descriptor,
+   the member's WireGuard public key + underlay UDP endpoint, its UDP intro
+   endpoint (`invite_listen`, default WG port + 1), its overlay mesh port,
+   an expiry, and a single-use token — minting IS the admission decision.
+2. `join <blob>` writes the workspace with WireGuard-shape defaults (own
+   plane, dual-stack mesh listen, `advertised = "overlay"`, the inviter's
+   overlay ULA as a Direct dial hint) and the node starts: it installs the
+   inviter as a join-window tunnel peer straight from the blob, announces
+   its identity + WireGuard key to the intro listener (one
+   token-authenticated datagram; the inviter installs the peer and acks),
+   and the tunnel comes up — before any p2p.
+3. The mesh dials the inviter's overlay ULA the moment the tunnel routes;
+   the joiner's lobby announce rides it, and the receiving member submits
+   the governance `Redeem` op automatically — no approval verb. The grant
+   cutover re-tracks the mesh, the pre-warm layer assembles tunnels with
+   every member, and the joiner syncs (rotating across every serving
+   validator) into a serving FULL NODE.
+4. Seating it in the quorum stays a separate, deliberate act (`promote`) —
+   the existing standby → online → activation machinery unchanged.
+
+Deliberate bounds, for now: the intro listener is inviter-hosted UDP, so
+the INVITER's WG/intro ports must be underlay-reachable (one forwarded UDP
+port suffices; the joiner needs nothing). A coordinator-relayed intro for a
+fully-NATed inviter is the named follow-up on the coordinator-auth thread.
+
+The two-node real-WireGuard container smoke that proved mesh-over-tunnels
+(and its cold-restart leg) lives at `ops/wg-smoke/run-smoke.sh`; extending
+it to drive this join recipe end-to-end on real tunnels is the standing
+verification gate for the tunnel-first flow (the TCP-carrier halves are
+proven by `bin/node/tests/join_request_e2e.rs`).
 
 ## Cold restart (shipped)
 
@@ -78,9 +102,9 @@ recipe above remains required for the join window).
 
 The plane's epochs still version ACTIVE members only (phase A's all-members
 rule stands — a registered-but-absent key must never stall an epoch), but
-the observer tier now rides a separate PRE-WARM layer with the opposite
+the resident tier now rides a separate PRE-WARM layer with the opposite
 trade: never versioned, never handshaked, applied live. Every `Retarget`
-carries the epoch's observer set as `standbys`; a standby's owner-signed
+carries the epoch's resident set as `standbys`; a standby's owner-signed
 `EndpointRecord` (bound to the epoch tuple, policy-checked, nonce-superseded)
 installs a tunnel by re-applying the full interface config in place — the
 same record-derived trust model as the cold-restart restore — and a
@@ -95,10 +119,15 @@ activation cutover, not seconds after.
 
 ## What remains (this seam's follow-ons)
 
-1. **Coordinator-auth (§3.5 of the original doc).** Rendezvous messages still
-   carry no inviter-signed token; a compromised coordinator can deny service
-   (never substitute keys — records pin WireGuard keys under the owner's
-   ed25519 signature). The token design remains open.
-2. **Relay-bind caveat.** A coordinator behind `0.0.0.0` must advertise a
-   routable relay IP — `run_coordinator_advertised` exists; operator guidance
-   in [`coordinator.md`](coordinator.md).
+1. **Coordinator-auth (§3.5 of the original doc).** The join window's first
+   contact is now token-authenticated end to end (the intro datagram carries
+   the inviter-signed token + the joiner's proofs), but COORDINATOR
+   rendezvous messages still carry no token; a compromised coordinator can
+   deny service (never substitute keys — records pin WireGuard keys under
+   the owner's ed25519 signature). Extending the intro's token discipline to
+   the rendezvous — and a coordinator-RELAYED intro for a fully-NATed
+   inviter — remains open.
+
+(The former item 2 — the relay-bind caveat — dissolved when the DERP-style
+relay was removed on 2026-07-06: a wildcard-bound coordinator is now fully
+functional, since every answer derives from the datagram's observed source.)

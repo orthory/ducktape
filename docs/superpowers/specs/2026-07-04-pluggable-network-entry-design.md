@@ -4,6 +4,15 @@ Status: design of record. Phase 1 (sentry) is implementable on the current
 mesh with a contained change. Phases 2–3 (coordinator, private cutover) are
 scoped here but deferred to their own spec→plan→impl cycles.
 
+**Amended 2026-07-06:** the optional coordinator transport relay (the
+DERP-style ciphertext splice, service 3 below) was built under the P2+P3 epic
+and subsequently **removed**. The coordinator is rendezvous + STUN only; the
+sole relay concept left in the system is the validator-only WireGuard
+data-plane `relay_candidates` mechanism. See
+`2026-07-05-private-cutover-coordinator-design.md` (amendment note) for the
+rationale. The relay text below is retained as the original design record,
+annotated where it no longer holds.
+
 Companion to `docs/wireguard-tunnel-upgrade.md`. That document specifies the
 validator-owned WireGuard **data-plane** tunnel-upgrade protocol. This document
 specifies the orthogonal **reachability plane**: how a node reaches the mesh at
@@ -201,8 +210,10 @@ A **coordinator** is a non-validator node that provides entry services only:
 1. **Rendezvous** — help a joiner find a current mesh member to bootstrap from.
 2. **Reflexive address (STUN-style)** — tell a NAT'd node its observed public
    `ip:port` so it can advertise it and attempt a direct data tunnel.
-3. **Transport relay (optional)** — a ciphertext splice used when direct dialing
-   fails; the reachability-plane equivalent of a DERP relay.
+3. ~~**Transport relay (optional)** — a ciphertext splice used when direct
+   dialing fails; the reachability-plane equivalent of a DERP relay.~~
+   *Removed 2026-07-06 (see the amendment note): the coordinator never
+   carries peer traffic.*
 
 The coordinator is not in the validator set, not in consensus, never serves
 state, and never decrypts. It generalizes the "hosted service" role so that
@@ -230,12 +241,11 @@ Cutover sequence, after admission over the entry plane:
 2. Attempt a **direct WireGuard** tunnel using either a static reachable UDP
    endpoint (if the node has one) or a **UDP hole-punch** coordinated via the
    coordinator's reflexive-address service plus simultaneous-open.
-3. On failure, emit signed `DirectDialFailureEvidence` and fall back to a relay.
-   Two relay flavors, both ciphertext-only, layered:
-   - **WireGuard data-plane relay** — validator-only, per
-     `wireguard-tunnel-upgrade.md` (the trust-minimized default).
-   - **Coordinator relay** — non-validator, reachability-plane (the pragmatic
-     fallback when no validator relay is reachable).
+3. On failure, emit signed `DirectDialFailureEvidence` and fall back to the
+   **WireGuard data-plane relay** — validator-only, per
+   `wireguard-tunnel-upgrade.md`. *(The original design listed a second,
+   coordinator-relay flavor here; it was built and then removed 2026-07-06 —
+   at the reachability plane, a failed punch is now terminal and surfaced.)*
 
 This phase wires the currently-inert effect layer
 (`WGApi::configure_interface`) and delivers the missing NAT-traversal primitive
@@ -246,7 +256,7 @@ and direct, and the coordinator drops out of the data path.
 
 | Actor | Can | Cannot |
 |-------|-----|--------|
-| Sentry / reverse tunnel / coordinator relay | Forward ciphertext, observe traffic metadata, withhold/delay | Read content, impersonate a peer, serve state, join consensus |
+| Sentry / reverse tunnel | Forward ciphertext, observe traffic metadata, withhold/delay | Read content, impersonate a peer, serve state, join consensus |
 | Coordinator (rendezvous / STUN) | Learn coarse topology + reflexive addresses, withhold service | Read content, impersonate, **MITM** |
 
 "Free tailnet lock": endpoint and WireGuard-key advertisements are signed by the
@@ -265,7 +275,9 @@ This model is strictly weaker-trust than making the relay a validator: a
 validator relay carries consensus authority, whereas a reachability-plane relay
 carries none. The existing "relay must be a validator" rule is thus a
 self-sovereignty choice for the data plane, not a security necessity for the
-reachability plane.
+reachability plane. *(With the coordinator relay removed, this weaker-trust
+argument is historical: the validator-only rule now describes every relay in
+the system.)*
 
 ## Roadmap
 
@@ -273,8 +285,8 @@ reachability plane.
 |-------|-------------|------------------|------------|
 | P0 | This design of record | none | n/a |
 | P1 | Sentry: configuration-only fronting confirmed + integration test + deployment recipes (typed reach hint / guardrails deferred — not needed; see the Phase 1 plan) | none | now |
-| P2 | Coordinator role: rendezvous + STUN reflexive service + coordinator relay | authorization-model addition (addressed, not tracked) | partial |
-| P3 | Private cutover: WGApi wiring + UDP hole-punch + relay fallback | data-plane wiring | staged |
+| P2 | Coordinator role: rendezvous + STUN reflexive service (relay built, then removed 2026-07-06) | authorization-model addition (addressed, not tracked) | partial |
+| P3 | Private cutover: WGApi wiring + UDP hole-punch (punch failure is terminal — no relay fallback) | data-plane wiring | staged |
 
 Each phase is independently useful and gets its own spec→plan→impl cycle.
 

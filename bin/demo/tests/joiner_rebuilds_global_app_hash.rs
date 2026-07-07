@@ -5,9 +5,9 @@
 //!
 //! the source drives real content through each module's own execute +
 //! commit_block path (payloads built via the modules' crate-root wire types, exactly as the
-//! demo binary does), including OVERWRITES in kv and document: a qmdb root is
+//! demo binary does), including OVERWRITES in kv: a qmdb root is
 //! op-log ordered, so a naive "export current pairs and re-apply" could never
-//! reproduce it — only the real sync path can. the joiner rebuilds kv, document,
+//! reproduce it — only the real sync path can. the joiner rebuilds kv
 //! and chat through the qmdb sync engine (target + resolver), forge / valset /
 //! directory / saga / agent through snapshot + install gated on the source
 //! root, and greeter fresh (stateless). every reconstructed module is then
@@ -41,11 +41,6 @@ use demo::state_sync::{
 };
 use directory::Directory;
 use directory::{DirMsg, encode_msg as dir_encode_msg};
-use document::Document;
-use document::{
-    Block, BlockKind, DocMsg, DocQuery, DocReply, decode_reply as doc_decode_reply,
-    encode_msg as doc_encode_msg, encode_query as doc_encode_query,
-};
 use forge::Forge;
 use forge::{ForgeMsg, encode_msg as forge_encode_msg};
 use greeter::Greeter;
@@ -168,7 +163,6 @@ impl Module for RegistryEntry {
 #[allow(clippy::too_many_arguments)]
 fn joiner_app_hash(
     kv: &dyn Module,
-    document: &dyn Module,
     chat: &dyn Module,
     directory: &dyn Module,
     greeter: &dyn Module,
@@ -179,14 +173,12 @@ fn joiner_app_hash(
     runs: &dyn Module,
 ) -> StateRoot {
     let kv_entry = RegistryEntry::of("kv", kv);
-    let document_entry = RegistryEntry::of("document", document);
     let chat_entry = RegistryEntry::of("chat", chat);
-    let mods: [&dyn Module; 10] = [
+    let mods: [&dyn Module; 9] = [
         &kv_entry,
         directory,
         greeter,
         forge,
-        &document_entry,
         &chat_entry,
         valset,
         saga,
@@ -276,55 +268,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             kv_encode(&KvMsg::Set {
                 key: b"motd".to_vec(),
                 value: b"final".to_vec(),
-            }),
-        )
-        .await;
-
-        let mut src_document = Document::init(context.child("source_document"), "document").await;
-        commit_op(
-            &mut src_document,
-            0,
-            doc_encode_msg(&DocMsg::CreateDoc {
-                doc_id: "readme".into(),
-            }),
-        )
-        .await;
-        commit_op(
-            &mut src_document,
-            0,
-            doc_encode_msg(&DocMsg::InsertBlock {
-                doc_id: "readme".into(),
-                after: None,
-                block: Block {
-                    id: "title".into(),
-                    kind: BlockKind::Heading,
-                    text: "ducktape".into(),
-                },
-            }),
-        )
-        .await;
-        commit_op(
-            &mut src_document,
-            0,
-            doc_encode_msg(&DocMsg::InsertBlock {
-                doc_id: "readme".into(),
-                after: Some("title".into()),
-                block: Block {
-                    id: "intro".into(),
-                    kind: BlockKind::Paragraph,
-                    text: "a draft".into(),
-                },
-            }),
-        )
-        .await;
-        // overwrite of the doc's qmdb key — op-log order matters here too.
-        commit_op(
-            &mut src_document,
-            0,
-            doc_encode_msg(&DocMsg::UpdateBlock {
-                doc_id: "readme".into(),
-                block_id: "intro".into(),
-                text: "a block document, rebuilt by a joiner".into(),
             }),
         )
         .await;
@@ -429,7 +372,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
 
         let mut src_valset = Valset::new("valset");
         // an established source network: two seated validators plus one
-        // OBSERVER (the staged-admission tier, protocol v3), so the
+        // RESIDENT (the staged-admission tier, protocol v3), so the
         // two-class snapshot round-trips both sections.
         src_valset.insert(validator_key(7));
         commit_op(
@@ -518,7 +461,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 display_name: "Quackbot".into(),
                 capability: "mock-llm-1".into(),
                 prompt_hash: vec![7u8; 32],
-                prompt_doc: None,
                 allowed_actions: vec![ACTION_CHAT_POST.into()],
             }),
         )
@@ -532,7 +474,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 display_name: "Sleepy".into(),
                 capability: "mock-llm-1".into(),
                 prompt_hash: vec![8u8; 32],
-                prompt_doc: None,
                 allowed_actions: Vec::new(),
             }),
         )
@@ -558,7 +499,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-            None,
         );
         commit_op_as(
             &mut src_runs,
@@ -575,7 +515,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
 
         // ---- the source app-hash: what consensus commits to ------------------
         let src_kv_root = src_kv.root();
-        let src_document_root = src_document.root();
         let src_directory_root = src_directory.root();
         let src_forge_root = src_forge.root();
         let src_chat_root = src_chat.root();
@@ -585,7 +524,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         let src_runs_root = src_runs.root();
         for (id, root) in [
             ("kv", src_kv_root),
-            ("document", src_document_root),
             ("directory", src_directory_root),
             ("forge", src_forge_root),
             ("chat", src_chat_root),
@@ -602,12 +540,11 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         }
 
         let src_global = {
-            let mods: [&dyn Module; 10] = [
+            let mods: [&dyn Module; 9] = [
                 &src_kv,
                 &src_directory,
                 &src_greeter,
                 &src_forge,
-                &src_document,
                 &src_chat,
                 &src_valset,
                 &src_saga,
@@ -699,8 +636,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         )
         .expect("decode kv target");
         let kv_resolver = src_kv.into_resolver();
-        let document_target = src_document.sync_target().await;
-        let document_resolver = src_document.into_resolver();
         let chat_target = src_chat.sync_target().await;
         let chat_resolver = src_chat.into_resolver();
 
@@ -710,14 +645,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             "kv-rebuilt",
             kv_target,
             kv_resolver,
-        )
-        .await
-        .expect("sync_from");
-        let join_document = Document::sync_from(
-            context.child("joiner_document"),
-            "document-rebuilt",
-            document_target,
-            document_resolver,
         )
         .await
         .expect("sync_from");
@@ -755,7 +682,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-            None,
         );
         join_runs
             .install(&runs_bytes, src_runs_root)
@@ -771,11 +697,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             join_kv.root(),
             src_kv_root,
             "kv: synced root != source root"
-        );
-        assert_eq!(
-            join_document.root(),
-            src_document_root,
-            "document: synced root != source root"
         );
         assert_eq!(
             join_chat.root(),
@@ -818,7 +739,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         assert_eq!(
             joiner_app_hash(
                 &join_kv,
-                &join_document,
                 &join_chat,
                 &join_directory,
                 &join_greeter,
@@ -841,19 +761,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
             join_kv.get(b"greeting:name").await.as_deref(),
             Some(b"hello world".as_ref())
         );
-
-        let reply = join_document
-            .query(&doc_encode_query(&DocQuery::GetDoc {
-                doc_id: "readme".into(),
-            }))
-            .await
-            .unwrap();
-        let DocReply::Doc(Some(blocks)) = doc_decode_reply(&reply).unwrap() else {
-            panic!("readme must exist on the joiner");
-        };
-        let ids: Vec<&str> = blocks.iter().map(|b| b.id.as_str()).collect();
-        assert_eq!(ids, ["title", "intro"]);
-        assert_eq!(blocks[1].text, "a block document, rebuilt by a joiner");
 
         assert_eq!(
             chat_messages(&join_chat, "general").await,
@@ -973,7 +880,6 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         assert_eq!(
             joiner_app_hash(
                 &join_kv,
-                &join_document,
                 &join_chat,
                 &join_directory,
                 &join_greeter,

@@ -79,6 +79,17 @@ async fn validators(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
+async fn residents(host: &Host) -> Vec<Vec<u8>> {
+    let reply = host
+        .query("valset", &valset_query(&ValsetQuery::Residents))
+        .await
+        .expect("valset query");
+    match valset_decode(&reply).expect("decode") {
+        ValsetReply::Residents(v) => v,
+        other => panic!("expected Residents, got {other:?}"),
+    }
+}
+
 async fn proposal_status(host: &Host, id: &str) -> Option<ProposalStatus> {
     let reply = host
         .query(
@@ -180,6 +191,74 @@ fn a_passing_proposal_admits_the_validator_and_direct_writes_are_refused() {
         let members = validators(&host).await;
         assert_eq!(members.len(), 3, "the admitted validator is a member");
         assert!(members.contains(&newcomer));
+    });
+}
+
+#[test]
+fn an_add_resident_proposal_grants_resident_standing_at_v0() {
+    // the disregarded version gate, end to end: a v0 block (see submit_as)
+    // proposes AddResident, a majority votes, and execution emits the valset
+    // Grant follow-up — resident standing lands with no protocol upgrade.
+    // before this change the Propose itself rejected below protocol version 3.
+    block_on(async {
+        let mut host = gov_host();
+        let (m1, m2, friend) = (member_key(1), member_key(2), member_key(9));
+
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "observe-9".into(),
+                action: GovAction::AddResident {
+                    key: friend.clone(),
+                },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect("propose AddResident at v0");
+        for (who, at) in [(&m1, 2u64), (&m2, 3u64)] {
+            submit_as(
+                &mut host,
+                who,
+                at,
+                "governance",
+                gov_encode(&GovMsg::Vote {
+                    proposal_id: "observe-9".into(),
+                    approve: true,
+                }),
+            )
+            .await
+            .expect("vote");
+        }
+        submit_as(
+            &mut host,
+            &m2,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "observe-9".into(),
+            }),
+        )
+        .await
+        .expect("execute");
+
+        assert_eq!(
+            proposal_status(&host, "observe-9").await,
+            Some(ProposalStatus::Passed)
+        );
+        assert_eq!(
+            residents(&host).await,
+            vec![friend],
+            "resident standing granted at protocol_version 0"
+        );
+        assert_eq!(
+            validators(&host).await.len(),
+            2,
+            "the validator set is untouched by a resident grant"
+        );
     });
 }
 

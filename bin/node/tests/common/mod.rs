@@ -174,21 +174,17 @@ impl NetworkShapeCluster {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// the token-less invite: the joiner's pubkey travels out-of-band and no
-    /// lobby announce happens — the pre-token manual flow, kept working.
-    pub fn invite_manual(&self) -> String {
-        let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
-            .args(["invite", "--manual", "--config"])
-            .arg(cfg)
-            .output()
-            .expect("run invite --manual");
-        assert!(
-            out.status.success(),
-            "invite --manual failed:\n{}",
-            command_output(&out)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    /// a MANUAL-flow join: every invite is tokened now (mint is the
+    /// admission), so the manual path is made by joining normally and then
+    /// dropping the stored credential — the node parks with no announce and
+    /// admission stays a member verb, which is exactly what the staged
+    /// admission tests exercise.
+    pub fn join_friend_manual(&self, invite: &str) -> String {
+        let key = self.join_friend(invite);
+        for stale in ["invite.token", "invite-wireguard.toml"] {
+            let _ = std::fs::remove_file(self.friend_dir.join(stale));
+        }
+        key
     }
 
     /// the founder's verified join-request queue, parsed from the
@@ -347,7 +343,7 @@ impl NetworkShapeCluster {
     }
 
     /// drive a membership ceremony verb (`promote`, `invite-accept`,
-    /// `observer-remove`) against node 0's running rpc, from node 0's config.
+    /// `resident-remove`) against node 0's running rpc, from node 0's config.
     pub fn run_membership_verb(&self, verb: &str, pubkey_hex: &str) -> (bool, String) {
         let cfg = self.config_file(0);
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
@@ -508,7 +504,7 @@ impl Cluster {
     }
 
     /// remove node `idx`'s storage directory — a killed slot reused as a
-    /// FRESH observer (the sync-only rebuild) must not inherit the previous
+    /// FRESH resident (the sync-only rebuild) must not inherit the previous
     /// occupant's state or index locks.
     pub fn wipe_storage(&self, idx: usize) {
         let id = self.peer_ids[idx];
@@ -803,6 +799,13 @@ impl Cluster {
         http_request(self.http_ports[idx], method, path, body)
     }
 
+    /// GET a raw TEXT body from node `idx`'s app surface — for non-json
+    /// responses like the Prometheus `/metrics` exposition, which the
+    /// json-parsing [`Self::http`] twin would flatten to `Null`.
+    pub fn http_text(&self, idx: usize, path: &str) -> (u16, String) {
+        http_text_request(self.http_ports[idx], path)
+    }
+
     /// every running node's log tail — the panic payload that makes a stalled
     /// mesh diagnosable from a CI failure alone.
     pub fn all_log_tails(&self, lines: usize) -> String {
@@ -881,6 +884,33 @@ pub fn http_request(
         .and_then(|b| serde_json::from_str(b.trim()).ok())
         .unwrap_or(serde_json::Value::Null);
     (status, payload)
+}
+
+/// GET a raw TEXT body from an app-surface port — the non-json twin of
+/// [`http_request`], for bodies like the Prometheus `/metrics` exposition.
+pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
+    use std::io::Read as _;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("app-surface connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("app-surface read timeout");
+    let req =
+        format!("GET {path} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).expect("app-surface write");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("app-surface read");
+    let text = String::from_utf8_lossy(&raw);
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    (status, body)
 }
 
 /// poll `probe` every 300ms until it returns `Some`, or panic with `what`

@@ -5,8 +5,9 @@ version.workspace = true
 
 [dependencies]
 commonware-cryptography.workspace = true
+commonware-codec.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros"] }
+tokio = { workspace = true, features = ["net", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros", "rt-multi-thread"] }

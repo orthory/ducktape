@@ -60,6 +60,9 @@ export const opKey = {
    *  reaction chip is its own optimistic feedback). */
   reaction: (channelId: string, seq: number, emoji: string) =>
     `chat/${channelId}/seq/${seq}/react/${emoji}`,
+  /** A join/leave of a channel's voice huddle — keyed by channel so the pill's
+   *  optimistic roster change carries a finalization record. */
+  huddle: (channelId: string) => `chat/huddle/${channelId}`,
   forgeHead: () => "forge/head",
   page: (pageId: string) => `page/${pageId}`,
   /** Page block ids are module-global — no page qualifier needed. */
@@ -73,6 +76,10 @@ export const opKey = {
   jobWorker: () => "agent/job-worker",
   proposal: (proposalId: string) => `governance/${proposalId}`,
   file: (fileId: string) => `file/${fileId}`,
+  /** A comment write (edit/delete) — keyed by the comment id. */
+  comment: (commentId: string) => `comment/${commentId}`,
+  /** A thread write (add first comment / reply / resolve) — keyed by thread. */
+  commentThread: (threadId: string) => `comment-thread/${threadId}`,
 };
 
 // ── Ledger transitions (pure) ───────────────────────────
@@ -127,6 +134,29 @@ export const hasFreshPending = (ops: OpLedger, now: number): boolean =>
   Object.values(ops).some(
     (op) => op.phase === "pending" && now - op.startedAt < OP_STALE_MS,
   );
+
+/** Entity-key prefixes whose optimistic projections live in the pages slices
+ *  (`pages`, `activePageBlocks`). */
+const PAGE_KEY_PREFIXES = ["page/", "page-block/"] as const;
+
+/** Is a snapshot whose fetch began at `fetchStartedAt` already superseded by
+ *  page ops? True while any page-scoped op is in flight (a fresh pending —
+ *  the snapshot cannot reflect it) or began after the fetch started (it may
+ *  even have settled since, but this snapshot predates it). The holder never
+ *  starves: every such op ends in its own completion/rollback refresh, whose
+ *  later fetch clears both conditions. A stale pending (a presumed-lost
+ *  submit) stops superseding, mirroring hasFreshPending. */
+export const pageSnapshotSuperseded = (
+  ops: OpLedger,
+  fetchStartedAt: number,
+  now: number,
+): boolean =>
+  Object.entries(ops).some(([key, op]) => {
+    if (!PAGE_KEY_PREFIXES.some((prefix) => key.startsWith(prefix))) return false;
+    return op.phase === "pending"
+      ? now - op.startedAt < OP_STALE_MS
+      : op.startedAt >= fetchStartedAt;
+  });
 
 // ── Reading the ledger ──────────────────────────────────
 

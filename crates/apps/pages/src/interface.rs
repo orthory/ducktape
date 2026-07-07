@@ -88,11 +88,17 @@ pub struct BlockRef {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PageMsg {
-    /// create a top-level page: a root block of kind `Page` whose text is
-    /// `title`. idempotent: re-creating an existing page is a benign no-op
-    /// that does NOT overwrite the title. `page_id` is a block id and shares
-    /// the global-uniqueness rule.
-    CreatePage { page_id: String, title: String },
+    /// create a page: a root block of kind `Page` whose text is `title`.
+    /// `parent`, when `Some`, nests this page under another page (a folder
+    /// relation stored only in the enumeration index — content blocks are
+    /// untouched). idempotent: re-creating an existing page is a benign no-op
+    /// that changes neither the title NOR the parent. `page_id` is a block id
+    /// and shares the global-uniqueness rule.
+    CreatePage {
+        page_id: String,
+        title: String,
+        parent: Option<String>,
+    },
     /// insert `block` under `parent` after the given sibling anchor (see the
     /// `after` rule). the parent may be the page root or any block — nesting
     /// is what makes toggles/indent work. rejected when `block.kind` is
@@ -119,6 +125,96 @@ pub enum PageMsg {
     },
     /// remove a block AND its whole subtree. rejected on page roots.
     RemoveBlock { block_id: String },
+    /// re-nest a page under a (possibly new) parent page, or to top level with
+    /// `None`. rejected when the target is not a page root, the parent is not a
+    /// page, or the move would form a cycle in the folder forest.
+    SetPageParent {
+        page_id: String,
+        parent: Option<String>,
+    },
+    /// delete a page: remove its root and whole block subtree, and PROMOTE its
+    /// direct child pages to the deleted page's parent (no cascade). rejected
+    /// when the id is not a page root.
+    DeletePage { page_id: String },
+
+    // ── comments ──
+    // a comment thread anchors to a `target` (a block id or a page id in THIS
+    // module). authorship is derived from the dispatch origin, never a payload
+    // (mirrors the chat module). ids are client-minted like block ids.
+    /// open a thread (when `thread_id` is new) anchored to `target` with this
+    /// first comment, or append `comment_id` to an existing thread (whose
+    /// target must match). author = origin.
+    AddComment {
+        thread_id: String,
+        comment_id: String,
+        target: String,
+        text: String,
+    },
+    /// replace a comment's text; stored-author-only. rejected on a tombstone.
+    EditComment { comment_id: String, text: String },
+    /// tombstone a comment; stored-author-only. when it was the thread's last
+    /// live comment, the whole thread record is removed.
+    DeleteComment { comment_id: String },
+    /// toggle a thread's resolved flag; records the resolver as origin.
+    ResolveThread { thread_id: String, resolved: bool },
+}
+
+// write-time caps for comments (consensus constants) — enforced before staging.
+pub const MAX_COMMENT_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_COMMENTS_PER_THREAD: usize = 4096;
+pub const MAX_THREADS_PER_TARGET: usize = 1024;
+pub const MAX_QUERY_TARGETS: usize = 512;
+
+/// who authored a comment — derived from `Env.origin`, never a payload. own
+/// copy of chat's shape (each module's interface is self-contained).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorRef {
+    User(Vec<u8>),
+    Agent { module: String, agent_id: String },
+    Module(String),
+    System,
+}
+
+/// a comment thread: a `target` (block or page id), its opener, resolve state,
+/// and the ordered ids of its comments (tombstoned comments stay listed until
+/// the whole thread is removed on last-live-delete).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Thread {
+    pub id: String,
+    pub target: String,
+    pub opener: AuthorRef,
+    pub created_at: u64,
+    pub resolved: bool,
+    pub resolved_by: Option<AuthorRef>,
+    pub comment_ids: Vec<String>,
+}
+
+/// one comment. `deleted` tombstones content but keeps the record so ordering
+/// and the thread skeleton survive until the thread is removed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Comment {
+    pub id: String,
+    pub thread_id: String,
+    pub author: AuthorRef,
+    pub text: String,
+    pub created_at: u64,
+    pub edited_at: Option<u64>,
+    pub deleted: bool,
+}
+
+/// a thread plus its live (non-tombstoned) comments in order.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadView {
+    pub thread: Thread,
+    pub comments: Vec<Comment>,
+}
+
+/// the threads anchored to one target.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TargetThreads {
+    pub target: String,
+    pub threads: Vec<ThreadView>,
 }
 
 pub fn encode_msg(m: &PageMsg) -> Vec<u8> {
@@ -143,6 +239,12 @@ pub enum PageQuery {
     /// enumerate every page, served from the module's reserved index entry
     /// (sorted by id), with titles read from the live roots.
     ListPages,
+    /// every thread anchored to any of `targets` (block or page ids), grouped
+    /// by target. a page render calls this once with all visible block ids +
+    /// the page id. `targets` beyond [`MAX_QUERY_TARGETS`] are rejected.
+    ThreadsForTargets { targets: Vec<String> },
+    /// one thread with its live comments.
+    CommentThread { thread_id: String },
 }
 
 /// one entry of [`PageReply::PageList`]: a page id and its current title.
@@ -150,6 +252,8 @@ pub enum PageQuery {
 pub struct PageMeta {
     pub id: String,
     pub title: String,
+    /// the containing page id (folder parent), or `None` for a top-level page.
+    pub parent: Option<String>,
 }
 
 /// replies to a [`PageQuery`]. `Option` mirrors absence.
@@ -159,6 +263,8 @@ pub enum PageReply {
     Page(Option<Vec<Block>>),
     Block(Option<Block>),
     PageList(Vec<PageMeta>),
+    CommentThreads(Vec<TargetThreads>),
+    CommentThread(Option<ThreadView>),
 }
 
 pub fn encode_query(q: &PageQuery) -> Vec<u8> {
@@ -172,4 +278,45 @@ pub fn encode_reply(r: &PageReply) -> Vec<u8> {
 }
 pub fn decode_reply(b: &[u8]) -> Result<PageReply, String> {
     serde_json::from_slice(b).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod interface_tests {
+    use super::*;
+
+    #[test]
+    fn create_page_carries_optional_parent() {
+        let m = PageMsg::CreatePage {
+            page_id: "p2".into(),
+            title: "child".into(),
+            parent: Some("p1".into()),
+        };
+        let round: PageMsg = decode_msg(&encode_msg(&m)).unwrap();
+        assert_eq!(round, m);
+        // top-level create serializes parent as null.
+        let top = PageMsg::CreatePage {
+            page_id: "p1".into(),
+            title: "root".into(),
+            parent: None,
+        };
+        assert!(String::from_utf8(encode_msg(&top)).unwrap().contains("\"parent\":null"));
+    }
+
+    #[test]
+    fn set_parent_and_delete_round_trip() {
+        for m in [
+            PageMsg::SetPageParent { page_id: "p2".into(), parent: None },
+            PageMsg::DeletePage { page_id: "p2".into() },
+        ] {
+            assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn page_meta_carries_parent() {
+        let meta = PageMeta { id: "p2".into(), title: "t".into(), parent: Some("p1".into()) };
+        let bytes = serde_json::to_vec(&meta).unwrap();
+        let back: PageMeta = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, meta);
+    }
 }

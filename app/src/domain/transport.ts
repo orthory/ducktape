@@ -43,48 +43,26 @@ export interface NodeStatus {
   appHash: string;
   height: number;
   modules: ModuleStatus[];
-}
-
-// ── Telemetry ───────────────────────────────────────────
-//
-// The node-local observability plane: one frame per finalized block, carrying
-// the host's deterministic dispatch trace decorated with this node's wall-clock
-// apply latency. Delivered live over the ws stream and pullable (recent ring)
-// via GET /v1/telemetry. Keyed by (height, source) — the same space the future
-// on-consensus telemetry module uses.
-
-/** One dispatch in a block's drain — a module ran, triggered by `origin`. */
-export interface TelemetryDispatch {
-  module: string;
-  /** `"external"`, `"external:<name>"`, `"system"`, or `"module:<id>"`. */
-  origin: string;
-  emittedMsgs: number;
-  emittedEvents: number;
-}
-
-/** One observability event a module emitted during the block. */
-export interface TelemetryEvent {
-  source: string;
-  /** Best-effort utf-8 preview of the module-defined payload. */
-  payload: string;
-}
-
-export interface TelemetryFrame {
-  height: number;
-  /** The block's agreed logical clock — NOT this node's wall clock. */
-  consensusTime: number;
-  /** Node-local cost of applying the block, microseconds (non-deterministic). */
-  latencyUs: number;
-  dispatches: TelemetryDispatch[];
-  events: TelemetryEvent[];
+  /** This node's mesh identity as 64-char hex — the voice fan-out address and
+   *  the `node` key a join_huddle op carries. Empty string / absent on a legacy
+   *  daemon that can't do voice; the ui hides every huddle affordance then. */
+  publicKey?: string;
 }
 
 // ── Blocks (explorer) ───────────────────────────────────
 //
 // The explorer plane: one record per NON-EMPTY finalized block — heartbeat
 // nops never enter the node's ring, so this is real history, not idle ticks.
-// Node-local observability like telemetry: pulled from the ring via
-// GET /v1/blocks; a node without the surface reads as "no blocks".
+// Pulled via GET /v1/blocks; a node without the surface reads as "no blocks".
+
+/** One dispatch in a block's drain — a module ran, triggered by `origin`. */
+export interface DispatchInfo {
+  module: string;
+  /** `"external"`, `"external:<name>"`, `"system"`, or `"module:<id>"`. */
+  origin: string;
+  emittedMsgs: number;
+  emittedEvents: number;
+}
 
 /** How a block's op landed: an applied op mutated state; a rejected op
  *  finalized but rolled back — a failed tx. */
@@ -104,7 +82,7 @@ export interface BlockRecord {
   target: string;
   /** The dispatch trace, in drain order — the transactions inside the block.
    *  Empty for a rejected op (a deterministic no-op leaves no trace). */
-  operations: TelemetryDispatch[];
+  operations: DispatchInfo[];
   /** Capped utf-8 preview of the root op's payload (module `*Msg` json). */
   payload: string;
   /** Hex content address of the root op — sha256 of the committed payload
@@ -152,11 +130,12 @@ export interface NodeTransport {
   getBlob(digest: string): Promise<Uint8Array<ArrayBuffer>>;
   status(): Promise<NodeStatus>;
   /**
-   * Recent per-block telemetry from the node's ring, oldest-first — the
-   * backfill a client pulls on connect before following the live stream.
-   * `limit` caps the count (default: all buffered).
+   * The node's Prometheus/OpenMetrics scrape (`GET /metrics`) as raw text —
+   * commonware's runtime series plus this node's `ducktape_*` block series
+   * (height, blocks, apply-latency histogram, per-module dispatch counters).
+   * Parse with `domain/metrics`. Rejects when the node has no metrics surface.
    */
-  telemetry(limit?: number): Promise<TelemetryFrame[]>;
+  metrics(): Promise<string>;
   /**
    * Recent non-empty blocks from the node's ring, oldest-first — the
    * explorer's backing read. `limit` caps the count (default: all buffered).
@@ -164,8 +143,6 @@ export interface NodeTransport {
   blocks(limit?: number): Promise<BlockRecord[]>;
   /** Subscribe to finalized blocks. Returns the unsubscribe. */
   onBlock(listener: (block: BlockEvent) => void): () => void;
-  /** Subscribe to live per-block telemetry frames. Returns the unsubscribe. */
-  onTelemetry(listener: (frame: TelemetryFrame) => void): () => void;
 }
 
 // ── The transport ───────────────────────────────────────
@@ -176,58 +153,133 @@ interface WsBlockFrame {
   appHash: string;
 }
 
-interface WsTelemetryFrame extends TelemetryFrame {
-  type: "telemetry";
+type WsFrame = WsBlockFrame;
+
+// ── Error classification + bounded fetch ────────────────
+
+/** Why a node call failed — the UI (and waitUntilUp) branch on this instead of
+ *  treating every failure identically as "down". `refused`: nothing answered
+ *  (not listening yet / CSP-blocked). `timeout`: the node accepted the
+ *  connection but never replied within the deadline — the old "10s" bound was a
+ *  lie, no fetch had one, so a wedged node hung the UI far longer. `httpError`:
+ *  it answered non-2xx (the node IS up, and erroring). `badBody`: it answered
+ *  2xx with an unparseable / non-ducktape body. */
+export type NodeErrorKind = "refused" | "timeout" | "httpError" | "badBody";
+
+export class NodeError extends Error {
+  readonly kind: NodeErrorKind;
+  readonly status?: number;
+  constructor(kind: NodeErrorKind, message: string, status?: number) {
+    super(message);
+    this.name = "NodeError";
+    this.kind = kind;
+    this.status = status;
+  }
 }
 
-type WsFrame = WsBlockFrame | WsTelemetryFrame;
+const STATUS_TIMEOUT_MS = 6_000; // the liveness probe must be bounded
+const CALL_TIMEOUT_MS = 30_000; // submit/query may wait on a commit — looser
 
-const RECONNECT_DELAY_MS = 2_000;
+/** fetch with a per-attempt deadline: a node that accepts the TCP connection
+ *  but never answers can no longer hang forever. An abort becomes a `timeout`
+ *  NodeError; any other network failure (connection refused, CSP block) becomes
+ *  `refused`. */
+const fetchDeadline = (
+  url: string,
+  init?: RequestInit,
+  timeoutMs: number = CALL_TIMEOUT_MS,
+): Promise<Response> => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...init, signal: controller.signal })
+    .catch((err: unknown) => {
+      if (controller.signal.aborted) {
+        throw new NodeError(
+          "timeout",
+          `the node accepted the connection but did not answer within ${timeoutMs}ms`,
+        );
+      }
+      throw new NodeError(
+        "refused",
+        `could not reach the node (${err instanceof Error ? err.message : String(err)})`,
+      );
+    })
+    .finally(() => clearTimeout(timer));
+};
 
-const postJson = <T>(url: string, body: unknown): Promise<T> =>
-  Promise.resolve()
-    .then(() =>
-      fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      }),
-    )
-    .then(async (res) => {
-      if (res.ok) return (await res.json()) as T;
-      const detail = await res
-        .json()
-        .then((payload) => String((payload as { error?: string }).error ?? ""))
-        .catch(() => "");
-      throw new Error(detail || `node replied ${res.status}`);
-    });
+/** A Response's error body — the node's json `{error}` or capped text — for the
+ *  message, instead of discarding it behind a bare status code. */
+const errorDetail = async (res: Response): Promise<string> => {
+  const body = await res.text().catch(() => "");
+  if (!body) return "";
+  try {
+    return String((JSON.parse(body) as { error?: string }).error ?? body).slice(0, 300);
+  } catch {
+    return body.slice(0, 300);
+  }
+};
+
+const RECONNECT_BASE_MS = 1_000;
+const RECONNECT_CAP_MS = 30_000;
+
+const postJson = async <T>(url: string, body: unknown): Promise<T> => {
+  const res = await fetchDeadline(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw new NodeError("httpError", (await errorDetail(res)) || `node replied ${res.status}`, res.status);
+  }
+  try {
+    return (await res.json()) as T;
+  } catch {
+    throw new NodeError("badBody", `${url} returned an invalid or empty response`);
+  }
+};
+
+/** A node base url in its websocket form: trailing slash stripped, http→ws
+ *  scheme swap — the ONE derivation both the block stream and the call
+ *  socket dial through. */
+const wsBase = (baseUrl: string): string =>
+  baseUrl.replace(/\/$/, "").replace(/^http/, "ws");
+
+/** The call websocket url for a channel on the node at `baseUrl` — same
+ *  host/port as the daemon's http/ws surface. The huddle session
+ *  (call-session.ts) dials this typed socket (audio + camera video + control);
+ *  kept here because this is where the base url and its ws form live. */
+export const callSocketUrl = (baseUrl: string, channel: string): string =>
+  `${wsBase(baseUrl)}/v1/call/ws?channel=${encodeURIComponent(channel)}`;
 
 export const remoteTransport = (baseUrl: string): NodeTransport => {
   const base = baseUrl.replace(/\/$/, "");
-  const wsUrl = `${base.replace(/^http/, "ws")}/v1/ws`;
+  const wsUrl = `${wsBase(baseUrl)}/v1/ws`;
 
-  // One shared socket for every subscriber (blocks + telemetry); reconnects
-  // while any remain, closes once all unsubscribe.
+  // One shared socket for every block subscriber; reconnects while any
+  // remain, closes once all unsubscribe.
   const blockListeners = new Set<(block: BlockEvent) => void>();
-  const telemetryListeners = new Set<(frame: TelemetryFrame) => void>();
-  const hasSubscribers = (): boolean =>
-    blockListeners.size > 0 || telemetryListeners.size > 0;
+  const hasSubscribers = (): boolean => blockListeners.size > 0;
   let socket: WebSocket | null = null;
+  let retries = 0;
 
   const connect = (): void => {
     if (socket || !hasSubscribers()) return;
     const ws = new WebSocket(wsUrl);
     socket = ws;
+    ws.onopen = () => {
+      retries = 0; // a clean connection resets the backoff
+    };
     ws.onmessage = (event) => {
-      const frame = JSON.parse(String(event.data)) as WsFrame;
+      let frame: WsFrame;
+      try {
+        frame = JSON.parse(String(event.data)) as WsFrame;
+      } catch {
+        return; // a malformed / non-json frame is a no-op, not an uncaught throw
+      }
       switch (frame.type) {
         case "block": {
           const block = { height: frame.height, appHash: frame.appHash };
           blockListeners.forEach((notify) => notify(block));
-          break;
-        }
-        case "telemetry": {
-          telemetryListeners.forEach((notify) => notify(frame));
           break;
         }
         default:
@@ -236,7 +288,12 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
     };
     ws.onclose = () => {
       socket = null;
-      if (hasSubscribers()) setTimeout(connect, RECONNECT_DELAY_MS);
+      if (!hasSubscribers()) return;
+      // exponential backoff (capped) + jitter, instead of the blind 2s retry
+      // loop that spammed the console every 2s forever against a dead node.
+      const backoff = Math.min(RECONNECT_CAP_MS, RECONNECT_BASE_MS * 2 ** retries);
+      retries += 1;
+      setTimeout(connect, backoff * (0.5 + Math.random() * 0.5));
     };
     ws.onerror = () => ws.close();
   };
@@ -290,58 +347,50 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
             .catch(() => "");
           throw new Error(detail || `node replied ${res.status}`);
         }),
-    status: () =>
-      Promise.resolve()
-        .then(() => fetch(`${base}/v1/status`))
-        .then((res) => {
-          if (!res.ok) throw new Error(`node replied ${res.status}`);
-          return res.json() as Promise<NodeStatus>;
-        }),
-    telemetry: (limit) =>
-      Promise.resolve()
-        .then(() =>
-          fetch(
-            limit === undefined
-              ? `${base}/v1/telemetry`
-              : `${base}/v1/telemetry?limit=${limit}`,
-          ),
-        )
-        .then((res) => {
-          if (!res.ok) throw new Error(`node replied ${res.status}`);
-          return res.json() as Promise<{ frames?: TelemetryFrame[] }>;
-        })
-        // best-effort observability: a node without a telemetry surface (or a
-        // malformed body) reads as "no telemetry", not an error.
-        .then((body) => body.frames ?? []),
-    blocks: (limit) =>
-      Promise.resolve()
-        .then(() =>
-          fetch(
-            limit === undefined
-              ? `${base}/v1/blocks`
-              : `${base}/v1/blocks?limit=${limit}`,
-          ),
-        )
-        .then((res) => {
-          if (!res.ok) throw new Error(`node replied ${res.status}`);
-          return res.json() as Promise<{ blocks?: BlockRecord[] }>;
-        })
-        // same best-effort contract as telemetry: a node without a blocks
-        // surface (or a malformed body) reads as "no blocks", not an error.
-        .then((body) => body.blocks ?? []),
+    status: async () => {
+      const res = await fetchDeadline(`${base}/v1/status`, undefined, STATUS_TIMEOUT_MS);
+      if (!res.ok) throw new NodeError("httpError", `node replied ${res.status}`, res.status);
+      let parsed: NodeStatus;
+      try {
+        parsed = (await res.json()) as NodeStatus;
+      } catch {
+        throw new NodeError("badBody", "/v1/status returned an invalid response");
+      }
+      // shape check: a non-ducktape process that answers 200 on this port must
+      // not read as a healthy node — "connecting" to it makes everything
+      // downstream fail confusingly (see NodeStatus).
+      if (
+        typeof parsed.version !== "string" ||
+        typeof parsed.height !== "number" ||
+        typeof parsed.appHash !== "string"
+      ) {
+        throw new NodeError("badBody", "the process answering this port is not a ducktape node");
+      }
+      return parsed;
+    },
+    // OpenMetrics text exposition (not json, not under /v1) — the scrape body.
+    metrics: async () => {
+      const res = await fetchDeadline(`${base}/metrics`, undefined, STATUS_TIMEOUT_MS);
+      if (!res.ok) throw new NodeError("httpError", `node replied ${res.status}`, res.status);
+      return res.text();
+    },
+    blocks: async (limit) => {
+      const res = await fetchDeadline(
+        limit === undefined ? `${base}/v1/blocks` : `${base}/v1/blocks?limit=${limit}`,
+        undefined,
+        STATUS_TIMEOUT_MS,
+      );
+      if (!res.ok) throw new NodeError("httpError", `node replied ${res.status}`, res.status);
+      // best-effort observability: a node without a blocks surface (or a
+      // malformed body) reads as "no blocks", not an error.
+      const body = (await res.json().catch(() => ({}))) as { blocks?: BlockRecord[] };
+      return body.blocks ?? [];
+    },
     onBlock: (listener) => {
       blockListeners.add(listener);
       connect();
       return () => {
         blockListeners.delete(listener);
-        closeIfIdle();
-      };
-    },
-    onTelemetry: (listener) => {
-      telemetryListeners.add(listener);
-      connect();
-      return () => {
-        telemetryListeners.delete(listener);
         closeIfIdle();
       };
     },

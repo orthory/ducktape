@@ -126,7 +126,7 @@ pub struct BlockOutcome {
     pub effects: Vec<Effect>,
     /// the deterministic dispatch trace: one entry per module dispatched this
     /// block, in drain order. the "what happened" spine the node layer tags with
-    /// node-local timing for telemetry.
+    /// node-local timing for its metrics.
     pub dispatches: Vec<DispatchRecord>,
 }
 

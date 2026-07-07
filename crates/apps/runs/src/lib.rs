@@ -21,7 +21,7 @@
 //!   block. the registry hook extends this to registration: an agent's
 //!   registry record and its dispatch recipe land (or abort) as one unit.
 //! - **P4 — anchored generation.** the ENTIRE model input is composed in
-//!   consensus — transcript window, prompt document, output contract — and
+//!   consensus — transcript window, prompt framing, output contract — and
 //!   rides the dispatch as committed payload data, so any validator holds the
 //!   exact prompt input as ordered state, and the reply is never presented as
 //!   ordered before its anchor.
@@ -127,9 +127,6 @@ use dispatch::{
     Routing, decode_reply as dispatch_decode_reply, decode_result_event,
     encode_msg as dispatch_encode_msg, encode_query as dispatch_encode_query,
 };
-use document::{
-    DocQuery, DocReply, decode_reply as doc_decode_reply, encode_query as doc_encode_query,
-};
 use jobs::{
     JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_event as jobs_decode_event,
     decode_reply as jobs_decode_reply, encode_msg as jobs_encode_msg,
@@ -223,27 +220,17 @@ const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this s
 {"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[]}
 Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Do not include markdown fences around the JSON."#;
 
-/// the canonical rendering of a prompt document: block texts joined by blank
-/// lines, kind-agnostic. `AgentRecord::prompt_hash` pins sha256 of exactly
-/// this string, so registrant and validator agree byte-for-byte.
-pub fn render_prompt_doc(blocks: &[document::Block]) -> String {
-    blocks
-        .iter()
-        .map(|b| b.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
 /// flatten a chat run into the single payload a non-interactive CLI takes:
 /// the system instructions, the strict-output contract, then the conversation.
+/// the host resolves the agent's real prompt (pinned by `prompt_hash`) from
+/// the blob store; the deterministic payload carries the generic default.
 fn render_payload(
-    system: Option<&str>,
     module_id: &str,
     agent_id: &str,
     transcript: &[MessageView],
 ) -> String {
     let mut out = String::new();
-    out.push_str(system.unwrap_or(DEFAULT_PROMPT));
+    out.push_str(DEFAULT_PROMPT);
     out.push_str("\n\n");
     out.push_str(STRICT_OUTPUT_INSTRUCTION);
     out.push_str("\n\n");
@@ -269,9 +256,9 @@ fn render_payload(
 
 /// flatten a job-backed run the same way: instructions, contract, then the
 /// job's coordinates and its FULL submitted spec.
-fn render_job_payload(system: Option<&str>, job_id: &str, spec: &str) -> String {
+fn render_job_payload(job_id: &str, spec: &str) -> String {
     let mut out = String::new();
-    out.push_str(system.unwrap_or(DEFAULT_PROMPT));
+    out.push_str(DEFAULT_PROMPT);
     out.push_str("\n\n");
     out.push_str(STRICT_OUTPUT_INSTRUCTION);
     out.push_str(&format!(
@@ -808,8 +795,6 @@ pub struct RunsModule {
     agent: ModuleId,
     tasks: Option<ModuleId>,
     jobs: Option<ModuleId>,
-    /// the document module prompt content is read from (`prompt_doc`).
-    document: Option<ModuleId>,
     /// committed state — what `root()` and the app-hash commit to.
     watches: BTreeMap<String, TurnPolicy>,
     /// in-flight correlation entries keyed by dispatch id — pruned on
@@ -837,7 +822,6 @@ impl RunsModule {
         agent: impl Into<ModuleId>,
         tasks: Option<ModuleId>,
         jobs: Option<ModuleId>,
-        document: Option<ModuleId>,
     ) -> Self {
         let id = id.into();
         let chat = chat.into();
@@ -854,7 +838,7 @@ impl RunsModule {
             agent.clone(),
         ]);
         let mut expected = 6;
-        for optional in [&tasks, &jobs, &document] {
+        for optional in [&tasks, &jobs] {
             if let Some(module) = optional {
                 ids.insert(module.clone());
                 expected += 1;
@@ -874,7 +858,6 @@ impl RunsModule {
             agent,
             tasks,
             jobs,
-            document,
             watches: BTreeMap::new(),
             pending: BTreeMap::new(),
             pending_watches: BTreeMap::new(),
@@ -1079,45 +1062,7 @@ impl RunsModule {
         Ok((thread_root, window))
     }
 
-    // ---- prompt + payload preparation (the dispatch plane's composition rule) -----
-
-    /// the agent's consensus-resident prompt text, when it has one: read from
-    /// the document module and verified against the registered
-    /// `prompt_hash`, so which prompt ran is part of the app-hash — a
-    /// drifted document is an error the caller turns into a skipped run.
-    async fn prompt_text(
-        &self,
-        ctx: &dyn Ctx,
-        agent: &AgentRecord,
-    ) -> Result<Option<String>, String> {
-        let Some(doc_id) = &agent.prompt_doc else {
-            return Ok(None);
-        };
-        let Some(document) = &self.document else {
-            return Err("agent has a prompt_doc but no document module is configured".into());
-        };
-        let reply = ctx
-            .query(
-                document,
-                &doc_encode_query(&DocQuery::GetDoc {
-                    doc_id: doc_id.clone(),
-                }),
-            )
-            .await
-            .map_err(|e| format!("document query failed: {e}"))?;
-        let blocks = match doc_decode_reply(&reply) {
-            Ok(DocReply::Doc(Some(blocks))) => blocks,
-            Ok(DocReply::Doc(None)) => return Err(format!("prompt document is missing: {doc_id}")),
-            _ => return Err("unexpected document reply for a prompt query".into()),
-        };
-        let text = render_prompt_doc(&blocks);
-        if Sha256::digest(text.as_bytes()).as_slice() != agent.prompt_hash.as_slice() {
-            return Err(format!(
-                "prompt document {doc_id} does not hash to the registered prompt_hash"
-            ));
-        }
-        Ok(Some(text))
-    }
+    // ---- payload preparation (the dispatch plane's composition rule) -----
 
     /// everything a chat run's dispatch needs, prepared read-only: the pinned
     /// context (P4) and the fully composed payload. any failure here is a
@@ -1131,9 +1076,8 @@ impl RunsModule {
         anchor_seq: u64,
     ) -> Result<PreparedDispatch, String> {
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
-        let prompt = self.prompt_text(ctx, agent).await?;
         let payload =
-            render_payload(prompt.as_deref(), &self.id, &agent.agent_id, &transcript).into_bytes();
+            render_payload(&self.id, &agent.agent_id, &transcript).into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(format!(
                 "composed payload is {} bytes; the dispatch cap is {MAX_PAYLOAD_BYTES}",
@@ -1293,15 +1237,15 @@ impl RunsModule {
             );
             return Ok(());
         }
-        let agent = match self.active_agent(&*ctx, agent_id).await {
-            Ok(Some(agent)) => agent,
+        match self.active_agent(&*ctx, agent_id).await {
+            Ok(Some(_)) => {}
             // an unknown or paused agent leaves the job on the board.
             Ok(None) => return Ok(()),
             Err(reason) => {
                 self.note(ctx, format!("dropped jobs event for {job_id}: {reason}"));
                 return Ok(());
             }
-        };
+        }
         let Some(jobs) = self.jobs.clone() else {
             self.note(
                 ctx,
@@ -1329,16 +1273,9 @@ impl RunsModule {
             }
         }
         // compose BEFORE claiming: a job whose payload cannot be composed
-        // (drifted prompt doc, oversized spec) is left unclaimed on the
-        // board, not claimed into a run that could never execute.
-        let prompt = match self.prompt_text(&*ctx, &agent).await {
-            Ok(prompt) => prompt,
-            Err(reason) => {
-                self.note(ctx, format!("job run skipped for {run_id}: {reason}"));
-                return Ok(());
-            }
-        };
-        let payload = render_job_payload(prompt.as_deref(), &job_id, &spec).into_bytes();
+        // (an oversized spec) is left unclaimed on the board, not claimed
+        // into a run that could never execute.
+        let payload = render_job_payload(&job_id, &spec).into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
             self.note(
                 ctx,
@@ -1429,8 +1366,8 @@ impl RunsModule {
     /// NO-FAIL ARM. the tagging plane routes a user post here in the same
     /// block as the post itself — an `Err` would abort the post (and every
     /// other subscriber's delivery), so malformed events, unwatched
-    /// channels, failed context pins, broken prompt documents, and oversized
-    /// payloads are all staged no-ops. the plane's loop rule guarantees the
+    /// channels, failed context pins, and oversized payloads are all staged
+    /// no-ops. the plane's loop rule guarantees the
     /// event is user-authored.
     async fn on_engagement(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
         let Ok(event) = tagging_decode_event(payload) else {
@@ -2154,9 +2091,6 @@ mod tests {
         DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
         encode_reply as dispatch_encode_reply, encode_result_event,
     };
-    use document::{
-        BlockKind, decode_query as doc_decode_query, encode_reply as doc_encode_reply,
-    };
     use futures::executor::block_on;
     use jobs::{
         Claim as JobClaim, Job, encode_event as jobs_encode_event,
@@ -2184,8 +2118,6 @@ mod tests {
         /// channel -> messages with contiguous seqs starting at 1.
         transcripts: BTreeMap<String, Vec<MessageView>>,
         tasks: Vec<Task>,
-        /// doc_id -> prompt document blocks served by the document arm.
-        docs: BTreeMap<String, Vec<document::Block>>,
         /// dispatch ids the dispatch module already has a record for — the
         /// committed turn-claim layer the module probes.
         taken_dispatches: BTreeSet<String>,
@@ -2209,7 +2141,6 @@ mod tests {
                 agents: Registry::new(),
                 transcripts: BTreeMap::new(),
                 tasks: Vec::new(),
-                docs: BTreeMap::new(),
                 taken_dispatches: BTreeSet::new(),
                 jobs: BTreeMap::new(),
                 msgs: Vec::new(),
@@ -2254,17 +2185,6 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
             });
-            self
-        }
-        fn with_doc(mut self, doc_id: &str, text: &str) -> Self {
-            self.docs.insert(
-                doc_id.into(),
-                vec![document::Block {
-                    id: "b1".into(),
-                    kind: BlockKind::Paragraph,
-                    text: text.into(),
-                }],
-            );
             self
         }
         fn with_taken_dispatch(mut self, dispatch_id: &str) -> Self {
@@ -2353,12 +2273,6 @@ mod tests {
                         self.agents.values().cloned().collect(),
                     ))),
                 },
-                "document" => match doc_decode_query(req).map_err(Error::Module)? {
-                    DocQuery::GetDoc { doc_id } => Ok(doc_encode_reply(&DocReply::Doc(
-                        self.docs.get(&doc_id).cloned(),
-                    ))),
-                    _ => Err(Error::QueryUnsupported),
-                },
                 "chat" => match chat::decode_query(req).map_err(Error::Module)? {
                     ChatQuery::MessagesRange {
                         channel_id,
@@ -2404,6 +2318,7 @@ mod tests {
                                 receiver: "runs".into(),
                                 status: DispatchStatus::Delivered,
                                 outcome: Some(Ok(Vec::new())),
+                                assignee: None,
                                 created_at: 0,
                                 updated_at: 0,
                             }
@@ -2438,7 +2353,6 @@ mod tests {
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-            Some("document".into()),
         )
     }
 
@@ -2461,7 +2375,6 @@ mod tests {
             display_name: agent_id.to_uppercase(),
             capability: "model-1".into(),
             prompt_hash: vec![7u8; PROMPT_HASH_LEN],
-            prompt_doc: None,
             allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
             status: AgentStatus::Active,
             created_at: 0,
@@ -2873,7 +2786,6 @@ mod tests {
             "agent",
             Some("tasks".into()),
             None,
-            None,
         );
         let mut ctx = CaptureCtx::new().from_origin(user(9));
         let err = exec(
@@ -2949,7 +2861,7 @@ mod tests {
         );
         assert!(
             text.starts_with("You are a Ducktape agent."),
-            "no prompt_doc: the generic instructions lead the payload"
+            "the generic instructions lead the deterministic payload"
         );
     }
 
@@ -3691,7 +3603,6 @@ mod tests {
             "agent",
             None,
             None,
-            None,
         );
         let mut ctx = CaptureCtx::new()
             .from_origin(user(9))
@@ -4231,105 +4142,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ctx.dispatch_msgs().len(), 1);
-    }
-
-    // ---- consensus-resident prompts ---------------------------------------------
-
-    #[test]
-    fn a_prompt_doc_rides_the_payload_only_when_it_hashes_to_the_pin() {
-        let prompt = "You are DUCK-1, a terse reviewer.";
-        let registry_with_doc = |prompt_hash: Vec<u8>| {
-            let mut r = registry(&[("bot", &[ACTION_CHAT_POST])]);
-            let bot = r.get_mut("bot").unwrap();
-            bot.prompt_hash = prompt_hash;
-            bot.prompt_doc = Some("prompts/bot".into());
-            r
-        };
-
-        // the doc's canonical rendering hashes to the pin: it LEADS the
-        // composed payload — for chat runs AND job runs.
-        let good_hash = Sha256::digest(prompt.as_bytes()).to_vec();
-        let registry = registry_with_doc(good_hash.clone());
-        let mut m = watched(TurnPolicy::All, &registry);
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .from_tagging()
-            .with_registry(&registry)
-            .with_transcript("general", transcript(2))
-            .with_doc("prompts/bot", prompt);
-        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
-        let dispatches = ctx.dispatch_msgs();
-        assert_eq!(dispatches.len(), 1);
-        let DispatchMsg::Dispatch { payload, .. } = &dispatches[0] else {
-            panic!("expected a dispatch");
-        };
-        assert!(String::from_utf8(payload.clone()).unwrap().starts_with(prompt));
-        abort(&mut m);
-
-        let mut ctx = CaptureCtx::new()
-            .at(3)
-            .from_jobs()
-            .with_registry(&registry)
-            .with_doc("prompts/bot", prompt);
-        exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/bot", "spec")).unwrap();
-        let dispatches = ctx.dispatch_msgs();
-        assert_eq!(dispatches.len(), 1);
-        let DispatchMsg::Dispatch { payload, .. } = &dispatches[0] else {
-            panic!("expected a dispatch");
-        };
-        assert!(
-            String::from_utf8(payload.clone()).unwrap().starts_with(prompt),
-            "the job payload leads with the prompt doc too"
-        );
-
-        // a drifted document (hash mismatch) skips the run — a breadcrumb,
-        // never a block abort; and an explicit request errors cleanly. a
-        // job submit is left UNCLAIMED the same way.
-        let drifted = registry_with_doc(vec![7u8; PROMPT_HASH_LEN]);
-        let mut m = watched(TurnPolicy::All, &drifted);
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .from_tagging()
-            .with_registry(&drifted)
-            .with_transcript("general", transcript(2))
-            .with_doc("prompts/bot", prompt);
-        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
-        assert!(ctx.msgs.is_empty(), "a drifted prompt doc dispatches nothing");
-        assert!(!ctx.events.is_empty());
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .from_jobs()
-            .with_registry(&drifted)
-            .with_doc("prompts/bot", prompt);
-        exec(&mut m, &mut ctx, &jobs_event("job-2", "agent/bot", "spec")).unwrap();
-        assert!(ctx.msgs.is_empty(), "no claim on an uncomposable job");
-        let mut ctx = CaptureCtx::new()
-            .from_origin(user(1))
-            .with_registry(&drifted)
-            .with_transcript("general", transcript(2))
-            .with_doc("prompts/bot", prompt);
-        let err = exec(
-            &mut m,
-            &mut ctx,
-            &admin(&RunsMsg::RequestRun {
-                agent_id: "bot".into(),
-                channel_id: "general".into(),
-                anchor_seq: 2,
-            }),
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::Module(reason) if reason.contains("prompt")));
-
-        // a MISSING document skips the same way.
-        let registry = registry_with_doc(good_hash);
-        let mut m = watched(TurnPolicy::All, &registry);
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .from_tagging()
-            .with_registry(&registry)
-            .with_transcript("general", transcript(2));
-        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
-        assert!(ctx.msgs.is_empty());
     }
 
     // ---- determinism + queries + state-sync -------------------------------------------

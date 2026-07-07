@@ -14,11 +14,14 @@ import {
 import type { ReactNode } from "react";
 
 import * as agentClient from "../../domain/agent-client";
+import * as capabilityClient from "../../domain/capability-client";
 import * as chatClient from "../../domain/chat-client";
+import * as dispatchClient from "../../domain/dispatch-client";
 import * as filesClient from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import type { ProposalView } from "../../domain/governance-client";
+import * as identityClient from "../../domain/identity-client";
 import * as pagesClient from "../../domain/pages-client";
 import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import {
@@ -32,20 +35,25 @@ import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
-import { hasFreshPending } from "./finalization";
+import { hasFreshPending, pageSnapshotSuperseded } from "./finalization";
+import {
+  HUDDLE_CLOSED_EVENT,
+  HUDDLE_CMD_EVENT,
+  HUDDLE_STATE_EVENT,
+  applyHuddleWindowCmd,
+  buildHuddleWindowState,
+} from "./huddle-window";
+import type { HuddleWindowCmd } from "./huddle-window";
 import { reducer } from "./reducer";
 import {
   applySnapshot,
   createInitialState,
   loadRemoteUrl,
+  saveDocTabs,
 } from "./state";
 
 export type { ConsoleActions } from "./actions";
 export type { ConsoleContextValue } from "./context";
-
-/** How many recent telemetry frames the console keeps in memory (the node's
- *  ring holds more; this bounds the live view's buffer). */
-const TELEMETRY_KEEP = 200;
 
 /** How many recent non-empty blocks the explorer pulls per refresh. */
 const BLOCKS_KEEP = 200;
@@ -87,7 +95,10 @@ export function DucktapeProvider({
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
     // the pages (docs) slice refreshes by enumeration + the open page's tree.
-    const activePage = stateRef.current.activePage;
+    const fetchedPage = stateRef.current.activePage;
+    // ops submitted at or after this instant cannot be in the snapshot the
+    // queries below return — pageSnapshotSuperseded keys off it at apply time.
+    const fetchStartedAt = Date.now();
     return Promise.resolve()
       .then(() =>
         Promise.all([
@@ -97,9 +108,9 @@ export function DucktapeProvider({
           // validator set) — best-effort like governance below, so a local
           // node reads as "no members" instead of never connecting.
           valsetClient.validators(live).catch((): number[][] => []),
-          // the observer tier (staged admission) — same best-effort contract:
-          // a pre-observer node (protocol < 3) reads as "no observers".
-          valsetClient.observers(live).catch((): number[][] => []),
+          // the resident tier (staged admission) — same best-effort contract:
+          // a pre-resident node (protocol < 3) reads as "no residents".
+          valsetClient.residents(live).catch((): number[][] => []),
           // governance is a first-class operator surface but best-effort in the
           // snapshot: a node/build without it just reads as "no proposals"
           // rather than failing the whole refresh.
@@ -109,24 +120,41 @@ export function DucktapeProvider({
           // best-effort, so a node without it reads as "no docs", never a
           // failed refresh.
           pagesClient.listPages(live).catch((): PageMeta[] => []),
-          activePage
+          fetchedPage
             ? pagesClient
-                .getPage(live, activePage)
+                .getPage(live, fetchedPage)
                 .catch((): PageBlock[] | null => null)
             : Promise.resolve<PageBlock[] | null>(null),
           agentClient.agents(live),
+          // the executor registry — best-effort like governance/files above, so
+          // a node without the capability module reads as "no executors" (the
+          // "Runs on" picker degrades to a text field) rather than a failed
+          // refresh.
+          capabilityClient.capabilities(live).catch((): string[] => []),
+          // the same registry, kept per-node so a member row can show what it
+          // runs — best-effort like everything else in the snapshot.
+          capabilityClient
+            .capabilitiesByNode(live)
+            .catch((): Map<string, string[]> => new Map()),
           runsClient.watches(live),
           // newest-first for the timeline; the wire orders by dispatch id.
           runsClient
             .pendingRuns(live)
             .then((list) => [...list].sort((a, b) => b.created_at - a.created_at)),
           profilesClient.allProfiles(live, { from: 0, limit: 256 }),
+          // identity is newer than some reachable nodes (any pre-identity
+          // network, e.g. the web build's node) — best-effort like pages
+          // above, so the overlay just degrades to profiles' names instead
+          // of failing the whole refresh.
+          identityClient
+            .allUsers(live, { from: 0, limit: 256 })
+            .catch((): identityClient.UserView[] => []),
           // files is best-effort so a node that does not register the module
           // reads as "empty", never a failed refresh (same contract as
           // governance above).
           filesClient.list(live, {}).catch(() => []),
-          // the explorer's ring pull — best-effort like telemetry, so a node
-          // without /v1/blocks reads as "no blocks yet".
+          // the explorer's ring pull — best-effort, so a node without
+          // /v1/blocks reads as "no blocks yet".
           live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
         ]),
       )
@@ -134,56 +162,130 @@ export function DucktapeProvider({
         status,
         channels,
         validators,
-        observerKeys,
+        residentKeys,
         proposals,
         forgeHead,
         pages,
         pageBlocks,
         agents,
+        capabilities,
+        capabilitiesByNode,
         watches,
         pendingRuns,
         profiles,
+        users,
         files,
         blocks,
       ]) => {
         // Profile.key is the origin bytes — the same bytes AuthorRef::User
         // carries — so hex(key) is exactly authorName's AuthorNames key.
-        const authorNames = Object.fromEntries(
+        // identity's per-user display name OVERLAYS profiles for every node
+        // that user binds — bound-user identity wins over the node's own
+        // origin-set profile, since the node/user split makes the user the
+        // durable identity and the node just its hardware.
+        const authorNames: Record<string, string> = Object.fromEntries(
           profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
         );
+        const nodeUsers: Record<string, { userKey: string; name: string | null }> = {};
+        for (const u of users) {
+          const userKey = chatClient.keyHex(u.user_key);
+          for (const node of u.nodes) {
+            const nodeHex = chatClient.keyHex(node);
+            nodeUsers[nodeHex] = { userKey, name: u.display_name };
+            if (u.display_name) authorNames[nodeHex] = u.display_name;
+          }
+        }
         const members = validators.map(valsetClient.validatorHex);
-        const observers = observerKeys.map(valsetClient.validatorHex);
+        const residents = residentKeys.map(valsetClient.validatorHex);
         const current = stateRef.current.activeChannel;
         const active =
           current && channels.some((c) => c.id === current)
             ? current
             : (channels[0]?.id ?? null);
-        return Promise.resolve()
-          .then(() => (active ? chatClient.latestMessages(live, active) : []))
-          .then((messages) =>
-            dispatch({
-              type: "patch",
-              patch: applySnapshot({
+        // A pages snapshot that predates a page op must not be applied: it
+        // would clobber the op's preconfirmed projection — an optimistically
+        // inserted block unmounts (dropping the focused textarea with it) and
+        // just-committed text reverts until the op finalizes. The block
+        // stream's hasFreshPending gate covers stream refreshes; this covers
+        // the completion refresh of an EARLIER op that settles while a later
+        // one is still in flight, and a snapshot raced by an op submitted
+        // mid-fetch. A snapshot for a page we've since navigated away from is
+        // equally stale. Held slices converge on the last op's own refresh.
+        const holdPages =
+          stateRef.current.activePage !== fetchedPage ||
+          pageSnapshotSuperseded(stateRef.current.ops, fetchStartedAt, Date.now());
+        // reconcile doc tabs against the live enumeration: a tab whose page no
+        // longer exists (deleted here or elsewhere) drops, and a now-dead
+        // active page falls back to the first surviving tab. CRITICAL: only
+        // reconcile when we actually got an enumeration — `listPages` is
+        // best-effort (`.catch(() => [])`), and an empty result may be a
+        // transient failure (node busy, module absent). Evicting open tabs on
+        // that would blank the editor mid-edit, so an empty result is a no-op.
+        // A held (superseded) enumeration is equally untrustworthy for
+        // eviction, so it is a no-op too.
+        const prevTabs = stateRef.current.openTabs;
+        const prevActive = stateRef.current.activePage;
+        let openTabs = prevTabs;
+        let activePage = prevActive;
+        if (!holdPages && pages.length > 0) {
+          const liveIds = new Set(pages.map((p) => p.id));
+          openTabs = prevTabs.filter((id) => liveIds.has(id));
+          if (openTabs.length !== prevTabs.length) saveDocTabs(openTabs);
+          activePage =
+            prevActive && liveIds.has(prevActive) ? prevActive : (openTabs[0] ?? null);
+        }
+        return Promise.all([
+          active ? chatClient.latestMessages(live, active) : [],
+          // one dispatch read per in-flight run → its executor node. bounded by
+          // pendingRuns.length; each is best-effort so one miss never fails the
+          // refresh.
+          Promise.all(
+            pendingRuns.map((run) =>
+              dispatchClient
+                .dispatch(live, { dispatchId: run.dispatch_id })
+                .then(
+                  (view) =>
+                    [run.run_id, dispatchClient.assigneeHex(view)] as const,
+                )
+                .catch(() => [run.run_id, null] as const),
+            ),
+          ),
+        ]).then(([messages, assigneePairs]) => {
+          const runAssignee = new Map<string, string>();
+          for (const [runId, hex] of assigneePairs) if (hex) runAssignee.set(runId, hex);
+          return dispatch({
+            type: "patch",
+            patch: {
+              ...applySnapshot({
                 connected: true,
                 status,
                 channels,
                 members,
-                observers,
+                residents,
                 proposals,
                 forgeHead,
                 activeChannel: active,
                 messages,
                 authorNames,
-                pages,
-                activePageBlocks: pageBlocks ?? [],
+                nodeUsers,
+                pages: holdPages ? stateRef.current.pages : pages,
+                activePageBlocks: holdPages
+                  ? stateRef.current.activePageBlocks
+                  : (pageBlocks ?? []),
                 agents,
+                capabilities,
+                capabilitiesByNode,
                 watches,
                 pendingRuns,
+                runAssignee,
                 files,
                 blocks,
               }),
-            }),
-          );
+              openTabs,
+              activePage,
+            },
+          });
+        });
       })
       .catch((err) => {
         dispatch({ type: "patch", patch: { connected: false } });
@@ -249,7 +351,14 @@ export function DucktapeProvider({
         return actions.connectActive(active);
       })
       .catch((err) => {
-        if (!cancelled) fail(err);
+        if (cancelled) return;
+        // A failed boot resolution (corrupt/locked ~/.ducktape registry,
+        // permissions, a concurrent instance holding a lock) used to drop to a
+        // hollow, disconnected shell with a toast that then vanished — no
+        // workspace list, no way forward. Land on the onboarding gate, the
+        // actionable front door, with the error shown, never an empty console.
+        dispatch({ type: "patch", patch: { needsOnboarding: true } });
+        fail(err);
       });
     // Reset the guard on cleanup so StrictMode's mount→unmount→remount re-runs
     // the boot: without this the first mount's async resolve is cancelled while
@@ -262,32 +371,22 @@ export function DucktapeProvider({
     };
   }, [transport, actions, fail]);
 
-  // 2. Hydrate once the node is resolved, then follow the block stream and the
-  //    node-local telemetry stream (backfilled from the ring, then live). The
-  //    telemetry updaters stay pure (StrictMode double-invokes them): they append
-  //    idempotently and dedupe on the strictly-increasing block height.
+  // 2. Hydrate once the node is resolved, then follow the block stream. The
+  //    lastBlock updater stays pure (StrictMode double-invokes it): it only
+  //    moves forward on the strictly-increasing block height.
   useEffect(() => {
     if (!node) return;
     refresh();
 
-    // Backfill recent telemetry, then keep any newer live frames layered on top.
-    node
-      .telemetry(TELEMETRY_KEEP)
-      .then((frames) =>
-        dispatch({
-          type: "update",
-          fn: (prev) => {
-            const cutoff = frames.length ? frames[frames.length - 1].height : -1;
-            const newer = prev.telemetry.filter((f) => f.height > cutoff);
-            return { telemetry: [...frames, ...newer].slice(-TELEMETRY_KEEP) };
-          },
-        }),
-      )
-      .catch(() => {
-        /* telemetry is best-effort observability; a miss just leaves it empty */
+    const offBlock = node.onBlock((block) => {
+      // The live chain tip, UNGATED — recorded before the pending gate below,
+      // so the console always knows the chain moved even while an op of ours
+      // is in flight (a seam duplicate or reconnect replay never moves it back).
+      dispatch({
+        type: "update",
+        fn: (prev) =>
+          block.height > (prev.lastBlock ?? -1) ? { lastBlock: block.height } : {},
       });
-
-    const offBlock = node.onBlock(() => {
       // A block landing while one of OUR ops is still in flight would re-query
       // state that predates the op and clobber its preconfirmed projection —
       // and the op's own completion refresh follows immediately anyway. Stale
@@ -295,21 +394,7 @@ export function DucktapeProvider({
       if (hasFreshPending(stateRef.current.ops, Date.now())) return;
       refresh();
     });
-    const offTelemetry = node.onTelemetry((frame) => {
-      dispatch({
-        type: "update",
-        fn: (prev) => {
-          const last = prev.telemetry[prev.telemetry.length - 1];
-          // Heights strictly increase; drop a seam duplicate or a reconnect replay.
-          if (last && frame.height <= last.height) return {};
-          return { telemetry: [...prev.telemetry, frame].slice(-TELEMETRY_KEEP) };
-        },
-      });
-    });
-    return () => {
-      offBlock();
-      offTelemetry();
-    };
+    return offBlock;
   }, [node, refresh]);
 
   // 2b. Liveness heartbeat — the "no running node" detection AND recovery. The
@@ -327,21 +412,147 @@ export function DucktapeProvider({
     if (state.needsOnboarding || state.onboardingPhase) return;
     const beat = () =>
       node.status().then(
-        () => {
-          // up: only pay for a full refresh on the down→up edge; while already
-          //     connected the block stream keeps projections fresh.
-          if (!stateRef.current.connected) refresh();
+        (s) => {
+          // Recovery identity re-check: a foreign / different-build node could
+          // have grabbed the reused port while ours was down (only the INITIAL
+          // adopt used to verify this). Adopting it would silently show another
+          // node's state. Guarded to when we know both keys (managed workspace).
+          const expected = stateRef.current.workspace?.pubkey;
+          const got = s.publicKey;
+          if (expected && got && got.toLowerCase() !== expected.toLowerCase()) {
+            if (stateRef.current.connected || !stateRef.current.connectionDown?.impostor) {
+              dispatch({
+                type: "patch",
+                patch: {
+                  connected: false,
+                  connectionDown: {
+                    reason:
+                      "a different node is now answering this workspace's port — not reconnecting",
+                    impostor: true,
+                  },
+                },
+              });
+            }
+            return;
+          }
+          // Healthy: on the down→up edge clear the banner and re-hydrate; while
+          // already connected the block stream keeps projections fresh.
+          if (!stateRef.current.connected || stateRef.current.connectionDown) {
+            dispatch({ type: "patch", patch: { connectionDown: null } });
+            refresh();
+          }
         },
-        () => {
-          // unreachable: surface it once; the next beats keep trying to recover.
-          if (stateRef.current.connected) {
-            dispatch({ type: "patch", patch: { connected: false } });
+        (err: unknown) => {
+          // Unreachable: surface the REAL reason in a persistent reconnecting
+          // banner and keep this loop trying to recover. Patch only on the
+          // down-edge to avoid a re-render every beat.
+          if (stateRef.current.connected || !stateRef.current.connectionDown) {
+            const reason = err instanceof Error ? err.message : String(err);
+            dispatch({
+              type: "patch",
+              patch: { connected: false, connectionDown: { reason } },
+            });
           }
         },
       );
     const timer = setInterval(beat, RECONNECT_POLL_MS);
     return () => clearInterval(timer);
   }, [node, state.needsOnboarding, state.onboardingPhase, refresh]);
+
+  // 2c. Keep a live huddle's voice fan-out in step with the consensus roster:
+  //     every refresh that lands a new channel snapshot may add/remove members,
+  //     so re-derive the recipient set and push it into the audio session. A
+  //     no-op when not huddling; the push itself dedupes by value (refresh
+  //     patches a fresh channels array every block).
+  useEffect(() => {
+    actions.syncHuddleRecipients();
+  }, [state.channels, state.voice.channelId, actions]);
+
+  // 2d. Best-effort roster reconciliation on the way out: quitting or
+  //     reloading mid-huddle can't run the normal leave path, so fire a
+  //     keepalive leave_huddle beacon — otherwise peers keep showing a
+  //     participant whose client is gone (the roster has no TTL).
+  useEffect(() => {
+    const channelId = state.voice.channelId;
+    const url = state.nodeUrl;
+    if (!channelId || !url) return;
+    const origin = state.author;
+    const leaveOnHide = () => {
+      const body = new Blob(
+        [
+          JSON.stringify({
+            target: "chat",
+            payload: { leave_huddle: { channel_id: channelId } },
+            origin,
+          }),
+        ],
+        { type: "application/json" },
+      );
+      navigator.sendBeacon(`${url.replace(/\/$/, "")}/v1/submit`, body);
+    };
+    window.addEventListener("pagehide", leaveOnHide);
+    return () => window.removeEventListener("pagehide", leaveOnHide);
+  }, [state.voice.channelId, state.nodeUrl, state.author]);
+
+  // 2e. Huddle pop-out bridge, sender half (desktop): while the huddle window
+  //     is open, mirror the session's display state to it. A fingerprint
+  //     dedupes the per-block channels churn. Protocol: store/huddle-window.ts.
+  const huddleStateFp = useRef("");
+  useEffect(() => {
+    if (!state.voice.popped || !isTauri()) return;
+    const snapshot = buildHuddleWindowState(state.voice, state.channels, state.authorNames);
+    if (!snapshot) return;
+    const fp = JSON.stringify(snapshot);
+    if (fp === huddleStateFp.current) return;
+    huddleStateFp.current = fp;
+    void import("@tauri-apps/api/event")
+      .then(({ emit }) => emit(HUDDLE_STATE_EVENT, snapshot))
+      .catch(() => {});
+  }, [state.voice, state.channels, state.authorNames]);
+
+  // 2f. ...and the receiver half: apply the window's commands to the store,
+  //     replay state on its ready handshake, and re-mount the in-app card when
+  //     Rust reports the window destroyed. Also closes a stale window left
+  //     over from a previous main-window life — the ephemeral session it
+  //     mirrored died with the reload.
+  useEffect(() => {
+    if (!isTauri()) return;
+    actions.popInHuddle();
+    const unlisteners: Array<() => void> = [];
+    let cancelled = false;
+    const hold = (un: () => void) => {
+      if (cancelled) un();
+      else unlisteners.push(un);
+    };
+    void import("@tauri-apps/api/event")
+      .then(({ listen, emit }) =>
+        Promise.all([
+          listen(HUDDLE_CMD_EVENT, (event) => {
+            const cmd = event.payload as HuddleWindowCmd;
+            const current = stateRef.current;
+            if (cmd.op === "ready") {
+              const snapshot = buildHuddleWindowState(
+                current.voice,
+                current.channels,
+                current.authorNames,
+              );
+              if (snapshot) void emit(HUDDLE_STATE_EVENT, snapshot);
+              return;
+            }
+            applyHuddleWindowCmd(cmd, actions, current.voice.channelId);
+          }),
+          listen(HUDDLE_CLOSED_EVENT, () => actions.popInHuddle()),
+        ]),
+      )
+      .then((uns) => uns.forEach(hold))
+      .catch(() => {
+        // event API unavailable (non-tauri / test stub) — the bridge no-ops.
+      });
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((un) => un());
+    };
+  }, [actions]);
 
   // 3. Reflect the accent into the css var the theme reads.
   useEffect(() => {

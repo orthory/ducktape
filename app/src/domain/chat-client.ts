@@ -41,6 +41,16 @@ export type ChatBlock =
 
 export type PostPolicy = "open" | "members_only";
 
+/** One participant in a channel's voice huddle, in join order. `user` is the
+ *  submitter identity bytes (the AuthorRef::User bytes — a readable origin name
+ *  on the embedded daemon), `node` is that member's 32-byte ed25519 mesh key
+ *  (the voice fan-out address), `joined_at` the consensus time it joined. */
+export interface HuddleMember {
+  user: number[];
+  node: number[];
+  joined_at: number;
+}
+
 export interface Channel {
   id: string;
   name: string;
@@ -49,6 +59,8 @@ export interface Channel {
   post_policy: PostPolicy;
   hooks: string[];
   pinned: number[];
+  /** Live voice huddle roster, in join order. Empty/absent = no huddle. */
+  huddle?: HuddleMember[];
 }
 
 export interface MessageHead {
@@ -98,6 +110,12 @@ export type AuthorNames = Record<string, string>;
  *  (and the `profiles` Profile.key, which IS these same origin bytes). */
 export const keyHex = (bytes: number[]): string =>
   bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
+
+/** Inverse of `keyHex` — a hex key string back to its raw bytes. Used to turn
+ *  status.publicKey (64-char hex mesh identity) into the `node` byte array a
+ *  join_huddle op carries. One converter for the whole domain layer: this is
+ *  agent-client's `hexToBytes` under the roster's vocabulary. */
+export { hexToBytes as keyBytes } from "./agent-client";
 
 /** A display name for an author. A User author's bytes are the submitter
  *  identity the daemon stamped; when the `profiles` registry (`names`) resolves
@@ -235,6 +253,46 @@ export const deleteMessage = (
   transport.submit(
     TARGET,
     { delete_message: { channel_id: params.channelId, seq: params.seq } },
+    params.origin,
+  );
+
+// ── Huddle (voice roster ops — consensus membership, not the audio) ──
+
+/** Join a channel's voice huddle. `node` is THIS node's 32-byte ed25519 mesh
+ *  key (status.publicKey decoded); the module gates members-only channels like
+ *  posting and is idempotent on a re-join. Authorship comes from `origin`. */
+export const joinHuddle = (
+  transport: NodeTransport,
+  params: { channelId: string; node: number[]; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { join_huddle: { channel_id: params.channelId, node: params.node } },
+    params.origin,
+  );
+
+/** Leave a channel's voice huddle (idempotent — leaving twice is a no-op). */
+export const leaveHuddle = (
+  transport: NodeTransport,
+  params: { channelId: string; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { leave_huddle: { channel_id: params.channelId } },
+    params.origin,
+  );
+
+/** Evict a (stale) huddle member — consensus cleanup for a client that died
+ *  without leaving (its beacons went silent). Keyed by the member's submitter
+ *  identity bytes (`user`), not its mesh node key; the module gates it
+ *  members-only like posting. Authorship comes from `origin`. */
+export const sweepHuddle = (
+  transport: NodeTransport,
+  params: { channelId: string; user: number[]; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { sweep_huddle: { channel_id: params.channelId, user: params.user } },
     params.origin,
   );
 

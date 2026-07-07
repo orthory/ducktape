@@ -13,8 +13,14 @@ import type {
 } from "../../domain/chat-client";
 import type { Manifest } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
-import type { PageBlock, PageMeta, PageSearchHit } from "../../domain/pages-client";
-import type { BlockRecord, NodeStatus, TelemetryFrame } from "../../domain/transport";
+import type {
+  PageBlock,
+  PageMeta,
+  PageSearchHit,
+  TargetThreads,
+} from "../../domain/pages-client";
+import type { BlockRecord, NodeStatus } from "../../domain/transport";
+import type { VoiceError } from "../../domain/voice-session";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
@@ -23,6 +29,27 @@ import type { PhaseReport, Workspace } from "../../domain/workspace-client";
  *  side confers authority — it is purely which surfaces the rail shows. */
 export type ViewMode = "user" | "operator";
 
+/** The ephemeral voice-huddle slice. Lives OUTSIDE ConsoleSnapshot (like
+ *  telemetry): the roster is committed consensus state on the channel, but
+ *  whether THIS client is in a live audio session — and its mic/connection
+ *  state — is per-client and never re-projected from the node. `channelId` is
+ *  the channel we're huddling in (null = not in a huddle). */
+export interface VoiceSlice {
+  channelId: string | null;
+  muted: boolean;
+  status: "idle" | "connecting" | "live" | "error";
+  /** Why `status` is "error" — picks the dock's message. Null otherwise. */
+  error: VoiceError | null;
+  /** The huddle lives in its own desktop window right now — the in-app card
+   *  yields to it (desktop only; see store/huddle-window.ts). */
+  popped: boolean;
+  /** Local camera state (ephemeral, beaconed to peers — never consensus). */
+  cameraOn: boolean;
+  /** Per-peer ephemeral call state from 1 Hz beacons, keyed by NODE hex.
+   *  Staleness (no beacon for >10 s) drives the sweep affordance. */
+  peers: Record<string, { muted: boolean; cameraOn: boolean; atMs: number }>;
+}
+
 /** One search round-trip across the modules that ship materialized views —
  *  chat and docs (the `pages` module) searched with the same text, grouped.
  *  `docs` holds the page-block hits — pages is the console's docs surface. */
@@ -30,6 +57,36 @@ export interface SearchResults {
   query: string;
   chat: ChatSearchHit[];
   docs: PageSearchHit[];
+}
+
+/** A managed (app-spawned) node failed to START or CONNECT — the dedicated
+ *  "Node failed to start" surface reads this instead of leaving the developer
+ *  on a hollow, disconnected shell. `reason` is the human headline (the Rust
+ *  `Err` string, which already folds in the node's exit reason, or the boot
+ *  timeout); `logTail` is the daemon.log content behind it; `logPath` powers the
+ *  "Open daemon.log" affordance; `workspaceId` lets Retry re-connect the SAME
+ *  workspace idempotently (never re-minting one). Null when there is no boot
+ *  failure. Distinct from `error` (transient, dismissible op failures) and from
+ *  a joiner's `onboardingPhase: fatal` (shown in the waiting room). */
+export interface BootError {
+  workspaceId: string | null;
+  reason: string;
+  logPath: string | null;
+  logTail: string;
+}
+
+/** The node was reachable and then went away MID-SESSION (crash, stop, remote
+ *  unplugged, a dev.sh restart, a wrong node grabbing the port) — drives a
+ *  persistent reconnecting banner with the reason and (for a managed node) a
+ *  Restart action, instead of a lone red dot beside a frozen-but-live-looking
+ *  height. Null while connected or before the first connect. Distinct from
+ *  `bootError` (never connected) and `error` (transient op failures). */
+export interface ConnectionDown {
+  reason: string;
+  /** True when a DIFFERENT node answered the reused port (identity mismatch on
+   *  recovery) rather than our node merely being unreachable — a stronger
+   *  warning, and Restart won't help. */
+  impostor?: boolean;
 }
 
 // ── State shape ─────────────────────────────────────────
@@ -57,16 +114,25 @@ export interface ConsoleState {
   messages: MessageView[];
   activeThread: ChatThread | null;
   /** hex(user key bytes) → display name, from the `profiles` module; threaded
-   *  into author rendering so messages show chosen names, not hex handles. */
+   *  into author rendering so messages show chosen names, not hex handles.
+   *  OVERLAID by `identity`'s per-user display name for every node it binds —
+   *  see DucktapeProvider's snapshot build. */
   authorNames: Record<string, string>;
+  /** hex(node key bytes) → its owning user, from the `identity` module — the
+   *  node/user split's resolver: `name` is that user's chosen display name
+   *  (null if unset), already folded into `authorNames` when present. */
+  nodeUsers: Record<string, { userKey: string; name: string | null }>;
+  /** This client's live voice-huddle session — ephemeral, never in the
+   *  committed snapshot (see VoiceSlice). */
+  voice: VoiceSlice;
 
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
   members: string[];
-  /** Hex-encoded observer public keys from the `valset` module — the
+  /** Hex-encoded resident public keys from the `valset` module — the
    *  staged-admission tier (mesh + statesync, no quorum seat). Disjoint from
    *  `members`: valset's Grant refuses validators, Join clears standing. */
-  observers: string[];
+  residents: string[];
 
   // ── Governance ──
   /** Every proposal from the `governance` module, sorted by id. Re-queried per
@@ -86,15 +152,33 @@ export interface ConsoleState {
   /** Preorder blocks of the active page — root first — re-queried per block /
    *  on open. The view derives depth/indent from the parent links. */
   activePageBlocks: PageBlock[];
+  /** Ordered ids of the open document tabs. `activePage` is the active tab.
+   *  Persisted (loadDocTabs) and reconciled against the live enumeration. */
+  openTabs: string[];
+  /** Comment threads for the open page's blocks + the page itself, grouped by
+   *  target. Loaded on page open and after any comment op. Not per-block
+   *  snapshot state. */
+  pageThreads: TargetThreads[];
 
   // ── Agents ──
   /** Every registered agent, re-queried per block like tasks. */
   agents: AgentRecord[];
+  /** Distinct executor tags announced network-wide (the `capability` registry),
+   *  sorted. Feeds the agent view's "Runs on" picker; empty when no host has
+   *  announced or the node predates the module (best-effort in the snapshot). */
+  capabilities: string[];
   /** Every channel watch and its turn policy. */
   watches: WatchView[];
   /** In-flight runs (dispatches awaiting delivery), newest-first. terminal
    *  history lives in the dispatch module, not here. */
   pendingRuns: PendingRun[];
+  /** hex node key -> the executor tags that node announced (the `capability`
+   *  registry, kept per-node instead of flattened). Members view shows what
+   *  each member runs; empty when nothing is announced. */
+  capabilitiesByNode: Map<string, string[]>;
+  /** run_id -> hex node key currently executing it (the saga assignee, via the
+   *  dispatch read facade). Only in-flight runs appear; empty otherwise. */
+  runAssignee: Map<string, string>;
 
   // ── Search (cross-module reads over the node's derived index) ──
   /** The last search's results, or null before any search ran. Query-driven —
@@ -109,14 +193,15 @@ export interface ConsoleState {
   /** Every file manifest (List, prefix ""), re-queried per block. */
   files: Manifest[];
 
-  /** Recent per-block node telemetry, oldest-first (the view renders newest
-   *  first). Node-local observability — never re-queried from committed state;
-   *  backfilled from the node's ring on connect, then followed live over ws. */
-  telemetry: TelemetryFrame[];
+  /** The newest finalized height seen on the ws block stream — updated
+   *  UNGATED (unlike the refresh the same stream drives, which is held while
+   *  an op is in flight), so the console always knows the chain moved. Null
+   *  until the first frame on this connection. */
+  lastBlock: number | null;
 
   /** Recent NON-EMPTY blocks, oldest-first (the explorer renders newest
-   *  first). Node-local observability like telemetry — re-pulled from the
-   *  node's ring on every refresh; empty on a node without the surface. */
+   *  first). Node-local observability — re-pulled from the node's ring on
+   *  every refresh; empty on a node without the surface. */
   blocks: BlockRecord[];
 
   /** Height the explorer should open on next render — the finalization-mark
@@ -132,6 +217,14 @@ export interface ConsoleState {
 
   error: string | null;
 
+  /** A managed node failed to start/connect — routes the console to the
+   *  dedicated "Node failed to start" body (see BootError). Null on success. */
+  bootError: BootError | null;
+
+  /** The node went away mid-session — drives a persistent reconnecting banner
+   *  (see ConnectionDown). Null while connected. */
+  connectionDown: ConnectionDown | null;
+
   // ── Workspace / onboarding ──
   /** Every registered workspace, for the switcher. Empty on web. */
   workspaces: Workspace[];
@@ -145,6 +238,10 @@ export interface ConsoleState {
    *  down/bricked) — reveal the force-forget override so a workspace whose node
    *  can never start is still removable. Cleared on any fresh forget attempt. */
   forgetNeedsForce: boolean;
+  /** The picker-row counterpart of `forgetNeedsForce`: the id of the workspace
+   *  whose guarded delete couldn't confirm its node left the valset, so its row
+   *  offers the force override. Null when no delete is awaiting escalation. */
+  deleteNeedsForce: string | null;
   /** A joiner's live park→promote phase while its node is not yet a ready
    *  validator; null on the founder/member path and once the node answers. */
   onboardingPhase: PhaseReport | null;
@@ -179,6 +276,49 @@ export const saveViewMode = (mode: ViewMode): void => {
   } catch {
     // persistence is best-effort; a failed write just doesn't survive restart.
   }
+};
+
+// ── Doc tab persistence ─────────────────────────────────
+//
+// The open Docs tabs survive restart as a single id list; on load they are
+// filtered against the live page enumeration (a stale id from another workspace
+// simply drops), so no per-workspace keying is needed.
+const DOC_TABS_KEY = "ducktape.docTabs";
+
+export const loadDocTabs = (): string[] => {
+  try {
+    const raw = localStorage.getItem(DOC_TABS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+};
+
+export const saveDocTabs = (tabs: string[]): void => {
+  try {
+    localStorage.setItem(DOC_TABS_KEY, JSON.stringify(tabs));
+  } catch {
+    // persistence is best-effort; a failed write just doesn't survive restart.
+  }
+};
+
+/** Append `id` if absent (order preserved). */
+export const addTab = (tabs: string[], id: string): string[] =>
+  tabs.includes(id) ? tabs : [...tabs, id];
+
+/** Remove `id`; if it was active, pick the following neighbor (else previous,
+ *  else null) as the next active tab. */
+export const removeTab = (
+  tabs: string[],
+  active: string | null,
+  id: string,
+): { tabs: string[]; active: string | null } => {
+  const idx = tabs.indexOf(id);
+  const next = tabs.filter((t) => t !== id);
+  if (active !== id) return { tabs: next, active };
+  const neighbor = next[idx] ?? next[idx - 1] ?? null;
+  return { tabs: next, active: neighbor };
 };
 
 // ── Remote node persistence ─────────────────────────────
@@ -230,30 +370,48 @@ export const createInitialState = (): ConsoleState => {
     messages: [],
     activeThread: null,
     authorNames: {},
+    nodeUsers: {},
+    voice: {
+      channelId: null,
+      muted: false,
+      status: "idle",
+      error: null,
+      popped: false,
+      cameraOn: false,
+      peers: {},
+    },
     members: [],
-    observers: [],
+    residents: [],
     proposals: [],
     forgeHead: null,
     pages: [],
     activePage: null,
     activePageBlocks: [],
+    openTabs: loadDocTabs(),
+    pageThreads: [],
     agents: [],
+    capabilities: [],
     watches: [],
     pendingRuns: [],
+    capabilitiesByNode: new Map(),
+    runAssignee: new Map(),
     search: null,
     searchPending: false,
     searchOpen: false,
     files: [],
-    telemetry: [],
+    lastBlock: null,
     blocks: [],
     explorerFocus: null,
     ops: {},
     error: null,
+    bootError: null,
+    connectionDown: null,
     workspaces: [],
     workspace: null,
     needsOnboarding: false,
     onboardingBusy: false,
     forgetNeedsForce: false,
+    deleteNeedsForce: null,
     onboardingPhase: null,
     inviteBlob: null,
   };
@@ -264,17 +422,21 @@ export interface ConsoleSnapshot {
   status: NodeStatus | null;
   channels: Channel[];
   members: string[];
-  observers: string[];
+  residents: string[];
   proposals: ProposalView[];
   forgeHead: string | null;
   activeChannel: string | null;
   messages: MessageView[];
   authorNames: Record<string, string>;
+  nodeUsers: Record<string, { userKey: string; name: string | null }>;
   pages: PageMeta[];
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
+  capabilities: string[];
   watches: WatchView[];
   pendingRuns: PendingRun[];
+  capabilitiesByNode: Map<string, string[]>;
+  runAssignee: Map<string, string>;
   files: Manifest[];
   blocks: BlockRecord[];
 }
@@ -286,17 +448,21 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   status: snapshot.status,
   channels: snapshot.channels,
   members: snapshot.members,
-  observers: snapshot.observers,
+  residents: snapshot.residents,
   proposals: snapshot.proposals,
   forgeHead: snapshot.forgeHead,
   activeChannel: snapshot.activeChannel,
   messages: snapshot.messages,
   authorNames: snapshot.authorNames,
+  nodeUsers: snapshot.nodeUsers,
   pages: snapshot.pages,
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,
+  capabilities: snapshot.capabilities,
   watches: snapshot.watches,
   pendingRuns: snapshot.pendingRuns,
+  capabilitiesByNode: snapshot.capabilitiesByNode,
+  runAssignee: snapshot.runAssignee,
   files: snapshot.files,
   blocks: snapshot.blocks,
 });

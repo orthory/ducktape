@@ -34,3 +34,15 @@ respawn behavior test와, finalized valset state를 watch하고 cutover point를
 결정하는 test된 deterministic cutover state machine(`ValsetOrchestrator`)이
 있다. 다만 그 결정에 따라 old orderer를 stop하고 new epoch를 start하고 transport
 readiness를 정렬하는 live loop는 아직 미래 작업이다.
+
+## Membership 위의 Identity
+
+membership과 quorum은 여전히 node identity로 key된다: `valset`의 validator/
+observer set과 그 위의 epoch machinery는 node key를 사람으로 절대 resolve하지
+않는다. `crates/system/identity`는 그 한 층 위에 있는 별도의 replicated
+module이다 — node key를 user key에 매핑해서, 한 사람이 여러 node를 굴려도
+(각 node는 자기 membership standing, 자기 vote, 자기 quorum weight를 그대로
+유지한 채) app과 다른 모든 consumer에게는 하나의 user로 렌더링되게 한다. node를
+user에 bind하는 것은 그 자체로 origin과 user-signature로 gate된 별개의
+operation이며, `valset`의 state나 위에서 설명한 cutover path를 절대 건드리지
+않는다.

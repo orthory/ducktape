@@ -126,6 +126,21 @@ function Group({ title, count, children }: { title: string; count: number; child
   );
 }
 
+// The chat index pre-renders authors as `user:<id>`, `agent:<mod>/<id>`,
+// `module:<id>`, or `system`. On a networked node `<id>` is the submitter's hex
+// pubkey — resolve it to a profile nickname (or a short hex handle) so a hit
+// reads like that author does everywhere else, and picks up member renames for
+// free. On the embedded daemon `<id>` is a claimed utf-8 name; show it as-is.
+// Agent / module / system authors keep their tag, which distinguishes them.
+export function resolveHitAuthor(author: string, names: Record<string, string>): string {
+  if (!author.startsWith("user:")) return author;
+  const id = author.slice("user:".length);
+  if (/^[0-9a-f]{16,}$/.test(id) && id.length % 2 === 0) {
+    return displayNameForKey(id, names) ?? shortKey(id);
+  }
+  return id;
+}
+
 function HitButton({ meta, text, onOpen }: { meta: string; text: string; onOpen: () => void }) {
   const [hover, setHover] = useState(false);
   return (
@@ -238,7 +253,14 @@ export function SearchModal() {
             style={searchInput}
             value={text}
             autoFocus
-            placeholder="Search chat, docs, members, files…"
+            // A search box, not prose: kill WebKit's autocorrect/-capitalize so
+            // typing "test" isn't "corrected" to "Test", and drop the native
+            // autocomplete dropdown. Matches the members search input.
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            placeholder="Search chat, pages, members, files…"
             aria-label="Search"
             onChange={(event) => setText(event.target.value)}
           />
@@ -248,7 +270,7 @@ export function SearchModal() {
         <div style={scroll}>
           {!query && (
             <p style={{ margin: "4px 10px", font: `400 12.5px ${font.sans}`, color: color.muted2 }}>
-              Type to search chat, docs, members, and files.
+              Type to search chat, pages, members, and files.
             </p>
           )}
 
@@ -269,7 +291,7 @@ export function SearchModal() {
               {chatHits.map((hit) => (
                 <HitButton
                   key={`${hit.channelId}/${hit.seq}`}
-                  meta={`#${hit.channelId} · ${hit.author}${hit.edited ? " · edited" : ""}`}
+                  meta={`#${hit.channelId} · ${resolveHitAuthor(hit.author, state.authorNames)}${hit.edited ? " · edited" : ""}`}
                   text={hit.text}
                   onOpen={() => openChat(hit.channelId)}
                 />
@@ -278,7 +300,7 @@ export function SearchModal() {
           )}
 
           {docHits.length > 0 && (
-            <Group title="Docs" count={docHits.length}>
+            <Group title="Pages" count={docHits.length}>
               {docHits.map((hit) => (
                 <HitButton
                   key={hit.blockId}

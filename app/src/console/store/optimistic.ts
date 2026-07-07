@@ -8,7 +8,8 @@
 //
 // Everything here is a pure function of (previous state, op params).
 
-import type { ChatBlock, MessageView } from "../../domain/chat-client";
+import { keyHex } from "../../domain/chat-client";
+import type { ChatBlock, HuddleMember, MessageView } from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
 import type { PageBlock } from "../../domain/pages-client";
 import type { ConsoleState } from "./state";
@@ -169,13 +170,69 @@ export const channelCreated = (
         ],
       };
 
+/** Add ourselves to a channel's huddle roster the instant we join, so the pill
+ *  and dock react before the block lands. Idempotent on our node key; the
+ *  refresh replaces the roster (with the module-assigned join order) after. */
+export const huddleJoined = (
+  prev: ConsoleState,
+  params: { channelId: string; node: number[]; author: string; at: number },
+): Partial<ConsoleState> => {
+  const channel = prev.channels.find((c) => c.id === params.channelId);
+  if (!channel) return {};
+  const selfHex = keyHex(params.node);
+  const roster = channel.huddle ?? [];
+  if (roster.some((m) => keyHex(m.node) === selfHex)) return {};
+  const member: HuddleMember = {
+    user: Array.from(new TextEncoder().encode(params.author)),
+    node: params.node,
+    joined_at: params.at,
+  };
+  return {
+    channels: prev.channels.map((c) =>
+      c.id === params.channelId ? { ...c, huddle: [...roster, member] } : c,
+    ),
+  };
+};
+
+/** Drop our own node from a channel's huddle roster the instant we leave. */
+export const huddleLeft = (
+  prev: ConsoleState,
+  channelId: string,
+  selfNodeHex: string,
+): Partial<ConsoleState> => ({
+  channels: prev.channels.map((c) =>
+    c.id === channelId
+      ? { ...c, huddle: (c.huddle ?? []).filter((m) => keyHex(m.node) !== selfNodeHex) }
+      : c,
+  ),
+});
+
+/** Drop a swept (stale) member from a channel's huddle roster the instant the
+ *  sweep is submitted — keyed by the target's submitter identity (user) hex,
+ *  the same key the sweep op carries (unlike leave, which keys on the mesh
+ *  node). The refresh replaces the roster with committed truth after. */
+export const huddleSwept = (
+  prev: ConsoleState,
+  channelId: string,
+  userKeyHex: string,
+): Partial<ConsoleState> => ({
+  channels: prev.channels.map((c) =>
+    c.id === channelId
+      ? { ...c, huddle: (c.huddle ?? []).filter((m) => keyHex(m.user) !== userKeyHex) }
+      : c,
+  ),
+});
+
 // ── Pages ───────────────────────────────────────────────
 
 export const pageCreated = (
   prev: ConsoleState,
-  params: { pageId: string; title: string },
+  params: { pageId: string; title: string; parent?: string | null },
 ): Partial<ConsoleState> => ({
-  pages: [...prev.pages, { id: params.pageId, title: params.title }],
+  pages: [
+    ...prev.pages,
+    { id: params.pageId, title: params.title, parent: params.parent ?? null },
+  ],
 });
 
 /** Every id in `blockId`'s subtree (itself included), via the children links. */

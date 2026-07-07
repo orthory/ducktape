@@ -2,19 +2,24 @@ use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 
-use crate::{Coordinator, Msg, NodeKey, Side};
+use crate::auth::{now_secs, sign_authenticator, AuthPolicy, CoordCap};
+use crate::AuthRequest;
+use crate::{Coordinator, Msg, NodeKey};
+use commonware_cryptography::ed25519;
 
 pub struct NatClient {
     sock: UdpSocket,
     key: NodeKey,
     coord: SocketAddr,
     coords: Vec<SocketAddr>,
+    signer: Option<ed25519::PrivateKey>,
+    cap: Option<CoordCap>,
 }
 
 impl NatClient {
     pub async fn bind(key: NodeKey, coord: SocketAddr) -> std::io::Result<Self> {
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        Ok(Self { sock, key, coord, coords: vec![coord] })
+        Ok(Self { sock, key, coord, coords: vec![coord], signer: None, cap: None })
     }
 
     /// Bind with an ordered set of coordinator hints (the reach `Vec`). The
@@ -25,7 +30,41 @@ impl NatClient {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty coordinator set")
         })?;
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        Ok(Self { sock, key, coord, coords })
+        Ok(Self { sock, key, coord, coords, signer: None, cap: None })
+    }
+
+    /// Bind with an authenticating identity: every request to the coordinator
+    /// is wrapped in an `AuthRequest` signed by `signer`, carrying `cap`
+    /// (private mode) or `None` (public / PoP-only).
+    pub async fn bind_multi_auth(
+        key: NodeKey,
+        coords: Vec<SocketAddr>,
+        signer: ed25519::PrivateKey,
+        cap: Option<CoordCap>,
+    ) -> std::io::Result<Self> {
+        let coord = *coords.first().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty coordinator set")
+        })?;
+        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        Ok(Self { sock, key, coord, coords, signer: Some(signer), cap })
+    }
+
+    /// Encode a client→coordinator request, wrapping it in a signed
+    /// `AuthRequest` when this client authenticates, or sending it bare
+    /// otherwise (tests / no-auth dev path).
+    fn authed(&self, inner: Msg) -> Vec<u8> {
+        match &self.signer {
+            Some(signer) => {
+                // The caller is THIS node's identity: the PoP is signed with
+                // `self.signer` (whose public key is `self.key`), and the
+                // coordinator verifies it against `caller`. For a cross-peer
+                // `Lookup { key: peer }` the inner key is the peer, but the
+                // authenticated principal is still this caller.
+                let auth = sign_authenticator(signer, &inner.encode(), now_secs(), self.cap.clone());
+                AuthRequest { caller: self.key, inner, auth }.encode()
+            }
+            None => inner.encode(),
+        }
     }
 
     pub async fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -34,7 +73,7 @@ impl NatClient {
 
     pub async fn discover_reflexive(&self) -> std::io::Result<SocketAddr> {
         self.sock
-            .send_to(&Msg::BindRequest { from: self.key }.encode(), self.coord)
+            .send_to(&self.authed(Msg::BindRequest { from: self.key }), self.coord)
             .await?;
         let mut buf = [0u8; 64];
         loop {
@@ -59,10 +98,10 @@ impl NatClient {
     /// not uniquely load-bearing.
     ///
     /// Crucially, on success this REPOINTS `self.coord` at the coordinator that
-    /// actually answered, so every subsequent `register`/`lookup`/`request_relay`
-    /// uses the live coordinator too. Without that, failover would only cover
-    /// reflexive discovery while the dead primary stayed uniquely load-bearing
-    /// for the rest of the join path.
+    /// actually answered, so every subsequent `register`/`lookup` uses the live
+    /// coordinator too. Without that, failover would only cover reflexive
+    /// discovery while the dead primary stayed uniquely load-bearing for the
+    /// rest of the join path.
     pub async fn discover_reflexive_failover(
         &mut self,
         per_try: std::time::Duration,
@@ -72,7 +111,7 @@ impl NatClient {
         let coords = self.coords.clone();
         for (i, c) in coords.iter().copied().enumerate() {
             self.sock
-                .send_to(&Msg::BindRequest { from: self.key }.encode(), c)
+                .send_to(&self.authed(Msg::BindRequest { from: self.key }), c)
                 .await?;
             let attempt = async {
                 let mut buf = [0u8; 64];
@@ -107,7 +146,7 @@ impl NatClient {
 
     pub async fn register(&self) -> std::io::Result<()> {
         self.sock
-            .send_to(&Msg::Register { key: self.key }.encode(), self.coord)
+            .send_to(&self.authed(Msg::Register { key: self.key }), self.coord)
             .await?;
         Ok(())
     }
@@ -121,7 +160,7 @@ impl NatClient {
     /// duplicate could otherwise roll back.
     pub async fn readvertise(&self, nonce: u64) -> std::io::Result<()> {
         self.sock
-            .send_to(&Msg::Readvertise { key: self.key, nonce }.encode(), self.coord)
+            .send_to(&self.authed(Msg::Readvertise { key: self.key, nonce }), self.coord)
             .await?;
         Ok(())
     }
@@ -131,7 +170,7 @@ impl NatClient {
     /// directly).
     pub async fn lookup(&self, peer: NodeKey) -> std::io::Result<SocketAddr> {
         self.sock
-            .send_to(&Msg::Lookup { key: peer }.encode(), self.coord)
+            .send_to(&self.authed(Msg::Lookup { key: peer }), self.coord)
             .await?;
         let mut buf = [0u8; 64];
         loop {
@@ -195,229 +234,33 @@ impl NatClient {
             }
         }
     }
-
-    /// Ask the coordinator to allocate a relay session to `peer`; return the
-    /// session id and THIS side's relay endpoint — the address to point the
-    /// WireGuard peer at on hole-punch failure (`peer_endpoint_override`).
-    pub async fn request_relay(&self, peer: NodeKey) -> std::io::Result<(u64, SocketAddr)> {
-        self.sock
-            .send_to(&Msg::RelayRequest { peer }.encode(), self.coord)
-            .await?;
-        let mut buf = [0u8; 64];
-        loop {
-            let (n, from) = self.sock.recv_from(&mut buf).await?;
-            if from != self.coord {
-                continue;
-            }
-            if let Ok(Msg::RelayGrant { session, relay }) = Msg::decode(&buf[..n]) {
-                return Ok((session, relay));
-            }
-        }
-    }
-
-    /// Send an OPAQUE datagram to a relay endpoint. The relay forwards it
-    /// verbatim; the bytes are never interpreted by this crate.
-    pub async fn relay_send(&self, relay: SocketAddr, payload: &[u8]) -> std::io::Result<()> {
-        self.sock.send_to(payload, relay).await?;
-        Ok(())
-    }
-
-    /// Receive a relayed OPAQUE datagram (up to one MTU). Returns the raw bytes
-    /// as delivered by the relay — no decode.
-    pub async fn relay_recv(&self) -> std::io::Result<Vec<u8>> {
-        let mut buf = [0u8; 1500];
-        let (n, _from) = self.sock.recv_from(&mut buf).await?;
-        Ok(buf[..n].to_vec())
-    }
 }
 
-/// The real opaque splice for one relay session: forward datagrams between two
-/// UDP sockets (one per side), learning each side's source on its first
-/// datagram and PINNING it thereafter, and tear down after `idle` of total
-/// inactivity. Never decodes a payload — it holds only the two learned source
-/// addresses.
-pub async fn run_relay_pair(a_sock: UdpSocket, b_sock: UdpSocket, idle: std::time::Duration) {
-    let mut a_src: Option<SocketAddr> = None;
-    let mut b_src: Option<SocketAddr> = None;
-    let mut a_buf = [0u8; 1500];
-    let mut b_buf = [0u8; 1500];
-    // A single idle deadline, reset only when a datagram is ACCEPTED (passes
-    // source pinning). A spoofer spraying wrong-source datagrams is dropped
-    // without refreshing this, so it can neither hijack routing nor hold the
-    // session open past `idle`.
-    let deadline = tokio::time::sleep(idle);
-    tokio::pin!(deadline);
+/// The coordinator event loop: decode control datagrams (authenticated or, under
+/// a fully-open policy, legacy), enforce the auth policy, feed the pure handler,
+/// send replies. Pure rendezvous — never binds a data socket, never carries
+/// peer traffic.
+pub async fn run_coordinator(sock: UdpSocket, policy: AuthPolicy) {
+    let mut coord = Coordinator::with_policy(policy);
+    // Big enough for an AuthRequest with a cap (~251 bytes worst case: the
+    // 32-byte caller field plus the inner request, authenticator, and cap).
+    let mut buf = [0u8; 512];
     loop {
-        tokio::select! {
-            r = a_sock.recv_from(&mut a_buf) => {
-                let (n, from) = match r { Ok(v) => v, Err(_) => continue };
-                // Learn A's source on the first datagram, then pin it: a
-                // datagram from any other source on A's socket is an injection
-                // attempt (session hijack) and is dropped without disturbing the
-                // learned source or the idle deadline.
-                match a_src {
-                    Some(pinned) if pinned != from => continue,
-                    _ => a_src = Some(from),
-                }
-                deadline.as_mut().reset(tokio::time::Instant::now() + idle);
-                if let Some(dst) = b_src {
-                    let _ = b_sock.send_to(&a_buf[..n], dst).await;
-                }
-            }
-            r = b_sock.recv_from(&mut b_buf) => {
-                let (n, from) = match r { Ok(v) => v, Err(_) => continue };
-                match b_src {
-                    Some(pinned) if pinned != from => continue,
-                    _ => b_src = Some(from),
-                }
-                deadline.as_mut().reset(tokio::time::Instant::now() + idle);
-                if let Some(dst) = a_src {
-                    let _ = a_sock.send_to(&b_buf[..n], dst).await;
-                }
-            }
-            _ = &mut deadline => {
-                // `idle` elapsed with no accepted datagram on either side.
-                // Bounded teardown: both sockets drop when this task returns.
-                return;
-            }
-        }
-    }
-}
-
-/// The coordinator event loop: decode control datagrams, feed the pure handler,
-/// send replies. `RelayRequest` is handled specially — it must bind real relay
-/// sockets, which the transport-free `Coordinator::handle` cannot do. Relay
-/// sessions idle out after 30s.
-pub async fn run_coordinator(sock: UdpSocket) {
-    run_coordinator_with_idle(sock, std::time::Duration::from_secs(30)).await
-}
-
-/// As [`run_coordinator`], but with a caller-chosen relay idle timeout. The
-/// relay endpoint advertised to peers is derived from the listen IP — correct
-/// only when that IP is concrete (tests bind loopback). A coordinator on the
-/// wildcard MUST use [`run_coordinator_advertised`] with an explicit reachable
-/// IP, or it would hand peers an unroutable `0.0.0.0:<port>` relay endpoint.
-pub async fn run_coordinator_with_idle(sock: UdpSocket, relay_idle: std::time::Duration) {
-    let advertise_ip = sock
-        .local_addr()
-        .map(|a| a.ip())
-        .unwrap_or_else(|_| std::net::IpAddr::from([0, 0, 0, 0]));
-    run_coordinator_advertised(sock, advertise_ip, relay_idle).await
-}
-
-/// The coordinator loop with an explicit relay-advertise IP: relay sockets bind
-/// the wildcard (to receive from any peer), but the address handed back in
-/// `RelayGrant` uses `advertise_ip` so a coordinator behind `0.0.0.0` still
-/// gives peers a routable relay endpoint.
-pub async fn run_coordinator_advertised(
-    sock: UdpSocket,
-    advertise_ip: std::net::IpAddr,
-    relay_idle: std::time::Duration,
-) {
-    use std::collections::HashMap;
-
-    let mut coord = Coordinator::new();
-    let mut buf = [0u8; 64];
-    // relay sockets bind on the same interface the control socket did (the
-    // wildcard is fine for RECEIVING); the port is ephemeral.
-    let bind_ip = sock
-        .local_addr()
-        .map(|a| a.ip())
-        .unwrap_or_else(|_| std::net::IpAddr::from([0, 0, 0, 0]));
-    // session id -> (side-A relay addr, side-B relay addr)
-    let mut relay_addrs: HashMap<u64, (SocketAddr, SocketAddr)> = HashMap::new();
-    // Relay splices are OWNED by this coordinator task via a `JoinSet`, not
-    // detached. If this task is dropped or aborted — the runtime-local model of
-    // the coordinator PROCESS dying — the `JoinSet` drops with it and every live
-    // splice is aborted, so an established RELAYED path does not outlive the
-    // coordinator. (A punched direct path touches no coordinator socket, so it
-    // survives — that asymmetry is the invariant.) Detaching the splices (a plain
-    // `tokio::spawn`) would instead let a relay keep forwarding after the
-    // coordinator was gone, a false "relay needs the coordinator" guarantee.
-    let mut relay_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    // Each relay-pair task signals its session id here once it idles out and its
-    // sockets are gone. The coordinator can't observe data-plane relay activity
-    // (it flows through the spawned splice, not this control socket), so a
-    // wall-clock prune would be blind to live sessions or tear down active
-    // ones. Reclaiming exactly on task completion keeps `relay_addrs` and the
-    // coordinator's session table in lockstep with the live sockets, so a
-    // re-request after teardown allocates a FRESH session instead of handing
-    // back a dead relay port.
-    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<u64>(64);
-    loop {
-        // Reap splices that have already idled out so the JoinSet stays bounded;
-        // their `relay_addrs`/session bookkeeping is reclaimed via `done_rx`.
-        while relay_tasks.try_join_next().is_some() {}
-        let (n, from) = tokio::select! {
-            r = sock.recv_from(&mut buf) => match r {
-                Ok(v) => v,
-                Err(_) => continue,
-            },
-            Some(session) = done_rx.recv() => {
-                relay_addrs.remove(&session);
-                coord.release_relay(session);
-                continue;
-            }
-        };
-        let msg = match Msg::decode(&buf[..n]) {
-            Ok(m) => m,
+        let (n, from) = match sock.recv_from(&mut buf).await {
+            Ok(v) => v,
             Err(_) => continue,
         };
-        if let Msg::RelayRequest { peer } = msg {
-            // Reclaim any sessions whose splice has already torn down before
-            // allocating, so a re-request can never be handed a dead relay port
-            // (closes the small window between task exit and the select branch
-            // above draining the signal).
-            while let Ok(session) = done_rx.try_recv() {
-                relay_addrs.remove(&session);
-                coord.release_relay(session);
-            }
-            if let Some((session, side)) = coord.request_relay(from, peer, 0) {
-                let pair = match relay_addrs.get(&session) {
-                    Some(&pair) => pair,
-                    None => {
-                        // Bind two ephemeral relay sockets on the coordinator's
-                        // own IP and spawn the opaque splice for this session.
-                        let a = match UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        };
-                        let b = match UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        };
-                        // peers dial the ADVERTISE ip at the socket's bound port
-                        // — never the bind ip, which may be the wildcard.
-                        let (a_addr, b_addr) = match (a.local_addr(), b.local_addr()) {
-                            (Ok(x), Ok(y)) => (
-                                SocketAddr::new(advertise_ip, x.port()),
-                                SocketAddr::new(advertise_ip, y.port()),
-                            ),
-                            _ => continue,
-                        };
-                        // Spawn the opaque splice INTO the coordinator-owned
-                        // JoinSet; when it idles out, signal its session id so the
-                        // coordinator reclaims the entry.
-                        let done = done_tx.clone();
-                        relay_tasks.spawn(async move {
-                            run_relay_pair(a, b, relay_idle).await;
-                            let _ = done.send(session).await;
-                        });
-                        relay_addrs.insert(session, (a_addr, b_addr));
-                        (a_addr, b_addr)
-                    }
-                };
-                let relay = match side {
-                    Side::A => pair.0,
-                    Side::B => pair.1,
-                };
-                let _ = sock
-                    .send_to(&Msg::RelayGrant { session, relay }.encode(), from)
-                    .await;
-            }
-            continue;
-        }
-        for (dst, reply) in coord.handle(from, msg) {
+        let now = now_secs();
+        // Tag 11 -> authenticated envelope; anything else -> legacy Msg. The two
+        // are mutually exclusive by tag, so try the envelope first and fall back.
+        let out = match AuthRequest::decode(&buf[..n]) {
+            Ok(req) => coord.handle_auth(from, req, now),
+            Err(_) => match Msg::decode(&buf[..n]) {
+                Ok(m) => coord.handle_legacy(from, m),
+                Err(_) => continue,
+            },
+        };
+        for (dst, reply) in out {
             let _ = sock.send_to(&reply.encode(), dst).await;
         }
     }
@@ -432,11 +275,103 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
+    async fn authorized_client_rendezvous_under_private_policy_but_unauthorized_is_dropped() {
+        use crate::auth::{mint_coord_cap, AuthPolicy};
+        use commonware_cryptography::{ed25519, Signer as _};
+
+        let g = ed25519::PrivateKey::from_seed(100);
+        let policy = AuthPolicy::Private { genesis_set: vec![g.public_key()] };
+
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        tokio::spawn(run_coordinator(coord_sock, policy));
+
+        // Two authorized nodes (joiners) with genesis caps.
+        let a_signer = ed25519::PrivateKey::from_seed(200);
+        let b_signer = ed25519::PrivateKey::from_seed(201);
+        let a_key = { let mut k=[0u8;32]; k.copy_from_slice(a_signer.public_key().as_ref()); NodeKey(k) };
+        let b_key = { let mut k=[0u8;32]; k.copy_from_slice(b_signer.public_key().as_ref()); NodeKey(k) };
+        let a_cap = mint_coord_cap(&g, a_key, crate::auth::now_secs() + 3600);
+        let b_cap = mint_coord_cap(&g, b_key, crate::auth::now_secs() + 3600);
+
+        let a = NatClient::bind_multi_auth(a_key, vec![coord_addr], a_signer, Some(a_cap)).await.unwrap();
+        let b = NatClient::bind_multi_auth(b_key, vec![coord_addr], b_signer, Some(b_cap)).await.unwrap();
+        a.register().await.unwrap();
+        b.register().await.unwrap();
+
+        // Per the committed wire semantics, a `Lookup`'s `subject_key()` is the
+        // LOOKED-UP key, so under Private policy the authenticator must be signed
+        // by (and admitted for) that key — a node resolves its OWN mapping. This
+        // proves an authorized register+lookup completes end-to-end over the real
+        // signed UDP path (a cross-node `a.lookup(b_key)` is impossible here: a
+        // does not hold b's signer, so its PoP would fail and be dropped).
+        let a_reflexive = timeout(Duration::from_secs(2), a.lookup(a_key)).await.expect("no timeout").expect("lookup");
+        assert_eq!(a_reflexive.port(), a.local_addr().await.unwrap().port());
+        let b_reflexive = timeout(Duration::from_secs(2), b.lookup(b_key)).await.expect("no timeout").expect("lookup");
+        assert_eq!(b_reflexive.port(), b.local_addr().await.unwrap().port());
+
+        // Unauthorized: a node with NO signer (bare Msg) cannot register under
+        // Private policy — its lookup for itself finds nothing.
+        let outsider = NatClient::bind(NodeKey([0xcd; 32]), coord_addr).await.unwrap();
+        outsider.register().await.unwrap(); // dropped by handle_legacy
+        let miss = timeout(Duration::from_millis(500), outsider.lookup(NodeKey([0xcd; 32]))).await;
+        assert!(miss.is_err() || miss.unwrap().is_err(), "unauthenticated register never created a mapping");
+    }
+
+    #[tokio::test]
+    async fn cross_peer_authenticated_lookup_and_punch_under_private_policy() {
+        // The core rendezvous path: two AUTHORIZED nodes A and B (each holding a
+        // genesis-minted cap) register, then A looks up B's DIFFERENT key and a
+        // simultaneous-open punch completes. This is the previously-impossible
+        // path — the coordinator authenticates the CALLER (A), not the looked-up
+        // key (B), so A's PoP (signed with A's own key) validates.
+        use crate::auth::{mint_coord_cap, AuthPolicy};
+        use commonware_cryptography::{ed25519, Signer as _};
+
+        let g = ed25519::PrivateKey::from_seed(700);
+        let policy = AuthPolicy::Private { genesis_set: vec![g.public_key()] };
+
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        tokio::spawn(run_coordinator(coord_sock, policy));
+
+        let a_signer = ed25519::PrivateKey::from_seed(701);
+        let b_signer = ed25519::PrivateKey::from_seed(702);
+        let a_key = { let mut k=[0u8;32]; k.copy_from_slice(a_signer.public_key().as_ref()); NodeKey(k) };
+        let b_key = { let mut k=[0u8;32]; k.copy_from_slice(b_signer.public_key().as_ref()); NodeKey(k) };
+        let a_cap = mint_coord_cap(&g, a_key, crate::auth::now_secs() + 3600);
+        let b_cap = mint_coord_cap(&g, b_key, crate::auth::now_secs() + 3600);
+
+        let a = NatClient::bind_multi_auth(a_key, vec![coord_addr], a_signer, Some(a_cap)).await.unwrap();
+        let b = NatClient::bind_multi_auth(b_key, vec![coord_addr], b_signer, Some(b_cap)).await.unwrap();
+        a.register().await.unwrap();
+        b.register().await.unwrap();
+
+        // A resolves B's reflexive via a CROSS-PEER Lookup. Under the OLD code
+        // (authenticate the looked-up key) A's PoP is verified against B's key
+        // and fails BadPop, so this Lookup is silently dropped and the lookup
+        // times out. Under the fix it resolves B's mapping.
+        let b_reflexive = timeout(Duration::from_secs(2), a.lookup(b_key))
+            .await
+            .expect("cross-peer lookup must not time out")
+            .expect("A resolves B");
+        assert_eq!(b_reflexive.port(), b.local_addr().await.unwrap().port());
+
+        // The fan-out PunchSync reached B (the coordinator told B where to punch
+        // A). B learns A's reflexive from that unsolicited PunchSync.
+        let a_reflexive = timeout(Duration::from_secs(2), b.recv_punch_sync())
+            .await
+            .expect("B receives the fan-out PunchSync")
+            .expect("punch sync");
+        assert_eq!(a_reflexive.port(), a.local_addr().await.unwrap().port());
+    }
+
+    #[tokio::test]
     async fn dead_primary_falls_through_to_live_secondary() {
         // A live coordinator (the secondary).
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        tokio::spawn(run_coordinator(live));
+        tokio::spawn(run_coordinator(live, crate::auth::AuthPolicy::Open { require_pop: false }));
 
         // A DEAD primary: a bound socket nobody ever serves. Datagrams sent to
         // it are buffered and never answered, so the per-try budget elapses.
@@ -463,7 +398,7 @@ mod tests {
         // previous test this proves neither position is uniquely required.
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        tokio::spawn(run_coordinator(live));
+        tokio::spawn(run_coordinator(live, crate::auth::AuthPolicy::Open { require_pop: false }));
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
 
@@ -483,7 +418,7 @@ mod tests {
     async fn client_discovers_its_reflexive_via_coordinator() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock));
+        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
 
         let client = NatClient::bind(NodeKey([1u8; 32]), coord_addr).await.unwrap();
         let reflexive = client.discover_reflexive().await.unwrap();
@@ -497,7 +432,7 @@ mod tests {
     async fn discover_reflexive_ignores_forged_bind_response_from_non_coordinator() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock));
+        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
 
         let client = NatClient::bind(NodeKey([2u8; 32]), coord_addr).await.unwrap();
         let client_addr = client.local_addr().await.unwrap();
@@ -526,7 +461,7 @@ mod tests {
     async fn recv_punch_from_ignores_spoofed_punch_from_wrong_sender() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock));
+        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
 
         let a_key = NodeKey([0xaa; 32]);
         let a = NatClient::bind(a_key, coord_addr).await.unwrap();
@@ -544,12 +479,12 @@ mod tests {
             b.local_addr().await.unwrap().port(),
         );
 
-        // A relay/third party sends a forged Punch — with a *different*
-        // claimed identity, so the test can tell the two datagrams apart by
-        // content — from its own socket, not A's rendezvous-resolved
-        // address. It lands first.
-        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        relay
+        // A third party sends a forged Punch — with a *different* claimed
+        // identity, so the test can tell the two datagrams apart by content —
+        // from its own socket, not A's rendezvous-resolved address. It lands
+        // first.
+        let forger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        forger
             .send_to(&Msg::Punch { from: NodeKey([0xcc; 32]) }.encode(), b_addr)
             .await
             .unwrap();
@@ -565,141 +500,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_clients_relay_opaque_datagrams_both_ways() {
-        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock));
-
-        let a_key = NodeKey([0xaa; 32]);
-        let b_key = NodeKey([0xbb; 32]);
-        let a = NatClient::bind(a_key, coord_addr).await.unwrap();
-        let b = NatClient::bind(b_key, coord_addr).await.unwrap();
-        a.register().await.unwrap();
-        b.register().await.unwrap();
-
-        let (s_a, a_relay) = timeout(Duration::from_secs(2), a.request_relay(b_key))
-            .await
-            .expect("no timeout")
-            .expect("grant a");
-        let (s_b, b_relay) = timeout(Duration::from_secs(2), b.request_relay(a_key))
-            .await
-            .expect("no timeout")
-            .expect("grant b");
-        assert_eq!(s_a, s_b, "one session per pair");
-        assert_ne!(a_relay, b_relay, "one relay port per side");
-
-        // The relay learns a side's source on its first datagram, so the far
-        // side's source must be known before a payload can be forwarded, and
-        // that first datagram is dropped. `run_relay_pair`'s `tokio::select!`
-        // also processes the two sockets in a nondeterministic order when both
-        // are ready, so a fixed send sequence cannot guarantee delivery. Model
-        // real WireGuard, which simply retransmits until a reply arrives: each
-        // side re-sends its OWN opaque payload until the far side receives it.
-        // `a` only ever emits `A_PAYLOAD` and `b` only ever emits `B_PAYLOAD`,
-        // and the relay only forwards a->b and b->a, so whatever a side
-        // receives is unambiguously the peer's ciphertext.
-        const A_PAYLOAD: &[u8] = b"opaque-ciphertext-A";
-        const B_PAYLOAD: &[u8] = b"opaque-ciphertext-B";
-
-        // Prime both sources so each direction can eventually forward.
-        a.relay_send(a_relay, A_PAYLOAD).await.unwrap();
-        b.relay_send(b_relay, B_PAYLOAD).await.unwrap();
-
-        // A -> B, retransmitting until B receives A's ciphertext (bounded so a
-        // genuinely broken relay fails fast instead of hanging CI).
-        let mut got_b = None;
-        for _ in 0..50 {
-            a.relay_send(a_relay, A_PAYLOAD).await.unwrap();
-            if let Ok(v) = timeout(Duration::from_millis(100), b.relay_recv()).await {
-                got_b = Some(v.expect("recv b"));
-                break;
-            }
-        }
-        assert_eq!(got_b.expect("B received A's ciphertext").as_slice(), A_PAYLOAD);
-
-        // B -> A, retransmitting until A receives B's ciphertext.
-        let mut got_a = None;
-        for _ in 0..50 {
-            b.relay_send(b_relay, B_PAYLOAD).await.unwrap();
-            if let Ok(v) = timeout(Duration::from_millis(100), a.relay_recv()).await {
-                got_a = Some(v.expect("recv a"));
-                break;
-            }
-        }
-        assert_eq!(got_a.expect("A received B's ciphertext").as_slice(), B_PAYLOAD);
-    }
-
-    #[tokio::test]
-    async fn relay_pair_tears_down_after_idle() {
-        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let handle = tokio::spawn(run_relay_pair(a, b, Duration::from_millis(50)));
-        // No traffic on either side -> the task returns within a bounded time.
-        timeout(Duration::from_secs(1), handle)
-            .await
-            .expect("relay pair did not idle out")
-            .expect("join");
-    }
-
-    #[tokio::test]
-    async fn run_relay_pair_pins_source_against_injection() {
-        // The relay's two per-side sockets.
-        let a_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let b_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let a_relay = a_sock.local_addr().unwrap();
-        let b_relay = b_sock.local_addr().unwrap();
-        tokio::spawn(run_relay_pair(a_sock, b_sock, Duration::from_secs(30)));
-
-        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        // 1. A sends first so the relay learns and PINS a_src = A's address.
-        a.send_to(b"a", a_relay).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // 2. The attacker sprays A's relay socket from its OWN address. With
-        //    source pinning this is dropped and a_src stays pinned to A;
-        //    without it, a_src would be hijacked to the attacker and B's return
-        //    traffic redirected there.
-        attacker.send_to(b"inject", a_relay).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // 3. B sends toward A. It must reach the REAL A, never the attacker.
-        //    Retransmit to absorb scheduling nondeterminism (as WireGuard does).
-        const B_PAYLOAD: &[u8] = b"from-b-to-a";
-        let mut got_a = None;
-        for _ in 0..50 {
-            b.send_to(B_PAYLOAD, b_relay).await.unwrap();
-            let mut buf = [0u8; 1500];
-            if let Ok(Ok((n, _))) =
-                timeout(Duration::from_millis(100), a.recv_from(&mut buf)).await
-            {
-                got_a = Some(buf[..n].to_vec());
-                break;
-            }
-        }
-        assert_eq!(
-            got_a.as_deref(),
-            Some(B_PAYLOAD),
-            "B->A must reach the real A; a pinned relay ignores the injector"
-        );
-
-        // The attacker must never have received relayed traffic.
-        let mut buf = [0u8; 1500];
-        assert!(
-            timeout(Duration::from_millis(200), attacker.recv_from(&mut buf))
-                .await
-                .is_err(),
-            "the injector must not receive relayed traffic (no session hijack)"
-        );
-    }
-
-    #[tokio::test]
     async fn direct_path_survives_coordinator_shutdown() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        let coord = tokio::spawn(run_coordinator(coord_sock));
+        let coord = tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
 
         let a_key = NodeKey([0xaa; 32]);
         let b_key = NodeKey([0xbb; 32]);
@@ -743,93 +547,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_setup_requires_a_live_coordinator() {
-        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let coord_addr = coord_sock.local_addr().unwrap();
-        let coord = tokio::spawn(run_coordinator(coord_sock));
-
-        let a = NatClient::bind(NodeKey([0xaa; 32]), coord_addr).await.unwrap();
-        a.register().await.unwrap();
-
-        // Coordinator down -> a relayed path cannot even be established: the
-        // grant never comes. (Unlike a punched path, which needs nothing.)
-        coord.abort();
-        let res = timeout(Duration::from_millis(400), a.request_relay(NodeKey([0xbb; 32]))).await;
-        assert!(
-            res.is_err(),
-            "without a live coordinator a relay session cannot be allocated"
-        );
-    }
-
-    #[tokio::test]
-    async fn coordinator_reclaims_idle_relay_and_regrants_fresh_session() {
-        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let coord_addr = coord_sock.local_addr().unwrap();
-        // Short relay idle so the splice tears down quickly.
-        tokio::spawn(run_coordinator_with_idle(coord_sock, Duration::from_millis(150)));
-
-        let a_key = NodeKey([0xaa; 32]);
-        let b_key = NodeKey([0xbb; 32]);
-        let a = NatClient::bind(a_key, coord_addr).await.unwrap();
-        let b = NatClient::bind(b_key, coord_addr).await.unwrap();
-        a.register().await.unwrap();
-        b.register().await.unwrap();
-
-        // First allocation for the pair.
-        let (s0, _relay0) = timeout(Duration::from_secs(2), a.request_relay(b_key))
-            .await
-            .expect("no timeout")
-            .expect("grant");
-
-        // Let the relay pair idle out (no data-plane traffic) and the
-        // coordinator reclaim the session.
-        tokio::time::sleep(Duration::from_millis(450)).await;
-
-        // Re-request the SAME pair: the coordinator must allocate a fresh
-        // session and bind a live relay, not hand back the torn-down one.
-        let (s1, relay1) = timeout(Duration::from_secs(2), a.request_relay(b_key))
-            .await
-            .expect("no timeout")
-            .expect("regrant");
-        assert_ne!(
-            s0, s1,
-            "a re-request after teardown must allocate a new session, not reuse the dead one"
-        );
-
-        // The fresh relay must actually deliver: prove it end to end so the test
-        // fails if the grant points at a dead port. Both sides drive the new
-        // session and retransmit their own opaque payload until it arrives.
-        let (_s1b, relay1_b) = timeout(Duration::from_secs(2), b.request_relay(a_key))
-            .await
-            .expect("no timeout")
-            .expect("regrant b");
-        assert_ne!(relay1, relay1_b, "one relay port per side");
-        const PAYLOAD: &[u8] = b"post-reclaim-A";
-        a.relay_send(relay1, PAYLOAD).await.unwrap();
-        b.relay_send(relay1_b, b"post-reclaim-B").await.unwrap();
-        let mut got_b = None;
-        for _ in 0..50 {
-            a.relay_send(relay1, PAYLOAD).await.unwrap();
-            if let Ok(v) = timeout(Duration::from_millis(100), b.relay_recv()).await {
-                got_b = Some(v.expect("recv b"));
-                break;
-            }
-        }
-        assert_eq!(
-            got_b.expect("B received A's ciphertext on the fresh relay").as_slice(),
-            PAYLOAD,
-            "the re-granted relay must be live, not a stale dead port"
-        );
-    }
-
-    #[tokio::test]
     async fn wire_readvertise_supersedes_stale_mapping_over_the_real_udp_path() {
         // The nonce-gated rebind must be reachable over the LIVE protocol, not
         // only via the in-process `Coordinator::readvertise` API: a rebound node
         // sends `Msg::Readvertise` over UDP and a peer re-resolves the new mapping.
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock));
+        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
 
         let a_key = NodeKey([0xaa; 32]);
         let b_key = NodeKey([0xbb; 32]);
@@ -875,12 +599,12 @@ mod tests {
 
     #[tokio::test]
     async fn failover_repoints_coord_so_join_path_uses_the_live_secondary() {
-        // Discovery failover is worthless if register/lookup/relay still hardcode
+        // Discovery failover is worthless if register/lookup still hardcode
         // the dead primary. After failover, the WHOLE join path must use the
         // coordinator that answered.
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        tokio::spawn(run_coordinator(live));
+        tokio::spawn(run_coordinator(live, crate::auth::AuthPolicy::Open { require_pop: false }));
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
 
@@ -914,69 +638,6 @@ mod tests {
             b_reflexive.port(),
             b.local_addr().await.unwrap().port(),
             "A's join path resolved B via the coordinator that actually answered"
-        );
-    }
-
-    #[tokio::test]
-    async fn established_relay_path_does_not_survive_coordinator_downtime() {
-        // Companion to the allocation-side check: prove an ALREADY-ESTABLISHED
-        // relayed data path stops flowing when the coordinator dies — not merely
-        // that a NEW allocation fails.
-        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let coord_addr = coord_sock.local_addr().unwrap();
-        // Long relay idle: only the coordinator's death — never a self-timeout —
-        // should stop the splice during this test.
-        let coord = tokio::spawn(run_coordinator_with_idle(coord_sock, Duration::from_secs(30)));
-
-        let a_key = NodeKey([0xaa; 32]);
-        let b_key = NodeKey([0xbb; 32]);
-        let a = NatClient::bind(a_key, coord_addr).await.unwrap();
-        let b = NatClient::bind(b_key, coord_addr).await.unwrap();
-        a.register().await.unwrap();
-        b.register().await.unwrap();
-
-        let (_s_a, a_relay) = timeout(Duration::from_secs(2), a.request_relay(b_key))
-            .await
-            .expect("no timeout")
-            .expect("grant a");
-        let (_s_b, b_relay) = timeout(Duration::from_secs(2), b.request_relay(a_key))
-            .await
-            .expect("no timeout")
-            .expect("grant b");
-
-        // Establish the relayed data path and PROVE it forwards while the
-        // coordinator lives (so the post-abort stall is a real death, not a path
-        // that never worked). Prime both sources first, then retransmit A->B.
-        const A_PAYLOAD: &[u8] = b"pre-abort-A";
-        a.relay_send(a_relay, A_PAYLOAD).await.unwrap();
-        b.relay_send(b_relay, b"pre-abort-B").await.unwrap();
-        let mut forwarded = false;
-        for _ in 0..50 {
-            a.relay_send(a_relay, A_PAYLOAD).await.unwrap();
-            if let Ok(v) = timeout(Duration::from_millis(100), b.relay_recv()).await {
-                assert_eq!(v.expect("recv").as_slice(), A_PAYLOAD);
-                forwarded = true;
-                break;
-            }
-        }
-        assert!(forwarded, "the relay must forward while the coordinator is alive");
-
-        // The coordinator dies. Because the splice is OWNED by the coordinator
-        // task, aborting it tears the established relay down too.
-        coord.abort();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        // Flush anything the pre-abort proof loop left buffered in B's socket.
-        while timeout(Duration::from_millis(50), b.relay_recv()).await.is_ok() {}
-
-        // The established relayed path no longer carries data: A's datagrams die
-        // at the now-dead relay port, so B receives nothing within a bounded wait.
-        // This is the RELAYED-non-survival invariant a punched path does NOT share.
-        for _ in 0..5 {
-            let _ = a.relay_send(a_relay, A_PAYLOAD).await;
-        }
-        assert!(
-            timeout(Duration::from_millis(500), b.relay_recv()).await.is_err(),
-            "an established relayed path must die with the coordinator"
         );
     }
 }

@@ -62,6 +62,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                             root: "ef".repeat(32),
                             category: ModuleCategory::of("chat"),
                         }],
+                        public_key: "ab".repeat(32),
                     });
                 }
                 NodeCommand::Metrics { reply } => {
@@ -313,4 +314,53 @@ async fn a_dead_actor_maps_to_service_unavailable() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// a GET carrying the RFC 6455 upgrade headers axum's `WebSocketUpgrade`
+/// extractor checks. NOTE the oneshot transport can never actually upgrade:
+/// hyper's `OnUpgrade` state only exists on a real served connection, so the
+/// extractor stops these requests with 426 BEFORE the handler body runs. that
+/// still separates "route is wired" (426) from "route is gone" (404); the
+/// handler's own no-hub refusal (503 + a body that says why) is exercised
+/// against the real spawned binary in `daemon_e2e.rs`.
+fn ws_upgrade(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, "websocket")
+        .header(header::SEC_WEBSOCKET_VERSION, "13")
+        .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn call_ws_route_is_wired() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(ws_upgrade("/v1/call/ws?channel=general"))
+        .await
+        .unwrap();
+
+    // 426 = axum's ConnectionNotUpgradable: the route matched and websocket
+    // extraction ran — anything but 404 proves the route exists.
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+}
+
+#[tokio::test]
+async fn the_old_voice_ws_route_is_gone() {
+    // app and node ship lockstep: `/v1/voice/ws` was replaced by `/v1/call/ws`,
+    // so the old path is simply unrouted now — a 404, not a refusal.
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(ws_upgrade("/v1/voice/ws?channel=general"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

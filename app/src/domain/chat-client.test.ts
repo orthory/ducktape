@@ -9,9 +9,14 @@ import {
   blocksText,
   channels,
   createChannel,
+  joinHuddle,
+  keyBytes,
+  keyHex,
   latestMessages,
+  leaveHuddle,
   postMessage,
   searchMessages,
+  sweepHuddle,
   thread,
 } from "./chat-client";
 import type { MessageView } from "./chat-client";
@@ -24,10 +29,9 @@ const stubTransport = (reply?: unknown): NodeTransport => ({
   putBlob: vi.fn(),
   getBlob: vi.fn(),
   status: vi.fn(),
-  telemetry: vi.fn(),
+  metrics: vi.fn(),
   blocks: vi.fn(),
   onBlock: vi.fn(),
-  onTelemetry: vi.fn(),
 });
 
 const wireMessage = (over: Partial<MessageView["head"]> = {}): MessageView => ({
@@ -107,6 +111,45 @@ describe("chat msgs", () => {
     });
     const [, payload] = vi.mocked(transport.submit).mock.calls[0];
     expect((payload as { post_message: { thread: number } }).post_message.thread).toBe(7);
+  });
+});
+
+describe("huddle msgs", () => {
+  it("encodes JoinHuddle with the node key bytes and stamps the origin", async () => {
+    const transport = stubTransport();
+    const node = keyBytes("ab".repeat(32));
+    await joinHuddle(transport, { channelId: "general", node, origin: "jess" });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "chat",
+      { join_huddle: { channel_id: "general", node } },
+      "jess",
+    );
+  });
+
+  it("encodes LeaveHuddle for the channel and stamps the origin", async () => {
+    const transport = stubTransport();
+    await leaveHuddle(transport, { channelId: "general", origin: "jess" });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "chat",
+      { leave_huddle: { channel_id: "general" } },
+      "jess",
+    );
+  });
+
+  it("encodes SweepHuddle with the target user bytes and stamps the origin", async () => {
+    const transport = stubTransport();
+    const user = Array.from(new TextEncoder().encode("stale"));
+    await sweepHuddle(transport, { channelId: "general", user, origin: "jess" });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "chat",
+      { sweep_huddle: { channel_id: "general", user } },
+      "jess",
+    );
+  });
+
+  it("keyBytes inverts keyHex for a mesh key", () => {
+    const bytes = Array.from({ length: 32 }, (_, i) => i * 7 % 256);
+    expect(keyBytes(keyHex(bytes))).toEqual(bytes);
   });
 });
 

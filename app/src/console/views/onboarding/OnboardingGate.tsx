@@ -9,6 +9,7 @@ import { useState } from "react";
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { useDucktape } from "../../store/use-ducktape";
 import { LIVE_JOIN_SUPPORTED } from "../../../domain/workspace-client";
+import type { Workspace } from "../../../domain/workspace-client";
 
 type Mode = "create" | "join" | "remote";
 
@@ -21,6 +22,20 @@ const inputStyle: React.CSSProperties = {
   background: color.sunken,
   font: `500 12.5px ${font.sans}`,
   color: color.ink,
+};
+
+const deleteButtonStyle: React.CSSProperties = {
+  all: "unset",
+  cursor: "pointer",
+  display: "flex",
+  alignItems: "center",
+  padding: "0 10px",
+  borderRadius: radius.sm,
+  border: `1px solid ${color.border}`,
+  background: color.paper,
+  font: `600 10.5px ${font.sans}`,
+  color: color.red,
+  whiteSpace: "nowrap",
 };
 
 function Tab({
@@ -77,6 +92,31 @@ export function OnboardingGate() {
     if (mode === "create") actions.createWorkspace(name);
     else if (mode === "join") actions.joinWorkspace(name, blob);
     else actions.connectRemote(url);
+  };
+
+  const confirmDelete = (w: Workspace): void => {
+    const ok = window.confirm(
+      `Delete "${w.name}"?\n\n` +
+        `This stops its node and deletes the workspace locally — its ` +
+        `directory, identity key, and registry entry are removed. It is ` +
+        `refused while its node is still a current validator of a network ` +
+        `with other members (that would halt the network's quorum).`,
+    );
+    if (ok) actions.deleteWorkspace(w.id);
+  };
+
+  const confirmForceDelete = (w: Workspace): void => {
+    const ok = window.confirm(
+      `Force-delete "${w.name}"?\n\n` +
+        `Its node couldn't confirm it has left its validator set — usually ` +
+        `because it can't start or was never admitted. Forcing deletes the ` +
+        `workspace WITHOUT that confirmation: its directory, identity key, ` +
+        `and registry entry are removed for good.\n\n` +
+        `Only do this for a network you know is solo or defunct. If this ` +
+        `node is still a validator of a network with OTHER live members, ` +
+        `destroying its identity can PERMANENTLY halt that network.`,
+    );
+    if (ok) actions.deleteWorkspace(w.id, true);
   };
 
   const title =
@@ -184,7 +224,7 @@ export function OnboardingGate() {
                   {mode === "join" && (
                     <textarea
                       value={blob}
-                      placeholder="Paste invite blob (ducktape-invite-v2:…)"
+                      placeholder="Paste invite blob (ducktape:…)"
                       onChange={(event) => setBlob(event.target.value)}
                       rows={3}
                       style={{ ...inputStyle, resize: "vertical", font: `500 11px ${font.mono}` }}
@@ -239,27 +279,49 @@ export function OnboardingGate() {
               YOUR WORKSPACES
             </span>
             {state.workspaces.map((w) => (
-              <button
-                key={w.id}
-                onClick={() => actions.selectWorkspace(w.id)}
-                style={{
-                  all: "unset",
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 10,
-                  padding: "9px 11px",
-                  borderRadius: radius.sm,
-                  border: `1px solid ${color.border}`,
-                  background: color.paper,
-                }}
-              >
-                <span style={{ font: `600 12px ${font.sans}`, color: color.ink }}>{w.name}</span>
-                <span style={{ font: `500 10px ${font.mono}`, color: color.muted2 }}>
-                  {w.chainId}
-                </span>
-              </button>
+              <div key={w.id} style={{ display: "flex", alignItems: "stretch", gap: 6 }}>
+                <button
+                  onClick={() => actions.selectWorkspace(w.id)}
+                  style={{
+                    all: "unset",
+                    cursor: "pointer",
+                    flex: 1,
+                    minWidth: 0,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 10,
+                    padding: "9px 11px",
+                    borderRadius: radius.sm,
+                    border: `1px solid ${color.border}`,
+                    background: color.paper,
+                  }}
+                >
+                  <span style={{ font: `600 12px ${font.sans}`, color: color.ink }}>{w.name}</span>
+                  <span style={{ font: `500 10px ${font.mono}`, color: color.muted2 }}>
+                    {w.chainId}
+                  </span>
+                </button>
+                {state.deleteNeedsForce === w.id ? (
+                  <button
+                    aria-label={`Force delete workspace ${w.name}`}
+                    title="The node couldn't confirm it left its network — force skips that check"
+                    onClick={() => confirmForceDelete(w)}
+                    style={{ ...deleteButtonStyle, background: color.red, color: color.onDark }}
+                  >
+                    Force delete
+                  </button>
+                ) : (
+                  <button
+                    aria-label={`Delete workspace ${w.name}`}
+                    title="Stop its node and delete this workspace locally"
+                    onClick={() => confirmDelete(w)}
+                    style={deleteButtonStyle}
+                  >
+                    Delete
+                  </button>
+                )}
+              </div>
             ))}
           </div>
         )}

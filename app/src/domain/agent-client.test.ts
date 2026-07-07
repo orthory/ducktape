@@ -26,10 +26,9 @@ const stubTransport = (reply?: unknown): NodeTransport => ({
   putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
   getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
   status: vi.fn(),
-  telemetry: vi.fn(),
+  metrics: vi.fn(),
   blocks: vi.fn(),
   onBlock: vi.fn(),
-  onTelemetry: vi.fn(),
 });
 
 describe("hexToBytes", () => {
@@ -65,7 +64,6 @@ describe("agent msgs", () => {
           display_name: "Helper",
           capability: "alpha",
           prompt_hash: promptHash,
-          prompt_doc: null,
           allowed_actions: ["chat.post"],
         },
       },
@@ -88,7 +86,6 @@ describe("agent msgs", () => {
           display_name: "Helper 2",
           capability: null,
           prompt_hash: null,
-          prompt_doc: null,
           allowed_actions: null,
         },
       },
@@ -122,7 +119,6 @@ describe("agent queries", () => {
     display_name: "Helper",
     capability: "alpha",
     prompt_hash: hexToBytes("cd".repeat(32)),
-    prompt_doc: null,
     allowed_actions: ["chat.post"],
     status: "active",
     created_at: 1,

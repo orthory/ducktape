@@ -33,6 +33,23 @@ const POLL_DELAY_MS = 250;
 export const isTauri = (): boolean =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+/** True only on the macOS desktop build, where `titleBarStyle: "Overlay"`
+ *  (tauri.conf.json) floats the native traffic-light controls over the
+ *  top-left of the web content. That overlay is macOS-only — Linux/Windows keep
+ *  native decorations and the web build has no window chrome — so UI that insets
+ *  to clear the traffic lights must gate on this predicate. Detected via the
+ *  WKWebView user-agent (`Macintosh`): synchronous, no extra plugin/capability.
+ *
+ *  Coupled to the window's user-agent: the default WKWebView UA carries
+ *  `Macintosh` on macOS, so this holds today. If a custom `userAgent` is ever set
+ *  in tauri.conf.json (or the target set grows to iOS, whose UA also matches
+ *  `/Mac/i`), revisit this — a false negative would let the traffic lights
+ *  occlude the brand, a false positive would inset where there are none. */
+export const isMacDesktop = (): boolean =>
+  isTauri() &&
+  typeof navigator !== "undefined" &&
+  /Mac/i.test(navigator.userAgent);
+
 const webUrl = (): string =>
   import.meta.env.VITE_DUCKTAPE_NODE_URL || `http://${DEFAULT_LISTEN}`;
 
@@ -67,7 +84,16 @@ export const connectRemote = (httpUrl: string): NodeResolution => ({
 export const normalizeNodeUrl = (raw: string): string => {
   const trimmed = raw.trim();
   if (!trimmed) return "";
-  return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+  try {
+    const parsed = new URL(withScheme);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    // reduce to the origin — the transport appends its own /v1/… paths, so a
+    // pasted url carrying a path/query would otherwise 404 every call.
+    return parsed.origin;
+  } catch {
+    return ""; // unparseable — the caller guards on empty
+  }
 };
 
 /** Poll /v1/status until the node answers, or reject after `attempts`. */
@@ -77,10 +103,21 @@ export const waitUntilUp = (
 ): Promise<void> =>
   transport.status().then(
     () => undefined,
-    (err) =>
-      attempts <= 1
-        ? Promise.reject(new Error(`the node did not come up: ${err}`))
-        : wait(POLL_DELAY_MS).then(() => waitUntilUp(transport, attempts - 1)),
+    (err: unknown) => {
+      // Only keep polling while the node isn't answering YET (refused/timeout).
+      // A node that IS up but erroring (httpError) or returning a non-ducktape
+      // body (badBody) won't heal by waiting — fail fast with the real reason so
+      // the UI shows "returned 500" / "not a ducktape node" instead of a 10s
+      // spinner ending in a generic timeout. An error with no kind stays
+      // transient, preserving the prior retry behaviour.
+      const kind = (err as { kind?: string } | null)?.kind;
+      const transient = kind === undefined || kind === "refused" || kind === "timeout";
+      if (!transient || attempts <= 1) {
+        const detail = err instanceof Error ? err.message : String(err);
+        return Promise.reject(new Error(`the node did not come up: ${detail}`));
+      }
+      return wait(POLL_DELAY_MS).then(() => waitUntilUp(transport, attempts - 1));
+    },
   );
 
 /** Ask a node to exit gracefully (POST /v1/shutdown). */

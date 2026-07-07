@@ -130,12 +130,12 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
       "jobs",
       "agent",
       "runs",
-      "document",
       "pages",
       "forge",
       "files",
       "memory",
       "profiles",
+      "identity",
     ]);
   });
 

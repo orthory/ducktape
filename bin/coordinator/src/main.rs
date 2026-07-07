@@ -1,7 +1,7 @@
-use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::net::SocketAddr;
 
-use nat_traversal::run_coordinator_advertised;
+use coordinator_bin::select_policy;
+use nat_traversal::run_coordinator;
 use tokio::net::UdpSocket;
 
 fn arg_value(flag: &str) -> Option<String> {
@@ -21,39 +21,24 @@ fn parse_addr(flag: &str, raw: &str) -> std::io::Result<SocketAddr> {
 async fn main() -> std::io::Result<()> {
     // `--listen <addr>` selects the bind; a malformed value is a HARD error, not
     // a silent fall-through to 0.0.0.0 — a typo'd flag or address must never
-    // quietly expose the untrusted control/relay port on every interface.
+    // quietly expose the untrusted control port on every interface.
     let listen: SocketAddr = match arg_value("--listen") {
         Some(s) => parse_addr("--listen", &s)?,
         None => "0.0.0.0:3478".parse().expect("default addr parses"),
     };
 
-    // the reachable IP peers dial for the relay data plane. when the listen IP
-    // is concrete we reuse it; when it is the wildcard, `--advertise <ip>` is
-    // REQUIRED — otherwise the coordinator would hand peers an unroutable
-    // `0.0.0.0:<port>` relay endpoint and the relay fallback would carry no
-    // traffic (silent in CI, which binds loopback).
-    let advertise_ip: IpAddr = match arg_value("--advertise") {
-        Some(s) => s.parse().map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("--advertise {s:?} is not a valid IP: {e}"),
-            )
-        })?,
-        None if !listen.ip().is_unspecified() => listen.ip(),
-        None => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "listening on a wildcard address requires --advertise <public-ip> so relayed \
-                 peers get a routable relay endpoint",
-            ));
-        }
-    };
+    // The per-network authorization policy, selected from CLI flags:
+    //   --genesis-set <network.toml>  => Private (PoP + pinned valset admission)
+    //   --allow-anonymous             => fully-open (legacy, no auth)
+    //   (no flag)                     => public with proof-of-possession
+    // A malformed --genesis-set path/file is a HARD error, never a silent
+    // fall-through to a weaker policy.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let policy = select_policy(&args)?;
 
     let sock = UdpSocket::bind(listen).await?;
-    // the address line stays parseable (tooling/tests read its tail); the relay
-    // advertise ip is a separate line.
+    // the address line stays parseable (tooling/tests read its tail).
     eprintln!("coordinator listening on {}", sock.local_addr()?);
-    eprintln!("relay endpoint advertised as {advertise_ip}");
-    run_coordinator_advertised(sock, advertise_ip, Duration::from_secs(30)).await;
+    run_coordinator(sock, policy).await;
     Ok(())
 }

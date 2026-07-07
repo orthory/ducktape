@@ -34,3 +34,14 @@ repo has tests for respawn behavior and a tested deterministic cutover state
 machine (`ValsetOrchestrator`) that watches finalized valset state and decides
 the cutover point, but the live loop that acts on it — stopping old orderers,
 starting the new epoch, aligning transport readiness — is still future work.
+
+## Identity Above Membership
+
+Membership and quorum stay keyed by node identity: `valset`'s validator and
+observer sets, and the epoch machinery above, never resolve a node key to a
+person. `crates/system/identity` sits one layer above as a separate replicated
+module: it maps node keys to user keys, so one person can run several nodes —
+each with its own membership standing, its own vote, its own quorum weight —
+while the app and every other consumer render them as one user. Binding a node
+to a user is its own origin-and-user-signature-gated operation; it never
+touches `valset`'s state or the cutover path described above.

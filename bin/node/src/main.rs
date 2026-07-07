@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use agent::AgentModule;
 use runs::RunsModule;
-use commonware_codec::DecodeExt as _;
+use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Signer, ed25519};
@@ -68,6 +68,10 @@ use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of
 
 mod config;
 mod lobby;
+mod relay;
+mod statesync_plane;
+mod userkey;
+mod voice;
 use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
 
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
@@ -79,20 +83,20 @@ const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
 /// `ReadinessSignaller` truthfully signals readiness for a pending upgrade iff
 /// `MAX_PROTOCOL_VERSION >= to_version`, and the boot preflight refuses a boundary
 /// whose `required_min_version` exceeds it. Phase 9 raised this to 2 when the
-/// forge v2 dual path landed; the staged-admission observer tier raised it to
+/// forge v2 dual path landed; the staged-admission resident tier raised it to
 /// 3 — this binary can execute a scheduled `to_version=3` (valset/governance
-/// observer ops, gated below 3) and truthfully `SignalReady`.
+/// resident ops, gated below 3) and truthfully `SignalReady`.
 const MAX_PROTOCOL_VERSION: u32 = 3;
 use automations::Automations;
 use capability::CapabilityRegistry;
 use chat::Chat;
 use directory::Directory;
 use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
-use document::Document;
 use files::Files;
 use forge::Forge;
 use governance::Governance;
 use host::Host;
+use identity::Identity;
 use inbox::Inbox;
 use jobs::Jobs;
 use kv::Kv;
@@ -111,7 +115,7 @@ use valset::Valset;
 use vaults::Vaults;
 
 /// the peer-set index a node WITHOUT consensus coordinates tracks (a parked
-/// joiner, a sync-only observer): the genesis mesh at index 0. a VALIDATOR
+/// joiner, a sync-only resident): the genesis mesh at index 0. a VALIDATOR
 /// tracks its epoch's mesh at index = epoch instead — discovery requires
 /// strictly increasing indexes per `track`, ignores indexes a peer does not
 /// know, but KILLS a peer whose set at a SHARED index has a different
@@ -163,6 +167,15 @@ const MAX_BACKLOG: usize = 128;
 /// deadline in the pump loop: ingress load can delay one drain by one
 /// request's service time, but can never starve the arm.
 const DRAIN_TICK: Duration = Duration::from_millis(100);
+/// the submit-relay channel: a resident-standing node ships a frame it
+/// SIGNED (its own identity key is the frame origin — authorship) to one
+/// current validator, which takes consensus custody (`submit_frame`) and
+/// answers with the frame's fate when it drains. the last free static slot
+/// below CHANNEL_STATE_SYNC; engine banks start at 9 (statics run 3–8).
+/// registered in EVERY
+/// mode like the lanes above — validators serve, residents speak, sync-only
+/// black-holes.
+const CHANNEL_SUBMIT_RELAY: u64 = 3;
 /// the statesync rpc channel: joiners request manifests / snapshot chunks /
 /// qmdb op-ranges here; validators answer between drains.
 const CHANNEL_STATE_SYNC: u64 = 4;
@@ -177,6 +190,16 @@ const CHANNEL_LOBBY: u64 = 5;
 /// EVERY mode — an unregistered channel is a protocol violation that kills
 /// the sender's connection — and black-holed where the plane does not run.
 const CHANNEL_REACHABILITY: u64 = 6;
+/// the voice channel: huddle audio datagrams between members (`chat::voice`
+/// media frames inside data-plane datagrams — the `voice` module's mesh
+/// transport arm). registered in EVERY mode like the lanes above; only the
+/// validator path runs the hub that consumes it, every other mode black-holes.
+const CHANNEL_VOICE: u64 = 7;
+/// the video channel: camera-frame fragments between huddle members
+/// (`chat::video` fragments inside data-plane datagrams). its own lane so
+/// keyframe bursts never queue ahead of voice, with its own per-peer quota
+/// sized for the top of the rate ladder plus keyframe bursts.
+const CHANNEL_VIDEO: u64 = 8;
 /// while parked and un-admitted, re-announce every N park-loop attempts
 /// (attempts tick ~2s apart, so this is roughly every 10s) — often enough to
 /// survive member restarts (the request queue is in-memory), quiet enough to
@@ -198,7 +221,6 @@ const CUTOVER_DELAY: u64 = 3;
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
 const MODULE_IDS: [&str; 22] = [
     "kv",
-    "document",
     "pages",
     "chat",
     "forge",
@@ -212,6 +234,7 @@ const MODULE_IDS: [&str; 22] = [
     "tasks",
     "vaults",
     "profiles",
+    "identity",
     "inbox",
     "directory",
     "automations",
@@ -229,9 +252,10 @@ const SUBMIT_HOLD: Duration = Duration::from_secs(10);
 /// eager payload-relay lane, and the payload FETCH lane (the lazy catch-up
 /// backstop — a validator that missed the one-shot relay gossip for a
 /// finalized op fetches its bytes by digest instead of wedging its apply
-/// prefix forever). starts at 8, clear of the statesync channel.
+/// prefix forever). starts at 9, clear of the fixed discovery channels
+/// (statesync 4, lobby 5, reachability 6, voice 7, video 8).
 fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
-    let base = 8 + epoch * 5;
+    let base = 9 + epoch * 5;
     (base, base + 1, base + 2, base + 3, base + 4)
 }
 
@@ -262,11 +286,11 @@ fn participant_bytes(
         .collect()
 }
 
-fn observer_bytes(
+fn resident_bytes(
     orchestrator: &consensus::ValsetOrchestrator<ed25519::PublicKey>,
 ) -> Vec<Vec<u8>> {
     orchestrator
-        .current_observers()
+        .current_residents()
         .iter()
         .map(|k| k.as_ref().to_vec())
         .collect()
@@ -288,19 +312,19 @@ async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
-/// read the valset module's current OBSERVER projection (committed state —
+/// read the valset module's current RESIDENT projection (committed state —
 /// called between drains, outside any block; same read point as
 /// [`read_valset_members`], so a boundary read sees one frozen state).
-async fn read_valset_observers(host: &Host) -> Vec<Vec<u8>> {
+async fn read_valset_residents(host: &Host) -> Vec<Vec<u8>> {
     use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let Ok(reply) = host
-        .query("valset", &encode_query(&ValsetQuery::Observers))
+        .query("valset", &encode_query(&ValsetQuery::Residents))
         .await
     else {
         return Vec::new();
     };
     match decode_reply(&reply) {
-        Ok(ValsetReply::Observers(v)) => v,
+        Ok(ValsetReply::Residents(v)) => v,
         Ok(_) | Err(_) => Vec::new(),
     }
 }
@@ -608,10 +632,14 @@ async fn genesis_host(
     forge_repo: &std::path::Path,
     duckfs_dir: &std::path::Path,
     genesis_validators: &[ed25519::PublicKey],
+    // the network binding invite tokens verify against (the genesis
+    // namespace) — wired into governance identically on every node, or
+    // `Redeem` settles differently across validators and the app-hash forks.
+    invite_binding: &[u8],
     blobs: blobstore::BlobHandle,
+    chain_id: &str,
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
-    let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
     let chat = Chat::init(context.child("chat"), "chat")
         .await
@@ -628,14 +656,15 @@ async fn genesis_host(
     }
     Host::genesis(vec![
         Box::new(kv),
-        Box::new(document),
         Box::new(pages),
         Box::new(chat),
         Box::new(forge),
         Box::new(valset),
         // governance is the SOLE authorized author of valset changes: member
         // proposals + ballots, deterministic tally, follow-up membership ops.
-        Box::new(Governance::new("governance", "valset", "upgrade")),
+        Box::new(
+            Governance::new("governance", "valset", "upgrade").with_invite_binding(invite_binding),
+        ),
         // the no-downtime upgrade coordinator: holds the at-most-one pending
         // upgrade + per-validator readiness set (valset-gated). its mere
         // presence in the registry is its genesis app-hash contribution.
@@ -667,6 +696,13 @@ async fn genesis_host(
         // the origin-gated display-name registry: each verified submit origin
         // may set its own name, so the ui can resolve authors to names.
         Box::new(Profiles::new("profiles")),
+        // the deterministic user->nodes binding registry: certificates are
+        // chain-scoped (this network's chain id), member-gated binds via valset.
+        Box::new(Identity::new(
+            "identity",
+            Some("valset".into()),
+            chain_id.to_string(),
+        )),
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
         Box::new(Inbox::new("inbox")),
@@ -686,7 +722,6 @@ async fn genesis_host(
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-            Some("document".into()),
         )),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
@@ -705,10 +740,12 @@ async fn restore_host(
     forge_repo: &std::path::Path,
     duckfs_dir: &std::path::Path,
     manifest: &Manifest,
+    // see `genesis_host` — the same binding must reach every rebuild path.
+    invite_binding: &[u8],
     blobs: blobstore::BlobHandle,
+    chain_id: &str,
 ) -> Result<Host, String> {
     let kv = Kv::init(context.child("kv"), "kv").await;
-    let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
     let chat = Chat::init(context.child("chat"), "chat")
         .await
@@ -739,7 +776,8 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
 
-    let mut governance = Governance::new("governance", "valset", "upgrade");
+    let mut governance =
+        Governance::new("governance", "valset", "upgrade").with_invite_binding(invite_binding);
     let (bytes, root) = snapshot_of("governance")?;
     governance
         .install(bytes, root)
@@ -792,6 +830,12 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("profiles install: {e}"))?;
 
+    let mut identity = Identity::new("identity", Some("valset".into()), chain_id.to_string());
+    let (bytes, root) = snapshot_of("identity")?;
+    identity
+        .install(bytes, root)
+        .map_err(|e| format!("identity install: {e}"))?;
+
     let mut inbox = Inbox::new("inbox");
     let (bytes, root) = snapshot_of("inbox")?;
     inbox
@@ -827,7 +871,6 @@ async fn restore_host(
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-        Some("document".into()),
     );
     let (bytes, root) = snapshot_of("runs")?;
     runs.install(bytes, root)
@@ -847,7 +890,6 @@ async fn restore_host(
 
     Host::genesis(vec![
         Box::new(kv),
-        Box::new(document),
         Box::new(pages),
         Box::new(chat),
         Box::new(forge),
@@ -861,6 +903,7 @@ async fn restore_host(
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
+        Box::new(identity),
         Box::new(inbox),
         Box::new(files),
         Box::new(jobs),
@@ -932,7 +975,10 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     manifest: &statesync::Manifest,
     forge_repo: &std::path::Path,
     duckfs_dir: &std::path::Path,
+    // see `genesis_host` — the same binding must reach every rebuild path.
+    invite_binding: &[u8],
     attempt: usize,
+    chain_id: &str,
 ) -> Result<Host, String> {
     let entry_root = |module: &str| -> Result<StateRoot, String> {
         Ok(manifest
@@ -977,15 +1023,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     let kv = Kv::sync_from(
         scratch_context.child(child_label("kv")),
         "kv",
-        target,
-        resolver,
-    )
-    .await?;
-
-    let (target, resolver) = fetch_target("document").await?;
-    let document = Document::sync_from(
-        scratch_context.child(child_label("document")),
-        "document",
         target,
         resolver,
     )
@@ -1061,7 +1098,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("tagging install: {e}"))?;
 
     let (bytes, root) = snapshot_of("governance").await?;
-    let mut governance = Governance::new("governance", "valset", "upgrade");
+    let mut governance =
+        Governance::new("governance", "valset", "upgrade").with_invite_binding(invite_binding);
     governance
         .install(&bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
@@ -1089,6 +1127,12 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     profiles
         .install(&bytes, root)
         .map_err(|e| format!("profiles install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("identity").await?;
+    let mut identity = Identity::new("identity", Some("valset".into()), chain_id.to_string());
+    identity
+        .install(&bytes, root)
+        .map_err(|e| format!("identity install: {e}"))?;
 
     let (bytes, root) = snapshot_of("inbox").await?;
     let mut inbox = Inbox::new("inbox");
@@ -1143,7 +1187,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-        Some("document".into()),
     );
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
@@ -1174,7 +1217,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     // composes a different app-hash and the join fails its final check.
     let host = Host::genesis(vec![
         Box::new(kv),
-        Box::new(document),
         Box::new(pages),
         Box::new(chat),
         Box::new(forge),
@@ -1188,6 +1230,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
+        Box::new(identity),
         Box::new(inbox),
         Box::new(files),
         Box::new(jobs),
@@ -1483,10 +1526,10 @@ fn sealed_frame_block_row(
     ))
 }
 
-/// the observer's explorer row: a followed BOUNDARY, not a sealed frame. the
+/// the resident's explorer row: a followed BOUNDARY, not a sealed frame. the
 /// populated fields are verified truth — the boundary height and the
 /// app-hash the manifest check passed — and every frame-derived field stays
-/// honestly empty, because an observer never sees the frames between
+/// honestly empty, because a resident never sees the frames between
 /// boundaries (the same degradation rule that keeps the frameless daemon
 /// lane's `hash` empty rather than fabricated).
 fn boundary_block_row(height: u64, app_hash: &StateRoot) -> Vec<u8> {
@@ -1888,7 +1931,7 @@ where
         target.epoch,
         target.view_base,
         target.participants.clone(),
-        target.observers.clone(),
+        target.residents.clone(),
         pending_cutover_view,
         target.current_version,
         target.pending_upgrade.clone(),
@@ -2159,20 +2202,20 @@ fn resume_member_keys(
     Ok(keys)
 }
 
-/// the recovered epoch's OBSERVER keys — empty on a fresh boot (genesis has
-/// no observers) and on checkpoints written before the staged-admission tier.
-fn resume_observer_keys(
+/// the recovered epoch's RESIDENT keys — empty on a fresh boot (genesis has
+/// no residents) and on checkpoints written before the staged-admission tier.
+fn resume_resident_keys(
     resumed: Option<&recovery::Recovered>,
 ) -> Result<Vec<ed25519::PublicKey>, String> {
     let raw: Vec<Vec<u8>> = match resumed {
-        Some(rec) => rec.observers.clone(),
+        Some(rec) => rec.residents.clone(),
         None => Vec::new(),
     };
     let mut keys = Vec::with_capacity(raw.len());
     for k in &raw {
         keys.push(
             ed25519::PublicKey::decode(k.as_slice())
-                .map_err(|e| format!("recovered observer set holds a non-ed25519 key: {e}"))?,
+                .map_err(|e| format!("recovered resident set holds a non-ed25519 key: {e}"))?,
         );
     }
     Ok(keys)
@@ -2372,16 +2415,42 @@ fn spawn_rpc_listener(
     });
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    // Convert any terminal error into the same stable `FATAL:` marker the node
+    // already prints for its other fatal paths (recovery, admission, promotion),
+    // plus a non-zero exit. This closes the run-path boot failures (bind
+    // conflict, config parse) that used to propagate as a bare `Error: …` the
+    // desktop app's classify() didn't recognize — now the app surfaces the
+    // reason immediately instead of inferring death. (Onboarding subcommands
+    // still surface their own stderr via run_verb; the prefix is harmless there.)
+    if let Err(err) = run() {
+        eprintln!("FATAL: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("keygen") => return cmd_keygen(&args[1..]),
+        Some("user-key") => {
+            return cmd_user_key(&args[1..], &mut std::io::BufReader::new(std::io::stdin()));
+        }
+        Some("user-sign-bind") => {
+            return cmd_user_sign_bind(&args[1..], &mut std::io::BufReader::new(std::io::stdin()));
+        }
+        Some("user-sign-unbind") => {
+            return cmd_user_sign_unbind(
+                &args[1..],
+                &mut std::io::BufReader::new(std::io::stdin()),
+            );
+        }
         Some("init") => return cmd_init(&args[1..]),
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
         Some("invite-accept") => return cmd_invite_accept(&args[1..]),
         Some("promote") => return cmd_promote(&args[1..]),
-        Some("observer-remove") => return cmd_observer_remove(&args[1..]),
+        Some("resident-remove") => return cmd_resident_remove(&args[1..]),
         Some("join-requests") => return cmd_join_requests(&args[1..]),
         Some("member-remove") => return cmd_member_remove(&args[1..]),
         Some("member-leave") => return cmd_member_leave(&args[1..]),
@@ -2404,7 +2473,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
-                     keygen|init|invite|admit|invite-accept|promote|observer-remove|\
+                     keygen|user-key|user-sign-bind|user-sign-unbind|init|invite|admit|\
+                     invite-accept|promote|resident-remove|\
                      join-requests|member-remove|member-leave|member-status|join|\
                      upgrade-status — or \
                      --config <path> | -n/--network <chain id> [--sync-only])"
@@ -2502,6 +2572,852 @@ fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// ============================================================================
+// user-key lifecycle verbs (init/restore/unlock/reveal/encrypt/status) — see
+// docs/superpowers/specs/2026-07-07-identity-onboarding-design.md's "CLI
+// verbs" section for the binding stdin/stdout contract. every secret
+// (password, mnemonic) crosses the process boundary via STDIN ONLY, one
+// newline-delimited field per line in the documented order — never argv/env,
+// which would leak into shell history / `ps`. each verb below is split into
+// a `user_key_*` core (takes the parsed stdin, returns the value to print —
+// directly unit-testable without capturing stdout) and a thin `cmd_user_key_*`
+// wrapper that prints it; the wrapper is what `run()`'s dispatch calls.
+// ============================================================================
+
+/// read one line from `stdin`, minus its trailing newline — the stdin-only
+/// convention every secret field crosses the process boundary through.
+/// errors only on true EOF (nothing at all, not even a newline): a caller
+/// that doesn't pipe the expected field. an explicit empty line (just `\n`)
+/// is NOT an error here — callers that need a non-empty value (passwords)
+/// reject that on their own terms (`check_password_len`), with a clearer
+/// message than a generic "missing" would give.
+fn read_stdin_line(stdin: &mut impl std::io::BufRead, field: &str) -> Result<String, String> {
+    let mut line = String::new();
+    let n = stdin
+        .read_line(&mut line)
+        .map_err(|e| format!("read {field} from stdin: {e}"))?;
+    if n == 0 {
+        return Err(format!("missing {field} on stdin"));
+    }
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    Ok(line)
+}
+
+/// the design spec's floor for NEW passwords (`init`/`restore`/`encrypt`),
+/// enforced before any file is touched. counts scalar chars, not bytes, so a
+/// multi-byte-but-short password isn't laundered past the floor.
+const MIN_PASSWORD_LEN: usize = 8;
+
+fn check_password_len(password: &str) -> Result<(), String> {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(format!(
+            "password must be at least {MIN_PASSWORD_LEN} characters"
+        ));
+    }
+    Ok(())
+}
+
+/// `path`'s raw trimmed line — the exact text [`userkey::open_user_key`]
+/// parses, as opposed to [`userkey::read_user_key_file`]'s already-decoded
+/// shape. verbs that must hand a v2 line to `open_user_key` read it via this.
+fn read_key_line(path: &std::path::Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
+    let line = text.trim();
+    if line.is_empty() {
+        return Err(format!("{path:?} is empty"));
+    }
+    Ok(line.to_string())
+}
+
+/// resolve the USER signer at `key_path` for the sign verbs: a v2
+/// (encrypted) file decrypts with a password read as the FIRST stdin line;
+/// anything else (legacy plaintext, or absent — freshly generated) falls
+/// through to [`config::load_or_generate_identity`] UNCHANGED, reading no
+/// stdin at all — byte-identical to the pre-onboarding sign-verb behavior.
+fn load_user_signer(
+    key_path: &std::path::Path,
+    stdin: &mut impl std::io::BufRead,
+) -> Result<ed25519::PrivateKey, Box<dyn std::error::Error>> {
+    if let Ok(text) = std::fs::read_to_string(key_path)
+        && text.trim().starts_with(userkey::USER_KEY_V2_PREFIX)
+    {
+        let password = read_stdin_line(stdin, "password")?;
+        return Ok(userkey::open_user_key(text.trim(), &password)?);
+    }
+    let (user, generated) = config::load_or_generate_identity(key_path)?;
+    if generated {
+        eprintln!("generated user identity at {}", key_path.display());
+    }
+    Ok(user)
+}
+
+/// `user-key init` core — see [`cmd_user_key_init`] for the print contract.
+/// returns `(mnemonic, pubkey-hex)` so tests can assert both independently.
+fn user_key_init(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let out = PathBuf::from(flags.get("out").map(String::as_str).unwrap_or("user.key"));
+    let password = read_stdin_line(stdin, "password")?;
+    check_password_len(&password)?;
+
+    let mut seed = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+    let words = userkey::mnemonic_of_seed(&seed);
+    let line = userkey::seal_user_key(&seed, &password)?;
+    userkey::write_user_key_new(&out, &line)?;
+
+    let key = ed25519::PrivateKey::decode(seed.as_slice()).expect("32 random bytes decode");
+    Ok((words, hex_bytes(key.public_key().as_ref())))
+}
+
+/// `user-key init --out <path>` — stdin: password. Generates a fresh seed,
+/// writes v2 (refuses to overwrite via `create_new`), and prints the 24-word
+/// mnemonic line THEN the pubkey-hex line — pubkey is the LAST stdout line
+/// (the `run_verb`/`last_line` contract), mnemonic is the line before it.
+fn cmd_user_key_init(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (words, pubkey_hex) = user_key_init(args, stdin)?;
+    println!("{words}");
+    println!("{pubkey_hex}");
+    Ok(())
+}
+
+/// `user-key restore` core — see [`cmd_user_key_restore`].
+fn user_key_restore(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let out = PathBuf::from(flags.get("out").map(String::as_str).unwrap_or("user.key"));
+    let mnemonic = read_stdin_line(stdin, "mnemonic")?;
+    let password = read_stdin_line(stdin, "password")?;
+    check_password_len(&password)?;
+
+    let seed = userkey::seed_of_mnemonic(&mnemonic)?;
+    let line = userkey::seal_user_key(&seed, &password)?;
+    userkey::write_user_key_new(&out, &line)?;
+
+    let key = ed25519::PrivateKey::decode(seed.as_slice())
+        .map_err(|e| format!("restored seed is not a valid ed25519 secret: {e}"))?;
+    Ok(hex_bytes(key.public_key().as_ref()))
+}
+
+/// `user-key restore --out <path>` — stdin: mnemonic line, then password
+/// line. Validates the BIP39 checksum, writes v2 (refuses to overwrite),
+/// prints the pubkey (the only stdout line).
+fn cmd_user_key_restore(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_key_restore(args, stdin)?);
+    Ok(())
+}
+
+/// `user-key unlock` core — see [`cmd_user_key_unlock`].
+fn user_key_unlock(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-key unlock needs --key <path>")?);
+    let password = read_stdin_line(stdin, "password")?;
+
+    let key = match userkey::read_user_key_file(&key_path)? {
+        userkey::UserKeyFile::Plaintext(key) => key,
+        userkey::UserKeyFile::Encrypted(_) => {
+            let line = read_key_line(&key_path)?;
+            userkey::open_user_key(&line, &password)?
+        }
+    };
+    Ok(hex_bytes(key.public_key().as_ref()))
+}
+
+/// `user-key unlock --key <path>` — stdin: password. Pure verification
+/// (nothing persists); prints the pubkey on success, a clean error + nonzero
+/// exit on a wrong password or a corrupt file.
+fn cmd_user_key_unlock(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_key_unlock(args, stdin)?);
+    Ok(())
+}
+
+/// `user-key reveal` core — see [`cmd_user_key_reveal`].
+fn user_key_reveal(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-key reveal needs --key <path>")?);
+
+    // legacy plaintext tolerates an absent/empty password line; only an
+    // encrypted file actually needs one. read leniently (empty on EOF) so a
+    // caller revealing a legacy key doesn't have to pipe an unused line.
+    let mut password = String::new();
+    let _ = stdin.read_line(&mut password);
+    while password.ends_with('\n') || password.ends_with('\r') {
+        password.pop();
+    }
+
+    let key = match userkey::read_user_key_file(&key_path)? {
+        userkey::UserKeyFile::Plaintext(key) => key,
+        userkey::UserKeyFile::Encrypted(_) => {
+            let line = read_key_line(&key_path)?;
+            userkey::open_user_key(&line, &password)?
+        }
+    };
+    let seed_bytes = key.encode();
+    let seed: [u8; 32] = seed_bytes
+        .as_ref()
+        .try_into()
+        .map_err(|_| "decoded key is not a 32-byte seed".to_string())?;
+    Ok(userkey::mnemonic_of_seed(&seed))
+}
+
+/// `user-key reveal --key <path>` — stdin: password (empty/absent tolerated
+/// for legacy plaintext, required to decrypt v2). Prints the 24-word
+/// mnemonic — the SAME encoding `init`/`restore` use, so it round-trips
+/// through `user-key restore` to the identical pubkey.
+fn cmd_user_key_reveal(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_key_reveal(args, stdin)?);
+    Ok(())
+}
+
+/// `user-key encrypt` core — see [`cmd_user_key_encrypt`].
+fn user_key_encrypt(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-key encrypt needs --key <path>")?);
+    let password = read_stdin_line(stdin, "password")?;
+    check_password_len(&password)?;
+
+    let key = match userkey::read_user_key_file(&key_path)? {
+        userkey::UserKeyFile::Plaintext(key) => key,
+        userkey::UserKeyFile::Encrypted(_) => {
+            return Err(format!("{} is already encrypted", key_path.display()).into());
+        }
+    };
+    let seed_bytes = key.encode();
+    let seed: [u8; 32] = seed_bytes
+        .as_ref()
+        .try_into()
+        .map_err(|_| "decoded key is not a 32-byte seed".to_string())?;
+    let line = userkey::seal_user_key(&seed, &password)?;
+    userkey::rewrite_user_key(&key_path, &line)?;
+    Ok(hex_bytes(key.public_key().as_ref()))
+}
+
+/// `user-key encrypt --key <path>` — stdin: password. Migrates a legacy v1
+/// plaintext file to v2 in place (temp file + rename, the same atomicity as
+/// every other in-place rewrite); errors (no-op) if the file is already v2.
+/// Prints the pubkey (unchanged by the migration).
+fn cmd_user_key_encrypt(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_key_encrypt(args, stdin)?);
+    Ok(())
+}
+
+/// `user-key status` core — see [`cmd_user_key_status`].
+fn user_key_status(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-key status needs --key <path>")?);
+    if !key_path.exists() {
+        return Ok("absent".to_string());
+    }
+    Ok(match userkey::read_user_key_file(&key_path)? {
+        userkey::UserKeyFile::Plaintext(key) => {
+            format!("plaintext {}", hex_bytes(key.public_key().as_ref()))
+        }
+        userkey::UserKeyFile::Encrypted(enc) => format!("encrypted {}", hex_bytes(&enc.pubkey)),
+    })
+}
+
+/// `user-key status --key <path>` — no stdin. Prints exactly one of `absent`
+/// | `plaintext <pubkey-hex>` | `encrypted <pubkey-hex>`; never touches a
+/// password, so it's safe to poll from the app on every launch.
+fn cmd_user_key_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_key_status(args)?);
+    Ok(())
+}
+
+/// `user-key [init|restore|unlock|reveal|encrypt|status]` — dispatches to the
+/// v2 lifecycle verbs (see the design spec's "CLI verbs" section); a bare
+/// `user-key [--out <path>]` (no recognized subcommand) falls through to the
+/// legacy v1 generate-or-reuse shape from #205, kept working unchanged for
+/// the app/tests until the app migrates onto the v2 verbs.
+fn cmd_user_key(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match args.first().map(String::as_str) {
+        Some("init") => return cmd_user_key_init(&args[1..], stdin),
+        Some("restore") => return cmd_user_key_restore(&args[1..], stdin),
+        Some("unlock") => return cmd_user_key_unlock(&args[1..], stdin),
+        Some("reveal") => return cmd_user_key_reveal(&args[1..], stdin),
+        Some("encrypt") => return cmd_user_key_encrypt(&args[1..], stdin),
+        Some("status") => return cmd_user_key_status(&args[1..]),
+        Some(other) if !other.starts_with("--") => {
+            return Err(format!(
+                "unknown user-key subcommand {other:?} (want \
+                 init|restore|unlock|reveal|encrypt|status, or a bare \
+                 `user-key [--out <path>]` to generate/reuse a legacy key)"
+            )
+            .into());
+        }
+        _ => {}
+    }
+    cmd_user_key_generate_legacy(args)
+}
+
+/// `user-key [--out <path>]` — generate (or reuse) a persisted ed25519 USER
+/// identity: the human's app-side keypair (distinct from `keygen`'s per-node
+/// identity), a bare hex ed25519 seed file under the same load-or-generate
+/// discipline. pubkey on stdout (scriptable — the desktop shell's `run_verb`
+/// takes the LAST stdout line as the value), provenance on stderr. the
+/// legacy v1 shape (#205), kept working verbatim; `init` is the v2
+/// replacement `cmd_user_key` dispatches to instead.
+fn cmd_user_key_generate_legacy(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let out = PathBuf::from(flags.get("out").map(String::as_str).unwrap_or("user.key"));
+    let (key, generated) = config::load_or_generate_identity(&out)?;
+    println!("{}", hex_bytes(key.public_key().as_ref()));
+    eprintln!(
+        "{} user identity at {}",
+        if generated { "generated" } else { "reusing" },
+        out.display()
+    );
+    Ok(())
+}
+
+/// `user-sign-bind` core — see [`cmd_user_sign_bind`].
+fn user_sign_bind(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use identity::{IdentityMsg, encode_msg};
+
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-sign-bind needs --key <path>")?);
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-sign-bind needs --chain-id <id>")?;
+    let node_pub_hex = flags
+        .get("node-pub")
+        .ok_or("user-sign-bind needs --node-pub <hex>")?;
+    let node_pub = config::decode_key(node_pub_hex)?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-sign-bind needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+
+    let user = load_user_signer(&key_path, stdin)?;
+    let user_sig = config::mint_bind_cert(&user, chain_id, node_pub.as_ref(), nonce);
+    let msg = IdentityMsg::BindNode {
+        user_key: user.public_key().as_ref().to_vec(),
+        user_sig,
+    };
+    Ok(String::from_utf8(encode_msg(&msg)).expect("json is utf-8"))
+}
+
+/// `user-sign-bind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
+/// — mint a bind certificate binding `node-pub` to the user identity at
+/// `--key` (generated there if absent, or decrypted with stdin's password
+/// line if it's a v2 file — see [`load_user_signer`]), at `chain-id`/`nonce`,
+/// and print the ready-to-submit `IdentityMsg::BindNode` JSON as the last
+/// (only) stdout line. `user_key` rides the payload — the node being bound is
+/// the verified submit ORIGIN, never a payload field; the module resolves it
+/// from the rpc transport, not from this CLI.
+fn cmd_user_sign_bind(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_sign_bind(args, stdin)?);
+    Ok(())
+}
+
+/// `user-sign-unbind` core — see [`cmd_user_sign_unbind`].
+fn user_sign_unbind(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use identity::{IdentityMsg, encode_msg};
+
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-sign-unbind needs --key <path>")?);
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-sign-unbind needs --chain-id <id>")?;
+    let node_pub_hex = flags
+        .get("node-pub")
+        .ok_or("user-sign-unbind needs --node-pub <hex>")?;
+    let node_pub = config::decode_key(node_pub_hex)?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-sign-unbind needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+
+    let user = load_user_signer(&key_path, stdin)?;
+    let user_sig = config::mint_unbind_cert(&user, chain_id, node_pub.as_ref(), nonce);
+    let msg = IdentityMsg::UnbindNode {
+        node_key: node_pub.as_ref().to_vec(),
+        user_sig,
+    };
+    Ok(String::from_utf8(encode_msg(&msg)).expect("json is utf-8"))
+}
+
+/// `user-sign-unbind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
+/// — mint an unbind certificate evicting `node-pub` from the user identity at
+/// `--key`, and print the ready-to-submit `IdentityMsg::UnbindNode` JSON as
+/// the last stdout line. `node_key` (not `user_key`) rides the payload:
+/// unbind carries no origin restriction — a surviving device evicts a lost
+/// one by naming it directly, identified via the existing binding.
+fn cmd_user_sign_unbind(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_sign_unbind(args, stdin)?);
+    Ok(())
+}
+
+#[cfg(test)]
+mod userkey_verb_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// build the `&[String]` verb args from string-literal parts.
+    fn args_of(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// a stdin double: one line per element, in order.
+    fn stdin_of(lines: &[&str]) -> Cursor<Vec<u8>> {
+        let mut s = String::new();
+        for l in lines {
+            s.push_str(l);
+            s.push('\n');
+        }
+        Cursor::new(s.into_bytes())
+    }
+
+    fn empty_stdin() -> Cursor<Vec<u8>> {
+        Cursor::new(Vec::new())
+    }
+
+    fn write_legacy(path: &std::path::Path, seed: &[u8; 32]) {
+        userkey::write_user_key_new(path, &hex_bytes(seed)).unwrap();
+    }
+
+    fn pubkey_of(seed: &[u8; 32]) -> String {
+        hex_bytes(
+            ed25519::PrivateKey::decode(seed.as_slice())
+                .unwrap()
+                .public_key()
+                .as_ref(),
+        )
+    }
+
+    #[test]
+    fn init_writes_v2_and_outputs_mnemonic_then_pubkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.key");
+        let mut stdin = stdin_of(&["correct horse battery"]);
+
+        let (words, pubkey_hex) = user_key_init(
+            &args_of(&["--out", &path.to_string_lossy()]),
+            &mut stdin,
+        )
+        .unwrap();
+
+        assert_eq!(words.split_whitespace().count(), 24);
+        assert_eq!(pubkey_hex.len(), 64);
+        match userkey::read_user_key_file(&path).unwrap() {
+            userkey::UserKeyFile::Encrypted(enc) => {
+                assert_eq!(hex_bytes(&enc.pubkey), pubkey_hex);
+            }
+            userkey::UserKeyFile::Plaintext(_) => panic!("expected v2/Encrypted"),
+        }
+    }
+
+    #[test]
+    fn restore_round_trips_init_mnemonic_to_identical_pubkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let init_path = dir.path().join("a.key");
+        let mut init_stdin = stdin_of(&["password one"]);
+        let (words, pubkey_hex) = user_key_init(
+            &args_of(&["--out", &init_path.to_string_lossy()]),
+            &mut init_stdin,
+        )
+        .unwrap();
+
+        let restore_path = dir.path().join("b.key");
+        let mut restore_stdin = stdin_of(&[&words, "password two"]);
+        let restored_pubkey = user_key_restore(
+            &args_of(&["--out", &restore_path.to_string_lossy()]),
+            &mut restore_stdin,
+        )
+        .unwrap();
+
+        assert_eq!(restored_pubkey, pubkey_hex);
+    }
+
+    #[test]
+    fn unlock_verifies_and_rejects_wrong_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.key");
+        let mut init_stdin = stdin_of(&["right password"]);
+        let (_, pubkey_hex) = user_key_init(
+            &args_of(&["--out", &path.to_string_lossy()]),
+            &mut init_stdin,
+        )
+        .unwrap();
+
+        let mut ok_stdin = stdin_of(&["right password"]);
+        let unlocked =
+            user_key_unlock(&args_of(&["--key", &path.to_string_lossy()]), &mut ok_stdin).unwrap();
+        assert_eq!(unlocked, pubkey_hex);
+
+        let mut bad_stdin = stdin_of(&["wrong password"]);
+        assert!(
+            user_key_unlock(&args_of(&["--key", &path.to_string_lossy()]), &mut bad_stdin)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reveal_returns_same_words_for_v2_and_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // v2: reveal requires the password.
+        let v2_path = dir.path().join("v2.key");
+        let mut init_stdin = stdin_of(&["a password"]);
+        let (words, _) = user_key_init(
+            &args_of(&["--out", &v2_path.to_string_lossy()]),
+            &mut init_stdin,
+        )
+        .unwrap();
+        let mut reveal_stdin = stdin_of(&["a password"]);
+        let revealed = user_key_reveal(
+            &args_of(&["--key", &v2_path.to_string_lossy()]),
+            &mut reveal_stdin,
+        )
+        .unwrap();
+        assert_eq!(revealed, words);
+
+        // legacy: reveal tolerates an absent password line entirely.
+        let legacy_path = dir.path().join("legacy.key");
+        let seed = [42u8; 32];
+        write_legacy(&legacy_path, &seed);
+        let legacy_words = userkey::mnemonic_of_seed(&seed);
+
+        let mut stdin = empty_stdin();
+        let revealed_legacy = user_key_reveal(
+            &args_of(&["--key", &legacy_path.to_string_lossy()]),
+            &mut stdin,
+        )
+        .unwrap();
+        assert_eq!(revealed_legacy, legacy_words);
+    }
+
+    #[test]
+    fn encrypt_migrates_legacy_to_v2_preserving_pubkey_and_mnemonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.key");
+        let seed = [9u8; 32];
+        write_legacy(&path, &seed);
+        let expected_pubkey = pubkey_of(&seed);
+
+        let mut before_stdin = empty_stdin();
+        let words_before =
+            user_key_reveal(&args_of(&["--key", &path.to_string_lossy()]), &mut before_stdin)
+                .unwrap();
+
+        let mut encrypt_stdin = stdin_of(&["fresh password"]);
+        let pubkey_after = user_key_encrypt(
+            &args_of(&["--key", &path.to_string_lossy()]),
+            &mut encrypt_stdin,
+        )
+        .unwrap();
+        assert_eq!(pubkey_after, expected_pubkey);
+
+        // already-v2 encrypt is a hard error, not a silent no-op.
+        let mut second_stdin = stdin_of(&["another password"]);
+        assert!(
+            user_key_encrypt(&args_of(&["--key", &path.to_string_lossy()]), &mut second_stdin)
+                .is_err()
+        );
+
+        let mut after_stdin = stdin_of(&["fresh password"]);
+        let words_after =
+            user_key_reveal(&args_of(&["--key", &path.to_string_lossy()]), &mut after_stdin)
+                .unwrap();
+        assert_eq!(words_after, words_before);
+    }
+
+    #[test]
+    fn status_reports_all_three_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let absent_path = dir.path().join("absent.key");
+        assert_eq!(
+            user_key_status(&args_of(&["--key", &absent_path.to_string_lossy()])).unwrap(),
+            "absent"
+        );
+
+        let plaintext_path = dir.path().join("plaintext.key");
+        let seed = [3u8; 32];
+        write_legacy(&plaintext_path, &seed);
+        assert_eq!(
+            user_key_status(&args_of(&["--key", &plaintext_path.to_string_lossy()])).unwrap(),
+            format!("plaintext {}", pubkey_of(&seed))
+        );
+
+        let encrypted_path = dir.path().join("encrypted.key");
+        let mut stdin = stdin_of(&["a password"]);
+        let (_, init_pubkey_hex) = user_key_init(
+            &args_of(&["--out", &encrypted_path.to_string_lossy()]),
+            &mut stdin,
+        )
+        .unwrap();
+        assert_eq!(
+            user_key_status(&args_of(&["--key", &encrypted_path.to_string_lossy()])).unwrap(),
+            format!("encrypted {init_pubkey_hex}")
+        );
+    }
+
+    #[test]
+    fn short_password_rejected_in_init_restore_encrypt() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let init_path = dir.path().join("init.key");
+        let mut stdin = stdin_of(&["short1"]);
+        assert!(
+            user_key_init(&args_of(&["--out", &init_path.to_string_lossy()]), &mut stdin)
+                .is_err()
+        );
+        assert!(
+            !init_path.exists(),
+            "a rejected password must not write a file"
+        );
+
+        let words = userkey::mnemonic_of_seed(&[1u8; 32]);
+        let restore_path = dir.path().join("restore.key");
+        let mut stdin = stdin_of(&[&words, "short1"]);
+        assert!(
+            user_key_restore(&args_of(&["--out", &restore_path.to_string_lossy()]), &mut stdin)
+                .is_err()
+        );
+        assert!(!restore_path.exists());
+
+        let legacy_path = dir.path().join("legacy.key");
+        let seed = [5u8; 32];
+        write_legacy(&legacy_path, &seed);
+        let mut stdin = stdin_of(&["short1"]);
+        assert!(
+            user_key_encrypt(&args_of(&["--key", &legacy_path.to_string_lossy()]), &mut stdin)
+                .is_err()
+        );
+        // a rejected password must not have migrated the file.
+        match userkey::read_user_key_file(&legacy_path).unwrap() {
+            userkey::UserKeyFile::Plaintext(_) => {}
+            userkey::UserKeyFile::Encrypted(_) => panic!("still-plaintext expected"),
+        }
+    }
+
+    /// same seed, two custody shapes (legacy plaintext vs v2+password) must
+    /// mint byte-identical bind JSON (ed25519 signing is deterministic), and
+    /// that JSON must decode via `identity::decode_msg`.
+    #[test]
+    fn sign_bind_v2_password_matches_legacy_and_decodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = [77u8; 32];
+        // an arbitrary but VALID ed25519 point — a public key derived from a
+        // seed, not raw bytes (not every 32-byte string is on-curve).
+        let node_pub_hex = pubkey_of(&[100u8; 32]);
+
+        let legacy_path = dir.path().join("legacy.key");
+        write_legacy(&legacy_path, &seed);
+        let mut stdin = empty_stdin();
+        let legacy_json = user_sign_bind(
+            &args_of(&[
+                "--key",
+                &legacy_path.to_string_lossy(),
+                "--chain-id",
+                "test-chain",
+                "--node-pub",
+                &node_pub_hex,
+                "--nonce",
+                "0",
+            ]),
+            &mut stdin,
+        )
+        .unwrap();
+
+        let v2_path = dir.path().join("v2.key");
+        let line = userkey::seal_user_key(&seed, "a password").unwrap();
+        userkey::write_user_key_new(&v2_path, &line).unwrap();
+        let mut stdin = stdin_of(&["a password"]);
+        let v2_json = user_sign_bind(
+            &args_of(&[
+                "--key",
+                &v2_path.to_string_lossy(),
+                "--chain-id",
+                "test-chain",
+                "--node-pub",
+                &node_pub_hex,
+                "--nonce",
+                "0",
+            ]),
+            &mut stdin,
+        )
+        .unwrap();
+
+        assert_eq!(legacy_json, v2_json);
+
+        match identity::decode_msg(legacy_json.as_bytes()).unwrap() {
+            identity::IdentityMsg::BindNode { user_key, .. } => {
+                assert_eq!(user_key, pubkey_bytes(&seed));
+            }
+            other => panic!("expected BindNode, got {other:?}"),
+        }
+
+        // wrong password fails cleanly (and never silently falls back to
+        // auto-generating a fresh legacy key underneath the v2 file).
+        let mut bad_stdin = stdin_of(&["wrong password"]);
+        assert!(
+            user_sign_bind(
+                &args_of(&[
+                    "--key",
+                    &v2_path.to_string_lossy(),
+                    "--chain-id",
+                    "test-chain",
+                    "--node-pub",
+                    &node_pub_hex,
+                    "--nonce",
+                    "0",
+                ]),
+                &mut bad_stdin,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sign_unbind_v2_password_matches_legacy_and_decodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = [88u8; 32];
+        let node_pub_hex = pubkey_of(&[101u8; 32]);
+
+        let legacy_path = dir.path().join("legacy.key");
+        write_legacy(&legacy_path, &seed);
+        let mut stdin = empty_stdin();
+        let legacy_json = user_sign_unbind(
+            &args_of(&[
+                "--key",
+                &legacy_path.to_string_lossy(),
+                "--chain-id",
+                "test-chain",
+                "--node-pub",
+                &node_pub_hex,
+                "--nonce",
+                "1",
+            ]),
+            &mut stdin,
+        )
+        .unwrap();
+
+        let v2_path = dir.path().join("v2.key");
+        let line = userkey::seal_user_key(&seed, "a password").unwrap();
+        userkey::write_user_key_new(&v2_path, &line).unwrap();
+        let mut stdin = stdin_of(&["a password"]);
+        let v2_json = user_sign_unbind(
+            &args_of(&[
+                "--key",
+                &v2_path.to_string_lossy(),
+                "--chain-id",
+                "test-chain",
+                "--node-pub",
+                &node_pub_hex,
+                "--nonce",
+                "1",
+            ]),
+            &mut stdin,
+        )
+        .unwrap();
+
+        assert_eq!(legacy_json, v2_json);
+        assert!(identity::decode_msg(legacy_json.as_bytes()).is_ok());
+    }
+
+    fn pubkey_bytes(seed: &[u8; 32]) -> Vec<u8> {
+        ed25519::PrivateKey::decode(seed.as_slice())
+            .unwrap()
+            .public_key()
+            .as_ref()
+            .to_vec()
+    }
+
+    #[test]
+    fn legacy_bare_generate_verb_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.key");
+        cmd_user_key_generate_legacy(&args_of(&["--out", &path.to_string_lossy()])).unwrap();
+        match userkey::read_user_key_file(&path).unwrap() {
+            userkey::UserKeyFile::Plaintext(_) => {}
+            userkey::UserKeyFile::Encrypted(_) => panic!("legacy generate must write v1"),
+        }
+    }
+
+    #[test]
+    fn unknown_subcommand_errors_cleanly() {
+        let mut stdin = empty_stdin();
+        let err = cmd_user_key(&args_of(&["bogus"]), &mut stdin).unwrap_err();
+        assert!(err.to_string().contains("unknown user-key subcommand"));
+    }
+}
+
 /// `init --name <human name> [--dir .] [--listen a] [--advertised a] [--http a]
 /// [--rpc a]` — found a network: mint the chain-id, write the descriptor +
 /// node config, seed the genesis validator set with this identity.
@@ -2544,6 +3460,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         validators: vec![hex_bytes(me.as_ref())],
         bootstrap: Vec::new(),
         reach: Vec::new(),
+        coordination: None,
     };
     if let Some(addr) = config::dialable(plumbing.advertised.as_deref(), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -2565,31 +3482,27 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `invite [--config node.toml] [--manual]` — emit the one-line paste blob:
-/// the network descriptor with THIS member's dial hint folded in (and
-/// persisted, so every future invite carries it), plus an INVITE TOKEN. the
-/// token lets the joiner's parked node deliver its pubkey over the lobby
-/// channel automatically — the join request then awaits member approval
-/// (`invite-accept`, or the app's approve button); a token never admits by
-/// itself. `--manual` omits the token: the joiner's pubkey travels out-of-band
-/// exactly as before. any current member may invite (the blob is a low-trust
-/// doorbell, gated by the descriptor's genesis fingerprint and the admission
-/// ballot — not a signed genesis-only credential).
+/// `invite [--config node.toml] [--ttl-days N]` — emit the one-line paste
+/// blob: the whole join credential. minting IS the admission decision — the
+/// blob carries the descriptor with THIS member's dial hint folded in (and
+/// persisted, so every future invite carries it), the inviter's WireGuard
+/// bootstrap when the reachability plane is configured (`wireguard_listen`),
+/// an expiry, and a single-use INVITE TOKEN, the whole envelope signed by
+/// this member's identity. the joiner's node redeems the token automatically
+/// (governance `Redeem`) — no member approval step follows.
 fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    // `--manual` is a bare boolean; strip it before the `--flag value` parser.
-    let mut manual = false;
-    let args: Vec<String> = args
-        .iter()
-        .filter(|a| {
-            let is_manual = a.as_str() == "--manual";
-            manual |= is_manual;
-            !is_manual
-        })
-        .cloned()
-        .collect();
-    let (pos, flags) = parse_flags(&args)?;
+    let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let ttl_days: u64 = match flags.get("ttl-days") {
+        Some(v) => v
+            .parse()
+            .map_err(|e| format!("--ttl-days {v:?}: {e}"))?,
+        None => config::DEFAULT_INVITE_TTL_DAYS,
+    };
+    if ttl_days == 0 {
+        return Err("--ttl-days must be at least 1".into());
     }
     let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
@@ -2600,16 +3513,19 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let descriptor_path = base.join(network_rel);
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
     let key = config::load_identity(&base.join(raw.key_file.as_deref().unwrap_or("identity.key")))?;
-    match config::dialable(raw.advertised.as_deref(), &raw.listen)? {
-        Some(addr) => descriptor.add_bootstrap(&key.public_key(), &addr),
-        // an invite must carry SOME dialable member. a member that joined via a
-        // v3 invite holds its dial hints as `reach` (bootstrap is empty), so
+    let dial_hint = config::dialable(raw.advertised.as_deref(), &raw.listen)?;
+    match &dial_hint {
+        Some(addr) => descriptor.add_bootstrap(&key.public_key(), addr),
+        // an invite must carry SOME dialable member. a member that joined via
+        // an invite holds its dial hints as `reach` (bootstrap is empty), so
         // check the union, not just bootstrap — else a reachable NAT'd member
-        // is wrongly refused.
-        None if descriptor
-            .reach_hints()
-            .map(|h| h.is_empty())
-            .unwrap_or(true) =>
+        // is wrongly refused. a WireGuard-planed inviter is exempt: its blob
+        // carries the tunnel bootstrap, which IS the dial path.
+        None if raw.wireguard_listen.is_none()
+            && descriptor
+                .reach_hints()
+                .map(|h| h.is_empty())
+                .unwrap_or(true) =>
         {
             return Err(
                 "no dialable address: give node.toml a concrete `listen` port or an \
@@ -2620,9 +3536,44 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => {}
     }
     descriptor.save(&descriptor_path)?;
-    let token = (!manual)
-        .then(|| config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes()));
-    println!("{}", config::encode_invite(&descriptor, token.as_ref())?);
+
+    // the WireGuard bootstrap: present iff this member runs the reachability
+    // plane. endpoints are minted from the advertised host (the listen IP is
+    // usually unspecified) + the plane's UDP ports; the mesh port is where
+    // the joiner dials this member's overlay ULA once the tunnel routes.
+    let wireguard = match config::resolved_wireguard_listen(raw.wireguard_listen.as_deref())? {
+        Some(wg_listen) => {
+            let (wg_keypair, _) =
+                reachability::WireGuardKeypair::load_or_generate(&base.join("wireguard.key"))
+                    .map_err(|e| format!("wireguard key: {e}"))?;
+            let host = config::endpoint_host(raw.advertised.as_deref(), &raw.listen, wg_listen)?;
+            let intro_port = config::resolved_invite_listen(raw.invite_listen.as_deref(), wg_listen)?
+                .port();
+            let mesh_port: u16 = raw
+                .listen
+                .parse::<std::net::SocketAddr>()
+                .map(|a| a.port())
+                .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
+            Some(config::InviteWireGuard {
+                public_key: wg_keypair.public_key().0,
+                endpoint: format!("{host}:{}", wg_listen.port()),
+                intro: format!("{host}:{intro_port}"),
+                mesh_port,
+            })
+        }
+        None => None,
+    };
+
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is past the epoch")
+        .as_secs()
+        + ttl_days * 24 * 60 * 60;
+    let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes());
+    println!(
+        "{}",
+        config::encode_invite(&descriptor, &token, wireguard.as_ref(), expires, &key)?
+    );
     Ok(())
 }
 
@@ -2721,12 +3672,12 @@ fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     }
 }
 
-fn read_observers(addr: &str) -> Result<Vec<Vec<u8>>, String> {
+fn read_residents(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
-    let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Observers))?;
+    let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Residents))?;
     match decode_reply(&raw)? {
-        ValsetReply::Observers(v) => Ok(v),
-        other => Err(format!("expected Observers, got {other:?}")),
+        ValsetReply::Residents(v) => Ok(v),
+        other => Err(format!("expected Residents, got {other:?}")),
     }
 }
 
@@ -2864,8 +3815,8 @@ enum CeremonyOutcome {
 /// for exactly this action (else mint an unused `<id_prefix><key>:<n>` id and
 /// propose), cast a yes ballot, and execute once decidable. idempotent across
 /// members — each runs the same verb; the run landing the deciding ballot
-/// executes. shared by `invite-accept` (AddObserver), `promote`
-/// (AddValidator), and `observer-remove` (RemoveObserver).
+/// executes. shared by `invite-accept` (AddResident), `promote`
+/// (AddValidator), and `resident-remove` (RemoveResident).
 fn drive_membership_ceremony(
     rpc_addr: &str,
     me_bytes: &[u8],
@@ -2975,12 +3926,12 @@ fn drive_membership_ceremony(
 }
 
 /// `invite-accept <hex pubkey> [--config node.toml]` — approve a join request
-/// as OBSERVER standing (the staged-admission tier): drive a governance
-/// AddObserver proposal for `pubkey` through this member's own RUNNING node.
+/// as RESIDENT standing (the staged-admission tier): drive a governance
+/// AddResident proposal for `pubkey` through this member's own RUNNING node.
 /// the passing proposal's valset Grant schedules the epoch cutover that
 /// admits the key to the mesh, at which point its parked node PRE-SYNCS
 /// state on a stride cadence. promotion into the quorum is the separate,
-/// deliberate `promote` verb — run it once the observer is warm.
+/// deliberate `promote` verb — run it once the resident is warm.
 fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use governance::GovAction;
 
@@ -3007,9 +3958,9 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         eprintln!("{pubkey_hex} is already a validator — nothing to do");
         return Ok(());
     }
-    if read_observers(&rpc_addr)?.contains(&key_bytes) {
+    if read_residents(&rpc_addr)?.contains(&key_bytes) {
         eprintln!(
-            "{pubkey_hex} already holds observer standing — promote with \
+            "{pubkey_hex} already holds resident standing — promote with \
              `ducktape-node promote {pubkey_hex}` once it is synced"
         );
         return Ok(());
@@ -3017,7 +3968,7 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     if !members.contains(&me_bytes) {
         return Err(
             "this node's identity is not a current member — only members admit \
-                    observers"
+                    residents"
                 .into(),
         );
     }
@@ -3027,12 +3978,12 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         &me_bytes,
         pubkey_hex,
         "invite-accept",
-        "observe:",
-        GovAction::AddObserver { key: key_bytes },
+        "resident:",
+        GovAction::AddResident { key: key_bytes },
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
-                "granted observer standing to {pubkey_hex}: the mesh admits it at the next \
+                "granted resident standing to {pubkey_hex}: the mesh admits it at the next \
                  epoch cutover and its parked node pre-syncs state. promote it into the \
                  quorum once warm:\n    ducktape-node promote {pubkey_hex}"
             );
@@ -3044,11 +3995,11 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 
 /// `promote <hex pubkey> [--config node.toml]` — seat a key in the consensus
 /// quorum: drive a governance AddValidator proposal through this member's own
-/// RUNNING node. the passing proposal's valset Join clears any observer
+/// RUNNING node. the passing proposal's valset Join clears any resident
 /// standing in the same block and schedules the epoch cutover; a pre-synced
-/// observer then catches up a small delta and reboots as a validator, so the
+/// resident then catches up a small delta and reboots as a validator, so the
 /// quorum only ever gains a warm member. also serves DIRECT (un-staged)
-/// admission — exactly the pre-observer `invite-accept` semantics.
+/// admission — exactly the pre-resident `invite-accept` semantics.
 fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use governance::GovAction;
 
@@ -3099,20 +4050,20 @@ fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// `observer-remove <hex pubkey> [--config node.toml]` — revoke observer
-/// standing: drive a governance RemoveObserver proposal through this member's
+/// `resident-remove <hex pubkey> [--config node.toml]` — revoke resident
+/// standing: drive a governance RemoveResident proposal through this member's
 /// own RUNNING node. the mirror of `invite-accept` with inverted guards — a
-/// no-op when the key holds no observer standing, and only members may drive
+/// no-op when the key holds no resident standing, and only members may drive
 /// it. the passing proposal's valset Revoke schedules the epoch cutover that
 /// drops the key from the mesh; its node falls back to a parked joiner, and
 /// `invite-accept` re-grants. a seated validator is `member-remove`'s job —
 /// standing never overlaps (Grant refuses validators, Join clears standing).
-fn cmd_observer_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_resident_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use governance::GovAction;
 
     let (pos, flags) = parse_flags(args)?;
     let [pubkey_hex] = pos.as_slice() else {
-        return Err("observer-remove needs exactly one <hex pubkey>".into());
+        return Err("resident-remove needs exactly one <hex pubkey>".into());
     };
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
@@ -3124,25 +4075,25 @@ fn cmd_observer_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     let rpc_addr = resolved
         .rpc_listen
         .clone()
-        .ok_or("observer-remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
+        .ok_or("resident-remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
     let me_bytes = resolved.signer.public_key().as_ref().to_vec();
 
     let members = read_members(&rpc_addr)?;
     if members.contains(&key_bytes) {
         eprintln!(
-            "{pubkey_hex} is a seated validator, not an observer — remove it with \
+            "{pubkey_hex} is a seated validator, not a resident — remove it with \
              `ducktape-node member-remove {pubkey_hex}`"
         );
         return Ok(());
     }
-    if !read_observers(&rpc_addr)?.contains(&key_bytes) {
-        eprintln!("{pubkey_hex} holds no observer standing — nothing to do");
+    if !read_residents(&rpc_addr)?.contains(&key_bytes) {
+        eprintln!("{pubkey_hex} holds no resident standing — nothing to do");
         return Ok(());
     }
     if !members.contains(&me_bytes) {
         return Err(
             "this node's identity is not a current member — only members remove \
-                    observers"
+                    residents"
                 .into(),
         );
     }
@@ -3151,13 +4102,13 @@ fn cmd_observer_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>
         &rpc_addr,
         &me_bytes,
         pubkey_hex,
-        "observer-remove",
+        "resident-remove",
         "revoke:",
-        GovAction::RemoveObserver { key: key_bytes },
+        GovAction::RemoveResident { key: key_bytes },
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
-                "revoked observer standing from {pubkey_hex}: the mesh drops it at the next \
+                "revoked resident standing from {pubkey_hex}: the mesh drops it at the next \
                  epoch cutover and its node parks again. a member re-grants with:\n    \
                  ducktape-node invite-accept {pubkey_hex}"
             );
@@ -3397,7 +4348,8 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let [blob] = pos.as_slice() else {
         return Err("join needs exactly one <invite blob>".into());
     };
-    let (descriptor, token) = config::decode_invite(blob)?;
+    let invite = config::decode_invite(blob)?;
+    let mut descriptor = invite.descriptor.clone();
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
     config::guard_join_descriptor(&dir, &descriptor)?;
@@ -3407,21 +4359,64 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // the join without leaving a half-migrated dir. the file is ALWAYS
     // rewritten in the network shape — a join must take effect even in a dir
     // holding the app's dev-shape solo config.
-    let plumbing = config::merged_plumbing(
+    let mut plumbing = config::merged_plumbing(
         &dir,
         flags.get("listen").map(String::as_str),
         flags.get("advertised").map(String::as_str),
         flags.get("http").map(String::as_str),
         flags.get("rpc").map(String::as_str),
     )?;
+    if let Some(wg) = &invite.wireguard {
+        // a WireGuard invite makes the tunnel the dial path, so the joiner's
+        // defaults change shape: its own plane comes up (wireguard_listen),
+        // its mesh listens dual-stack on a CONCRETE port and advertises the
+        // overlay ULA (members reverse-dial it over the tunnels), and the
+        // descriptor gains the inviter's overlay mesh address as a Direct
+        // hint — dialable the moment the invite tunnel routes. explicit
+        // flags and an existing node.toml still win.
+        if plumbing.wireguard_listen.is_none() {
+            plumbing.wireguard_listen = Some("0.0.0.0:51820".into());
+        }
+        if flags.get("listen").is_none() {
+            let port: u16 = plumbing
+                .listen
+                .parse::<std::net::SocketAddr>()
+                .map(|a| a.port())
+                .unwrap_or(0);
+            if port == 0 || !plumbing.listen.starts_with('[') {
+                plumbing.listen = format!("[::]:{}", if port == 0 { 52200 } else { port });
+            }
+        }
+        if plumbing.advertised.is_none() {
+            plumbing.advertised = Some("overlay".into());
+        }
+        let issuer_identity =
+            wireguard_upgrade::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
+                .map_err(|e| format!("inviter identity: {e:?}"))?;
+        let inviter_ula = wireguard_upgrade::ula_v6_member_addr(
+            &descriptor.genesis_namespace(),
+            issuer_identity,
+        );
+        descriptor.add_reach(&config::ReachHint {
+            expected_key: invite.token.issuer.clone(),
+            reach: config::Reach::Direct(format!("[{inviter_ula}]:{}", wg.mesh_port)),
+        });
+    }
     descriptor.save(&dir.join("network.toml"))?;
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me_hex = hex_bytes(key.public_key().as_ref());
     config::write_node_toml(&dir, &plumbing)?;
-    if let Some(token) = &token {
-        // the bearer credential the parked node announces with; a re-join
-        // with a fresh invite replaces a stale one.
-        config::save_invite_token(&dir, token)?;
+    // the capability the joining node redeems automatically; a re-join with a
+    // fresh invite replaces a stale/spent one.
+    config::save_invite_token(&dir, &invite.token)?;
+    if let Some(wg) = &invite.wireguard {
+        // the tunnel bootstrap the joining node dials BEFORE any p2p; kept
+        // beside the token so `run_node` can bring the interface up first.
+        config::save_invite_wireguard(&dir, &invite.token.issuer, wg)?;
+        // mint the WireGuard identity NOW so the run's plane and intro
+        // announcer read one settled key file instead of racing to create it.
+        reachability::WireGuardKeypair::load_or_generate(&dir.join("wireguard.key"))
+            .map_err(|e| format!("wireguard key: {e}"))?;
     }
     eprintln!(
         "{} identity {me_hex}",
@@ -3437,25 +4432,14 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "this identity is a member — start: ducktape-node --config {}/node.toml",
             dir.display()
         );
-    } else if token.is_some() {
-        eprintln!(
-            "NOT yet a member. start now — `ducktape-node --config {}/node.toml` parks on \
-             the mesh and DELIVERS this identity to the members automatically (the invite \
-             carries a token); a member then approves the join request (the app's approve \
-             button, or `ducktape-node invite-accept {me_hex}`), and this node promotes \
-             itself.",
-            dir.display()
-        );
     } else {
-        eprintln!("NOT yet a member. send this identity to a member, then:");
-        eprintln!("  running network: the member runs `ducktape-node invite-accept {me_hex}`,");
         eprintln!(
-            "    and you start now — `ducktape-node --config {}/node.toml` parks on the \
-             mesh and promotes itself once admitted;",
+            "NOT yet a member. start now — `ducktape-node --config {}/node.toml` redeems \
+             this invite automatically: the node joins the network's VPN, syncs state, and \
+             comes up as a full node. no approval step follows (minting the invite WAS the \
+             approval); a member can later promote it into the quorum with `promote {me_hex}`.",
             dir.display()
         );
-        eprintln!("  before genesis: the member runs `ducktape-node admit {me_hex}` and you");
-        eprintln!("    join again with the refreshed invite (the identity here is kept).");
     }
     println!("{me_hex}");
     Ok(())
@@ -3489,6 +4473,11 @@ fn wire_reachability_plane<S, R>(
     wireguard_effect: WireGuardEffectKind,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
+    intro_listen: Option<std::net::SocketAddr>,
+    // the genesis-issued admission capability presented on every coordinator
+    // request (private coordination); `None` for a genesis validator, a public
+    // coordinator, or the dev shape.
+    coord_cap: Option<nat_traversal::CoordCap>,
     reach_p2p_tx: S,
     mut reach_p2p_rx: R,
 ) -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>
@@ -3501,6 +4490,7 @@ where
 
     let thread_label = label.to_string();
     let reach_signer = signer.clone();
+    let reach_coord_cap = coord_cap;
     let plane_chain_id = chain_id.to_string();
     let key_file = wireguard_key_file.to_path_buf();
     let state_file = mesh_state_file.to_path_buf();
@@ -3522,6 +4512,8 @@ where
                     wireguard_effect,
                     advertised,
                     coordinators,
+                    intro_listen,
+                    reach_coord_cap,
                     cmd_rx,
                     nudge_tx,
                     ev_tx,
@@ -3581,6 +4573,12 @@ where
                         "[node {pump_label}] reachability: epoch {epoch} standby pre-warm \
                          tunnels on {interface} ({peers} peer(s))"
                     ),
+                    reachability::ReachabilityEvent::InvitePeerInstalled { peer, interface } => {
+                        println!(
+                            "[node {pump_label}] reachability: invite tunnel to {} on {interface}",
+                            hex_bytes(&peer.as_ref()[..4])
+                        )
+                    }
                     reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
                         println!(
                             "[node {pump_label}] reachability: peer {}: {reason}",
@@ -3617,6 +4615,7 @@ where
     cmd_tx
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reachability_plane(
     label: String,
     chain_id: String,
@@ -3629,6 +4628,13 @@ async fn reachability_plane(
     effect_kind: WireGuardEffectKind,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
+    // the invite intro listener: where a fresh joiner announces its keys
+    // (token-authenticated) so its tunnel exists before any p2p.
+    intro_listen: Option<std::net::SocketAddr>,
+    // the genesis-issued admission capability presented on every coordinator
+    // request (private coordination); `None` for a genesis validator, a public
+    // coordinator, or the dev shape.
+    coord_cap: Option<nat_traversal::CoordCap>,
     commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
     // a clone of the `commands` sender, for the plane's own nudge ticker.
     nudges: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
@@ -3693,7 +4699,13 @@ async fn reachability_plane(
         }
     }
     let me = reachability::node_key(reachability::identity_of(&signer.public_key()));
-    let resolver = match reachability::NatResolver::bind(me, coords.clone()).await {
+    // authenticate every coordinator request: the node signs a
+    // proof-of-possession with its identity key and, in private coordination,
+    // carries the genesis-issued cap. A fully-open coordinator ignores the
+    // authenticator; a public/private one requires it. With no coordinators
+    // configured `bind` short-circuits to pass-through and never touches this.
+    let auth = Some((signer.clone(), coord_cap));
+    let resolver = match reachability::NatResolver::bind(me, coords.clone(), auth).await {
         Ok(resolver) => resolver,
         Err(err) => {
             eprintln!(
@@ -3722,6 +4734,88 @@ async fn reachability_plane(
         persist_file: Some(mesh_state_file),
         gossip_ingress,
     };
+    // the invite intro listener: a fresh joiner's first contact. one
+    // datagram carries the token, the joiner's identity + proof, and its
+    // WireGuard key (identity-bound); a verified intro installs the
+    // join-window tunnel peer (endpoint = the datagram's observed source —
+    // WireGuard roams to the joiner's authenticated initiation anyway) and
+    // the ack goes back only after the interface really carries it.
+    // membership is NOT checked here (this task has no state access) — the
+    // in-consensus redemption enforces it; a revoked member's token can at
+    // worst open a tunnel that admits nothing.
+    if let Some(intro_addr) = intro_listen {
+        let intro_cmds = nudges.clone().downgrade();
+        let intro_label = label.clone();
+        // `chain_id` (the namespace string) moved into the plane config
+        // above; the binding tokens sign over is those same bytes.
+        let binding = config.chain_id.clone().into_bytes();
+        tokio::spawn(async move {
+            let socket = match tokio::net::UdpSocket::bind(intro_addr).await {
+                Ok(socket) => socket,
+                Err(err) => {
+                    eprintln!(
+                        "[node {intro_label}] invite intro listener bind {intro_addr} failed: \
+                         {err} — joins via this node's invites need another member"
+                    );
+                    return;
+                }
+            };
+            println!("[node {intro_label}] invite intro listening on udp/{intro_addr}");
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((n, src)) = socket.recv_from(&mut buf).await else {
+                    continue;
+                };
+                let Ok(msg) = lobby::decode_intro(&buf[..n]) else {
+                    continue; // junk on the doorbell — drop.
+                };
+                let ack = |installed: bool, detail: String| {
+                    let ack = lobby::IntroAck {
+                        nonce: msg.nonce.clone(),
+                        installed,
+                        detail,
+                    };
+                    let bytes = lobby::encode_intro_ack(&ack);
+                    let socket = &socket;
+                    async move {
+                        let _ = socket.send_to(&bytes, src).await;
+                    }
+                };
+                let verified = match lobby::verify_intro(&msg, &binding) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        ack(false, e).await;
+                        continue;
+                    }
+                };
+                let Some(cmds) = intro_cmds.upgrade() else { break };
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let install = reachability::ReachabilityCommand::InstallInvitePeer {
+                    peer: verified.joiner.clone(),
+                    wireguard_public_key: wireguard_upgrade::X25519PublicKey(
+                        verified.wg_public_key,
+                    ),
+                    endpoint: src,
+                    reply: reachability::InstallReply(reply_tx),
+                };
+                if cmds.send(install).await.is_err() {
+                    break;
+                }
+                match reply_rx.await {
+                    Ok(Ok(())) => {
+                        println!(
+                            "[node {intro_label}] invite intro: tunnel peer installed for {}",
+                            config::hex_bytes(&verified.joiner.as_ref()[..4])
+                        );
+                        ack(true, "tunnel installed".into()).await;
+                    }
+                    Ok(Err(e)) => ack(false, e).await,
+                    Err(_) => ack(false, "plane exited".into()).await,
+                }
+            }
+        });
+    }
+
     // the boot `Retarget`'s record fan-out fires before the p2p actors have
     // a single live connection, and mesh sends are best-effort — when both
     // sides of a link lose that first datagram the plane deadlocks in record
@@ -3818,6 +4912,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         signer,
         label,
         namespace,
+        // the descriptor's own chain-id (network shape) or the raw dev-shape
+        // namespace — NOT `namespace` below, which is `genesis_namespace()`
+        // (chain_id@fingerprint) on the network shape. this is the string the
+        // desktop app records as `Workspace.chain_id`; threaded into
+        // `identity`'s certificate domain separation.
+        chain_id: identity_chain_id,
         mesh: peers,
         validators,
         bootstrappers,
@@ -3830,11 +4930,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         wireguard_listen,
         wireguard_effect,
         wireguard_key_file,
+        invite_listen,
         dev_demo,
         checkpoint_blocks,
         invite_token,
+        invite_wireguard,
         sync_index,
         announce_capabilities,
+        coordination,
+        coord_cap,
+        workspace,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
@@ -3856,17 +4961,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         if invite_token.is_some() {
             println!(
                 "[node {label}] identity {} is not in the genesis validator set — joiner \
-                 mode: parking on the mesh and announcing this key with the invite token; \
-                 a member approves the join request (the app, or `ducktape-node \
-                 invite-accept {}`)",
-                hex_bytes(signer.public_key().as_ref()),
+                 mode: announcing this key with the invite token; a member node redeems it \
+                 automatically (the mint was the approval) and full-node standing lands at \
+                 the next block",
                 hex_bytes(signer.public_key().as_ref())
             );
         } else {
             println!(
                 "[node {label}] identity {} is not in the genesis validator set — joiner \
-                 mode: parking on the mesh until a member runs `ducktape-node \
-                 invite-accept {}`",
+                 mode: no invite token on disk, so a member must grant standing manually \
+                 (`ducktape-node invite-accept {}`)",
                 hex_bytes(signer.public_key().as_ref()),
                 hex_bytes(signer.public_key().as_ref())
             );
@@ -3887,6 +4991,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // the plane's to surface at its restore; here they just mean no seeds.
     let chain_id = String::from_utf8_lossy(&namespace).to_string();
     let mesh_state_file = storage.join("mesh-state.json");
+    // fail-closed check for private coordination: a node that is neither a
+    // genesis validator (admitted by membership) nor holding a `coord.cap`
+    // will have every rendezvous request silently dropped by a private
+    // coordinator. Surface that loudly instead of pretending the plane is
+    // healthy — the tunnels never come up, and the operator needs to know it
+    // is a missing credential, not a network fault.
+    if wireguard_listen.is_some()
+        && !coordinated.is_empty()
+        && coordination == config::Coordination::Private
+        && coord_cap.is_none()
+        && !validators.contains(&signer.public_key())
+    {
+        eprintln!(
+            "[node {label}] reachability: private coordination but no coord.cap and not a \
+             genesis validator — rendezvous will be denied; provide coord.cap or use a \
+             fronted/direct reach hint"
+        );
+    }
     let mesh_dial_seeds: Vec<(ed25519::PublicKey, Ingress)> =
         match reachability::store::load(&mesh_state_file, &chain_id) {
             Ok(Some(mesh)) => {
@@ -3943,7 +5065,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
     // there was a silent no-op). reaching them is the reachability plane's
     // job: gossip relays through whatever mesh links exist, the nat client
-    // hole-punches/relays the WireGuard path through the coordinator, and
+    // rendezvouses via the coordinator and hole-punches the WireGuard path, and
     // once tunnels apply the mesh dials the target's advertised overlay
     // address over the tunnel (the target sets `advertised = "overlay"`).
     // what still needs a TCP foothold is the gossip itself: with ZERO
@@ -3991,7 +5113,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise. a
-    // JOINER binds too: the park loop pumps the same surface — an observer
+    // JOINER binds too: the park loop pumps the same surface — a resident
     // serves local reads from its pre-synced boundary, a still-parked joiner
     // answers with a clear not-admitted error instead of a dead port.
     let rpc_listener = match rpc_listen.as_deref() {
@@ -4007,23 +5129,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // the derived per-module index (noded's exact store, <storage>/index),
     // plus the blocks database the explorer reads: the pump folds sealed
     // blocks into it, boot heals it from verified state at sync/recovery
-    // boundaries, an observer's follow arm heals it at every state-changing
+    // boundaries, a resident's follow arm heals it at every state-changing
     // boundary it serves, and the already-routed GET /v1/blocks +
     // /v1/index/* lanes light up through the handle below. an open failure
     // is fatal-with-remedy rather than a silent no-index run: the tier is
     // rebuildable, so the fix is always "delete <storage>/index".
     let index = noded::open_index_store(&storage, &MODULE_IDS)?;
+    // the voice hub's session lane: /v1/call/ws handlers ask for huddle
+    // audio sessions here. created up front because the app-surface thread
+    // starts before the mesh exists; only the validator path below spawns the
+    // hub that drains it — on every other path the receiver just drops and
+    // the route answers with a refusal.
+    let (voice_lane, voice_requests) = tokio::sync::mpsc::channel::<noded::CallSessionRequest>(8);
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
     let http_handle = http_handle
         .with_forge_repo(storage.join("forge-repo"))
-        .with_index_store(index.clone());
+        .with_index_store(index.clone())
+        .with_call(voice_lane);
     let blobs = http_handle.blob_handle();
-    // share the ring the app-surface's GET /v1/telemetry handler reads, so the
-    // pump can push a telemetry frame per applied block (mirrors the noded
-    // daemon lane). the `async move` pump closure below captures this clone.
-    let telemetry = http_handle.telemetry_ring();
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
     match http_listen.as_deref() {
@@ -4069,18 +5194,30 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
+        // the validator's own `ducktape_*` Prometheus series, registered on the
+        // SAME runtime registry `context.encode()` (GET /metrics) serves — the
+        // drain loop below folds each applied block in (height, count, apply
+        // latency, per-module dispatch counters), so the networked node reports
+        // the series the local daemon does and one Grafana board reads both.
+        let metrics = noded::NodeMetrics::register(&context);
+
         // the authorized MESH set, SORTED — what discovery tracks. the
         // consensus scheme uses the (possibly smaller) validator set derived
         // from committed valset state after the recovery boot below.
         let mesh_participants: Set<ed25519::PublicKey> =
             Set::try_from(peers.clone()).expect("authorized peer set has no duplicates");
 
+        // this node's mesh identity, as served on /v1/status — clients stamp
+        // it into peer-routed ops (chat's JoinHuddle.node).
+        let status_public_key = hex_bytes(signer.public_key().as_ref());
+
         // the statesync source a --sync-only joiner pulls from: only
         // validators serve the channel, so the candidate must be a validator
         // that is not us (a non-validator hint or our own key would be
         // retried forever — discovery never connects a node to itself).
-        let sync_source =
-            config::choose_sync_source(&sync_candidates, &validators, &signer.public_key());
+        let sync_sources =
+            config::sync_source_candidates(&sync_candidates, &validators, &signer.public_key());
+        let sync_source = sync_sources.first().cloned();
 
         // the real encrypted TCP mesh. `local` is the dev preset (allows private
         // ips). MUST be the real tokio runtime — discovery live-locks under the
@@ -4153,7 +5290,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
-            // the lobby lane: a sync-only observer never announces or answers,
+            // the submit-relay lane: a sync-only resident holds no standing,
+            // relays no writes, and answers nothing — but an unregistered
+            // channel kills the sender, so black-hole.
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_submit_relay")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
+            // the lobby lane: a sync-only resident never announces or answers,
             // but an unregistered channel is a protocol violation — black-hole.
             {
                 let (_tx, mut rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
@@ -4161,7 +5307,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     while rx.recv().await.is_ok() {}
                 });
             }
-            // the reachability lane: a sync-only observer runs no WireGuard
+            // the reachability lane: a sync-only resident runs no WireGuard
             // plane, but the channel must exist — black-hole.
             {
                 let (_tx, mut rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
@@ -4169,20 +5315,42 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     .child("blackhole_reachability")
                     .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
             }
+            // the voice lane: a sync-only resident serves no huddle audio,
+            // but the channel must exist — black-hole. dropping the session
+            // lane makes /v1/call/ws refuse instead of hang (this branch
+            // never reaches the validator hub below).
+            drop(voice_requests);
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_voice")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
+            // the video lane: a sync-only resident serves no huddle video, but
+            // the channel must exist — black-hole.
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_VIDEO, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_video")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
             network.start();
 
-            let Some(server_peer) = sync_source else {
+            if sync_sources.is_empty() {
                 eprintln!(
                     "[node {label}] no statesync source: no validator other than this node \
                      is available to serve (only validators answer the statesync channel)"
                 );
                 std::process::exit(1);
-            };
-            let client = P2pSyncClient::new(
+            }
+            // rotate across every validator that can serve — the payloads
+            // verify against consensus roots, so source choice is pure
+            // availability.
+            let client = P2pSyncClient::with_sources(
                 context.child("sync_client"),
                 sync_tx,
                 sync_rx,
-                server_peer,
+                sync_sources.clone(),
             );
 
             // the mesh takes a moment to connect, and the server only serves
@@ -4219,7 +5387,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // print the greppable line the demo script asserts on.
             let forge_repo = storage_for_sync.join("forge-repo");
             let duckfs_dir = storage_for_sync.join("duckfs");
-            match sync_all_modules(&context, &client, &manifest, &forge_repo, &duckfs_dir, 0).await
+            match sync_all_modules(
+                &context,
+                &client,
+                &manifest,
+                &forge_repo,
+                &duckfs_dir,
+                &namespace,
+                0,
+                &identity_chain_id,
+            )
+            .await
             {
                 Ok(host) => {
                     println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
@@ -4276,7 +5454,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
             // the parked mesh identity: genesis set at the base index (no
             // consensus coordinates yet), engine lanes black-holed exactly
-            // like the sync-only observer — an unregistered channel is a
+            // like the sync-only resident — an unregistered channel is a
             // protocol violation that kills the very connection the sync
             // client needs.
             oracle.track(PEER_SET, mesh_participants.clone());
@@ -4293,7 +5471,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
             // the reachability lane: a parked joiner with a WireGuard config
-            // runs the plane in its STANDBY role — once observer standing
+            // runs the plane in its STANDBY role — once resident standing
             // lands (the park loop below drives Retargets off the manifest),
             // it pre-warms tunnels with every member so activation, and the
             // promotion reboot via the persisted mesh, start connected
@@ -4317,6 +5495,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             wireguard_effect,
                             advertised_reach,
                             coordinators,
+                            // a joiner serves no intros — only members mint
+                            // redeemable invites.
+                            None,
+                            coord_cap.clone(),
                             reach_tx,
                             reach_rx,
                         ))
@@ -4330,20 +5512,199 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     }
                 }
             };
+            // the TUNNEL-FIRST join window: an invite that carried a WireGuard
+            // bootstrap makes the tunnel the join's carrier — before any p2p,
+            // (a) this node's interface gains the INVITER as a peer (endpoint
+            // straight from the blob), and (b) an intro announcer delivers
+            // this node's identity + WireGuard key to the inviter's intro
+            // listener until acked, at which point the inviter's side of the
+            // tunnel exists too. the mesh dialer below then reaches the
+            // inviter's overlay ULA (the join-minted Direct hint) the moment
+            // the tunnel routes, and everything else — lobby announce,
+            // redemption, statesync — rides it.
+            if let (Some(reach), Some(wg), Some(token)) =
+                (&reach_cmd, &invite_wireguard, &invite_token)
+            {
+                use std::net::ToSocketAddrs as _;
+                let install = wg.issuer_key().and_then(|issuer| {
+                    let endpoint = wg
+                        .endpoint
+                        .to_socket_addrs()
+                        .map_err(|e| format!("invite wireguard endpoint {:?}: {e}", wg.endpoint))?
+                        .next()
+                        .ok_or_else(|| format!("invite wireguard endpoint {:?} did not resolve", wg.endpoint))?;
+                    let public_key = wg.public_key_bytes()?;
+                    Ok((issuer, public_key, endpoint))
+                });
+                match install {
+                    Ok((issuer, public_key, endpoint)) => {
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        let _ = reach
+                            .send(reachability::ReachabilityCommand::InstallInvitePeer {
+                                peer: issuer,
+                                wireguard_public_key: wireguard_upgrade::X25519PublicKey(public_key),
+                                endpoint,
+                                reply: reachability::InstallReply(reply_tx),
+                            })
+                            .await;
+                        match reply_rx.await {
+                            Ok(Ok(())) => println!(
+                                "[node {label}] invite: tunnel to the inviter configured \
+                                 (endpoint {endpoint})"
+                            ),
+                            Ok(Err(e)) => eprintln!(
+                                "[node {label}] invite: inviter tunnel not configured: {e}"
+                            ),
+                            Err(_) => {}
+                        }
+                        // the announcer: a plain blocking UDP loop on its own OS
+                        // thread (nothing here touches the runtime) — re-sends
+                        // the intro every 2s until the inviter acks an install.
+                        let announce_label = label.clone();
+                        let announce_signer = signer.clone();
+                        let announce_namespace = namespace.clone();
+                        let announce_token = token.clone();
+                        let intro_dest = wg.intro.clone();
+                        let key_file = wireguard_key_file.clone();
+                        std::thread::Builder::new()
+                            .name("invite-intro".into())
+                            .spawn(move || {
+                                let Ok((keypair, _)) =
+                                    reachability::WireGuardKeypair::load_or_generate(&key_file)
+                                else {
+                                    eprintln!(
+                                        "[node {announce_label}] invite: wireguard key unreadable — \
+                                         intro not announced"
+                                    );
+                                    return;
+                                };
+                                let request = lobby::encode_intro(&lobby::intro_request(
+                                    &announce_signer,
+                                    &announce_namespace,
+                                    &announce_token,
+                                    keypair.public_key().0,
+                                ));
+                                let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+                                    return;
+                                };
+                                let _ = socket
+                                    .set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                                let mut announced = false;
+                                let mut buf = [0u8; 2048];
+                                loop {
+                                    let Ok(dest) = intro_dest.to_socket_addrs() else {
+                                        std::thread::sleep(std::time::Duration::from_secs(2));
+                                        continue;
+                                    };
+                                    let Some(dest) = dest.into_iter().next() else {
+                                        std::thread::sleep(std::time::Duration::from_secs(2));
+                                        continue;
+                                    };
+                                    if socket.send_to(&request, dest).is_ok() && !announced {
+                                        announced = true;
+                                        println!(
+                                            "[node {announce_label}] invite: introducing this \
+                                             node to the inviter at udp/{dest}"
+                                        );
+                                    }
+                                    if let Ok((n, _)) = socket.recv_from(&mut buf)
+                                        && let Ok(ack) = lobby::decode_intro_ack(&buf[..n])
+                                        && ack.nonce == announce_token.nonce.to_vec()
+                                    {
+                                        if ack.installed {
+                                            println!(
+                                                "[node {announce_label}] invite: inviter \
+                                                 installed our tunnel — join rides the overlay"
+                                            );
+                                            return;
+                                        }
+                                        eprintln!(
+                                            "[node {announce_label}] invite: inviter refused \
+                                             the intro: {}",
+                                            ack.detail
+                                        );
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_secs(2));
+                                }
+                            })
+                            .expect("spawn invite-intro thread");
+                    }
+                    Err(e) => eprintln!(
+                        "[node {label}] invite: wireguard bootstrap unusable ({e}) — falling \
+                         back to the descriptor's reach hints"
+                    ),
+                }
+            }
+            // the voice lane: a parked joiner serves no huddle audio, but the
+            // channel must exist — black-hole. dropping the session lane makes
+            // /v1/call/ws refuse instead of hang (this branch always ends in
+            // the promotion reboot, never the validator hub below).
+            drop(voice_requests);
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_voice")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
+            // the video lane: a parked joiner serves no huddle video, but the
+            // channel must exist — black-hole.
+            {
+                let (_tx, mut rx) = network.register(CHANNEL_VIDEO, quota, MAX_BACKLOG);
+                context
+                    .child("blackhole_video")
+                    .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+            }
+            // the submit-relay lane: once resident standing lands, writes leave
+            // here — this node signs its own frames and a validator takes
+            // custody. replies (the frame's consensus fate) come back on the
+            // same lane. bound `mut` because the serve window's relay helper
+            // sends on `relay_tx`; `relay_rx` is bridged into the serve window
+            // below (a torn-down select must never drop its `recv()` mid-flight).
+            let (mut relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
             // the lobby lane: where this parked node announces its key. member
             // replies are drained by a printer task — purely informational.
             let (mut lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
             {
                 let label = label.clone();
+                // the parked joiner persists a coord.cap delivered over a
+                // JoinReply into its workspace, so a later boot presents it to
+                // the private coordinator (loaded via `load_coord_cap`).
+                let cap_dir = workspace.clone();
                 context.child("lobby_replies").spawn(move |_ctx| async move {
                     while let Ok((peer, msg)) = lobby_rx.recv().await {
                         let bytes: Vec<u8> = msg.into();
                         match lobby::decode_msg(&bytes) {
-                            Ok(lobby::LobbyMsg::JoinReply { recorded, detail }) => println!(
-                                "[node {label}] member {}: {}{detail}",
-                                hex_bytes(&peer.as_ref()[..4]),
-                                if recorded { "" } else { "join request refused — " },
-                            ),
+                            Ok(lobby::LobbyMsg::JoinReply { recorded, detail, cap }) => {
+                                println!(
+                                    "[node {label}] member {}: {}{detail}",
+                                    hex_bytes(&peer.as_ref()[..4]),
+                                    if recorded { "" } else { "join request refused — " },
+                                );
+                                // a delivered cap (private coordination): unpack
+                                // the opaque bytes and persist beside identity.
+                                if let Some(cap_bytes) = cap {
+                                    match config::unpack_coord_cap(&cap_bytes) {
+                                        Ok(cap) => match config::save_coord_cap(&cap_dir, &cap) {
+                                            Ok(()) => println!(
+                                                "[node {label}] coordinator cap delivered by \
+                                                 member {} — saved (issuer {}, expires {})",
+                                                hex_bytes(&peer.as_ref()[..4]),
+                                                hex_bytes(&cap.issuer.as_ref()[..4]),
+                                                cap.not_after,
+                                            ),
+                                            Err(e) => eprintln!(
+                                                "[node {label}] coordinator cap delivered but \
+                                                 could not be saved: {e}"
+                                            ),
+                                        },
+                                        Err(e) => eprintln!(
+                                            "[node {label}] member {} sent a malformed \
+                                             coordinator cap: {e}",
+                                            hex_bytes(&peer.as_ref()[..4]),
+                                        ),
+                                    }
+                                }
+                            }
                             Ok(_) | Err(_) => {}
                         }
                     }
@@ -4358,8 +5719,36 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 );
                 std::process::exit(1);
             };
-            let client =
-                P2pSyncClient::new(context.child("sync_client"), sync_tx, sync_rx, server_peer);
+            // the joiner's sync client: the mesh path always works and
+            // ROTATES across every validator that can serve; with the
+            // statesync plane enabled, requests PREFER an overlay stream to
+            // the primary source and fall back on transport failure — the
+            // plane binds lazily once the invite tunnel brings the interface
+            // up.
+            let mesh_client = P2pSyncClient::with_sources(
+                context.child("sync_client"),
+                sync_tx,
+                sync_rx,
+                sync_sources.clone(),
+            );
+            let client = {
+                let plane_slot: statesync_plane::PlaneSlot =
+                    std::sync::Arc::new(std::sync::OnceLock::new());
+                if statesync_plane::enabled() && wireguard_listen.is_some() {
+                    let book = statesync_plane::OverlayBook::new(
+                        String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+                    );
+                    book.set_peers(peers.iter());
+                    statesync_plane::spawn_bring_up(
+                        label.clone(),
+                        book,
+                        signer.public_key(),
+                        std::sync::Arc::clone(&plane_slot),
+                        None,
+                    );
+                }
+                statesync_plane::PlaneFallbackClient::new(plane_slot, &server_peer, mesh_client)
+            };
 
             // the announce, built once: this key + the invite token + the
             // proof-of-possession binding them. re-sent (round-robin over the
@@ -4378,10 +5767,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let mut last_plane_epoch: Option<u64> = None;
             let mut attempt = 0usize;
             let mut announce_round = 0usize;
-            // once observer standing is seen, parking is the STEADY state
+            // once resident standing is seen, parking is the STEADY state
             // (awaiting a deliberate promote) — the not-admitted bail below
             // must never fire.
-            let mut observer_standing = false;
+            let mut resident_standing = false;
             let mut send_announce = |targets: &[ed25519::PublicKey], attempt: usize| {
                 let Some(frame) = &announce_frame else { return };
                 if attempt % LOBBY_ANNOUNCE_EVERY != 1 || targets.is_empty() {
@@ -4392,16 +5781,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 let attempted = lobby_tx.send(Recipients::One(target.clone()), frame.clone(), false);
                 if !attempted.is_empty() {
                     println!(
-                        "[node {label}] join request sent to member {} — awaiting approval",
+                        "[node {label}] invite announce sent to member {} — redemption follows",
                         hex_bytes(&target.as_ref()[..4])
                     );
                 }
             };
 
-            // ---- the OBSERVER's serving lanes ------------------------------
+            // ---- the RESIDENT's serving lanes ------------------------------
             //
             // the same two local surfaces a validator exposes, pumped by the
-            // park loop's serve window below: an observer answers reads from
+            // park loop's serve window below: a resident answers reads from
             // its last pre-synced boundary; a still-parked joiner answers
             // with a clear not-admitted error instead of a dead port. writes
             // are refused — ops enter the chain through validators only.
@@ -4419,7 +5808,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 drop(rpc_tx); // rpc off: the ingress arm stays terminated.
             }
             let mut http_ingress = http_cmds;
-            // the last pre-synced boundary this observer serves reads from:
+            // the last pre-synced boundary this resident serves reads from:
             // (boundary height, the composed host). exactly ONE live host may
             // exist — the sync path reopens the same on-disk partitions, so
             // this is dropped before every re-sync.
@@ -4434,22 +5823,106 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let mut last_indexed_root: Option<StateRoot> = None;
             let not_serving = |standing: bool| -> String {
                 if standing {
-                    "observer: no boundary pre-synced yet — retry shortly".into()
+                    "resident: no boundary pre-synced yet — retry shortly".into()
                 } else {
-                    "parked: not admitted yet — no state to serve (a member must run \
-                     `invite-accept` for this key)"
-                        .into()
+                    "joining: redemption not landed yet — no state to serve".into()
                 }
             };
+            // relay a caller's op: sign with THIS node's identity (the frame
+            // origin — chat authorship, status.publicKey), bump+persist the seq
+            // BEFORE building the frame (a crash between persist and send costs
+            // one seq number, never a reuse), ship to one current validator
+            // round-robin. Err is immediate — nothing is held on it, and
+            // `relay_round` advances only on an actual send attempt.
+            fn relay_submit_frame<S: P2pSender<PublicKey = ed25519::PublicKey>>(
+                signer: &ed25519::PrivateKey,
+                relay_seq_file: &std::path::Path,
+                relay_seq: &mut u64,
+                relay_round: &mut usize,
+                targets: &[ed25519::PublicKey],
+                relay_tx: &mut S,
+                target: String,
+                payload: Vec<u8>,
+            ) -> Result<node::FrameId, String> {
+                if targets.is_empty() {
+                    return Err("no validator known yet — the manifest poll has not landed".into());
+                }
+                *relay_seq += 1;
+                if let Err(e) = std::fs::write(relay_seq_file, relay_seq.to_string()) {
+                    // persist FAILED before any send: surface it and hold nothing
+                    // (a wedged disk must not silently reuse a seq into the mesh).
+                    return Err(format!("cannot persist the submit seq: {e}"));
+                }
+                let frame = node::encode_frame(signer, *relay_seq, &Msg { target, payload });
+                let id = node::frame_id(&frame);
+                let target_v = targets[*relay_round % targets.len()].clone();
+                *relay_round += 1;
+                let sent = relay_tx.send(
+                    Recipients::One(target_v),
+                    IoBuf::from(relay::encode_msg(&relay::RelayMsg::Submit { frame })),
+                    false,
+                );
+                if sent.is_empty() {
+                    return Err("validator unreachable — retry shortly".into());
+                }
+                Ok(id)
+            }
+            // the caller's held reply for a relayed submit, keyed by the frame's
+            // content address. either surface may hold: the rpc bridge sender or
+            // the app-surface oneshot. swept on the serve-window tick with the
+            // validator's own SUBMIT_HOLD budget (the rpc bridge times out at
+            // that same 10s — a sweep race there reads as a stuck node, same as
+            // on a validator).
+            enum RelayHold {
+                Rpc(std::sync::mpsc::Sender<RpcReply>),
+                Http(futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>),
+            }
+            let mut pending_relayed: std::collections::HashMap<
+                node::FrameId,
+                (RelayHold, std::time::Instant),
+            > = std::collections::HashMap::new();
+            let mut relay_round = 0usize;
+            // this origin's next frame seq, persisted so restarts keep climbing
+            // (a lost file restarts at 0 — kernel-safe: distinct digests both
+            // apply; per-origin nonces are the documented roadmap item).
+            let relay_seq_file = storage_for_sync.join("relay-submit-seq");
+            let mut relay_seq: u64 = std::fs::read_to_string(&relay_seq_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            // bridge the relay lane ONCE, before the park loop: the serve
+            // window's select is torn down every 2s tick, and dropping the p2p
+            // receiver's actor-backed `recv()` mid-flight could eat a delivered
+            // reply. a bounded drop-on-full mpsc survives the tick losslessly;
+            // a dropped reply degrades to the caller's honest SUBMIT_HOLD sweep.
+            let (relay_bridge_tx, mut relay_ingress) =
+                futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
+            context.child("relay_replies").spawn(move |_ctx| {
+                let mut receiver = relay_rx;
+                let mut bridge_tx = relay_bridge_tx;
+                async move {
+                    loop {
+                        match receiver.recv().await {
+                            Ok((peer, msg)) => {
+                                let bytes: Vec<u8> = msg.into();
+                                let _ = bridge_tx.try_send((peer, bytes));
+                            }
+                            Err(_) => return, // network shutdown — nothing to serve.
+                        }
+                    }
+                }
+            });
             let (boundary, host, floor) = loop {
                 attempt += 1;
-                if attempt > 900 && !observer_standing {
+                if attempt > 900 && !resident_standing {
                     // ~30 minutes of 2s retries: parking forever is operator
-                    // guidance territory, not a silent spin. (an OBSERVER
-                    // parks indefinitely by design — that bail is gated off.)
+                    // guidance territory, not a silent spin. (a RESIDENT
+                    // holds standing indefinitely — that bail is gated off.)
                     eprintln!(
-                        "[node {label}] FATAL: still not admitted after {attempt} attempts — \
-                         has a member run `ducktape-node invite-accept {}`?",
+                        "[node {label}] FATAL: still no standing after {attempt} attempts — \
+                         the invite may be spent or expired, or no member is reachable; \
+                         ask for a fresh invite (manual fallback: `ducktape-node \
+                         invite-accept {}`)",
                         hex_bytes(&me_bytes)
                     );
                     std::process::exit(1);
@@ -4468,10 +5941,49 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             job = rpc_ingress.next() => {
                                 let Some((req, reply)) = job else { continue };
                                 let resp = match req {
-                                    RpcRequest::Submit { .. } => RpcReply::err(
-                                        "this node is not a validator: observer standing \
-                                         serves reads only — submit ops via a validator",
-                                    ),
+                                    // WITH standing AND a pre-synced boundary, a
+                                    // write leaves here: sign it, relay to a
+                                    // validator, HOLD this caller's reply keyed by
+                                    // the frame id (answered on the relay Reply arm
+                                    // or the sweep). the refusal stays for the
+                                    // un-standing / not-yet-serving cases.
+                                    RpcRequest::Submit { target, payload_hex } => {
+                                        if !resident_standing || serving.is_none() {
+                                            RpcReply::err(not_serving(resident_standing))
+                                        } else {
+                                            match unhex(&payload_hex) {
+                                                Ok(payload) => match relay_submit_frame(
+                                                    &signer,
+                                                    &relay_seq_file,
+                                                    &mut relay_seq,
+                                                    &mut relay_round,
+                                                    &announce_targets,
+                                                    &mut relay_tx,
+                                                    target,
+                                                    payload,
+                                                ) {
+                                                    Ok(id) => {
+                                                        pending_relayed.insert(
+                                                            id,
+                                                            (
+                                                                RelayHold::Rpc(reply.clone()),
+                                                                std::time::Instant::now()
+                                                                    + SUBMIT_HOLD,
+                                                            ),
+                                                        );
+                                                        // held — answered by the relay
+                                                        // Reply or the sweep; skip the
+                                                        // shared tail send below.
+                                                        continue;
+                                                    }
+                                                    Err(e) => RpcReply::err(e),
+                                                },
+                                                Err(e) => {
+                                                    RpcReply::err(format!("bad payload_hex: {e}"))
+                                                }
+                                            }
+                                        }
+                                    }
                                     RpcRequest::Query { target, req_hex } => match &serving {
                                         Some((_, host)) => match unhex(&req_hex) {
                                             Ok(req_bytes) => {
@@ -4487,7 +5999,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                             }
                                             Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
                                         },
-                                        None => RpcReply::err(not_serving(observer_standing)),
+                                        None => RpcReply::err(not_serving(resident_standing)),
                                     },
                                     RpcRequest::Status => match &serving {
                                         Some((height, host)) => {
@@ -4506,14 +6018,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                                 ..RpcReply::ok()
                                             }
                                         }
-                                        None => RpcReply::err(not_serving(observer_standing)),
+                                        None => RpcReply::err(not_serving(resident_standing)),
                                     },
                                     RpcRequest::JoinRequests => RpcReply::err(
                                         "this node is not a member — join requests queue on \
                                          validators",
                                     ),
                                     RpcRequest::Shutdown => {
-                                        // an observer writes no checkpoint — nothing to
+                                        // a resident writes no checkpoint — nothing to
                                         // flush; a restart parks straight back here.
                                         let _ = reply.send(RpcReply::ok());
                                         println!(
@@ -4527,12 +6039,50 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             cmd = http_ingress.next() => {
                                 let Some(cmd) = cmd else { continue };
                                 match cmd {
-                                    noded::NodeCommand::Submit { reply, .. } => {
-                                        let _ = reply.send(Err(
-                                            "this node is not a validator: observer standing \
-                                             serves reads only — submit ops via a validator"
-                                                .into(),
-                                        ));
+                                    // `origin` is the caller's CLAIMED submitter — but
+                                    // this lane signs frames with THIS node's identity
+                                    // (authorship = status.publicKey), so it is ignored.
+                                    // WITH standing AND a boundary, relay and HOLD the
+                                    // oneshot keyed by the frame id; otherwise refuse.
+                                    noded::NodeCommand::Submit {
+                                        target,
+                                        payload,
+                                        origin: _,
+                                        reply,
+                                    } => {
+                                        if !resident_standing || serving.is_none() {
+                                            let _ =
+                                                reply.send(Err(not_serving(resident_standing)));
+                                        } else {
+                                            match relay_submit_frame(
+                                                &signer,
+                                                &relay_seq_file,
+                                                &mut relay_seq,
+                                                &mut relay_round,
+                                                &announce_targets,
+                                                &mut relay_tx,
+                                                target,
+                                                payload,
+                                            ) {
+                                                // move the oneshot into the hold on
+                                                // success, use it for the error on
+                                                // failure — mutually exclusive, so one
+                                                // reply is guaranteed on every path.
+                                                Ok(id) => {
+                                                    pending_relayed.insert(
+                                                        id,
+                                                        (
+                                                            RelayHold::Http(reply),
+                                                            std::time::Instant::now()
+                                                                + SUBMIT_HOLD,
+                                                        ),
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    let _ = reply.send(Err(e));
+                                                }
+                                            }
+                                        }
                                     }
                                     noded::NodeCommand::Query { target, req, reply } => {
                                         let result = match &serving {
@@ -4540,7 +6090,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                                 .query(&target, &req)
                                                 .await
                                                 .map_err(|e| e.to_string()),
-                                            None => Err(not_serving(observer_standing)),
+                                            None => Err(not_serving(resident_standing)),
                                         };
                                         let _ = reply.send(result);
                                     }
@@ -4571,6 +6121,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                             app_hash,
                                             height,
                                             modules,
+                                            public_key: status_public_key.clone(),
                                         });
                                     }
                                     noded::NodeCommand::Metrics { reply } => {
@@ -4578,7 +6129,78 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     }
                                 }
                             }
+                            // a validator's answer for a frame we relayed: match it
+                            // to the held caller by frame id and release the reply.
+                            // an unknown id (already swept, or a stray) drops.
+                            answer = relay_ingress.next() => {
+                                let Some((_peer, bytes)) = answer else { continue };
+                                let Ok(relay::RelayMsg::Reply { frame_id, outcome }) =
+                                    relay::decode_msg(&bytes)
+                                else {
+                                    continue; // junk or a stray Submit at a resident — drop.
+                                };
+                                let Some((hold, _)) = pending_relayed.remove(&frame_id) else {
+                                    continue;
+                                };
+                                match (hold, outcome) {
+                                    (RelayHold::Rpc(tx), relay::RelayOutcome::Applied { .. }) => {
+                                        let _ = tx.send(RpcReply::ok());
+                                    }
+                                    (RelayHold::Rpc(tx), relay::RelayOutcome::Rejected { detail })
+                                    | (
+                                        RelayHold::Rpc(tx),
+                                        relay::RelayOutcome::Refused { detail },
+                                    ) => {
+                                        let _ = tx.send(RpcReply::err(detail));
+                                    }
+                                    (
+                                        RelayHold::Http(tx),
+                                        relay::RelayOutcome::Applied { height, app_hash },
+                                    ) => {
+                                        let _ = tx.send(Ok(noded::BlockSummary {
+                                            height,
+                                            app_hash,
+                                        }));
+                                    }
+                                    (
+                                        RelayHold::Http(tx),
+                                        relay::RelayOutcome::Rejected { detail },
+                                    )
+                                    | (
+                                        RelayHold::Http(tx),
+                                        relay::RelayOutcome::Refused { detail },
+                                    ) => {
+                                        let _ = tx.send(Err(detail));
+                                    }
+                                }
+                            }
                             _ = tick => break,
+                        }
+                    }
+                }
+                // expire relay holds the mesh never answered. the op may still
+                // land — the app re-queries on block events, same contract as a
+                // validator hold. budget is SUBMIT_HOLD (the rpc bridge caps at
+                // that same 10s, so a sweep race reads as a stuck node either way).
+                if !pending_relayed.is_empty() {
+                    let now = std::time::Instant::now();
+                    let expired: Vec<node::FrameId> = pending_relayed
+                        .iter()
+                        .filter(|(_, (_, deadline))| *deadline <= now)
+                        .map(|(k, _)| *k)
+                        .collect();
+                    for k in expired {
+                        if let Some((hold, _)) = pending_relayed.remove(&k) {
+                            let detail =
+                                "timed out awaiting the relay answer — re-query on the next block";
+                            match hold {
+                                RelayHold::Rpc(tx) => {
+                                    let _ = tx.send(RpcReply::err(detail));
+                                }
+                                RelayHold::Http(tx) => {
+                                    let _ = tx.send(Err(detail.into()));
+                                }
+                            }
                         }
                     }
                 }
@@ -4591,12 +6213,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         // is genuinely unreachable. lead with admission and demote
                         // the raw transport error: the old "mesh unreachable /
                         // server dead" wording read as a crash and misdirected
-                        // debugging. the joiner-mode banner above carries the exact
-                        // `invite-accept <key>` command, so we don't repeat the key.
+                        // debugging.
                         println!(
-                            "[node {label}] parked: not yet admitted (or the mesh is \
-                             unreachable) — a member must run `invite-accept` for this \
-                             key; see the joiner-mode banner above. retrying ({e})"
+                            "[node {label}] joining: redemption not landed yet (or the mesh \
+                             is unreachable) — the announce keeps retrying and a member node \
+                             redeems it automatically. retrying ({e})"
                         );
                         send_announce(&announce_targets, attempt);
                         continue;
@@ -4630,14 +6251,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     last_tracked = m.epoch;
                 }
                 // drive the reachability plane's standby role off the
-                // manifest: membership and observer standing come from the
+                // manifest: membership and resident standing come from the
                 // synced boundary, whose height doubles as the plane's
                 // freshness clock (the same app-height regime the members'
                 // ViewTicks run — within the advert TTL's generous window).
                 // Nothing is sent before standing: no member would admit the
                 // gossip yet.
                 if let Some(cmd) = &reach_cmd {
-                    if m.observers.iter().any(|k| k == &me_bytes) {
+                    if m.residents.iter().any(|k| k == &me_bytes) {
                         let clock = m.view_base.max(m.height);
                         let _ = cmd
                             .send(reachability::ReachabilityCommand::ViewTick(clock))
@@ -4649,7 +6270,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
                                 .collect();
                             let standbys: Vec<ed25519::PublicKey> = m
-                                .observers
+                                .residents
                                 .iter()
                                 .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
                                 .collect();
@@ -4678,15 +6299,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     if !current.is_empty() {
                         announce_targets = current;
                     }
-                    if m.observers.iter().any(|k| k == &me_bytes) {
-                        if !observer_standing {
-                            observer_standing = true;
+                    if m.residents.iter().any(|k| k == &me_bytes) {
+                        if !resident_standing {
+                            resident_standing = true;
                             println!(
-                                "[node {label}] observer: standing granted — following \
+                                "[node {label}] resident: standing granted — following \
                                  boundaries and serving local reads"
                             );
                         }
-                        // OBSERVER standing (staged admission): granted, so
+                        // RESIDENT standing (staged admission): granted, so
                         // stop knocking — and FOLLOW: every boundary advance
                         // re-syncs the warm substrates (the qmdb lanes fetch
                         // deltas; snapshots re-install), then serves reads
@@ -4702,7 +6323,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 std::process::exit(1);
                             }
                             println!(
-                                "[node {label}] observer: pre-syncing boundary {} ({} modules)",
+                                "[node {label}] resident: pre-syncing boundary {} ({} modules)",
                                 m.height,
                                 m.entries.len()
                             );
@@ -4717,23 +6338,25 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 &m,
                                 &forge_repo,
                                 &duckfs_dir,
+                                &namespace,
                                 attempt,
+                                &identity_chain_id,
                             )
                             .await
                             {
                                 Ok(host) => {
                                     let root = host.app_hash();
                                     println!(
-                                        "[node {label}] observer: pre-synced boundary {} app_hash={}",
+                                        "[node {label}] resident: pre-synced boundary {} app_hash={}",
                                         m.height,
                                         hex(&root)
                                     );
                                     // the DERIVED tier follows the boundary
                                     // too: read models re-derive from the
-                                    // verified state (an observer folds no
+                                    // verified state (a resident folds no
                                     // blocks, so every module's watermark
                                     // trails), the explorer records the one
-                                    // thing an observer observes — the
+                                    // thing a resident observes — the
                                     // boundary — and ws subscribers learn
                                     // the advance. index failures poison and
                                     // log; canonical reads keep serving.
@@ -4744,7 +6367,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                             boundary_block_row(m.height, &root),
                                         ) {
                                             eprintln!(
-                                                "[node {label}] observer: explorer row at \
+                                                "[node {label}] resident: explorer row at \
                                                  boundary {} refused: {err}",
                                                 m.height
                                             );
@@ -4756,7 +6379,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                             },
                                         ));
                                         println!(
-                                            "[node {label}] observer: derived index follows \
+                                            "[node {label}] resident: derived index follows \
                                              boundary {}",
                                             m.height
                                         );
@@ -4765,7 +6388,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     serving = Some((m.height, host));
                                 }
                                 Err(e) => println!(
-                                    "[node {label}] observer pre-sync at boundary {} failed: {e}",
+                                    "[node {label}] resident pre-sync at boundary {} failed: {e}",
                                     m.height
                                 ),
                             }
@@ -4773,7 +6396,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         continue;
                     }
                     println!(
-                        "[node {label}] parked: awaiting admission (epoch {} has {} validators)",
+                        "[node {label}] joining: awaiting redemption (epoch {} has {} validators)",
                         m.epoch,
                         m.participants.len()
                     );
@@ -4806,11 +6429,20 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     eprintln!("[node {label}] FATAL: cannot promote — {e}");
                     std::process::exit(1);
                 }
-                // a promoted observer stops serving: drop the served host
+                // a promoted resident stops serving: drop the served host
                 // before the promotion sync reopens the same partitions.
                 serving = None;
-                match sync_all_modules(&context, &client, &m, &forge_repo, &duckfs_dir, attempt)
-                    .await
+                match sync_all_modules(
+                    &context,
+                    &client,
+                    &m,
+                    &forge_repo,
+                    &duckfs_dir,
+                    &namespace,
+                    attempt,
+                    &identity_chain_id,
+                )
+                .await
                 {
                     Ok(host) => {
                         let latest = match fetch_manifest(&client).await {
@@ -4927,7 +6559,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 boundary.epoch,
                 boundary.view_base,
                 boundary.participants.clone(),
-                boundary.observers.clone(),
+                boundary.residents.clone(),
                 None,
                 cv,
                 pu,
@@ -5006,7 +6638,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     &forge_repo,
                     &duckfs_dir,
                     &validators,
+                    &namespace,
                     blobs.clone(),
+                    &identity_chain_id,
                 )
                 .await;
                 let pos = recovery.oplog_pos().await;
@@ -5060,7 +6694,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     &forge_repo,
                     &duckfs_dir,
                     &manifest,
+                    &namespace,
                     blobs.clone(),
+                    &identity_chain_id,
                 )
                 .await;
                 let mut host = match restored {
@@ -5136,14 +6772,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         }
         let initial_resume_epoch = resumed.as_ref().map(|r| r.epoch).unwrap_or(0);
 
-        // the TRANSPORT baseline adds the committed OBSERVER set (granted,
+        // the TRANSPORT baseline adds the committed RESIDENT set (granted,
         // quorum-exempt keys the mesh must admit so they can sync). read
         // LIVE from the recovered host, unlike the frozen participant set
-        // above: an observer grant arms its own cutover, so within any epoch
-        // the observer set is constant — except a reboot inside that cutover
+        // above: a resident grant arms its own cutover, so within any epoch
+        // the resident set is constant — except a reboot inside that cutover
         // window, where this node briefly tracks the wider set alone; the
         // boundary re-tracks identically a few views later.
-        let initial_observer_keys: Vec<ed25519::PublicKey> = read_valset_observers(&host)
+        let initial_resident_keys: Vec<ed25519::PublicKey> = read_valset_residents(&host)
             .await
             .iter()
             .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
@@ -5173,7 +6809,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             mesh_at(
                 &initial_member_keys
                     .iter()
-                    .chain(initial_observer_keys.iter())
+                    .chain(initial_resident_keys.iter())
                     .cloned()
                     .collect(),
             ),
@@ -5220,6 +6856,69 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // as the derived lobby identity); this member verifies each announce
         // against the invite token it carries and RECORDS it for approval.
         let (mut lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
+        // the submit-relay lane: a resident-standing node ships its own
+        // signed frame here; this validator takes custody and answers on
+        // drain/expiry. bound `mut` because the pump uses `relay_tx` from BOTH
+        // the ingress select arm and the drain-resolution/expiry code.
+        let (mut relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
+
+        // the voice lane + hub: huddle audio between members. the hub runs on
+        // its OWN plain-tokio OS thread (the reachability/app-surface split
+        // exactly); these two pumps are its only mesh coupling — outbound
+        // datagrams fan out addressed to roster node keys, inbound receipts
+        // arrive stamped with the mesh-authenticated sender.
+        {
+            let (mut voice_p2p_tx, mut voice_p2p_rx) =
+                network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
+            // video's own per-peer quota: 512 × 1372 B ≈ 5.6 Mbps — the
+            // 1200 kbps ladder top (~112 fragments/s) plus keyframe bursts.
+            // its own lane so a keyframe burst can't queue ahead of voice.
+            let video_quota = Quota::per_second(NZU32!(512));
+            let (mut video_p2p_tx, mut video_p2p_rx) =
+                network.register(CHANNEL_VIDEO, video_quota, MAX_BACKLOG);
+            let (mut voice_egress, mut video_egress, media_ingress) =
+                voice::spawn_hub(voice_requests);
+            context.child("voice_egress").spawn(move |_ctx| async move {
+                while let Some((to, frame)) = voice_egress.recv().await {
+                    let Ok(key) = ed25519::PublicKey::decode(&to[..]) else {
+                        continue;
+                    };
+                    // offline/rate-limited recipients drop the frame — voice
+                    // retries nothing, the receiver's jitter buffer fills gaps.
+                    let _ = voice_p2p_tx.send(Recipients::One(key), IoBuf::from(frame), false);
+                }
+            });
+            let voice_ingress = media_ingress.clone();
+            context.child("voice_ingress").spawn(move |_ctx| async move {
+                while let Ok((peer, bytes)) = voice_p2p_rx.recv().await {
+                    let mut raw = [0u8; 32];
+                    raw.copy_from_slice(peer.as_ref());
+                    // a full hub lane sheds the frame (late audio is dead
+                    // audio); the plane's per-flow accounting covers the rest.
+                    let _ = voice_ingress.try_send((raw, bytes.into()));
+                }
+            });
+            context.child("video_egress").spawn(move |_ctx| async move {
+                while let Some((to, frame)) = video_egress.recv().await {
+                    let Ok(key) = ed25519::PublicKey::decode(&to[..]) else {
+                        continue;
+                    };
+                    // offline/rate-limited recipients drop the fragment — video
+                    // retries nothing, the next keyframe renders the gap.
+                    let _ = video_p2p_tx.send(Recipients::One(key), IoBuf::from(frame), false);
+                }
+            });
+            let video_ingress = media_ingress.clone();
+            context.child("video_ingress").spawn(move |_ctx| async move {
+                while let Ok((peer, bytes)) = video_p2p_rx.recv().await {
+                    let mut raw = [0u8; 32];
+                    raw.copy_from_slice(peer.as_ref());
+                    // a full hub lane sheds the fragment; the reassembler asks
+                    // the sender for a keyframe when a frame dies incomplete.
+                    let _ = video_ingress.try_send((raw, bytes.into()));
+                }
+            });
+        }
 
         // the reachability lane + the staged WireGuard plane. the channel is
         // registered unconditionally (an unregistered channel is a protocol
@@ -5247,6 +6946,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         wireguard_effect,
                         advertised_reach,
                         coordinators,
+                        // members serve the invite intro: a fresh joiner's
+                        // tunnel comes up against this listener before any p2p.
+                        invite_listen,
+                        coord_cap.clone(),
                         reach_p2p_tx,
                         reach_p2p_rx,
                     ))
@@ -5260,7 +6963,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
             };
         // boot: target the resume epoch's member set immediately (with the
-        // committed observer set as the pre-warm standbys); cutovers
+        // committed resident set as the pre-warm standbys); cutovers
         // retarget from the orchestrator loop below. the recovered view base
         // keeps advert expiries in the same view regime as live peers.
         if let Some(cmd) = &reach_cmd {
@@ -5269,7 +6972,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     reachability::MeshEpochEvent {
                         epoch: initial_resume_epoch,
                         members: initial_member_keys.clone(),
-                        standbys: initial_observer_keys.clone(),
+                        standbys: initial_resident_keys.clone(),
                         current_view: resumed.as_ref().map(|r| r.view_base).unwrap_or(0),
                     },
                 ))
@@ -5289,7 +6992,28 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 );
                 std::process::exit(1);
             };
-            let client = BootP2pSyncClient::new(sync_tx, sync_rx, server_peer);
+            // like the parked joiner's client: prefer the plane (lazy bind —
+            // the promotion reboot restores its tunnels from disk) and fall
+            // back to the mesh path on transport failure.
+            let mesh_client = BootP2pSyncClient::new(sync_tx, sync_rx, server_peer.clone());
+            let client = {
+                let plane_slot: statesync_plane::PlaneSlot =
+                    std::sync::Arc::new(std::sync::OnceLock::new());
+                if statesync_plane::enabled() && wireguard_listen.is_some() {
+                    let book = statesync_plane::OverlayBook::new(
+                        String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+                    );
+                    book.set_peers(peers.iter());
+                    statesync_plane::spawn_bring_up(
+                        label.clone(),
+                        book,
+                        signer.public_key(),
+                        std::sync::Arc::clone(&plane_slot),
+                        None,
+                    );
+                }
+                statesync_plane::PlaneFallbackClient::new(plane_slot, &server_peer, mesh_client)
+            };
             let mut attempts = 0usize;
             loop {
                 attempts += 1;
@@ -5342,7 +7066,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 target.epoch,
                                 target.view_base,
                                 &target.participants,
-                                &target.observers,
+                                &target.residents,
                             )
                             .await
                             {
@@ -5441,7 +7165,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             &target,
                             &forge_repo,
                             &duckfs_dir,
+                            &namespace,
                             10_000 + attempts,
+                            &identity_chain_id,
                         )
                         .await
                         {
@@ -5464,7 +7190,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 target.epoch,
                                 target.view_base,
                                 &target.participants,
-                                &target.observers,
+                                &target.residents,
                             )
                             .await
                             {
@@ -5481,7 +7207,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             target.epoch,
                             target.view_base,
                             target.participants.clone(),
-                            target.observers.clone(),
+                            target.residents.clone(),
                             None,
                             target.current_version,
                             target.pending_upgrade.clone(),
@@ -5553,7 +7279,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     }
                 }
             }
-            match client.into_parts() {
+            match client.into_inner().into_parts() {
                 Ok((tx, rx)) => {
                     sync_tx = tx;
                     sync_rx = rx;
@@ -5652,25 +7378,49 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // future between ticks is lossless, whereas dropping the p2p receiver's
         // actor-backed `recv()` future mid-flight could eat a delivered
         // message. bounded + drop-on-full: clients time out and retry, so a
-        // flood degrades to retries instead of unbounded memory.
+        // flood degrades to retries instead of unbounded memory. the queue
+        // carries BOTH statesync carriers — mesh rpc frames and data-plane
+        // request streams — so one serve arm answers both.
         let (bridge_tx, mut sync_ingress) =
-            futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
-        context.child("sync_ingress").spawn(move |_ctx| {
-            let mut receiver = sync_rx;
-            let mut bridge_tx = bridge_tx;
-            async move {
-                loop {
-                    match receiver.recv().await {
-                        Ok((peer, msg)) => {
-                            let bytes: Vec<u8> = msg.into();
-                            // full bridge = flood pressure: drop; clients retry.
-                            let _ = bridge_tx.try_send((peer, bytes));
+            futures::channel::mpsc::channel::<statesync_plane::SyncJob>(64);
+        {
+            let mut bridge_tx = bridge_tx.clone();
+            context.child("sync_ingress").spawn(move |_ctx| {
+                let mut receiver = sync_rx;
+                async move {
+                    loop {
+                        match receiver.recv().await {
+                            Ok((peer, msg)) => {
+                                let bytes: Vec<u8> = msg.into();
+                                // full bridge = flood pressure: drop; clients retry.
+                                let _ = bridge_tx
+                                    .try_send(statesync_plane::SyncJob::Mesh(peer, bytes));
+                            }
+                            Err(_) => return, // network shutdown — nothing to serve.
                         }
-                        Err(_) => return, // network shutdown — nothing to serve.
                     }
                 }
-            }
+            });
+        }
+        // statesync's per-use data plane (env-gated, default off): the same
+        // requests over overlay stream sockets, accepted into the same queue.
+        // the address book doubles as admission — members + standbys of the
+        // tracked view, updated at every cutover re-track below.
+        let sync_plane_book = statesync_plane::enabled().then(|| {
+            let book = statesync_plane::OverlayBook::new(
+                String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+            );
+            book.set_peers(initial_member_keys.iter().chain(initial_resident_keys.iter()));
+            statesync_plane::spawn_bring_up(
+                label.clone(),
+                std::sync::Arc::clone(&book),
+                signer.public_key(),
+                std::sync::Arc::new(std::sync::OnceLock::new()),
+                Some(bridge_tx.clone()),
+            );
+            book
         });
+        drop(bridge_tx);
         // the lobby lane rides the same bridge pattern: announces are consumed
         // by the pump between drains. drop-on-full is doubly safe here — a
         // parked joiner re-announces every few seconds anyway.
@@ -5679,6 +7429,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         context.child("lobby_ingress").spawn(move |_ctx| {
             let mut receiver = lobby_rx;
             let mut bridge_tx = lobby_bridge_tx;
+            async move {
+                loop {
+                    match receiver.recv().await {
+                        Ok((peer, msg)) => {
+                            let bytes: Vec<u8> = msg.into();
+                            let _ = bridge_tx.try_send((peer, bytes));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+        });
+        // the submit-relay lane rides the same bounded drop-on-full bridge: a
+        // dropped relay degrades to the resident client's honest timeout +
+        // re-submit, so flood pressure never blocks the pump.
+        let (relay_bridge_tx, mut relay_ingress) =
+            futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
+        context.child("relay_ingress").spawn(move |_ctx| {
+            let mut receiver = relay_rx;
+            let mut bridge_tx = relay_bridge_tx;
             async move {
                 loop {
                     match receiver.recv().await {
@@ -5851,7 +7621,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // schedules deterministic epoch cutovers. it resumes at the recovered
         // epoch coordinates over the epoch's ENGINE PARTICIPANT SET, and
         // re-arms a cutover the pre-crash process had scheduled.
-        let observer_keys = match resume_observer_keys(resumed.as_ref()) {
+        let resident_keys = match resume_resident_keys(resumed.as_ref()) {
             Ok(keys) => keys,
             Err(e) => {
                 eprintln!("[node {label}] FATAL: {e}");
@@ -5861,7 +7631,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut orchestrator = consensus::ValsetOrchestrator::resume(
             CUTOVER_DELAY,
             member_keys.clone(),
-            observer_keys.clone(),
+            resident_keys.clone(),
             resume_epoch,
             view_base,
             pending_boot,
@@ -5946,6 +7716,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 std::time::Instant,
             ),
         > = std::collections::HashMap::new();
+        // relayed submits held for a wire answer, keyed like pending_submits by
+        // the frame's content address: resolved by the SAME drain that resolves
+        // local holds, expired on the same SUBMIT_HOLD budget. the peer is where
+        // the Reply goes.
+        let mut pending_relays: std::collections::HashMap<
+            node::FrameId,
+            (ed25519::PublicKey, std::time::Instant),
+        > = std::collections::HashMap::new();
         let mut last_published: Option<u64> = None;
         let mut sync_server = SyncServer::new();
         // verified-but-unapproved join requests, keyed by joiner key. NODE-
@@ -5963,11 +7741,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // throttle for the pending-cutover nop pusher below.
         let mut last_nop = std::time::Instant::now();
         // dev override (`make dev` sets DUCKTAPE_DISABLE_HEARTBEAT): keep an idle
-        // dev chain quiet — no nop blocks — so telemetry shows every block (all
-        // real activity) and idle honestly reads as empty, with no nop churn in
-        // the ring. NEVER set this on a multi-node or upgrade-driving network:
-        // the heartbeat is what ticks an idle chain across a pending cutover and
-        // keeps the console height visibly live.
+        // dev chain quiet — no nop blocks — so every committed block is real
+        // activity and the journal/logs carry no idle churn. NEVER set this on a
+        // multi-node or upgrade-driving network: the heartbeat is what ticks an
+        // idle chain across a pending cutover and keeps the console height
+        // visibly live.
         let heartbeat_disabled = std::env::var_os("DUCKTAPE_DISABLE_HEARTBEAT").is_some();
         // throttle for the saga crank pump below.
         let mut last_crank = std::time::Instant::now();
@@ -6065,7 +7843,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         orchestrator.epoch(),
                         orchestrator.epoch_base(),
                         participant_bytes(&orchestrator),
-                        observer_bytes(&orchestrator),
+                        resident_bytes(&orchestrator),
                         orchestrator.pending_cutover().map(|c| c.cutover_view()),
                         cv,
                         pu,
@@ -6170,36 +7948,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             (node::Disposition::Applied, Some(op)) => &op.dispatches,
                             _ => &[],
                         };
-                        // telemetry: one frame per applied, non-heartbeat block —
-                        // the applied subset of the explorer's rows below (the
-                        // explorer also records rejected rows), decorated with
-                        // this node's apply latency. push-then-fan, both
-                        // best-effort (a full ring evicts oldest; a
-                        // subscriber-less send errs) — mirrors the noded lane. a
-                        // rejected op is a deterministic no-op with no trace, and
-                        // the nop heartbeat is filtered like the explorer's row,
-                        // so an idle chain streams nothing here (the empty-state
-                        // copy covers it) and the ring keeps real activity.
-                        if let (node::Disposition::Applied, Some(op)) = (&d.disposition, &d.op)
-                            && op.target != NOP_TARGET
-                        {
-                            let frame = noded::TelemetryFrame {
-                                height: d.height,
-                                // this lane's agreed clock IS the height (the
-                                // drain stamps BlockContext { consensus_time:
-                                // height }); never this node's wall clock.
-                                consensus_time: d.height,
-                                latency_us: op.latency_us,
-                                dispatches: dispatches
-                                    .iter()
-                                    .map(noded::DispatchInfo::from)
-                                    .collect(),
-                                // DrainedOp drops BlockOutcome.events and no
-                                // module emits events yet — honestly empty.
-                                events: Vec::new(),
-                            };
-                            telemetry.push(frame.clone());
-                            let _ = http_events.send(noded::WsFrame::Telemetry(frame));
+                        // metrics: fold the block into the validator's
+                        // `ducktape_*` Prometheus series (GET /metrics). an
+                        // APPLIED block records fully — count, this node's
+                        // apply latency, per-module dispatch counters; a
+                        // REJECTED frame (a deterministic no-op — the idle
+                        // heartbeat nop lands here) only follows the height
+                        // gauge, so it never pollutes the block series.
+                        match (&d.disposition, &d.op) {
+                            (node::Disposition::Applied, Some(op)) => {
+                                metrics.record_block(d.height, op.latency_us, dispatches);
+                            }
+                            _ => metrics.record_height(d.height),
                         }
                         let record = match &d.op {
                             Some(op) if op.target != NOP_TARGET => {
@@ -6251,6 +8011,27 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         if d.disposition == node::Disposition::Discarded {
                             continue;
                         }
+                        // resolve a relayed hold FIRST: a relayed frame has no
+                        // local pending_submits entry, so this must precede the
+                        // `else { continue }` below or the wire Reply is lost.
+                        if let Some((peer, _)) = pending_relays.remove(&d.id) {
+                            let outcome = match d.disposition {
+                                node::Disposition::Applied => relay::RelayOutcome::Applied {
+                                    height: d.height,
+                                    app_hash: hex(&d.app_hash),
+                                },
+                                node::Disposition::Rejected => relay::RelayOutcome::Rejected {
+                                    detail: "op finalized but rejected (deterministic no-op)".into(),
+                                },
+                                node::Disposition::Discarded => unreachable!("filtered at the loop top"),
+                            };
+                            let msg = relay::RelayMsg::Reply { frame_id: d.id, outcome };
+                            let _ = relay_tx.send(
+                                Recipients::One(peer),
+                                IoBuf::from(relay::encode_msg(&msg)),
+                                false,
+                            );
+                        }
                         let Some((reply, _)) = pending_submits.remove(&d.id) else { continue };
                         let _ = reply.send(match d.disposition {
                             node::Disposition::Applied => Ok(noded::BlockSummary {
@@ -6286,11 +8067,37 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                         }
                     }
+                    // the same expiry contract for relayed holds: the mesh never
+                    // finalized in time, so answer the resident truthfully — the
+                    // op may still land, it re-queries on the next block.
+                    if !pending_relays.is_empty() {
+                        let now = std::time::Instant::now();
+                        let expired: Vec<node::FrameId> = pending_relays
+                            .iter()
+                            .filter(|(_, (_, deadline))| *deadline <= now)
+                            .map(|(k, _)| *k)
+                            .collect();
+                        for k in expired {
+                            if let Some((peer, _)) = pending_relays.remove(&k) {
+                                let msg = relay::RelayMsg::Reply {
+                                    frame_id: k,
+                                    outcome: relay::RelayOutcome::Refused {
+                                        detail: "timed out awaiting finalization — re-query on the next block".into(),
+                                    },
+                                };
+                                let _ = relay_tx.send(
+                                    Recipients::One(peer),
+                                    IoBuf::from(relay::encode_msg(&msg)),
+                                    false,
+                                );
+                            }
+                        }
+                    }
                     // publish each newly-applied boundary to ws subscribers
-                    // (send only errs when nobody is subscribed — fine).
-                    // telemetry frames are emitted per applied block in the drain
-                    // loop above; this tip seam carries the block summary only —
-                    // it fires once per drain and holds no dispatch trace.
+                    // (send only errs when nobody is subscribed — fine). the
+                    // drain loop above already folded each block into the
+                    // metrics series; this tip seam carries the ws block
+                    // summary only — it fires once per drain.
                     if let Some(f) = node.finalized() {
                         if last_published != Some(f.height) {
                             let _ = http_events.send(noded::WsFrame::Block(noded::BlockSummary {
@@ -6343,7 +8150,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 orchestrator.epoch(),
                                 orchestrator.epoch_base(),
                                 participant_bytes(&orchestrator),
-                                observer_bytes(&orchestrator),
+                                resident_bytes(&orchestrator),
                                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
                                 cv,
                                 pu,
@@ -6413,21 +8220,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 observed.push(pk);
                             }
                         }
-                        // the OBSERVER projection, read at the same frozen
+                        // the RESIDENT projection, read at the same frozen
                         // point: a grant/revoke arms the same single cutover
                         // slot (mesh admission is epoch-scoped).
-                        let observers_raw = read_valset_observers(node.host()).await;
-                        let mut observed_observers: Vec<ed25519::PublicKey> = Vec::new();
-                        for key in &observers_raw {
+                        let residents_raw = read_valset_residents(node.host()).await;
+                        let mut observed_residents: Vec<ed25519::PublicKey> = Vec::new();
+                        for key in &residents_raw {
                             if let Ok(pk) = ed25519::PublicKey::decode(key.as_slice()) {
-                                observed_observers.push(pk);
+                                observed_residents.push(pk);
                             }
                         }
                         if let consensus::ObservationOutcome::Scheduled(cutover) =
                             orchestrator.observe_members(
                                 engine_view,
                                 observed.iter().cloned(),
-                                observed_observers.iter().cloned(),
+                                observed_residents.iter().cloned(),
                             )
                         {
                             println!(
@@ -6463,33 +8270,38 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         if let Some(plan) = orchestrator.respawn_if_due(
                             engine_view,
                             observed,
-                            observed_observers,
+                            observed_residents,
                             boundary_upgrade,
                         ) {
                             let members = plan.valset().consensus_members();
                             let member_bytes: Vec<Vec<u8>> =
                                 members.iter().map(|k| k.as_ref().to_vec()).collect();
-                            let plan_observers: Vec<ed25519::PublicKey> = plan
+                            let plan_residents: Vec<ed25519::PublicKey> = plan
                                 .valset()
                                 .transport_members()
                                 .difference(members)
                                 .cloned()
                                 .collect();
-                            let plan_observer_bytes: Vec<Vec<u8>> = plan_observers
+                            let plan_resident_bytes: Vec<Vec<u8>> = plan_residents
                                 .iter()
                                 .map(|k| k.as_ref().to_vec())
                                 .collect();
                             // transport FIRST: the new epoch's mesh must admit
                             // its members (a fresh joiner — or a granted
-                            // observer — above all) before anything is
+                            // resident — above all) before anything is
                             // expected of them. the mesh tracks the TRANSPORT
                             // union; the engine below gets validators only.
                             // index = epoch, strictly increasing across
                             // cutovers.
                             mesh_oracle.track(plan.epoch(), mesh_at(plan.valset().transport_members()));
+                            // the statesync plane serves (and admits) exactly
+                            // who the mesh tracks — follow the re-track.
+                            if let Some(book) = &sync_plane_book {
+                                book.set_peers(plan.valset().transport_members().iter());
+                            }
                             // the reachability plane retunnels for the new
                             // member set the moment transport admits it —
-                            // with the epoch's observer tier as the pre-warm
+                            // with the epoch's resident tier as the pre-warm
                             // standbys, so a registered joiner's tunnels
                             // assemble ahead of its activation cutover.
                             // cutover_app_height IS the new epoch's absolute
@@ -6503,7 +8315,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         reachability::MeshEpochEvent {
                                             epoch: plan.epoch(),
                                             members: members.iter().cloned().collect(),
-                                            standbys: plan_observers.clone(),
+                                            standbys: plan_residents.clone(),
                                             current_view: plan.cutover_app_height(),
                                         },
                                     ))
@@ -6511,7 +8323,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                             if !members.contains(&signer.public_key()) {
                                 println!(
-                                    "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/observer)",
+                                    "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/resident)",
                                     plan.epoch()
                                 );
                                 std::process::exit(0);
@@ -6535,7 +8347,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     plan.epoch(),
                                     plan.cutover_app_height(),
                                     &member_bytes,
-                                    &plan_observer_bytes,
+                                    &plan_resident_bytes,
                                 )
                                 .await
                             {
@@ -6592,7 +8404,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 orchestrator.epoch(),
                                 orchestrator.epoch_base(),
                                 participant_bytes(&orchestrator),
-                                observer_bytes(&orchestrator),
+                                resident_bytes(&orchestrator),
                                 None,
                                 cv,
                                 pu,
@@ -6927,12 +8739,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                         RpcRequest::JoinRequests => {
                             // read-time hygiene: an approved joiner holds
-                            // STANDING now (observer or already validator) —
+                            // STANDING now (resident or already validator) —
                             // its request is settled, drop it.
                             let members = read_members_from_host(node.host()).await;
-                            let observers_now = read_valset_observers(node.host()).await;
+                            let residents_now = read_valset_residents(node.host()).await;
                             join_requests.retain(|joiner, _| {
-                                !members.contains(joiner) && !observers_now.contains(joiner)
+                                !members.contains(joiner) && !residents_now.contains(joiner)
                             });
                             let views = join_requests
                                 .iter()
@@ -6963,8 +8775,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
                 announce = lobby_ingress.next() => {
                     let Some((peer, bytes)) = announce else { continue };
-                    let mut send_reply = |recorded: bool, detail: String| {
-                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail };
+                    let mut send_reply = |recorded: bool, detail: String, cap: Option<Vec<u8>>| {
+                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail, cap };
                         let _ = lobby_tx.send(
                             Recipients::One(peer.clone()),
                             IoBuf::from(lobby::encode_msg(&msg)),
@@ -6980,25 +8792,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let verified = match lobby::verify_join_request(&msg, &namespace) {
                         Ok(v) => v,
                         Err(e) => {
-                            send_reply(false, e);
+                            send_reply(false, e, None);
                             continue;
                         }
                     };
                     // then membership: the issuer must still be a member (a
                     // removed member's outstanding invites die with it), and a
                     // joiner that already holds standing — VALIDATOR or
-                    // OBSERVER — has nothing pending.
+                    // RESIDENT — has nothing pending.
                     let members = read_members_from_host(node.host()).await;
-                    let observers_now = read_valset_observers(node.host()).await;
+                    let residents_now = read_valset_residents(node.host()).await;
                     let joiner_bytes = verified.joiner.as_ref().to_vec();
                     if members.contains(&joiner_bytes) {
-                        send_reply(false, "already a validator".into());
+                        send_reply(false, "already a validator".into(), None);
                         continue;
                     }
-                    if observers_now.contains(&joiner_bytes) {
+                    if residents_now.contains(&joiner_bytes) {
                         send_reply(
                             false,
-                            "already an observer — a member promotes it into the quorum".into(),
+                            "already a resident — a member promotes it into the quorum".into(),
+                            None,
                         );
                         continue;
                     }
@@ -7006,9 +8819,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         send_reply(
                             false,
                             "the inviting member is no longer part of this network".into(),
+                            None,
                         );
                         continue;
                     }
+                    // AUTO-REDEMPTION: minting the invite WAS the approval, so
+                    // a verified announce submits the governance Redeem op on
+                    // the joiner's behalf — no human step. every validator
+                    // re-verifies the token in-consensus and the nonce set
+                    // makes it single-use, so racing members (the joiner
+                    // round-robins its announce) collapse to one grant and
+                    // deterministic rejects. the in-memory map only throttles
+                    // re-submits across the joiner's ~3s re-announces.
                     let now = unix_ms();
                     let fresh = !join_requests.contains_key(&joiner_bytes);
                     let record = join_requests
@@ -7016,22 +8838,131 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         .or_insert(JoinRequestRecord {
                             issuer: verified.issuer.as_ref().to_vec(),
                             first_seen_ms: now,
-                            last_seen_ms: now,
+                            last_seen_ms: 0,
                         });
-                    record.last_seen_ms = now;
-                    if fresh {
-                        println!(
-                            "[node {label}] join request: {} asks to join (invited by {}) — \
-                             approve in the app, or run `ducktape-node invite-accept {}`",
-                            hex_bytes(verified.joiner.as_ref()),
-                            hex_bytes(&record.issuer),
-                            hex_bytes(verified.joiner.as_ref())
+                    // MINT the coordinator capability for the joiner, additive
+                    // and side-effect-free (a pure ed25519 sign — no consensus,
+                    // no valset change). Gated: only a GENESIS validator on a
+                    // PRIVATE network issues one — its key is in the
+                    // coordinator's pinned genesis set, so the cap it signs
+                    // actually admits. A public network needs no cap; a
+                    // non-genesis member cannot mint one the coordinator trusts.
+                    // The cap cannot ride the invite (the joiner's key did not
+                    // exist at invite-mint time), so the JoinReply is its only
+                    // delivery channel — re-delivered on every re-announce in
+                    // case a reply was lost. Rotation is DEFERRED — the cap is
+                    // long-lived (COORD_CAP_TTL_SECS).
+                    let minted_cap = if coordination == config::Coordination::Private
+                        && validators.contains(&signer.public_key())
+                    {
+                        let mut subj = [0u8; 32];
+                        subj.copy_from_slice(verified.joiner.as_ref());
+                        let cap = nat_traversal::mint_coord_cap(
+                            &signer,
+                            nat_traversal::NodeKey(subj),
+                            nat_traversal::now_secs() + nat_traversal::COORD_CAP_TTL_SECS,
                         );
+                        Some(config::pack_coord_cap(&cap))
+                    } else {
+                        None
+                    };
+                    const REDEEM_RESUBMIT_MS: u64 = 30_000;
+                    if !fresh && now.saturating_sub(record.last_seen_ms) < REDEEM_RESUBMIT_MS {
+                        send_reply(
+                            true,
+                            "redemption in flight — standing lands shortly".into(),
+                            minted_cap,
+                        );
+                        continue;
                     }
-                    send_reply(
-                        true,
-                        "join request recorded — awaiting member approval".into(),
-                    );
+                    record.last_seen_ms = now;
+                    let redeem = governance::GovMsg::Redeem {
+                        issuer: verified.issuer.as_ref().to_vec(),
+                        nonce: verified.nonce.to_vec(),
+                        token_sig: match &msg {
+                            lobby::LobbyMsg::JoinRequest { token_sig, .. } => token_sig.clone(),
+                            _ => unreachable!("verified above"),
+                        },
+                        joiner: verified.joiner.as_ref().to_vec(),
+                        proof: match &msg {
+                            lobby::LobbyMsg::JoinRequest { proof, .. } => proof.clone(),
+                            _ => unreachable!("verified above"),
+                        },
+                    };
+                    let seq = next_seq;
+                    next_seq += 1;
+                    match node
+                        .submit(
+                            &signer,
+                            seq,
+                            Msg {
+                                target: "governance".into(),
+                                payload: governance::encode_msg(&redeem),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            println!(
+                                "[node {label}] invite redemption submitted: {} (invited by {})",
+                                hex_bytes(verified.joiner.as_ref()),
+                                hex_bytes(verified.issuer.as_ref())
+                            );
+                            send_reply(
+                                true,
+                                "invite verified — redemption submitted, resident standing \
+                                 lands at the next block"
+                                    .into(),
+                                minted_cap,
+                            );
+                        }
+                        Err(e) => {
+                            send_reply(false, format!("redemption submit failed: {e}"), None);
+                        }
+                    }
+                }
+                relayed = relay_ingress.next() => {
+                    let Some((peer, bytes)) = relayed else { continue };
+                    let mut send_reply = |frame_id: node::FrameId, outcome: relay::RelayOutcome| {
+                        let msg = relay::RelayMsg::Reply { frame_id, outcome };
+                        let _ = relay_tx.send(
+                            Recipients::One(peer.clone()),
+                            IoBuf::from(relay::encode_msg(&msg)),
+                            false,
+                        );
+                    };
+                    let msg = match relay::decode_msg(&bytes) {
+                        Ok(m) => m,
+                        Err(_) => continue, // junk on the doorbell — drop, lobby idiom.
+                    };
+                    let relay::RelayMsg::Submit { frame } = msg else {
+                        continue; // a Reply at a validator is a protocol confusion — drop.
+                    };
+                    // the door check needs committed state: the resident projection at
+                    // this node's latest boundary. the frame signature and the ORIGIN's
+                    // standing ride inside — the sending peer is not consulted (residents
+                    // speak from the shared, invite-derivable lobby transport identity).
+                    let residents_now = read_valset_residents(node.host()).await;
+                    let frame_id = match relay::verify_relay_submit(&frame, &residents_now) {
+                        Ok(id) => id,
+                        Err(detail) => {
+                            send_reply(node::frame_id(&frame), relay::RelayOutcome::Refused { detail });
+                            continue;
+                        }
+                    };
+                    match node.submit_frame(frame).await {
+                        Ok(id) => {
+                            debug_assert_eq!(id, frame_id);
+                            pending_relays.insert(
+                                id,
+                                (peer.clone(), std::time::Instant::now() + SUBMIT_HOLD),
+                            );
+                        }
+                        Err(e) => send_reply(
+                            frame_id,
+                            relay::RelayOutcome::Refused { detail: format!("submit failed: {e}") },
+                        ),
+                    }
                 }
                 cmd = http_ingress.next() => {
                     let Some(cmd) = cmd else { continue };
@@ -7087,26 +9018,37 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 app_hash: hex(&node.app_hash()),
                                 height: node.finalized().map(|f| f.height).unwrap_or(0),
                                 modules,
+                                public_key: status_public_key.clone(),
                             });
                         }
                         noded::NodeCommand::Metrics { reply } => {
-                            // the validator serves commonware's runtime registry;
-                            // the `ducktape_*` block series are the local daemon's
-                            // (noded's) surface, not wired into this consensus path.
+                            // one registry: commonware's runtime series plus the
+                            // `ducktape_*` block series the drain loop records.
                             let _ = reply.send(context.encode());
                         }
                     }
                 }
                 msg = sync_ingress.next() => {
-                    let Some((peer, bytes)) = msg else {
+                    let Some(job) = msg else {
                         // the ingress task ended (network shutdown) — nothing
                         // left to serve; keep draining consensus regardless.
                         continue;
                     };
-                    let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
-                        continue; // malformed rpc envelope: drop, never crash.
+                    // both carriers land here: mesh frames ride an rpc
+                    // envelope (multiplexed channel — the id correlates);
+                    // a plane stream IS its own correlation and reply path.
+                    let (reply_to, rpc_id, body) = match job {
+                        statesync_plane::SyncJob::Mesh(peer, bytes) => {
+                            let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                                continue; // malformed rpc envelope: drop, never crash.
+                            };
+                            (statesync_plane::SyncReplyTo::Mesh(peer), rpc_id, body.to_vec())
+                        }
+                        statesync_plane::SyncJob::Plane(stream, req) => {
+                            (statesync_plane::SyncReplyTo::Plane(stream), 0, req)
+                        }
                     };
-                    let resp = match statesync::decode_request(body) {
+                    let resp = match statesync::decode_request(&body) {
                         Ok(statesync::SyncRequest::Frames {
                             after_height,
                             up_to_height,
@@ -7177,7 +9119,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 epoch: orchestrator.epoch(),
                                 view_base: orchestrator.epoch_base(),
                                 participants: participant_bytes(&orchestrator),
-                                observers: observer_bytes(&orchestrator),
+                                residents: resident_bytes(&orchestrator),
                                 current_version: bc_current,
                                 pending_upgrade: bc_pending,
                                 floor_cert: latest_floor
@@ -7199,11 +9141,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             format!("bad request frame: {e}"),
                         )),
                     };
-                    let _ = sync_tx.send(
-                        Recipients::One(peer),
-                        IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
-                        false,
-                    );
+                    match reply_to {
+                        statesync_plane::SyncReplyTo::Mesh(peer) => {
+                            let _ = sync_tx.send(
+                                Recipients::One(peer),
+                                IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
+                                false,
+                            );
+                        }
+                        statesync_plane::SyncReplyTo::Plane(mut stream) => {
+                            // one request per stream: write the response and
+                            // drop — the close is the client's completion.
+                            let _ =
+                                statesync::dataplane::write_frame(&mut stream, &resp).await;
+                        }
+                    }
                 }
             }
         }
@@ -7238,7 +9190,7 @@ mod tests {
             epoch: 0,
             view_base: 0,
             participants: vec![test_me()],
-            observers: vec![],
+            residents: vec![],
             floor_cert,
             current_version: host::BASELINE_VERSION,
             pending_upgrade: None,
@@ -7722,7 +9674,7 @@ mod tests {
                 epoch: 0,
                 view_base: 0,
                 participants: vec![test_me()],
-                observers: vec![],
+                residents: vec![],
                 floor_cert: Some(vec![1, 2, 3]),
                 current_version: host::BASELINE_VERSION,
                 pending_upgrade: None,

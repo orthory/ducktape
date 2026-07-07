@@ -682,8 +682,9 @@ pub struct DrainedOp {
     pub dispatches: Vec<host::DispatchRecord>,
     /// node-local wall-clock cost of applying this block, in microseconds —
     /// the ONE non-deterministic field. measured in THIS effectful node layer
-    /// (never inside the clock-free host) and fed only into telemetry, so it
-    /// can never enter consensus. differs per node.
+    /// (never inside the clock-free host) and fed only into node-local metrics
+    /// (the apply-latency histogram), so it can never enter consensus. differs
+    /// per node.
     pub latency_us: u64,
 }
 
@@ -736,7 +737,7 @@ pub trait BlockSink {
     fn seal(&mut self, seal: &BlockSeal) -> impl std::future::Future<Output = Result<(), Error>>;
     /// durably record an epoch cutover: the new epoch, its app-height base,
     /// the ENGINE PARTICIPANT SET it was spawned over, and the epoch's
-    /// OBSERVER set (raw public-key bytes). the sets ride the record because
+    /// RESIDENT set (raw public-key bytes). the sets ride the record because
     /// a restart must respawn the engine (and re-track the mesh) with the
     /// EPOCH'S sets — the instantaneous valset projection may already include
     /// a change awaiting the next cutover.
@@ -745,7 +746,7 @@ pub trait BlockSink {
         epoch: u64,
         view_base: u64,
         participants: &[Vec<u8>],
-        observers: &[Vec<u8>],
+        residents: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), Error>>;
 }
 
@@ -774,7 +775,7 @@ impl BlockSink for NullSink {
         _epoch: u64,
         _view_base: u64,
         _participants: &[Vec<u8>],
-        _observers: &[Vec<u8>],
+        _residents: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), Error>> {
         async { Ok(()) }
     }
@@ -949,9 +950,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         epoch: u64,
         view_base: u64,
         participants: &[Vec<u8>],
-        observers: &[Vec<u8>],
+        residents: &[Vec<u8>],
     ) -> Result<usize, Error> {
-        self.sink.cutover(epoch, view_base, participants, observers).await?;
+        self.sink.cutover(epoch, view_base, participants, residents).await?;
         self.orderer = orderer;
         self.view_base = view_base;
         self.last_engine_view = None;
@@ -1006,17 +1007,30 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         msg: Msg,
     ) -> Result<FrameId, Error> {
         let frame = encode_frame(signer, seq, &msg);
+        self.submit_frame(frame).await
+    }
+
+    /// take custody of an ALREADY-SIGNED frame (the relay entry point: a
+    /// resident signs with its own identity key, a validator injects). the
+    /// signature is verified BEFORE anything is pinned — junk from the wire
+    /// must never enter the durable store or the orderer. custody semantics
+    /// are identical to [`OrderedNode::submit`]: pin, propose, track
+    /// outstanding (the cutover carry and the exactly-once digest gate treat
+    /// a relayed frame exactly like a local one).
+    pub async fn submit_frame(&mut self, frame: Vec<u8>) -> Result<FrameId, Error> {
         // the SIZE GUARD (#215): an over-cap frame must be rejected HERE, as a
         // plain error the submitter sees — commonware's p2p sender ASSERTS on
         // its message cap, so letting the frame through would panic the
         // proposer's gossip task instead. rejected BEFORE the pin: nothing is
-        // journaled, proposed, or held in custody for it.
+        // journaled, proposed, or held in custody for it. guards the relay
+        // entry too — a resident's over-cap frame must not panic its relay.
         if frame.len() > MAX_FRAME_BYTES {
             return Err(Error::Host(sdk::Error::Module(format!(
                 "op frame is {} bytes, over the {MAX_FRAME_BYTES}-byte cap — split the payload",
                 frame.len()
             ))));
         }
+        decode_frame(&frame)?;
         let id = frame_id(&frame);
         // durably pin the bytes BEFORE the orderer may propose their digest:
         // once the engine journals a finalization, these bytes are the only
@@ -1029,6 +1043,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         // errored submit is reported to the caller, who retries — tracking
         // it would double the op when the retry lands and a cutover carries
         // the failed original too.
+        let (_, seq) = frame_origin_seq(&frame).expect("decode_frame verified the envelope");
         self.outstanding.insert(id, (seq, frame));
         Ok(id)
     }
@@ -1157,7 +1172,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // contributes no effects — same on every validator.
             let started = std::time::Instant::now();
             let result = self.host.submit_at(ctx, msg).await;
-            // node-local apply cost — the telemetry plane's one non-consensus
+            // node-local apply cost — the metrics plane's one non-consensus
             // signal, timed HERE in the effectful node layer (never inside the
             // clock-free host). tight span: no `.await` between start and stop.
             let latency_us = started.elapsed().as_micros() as u64;

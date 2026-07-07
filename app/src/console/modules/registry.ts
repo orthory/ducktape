@@ -10,21 +10,21 @@ import { GovernanceView } from "../views/governance/GovernanceView";
 import { MembersView } from "../views/members/MembersView";
 import { ModulesView } from "../views/modules/ModulesView";
 import { PagesView } from "../views/pages/PagesView";
+import { MetricsView } from "../views/metrics/MetricsView";
 import { StatusView } from "../views/status/StatusView";
-import { TelemetryView } from "../views/telemetry/TelemetryView";
 import type { AppModule, NavSection } from "./module-def";
 
 // The sidebar's view-mode toggle partitions these into two rails:
-//   USER          — the participant apps (chat, docs, files, forge, agents)
+//   USER          — the participant apps (chat, pages, files, forge, agents)
 //   NODE OPERATOR — the node/network surfaces (members, governance, modules,
-//                   node, telemetry, explorer)
+//                   node, metrics, explorer)
 // `order` is a sort key WITHIN a section, so the two rails number from 0
 // independently. Cross-module search is NOT a module — it is the ⌘K overlay
 // the shell owns (see SearchModal), reachable from either rail.
 export const MODULES: AppModule[] = [
   // ── User apps ──
   { id: "chat", nav: { icon: "chat", label: "Chat", order: 0, section: "user" }, Screen: ChatView },
-  { id: "pages", nav: { icon: "pages", label: "Docs", order: 1, section: "user" }, Screen: PagesView },
+  { id: "pages", nav: { icon: "pages", label: "Pages", order: 1, section: "user" }, Screen: PagesView },
   { id: "files", nav: { icon: "files", label: "Files", order: 2, section: "user" }, Screen: FilesView },
   { id: "forge", nav: { icon: "forge", label: "Forge", order: 3, section: "user" }, Screen: ForgeView },
   { id: "agent", nav: { icon: "agent", label: "Agents", order: 4, section: "user" }, Screen: AgentView },
@@ -33,7 +33,7 @@ export const MODULES: AppModule[] = [
   { id: "governance", nav: { icon: "governance", label: "Governance", order: 1, section: "operator" }, Screen: GovernanceView },
   { id: "modules", nav: { icon: "modules", label: "Modules", order: 2, section: "operator" }, Screen: ModulesView },
   { id: "status", nav: { icon: "node", label: "Node", order: 3, section: "operator" }, Screen: StatusView },
-  { id: "telemetry", nav: { icon: "telemetry", label: "Telemetry", order: 4, section: "operator" }, Screen: TelemetryView },
+  { id: "metrics", nav: { icon: "metrics", label: "Metrics", order: 4, section: "operator" }, Screen: MetricsView },
   { id: "explorer", nav: { icon: "hash", label: "Explorer", order: 5, section: "operator" }, Screen: ExplorerView },
 ];
 

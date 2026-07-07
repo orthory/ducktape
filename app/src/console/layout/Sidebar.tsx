@@ -87,6 +87,10 @@ function ModeToggle({
   );
 }
 
+/** The icon rail's fixed width — ConsoleShell offsets the floating huddle
+ *  dock by exactly this, so the two must agree. */
+export const SIDEBAR_ICON_RAIL_WIDTH = 74;
+
 export function Sidebar() {
   const { state, actions } = useDucktape();
   const rail = modulesInSection(state.viewMode);
@@ -94,7 +98,7 @@ export function Sidebar() {
   return (
     <div
       style={{
-        width: 74,
+        width: SIDEBAR_ICON_RAIL_WIDTH,
         flexShrink: 0,
         borderRight: `1px solid ${color.borderSoft}`,
         background: color.sidebar,
@@ -122,27 +126,6 @@ export function Sidebar() {
       >
         D
       </div>
-
-      <button
-        onClick={actions.openSearch}
-        title="Search (⌘K)"
-        aria-label="Search"
-        style={{
-          all: "unset",
-          cursor: "pointer",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          width: 34,
-          height: 34,
-          borderRadius: 9,
-          marginBottom: 8,
-          background: color.sunken,
-          border: `1px solid ${color.borderSoft}`,
-        }}
-      >
-        <Icon name="search" size={17} color={color.iconIdle} />
-      </button>
 
       <ModeToggle mode={state.viewMode} onSelect={actions.setViewMode} />
 

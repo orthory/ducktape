@@ -8,7 +8,10 @@
 // pure functions over an injected NodeTransport.
 
 import type { BlockEvent, NodeTransport } from "./transport";
+import type { AuthorRef } from "./chat-client";
 import { replyVariant } from "./wire";
+
+export type { AuthorRef };
 
 // ── Wire types (block records + PageReply payloads, verbatim) ─
 
@@ -40,10 +43,12 @@ export interface PageBlock {
   children: string[];
 }
 
-/** One entry of the page enumeration: id + live title. */
+/** One entry of the page enumeration: id + live title + folder parent. */
 export interface PageMeta {
   id: string;
   title: string;
+  /** Folder parent page id, or null for a top-level page. */
+  parent: string | null;
 }
 
 /** A stable pointer to one block in one pages module — the shape a future
@@ -63,11 +68,32 @@ const TARGET = "pages";
 
 export const createPage = (
   transport: NodeTransport,
-  params: { pageId: string; title: string },
+  params: { pageId: string; title: string; parent?: string | null },
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, {
-    create_page: { page_id: params.pageId, title: params.title },
+    create_page: {
+      page_id: params.pageId,
+      title: params.title,
+      parent: params.parent ?? null,
+    },
   });
+
+/** Re-nest a page under a (possibly new) parent page, or to top level with
+ *  null. */
+export const setPageParent = (
+  transport: NodeTransport,
+  params: { pageId: string; parent: string | null },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, {
+    set_page_parent: { page_id: params.pageId, parent: params.parent },
+  });
+
+/** Delete a page: its root + block subtree; child pages are promoted up. */
+export const deletePage = (
+  transport: NodeTransport,
+  pageId: string,
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, { delete_page: { page_id: pageId } });
 
 export const insertBlock = (
   transport: NodeTransport,
@@ -183,3 +209,92 @@ export const searchPageBlocks = (
       }),
     )
     .then((reply) => replyVariant<PageSearchHit[]>(reply, "hits"));
+
+// ── Comments (threads anchored to a block/page, in the same module) ─────
+//
+// A comment thread anchors to a `target` — a block id or a page id in THIS
+// module. Authorship is derived by the module from the submit origin, so it
+// appears only in replies.
+
+export interface Comment {
+  id: string;
+  thread_id: string;
+  author: AuthorRef;
+  text: string;
+  created_at: number;
+  edited_at: number | null;
+  deleted: boolean;
+}
+
+export interface Thread {
+  id: string;
+  target: string;
+  opener: AuthorRef;
+  created_at: number;
+  resolved: boolean;
+  resolved_by: AuthorRef | null;
+  comment_ids: string[];
+}
+
+export interface ThreadView {
+  thread: Thread;
+  comments: Comment[];
+}
+
+export interface TargetThreads {
+  target: string;
+  threads: ThreadView[];
+}
+
+export const addComment = (
+  transport: NodeTransport,
+  params: { threadId: string; commentId: string; target: string; text: string },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, {
+    add_comment: {
+      thread_id: params.threadId,
+      comment_id: params.commentId,
+      target: params.target,
+      text: params.text,
+    },
+  });
+
+export const editComment = (
+  transport: NodeTransport,
+  params: { commentId: string; text: string },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, {
+    edit_comment: { comment_id: params.commentId, text: params.text },
+  });
+
+export const deleteComment = (
+  transport: NodeTransport,
+  commentId: string,
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, { delete_comment: { comment_id: commentId } });
+
+export const resolveThread = (
+  transport: NodeTransport,
+  params: { threadId: string; resolved: boolean },
+): Promise<BlockEvent> =>
+  transport.submit(TARGET, {
+    resolve_thread: { thread_id: params.threadId, resolved: params.resolved },
+  });
+
+/** Every thread anchored to any of `targets` (block/page ids), grouped by
+ *  target — one round-trip for a whole page's visible blocks. */
+export const threadsForTargets = (
+  transport: NodeTransport,
+  params: { targets: string[] },
+): Promise<TargetThreads[]> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, { threads_for_targets: { targets: params.targets } }))
+    .then((reply) => replyVariant<TargetThreads[]>(reply, "comment_threads"));
+
+export const getThread = (
+  transport: NodeTransport,
+  threadId: string,
+): Promise<ThreadView | null> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, { comment_thread: { thread_id: threadId } }))
+    .then((reply) => replyVariant<ThreadView | null>(reply, "comment_thread"));

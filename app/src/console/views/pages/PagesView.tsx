@@ -1,7 +1,6 @@
-// The pages surface over the node's `pages` module: a notion-like block-tree
-// editor. A page is a tree of blocks (the page itself is the root block; its
-// text is the title), every block id is globally unique and shown as a
-// copyable handle, and editing is KEYBOARD-FIRST:
+// The Docs surface over the node's `pages` module: a Notion-like block-tree
+// editor with a nested page tree, document tabs, and comment threads. Editing
+// is KEYBOARD-FIRST:
 //
 //   Enter          split: a fresh sibling below (lists continue their kind)
 //   Backspace      on an empty block: remove it, focus the previous one
@@ -11,11 +10,14 @@
 //   "# " "- " …    markdown prefixes convert a paragraph's kind
 //   "/"            slash menu over every block kind
 //
-// Text commits on blur (and before any structural op) — one consensus op per
-// change, mirroring the rest of the console's server-authoritative writes.
+// Text commits on debounced edit boundaries (a typing pause), on blur, and
+// before any structural op — one consensus op per boundary, mirroring the
+// rest of the console's server-authoritative writes. A landing snapshot never
+// overwrites the draft of the block being edited; committed truth reconciles
+// through the next boundary commit instead.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, FormEvent, KeyboardEvent, ReactNode } from "react";
+import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
 
 import type { BlockKind } from "../../../domain/pages-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
@@ -35,12 +37,16 @@ import {
   shortcutFor,
 } from "./pages-model";
 import type { Row } from "./pages-model";
+import { DocTabs } from "./DocTabs";
+import { PageTree } from "./PageTree";
+import { CommentsPanel } from "./CommentsPanel";
+import { buildForest } from "./page-tree";
 
 const INDENT = 26;
-
-function shortId(id: string): string {
-  return id.length > 12 ? `${id.slice(0, 8)}…` : id;
-}
+const TREE_COLLAPSE_KEY = "ducktape.docTreeCollapsed";
+/** A pause this long while typing is one edit boundary — one consensus op.
+ *  Exported for the tests that drive the boundary timer. */
+export const EDIT_BOUNDARY_MS = 700;
 
 const sectionLabelStyle: CSSProperties = {
   font: `600 9px ${font.mono}`,
@@ -67,27 +73,28 @@ function kindFont(kind: BlockKind): string {
   }
 }
 
-function kindPlaceholder(kind: BlockKind): string {
+/** The placeholder shown ONLY on a focused, empty block. */
+function focusPlaceholder(kind: BlockKind): string {
   switch (kind) {
     case "heading1":
     case "heading2":
     case "heading3":
-      return "heading";
+      return "Heading";
     case "todo":
       return "To-do";
     case "bulleted":
     case "numbered":
       return "List item";
     case "toggle":
-      return "toggle";
+      return "Toggle";
     case "quote":
-      return "quote";
+      return "Quote";
     case "code":
-      return "code";
+      return "Code";
     case "callout":
-      return "callout";
+      return "Callout";
     default:
-      return "Type '/' for commands";
+      return "Write, or press '/' for commands";
   }
 }
 
@@ -182,6 +189,7 @@ interface RowHandlers {
   toggleCollapse(blockId: string): void;
   focusRelative(row: Row, delta: -1 | 1): void;
   registerInput(blockId: string, el: HTMLTextAreaElement | null): void;
+  openComments(blockId: string): void;
 }
 
 function BlockRow({
@@ -189,23 +197,36 @@ function BlockRow({
   index,
   expanded,
   op,
+  threadCount,
   handlers,
 }: {
   row: Row;
   index: number;
   /** Only meaningful for Toggle rows: whether children are shown. */
   expanded: boolean;
-  /** The block's finalization record — the action cell draws the inline mark. */
+  /** The block's finalization record — only rendered while pending/failed. */
   op: OpRecord | undefined;
+  /** Number of live comment threads on this block. */
+  threadCount: number;
   handlers: RowHandlers;
 }) {
   const { block, depth } = row;
   const [draft, setDraft] = useState(block.text);
   const [slashDismissed, setSlashDismissed] = useState(false);
   const [slashIndex, setSlashIndex] = useState(0);
+  const [focused, setFocused] = useState(false);
+  const [hover, setHover] = useState(false);
   const areaRef = useRef<HTMLTextAreaElement | null>(null);
+  // focus mirrored into a ref so the draft-sync effect below reads the live
+  // value without re-running on focus flips.
+  const focusedRef = useRef(false);
 
-  useEffect(() => setDraft(block.text), [block.text]);
+  // adopt store text only while the block is NOT being edited: a snapshot
+  // landing mid-edit (another op's completion refresh) must never clobber the
+  // live draft — the edit-boundary commit below reconciles it instead.
+  useEffect(() => {
+    if (!focusedRef.current) setDraft(block.text);
+  }, [block.text]);
 
   // auto-grow: the textarea is exactly as tall as its content.
   useEffect(() => {
@@ -225,6 +246,21 @@ function BlockRow({
   const maybeCommit = () => {
     if (dirty()) handlers.commitText(block.id, draft);
   };
+
+  // the latest commit closure lives in a ref so the boundary timer neither
+  // resets when the store re-renders (handlers is rebuilt per store change)
+  // nor commits a stale draft.
+  const commitBoundaryRef = useRef(() => {});
+  commitBoundaryRef.current = maybeCommit;
+
+  // per-edit-boundary commits: a typing pause flows one consensus op, so
+  // peers and the finalization mark track text without waiting for blur or a
+  // structural op. An open slash menu is a command in progress, not text.
+  useEffect(() => {
+    if (draft === block.text || slashOpen) return;
+    const timer = setTimeout(() => commitBoundaryRef.current(), EDIT_BOUNDARY_MS);
+    return () => clearTimeout(timer);
+  }, [draft, block.text, slashOpen]);
 
   const pickSlash = (kind: BlockKind) => {
     setDraft("");
@@ -430,9 +466,17 @@ function BlockRow({
           value={draft}
           rows={1}
           onChange={(event) => onChange(event.target.value)}
-          onBlur={maybeCommit}
+          onFocus={() => {
+            focusedRef.current = true;
+            setFocused(true);
+          }}
+          onBlur={() => {
+            focusedRef.current = false;
+            setFocused(false);
+            maybeCommit();
+          }}
           onKeyDown={onKeyDown}
-          placeholder={kindPlaceholder(block.kind)}
+          placeholder={focused && draft === "" ? focusPlaceholder(block.kind) : ""}
           spellCheck={!code}
           style={{
             display: "block",
@@ -461,6 +505,8 @@ function BlockRow({
 
   return (
     <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
       style={{
         display: "flex",
         alignItems: "flex-start",
@@ -488,76 +534,110 @@ function BlockRow({
           flexShrink: 0,
           display: "flex",
           alignItems: "center",
-          gap: 4,
+          gap: 3,
           paddingTop: 3,
+          minWidth: 44,
+          justifyContent: "flex-end",
         }}
       >
         <FinalizationMark op={op} />
-        <button
-          type="button"
-          aria-label={`Copy id of block ${blockNumber}`}
-          title={`copy block id\n${block.id}`}
-          onClick={() => {
-            void navigator.clipboard?.writeText(block.id);
-          }}
-          style={{
-            all: "unset",
-            cursor: "pointer",
-            display: "inline-flex",
-            alignItems: "center",
-            gap: 3,
-            padding: "2px 5px",
-            borderRadius: 5,
-            color: color.muted2,
-            font: `500 9.5px ${font.mono}`,
-          }}
-        >
-          <Icon name="hash" size={9} />
-          {shortId(block.id)}
-        </button>
-        <button
-          type="button"
-          aria-label={`Remove block ${blockNumber}`}
-          title="Remove block (and its subtree)"
-          onClick={() => handlers.remove(block.id)}
-          style={{
-            all: "unset",
-            cursor: "pointer",
-            width: 20,
-            height: 20,
-            borderRadius: 5,
-            color: color.muted2,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >
-          <Icon name="close" size={11} />
-        </button>
+        {threadCount > 0 || hover ? (
+          <button
+            type="button"
+            aria-label={`Comment on block ${blockNumber}`}
+            title={threadCount > 0 ? `${threadCount} comment thread(s)` : "Comment"}
+            onClick={() => handlers.openComments(block.id)}
+            style={{
+              all: "unset",
+              cursor: "pointer",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 2,
+              padding: "2px 4px",
+              borderRadius: 5,
+              color: threadCount > 0 ? accentVar : color.muted2,
+              font: `600 9.5px ${font.mono}`,
+            }}
+          >
+            <Icon name="chat" size={12} strokeWidth={1.8} />
+            {threadCount > 0 ? threadCount : null}
+          </button>
+        ) : null}
+        {hover ? (
+          <button
+            type="button"
+            aria-label={`Copy link to block ${blockNumber}`}
+            title="Copy block link"
+            onClick={() => {
+              void navigator.clipboard?.writeText(block.id);
+            }}
+            style={{
+              all: "unset",
+              cursor: "pointer",
+              width: 20,
+              height: 20,
+              borderRadius: 5,
+              color: color.muted2,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Icon name="hash" size={11} />
+          </button>
+        ) : null}
+        {hover ? (
+          <button
+            type="button"
+            aria-label={`Remove block ${blockNumber}`}
+            title="Remove block (and its subtree)"
+            onClick={() => handlers.remove(block.id)}
+            style={{
+              all: "unset",
+              cursor: "pointer",
+              width: 20,
+              height: 20,
+              borderRadius: 5,
+              color: color.muted2,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Icon name="close" size={11} />
+          </button>
+        ) : null}
       </div>
     </div>
   );
 }
 
-// ── Page rail (enumerated pages) ─────────────────────────
+// ── Page rail (nested page tree) ─────────────────────────
 
 function PageRail({
   pages,
   activePage,
-  newTitle,
-  setNewTitle,
-  onCreate,
+  collapsed,
+  onToggleCollapse,
+  onNewPage,
+  onAddChild,
+  onOpen,
+  onDelete,
+  onMove,
   onRefresh,
-  openPage,
 }: {
-  pages: { id: string; title: string }[];
+  pages: { id: string; title: string; parent: string | null }[];
   activePage: string | null;
-  newTitle: string;
-  setNewTitle: (title: string) => void;
-  onCreate: (event: FormEvent) => void;
+  collapsed: ReadonlySet<string>;
+  onToggleCollapse: (id: string) => void;
+  onNewPage: () => void;
+  onAddChild: (id: string) => void;
+  onOpen: (id: string) => void;
+  onDelete: (id: string) => void;
+  onMove: (id: string, parent: string | null) => void;
   onRefresh: () => void;
-  openPage: (id: string) => void;
 }) {
+  const forest = useMemo(() => buildForest(pages), [pages]);
   return (
     <aside
       style={{
@@ -596,94 +676,56 @@ function PageRail({
         >
           <Icon name="pages" size={14} strokeWidth={1.7} />
         </span>
-        <div style={{ minWidth: 0 }}>
-          <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>Docs</div>
-          <div style={{ marginTop: 1, font: `400 10.5px ${font.mono}`, color: color.muted2 }}>
-            block trees
-          </div>
-        </div>
-        <div style={{ marginLeft: "auto", font: `500 11px ${font.mono}`, color: color.muted2 }}>
-          {pages.length}
-        </div>
+        <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>Pages</div>
+        <button
+          type="button"
+          aria-label="Refresh pages"
+          title="Refresh pages"
+          onClick={onRefresh}
+          style={{
+            all: "unset",
+            cursor: "pointer",
+            marginLeft: "auto",
+            width: 26,
+            height: 26,
+            borderRadius: 6,
+            border: `1px solid ${color.border}`,
+            background: color.paper,
+            color: color.muted3,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="refresh" size={13} strokeWidth={1.7} />
+        </button>
       </div>
 
-      <div style={{ padding: 14, borderBottom: `1px solid ${color.borderSoft}` }}>
-        <form onSubmit={onCreate} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <label htmlFor="pages-new-title" style={sectionLabelStyle}>
-            New page title
-          </label>
-          <div style={{ display: "flex", gap: 7 }}>
-            <input
-              id="pages-new-title"
-              value={newTitle}
-              onChange={(event) => setNewTitle(event.target.value)}
-              placeholder="Launch plan"
-              spellCheck={false}
-              style={{
-                width: "100%",
-                minWidth: 0,
-                boxSizing: "border-box",
-                padding: "8px 10px",
-                borderRadius: radius.sm,
-                border: `1px solid ${color.borderStrong}`,
-                background: color.paper,
-                font: `400 12.5px ${font.sans}`,
-                color: color.ink,
-                outline: "none",
-              }}
-            />
-            <button
-              type="submit"
-              aria-label="Create page"
-              title="Create page"
-              disabled={!newTitle.trim()}
-              style={{
-                all: "unset",
-                cursor: newTitle.trim() ? "pointer" : "default",
-                flexShrink: 0,
-                width: 32,
-                height: 32,
-                borderRadius: 8,
-                background: newTitle.trim() ? color.dark : color.chip,
-                color: newTitle.trim() ? color.onDark : color.muted2,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}
-            >
-              <Icon name="plus" size={14} strokeWidth={1.9} />
-            </button>
-          </div>
-        </form>
-      </div>
+      <button
+        type="button"
+        aria-label="New page"
+        onClick={onNewPage}
+        style={{
+          all: "unset",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          margin: "12px 12px 6px",
+          padding: "8px 10px",
+          borderRadius: radius.sm,
+          background: color.dark,
+          color: color.onDark,
+          font: `600 12.5px ${font.sans}`,
+        }}
+      >
+        <Icon name="plus" size={14} strokeWidth={1.9} /> New page
+      </button>
 
-      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "13px 0" }}>
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "6px 0 13px" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 14px 8px" }}>
           <div style={sectionLabelStyle}>All pages</div>
-          <button
-            type="button"
-            aria-label="Refresh pages"
-            title="Refresh pages"
-            onClick={onRefresh}
-            style={{
-              all: "unset",
-              cursor: "pointer",
-              marginLeft: "auto",
-              width: 24,
-              height: 24,
-              borderRadius: 6,
-              border: `1px solid ${color.border}`,
-              background: color.paper,
-              color: color.muted3,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}
-          >
-            <Icon name="refresh" size={13} strokeWidth={1.7} />
-          </button>
         </div>
-
         {pages.length === 0 ? (
           <div
             style={{
@@ -699,79 +741,17 @@ function PageRail({
             No pages on this node yet. Create one above to start writing.
           </div>
         ) : (
-          pages.map((page) => {
-            const active = page.id === activePage;
-            return (
-              <button
-                key={page.id}
-                type="button"
-                aria-label={`Open ${page.title || "untitled page"}`}
-                title={page.id}
-                onClick={() => openPage(page.id)}
-                style={{
-                  all: "unset",
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  boxSizing: "border-box",
-                  width: "calc(100% - 12px)",
-                  margin: "1px 6px",
-                  padding: "6px 8px",
-                  borderRadius: radius.sm,
-                  background: active ? color.hover : "transparent",
-                  color: active ? color.ink : color.inkSofter,
-                }}
-              >
-                <Icon
-                  name="pages"
-                  size={14}
-                  strokeWidth={1.7}
-                  style={{ flexShrink: 0, color: active ? accentVar : color.muted2 }}
-                />
-                <span
-                  style={{
-                    flex: 1,
-                    minWidth: 0,
-                    font: active ? `600 12.5px ${font.sans}` : `500 12.5px ${font.sans}`,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {page.title || "Untitled"}
-                </span>
-                {active ? (
-                  <span
-                    style={{
-                      flexShrink: 0,
-                      font: `600 8.5px ${font.mono}`,
-                      color: color.onDark,
-                      background: color.dark,
-                      borderRadius: 4,
-                      padding: "2px 5px",
-                      letterSpacing: ".05em",
-                    }}
-                  >
-                    OPEN
-                  </span>
-                ) : null}
-              </button>
-            );
-          })
+          <PageTree
+            nodes={forest}
+            activeId={activePage}
+            collapsed={collapsed}
+            onOpen={onOpen}
+            onToggle={onToggleCollapse}
+            onAddChild={onAddChild}
+            onDelete={onDelete}
+            onMove={onMove}
+          />
         )}
-      </div>
-
-      <div
-        style={{
-          padding: "12px 14px 14px",
-          borderTop: `1px solid ${color.borderSoft}`,
-          font: `400 11.5px/1.45 ${font.sans}`,
-          color: color.muted2,
-        }}
-      >
-        Every block has a globally unique id — copy it from a block&apos;s hash
-        chip to reference it from anywhere.
       </div>
     </aside>
   );
@@ -779,14 +759,37 @@ function PageRail({
 
 // ── The view ─────────────────────────────────────────────
 
+const loadTreeCollapsed = (): Set<string> => {
+  try {
+    const raw = localStorage.getItem(TREE_COLLAPSE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : []);
+  } catch {
+    return new Set();
+  }
+};
+const saveTreeCollapsed = (set: ReadonlySet<string>): void => {
+  try {
+    localStorage.setItem(TREE_COLLAPSE_KEY, JSON.stringify([...set]));
+  } catch {
+    // best-effort
+  }
+};
+
 export function PagesView() {
   const { state, actions } = useDucktape();
-  const [newTitle, setNewTitle] = useState("");
   const [titleDraft, setTitleDraft] = useState("");
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
+  const [treeCollapsed, setTreeCollapsed] = useState<ReadonlySet<string>>(loadTreeCollapsed);
   const [focusId, setFocusId] = useState<string | null>(null);
+  const [panelOpen, setPanelOpen] = useState(false);
+  // target (block id or page id) the new-thread composer is aimed at; null
+  // hides the composer. WKWebView has no window.prompt, so composing lives
+  // in the panel as a real element.
+  const [composerTarget, setComposerTarget] = useState<string | null>(null);
   const inputs = useRef(new Map<string, HTMLTextAreaElement>());
   const titleRef = useRef<HTMLInputElement | null>(null);
+  const titleFocusedRef = useRef(false);
 
   const blocks = state.activePageBlocks;
   const root =
@@ -795,13 +798,40 @@ export function PagesView() {
       : null;
   const rows = useMemo(() => buildRows(blocks, collapsed), [blocks, collapsed]);
 
+  // live thread count keyed by target (block id or page id).
+  const threadsByTarget = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const group of state.pageThreads) map.set(group.target, group.threads.length);
+    return map;
+  }, [state.pageThreads]);
+
   // enumerate the page list on mount; the rail's refresh re-runs it and every
   // committed block re-enumerates through the store's refresh.
   useEffect(() => {
     actions.listPages();
   }, [actions]);
 
-  useEffect(() => setTitleDraft(root?.text ?? ""), [root?.text]);
+  // adopt the store title only while the input is not being edited — the
+  // same draft-protection contract as a block row...
+  useEffect(() => {
+    if (!titleFocusedRef.current) setTitleDraft(root?.text ?? "");
+  }, [root?.text]);
+  // ...but a page switch resets unconditionally (declared after, so it wins
+  // when both fire): a still-focused input must never carry one page's draft
+  // onto another.
+  useEffect(() => setTitleDraft(root?.text ?? ""), [root?.id]);
+
+  // load comment threads when the active page changes; a composer aimed at
+  // the previous page's blocks must not survive the switch.
+  useEffect(() => {
+    setComposerTarget(null);
+    actions.loadPageThreads();
+  }, [actions, state.activePage]);
+
+  // a freshly-created empty page drops the cursor in the title.
+  useEffect(() => {
+    if (root && root.text === "") titleRef.current?.focus();
+  }, [root?.id]);
 
   // once the snapshot carries a block we queued focus for, focus it.
   useEffect(() => {
@@ -813,6 +843,43 @@ export function PagesView() {
       setFocusId(null);
     }
   }, [rows, focusId]);
+
+  // Docs-scoped keyboard shortcuts. This listener is registered only while the
+  // Docs screen is mounted, so it never leaks into other modules:
+  //   ⌘/Ctrl + ⇧ + [ / ]   previous / next tab (cycles, wraps at the ends)
+  //   ⌘/Ctrl + T or N       new top-level page
+  //   ⌘/Ctrl + W            deliberately NOT handled — it must fall through to
+  //                         the window (close-to-tray), never close a doc tab.
+  // Bracket keys are matched on `event.code` (physical key), so the shift-
+  // produced "{"/"}" characters don't matter.
+  useEffect(() => {
+    // DocumentEventMap["keydown"] is the DOM KeyboardEvent; the bare name is
+    // shadowed here by React's KeyboardEvent import used above in BlockRow.
+    const onKey = (event: DocumentEventMap["keydown"]) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+
+      if (
+        event.shiftKey &&
+        (event.code === "BracketRight" || event.code === "BracketLeft")
+      ) {
+        const tabs = state.openTabs;
+        if (tabs.length === 0) return;
+        event.preventDefault();
+        const step = event.code === "BracketRight" ? 1 : -1;
+        const current = state.activePage ? tabs.indexOf(state.activePage) : -1;
+        const base = current === -1 ? 0 : current;
+        actions.openPage(tabs[(base + step + tabs.length) % tabs.length]);
+        return;
+      }
+
+      if (!event.shiftKey && (event.code === "KeyT" || event.code === "KeyN")) {
+        event.preventDefault();
+        actions.createChildPage(null);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [actions, state.openTabs, state.activePage]);
 
   const insertAfterRow = (row: Row, kind: BlockKind) => {
     if (!row.block.parent) return;
@@ -856,6 +923,34 @@ export function PagesView() {
       el.focus();
       el.setSelectionRange(el.value.length, el.value.length);
     }
+  };
+
+  const toggleTreeCollapse = (id: string) =>
+    setTreeCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      saveTreeCollapsed(next);
+      return next;
+    });
+
+  const confirmThenDelete = (id: string) => {
+    const title = state.pages.find((p) => p.id === id)?.title || "Untitled";
+    if (window.confirm(`Delete "${title}" and its contents? Child pages move up a level.`)) {
+      actions.deletePage(id);
+    }
+  };
+
+  const openBlockComments = (blockId: string) => {
+    setPanelOpen(true);
+    const has = state.pageThreads.some((g) => g.target === blockId && g.threads.length > 0);
+    setComposerTarget(has ? null : blockId);
+  };
+
+  const commentOnPage = () => {
+    if (!state.activePage) return;
+    setPanelOpen(true);
+    setComposerTarget(state.activePage);
   };
 
   const handlers: RowHandlers = {
@@ -905,13 +1000,7 @@ export function PagesView() {
       if (el) inputs.current.set(blockId, el);
       else inputs.current.delete(blockId);
     },
-  };
-
-  const create = (event: FormEvent) => {
-    event.preventDefault();
-    if (!newTitle.trim()) return;
-    actions.createPage(newTitle);
-    setNewTitle("");
+    openComments: openBlockComments,
   };
 
   const commitTitle = () => {
@@ -920,9 +1009,21 @@ export function PagesView() {
     }
   };
 
+  // the title rides the same edit-boundary contract as a block row: a typing
+  // pause commits the rename as one op. The ref keeps the timer from
+  // resetting on unrelated store re-renders; root?.id in the deps cancels a
+  // pending boundary when the page switches.
+  const commitTitleRef = useRef(() => {});
+  commitTitleRef.current = commitTitle;
+  useEffect(() => {
+    if (!root || titleDraft === root.text) return;
+    const timer = setTimeout(() => commitTitleRef.current(), EDIT_BOUNDARY_MS);
+    return () => clearTimeout(timer);
+  }, [titleDraft, root?.text, root?.id]);
+
   return (
     <div
-      data-screen-label="Docs"
+      data-screen-label="Pages"
       style={{
         flex: 1,
         minWidth: 0,
@@ -934,195 +1035,273 @@ export function PagesView() {
       <PageRail
         pages={state.pages}
         activePage={state.activePage}
-        newTitle={newTitle}
-        setNewTitle={setNewTitle}
-        onCreate={create}
+        collapsed={treeCollapsed}
+        onToggleCollapse={toggleTreeCollapse}
+        onNewPage={() => actions.createChildPage(null)}
+        onAddChild={(id) => actions.createChildPage(id)}
+        onOpen={actions.openPage}
+        onDelete={confirmThenDelete}
+        onMove={(id, parent) => actions.setPageParent({ pageId: id, parent })}
         onRefresh={actions.listPages}
-        openPage={actions.openPage}
       />
 
       <main style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
-        <header
-          style={{
-            height: 56,
-            flexShrink: 0,
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-            padding: "0 22px",
-            borderBottom: `1px solid ${color.borderSoft}`,
-            background: color.paper,
-          }}
-        >
-          <div style={{ font: `600 16px ${font.sans}`, color: color.dark }}>Docs</div>
-          {root ? (
-            <>
-              <div
-                title={root.id}
-                style={{
-                  minWidth: 0,
-                  font: `500 12px ${font.mono}`,
-                  color: color.muted2,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {root.text || "Untitled"}
-              </div>
-              <div style={{ marginLeft: "auto", font: `500 11px ${font.mono}`, color: color.muted2 }}>
-                {rows.length} {rows.length === 1 ? "block" : "blocks"}
-              </div>
-            </>
-          ) : (
-            <div style={{ marginLeft: "auto", font: `500 11px ${font.mono}`, color: color.muted2 }}>
-              no page open
-            </div>
-          )}
-        </header>
-
-        <div
-          style={{
-            flex: 1,
-            minHeight: 0,
-            overflowY: "auto",
-            background: color.sidebar,
-            padding: root ? "22px 26px" : 0,
-          }}
-        >
-          {!root ? (
-            <div
+        <DocTabs
+          open={state.openTabs}
+          active={state.activePage}
+          titleOf={(id) => state.pages.find((p) => p.id === id)?.title ?? ""}
+          onSelect={actions.openPage}
+          onClose={actions.closeTab}
+        />
+        <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
+          <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
+            <header
               style={{
-                minHeight: 240,
-                height: "100%",
+                height: 56,
+                flexShrink: 0,
                 display: "flex",
                 alignItems: "center",
-                justifyContent: "center",
-                textAlign: "center",
-                color: color.muted2,
+                gap: 10,
+                padding: "0 22px",
+                borderBottom: `1px solid ${color.borderSoft}`,
+                background: color.paper,
               }}
             >
-              <div style={{ maxWidth: 330, padding: 22 }}>
+              <div style={{ font: `600 15px ${font.sans}`, color: color.dark }}>Pages</div>
+              {root ? (
+                <>
+                  <span style={{ color: color.muted2 }}>/</span>
+                  <div
+                    style={{
+                      minWidth: 0,
+                      font: `500 13px ${font.sans}`,
+                      color: color.ink,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {root.text || "Untitled"}
+                  </div>
+                  <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+                    <button
+                      type="button"
+                      aria-label="Comment on page"
+                      onClick={commentOnPage}
+                      style={headerBtn}
+                    >
+                      <Icon name="chat" size={13} strokeWidth={1.8} /> Comment
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={panelOpen ? "Hide comments" : "Show comments"}
+                      aria-pressed={panelOpen}
+                      onClick={() => {
+                        if (panelOpen) setComposerTarget(null);
+                        setPanelOpen((o) => !o);
+                      }}
+                      style={{
+                        ...headerBtn,
+                        background: panelOpen ? color.hover : color.paper,
+                      }}
+                    >
+                      Comments
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div style={{ marginLeft: "auto", font: `500 11px ${font.mono}`, color: color.muted2 }}>
+                  no page open
+                </div>
+              )}
+            </header>
+
+            <div
+              style={{
+                flex: 1,
+                minHeight: 0,
+                overflowY: "auto",
+                background: color.sidebar,
+                padding: root ? "22px 26px" : 0,
+              }}
+            >
+              {!root ? (
                 <div
                   style={{
-                    width: 42,
-                    height: 42,
-                    margin: "0 auto 13px",
-                    borderRadius: radius.lg,
-                    border: `1px solid ${color.border}`,
-                    background: color.paper,
-                    color: color.muted2,
+                    minHeight: 240,
+                    height: "100%",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
+                    textAlign: "center",
+                    color: color.muted2,
                   }}
                 >
-                  <Icon name="pages" size={18} />
+                  <div style={{ maxWidth: 330, padding: 22 }}>
+                    <div
+                      style={{
+                        width: 42,
+                        height: 42,
+                        margin: "0 auto 13px",
+                        borderRadius: radius.lg,
+                        border: `1px solid ${color.border}`,
+                        background: color.paper,
+                        color: color.muted2,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                      }}
+                    >
+                      <Icon name="pages" size={18} />
+                    </div>
+                    <div style={{ font: `600 14px ${font.sans}`, color: color.ink }}>
+                      No page open
+                    </div>
+                    <div style={{ marginTop: 5, font: `400 12px/1.5 ${font.sans}`, color: color.muted }}>
+                      Pick a page from the rail, or create one to start writing.
+                    </div>
+                  </div>
                 </div>
-                <div style={{ font: `600 14px ${font.sans}`, color: color.ink }}>
-                  No page open
+              ) : (
+                <div
+                  style={{
+                    maxWidth: 820,
+                    margin: "0 auto",
+                    minHeight: "100%",
+                    border: `1px solid ${color.border}`,
+                    borderRadius: radius.lg,
+                    background: color.paper,
+                    boxShadow: shadow.card,
+                    overflow: "visible",
+                    padding: "36px 44px 44px",
+                    boxSizing: "border-box",
+                  }}
+                >
+                  <input
+                    ref={titleRef}
+                    aria-label="Page title"
+                    value={titleDraft}
+                    onChange={(event) => setTitleDraft(event.target.value)}
+                    onFocus={() => {
+                      titleFocusedRef.current = true;
+                    }}
+                    onBlur={() => {
+                      titleFocusedRef.current = false;
+                      commitTitle();
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === "ArrowDown") {
+                        event.preventDefault();
+                        commitTitle();
+                        focusRow(rows.find((r) => inputs.current.has(r.block.id)));
+                      }
+                    }}
+                    placeholder="Untitled"
+                    spellCheck={false}
+                    style={{
+                      width: "100%",
+                      boxSizing: "border-box",
+                      border: "none",
+                      outline: "none",
+                      background: "transparent",
+                      padding: 0,
+                      marginBottom: 18,
+                      color: color.dark,
+                      font: `650 30px/1.2 ${font.sans}`,
+                    }}
+                  />
+
+                  {rows.map((row, index) => (
+                    <BlockRow
+                      key={row.block.id}
+                      row={row}
+                      index={index}
+                      expanded={!collapsed.has(row.block.id)}
+                      op={state.ops[opKey.pageBlock(row.block.id)]}
+                      threadCount={threadsByTarget.get(row.block.id) ?? 0}
+                      handlers={handlers}
+                    />
+                  ))}
+
+                  <button
+                    type="button"
+                    aria-label="Add a block"
+                    onClick={appendBlock}
+                    style={{
+                      all: "unset",
+                      cursor: "text",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      width: "100%",
+                      boxSizing: "border-box",
+                      padding: "8px 0 24px 28px",
+                      color: color.muted2,
+                      font: `400 13px ${font.sans}`,
+                    }}
+                  >
+                    <Icon name="plus" size={13} strokeWidth={1.8} />
+                    {rows.length === 0 ? "Start writing — or press '/' for a block menu" : "Add a block"}
+                  </button>
                 </div>
-                <div style={{ marginTop: 5, font: `400 12px/1.5 ${font.sans}`, color: color.muted }}>
-                  Pick a page from the rail, or create one to start a block tree.
-                </div>
-              </div>
+              )}
             </div>
-          ) : (
-            <div
-              style={{
-                maxWidth: 820,
-                margin: "0 auto",
-                minHeight: "100%",
-                border: `1px solid ${color.border}`,
-                borderRadius: radius.lg,
-                background: color.paper,
-                boxShadow: shadow.card,
-                overflow: "visible",
-                padding: "36px 44px 44px",
-                boxSizing: "border-box",
+          </div>
+
+          {panelOpen && root ? (
+            <CommentsPanel
+              threads={state.pageThreads}
+              authorNames={state.authorNames}
+              composer={
+                composerTarget
+                  ? {
+                      target: composerTarget,
+                      label: composerTarget === state.activePage ? "this page" : "this block",
+                    }
+                  : null
+              }
+              onClose={() => {
+                setPanelOpen(false);
+                setComposerTarget(null);
               }}
-            >
-              <input
-                ref={titleRef}
-                aria-label="Page title"
-                value={titleDraft}
-                onChange={(event) => setTitleDraft(event.target.value)}
-                onBlur={commitTitle}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === "ArrowDown") {
-                    event.preventDefault();
-                    commitTitle();
-                    focusRow(rows.find((r) => inputs.current.has(r.block.id)));
-                  }
-                }}
-                placeholder="Untitled"
-                spellCheck={false}
-                style={{
-                  width: "100%",
-                  boxSizing: "border-box",
-                  border: "none",
-                  outline: "none",
-                  background: "transparent",
-                  padding: 0,
-                  marginBottom: 4,
-                  color: color.dark,
-                  font: `650 30px/1.2 ${font.sans}`,
-                }}
-              />
-              <div
-                title={root.id}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 5,
-                  marginBottom: 18,
-                  color: color.muted2,
-                }}
-              >
-                <Icon name="hash" size={10} />
-                <span style={{ font: `500 10px ${font.mono}` }}>{shortId(root.id)}</span>
-                <FinalizationMark
-                  op={[state.ops[opKey.page(root.id)], state.ops[opKey.pageBlock(root.id)]]
-                    .filter((record): record is NonNullable<typeof record> => Boolean(record))
-                    .sort((a, b) => b.seq - a.seq)[0]}
-                />
-              </div>
-
-              {rows.map((row, index) => (
-                <BlockRow
-                  key={row.block.id}
-                  row={row}
-                  index={index}
-                  expanded={!collapsed.has(row.block.id)}
-                  op={state.ops[opKey.pageBlock(row.block.id)]}
-                  handlers={handlers}
-                />
-              ))}
-
-              <button
-                type="button"
-                aria-label="Add a block"
-                onClick={appendBlock}
-                style={{
-                  all: "unset",
-                  cursor: "text",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  width: "100%",
-                  boxSizing: "border-box",
-                  padding: "8px 0 24px 28px",
-                  color: color.muted2,
-                  font: `400 13px ${font.sans}`,
-                }}
-              >
-                <Icon name="plus" size={13} strokeWidth={1.8} />
-                {rows.length === 0 ? "Start writing — or type '/' for a block menu" : "Add a block"}
-              </button>
-            </div>
-          )}
+              onSubmitNew={(target, text) => {
+                actions.addComment({ target, text });
+                setComposerTarget(null);
+              }}
+              onCancelNew={() => setComposerTarget(null)}
+              onReply={(threadId, text) => {
+                // a reply must carry the THREAD's target (a block id or the
+                // page id) — the module rejects an append whose target differs
+                // from the thread's. Never assume the page here.
+                const target =
+                  state.pageThreads
+                    .flatMap((g) => g.threads)
+                    .find((v) => v.thread.id === threadId)?.thread.target ??
+                  state.activePage ??
+                  "";
+                actions.addComment({ threadId, target, text });
+              }}
+              onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
+              onEdit={(commentId, text) => actions.editComment({ commentId, text })}
+              onDelete={(commentId) => actions.deleteComment(commentId)}
+            />
+          ) : null}
         </div>
       </main>
     </div>
   );
 }
+
+const headerBtn: CSSProperties = {
+  all: "unset",
+  cursor: "pointer",
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 5,
+  padding: "5px 10px",
+  borderRadius: radius.sm,
+  border: `1px solid ${color.border}`,
+  background: color.paper,
+  color: color.muted3,
+  font: `500 11.5px ${font.sans}`,
+};

@@ -7,8 +7,8 @@ describe("parseMessageInput", () => {
     expect(parseMessageInput("just words")).toEqual([{ paragraph: [{ text: "just words", marks: [] }] }]);
   });
 
-  it("marks **bold**, *italic*, and bare URLs inside a paragraph", () => {
-    const blocks = parseMessageInput("a **b** and *c* see https://x.test/y");
+  it("marks **bold**, *italic*, markdown links, and bare URLs inside a paragraph", () => {
+    const blocks = parseMessageInput("a **b** and *c* read [docs](https://x.test/docs) see https://x.test/y");
     expect(blocks).toEqual([
       {
         paragraph: [
@@ -16,6 +16,8 @@ describe("parseMessageInput", () => {
           { text: "b", marks: ["bold"] },
           { text: " and ", marks: [] },
           { text: "c", marks: ["italic"] },
+          { text: " read ", marks: [] },
+          { text: "docs", marks: [{ link: "https://x.test/docs" }] },
           { text: " see ", marks: [] },
           { text: "https://x.test/y", marks: [{ link: "https://x.test/y" }] },
         ],
@@ -63,11 +65,32 @@ describe("parseMessageInput", () => {
       { code: { lang: null, text: "code" } },
     ]);
   });
+
+  it("turns quote lines into marked quote blocks", () => {
+    const blocks = parseMessageInput("> **ship** this\n> with [context](https://x.test/context)");
+    expect(blocks).toEqual([
+      {
+        quote: [
+          { text: "ship", marks: ["bold"] },
+          { text: " this\nwith ", marks: [] },
+          { text: "context", marks: [{ link: "https://x.test/context" }] },
+        ],
+      },
+    ]);
+  });
+
+  it("turns divider lines into divider blocks between paragraphs", () => {
+    expect(parseMessageInput("before\n---\nafter")).toEqual([
+      { paragraph: [{ text: "before", marks: [] }] },
+      "divider",
+      { paragraph: [{ text: "after", marks: [] }] },
+    ]);
+  });
 });
 
 describe("blocksToInput (edit round-trip)", () => {
   it("round-trips marks and code fences back through the parser", () => {
-    const source = "a **b** and *c*\n\n```ts\nconst a = 1;\n```";
+    const source = "a **b** and *c* plus [docs](https://x.test/docs)\n\n```ts\nconst a = 1;\n```";
     const blocks = parseMessageInput(source);
     // re-rendering to composer text and re-parsing yields the same blocks
     expect(parseMessageInput(blocksToInput(blocks))).toEqual(blocks);
@@ -75,5 +98,10 @@ describe("blocksToInput (edit round-trip)", () => {
 
   it("renders code blocks with fences and language", () => {
     expect(blocksToInput([{ code: { lang: "rs", text: "fn main() {}" } }])).toBe("```rs\nfn main() {}\n```");
+  });
+
+  it("round-trips quote and divider blocks", () => {
+    const blocks = parseMessageInput("intro\n\n> quoted **text**\n\n---\n\noutro");
+    expect(parseMessageInput(blocksToInput(blocks))).toEqual(blocks);
   });
 });
