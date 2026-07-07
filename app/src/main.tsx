@@ -22,13 +22,18 @@ import { ErrorBoundary } from "./console/layout/ErrorBoundary";
 // Every other window is the full console.
 const view = new URLSearchParams(window.location.search).get("view");
 
-// dev-only: connect the tauri-plugin-mcp guest bindings so the socket helper
-// (app/scripts/tauri-debug.mjs) can run JS / inspect the DOM in this webview.
-// screenshots work without it; the DOM/JS commands need it. never in release.
+// dev-only: install the tauri-agent guest instrumentation so the `tauri-agent`
+// CLI / MCP server can snapshot the semantic tree, drive input, capture logs,
+// and render DOM-SVG screenshots in this webview. One instance per window,
+// labelled by the real Tauri window label. Never in release.
 if (import.meta.env.DEV) {
-  void import("tauri-plugin-mcp")
-    .then(({ setupPluginListeners }) => setupPluginListeners())
-    .catch(() => {});
+  void (async () => {
+    const [{ WebviewAgentInstrumentation }, { getCurrentWindow }] = await Promise.all([
+      import("@byeongsu-hong/tauri-plugin-agent"),
+      import("@tauri-apps/api/window"),
+    ]);
+    new WebviewAgentInstrumentation({ windowLabel: getCurrentWindow().label }).install();
+  })().catch(() => {});
 }
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
