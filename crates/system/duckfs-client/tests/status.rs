@@ -204,3 +204,59 @@ fn a_new_empty_dir_is_added_but_a_recorded_one_is_clean() {
         paths(&st.added)
     );
 }
+
+// ---- a dir emptied by removing its last child is NOT "added" -----------------
+
+#[test]
+fn dir_emptied_by_removing_its_last_child_is_not_reported_added() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // base: a file inside a subdirectory, recorded in the index. the dir itself
+    // is NOT an index entry (only empty dirs are) — it exists upstream implied
+    // by its child.
+    fs::create_dir(root.join("sub")).unwrap();
+    fs::write(root.join("sub/only.txt"), b"last child").unwrap();
+    let mut idx = Index::new(PREFIX, "http://node", None);
+    record_file(&mut idx, root, "sub/only.txt", false);
+    idx.save(root).unwrap();
+
+    // remove the last child; the now-empty dir stays on disk. upstream the dir
+    // still exists (Rm removes the entry, not its parent tree), so reporting it
+    // "added" would plan a Mkdir the module rejects ("target already exists").
+    fs::remove_file(root.join("sub/only.txt")).unwrap();
+
+    let st = status(root).unwrap();
+    assert_eq!(
+        st.removed,
+        vec![dpath("sub/only.txt")],
+        "the deleted child is the removal"
+    );
+    assert!(
+        paths(&st.added).is_empty(),
+        "a base-known dir emptied by child removal must not be re-added: {:?}",
+        paths(&st.added)
+    );
+    assert!(!st.clean, "the removal makes the worktree dirty");
+}
+
+#[test]
+fn genuinely_new_empty_dir_is_still_added() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::write(root.join("a.txt"), b"content").unwrap();
+    let mut idx = Index::new(PREFIX, "http://node", None);
+    record_file(&mut idx, root, "a.txt", false);
+    idx.save(root).unwrap();
+
+    // a brand-new empty dir with no base ancestry: this one IS a real Mkdir.
+    fs::create_dir(root.join("fresh")).unwrap();
+
+    let st = status(root).unwrap();
+    assert_eq!(
+        paths(&st.added),
+        vec![dpath("fresh")],
+        "a new empty dir must still plan a Mkdir"
+    );
+}

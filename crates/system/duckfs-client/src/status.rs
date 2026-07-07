@@ -45,6 +45,13 @@ pub fn status(root: &Path) -> Result<Status, StatusError> {
     let scanned = scan(root, &index.prefix)?;
     let index_mtime = index_file_mtime(root)?;
 
+    // every ancestor directory of an indexed path exists in the base snapshot
+    // (implied by its children — only EMPTY dirs get their own index entry). a
+    // dir emptied on disk by deleting its last indexed child is still one of
+    // these: the module's Rm removes the entry, never its parent tree, so
+    // planning a Mkdir for it would reject ("target already exists").
+    let base_dirs = ancestor_dirs(&index);
+
     let mut added = Vec::new();
     let mut modified = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -59,6 +66,7 @@ pub fn status(root: &Path) -> Result<Status, StatusError> {
                     match index.entries.get(&entry.path) {
                         Some(e) if e.kind == EntryKind::Dir => {}
                         Some(_) => modified.push(entry.clone()),
+                        None if base_dirs.contains(&entry.path) => {}
                         None => added.push(entry.clone()),
                     }
                 }
@@ -153,6 +161,23 @@ fn is_modified(
         &recorded.meta,
     ));
     Ok(recomputed != recorded.object)
+}
+
+/// every strict-ancestor directory of every indexed path — the directories the
+/// base snapshot holds implicitly (a non-empty dir never gets its own entry).
+fn ancestor_dirs(index: &Index) -> BTreeSet<String> {
+    let mut dirs = BTreeSet::new();
+    for path in index.entries.keys() {
+        let mut end = path.len();
+        while let Some(slash) = path[..end].rfind('/') {
+            if slash == 0 {
+                break;
+            }
+            dirs.insert(path[..slash].to_string());
+            end = slash;
+        }
+    }
+    dirs
 }
 
 /// the index file's own mtime, the reference the racy-clean rule compares against.
