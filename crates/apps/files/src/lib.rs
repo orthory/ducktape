@@ -76,6 +76,10 @@
 mod wire;
 pub use wire::*;
 
+// the shared canonical cursor codec `objects` and `state` both speak — private
+// and pure (part of the always-compiled core).
+mod codec;
+
 pub mod fs;
 pub mod gc;
 pub mod objects;

@@ -14,22 +14,22 @@ use crate::wire::{MAX_DEPTH, MAX_NAME_BYTES, MAX_PATH_BYTES};
 pub fn canonical(path: &str) -> Result<Vec<String>, String> {
     // absolute: every path is anchored at root, so a leading '/' is required.
     if !path.starts_with('/') {
-        return Err("path must be absolute (start with '/')".to_string());
+        return Err("files: path must be absolute (start with '/')".to_string());
     }
     // NFC once over the whole path: reject any string that is not already in
     // composed form so that a byte sequence maps to exactly one path.
     if path.chars().nfc().collect::<String>() != path {
-        return Err("path is not NFC-normalized".to_string());
+        return Err("files: path is not NFC-normalized".to_string());
     }
     // a '/' can never survive the split below, but a NUL can, so guard it here
     // over the whole path (paths address entries in a real tree).
     if path.contains('\0') {
-        return Err("path must not contain a NUL byte".to_string());
+        return Err("files: path must not contain a NUL byte".to_string());
     }
     // total byte length is capped before we do any per-segment work.
     if path.len() > MAX_PATH_BYTES {
         return Err(format!(
-            "path exceeds the {MAX_PATH_BYTES}-byte length limit"
+            "files: path exceeds the {MAX_PATH_BYTES}-byte length limit"
         ));
     }
     // root has no segments; return early so the split does not see an empty tail.
@@ -43,20 +43,22 @@ pub fn canonical(path: &str) -> Result<Vec<String>, String> {
         // empty (`//`), current (`.`), and parent (`..`) segments are illegal:
         // there is no relative or self-referential navigation in a canonical path.
         if segment.is_empty() || segment == "." || segment == ".." {
-            return Err("path contains an empty or dot segment".to_string());
+            return Err("files: path contains an empty or dot segment".to_string());
         }
         // name cap is on encoded BYTES, so a multi-byte utf-8 name counts its
         // full utf-8 length, not its char count.
         if segment.len() > MAX_NAME_BYTES {
             return Err(format!(
-                "segment name exceeds the {MAX_NAME_BYTES}-byte limit"
+                "files: segment name exceeds the {MAX_NAME_BYTES}-byte limit"
             ));
         }
         segments.push(segment.to_string());
     }
     // depth is the number of segments; the byte cap already bounds the count.
     if segments.len() > MAX_DEPTH {
-        return Err(format!("path exceeds the maximum depth of {MAX_DEPTH}"));
+        return Err(format!(
+            "files: path exceeds the maximum depth of {MAX_DEPTH}"
+        ));
     }
     Ok(segments)
 }
@@ -80,21 +82,23 @@ pub fn check_authority(owner: &str, segments: &[String]) -> Result<(), String> {
                 if o == owner {
                     Ok(())
                 } else {
-                    Err(format!("actor '{owner}' is not the home owner '{o}'"))
+                    Err(format!(
+                        "files: actor '{owner}' is not the home owner '{o}'"
+                    ))
                 }
             }
             // `/home` or `/home/<o>` on their own: writing the home root rejects.
-            _ => Err("home root is not writable".to_string()),
+            _ => Err("files: home root is not writable".to_string()),
         },
         // `/shared/**` is public, but the shared root itself is not a target.
         Some("shared") => {
             if segments.len() >= 2 {
                 Ok(())
             } else {
-                Err("shared root is not writable".to_string())
+                Err("files: shared root is not writable".to_string())
             }
         }
         // anything else (including the empty-segment filesystem root) is out.
-        _ => Err("path is outside /home and /shared".to_string()),
+        _ => Err("files: path is outside /home and /shared".to_string()),
     }
 }

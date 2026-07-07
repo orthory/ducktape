@@ -10,7 +10,7 @@ use base64::engine::general_purpose::STANDARD;
 
 use crate::objects::{
     EntryKind, FileObj, Kind, ObjectId, SnapshotObj, TreeEntry, TreeObj, object_id,
-    verify_file_shape,
+    verify_chunk_len_at, verify_file_shape,
 };
 use crate::paths::{canonical, check_authority};
 use crate::state::{PinEntry, Refs, Staged, decode_refs, encode_refs, root_bytes};
@@ -67,12 +67,14 @@ pub(crate) struct Pending {
     pub refs: Refs,
     pub objects: StagedObjects,
     /// per-block index over `objects` — the id of every object buffered this
-    /// block. maintained in lockstep with `objects` so availability checks
-    /// (commit step 6) and putblob's no-op dedup stay O(log n) instead of
-    /// re-hashing every buffered megabyte on each call. a chunk uploaded inline
+    /// block, mapped to its `(kind, body length)`. maintained in lockstep with
+    /// `objects` so availability checks (commit step 6) and putblob's no-op
+    /// dedup stay O(log n) instead of re-hashing every buffered megabyte on
+    /// each call, and so commit's chunk-length verification reads the length
+    /// from this index rather than the buffered bytes. a chunk uploaded inline
     /// by an earlier commit THIS block (in `objects`, not in `staging`) is thus
     /// seen as available by a later commit and no-op'd by a later putblob.
-    pub object_ids: BTreeSet<ObjectId>,
+    pub object_ids: BTreeMap<ObjectId, (Kind, u64)>,
     pub height: u64,
 }
 
@@ -82,7 +84,7 @@ impl Pending {
     /// same bytes buffered twice cost one entry (the flush is idempotent anyway).
     fn push_object(&mut self, kind: Kind, body: Vec<u8>) {
         let id = object_id(kind, &body);
-        self.object_ids.insert(id);
+        self.object_ids.insert(id, (kind, body.len() as u64));
         self.objects.push((kind, body));
     }
 }
@@ -200,7 +202,7 @@ impl<S: ObjectStore> Fs<S> {
             self.pending = Some(Pending {
                 refs: self.refs.clone(),
                 objects: Vec::new(),
-                object_ids: BTreeSet::new(),
+                object_ids: BTreeMap::new(),
                 height,
             });
         }
@@ -230,7 +232,10 @@ impl<S: ObjectStore> Fs<S> {
     /// land. production staging happens inside the op methods.
     #[doc(hidden)]
     pub fn stage_pending(&mut self, refs: Refs, height: u64, objects: StagedObjects) {
-        let object_ids = objects.iter().map(|(k, b)| object_id(*k, b)).collect();
+        let object_ids = objects
+            .iter()
+            .map(|(k, b)| (object_id(*k, b), (*k, b.len() as u64)))
+            .collect();
         self.pending = Some(Pending {
             refs,
             objects,
@@ -278,10 +283,10 @@ impl<S: ObjectStore> Fs<S> {
         // whole block in production, so this never leaves the sweep half-applied;
         // the direct-execute tests likewise keep earlier same-block stages.)
         if bytes.is_empty() {
-            return Err("chunk must not be empty".into());
+            return Err("files: chunk must not be empty".into());
         }
         if bytes.len() as u64 > CHUNK_SIZE {
-            return Err("chunk exceeds CHUNK_SIZE".into());
+            return Err("files: chunk exceeds CHUNK_SIZE".into());
         }
 
         let digest = object_id(Kind::Chunk, bytes);
@@ -292,7 +297,7 @@ impl<S: ObjectStore> Fs<S> {
         // inline (in objects, NOT in staging). the per-block object index covers
         // both cases, so a putblob after an inline commit of the same chunk
         // no-ops instead of double-staging.
-        if store.has(&digest) || pending.object_ids.contains(&digest) {
+        if store.has(&digest) || pending.object_ids.contains_key(&digest) {
             return Ok(());
         }
 
@@ -328,7 +333,7 @@ impl<S: ObjectStore> Fs<S> {
             return Err("files: staging entry quota exceeded".into());
         }
         if used.saturating_add(len) > quota {
-            return Err("staging quota exceeded".into());
+            return Err("files: staging quota exceeded".into());
         }
 
         // stage: the entry makes the chunk gc-reachable (task 13 marks staging
@@ -731,7 +736,7 @@ impl<S: ObjectStore> Fs<S> {
         if kind == Kind::File {
             let file = FileObj::decode(body)?;
             verify_file_shape(file.size, file.chunks.len())
-                .map_err(|_| "ingest: file object size/chunk shape invalid".to_string())?;
+                .map_err(|_| "files: ingest file object size/chunk shape invalid".to_string())?;
         }
         self.store.put(kind, body)?;
         Ok(())
@@ -799,7 +804,7 @@ enum EditOp {
 #[allow(clippy::too_many_arguments)]
 fn commit_apply(
     store: &Store,
-    pending_ids: &BTreeSet<ObjectId>,
+    pending_ids: &BTreeMap<ObjectId, (Kind, u64)>,
     mut refs: Refs,
     actor: &str,
     height: u64,
@@ -852,12 +857,15 @@ fn commit_apply(
     // `objects`/`staged_ids`; `touched` (canonical joined path + segments) drives
     // dedup, CAS and watch fan-out; `chunk_refs` drives staged-quota reclaim.
     let mut objects: StagedObjects = Vec::new();
-    let mut staged_ids: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut staged_ids: BTreeMap<ObjectId, (Kind, u64)> = BTreeMap::new();
     let mut plan: Vec<EditOp> = Vec::with_capacity(changes.len());
     let mut touched: Vec<(String, Vec<String>)> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut chunk_refs: Vec<ObjectId> = Vec::new();
-    let mut chunks_to_check: Vec<ObjectId> = Vec::new();
+    // deferred per-file `(declared size, referenced chunk ids)` pairs — step 6
+    // verifies availability AND stored length for each once the plan pass has
+    // revealed every inline-staged chunk.
+    let mut chunks_to_check: Vec<(u64, Vec<ObjectId>)> = Vec::new();
     let mut inline_bytes: usize = 0;
 
     for change in changes {
@@ -900,9 +908,10 @@ fn commit_apply(
                     }
                     Content::Chunks { size, chunks } => {
                         // step 6: size/chunk consistency + hex parse; availability
-                        // is checked below once all inline chunks are known.
+                        // and stored length are checked below once all inline
+                        // chunks are known.
                         let ids = validate_chunks(*size, chunks)?;
-                        chunks_to_check.extend_from_slice(&ids);
+                        chunks_to_check.push((*size, ids.clone()));
                         let fileobj_id = stage_fileobj(
                             *size,
                             &ids,
@@ -1002,17 +1011,22 @@ fn commit_apply(
         }
     }
 
-    // step 6 (availability): every referenced chunk must be reachable — staged
-    // via putblob, durable in the odb, produced by a prior commit this block, or
-    // produced inline by THIS commit. checked after the plan pass so an inline
-    // chunk in a later change is visible to an earlier `Chunks` reference.
-    for id in &chunks_to_check {
-        let available = refs.staging.contains_key(id)
-            || pending_ids.contains(id)
-            || staged_ids.contains(id)
-            || store.store.has(id);
-        if !available {
-            return Err("files: chunk not available".into());
+    // step 6 (availability + stored length): every referenced chunk must be
+    // reachable — staged via putblob, durable in the odb, produced by a prior
+    // commit this block, or produced inline by THIS commit — AND its stored
+    // byte length must satisfy the exact-length rule for its position
+    // ([`verify_chunk_len_at`]). `validate_chunks` pinned the size/COUNT shape;
+    // without the length half a wrong-length digest would commit fine and only
+    // explode at read time — a committed-but-unreadable file. every source
+    // answers from metadata alone (the staging entry, the in-memory block
+    // indexes, an odb stat), so no chunk body is ever read on the execute
+    // path. checked after the plan pass so an inline chunk in a later change
+    // is visible to an earlier `Chunks` reference.
+    for (size, ids) in &chunks_to_check {
+        for (index, id) in ids.iter().enumerate() {
+            let got = chunk_stat(id, &refs, pending_ids, &staged_ids, store)?
+                .ok_or_else(|| "files: chunk not available".to_string())?;
+            verify_chunk_len_at(*size, ids.len(), index, got)?;
         }
     }
 
@@ -1048,9 +1062,12 @@ fn commit_apply(
             }
             .encode();
             let id = object_id(Kind::Tree, &body);
-            if !staged_ids.contains(&id) && !pending_ids.contains(&id) && !store.store.has(&id) {
+            if !staged_ids.contains_key(&id)
+                && !pending_ids.contains_key(&id)
+                && !store.store.has(&id)
+            {
+                staged_ids.insert(id, (Kind::Tree, body.len() as u64));
                 objects.push((Kind::Tree, body));
-                staged_ids.insert(id);
             }
             id
         }
@@ -1105,6 +1122,38 @@ fn commit_apply(
         objects,
         notifications,
     })
+}
+
+/// the stored byte length of one referenced chunk, from metadata only, across
+/// the four reachability sources commit accepts: the putblob staging table
+/// (which recorded the exact length it measured), this block's prior-object
+/// index, THIS commit's staged-object index (both in-memory), and the durable
+/// odb (a stat — kind tag + file length, never a body read). `Ok(None)` =
+/// reachable nowhere, the availability reject. a digest that resolves to a
+/// NON-chunk object is a malformed reference and errors — a File/Tree/Snapshot
+/// body must not pose as a chunk even when its byte length happens to fit.
+fn chunk_stat(
+    id: &ObjectId,
+    refs: &Refs,
+    pending_ids: &BTreeMap<ObjectId, (Kind, u64)>,
+    staged_ids: &BTreeMap<ObjectId, (Kind, u64)>,
+    store: &Store,
+) -> Result<Option<u64>, String> {
+    // staging entries are chunks by construction (putblob stages only chunks).
+    if let Some(staged) = refs.staging.get(id) {
+        return Ok(Some(staged.len));
+    }
+    if let Some((kind, len)) = pending_ids.get(id).or_else(|| staged_ids.get(id)) {
+        if *kind != Kind::Chunk {
+            return Err("files: referenced digest is not a chunk".into());
+        }
+        return Ok(Some(*len));
+    }
+    match store.store.stat(id)? {
+        Some((Kind::Chunk, len)) => Ok(Some(len)),
+        Some(_) => Err("files: referenced digest is not a chunk".into()),
+        None => Ok(None),
+    }
 }
 
 /// canonicalize a written path and authority-check it for `actor`.
@@ -1211,9 +1260,9 @@ fn validate_chunks(size: u64, chunks: &[String]) -> Result<Vec<ObjectId>, String
 fn chunk_bytes(
     bytes: &[u8],
     store: &Store,
-    pending_ids: &BTreeSet<ObjectId>,
+    pending_ids: &BTreeMap<ObjectId, (Kind, u64)>,
     objects: &mut StagedObjects,
-    staged_ids: &mut BTreeSet<ObjectId>,
+    staged_ids: &mut BTreeMap<ObjectId, (Kind, u64)>,
 ) -> Vec<ObjectId> {
     if bytes.is_empty() {
         return Vec::new();
@@ -1239,9 +1288,9 @@ fn stage_fileobj(
     chunks: &[ObjectId],
     meta: &BTreeMap<String, String>,
     store: &Store,
-    pending_ids: &BTreeSet<ObjectId>,
+    pending_ids: &BTreeMap<ObjectId, (Kind, u64)>,
     objects: &mut StagedObjects,
-    staged_ids: &mut BTreeSet<ObjectId>,
+    staged_ids: &mut BTreeMap<ObjectId, (Kind, u64)>,
 ) -> ObjectId {
     let fileobj = FileObj {
         size,
@@ -1267,14 +1316,14 @@ fn stage_object(
     kind: Kind,
     body: Vec<u8>,
     store: &Store,
-    pending_ids: &BTreeSet<ObjectId>,
+    pending_ids: &BTreeMap<ObjectId, (Kind, u64)>,
     objects: &mut StagedObjects,
-    staged_ids: &mut BTreeSet<ObjectId>,
+    staged_ids: &mut BTreeMap<ObjectId, (Kind, u64)>,
 ) -> ObjectId {
     let id = object_id(kind, &body);
-    if !staged_ids.contains(&id) && !pending_ids.contains(&id) && !store.store.has(&id) {
+    if !staged_ids.contains_key(&id) && !pending_ids.contains_key(&id) && !store.store.has(&id) {
+        staged_ids.insert(id, (kind, body.len() as u64));
         objects.push((kind, body));
-        staged_ids.insert(id);
     }
     id
 }

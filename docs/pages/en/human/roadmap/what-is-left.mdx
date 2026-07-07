@@ -20,6 +20,15 @@ depth.
   membership.
 - **Governance and vaults.** Member-gated proposals drive membership; vaults
   replicate opaque secret ciphertext with owner-gated write integrity.
+- **duckfs (files as a real filesystem).** Phases 1–2 shipped: the `files`
+  module is now a consensus-replicated, copy-on-write, content-addressed
+  filesystem — every byte is consensus state that survives restart, with staged
+  uploads, atomic per-path-CAS commits, pinned snapshots, snapshot-addressed
+  reads, resolver-backed state sync to full possession, and a noded HTTP
+  surface. The `memory` module was removed — absorbed by duckfs (generations
+  became snapshots, `duck://memory/...` URIs became `duck://files/...`). The
+  client stack — checkout/commit engine, CLI, FUSE mount, the app FilesView
+  rebuild — is Phases 3–5 and still open.
 
 ## Durability And Promotion
 

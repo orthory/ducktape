@@ -16,6 +16,16 @@ fn roundtrip_contract<S: ObjectStore>(store: &mut S) {
         store.get(&id).unwrap(),
         Some((Kind::Chunk, b"bytes".to_vec()))
     );
+    // stat is metadata-only kind + BODY length (the disk file also carries a
+    // kind tag byte, which must NOT count), absent = Ok(None).
+    assert_eq!(store.stat(&id).unwrap(), Some((Kind::Chunk, 5)));
+    let tree_id = store.put(Kind::Tree, b"bytes").unwrap();
+    assert_eq!(store.stat(&tree_id).unwrap(), Some((Kind::Tree, 5)));
+    store.remove(&tree_id).unwrap();
+    assert_eq!(
+        store.stat(&object_id(Kind::Chunk, b"absent")).unwrap(),
+        None
+    );
     // idempotent re-put: content-addressed, same id, no error, single entry.
     let id2 = store.put(Kind::Chunk, b"bytes").unwrap();
     assert_eq!(id, id2, "idempotent re-put");

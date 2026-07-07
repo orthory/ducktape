@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 
 use sha2::{Digest as _, Sha256};
 
+use crate::codec::{Reader, push_string};
+
 use crate::{
     CHUNK_SIZE, MAX_CHUNKS_PER_FILE, MAX_DIR_ENTRIES, MAX_MESSAGE_BYTES, MAX_META_ENTRIES,
     MAX_META_KEY_BYTES, MAX_META_VALUE_BYTES, MAX_NAME_BYTES,
@@ -87,10 +89,10 @@ impl FileObj {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        let mut off = 0usize;
-        let size = read_u64(bytes, &mut off)?;
+        let mut r = Reader::new("object body", bytes);
+        let size = r.u64()?;
 
-        let chunk_count = read_u32(bytes, &mut off)? as usize;
+        let chunk_count = r.u32()? as usize;
         if chunk_count > MAX_CHUNKS_PER_FILE {
             return Err("files: file chunk count over cap".into());
         }
@@ -98,17 +100,17 @@ impl FileObj {
         // ids are actually read, so growth stays amortized instead.
         let mut chunks = Vec::new();
         for _ in 0..chunk_count {
-            chunks.push(read_bytes32(bytes, &mut off)?);
+            chunks.push(r.bytes32()?);
         }
 
-        let meta_count = read_u16(bytes, &mut off)? as usize;
+        let meta_count = r.u16()? as usize;
         if meta_count > MAX_META_ENTRIES {
             return Err("files: file meta count over cap".into());
         }
         let mut meta: BTreeMap<String, String> = BTreeMap::new();
         for _ in 0..meta_count {
-            let key = read_string(bytes, &mut off)?;
-            let value = read_string(bytes, &mut off)?;
+            let key = r.string()?;
+            let value = r.string()?;
             if key.len() > MAX_META_KEY_BYTES {
                 return Err("files: file meta key over cap".into());
             }
@@ -126,7 +128,7 @@ impl FileObj {
             meta.insert(key, value);
         }
 
-        finish(bytes, off)?;
+        r.finish()?;
         Ok(FileObj { size, chunks, meta })
     }
 }
@@ -189,22 +191,22 @@ impl TreeObj {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        let mut off = 0usize;
-        let entry_count = read_u32(bytes, &mut off)? as usize;
+        let mut r = Reader::new("object body", bytes);
+        let entry_count = r.u32()? as usize;
         if entry_count > MAX_DIR_ENTRIES {
             return Err("files: tree entry count over cap".into());
         }
         let mut entries: BTreeMap<String, TreeEntry> = BTreeMap::new();
         for _ in 0..entry_count {
-            let name = read_string(bytes, &mut off)?;
+            let name = r.string()?;
             if name.len() > MAX_NAME_BYTES {
                 return Err("files: tree entry name over cap".into());
             }
-            let kind = EntryKind::from_u8(read_u8(bytes, &mut off)?)
+            let kind = EntryKind::from_u8(r.u8()?)
                 .ok_or_else(|| "files: tree entry has an unknown kind".to_string())?;
-            let id = read_bytes32(bytes, &mut off)?;
-            let exec = read_bool(bytes, &mut off)?;
-            let size = read_u64(bytes, &mut off)?;
+            let id = r.bytes32()?;
+            let exec = r.boolean()?;
+            let size = r.u64()?;
             if entries
                 .last_key_value()
                 .is_some_and(|(last, _)| last.as_str() >= name.as_str())
@@ -222,7 +224,7 @@ impl TreeObj {
             );
         }
 
-        finish(bytes, off)?;
+        r.finish()?;
         Ok(TreeObj { entries })
     }
 }
@@ -258,23 +260,23 @@ impl SnapshotObj {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        let mut off = 0usize;
-        let root = read_bytes32(bytes, &mut off)?;
+        let mut r = Reader::new("object body", bytes);
+        let root = r.bytes32()?;
         // has_parent is a canonical bool: the parent id is present iff it is 1.
-        let parent = if read_bool(bytes, &mut off)? {
-            Some(read_bytes32(bytes, &mut off)?)
+        let parent = if r.boolean()? {
+            Some(r.bytes32()?)
         } else {
             None
         };
-        let author = read_string(bytes, &mut off)?;
-        let consensus_time = read_u64(bytes, &mut off)?;
-        let height = read_u64(bytes, &mut off)?;
-        let message = read_string(bytes, &mut off)?;
+        let author = r.string()?;
+        let consensus_time = r.u64()?;
+        let height = r.u64()?;
+        let message = r.string()?;
         if message.len() > MAX_MESSAGE_BYTES {
             return Err("files: snapshot message over cap".into());
         }
 
-        finish(bytes, off)?;
+        r.finish()?;
         Ok(SnapshotObj {
             root,
             parent,
@@ -292,7 +294,19 @@ impl SnapshotObj {
 /// remainder is an inconsistent size/chunks pair and rejects — so a zero-length
 /// "chunk" can never spoof a hole, and the byte length alone pins each chunk.
 pub fn verify_chunk_len(file: &FileObj, index: usize, got_len: u64) -> Result<(), String> {
-    let n = file.chunks.len();
+    verify_chunk_len_at(file.size, file.chunks.len(), index, got_len)
+}
+
+/// [`verify_chunk_len`] over bare `(size, chunk_count)` parts — the commit
+/// executor verifies referenced chunks BEFORE any [`FileObj`] exists, and the
+/// read path already holds one; both charge the identical rule here.
+pub fn verify_chunk_len_at(
+    size: u64,
+    chunk_count: usize,
+    index: usize,
+    got_len: u64,
+) -> Result<(), String> {
+    let n = chunk_count;
     if index >= n {
         return Err("files: chunk index out of range".into());
     }
@@ -300,8 +314,7 @@ pub fn verify_chunk_len(file: &FileObj, index: usize, got_len: u64) -> Result<()
         let prefix = (n as u64 - 1)
             .checked_mul(CHUNK_SIZE)
             .ok_or_else(|| "files: chunk prefix length overflows".to_string())?;
-        let last = file
-            .size
+        let last = size
             .checked_sub(prefix)
             .ok_or_else(|| "files: file size smaller than its chunk count implies".to_string())?;
         if last == 0 || last > CHUNK_SIZE {
@@ -349,82 +362,4 @@ pub fn verify_file_shape(size: u64, chunk_count: usize) -> Result<(), String> {
         return Err("files: file size inconsistent with its chunk count".into());
     }
     Ok(())
-}
-
-// ---- canonical codec helpers ------------------------------------------------
-//
-// every read advances a cursor and bounds-checks against the input; a field
-// that runs past the end is a truncation, and callers finish with `finish` so
-// unconsumed trailing bytes reject.
-
-fn push_string(out: &mut Vec<u8>, value: &str) {
-    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
-    out.extend_from_slice(value.as_bytes());
-}
-
-/// every byte must be accounted for — a decode that stops short of the end saw
-/// trailing bytes and is not canonical.
-fn finish(bytes: &[u8], off: usize) -> Result<(), String> {
-    if off != bytes.len() {
-        return Err("files: object body has trailing bytes".into());
-    }
-    Ok(())
-}
-
-/// read `N` little-endian bytes, advancing the cursor; running past the end is a
-/// truncation.
-fn read_array<const N: usize>(bytes: &[u8], off: &mut usize) -> Result<[u8; N], String> {
-    let end = off
-        .checked_add(N)
-        .filter(|&end| end <= bytes.len())
-        .ok_or_else(|| "files: object body truncated".to_string())?;
-    let mut buf = [0u8; N];
-    buf.copy_from_slice(&bytes[*off..end]);
-    *off = end;
-    Ok(buf)
-}
-
-fn read_u64(bytes: &[u8], off: &mut usize) -> Result<u64, String> {
-    Ok(u64::from_le_bytes(read_array::<8>(bytes, off)?))
-}
-
-fn read_u32(bytes: &[u8], off: &mut usize) -> Result<u32, String> {
-    Ok(u32::from_le_bytes(read_array::<4>(bytes, off)?))
-}
-
-fn read_u16(bytes: &[u8], off: &mut usize) -> Result<u16, String> {
-    Ok(u16::from_le_bytes(read_array::<2>(bytes, off)?))
-}
-
-fn read_u8(bytes: &[u8], off: &mut usize) -> Result<u8, String> {
-    Ok(read_array::<1>(bytes, off)?[0])
-}
-
-fn read_bytes32(bytes: &[u8], off: &mut usize) -> Result<[u8; 32], String> {
-    read_array::<32>(bytes, off)
-}
-
-/// a single-byte boolean; only 0 and 1 are canonical, any other byte rejects.
-fn read_bool(bytes: &[u8], off: &mut usize) -> Result<bool, String> {
-    match read_u8(bytes, off)? {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err("files: expected a 0/1 boolean byte".into()),
-    }
-}
-
-/// a `u64` length prefix followed by exactly that many utf-8 bytes. the length
-/// is bounded by the remaining input before any allocation, so a bogus length
-/// truncates rather than over-allocating.
-fn read_string(bytes: &[u8], off: &mut usize) -> Result<String, String> {
-    let len = read_u64(bytes, off)?;
-    let len = usize::try_from(len).map_err(|_| "files: object body truncated".to_string())?;
-    let end = off
-        .checked_add(len)
-        .filter(|&end| end <= bytes.len())
-        .ok_or_else(|| "files: object body truncated".to_string())?;
-    let value = std::str::from_utf8(&bytes[*off..end])
-        .map_err(|_| "files: object string is not utf-8".to_string())?;
-    *off = end;
-    Ok(value.to_owned())
 }

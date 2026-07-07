@@ -11,6 +11,12 @@ pub trait ObjectStore {
     fn put(&mut self, kind: Kind, body: &[u8]) -> Result<ObjectId, String>;
     fn get(&self, id: &ObjectId) -> Result<Option<(Kind, Vec<u8>)>, String>;
     fn has(&self, id: &ObjectId) -> bool;
+    /// metadata-only: the stored object's kind and BODY byte length without
+    /// reading the body. commit's execute-path chunk-length verification rides
+    /// this, so an implementation must answer from metadata (a map lookup, a
+    /// file stat + tag byte) — never a full body read on the consensus path.
+    /// `Ok(None)` = absent, sharply distinct from a corrupt `Err`.
+    fn stat(&self, id: &ObjectId) -> Result<Option<(Kind, u64)>, String>;
     fn remove(&mut self, id: &ObjectId) -> Result<(), String>;
     fn list(&self) -> Result<Vec<ObjectId>, String>;
 }
@@ -46,6 +52,13 @@ impl ObjectStore for MemStore {
 
     fn has(&self, id: &ObjectId) -> bool {
         self.objects.contains_key(id)
+    }
+
+    fn stat(&self, id: &ObjectId) -> Result<Option<(Kind, u64)>, String> {
+        Ok(self
+            .objects
+            .get(id)
+            .map(|(kind, body)| (*kind, body.len() as u64)))
     }
 
     fn remove(&mut self, id: &ObjectId) -> Result<(), String> {
@@ -107,6 +120,15 @@ mod tests {
         let absent = object_id(Kind::File, b"missing");
         assert!(!s.has(&absent));
         assert_eq!(s.get(&absent).unwrap(), None);
+    }
+
+    #[test]
+    fn stat_answers_kind_and_body_len_absent_is_none() {
+        let mut s = MemStore::new();
+        let id = s.put(Kind::Chunk, b"hello").unwrap();
+        assert_eq!(s.stat(&id).unwrap(), Some((Kind::Chunk, 5)));
+        let absent = object_id(Kind::Chunk, b"missing");
+        assert_eq!(s.stat(&absent).unwrap(), None);
     }
 
     #[test]

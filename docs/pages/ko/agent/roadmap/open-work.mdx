@@ -46,10 +46,22 @@ agent module은 존재하고 demo/test는 model output을 ordered op로 commit�
 worker set은 비어 있고, production genesis에는 `agent`가 없으며, live operator UX로
 tasks에 연결되어 있지 않다.
 
+## duckfs Client Stack
+
+duckfs Phase 1–2는 shipped다: 다시 만든 `files` module(staging, atomic
+per-path-CAS commit, snapshot, pin, watch, snapshot-addressed read),
+full possession까지 가는 resolver-backed state sync, restart durability, noded
+HTTP surface. 이것들을 missing으로 기록하면 안 된다. 아직 아무것도 mount하지
+않는다: checkout/commit engine(`duckfs-client`, `.duckfs/` index), CLI, FUSE
+mount, duckfs verb 위로 다시 만드는 app FilesView는 Phase 3–5이고 아직 open이다.
+`memory` module은 삭제되었다 — duckfs가 흡수했다(generation은 snapshot이 되고,
+`duck://memory/...`는 `duck://files/...`가 되었다). automations memory-watch
+trigger도 함께 제거되었다. filesystem-change automation은 migration이 아니라
+새 duckfs-watch trigger라는 fresh feature로 돌아온다.
+
 ## Module Integration Wave
 
 다음 module wave는 implementation 전에 design/spec work가 먼저다. automations가
-inbox `Deliver`를 emit하고, automations trigger source가 memory watch에서 오고, 64
-KiB를 넘는 memory body가 files manifest를 통해 이동하고, agent가 jobs를 claim하고,
-tasks가 deadline state, cure/escalation lineage, atomic cross-module creation을 갖춘
-obligation pattern이 되어야 한다.
+inbox `Deliver`를 emit하고, agent가 jobs를 claim하고, tasks가 deadline state,
+cure/escalation lineage, atomic cross-module creation을 갖춘 obligation
+pattern이 되어야 한다.

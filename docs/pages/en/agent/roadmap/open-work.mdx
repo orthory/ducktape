@@ -49,10 +49,23 @@ pattern. `bin/node`/`bin/noded` do not run an agent LLM worker yet: the node
 worker set is empty, production genesis does not include `agent`, and the path is
 not wired to tasks as live operator UX.
 
+## duckfs Client Stack
+
+duckfs Phases 1–2 are shipped: the rebuilt `files` module (staging, atomic
+per-path-CAS commits, snapshots, pins, watches, snapshot-addressed reads),
+resolver-backed state sync to full possession, restart durability, and the
+noded HTTP surface. Do not list those as missing. Nothing mounts it yet: the
+checkout/commit engine (`duckfs-client`, the `.duckfs/` index), the CLI, the
+FUSE mount, and the app FilesView rebuilt on duckfs verbs are Phases 3–5 and
+remain open. The `memory` module was deleted — absorbed by duckfs (generations
+became snapshots, `duck://memory/...` became `duck://files/...`). The
+automations memory-watch trigger was removed with it; filesystem-change
+automations would return as a new duckfs-watch trigger, a fresh feature, not a
+migration.
+
 ## Module Integration Wave
 
 The next module wave is design/spec work before implementation: automations
-deliver to inbox via `Deliver`; automations can trigger from memory watches;
-memory bodies over 64 KiB ride through files manifests; agents can claim jobs;
-and tasks can be modeled as obligations with deadline state, cure/escalation
-lineage, and atomic cross-module creation.
+deliver to inbox via `Deliver`; agents can claim jobs; and tasks can be modeled
+as obligations with deadline state, cure/escalation lineage, and atomic
+cross-module creation.

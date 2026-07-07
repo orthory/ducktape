@@ -294,3 +294,64 @@ fn chunk_len_rule() {
         "last-chunk remainder underflows"
     );
 }
+
+/// golden equality: each object kind encodes to exactly the hand-built byte
+/// image. object bodies are id preimages and cursors cross the wire, so the
+/// byte layout is a contract that must survive any internal codec refactor —
+/// this test pins it independently of the production encoder.
+#[test]
+fn encodings_match_the_hand_built_bytes() {
+    // FileObj: size u64 ‖ chunk count u32 ‖ ids ‖ meta count u16 ‖ k/v strings.
+    let f = FileObj {
+        size: 5,
+        chunks: vec![[7u8; 32]],
+        meta: [("kind".into(), "skill".into())].into(),
+    };
+    let mut want = 5u64.to_le_bytes().to_vec();
+    want.extend_from_slice(&1u32.to_le_bytes());
+    want.extend_from_slice(&[7u8; 32]);
+    want.extend_from_slice(&1u16.to_le_bytes());
+    push_str(&mut want, b"kind");
+    push_str(&mut want, b"skill");
+    assert_eq!(f.encode(), want, "FileObj byte layout drifted");
+
+    // TreeObj: entry count u32 ‖ (name ‖ kind u8 ‖ id ‖ exec u8 ‖ size u64)*.
+    let t = TreeObj {
+        entries: [(
+            "a.txt".to_string(),
+            TreeEntry {
+                kind: EntryKind::File,
+                id: [1; 32],
+                exec: true,
+                size: 5,
+            },
+        )]
+        .into(),
+    };
+    let mut want = 1u32.to_le_bytes().to_vec();
+    push_str(&mut want, b"a.txt");
+    want.push(0); // EntryKind::File tag
+    want.extend_from_slice(&[1u8; 32]);
+    want.push(1); // exec = true
+    want.extend_from_slice(&5u64.to_le_bytes());
+    assert_eq!(t.encode(), want, "TreeObj byte layout drifted");
+
+    // SnapshotObj: root ‖ parent flag(+id) ‖ author ‖ time u64 ‖ height u64 ‖
+    // message.
+    let s = SnapshotObj {
+        root: [2; 32],
+        parent: Some([3; 32]),
+        author: "ext:aa".into(),
+        consensus_time: 7,
+        height: 9,
+        message: "m".into(),
+    };
+    let mut want = [2u8; 32].to_vec();
+    want.push(1); // has_parent
+    want.extend_from_slice(&[3u8; 32]);
+    push_str(&mut want, b"ext:aa");
+    want.extend_from_slice(&7u64.to_le_bytes());
+    want.extend_from_slice(&9u64.to_le_bytes());
+    push_str(&mut want, b"m");
+    assert_eq!(s.encode(), want, "SnapshotObj byte layout drifted");
+}

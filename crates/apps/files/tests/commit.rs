@@ -773,3 +773,104 @@ fn stat_by_snapshot_resolves_root_none_and_bad_snapshot_errs() {
         "got {reply:?}"
     );
 }
+
+// ---- execute-time chunk-length verification ---------------------------------
+
+/// a referenced chunk's STORED length must satisfy the exact-length rule at
+/// commit (every chunk but the last exactly CHUNK_SIZE, the last exactly the
+/// remainder). without this an available digest of the wrong length would
+/// commit fine and only explode at read time — a committed-but-unreadable file.
+#[test]
+fn chunk_length_must_match_the_size_rule_at_commit() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    let c = b"hello".to_vec(); // a real 5-byte staged chunk
+    let c_hex = chunk_hex(&c);
+    putblob(&mut f, ext(b"u"), 1, &c).expect("stage");
+
+    // last-chunk lie: a size-3 file whose only chunk is actually 5 bytes.
+    let err = commit(
+        &mut f,
+        ext(b"u"),
+        1,
+        None,
+        vec![put_chunks("/shared/lie", 3, &[&c_hex])],
+    )
+    .expect_err("short size vs a longer stored chunk rejects");
+    assert!(
+        matches!(&err, sdk::Error::Module(m) if m.contains("chunk length")),
+        "got {err:?}"
+    );
+
+    // interior lie: size CHUNK_SIZE+1 needs chunk[0] == CHUNK_SIZE, got 5.
+    let err = commit(
+        &mut f,
+        ext(b"u"),
+        1,
+        None,
+        vec![put_chunks(
+            "/shared/lie2",
+            files::CHUNK_SIZE + 1,
+            &[&c_hex, &c_hex],
+        )],
+    )
+    .expect_err("a short interior chunk rejects");
+    assert!(
+        matches!(&err, sdk::Error::Module(m) if m.contains("chunk length")),
+        "got {err:?}"
+    );
+
+    // the honest size commits, and the earlier rejects left the block usable.
+    commit(
+        &mut f,
+        ext(b"u"),
+        1,
+        None,
+        vec![put_chunks("/shared/ok", 5, &[&c_hex])],
+    )
+    .expect("the honest size commits");
+    commit_block(&mut f);
+    assert_eq!(stat(&f, "/shared/ok", None).expect("present").size, 5);
+}
+
+/// a digest that names a durable NON-chunk object cannot pose as a chunk, even
+/// when its body length happens to match the size rule — the kind is checked,
+/// not just the byte count.
+#[test]
+fn a_non_chunk_object_cannot_pose_as_a_chunk() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    // block 1: an inline commit makes a FileObj durable in the odb.
+    commit(
+        &mut f,
+        ext(b"u"),
+        1,
+        None,
+        vec![put_inline("/shared/a", b"x")],
+    )
+    .expect("seed");
+    commit_block(&mut f);
+
+    // reconstruct that FileObj byte-for-byte and reference ITS id as a chunk
+    // digest, with the size chosen so the LENGTH rule alone would pass.
+    let fileobj = files::objects::FileObj {
+        size: 1,
+        chunks: vec![files::objects::object_id(files::Kind::Chunk, b"x")],
+        meta: BTreeMap::new(),
+    };
+    let body = fileobj.encode();
+    let hex = to_hex(&files::objects::object_id(files::Kind::File, &body));
+    let err = commit(
+        &mut f,
+        ext(b"u"),
+        2,
+        None,
+        vec![put_chunks("/shared/fake", body.len() as u64, &[&hex])],
+    )
+    .expect_err("a File object under a chunk reference rejects");
+    assert!(
+        matches!(&err, sdk::Error::Module(m) if m.contains("not a chunk")),
+        "got {err:?}"
+    );
+    abort_block(&mut f);
+}

@@ -245,3 +245,22 @@ fn duplicate_keys_reject() {
         "duplicate watch must reject"
     );
 }
+
+/// golden equality: `encode_refs` emits exactly the hand-built frame. the refs
+/// image is the root preimage and the snapshot-lane payload, so its byte
+/// layout is a contract that must survive any internal codec refactor — this
+/// test pins it independently of the production encoder.
+#[test]
+fn encode_matches_the_hand_built_frame() {
+    let enc = encode_refs(&populated());
+    // pins ascend by name, staging by digest, watches by tuple — the orders
+    // the decoder re-checks.
+    let want = frame(
+        Some([1; 32]),
+        &[[2; 32], [3; 32]],
+        &[("alpha", [5; 32], "kv"), ("beta", [4; 32], "ext:aa")],
+        &[([6; 32], "chat", 20, 200), ([7; 32], "ext:bb", 10, 100)],
+        &[("home/kv", "kv"), ("shared", "chat")],
+    );
+    assert_eq!(enc, want, "refs byte layout drifted");
+}

@@ -258,7 +258,7 @@ fn mark_chunk(
         return Ok(());
     }
     if !store.has(id) {
-        return Err(format!("gc: root object missing: {}", to_hex(id)));
+        return Err(format!("files: gc: root object missing: {}", to_hex(id)));
     }
     Ok(())
 }
@@ -269,11 +269,11 @@ fn mark_chunk(
 /// sweeps nothing.
 fn fetch(store: &dyn ObjectStore, id: &ObjectId, expected: Kind) -> Result<Vec<u8>, String> {
     match store.get(id)? {
-        None => Err(format!("gc: root object missing: {}", to_hex(id))),
+        None => Err(format!("files: gc: root object missing: {}", to_hex(id))),
         Some((kind, body)) => {
             if kind != expected {
                 return Err(format!(
-                    "gc: corrupt object graph: {} is not a {:?}",
+                    "files: gc: corrupt object graph: {} is not a {:?}",
                     to_hex(id),
                     expected
                 ));
