@@ -27,8 +27,8 @@
 //! mixed v1/v2 handshake cannot be spawned here. The structurally-load-bearing
 //! property it would assert — version gating rides the app/consensus payload, not
 //! the p2p handshake namespace `sha256(scheme ‖ validators)` — is covered by the
-//! design doc (`docs/superpowers/plans/2026-07-04-no-downtime-node-upgrade-plan.md`,
-//! Phase 9 `upgrade_mixed_binary_no_partition`) and by the below-`H` byte-identical
+//! design doc (`docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md`)
+//! and by the below-`H` byte-identical
 //! inertness the forge unit tests prove.
 
 mod common;

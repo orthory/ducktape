@@ -21,12 +21,22 @@ import {
 } from "../../../domain/forge-git-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { CodeView } from "./CodeView";
+import { fileIcon } from "./file-icons";
+import { MarkdownPreview } from "./MarkdownPreview";
 import { opKey } from "../../store/finalization";
 import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 
 type ForgeTab = "code" | "commits";
+
+// remark parses markdown synchronously on the main thread and is superlinear on
+// long flat lists, so a very large .md/.mdx doc would freeze the webview. Above
+// this size we don't offer the rendered preview — the file still shows as Raw
+// text (mirrors CodeView's own highlight cap). Untrusted repo content, so this
+// is a guard, not just a nicety.
+const MARKDOWN_PREVIEW_MAX_BYTES = 200_000;
 
 interface TreeRow {
   path: string;
@@ -123,6 +133,9 @@ export function ForgeView() {
 
   const fileRequestRef = useRef(0);
   const dirTokenRef = useRef(0);
+  // the repo the tree/file readers target — the real on-disk name of the
+  // currently-opened repo, so lazy dir/file loads read the right repo.
+  const activeRepoRef = useRef<string | null>(null);
 
   const selectedRepo = useMemo(
     () => repos?.find((repo) => repo.id === selectedRepoId) ?? null,
@@ -131,12 +144,14 @@ export function ForgeView() {
   const displayHead = localHead ?? selectedRepo?.head ?? state.forgeHead;
 
   const loadFile = useCallback((filePath: string) => {
+    const repo = activeRepoRef.current;
+    if (!repo) return;
     const req = ++fileRequestRef.current;
     setSelected(filePath);
     setFileText(null);
     setFileError(null);
     setFileLoading(true);
-    forgeReadFile(filePath)
+    forgeReadFile(repo, filePath)
       .then((text) => {
         if (fileRequestRef.current !== req) return;
         setFileText(text);
@@ -151,8 +166,10 @@ export function ForgeView() {
   }, []);
 
   const loadDir = useCallback((dir: string) => {
+    const repo = activeRepoRef.current;
+    if (!repo) return;
     const token = dirTokenRef.current;
-    forgeTree(dir)
+    forgeTree(repo, dir)
       .then((entries) => {
         if (dirTokenRef.current !== token) return;
         setTreeCache((cache) => ({ ...cache, [dir]: entries }));
@@ -199,6 +216,7 @@ export function ForgeView() {
     const token = dirTokenRef.current + 1;
     dirTokenRef.current = token;
     fileRequestRef.current += 1;
+    activeRepoRef.current = selectedRepo.name;
     setRootLoading(true);
     setLocalHead(selectedRepo.head);
     setTreeError(null);
@@ -217,7 +235,11 @@ export function ForgeView() {
       };
     }
 
-    Promise.allSettled([readLocalHead(), forgeTree(""), forgeLog(32)])
+    Promise.allSettled([
+      readLocalHead(selectedRepo.name),
+      forgeTree(selectedRepo.name, ""),
+      forgeLog(selectedRepo.name),
+    ])
       .then(([headResult, treeResult, logResult]) => {
         if (!alive || dirTokenRef.current !== token) return;
         if (headResult.status === "fulfilled") setLocalHead(headResult.value);
@@ -462,7 +484,6 @@ function RepoListing({
   onSelectFile: (path: string) => void;
 }) {
   const latest = commits[0] ?? null;
-  const lines = fileText !== null ? fileText.split("\n") : [];
 
   return (
     <>
@@ -533,7 +554,6 @@ function RepoListing({
             fileLoading={fileLoading}
             fileError={fileError}
             fileText={fileText}
-            lines={lines}
             repoName={repo.name}
             onToggleDir={onToggleDir}
             onSelectFile={onSelectFile}
@@ -557,7 +577,6 @@ function CodeBrowser({
   fileLoading,
   fileError,
   fileText,
-  lines,
   repoName,
   onToggleDir,
   onSelectFile,
@@ -570,7 +589,6 @@ function CodeBrowser({
   fileLoading: boolean;
   fileError: string | null;
   fileText: string | null;
-  lines: string[];
   repoName: string;
   onToggleDir: (dir: string) => void;
   onSelectFile: (path: string) => void;
@@ -592,7 +610,6 @@ function CodeBrowser({
         loading={fileLoading}
         error={fileError}
         text={fileText}
-        lines={lines}
       />
     </div>
   );
@@ -654,6 +671,7 @@ function TreeButton({
 }) {
   const [hover, setHover] = useState(false);
   const indent = 13 + row.depth * 15;
+  const fi = row.isDir ? null : fileIcon(row.name);
   return (
     <button
       type="button"
@@ -685,7 +703,11 @@ function TreeButton({
       ) : (
         <span style={{ width: 11, flexShrink: 0 }} />
       )}
-      <Icon name={row.isDir ? "modules" : "document"} size={13} color={row.isDir ? color.accent : color.iconIdle} />
+      {row.isDir ? (
+        <Icon name="modules" size={13} color={color.accent} />
+      ) : (
+        <Icon name={fi!.icon} size={13} color={fi!.color} strokeWidth={1.7} />
+      )}
       <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{row.name}</span>
     </button>
   );
@@ -698,7 +720,6 @@ function FileViewer({
   loading,
   error,
   text,
-  lines,
 }: {
   repoName: string;
   selected: string | null;
@@ -706,9 +727,13 @@ function FileViewer({
   loading: boolean;
   error: string | null;
   text: string | null;
-  lines: string[];
 }) {
+  const [mdMode, setMdMode] = useState<"preview" | "raw">("preview");
   const title = selected ? `${repoName}/${selected}` : "Select a file";
+  const isMarkdown = selected !== null && /\.mdx?$/i.test(selected);
+  const canPreview = isMarkdown && text !== null && text.length <= MARKDOWN_PREVIEW_MAX_BYTES;
+  const showPreview = canPreview && mdMode === "preview";
+
   return (
     <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", background: color.paper }}>
       <div
@@ -734,63 +759,66 @@ function FileViewer({
         >
           {title}
         </span>
-        {latest && (
-          <span
-            title={latest.id}
-            style={{
-              marginLeft: "auto",
-              minWidth: 0,
-              font: `400 10px ${font.mono}`,
-              color: color.muted2,
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-            }}
-          >
-            {[latest.summary, latest.author, relTime(latest.time)].filter(Boolean).join(" · ")}
-          </span>
-        )}
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+          {canPreview && (
+            <div style={{ display: "flex", flexShrink: 0, border: `1px solid ${color.border}`, borderRadius: radius.sm, overflow: "hidden" }}>
+              <SegButton label="Preview" active={mdMode === "preview"} onClick={() => setMdMode("preview")} />
+              <SegButton label="Raw" active={mdMode === "raw"} onClick={() => setMdMode("raw")} />
+            </div>
+          )}
+          {latest && (
+            <span
+              title={latest.id}
+              style={{
+                minWidth: 0,
+                font: `400 10px ${font.mono}`,
+                color: color.muted2,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {[latest.summary, latest.author, relTime(latest.time)].filter(Boolean).join(" · ")}
+            </span>
+          )}
+        </div>
       </div>
       <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
         {loading && <CenterNote title="Loading file..." />}
         {error && <ErrorNote message={error} padded />}
-        {!loading && !error && text !== null && (
-          <div style={{ minWidth: "max-content", padding: "8px 0 20px" }}>
-            {lines.map((line, index) => (
-              <div
-                key={index}
-                style={{
-                  display: "flex",
-                  font: `400 12px ${font.mono}`,
-                  lineHeight: 1.65,
-                  minWidth: "max-content",
-                }}
-              >
-                <span
-                  style={{
-                    width: 48,
-                    flexShrink: 0,
-                    textAlign: "right",
-                    paddingRight: 12,
-                    color: color.iconIdle,
-                    userSelect: "none",
-                    background: color.sidebar,
-                  }}
-                >
-                  {index + 1}
-                </span>
-                <span style={{ flex: 1, whiteSpace: "pre", color: color.inkSoft, paddingLeft: 13, paddingRight: 24 }}>
-                  {line || " "}
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
+        {!loading && !error && text !== null ? (
+          showPreview ? (
+            <MarkdownPreview text={text} />
+          ) : (
+            <CodeView text={text} filename={selected} />
+          )
+        ) : null}
         {!loading && !error && text === null && (
           <CenterNote title={selected ? selected.split("/").pop() || selected : "Select a file"} />
         )}
       </div>
     </div>
+  );
+}
+
+function SegButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        all: "unset",
+        cursor: "pointer",
+        padding: "3px 9px",
+        font: `600 10px ${font.mono}`,
+        letterSpacing: ".04em",
+        textTransform: "uppercase",
+        color: active ? color.ink : color.muted2,
+        background: active ? color.panel : "transparent",
+      }}
+    >
+      {label}
+    </button>
   );
 }
 

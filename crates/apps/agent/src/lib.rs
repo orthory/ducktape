@@ -62,12 +62,10 @@ struct AgentState {
     /// WHAT the run needs; how it executes (binary, flags, model) is host
     /// policy in each provider's spec, invisible to consensus.
     capability: String,
-    /// sha256 of the prompt content (exactly [`PROMPT_HASH_LEN`] bytes).
+    /// sha256 of the prompt content (exactly [`PROMPT_HASH_LEN`] bytes); the
+    /// content is content-addressed in the blob store under this digest and
+    /// resolved host-side, so consensus pins only the hash.
     prompt_hash: Vec<u8>,
-    /// the document module doc holding the prompt content; its canonical
-    /// rendering must hash to `prompt_hash` (verified by the runs module at
-    /// dispatch time).
-    prompt_doc: Option<String>,
     /// granted action names from the known vocabulary, deduped and sorted.
     allowed_actions: BTreeSet<String>,
     /// false = paused: the agent never engages new runs.
@@ -87,16 +85,6 @@ struct AgentState {
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
     out.extend_from_slice(bytes);
-}
-
-fn put_opt_string(out: &mut Vec<u8>, opt: &Option<String>) {
-    match opt {
-        None => out.push(0),
-        Some(value) => {
-            out.push(1);
-            put_bytes(out, value.as_bytes());
-        }
-    }
 }
 
 fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
@@ -122,7 +110,6 @@ fn encode_committed(agents: &BTreeMap<String, AgentState>) -> Vec<u8> {
         put_bytes(&mut out, a.display_name.as_bytes());
         put_bytes(&mut out, a.capability.as_bytes());
         put_bytes(&mut out, &a.prompt_hash);
-        put_opt_string(&mut out, &a.prompt_doc);
         out.extend_from_slice(&(a.allowed_actions.len() as u64).to_le_bytes());
         for action in &a.allowed_actions {
             put_bytes(&mut out, action.as_bytes());
@@ -185,14 +172,6 @@ fn take_lp_string(buf: &mut &[u8]) -> Result<String, String> {
         .to_owned())
 }
 
-fn take_opt_string(buf: &mut &[u8]) -> Result<Option<String>, String> {
-    match take(buf, 1)?[0] {
-        0 => Ok(None),
-        1 => Ok(Some(take_lp_string(buf)?)),
-        t => Err(format!("snapshot has unknown option tag {t}")),
-    }
-}
-
 fn take_origin(buf: &mut &[u8]) -> Result<SagaOrigin, String> {
     match take(buf, 1)?[0] {
         0 => Ok(SagaOrigin::External(take_lp_bytes(buf)?)),
@@ -235,7 +214,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
     // per-entry minimum size: an agent costs its id prefix, one origin
     // discriminant, three length prefixes, a prompt-doc tag, an action
     // count, a status byte, and two u64s.
-    const MIN_AGENT_BYTES: u64 = 8 + 1 + 8 + 8 + 8 + 1 + 8 + 1 + 8 + 8;
+    const MIN_AGENT_BYTES: u64 = 8 + 1 + 8 + 8 + 8 + 8 + 1 + 8 + 8;
 
     let mut agents: BTreeMap<String, AgentState> = BTreeMap::new();
     let count = take_count(&mut buf, MIN_AGENT_BYTES, "agent")?;
@@ -248,7 +227,6 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
         let display_name = take_lp_string(&mut buf)?;
         let capability = take_lp_string(&mut buf)?;
         let prompt_hash = take_lp_bytes(&mut buf)?;
-        let prompt_doc = take_opt_string(&mut buf)?;
         let mut allowed_actions: BTreeSet<String> = BTreeSet::new();
         let actions = take_count(&mut buf, 8, "action")?;
         for _ in 0..actions {
@@ -275,7 +253,6 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
                 display_name,
                 capability,
                 prompt_hash,
-                prompt_doc,
                 allowed_actions,
                 active,
                 created_at,
@@ -364,7 +341,6 @@ impl AgentModule {
             display_name: a.display_name.clone(),
             capability: a.capability.clone(),
             prompt_hash: a.prompt_hash.clone(),
-            prompt_doc: a.prompt_doc.clone(),
             allowed_actions: a.allowed_actions.iter().cloned().collect(),
             status: if a.active {
                 AgentStatus::Active
@@ -479,7 +455,6 @@ impl AgentModule {
                 display_name,
                 capability,
                 prompt_hash,
-                prompt_doc,
                 allowed_actions,
             } => {
                 let owner = Self::admin_origin(&ctx.env().origin)?;
@@ -492,9 +467,6 @@ impl AgentModule {
                 Self::validate_non_empty("display_name", &display_name)?;
                 validate_tag(&capability).map_err(Error::Module)?;
                 Self::validate_prompt_hash(&prompt_hash)?;
-                if let Some(doc_id) = &prompt_doc {
-                    Self::validate_non_empty("prompt_doc", doc_id)?;
-                }
                 let allowed_actions = Self::validate_actions(allowed_actions)?;
                 if self.agent(&agent_id).is_some() {
                     return Err(Error::Module(format!("agent already exists: {agent_id}")));
@@ -504,7 +476,6 @@ impl AgentModule {
                     display_name,
                     capability: capability.clone(),
                     prompt_hash,
-                    prompt_doc,
                     allowed_actions,
                     active: true,
                     created_at: now,
@@ -529,7 +500,6 @@ impl AgentModule {
                 display_name,
                 capability,
                 prompt_hash,
-                prompt_doc,
                 allowed_actions,
             } => {
                 let mut state = self.owned_agent(&*ctx, &agent_id)?.clone();
@@ -555,10 +525,6 @@ impl AgentModule {
                 if let Some(prompt_hash) = prompt_hash {
                     Self::validate_prompt_hash(&prompt_hash)?;
                     state.prompt_hash = prompt_hash;
-                }
-                if let Some(doc_id) = prompt_doc {
-                    Self::validate_non_empty("prompt_doc", &doc_id)?;
-                    state.prompt_doc = Some(doc_id);
                 }
                 if let Some(allowed_actions) = allowed_actions {
                     state.allowed_actions = Self::validate_actions(allowed_actions)?;
@@ -778,7 +744,6 @@ mod tests {
             display_name: agent_id.to_uppercase(),
             capability: "model-1".into(),
             prompt_hash: vec![7u8; PROMPT_HASH_LEN],
-            prompt_doc: None,
             allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -879,7 +844,6 @@ mod tests {
                     display_name: "A".into(),
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 31],
-                    prompt_doc: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -891,7 +855,6 @@ mod tests {
                     display_name: "A".into(),
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
-                    prompt_doc: None,
                     allowed_actions: vec!["forge.push".into()],
                 },
             ),
@@ -903,7 +866,6 @@ mod tests {
                     display_name: "A".into(),
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
-                    prompt_doc: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -914,7 +876,6 @@ mod tests {
                     display_name: "A".into(),
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
-                    prompt_doc: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -925,7 +886,6 @@ mod tests {
                     display_name: "A".into(),
                     capability: String::new(),
                     prompt_hash: vec![7u8; 32],
-                    prompt_doc: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -937,7 +897,6 @@ mod tests {
                     display_name: "x".repeat(MAX_AGENT_RECORD_BYTES),
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
-                    prompt_doc: None,
                     allowed_actions: Vec::new(),
                 },
             ),
@@ -969,7 +928,6 @@ mod tests {
                 display_name: Some("Stolen".into()),
                 capability: None,
                 prompt_hash: None,
-                prompt_doc: None,
                 allowed_actions: None,
             },
             AgentMsg::PauseAgent {
@@ -995,7 +953,6 @@ mod tests {
                 display_name: None,
                 capability: Some("model-2".into()),
                 prompt_hash: None,
-                prompt_doc: None,
                 allowed_actions: Some(vec![ACTION_TASKS_CREATE.into()]),
             }),
         )
@@ -1038,7 +995,6 @@ mod tests {
                 display_name: Some("Bot".into()),
                 capability: Some("model-2".into()),
                 prompt_hash: None,
-                prompt_doc: None,
                 allowed_actions: None,
             }),
         )
@@ -1148,7 +1104,6 @@ mod tests {
                     display_name: None,
                     capability: Some("model-2".into()),
                     prompt_hash: None,
-                    prompt_doc: Some("doc-1".into()),
                     allowed_actions: None,
                 },
             ),

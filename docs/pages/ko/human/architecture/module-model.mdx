@@ -17,6 +17,40 @@ shape는 CosmWasm과 비슷하지만, 현재 구현은 Wasm이 아니라 native 
 - `Module`은 `id`, `root`, `execute`, read projection, `commit_block`,
   `abort_block`을 제공한다.
 
+## Lifecycle
+
+module lifecycle은 genesis registration에서 committed state transition까지 이어지는
+host-owned 경로다. Ducktape에는 아직 runtime install/enable/disable row가 없다.
+genesis에 등록된 module은 모두 active이고, module set 변경은 새 genesis 또는
+coordinated upgrade의 영역이다.
+
+운영 lifecycle은 다음 순서다.
+
+1. **Register.** genesis가 module instance를 안정적인 `ModuleId` 아래에 wiring한다.
+   초기 `root()`는 첫 global app-hash에 포함된다.
+2. **Read committed state.** block 사이에서 `query`, `query_with`, `serve_sync`,
+   `state_sync_handle`은 committed state만 설명하거나 읽는다. staged write를
+   관측하면 안 된다.
+3. **Execute and stage.** agreed `Msg`마다 host가 deterministic `Env`와 `Ctx`를
+   넘겨 `execute`를 호출한다. module은 payload를 검증하고, 자기 substrate를 읽고,
+   host에 read-only projection을 요청할 수 있으며, durable write는 private overlay에
+   stage한다.
+4. **Drain follow-ups.** emit된 `Msg`는 host queue에 들어가 같은 block 안에서 local
+   follow-up으로 나중에 dispatch된다. 이것이 module boundary를 넘는 유일한 write
+   path다.
+5. **Close the block.** drain이 clean하게 끝나면 host는 touched module마다 registry
+   order로 `commit_block`을 한 번 호출한다. 반환 후 `root()`는 staged write를
+   포함해야 한다. dispatch가 reject되거나 dispatch budget을 초과하면 host는 touched
+   module에 `abort_block`을 호출하고 실패한 block은 root를 바꾸지 않는다.
+6. **Serve finalized state.** finalized boundary에서 node는 각 module의 committed
+   sync surface를 capture하거나 serve할 수 있다. snapshot module은 install 가능한
+   bytes를 내보내고, resolver-backed module은 committed root로 검증되는
+   backend-specific path를 노출한다.
+
+`commit_block` 또는 `abort_block` 내부 failure는 deterministic rejected operation이
+아니다. node-local boundary fault이므로, registry가 peer와 달라졌을 수 있어 node는
+block 적용을 멈춰야 한다.
+
 ## State Ownership
 
 각 module은 자기 작업에 맞는 state substrate를 고른다.

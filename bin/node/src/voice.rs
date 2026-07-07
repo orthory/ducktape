@@ -1,10 +1,14 @@
-//! The node's live-voice runtime: the bridge between huddle websockets
-//! (`noded`'s `/v1/voice/ws`), the chat voice engine, and the p2p mesh.
+//! The node's live-call runtime: the bridge between huddle websockets
+//! (`noded`'s `/v1/call/ws` typed audio+video+control socket), the chat voice
+//! engine + video wire, and the p2p mesh.
 //!
 //! Runtime shape mirrors the reachability plane's split exactly: the hub runs
 //! on its OWN plain-tokio OS thread (the engine's pump and the 20 ms playout
 //! tick are tokio-native), and mesh I/O crosses to the commonware runner over
-//! two channel pumps `main.rs` owns on the dedicated `CHANNEL_VOICE` lane.
+//! channel pumps `main.rs` owns on two dedicated lanes: audio and call control
+//! ride `CHANNEL_VOICE`, camera video rides `CHANNEL_VIDEO` so a keyframe burst
+//! can't queue ahead of voice. Each datagram still carries the plane's
+//! per-(service, flow) header, which demultiplexes the flows within a lane.
 //!
 //! Three pieces, all off-consensus:
 //! - [`ChannelTransport`] — a datagram-only [`DataPlaneTransport`] arm over
@@ -13,59 +17,98 @@
 //!   trades head-of-line latency (absorbed by the engine's jitter buffer) for
 //!   zero new infrastructure, and swaps out later behind the same trait
 //!   without touching the engine.
-//! - An [`AdmissionPolicy`] over the node's ACTIVE sessions: this node
-//!   receives (and emits) voice only for flows its own operator has a live
-//!   huddle websocket on. The mesh already authenticates every peer as a
-//!   workspace member; roster-level gating is the client's job (it steers the
-//!   fan-out from consensus state), and unadmitted traffic drops counted at
-//!   the plane per its default-deny contract.
-//! - The hub loop — drains [`noded::VoiceSessionRequest`]s from the app
+//! - An [`AdmissionPolicy`] over the node's ACTIVE flows, now keyed by
+//!   `(Service, FlowId)`: this node receives (and emits) call media only for
+//!   flows its own operator has a live huddle session on — the mic and control
+//!   flows on `Service::Voice`, the camera flow on `Service::Video`. The mesh
+//!   already authenticates every peer as a workspace member; roster-level
+//!   gating is the client's job (it steers the fan-out from consensus state),
+//!   and unadmitted traffic drops counted at the plane per its default-deny
+//!   contract.
+//! - The hub loop — drains [`noded::CallSessionRequest`]s from the app
 //!   surface and runs AT MOST ONE session at a time (Slack semantics: you are
 //!   in one huddle). A session owns a [`VoiceEngine`] on the channel-derived
-//!   flow and pumps: websocket pcm in → encode + fan-out; a 20 ms tick →
-//!   mixed playout → websocket out. Dropping either websocket end tears the
-//!   session down; a new request replaces the current session.
+//!   audio flow plus datagram flows for camera video and call control, and
+//!   pumps: websocket pcm in → encode + fan-out; a 20 ms tick → mixed playout
+//!   → websocket out; captured camera frames → fragment + fan-out; inbound
+//!   fragments → reassemble → webview; and the call-control machinery
+//!   (keyframe requests, 1 Hz presence beacons, the sender/receiver bitrate
+//!   ladder). Dropping the webview ends tears the session down; a new request
+//!   replaces the current session.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chat::voice::{FRAME_MILLIS, FRAME_SAMPLES, VoiceConfig, VoiceEngine};
 use data_plane::{
-    AdmissionPolicy, DataPlane, DataPlaneTransport, DatagramPolicy, FlowId, PeerId, PlaneConfig,
-    Service, TransportError,
+    AdmissionPolicy, DataPlane, DataPlaneTransport, DatagramFlow, DatagramPolicy, FlowId, PeerId,
+    PlaneConfig, Service, TransportError,
 };
 use tokio::sync::{mpsc, watch};
 
-/// One voice datagram crossing the mesh pumps: (raw ed25519 peer key, frame).
+/// One call datagram crossing the mesh pumps: (raw ed25519 peer key, frame).
 /// Outbound the key names the recipient; inbound it is the authenticated
-/// sender the mesh reports.
+/// sender the mesh reports. The frame carries the plane's `(service, flow)`
+/// header; [`ChannelTransport`] routes each outbound datagram to the voice or
+/// video mesh lane by that header's service byte.
 pub type VoiceDatagram = ([u8; 32], Vec<u8>);
 
-/// Mesh-pump lane depth: ~5 s of one speaker's frames. Voice is
+/// Voice mesh-pump lane depth: ~5 s of one speaker's frames. Call media is
 /// fire-and-forget, so overflow drops rather than backpressures.
 const WIRE_LANE: usize = 256;
-/// Inbound datagram queue per flow: ~2.5 s of one speaker's frames. Overflow
+/// Video mesh-pump lane depth: ~4 keyframes of fragments. Its own outbound
+/// lane so a keyframe burst can't queue ahead of voice.
+const VIDEO_WIRE_LANE: usize = 512;
+/// Inbound audio queue per flow: ~2.5 s of one speaker's frames. Overflow
 /// drops the oldest inside the flow (the plane's drop-oldest contract).
 const FLOW_QUEUE: usize = 128;
+/// Inbound camera queue per flow: ~2 keyframe-burst frames of fragments.
+const VIDEO_FLOW_QUEUE: usize = 256;
+/// Inbound call-control queue per flow: tiny, one message per event.
+const CTL_FLOW_QUEUE: usize = 32;
 /// Webview↔hub pcm lanes: a small cushion (8 × 20 ms); late audio is dead
 /// audio, so both sides drop rather than backpressure when it fills.
 const PCM_LANE: usize = 8;
+/// Webview↔hub video lanes: frames (not fragments) — ~1 s at 30 fps.
+const VIDEO_LANE: usize = 32;
+/// Webview↔hub call-control lanes.
+const CTL_LANE: usize = 32;
 
-/// derive the voice flow for a chat channel — the exact domain string both
+/// derive the audio flow for a chat channel — the exact domain string both
 /// ends agree on (every participant derives it from the same channel id).
 fn channel_flow(channel_id: &str) -> FlowId {
     FlowId::derive(format!("voice-channel:{channel_id}").as_bytes())
 }
 
-/// Stand up the voice runtime on its own OS thread and return the mesh ends:
-/// `main.rs` drains the outbound receiver into the `CHANNEL_VOICE` sender and
-/// feeds mesh receipts into the inbound sender. `requests` is the app
-/// surface's session lane ([`noded::NodeHandle::with_voice`]).
+/// the camera flow for a chat channel (Service::Video).
+fn video_flow(channel_id: &str) -> FlowId {
+    FlowId::derive(format!("video-channel:{channel_id}").as_bytes())
+}
+
+/// the call-control flow (Service::Voice — control must work in an
+/// audio-only build, ADR §2).
+fn ctl_flow(channel_id: &str) -> FlowId {
+    FlowId::derive(format!("callctl-channel:{channel_id}").as_bytes())
+}
+
+/// Stand up the call runtime on its own OS thread and return the mesh ends:
+/// `main.rs` drains the voice outbound receiver into the `CHANNEL_VOICE`
+/// sender and the video outbound receiver into the `CHANNEL_VIDEO` sender, and
+/// feeds mesh receipts from both lanes into the one inbound sender.
+/// [`ChannelTransport`] routes each datagram to a lane by its plane header's
+/// service byte (`frame[1]`); audio and call control ride voice, camera video
+/// rides video. `requests` is the app surface's session lane
+/// ([`noded::NodeHandle::with_call`]).
 pub fn spawn_hub(
-    requests: mpsc::Receiver<noded::VoiceSessionRequest>,
-) -> (mpsc::Receiver<VoiceDatagram>, mpsc::Sender<VoiceDatagram>) {
-    let (outbound_tx, outbound_rx) = mpsc::channel(WIRE_LANE);
+    requests: mpsc::Receiver<noded::CallSessionRequest>,
+) -> (
+    mpsc::Receiver<VoiceDatagram>,
+    mpsc::Receiver<VoiceDatagram>,
+    mpsc::Sender<VoiceDatagram>,
+) {
+    let (outbound_voice_tx, outbound_voice_rx) = mpsc::channel(WIRE_LANE);
+    let (outbound_video_tx, outbound_video_rx) = mpsc::channel(VIDEO_WIRE_LANE);
     let (inbound_tx, inbound_rx) = mpsc::channel(WIRE_LANE);
     std::thread::Builder::new()
         .name("voice-hub".into())
@@ -75,17 +118,23 @@ pub fn spawn_hub(
                 .enable_all()
                 .build()
                 .expect("voice-hub tokio runtime")
-                .block_on(hub_loop(requests, outbound_tx, inbound_rx));
+                .block_on(hub_loop(
+                    requests,
+                    outbound_voice_tx,
+                    outbound_video_tx,
+                    inbound_rx,
+                ));
         })
         .expect("spawn voice-hub thread");
-    (outbound_rx, inbound_tx)
+    (outbound_voice_rx, outbound_video_rx, inbound_tx)
 }
 
-/// The datagram-only transport arm over the mesh pump channels. Voice never
-/// opens streams, so the stream half reports [`TransportError::Closed`] — the
-/// plane's acceptor loop exits immediately and `connect` refuses.
+/// The datagram-only transport arm over the mesh pump channels. Call media
+/// never opens streams, so the stream half reports [`TransportError::Closed`]
+/// — the plane's acceptor loop exits immediately and `connect` refuses.
 struct ChannelTransport {
-    outbound: mpsc::Sender<VoiceDatagram>,
+    outbound_voice: mpsc::Sender<VoiceDatagram>,
+    outbound_video: mpsc::Sender<VoiceDatagram>,
     inbound: tokio::sync::Mutex<mpsc::Receiver<VoiceDatagram>>,
 }
 
@@ -98,8 +147,16 @@ impl DataPlaneTransport for ChannelTransport {
 
     async fn send_datagram(&self, to: PeerId, frame: Vec<u8>) -> Result<(), TransportError> {
         // fire-and-forget per the trait: a full pump lane drops the frame —
-        // voice retries nothing, the jitter buffer renders the gap.
-        let _ = self.outbound.try_send((to.0, frame));
+        // call media retries nothing, the jitter buffer / next keyframe
+        // renders the gap.
+        // route by the plane header's service byte: video fragments ride
+        // their own mesh lane so a keyframe burst can't queue ahead of voice.
+        let lane = if frame.get(1) == Some(&(Service::Video as u8)) {
+            &self.outbound_video
+        } else {
+            &self.outbound_voice
+        };
+        let _ = lane.try_send((to.0, frame));
         Ok(())
     }
 
@@ -119,59 +176,66 @@ impl DataPlaneTransport for ChannelTransport {
     }
 }
 
-/// The flows this node's operator is live on. Shared between the plane's
-/// admission checks (per datagram) and the hub (session open/close).
+/// The `(service, flow)` pairs this node's operator is live on. Shared between
+/// the plane's admission checks (per datagram) and the hub (session
+/// open/close). A session admits three: mic + control on `Service::Voice`,
+/// camera on `Service::Video`.
 #[derive(Default)]
-struct ActiveFlows(Mutex<HashSet<FlowId>>);
+struct ActiveFlows(Mutex<HashSet<(Service, FlowId)>>);
 
 impl ActiveFlows {
-    fn insert(&self, flow: FlowId) {
-        self.0.lock().expect("flows lock").insert(flow);
+    fn insert(&self, key: (Service, FlowId)) {
+        self.0.lock().expect("flows lock").insert(key);
     }
 
-    fn remove(&self, flow: &FlowId) {
-        self.0.lock().expect("flows lock").remove(flow);
+    fn remove(&self, key: &(Service, FlowId)) {
+        self.0.lock().expect("flows lock").remove(key);
     }
 }
 
 impl AdmissionPolicy for ActiveFlows {
     fn permits(&self, _peer: PeerId, service: Service, flow: FlowId) -> bool {
-        service == Service::Voice && self.0.lock().expect("flows lock").contains(&flow)
+        self.0.lock().expect("flows lock").contains(&(service, flow))
     }
 }
 
-/// One live session's teardown handle: aborting the task drops the engine,
-/// which aborts its pump and releases the flow registration.
+/// One live session's teardown handle: aborting the task drops the engine and
+/// the video/control flow handles, releasing their plane registrations.
 struct SessionGuard {
     task: tokio::task::JoinHandle<()>,
-    flow: FlowId,
+    /// the three `(service, flow)` admissions this session opened.
+    registered: [(Service, FlowId); 3],
     flows: Arc<ActiveFlows>,
 }
 
 impl SessionGuard {
     /// end the session and WAIT for its state to drop, so the next session
-    /// for the same channel can re-register the flow without racing.
+    /// for the same channel can re-register the flows without racing.
     async fn teardown(self) {
         self.task.abort();
         let _ = self.task.await;
-        self.flows.remove(&self.flow);
+        for key in &self.registered {
+            self.flows.remove(key);
+        }
     }
 }
 
 async fn hub_loop(
-    mut requests: mpsc::Receiver<noded::VoiceSessionRequest>,
-    outbound: mpsc::Sender<VoiceDatagram>,
+    mut requests: mpsc::Receiver<noded::CallSessionRequest>,
+    outbound_voice: mpsc::Sender<VoiceDatagram>,
+    outbound_video: mpsc::Sender<VoiceDatagram>,
     inbound: mpsc::Receiver<VoiceDatagram>,
 ) {
     let flows = Arc::new(ActiveFlows::default());
     let plane = DataPlane::new(
         ChannelTransport {
-            outbound,
+            outbound_voice,
+            outbound_video,
             inbound: tokio::sync::Mutex::new(inbound),
         },
         flows.clone() as Arc<dyn AdmissionPolicy>,
-        // stream-class pacing config; voice runs no streams, so these only
-        // need to exist.
+        // stream-class pacing config; call media runs no streams, so these
+        // only need to exist.
         PlaneConfig {
             bulk_bytes_per_sec: 1 << 20,
             bulk_burst_bytes: 1 << 20,
@@ -204,76 +268,183 @@ async fn hub_loop(
     }
 }
 
-async fn open_session<T: DataPlaneTransport>(
+/// register one datagram flow, retrying the ~1 s window a torn-down
+/// predecessor needs to release it. a same-channel rejoin can transiently
+/// collide because the previous session's engine/flow handles release their
+/// plane registration asynchronously (task abort), so retry instead of
+/// refusing the join. a loaded runtime can take a while to actually drop the
+/// aborted pump — 40 × 25 ms ≈ 1 s.
+async fn register_datagram_flow<T: DataPlaneTransport>(
     plane: &DataPlane<T>,
-    flows: &Arc<ActiveFlows>,
+    service: Service,
+    flow: FlowId,
+    max_queued: usize,
     channel_id: &str,
-) -> Result<(noded::VoiceSession, SessionGuard), String> {
-    let flow = channel_flow(channel_id);
-    // a torn-down predecessor's engine pump releases its flow registration
-    // asynchronously (task abort), so a same-channel rejoin can transiently
-    // collide — retry for up to ~1 s (a loaded runtime can take a while to
-    // actually drop the aborted pump) instead of refusing the join.
+    label: &str,
+) -> Result<DatagramFlow<T>, String> {
     let mut attempts = 0;
-    let datagram_flow = loop {
-        match plane.datagram_flow(
-            Service::Voice,
-            flow,
-            DatagramPolicy {
-                max_queued: FLOW_QUEUE,
-            },
-        ) {
-            Ok(datagram_flow) => break datagram_flow,
+    loop {
+        match plane.datagram_flow(service, flow, DatagramPolicy { max_queued }) {
+            Ok(handle) => return Ok(handle),
             Err(e) if attempts >= 40 => {
-                return Err(format!("voice flow unavailable for {channel_id}: {e}"));
+                return Err(format!("{label} flow unavailable for {channel_id}: {e}"));
             }
             Err(_) => {
                 attempts += 1;
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
-    };
-    let engine = VoiceEngine::new(datagram_flow, VoiceConfig::default())
+    }
+}
+
+async fn open_session<T: DataPlaneTransport>(
+    plane: &DataPlane<T>,
+    flows: &Arc<ActiveFlows>,
+    channel_id: &str,
+) -> Result<(noded::CallSession, SessionGuard), String> {
+    let mic_flow = channel_flow(channel_id);
+    let cam_flow = video_flow(channel_id);
+    let control_flow = ctl_flow(channel_id);
+
+    // register all three datagram flows (each behind the retry loop, since a
+    // torn-down predecessor releases them asynchronously).
+    let mic_dgram =
+        register_datagram_flow(plane, Service::Voice, mic_flow, FLOW_QUEUE, channel_id, "voice")
+            .await?;
+    let cam_dgram = register_datagram_flow(
+        plane,
+        Service::Video,
+        cam_flow,
+        VIDEO_FLOW_QUEUE,
+        channel_id,
+        "video",
+    )
+    .await?;
+    let ctl_dgram = register_datagram_flow(
+        plane,
+        Service::Voice,
+        control_flow,
+        CTL_FLOW_QUEUE,
+        channel_id,
+        "control",
+    )
+    .await?;
+
+    let engine = VoiceEngine::new(mic_dgram, VoiceConfig::default())
         .map_err(|e| format!("voice codec init failed: {e}"))?;
-    flows.insert(flow);
+
+    let registered = [
+        (Service::Voice, mic_flow),
+        (Service::Video, cam_flow),
+        (Service::Voice, control_flow),
+    ];
+    for key in &registered {
+        flows.insert(*key);
+    }
+
     let (pcm_tx, pcm_rx) = mpsc::channel(PCM_LANE);
     let (mixed_tx, mixed_rx) = mpsc::channel(PCM_LANE);
     let (recipients_tx, recipients_rx) = watch::channel(Vec::new());
+    let (video_in_tx, video_in_rx) = mpsc::channel(VIDEO_LANE);
+    let (video_out_tx, video_out_rx) = mpsc::channel(VIDEO_LANE);
+    let (control_in_tx, control_in_rx) = mpsc::channel(CTL_LANE);
+    let (control_out_tx, control_out_rx) = mpsc::channel(CTL_LANE);
+
     let task = tokio::spawn(run_session(
         engine,
+        cam_dgram,
+        ctl_dgram,
         pcm_rx,
         mixed_tx,
+        video_in_rx,
+        video_out_tx,
+        control_in_rx,
+        control_out_tx,
         recipients_rx,
         flows.clone(),
-        flow,
+        registered,
     ));
     Ok((
-        noded::VoiceSession {
+        noded::CallSession {
             pcm_in: pcm_tx,
             mixed_out: mixed_rx,
             recipients: recipients_tx,
+            video_in: video_in_tx,
+            video_out: video_out_rx,
+            control_in: control_in_tx,
+            control_out: control_out_rx,
         },
         SessionGuard {
             task,
-            flow,
+            registered,
             flows: flows.clone(),
         },
     ))
 }
 
-/// The session pump: captured frames out, mixed playout back, until the
-/// websocket drops either lane end.
+/// per-sending-peer receive state on the video/control flows.
+struct PeerLane {
+    reassembler: chat::video::Reassembler,
+    /// last time we asked THIS peer for a keyframe (≥1 s apart).
+    last_keyframe_req: Option<Instant>,
+    /// `dropped_frames()` when we last inspected this peer — a keyframe ask
+    /// fires only when the count ADVANCES, so mid-frame fragments don't spam.
+    last_seen_dropped: u64,
+    /// the hint we currently give this peer, and this window's loss counts.
+    hint_kbps: u32,
+    clean_windows: u8,
+    window_complete: u64,
+    window_dropped_base: u64, // reassembler.dropped_frames() at window start
+}
+
+impl PeerLane {
+    fn new() -> Self {
+        PeerLane {
+            reassembler: chat::video::Reassembler::default(),
+            last_keyframe_req: None,
+            last_seen_dropped: 0,
+            hint_kbps: chat::video::RATE_LADDER_KBPS[0],
+            clean_windows: 0,
+            window_complete: 0,
+            window_dropped_base: 0,
+        }
+    }
+}
+
+/// The session pump: audio + camera video + call control, until the webview
+/// drops its lane ends.
+#[allow(clippy::too_many_arguments)]
 async fn run_session<T: DataPlaneTransport>(
     mut engine: VoiceEngine<T>,
+    video: DatagramFlow<T>,
+    ctl: DatagramFlow<T>,
     mut pcm_in: mpsc::Receiver<Vec<i16>>,
     mixed_out: mpsc::Sender<Vec<i16>>,
+    mut video_in: mpsc::Receiver<noded::CapturedVideo>,
+    video_out: mpsc::Sender<noded::PeerVideo>,
+    mut control_in: mpsc::Receiver<noded::CallControlIn>,
+    control_out: mpsc::Sender<noded::CallControlOut>,
     recipients: watch::Receiver<Vec<[u8; 32]>>,
     flows: Arc<ActiveFlows>,
-    flow: FlowId,
+    registered: [(Service, FlowId); 3],
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(FRAME_MILLIS));
     // audio has no catch-up: a missed tick's frame is gone, do not burst.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut frame_no: u32 = 0;
+    let mut peer_lanes: HashMap<[u8; 32], PeerLane> = HashMap::new();
+    // what the webview last told us — repeated at 1 Hz as our beacon.
+    let (mut muted, mut camera_on) = (true, false);
+    // rate hints RECEIVED from each peer about OUR sending; effective = min.
+    let mut inbound_hints: HashMap<[u8; 32], u32> = HashMap::new();
+    let mut effective_kbps: u32 = chat::video::RATE_LADDER_KBPS[0];
+    // ≥1 s between keyframes we ask our own encoder for.
+    let mut last_encoder_kick: Option<Instant> = None;
+    let mut ctl_tick = tokio::time::interval(Duration::from_secs(1));
+    ctl_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut window: u8 = 0; // 5 ctl ticks = one rate window
+
     loop {
         tokio::select! {
             captured = pcm_in.recv() => {
@@ -304,14 +475,238 @@ async fn run_session<T: DataPlaneTransport>(
                 // than queue stale audio.
                 let _ = mixed_out.try_send(mixed.to_vec());
             }
+            captured = video_in.recv() => {
+                let Some(frame) = captured else { break };
+                let recipients_now: Vec<PeerId> =
+                    recipients.borrow().iter().map(|raw| PeerId(*raw)).collect();
+                if recipients_now.is_empty() { continue; }
+                let Ok(fragments) = chat::video::fragment_frame(
+                    frame_no, frame.keyframe, frame.ts_ms, &frame.data,
+                ) else { continue }; // oversize/empty: drop, stay alive
+                frame_no = frame_no.wrapping_add(1);
+                for fragment in &fragments {
+                    for peer in &recipients_now {
+                        // fire-and-forget, same posture as voice.
+                        let _ = video.send_to(*peer, fragment).await;
+                    }
+                }
+            }
+            inbound = video.recv() => {
+                let (peer, bytes) = inbound;
+                let Ok((header, payload)) = chat::video::decode_fragment(&bytes) else { continue };
+                let lane = peer_lanes.entry(peer.0).or_insert_with(PeerLane::new);
+                match lane.reassembler.insert(header, payload) {
+                    chat::video::Assembly::Complete(done) => {
+                        lane.window_complete += 1;
+                        // full lane = the webview is behind; a dropped frame
+                        // is recovered by the next keyframe request from the
+                        // browser decoder, so shed rather than backpressure.
+                        let _ = video_out.try_send(noded::PeerVideo {
+                            peer: peer.0,
+                            keyframe: done.keyframe,
+                            ts_ms: done.ts_ms,
+                            data: done.data,
+                        });
+                    }
+                    chat::video::Assembly::Progress | chat::video::Assembly::Stale => {
+                        // a frame died incomplete since we last looked → ask
+                        // its sender for a sync point (rate-limited). gate on
+                        // the dropped counter ADVANCING so mid-frame fragments
+                        // of a healthy frame don't spam the limiter.
+                        let dropped_now = lane.reassembler.dropped_frames();
+                        if dropped_now > lane.last_seen_dropped {
+                            lane.last_seen_dropped = dropped_now;
+                            request_keyframe_if_due(&ctl, peer, lane).await;
+                        }
+                    }
+                }
+            }
+            inbound = ctl.recv() => {
+                let (peer, bytes) = inbound;
+                let Ok(message) = chat::video::CallControl::decode(&bytes) else { continue };
+                match message {
+                    chat::video::CallControl::KeyframeRequest => {
+                        // honor at most one encoder kick per second.
+                        let due = last_encoder_kick
+                            .is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+                        if due {
+                            last_encoder_kick = Some(Instant::now());
+                            let _ = control_out.try_send(noded::CallControlOut::KeyframeRequest);
+                        }
+                    }
+                    chat::video::CallControl::Beacon { muted, camera_on } => {
+                        let _ = control_out.try_send(noded::CallControlOut::PeerBeacon {
+                            peer: peer.0, muted, camera_on,
+                        });
+                    }
+                    chat::video::CallControl::RateHint { max_kbps } => {
+                        // hints outside the ladder are hostile-or-broken; clamping
+                        // preserves min semantics without letting a peer push the
+                        // encoder outside its envelope (a 1 kbps hint would freeze
+                        // our video for every recipient via the min; a huge one
+                        // would fail the encoder's configure and drop our camera).
+                        let clamped = max_kbps.clamp(
+                            *chat::video::RATE_LADDER_KBPS
+                                .last()
+                                .expect("non-empty ladder"),
+                            chat::video::RATE_LADDER_KBPS[0],
+                        );
+                        inbound_hints.insert(peer.0, clamped);
+                        push_effective_rate(
+                            &recipients, &inbound_hints, &mut effective_kbps, &control_out,
+                        );
+                    }
+                }
+            }
+            state = control_in.recv() => {
+                let Some(state) = state else { break };
+                match state {
+                    noded::CallControlIn::Beacon { muted: m, camera_on: c } => {
+                        (muted, camera_on) = (m, c);
+                        // push immediately so toggles feel live; the 1 Hz
+                        // tick keeps late joiners current.
+                        send_beacon(&ctl, &recipients, muted, camera_on).await;
+                    }
+                    noded::CallControlIn::KeyframeRequest { peer } => {
+                        if let Some(lane) = peer_lanes.get_mut(&peer) {
+                            request_keyframe_if_due(&ctl, PeerId(peer), lane).await;
+                        }
+                    }
+                }
+            }
+            _ = ctl_tick.tick() => {
+                send_beacon(&ctl, &recipients, muted, camera_on).await;
+                // hints from peers no longer in the roster must not pin our rate.
+                let live: HashSet<[u8; 32]> = recipients.borrow().iter().copied().collect();
+                inbound_hints.retain(|peer, _| live.contains(peer));
+                // a peer who left frees their receive lane too: a rejoiner's new
+                // session restarts frame_no at 0, which a retained reassembler
+                // (high last_emitted) would reject as Stale forever — and Stale
+                // doesn't advance dropped_frames, so no keyframe request self-heals
+                // it. Evicting the lane means the rejoiner's next frame builds a
+                // fresh reassembler and their tile lights up.
+                peer_lanes.retain(|peer, _| live.contains(peer));
+                push_effective_rate(&recipients, &inbound_hints, &mut effective_kbps, &control_out);
+                window += 1;
+                if window >= 5 {
+                    window = 0;
+                    evaluate_rate_windows(&ctl, &mut peer_lanes).await;
+                }
+            }
         }
     }
-    flows.remove(&flow);
+    for key in &registered {
+        flows.remove(key);
+    }
+}
+
+/// send a KeyframeRequest to `peer` unless one went out under a second ago.
+async fn request_keyframe_if_due<T: DataPlaneTransport>(
+    ctl: &DatagramFlow<T>,
+    peer: PeerId,
+    lane: &mut PeerLane,
+) {
+    if lane
+        .last_keyframe_req
+        .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+    {
+        lane.last_keyframe_req = Some(Instant::now());
+        let _ = ctl
+            .send_to(peer, &chat::video::CallControl::KeyframeRequest.encode())
+            .await;
+    }
+}
+
+/// our 1 Hz presence beacon to every current recipient.
+async fn send_beacon<T: DataPlaneTransport>(
+    ctl: &DatagramFlow<T>,
+    recipients: &watch::Receiver<Vec<[u8; 32]>>,
+    muted: bool,
+    camera_on: bool,
+) {
+    let frame = chat::video::CallControl::Beacon { muted, camera_on }.encode();
+    let peers: Vec<PeerId> = recipients.borrow().iter().map(|raw| PeerId(*raw)).collect();
+    for peer in peers {
+        let _ = ctl.send_to(peer, &frame).await;
+    }
+}
+
+/// sender side of REMB: min inbound hint (or the ladder top with no hints),
+/// forwarded to the webview encoder only when it changes.
+fn push_effective_rate(
+    recipients: &watch::Receiver<Vec<[u8; 32]>>,
+    inbound_hints: &HashMap<[u8; 32], u32>,
+    effective_kbps: &mut u32,
+    control_out: &mpsc::Sender<noded::CallControlOut>,
+) {
+    let live = recipients.borrow();
+    let next = live
+        .iter()
+        .filter_map(|peer| inbound_hints.get(peer))
+        .copied()
+        .min()
+        .unwrap_or(chat::video::RATE_LADDER_KBPS[0]);
+    if next != *effective_kbps {
+        *effective_kbps = next;
+        let _ = control_out.try_send(noded::CallControlOut::RateHint { max_kbps: next });
+    }
+}
+
+/// receiver side of REMB, every 5 s per sending peer: >10% lost frames steps
+/// the hint down; 3 consecutive clean windows step it back up. Hints are
+/// sent only when they change.
+async fn evaluate_rate_windows<T: DataPlaneTransport>(
+    ctl: &DatagramFlow<T>,
+    peers: &mut HashMap<[u8; 32], PeerLane>,
+) {
+    for (raw, lane) in peers.iter_mut() {
+        let dropped = lane.reassembler.dropped_frames() - lane.window_dropped_base;
+        let complete = lane.window_complete;
+        lane.window_dropped_base = lane.reassembler.dropped_frames();
+        lane.window_complete = 0;
+        if complete + dropped == 0 {
+            continue; // peer isn't sending video — nothing to rate
+        }
+        let lossy = dropped * 10 > (complete + dropped); // >10%
+        let next = if lossy {
+            lane.clean_windows = 0;
+            chat::video::step_down(lane.hint_kbps)
+        } else {
+            lane.clean_windows = lane.clean_windows.saturating_add(1);
+            if lane.clean_windows >= 3 {
+                lane.clean_windows = 0;
+                chat::video::step_up(lane.hint_kbps)
+            } else {
+                lane.hint_kbps
+            }
+        };
+        if next != lane.hint_kbps {
+            lane.hint_kbps = next;
+            let _ = ctl
+                .send_to(
+                    PeerId(*raw),
+                    &chat::video::CallControl::RateHint { max_kbps: next }.encode(),
+                )
+                .await;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// open (or replace) a session on channel "general" over a hub lane.
+    async fn open(lane: mpsc::Sender<noded::CallSessionRequest>) -> noded::CallSession {
+        let (reply, opened) = tokio::sync::oneshot::channel();
+        lane.send(noded::CallSessionRequest {
+            channel_id: "general".into(),
+            reply,
+        })
+        .await
+        .expect("hub alive");
+        opened.await.expect("hub replies").expect("session opens")
+    }
 
     /// two hubs wired back-to-back through their mesh lanes: a frame sent by
     /// one operator's session comes out of the other's mixed playout, and a
@@ -324,31 +719,27 @@ mod tests {
 
         let (req_a_tx, req_a) = mpsc::channel(4);
         let (req_b_tx, req_b) = mpsc::channel(4);
-        let (mut out_a, in_a) = spawn_hub(req_a);
-        let (mut out_b, in_b) = spawn_hub(req_b);
-        // the "mesh": a's outbound datagrams appear on b's inbound stamped
-        // with a's key, and vice versa.
-        tokio::spawn(async move {
-            while let Some((_to, frame)) = out_a.recv().await {
-                let _ = in_b.send((key_a, frame)).await;
-            }
-        });
-        tokio::spawn(async move {
-            while let Some((_to, frame)) = out_b.recv().await {
-                let _ = in_a.send((key_b, frame)).await;
-            }
-        });
+        let (voice_out_a, video_out_a, in_a) = spawn_hub(req_a);
+        let (voice_out_b, video_out_b, in_b) = spawn_hub(req_b);
+        // the "mesh": a's outbound datagrams — BOTH the voice and video lanes —
+        // appear on b's inbound stamped with a's key, and vice versa.
+        for mut out in [voice_out_a, video_out_a] {
+            let in_b = in_b.clone();
+            tokio::spawn(async move {
+                while let Some((_to, frame)) = out.recv().await {
+                    let _ = in_b.send((key_a, frame)).await;
+                }
+            });
+        }
+        for mut out in [voice_out_b, video_out_b] {
+            let in_a = in_a.clone();
+            tokio::spawn(async move {
+                while let Some((_to, frame)) = out.recv().await {
+                    let _ = in_a.send((key_b, frame)).await;
+                }
+            });
+        }
 
-        let open = |lane: mpsc::Sender<noded::VoiceSessionRequest>| async move {
-            let (reply, opened) = tokio::sync::oneshot::channel();
-            lane.send(noded::VoiceSessionRequest {
-                channel_id: "general".into(),
-                reply,
-            })
-            .await
-            .expect("hub alive");
-            opened.await.expect("hub replies").expect("session opens")
-        };
         // both request lanes must outlive the sessions: a closed lane means
         // app-surface shutdown and the hub tears its active session down.
         let session_a = open(req_a_tx.clone()).await;
@@ -376,12 +767,383 @@ mod tests {
             .expect("audio must cross the hubs");
 
         // replace a's session with a new one on the SAME channel: teardown
-        // must release the flow so the re-open succeeds.
+        // must release the flows so the re-open succeeds.
         let session_a2 = open(req_a_tx.clone()).await;
         assert!(
             !session_a2.pcm_in.is_closed(),
             "replacement session must be live"
         );
         drop((req_a_tx, req_b_tx));
+    }
+
+    /// wire two hubs A→B / B→A applying `a_to_b` to every A→B datagram (it may
+    /// swallow a frame to model loss). returns the two request lanes; keep them
+    /// alive for the test's duration.
+    fn two_hubs(
+        key_a: [u8; 32],
+        key_b: [u8; 32],
+        mut a_to_b: impl FnMut(&[u8]) -> bool + Send + 'static,
+    ) -> (
+        mpsc::Sender<noded::CallSessionRequest>,
+        mpsc::Sender<noded::CallSessionRequest>,
+    ) {
+        let (req_a_tx, req_a) = mpsc::channel(4);
+        let (req_b_tx, req_b) = mpsc::channel(4);
+        let (mut voice_out_a, mut video_out_a, in_a) = spawn_hub(req_a);
+        let (voice_out_b, video_out_b, in_b) = spawn_hub(req_b);
+        // A→B: the loss filter guards BOTH of A's outbound lanes, so a
+        // per-frame decision (e.g. "drop the first frag_index==1") sees every
+        // A→B datagram regardless of which lane carried it. Merge the two
+        // lanes into one filtered forwarder to keep the filter single-owner.
+        tokio::spawn(async move {
+            loop {
+                let frame = tokio::select! {
+                    Some((_to, f)) = voice_out_a.recv() => f,
+                    Some((_to, f)) = video_out_a.recv() => f,
+                    else => break,
+                };
+                if a_to_b(&frame) {
+                    let _ = in_b.send((key_a, frame)).await;
+                }
+            }
+        });
+        // B→A: unfiltered; forward both of B's lanes.
+        for mut out in [voice_out_b, video_out_b] {
+            let in_a = in_a.clone();
+            tokio::spawn(async move {
+                while let Some((_to, frame)) = out.recv().await {
+                    let _ = in_a.send((key_b, frame)).await;
+                }
+            });
+        }
+        (req_a_tx, req_b_tx)
+    }
+
+    /// captured camera frames fan out from A, fragment across the plane, and
+    /// reassemble intact on B — a multi-fragment keyframe then a delta.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn video_frames_fragment_and_cross_hubs() {
+        let key_a = [0xaa_u8; 32];
+        let key_b = [0xbb_u8; 32];
+        let (req_a_tx, req_b_tx) = two_hubs(key_a, key_b, |_| true);
+
+        let session_a = open(req_a_tx.clone()).await;
+        let mut session_b = open(req_b_tx.clone()).await;
+        session_a
+            .recipients
+            .send(vec![key_b])
+            .expect("session a alive");
+        // B lists A too: a real huddle roster is symmetric, and B's 1 Hz ctl
+        // tick evicts receive lanes for peers NOT in its recipients — without
+        // this, a tick landing mid-keyframe would drop A's in-progress frame.
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
+
+        // position-dependent fills (not uniform bytes) so a fragment-ordering
+        // or reassembly regression in the hub path shows up — a reordered or
+        // duplicated fragment would break exact-equality on the full vector.
+        let keyframe_data: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        let delta_data: Vec<u8> = (0..5000).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+
+        // a 5000-byte keyframe fragments across ≥4 datagrams.
+        session_a
+            .video_in
+            .send(noded::CapturedVideo {
+                keyframe: true,
+                ts_ms: 7,
+                data: keyframe_data.clone(),
+            })
+            .await
+            .expect("session a alive");
+        let got = tokio::time::timeout(Duration::from_secs(10), session_b.video_out.recv())
+            .await
+            .expect("video must cross the hubs")
+            .expect("session b alive");
+        assert_eq!(got.peer, key_a);
+        assert!(got.keyframe);
+        assert_eq!(got.ts_ms, 7);
+        assert_eq!(got.data, keyframe_data);
+
+        // a second (delta) frame with a different fill crosses intact too.
+        session_a
+            .video_in
+            .send(noded::CapturedVideo {
+                keyframe: false,
+                ts_ms: 40,
+                data: delta_data.clone(),
+            })
+            .await
+            .expect("session a alive");
+        let got = tokio::time::timeout(Duration::from_secs(10), session_b.video_out.recv())
+            .await
+            .expect("second video frame must cross")
+            .expect("session b alive");
+        assert!(!got.keyframe);
+        assert_eq!(got.ts_ms, 40);
+        assert_eq!(got.data, delta_data);
+
+        drop((req_a_tx, req_b_tx));
+    }
+
+    /// a lost fragment leaves frame 0 incomplete; when frame 1 supersedes it,
+    /// B notices the drop and asks A's encoder (over the control flow) for a
+    /// keyframe. B emits only frame 1's bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lost_fragment_triggers_keyframe_request() {
+        let key_a = [0xaa_u8; 32];
+        let key_b = [0xbb_u8; 32];
+        // drop the FIRST A→B video datagram whose decoded header has
+        // frag_index == 1; pass everything else (audio, control, other frags).
+        let mut dropped_one = false;
+        let (req_a_tx, req_b_tx) = two_hubs(key_a, key_b, move |frame| {
+            if !dropped_one
+                && frame.len() > 12
+                && frame[1] == Service::Video as u8
+                && let Ok((header, _)) = chat::video::decode_fragment(&frame[12..])
+                && header.frag_index == 1
+            {
+                dropped_one = true;
+                return false; // swallow this fragment
+            }
+            true
+        });
+
+        let session_a = open(req_a_tx.clone()).await;
+        let mut session_b = open(req_b_tx.clone()).await;
+        session_a
+            .recipients
+            .send(vec![key_b])
+            .expect("session a alive");
+        // symmetric roster (see video_frames_fragment_and_cross_hubs): keeps
+        // B's 1 Hz peer-lane eviction from dropping A's in-progress frame 0.
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
+        let mut control_a = session_a.control_out;
+
+        // frame 0 loses a fragment (incomplete); frame 1 completes.
+        session_a
+            .video_in
+            .send(noded::CapturedVideo {
+                keyframe: true,
+                ts_ms: 1,
+                data: vec![0xA0; 5000],
+            })
+            .await
+            .expect("session a alive");
+        session_a
+            .video_in
+            .send(noded::CapturedVideo {
+                keyframe: false,
+                ts_ms: 2,
+                data: vec![0xB1; 5000],
+            })
+            .await
+            .expect("session a alive");
+
+        // B emits ONLY frame 1's bytes (frame 0 died incomplete).
+        let got = tokio::time::timeout(Duration::from_secs(10), session_b.video_out.recv())
+            .await
+            .expect("frame 1 must cross")
+            .expect("session b alive");
+        assert_eq!(got.ts_ms, 2);
+        assert_eq!(got.data, vec![0xB1; 5000]);
+
+        // B's hub asked A's encoder to sync — the keyframe request crossed the
+        // control flow and A surfaced it to its webview. B also beacons A at
+        // 1 Hz (symmetric roster), so skip any interleaved peer state.
+        let saw_keyframe_req = async {
+            loop {
+                match control_a.recv().await {
+                    Some(noded::CallControlOut::KeyframeRequest) => break,
+                    Some(_) => continue,
+                    None => panic!("session a ended before a keyframe request"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), saw_keyframe_req)
+            .await
+            .expect("keyframe request must reach A");
+
+        drop((req_a_tx, req_b_tx));
+    }
+
+    /// a beacon the webview pushes on A crosses the control flow and lands on
+    /// B as peer state tagged with A's key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn beacons_cross_as_peer_state() {
+        let key_a = [0xaa_u8; 32];
+        let key_b = [0xbb_u8; 32];
+        let (req_a_tx, req_b_tx) = two_hubs(key_a, key_b, |_| true);
+
+        let session_a = open(req_a_tx.clone()).await;
+        let mut session_b = open(req_b_tx.clone()).await;
+        // A beacons to its recipients — B must be one of them.
+        session_a
+            .recipients
+            .send(vec![key_b])
+            .expect("session a alive");
+
+        session_a
+            .control_in
+            .send(noded::CallControlIn::Beacon {
+                muted: false,
+                camera_on: true,
+            })
+            .await
+            .expect("session a alive");
+
+        // B's control_out yields A's beacon as peer state (the 1 Hz tick also
+        // repeats it, so a generous timeout is safe).
+        let state = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), session_b.control_out.recv())
+                .await
+                .expect("beacon must reach B")
+                .expect("session b alive");
+            if let noded::CallControlOut::PeerBeacon {
+                peer,
+                muted,
+                camera_on,
+            } = msg
+            {
+                break (peer, muted, camera_on);
+            }
+        };
+        assert_eq!(state, (key_a, false, true));
+
+        drop((req_a_tx, req_b_tx));
+    }
+
+    /// A peer who leaves the roster and rejoins (a fresh session, `frame_no`
+    /// reset to 0) must light back up. Without lane eviction, B's retained
+    /// reassembler keeps a high `last_emitted` and rejects every post-rejoin
+    /// frame as Stale — forever, with no keyframe-request self-heal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_lane_evicts_on_departure_so_rejoin_is_not_stale() {
+        let key_a = [0xaa_u8; 32];
+        let key_b = [0xbb_u8; 32];
+        let (req_a_tx, req_b_tx) = two_hubs(key_a, key_b, |_| true);
+
+        let session_a = open(req_a_tx.clone()).await;
+        let mut session_b = open(req_b_tx.clone()).await;
+        session_a.recipients.send(vec![key_b]).expect("session a alive");
+        session_b.recipients.send(vec![key_a]).expect("session b alive");
+
+        // A's first stream: one keyframe crosses and B emits it, so B's
+        // peer_lane for A now carries last_emitted = 0.
+        let first: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        session_a
+            .video_in
+            .send(noded::CapturedVideo {
+                keyframe: true,
+                ts_ms: 1,
+                data: first.clone(),
+            })
+            .await
+            .expect("session a alive");
+        let got = tokio::time::timeout(Duration::from_secs(10), session_b.video_out.recv())
+            .await
+            .expect("first frame must cross")
+            .expect("session b alive");
+        assert_eq!(got.data, first);
+
+        // A leaves B's roster. B's 1 Hz ctl tick derives `live` from its
+        // recipients watch, so with A gone for >1 tick B must evict A's stale
+        // lane. Wait out two ticks (generous), then restore the roster.
+        session_b.recipients.send(vec![]).expect("session b alive");
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        session_b.recipients.send(vec![key_a]).expect("session b alive");
+
+        // A rejoins with a FRESH session on the same hub: teardown + reopen
+        // resets frame_no to 0.
+        let session_a2 = open(req_a_tx.clone()).await;
+        session_a2
+            .recipients
+            .send(vec![key_b])
+            .expect("session a2 alive");
+
+        let rejoined: Vec<u8> = (0..5000).map(|i| ((i * 3 + 1) % 251) as u8).collect();
+        session_a2
+            .video_in
+            .send(noded::CapturedVideo {
+                keyframe: true,
+                ts_ms: 2,
+                data: rejoined.clone(),
+            })
+            .await
+            .expect("session a2 alive");
+        // Without the eviction fix, B rejects frame_no 0 as Stale and never
+        // emits — this recv times out. With it, a fresh reassembler completes.
+        let got = tokio::time::timeout(Duration::from_secs(10), session_b.video_out.recv())
+            .await
+            .expect("rejoined frame must cross — B must evict A's lane on departure")
+            .expect("session b alive");
+        assert_eq!(
+            got.data, rejoined,
+            "B must emit A's post-rejoin frame, not reject it as stale"
+        );
+
+        drop((req_a_tx, req_b_tx));
+    }
+
+    /// pull the next RateHint the hub forwards to its local encoder, skipping
+    /// any interleaved beacons/keyframe requests.
+    async fn next_rate_hint(control_out: &mut mpsc::Receiver<noded::CallControlOut>) -> u32 {
+        loop {
+            match control_out.recv().await {
+                Some(noded::CallControlOut::RateHint { max_kbps }) => return max_kbps,
+                Some(_) => continue,
+                None => panic!("session ended before a rate hint"),
+            }
+        }
+    }
+
+    /// A hostile peer's out-of-ladder RateHint must be clamped into the ladder
+    /// envelope before it reaches our encoder: a floor of 1 kbps (would freeze
+    /// our video via min semantics) clamps up to 300, a ceiling of 4e9 (would
+    /// blow the encoder configure) clamps down to 1200.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rate_hint_is_clamped_to_the_ladder() {
+        let peer = [0xcc_u8; 32];
+        let (req_tx, req) = mpsc::channel(4);
+        let (_voice_out, _video_out, inbound) = spawn_hub(req);
+        let session = open(req_tx.clone()).await;
+        session.recipients.send(vec![peer]).expect("session alive");
+        let mut control_out = session.control_out;
+
+        // hand-craft a control datagram on the session's ctl flow, exactly as a
+        // hostile peer could inject over the mesh.
+        let flow = ctl_flow("general");
+        let inject = |max_kbps: u32| {
+            data_plane::wire::encode_datagram(
+                Service::Voice,
+                flow,
+                &chat::video::CallControl::RateHint { max_kbps }.encode(),
+            )
+            .expect("datagram encodes")
+        };
+
+        inbound
+            .send((peer, inject(1)))
+            .await
+            .expect("inbound alive");
+        let hint = tokio::time::timeout(Duration::from_secs(5), next_rate_hint(&mut control_out))
+            .await
+            .expect("a rate hint must reach the encoder");
+        assert_eq!(hint, 300, "a 1 kbps hint must clamp up to the ladder bottom");
+
+        inbound
+            .send((peer, inject(4_000_000_000)))
+            .await
+            .expect("inbound alive");
+        let hint = tokio::time::timeout(Duration::from_secs(5), next_rate_hint(&mut control_out))
+            .await
+            .expect("a rate hint must reach the encoder");
+        assert_eq!(hint, 1200, "a 4e9 kbps hint must clamp down to the ladder top");
+
+        drop(req_tx);
     }
 }

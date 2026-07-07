@@ -32,12 +32,12 @@ use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
 use tagging::TaggingModule;
 use dispatch_oracle::DispatchWorker;
-use document::Document;
 use files::Files;
 use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::{BlockContext, DispatchRecord, Host, SubmitError};
+use identity::Identity;
 use inbox::Inbox;
 use indexer::IndexStore;
 use jobs::Jobs;
@@ -68,12 +68,12 @@ const MODULE_IDS: [&str; 16] = [
     "jobs",
     "agent",
     "runs",
-    "document",
     "pages",
     "forge",
     "files",
     "memory",
     "profiles",
+    "identity",
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 
@@ -164,7 +164,7 @@ fn run_node(
     executor.start(|context| async move {
         // genesis: the full product surface. chat/tasks/inbox as the core loop,
         // automations bridging chat/memory events into chat/tasks/inbox
-        // follow-ups, jobs for deferred work, document + forge for the
+        // follow-ups, jobs for deferred work, pages + forge for the
         // substrate-backed stores, and files + memory for the content planes.
         // files registers over the
         // http layer's blob handle so uploads land in the store `serve_sync`
@@ -192,9 +192,7 @@ fn run_node(
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-            Some("document".into()),
         );
-        let document = Document::init(context.child("document"), "document").await;
         let pages = Pages::init(context.child("pages"), "pages").await;
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the
@@ -210,6 +208,10 @@ fn run_node(
         // the origin-gated display-name registry: maps each verified submit
         // origin to a chosen name so the ui can resolve authors to names.
         let profiles = Profiles::new("profiles");
+        // the deterministic user->nodes binding registry. the single-node
+        // daemon carries no valset (ungated binds) and no chain (dev-only,
+        // chain-unscoped certs are an acceptable surface here).
+        let identity = Identity::new("identity", None, String::new());
         let mut host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),
@@ -221,12 +223,12 @@ fn run_node(
             Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
-            Box::new(document),
             Box::new(pages),
             Box::new(forge),
             Box::new(files),
             Box::new(memory),
             Box::new(profiles),
+            Box::new(identity),
         ])
         .expect("genesis");
 

@@ -29,13 +29,10 @@ use serde::{Deserialize, Serialize};
 /// (see `ConsensusScheme`); anything else is a build from the future.
 pub const SCHEME_ED25519: &str = "ed25519";
 
-/// the invite blob prefix; versioned so a stale-format paste fails loudly. the
-/// prefix stays "v2" while the PAYLOAD version byte (2 or 3) is authoritative:
-/// v2 = descriptor only (manual flow), v3 = descriptor + reach hints + an
-/// appended lobby token. a decoded v3 descriptor carries typed `reach` hints;
-/// admission is still a member ballot, so the blob is a low-trust doorbell —
-/// its integrity comes from the genesis fingerprint, not a signature.
-const INVITE_PREFIX: &str = "ducktape-invite-v2:";
+/// the invite blob prefix. UNVERSIONED on purpose (bootstrapping posture): the
+/// network re-mints invites on a format change, and a stale paste fails loudly
+/// at decode — the old `ducktape-invite-v*:` prefixes no longer decode at all.
+const INVITE_PREFIX: &str = "ducktape:";
 
 // ============================================================================
 // hex — dependency-free codecs for keys, roots, and the invite blob.
@@ -71,7 +68,10 @@ pub fn unhex(s: &str) -> Result<Vec<u8>, String> {
 
 /// load the identity at `path`, or generate one there from OS randomness.
 /// returns the signer and whether it was freshly generated. written 0600 on
-/// unix — it is the node's (and for now the user's) whole identity.
+/// unix — this is the NODE's identity (mesh/valset/frame-signing key) only.
+/// the user's identity is a separate keypair held by the app
+/// (`~/.ducktape/user.key`) and bound to this node's key through the
+/// `identity` module (`crates/system/identity`); this file never holds it.
 pub fn load_or_generate_identity(path: &Path) -> Result<(ed25519::PrivateKey, bool), String> {
     if path.exists() {
         return load_identity(path).map(|k| (k, false));
@@ -117,6 +117,42 @@ pub fn load_identity(path: &Path) -> Result<ed25519::PrivateKey, String> {
         .map_err(|e| format!("{path:?} is not an ed25519 secret: {e}"))
 }
 
+/// mint a bind certificate: the USER key's signature over
+/// [`identity::bind_preimage`] in the [`identity::IDENTITY_BIND_NS`] domain --
+/// the consent artifact `IdentityMsg::BindNode` carries as `user_sig`. chain-
+/// and nonce-scoped, so a certificate can never replay across networks or
+/// after an unbind bumps the nonce.
+pub fn mint_bind_cert(
+    user: &ed25519::PrivateKey,
+    chain_id: &str,
+    node_pub: &[u8],
+    nonce: u64,
+) -> Vec<u8> {
+    user.sign(
+        identity::IDENTITY_BIND_NS,
+        &identity::bind_preimage(chain_id, node_pub, nonce),
+    )
+    .as_ref()
+    .to_vec()
+}
+
+/// mint an unbind certificate (same shape as [`mint_bind_cert`], but signed
+/// over [`identity::unbind_preimage`] in the [`identity::IDENTITY_UNBIND_NS`]
+/// domain -- the consent artifact `IdentityMsg::UnbindNode` carries).
+pub fn mint_unbind_cert(
+    user: &ed25519::PrivateKey,
+    chain_id: &str,
+    node_pub: &[u8],
+    nonce: u64,
+) -> Vec<u8> {
+    user.sign(
+        identity::IDENTITY_UNBIND_NS,
+        &identity::unbind_preimage(chain_id, node_pub, nonce),
+    )
+    .as_ref()
+    .to_vec()
+}
+
 /// mint a chain-id: the human-readable name plus a short salt, so two
 /// unrelated networks that pick the same name still get distinct namespaces
 /// (their handshakes fail cleanly instead of colliding). the salt hashes the
@@ -159,6 +195,11 @@ pub struct NetworkDescriptor {
     /// synthesises all-`Direct` hints from `bootstrap`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reach: Vec<String>,
+    /// Coordination privacy for the reachability plane. `None` => `Private`
+    /// (the safer default). Operational policy, parsed like the reach hints —
+    /// NOT part of `genesis_namespace` (validator identity only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination: Option<String>,
 }
 
 impl NetworkDescriptor {
@@ -356,6 +397,25 @@ impl NetworkDescriptor {
     }
 }
 
+/// coordination privacy for the reachability plane — per-network operational
+/// policy (like `checkpoint_blocks`), NOT part of the genesis fingerprint.
+/// `Public` = the coordinator admits any proof-of-possession request;
+/// `Private` (the default) also requires a genesis-issued `CoordCap`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coordination {
+    Public,
+    Private,
+}
+
+impl NetworkDescriptor {
+    pub fn coordination(&self) -> Coordination {
+        match self.coordination.as_deref() {
+            Some("public") => Coordination::Public,
+            _ => Coordination::Private,
+        }
+    }
+}
+
 /// a reach hint resolved to how the mesh actually reaches a member. `Direct`
 /// dials the ingress and authenticates `expected_key` end-to-end (a fronted
 /// path is transparent, so it looks the same to the dialer); `Coordinated`
@@ -377,32 +437,19 @@ pub fn decode_key(hex: &str) -> Result<ed25519::PublicKey, String> {
 }
 
 // ============================================================================
-// invite tokens — the bearer credential a v3 invite blob carries. minted by a
-// member (`invite`), presented by the joiner's parked node over the lobby
-// channel, verified by each RECEIVING member node before it records the join
-// request for manual approval. the token authenticates that an announce comes
-// from a real invitation (and names the inviter); it does NOT admit by itself
-// — admission stays a member decision through the normal governance ballots.
+// invite tokens — the capability an invite blob carries. minted by a member
+// (`invite`), presented by the joiner over the lobby channel, redeemed
+// in-consensus by governance's `Redeem` op: MINTING IS THE ADMISSION
+// DECISION, redemption is mechanical and single-use. the canonical types and
+// verification live in `governance::invite` (the same code every validator's
+// in-consensus check runs); this module re-exports them and owns the
+// node-side pieces — minting (OS randomness) and the on-disk token file.
 // ============================================================================
 
-/// ed25519 signing namespace for the grant an issuer mints:
-/// `sign(INVITE_GRANT_NAMESPACE, binding ‖ nonce)`.
-pub const INVITE_GRANT_NAMESPACE: &[u8] = b"ducktape-invite-grant-v1";
-/// ed25519 signing namespace for the joiner's proof-of-possession:
-/// `sign(INVITE_JOIN_NAMESPACE, binding ‖ nonce ‖ joiner)`.
-pub const INVITE_JOIN_NAMESPACE: &[u8] = b"ducktape-invite-join-v1";
-/// invite token nonce width in bytes.
-pub const INVITE_NONCE_LEN: usize = 16;
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct InviteToken {
-    /// the minting member — checked against CURRENT membership on receipt.
-    pub issuer: ed25519::PublicKey,
-    /// per-invite randomness: distinguishes tokens, keys announce dedup.
-    pub nonce: [u8; INVITE_NONCE_LEN],
-    /// issuer's signature over `binding ‖ nonce` in the invite-grant namespace.
-    pub sig: ed25519::Signature,
-}
+pub use governance::invite::{
+    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof, verify_invite_token,
+    verify_join_proof,
+};
 
 /// mint a token binding an invite to `binding` (the genesis namespace): fresh
 /// OS randomness for the nonce, signed by this member's identity.
@@ -415,44 +462,6 @@ pub fn mint_invite_token(signer: &ed25519::PrivateKey, binding: &[u8]) -> Invite
         nonce,
         sig: signer.sign(INVITE_GRANT_NAMESPACE, &msg),
     }
-}
-
-/// the joiner's proof-of-possession over its own key for `token` — binds the
-/// announced pubkey to someone actually holding its secret, so a blob holder
-/// cannot park a join request under a key that never asked to join.
-pub fn sign_join_proof(
-    joiner: &ed25519::PrivateKey,
-    binding: &[u8],
-    token: &InviteToken,
-) -> ed25519::Signature {
-    let msg = [
-        binding,
-        token.nonce.as_slice(),
-        joiner.public_key().as_ref(),
-    ]
-    .concat();
-    joiner.sign(INVITE_JOIN_NAMESPACE, &msg)
-}
-
-/// verify a token on receipt: issuer signature over `binding ‖ nonce`.
-pub fn verify_invite_token(token: &InviteToken, binding: &[u8]) -> bool {
-    use commonware_cryptography::Verifier as _;
-    let msg = [binding, token.nonce.as_slice()].concat();
-    token
-        .issuer
-        .verify(INVITE_GRANT_NAMESPACE, &msg, &token.sig)
-}
-
-/// verify a joiner's proof-of-possession against `token`.
-pub fn verify_join_proof(
-    joiner: &ed25519::PublicKey,
-    binding: &[u8],
-    token: &InviteToken,
-    proof: &ed25519::Signature,
-) -> bool {
-    use commonware_cryptography::Verifier as _;
-    let msg = [binding, token.nonce.as_slice(), joiner.as_ref()].concat();
-    joiner.verify(INVITE_JOIN_NAMESPACE, &msg, proof)
 }
 
 const INVITE_TOKEN_FILE: &str = "invite.token";
@@ -510,6 +519,127 @@ pub fn load_invite_token(dir: &Path) -> Result<Option<InviteToken>, String> {
     let text = std::fs::read_to_string(&path).map_err(|e| format!("read {path:?}: {e}"))?;
     let raw = unhex(text.trim()).map_err(|e| format!("{path:?}: {e}"))?;
     unpack_invite_token(&raw).map(Some)
+}
+
+const INVITE_WIREGUARD_FILE: &str = "invite-wireguard.toml";
+
+/// the inviter's WireGuard bootstrap a `join` stored beside the token — what
+/// the joining node dials BEFORE any p2p. `issuer` names the inviter (its
+/// overlay ULA derives from it), the rest mirrors [`InviteWireGuard`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredInviteWireGuard {
+    /// the inviter's ed25519 identity, hex.
+    pub issuer: String,
+    /// the inviter's X25519 WireGuard public key, hex.
+    pub public_key: String,
+    /// the inviter's underlay WireGuard UDP endpoint, `host:port`.
+    pub endpoint: String,
+    /// the inviter's underlay UDP intro endpoint, `host:port`.
+    pub intro: String,
+    /// the inviter's control-mesh listen port on the overlay.
+    pub mesh_port: u16,
+}
+
+impl StoredInviteWireGuard {
+    /// the inviter's X25519 key, decoded.
+    pub fn public_key_bytes(&self) -> Result<[u8; 32], String> {
+        let raw = unhex(&self.public_key)?;
+        raw.try_into()
+            .map_err(|_| "invite wireguard public_key must be 32 bytes".to_string())
+    }
+
+    /// the inviter's ed25519 identity, decoded.
+    pub fn issuer_key(&self) -> Result<ed25519::PublicKey, String> {
+        decode_key(&self.issuer)
+    }
+}
+
+/// persist the invite's WireGuard bootstrap beside the token. overwrites —
+/// a re-join with a fresh invite replaces a stale one.
+pub fn save_invite_wireguard(
+    dir: &Path,
+    issuer: &ed25519::PublicKey,
+    wg: &InviteWireGuard,
+) -> Result<(), String> {
+    let stored = StoredInviteWireGuard {
+        issuer: hex_bytes(issuer.as_ref()),
+        public_key: hex_bytes(&wg.public_key),
+        endpoint: wg.endpoint.clone(),
+        intro: wg.intro.clone(),
+        mesh_port: wg.mesh_port,
+    };
+    let path = dir.join(INVITE_WIREGUARD_FILE);
+    let text = toml::to_string_pretty(&stored).map_err(|e| format!("encode {path:?}: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("write {path:?}: {e}"))
+}
+
+/// the WireGuard bootstrap a previous `join` stored, if any.
+pub fn load_invite_wireguard(dir: &Path) -> Result<Option<StoredInviteWireGuard>, String> {
+    let path = dir.join(INVITE_WIREGUARD_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("read {path:?}: {e}"))?;
+    toml::from_str(&text)
+        .map(Some)
+        .map_err(|e| format!("{path:?}: {e}"))
+}
+
+// ============================================================================
+// coordinator capability — the private-mode admission token a node presents on
+// each rendezvous request. Minted by a genesis validator (`mint_coord_cap`),
+// persisted 0600 beside the descriptor like `invite.token`. Genesis validators
+// need none (the coordinator's pinned set covers them).
+// ============================================================================
+
+const COORD_CAP_FILE: &str = "coord.cap";
+const COORD_CAP_LEN: usize = 32 + 8 + 64;
+
+pub fn pack_coord_cap(cap: &nat_traversal::CoordCap) -> Vec<u8> {
+    let mut out = Vec::with_capacity(COORD_CAP_LEN);
+    out.extend_from_slice(cap.issuer.as_ref());
+    out.extend_from_slice(&cap.not_after.to_be_bytes());
+    out.extend_from_slice(cap.issuer_sig.encode().as_ref());
+    out
+}
+
+pub fn unpack_coord_cap(bytes: &[u8]) -> Result<nat_traversal::CoordCap, String> {
+    if bytes.len() != COORD_CAP_LEN {
+        return Err(format!(
+            "coord cap must be {COORD_CAP_LEN} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let issuer =
+        ed25519::PublicKey::decode(&bytes[..32]).map_err(|e| format!("coord cap issuer: {e}"))?;
+    let mut na = [0u8; 8];
+    na.copy_from_slice(&bytes[32..40]);
+    let not_after = u64::from_be_bytes(na);
+    let issuer_sig =
+        ed25519::Signature::decode(&bytes[40..]).map_err(|e| format!("coord cap sig: {e}"))?;
+    Ok(nat_traversal::CoordCap { issuer, not_after, issuer_sig })
+}
+
+pub fn save_coord_cap(dir: &Path, cap: &nat_traversal::CoordCap) -> Result<(), String> {
+    use std::io::Write as _;
+    let path = dir.join(COORD_CAP_FILE);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path).map_err(|e| format!("create {path:?}: {e}"))?;
+    f.write_all(format!("{}\n", hex_bytes(&pack_coord_cap(cap))).as_bytes())
+        .map_err(|e| format!("write {path:?}: {e}"))
+}
+
+pub fn load_coord_cap(dir: &Path) -> Option<nat_traversal::CoordCap> {
+    let path = dir.join(COORD_CAP_FILE);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let bytes = unhex(raw.trim()).ok()?;
+    unpack_coord_cap(&bytes).ok()
 }
 
 // ============================================================================
@@ -703,75 +833,144 @@ impl ReachHint {
 }
 
 // ============================================================================
-// the invite blob — the descriptor packed into a compact, single-line token.
+// the invite blob — the whole join credential packed into one signed line.
 //
-// v1 hex-wrapped the whole `network.toml` (field names, quotes, and 64-char hex
-// keys carried twice), which ballooned a solo invite past 470 chars. v2 packed
-// only what a joiner needs — chain-id, the raw (un-hexed) validator keys, and
-// raw key+addr dial hints — and base64url-encoded it. ~4x smaller.
-//
-// v3 (the production encoder) carries the same chain-id + validators plus TYPED
-// reach hints (`Direct`/`Fronted`/`Coordinated`), an expiry, the inviter's
-// embedded public key, and a domain-separated ed25519 signature over the whole
-// envelope. decode FAILS CLOSED: it verifies the signature against the embedded
-// key, requires that key to be a genesis validator, and rejects an expired blob.
-// v2 is REJECTED on decode (SECURITY, Slice 1 review: a v2 blob is unsigned, so
-// trusting one would let an attacker downgrade past v3's signature and persist an
-// arbitrary descriptor). the production v2 parser is gone; only a test-only v2
-// encoder survives, to prove the join path refuses a well-formed v2 blob. v3 and
-// v2 stay non-confusable — distinct prefix AND version byte. flag-day: v1 AND v2
-// blobs no longer decode; v3 is the only invite a joiner trusts.
+// ONE format, unversioned (bootstrapping posture — a format change re-mints
+// invites; the older `ducktape-invite-v*:` generations no longer decode). the
+// blob is a CAPABILITY, not a doorbell: it carries the descriptor (chain-id +
+// genesis validators + typed reach hints), the inviter's WireGuard bootstrap
+// (when the inviter runs the reachability plane), an expiry, and the invite
+// token whose mint IS the admission decision. the whole envelope is signed by
+// the token's issuer in a dedicated namespace, and decode FAILS CLOSED:
+// envelope signature, then token-against-computed-binding (which transitively
+// pins chain-id + validators — tampering either changes the genesis
+// fingerprint and kills the token), then expiry.
 // ============================================================================
 
-/// invite payload format tags (the first packed byte). v2 = descriptor only
-/// (the manual flow: the joiner's key travels out-of-band and a member runs
-/// `invite-accept`); v3 = descriptor + typed reach hints + an appended
-/// [`InviteToken`] — the bearer doorbell that lets the joiner announce itself
-/// over the lobby channel. neither is signed: the blob is a low-trust invite
-/// whose integrity is the genesis fingerprint, and admission stays a ballot.
-const INVITE_VERSION_V2: u8 = 2;
-const INVITE_VERSION_V3: u8 = 3;
+/// ed25519 signing namespace for the invite envelope: the issuer signs every
+/// packed byte that precedes the signature.
+pub const INVITE_ENVELOPE_NAMESPACE: &[u8] = b"ducktape-invite-envelope";
+/// how long a minted invite stays redeemable unless `--ttl-days` says
+/// otherwise. single-use bounds the damage of a leaked blob; expiry bounds a
+/// LOST one.
+pub const DEFAULT_INVITE_TTL_DAYS: u64 = 7;
 
 const INVITE_B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-/// encode an invite blob: v3 when a token rides along (carrying reach hints),
-/// v2 (descriptor only, manual flow) when not.
-pub fn encode_invite(
-    descriptor: &NetworkDescriptor,
-    token: Option<&InviteToken>,
-) -> Result<String, String> {
-    use base64::Engine as _;
-    Ok(format!(
-        "{INVITE_PREFIX}{}",
-        INVITE_B64.encode(pack_invite(descriptor, token)?)
-    ))
+/// the inviter's WireGuard bootstrap — everything a joiner needs to bring its
+/// tunnel to the inviter up BEFORE any p2p: the inviter's X25519 public key,
+/// its underlay UDP WireGuard endpoint, the UDP intro endpoint the joiner
+/// announces its own keys to (token-authenticated first contact), and the
+/// inviter's control-mesh listen port on the overlay (the joiner dials the
+/// inviter's derived ULA at this port once the tunnel routes).
+#[derive(Clone, Debug, PartialEq)]
+pub struct InviteWireGuard {
+    /// the inviter's X25519 WireGuard public key, raw.
+    pub public_key: [u8; 32],
+    /// the inviter's underlay WireGuard UDP endpoint, `host:port`.
+    pub endpoint: String,
+    /// the inviter's underlay UDP intro endpoint, `host:port`.
+    pub intro: String,
+    /// the inviter's control-mesh listen port, dialed at its overlay ULA.
+    pub mesh_port: u16,
 }
 
-/// decode an invite blob; the token is `None` for a v2 (manual-flow) blob.
-pub fn decode_invite(blob: &str) -> Result<(NetworkDescriptor, Option<InviteToken>), String> {
+/// a decoded, VERIFIED invite — the only constructor is [`decode_invite`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Invite {
+    pub descriptor: NetworkDescriptor,
+    pub token: InviteToken,
+    /// `None` when the inviter runs no reachability plane (a TCP-reachable
+    /// network) — the joiner then rides the descriptor's reach hints alone.
+    pub wireguard: Option<InviteWireGuard>,
+    pub expires_unix_secs: u64,
+}
+
+/// encode an invite blob, signing the envelope as the token's issuer (the
+/// caller must pass the same identity that minted `token`).
+pub fn encode_invite(
+    descriptor: &NetworkDescriptor,
+    token: &InviteToken,
+    wireguard: Option<&InviteWireGuard>,
+    expires_unix_secs: u64,
+    signer: &ed25519::PrivateKey,
+) -> Result<String, String> {
     use base64::Engine as _;
+    if signer.public_key() != token.issuer {
+        return Err("invite envelope must be signed by the token's issuer".into());
+    }
+    let mut out = pack_invite(descriptor, token, wireguard, expires_unix_secs)?;
+    let sig = signer.sign(INVITE_ENVELOPE_NAMESPACE, &out);
+    out.extend_from_slice(sig.encode().as_ref());
+    Ok(format!("{INVITE_PREFIX}{}", INVITE_B64.encode(out)))
+}
+
+/// decode an invite blob against the real clock. fail-closed: see
+/// [`decode_invite_at`].
+pub fn decode_invite(blob: &str) -> Result<Invite, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is past the epoch")
+        .as_secs();
+    decode_invite_at(blob, now)
+}
+
+/// decode an invite blob at an injected clock (deterministic expiry tests).
+/// fail-closed order: ① envelope signature by the embedded token issuer over
+/// every preceding byte, ② token signature against the binding COMPUTED from
+/// the decoded descriptor (pins chain-id + validators transitively), ③ expiry.
+pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String> {
+    use base64::Engine as _;
+    use commonware_cryptography::Verifier as _;
     let body = blob
         .trim()
         .strip_prefix(INVITE_PREFIX)
-        .ok_or_else(|| format!("not a ducktape invite (expected {INVITE_PREFIX}...)"))?;
+        .ok_or_else(|| {
+            format!(
+                "not a ducktape invite (expected {INVITE_PREFIX}...); an older \
+                 ducktape-invite-v*: blob no longer decodes — ask for a fresh invite"
+            )
+        })?;
     let bytes = INVITE_B64
         .decode(body)
         .map_err(|e| format!("invite is not valid base64url: {e}"))?;
-    unpack_invite(&bytes)
+    // the trailing 64 bytes are the envelope signature over everything before.
+    let Some(signed_len) = bytes.len().checked_sub(64) else {
+        return Err("invite payload truncated".into());
+    };
+    let (signed, sig_bytes) = bytes.split_at(signed_len);
+    let sig = ed25519::Signature::decode(sig_bytes).map_err(|e| format!("envelope signature: {e}"))?;
+    let invite = unpack_invite(signed, now_unix_secs)?;
+    if !invite
+        .token
+        .issuer
+        .verify(INVITE_ENVELOPE_NAMESPACE, signed, &sig)
+    {
+        return Err("invite envelope signature does not verify".into());
+    }
+    let binding = invite.descriptor.genesis_namespace();
+    if !verify_invite_token(&invite.token, binding.as_bytes()) {
+        return Err(
+            "invite token does not verify against this blob's own network — the blob was \
+             tampered with"
+                .into(),
+        );
+    }
+    Ok(invite)
 }
 
-/// pack a descriptor into the compact v2/v3 payload. validator hex is decoded
-/// to raw keys (rejecting a malformed descriptor here rather than shipping it);
-/// the typed reach hints come from [`NetworkDescriptor::reach_hints`] (the
-/// union of `reach` and `bootstrap`-synthesised Direct hints), so a founder
-/// that only ever ran `add_bootstrap` still ships a well-formed invite. a v3
-/// payload appends the lobby [`InviteToken`]; nothing is signed.
-fn pack_invite(d: &NetworkDescriptor, token: Option<&InviteToken>) -> Result<Vec<u8>, String> {
-    let mut out = vec![if token.is_some() {
-        INVITE_VERSION_V3
-    } else {
-        INVITE_VERSION_V2
-    }];
+/// pack the signed portion of the invite. validator hex is decoded to raw keys
+/// (rejecting a malformed descriptor here rather than shipping it); the typed
+/// reach hints come from [`NetworkDescriptor::reach_hints`] (the union of
+/// `reach` and `bootstrap`-synthesised Direct hints), so a founder that only
+/// ever ran `add_bootstrap` still ships a well-formed invite.
+fn pack_invite(
+    d: &NetworkDescriptor,
+    token: &InviteToken,
+    wireguard: Option<&InviteWireGuard>,
+    expires_unix_secs: u64,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
 
     let cid = d.chain_id.as_bytes();
     out.push(u8::try_from(cid.len()).map_err(|_| format!("chain_id too long ({} bytes)", cid.len()))?);
@@ -803,9 +1002,29 @@ fn pack_invite(d: &NetworkDescriptor, token: Option<&InviteToken>) -> Result<Vec
             }
         }
     }
-    if let Some(t) = token {
-        out.extend_from_slice(&pack_invite_token(t));
+
+    match wireguard {
+        Some(wg) => {
+            out.push(1);
+            out.extend_from_slice(&wg.public_key);
+            put_str_u8(&mut out, &wg.endpoint)?;
+            put_str_u8(&mut out, &wg.intro)?;
+            out.extend_from_slice(&wg.mesh_port.to_le_bytes());
+        }
+        None => out.push(0),
     }
+
+    // the coordination-mode echo: one byte inside the SIGNED envelope,
+    // sourced from the descriptor (None resolves to Private, the safe
+    // default) — a fresh joiner learns off the invite alone whether the
+    // coordinator is private, so it knows to expect (and present) a CoordCap.
+    out.push(match d.coordination() {
+        Coordination::Public => 0,
+        Coordination::Private => 1,
+    });
+
+    out.extend_from_slice(&expires_unix_secs.to_le_bytes());
+    out.extend_from_slice(&pack_invite_token(token));
     Ok(out)
 }
 
@@ -817,20 +1036,14 @@ fn put_str_u8(out: &mut Vec<u8>, s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// inverse of [`pack_invite`]; yields a descriptor canonicalized exactly as
-/// [`NetworkDescriptor::from_toml`] would (sorted validators, sorted canonical
-/// reach) so the genesis fingerprint of a decoded invite matches the founder's.
-/// a v3 payload also carries the lobby [`InviteToken`]; nothing is signed — the
-/// blob's integrity is the genesis fingerprint and admission is a ballot.
-fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>), String> {
+/// inverse of [`pack_invite`] (the signed portion — the caller has already
+/// split the envelope signature off); yields a descriptor canonicalized
+/// exactly as [`NetworkDescriptor::from_toml`] would (sorted validators,
+/// sorted canonical reach) so the genesis fingerprint of a decoded invite
+/// matches the founder's. signature verification is the CALLER's
+/// ([`decode_invite_at`]) — this only parses and enforces expiry.
+fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
     let mut r = InviteReader::new(bytes);
-    let version = r.u8()?;
-    if version != INVITE_VERSION_V2 && version != INVITE_VERSION_V3 {
-        return Err(format!(
-            "unsupported invite version {version} (this build reads v{INVITE_VERSION_V2} and \
-             v{INVITE_VERSION_V3})"
-        ));
-    }
     let cid_len = r.u8()? as usize;
     let chain_id = String::from_utf8(r.take(cid_len)?.to_vec()).map_err(|e| format!("chain_id: {e}"))?;
 
@@ -853,22 +1066,48 @@ fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>
                 let coord_key = r.take_key()?;
                 Reach::Coordinated(CoordRef { coord_addr, coord_key })
             }
-            other => return Err(format!("unknown reach tag {other} in v3 invite")),
+            other => return Err(format!("unknown reach tag {other} in invite")),
         };
         reach.push(ReachHint { expected_key, reach: reach_val }.to_canonical());
     }
     reach.sort();
-    // a v3 payload carries the lobby token; v2 stops after the descriptor.
-    let token = if version == INVITE_VERSION_V3 {
-        Some(unpack_invite_token(r.take(INVITE_TOKEN_LEN)?)?)
-    } else {
-        None
+
+    let wireguard = match r.u8()? {
+        0 => None,
+        1 => {
+            let mut public_key = [0u8; 32];
+            public_key.copy_from_slice(r.take(32)?);
+            let endpoint = r.take_str_u8()?;
+            let intro = r.take_str_u8()?;
+            let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
+            Some(InviteWireGuard {
+                public_key,
+                endpoint,
+                intro,
+                mesh_port,
+            })
+        }
+        other => return Err(format!("unknown wireguard flag {other} in invite")),
     };
+
+    // the coordination-mode echo — decoded back into the descriptor so the
+    // joiner's workspace records whether the coordinator expects a CoordCap.
+    let coordination = match r.u8()? {
+        0 => Some("public".to_string()),
+        1 => Some("private".to_string()),
+        other => return Err(format!("unknown coordination mode {other} in invite")),
+    };
+
+    let expires_unix_secs = u64::from_le_bytes(r.take(8)?.try_into().expect("8 bytes"));
+    if now_unix_secs >= expires_unix_secs {
+        return Err("this invite has expired — ask for a fresh one".into());
+    }
+    let token = unpack_invite_token(r.take(INVITE_TOKEN_LEN)?)?;
     if !r.done() {
         return Err("invite payload has trailing bytes".into());
     }
-    Ok((
-        NetworkDescriptor {
+    Ok(Invite {
+        descriptor: NetworkDescriptor {
             chain_id,
             scheme: SCHEME_ED25519.into(),
             validators,
@@ -876,9 +1115,12 @@ fn unpack_invite(bytes: &[u8]) -> Result<(NetworkDescriptor, Option<InviteToken>
             // stays empty and both feed one dial source via `reach_hints`.
             bootstrap: Vec::new(),
             reach,
+            coordination,
         },
         token,
-    ))
+        wireguard,
+        expires_unix_secs,
+    })
 }
 
 /// a bounds-checked forward cursor over the packed invite bytes.
@@ -970,6 +1212,11 @@ pub struct NodeToml {
     /// memory; for dev/sim runs, and for several same-chain nodes on one
     /// host, which would otherwise fight over one interface name).
     pub wireguard_effect: Option<String>,
+    /// the UDP endpoint this node's invite intro listener binds — where a
+    /// fresh joiner announces its keys (token-authenticated) so the tunnel
+    /// can come up before any p2p. defaults to `wireguard_listen` with the
+    /// port + 1; only meaningful when the plane runs.
+    pub invite_listen: Option<String>,
     /// opt-in shipped-index warm start when joining (node-local operator
     /// policy, like checkpoint_blocks): fetch the sync source's derived
     /// index checkpoints alongside state-sync. the derived tier has no
@@ -1013,6 +1260,11 @@ pub struct Plumbing {
     pub rpc_listen: Option<String>,
     /// merged like the rest — a hand-edited storage_dir survives rewrites.
     pub storage_dir: String,
+    /// merged from an existing file only (no flag); a WireGuard join seeds a
+    /// default AFTER the merge when the invite carries a tunnel bootstrap.
+    pub wireguard_listen: Option<String>,
+    /// merged from an existing file only — a hand-set "fake" survives.
+    pub wireguard_effect: Option<String>,
 }
 
 pub fn merged_plumbing(
@@ -1046,6 +1298,8 @@ pub fn merged_plumbing(
         storage_dir: e
             .and_then(|r| r.storage_dir.clone())
             .unwrap_or_else(|| "storage".into()),
+        wireguard_listen: e.and_then(|r| r.wireguard_listen.clone()),
+        wireguard_effect: e.and_then(|r| r.wireguard_effect.clone()),
     })
 }
 
@@ -1069,6 +1323,12 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     if let Some(r) = &p.rpc_listen {
         s += &format!("rpc_listen = \"{r}\"\n");
     }
+    if let Some(w) = &p.wireguard_listen {
+        s += &format!("wireguard_listen = \"{w}\"\n");
+    }
+    if let Some(w) = &p.wireguard_effect {
+        s += &format!("wireguard_effect = \"{w}\"\n");
+    }
     let path = dir.join("node.toml");
     std::fs::write(&path, s).map_err(|e| format!("write {path:?}: {e}"))?;
     Ok(path)
@@ -1085,12 +1345,32 @@ pub fn choose_sync_source<A>(
     validators: &[ed25519::PublicKey],
     me: &ed25519::PublicKey,
 ) -> Option<ed25519::PublicKey> {
-    bootstrappers
+    sync_source_candidates(bootstrappers, validators, me)
+        .into_iter()
+        .next()
+}
+
+/// EVERY candidate statesync source, ordered: bootstrap-hinted validators
+/// first (a dial path is already configured), then the remaining validators.
+/// the rotating client fails over down this list — any validator can serve,
+/// because every payload verifies against consensus-agreed roots.
+pub fn sync_source_candidates<A>(
+    bootstrappers: &[(ed25519::PublicKey, A)],
+    validators: &[ed25519::PublicKey],
+    me: &ed25519::PublicKey,
+) -> Vec<ed25519::PublicKey> {
+    let mut out: Vec<ed25519::PublicKey> = bootstrappers
         .iter()
         .map(|(k, _)| k)
-        .find(|k| *k != me && validators.contains(k))
-        .or_else(|| validators.iter().find(|k| *k != me))
+        .filter(|k| *k != me && validators.contains(k))
         .cloned()
+        .collect();
+    for k in validators {
+        if k != me && !out.contains(k) {
+            out.push(k.clone());
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -1167,6 +1447,15 @@ pub struct Resolved {
     pub label: String,
     /// the chain-id (network shape) or legacy namespace bytes.
     pub namespace: Vec<u8>,
+    /// this network's chain id — the descriptor's own `chain_id` field (network
+    /// shape) or the raw configured namespace (dev shape, which has no
+    /// fingerprint appended). NOT `namespace`: the network shape's `namespace`
+    /// is `genesis_namespace()`, i.e. `chain_id@fingerprint` — a DIFFERENT
+    /// string. This is the exact string the desktop app records as
+    /// `Workspace.chain_id` (the `init` verb's last stdout line), so modules
+    /// that must agree with the app on "this network's id" (e.g. `identity`'s
+    /// certificate domain separation) use this field, never `namespace`.
+    pub chain_id: String,
     /// the authorized mesh set (unsorted here; the caller builds the ordered
     /// Set discovery tracks).
     pub mesh: Vec<ed25519::PublicKey>,
@@ -1194,6 +1483,9 @@ pub struct Resolved {
     pub wireguard_listen: Option<SocketAddr>,
     /// which `WireGuardEffect` the plane drives when it is on.
     pub wireguard_effect: WireGuardEffectKind,
+    /// the invite intro listener endpoint (`invite_listen`, defaulted from
+    /// `wireguard_listen` + 1); `None` when the plane is off.
+    pub invite_listen: Option<SocketAddr>,
     /// where the node's X25519 WireGuard keypair persists (beside
     /// identity.key in the network shape).
     pub wireguard_key_file: PathBuf,
@@ -1206,11 +1498,32 @@ pub struct Resolved {
     /// parked joiner announces over the lobby channel. always `None` for the
     /// dev shape and for manual (token-less) joins.
     pub invite_token: Option<InviteToken>,
+    /// the inviter's WireGuard bootstrap a `join` stored, if any — the tunnel
+    /// the joining node brings up BEFORE any p2p. always `None` for the dev
+    /// shape and for members.
+    pub invite_wireguard: Option<StoredInviteWireGuard>,
     /// opt-in shipped-index warm start when joining; see `NodeToml::sync_index`.
     pub sync_index: bool,
     /// publish the discovered provider set into the capability registry; see
     /// `NodeToml::announce_capabilities`.
     pub announce_capabilities: bool,
+    /// the reachability plane's coordination privacy (per-network operational
+    /// policy). `Private` (the default) requires a genesis-issued `CoordCap`
+    /// for a node outside the genesis validator set; `Public` accepts any
+    /// proof-of-possession. The dev shape is always `Private` (it never uses a
+    /// real coordinator).
+    pub coordination: Coordination,
+    /// the genesis-issued admission capability this node presents on every
+    /// coordinator request (loaded from `coord.cap` beside the identity).
+    /// `None` for a genesis validator (admitted by membership), the dev shape,
+    /// or a node that has not been issued one.
+    pub coord_cap: Option<nat_traversal::CoordCap>,
+    /// the workspace base directory — where `identity.key`, `network.toml`,
+    /// `wireguard.key` and `coord.cap` live (the network shape's config
+    /// directory; the dev shape's `storage_dir`). Threaded so a parked
+    /// joiner's lobby-reply task can persist a `coord.cap` delivered over its
+    /// `JoinReply` via `save_coord_cap`.
+    pub workspace: PathBuf,
 }
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
@@ -1298,10 +1611,14 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     let bootstrappers = bootstrap.into_iter().filter(|(k, _)| *k != me).collect();
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
+    let invite_listen = wireguard_listen
+        .map(|wg| resolved_invite_listen(raw.invite_listen.as_deref(), wg))
+        .transpose()?;
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
         namespace: descriptor.genesis_namespace().into_bytes(),
+        chain_id: descriptor.chain_id.clone(),
         signer,
         mesh,
         validators,
@@ -1315,11 +1632,21 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         wireguard_listen,
         wireguard_effect,
         wireguard_key_file: base.join("wireguard.key"),
+        invite_listen,
         dev_demo: false,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: load_invite_token(base)?,
+        invite_wireguard: load_invite_wireguard(base)?,
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
+        coordination: descriptor.coordination(),
+        // the reachability plane presents this on every coordinator request; a
+        // genesis validator needs none (admitted by membership), a joiner is
+        // issued one beside its identity.
+        coord_cap: load_coord_cap(base),
+        // the config directory: identity.key / network.toml / coord.cap live
+        // here, so a joiner persists a delivered cap into it.
+        workspace: base.to_path_buf(),
     })
 }
 
@@ -1329,6 +1656,55 @@ fn parse_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, Strin
             .map_err(|e| format!("wireguard_listen: {e}"))
     })
     .transpose()
+}
+
+/// the parsed `wireguard_listen`, for callers working off a raw `NodeToml`
+/// (the CLI verbs) rather than a full `resolve`.
+pub fn resolved_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, String> {
+    parse_wireguard_listen(raw)
+}
+
+/// the invite intro listener endpoint: explicit `invite_listen`, else the
+/// WireGuard listen address with the next port — one convention both the
+/// minting side (what lands in the blob) and the serving side (what the
+/// plane binds) derive identically.
+pub fn resolved_invite_listen(
+    raw: Option<&str>,
+    wireguard_listen: SocketAddr,
+) -> Result<SocketAddr, String> {
+    match raw {
+        Some(a) => a.parse().map_err(|e| format!("invite_listen: {e}")),
+        None => {
+            let port = wireguard_listen
+                .port()
+                .checked_add(1)
+                .ok_or("wireguard_listen port has no successor for the intro default")?;
+            Ok(SocketAddr::new(wireguard_listen.ip(), port))
+        }
+    }
+}
+
+/// the HOST a minted invite's UDP endpoints carry: the WireGuard listen IP
+/// when it is concrete, else the advertised host (an invite must hand the
+/// joiner an underlay address that reaches this machine — the usual listen
+/// is unspecified, so `advertised` is the truth).
+pub fn endpoint_host(
+    advertised: Option<&str>,
+    listen: &str,
+    wireguard_listen: SocketAddr,
+) -> Result<String, String> {
+    if !wireguard_listen.ip().is_unspecified() {
+        return Ok(wireguard_listen.ip().to_string());
+    }
+    let dial = dialable(advertised, listen)?.ok_or(
+        "no dialable host for the WireGuard invite endpoints: set `advertised` (or a \
+         concrete wireguard_listen IP) so a joiner can reach this node's tunnel",
+    )?;
+    // strip the port: `host:port` or `[v6]:port`.
+    match dial.rsplit_once(':') {
+        Some((host, _)) => Ok(host.trim_matches(['[', ']']).to_string()),
+        None => Ok(dial),
+    }
 }
 
 /// which `WireGuardEffect` implementation the reachability plane drives.
@@ -1460,6 +1836,9 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
+        // the dev shape's namespace carries no fingerprint suffix (unlike the
+        // network shape's `genesis_namespace()`), so it IS the chain id here.
+        chain_id: namespace.clone(),
         namespace: namespace.into_bytes(),
         mesh,
         validators,
@@ -1471,16 +1850,27 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         // the dev shape has no identity.key directory; the wireguard key
         // lives with the node's other per-process state.
         wireguard_key_file: storage_dir.join("wireguard.key"),
+        // the dev shape has no config directory; its per-process state dir
+        // stands in as the workspace base (it never delivers a real cap).
+        workspace: storage_dir.clone(),
         storage_dir,
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
         wireguard_listen,
         wireguard_effect,
+        invite_listen: wireguard_listen
+            .map(|wg| resolved_invite_listen(raw.invite_listen.as_deref(), wg))
+            .transpose()?,
         dev_demo: true,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: None,
+        invite_wireguard: None,
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
+        // the dev shape wires direct sockets only — no real coordinator, so
+        // the coordination mode defaults to Private and no cap is presented.
+        coordination: Coordination::Private,
+        coord_cap: None,
     })
 }
 
@@ -1499,6 +1889,41 @@ mod tests {
     }
 
     #[test]
+    fn coord_cap_roundtrips_through_pack_and_files() {
+        use commonware_cryptography::{Signer as _, ed25519};
+        use nat_traversal::{NodeKey, mint_coord_cap};
+        let g = ed25519::PrivateKey::from_seed(7);
+        let subject = NodeKey([0x11; 32]);
+        let cap = mint_coord_cap(&g, subject, 4_000_000);
+        let bytes = pack_coord_cap(&cap);
+        assert_eq!(bytes.len(), 32 + 8 + 64);
+        assert_eq!(unpack_coord_cap(&bytes).unwrap(), cap);
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_coord_cap(dir.path()).is_none());
+        save_coord_cap(dir.path(), &cap).unwrap();
+        assert_eq!(load_coord_cap(dir.path()).unwrap(), cap);
+    }
+
+    #[test]
+    fn coordination_defaults_to_private_and_parses_public() {
+        let mut d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        // default (field unset) -> Private
+        assert_eq!(d.coordination(), Coordination::Private);
+        d.coordination = Some("public".to_string());
+        assert_eq!(d.coordination(), Coordination::Public);
+        d.coordination = Some("private".to_string());
+        assert_eq!(d.coordination(), Coordination::Private);
+    }
+
+    #[test]
     fn identity_roundtrips_and_reuses() {
         let dir = tmp("identity");
         let path = dir.join("identity.key");
@@ -1512,45 +1937,191 @@ mod tests {
         assert_eq!(a.public_key(), b.public_key());
     }
 
+    /// mint + encode with the test defaults: issuer-signed, far-future expiry.
+    fn encode_test_invite(
+        d: &NetworkDescriptor,
+        issuer: &ed25519::PrivateKey,
+        wireguard: Option<&InviteWireGuard>,
+    ) -> String {
+        let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes());
+        encode_invite(d, &token, wireguard, u64::MAX, issuer).expect("encode")
+    }
+
+    // ---- user-key bind/unbind certificates ---------------------------------
+
     #[test]
-    fn invite_blob_roundtrips_the_descriptor() {
-        let me = ed25519::PrivateKey::from_seed(7).public_key();
+    fn mint_bind_cert_verifies_against_module_preimage() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(1);
+        let node_pub = [9u8; 32];
+        let cert = mint_bind_cert(&user, "chain-a", &node_pub, 0);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage = identity::bind_preimage("chain-a", &node_pub, 0);
+        assert!(user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage, &sig));
+    }
+
+    #[test]
+    fn mint_bind_cert_is_chain_scoped() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(1);
+        let node_pub = [9u8; 32];
+        let cert = mint_bind_cert(&user, "chain-a", &node_pub, 0);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        // a cert minted for chain-a must NOT verify against chain-b's preimage.
+        let preimage_b = identity::bind_preimage("chain-b", &node_pub, 0);
+        assert!(!user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage_b, &sig));
+    }
+
+    #[test]
+    fn mint_bind_cert_does_not_verify_under_unbind_namespace() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(1);
+        let node_pub = [9u8; 32];
+        let cert = mint_bind_cert(&user, "chain-a", &node_pub, 0);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage = identity::bind_preimage("chain-a", &node_pub, 0);
+        // signed under IDENTITY_BIND_NS -- must NOT verify under the unbind ns.
+        assert!(!user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage, &sig));
+    }
+
+    #[test]
+    fn mint_unbind_cert_verifies_against_module_preimage() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(2);
+        let node_pub = [11u8; 32];
+        let cert = mint_unbind_cert(&user, "chain-a", &node_pub, 3);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage = identity::unbind_preimage("chain-a", &node_pub, 3);
+        assert!(user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage, &sig));
+    }
+
+    #[test]
+    fn mint_unbind_cert_is_chain_scoped() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(2);
+        let node_pub = [11u8; 32];
+        let cert = mint_unbind_cert(&user, "chain-a", &node_pub, 3);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage_b = identity::unbind_preimage("chain-b", &node_pub, 3);
+        assert!(!user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage_b, &sig));
+    }
+
+    #[test]
+    fn mint_unbind_cert_does_not_verify_under_bind_namespace() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(2);
+        let node_pub = [11u8; 32];
+        let cert = mint_unbind_cert(&user, "chain-a", &node_pub, 3);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage = identity::unbind_preimage("chain-a", &node_pub, 3);
+        // signed under IDENTITY_UNBIND_NS -- must NOT verify under the bind ns.
+        assert!(!user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage, &sig));
+    }
+
+    /// mirrors exactly what `cmd_user_sign_bind`/`cmd_user_sign_unbind` build,
+    /// so this is a stand-in for hand-verifying the CLI's JSON output: encode
+    /// through `identity::encode_msg`, decode through `identity::decode_msg`,
+    /// and check the message the module actually consumes round-trips.
+    #[test]
+    fn user_sign_messages_round_trip_through_identity_codec() {
+        let user = ed25519::PrivateKey::from_seed(3);
+        let node_pub = [42u8; 32];
+
+        let bind_sig = mint_bind_cert(&user, "test@abc", &node_pub, 0);
+        let bind_msg = identity::IdentityMsg::BindNode {
+            user_key: user.public_key().as_ref().to_vec(),
+            user_sig: bind_sig,
+        };
+        let encoded = identity::encode_msg(&bind_msg);
+        // the wire contract: a single utf-8 JSON line, decodable as-is.
+        assert_eq!(String::from_utf8(encoded.clone()).unwrap().lines().count(), 1);
+        assert_eq!(identity::decode_msg(&encoded).unwrap(), bind_msg);
+
+        let unbind_sig = mint_unbind_cert(&user, "test@abc", &node_pub, 1);
+        let unbind_msg = identity::IdentityMsg::UnbindNode {
+            node_key: node_pub.to_vec(),
+            user_sig: unbind_sig,
+        };
+        let encoded = identity::encode_msg(&unbind_msg);
+        assert_eq!(String::from_utf8(encoded.clone()).unwrap().lines().count(), 1);
+        assert_eq!(identity::decode_msg(&encoded).unwrap(), unbind_msg);
+    }
+
+    #[test]
+    fn invite_blob_roundtrips_and_verifies() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let me = issuer.public_key();
         let mut d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
             scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
-        // token-less blob is the v2 manual flow. decode NORMALISES bootstrap
-        // hints into typed Direct reach hints, so the decoded descriptor dials
-        // the same members via `reach` even though it carries no `bootstrap`.
-        let (decoded, token) =
-            decode_invite(&encode_invite(&d, None).expect("encode")).expect("roundtrip");
-        assert_eq!(token, None, "a token-less blob is the v2 manual flow");
+        // decode NORMALISES bootstrap hints into typed Direct reach hints, so
+        // the decoded descriptor dials the same members via `reach` even
+        // though it carries no `bootstrap`.
+        let invite = decode_invite(&encode_test_invite(&d, &issuer, None)).expect("roundtrip");
         assert_eq!(
-            decoded.reach_hints().expect("decoded hints"),
+            invite.descriptor.reach_hints().expect("decoded hints"),
             d.reach_hints().expect("source hints"),
             "the dial hints survive as typed reach hints"
         );
+        assert_eq!(invite.wireguard, None);
+        let binding = d.genesis_namespace();
+        assert!(verify_invite_token(&invite.token, binding.as_bytes()));
 
         // a HOSTNAME dial hint survives verbatim (stored as a string, resolved
         // only at dial time — never at encode/decode).
         let other = ed25519::PrivateKey::from_seed(8).public_key();
         d.add_bootstrap(&other, "node.ducktape.industries:443");
-        let (decoded, _) =
-            decode_invite(&encode_invite(&d, None).expect("encode")).expect("roundtrip");
+        let invite = decode_invite(&encode_test_invite(&d, &issuer, None)).expect("roundtrip");
         assert!(
-            decoded
+            invite
+                .descriptor
                 .reach
                 .iter()
                 .any(|r| r.ends_with("@node.ducktape.industries:443"))
         );
+
+        // the joiner's proof-of-possession verifies for the signing key only.
+        let joiner = ed25519::PrivateKey::from_seed(9);
+        let proof = sign_join_proof(&joiner, binding.as_bytes(), &invite.token);
+        assert!(verify_join_proof(
+            &joiner.public_key(),
+            binding.as_bytes(),
+            &invite.token,
+            &proof
+        ));
+        let thief = ed25519::PrivateKey::from_seed(10).public_key();
+        assert!(
+            !verify_join_proof(&thief, binding.as_bytes(), &invite.token, &proof),
+            "a substituted key fails the proof"
+        );
     }
 
     #[test]
-    fn invite_blob_roundtrips_the_token_and_verifies() {
+    fn invite_blob_carries_the_wireguard_bootstrap() {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
@@ -1558,33 +2129,157 @@ mod tests {
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            // a token invite now packs v4, which echoes the coordination mode;
+            // a `None` source resolves to Private, so it decodes as an EXPLICIT
+            // "private" (semantically identical — see `coordination()`).
+            coordination: Some("private".into()),
         };
-        let binding = d.genesis_namespace();
-        let token = mint_invite_token(&issuer, binding.as_bytes());
-        let (decoded, carried) =
-            decode_invite(&encode_invite(&d, Some(&token)).expect("encode")).expect("roundtrip");
-        assert_eq!(decoded, d);
-        let carried = carried.expect("v3 carries the token");
-        assert_eq!(carried, token);
-        assert!(verify_invite_token(&carried, binding.as_bytes()));
+        let wg = InviteWireGuard {
+            public_key: [42u8; 32],
+            endpoint: "203.0.113.7:51820".into(),
+            intro: "203.0.113.7:51821".into(),
+            mesh_port: 52200,
+        };
+        let invite = decode_invite(&encode_test_invite(&d, &issuer, Some(&wg))).expect("decode");
+        assert_eq!(invite.wireguard, Some(wg));
+    }
+
+    #[test]
+    fn a_tampered_or_expired_or_stale_prefix_invite_is_refused() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+
+        // expiry is enforced at decode, deterministically via the injected clock.
+        let blob = encode_invite(&d, &token, None, 1_000, &issuer).expect("encode");
+        assert!(decode_invite_at(&blob, 999).is_ok());
+        let err = decode_invite_at(&blob, 1_000).expect_err("expired");
+        assert!(err.contains("expired"), "{err}");
+
+        // a flipped payload bit kills the envelope signature.
+        use base64::Engine as _;
+        let body = blob.strip_prefix(INVITE_PREFIX).unwrap();
+        let mut bytes = INVITE_B64.decode(body).unwrap();
+        bytes[2] ^= 0x01;
+        let tampered = format!("{INVITE_PREFIX}{}", INVITE_B64.encode(&bytes));
+        let err = decode_invite_at(&tampered, 0).expect_err("tampered");
         assert!(
-            !verify_invite_token(&carried, b"other-net"),
-            "a token binds to its network"
+            err.contains("signature") || err.contains("tampered"),
+            "{err}"
         );
 
-        // the joiner's proof-of-possession verifies for the signing key only.
-        let joiner = ed25519::PrivateKey::from_seed(9);
-        let proof = sign_join_proof(&joiner, binding.as_bytes(), &carried);
-        assert!(verify_join_proof(
-            &joiner.public_key(),
-            binding.as_bytes(),
-            &carried,
-            &proof
-        ));
-        let thief = ed25519::PrivateKey::from_seed(10).public_key();
+        // an envelope signed by someone other than the token's issuer is
+        // refused at encode (and would fail decode's issuer verify anyway).
+        let outsider = ed25519::PrivateKey::from_seed(8);
+        assert!(encode_invite(&d, &token, None, u64::MAX, &outsider).is_err());
+
+        // the old versioned prefixes are gone: a stale paste fails loudly
+        // with re-mint guidance.
+        let err = decode_invite_at("ducktape-invite-v2:AAAA", 0).expect_err("stale prefix");
+        assert!(err.contains("fresh invite"), "{err}");
+    }
+
+    #[test]
+    fn invite_echoes_the_coordination_mode() {
+        // the mode byte rides the SIGNED envelope: a joiner learns off the
+        // invite alone whether the coordinator expects a CoordCap.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let base = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        for (mode, expect) in [("public", Coordination::Public), ("private", Coordination::Private)]
+        {
+            let mut d = base.clone();
+            d.coordination = Some(mode.to_string());
+            let invite =
+                decode_invite(&encode_test_invite(&d, &issuer, None)).expect("roundtrip");
+            assert_eq!(
+                invite.descriptor.coordination(),
+                expect,
+                "the {mode} mode byte roundtrips"
+            );
+            assert_eq!(invite.descriptor.coordination.as_deref(), Some(mode));
+        }
+        // an unset source resolves to Private, the safe default, and decodes
+        // as the EXPLICIT "private" (semantically identical).
+        let invite =
+            decode_invite(&encode_test_invite(&base, &issuer, None)).expect("roundtrip");
+        assert_eq!(invite.descriptor.coordination.as_deref(), Some("private"));
+    }
+
+    /// the FULL delivery chain at the crypto level: a genesis validator mints a
+    /// cap for a joiner, it is packed for the wire (`pack_coord_cap`), the
+    /// joiner unpacks it (`unpack_coord_cap`) and presents it on an
+    /// authenticated request — and the coordinator's private `verify_request`
+    /// admits the joiner off that delivered cap. Proves the cap the member
+    /// hands over its `JoinReply` actually authorizes the holder.
+    #[test]
+    fn delivered_cap_admits_the_joiner_under_private_policy() {
+        use commonware_cryptography::Signer as _;
+        use nat_traversal::{
+            mint_coord_cap, now_secs, sign_authenticator, verify_request, AuthPolicy, NodeKey,
+            COORD_CAP_TTL_SECS, DEFAULT_FRESHNESS_WINDOW_SECS,
+        };
+
+        let genesis = ed25519::PrivateKey::from_seed(1);
+        let joiner = ed25519::PrivateKey::from_seed(2);
+        let mut subj = [0u8; 32];
+        subj.copy_from_slice(joiner.public_key().as_ref());
+        let subject = NodeKey(subj);
+
+        let now = now_secs();
+        // MINT (member side) -> PACK (wire) -> UNPACK (joiner side).
+        let minted = mint_coord_cap(&genesis, subject, now + COORD_CAP_TTL_SECS);
+        let wire = pack_coord_cap(&minted);
+        let delivered = unpack_coord_cap(&wire).expect("joiner unpacks the delivered cap");
+        assert_eq!(delivered, minted, "the cap survives the wire byte-for-byte");
+
+        // the joiner builds an authenticated request carrying the delivered cap.
+        let inner = b"\x03register-request-bytes";
+        let auth = sign_authenticator(&joiner, inner, now, Some(delivered));
+
+        // the coordinator, pinned to this genesis key, admits the joiner.
+        let policy = AuthPolicy::Private {
+            genesis_set: vec![genesis.public_key()],
+        };
+        assert_eq!(
+            verify_request(
+                &policy,
+                now,
+                DEFAULT_FRESHNESS_WINDOW_SECS,
+                subject,
+                inner,
+                &auth
+            ),
+            Ok(()),
+            "the delivered cap admits the joiner"
+        );
+
+        // control: WITHOUT the cap the same private policy rejects the joiner.
+        let bare = sign_authenticator(&joiner, inner, now, None);
         assert!(
-            !verify_join_proof(&thief, binding.as_bytes(), &carried, &proof),
-            "a substituted key fails the proof"
+            verify_request(
+                &policy,
+                now,
+                DEFAULT_FRESHNESS_WINDOW_SECS,
+                subject,
+                inner,
+                &bare
+            )
+            .is_err(),
+            "a joiner with no cap is not admitted to a private network"
         );
     }
 
@@ -1614,6 +2309,7 @@ mod tests {
                 hex_bytes(me.public_key().as_ref())
             )],
             reach: vec![],
+            coordination: None,
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1652,6 +2348,7 @@ mod tests {
                 )],
                 bootstrap: vec![],
                 reach: vec![],
+                coordination: None,
             };
             d.save(&dir.join("network.toml")).expect("save");
         }
@@ -1695,6 +2392,7 @@ mod tests {
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1721,6 +2419,7 @@ mod tests {
             validators: vec![],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.admit(&a);
         d.admit(&b);
@@ -1746,6 +2445,7 @@ mod tests {
             ],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.add_bootstrap(&other, "127.0.0.1:52200");
         d.save(&dir.join("network.toml")).expect("save descriptor");
@@ -1768,6 +2468,9 @@ mod tests {
         assert!(!r.dev_demo);
         assert_eq!(r.signer.public_key(), me.public_key());
         assert_eq!(r.storage_dir, dir.join("storage"));
+        // the workspace base is the config directory — where a joiner would
+        // persist a `coord.cap` delivered over its JoinReply.
+        assert_eq!(r.workspace, dir);
     }
 
     #[test]
@@ -1781,6 +2484,7 @@ mod tests {
             validators: vec![hex_bytes(other.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1815,6 +2519,7 @@ mod tests {
             validators: vec![hex_bytes(a.as_ref()), hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         assert!(
             d.validator_keys().is_err(),
@@ -1832,6 +2537,7 @@ mod tests {
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         let founder_only = d.genesis_namespace();
         assert!(founder_only.starts_with("net#00000000@"));
@@ -1904,6 +2610,7 @@ mod tests {
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // empty dir: anything goes.
         assert!(guard_join_descriptor(&dir, &ours).is_ok());
@@ -1978,6 +2685,7 @@ mod tests {
             validators: vec![lower, upper],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         assert!(
             d.validator_keys().is_err(),
@@ -1995,6 +2703,7 @@ mod tests {
             validators: vec![hex_bytes(a.as_ref()), hex_bytes(b.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // a hand-edited twin: uppercase, whitespace, different order.
         let messy = NetworkDescriptor {
@@ -2006,6 +2715,7 @@ mod tests {
             ],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // identical decoded sets MUST run under the identical namespace.
         assert_eq!(messy.genesis_namespace(), canonical.genesis_namespace());
@@ -2036,6 +2746,7 @@ mod tests {
                 format!("{}@127.0.0.1:52200", hex_bytes(b.as_ref())),
             ],
             reach: vec![],
+            coordination: None,
         };
         let entries = d.bootstrap_entries().expect("well-formed hints parse");
         assert_eq!(
@@ -2048,6 +2759,7 @@ mod tests {
         let bad = NetworkDescriptor {
             bootstrap: vec!["nope".into()],
             reach: vec![],
+            coordination: None,
             ..d
         };
         assert!(bad.bootstrap_entries().is_err());
@@ -2063,13 +2775,13 @@ mod tests {
     #[test]
     fn sync_source_prefers_validator_hints_and_never_self() {
         let me = ed25519::PrivateKey::from_seed(31).public_key();
-        let observer = ed25519::PrivateKey::from_seed(32).public_key();
+        let resident = ed25519::PrivateKey::from_seed(32).public_key();
         let validator = ed25519::PrivateKey::from_seed(33).public_key();
         let addr: SocketAddr = "127.0.0.1:52200".parse().unwrap();
         let validators = vec![me.clone(), validator.clone()];
 
         // a non-validator hint sorts first but can never serve — skipped.
-        let hints = vec![(observer.clone(), addr), (validator.clone(), addr)];
+        let hints = vec![(resident.clone(), addr), (validator.clone(), addr)];
         assert_eq!(
             choose_sync_source(&hints, &validators, &me),
             Some(validator.clone())
@@ -2252,6 +2964,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // an existing network.toml without a [reach] array still parses (serde default),
         // and an empty reach is not serialised (skip_serializing_if).
@@ -2270,6 +2983,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.add_bootstrap(&a, "127.0.0.1:52200");
         let hints = d.reach_hints().expect("hints");
@@ -2287,6 +3001,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("1.1.1.1:1".into()) });
         // same expected_key, different reach — replaces, never duplicates.
@@ -2311,6 +3026,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(v.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         let ns0 = base.genesis_namespace();
 
@@ -2341,6 +3057,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(target.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // a coordinated hint routes through the coordinator, but the identity
         // we expect end-to-end is the TARGET; the coordinator's own ingress and
@@ -2370,6 +3087,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // a bootstrap hint alone synthesises a Direct reach ingress...
         d.add_bootstrap(&a, "127.0.0.1:52200");

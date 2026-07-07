@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::process::Stdio;
 use std::time::Duration;
 
+use commonware_cryptography::{ed25519, Signer as _};
 use nat_traversal::{NatClient, NodeKey};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -43,8 +44,17 @@ async fn deployed_coordinator_binary_answers_a_bind_request() {
     .await
     .expect("coordinator must announce its listen address promptly");
 
-    // Drive the real STUN reflexive path against the running process.
-    let client = NatClient::bind(NodeKey([7u8; 32]), addr)
+    // Drive the real STUN reflexive path against the running process. The
+    // service boots with NO auth flag, so the deployed default is public +
+    // proof-of-possession: a real node signs its request with its identity key.
+    // Bind an authenticating client whose NodeKey is that key's public half.
+    let signer = ed25519::PrivateKey::from_seed(7);
+    let key = {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(signer.public_key().as_ref());
+        NodeKey(k)
+    };
+    let client = NatClient::bind_multi_auth(key, vec![addr], signer, None)
         .await
         .expect("bind client");
     let reflexive = timeout(Duration::from_secs(5), client.discover_reflexive())

@@ -64,13 +64,13 @@ use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
 use tagging::TaggingModule;
-use document::Document;
 use files::Files;
 use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use futures::select;
 use host::{BlockContext, DispatchRecord, Host, SubmitError};
+use identity::Identity;
 use inbox::Inbox;
 use indexer::{AppliedOp, BlockOps, IndexStore};
 use jobs::Jobs;
@@ -101,12 +101,12 @@ const MODULE_IDS: [&str; 16] = [
     "jobs",
     "agent",
     "runs",
-    "document",
     "pages",
     "forge",
     "files",
     "memory",
     "profiles",
+    "identity",
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 const PEER_ORIGIN: &[u8] = b"peer";
@@ -257,7 +257,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 store
                     .with_indexer(Box::new(chat::index::ChatIndex::new("chat")))
                     .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
-                    .with_indexer(Box::new(document::index::DocumentIndex::new("document")))
                     .with_indexer(Box::new(pages::index::PagesIndex::new("pages"))),
             )
         })
@@ -391,14 +390,15 @@ fn run_sim(
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-            Some("document".into()),
         );
-        let document = Document::init(context.child("document"), "document").await;
         let pages = Pages::init(context.child("pages"), "pages").await;
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
         let files = Files::with_blobs("files", blobs.clone());
         let memory = Memory::new("memory", "files");
         let profiles = Profiles::new("profiles");
+        // the deterministic user->nodes binding registry — no valset, no chain
+        // (the simulator has neither), matching noded's daemon wiring.
+        let identity = Identity::new("identity", None, String::new());
         let host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),
@@ -410,12 +410,12 @@ fn run_sim(
             Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
-            Box::new(document),
             Box::new(pages),
             Box::new(forge),
             Box::new(files),
             Box::new(memory),
             Box::new(profiles),
+            Box::new(identity),
         ])
         .expect("genesis");
 

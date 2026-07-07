@@ -9,7 +9,6 @@ kv = { workspace = true }
 directory = { workspace = true }
 greeter = { workspace = true }
 forge = { workspace = true }
-document = { workspace = true }
 chat = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
@@ -18,6 +17,7 @@ dispatch = { workspace = true }
 tagging = { workspace = true }
 tasks = { workspace = true }
 profiles = { workspace = true }
+identity = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }

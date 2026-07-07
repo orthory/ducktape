@@ -1,0 +1,87 @@
+# ADR: Per-Use Data Plane Instances
+
+Date: 2026-07-07. Status: **Accepted**. This formalizes how consumers of the
+WireGuard overlay obtain a byte transport: one `DataPlane` instance per
+consumer ("per-use"), governed by a kernel-owned contract, instead of one
+shared node-wide plane instance with per-service registration.
+
+## Context
+
+The original data-plane design (`research-dataplane-design.md`) sketched a
+single `DataPlane` wired once in `bin/node`, with consumers registering a
+`Service` (compile-time u8 registry: `Service::Voice`,
+`Service::StateSync`, ...) and drawing isolation from two structural layers:
+separate sockets per class (datagram vs stream) and per-flow bounded queues.
+A third layer — a global bulk token bucket shared across stream services —
+was the one property that genuinely required a single shared instance.
+
+Implementation reality diverged before the shared instance ever existed:
+
+- Voice runs its own `DataPlane` over a datagram-only mesh-encapsulation
+  `ChannelTransport`, on a dedicated tokio runtime bridged to the node
+  (`bin/node/src/voice.rs`).
+- Statesync's plane arm (`data_plane::OverlaySockets` +
+  `DataPlaneSyncClient`, PR #184) must be constructed on the node's own
+  runtime — the qmdb resolver lane has to be pollable across the plane's
+  futures, which requires sharing the node's reactor. It cannot share
+  voice's bridged-runtime instance.
+
+So the two live consumers already need different transports and different
+runtimes. Forcing them through one instance would require the plane to
+multiplex across runtimes and transport arms — complexity that buys nothing
+today, since statesync is the only stream-class (bulk) consumer and the
+shared bulk bucket therefore has exactly one drawer.
+
+## Decision
+
+**A `DataPlane` is instantiated per consumer, not per node.** Each use —
+statesync, voice, future blob/attachments — constructs its own plane over
+the transport arm and runtime that fit its lanes. What keeps this a system
+rather than a sprawl is a kernel-owned contract, host-owned lifecycle split:
+
+**The kernel (`crates/kernel/data-plane`) governs the contract:**
+
+- The `Service` registry stays the single compile-time namespace. Because
+  planes no longer share sockets, the registry doubles as the **overlay port
+  registry**: each service's listener/datagram ports are compile-time
+  constants keyed by `Service`, so two per-use planes can never collide on a
+  bind. Ports are safe as fixed constants because every plane binds a
+  specific member `/128` (`ula_v6_member_addr`), never a wildcard.
+- Class isolation invariants are unchanged and non-negotiable: datagram and
+  stream classes never share a socket; per-flow bounded queues with
+  class-appropriate overflow policy; unknown `(service, flow)` at demux is
+  drop-and-count, never buffered.
+- Identity stays cryptokey routing: source overlay address → identity via
+  the injected `AddressBook`; no plane-level handshake. Admission is an
+  injected `AdmissionPolicy` — the plane never decides who is served.
+
+**The host (`bin/node`) governs instantiation:**
+
+- The host decides which planes exist, constructs each one's transport arm
+  (`OverlaySockets`, sim, or mesh-encapsulation), injects its `AddressBook`
+  and `AdmissionPolicy`, and owns staging: a plane comes up only when the
+  reachability plane reports the overlay live (`MeshReady`), and rides the
+  runtime its consumer's lanes require (statesync: the node runtime; voice:
+  its bridged runtime).
+- Consumers never construct transports themselves and never touch WireGuard
+  config — reachability drives the interface, planes only use it. The
+  layering invariant from the original design stands.
+
+**Cross-service bulk pacing is deferred, with a named shape:** when a second
+stream-class consumer lands, the global bulk budget returns as a shared
+pacing coordinator object injected into each per-use plane at construction —
+the budget is shared state, not shared sockets. It must not be solved by
+re-merging planes.
+
+## Consequences
+
+- Voice's existing arm is already conformant; no migration.
+- Statesync's `bin/node` wiring instantiates the second per-use plane and is
+  the pattern-setter for future consumers.
+- Per-service observability falls out naturally: each plane's counters are
+  its consumer's counters.
+- A misbehaving consumer can only exhaust its own plane's queues and ports;
+  the blast radius of a plane bug is one service by construction.
+- The one regression risk versus a shared instance — uncoordinated bulk
+  senders saturating the uplink — is acknowledged and parked until a second
+  bulk consumer exists (see the pacing-coordinator shape above).

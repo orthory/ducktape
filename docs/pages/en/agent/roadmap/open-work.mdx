@@ -19,13 +19,13 @@ WireGuard interface is still deliberately descoped.
 ## Demotion And Promotion Edges
 
 A validator removed at epoch cutover still halts instead of staying online as a
-sync/observer. Joiner promotion itself has shipped: a parked joiner can sync an
+sync/resident. Joiner promotion itself has shipped: a parked joiner can sync an
 admitting boundary, write a promotion checkpoint, reboot, and vote. Do not list
 that as missing.
 
 The remaining promotion-adjacent operator work is the stale local-state story:
 pre-recovery or damaged recovery directories fail loudly rather than migrating,
-and demoted nodes do not yet fall back into an observer role automatically.
+and demoted nodes do not yet fall back into a resident role automatically.
 
 ## Replay Nonces
 
@@ -44,15 +44,18 @@ place.
 
 ## Agent/Reactor Product Path
 
-The agent module exists, and demo/tests show the model-output-as-ordered-op
-pattern. `bin/node`/`bin/noded` do not run an agent LLM worker yet: the node
-worker set is empty, production genesis does not include `agent`, and the path is
-not wired to tasks as live operator UX.
+The live node now includes `agent`, `runs`, `jobs`, `dispatch`, `saga`,
+`capability`, and `tagging` in its module set. It discovers local capability
+providers, announces the truthful tag set, and runs a dispatch worker over
+leases assigned to its own key. The remaining product work is not the basic
+agent execution loop; it is richer operator UX and package-level behavior:
+packaged agents and harnesses, broader action vocabularies, task obligations,
+and durable agent workflows that feel native rather than a debug surface.
 
 ## Module Integration Wave
 
-The next module wave is design/spec work before implementation: automations
-deliver to inbox via `Deliver`; automations can trigger from memory watches;
-memory bodies over 64 KiB ride through files manifests; agents can claim jobs;
-and tasks can be modeled as obligations with deadline state, cure/escalation
-lineage, and atomic cross-module creation.
+The next module wave is integration work across modules that already exist:
+automations deliver to inbox via `Deliver`; automations can trigger from memory
+watches; memory bodies over 64 KiB ride through files manifests; package
+harnesses can own agents and action routes; and tasks can become obligations
+with deadline state, cure/escalation lineage, and atomic cross-module creation.

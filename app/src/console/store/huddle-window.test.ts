@@ -17,6 +17,8 @@ const voice = (over: Partial<VoiceSlice> = {}): VoiceSlice => ({
   status: "live",
   error: null,
   popped: true,
+  cameraOn: false,
+  peers: {},
   ...over,
 });
 

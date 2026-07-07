@@ -15,6 +15,7 @@ const humanEn = [
   },
   { text: 'Network and Membership', link: '/en/human/network/network-and-membership' },
   { text: 'Node Upgrades', link: '/en/human/network/node-upgrades' },
+  { text: 'Coordination', link: '/en/human/network/coordination' },
   { text: 'Product Modules', link: '/en/human/modules/product-modules' },
   { text: 'What Is Left', link: '/en/human/roadmap/what-is-left' },
   {
@@ -22,6 +23,7 @@ const humanEn = [
     items: [
       { text: 'Repository Map', link: '/en/human/reference/repository-map' },
       { text: 'Implementation Status', link: '/en/human/reference/implementation-status' },
+      { text: 'Design Records', link: '/en/human/reference/design-records' },
       { text: 'Gotchas', link: '/en/human/reference/gotchas' },
     ],
   },
@@ -42,6 +44,7 @@ const humanKo = [
   },
   { text: 'Network and Membership', link: '/ko/human/network/network-and-membership' },
   { text: 'Node Upgrades', link: '/ko/human/network/node-upgrades' },
+  { text: 'Coordination', link: '/ko/human/network/coordination' },
   { text: 'Product Modules', link: '/ko/human/modules/product-modules' },
   { text: 'What Is Left', link: '/ko/human/roadmap/what-is-left' },
   {
@@ -49,6 +52,7 @@ const humanKo = [
     items: [
       { text: 'Repository Map', link: '/ko/human/reference/repository-map' },
       { text: 'Implementation Status', link: '/ko/human/reference/implementation-status' },
+      { text: 'Design Records', link: '/ko/human/reference/design-records' },
       { text: 'Gotchas', link: '/ko/human/reference/gotchas' },
     ],
   },
@@ -72,6 +76,7 @@ const agentEn = [
     items: [
       { text: 'Repository Map', link: '/en/agent/reference/repository-map' },
       { text: 'Verification Matrix', link: '/en/agent/reference/verification-matrix' },
+      { text: 'Design Records', link: '/en/agent/reference/design-records' },
       { text: 'Gotchas', link: '/en/agent/reference/gotchas' },
     ],
   },
@@ -95,6 +100,7 @@ const agentKo = [
     items: [
       { text: 'Repository Map', link: '/ko/agent/reference/repository-map' },
       { text: 'Verification Matrix', link: '/ko/agent/reference/verification-matrix' },
+      { text: 'Design Records', link: '/ko/agent/reference/design-records' },
       { text: 'Gotchas', link: '/ko/agent/reference/gotchas' },
     ],
   },

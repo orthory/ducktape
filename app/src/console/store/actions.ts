@@ -7,6 +7,8 @@ import * as filesClient from "../../domain/files-client";
 import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
+import * as identityClient from "../../domain/identity-client";
+import { normalizeKey } from "../../domain/names";
 import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
 import * as profilesClient from "../../domain/profiles-client";
@@ -15,10 +17,17 @@ import type { TurnPolicy } from "../../domain/runs-client";
 import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
 import * as bootstrap from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
-import { voiceSocketUrl } from "../../domain/transport";
-import { createVoiceSession, huddleRecipients } from "../../domain/voice-session";
-import type { VoiceError, VoiceSession, VoiceStatus } from "../../domain/voice-session";
-import { keyBytes } from "../../domain/chat-client";
+import { callSocketUrl } from "../../domain/transport";
+// Task 7 moved the huddle session to call-session (typed /v1/call/ws + audio +
+// camera video + control on one socket); this store drives it via CallEvent.
+import {
+  createCallSession,
+  supportsVideoCalls,
+  MAX_VIDEO_PARTICIPANTS,
+} from "../../domain/call-session";
+import type { CallSession, CallEvent } from "../../domain/call-session";
+import { huddleRecipients } from "../../domain/voice-session";
+import { keyBytes, keyHex } from "../../domain/chat-client";
 import * as valsetClient from "../../domain/valset-client";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
@@ -28,6 +37,7 @@ import {
   sectionForScreen,
 } from "../modules/registry";
 import type { Action } from "./reducer";
+import { autoBindUserIdentity } from "./auto-bind";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
 import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
@@ -105,8 +115,26 @@ export interface ConsoleActions {
    *  and push it. Called by the provider whenever a refresh lands a new
    *  snapshot while a huddle is active; a no-op when not huddling. */
   syncHuddleRecipients(): void;
+  /** Turn the local camera on / off in the active huddle — acquires + encodes
+   *  (or tears down) camera video on the live session and beacons the change to
+   *  peers. Guarded: no-op with no session, on a runtime that can't do video,
+   *  or when the roster already EXCEEDS the video cap (audio-only past it). */
+  setCamera(on: boolean): void;
+  /** Whether this runtime can do video calls — WebKitGTK can't (no WebCodecs),
+   *  its Chromium companion window can. Drives the camera control's enablement. */
+  videoSupported(): boolean;
+  /** Evict a stale huddle member (one whose beacons went silent) from the
+   *  channel roster on consensus — the cleanup for a client that died without
+   *  leaving. Keyed by the target's submitter identity bytes, not its node. */
+  sweepHuddle(channelId: string, user: number[]): void;
+  /** The live call session (audio graph + camera + ws), or null when not
+   *  huddling — so video tiles can bind their canvas / preview element to it.
+   *  Ephemeral and per-client, exactly like the session itself. */
+  getCallSession(): CallSession | null;
   /** Pop the huddle out into its own desktop window (Tauri only) — the in-app
-   *  card yields while the window is open. No-op when not in a huddle. */
+   *  card yields while the window is open. No-op when not in a huddle. The
+   *  popped window is an AUDIO remote (mute/leave/retry); the camera toggle and
+   *  video tiles stay in the main-window dock, reached by popping back in. */
   popOutHuddle(): void;
   /** Return the huddle to the in-app card, closing the window. Also invoked
    *  when Rust reports the window destroyed (any way it dies). */
@@ -237,6 +265,10 @@ export interface ConsoleActions {
   stopNode(): void;
   /** Re-spawn / re-adopt the managed daemon after a stop (desktop only). */
   startNode(): void;
+  /** Retry connecting the SAME workspace after a boot failure (from the
+   *  "Node failed to start" surface). Idempotent — re-runs connectActive
+   *  against the existing workspace, never re-minting one. */
+  retryConnect(): void;
   /** Scrape + parse the node's `/metrics`. Null when no node is resolved or the
    *  scrape fails — best-effort, for the poll-driven Metrics view. */
   readMetrics(): Promise<NodeMetrics | null>;
@@ -255,14 +287,14 @@ export interface ConsoleActions {
   /** Fetch the active workspace's invite blob into state for sharing. */
   revealInvite(): void;
   /** Admit a joiner by pubkey through the active (member) workspace — grants
-   *  OBSERVER standing (staged admission's first step); promote seats it. */
+   *  RESIDENT standing (staged admission's first step); promote seats it. */
   admitMember(pubkey: string): void;
-  /** Promote an observer into the consensus quorum by pubkey — staged
-   *  admission's second step, once the observer's node is warm. */
+  /** Promote a resident into the consensus quorum by pubkey — staged
+   *  admission's second step, once the resident's node is warm. */
   promoteMember(pubkey: string): void;
-  /** Revoke a key's observer standing — the undo of admitMember; its node
+  /** Revoke a key's resident standing — the undo of admitMember; its node
    *  parks again and another admit re-grants. */
-  removeObserver(pubkey: string): void;
+  removeResident(pubkey: string): void;
   /** Open a removal proposal for a validator by pubkey and cast this node's
    *  yes-ballot; the removal takes effect only once a strict majority approve. */
   demoteMember(pubkey: string): void;
@@ -330,10 +362,10 @@ export function createActions({
   // query's results (or repopulate a cleared palette).
   let searchToken = 0;
 
-  // The live voice session (the browser audio graph + ws), or null when not in
-  // a huddle. Ephemeral and per-client — it lives here, not in state; the
-  // `voice` slice mirrors only its status for the ui.
-  let voice: VoiceSession | null = null;
+  // The live call session (the browser audio graph + camera + ws), or null when
+  // not in a huddle. Ephemeral and per-client — it lives here, not in state;
+  // the `voice` slice mirrors only its status + camera/peer beacons for the ui.
+  let voice: CallSession | null = null;
 
   /** Our own node key hex — the fan-out set excludes it. Empty on a daemon
    *  that can't do voice. */
@@ -363,22 +395,57 @@ export function createActions({
     lastRecipients = null;
   };
 
-  // Session lifecycle → the voice slice. Any terminal end reconciles the
+  // Session events → the voice slice. A `peerBeacon` merges that peer's latest
+  // ephemeral call state (keyed by its already-lowercase node hex) into the
+  // slice. A `status` event drives lifecycle: any terminal end reconciles the
   // consensus roster (submit leave) so peers never keep showing a dead
-  // participant: 'closed' (the session was replaced) clears the slice
-  // entirely; 'error' (hub refusal, socket failure, mic denial) keeps the dock
-  // up in its error state so the failure is visible — Leave dismisses it.
-  const onVoiceStatus = (status: VoiceStatus, error?: VoiceError): void => {
+  // participant, and clears local camera/peer state (the session is gone) —
+  // 'closed' (the session was replaced) clears the slice entirely (and closes
+  // the popped-out window); 'error' (hub refusal, socket failure, mic denial)
+  // keeps the dock up in its error state so the failure is visible — the status
+  // event carries WHY (error), which the slice mirrors for the dock's message.
+  // Leave dismisses it.
+  const onCallEvent = (event: CallEvent): void => {
+    if (event.kind === "peerBeacon") {
+      update((prev) => ({
+        voice: {
+          ...prev.voice,
+          peers: {
+            ...prev.voice.peers,
+            [event.peer]: { muted: event.muted, cameraOn: event.cameraOn, atMs: event.atMs },
+          },
+        },
+      }));
+      return;
+    }
+    const status = event.status;
+    const error = event.error;
     if (status === "closed" || status === "error") {
       const channelId = getState().voice.channelId;
       stopVoice();
       if (channelId) submitLeaveHuddle(channelId);
       if (status === "closed") {
         closeHuddleWindow();
-        patch({ voice: { channelId: null, muted: false, status: "idle", error: null, popped: false } });
+        patch({
+          voice: {
+            channelId: null,
+            muted: false,
+            status: "idle",
+            error: null,
+            popped: false,
+            cameraOn: false,
+            peers: {},
+          },
+        });
       } else {
         update((prev) => ({
-          voice: { ...prev.voice, status: "error", error: error ?? "connection" },
+          voice: {
+            ...prev.voice,
+            status: "error",
+            error: error ?? "connection",
+            cameraOn: false,
+            peers: {},
+          },
         }));
       }
       return;
@@ -558,6 +625,12 @@ export function createActions({
       forgetNeedsForce: false,
       deleteNeedsForce: null,
       inviteBlob: null,
+      // a fresh connect/retry starts from a clean slate — clear any prior boot
+      // failure, mid-session-down banner, and error so a stale reason can't
+      // linger over the new attempt.
+      bootError: null,
+      connectionDown: null,
+      error: null,
       // per-node observability belonging to the workspace we're leaving; the
       // node effect re-hydrates blocks and re-follows the block stream once
       // the new node is set below.
@@ -591,6 +664,17 @@ export function createActions({
           `still running on this port; quit it and try again.`,
       );
     };
+    // Adopt a node that just proved it's this workspace's own: clear the
+    // onboarding phase, hand it to the store, and — best-effort, desktop-only
+    // — offer this machine's user key to bind it (Task 8). Fire-and-forget:
+    // a failed bind is invisible here by design (auto-bind.ts never throws)
+    // and the provider's per-block refresh already re-reads the identity
+    // module, so a successful bind surfaces on its own on the next block.
+    const adopt = (transport: NodeTransport): void => {
+      patch({ onboardingPhase: null });
+      setNode(transport);
+      autoBindUserIdentity(transport, target).catch(() => {});
+    };
     return Promise.resolve()
       .then(() => ws.selectWorkspace(target.id))
       .then((sel) => {
@@ -604,8 +688,7 @@ export function createActions({
             return transport.status().then((s) => {
               if (stale()) return;
               if (!identityMatches(s.publicKey)) return rejectImpostor();
-              patch({ onboardingPhase: null });
-              setNode(transport);
+              adopt(transport);
             });
           });
         }
@@ -645,8 +728,7 @@ export function createActions({
                 .then((seated) => {
                   if (stale()) return;
                   if (!seated) return park();
-                  patch({ onboardingPhase: null });
-                  setNode(transport);
+                  adopt(transport);
                 });
             },
             () => park(),
@@ -655,10 +737,43 @@ export function createActions({
         return tick();
       })
       .catch((err) => {
-        if (!stale()) {
-          patch({ onboardingBusy: false });
-          fail(err);
-        }
+        if (stale()) return;
+        patch({ onboardingBusy: false });
+        const reason =
+          typeof err === "object" && err && "message" in err
+            ? String((err as { message?: unknown }).message)
+            : String(err);
+        // Best-effort: pull the node's daemon.log so even a plain "did not come
+        // up" boot timeout carries the real reason the node wrote to disk (bind
+        // conflict, bad config, panic) — the file nothing in the UI used to read.
+        Promise.resolve()
+          .then(() => ws.workspaceLogTail(target.id))
+          .then(
+            (log): { path: string | null; tail: string } => ({ path: log.path, tail: log.tail }),
+            () => ({ path: null, tail: "" }),
+          )
+          .then((log) => {
+            if (stale()) return;
+            if (target.member) {
+              // member/founder: route to the dedicated "Node failed to start"
+              // body with the reason, the log, and an idempotent Retry — never
+              // a hollow disconnected console whose toast then vanishes.
+              patch({
+                bootError: {
+                  workspaceId: target.id,
+                  reason,
+                  logPath: log.path,
+                  logTail: log.tail,
+                },
+              });
+            } else {
+              // joiner: surface it IN the waiting room as a fatal phase instead
+              // of leaving the "ask a member to approve" spinner up over a node
+              // that never started.
+              patch({ onboardingPhase: { phase: "fatal", detail: reason } });
+            }
+            fail(reason);
+          });
       });
   };
 
@@ -716,13 +831,25 @@ export function createActions({
     },
 
     // Keep the local author identity (still the web-origin string) AND submit
-    // SetName so the chosen name propagates: it's origin-gated, so passing our
-    // origin sets our OWN profile only. Refresh re-reads authorNames.
+    // a name write so the chosen name propagates: it's origin-gated, so
+    // passing our origin only ever writes OUR OWN name. Once this node is
+    // bound to a user (state.nodeUsers has it), the durable identity is the
+    // USER, not the node — so the write goes through identity's SetUserName
+    // instead of profiles' SetName, the same way MembersView's inline
+    // self-rename (canRename row, also wired to this action) picks up the
+    // bound-vs-unbound distinction for free. An unbound node keeps the
+    // original profiles path unchanged. Refresh re-reads authorNames/nodeUsers.
     setDisplayName: (name) => {
-      const origin = getState().author;
+      const current = getState();
+      const origin = current.author;
+      const nodeKeyNorm = normalizeKey(current.workspace?.pubkey);
+      const bound = nodeKeyNorm ? current.nodeUsers[nodeKeyNorm] : undefined;
       submitTracked(
         opKey.profile(),
-        (live) => profilesClient.setName(live, { displayName: name, origin }),
+        (live) =>
+          bound
+            ? identityClient.setUserName(live, { displayName: name, origin })
+            : profilesClient.setName(live, { displayName: name, origin }),
         () => ({ author: name }),
       );
     },
@@ -921,7 +1048,7 @@ export function createActions({
       if (active === channelId && state.voice.status !== "error") return;
       // switching huddles: the server replaces the session, so leave the old on
       // consensus and stop its audio before starting the new one. An errored
-      // session already left (onVoiceStatus reconciled the roster) — skip it.
+      // session already left (onCallEvent reconciled the roster) — skip it.
       if (active && active !== channelId) submitLeaveHuddle(active);
       stopVoice();
       // submit the join carrying our node key bytes; optimistically add us to
@@ -946,20 +1073,32 @@ export function createActions({
           settled.voice.channelId === channelId
         ) {
           stopVoice();
-          update((prev) => ({ voice: { ...prev.voice, status: "error", error: "refused" } }));
+          // the session is gone — camera/beacon state must not outlive it.
+          update((prev) => ({
+            voice: { ...prev.voice, status: "error", error: "refused", cameraOn: false, peers: {} },
+          }));
         }
       });
       // start the audio session and reflect "connecting"; push whatever roster
       // we already know (others may be huddling), self excluded. joins start
       // MUTED — joining a room must never be a hot-mic moment; unmuting is the
       // deliberate act.
-      voice = createVoiceSession(onVoiceStatus);
+      voice = createCallSession(onCallEvent);
       voice.setMuted(true);
-      // a retry from the popped window must keep it popped — spread, don't reset.
+      // a retry from the popped window must keep it popped — spread, don't reset;
+      // camera/peer state resets since this is a fresh session.
       update((prev) => ({
-        voice: { ...prev.voice, channelId, muted: true, status: "connecting", error: null },
+        voice: {
+          ...prev.voice,
+          channelId,
+          muted: true,
+          status: "connecting",
+          error: null,
+          cameraOn: false,
+          peers: {},
+        },
       }));
-      voice.start(voiceSocketUrl(nodeUrl, channelId));
+      voice.start(callSocketUrl(nodeUrl, channelId));
       pushRecipients(channelId);
     },
 
@@ -967,7 +1106,17 @@ export function createActions({
       const channelId = getState().voice.channelId;
       stopVoice();
       closeHuddleWindow();
-      patch({ voice: { channelId: null, muted: false, status: "idle", error: null, popped: false } });
+      patch({
+        voice: {
+          channelId: null,
+          muted: false,
+          status: "idle",
+          error: null,
+          popped: false,
+          cameraOn: false,
+          peers: {},
+        },
+      });
       if (channelId) submitLeaveHuddle(channelId);
     },
 
@@ -977,6 +1126,29 @@ export function createActions({
     },
 
     syncHuddleRecipients: () => pushRecipients(),
+
+    setCamera: (on) => {
+      if (!voice) return;
+      if (on && !supportsVideoCalls()) return; // capability-gated UI should prevent this
+      const channel = getState().channels.find((c) => c.id === getState().voice.channelId);
+      // block turning the camera on once the roster EXCEEDS the video cap — the
+      // grid can't render more tiles, so those huddles stay audio-only.
+      if (on && (channel?.huddle?.length ?? 0) > MAX_VIDEO_PARTICIPANTS) return;
+      voice.setCamera(on);
+      update((prev) => ({ voice: { ...prev.voice, cameraOn: on } }));
+    },
+
+    videoSupported: () => supportsVideoCalls(),
+
+    sweepHuddle: (channelId, user) => {
+      submitTracked(
+        opKey.huddle(channelId),
+        (live) => chatClient.sweepHuddle(live, { channelId, user, origin: getState().author }),
+        (prev) => optimistic.huddleSwept(prev, channelId, keyHex(user)),
+      );
+    },
+
+    getCallSession: () => voice,
 
     popOutHuddle: () => {
       if (!getState().voice.channelId) return;
@@ -1409,6 +1581,21 @@ export function createActions({
 
     dismissError: () => patch({ error: null }),
 
+    retryConnect: () => {
+      const st = getState();
+      const id = st.bootError?.workspaceId ?? st.workspace?.id ?? null;
+      const target =
+        (id ? st.workspaces.find((w) => w.id === id) : undefined) ?? st.workspace ?? null;
+      if (!target) {
+        // nothing to reconnect to — fall back to the front door.
+        patch({ bootError: null, needsOnboarding: true });
+        return;
+      }
+      // connectActive clears bootError/error at the start; re-drive the SAME
+      // workspace (idempotent — never mints a new one).
+      connectActive(target).catch(fail);
+    },
+
     // ── Onboarding / workspaces ──
     createWorkspace: (name) => {
       if (!name.trim()) return;
@@ -1582,11 +1769,11 @@ export function createActions({
         .catch(fail);
     },
 
-    removeObserver: (pubkey) => {
+    removeResident: (pubkey) => {
       const target = getState().workspace;
       if (!target || !pubkey.trim()) return;
       Promise.resolve()
-        .then(() => ws.removeObserver(target.id, pubkey.trim()))
+        .then(() => ws.removeResident(target.id, pubkey.trim()))
         .then(() => refresh())
         .catch(fail);
     },
@@ -1729,7 +1916,7 @@ export function createActions({
         });
     },
 
-    newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null }),
+    newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null, bootError: null }),
 
     dismissOnboarding: () =>
       // Closable when there's a connection to return to — a local workspace or a

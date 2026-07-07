@@ -6,7 +6,8 @@ that fits its job.
 
 ## Built or Started
 
-- `document` stores block-based documents on QMDB and exposes QMDB state sync.
+- `pages` stores nested block-based pages, page tabs, and comment threads on
+  QMDB, and exposes QMDB state sync.
 - `forge` stores git-backed project state, with a root derived from the git head
   and pack install guarded by connectivity verification.
 - `chat` is the storage-owning chat module: channels, threads, edits, reactions,
@@ -22,8 +23,56 @@ that fits its job.
 - `memory` is a filesystem-shaped shared agent workspace with immutable
   generations.
 - `jobs` is a consensus-native work board with first-claim-wins claims.
+- `identity` binds node keys to user keys — a replicated registry so a person
+  running several nodes still resolves to one identity above mesh/valset.
 - `kv`, `valset`, `saga`, `governance`, `directory`, and `greeter` support
   infrastructure, examples, and tests.
+
+## Chat And Huddles
+
+Chat owns channels, message threads, edits, reactions, membership, and hook
+fan-out. It stores one QMDB record per entity instead of one whole-history
+value, which keeps hot channels from becoming commit bombs and lets reads page
+by computed keys.
+
+Huddles are attached to chat channels. Consensus stores the roster with
+`join_huddle`, `leave_huddle`, and `sweep_huddle`; media state such as mute,
+camera, and peer beacons stays ephemeral. The live node has a typed call socket
+and voice/video hub: audio and control ride the voice lane, camera fragments ride
+their own video lane, and the app renders a docked or popped-out huddle card.
+Current admission is intentionally local-live-flow based; harder roster-derived
+media admission remains a security hardening seam.
+
+## Pages
+
+Pages is the block editor module. It stores page roots, nested page parents,
+blocks, and comment threads in the same QMDB-backed module, so page content and
+comments state-sync together. Writes go through `CreatePage`, `SetPageParent`,
+`DeletePage`, `InsertBlock`, `UpdateText`, `SetKind`, `SetChecked`,
+`MoveBlock`, `RemoveBlock`, `AddComment`, `EditComment`, `DeleteComment`, and
+`ResolveThread`; reads include page/block lookups, page lists, and comment-thread
+queries for a page or visible block set.
+
+The UI mirrors that shape: a nested page tree, page tabs backed by
+`openTabs`, focus-light block editing, per-block comment affordances, and a
+right-hand comments panel. Comments are plain text for now and live in `pages`
+rather than a separate `comments` crate, which is the implemented divergence from
+the earlier redesign plan.
+
+## Agents And Runs
+
+The agent stack is split deliberately. `agent` is the registry: display names,
+executor requirement, prompt pins, permissions, status, watches, and run records.
+`runs` composes prompts from chat context, submits dispatch recipes, records
+responses, watches channels, and can opt into the jobs board. `dispatch` and
+`saga` own capability-routed execution and strict leases, so model output returns
+as ordered data rather than hidden local state.
+
+The node discovers local capability providers from operator specs, announces the
+truthful tag set to the `capability` module, and runs a dispatch worker only for
+leases assigned to its own key. The console joins that state back together:
+members show announced executor tags, agents use a registry-backed **Runs on**
+picker, and in-flight runs can show the node currently holding the saga lease.
 
 ## Inbox
 
@@ -141,6 +190,56 @@ If two registered workers both claim the same submitted job inside the submit
 cascade, the second `Claim` observes the first staged claim, rejects, and aborts
 the entire submit block under P2. `MAX_WORKERS` exists for later off-cascade
 strategies, not for multiple in-cascade claimants of the same kind.
+
+## Identity
+
+Identity is the user/node binding registry (`crates/system/identity`): a user
+is an ed25519 keypair held by the person in the app; a node is a workspace's
+mesh/valset identity. The module stores, per user, a display name, a
+replay-guard nonce, and the set of bound node keys — one person can bind
+several nodes to the same user.
+
+`BindNode` binds the SUBMITTING node (the verified origin, never a payload
+field) to a user, consented to by a user-key signature over a
+chain-id ‖ node-key ‖ nonce preimage — a certificate can never replay onto a
+different network, a cert minted for node A can never bind node B, and a
+stale nonce (from a prior bind/unbind) rejects. On
+the networked node, `BindNode` is additionally gated to current members: the
+origin must be a validator or an observer, so a node with no standing at all
+cannot mint itself a user. `UnbindNode` carries no such gate and is accepted
+from ANY external origin — a surviving device can evict a lost one — and it
+bumps the user's nonce so a captured bind certificate for the evicted node is
+dead forever; unbinding a user's last node keeps the user record — name and
+nonce persist with zero nodes, so a later bind resolves the same identity.
+`SetUserName` is origin-gated only (a bound node is trusted
+hardware, no user signature required): it sets the display name of the user
+the submitting node is bound to, under the same 64-byte limit as profiles,
+and it does not bump the nonce — no user signature is consumed.
+
+Binding does not change what stays per node: mesh tracking, valset seats, and
+quorum arithmetic are untouched by this module. A user running three
+validators still holds three seats and casts three votes — identity maps keys
+to a person for display and authorship resolution, it does not collapse
+consensus weight.
+
+Adding identity to a network that predates it is a module-set change like any
+other: the genesis app-hash moves, so an already-running network needs a
+coordinated rebuild — a lockstep upgrade across every validator, not a rolling
+one — to adopt it.
+
+The module stores keys; custody of the user key itself is a desktop-app
+concern layered on top (`bin/node`'s `user-key` verbs; see
+`docs/superpowers/specs/2026-07-07-identity-onboarding-design.md`). The
+24-word mnemonic is an entropy-preserving, identity-preserving encoding of the
+raw ed25519 seed, so it recovers the identity exactly rather than deriving a
+new one. The password is local-encryption only — argon2id wraps a key that
+encrypts the seed at rest with XChaCha20-Poly1305 — and never enters key
+derivation, so a forgotten password just means restoring from the mnemonic
+and setting a new one. Node keys deliberately get neither treatment: they
+stay plaintext and disposable, because consensus signs with a node key on
+every view and a boot must never block on a password prompt; unbind-and-rejoin
+is the recovery story for a lost or compromised device, and OS full-disk
+encryption is the documented answer for at-rest protection of the node key.
 
 ## Interface Shape
 

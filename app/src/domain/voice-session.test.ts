@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import { keyBytes, keyHex } from "./chat-client";
 import type { HuddleMember } from "./chat-client";
-import { voiceSocketUrl } from "./transport";
+import { callSocketUrl } from "./transport";
 import { FRAME_SAMPLES, floatToPcm16, huddleRecipients, pcm16ToFloat, voiceErrorOf } from "./voice-session";
 
 describe("pcm conversion", () => {
@@ -62,16 +62,16 @@ describe("hex key round-trip", () => {
   });
 });
 
-describe("voiceSocketUrl", () => {
+describe("callSocketUrl", () => {
   it("swaps http→ws, keeps host/port, and appends the channel query", () => {
-    expect(voiceSocketUrl("http://127.0.0.1:8844", "general")).toBe(
-      "ws://127.0.0.1:8844/v1/voice/ws?channel=general",
+    expect(callSocketUrl("http://127.0.0.1:8844", "general")).toBe(
+      "ws://127.0.0.1:8844/v1/call/ws?channel=general",
     );
   });
 
   it("swaps https→wss, strips a trailing slash, and encodes the channel", () => {
-    expect(voiceSocketUrl("https://node.example:9000/", "a b")).toBe(
-      "wss://node.example:9000/v1/voice/ws?channel=a%20b",
+    expect(callSocketUrl("https://node.example:9000/", "a b")).toBe(
+      "wss://node.example:9000/v1/call/ws?channel=a%20b",
     );
   });
 });

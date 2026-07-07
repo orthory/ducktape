@@ -5,7 +5,7 @@
 #   crates/kernel/   — the platform: sdk (interface), state (app-hash), host
 #                      (dispatch), node (transport seam), consensus (BFT orderer)
 #   crates/system/   — consensus infrastructure modules (kv, valset)
-#   crates/apps/     — product feature modules (forge; future document, chat, tasks)
+#   crates/apps/     — product feature modules (forge, chat, tasks, pages, …)
 #   crates/examples/ — demo + test scaffolding modules (directory, greeter)
 #   bin/             — runnable binaries (in-process demo, real-socket node)
 # the host dispatches modules over BFT consensus and composes each authenticated
@@ -23,7 +23,8 @@ members = [
     "crates/system/kv", 
     "crates/system/valset", 
     
-    "crates/system/governance", 
+    "crates/system/governance",
+    "crates/system/identity",
     "crates/system/upgrade", 
     "crates/system/wireguard-upgrade",
     "crates/system/wireguard-effect",
@@ -36,9 +37,8 @@ members = [
     "crates/system/dispatch-oracle",
     "crates/system/tagging", 
     # apps — product feature modules
-    "crates/apps/forge", 
-    "crates/apps/document", 
-    "crates/apps/pages", 
+    "crates/apps/forge",
+    "crates/apps/pages",
     "crates/apps/chat",
     "crates/apps/agent",
     "crates/apps/runs", 
@@ -93,6 +93,15 @@ defguard_wireguard_rs = "0.10.0"
 # ed25519 signer's); static_secrets because the key persists across boots.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
+# user-key v2 at-rest custody (bin/node/src/userkey.rs only): BIP39
+# wordlist + entropy checksum (the PBKDF2 `to_seed` path is deliberately
+# unused — see the identity-onboarding design doc's custody model),
+# argon2id KEK derivation, and XChaCha20-Poly1305 AEAD. zeroize scrubs the
+# derived key on drop.
+bip39 = "2"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = "1"
 
 # fluent31 — the derived read-model engine (LSM + MVCC snapshots) behind the
 # per-module indexer tier ONLY: nothing the app-hash commits to may live in it
@@ -117,6 +126,7 @@ capability-host = { path = "crates/kernel/capability-host" }
 kv = { path = "crates/system/kv" }
 valset = { path = "crates/system/valset" }
 governance = { path = "crates/system/governance" }
+identity = { path = "crates/system/identity" }
 upgrade = { path = "crates/system/upgrade" }
 saga = { path = "crates/system/saga" }
 capability = { path = "crates/system/capability" }
@@ -124,7 +134,6 @@ dispatch = { path = "crates/system/dispatch" }
 dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }
 forge = { path = "crates/apps/forge" }
-document = { path = "crates/apps/document" }
 pages = { path = "crates/apps/pages" }
 chat = { path = "crates/apps/chat" }
 agent = { path = "crates/apps/agent" }
