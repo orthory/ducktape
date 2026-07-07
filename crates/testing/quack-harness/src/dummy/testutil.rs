@@ -8,6 +8,7 @@
 
 use futures::executor::block_on;
 use jobs::JobsReply;
+use memory::{MemoryQuery, MemoryReply};
 use package::{
     ActionRoute, AgentSeed, EngagementRule, HarnessMsg, InstallSpec, MANIFEST_HASH_LEN,
     ModuleBinding, PackageActionMsg, PromptSeed, UninstallPolicy, encode_action_msg,
@@ -26,6 +27,10 @@ pub(crate) struct TestCtx {
     env: sdk::Env,
     pub(crate) emitted: Vec<Msg>,
     pub(crate) events: Vec<String>,
+    /// the latest generation the canned memory `Stat` reports for any prompt
+    /// path (what the staged seed publish landed on) — default 1 (a fresh
+    /// path, no squatter).
+    pub(crate) prompt_generation: u64,
 }
 
 impl TestCtx {
@@ -40,6 +45,7 @@ impl TestCtx {
             },
             emitted: Vec::new(),
             events: Vec::new(),
+            prompt_generation: 1,
         }
     }
 }
@@ -52,12 +58,28 @@ impl Ctx for TestCtx {
     fn module_root(&self, _target: &str) -> Option<StateRoot> {
         Some(StateRoot::ZERO)
     }
-    async fn query(&self, target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-        // the jobs probe-before-emit: an empty board.
-        if target == "jobs" {
-            return Ok(jobs::encode_reply(&JobsReply::Job(None)));
+    async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
+        match target {
+            // the jobs probe-before-emit: an empty board.
+            "jobs" => Ok(jobs::encode_reply(&JobsReply::Job(None))),
+            // the install arm's prompt-generation resolution.
+            "memory" => {
+                let reply = match memory::decode_query(req).map_err(Error::Module)? {
+                    MemoryQuery::Stat { path } => MemoryReply::Stat(Some(memory::FileStat {
+                        path,
+                        latest_generation: self.prompt_generation,
+                        generations: 1,
+                        latest_meta: memory::Meta::new(),
+                        latest_author: "package".into(),
+                        latest_published_at_height: 1,
+                        body_len: 0,
+                    })),
+                    other => return Err(Error::Module(format!("unexpected query: {other:?}"))),
+                };
+                Ok(memory::encode_reply(&reply))
+            }
+            other => Err(Error::UnknownModule(other.into())),
         }
-        Err(Error::UnknownModule(target.into()))
     }
     fn emit_msg(&mut self, msg: Msg) {
         self.emitted.push(msg);
@@ -118,7 +140,7 @@ pub(crate) fn spec() -> InstallSpec {
 }
 
 pub(crate) fn module() -> DummyHarness {
-    DummyHarness::new(HARNESS, "package", "agent", "jobs", "memory")
+    DummyHarness::new(HARNESS, "package", "agent", "jobs", "memory", "runs")
 }
 
 pub(crate) fn package_origin() -> Origin {

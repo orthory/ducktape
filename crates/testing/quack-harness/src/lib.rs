@@ -42,10 +42,12 @@
 //! copy from.
 
 pub mod dummy;
+mod error;
 mod golden;
 mod install;
 mod testbed;
 
+pub use error::HarnessError;
 pub use golden::{
     GoldenError, GoldenFixture, GoldenRun, GoldenStep, SubmitExpect, diff_json, parse_origin,
     run_golden,

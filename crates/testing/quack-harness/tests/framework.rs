@@ -35,7 +35,7 @@ fn dummy_capsule() -> quack::Capsule {
 
 fn dummy_modules() -> Vec<Box<dyn Module>> {
     vec![Box::new(DummyHarness::new(
-        HARNESS, "package", "agent", "jobs", "memory",
+        HARNESS, "package", "agent", "jobs", "memory", "runs",
     ))]
 }
 
@@ -126,12 +126,18 @@ fn install_spec_mapping_rejects_a_tampered_capsule() {
     tampered.insert("prompts/dummy.md", b"tampered".to_vec());
     let err = quack_harness::install_spec_from_capsule(&tampered, HARNESS, &BTreeMap::new())
         .expect_err("tampered prompt bytes must fail digest verification");
-    assert!(err.contains("digest"), "readable failure, got: {err}");
+    assert!(
+        err.to_string().contains("digest"),
+        "readable failure, got: {err}"
+    );
 
     // an unbound harness logical fails the mapping too.
     let err = quack_harness::install_spec_from_capsule(&dummy_capsule(), "ghost", &BTreeMap::new())
         .expect_err("an undeclared harness logical must fail");
-    assert!(err.contains("ghost"), "names the bad logical, got: {err}");
+    assert!(
+        err.to_string().contains("ghost"),
+        "names the bad logical, got: {err}"
+    );
 }
 
 #[test]
@@ -164,7 +170,10 @@ fn the_manifest_harness_key_defaults_the_mapping_and_an_explicit_logical_overrid
     );
     let err = quack_harness::install_spec_from_capsule_defaulted(&keyless, None, &BTreeMap::new())
         .expect_err("no harness anywhere must reject");
-    assert!(err.contains("harness"), "readable failure, got: {err}");
+    assert!(
+        err.to_string().contains("harness"),
+        "readable failure, got: {err}"
+    );
 }
 
 // ---- the engagement -> job -> oracle -> apply loop ---------------------------------
@@ -263,6 +272,97 @@ fn a_sibling_action_targeting_a_same_response_create_probe_rejects() {
             "the create landed; the sibling edit was probe-rejected"
         );
         bed.assert_failure_breadcrumb("runs", "rejected by dummy-harness");
+    });
+}
+
+// ---- multi-capability oracle targeting ------------------------------------------
+
+/// the dummy fixture's package, plus a SECOND agent under a distinct
+/// capability tag — a two-capability package, built by mutating the fixture's
+/// `quack.toml` text (capability/agent/engagement fields are not
+/// digest-pinned, so this needs no re-signing). proves the oracle gate
+/// selects by capability, not queue position.
+fn two_capability_dummy_capsule() -> quack::Capsule {
+    let mut capsule = dummy_capsule();
+    let toml = String::from_utf8(capsule.files.get("quack.toml").unwrap().clone()).unwrap();
+    let extra = r#"
+[[agents]]
+id = "dummy.other-taker"
+display_name = "Dummy Note Taker 2"
+prompt = "note_taker_prompt"
+capability = "mock-llm-2"
+actions = ["dummy.note.add"]
+status = "active"
+
+[[engagements]]
+source = "pages"
+event = "comment_added"
+agent = "dummy.other-taker"
+policy = "mention"
+"#;
+    capsule.insert("quack.toml", format!("{toml}{extra}").into_bytes());
+    capsule
+}
+
+#[test]
+fn oracle_for_targets_the_right_capability_regardless_of_queue_order() {
+    PackageTestBed::run(dummy_modules(), |mut bed| async move {
+        bed.install_capsule(
+            &two_capability_dummy_capsule(),
+            HARNESS,
+            &BTreeMap::new(),
+            alice(),
+        )
+        .await
+        .expect("the two-capability dummy package installs");
+
+        // both agents engage BEFORE either oracle turn: two WorkerRequests
+        // queue up, "mock-llm-1" first (note-taker engaged first).
+        engage(&mut bed, "c1", &mention("note this")).await;
+        engage(&mut bed, "c2", "@dummy.other-taker note this too").await;
+        bed.assert_job_count("agent/dummy.note-taker", 1).await;
+        bed.assert_job_count("agent/dummy.other-taker", 1).await;
+        assert_eq!(bed.pending_oracle_requests(), 2);
+
+        // answer capability 2 FIRST — out of arrival order — proving the
+        // gate selects by capability tag, not queue position.
+        bed.oracle_response_json_for(
+            "mock-llm-2",
+            &json!({"reply_blocks": [], "actions": [
+                {"action_id": "a1", "tag": ACTION_NOTE_ADD,
+                 "payload": {"note_id": "n2", "text": "second"}},
+            ]}),
+        )
+        .await
+        .expect("capability 2's oracle turn commits");
+        bed.oracle_response_json_for(
+            "mock-llm-1",
+            &json!({"reply_blocks": [], "actions": [
+                {"action_id": "a1", "tag": ACTION_NOTE_ADD,
+                 "payload": {"note_id": "n1", "text": "first"}},
+            ]}),
+        )
+        .await
+        .expect("capability 1's oracle turn commits");
+
+        bed.deliver().await.expect("delivery block commits");
+        let notes = bed.query_json(HARNESS, &json!("notes")).await.unwrap();
+        assert_eq!(
+            notes,
+            json!({"notes": [
+                {"note_id": "n1", "text": "first"},
+                {"note_id": "n2", "text": "second"},
+            ]}),
+            "each response landed against the RIGHT agent's note, not swapped"
+        );
+
+        // a capability with nothing pending names what actually IS pending.
+        let err = bed
+            .oracle_response_json_for("mock-llm-9", &json!({"reply_blocks": [], "actions": []}))
+            .await
+            .expect_err("no pending request for an unused capability")
+            .to_string();
+        assert!(err.contains("mock-llm-9"), "{err}");
     });
 }
 
@@ -389,7 +489,8 @@ fn golden_parsing_is_strict() {
     let err = GoldenFixture::parse(
         br#"{"schema":1,"package":"p","harness":"h","steps":[{"explode":{}}]}"#,
     )
-    .expect_err("unknown step kind must reject");
+    .expect_err("unknown step kind must reject")
+    .to_string();
     assert!(err.contains("explode") || err.contains("unknown"), "{err}");
 
     // unknown fields inside a known step reject.
@@ -594,7 +695,8 @@ fn the_sweep_refuses_dishonest_and_uncovered_modules() {
         let err = bed
             .snapshot_roundtrip_all()
             .await
-            .expect_err("a dishonest snapshot must fail the sweep");
+            .expect_err("a dishonest snapshot must fail the sweep")
+            .to_string();
         assert!(
             err.contains("misrooted") && err.contains("do not hash"),
             "{err}"
@@ -606,8 +708,38 @@ fn the_sweep_refuses_dishonest_and_uncovered_modules() {
         let err = bed
             .snapshot_roundtrip_all()
             .await
-            .expect_err("an uncovered module must fail the sweep");
+            .expect_err("an uncovered module must fail the sweep")
+            .to_string();
         assert!(err.contains("opaque"), "{err}");
+    });
+}
+
+/// the honesty boundary above is proven at the FUNCTION level
+/// (`snapshot_roundtrip_all` called directly); this proves the SAME failure
+/// surfaces correctly through the golden runner's `snapshot_roundtrip` step —
+/// the failure names/points at that specific step, not just "some step
+/// failed" (a two-step fixture, so the index is not trivially 1).
+#[test]
+fn a_golden_snapshot_roundtrip_step_names_the_failing_step() {
+    PackageTestBed::run(vec![Box::new(Misrooted)], |mut bed| async move {
+        let fixture = GoldenFixture::parse(
+            br#"{"schema":1,"package":"p","steps":[{"deliver":{}},{"snapshot_roundtrip":{}}]}"#,
+        )
+        .expect("fixture parses");
+        // no Install step in this fixture, so the capsule is never touched.
+        let capsule = quack::Capsule::new();
+        let err = run_golden(&mut bed, &capsule, &fixture)
+            .await
+            .expect_err("the misrooted module must fail the snapshot_roundtrip step");
+        assert_eq!(
+            err.step, 2,
+            "the SECOND step (snapshot_roundtrip), not the first"
+        );
+        assert_eq!(err.label, "snapshot_roundtrip");
+        assert!(
+            err.message.contains("misrooted") && err.message.contains("do not hash"),
+            "{err}"
+        );
     });
 }
 

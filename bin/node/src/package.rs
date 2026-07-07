@@ -185,8 +185,7 @@ fn cmd_test(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err("signature verification failed".into());
     }
 
-    let fixture = quack_harness::GoldenFixture::from_capsule(&capsule)
-        .map_err(|e| format!("golden fixture: {e}"))?;
+    let fixture = quack_harness::GoldenFixture::from_capsule(&capsule)?;
     let extras = native_catalog(&manifest, &fixture.bindings)?;
     let labels: Vec<&'static str> = fixture.steps.iter().map(|s| s.label()).collect();
     println!("golden   {} steps against the native catalog", labels.len());

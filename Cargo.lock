@@ -5082,6 +5082,7 @@ dependencies = [
  "sha2",
  "tagging",
  "tasks",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

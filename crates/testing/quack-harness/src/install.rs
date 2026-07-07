@@ -12,9 +12,23 @@ use package::{
     ActionRoute, AgentSeed, EngagementRule, InstallSpec, ModuleBinding, PackageQuery, PackageReply,
     PackageStatus, PromptSeed, UninstallPolicy,
 };
-use quack::Capsule;
+use quack::{Capsule, PackageManifest};
 use saga::SagaOrigin;
 use sha2::{Digest, Sha256};
+
+use crate::error::HarnessError;
+
+/// parse, validate, and digest-verify a capsule's manifest — ONE parse,
+/// reused by every driving path (the public mapping functions below, the
+/// testbed's `install_capsule`, and the golden `Install` step) so a single
+/// install never re-parses the same `quack.toml` twice.
+pub(crate) fn parse_verified_manifest(capsule: &Capsule) -> Result<PackageManifest, HarnessError> {
+    let toml = capsule.manifest_bytes().ok_or(HarnessError::NoManifest)?;
+    let manifest = quack::parse_manifest(toml)?;
+    quack::validate(&manifest)?;
+    quack::verify_digests(capsule, &manifest)?;
+    Ok(manifest)
+}
 
 /// map a verified capsule into the [`InstallSpec`] wire shape.
 ///
@@ -34,7 +48,7 @@ pub fn install_spec_from_capsule(
     capsule: &Capsule,
     harness_logical: &str,
     bindings: &BTreeMap<String, String>,
-) -> Result<InstallSpec, String> {
+) -> Result<InstallSpec, HarnessError> {
     install_spec_from_capsule_defaulted(capsule, Some(harness_logical), bindings)
 }
 
@@ -45,20 +59,27 @@ pub fn install_spec_from_capsule_defaulted(
     capsule: &Capsule,
     harness_logical: Option<&str>,
     bindings: &BTreeMap<String, String>,
-) -> Result<InstallSpec, String> {
-    let toml = capsule
-        .manifest_bytes()
-        .ok_or("no quack.toml in the capsule")?;
-    let manifest = quack::parse_manifest(toml).map_err(|e| format!("manifest: {e}"))?;
-    quack::validate(&manifest).map_err(|e| format!("manifest: {e}"))?;
-    quack::verify_digests(capsule, &manifest).map_err(|e| format!("content digests: {e}"))?;
+) -> Result<InstallSpec, HarnessError> {
+    let manifest = parse_verified_manifest(capsule)?;
+    build_install_spec(capsule, &manifest, harness_logical, bindings)
+}
 
+/// map an ALREADY parsed+validated+digest-verified manifest into the
+/// [`InstallSpec`] wire shape — the seam [`install_spec_from_capsule_defaulted`]
+/// and the testbed's driving paths both build on, so a manifest is parsed at
+/// most once per install (the double-parse this crate used to do).
+pub(crate) fn build_install_spec(
+    capsule: &Capsule,
+    manifest: &PackageManifest,
+    harness_logical: Option<&str>,
+    bindings: &BTreeMap<String, String>,
+) -> Result<InstallSpec, HarnessError> {
     let harness_logical = match harness_logical {
         Some(explicit) => explicit.to_string(),
         None => manifest
             .harness
             .clone()
-            .ok_or("no harness logical: pass one explicitly or set the manifest's `harness` key")?,
+            .ok_or(HarnessError::NoHarnessLogical)?,
     };
     let harness_logical = harness_logical.as_str();
 
@@ -74,9 +95,9 @@ pub fn install_spec_from_capsule_defaulted(
         })
         .collect();
     if !modules.iter().any(|b| b.logical == harness_logical) {
-        return Err(format!(
-            "harness logical {harness_logical:?} is not a declared [[modules]] entry"
-        ));
+        return Err(HarnessError::UnboundHarness {
+            logical: harness_logical.to_string(),
+        });
     }
 
     let mut prompts = Vec::new();
@@ -86,17 +107,20 @@ pub fn install_spec_from_capsule_defaulted(
             .get(&entry.path)
             .expect("verify_digests checked every prompt file");
         let content = std::str::from_utf8(bytes)
-            .map_err(|_| format!("prompt {} is not utf-8: {}", entry.logical, entry.path))?
+            .map_err(|_| HarnessError::PromptNotUtf8 {
+                logical: entry.logical.clone(),
+                path: entry.path.clone(),
+            })?
             .to_string();
         prompts.push(PromptSeed {
             logical: entry.logical.clone(),
             path: format!("/packages/{}/{}", manifest.package, entry.path),
             content,
             sha256: parse_sha256_field(&entry.hash).ok_or_else(|| {
-                format!(
-                    "prompt {} hash field is malformed: {}",
-                    entry.logical, entry.hash
-                )
+                HarnessError::MalformedPromptHash {
+                    logical: entry.logical.clone(),
+                    hash: entry.hash.clone(),
+                }
             })?,
         });
     }
@@ -107,10 +131,10 @@ pub fn install_spec_from_capsule_defaulted(
             "active" => true,
             "paused" => false,
             other => {
-                return Err(format!(
-                    "agent {} has unknown status {other:?} (want \"active\" or \"paused\")",
-                    entry.id
-                ));
+                return Err(HarnessError::UnknownAgentStatus {
+                    agent_id: entry.id.clone(),
+                    status: other.to_string(),
+                });
             }
         };
         agents.push(AgentSeed {
@@ -126,7 +150,12 @@ pub fn install_spec_from_capsule_defaulted(
     Ok(InstallSpec {
         package: manifest.package.clone(),
         version: manifest.version.clone(),
-        manifest_hash: quack::manifest_hash(toml).to_vec(),
+        manifest_hash: quack::manifest_hash(
+            capsule
+                .manifest_bytes()
+                .expect("checked by the caller's parse"),
+        )
+        .to_vec(),
         modules,
         harness: harness_logical.to_string(),
         prompts,
@@ -273,7 +302,10 @@ impl InstallReport {
 }
 
 /// query the committed registries for what `spec`'s install actually landed.
-pub(crate) async fn build_report(host: &Host, spec: &InstallSpec) -> Result<InstallReport, String> {
+pub(crate) async fn build_report(
+    host: &Host,
+    spec: &InstallSpec,
+) -> Result<InstallReport, HarnessError> {
     // the package row.
     let reply = host
         .query(
@@ -283,13 +315,26 @@ pub(crate) async fn build_report(host: &Host, spec: &InstallSpec) -> Result<Inst
             }),
         )
         .await
-        .map_err(|e| format!("package query: {e}"))?;
-    let view = match package::decode_reply(&reply).map_err(|e| format!("package reply: {e}"))? {
+        .map_err(|e| HarnessError::Query {
+            module: "package",
+            reason: e.to_string(),
+        })?;
+    let view = match package::decode_reply(&reply).map_err(|e| HarnessError::Query {
+        module: "package",
+        reason: e,
+    })? {
         PackageReply::Package(Some(view)) => view,
         PackageReply::Package(None) => {
-            return Err(format!("package {} has no committed row", spec.package));
+            return Err(HarnessError::NoCommittedRow {
+                package: spec.package.clone(),
+            });
         }
-        other => return Err(format!("unexpected package reply: {other:?}")),
+        other => {
+            return Err(HarnessError::UnexpectedReply {
+                module: "package",
+                reply: format!("{other:?}"),
+            });
+        }
     };
 
     // the seeded prompts, read back from memory at their committed latest
@@ -306,27 +351,38 @@ pub(crate) async fn build_report(host: &Host, spec: &InstallSpec) -> Result<Inst
                 }),
             )
             .await
-            .map_err(|e| format!("memory query: {e}"))?;
-        let generation =
-            match memory::decode_reply(&reply).map_err(|e| format!("memory reply: {e}"))? {
-                MemoryReply::Read(Some(generation)) => generation,
-                MemoryReply::Read(None) => {
-                    return Err(format!(
-                        "prompt {} was not seeded at {}",
-                        seed.logical, seed.path
-                    ));
-                }
-                other => return Err(format!("unexpected memory reply: {other:?}")),
-            };
+            .map_err(|e| HarnessError::Query {
+                module: "memory",
+                reason: e.to_string(),
+            })?;
+        let generation = match memory::decode_reply(&reply).map_err(|e| HarnessError::Query {
+            module: "memory",
+            reason: e,
+        })? {
+            MemoryReply::Read(Some(generation)) => generation,
+            MemoryReply::Read(None) => {
+                return Err(HarnessError::PromptNotSeeded {
+                    logical: seed.logical.clone(),
+                    path: seed.path.clone(),
+                });
+            }
+            other => {
+                return Err(HarnessError::UnexpectedReply {
+                    module: "memory",
+                    reply: format!("{other:?}"),
+                });
+            }
+        };
         let Body::Inline(content) = &generation.body else {
-            return Err(format!("prompt {} body is not inline", seed.logical));
+            return Err(HarnessError::PromptBodyNotInline {
+                logical: seed.logical.clone(),
+            });
         };
         let digest: Vec<u8> = Sha256::digest(content.as_bytes()).to_vec();
         if digest != seed.sha256 {
-            return Err(format!(
-                "prompt {} committed content does not hash to its pin",
-                seed.logical
-            ));
+            return Err(HarnessError::PromptPinMismatch {
+                logical: seed.logical.clone(),
+            });
         }
         prompts.push(SeededPrompt {
             logical: seed.logical.clone(),
@@ -347,13 +403,26 @@ pub(crate) async fn build_report(host: &Host, spec: &InstallSpec) -> Result<Inst
                 }),
             )
             .await
-            .map_err(|e| format!("agent query: {e}"))?;
-        let record = match agent::decode_reply(&reply).map_err(|e| format!("agent reply: {e}"))? {
+            .map_err(|e| HarnessError::Query {
+                module: "agent",
+                reason: e.to_string(),
+            })?;
+        let record = match agent::decode_reply(&reply).map_err(|e| HarnessError::Query {
+            module: "agent",
+            reason: e,
+        })? {
             AgentReply::Agent(Some(record)) => record,
             AgentReply::Agent(None) => {
-                return Err(format!("agent {} was not registered", seed.agent_id));
+                return Err(HarnessError::AgentNotRegistered {
+                    agent_id: seed.agent_id.clone(),
+                });
             }
-            other => return Err(format!("unexpected agent reply: {other:?}")),
+            other => {
+                return Err(HarnessError::UnexpectedReply {
+                    module: "agent",
+                    reply: format!("{other:?}"),
+                });
+            }
         };
         agents.push(RegisteredAgent {
             agent_id: record.agent_id,
@@ -376,15 +445,28 @@ pub(crate) async fn build_report(host: &Host, spec: &InstallSpec) -> Result<Inst
                 }),
             )
             .await
-            .map_err(|e| format!("package query: {e}"))?;
-        match package::decode_reply(&reply).map_err(|e| format!("package reply: {e}"))? {
+            .map_err(|e| HarnessError::Query {
+                module: "package",
+                reason: e.to_string(),
+            })?;
+        match package::decode_reply(&reply).map_err(|e| HarnessError::Query {
+            module: "package",
+            reason: e,
+        })? {
             PackageReply::Owner(Some(owner)) => {
                 routes.insert(route.tag.clone(), owner);
             }
             PackageReply::Owner(None) => {
-                return Err(format!("action {} was not routed", route.tag));
+                return Err(HarnessError::ActionNotRouted {
+                    tag: route.tag.clone(),
+                });
             }
-            other => return Err(format!("unexpected package reply: {other:?}")),
+            other => {
+                return Err(HarnessError::UnexpectedReply {
+                    module: "package",
+                    reply: format!("{other:?}"),
+                });
+            }
         }
     }
 

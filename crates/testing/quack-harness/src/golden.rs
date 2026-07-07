@@ -15,7 +15,8 @@ use sdk::Origin;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::install::{InstallReport, install_spec_from_capsule_defaulted};
+use crate::error::HarnessError;
+use crate::install::{InstallReport, build_install_spec, parse_verified_manifest};
 use crate::testbed::PackageTestBed;
 
 /// where the fixture lives inside a capsule — the capsule crate's reserved
@@ -46,24 +47,21 @@ pub struct GoldenFixture {
 impl GoldenFixture {
     /// parse fixture bytes STRICTLY: unknown step kinds, unknown fields, and
     /// unsupported schemas all reject.
-    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let fixture: GoldenFixture =
-            serde_json::from_slice(bytes).map_err(|e| format!("golden fixture: {e}"))?;
+    pub fn parse(bytes: &[u8]) -> Result<Self, HarnessError> {
+        let fixture: GoldenFixture = serde_json::from_slice(bytes)
+            .map_err(|e| HarnessError::GoldenFixtureJson(e.to_string()))?;
         if fixture.schema != GOLDEN_SCHEMA_V1 {
-            return Err(format!(
-                "unsupported golden schema {} (this build understands {GOLDEN_SCHEMA_V1})",
-                fixture.schema
-            ));
+            return Err(HarnessError::UnsupportedGoldenSchema(fixture.schema));
         }
         Ok(fixture)
     }
 
     /// read the fixture from a capsule's `harness/golden.json`.
-    pub fn from_capsule(capsule: &Capsule) -> Result<Self, String> {
+    pub fn from_capsule(capsule: &Capsule) -> Result<Self, HarnessError> {
         let bytes = capsule
             .files
             .get(GOLDEN_PATH)
-            .ok_or_else(|| format!("capsule has no {GOLDEN_PATH}"))?;
+            .ok_or(HarnessError::NoGoldenFixture)?;
         Self::parse(bytes)
     }
 }
@@ -198,25 +196,31 @@ pub async fn run_golden(
         };
         match step {
             GoldenStep::Install { origin } => {
-                let origin = parse_origin(origin).map_err(&fail)?;
+                let origin = parse_origin(origin).map_err(|e| fail(e.to_string()))?;
+                // ONE parse: the manifest is parsed+validated+digest-verified
+                // HERE and reused for both the package-id invariant check and
+                // the actual install — `install_prepared` never re-derives it
+                // (the double manifest parse this step used to do).
+                let manifest = parse_verified_manifest(capsule).map_err(|e| fail(e.to_string()))?;
                 // the fixture must drive the capsule it ships in: a package
                 // id mismatch is a fixture bug, caught before any block.
-                let spec = install_spec_from_capsule_defaulted(
+                if manifest.package != fixture.package {
+                    return Err(fail(format!(
+                        "fixture drives package {:?} but the capsule manifest declares {:?}",
+                        fixture.package, manifest.package
+                    )));
+                }
+                let spec = build_install_spec(
                     capsule,
+                    &manifest,
                     fixture.harness.as_deref(),
                     &fixture.bindings,
                 )
-                .map_err(&fail)?;
-                if spec.package != fixture.package {
-                    return Err(fail(format!(
-                        "fixture drives package {:?} but the capsule manifest declares {:?}",
-                        fixture.package, spec.package
-                    )));
-                }
+                .map_err(|e| fail(e.to_string()))?;
                 let report = bed
-                    .install_capsule(capsule, &spec.harness, &fixture.bindings, origin)
+                    .install_prepared(&manifest, spec, origin)
                     .await
-                    .map_err(&fail)?;
+                    .map_err(|e| fail(e.to_string()))?;
                 run.install = Some(report);
             }
             GoldenStep::Submit {
@@ -225,7 +229,7 @@ pub async fn run_golden(
                 payload,
                 expect,
             } => {
-                let origin = parse_origin(origin).map_err(&fail)?;
+                let origin = parse_origin(origin).map_err(|e| fail(e.to_string()))?;
                 let outcome = bed.submit_json(origin, target, payload).await;
                 match (outcome, expect) {
                     (Ok(_), SubmitExpect::Ok) => {}
@@ -234,8 +238,14 @@ pub async fn run_golden(
                             "the block committed but the fixture expected rejection".into(),
                         ));
                     }
-                    (Err(SubmitError::Rejected(_)), SubmitExpect::Rejected) => {}
-                    (Err(e), _) => return Err(fail(format!("block rejected: {e:?}"))),
+                    (
+                        Err(HarnessError::Submit {
+                            source: SubmitError::Rejected(_),
+                            ..
+                        }),
+                        SubmitExpect::Rejected,
+                    ) => {}
+                    (Err(e), _) => return Err(fail(e.to_string())),
                 }
             }
             GoldenStep::Oracle { response, error } => {
@@ -250,10 +260,10 @@ pub async fn run_golden(
                         ));
                     }
                 };
-                bed.oracle(outcome).await.map_err(&fail)?;
+                bed.oracle(outcome).await.map_err(|e| fail(e.to_string()))?;
             }
             GoldenStep::Deliver {} => {
-                bed.deliver().await.map_err(&fail)?;
+                bed.deliver().await.map_err(|e| fail(e.to_string()))?;
             }
             GoldenStep::ExpectJob {
                 job_id,
@@ -297,7 +307,10 @@ pub async fn run_golden(
                 query,
                 expect,
             } => {
-                let actual = bed.query_json(module, query).await.map_err(&fail)?;
+                let actual = bed
+                    .query_json(module, query)
+                    .await
+                    .map_err(|e| fail(e.to_string()))?;
                 if let Some(diff) = diff_json(expect, &actual) {
                     return Err(fail(format!("{module} reply mismatch: {diff}")));
                 }
@@ -335,7 +348,9 @@ pub async fn run_golden(
                 }
             }
             GoldenStep::SnapshotRoundtrip {} => {
-                bed.snapshot_roundtrip_all().await.map_err(&fail)?;
+                bed.snapshot_roundtrip_all()
+                    .await
+                    .map_err(|e| fail(e.to_string()))?;
             }
         }
         run.steps.push(step.label().to_string());
@@ -346,7 +361,7 @@ pub async fn run_golden(
 /// parse a fixture origin string STRICTLY: `"external:<lowercase hex>"` (a
 /// non-empty, even-length key) or `"module:<id>"` (a non-empty id within the
 /// platform's module-id byte bound). every other form rejects.
-pub fn parse_origin(s: &str) -> Result<Origin, String> {
+pub fn parse_origin(s: &str) -> Result<Origin, HarnessError> {
     if let Some(hex) = s.strip_prefix("external:") {
         if hex.is_empty()
             || !hex.len().is_multiple_of(2)
@@ -354,9 +369,7 @@ pub fn parse_origin(s: &str) -> Result<Origin, String> {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
-            return Err(format!(
-                "malformed external origin {s:?} (want non-empty, even-length lowercase hex)"
-            ));
+            return Err(HarnessError::MalformedExternalOrigin(s.to_string()));
         }
         let key = (0..hex.len())
             .step_by(2)
@@ -366,13 +379,11 @@ pub fn parse_origin(s: &str) -> Result<Origin, String> {
     }
     if let Some(id) = s.strip_prefix("module:") {
         if id.is_empty() || id.len() > package::MAX_MODULE_ID_BYTES {
-            return Err(format!("malformed module origin {s:?}"));
+            return Err(HarnessError::MalformedModuleOrigin(s.to_string()));
         }
         return Ok(Origin::Module(id.to_string()));
     }
-    Err(format!(
-        "unknown origin form {s:?} (want \"external:<hex>\" or \"module:<id>\")"
-    ))
+    Err(HarnessError::UnknownOriginForm(s.to_string()))
 }
 
 /// structural JSON comparison with a readable verdict: `None` when equal,

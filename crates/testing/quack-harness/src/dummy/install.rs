@@ -1,10 +1,11 @@
 //! the `HarnessMsg` arms — install/suspend/resume/unplug, accepted ONLY from
-//! the package module's origin — including the prompt pin and the agent +
-//! hook registrations (see the module docs).
+//! the package module's origin — including the prompt generation pin and the
+//! agent + hook registrations (see the module docs).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use agent::{AgentMsg, PromptRef, RENDERER_MEMORY_GENERATION, encode_msg as agent_encode_msg};
+use memory::{MemoryQuery, MemoryReply, encode_query as memory_encode_query};
 use package::{InstallSpec, PackageMsg, encode_msg as package_encode_msg};
 use pages::{PageMsg, encode_msg as pages_encode_msg};
 use sdk::{Ctx, Error, ModuleId, Msg};
@@ -12,14 +13,10 @@ use sdk::{Ctx, Error, ModuleId, Msg};
 use super::DummyHarness;
 use super::state::{Installed, Phase};
 
-/// the memory generation a fresh package prompt path commits at (see the
-/// module docs on the pin assumption).
-const FIRST_GENERATION: u64 = 1;
-
 impl DummyHarness {
     // ---- the harness contract (origin == package module) ----------------------
 
-    pub(crate) fn install(
+    pub(crate) async fn install(
         &mut self,
         ctx: &mut dyn Ctx,
         package: String,
@@ -52,7 +49,8 @@ impl DummyHarness {
         }
 
         // register each agent seed FROM THIS MODULE'S ORIGIN (harness-owned),
-        // its prompt pinned to the seed path at the fresh generation.
+        // its prompt pinned to the generation the seed ACTUALLY landed on —
+        // never an assumed generation 1 (see the module docs).
         for seed in &spec.agents {
             let prompt = spec
                 .prompts
@@ -61,6 +59,7 @@ impl DummyHarness {
                 .ok_or_else(|| {
                     Error::Module(format!("agent prompt is not seeded: {}", seed.agent_id))
                 })?;
+            let generation = self.seeded_generation(&*ctx, &prompt.path).await?;
             ctx.emit_msg(Msg {
                 target: self.agent.clone(),
                 payload: agent_encode_msg(&AgentMsg::RegisterAgent {
@@ -69,7 +68,7 @@ impl DummyHarness {
                     capability: seed.capability.clone(),
                     prompt: Some(PromptRef {
                         module: self.memory.clone(),
-                        target: format!("{}@{FIRST_GENERATION}", prompt.path),
+                        target: format!("{}@{generation}", prompt.path),
                         renderer: RENDERER_MEMORY_GENERATION.into(),
                         sha256: prompt.sha256.clone(),
                     }),
@@ -100,6 +99,32 @@ impl DummyHarness {
             payload: package_encode_msg(&PackageMsg::MarkActive { package }),
         });
         Ok(())
+    }
+
+    /// the generation the just-staged prompt seed landed on. the package
+    /// module publishes every seed BEFORE this install arm runs in the same
+    /// block, and memory serves same-block queries staged-over-committed, so
+    /// the path's live latest IS the seed — whatever a squatter parked at
+    /// older generations. a missing stat means the seed never preceded us: a
+    /// wiring bug, and the install arm MAY fail (it rides the installer's own
+    /// block). mirrors `docs-harness`'s `seeded_generation` exactly — the
+    /// template's copy of the same fix.
+    async fn seeded_generation(&self, ctx: &dyn Ctx, path: &str) -> Result<u64, Error> {
+        let reply = ctx
+            .query(
+                &self.memory,
+                &memory_encode_query(&MemoryQuery::Stat { path: path.into() }),
+            )
+            .await
+            .map_err(|e| Error::Module(format!("memory stat of the prompt seed failed: {e}")))?;
+        match memory::decode_reply(&reply) {
+            Ok(MemoryReply::Stat(Some(stat))) => Ok(stat.latest_generation),
+            Ok(MemoryReply::Stat(None)) => Err(Error::Module(format!(
+                "prompt seed is not staged in memory: {path}"
+            ))),
+            Ok(other) => Err(Error::Module(format!("unexpected memory reply: {other:?}"))),
+            Err(e) => Err(Error::Module(e)),
+        }
     }
 
     /// the shared lifecycle transition: check the recorded package + expected
@@ -248,6 +273,36 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn install_pins_the_staged_seed_generation_not_an_assumed_first() {
+        // a squatter pre-published junk at the predictable prompt path, so
+        // the staged seed landed at generation 3 — the PromptRef must pin 3,
+        // or every future run fails pin-mismatch forever (same class of bug
+        // as the squat fixed in docs-harness; see the module docs).
+        let mut m = module();
+        let mut ctx = TestCtx::at(package_origin());
+        ctx.prompt_generation = 3;
+        exec(
+            &mut m,
+            &mut ctx,
+            encode_harness_msg(&HarnessMsg::InstallPackage {
+                package: PKG.into(),
+                spec: spec(),
+            }),
+        )
+        .unwrap();
+        match agent::decode_msg(&ctx.emitted[1].payload).unwrap() {
+            AgentMsg::RegisterAgent { prompt, .. } => {
+                let prompt = prompt.expect("prompt pinned");
+                assert_eq!(
+                    prompt.target,
+                    "/packages/org.example.dummy/prompts/dummy.md@3"
+                );
+            }
+            other => panic!("expected RegisterAgent, got {other:?}"),
+        }
     }
 
     #[test]

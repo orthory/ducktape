@@ -1,9 +1,13 @@
 //! the framework's reference package: the smallest COMPLETE harness module.
 //!
-//! `DummyHarness` implements the whole harness contract (design D4) against a
-//! trivial domain — a keyed note pad — so the framework can prove itself
-//! end-to-end without the real `docs-harness`, and a package author has a
-//! template to copy:
+//! **this module is a TEST FIXTURE and a COPYABLE TEMPLATE — it is not a
+//! production package.** `DummyHarness` implements the whole harness contract
+//! (design D4) against a trivial domain — a keyed note pad — so the framework
+//! can prove itself end-to-end without depending on the real `docs-harness`,
+//! and so a package author has the smallest COMPLETE reference to copy the
+//! contract from. it ships as unconditional public API (this crate's own
+//! tests drive it from an external `tests/` integration test, so it cannot be
+//! `#[cfg(test)]`-gated) — never wire it into a real module catalog.
 //!
 //! - `HarnessMsg` arms, accepted ONLY from the package module's origin:
 //!   install registers a `PageMsg::RegisterHook` on every engagement source,
@@ -15,17 +19,21 @@
 //!   mentioning `@<agent_id>` mints ONE idempotent `JobsMsg::Submit`
 //!   (`kind = "agent/<agent_id>"`), probe-before-emit against the jobs board.
 //! - the action-owner contract for `dummy.note.add` / `dummy.note.set_text`:
-//!   `Probe` validates against staged-or-committed state; `Apply` is no-fail
+//!   `Probe` validates against staged-or-committed state; `Apply` — gated to
+//!   the RUNS module's origin, tighter than an any-module gate — is no-fail
 //!   (decode-or-drop, re-check, breadcrumb on late conflict).
 //!
 //! ## prompt generation pin
 //!
 //! the install block publishes each prompt seed into memory BEFORE this
-//! module's install arm runs, but queries observe committed state only — so
-//! the harness pins generation 1, the committed generation a FRESH package
-//! path lands on. a pre-published path would make the pin miss at compose
-//! time, which fails the RUN deterministically (never the block) — the ADR's
-//! prompt-pin rule, not a harness concern.
+//! module's install arm runs, and memory serves same-block queries
+//! staged-over-committed — so the install arm asks memory for each seed
+//! path's ACTUAL latest generation and pins THAT, exactly like the
+//! `docs-harness` reference (see its module docs on this same pin): a
+//! pre-published path would otherwise make the pin miss at compose time,
+//! which fails the RUN deterministically (never the block) with no repair
+//! path — the ADR's prompt-pin rule, not a harness concern, but the copyable
+//! template must model it correctly.
 
 use package::{
     HarnessMsg, PackageActionQuery, PackageActionReply, decode_action_msg, decode_action_query,
@@ -57,6 +65,9 @@ pub struct DummyHarness {
     jobs: ModuleId,
     /// the memory workspace (prompt seeds live here; `PromptRef.module`).
     memory: ModuleId,
+    /// the runs module: the ONLY origin an action `Apply` is accepted from
+    /// (the docs-harness reference's tighter-than-any-module gate).
+    runs: ModuleId,
     committed: Store,
     pending: Option<Store>,
 }
@@ -68,6 +79,7 @@ impl DummyHarness {
         agent: impl Into<ModuleId>,
         jobs: impl Into<ModuleId>,
         memory: impl Into<ModuleId>,
+        runs: impl Into<ModuleId>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -75,6 +87,7 @@ impl DummyHarness {
             agent: agent.into(),
             jobs: jobs.into(),
             memory: memory.into(),
+            runs: runs.into(),
             committed: Store::default(),
             pending: None,
         }
@@ -112,7 +125,9 @@ impl Module for DummyHarness {
         // rejection below: it is never acted on.
         if origin == Origin::Module(self.package.clone()) {
             return match decode_harness_msg(&msg.payload).map_err(Error::Module)? {
-                HarnessMsg::InstallPackage { package, spec } => self.install(ctx, package, spec),
+                HarnessMsg::InstallPackage { package, spec } => {
+                    self.install(ctx, package, spec).await
+                }
                 HarnessMsg::SuspendPackage { package } => self.suspend(ctx, package),
                 HarnessMsg::ResumePackage { package } => self.resume(ctx, package),
                 HarnessMsg::UnplugPackage { package } => self.unplug(ctx, package),
@@ -134,16 +149,23 @@ impl Module for DummyHarness {
                 }
                 return Ok(());
             }
-            // an accepted action's Apply, riding the delivery block — NO-FAIL.
-            if let Ok(apply) = decode_action_msg(&msg.payload) {
-                self.apply_action(ctx, &apply);
-                return Ok(());
+        }
+
+        // an accepted action's Apply, riding the delivery block — NO-FAIL,
+        // and gated to the RUNS module's origin specifically (tighter than an
+        // any-module gate — the copyable template must model this, not the
+        // any-module hole the dummy shipped with originally).
+        if origin == Origin::Module(self.runs.clone()) {
+            match decode_action_msg(&msg.payload) {
+                Ok(apply) => self.apply_action(ctx, &apply),
+                Err(e) => self.breadcrumb(ctx, format!("dropped undecodable apply: {e}")),
             }
+            return Ok(());
         }
 
         Err(Error::Module(
             "dummy-harness accepts HarnessMsg from the package module, PageEvents from its \
-             recorded sources, and package-action Applies from module origins"
+             recorded sources, and package-action Applies from the runs module"
                 .into(),
         ))
     }
@@ -234,5 +256,38 @@ mod tests {
         }
         commit(&mut m);
         assert_eq!(m.committed.installed, None, "no state landed");
+    }
+
+    #[test]
+    fn applies_from_non_runs_origins_are_never_acted_on() {
+        let mut m = module();
+        installed(&mut m);
+        let payload = apply(
+            ACTION_NOTE_ADD,
+            serde_json::json!({"note_id": "n1", "text": "hi"}),
+        );
+        // module origins other than runs are rejected outright — tighter than
+        // the old any-module gate — except a recorded source (pages), whose
+        // lane treats the bytes as an undecodable event (no-fail, nothing
+        // acted on either way).
+        for origin in [
+            Origin::External(b"mallory".to_vec()),
+            Origin::Module("mallory-module".into()),
+            Origin::Module("agent".into()),
+            Origin::System,
+        ] {
+            let mut ctx = TestCtx::at(origin.clone());
+            assert!(
+                exec(&mut m, &mut ctx, payload.clone()).is_err(),
+                "{origin:?} must not drive an apply"
+            );
+            assert!(ctx.emitted.is_empty(), "{origin:?} must emit nothing");
+        }
+        let mut via_pages = TestCtx::at(Origin::Module("pages".into()));
+        exec(&mut m, &mut via_pages, payload).unwrap();
+        assert!(via_pages.emitted.is_empty());
+        assert!(via_pages.events.iter().any(|e| e.contains("undecodable")));
+        commit(&mut m);
+        assert_eq!(m.committed.notes.len(), 0, "no note landed");
     }
 }
