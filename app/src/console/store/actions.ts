@@ -553,7 +553,11 @@ export function createActions({
       return Promise.resolve();
     }
     const blocks = blocksOverride ?? getState().activePageBlocks;
-    const targets = [page, ...blocks.map((b) => b.id)];
+    // dedupe: the tree's root block carries the page's own id, so naively
+    // prepending `page` requests it twice — and the module answers with one
+    // group PER REQUESTED target, duplicating every page-level thread in the
+    // panel.
+    const targets = [...new Set([page, ...blocks.map((b) => b.id)])];
     // the module rejects a ThreadsForTargets over MAX_QUERY_TARGETS (512), so a
     // large page must chunk its targets across several queries.
     const CHUNK = 512;
