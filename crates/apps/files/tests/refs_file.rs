@@ -281,6 +281,37 @@ fn module_commit_block_persists_and_survives_restart() {
 }
 
 #[test]
+fn durable_commit_height_cursor_tracks_the_refs_envelope() {
+    // the kernel-facing per-commit height cursor (Module::durable_commit_height):
+    // None until a refs envelope exists — a fresh dir has no durable commit to
+    // claim, and recovery's trailing bound-and-verify must never read "never
+    // committed" as "committed at height 0" — then exactly the committed height,
+    // surviving a restart (it rides the same atomic refs-envelope write as the
+    // state itself).
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut f = open_files(&d);
+        assert_eq!(
+            sdk::Module::durable_commit_height(&f),
+            None,
+            "a fresh dir claims no durable commit"
+        );
+        f.stage_pending_for_test(a_refs(), 12, vec![(Kind::Chunk, b"c".to_vec())]);
+        futures::executor::block_on(f.commit_block()).unwrap();
+        assert_eq!(
+            sdk::Module::durable_commit_height(&f),
+            Some(12),
+            "the cursor claims exactly the committed height"
+        );
+    }
+    // a reopen reads the cursor back from the envelope — the same durability
+    // unit as the refs image, so the (root, height) binding cannot tear.
+    let f2 = open_files(&d);
+    assert_eq!(sdk::Module::durable_commit_height(&f2), Some(12));
+    assert_eq!(f2.durable_height(), 12, "the inherent glue accessor agrees");
+}
+
+#[test]
 fn install_round_trips_and_rejects_wrong_root() {
     let d = tempfile::tempdir().unwrap();
     let mut f = open_files(&d);

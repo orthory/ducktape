@@ -550,6 +550,16 @@ impl Host {
             .collect()
     }
 
+    /// a registered module's per-commit durable height cursor (see
+    /// [`Module::durable_commit_height`]): the block height its last durable
+    /// commit was written for, persisted atomically with that commit. `None`
+    /// for unregistered ids and for modules that track no cursor. recovery
+    /// reads this to bound-and-verify a disk module's TRAILING durable commit
+    /// whose journal seal was lost to a power cut.
+    pub fn durable_commit_height(&self, id: &str) -> Option<u64> {
+        self.registry.get(id).and_then(|m| m.durable_commit_height())
+    }
+
     /// capture the committed registry view for a finalized block.
     ///
     /// The caller supplies the finalized app-hash from consensus. The host

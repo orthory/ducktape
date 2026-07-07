@@ -28,7 +28,11 @@
 //!   synced, which also makes every earlier append durable). boot ROLLS it
 //!   FORWARD: if the live roots still equal the pre-block vector the frame
 //!   re-applies; if they moved, the apply completed before the crash and the
-//!   block is sealed from the observed roots.
+//!   block is sealed from the observed roots. a POWER CUT flavor of this
+//!   window — the disk substrate committed the block but the un-fsync'd seal
+//!   was lost — is bound-and-verified through the substrate's per-commit
+//!   height cursor (see `trailing.rs`): the cursor must claim exactly the
+//!   trailing WAL height, or the state stays fail-closed as [`Error::Torn`].
 //! - a TORN SEALED block: a block whose commit spans substrates with different
 //!   durability — a qmdb store commits to disk PER BLOCK, while the in-memory
 //!   cohort only persists at the periodic checkpoint. a crash (or a hard kill)
@@ -67,6 +71,8 @@
 //!   pinned at submit time ([`Record::Pinned`]), before the engine can ever
 //!   propose their digest. boot seeds the consensus content store from these
 //!   records so the re-reported finalization resolves and applies.
+
+mod trailing;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
@@ -1196,6 +1202,22 @@ where
                 }
             }
         }
+        // TRAILING bound-and-verify (see `trailing.rs`): a power cut can lose
+        // the tip block's seal (a plain append; only the NEXT pre-apply syncs
+        // it) after a disk module already committed that block — leaving its
+        // live root matching NO recorded post-root, which the exact-match scan
+        // above rightly refuses to floor. a disk module carrying a per-commit
+        // height cursor (persisted atomically with its own commit) is floored
+        // AT the trailing unsealed WAL height iff the cursor claims exactly
+        // that height — binding the live root to the one finalized frame the
+        // WAL still holds durably. everything else stays floorless (Torn).
+        let trailing_claims = trailing::seed_trailing_claims(
+            host,
+            &disk_cohort,
+            &expected,
+            trailing::trailing_wal_height(&records, manifest.height),
+            &mut disk_floor,
+        );
 
         for record in records {
             match record {
@@ -1493,12 +1515,14 @@ where
             let protocol_version = host.effective_version(height).await;
             let pre_version = host.effective_version(height.saturating_sub(1)).await;
             host.set_active_version(pre_version);
-            let at_pre = host
+            let moved: BTreeSet<ModuleId> = host
                 .module_roots()
                 .iter()
-                .all(|(id, root)| expected.get(id) == Some(root));
+                .filter(|(id, root)| expected.get(id) != Some(root))
+                .map(|(id, _)| id.clone())
+                .collect();
             host.set_active_version(protocol_version);
-            let disposition = if at_pre {
+            let disposition = if moved.is_empty() {
                 let (disposition, dispatches) =
                     apply_block(host, height, &frame, protocol_version, None).await?;
                 if let Some(sink) = sink.as_deref_mut() {
@@ -1514,13 +1538,72 @@ where
                 }
                 disposition
             } else {
-                // the apply completed before the crash; the roots that moved
-                // are its outcome. (single-disk-substrate blocks make this
-                // exact — see the crate doc on the multi-store limit.)
-                if let Some(sink) = sink.as_deref_mut() {
-                    sink.opaque_block(height);
+                match trailing::classify_trailing(height, &moved, &trailing_claims)? {
+                    // no verified trailing claim among the movers: the apply
+                    // completed before the crash; the roots that moved are its
+                    // outcome. (single-disk-substrate blocks make this exact —
+                    // see the crate doc on the multi-store limit.)
+                    trailing::TrailingPlan::AssumeApplied => {
+                        if let Some(sink) = sink.as_deref_mut() {
+                            sink.opaque_block(height);
+                        }
+                        Disposition::Applied
+                    }
+                    // exactly one disk module verifiably committed this block
+                    // (its height cursor claims the trailing WAL height) and
+                    // everything else is still at pre: re-execute the durable
+                    // frame committing ONLY the at-pre cohort — restoring any
+                    // writes the block fanned out to the in-memory cohort
+                    // (lost with RAM) — and aborting the claimant, whose
+                    // re-commit would move its op-log root and fork us.
+                    trailing::TrailingPlan::SelectiveReplay => {
+                        let commit_only: BTreeSet<ModuleId> = host
+                            .module_roots()
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .filter(|id| !moved.contains(id))
+                            .collect();
+                        let (disposition, dispatches) = apply_block_committing(
+                            host,
+                            height,
+                            &frame,
+                            protocol_version,
+                            None,
+                            &commit_only,
+                        )
+                        .await?;
+                        // consistency backstops: a claimant whose commit this
+                        // frame cannot explain is damage, not a roll-forward.
+                        if disposition != Disposition::Applied {
+                            return Err(Error::Torn(format!(
+                                "trailing block {height} re-landed as {disposition:?}, but a \
+                                 disk module's height cursor claims its durable commit — the \
+                                 claimed state cannot come from this frame. wipe app state \
+                                 and re-sync (keep the consensus journal)"
+                            )));
+                        }
+                        for id in &moved {
+                            if !dispatches.iter().any(|d| d.module == *id) {
+                                return Err(Error::Torn(format!(
+                                    "trailing block {height} never dispatched module {id}, \
+                                     which claims to have committed it — the claimed state \
+                                     cannot come from this frame. wipe app state and re-sync \
+                                     (keep the consensus journal)"
+                                )));
+                            }
+                        }
+                        if let Some(sink) = sink.as_deref_mut() {
+                            sink.folded_block(&FoldedBlock {
+                                height,
+                                frame: &frame,
+                                disposition,
+                                app_hash: host.app_hash(),
+                                dispatches: &dispatches,
+                            });
+                        }
+                        disposition
+                    }
                 }
-                Disposition::Applied
             };
             let seal = BlockSeal {
                 height,

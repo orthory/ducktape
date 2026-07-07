@@ -402,6 +402,29 @@ pub trait Module {
         Ok(())
     }
 
+    /// the PER-COMMIT HEIGHT CURSOR of a per-block-durable (disk-cohort)
+    /// module: the block height of its most recent durable commit, persisted
+    /// ATOMICALLY with that commit — inside the same fsync'd durability unit
+    /// as the module's own state advance (e.g. the duckfs refs-file envelope,
+    /// or a qmdb commit-metadata slot) — or `None` when the module tracks no
+    /// cursor (the default: the in-memory cohort and legacy disk modules).
+    ///
+    /// recovery consults this to BOUND-AND-VERIFY a trailing durable commit
+    /// whose journal seal was lost to a power cut: a disk module whose live
+    /// root matches no recorded post-root is accepted ONLY when its cursor
+    /// claims exactly the journal's single unsealed WAL height; any other
+    /// value (or no cursor) stays fail-closed as torn state. the atomicity
+    /// requirement is load-bearing — a cursor written in a separate
+    /// durability step could survive while the state write it describes was
+    /// lost (or vice versa), turning the bound into a lie.
+    ///
+    /// NEVER a consensus input: the height lives outside every `root()`
+    /// preimage and outside all op/wire encodings (per-node recovery
+    /// bookkeeping only).
+    fn durable_commit_height(&self) -> Option<u64> {
+        None
+    }
+
     /// ACTIVATION HOOK. the host drives this across the whole registry at the
     /// finalized activation boundary (from the orchestrator's agreed
     /// `RespawnPlan::boundary_version`) so a `root()`-changing dual-path module

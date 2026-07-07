@@ -46,8 +46,12 @@ pub struct Files {
     /// the durable refs file at `<dir>/refs` — the block commit point.
     refs_store: DiskRefs,
     /// last block height whose refs are durable; per-node recovery bookkeeping,
-    /// persisted in the refs-file envelope, never in the root preimage.
-    durable_height: u64,
+    /// persisted in the refs-file envelope, never in the root preimage. `None`
+    /// until a refs envelope exists (a fresh dir that has never committed or
+    /// installed) — the distinction matters to the kernel's trailing-commit
+    /// bound-and-verify, which must not read "never committed" as "committed
+    /// at height 0".
+    durable_height: Option<u64>,
     /// gc watermark (per-node bookkeeping); the trigger policy lands in task 13,
     /// so it stays 0 here but is threaded through save/load already.
     gc_watermark: u64,
@@ -65,8 +69,8 @@ impl Files {
             .load()
             .map_err(|e| Error::Module(format!("files: refs load: {e}")))?
         {
-            Some((refs, height, gc_watermark)) => (refs, height, gc_watermark),
-            None => (Refs::default(), 0, 0),
+            Some((refs, height, gc_watermark)) => (refs, Some(height), gc_watermark),
+            None => (Refs::default(), None, 0),
         };
         let store = DiskStore::open(dir.join("objects"))
             .map_err(|e| Error::Module(format!("files: odb open: {e}")))?;
@@ -103,18 +107,20 @@ impl Files {
         self.fs
             .install_refs(bytes, expected.0)
             .map_err(Error::Module)?;
-        self.durable_height = height;
+        self.durable_height = Some(height);
         self.refs_store
-            .save(self.fs.refs(), self.durable_height, self.gc_watermark)
+            .save(self.fs.refs(), height, self.gc_watermark)
             .map_err(|e| Error::Module(format!("files: refs save: {e}")))?;
         Ok(())
     }
 
     /// last height whose refs are durable — glue surface for the node sync
     /// integration; set by [`Files::install`] to the sync-target height and by
-    /// `commit_block` to each committed height.
+    /// `commit_block` to each committed height. `0` on a fresh dir that has no
+    /// refs envelope yet (the kernel-facing cursor distinguishes that case —
+    /// see [`Module::durable_commit_height`]).
     pub fn durable_height(&self) -> u64 {
-        self.durable_height
+        self.durable_height.unwrap_or(0)
     }
 
     /// the ids of up to `limit` objects reachable from the committed refs but not
@@ -265,6 +271,18 @@ impl Module for Files {
         StateRoot(self.fs.root_bytes())
     }
 
+    /// the per-commit height cursor the kernel's trailing-commit
+    /// bound-and-verify reads: the refs-file envelope's height field, written
+    /// in the SAME atomic durability unit as the refs image itself
+    /// (tmp → fsync → rename → parent-dir fsync in [`DiskRefs::save`], with
+    /// the whole envelope under one checksum) — so the (root, height) binding
+    /// can never tear. `None` until a refs envelope exists: a fresh dir has
+    /// no durable commit to claim, and height 0 must remain claimable only by
+    /// a module that really committed block 0.
+    fn durable_commit_height(&self) -> Option<u64> {
+        self.durable_height
+    }
+
     /// duckfs syncs object-by-object, not as one self-contained blob: the
     /// snapshot lane would ship the refs image alone (the `root()` preimage) and
     /// leave the joiner with an EMPTY odb — it would know every file exists but
@@ -401,7 +419,7 @@ impl Module for Files {
             .map_err(|e| Error::Module(format!("files: refs save: {e}")))?;
         // 5. adopt — root advances only now that the refs file is durable.
         self.fs.adopt_refs(refs);
-        self.durable_height = height;
+        self.durable_height = Some(height);
 
         // 6. gc watermark trigger — per-node bookkeeping, NOT consensus (the root
         // covers refs only, and unreachable-on-one-node is unreachable on every
@@ -418,7 +436,7 @@ impl Module for Files {
                 .map_err(|e| Error::Module(format!("files: gc: {e}")))?;
             self.gc_watermark = height;
             self.refs_store
-                .save(self.fs.refs(), self.durable_height, self.gc_watermark)
+                .save(self.fs.refs(), height, self.gc_watermark)
                 .map_err(|e| Error::Module(format!("files: refs save (gc watermark): {e}")))?;
         }
         Ok(())
