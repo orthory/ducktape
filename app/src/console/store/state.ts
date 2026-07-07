@@ -8,6 +8,7 @@ import type { PendingRun, WatchView } from "../../domain/runs-client";
 import type {
   Channel,
   ChatSearchHit,
+  ChatTagRow,
   ChatThread,
   MessageView,
 } from "../../domain/chat-client";
@@ -57,6 +58,15 @@ export interface SearchResults {
   query: string;
   chat: ChatSearchHit[];
   docs: PageSearchHit[];
+}
+
+/** The active #tag filter on the chat surface: while set, the message pane
+ *  renders the tag's `tagSearch` hits instead of the live slice. `tag` keeps
+ *  the as-typed display form (the node's index normalizes); `channelId` is
+ *  the channel the filter was set in — switching channels clears it. */
+export interface TagFilter {
+  tag: string;
+  channelId: string | null;
 }
 
 /** A managed (app-spawned) node failed to START or CONNECT — the dedicated
@@ -113,6 +123,16 @@ export interface ConsoleState {
   /** Messages of the active channel only (all sequences; views filter). */
   messages: MessageView[];
   activeThread: ChatThread | null;
+  /** The active #tag filter (see TagFilter), or null for the live view. */
+  tagFilter: TagFilter | null;
+  /** The active tag filter's hits (newest first) — query-driven, like
+   *  `search`; never part of the per-block snapshot. */
+  tagHits: ChatSearchHit[];
+  /** A tagSearch round-trip is in flight. */
+  tagHitsPending: boolean;
+  /** The active channel's tag catalog (count-ordered), loaded on demand for
+   *  the header's tag dropdown. Cleared on channel switch. */
+  channelTags: ChatTagRow[];
   /** hex(user key bytes) → display name, from the `profiles` module; threaded
    *  into author rendering so messages show chosen names, not hex handles.
    *  OVERLAID by `identity`'s per-user display name for every node it binds —
@@ -369,6 +389,10 @@ export const createInitialState = (): ConsoleState => {
     activeChannel: null,
     messages: [],
     activeThread: null,
+    tagFilter: null,
+    tagHits: [],
+    tagHitsPending: false,
+    channelTags: [],
     authorNames: {},
     nodeUsers: {},
     voice: {

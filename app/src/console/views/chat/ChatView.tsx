@@ -17,6 +17,7 @@ import { Composer } from "./Composer";
 import { HoverButton } from "./HoverButton";
 import { HuddleHeaderButton, HuddleRailBadge } from "./Huddle";
 import { MessageList } from "./MessageList";
+import { ChannelTagsButton, TagFilterBar, TagHitList } from "./TagFilter";
 import { ThreadPanel } from "./ThreadPanel";
 
 function LockGlyph({ size = 11 }: { size?: number }) {
@@ -398,32 +399,41 @@ export function ChatView() {
               <LockGlyph size={10} /> Members only
             </span>
           )}
+          {channel && <ChannelTagsButton />}
           {channel && <HuddleHeaderButton channel={channel} />}
         </div>
 
         {channel ? (
           <>
-            <MessageList
-              channelName={channel.name}
-              messages={state.messages}
-              names={state.authorNames}
-              ops={state.ops}
-              selfKey={selfKey}
-              workspaceId={workspaceId}
-              hoverMsg={hoverMsg}
-              menuOpenId={msgMenuId}
-              listRef={listRef}
-              onScroll={(event) => {
-                const el = event.currentTarget;
-                pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-              }}
-              onHover={setHoverMsg}
-              onMenuToggle={setMsgMenuId}
-              onOpenThread={actions.openThread}
-              onReact={actions.toggleReaction}
-              onEdit={actions.editMessage}
-              onDelete={actions.deleteMessage}
-            />
+            <TagFilterBar />
+            {state.tagFilter ? (
+              // filtering: the tag's hits (read-only, newest first) replace
+              // the live slice until the bar's ✕ clears the filter.
+              <TagHitList />
+            ) : (
+              <MessageList
+                channelName={channel.name}
+                messages={state.messages}
+                names={state.authorNames}
+                ops={state.ops}
+                selfKey={selfKey}
+                workspaceId={workspaceId}
+                hoverMsg={hoverMsg}
+                menuOpenId={msgMenuId}
+                listRef={listRef}
+                onScroll={(event) => {
+                  const el = event.currentTarget;
+                  pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+                }}
+                onHover={setHoverMsg}
+                onMenuToggle={setMsgMenuId}
+                onOpenThread={actions.openThread}
+                onReact={actions.toggleReaction}
+                onEdit={actions.editMessage}
+                onDelete={actions.deleteMessage}
+                onTagClick={actions.setTagFilter}
+              />
+            )}
             <Composer
               value={draft}
               onChange={setDraft}
