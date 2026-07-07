@@ -1019,6 +1019,31 @@ impl Module for SagaModule {
                     .min();
                 Ok(encode_reply(&SagaReply::NextExpiry(next)))
             }
+            SagaQuery::AssignedPending { assignee } => {
+                // the resident worker pump's read: reconstruct exactly the
+                // WorkerRequest the effect lane carried for every pending
+                // attempt leased to `assignee`. a node that installs synced
+                // boundaries (and so never observes effects) discovers its
+                // own assigned work here; visible_ids is sorted, so the
+                // projection is deterministic.
+                let requests = self
+                    .visible_ids()
+                    .into_iter()
+                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
+                    .filter(|(_, saga)| {
+                        !saga.status.is_terminal()
+                            && saga.assignee.as_deref() == Some(assignee.as_slice())
+                    })
+                    .map(|(id, saga)| WorkerRequest {
+                        saga_id: id,
+                        attempt: saga.attempt,
+                        spec: saga.spec.clone(),
+                        deadline: saga.deadline,
+                        assignee: saga.assignee.clone(),
+                    })
+                    .collect();
+                Ok(encode_reply(&SagaReply::AssignedPending(requests)))
+            }
         }
     }
 
@@ -1198,6 +1223,16 @@ mod tests {
         match decode_reply(&reply).unwrap() {
             SagaReply::NextExpiry(v) => v,
             other => panic!("expected NextExpiry reply, got {other:?}"),
+        }
+    }
+    fn assigned_pending(m: &SagaModule, assignee: &[u8]) -> Vec<WorkerRequest> {
+        let reply = block_on(m.query(&encode_query(&SagaQuery::AssignedPending {
+            assignee: assignee.to_vec(),
+        })))
+        .unwrap();
+        match decode_reply(&reply).unwrap() {
+            SagaReply::AssignedPending(v) => v,
+            other => panic!("expected AssignedPending reply, got {other:?}"),
         }
     }
     fn exec(m: &mut SagaModule, ctx: &mut CaptureCtx, op: &Msg) -> Result<(), Error> {
@@ -2529,6 +2564,69 @@ mod tests {
         exec(&mut m, &mut ctx, &oracle("b", 0, Ok(b"r".to_vec()))).unwrap();
         commit(&mut m);
         assert_eq!(next_expiry(&m), Some(50), "terminal sagas carry no expiry");
+    }
+
+    #[test]
+    fn assigned_pending_projects_own_leases_as_worker_requests() {
+        // the resident worker pump's read: a capability-tagged saga leased to
+        // `me` surfaces as exactly the WorkerRequest the effect carried;
+        // other keys see nothing, and a landed result retires it.
+        let me = b"resident-key".to_vec();
+        let other = b"someone-else".to_vec();
+        let mut m = SagaModule::with_assignment(
+            "saga",
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        );
+        assert!(
+            assigned_pending(&m, &me).is_empty(),
+            "an empty ledger assigns nothing"
+        );
+
+        // a single-provider pool makes the rendezvous pick deterministic.
+        let mut ctx = CaptureCtx::new().at(4).with_providers(vec![me.clone()]);
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
+                saga_id: "job".into(),
+                spec: b"the work spec".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: Some(90),
+                max_attempts: 3,
+                lease_views: Some(10),
+                capability: Some("codex".into()),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        // the projection IS the effect's work order, field for field.
+        let emitted = ctx.worker_requests();
+        assert_eq!(emitted.len(), 1, "the trigger emitted one request");
+        assert_eq!(
+            assigned_pending(&m, &me),
+            emitted,
+            "the state projection matches the effect lane's request"
+        );
+        assert!(
+            assigned_pending(&m, &other).is_empty(),
+            "another key's read excludes foreign leases"
+        );
+
+        // the assignee's result settles the saga: nothing pending remains.
+        let mut ctx = CaptureCtx::new()
+            .at(5)
+            .from_origin(Origin::External(me.clone()));
+        exec(&mut m, &mut ctx, &oracle("job", 0, Ok(b"done".to_vec()))).unwrap();
+        commit(&mut m);
+        assert!(
+            assigned_pending(&m, &me).is_empty(),
+            "a terminal saga is no longer assigned work"
+        );
     }
 
     #[test]
