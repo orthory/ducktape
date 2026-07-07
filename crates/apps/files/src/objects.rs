@@ -294,7 +294,19 @@ impl SnapshotObj {
 /// remainder is an inconsistent size/chunks pair and rejects — so a zero-length
 /// "chunk" can never spoof a hole, and the byte length alone pins each chunk.
 pub fn verify_chunk_len(file: &FileObj, index: usize, got_len: u64) -> Result<(), String> {
-    let n = file.chunks.len();
+    verify_chunk_len_at(file.size, file.chunks.len(), index, got_len)
+}
+
+/// [`verify_chunk_len`] over bare `(size, chunk_count)` parts — the commit
+/// executor verifies referenced chunks BEFORE any [`FileObj`] exists, and the
+/// read path already holds one; both charge the identical rule here.
+pub fn verify_chunk_len_at(
+    size: u64,
+    chunk_count: usize,
+    index: usize,
+    got_len: u64,
+) -> Result<(), String> {
+    let n = chunk_count;
     if index >= n {
         return Err("files: chunk index out of range".into());
     }
@@ -302,8 +314,7 @@ pub fn verify_chunk_len(file: &FileObj, index: usize, got_len: u64) -> Result<()
         let prefix = (n as u64 - 1)
             .checked_mul(CHUNK_SIZE)
             .ok_or_else(|| "files: chunk prefix length overflows".to_string())?;
-        let last = file
-            .size
+        let last = size
             .checked_sub(prefix)
             .ok_or_else(|| "files: file size smaller than its chunk count implies".to_string())?;
         if last == 0 || last > CHUNK_SIZE {

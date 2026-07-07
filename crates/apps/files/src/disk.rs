@@ -176,6 +176,32 @@ impl ObjectStore for DiskStore {
         self.object_path(id).1.exists()
     }
 
+    fn stat(&self, id: &ObjectId) -> Result<Option<(Kind, u64)>, String> {
+        // metadata-only by contract: one open, a 1-byte kind-tag read, and an
+        // fstat — the body (file length minus the tag byte) is never read, so
+        // commit's chunk-length check stays cheap on the execute path.
+        let (hex, path) = self.object_path(id);
+        let mut f = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            // absent is Ok(None), sharply distinct from a corrupt Err below.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("files: odb stat {hex}: {e}")),
+        };
+        let len = f
+            .metadata()
+            .map_err(|e| format!("files: odb stat {hex}: {e}"))?
+            .len();
+        if len == 0 {
+            return Err(format!("files: odb stat {hex}: object file is empty"));
+        }
+        let mut tag = [0u8; 1];
+        std::io::Read::read_exact(&mut f, &mut tag)
+            .map_err(|e| format!("files: odb stat {hex}: {e}"))?;
+        let kind = Kind::from_u8(tag[0])
+            .ok_or_else(|| format!("files: odb stat {hex}: unknown kind tag {}", tag[0]))?;
+        Ok(Some((kind, len - 1)))
+    }
+
     fn remove(&mut self, id: &ObjectId) -> Result<(), String> {
         let (hex, path) = self.object_path(id);
         match std::fs::remove_file(&path) {
