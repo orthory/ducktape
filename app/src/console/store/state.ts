@@ -12,7 +12,7 @@ import type {
   ChatThread,
   MessageView,
 } from "../../domain/chat-client";
-import type { Manifest } from "../../domain/files-client";
+import type { FileEntry } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
 import type {
   PageBlock,
@@ -209,9 +209,11 @@ export interface ConsoleState {
   /** The ⌘K command-palette search overlay is open. Global UI, not per-block. */
   searchOpen: boolean;
 
-  // ── Files (content-addressed manifests) ──
-  /** Every file manifest (List, prefix ""), re-queried per block. */
-  files: Manifest[];
+  // ── Files (duckfs) ──
+  /** A flat index of file entries under the tree root (Find, prefix "/"),
+   *  re-queried per block. Feeds the command palette's file filter; the files
+   *  browser pages the tree live off the transport instead. */
+  files: FileEntry[];
 
   /** The newest finalized height seen on the ws block stream — updated
    *  UNGATED (unlike the refresh the same stream drives, which is held while
@@ -461,7 +463,7 @@ export interface ConsoleSnapshot {
   pendingRuns: PendingRun[];
   capabilitiesByNode: Map<string, string[]>;
   runAssignee: Map<string, string>;
-  files: Manifest[];
+  files: FileEntry[];
   blocks: BlockRecord[];
 }
 
