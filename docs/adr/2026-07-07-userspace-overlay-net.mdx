@@ -1,0 +1,170 @@
+# ADR: Userspace Overlay Networking (in-process BoringTun, TUN-less by default)
+
+Date: 2026-07-07. Status: **Accepted**. This decides how the node carries its
+WireGuard overlay for end users: an in-process, TUN-less data plane built
+directly on `boringtun` becomes the desktop default, behind a backend seam
+that keeps today's TUN path available for servers and validators.
+
+## Context
+
+The private data tunnel today is `defguard_wireguard_rs`'s
+`WGApi::<Userspace>` — which already runs **BoringTun in-process**
+(`defguard_boringtun::device::DeviceHandle`), but exposes the tunnel to the
+node the way a VPN exposes it to a laptop: through an OS **TUN device**. The
+crypto was never the privileged part; the device is. That single choice is
+the source of every user-experience cost we carry:
+
+- **Privilege.** Creating the TUN needs root or `CAP_NET_ADMIN` plus
+  `/dev/net/tun`. The desktop app spawns `ducktape-node` as an unprivileged
+  sidecar, so a stock desktop install cannot bring private networking up at
+  all — the core UX blocker this ADR removes.
+- **External binaries.** The Linux path shells out to `ip` (link up + peer
+  routes) and `resolvconf` at teardown; a missing binary fails the tunnel
+  lifecycle (`IoError(NotFound)`) on hosts that are otherwise fine.
+- **Host mutation.** Interfaces, routes, and DNS state are global: crashes
+  orphan `dt-*` devices, user VPNs (Tailscale, corp WireGuard) contend for
+  routes, and fleet QA (N worktree nodes per box) needs N privileged TUNs.
+- **Platform ceiling.** macOS needs utun entitlements, Windows needs the
+  wintun driver — both are installer/permission friction we would inherit
+  the moment the desktop app leaves Linux.
+- **Library debt.** `DefguardWireGuardEffect` already carries workarounds
+  for defguard lifecycle bugs (stale `DeviceHandle` unlinking the successor's
+  UAPI socket; async worker teardown polled via `/sys/class/net`).
+- **NAT seam.** The WG UDP socket is bound *inside* defguard's device, while
+  hole punching must originate from the same 5-tuple. Owning the socket
+  in-process is what makes the remaining `Coordinated`-hint consumption
+  work sane.
+
+The decisive observation: **every shipped consumer of the overlay lives
+inside the node process.** The control mesh (`advertised = "overlay"`) dials
+member ULAs from the node; statesync's per-use data plane
+(`data_plane::OverlaySockets`) binds the member `/128` from the node; voice
+rides mesh-encapsulation channels; the invite intro listener is underlay
+UDP (unaffected). Nothing shipped requires the *host* to route overlay
+addresses — forge is served by the local node over localhost HTTP, the
+huddle gateway is a local WebSocket. An OS-visible interface is a
+generality we pay for and do not use.
+
+## Decision
+
+**Two backends behind one seam; the TUN-less userspace backend is the
+desktop default.**
+
+1. **`OverlayNet` seam.** Overlay reachability becomes an abstraction the
+   node routes through, not an assumption that ULAs are OS-routable. The
+   concrete integration point already exists: `commonware_runtime::Network`
+   (`bind`/`dial`) — the p2p stack is generic over the runtime context (the
+   deterministic-runtime tests prove it). We add a wrapper context around
+   `tokio::Context` that delegates everything except `Network`, whose
+   `dial`/`bind` route **by address**: overlay ULAs go to the active overlay
+   backend, everything else passes through to the OS. The data plane's
+   `OverlaySockets` gains the same routing via an injected socket factory.
+   The p2p dialer therefore never `connect()`s an overlay ULA on a raw OS
+   socket again — in TUN mode the backend's answer *is* the OS socket
+   (pass-through), in userspace mode it is a virtual one.
+
+2. **`UserspaceOverlayNet` backend.** A new in-process data plane built
+   directly on `boringtun`'s sans-io core (`boringtun::noise::Tunn` — not
+   its device layer): one process-owned underlay UDP socket per node (the
+   `wireguard_listen` endpoint, shared with the NAT punch by construction),
+   one `Tunn` per peer keyed by allowed-ip `/128` (the cryptokey routing we
+   already rely on), and above it a minimal virtual host — `smoltcp` bound
+   to the node's overlay ULA — exposing async TCP dial/listen and UDP
+   sockets to the seam. No TUN, no privilege, no external binaries, no host
+   mutation.
+
+3. **Backend selection.** `wireguard_effect` grows from `real | fake` to
+   `socket | tun | fake` (`real` stays as an alias for `tun`). The desktop
+   app's spawned sidecar defaults to `socket`; servers, validators, and
+   anyone wanting host-routable overlay addresses or kernel TCP for bulk
+   keeps `tun`. Defaults for self-managed nodes stay `tun` until the perf
+   gate (below) passes.
+
+4. **The orchestration boundary does not move.** The reachability
+   orchestrator, epoch cutover, standby pre-warm, cold restart, and the
+   tunnel-first join recipe all drive tunnels through the `WireGuardEffect`
+   trait (`create_interface` / `apply` / `remove_interface`). The userspace
+   backend implements the same trait — `create` allocates the stack, `apply`
+   replaces the peer set + ULA atomically, `remove` drops it — so none of
+   that machinery changes.
+
+5. **Wire compatibility is a requirement, not a hope.** It is still
+   WireGuard: same Noise handshake, same X25519 keys, same wire format, same
+   invite blob. A `socket`-mode node interoperates with a `tun`-mode node on
+   the same network; the choice is per-node, has zero consensus impact, and
+   needs no lockstep. The mixed-mode container smoke (below) is the gate.
+
+## Alternatives considered
+
+- **Package around the privilege (setcap on the sidecar, polkit, sudo
+  prompts).** Papers over Linux only: still `/dev/net/tun`, still
+  `ip`/`resolvconf`, nothing for macOS/Windows, and dev iteration relinks
+  the binary constantly (the tauri sidecar hardlink already bites us), so
+  the capability grant is a treadmill.
+- **Drop defguard, embed boringtun with its own TUN layer.** Buys back the
+  lifecycle bugs and (via rtnetlink) the external binaries, but keeps the
+  privileged device — the actual UX blocker survives. Rejected as the main
+  path; the seam leaves room to swap the TUN backend's implementation later
+  if defguard debt grows.
+- **True kernel WireGuard backend (`WGApi::<Kernel>`) for servers.** Not
+  taken now, but the seam makes it a contained follow-up if bulk perf on
+  servers ever warrants it. (Note: today's "real" path is *not* kernel
+  WireGuard — it is BoringTun-over-TUN; a kernel backend would be new.)
+- **Replace WireGuard with QUIC/mTLS overlay.** Throws away the proven
+  reachability plane, invite format, cold restart, NAT machinery, and wire
+  interop for no user-visible gain. Rejected.
+
+## Consequences
+
+- **Won:** `join <blob>` works as a normal user on a stock machine — no
+  sudo, no setcap, no kernel module, no `/dev/net/tun`, no `wg`/`ip`/
+  `resolvconf`. Desktop private networking works straight from the
+  installer. No host network mutations → coexists with user VPNs, nothing
+  to clean up after a crash. N nodes per host without interface-namespace
+  collisions (fleet QA on real tunnels becomes cheap). A driverless path to
+  macOS/Windows desktop. The punch and the tunnel share one process-owned
+  socket.
+- **Lost in `socket` mode:** host tools cannot reach overlay ULAs (there is
+  no OS route). Any future feature that serves non-ducktape processes over
+  the overlay needs `tun` mode — which is why `tun` stays a supported
+  backend, not a deprecation.
+- **Perf:** `smoltcp` TCP is not kernel TCP. Datagram lanes barely touch it
+  (thin UDP), but statesync bulk streams are the stress case. A documented
+  benchmark — statesync bulk throughput, `socket` vs `tun`, same pair — is
+  the gate before `socket` becomes a default anywhere beyond the desktop
+  sidecar. Worst case, bulk statesync stays on the control mesh or `tun`
+  nodes; the desktop UX win does not depend on winning the benchmark.
+- **New moving parts:** the `Tunn` timer machinery (handshake retry,
+  keepalive, rekey) is now ours to drive; the wrapper context is one more
+  delegation layer to maintain; two backends live until the gate resolves
+  defaults.
+
+## Plan
+
+Phased so every step lands green on `dev`; the TUN path keeps working
+throughout (phase 0 explicitly preserves it).
+
+- **Phase 0 — carve the seam.** Introduce the overlay routing boundary:
+  wrapper runtime context implementing `commonware_runtime::Network` with
+  by-address routing; `OverlaySockets` socket-factory injection; the TUN
+  backend is the pass-through implementation, and behavior today is
+  bit-identical. The p2p dialer's direct OS `connect` to ULAs moves behind
+  the seam here.
+- **Phase 1 — userspace core.** New crate `crates/system/overlay-net`
+  (split by responsibility: `lib.rs` seam + routing types, `tun.rs`
+  pass-through backend, `userspace/device.rs` Tunn table + UDP pump +
+  timers, `userspace/stack.rs` smoltcp host, `userspace/effect.rs`
+  `WireGuardEffect` impl; ~600-line soft cap per file). Loopback pair test:
+  handshake, datagram echo, rekey, peer replace.
+- **Phase 2 — minimal TCP/UDP + wire compat.** smoltcp host exposes async
+  TCP dial/listen + UDP bound at the member ULA. Interop leg in the
+  container smoke: userspace backend ↔ today's TUN backend, proving the
+  wire format and cryptokey routing match before any node wiring.
+- **Phase 3 — node wiring.** `wireguard_effect = "socket"`; the
+  orchestrator drives the new backend through `WireGuardEffect` unchanged;
+  NAT punch moves onto the plane's own UDP socket; join recipe, cold
+  restart, and standby pre-warm exercised in socket mode; `ops/wg-smoke`
+  gains the mixed-mode pair as its standing gate.
+- **Phase 4 — defaults + gate.** Desktop-spawned sidecars default to
+  `socket`; self-managed/server config keeps `tun`; run and document the
+  statesync bulk benchmark; revisit server defaults only on its results.

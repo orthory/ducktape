@@ -24,6 +24,7 @@ import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { HealthBar, HealthLegend } from "./HealthBar";
 import { commitHealth, healthSegments, nodeLiveness } from "./node-health";
+import { NodeFactsCard } from "./NodeFactsCard";
 import { PeersTab } from "./PeersTab";
 
 type TabId = "overview" | "peers" | "permissions";
@@ -852,6 +853,9 @@ function OverviewTab() {
       <SectionLabel>YOUR ACCESS</SectionLabel>
       <div style={{ marginTop: 9 }}>
         <AccessCard />
+      </div>
+      <div style={{ marginTop: 10 }}>
+        <NodeFactsCard />
       </div>
 
       <SectionLabel style={{ marginTop: 22 }}>NETWORK</SectionLabel>

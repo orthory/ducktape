@@ -3,8 +3,6 @@ import type { Dispatch } from "react";
 import * as agentClient from "../../domain/agent-client";
 import * as chatClient from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
-import * as filesClient from "../../domain/files-client";
-import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import * as identityClient from "../../domain/identity-client";
@@ -46,6 +44,7 @@ import {
   channelIdOf,
   clearRemoteUrl,
   removeTab,
+  saveAccent,
   saveDocTabs,
   saveRemoteUrl,
   saveViewMode,
@@ -262,17 +261,11 @@ export interface ConsoleActions {
    *  leaves the list empty. */
   loadChannelTags(): void;
 
-  // ── Files (content-addressed manifests over the `files` module) ──
-  /** Chunk + stage a file's bytes into the blob store, then commit its manifest. */
-  uploadFile(params: { name: string; mime: string; bytes: Uint8Array<ArrayBuffer> }): void;
-  /** Remove a manifest (owner-gated; rides the daemon identity that added it). */
-  removeFile(fileId: string): void;
-  /** Reassemble a file's bytes, verifying every chunk against the manifest.
-   *  Returns the manifest + bytes for the view to hand to a browser download,
-   *  or null when the file/node is unavailable. */
-  downloadFile(
-    fileId: string,
-  ): Promise<{ manifest: Manifest; bytes: Uint8Array<ArrayBuffer> } | null>;
+  // ── Files (duckfs) ──
+  // The files browser drives duckfs reads/writes directly off the live
+  // transport (context.transport) via domain/files-client — no store action,
+  // like the forge browser. The per-block Find projection into `state.files`
+  // (DucktapeProvider) is all the store keeps, feeding the command palette.
 
   /** Ask the managed daemon to exit (desktop only). */
   stopNode(): void;
@@ -843,7 +836,10 @@ export function createActions({
       });
     },
 
-    setAccent: (accent) => patch({ accent }),
+    setAccent: (accent) => {
+      saveAccent(accent);
+      patch({ accent });
+    },
     setAuthor: (author) => patch({ author }),
 
     readMetrics: () => {
@@ -1582,48 +1578,6 @@ export function createActions({
         })
         // best-effort: an older node without the index tier 404s the view.
         .catch(() => {});
-    },
-
-    // ── Files ──
-    uploadFile: ({ name, mime, bytes }) => {
-      const cleanName = name.trim();
-      if (!cleanName) return;
-      const fileId = crypto.randomUUID();
-      submitTracked(opKey.file(fileId), (live) =>
-        filesClient.uploadFile(live, {
-          fileId,
-          name: cleanName,
-          mime: mime || "application/octet-stream",
-          bytes,
-        }),
-      );
-    },
-
-    removeFile: (fileId) => {
-      if (!fileId) return;
-      submitTracked(
-        opKey.file(fileId),
-        (live) => filesClient.removeManifest(live, fileId),
-        (prev) => optimistic.fileRemoved(prev, fileId),
-      );
-    },
-
-    downloadFile: (fileId) => {
-      const live = getNode();
-      if (!live || !fileId) return Promise.resolve(null);
-      return Promise.resolve()
-        .then(() => filesClient.stat(live, fileId))
-        .then((manifest) =>
-          manifest
-            ? filesClient
-                .downloadFile(live, manifest)
-                .then((bytes) => ({ manifest, bytes }))
-            : null,
-        )
-        .catch((err) => {
-          fail(err);
-          return null;
-        });
     },
 
     stopNode: () => {

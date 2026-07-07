@@ -129,17 +129,17 @@ fn duckfs_engine_round_trips_across_two_nodes() {
         "the round-trip edit is visible back at node 0"
     );
 
-    // ---- step 3a: same-path conflict → a SAFE failure (no silent merge) ----
+    // ---- step 3a: same-path conflict → a STRUCTURED report (no silent merge) --
     //
-    // over REAL consensus, a module rejection finalizes as a generic
-    // deterministic-no-op: bin/node's `Disposition::Rejected` carries no reason
-    // string, so the `"files: conflict:"` text the engine keys on does NOT
-    // survive consensus (Risk #4). the engine therefore surfaces a plain
-    // `Rejected` here rather than the structured `ConflictReport` — which the
-    // SINGLE-DAEMON noded path DOES produce (proven in noded's daemon_e2e,
-    // `duckfs_engine_round_trips_and_reports_conflict_through_http_node`). the
-    // load-bearing safety property is identical either way: B's commit FAILS and
-    // never silently clobbers A.
+    // over REAL consensus, the module's per-path CAS rejection ("files: conflict:
+    // <path> changed since base") now rides the finalized `Disposition::Rejected`
+    // back to the submitter verbatim (node-local reason capture off the
+    // DrainedFrame — never consensus state), so the `"files: conflict:"` text the
+    // engine keys on survives consensus. the cluster therefore surfaces the SAME
+    // structured `ConflictReport` naming the clashing path that the SINGLE-DAEMON
+    // noded path produces (noded's daemon_e2e,
+    // `duckfs_engine_round_trips_and_reports_conflict_through_http_node`). B's
+    // commit FAILS and never silently clobbers A.
     let conf_a = tempfile::tempdir().expect("conf a");
     let conf_b = tempfile::tempdir().expect("conf b");
     checkout_with(&node0, conf_a.path(), "/shared/e2e", None, &opts0).expect("conflict checkout a");
@@ -149,17 +149,11 @@ fn duckfs_engine_round_trips_across_two_nodes() {
     let a_snap = commit(&node0, conf_a.path(), "A").expect("A commits clean");
     let err = commit(&node0, conf_b.path(), "B").expect_err("B must not silently overwrite A");
     match err {
-        // the noded path (or a future node build that propagates the reason).
         CommitError::Conflict(report) => assert!(
             report.clashing.iter().any(|p| p == "/shared/e2e/small.txt"),
-            "the conflict names the clashing path: {report:?}"
+            "the conflict names the clashing path over the cluster: {report:?}"
         ),
-        // the current cluster path: a safe generic finalized-rejection.
-        CommitError::Rejected(msg) => assert!(
-            msg.contains("rejected"),
-            "a same-path commit is safely rejected over consensus: {msg}"
-        ),
-        other => panic!("expected a conflict or a safe rejection, got {other:?}"),
+        other => panic!("expected a structured conflict over the cluster, got {other:?}"),
     }
     // A's write survived — no silent merge: a fresh checkout at node 0 reads it.
     wait_head(&cluster, 0, &a_snap.snapshot);

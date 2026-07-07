@@ -107,6 +107,20 @@ describe("StatusView", () => {
     expect(screen.getByText("tasks")).toBeInTheDocument();
   });
 
+  it("shows the node ops facts that moved here from Settings", () => {
+    renderStatus({ members: [workspace.pubkey, PEER_B, RESIDENT_C] });
+
+    expect(screen.getByText("Data dir")).toBeInTheDocument();
+    expect(
+      screen.getByText("~/.ducktape/workspaces/acme-research"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Ports")).toBeInTheDocument();
+    expect(screen.getByText("p2p 7420 · http 8844 · rpc 9020")).toBeInTheDocument();
+    expect(screen.getByText("Quorum threshold")).toBeInTheDocument();
+    // floor(3 * 2/3) + 1 = 3 of the 3 validators.
+    expect(screen.getByText("3 of 3 validators")).toBeInTheDocument();
+  });
+
   it("lists connections with derived liveness on the Connections tab", () => {
     renderStatus({
       members: [workspace.pubkey, PEER_B],
