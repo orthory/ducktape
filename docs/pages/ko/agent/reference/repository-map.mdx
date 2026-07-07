@@ -42,7 +42,10 @@
 - `bin/node`: p2p validator/mesh node (noded app surface도 함께 제공).
 - `bin/noded`: http/ws app surface 뒤의 single embedded-host daemon.
 - `bin/fs`: `ducktape-fs`, duckfs working-copy CLI — read verb과
-  `crates/system/duckfs-client` 위의 checkout/status/commit/pin loop.
+  `crates/system/duckfs-client` 위의 checkout/status/commit/pin loop. `mount`
+  verb(FUSE, `src/fuse/`)는 `fuse` cargo feature 뒤에 gate된다 — pinned snapshot
+  에서 `NodeApi`로 read-only, `--rw`는 backing checkout 위 — 그래서 default build은
+  libfuse/`fuser`를 끌어오지 않는다.
 
 ## Docs
 
