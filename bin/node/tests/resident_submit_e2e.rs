@@ -62,7 +62,7 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     let friend_key = cluster.join_friend_manual(&invite);
     assert_eq!(friend_key.len(), 64, "join prints the friend's pubkey hex");
     cluster.spawn(1);
-    cluster.wait_marker(1, "parked:", Duration::from_secs(60));
+    cluster.wait_marker(1, "joining:", Duration::from_secs(60));
 
     // (1) WHILE PARKED (no standing): a write is refused, and the refusal names
     //     the parked/no-standing contract — refused for the RIGHT reason.
