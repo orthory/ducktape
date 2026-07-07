@@ -5,20 +5,39 @@ pub struct NodeKey(pub [u8; 32]);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Msg {
-    BindRequest { from: NodeKey },
-    BindResponse { reflexive: SocketAddr },
-    Register { key: NodeKey },
+    BindRequest {
+        from: NodeKey,
+    },
+    BindResponse {
+        reflexive: SocketAddr,
+    },
+    Register {
+        key: NodeKey,
+    },
     /// Rebind re-advertisement: republish the sender's reflexive under a
     /// strictly-monotonic `nonce`. Unlike `Register` (an unconditional nonce-0
     /// boot baseline), the coordinator applies the `AdvertBook` staleness guard
     /// so a replayed/reordered equal-or-lower nonce cannot roll a fresh mapping
     /// back. The reflexive stored is still the coordinator-observed source, never
     /// this datagram's self-report — the nonce only orders adverts.
-    Readvertise { key: NodeKey, nonce: u64 },
-    Lookup { key: NodeKey },
-    LookupResponse { key: NodeKey, reflexive: Option<SocketAddr> },
-    PunchSync { peer: NodeKey, peer_reflexive: SocketAddr },
-    Punch { from: NodeKey },
+    Readvertise {
+        key: NodeKey,
+        nonce: u64,
+    },
+    Lookup {
+        key: NodeKey,
+    },
+    LookupResponse {
+        key: NodeKey,
+        reflexive: Option<SocketAddr>,
+    },
+    PunchSync {
+        peer: NodeKey,
+        peer_reflexive: SocketAddr,
+    },
+    Punch {
+        from: NodeKey,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -169,7 +188,10 @@ impl Msg {
                     None => out.push(0),
                 }
             }
-            Msg::PunchSync { peer, peer_reflexive } => {
+            Msg::PunchSync {
+                peer,
+                peer_reflexive,
+            } => {
                 out.push(TAG_PUNCH_SYNC);
                 put_key(&mut out, peer);
                 put_addr(&mut out, peer_reflexive);
@@ -186,7 +208,9 @@ impl Msg {
     pub fn subject_key(&self) -> Option<NodeKey> {
         match self {
             Msg::BindRequest { from } => Some(*from),
-            Msg::Register { key } | Msg::Readvertise { key, .. } | Msg::Lookup { key } => Some(*key),
+            Msg::Register { key } | Msg::Readvertise { key, .. } | Msg::Lookup { key } => {
+                Some(*key)
+            }
             _ => None,
         }
     }
@@ -213,9 +237,14 @@ impl Msg {
         let tag = r.take(1)?[0];
         let msg = match tag {
             TAG_BIND_REQ => Msg::BindRequest { from: r.key()? },
-            TAG_BIND_RESP => Msg::BindResponse { reflexive: r.addr()? },
+            TAG_BIND_RESP => Msg::BindResponse {
+                reflexive: r.addr()?,
+            },
             TAG_REGISTER => Msg::Register { key: r.key()? },
-            TAG_READVERTISE => Msg::Readvertise { key: r.key()?, nonce: r.u64()? },
+            TAG_READVERTISE => Msg::Readvertise {
+                key: r.key()?,
+                nonce: r.u64()?,
+            },
             TAG_LOOKUP => Msg::Lookup { key: r.key()? },
             TAG_LOOKUP_RESP => {
                 let key = r.key()?;
@@ -309,7 +338,15 @@ impl AuthRequest {
         if r.pos != buf.len() {
             return Err(WireError::Trailing);
         }
-        Ok(AuthRequest { caller, inner, auth: Authenticator { timestamp, pop_sig, cap } })
+        Ok(AuthRequest {
+            caller,
+            inner,
+            auth: Authenticator {
+                timestamp,
+                pop_sig,
+                cap,
+            },
+        })
     }
 }
 
@@ -325,15 +362,37 @@ mod tests {
     #[test]
     fn every_variant_roundtrips() {
         let cases = vec![
-            Msg::BindRequest { from: NodeKey([1u8; 32]) },
-            Msg::BindResponse { reflexive: addr(2, 51820) },
-            Msg::Register { key: NodeKey([3u8; 32]) },
-            Msg::Readvertise { key: NodeKey([13u8; 32]), nonce: 0x0102_0304_dead_beef },
-            Msg::Lookup { key: NodeKey([4u8; 32]) },
-            Msg::LookupResponse { key: NodeKey([5u8; 32]), reflexive: Some(addr(6, 443)) },
-            Msg::LookupResponse { key: NodeKey([7u8; 32]), reflexive: None },
-            Msg::PunchSync { peer: NodeKey([8u8; 32]), peer_reflexive: addr(9, 7000) },
-            Msg::Punch { from: NodeKey([10u8; 32]) },
+            Msg::BindRequest {
+                from: NodeKey([1u8; 32]),
+            },
+            Msg::BindResponse {
+                reflexive: addr(2, 51820),
+            },
+            Msg::Register {
+                key: NodeKey([3u8; 32]),
+            },
+            Msg::Readvertise {
+                key: NodeKey([13u8; 32]),
+                nonce: 0x0102_0304_dead_beef,
+            },
+            Msg::Lookup {
+                key: NodeKey([4u8; 32]),
+            },
+            Msg::LookupResponse {
+                key: NodeKey([5u8; 32]),
+                reflexive: Some(addr(6, 443)),
+            },
+            Msg::LookupResponse {
+                key: NodeKey([7u8; 32]),
+                reflexive: None,
+            },
+            Msg::PunchSync {
+                peer: NodeKey([8u8; 32]),
+                peer_reflexive: addr(9, 7000),
+            },
+            Msg::Punch {
+                from: NodeKey([10u8; 32]),
+            },
         ];
         for m in cases {
             let bytes = m.encode();
@@ -370,19 +429,28 @@ mod tests {
         // A well-formed message with extra bytes appended (oversized /
         // malformed datagram) must be rejected outright, not silently
         // accepted by ignoring whatever the reader didn't consume.
-        let mut bytes = Msg::BindRequest { from: NodeKey([9u8; 32]) }.encode();
+        let mut bytes = Msg::BindRequest {
+            from: NodeKey([9u8; 32]),
+        }
+        .encode();
         bytes.push(0xff);
         assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
 
-        let mut bytes = Msg::PunchSync { peer: NodeKey([1u8; 32]), peer_reflexive: addr(2, 51820) }
-            .encode();
+        let mut bytes = Msg::PunchSync {
+            peer: NodeKey([1u8; 32]),
+            peer_reflexive: addr(2, 51820),
+        }
+        .encode();
         bytes.extend_from_slice(&[0, 0, 0]);
         assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
     }
 
     #[test]
     fn readvertise_carries_key_and_nonce() {
-        let m = Msg::Readvertise { key: NodeKey([0xab; 32]), nonce: 0xffff_0000_ffff_0001 };
+        let m = Msg::Readvertise {
+            key: NodeKey([0xab; 32]),
+            nonce: 0xffff_0000_ffff_0001,
+        };
         let back = Msg::decode(&m.encode()).expect("decode");
         assert_eq!(m, back);
         // Trailing garbage after a Readvertise is rejected like any other message.
@@ -393,8 +461,8 @@ mod tests {
 
     #[test]
     fn auth_request_roundtrips_for_every_request_shape() {
-        use crate::auth::{sign_authenticator, mint_coord_cap};
-        use commonware_cryptography::{ed25519, Signer as _};
+        use crate::auth::{mint_coord_cap, sign_authenticator};
+        use commonware_cryptography::{Signer as _, ed25519};
 
         let node = ed25519::PrivateKey::from_seed(1);
         let g = ed25519::PrivateKey::from_seed(2);
@@ -405,8 +473,13 @@ mod tests {
         let inners = vec![
             Msg::BindRequest { from: subject },
             Msg::Register { key: subject },
-            Msg::Readvertise { key: subject, nonce: 42 },
-            Msg::Lookup { key: NodeKey([7u8; 32]) },
+            Msg::Readvertise {
+                key: subject,
+                nonce: 42,
+            },
+            Msg::Lookup {
+                key: NodeKey([7u8; 32]),
+            },
         ];
         for inner in inners {
             // With and without a cap.
@@ -414,7 +487,11 @@ mod tests {
                 let auth = sign_authenticator(&node, &inner.encode(), 1234, cap);
                 // caller is the authenticating identity — for a cross-peer
                 // Lookup it deliberately differs from the inner key.
-                let req = AuthRequest { caller: subject, inner: inner.clone(), auth };
+                let req = AuthRequest {
+                    caller: subject,
+                    inner: inner.clone(),
+                    auth,
+                };
                 let bytes = req.encode();
                 let back = AuthRequest::decode(&bytes).expect("decode");
                 assert_eq!(req, back);
@@ -425,28 +502,57 @@ mod tests {
     #[test]
     fn auth_request_rejects_response_inner() {
         use crate::auth::sign_authenticator;
-        use commonware_cryptography::{ed25519, Signer as _};
+        use commonware_cryptography::{Signer as _, ed25519};
         let node = ed25519::PrivateKey::from_seed(1);
         // Hand-encode an envelope whose inner is a RESPONSE (LookupResponse).
-        let inner = Msg::LookupResponse { key: NodeKey([1u8; 32]), reflexive: None };
+        let inner = Msg::LookupResponse {
+            key: NodeKey([1u8; 32]),
+            reflexive: None,
+        };
         let auth = sign_authenticator(&node, &inner.encode(), 1, None);
-        let bytes = AuthRequest { caller: NodeKey([9u8; 32]), inner, auth }.encode();
+        let bytes = AuthRequest {
+            caller: NodeKey([9u8; 32]),
+            inner,
+            auth,
+        }
+        .encode();
         assert_eq!(AuthRequest::decode(&bytes), Err(WireError::NotARequest));
     }
 
     #[test]
     fn auth_request_rejects_trailing_and_bare_msg_decode_rejects_tag_11() {
         use crate::auth::sign_authenticator;
-        use commonware_cryptography::{ed25519, Signer as _};
+        use commonware_cryptography::{Signer as _, ed25519};
         let node = ed25519::PrivateKey::from_seed(1);
-        let inner = Msg::Register { key: NodeKey([2u8; 32]) };
+        let inner = Msg::Register {
+            key: NodeKey([2u8; 32]),
+        };
         let auth = sign_authenticator(&node, &inner.encode(), 1, None);
-        let mut bytes = AuthRequest { caller: NodeKey([2u8; 32]), inner, auth }.encode();
+        let mut bytes = AuthRequest {
+            caller: NodeKey([2u8; 32]),
+            inner,
+            auth,
+        }
+        .encode();
         bytes.push(0xff);
         assert_eq!(AuthRequest::decode(&bytes), Err(WireError::Trailing));
         // A tag-11 envelope must NOT decode as a bare Msg.
-        let clean = AuthRequest { caller: NodeKey([2u8; 32]), inner: Msg::Register { key: NodeKey([2u8; 32]) },
-            auth: sign_authenticator(&node, &Msg::Register { key: NodeKey([2u8; 32]) }.encode(), 1, None) }.encode();
+        let clean = AuthRequest {
+            caller: NodeKey([2u8; 32]),
+            inner: Msg::Register {
+                key: NodeKey([2u8; 32]),
+            },
+            auth: sign_authenticator(
+                &node,
+                &Msg::Register {
+                    key: NodeKey([2u8; 32]),
+                }
+                .encode(),
+                1,
+                None,
+            ),
+        }
+        .encode();
         assert_eq!(Msg::decode(&clean), Err(WireError::BadTag(11)));
     }
 }

@@ -6,7 +6,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use commonware_cryptography::{ed25519, Signer as _, Verifier as _};
+use commonware_cryptography::{Signer as _, Verifier as _, ed25519};
 
 use crate::NodeKey;
 
@@ -48,7 +48,9 @@ pub enum AuthPolicy {
     /// `false` is the legacy fully-open shape (tests / `--allow-anonymous`).
     Open { require_pop: bool },
     /// Private coordination: PoP + admission against the pinned genesis set.
-    Private { genesis_set: Vec<ed25519::PublicKey> },
+    Private {
+        genesis_set: Vec<ed25519::PublicKey>,
+    },
 }
 
 impl Default for AuthPolicy {
@@ -98,11 +100,7 @@ fn subject_pubkey(subject: NodeKey) -> Option<ed25519::PublicKey> {
 
 /// Mint a capability binding `subject` (a node's ed25519 key) to `not_after`,
 /// signed by `issuer` (a genesis validator's private key).
-pub fn mint_coord_cap(
-    issuer: &ed25519::PrivateKey,
-    subject: NodeKey,
-    not_after: u64,
-) -> CoordCap {
+pub fn mint_coord_cap(issuer: &ed25519::PrivateKey, subject: NodeKey, not_after: u64) -> CoordCap {
     CoordCap {
         issuer: issuer.public_key(),
         not_after,
@@ -137,8 +135,11 @@ fn cap_admits(
     if !genesis_set.iter().any(|g| g == &cap.issuer) {
         return false;
     }
-    cap.issuer
-        .verify(COORD_CAP_NS, &cap_msg(subject, cap.not_after), &cap.issuer_sig)
+    cap.issuer.verify(
+        COORD_CAP_NS,
+        &cap_msg(subject, cap.not_after),
+        &cap.issuer_sig,
+    )
 }
 
 /// Stateless authorization decision for one request. `now`/`window` are seconds.
@@ -164,13 +165,19 @@ pub fn verify_request(
 
     // 2. Proof-of-possession.
     let subj_pk = subject_pubkey(subject).ok_or(AuthError::BadSubjectKey)?;
-    if !subj_pk.verify(COORD_REQ_NS, &pop_msg(inner_bytes, auth.timestamp), &auth.pop_sig) {
+    if !subj_pk.verify(
+        COORD_REQ_NS,
+        &pop_msg(inner_bytes, auth.timestamp),
+        &auth.pop_sig,
+    ) {
         return Err(AuthError::BadPop);
     }
 
     // 3. Admission (private mode only).
     if let AuthPolicy::Private { genesis_set } = policy {
-        let is_member = genesis_set.iter().any(|g| g.as_ref() == subject.0.as_slice());
+        let is_member = genesis_set
+            .iter()
+            .any(|g| g.as_ref() == subject.0.as_slice());
         let by_cap = auth
             .cap
             .as_ref()
@@ -209,7 +216,10 @@ mod tests {
         let now = 1_000_000;
 
         let good = sign_authenticator(&node, INNER, now, None);
-        assert_eq!(verify_request(&policy, now, 30, subject, INNER, &good), Ok(()));
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &good),
+            Ok(())
+        );
 
         // Signed by a DIFFERENT key: PoP must fail.
         let attacker = key(2);
@@ -227,10 +237,19 @@ mod tests {
         let policy = AuthPolicy::Open { require_pop: true };
         let a = sign_authenticator(&node, INNER, 1_000_000, None);
         // 31s in the past and future both exceed the 30s window.
-        assert_eq!(verify_request(&policy, 1_000_031, 30, subject, INNER, &a), Err(AuthError::Stale));
-        assert_eq!(verify_request(&policy, 999_969, 30, subject, INNER, &a), Err(AuthError::Stale));
+        assert_eq!(
+            verify_request(&policy, 1_000_031, 30, subject, INNER, &a),
+            Err(AuthError::Stale)
+        );
+        assert_eq!(
+            verify_request(&policy, 999_969, 30, subject, INNER, &a),
+            Err(AuthError::Stale)
+        );
         // 30s exactly is still fresh.
-        assert_eq!(verify_request(&policy, 1_000_030, 30, subject, INNER, &a), Ok(()));
+        assert_eq!(
+            verify_request(&policy, 1_000_030, 30, subject, INNER, &a),
+            Ok(())
+        );
     }
 
     #[test]
@@ -239,17 +258,25 @@ mod tests {
         let policy = AuthPolicy::Open { require_pop: false };
         let node = key(3);
         let auth = sign_authenticator(&node, INNER, 0, None); // wrong signer, ancient ts
-        assert_eq!(verify_request(&policy, 5_000_000, 30, subject, INNER, &auth), Ok(()));
+        assert_eq!(
+            verify_request(&policy, 5_000_000, 30, subject, INNER, &auth),
+            Ok(())
+        );
     }
 
     #[test]
     fn private_admits_genesis_member_without_cap() {
         let g = key(10);
         let subject = nk(&g.public_key());
-        let policy = AuthPolicy::Private { genesis_set: vec![g.public_key()] };
+        let policy = AuthPolicy::Private {
+            genesis_set: vec![g.public_key()],
+        };
         let now = 2_000_000;
         let auth = sign_authenticator(&g, INNER, now, None);
-        assert_eq!(verify_request(&policy, now, 30, subject, INNER, &auth), Ok(()));
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &auth),
+            Ok(())
+        );
     }
 
     #[test]
@@ -257,10 +284,15 @@ mod tests {
         let g = key(10);
         let outsider = key(11);
         let subject = nk(&outsider.public_key());
-        let policy = AuthPolicy::Private { genesis_set: vec![g.public_key()] };
+        let policy = AuthPolicy::Private {
+            genesis_set: vec![g.public_key()],
+        };
         let now = 2_000_000;
         let auth = sign_authenticator(&outsider, INNER, now, None); // valid PoP, but not admitted
-        assert_eq!(verify_request(&policy, now, 30, subject, INNER, &auth), Err(AuthError::NotAdmitted));
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &auth),
+            Err(AuthError::NotAdmitted)
+        );
     }
 
     #[test]
@@ -268,11 +300,16 @@ mod tests {
         let g = key(10);
         let joiner = key(20);
         let subject = nk(&joiner.public_key());
-        let policy = AuthPolicy::Private { genesis_set: vec![g.public_key()] };
+        let policy = AuthPolicy::Private {
+            genesis_set: vec![g.public_key()],
+        };
         let now = 2_000_000;
         let cap = mint_coord_cap(&g, subject, now + 3600);
         let auth = sign_authenticator(&joiner, INNER, now, Some(cap));
-        assert_eq!(verify_request(&policy, now, 30, subject, INNER, &auth), Ok(()));
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &auth),
+            Ok(())
+        );
     }
 
     #[test]
@@ -281,24 +318,35 @@ mod tests {
         let notg = key(99);
         let joiner = key(20);
         let subject = nk(&joiner.public_key());
-        let policy = AuthPolicy::Private { genesis_set: vec![g.public_key()] };
+        let policy = AuthPolicy::Private {
+            genesis_set: vec![g.public_key()],
+        };
         let now = 2_000_000;
 
         // Expired.
         let expired = mint_coord_cap(&g, subject, now - 1);
         let a1 = sign_authenticator(&joiner, INNER, now, Some(expired));
-        assert_eq!(verify_request(&policy, now, 30, subject, INNER, &a1), Err(AuthError::NotAdmitted));
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &a1),
+            Err(AuthError::NotAdmitted)
+        );
 
         // Issuer not in the pinned genesis set.
         let wrong_issuer = mint_coord_cap(&notg, subject, now + 3600);
         let a2 = sign_authenticator(&joiner, INNER, now, Some(wrong_issuer));
-        assert_eq!(verify_request(&policy, now, 30, subject, INNER, &a2), Err(AuthError::NotAdmitted));
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &a2),
+            Err(AuthError::NotAdmitted)
+        );
 
         // Cap minted for a DIFFERENT subject (attacker replays someone else's cap).
         let other = nk(&key(21).public_key());
         let wrong_subject = mint_coord_cap(&g, other, now + 3600);
         let a3 = sign_authenticator(&joiner, INNER, now, Some(wrong_subject));
-        assert_eq!(verify_request(&policy, now, 30, subject, INNER, &a3), Err(AuthError::NotAdmitted));
+        assert_eq!(
+            verify_request(&policy, now, 30, subject, INNER, &a3),
+            Err(AuthError::NotAdmitted)
+        );
     }
 
     #[test]

@@ -122,13 +122,27 @@ pub fn drive_simulated(
     //    `a_single_one_shot_attempt_drops_as_first_packet` regression test
     //    below — Slice 0a review). Retry each side's punch until a round
     //    actually delivers it, observed per-round, not from final filter state.
-    let a_side = PunchSide { key: a_key, mapped: a_mapped, peer: a_peer };
-    let b_side = PunchSide { key: b_key, mapped: b_mapped, peer: b_peer };
+    let a_side = PunchSide {
+        key: a_key,
+        mapped: a_mapped,
+        peer: a_peer,
+    };
+    let b_side = PunchSide {
+        key: b_key,
+        mapped: b_mapped,
+        peer: b_peer,
+    };
     punch_until_bidirectional(a_side, b_side, a_nat, b_nat)?;
 
     Ok((
-        PunchPlan { local_mapped: a_mapped, peer_reflexive: a_peer },
-        PunchPlan { local_mapped: b_mapped, peer_reflexive: b_peer },
+        PunchPlan {
+            local_mapped: a_mapped,
+            peer_reflexive: a_peer,
+        },
+        PunchPlan {
+            local_mapped: b_mapped,
+            peer_reflexive: b_peer,
+        },
     ))
 }
 
@@ -174,7 +188,13 @@ pub fn drive_rebind_reconnect(
     //    re-observes `new_a_mapped` as the source and applies the nonce guard.
     //    Supersession is asserted end-to-end by step 5's re-resolution below (a
     //    stale mapping would resolve the OLD reflexive and fail `NoReflexive`).
-    let _ = coord.handle(new_a_mapped, Msg::Readvertise { key: a_key, nonce: 1 });
+    let _ = coord.handle(
+        new_a_mapped,
+        Msg::Readvertise {
+            key: a_key,
+            nonce: 1,
+        },
+    );
 
     // 5. B re-resolves: its Lookup now returns A's NEW reflexive, and the
     //    coordinator fans out PunchSync to both the new A mapping and B.
@@ -195,15 +215,29 @@ pub fn drive_rebind_reconnect(
     let a_peer = a_peer.ok_or(PunchError::NoReflexive)?;
 
     // 6. Reconnect on the new mapping.
-    let a_side = PunchSide { key: a_key, mapped: new_a_mapped, peer: a_peer };
-    let b_side = PunchSide { key: b_key, mapped: b_mapped, peer: b_peer };
+    let a_side = PunchSide {
+        key: a_key,
+        mapped: new_a_mapped,
+        peer: a_peer,
+    };
+    let b_side = PunchSide {
+        key: b_key,
+        mapped: b_mapped,
+        peer: b_peer,
+    };
     punch_until_bidirectional(a_side, b_side, a_nat, b_nat)?;
 
     Ok(RebindProof {
         old_a_reflexive,
         new_a_reflexive: new_a_mapped,
-        a_plan: PunchPlan { local_mapped: new_a_mapped, peer_reflexive: a_peer },
-        b_plan: PunchPlan { local_mapped: b_mapped, peer_reflexive: b_peer },
+        a_plan: PunchPlan {
+            local_mapped: new_a_mapped,
+            peer_reflexive: a_peer,
+        },
+        b_plan: PunchPlan {
+            local_mapped: b_mapped,
+            peer_reflexive: b_peer,
+        },
     })
 }
 
@@ -276,13 +310,27 @@ mod tests {
 
         let (a_mapped, b_mapped, a_peer, b_peer) =
             rendezvous(a_key, b_key, &mut a_nat, &mut b_nat, &mut coord);
-        let a_side = PunchSide { key: a_key, mapped: a_mapped, peer: a_peer };
-        let b_side = PunchSide { key: b_key, mapped: b_mapped, peer: b_peer };
+        let a_side = PunchSide {
+            key: a_key,
+            mapped: a_mapped,
+            peer: a_peer,
+        };
+        let b_side = PunchSide {
+            key: b_key,
+            mapped: b_mapped,
+            peer: b_peer,
+        };
 
         let (a_delivered, b_delivered) = punch_once(a_side, b_side, &mut a_nat, &mut b_nat);
 
-        assert!(!a_delivered, "A's first punch must be dropped before B opens its filter");
-        assert!(b_delivered, "B's punch lands because A already opened its filter this round");
+        assert!(
+            !a_delivered,
+            "A's first punch must be dropped before B opens its filter"
+        );
+        assert!(
+            b_delivered,
+            "B's punch lands because A already opened its filter this round"
+        );
     }
 
     #[test]
@@ -322,20 +370,34 @@ mod tests {
 
         let (a_mapped, b_mapped, a_peer, b_peer) =
             rendezvous(a_key, b_key, &mut a_nat, &mut b_nat, &mut coord);
-        let a_side = PunchSide { key: a_key, mapped: a_mapped, peer: a_peer };
-        let b_side = PunchSide { key: b_key, mapped: b_mapped, peer: b_peer };
+        let a_side = PunchSide {
+            key: a_key,
+            mapped: a_mapped,
+            peer: a_peer,
+        };
+        let b_side = PunchSide {
+            key: b_key,
+            mapped: b_mapped,
+            peer: b_peer,
+        };
 
         // Round 1 (adverse): A's datagram is DROPPED (B's filter not yet open);
         // B's lands (A opened its filter first this round).
         let (a1, b1) = punch_once(a_side, b_side, &mut a_nat, &mut b_nat);
         assert!(!a1, "A's FIRST punch is dropped under the adverse order");
-        assert!(b1, "B's punch is delivered because A already opened its filter");
+        assert!(
+            b1,
+            "B's punch is delivered because A already opened its filter"
+        );
 
         // Round 2 (retry): A's retransmit is now admitted — B opened its filter
         // in round 1. BOTH directions have now had a datagram actually delivered,
         // observed per-round, not inferred from final filter state.
         let (a2, _b2) = punch_once(a_side, b_side, &mut a_nat, &mut b_nat);
-        assert!(a2, "A's retransmit is delivered on round 2: real bidirectional delivery");
+        assert!(
+            a2,
+            "A's retransmit is delivered on round 2: real bidirectional delivery"
+        );
 
         // And the full driver reaches the same success on the same fresh pair.
         let mut a_nat2 = SimNat::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));

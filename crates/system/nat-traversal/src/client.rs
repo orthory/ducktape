@@ -2,8 +2,8 @@ use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 
-use crate::auth::{now_secs, sign_authenticator, AuthPolicy, CoordCap};
 use crate::AuthRequest;
+use crate::auth::{AuthPolicy, CoordCap, now_secs, sign_authenticator};
 use crate::{Coordinator, Msg, NodeKey};
 use commonware_cryptography::ed25519;
 
@@ -19,7 +19,14 @@ pub struct NatClient {
 impl NatClient {
     pub async fn bind(key: NodeKey, coord: SocketAddr) -> std::io::Result<Self> {
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        Ok(Self { sock, key, coord, coords: vec![coord], signer: None, cap: None })
+        Ok(Self {
+            sock,
+            key,
+            coord,
+            coords: vec![coord],
+            signer: None,
+            cap: None,
+        })
     }
 
     /// Bind with an ordered set of coordinator hints (the reach `Vec`). The
@@ -30,7 +37,14 @@ impl NatClient {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty coordinator set")
         })?;
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        Ok(Self { sock, key, coord, coords, signer: None, cap: None })
+        Ok(Self {
+            sock,
+            key,
+            coord,
+            coords,
+            signer: None,
+            cap: None,
+        })
     }
 
     /// Bind with an authenticating identity: every request to the coordinator
@@ -46,7 +60,14 @@ impl NatClient {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty coordinator set")
         })?;
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        Ok(Self { sock, key, coord, coords, signer: Some(signer), cap })
+        Ok(Self {
+            sock,
+            key,
+            coord,
+            coords,
+            signer: Some(signer),
+            cap,
+        })
     }
 
     /// Encode a client→coordinator request, wrapping it in a signed
@@ -60,8 +81,14 @@ impl NatClient {
                 // coordinator verifies it against `caller`. For a cross-peer
                 // `Lookup { key: peer }` the inner key is the peer, but the
                 // authenticated principal is still this caller.
-                let auth = sign_authenticator(signer, &inner.encode(), now_secs(), self.cap.clone());
-                AuthRequest { caller: self.key, inner, auth }.encode()
+                let auth =
+                    sign_authenticator(signer, &inner.encode(), now_secs(), self.cap.clone());
+                AuthRequest {
+                    caller: self.key,
+                    inner,
+                    auth,
+                }
+                .encode()
             }
             None => inner.encode(),
         }
@@ -73,7 +100,10 @@ impl NatClient {
 
     pub async fn discover_reflexive(&self) -> std::io::Result<SocketAddr> {
         self.sock
-            .send_to(&self.authed(Msg::BindRequest { from: self.key }), self.coord)
+            .send_to(
+                &self.authed(Msg::BindRequest { from: self.key }),
+                self.coord,
+            )
             .await?;
         let mut buf = [0u8; 64];
         loop {
@@ -160,7 +190,13 @@ impl NatClient {
     /// duplicate could otherwise roll back.
     pub async fn readvertise(&self, nonce: u64) -> std::io::Result<()> {
         self.sock
-            .send_to(&self.authed(Msg::Readvertise { key: self.key, nonce }), self.coord)
+            .send_to(
+                &self.authed(Msg::Readvertise {
+                    key: self.key,
+                    nonce,
+                }),
+                self.coord,
+            )
             .await?;
         Ok(())
     }
@@ -179,10 +215,16 @@ impl NatClient {
                 continue;
             }
             match Msg::decode(&buf[..n]) {
-                Ok(Msg::LookupResponse { key, reflexive: Some(addr) }) if key == peer => {
+                Ok(Msg::LookupResponse {
+                    key,
+                    reflexive: Some(addr),
+                }) if key == peer => {
                     return Ok(addr);
                 }
-                Ok(Msg::LookupResponse { key, reflexive: None }) if key == peer => {
+                Ok(Msg::LookupResponse {
+                    key,
+                    reflexive: None,
+                }) if key == peer => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         "peer not registered with coordinator",
@@ -256,7 +298,7 @@ pub async fn run_coordinator(sock: UdpSocket, policy: AuthPolicy) {
         let out = match AuthRequest::decode(&buf[..n]) {
             Ok(req) => coord.handle_auth(from, req, now),
             Err(_) => match Msg::decode(&buf[..n]) {
-                Ok(m) => coord.handle_legacy(from, m),
+                Ok(m) => coord.handle_legacy(from, m, now),
                 Err(_) => continue,
             },
         };
@@ -276,11 +318,13 @@ mod tests {
 
     #[tokio::test]
     async fn authorized_client_rendezvous_under_private_policy_but_unauthorized_is_dropped() {
-        use crate::auth::{mint_coord_cap, AuthPolicy};
-        use commonware_cryptography::{ed25519, Signer as _};
+        use crate::auth::{AuthPolicy, mint_coord_cap};
+        use commonware_cryptography::{Signer as _, ed25519};
 
         let g = ed25519::PrivateKey::from_seed(100);
-        let policy = AuthPolicy::Private { genesis_set: vec![g.public_key()] };
+        let policy = AuthPolicy::Private {
+            genesis_set: vec![g.public_key()],
+        };
 
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
@@ -289,13 +333,25 @@ mod tests {
         // Two authorized nodes (joiners) with genesis caps.
         let a_signer = ed25519::PrivateKey::from_seed(200);
         let b_signer = ed25519::PrivateKey::from_seed(201);
-        let a_key = { let mut k=[0u8;32]; k.copy_from_slice(a_signer.public_key().as_ref()); NodeKey(k) };
-        let b_key = { let mut k=[0u8;32]; k.copy_from_slice(b_signer.public_key().as_ref()); NodeKey(k) };
+        let a_key = {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(a_signer.public_key().as_ref());
+            NodeKey(k)
+        };
+        let b_key = {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(b_signer.public_key().as_ref());
+            NodeKey(k)
+        };
         let a_cap = mint_coord_cap(&g, a_key, crate::auth::now_secs() + 3600);
         let b_cap = mint_coord_cap(&g, b_key, crate::auth::now_secs() + 3600);
 
-        let a = NatClient::bind_multi_auth(a_key, vec![coord_addr], a_signer, Some(a_cap)).await.unwrap();
-        let b = NatClient::bind_multi_auth(b_key, vec![coord_addr], b_signer, Some(b_cap)).await.unwrap();
+        let a = NatClient::bind_multi_auth(a_key, vec![coord_addr], a_signer, Some(a_cap))
+            .await
+            .unwrap();
+        let b = NatClient::bind_multi_auth(b_key, vec![coord_addr], b_signer, Some(b_cap))
+            .await
+            .unwrap();
         a.register().await.unwrap();
         b.register().await.unwrap();
 
@@ -305,17 +361,32 @@ mod tests {
         // proves an authorized register+lookup completes end-to-end over the real
         // signed UDP path (a cross-node `a.lookup(b_key)` is impossible here: a
         // does not hold b's signer, so its PoP would fail and be dropped).
-        let a_reflexive = timeout(Duration::from_secs(2), a.lookup(a_key)).await.expect("no timeout").expect("lookup");
+        let a_reflexive = timeout(Duration::from_secs(2), a.lookup(a_key))
+            .await
+            .expect("no timeout")
+            .expect("lookup");
         assert_eq!(a_reflexive.port(), a.local_addr().await.unwrap().port());
-        let b_reflexive = timeout(Duration::from_secs(2), b.lookup(b_key)).await.expect("no timeout").expect("lookup");
+        let b_reflexive = timeout(Duration::from_secs(2), b.lookup(b_key))
+            .await
+            .expect("no timeout")
+            .expect("lookup");
         assert_eq!(b_reflexive.port(), b.local_addr().await.unwrap().port());
 
         // Unauthorized: a node with NO signer (bare Msg) cannot register under
         // Private policy — its lookup for itself finds nothing.
-        let outsider = NatClient::bind(NodeKey([0xcd; 32]), coord_addr).await.unwrap();
+        let outsider = NatClient::bind(NodeKey([0xcd; 32]), coord_addr)
+            .await
+            .unwrap();
         outsider.register().await.unwrap(); // dropped by handle_legacy
-        let miss = timeout(Duration::from_millis(500), outsider.lookup(NodeKey([0xcd; 32]))).await;
-        assert!(miss.is_err() || miss.unwrap().is_err(), "unauthenticated register never created a mapping");
+        let miss = timeout(
+            Duration::from_millis(500),
+            outsider.lookup(NodeKey([0xcd; 32])),
+        )
+        .await;
+        assert!(
+            miss.is_err() || miss.unwrap().is_err(),
+            "unauthenticated register never created a mapping"
+        );
     }
 
     #[tokio::test]
@@ -325,11 +396,13 @@ mod tests {
         // simultaneous-open punch completes. This is the previously-impossible
         // path — the coordinator authenticates the CALLER (A), not the looked-up
         // key (B), so A's PoP (signed with A's own key) validates.
-        use crate::auth::{mint_coord_cap, AuthPolicy};
-        use commonware_cryptography::{ed25519, Signer as _};
+        use crate::auth::{AuthPolicy, mint_coord_cap};
+        use commonware_cryptography::{Signer as _, ed25519};
 
         let g = ed25519::PrivateKey::from_seed(700);
-        let policy = AuthPolicy::Private { genesis_set: vec![g.public_key()] };
+        let policy = AuthPolicy::Private {
+            genesis_set: vec![g.public_key()],
+        };
 
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
@@ -337,13 +410,25 @@ mod tests {
 
         let a_signer = ed25519::PrivateKey::from_seed(701);
         let b_signer = ed25519::PrivateKey::from_seed(702);
-        let a_key = { let mut k=[0u8;32]; k.copy_from_slice(a_signer.public_key().as_ref()); NodeKey(k) };
-        let b_key = { let mut k=[0u8;32]; k.copy_from_slice(b_signer.public_key().as_ref()); NodeKey(k) };
+        let a_key = {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(a_signer.public_key().as_ref());
+            NodeKey(k)
+        };
+        let b_key = {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(b_signer.public_key().as_ref());
+            NodeKey(k)
+        };
         let a_cap = mint_coord_cap(&g, a_key, crate::auth::now_secs() + 3600);
         let b_cap = mint_coord_cap(&g, b_key, crate::auth::now_secs() + 3600);
 
-        let a = NatClient::bind_multi_auth(a_key, vec![coord_addr], a_signer, Some(a_cap)).await.unwrap();
-        let b = NatClient::bind_multi_auth(b_key, vec![coord_addr], b_signer, Some(b_cap)).await.unwrap();
+        let a = NatClient::bind_multi_auth(a_key, vec![coord_addr], a_signer, Some(a_cap))
+            .await
+            .unwrap();
+        let b = NatClient::bind_multi_auth(b_key, vec![coord_addr], b_signer, Some(b_cap))
+            .await
+            .unwrap();
         a.register().await.unwrap();
         b.register().await.unwrap();
 
@@ -371,7 +456,10 @@ mod tests {
         // A live coordinator (the secondary).
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        tokio::spawn(run_coordinator(live, crate::auth::AuthPolicy::Open { require_pop: false }));
+        tokio::spawn(run_coordinator(
+            live,
+            crate::auth::AuthPolicy::Open { require_pop: false },
+        ));
 
         // A DEAD primary: a bound socket nobody ever serves. Datagrams sent to
         // it are buffered and never answered, so the per-try budget elapses.
@@ -381,13 +469,18 @@ mod tests {
         let mut client = NatClient::bind_multi(NodeKey([1u8; 32]), vec![dead_addr, live_addr])
             .await
             .unwrap();
-        let (idx, reflexive) =
-            timeout(Duration::from_secs(2), client.discover_reflexive_failover(Duration::from_millis(150)))
-                .await
-                .expect("failover must be bounded, never stuck")
-                .expect("secondary answers");
+        let (idx, reflexive) = timeout(
+            Duration::from_secs(2),
+            client.discover_reflexive_failover(Duration::from_millis(150)),
+        )
+        .await
+        .expect("failover must be bounded, never stuck")
+        .expect("secondary answers");
 
-        assert_eq!(idx, 1, "the dead primary is skipped; the live secondary answers");
+        assert_eq!(
+            idx, 1,
+            "the dead primary is skipped; the live secondary answers"
+        );
         assert_eq!(reflexive.port(), client.local_addr().await.unwrap().port());
     }
 
@@ -398,18 +491,23 @@ mod tests {
         // previous test this proves neither position is uniquely required.
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        tokio::spawn(run_coordinator(live, crate::auth::AuthPolicy::Open { require_pop: false }));
+        tokio::spawn(run_coordinator(
+            live,
+            crate::auth::AuthPolicy::Open { require_pop: false },
+        ));
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
 
         let mut client = NatClient::bind_multi(NodeKey([2u8; 32]), vec![live_addr, dead_addr])
             .await
             .unwrap();
-        let (idx, reflexive) =
-            timeout(Duration::from_secs(2), client.discover_reflexive_failover(Duration::from_millis(150)))
-                .await
-                .expect("no timeout")
-                .expect("primary answers");
+        let (idx, reflexive) = timeout(
+            Duration::from_secs(2),
+            client.discover_reflexive_failover(Duration::from_millis(150)),
+        )
+        .await
+        .expect("no timeout")
+        .expect("primary answers");
         assert_eq!(idx, 0, "a live primary is used directly");
         assert_eq!(reflexive.port(), client.local_addr().await.unwrap().port());
     }
@@ -418,9 +516,14 @@ mod tests {
     async fn client_discovers_its_reflexive_via_coordinator() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
+        tokio::spawn(run_coordinator(
+            coord_sock,
+            crate::auth::AuthPolicy::Open { require_pop: false },
+        ));
 
-        let client = NatClient::bind(NodeKey([1u8; 32]), coord_addr).await.unwrap();
+        let client = NatClient::bind(NodeKey([1u8; 32]), coord_addr)
+            .await
+            .unwrap();
         let reflexive = client.discover_reflexive().await.unwrap();
         // The socket binds 0.0.0.0:0, so local_addr() reports the wildcard IP
         // while the coordinator observes 127.0.0.1 as the source — the IPs
@@ -432,9 +535,14 @@ mod tests {
     async fn discover_reflexive_ignores_forged_bind_response_from_non_coordinator() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
+        tokio::spawn(run_coordinator(
+            coord_sock,
+            crate::auth::AuthPolicy::Open { require_pop: false },
+        ));
 
-        let client = NatClient::bind(NodeKey([2u8; 32]), coord_addr).await.unwrap();
+        let client = NatClient::bind(NodeKey([2u8; 32]), coord_addr)
+            .await
+            .unwrap();
         let client_addr = client.local_addr().await.unwrap();
 
         // A forger — some socket that is not the coordinator — races the
@@ -445,7 +553,10 @@ mod tests {
         let client_dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_addr.port());
         let forged = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 5555);
         forger
-            .send_to(&Msg::BindResponse { reflexive: forged }.encode(), client_dst)
+            .send_to(
+                &Msg::BindResponse { reflexive: forged }.encode(),
+                client_dst,
+            )
             .await
             .unwrap();
 
@@ -461,11 +572,16 @@ mod tests {
     async fn recv_punch_from_ignores_spoofed_punch_from_wrong_sender() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
+        tokio::spawn(run_coordinator(
+            coord_sock,
+            crate::auth::AuthPolicy::Open { require_pop: false },
+        ));
 
         let a_key = NodeKey([0xaa; 32]);
         let a = NatClient::bind(a_key, coord_addr).await.unwrap();
-        let b = NatClient::bind(NodeKey([0xbb; 32]), coord_addr).await.unwrap();
+        let b = NatClient::bind(NodeKey([0xbb; 32]), coord_addr)
+            .await
+            .unwrap();
         // Sockets bind 0.0.0.0:0, so local_addr() reports the wildcard IP,
         // but a loopback send is observed from 127.0.0.1 — same caveat as
         // `client_discovers_its_reflexive_via_coordinator` above. Use the
@@ -485,7 +601,13 @@ mod tests {
         // first.
         let forger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         forger
-            .send_to(&Msg::Punch { from: NodeKey([0xcc; 32]) }.encode(), b_addr)
+            .send_to(
+                &Msg::Punch {
+                    from: NodeKey([0xcc; 32]),
+                }
+                .encode(),
+                b_addr,
+            )
             .await
             .unwrap();
 
@@ -503,7 +625,10 @@ mod tests {
     async fn direct_path_survives_coordinator_shutdown() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        let coord = tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
+        let coord = tokio::spawn(run_coordinator(
+            coord_sock,
+            crate::auth::AuthPolicy::Open { require_pop: false },
+        ));
 
         let a_key = NodeKey([0xaa; 32]);
         let b_key = NodeKey([0xbb; 32]);
@@ -553,7 +678,10 @@ mod tests {
         // sends `Msg::Readvertise` over UDP and a peer re-resolves the new mapping.
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Open { require_pop: false }));
+        tokio::spawn(run_coordinator(
+            coord_sock,
+            crate::auth::AuthPolicy::Open { require_pop: false },
+        ));
 
         let a_key = NodeKey([0xaa; 32]);
         let b_key = NodeKey([0xbb; 32]);
@@ -574,7 +702,11 @@ mod tests {
         // the new socket's source and must supersede the stale mapping.
         let a2 = NatClient::bind(a_key, coord_addr).await.unwrap();
         let a2_port = a2.local_addr().await.unwrap().port();
-        assert_ne!(a2_port, a_first.port(), "the rebound socket has a fresh port");
+        assert_ne!(
+            a2_port,
+            a_first.port(),
+            "the rebound socket has a fresh port"
+        );
         a2.readvertise(1).await.unwrap();
 
         // B re-resolves and now sees A's NEW mapping, not the stale one. Poll to
@@ -604,7 +736,10 @@ mod tests {
         // coordinator that answered.
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        tokio::spawn(run_coordinator(live, crate::auth::AuthPolicy::Open { require_pop: false }));
+        tokio::spawn(run_coordinator(
+            live,
+            crate::auth::AuthPolicy::Open { require_pop: false },
+        ));
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
 
