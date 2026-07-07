@@ -276,6 +276,85 @@ impl NatClient {
             }
         }
     }
+
+    /// Fire-and-forget Lookup — the response arrives as a
+    /// [`ClientEvent::LookupResponse`] via [`Self::recv_event`]. The blocking
+    /// [`Self::lookup`] stays for sequential callers; a dispatching consumer
+    /// (the reachability pump) must NOT mix the two on one socket — every
+    /// per-method recv loop silently eats the datagrams it filters out.
+    pub async fn send_lookup(&self, peer: NodeKey) -> std::io::Result<()> {
+        self.sock
+            .send_to(&self.authed(Msg::Lookup { key: peer }), self.coord)
+            .await?;
+        Ok(())
+    }
+
+    /// Receive the next classified event. Never surfaces coordinator-shaped
+    /// control (`BindResponse`/`LookupResponse`/`PunchSync`) from a
+    /// non-coordinator source — a forged control datagram is dropped exactly
+    /// like the per-method recv loops drop it. Undecodable datagrams are
+    /// skipped. This is the single-dispatch alternative to those loops: one
+    /// consumer sees EVERY datagram, so an unsolicited PunchSync arriving
+    /// between operations is delivered instead of eaten.
+    pub async fn recv_event(&self) -> std::io::Result<ClientEvent> {
+        let mut buf = [0u8; 128];
+        loop {
+            let (n, from) = self.sock.recv_from(&mut buf).await?;
+            let Ok(msg) = Msg::decode(&buf[..n]) else {
+                continue;
+            };
+            let from_coord = from == self.coord;
+            match msg {
+                Msg::BindResponse { reflexive } if from_coord => {
+                    return Ok(ClientEvent::BindResponse { reflexive });
+                }
+                Msg::LookupResponse { key, reflexive } if from_coord => {
+                    return Ok(ClientEvent::LookupResponse { key, reflexive });
+                }
+                Msg::PunchSync {
+                    peer,
+                    peer_reflexive,
+                } if from_coord => {
+                    return Ok(ClientEvent::PunchSync {
+                        peer,
+                        peer_reflexive,
+                    });
+                }
+                Msg::Punch { from: peer } => {
+                    return Ok(ClientEvent::Punch {
+                        from: peer,
+                        src: from,
+                    });
+                }
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// One decoded datagram from the rendezvous socket, classified for a single
+/// dispatching consumer ([`NatClient::recv_event`]). Coordinator-originated
+/// control is only surfaced when it actually came from the coordinator this
+/// client is pointed at. `Punch` is peer-originated by design, so it carries
+/// its observed source for the consumer to match against the
+/// rendezvous-resolved address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientEvent {
+    BindResponse {
+        reflexive: SocketAddr,
+    },
+    LookupResponse {
+        key: NodeKey,
+        reflexive: Option<SocketAddr>,
+    },
+    PunchSync {
+        peer: NodeKey,
+        peer_reflexive: SocketAddr,
+    },
+    Punch {
+        from: NodeKey,
+        src: SocketAddr,
+    },
 }
 
 /// The coordinator event loop: decode control datagrams (authenticated or, under
@@ -283,7 +362,12 @@ impl NatClient {
 /// send replies. Pure rendezvous — never binds a data socket, never carries
 /// peer traffic.
 pub async fn run_coordinator(sock: UdpSocket, policy: AuthPolicy) {
-    let mut coord = Coordinator::with_policy(policy);
+    run_coordinator_with(sock, Coordinator::with_policy(policy)).await
+}
+
+/// [`run_coordinator`] with a caller-built [`Coordinator`] — the seam for a
+/// custom registration TTL or a pre-seeded book (tests, short-lived rigs).
+pub async fn run_coordinator_with(sock: UdpSocket, mut coord: Coordinator) {
     // Big enough for an AuthRequest with a cap (~251 bytes worst case: the
     // 32-byte caller field plus the inner request, authenticator, and cap).
     let mut buf = [0u8; 512];
@@ -774,5 +858,91 @@ mod tests {
             b.local_addr().await.unwrap().port(),
             "A's join path resolved B via the coordinator that actually answered"
         );
+    }
+
+    #[tokio::test]
+    async fn recv_event_dispatches_lookup_response_and_punch_sync_and_filters_forgeries() {
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        tokio::spawn(run_coordinator(
+            coord_sock,
+            crate::auth::AuthPolicy::Open { require_pop: false },
+        ));
+
+        let a_key = NodeKey([0xaa; 32]);
+        let b_key = NodeKey([0xbb; 32]);
+        let a = NatClient::bind(a_key, coord_addr).await.unwrap();
+        let b = NatClient::bind(b_key, coord_addr).await.unwrap();
+        a.register().await.unwrap();
+        b.register().await.unwrap();
+
+        // A forged PunchSync from a non-coordinator must NOT surface as an
+        // event on A's socket.
+        let forger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let forged_reflexive = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 66)), 6666);
+        let a_dst = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            a.local_addr().await.unwrap().port(),
+        );
+        forger
+            .send_to(
+                &Msg::PunchSync {
+                    peer: b_key,
+                    peer_reflexive: forged_reflexive,
+                }
+                .encode(),
+                a_dst,
+            )
+            .await
+            .unwrap();
+
+        // B looks A up through the event API: the coordinator-sourced events on
+        // B's socket are the LookupResponse and B's own caller-side PunchSync.
+        b.send_lookup(a_key).await.unwrap();
+        let mut saw_lookup = false;
+        let mut saw_sync = false;
+        for _ in 0..8 {
+            match timeout(Duration::from_secs(2), b.recv_event())
+                .await
+                .expect("bounded")
+                .expect("recv")
+            {
+                ClientEvent::LookupResponse { key, reflexive } if key == a_key => {
+                    assert!(reflexive.is_some(), "A is registered");
+                    saw_lookup = true;
+                }
+                ClientEvent::PunchSync { peer, .. } if peer == a_key => saw_sync = true,
+                _ => {}
+            }
+            if saw_lookup && saw_sync {
+                break;
+            }
+        }
+        assert!(
+            saw_lookup && saw_sync,
+            "lookup response and caller-side punch sync both dispatched as events"
+        );
+
+        // A's socket sees the coordinator's fan-out PunchSync about B — and the
+        // forged datagram it received earlier was dropped, so the FIRST
+        // PunchSync event names B's real reflexive, not the forger's invention.
+        let ev = timeout(Duration::from_secs(2), a.recv_event())
+            .await
+            .expect("bounded")
+            .expect("recv");
+        match ev {
+            ClientEvent::PunchSync {
+                peer,
+                peer_reflexive,
+            } => {
+                assert_eq!(peer, b_key);
+                assert_ne!(
+                    peer_reflexive, forged_reflexive,
+                    "forged PunchSync was dropped"
+                );
+                assert_eq!(peer_reflexive.port(), b.local_addr().await.unwrap().port());
+            }
+            other => panic!("expected the coordinator fan-out PunchSync first, got {other:?}"),
+        }
     }
 }
