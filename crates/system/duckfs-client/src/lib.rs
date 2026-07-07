@@ -8,6 +8,8 @@
 //! symlinks, exec bits) only ever shape a node's local working copy — never the
 //! replicated state. all node access flows through one small SYNCHRONOUS
 //! [`NodeApi`] trait so a colocated-odb fast path can slot in for phase-4 FUSE.
+pub mod api;
+pub mod checkout;
 pub mod chunk;
 pub mod index;
 pub mod scan;
