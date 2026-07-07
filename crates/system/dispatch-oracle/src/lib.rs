@@ -13,14 +13,121 @@
 //! are skipped: under the strict policy someone else's assignment would be a
 //! no-op result, so not spawning is what turns
 //! N-nodes-each-paying-for-the-same-call into one call.
+//!
+//! two workers share ONE gate ([`gate`], so their verdicts can never drift):
+//!
+//! - [`DispatchWorker`] awaits the provider INLINE — the simple embedding for
+//!   tests and in-process reactors.
+//! - [`DispatchPool`] (see [`pool`]) hands execution to a spawned background
+//!   task and returns immediately — what real hosts run, so a minutes-long
+//!   CLI call never stalls the host's event loop.
 
 use capability_host::ProviderSet;
-use dispatch::decode_work_spec;
+use dispatch::{WorkSpec, decode_work_spec};
 use reactor::{WorkOutcome, Worker};
 use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Effect, Msg};
 
-/// Production worker for dispatch `WorkSpec` saga effects.
+mod pool;
+pub use pool::{
+    DEFAULT_MAX_CONCURRENT_RUNS, DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env,
+};
+
+/// everything a provider execution needs, extracted by the gate so the
+/// expensive run can happen away from the effect-offer callsite (on a spawned
+/// task, or inline — the gate does not care).
+pub struct ExecJob {
+    pub saga_id: String,
+    pub attempt: u32,
+    pub capability: String,
+    /// the fully rendered prompt — the WorkSpec payload, verbatim.
+    pub input: String,
+}
+
+/// the fast, deterministic half of the worker step: decode routing plus the
+/// lease gate. everything here is cheap; only [`Gated::Execute`] carries work
+/// that costs real time.
+pub enum Gated {
+    /// not a dispatch `WorkSpec` effect — offer it to the next worker.
+    NotMine,
+    /// ours, deliberately not run (foreign lease, or an announcement this
+    /// host cannot serve): a claimed skip.
+    Skip,
+    /// ours, answered without touching a provider: an `Accept` claim for a
+    /// servable announcement, or the error `OracleResult` for a lease that
+    /// can never execute (non-utf-8 payload, unresolvable capability).
+    Immediate(Msg),
+    /// our lease, executable: run the provider and submit the result.
+    Execute(ExecJob),
+}
+
+/// decode + lease-gate one effect against this host's provider surface.
+pub fn gate(providers: &ProviderSet, node_key: &[u8], effect: &Effect) -> Gated {
+    let request = match decode_worker_request(&effect.0) {
+        Ok(request) => request,
+        Err(_) => return Gated::NotMine,
+    };
+    // the kind-gated decode: foreign spec shapes are NotMine, never a
+    // guessed execution.
+    let work = match decode_work_spec(&request.spec) {
+        Ok(work) => work,
+        Err(_) => return Gated::NotMine,
+    };
+    match &request.assignee {
+        // the lease gate, host side: someone else's assignment is a
+        // claimed skip — it IS our effect type, but the assignee submits
+        // the result.
+        Some(assignee) if *assignee != node_key => Gated::Skip,
+        Some(_) => gate_own_lease(providers, &request, work),
+        // an UNASSIGNED request is an announcement, not a work order:
+        // running it would be one execution per capable node. claim it
+        // with Accept when this host can actually run the capability;
+        // the re-emitted request naming the winner is what executes.
+        None => {
+            if providers.resolve(&work.capability).is_err() {
+                return Gated::Skip;
+            }
+            Gated::Immediate(accept_op(&request))
+        }
+    }
+}
+
+/// gate an own-lease request down to an [`ExecJob`] — or the inline error
+/// result for a lease that can never execute.
+fn gate_own_lease(providers: &ProviderSet, request: &WorkerRequest, work: WorkSpec) -> Gated {
+    // payload shape first: this verdict must not depend on what happens
+    // to be installed on this host.
+    let input = match String::from_utf8(work.payload) {
+        Ok(input) => input,
+        Err(_) => {
+            return Gated::Immediate(oracle_result(
+                &request.saga_id,
+                request.attempt,
+                Err(clean_error(
+                    "dispatch payload is not utf-8; providers take text".to_string(),
+                )),
+            ));
+        }
+    };
+    if let Err(e) = providers.resolve(&work.capability) {
+        return Gated::Immediate(oracle_result(
+            &request.saga_id,
+            request.attempt,
+            Err(clean_error(e)),
+        ));
+    }
+    Gated::Execute(ExecJob {
+        saga_id: request.saga_id.clone(),
+        attempt: request.attempt,
+        capability: work.capability,
+        input,
+    })
+}
+
+/// Inline worker for dispatch `WorkSpec` saga effects: gate, then await the
+/// provider on the caller's own task. real hosts run [`DispatchPool`]
+/// instead — an inline await stalls the host loop for the provider's whole
+/// runtime.
 pub struct DispatchWorker {
     providers: ProviderSet,
     /// this node's external submit key — compared against a request's
@@ -50,48 +157,34 @@ impl DispatchWorker {
 #[async_trait::async_trait(?Send)]
 impl Worker for DispatchWorker {
     async fn run(&self, effect: &Effect) -> Result<WorkOutcome, reactor::Error> {
-        let request = match decode_worker_request(&effect.0) {
-            Ok(request) => request,
-            Err(_) => return Ok(WorkOutcome::NotMine),
-        };
-        // the kind-gated decode: foreign spec shapes are NotMine, never a
-        // guessed execution.
-        let work = match decode_work_spec(&request.spec) {
-            Ok(work) => work,
-            Err(_) => return Ok(WorkOutcome::NotMine),
-        };
-        match &request.assignee {
-            // the lease gate, host side: someone else's assignment is a
-            // claimed skip — it IS our effect type, but the assignee submits
-            // the result.
-            Some(assignee) if *assignee != self.node_key => Ok(WorkOutcome::Handled(None)),
-            Some(_) => {
+        match gate(&self.providers, &self.node_key, effect) {
+            Gated::NotMine => Ok(WorkOutcome::NotMine),
+            Gated::Skip => Ok(WorkOutcome::Handled(None)),
+            Gated::Immediate(msg) => Ok(WorkOutcome::Handled(Some(msg))),
+            Gated::Execute(job) => {
                 let outcome = self
-                    .answer(&work.capability, &work.payload)
+                    .answer(&job.capability, job.input.as_bytes())
                     .await
                     .map_err(clean_error);
-                Ok(WorkOutcome::Handled(Some(oracle_result(&request, outcome))))
-            }
-            // an UNASSIGNED request is an announcement, not a work order:
-            // running it would be one execution per capable node. claim it
-            // with Accept when this host can actually run the capability;
-            // the re-emitted request naming the winner is what executes.
-            None => {
-                if self.providers.resolve(&work.capability).is_err() {
-                    return Ok(WorkOutcome::Handled(None));
-                }
-                Ok(WorkOutcome::Handled(Some(accept_op(&request))))
+                Ok(WorkOutcome::Handled(Some(oracle_result(
+                    &job.saga_id,
+                    job.attempt,
+                    outcome,
+                ))))
             }
         }
     }
 }
 
-fn oracle_result(request: &WorkerRequest, outcome: Result<Vec<u8>, String>) -> Msg {
+/// the follow-up op that carries one attempt's outcome back through the
+/// normal submit path, echoing the request's `(saga_id, attempt)`
+/// idempotency key.
+fn oracle_result(saga_id: &str, attempt: u32, outcome: Result<Vec<u8>, String>) -> Msg {
     Msg {
         target: "saga".into(),
         payload: encode_msg(&SagaMsg::OracleResult {
-            saga_id: request.saga_id.clone(),
-            attempt: request.attempt,
+            saga_id: saga_id.into(),
+            attempt,
             outcome,
         }),
     }
@@ -218,7 +311,7 @@ format = "text"
 
     /// a provider whose only job is making resolve() succeed in tests.
     struct StubProvider;
-    #[async_trait::async_trait(?Send)]
+    #[async_trait::async_trait]
     impl capability_host::Provider for StubProvider {
         fn capability(&self) -> &str {
             "alpha"

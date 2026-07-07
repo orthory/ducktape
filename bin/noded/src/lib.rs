@@ -616,6 +616,13 @@ impl NodeHandle {
         self.blobs.clone()
     }
 
+    /// a clone of the command lane's sender, for embedder-side producers
+    /// that inject commands exactly as the http layer does — the oracle
+    /// pool's completed provider runs re-enter as `Submit` commands here.
+    pub fn command_sender(&self) -> mpsc::Sender<NodeCommand> {
+        self.cmds.clone()
+    }
+
     /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
     /// `Notify` stores the permit, so a request that lands before anyone awaits
     /// is not lost.

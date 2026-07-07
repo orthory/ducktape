@@ -31,7 +31,6 @@ use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
 use tagging::TaggingModule;
-use dispatch_oracle::DispatchWorker;
 use files::Files;
 use forge::Forge;
 use futures::StreamExt as _;
@@ -75,6 +74,8 @@ const MODULE_IDS: [&str; 15] = [
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 
+mod oracle_pool;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: SocketAddr = "127.0.0.1:8844".parse()?;
     let mut storage: Option<PathBuf> = None;
@@ -115,6 +116,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor_forge_repo = forge_repo.clone();
     let actor_index = index.clone();
     let blobs = handle.blob_handle();
+    // the oracle pool's re-entry lane: completed provider runs inject their
+    // results as Submit commands, exactly as the http layer does.
+    let oracle_cmds = handle.command_sender();
     std::thread::Builder::new()
         .name("node-actor".into())
         .spawn(move || {
@@ -123,6 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 actor_forge_repo,
                 actor_index,
                 blobs,
+                oracle_cmds,
                 cmd_rx,
                 event_tx,
             )
@@ -152,6 +157,7 @@ fn run_node(
     forge_repo: PathBuf,
     index: Arc<IndexStore>,
     blobs: noded::blobs::BlobHandle,
+    oracle_cmds: mpsc::Sender<NodeCommand>,
     mut cmds: mpsc::Receiver<NodeCommand>,
     events: broadcast::Sender<WsFrame>,
 ) {
@@ -233,7 +239,12 @@ fn run_node(
         // runtime metrics. the handles are retained for the block loop's life.
         let metrics = NodeMetrics::register(&context);
 
-        let workers = oracle_workers();
+        // OFF-LOOP execution: the pool gates effects inline but runs the
+        // provider CLI on spawned tasks; a completed run re-enters as a
+        // Submit command on `oracle_cmds`, so this serial command loop
+        // never awaits a provider and Query/Status stay responsive while
+        // runs are in flight.
+        let workers = oracle_pool::oracle_workers(&context, oracle_cmds);
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would
         // re-use indexed heights — every new block silently skipped.
@@ -337,26 +348,6 @@ fn unix_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock is past the epoch")
         .as_millis() as u64
-}
-
-fn oracle_workers() -> Vec<Box<dyn reactor::Worker>> {
-    #[cfg(debug_assertions)]
-    {
-        if std::env::var_os("DUCKTAPE_NODED_ECHO_ORACLE").is_some() {
-            return vec![Box::new(EchoWorker)];
-        }
-    }
-    vec![Box::new(DispatchWorker::new(
-        // BYO: run whatever executor CLIs the capability specs describe and
-        // this host has installed — no credential handling here (see
-        // docs/capability-spec.md). a broken operator spec is a boot error.
-        capability_host::discover()
-            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
-        // the daemon's oracle identity: its worker follow-ups are
-        // submitted under ORACLE_ORIGIN, so an Accept claim records that
-        // key as the assignee and the re-emitted request must match it.
-        ORACLE_ORIGIN.to_vec(),
-    ))]
 }
 
 /// commit the caller's op, then drain worker follow-ups (each its own block).
@@ -572,29 +563,3 @@ async fn offer_effects(
     }
 }
 
-#[cfg(debug_assertions)]
-struct EchoWorker;
-
-#[cfg(debug_assertions)]
-#[async_trait::async_trait(?Send)]
-impl reactor::Worker for EchoWorker {
-    async fn run(&self, effect: &Effect) -> Result<reactor::WorkOutcome, reactor::Error> {
-        let request = match saga::decode_worker_request(&effect.0) {
-            Ok(request) => request,
-            Err(_) => return Ok(reactor::WorkOutcome::NotMine),
-        };
-        // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
-        // module judged a Text contract; the agent module normalizes).
-        let Ok(work) = dispatch::decode_work_spec(&request.spec) else {
-            return Ok(reactor::WorkOutcome::NotMine);
-        };
-        Ok(reactor::WorkOutcome::Handled(Some(Msg {
-            target: "saga".into(),
-            payload: saga::encode_msg(&saga::SagaMsg::OracleResult {
-                saga_id: request.saga_id,
-                attempt: request.attempt,
-                outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id).into_bytes()),
-            }),
-        })))
-    }
-}
