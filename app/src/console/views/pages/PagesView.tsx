@@ -512,6 +512,13 @@ export function PagesView() {
                       event.preventDefault();
                       appendBlock();
                     }}
+                    // keyboard activation (Enter/Space) synthesizes a click
+                    // with detail 0 and no mousedown — only that path appends
+                    // here; a pointer's trailing click (detail ≥ 1) was
+                    // already handled above.
+                    onClick={(event) => {
+                      if (event.detail === 0) appendBlock();
+                    }}
                     style={{
                       all: "unset",
                       cursor: "text",

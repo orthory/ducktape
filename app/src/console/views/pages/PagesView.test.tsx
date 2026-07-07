@@ -470,6 +470,20 @@ describe("endless canvas", () => {
     expect(spies.insertPageBlock).toHaveBeenCalledWith(appended);
   });
 
+  it("appends on keyboard activation (detail-0 click) but not twice per pointer press", () => {
+    const { spies } = renderPagesView();
+    const btn = screen.getByRole("button", { name: "Add a block" });
+    // Enter/Space on the focused button synthesizes a click with detail 0
+    // and no preceding mousedown — the button must still work.
+    fireEvent.click(btn, { detail: 0 });
+    expect(spies.insertPageBlock).toHaveBeenCalledTimes(1);
+    // a real pointer press fires mousedown AND a trailing detail-1 click;
+    // that must append exactly once.
+    fireEvent.mouseDown(btn);
+    fireEvent.click(btn, { detail: 1 });
+    expect(spies.insertPageBlock).toHaveBeenCalledTimes(2);
+  });
+
   it("appends a block when the canvas below the content is pressed", () => {
     const { spies } = renderPagesView();
     fireEvent.mouseDown(screen.getByTestId("page-canvas-filler"));
