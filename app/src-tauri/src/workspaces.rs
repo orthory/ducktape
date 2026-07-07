@@ -71,6 +71,13 @@ struct Registry {
     /// the workspace whose node the app currently talks to.
     active: Option<String>,
     workspaces: Vec<Workspace>,
+    /// has the identity-creation mnemonic been shown + re-entered once on
+    /// this machine? UX-only (no security weight) — gates whether the
+    /// identity gate re-shows the "confirm your recovery phrase" step.
+    /// `#[serde(default)]` so a pre-existing `registry.json` (version stays
+    /// 1) keeps loading with this defaulting to `false`.
+    #[serde(default)]
+    mnemonic_confirmed: bool,
 }
 
 /// the http coordinates [`workspace_select`] returns to the webview.
@@ -117,6 +124,7 @@ fn empty_registry() -> Registry {
         version: 1,
         active: None,
         workspaces: Vec::new(),
+        mnemonic_confirmed: false,
     }
 }
 
@@ -248,26 +256,13 @@ fn reserved_ports(reg: &Registry) -> Vec<u16> {
 /// can't freeze forget/delete (and, on repeats, the whole Tauri worker pool).
 const VERB_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// run a `ducktape-node` onboarding verb and return its stdout (trimmed). the
-/// verbs print the datum (chain-id, pubkey, invite blob) to stdout and human
-/// guidance to stderr; a non-zero exit surfaces stderr. bounded by
-/// [`VERB_TIMEOUT`]: a wedged node (one that accepts the rpc but never replies)
-/// used to make `.output()` block FOREVER — hanging forget/delete with the
-/// spinner stuck, and exhausting the worker pool on repeats until the whole UI
-/// stopped. now it is killed on the deadline and reported. stdout/stderr are
-/// drained on threads so a chatty verb can't fill a pipe and deadlock the wait.
-/// `pub(crate)` so [`crate::user_identity`] drives the `user-key`/
-/// `user-sign-bind`/`user-sign-unbind` verbs the same way.
-pub(crate) fn run_verb(node_bin: &Path, args: &[&str]) -> Result<String, String> {
-    let verb = args.first().copied().unwrap_or("");
-    let mut child = Command::new(node_bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("run ducktape-node {verb}: {err}"))?;
-
+/// drain a spawned verb's stdout/stderr on threads and wait for it, bounded by
+/// [`VERB_TIMEOUT`] — the guts shared by [`run_verb`] and
+/// [`run_verb_with_stdin`], so the wedged-node kill/timeout/error-surfacing
+/// logic (see `run_verb`'s doc) lives in exactly one place. `verb` is only
+/// used for error text; `child` must have piped stdout+stderr (stdin is the
+/// caller's concern — already written-to-and-closed, or `Stdio::null()`).
+fn wait_for_verb(verb: &str, mut child: std::process::Child) -> Result<String, String> {
     let mut out_pipe = child.stdout.take().expect("stdout piped");
     let mut err_pipe = child.stderr.take().expect("stderr piped");
     let out_reader = thread::spawn(move || {
@@ -316,6 +311,62 @@ pub(crate) fn run_verb(node_bin: &Path, args: &[&str]) -> Result<String, String>
         });
     }
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+}
+
+/// run a `ducktape-node` onboarding verb and return its stdout (trimmed). the
+/// verbs print the datum (chain-id, pubkey, invite blob) to stdout and human
+/// guidance to stderr; a non-zero exit surfaces stderr. bounded by
+/// [`VERB_TIMEOUT`]: a wedged node (one that accepts the rpc but never replies)
+/// used to make `.output()` block FOREVER — hanging forget/delete with the
+/// spinner stuck, and exhausting the worker pool on repeats until the whole UI
+/// stopped. now it is killed on the deadline and reported. stdout/stderr are
+/// drained on threads so a chatty verb can't fill a pipe and deadlock the wait.
+/// `pub(crate)` so [`crate::user_identity`] drives the `user-key`/
+/// `user-sign-bind`/`user-sign-unbind` verbs the same way.
+pub(crate) fn run_verb(node_bin: &Path, args: &[&str]) -> Result<String, String> {
+    let verb = args.first().copied().unwrap_or("");
+    let child = Command::new(node_bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("run ducktape-node {verb}: {err}"))?;
+    wait_for_verb(verb, child)
+}
+
+/// like [`run_verb`], but pipes `stdin_lines` to the child — one line per
+/// element, each newline-terminated, stdin then closed (EOF) — for the
+/// user-key verbs that read a password (and, for `restore`, a mnemonic) off
+/// stdin rather than argv, so a secret never touches argv/env (shell history,
+/// `ps`). `pub(crate)` so [`crate::user_identity`] can feed passwords to
+/// `user-key init/restore/unlock/reveal/encrypt` and to
+/// `user-sign-bind`/`user-sign-unbind` when the key is encrypted.
+pub(crate) fn run_verb_with_stdin(
+    node_bin: &Path,
+    args: &[&str],
+    stdin_lines: &[&str],
+) -> Result<String, String> {
+    let verb = args.first().copied().unwrap_or("");
+    let mut child = Command::new(node_bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("run ducktape-node {verb}: {err}"))?;
+    {
+        use std::io::Write as _;
+        // write, then let this handle drop (closing the pipe -> EOF) even if
+        // the child exited early (a rejected flag, say) and a write fails.
+        let mut stdin_pipe = child.stdin.take().expect("stdin piped");
+        for line in stdin_lines {
+            if writeln!(stdin_pipe, "{line}").is_err() {
+                break;
+            }
+        }
+    }
+    wait_for_verb(verb, child)
 }
 
 /// the last non-empty line of a verb's stdout — the datum (verbs may print a
@@ -1042,6 +1093,38 @@ pub fn workspace_log_tail(app: tauri::AppHandle, id: String) -> Result<LogTail, 
     })
 }
 
+/// has the identity-creation mnemonic been confirmed once on this machine?
+/// `pub(crate)` so [`crate::user_identity::user_identity_state`] can fold
+/// this UX flag into its reported state without reaching into `Registry`'s
+/// otherwise-private fields.
+pub(crate) fn mnemonic_confirmed(app: &tauri::AppHandle) -> Result<bool, String> {
+    Ok(load_registry(app)?.mnemonic_confirmed)
+}
+
+/// persist the mnemonic-confirmed flag, idempotently (no write if already
+/// set). `pub(crate)` so [`crate::user_identity::user_identity_restore`] can
+/// set it directly (a restore counts as confirmed — the words were just
+/// typed back in), alongside the [`user_identity_confirm_mnemonic`] command
+/// below for the create-flow's explicit confirmation step.
+pub(crate) fn set_mnemonic_confirmed(app: &tauri::AppHandle) -> Result<(), String> {
+    let mut reg = load_registry(app)?;
+    if !reg.mnemonic_confirmed {
+        reg.mnemonic_confirmed = true;
+        save_registry(app, &reg)?;
+    }
+    Ok(())
+}
+
+/// mark the identity-creation mnemonic confirmed (shown once, re-entered
+/// correctly) — a persisted, UX-only flag with no security weight: it only
+/// stops the identity gate from re-showing the confirmation step on future
+/// launches. lives here (not `user_identity.rs`) because it is purely a
+/// `Registry` mutation, same as every other workspace-registry command.
+#[tauri::command]
+pub fn user_identity_confirm_mnemonic(app: tauri::AppHandle) -> Result<(), String> {
+    set_mnemonic_confirmed(&app)
+}
+
 // ── Phase classification ────────────────────────────────
 
 /// map the node's stable stdout markers to a phase. the log only appends and,
@@ -1437,6 +1520,7 @@ mod tests {
             version: 1,
             active: Some("team".into()),
             workspaces: Vec::new(),
+            mnemonic_confirmed: false,
         };
         save_registry_at(&path, &reg).unwrap();
         assert!(
