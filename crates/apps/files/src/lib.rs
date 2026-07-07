@@ -104,6 +104,10 @@ mod cap;
 mod disk;
 #[cfg(feature = "native")]
 mod module;
+// the attempt-scoped statesync scratch + verified promotion (#219 hardening);
+// disk-store glue, so it rides the same `native` gate as `disk`.
+#[cfg(feature = "native")]
+mod scratch;
 
 // the typed fs capability: pure sugar over `sdk::Ctx` (reads ride `query`, writes
 // ride `emit_msg`), so it lives behind the same `native` gate as the sdk glue.
@@ -113,3 +117,5 @@ pub use cap::{FsCap, Notify, decode_notify};
 pub use disk::{DiskRefs, DiskStore};
 #[cfg(feature = "native")]
 pub use module::{Files, owner_of};
+#[cfg(feature = "native")]
+pub use scratch::SyncScratch;

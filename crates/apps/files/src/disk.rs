@@ -87,8 +87,9 @@ impl DiskStore {
 /// fsync a directory so its name→inode entries are durable — the barrier that
 /// makes a `rename` into (or a fresh subdir under) `dir` survive a crash. opened
 /// read-only and `sync_all`'d; this is a unix/macos operation (the deploy
-/// targets), where a directory can be opened as a file for fsync.
-fn fsync_dir(dir: &Path) -> Result<(), String> {
+/// targets), where a directory can be opened as a file for fsync. `pub(crate)`:
+/// the statesync scratch promotion (`scratch.rs`) shares this barrier.
+pub(crate) fn fsync_dir(dir: &Path) -> Result<(), String> {
     std::fs::File::open(dir)
         .and_then(|f| f.sync_all())
         .map_err(|e| format!("fsync dir {}: {e}", dir.display()))
