@@ -116,8 +116,15 @@ function CreateFlow({
     >
       <ConfirmWords
         mnemonic={mnemonic}
+        busy={busy}
+        error={error}
         onConfirmed={() => {
-          void confirmMnemonic().then(onDone);
+          setBusy(true);
+          setError(null);
+          confirmMnemonic()
+            .then(onDone)
+            .catch((err) => setError(errMessage(err)))
+            .finally(() => setBusy(false));
         }}
       />
     </GateCard>
@@ -134,12 +141,14 @@ function RestoreFlow({
   onSwitchToCreate: () => void;
 }) {
   const [words, setWords] = useState("");
-  const [password, setPassword] = useState("");
-  const [confirm, setConfirm] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const submit = () => {
+  // PasswordForm owns the password ×2 policy (min length, mismatch), so this
+  // only fires once the password is valid — it validates the words, then runs
+  // the restore. Word errors surface through PasswordForm's `error` prop, the
+  // same inline slot the server's checksum rejection lands in.
+  const submit = (password: string) => {
     setError(null);
     const list = words
       .trim()
@@ -153,14 +162,6 @@ function RestoreFlow({
     const bad = list.find((w) => !BIP39_ENGLISH_SET.has(w));
     if (bad) {
       setError(`"${bad}" is not a recovery-phrase word`);
-      return;
-    }
-    if (password.length < 8) {
-      setError("password must be at least 8 characters");
-      return;
-    }
-    if (password !== confirm) {
-      setError("passwords do not match");
       return;
     }
     setBusy(true);
@@ -184,26 +185,15 @@ function RestoreFlow({
           rows={4}
           style={{ ...inputStyle, resize: "vertical", font: `500 11px ${font.mono}` }}
         />
-        <input
-          type="password"
-          value={password}
+        <PasswordForm
+          mode="set"
+          busy={busy}
+          error={error}
           placeholder="New password"
-          onChange={(event) => setPassword(event.target.value)}
-          autoComplete="new-password"
-          style={inputStyle}
+          confirmPlaceholder="Confirm new password"
+          submitLabel={busy ? "Restoring…" : "Restore identity"}
+          onSubmit={submit}
         />
-        <input
-          type="password"
-          value={confirm}
-          placeholder="Confirm new password"
-          onChange={(event) => setConfirm(event.target.value)}
-          autoComplete="new-password"
-          style={inputStyle}
-        />
-        {error && <span style={errorTextStyle}>{error}</span>}
-        <button onClick={submit} disabled={busy} style={primaryButtonStyle(busy)}>
-          {busy ? "Restoring…" : "Restore identity"}
-        </button>
       </div>
     </GateCard>
   );
@@ -393,8 +383,15 @@ function ResumeScreen({ onDone }: { onDone: () => void }) {
     >
       <ConfirmWords
         mnemonic={mnemonic}
+        busy={busy}
+        error={error}
         onConfirmed={() => {
-          void confirmMnemonic().then(onDone);
+          setBusy(true);
+          setError(null);
+          confirmMnemonic()
+            .then(onDone)
+            .catch((err) => setError(errMessage(err)))
+            .finally(() => setBusy(false));
         }}
       />
     </GateCard>

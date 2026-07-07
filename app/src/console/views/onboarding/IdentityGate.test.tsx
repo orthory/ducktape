@@ -231,6 +231,54 @@ describe("identity gate — create flow", () => {
     expect(confirmMnemonicMock).toHaveBeenCalledTimes(1);
   });
 
+  it("surfaces a confirmMnemonic failure inline and allows retry", async () => {
+    markTauri();
+    identityStateMock
+      .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "ab12", mnemonic: TEST_MNEMONIC });
+    confirmMnemonicMock
+      .mockRejectedValueOnce(new Error("registry write failed"))
+      .mockResolvedValue(undefined);
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Create your identity");
+    fireEvent.change(screen.getByPlaceholderText("Password (min 8 characters)"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Confirm password"), {
+      target: { value: "correct horse battery" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Create identity"));
+    });
+    fireEvent.click(await screen.findByText("I've saved it — continue"));
+    await screen.findByText("Confirm your recovery phrase");
+
+    await fillConfirmWords(TEST_WORDS);
+    await act(async () => {
+      fireEvent.click(screen.getByText("Confirm"));
+    });
+
+    // the failure surfaces inline; the gate stays on the confirm step (the
+    // console never renders — onDone/refetch never fired on the failure).
+    expect(await screen.findByText("registry write failed")).toBeInTheDocument();
+    expect(screen.queryByTestId("console")).toBeNull();
+    expect(identityStateMock).toHaveBeenCalledTimes(1);
+
+    // retry with the same (already correct) words succeeds.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Confirm"));
+    });
+    expect(confirmMnemonicMock).toHaveBeenCalledTimes(2);
+    expect(await screen.findByTestId("console")).toBeInTheDocument();
+  });
+
   it("mismatched create password shows an inline error without calling the client", async () => {
     markTauri();
     identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });

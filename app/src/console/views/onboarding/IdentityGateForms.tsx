@@ -175,6 +175,10 @@ export interface PasswordFormProps {
   /** Server-side error to show inline (wrong password, etc). */
   error?: string | null;
   minLength?: number;
+  /** Override the password field's placeholder (e.g. restore's "New password"). */
+  placeholder?: string;
+  /** Override the confirm field's placeholder ("set" mode only). */
+  confirmPlaceholder?: string;
 }
 
 /** A password entry form — single field ("confirm") or double with inline
@@ -187,6 +191,8 @@ export function PasswordForm({
   busy = false,
   error = null,
   minLength = 8,
+  placeholder,
+  confirmPlaceholder = "Confirm password",
 }: PasswordFormProps) {
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -214,7 +220,7 @@ export function PasswordForm({
       <input
         type="password"
         value={password}
-        placeholder={mode === "set" ? "Password (min 8 characters)" : "Password"}
+        placeholder={placeholder ?? (mode === "set" ? "Password (min 8 characters)" : "Password")}
         onChange={(event) => {
           setPassword(event.target.value);
           setLocalError(null);
@@ -227,7 +233,7 @@ export function PasswordForm({
         <input
           type="password"
           value={confirm}
-          placeholder="Confirm password"
+          placeholder={confirmPlaceholder}
           onChange={(event) => {
             setConfirm(event.target.value);
             setLocalError(null);
@@ -329,28 +335,39 @@ function pickConfirmIndices(total: number, count: number): number[] {
 
 /** The confirm-3-words step: rejects a wrong word inline and allows retry —
  *  the indices themselves stay fixed across retries (memoized on the
- *  mnemonic), only the offending word must be corrected. */
+ *  mnemonic), only the offending word must be corrected. `onConfirmed` fires
+ *  only once the words match; the caller owns the async terminal action
+ *  (`confirmMnemonic`) and feeds its in-flight/failure state back via
+ *  `busy`/`error`, the same contract as PasswordForm. */
 export function ConfirmWords({
   mnemonic,
   onConfirmed,
+  busy = false,
+  error = null,
 }: {
   mnemonic: string;
   onConfirmed: () => void;
+  busy?: boolean;
+  /** Server-side error to show inline (a failed confirmMnemonic, etc). */
+  error?: string | null;
 }) {
   const words = useMemo(() => mnemonic.trim().split(/\s+/), [mnemonic]);
   const indices = useMemo(() => pickConfirmIndices(words.length, 3), [words]);
   const [answers, setAnswers] = useState<Record<number, string>>({});
-  const [error, setError] = useState<string | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
 
   const submit = () => {
+    if (busy) return;
     const wrong = indices.find((i) => (answers[i] ?? "").trim().toLowerCase() !== words[i]);
     if (wrong !== undefined) {
-      setError(`word #${wrong + 1} doesn't match — try again`);
+      setLocalError(`word #${wrong + 1} doesn't match — try again`);
       return;
     }
-    setError(null);
+    setLocalError(null);
     onConfirmed();
   };
+
+  const shown = localError ?? error;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -370,9 +387,9 @@ export function ConfirmWords({
           style={inputStyle}
         />
       ))}
-      {error && <span style={errorTextStyle}>{error}</span>}
-      <button onClick={submit} style={primaryButtonStyle(false)}>
-        Confirm
+      {shown && <span style={errorTextStyle}>{shown}</span>}
+      <button onClick={submit} disabled={busy} style={primaryButtonStyle(busy)}>
+        {busy ? "Confirming…" : "Confirm"}
       </button>
     </div>
   );
