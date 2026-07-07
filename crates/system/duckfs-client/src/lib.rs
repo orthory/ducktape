@@ -10,3 +10,5 @@
 //! [`NodeApi`] trait so a colocated-odb fast path can slot in for phase-4 FUSE.
 pub mod chunk;
 pub mod index;
+pub mod scan;
+pub mod status;

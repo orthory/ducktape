@@ -21,15 +21,19 @@ pub const DUCKFS_DIR: &str = ".duckfs";
 /// the index file inside [`DUCKFS_DIR`].
 pub const INDEX_FILE: &str = "index.json";
 
-/// what a recorded entry is. directories are not recorded (they are implied by
-/// their entries and rematerialized structurally); only files and symlinks carry
-/// content that status must track. a symlink's `object` is the file id over its
-/// target bytes, exactly as the module stores it.
+/// what a recorded entry is. files and symlinks carry content status must track;
+/// a symlink's `object` is the file id over its target bytes, exactly as the
+/// module stores it. only EMPTY directories are recorded (`Dir`, object empty):
+/// non-empty dirs are implied by their entries and rematerialized structurally,
+/// but an empty dir has nothing to imply it, so status tracks it explicitly to
+/// tell a fresh empty dir (needs a `Mkdir`) from one already in the base snapshot
+/// (`mkdir` on an existing dir rejects, so re-emitting it would break the commit).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
     File,
     Symlink,
+    Dir,
 }
 
 /// one recorded path: the committed file object id, plus the size/mtime/exec the
