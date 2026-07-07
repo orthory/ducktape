@@ -4,10 +4,10 @@
 //! webview are the `~/.ducktape` WORKSPACE REGISTRY (see [`workspaces`]) — found
 //! or join networks, allocate ports, drive the node's onboarding verbs, and
 //! spawn the selected workspace's node DETACHED (its own process group, stdio
-//! to `daemon.log`) so it survives this app exiting — and the legacy single-node
-//! `daemon_spawn` fallback it is retiring. everything else is the webview's: it
-//! probes /v1/status, streams blocks over /v1/ws, and retires the node with
-//! POST /v1/shutdown. no pid is tracked; the port is the node's identity.
+//! to `daemon.log`) so closing the console window only hides to the menu-bar
+//! app instead of killing the network. a real app quit (tray Quit / Cmd-Q /
+//! OS exit) stops the active managed node through the workspace pidfile before
+//! the shell exits.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -84,7 +84,14 @@ fn main() {
         ));
     }
 
-    builder
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            if let Err(err) = workspaces::stop_active_workspace_node(app) {
+                eprintln!("app exit: could not stop active workspace node: {err}");
+            }
+        }
+    });
 }
