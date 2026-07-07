@@ -109,6 +109,14 @@ fn cmd_build(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         for p in &manifest.prompts {
             emit_hash(&capsule, &p.logical, &p.path)?;
         }
+        for a in &manifest.actions {
+            if let Some(schema) = &a.schema {
+                emit_hash(&capsule, &a.tag, schema)?;
+            }
+        }
+        if capsule.files.contains_key(quack::GOLDEN_PATH) {
+            emit_hash(&capsule, "golden", quack::GOLDEN_PATH)?;
+        }
         return Ok(());
     }
 
@@ -128,7 +136,7 @@ fn cmd_build(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .out
         .clone()
         .unwrap_or_else(|| default_out(dir, &manifest));
-    std::fs::write(&out, quack::build_tar(&capsule))?;
+    std::fs::write(&out, quack::build_tar(&capsule)?)?;
     println!("built {} ({} files)", out.display(), capsule.files.len());
     Ok(())
 }
@@ -149,7 +157,7 @@ fn cmd_verify(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let status = signature_status(&capsule, toml);
     println!("signature {status}");
-    if status.starts_with("invalid") {
+    if status.is_invalid() {
         return Err("signature verification failed".into());
     }
     println!("ok {} {}", manifest.package, manifest.version);
@@ -173,7 +181,7 @@ fn cmd_test(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("digests  ok ({} referenced files)", digest_count(&manifest));
     let status = signature_status(&capsule, toml);
     println!("signature {status}");
-    if status.starts_with("invalid") {
+    if status.is_invalid() {
         return Err("signature verification failed".into());
     }
 
@@ -252,19 +260,60 @@ fn native_catalog(
     Ok(extras)
 }
 
-/// Describe the signature state of a capsule: unsigned, signed-by, or invalid.
-fn signature_status(capsule: &quack::Capsule, toml: &[u8]) -> String {
+/// The signature state of a capsule — classified once, rendered only at the
+/// display edge. `verify`/`test` treat a present-but-unverifiable signature
+/// (`Malformed` or `BadSignature`) as a hard failure via [`Self::is_invalid`],
+/// rather than sniffing the rendered prose.
+enum SignatureStatus {
+    Unsigned,
+    Signed { signer: Vec<u8> },
+    Malformed { detail: String },
+    BadSignature { signer: Vec<u8> },
+}
+
+impl SignatureStatus {
+    /// a signature is present but did not verify — a failure for `verify`/`test`.
+    fn is_invalid(&self) -> bool {
+        matches!(
+            self,
+            SignatureStatus::Malformed { .. } | SignatureStatus::BadSignature { .. }
+        )
+    }
+}
+
+impl std::fmt::Display for SignatureStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignatureStatus::Unsigned => write!(f, "unsigned"),
+            SignatureStatus::Signed { signer } => write!(f, "signed by {}", hex_bytes(signer)),
+            SignatureStatus::Malformed { detail } => {
+                write!(f, "invalid (malformed package.sig: {detail})")
+            }
+            SignatureStatus::BadSignature { signer } => {
+                write!(f, "invalid (bad signature from {})", hex_bytes(signer))
+            }
+        }
+    }
+}
+
+/// Classify the signature state of a capsule: unsigned, signed-by, malformed,
+/// or a bad signature.
+fn signature_status(capsule: &quack::Capsule, toml: &[u8]) -> SignatureStatus {
     let Some(raw) = capsule.files.get("signatures/package.sig") else {
-        return "unsigned".to_string();
+        return SignatureStatus::Unsigned;
     };
     let sig: quack::PackageSig = match serde_json::from_slice(raw) {
         Ok(sig) => sig,
-        Err(e) => return format!("invalid (malformed package.sig: {e})"),
+        Err(e) => {
+            return SignatureStatus::Malformed {
+                detail: e.to_string(),
+            };
+        }
     };
     if quack::verify_manifest_sig(&sig, &quack::manifest_hash(toml)) {
-        format!("signed by {}", hex_bytes(&sig.signer))
+        SignatureStatus::Signed { signer: sig.signer }
     } else {
-        format!("invalid (bad signature from {})", hex_bytes(&sig.signer))
+        SignatureStatus::BadSignature { signer: sig.signer }
     }
 }
 
@@ -290,6 +339,11 @@ fn digest_count(m: &quack::PackageManifest) -> usize {
             .iter()
             .filter(|e| e.artifact.is_some() && e.hash.is_some())
             .count()
+        + m.actions
+            .iter()
+            .filter(|a| a.schema.is_some() && a.schema_hash.is_some())
+            .count()
+        + usize::from(m.golden.is_some())
 }
 
 fn default_out(dir: &Path, m: &quack::PackageManifest) -> PathBuf {
@@ -356,4 +410,51 @@ impl Opts {
 
 fn next<'a>(it: &mut std::slice::Iter<'a, String>, flag: &str) -> Result<&'a String, String> {
     it.next().ok_or_else(|| format!("{flag} needs a value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOML: &[u8] = b"schema = 1\n";
+
+    fn capsule(sig: Option<&[u8]>) -> quack::Capsule {
+        let mut c = quack::Capsule::new();
+        c.insert("quack.toml", TOML.to_vec());
+        if let Some(sig) = sig {
+            c.insert("signatures/package.sig", sig.to_vec());
+        }
+        c
+    }
+
+    #[test]
+    fn unsigned_status_is_not_invalid_and_renders_stably() {
+        let s = signature_status(&capsule(None), TOML);
+        assert!(matches!(s, SignatureStatus::Unsigned));
+        assert!(!s.is_invalid());
+        assert_eq!(s.to_string(), "unsigned");
+    }
+
+    #[test]
+    fn a_malformed_sig_is_invalid() {
+        let s = signature_status(&capsule(Some(b"not json")), TOML);
+        assert!(matches!(s, SignatureStatus::Malformed { .. }));
+        assert!(s.is_invalid());
+        assert!(s.to_string().starts_with("invalid (malformed package.sig:"));
+    }
+
+    #[test]
+    fn a_wellformed_but_wrong_sig_is_invalid() {
+        // a genuine ed25519 signature over a DIFFERENT hash: well-formed, but it
+        // does not verify against this manifest's hash — classified
+        // BadSignature, not sniffed from prose.
+        use commonware_cryptography::{Signer, ed25519};
+        let key = ed25519::PrivateKey::from_seed(1);
+        let sig = quack::sign_manifest(&key, &[0x22u8; 32]);
+        let json = serde_json::to_vec(&sig).expect("sig serializes");
+        let s = signature_status(&capsule(Some(&json)), TOML);
+        assert!(matches!(s, SignatureStatus::BadSignature { .. }));
+        assert!(s.is_invalid());
+        assert!(s.to_string().starts_with("invalid (bad signature from "));
+    }
 }

@@ -18,8 +18,9 @@ use serde_json::Value;
 use crate::install::{InstallReport, install_spec_from_capsule_defaulted};
 use crate::testbed::PackageTestBed;
 
-/// where the fixture lives inside a capsule.
-pub const GOLDEN_PATH: &str = "harness/golden.json";
+/// where the fixture lives inside a capsule — the capsule crate's reserved
+/// harness-proof path (pinned by the manifest's `golden` field).
+pub use quack::GOLDEN_PATH;
 /// the fixture schema this build understands.
 pub const GOLDEN_SCHEMA_V1: u32 = 1;
 

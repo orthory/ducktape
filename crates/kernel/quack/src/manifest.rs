@@ -37,6 +37,13 @@ pub struct PackageManifest {
     /// this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
+    /// The content pin of the capsule's `harness/golden.json` proof (a
+    /// `sha256:<hex>` field). Optional: a package that ships no harness proof
+    /// omits it. When a capsule carries a proof it MUST be pinned here — the
+    /// enforcement lives in [`crate::verify_digests`], so the golden the
+    /// recipient replays before activation is the one the signature commits to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golden: Option<String>,
     pub requires: Requires,
     #[serde(default)]
     pub modules: Vec<ModuleEntry>,
@@ -94,13 +101,18 @@ pub struct PromptEntry {
 }
 
 /// One `[[actions]]` entry: an open action tag owned by a module, with an
-/// optional JSON schema file describing its payload.
+/// optional JSON schema file describing its payload. A declared `schema` is
+/// content-pinned by `schema_hash` (a `sha256:<hex>` field, like a prompt's
+/// `hash`) — the two travel together or not at all (see [`validate`]), so a
+/// schema can never be swapped under a valid signature.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionEntry {
     pub tag: String,
     pub owner: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_hash: Option<String>,
 }
 
 /// One `[[agents]]` entry: a package-owned agent skillset.
@@ -162,6 +174,12 @@ pub enum ManifestError {
     BadTag { value: String },
     #[error("duplicate logical id {0:?}")]
     DuplicateLogical(String),
+    #[error("logical id {0:?} is declared in more than one namespace (a module and a prompt)")]
+    CrossNamespaceLogical(String),
+    #[error("action {tag:?} declares a schema but no schema_hash to pin it")]
+    SchemaWithoutHash { tag: String },
+    #[error("action {tag:?} declares a schema_hash but no schema file to pin")]
+    HashWithoutSchema { tag: String },
     #[error("duplicate action tag {0:?}")]
     DuplicateAction(String),
     #[error("duplicate agent id {0:?}")]
@@ -226,16 +244,23 @@ pub fn validate(m: &PackageManifest) -> Result<(), ManifestError> {
         }
     }
 
-    // prompts: unique logical ids; well-formed ids.
+    // prompts: unique logical ids; well-formed ids; no id shared with a module
+    // (logical ids are one flat namespace across modules and prompts, so the
+    // install mapping is never ambiguous).
     let mut prompt_ids = BTreeSet::new();
     for pe in &m.prompts {
         validate_tag(&pe.logical)?;
+        if module_ids.contains(pe.logical.as_str()) {
+            return Err(ManifestError::CrossNamespaceLogical(pe.logical.clone()));
+        }
         if !prompt_ids.insert(pe.logical.as_str()) {
             return Err(ManifestError::DuplicateLogical(pe.logical.clone()));
         }
     }
 
-    // actions: well-formed tags; unique; owner resolves to a declared module.
+    // actions: well-formed tags; unique; owner resolves to a declared module; a
+    // declared schema and its pin travel together (a schema with no pin is the
+    // unverifiable-payload hole; a pin with no schema is a dangling reference).
     let mut action_tags = BTreeSet::new();
     for ae in &m.actions {
         validate_tag(&ae.tag)?;
@@ -247,6 +272,19 @@ pub fn validate(m: &PackageManifest) -> Result<(), ManifestError> {
                 tag: ae.tag.clone(),
                 owner: ae.owner.clone(),
             });
+        }
+        match (&ae.schema, &ae.schema_hash) {
+            (Some(_), None) => {
+                return Err(ManifestError::SchemaWithoutHash {
+                    tag: ae.tag.clone(),
+                });
+            }
+            (None, Some(_)) => {
+                return Err(ManifestError::HashWithoutSchema {
+                    tag: ae.tag.clone(),
+                });
+            }
+            _ => {}
         }
     }
 
@@ -319,6 +357,11 @@ pub fn validate_tag(tag: &str) -> Result<(), ManifestError> {
     }
 }
 
+// This inline test module pushes the file past the ~600-line soft cap; the
+// production code above is ~360 lines. The tests stay inline (rather than an
+// external `tests/` file) because they share the `GOOD` fixture and pin the
+// domain-separation invariant against the private `MANIFEST_NAMESPACE` — moving
+// them out would break both.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,11 +396,13 @@ hash = "sha256:aa"
 tag = "pages.comment.add"
 owner = "docs-harness"
 schema = "actions/pages.comment.add.schema.json"
+schema_hash = "sha256:aa"
 
 [[actions]]
 tag = "pages.block.update_text"
 owner = "docs-harness"
 schema = "actions/pages.block.update_text.schema.json"
+schema_hash = "sha256:bb"
 
 [[agents]]
 id = "docs.editor"
@@ -463,6 +508,56 @@ package_state = "tombstone"
     }
 
     #[test]
+    fn rejects_action_schema_without_a_hash() {
+        // a declared schema with no pin is the unverifiable-payload hole.
+        let mut m = good();
+        m.actions[0].schema_hash = None;
+        assert_eq!(
+            validate(&m),
+            Err(ManifestError::SchemaWithoutHash {
+                tag: "pages.comment.add".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_action_hash_without_a_schema() {
+        // a pin with no schema file to check is a dangling reference.
+        let mut m = good();
+        m.actions[0].schema = None;
+        assert_eq!(
+            validate(&m),
+            Err(ManifestError::HashWithoutSchema {
+                tag: "pages.comment.add".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_actions_with_neither_schema_nor_hash() {
+        // a plain action tag (no schema) is fine — the docs actions declare
+        // schemas, so clear both to exercise the neither-branch.
+        let mut m = good();
+        for ae in &mut m.actions {
+            ae.schema = None;
+            ae.schema_hash = None;
+        }
+        validate(&m).expect("schema-less actions validate");
+    }
+
+    #[test]
+    fn parses_schema_hash_and_golden_fields() {
+        let with = GOOD.replace(
+            "version = \"0.1.0\"",
+            "version = \"0.1.0\"\ngolden = \"sha256:cc\"",
+        );
+        let m = parse_manifest(with.as_bytes()).expect("golden + schema_hash parse");
+        assert_eq!(m.golden.as_deref(), Some("sha256:cc"));
+        assert_eq!(m.actions[0].schema_hash.as_deref(), Some("sha256:aa"));
+        validate(&m).expect("validates");
+    }
+
+    #[test]
     fn rejects_dangling_owner() {
         let mut m = good();
         m.actions[0].owner = "nope".into();
@@ -532,6 +627,23 @@ package_state = "tombstone"
         assert_eq!(
             validate(&m),
             Err(ManifestError::DuplicateLogical("pages".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_cross_namespace_logical_collision() {
+        // a prompt logical that shadows a module logical: distinct namespaces
+        // sharing an id is operator confusion with no legitimate use, so it is
+        // rejected at validation (not silently deduped per-namespace).
+        let mut m = good();
+        // shadow the "pages" module logical with a prompt of the same id; keep
+        // the agent's prompt reference consistent so this isolates the
+        // cross-namespace rule (not a dangling reference).
+        m.prompts[0].logical = "pages".into();
+        m.agents[0].prompt = "pages".into();
+        assert_eq!(
+            validate(&m),
+            Err(ManifestError::CrossNamespaceLogical("pages".into()))
         );
     }
 

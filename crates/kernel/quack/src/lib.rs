@@ -18,15 +18,17 @@
 pub mod capsule;
 pub mod manifest;
 pub mod sign;
+pub mod tar;
 
 pub use capsule::{
-    Capsule, CapsuleError, build_tar, file_digest, open_dir, open_tar, verify_digests,
+    Capsule, CapsuleError, GOLDEN_PATH, MANIFEST_PATH, file_digest, open_dir, verify_digests,
 };
 pub use manifest::{
     ActionEntry, AgentEntry, EngagementEntry, InstallPolicy, ManifestError, ModuleEntry,
     ModuleKind, PackageManifest, PromptEntry, Requires, UninstallPolicy, manifest_hash,
     parse_manifest, validate, validate_tag,
 };
+pub use tar::{build_tar, open_tar};
 pub use sign::{PackageSig, SIG_NAMESPACE, sign_manifest, verify_manifest_sig};
 
 /// Lowercase-hex encode raw bytes — the dependency-free codec every hash/key

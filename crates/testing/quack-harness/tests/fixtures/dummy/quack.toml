@@ -2,6 +2,7 @@ schema = 1
 package = "org.example.dummy"
 version = "0.1.0"
 harness = "dummy-harness"
+golden = "sha256:08a5f2c3e3ba555fe48cd930392225eb5c405f08d9a2a3d5e8757b7a865cc79c"
 
 [requires]
 protocol_min = 1
