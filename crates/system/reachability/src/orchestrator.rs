@@ -47,7 +47,7 @@ use wireguard_effect::{
     PeerTunnelConfig, WireGuardEffect, apply_peer_tunnels, plan_peer_configs, update_peer_tunnels,
 };
 use wireguard_upgrade::{
-    ActiveValidatorSet, EndpointAdvertisement, EndpointRecord, Endpoint, MeshVersion, MeshView,
+    ActiveValidatorSet, Endpoint, EndpointAdvertisement, EndpointRecord, MeshVersion, MeshView,
     OverlayPolicy, Perspective, PortPolicy, ReplayCache, SignedEndpointRecord, TunnelInstallPlan,
     TunnelUpgradeAck, TunnelUpgradeAckFields, TunnelUpgradeRequest, TunnelUpgradeRequestFields,
     TunnelUpgradeResponse, TunnelUpgradeResponseFields, UpgradeError, ValidatorIdentity,
@@ -299,36 +299,67 @@ const COORD_STEP_TIMEOUT: Duration = Duration::from_secs(3);
 const PUNCH_STEP_TIMEOUT: Duration = Duration::from_secs(1);
 const PUNCH_TRIES: usize = 3;
 
-/// The production resolver: drives `nat_traversal::NatClient` against the
-/// configured coordinators — reflexive discovery + `register` at bind, then
-/// per peer `lookup` -> simultaneous-open punch. With NO coordinators
-/// configured every resolution is `Advertised`.
+/// How often the rendezvous pump re-advertises this node to its coordinator.
+/// Must sit well under common NAT UDP mapping timeouts (~30 s): the keepalive
+/// holds the pinhole open AND refreshes the coordinator's registration TTL
+/// (`nat_traversal::REGISTRATION_TTL_SECS`). Distinct from the WireGuard
+/// `KEEPALIVE_SECONDS` — different plane, different socket.
+pub const RENDEZVOUS_KEEPALIVE: Duration = Duration::from_secs(25);
+
+/// How every coordinator request is presented: `Some((signer, cap))`
+/// authenticates each request with a proof-of-possession over `signer`
+/// (whose public key MUST match the resolver's node key), carrying `cap`
+/// for a private (genesis-gated) coordinator or `None` for a public
+/// PoP-only one; `None` sends bare requests — the legacy unauthenticated
+/// dev path for fully-open coordinators.
+pub type CoordinatorAuth = Option<(
+    commonware_cryptography::ed25519::PrivateKey,
+    Option<nat_traversal::CoordCap>,
+)>;
+
+/// The production resolver: a handle to the rendezvous PUMP task that owns
+/// the `NatClient`'s receive side. The pump answers unsolicited `PunchSync`
+/// fan-outs while this node is otherwise idle (the passive half of somebody
+/// else's punch — previously those datagrams were eaten by whichever
+/// blocking recv happened to poll, so a punch only completed when both sides
+/// resolved simultaneously) and serves `resolve()` commands; a separate
+/// SEND-ONLY task keepalive-readvertises on the same socket, so a long run
+/// of busy resolves can never starve the keepalive past the coordinator's
+/// registration TTL. With NO coordinators configured every resolution is
+/// `Advertised` and no task is spawned.
 pub struct NatResolver {
-    client: Option<NatClient>,
+    commands: Option<tokio::sync::mpsc::Sender<ResolveCmd>>,
     reflexive: Option<SocketAddr>,
+}
+
+struct ResolveCmd {
+    peer: NodeKey,
+    reply: tokio::sync::oneshot::Sender<Result<Resolution, String>>,
 }
 
 impl NatResolver {
     /// Bind the nat client's UDP socket, discover this node's reflexive
-    /// (failing over across the coordinator hints), and register. `key` is
-    /// this node's identity bytes (`binding::node_key`). An empty
-    /// coordinator set yields the pass-through resolver.
-    ///
-    /// `auth` gates how every coordinator request is presented:
-    /// - `Some((signer, cap))` authenticates each request with a
-    ///   proof-of-possession over `signer` (whose public key MUST match `key`),
-    ///   carrying `cap` for a private (genesis-gated) coordinator or `None` for
-    ///   a public PoP-only one.
-    /// - `None` sends bare requests — the legacy unauthenticated dev path for
-    ///   fully-open coordinators.
+    /// (failing over across the coordinator hints), register, and spawn the
+    /// pump. `key` is this node's identity bytes (`binding::node_key`). An
+    /// empty coordinator set yields the pass-through resolver.
     pub async fn bind(
         key: NodeKey,
         coordinators: Vec<SocketAddr>,
-        auth: Option<(commonware_cryptography::ed25519::PrivateKey, Option<nat_traversal::CoordCap>)>,
+        auth: CoordinatorAuth,
+    ) -> std::io::Result<Self> {
+        Self::bind_with_keepalive(key, coordinators, auth, RENDEZVOUS_KEEPALIVE).await
+    }
+
+    /// [`Self::bind`] with an explicit keepalive interval (tests shrink it).
+    pub async fn bind_with_keepalive(
+        key: NodeKey,
+        coordinators: Vec<SocketAddr>,
+        auth: CoordinatorAuth,
+        keepalive: Duration,
     ) -> std::io::Result<Self> {
         if coordinators.is_empty() {
             return Ok(Self {
-                client: None,
+                commands: None,
                 reflexive: None,
             });
         }
@@ -338,10 +369,25 @@ impl NatResolver {
             }
             None => NatClient::bind_multi(key, coordinators).await?,
         };
-        let (_idx, reflexive) = client.discover_reflexive_failover(COORD_STEP_TIMEOUT).await?;
+        let (_idx, reflexive) = client
+            .discover_reflexive_failover(COORD_STEP_TIMEOUT)
+            .await?;
         client.register().await?;
+        let client = std::sync::Arc::new(client);
+        // The keepalive is SEND-ONLY (readvertise never touches the recv
+        // side), so it runs as its own task on the shared socket: the same
+        // socket keeps the same NAT pinhole and coordinator mapping, while a
+        // resolve() that runs for its full budget can no longer delay the
+        // keepalive past the registration TTL. It holds a Weak handle and
+        // exits within one interval of the pump dropping the client.
+        tokio::spawn(rendezvous_keepalive(
+            std::sync::Arc::downgrade(&client),
+            keepalive,
+        ));
+        let (commands, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(rendezvous_pump(client, rx));
         Ok(Self {
-            client: Some(client),
+            commands: Some(commands),
             reflexive: Some(reflexive),
         })
     }
@@ -359,34 +405,152 @@ impl EndpointResolver for NatResolver {
         peer: NodeKey,
         _advertised: SocketAddr,
     ) -> Result<Resolution, String> {
-        let Some(client) = &self.client else {
+        let Some(commands) = &self.commands else {
             return Ok(Resolution::Advertised);
         };
-        let peer_reflexive = tokio::time::timeout(COORD_STEP_TIMEOUT, client.lookup(peer))
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        commands
+            .send(ResolveCmd { peer, reply })
             .await
-            .map_err(|_| "coordinator lookup timed out".to_string())?
-            .map_err(|e| format!("coordinator lookup: {e}"))?;
-        // simultaneous open: both sides resolve around the same time (the
-        // initiator's lookup fans a PunchSync to the passive side, and the
-        // passive side runs its own lookup anyway), so a few send/recv
-        // rounds absorb the timing skew.
-        for _ in 0..PUNCH_TRIES {
-            if let Err(e) = client.send_punch_to(peer_reflexive).await {
-                return Err(format!("punch send: {e}"));
-            }
-            match tokio::time::timeout(PUNCH_STEP_TIMEOUT, client.recv_punch_from(peer_reflexive))
-                .await
-            {
-                Ok(Ok(_)) => return Ok(Resolution::Punched(peer_reflexive)),
-                Ok(Err(e)) => return Err(format!("punch recv: {e}")),
-                Err(_) => continue,
-            }
-        }
-        // No relay fallback: the coordinator is rendezvous-only. A failed
-        // punch is surfaced as an error so the peer rides its advertised
-        // endpoint and a `PeerFailed` is emitted for observability.
-        Err(format!("hole-punch failed after {PUNCH_TRIES} tries"))
+            .map_err(|_| "rendezvous pump terminated".to_string())?;
+        rx.await
+            .map_err(|_| "rendezvous pump terminated".to_string())?
     }
+}
+
+/// The keepalive body: a SEND-ONLY loop on the shared rendezvous socket.
+/// Readvertise nonces are wall-clock-seeded so a REBOOTED node's first
+/// keepalive strictly supersedes every nonce its previous life published —
+/// otherwise the coordinator would keep answering lookups with the dead
+/// pre-reboot mapping (for up to the TTL) while rejecting the fresh adverts
+/// as stale replays. Exits within one interval of the pump releasing the
+/// client (the `Weak` stops upgrading).
+async fn rendezvous_keepalive(client: std::sync::Weak<NatClient>, keepalive: Duration) {
+    let mut tick = tokio::time::interval(keepalive);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await; // an interval's first tick fires immediately — consume it.
+    let mut nonce = nat_traversal::now_secs();
+    loop {
+        tick.tick().await;
+        let Some(client) = client.upgrade() else {
+            return;
+        };
+        nonce = nonce.max(nat_traversal::now_secs()) + 1;
+        let _ = client.readvertise(nonce).await;
+    }
+}
+
+/// The pump body: single owner of the rendezvous socket's RECEIVE side, so
+/// every datagram reaches ONE dispatch point instead of whichever blocking
+/// recv was polling. Two duties — serve `resolve()` commands and answer
+/// unsolicited `PunchSync` while idle. (The keepalive is deliberately NOT a
+/// third select arm: a resolve() runs its full budget inside one arm, and a
+/// sequential burst of dead-peer resolves — an epoch cutover with a dozen
+/// unreachable peers — would starve an in-loop tick past the registration
+/// TTL. It lives in [`rendezvous_keepalive`] on the shared socket instead.)
+async fn rendezvous_pump(
+    client: std::sync::Arc<NatClient>,
+    mut commands: tokio::sync::mpsc::Receiver<ResolveCmd>,
+) {
+    loop {
+        tokio::select! {
+            cmd = commands.recv() => {
+                let Some(ResolveCmd { peer, reply }) = cmd else { return };
+                let _ = reply.send(do_resolve(&client, peer).await);
+            }
+            ev = client.recv_event() => match ev {
+                Ok(nat_traversal::ClientEvent::PunchSync { peer_reflexive, .. }) => {
+                    // The passive half of a peer's rendezvous: open our
+                    // pinhole toward the address the coordinator vouched for.
+                    // Bounded — one punch per coordinator-sourced PunchSync
+                    // (the active side's per-try re-Lookup drives repeats).
+                    let _ = client.send_punch_to(peer_reflexive).await;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    // A transient recv error (interface flap, ENOBUFS) must
+                    // not kill rendezvous for the rest of the process — the
+                    // old per-call clients isolated failures to one resolve,
+                    // and the pump must not be weaker. Back off briefly so a
+                    // persistently-broken socket cannot spin the loop hot;
+                    // if it IS permanently dead, every resolve() surfaces
+                    // its own error exactly like the pre-pump code did.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            },
+        }
+    }
+}
+
+/// One resolve: per TRY, a fresh `Lookup` (each one re-fans `PunchSync` to
+/// BOTH sides — the retry is what absorbs a lost fan-out datagram or a
+/// momentarily busy peer pump), then a punch exchange bounded by
+/// [`PUNCH_STEP_TIMEOUT`]. PunchSyncs arriving mid-resolve are answered
+/// inline: this node can simultaneously be the passive side of a DIFFERENT
+/// pair's rendezvous. No relay fallback exists — a failed punch is surfaced
+/// as an error so the peer rides its advertised endpoint and a `PeerFailed`
+/// is emitted for observability.
+async fn do_resolve(client: &NatClient, peer: NodeKey) -> Result<Resolution, String> {
+    use nat_traversal::ClientEvent;
+    let mut lookup_timeouts = 0usize;
+    for _ in 0..PUNCH_TRIES {
+        client
+            .send_lookup(peer)
+            .await
+            .map_err(|e| format!("coordinator lookup: {e}"))?;
+        let looked_up = tokio::time::timeout(COORD_STEP_TIMEOUT, async {
+            loop {
+                match client.recv_event().await {
+                    Ok(ClientEvent::LookupResponse { key, reflexive }) if key == peer => {
+                        return Ok(reflexive);
+                    }
+                    Ok(ClientEvent::PunchSync { peer_reflexive, .. }) => {
+                        let _ = client.send_punch_to(peer_reflexive).await;
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(format!("coordinator lookup: {e}")),
+                }
+            }
+        })
+        .await;
+        let peer_reflexive = match looked_up {
+            Err(_elapsed) => {
+                lookup_timeouts += 1;
+                continue;
+            }
+            Ok(Err(e)) => return Err(e),
+            Ok(Ok(None)) => return Err("peer not registered with coordinator".into()),
+            Ok(Ok(Some(addr))) => addr,
+        };
+        if let Err(e) = client.send_punch_to(peer_reflexive).await {
+            return Err(format!("punch send: {e}"));
+        }
+        let punched = tokio::time::timeout(PUNCH_STEP_TIMEOUT, async {
+            loop {
+                match client.recv_event().await {
+                    Ok(ClientEvent::Punch { src, .. }) if src == peer_reflexive => return Ok(()),
+                    Ok(ClientEvent::PunchSync {
+                        peer_reflexive: sync_to,
+                        ..
+                    }) => {
+                        let _ = client.send_punch_to(sync_to).await;
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Err(format!("punch recv: {e}")),
+                }
+            }
+        })
+        .await;
+        match punched {
+            Ok(Ok(())) => return Ok(Resolution::Punched(peer_reflexive)),
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => continue, // this try's punch window closed — re-Lookup and retry.
+        }
+    }
+    if lookup_timeouts == PUNCH_TRIES {
+        return Err("coordinator lookup timed out".to_string());
+    }
+    Err(format!("hole-punch failed after {PUNCH_TRIES} tries"))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -910,12 +1074,15 @@ where
                 .overlay
                 .identity_allowed_ips(record.validator_identity)
                 .expect("the plane's overlay is ula_v6, which derives view-free");
-            peers.insert(record.validator_identity, PeerTunnelConfig {
-                wireguard_public_key: record.wireguard_public_key,
-                endpoint,
-                allowed_ips,
-                keepalive_seconds: Some(KEEPALIVE_SECONDS),
-            });
+            peers.insert(
+                record.validator_identity,
+                PeerTunnelConfig {
+                    wireguard_public_key: record.wireguard_public_key,
+                    endpoint,
+                    allowed_ips,
+                    keepalive_seconds: Some(KEEPALIVE_SECONDS),
+                },
+            );
         }
         let local_interface_ips = self
             .overlay
@@ -1068,9 +1235,7 @@ where
                 let to_standbys = state
                     .standbys
                     .iter()
-                    .flat_map(|standby| {
-                        member_gossip.iter().map(|msg| (*standby, msg.clone()))
-                    });
+                    .flat_map(|standby| member_gossip.iter().map(|msg| (*standby, msg.clone())));
                 let standby_records = state.standby_records.values().flat_map(|record| {
                     let owner = record.record.validator_identity;
                     let msg = ReachabilityMsg::Record(record.clone());
@@ -1233,11 +1398,15 @@ where
         msg: ReachabilityMsg,
     ) -> Result<(), ReachabilityError> {
         if !verified {
-            return self.fail_peer(via, "relayed an unverifiable handshake message").await;
+            return self
+                .fail_peer(via, "relayed an unverifiable handshake message")
+                .await;
         }
         let state = self.state.as_mut().expect("deliver checked state");
         if !state.set.contains(pair.0) || !state.set.contains(pair.1) {
-            return self.fail_peer(via, "relayed a handshake for a non-member pair").await;
+            return self
+                .fail_peer(via, "relayed a handshake for a non-member pair")
+                .await;
         }
         if expires_at_view < self.view {
             return Ok(());
@@ -1248,12 +1417,15 @@ where
             Some(slot) if stage <= slot.stage => return Ok(()),
             _ => {}
         }
-        state.relayed.insert(pair, RelaySlot {
-            stage,
-            signer,
-            msg: msg.clone(),
-            expires_at_view,
-        });
+        state.relayed.insert(
+            pair,
+            RelaySlot {
+                stage,
+                signer,
+                msg: msg.clone(),
+                expires_at_view,
+            },
+        );
         let targets: Vec<ValidatorIdentity> = state
             .peers
             .iter()
@@ -1356,7 +1528,9 @@ where
         // record is a violation; a neighboring epoch's is cutover skew (the
         // standby re-signs once its manifest poll crosses the boundary).
         if signed.record.namespace != state.set.namespace {
-            return self.fail_peer(via, "standby record from another chain").await;
+            return self
+                .fail_peer(via, "standby record from another chain")
+                .await;
         }
         if signed.record.epoch != state.set.epoch
             || signed.record.valset_root != state.set.valset_root
@@ -1391,12 +1565,15 @@ where
             .identity_allowed_ips(owner)
             .expect("the plane's overlay is ula_v6, which derives view-free");
         let state = self.state.as_mut().expect("still in epoch");
-        state.prewarm_peers.insert(owner, PeerTunnelConfig {
-            wireguard_public_key: signed.record.wireguard_public_key,
-            endpoint,
-            allowed_ips,
-            keepalive_seconds: Some(KEEPALIVE_SECONDS),
-        });
+        state.prewarm_peers.insert(
+            owner,
+            PeerTunnelConfig {
+                wireguard_public_key: signed.record.wireguard_public_key,
+                endpoint,
+                allowed_ips,
+                keepalive_seconds: Some(KEEPALIVE_SECONDS),
+            },
+        );
         self.sync_prewarm().await?;
         if first_contact {
             // the standby just appeared: hand it our own gossip directly —
@@ -1411,7 +1588,8 @@ where
             self.send_msg(owner, &ReachabilityMsg::Record(own_record))
                 .await?;
             if let Some(advert) = own_advert {
-                self.send_msg(owner, &ReachabilityMsg::Advert(advert)).await?;
+                self.send_msg(owner, &ReachabilityMsg::Advert(advert))
+                    .await?;
             }
         }
         // relay the accepted record onward — members with no link to the
@@ -1568,7 +1746,9 @@ where
         let state = self.state.as_mut().expect("pre-warm inside an epoch");
         let owner = record.validator_identity;
         if record.namespace != state.set.namespace {
-            return self.fail_peer(owner, "member record from another chain").await;
+            return self
+                .fail_peer(owner, "member record from another chain")
+                .await;
         }
         if record.epoch != state.set.epoch
             || record.valset_root != state.set.valset_root
@@ -1595,12 +1775,15 @@ where
             .identity_allowed_ips(owner)
             .expect("the plane's overlay is ula_v6, which derives view-free");
         let state = self.state.as_mut().expect("still in epoch");
-        state.prewarm_peers.insert(owner, PeerTunnelConfig {
-            wireguard_public_key: record.wireguard_public_key,
-            endpoint,
-            allowed_ips,
-            keepalive_seconds: Some(KEEPALIVE_SECONDS),
-        });
+        state.prewarm_peers.insert(
+            owner,
+            PeerTunnelConfig {
+                wireguard_public_key: record.wireguard_public_key,
+                endpoint,
+                allowed_ips,
+                keepalive_seconds: Some(KEEPALIVE_SECONDS),
+            },
+        );
         self.sync_prewarm().await
     }
 
@@ -1788,11 +1971,12 @@ where
                 nonce,
             };
             let request = TunnelUpgradeRequest::sign(fields, &self.config.signer);
-            state
-                .handshakes
-                .insert(peer, PeerHandshake::AwaitingResponse {
+            state.handshakes.insert(
+                peer,
+                PeerHandshake::AwaitingResponse {
                     request: request.clone(),
-                });
+                },
+            );
             self.fan_msg(&ReachabilityMsg::Request(request)).await?;
         }
         Ok(())
@@ -1899,19 +2083,24 @@ where
     ) -> Result<(), ReachabilityError> {
         let identity = binding::identity_of(&peer);
         if identity == self.me {
-            let _ = reply.0.send(Err("refusing an invite tunnel to self".into()));
+            let _ = reply
+                .0
+                .send(Err("refusing an invite tunnel to self".into()));
             return Ok(());
         }
         let allowed_ips = self
             .overlay
             .identity_allowed_ips(identity)
             .expect("the plane's overlay is ula_v6, which derives view-free");
-        self.invite_peers.insert(identity, PeerTunnelConfig {
-            wireguard_public_key,
-            endpoint,
-            allowed_ips,
-            keepalive_seconds: Some(KEEPALIVE_SECONDS),
-        });
+        self.invite_peers.insert(
+            identity,
+            PeerTunnelConfig {
+                wireguard_public_key,
+                endpoint,
+                allowed_ips,
+                keepalive_seconds: Some(KEEPALIVE_SECONDS),
+            },
+        );
 
         let mut merged = self.base_peers.clone().unwrap_or_default();
         if let Some(state) = &self.state {
@@ -2058,7 +2247,9 @@ where
             return self.fail_peer(via, "request signature invalid").await;
         }
         if !state.set.contains(sender) {
-            return self.fail_peer(via, "request from a non-member initiator").await;
+            return self
+                .fail_peer(via, "request from a non-member initiator")
+                .await;
         }
         if state.failed.contains(&sender) {
             // the pair already failed this epoch — its nonces are burnt in
@@ -2069,23 +2260,24 @@ where
             return self.fail_peer(sender, "request from the wrong side").await;
         }
         match state.handshakes.get(&sender) {
-            Some(PeerHandshake::AwaitingAck { request: stored, response })
-                if stored.hash() == request.hash() =>
-            {
+            Some(PeerHandshake::AwaitingAck {
+                request: stored,
+                response,
+            }) if stored.hash() == request.hash() => {
                 let response = response.clone();
                 return self.fan_msg(&ReachabilityMsg::Response(response)).await;
             }
             // stale in-flight duplicate: our ack receipt proves the
             // initiator completed long ago — nothing left to answer.
-            Some(PeerHandshake::Done { request_hash, .. })
-                if *request_hash == request.hash() =>
-            {
+            Some(PeerHandshake::Done { request_hash, .. }) if *request_hash == request.hash() => {
                 return Ok(());
             }
             // a DIFFERENT request over an in-flight/completed handshake is a
             // re-sign the protocol never does — loud, like every mismatch.
             Some(_) => {
-                return self.fail_peer(sender, "conflicting handshake request").await;
+                return self
+                    .fail_peer(sender, "conflicting handshake request")
+                    .await;
             }
             None => {}
         }
@@ -2117,12 +2309,13 @@ where
             nonce,
         };
         let response = TunnelUpgradeResponse::sign(fields, &self.config.signer);
-        state
-            .handshakes
-            .insert(sender, PeerHandshake::AwaitingAck {
+        state.handshakes.insert(
+            sender,
+            PeerHandshake::AwaitingAck {
                 request,
                 response: response.clone(),
-            });
+            },
+        );
         self.fan_msg(&ReachabilityMsg::Response(response)).await
     }
 
@@ -2144,7 +2337,9 @@ where
             return self.fail_peer(via, "response signature invalid").await;
         }
         if !state.set.contains(sender) {
-            return self.fail_peer(via, "response from a non-member responder").await;
+            return self
+                .fail_peer(via, "response from a non-member responder")
+                .await;
         }
         if state.failed.contains(&sender) {
             // failed pairs stay failed for the epoch — see `on_request`.
@@ -2152,18 +2347,24 @@ where
         }
         let request = match state.handshakes.get(&sender) {
             Some(PeerHandshake::AwaitingResponse { request }) => request.clone(),
-            Some(PeerHandshake::Done { response_hash, ack: Some(ack), .. })
-                if *response_hash == response.hash() =>
-            {
+            Some(PeerHandshake::Done {
+                response_hash,
+                ack: Some(ack),
+                ..
+            }) if *response_hash == response.hash() => {
                 let ack = ack.clone();
                 return self.fan_msg(&ReachabilityMsg::Ack(ack)).await;
             }
             _ => {
-                return self.fail_peer(sender, "unsolicited handshake response").await;
+                return self
+                    .fail_peer(sender, "unsolicited handshake response")
+                    .await;
             }
         };
         if response.fields.request_hash != request.hash() {
-            return self.fail_peer(sender, "response does not match our request").await;
+            return self
+                .fail_peer(sender, "response does not match our request")
+                .await;
         }
         let view = state.view_state.as_ref().expect("mesh verified").clone();
         let fields = TunnelUpgradeAckFields {
@@ -2197,11 +2398,14 @@ where
         // and let the peer's own validation refuse it too.
         match plan {
             Ok(plan) => {
-                state.handshakes.insert(sender, PeerHandshake::Done {
-                    request_hash: request.hash(),
-                    response_hash: response.hash(),
-                    ack: Some(ack.clone()),
-                });
+                state.handshakes.insert(
+                    sender,
+                    PeerHandshake::Done {
+                        request_hash: request.hash(),
+                        response_hash: response.hash(),
+                        ack: Some(ack.clone()),
+                    },
+                );
                 state.plans.insert(sender, plan);
                 self.fan_msg(&ReachabilityMsg::Ack(ack)).await?;
                 self.advance().await
@@ -2242,9 +2446,12 @@ where
             Some(PeerHandshake::AwaitingAck { request, response }) => {
                 (request.clone(), response.clone())
             }
-            Some(PeerHandshake::Done { request_hash, response_hash, .. })
-                if *request_hash == ack.fields.request_hash
-                    && *response_hash == ack.fields.response_hash =>
+            Some(PeerHandshake::Done {
+                request_hash,
+                response_hash,
+                ..
+            }) if *request_hash == ack.fields.request_hash
+                && *response_hash == ack.fields.response_hash =>
             {
                 return Ok(());
             }
@@ -2252,10 +2459,11 @@ where
                 return self.fail_peer(sender, "unsolicited handshake ack").await;
             }
         };
-        if ack.fields.request_hash != request.hash()
-            || ack.fields.response_hash != response.hash()
+        if ack.fields.request_hash != request.hash() || ack.fields.response_hash != response.hash()
         {
-            return self.fail_peer(sender, "ack does not match the handshake").await;
+            return self
+                .fail_peer(sender, "ack does not match the handshake")
+                .await;
         }
         let view = state.view_state.as_ref().expect("mesh verified").clone();
         let plan = wireguard_upgrade::validate_upgrade_as(
@@ -2271,11 +2479,14 @@ where
         );
         match plan {
             Ok(plan) => {
-                state.handshakes.insert(sender, PeerHandshake::Done {
-                    request_hash: request.hash(),
-                    response_hash: response.hash(),
-                    ack: None,
-                });
+                state.handshakes.insert(
+                    sender,
+                    PeerHandshake::Done {
+                        request_hash: request.hash(),
+                        response_hash: response.hash(),
+                        ack: None,
+                    },
+                );
                 state.plans.insert(sender, plan);
                 self.advance().await
             }
@@ -2323,5 +2534,174 @@ mod tests {
         // self-pairs never occur (a node has no tunnel to itself), and the
         // rule is strict either way.
         assert!(!initiates(low, low));
+    }
+
+    mod nat_pump {
+        use super::super::*;
+        use tokio::net::UdpSocket;
+
+        #[tokio::test]
+        async fn passive_resolver_punches_back_while_idle() {
+            // A real coordinator, open policy.
+            let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let coord_addr = coord_sock.local_addr().unwrap();
+            tokio::spawn(nat_traversal::run_coordinator(
+                coord_sock,
+                nat_traversal::AuthPolicy::Open { require_pop: false },
+            ));
+
+            let a_key = binding::node_key(ValidatorIdentity([0xaa; 32]));
+            let b_key = binding::node_key(ValidatorIdentity([0xbb; 32]));
+            let mut a = NatResolver::bind(a_key, vec![coord_addr], None)
+                .await
+                .unwrap();
+            let _b = NatResolver::bind(b_key, vec![coord_addr], None)
+                .await
+                .unwrap();
+
+            // B NEVER calls resolve. Under the pre-pump code its socket sat
+            // deaf outside resolve() windows: the coordinator's PunchSync
+            // fan-out was eaten unanswered, B never punched, and A's resolve
+            // failed with "hole-punch failed after 3 tries". The pump answers
+            // from B's side while B is idle.
+            let advertised: SocketAddr = "203.0.113.9:1".parse().unwrap();
+            let resolution = a
+                .resolve(b_key, advertised)
+                .await
+                .expect("punch completes against an idle peer");
+            match resolution {
+                Resolution::Punched(_) => {}
+                other => panic!("expected a punched path, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn keepalive_readvertises_hold_the_registration_past_the_ttl() {
+            // A coordinator whose registrations expire after 1 second.
+            let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let coord_addr = coord_sock.local_addr().unwrap();
+            let coordinator = nat_traversal::Coordinator::with_policy_and_ttl(
+                nat_traversal::AuthPolicy::Open { require_pop: false },
+                1,
+            );
+            tokio::spawn(nat_traversal::run_coordinator_with(coord_sock, coordinator));
+
+            // A keeps itself alive on a 300ms keepalive; X registers once and
+            // goes silent.
+            let a_key = binding::node_key(ValidatorIdentity([0x0a; 32]));
+            let x_key = binding::node_key(ValidatorIdentity([0x0f; 32]));
+            let _a = NatResolver::bind_with_keepalive(
+                a_key,
+                vec![coord_addr],
+                None,
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap();
+            let x = nat_traversal::NatClient::bind(x_key, coord_addr)
+                .await
+                .unwrap();
+            x.register().await.unwrap();
+
+            // Whole seconds: `now_secs()` truncates, so a 1.x s sleep can look
+            // like Δ=1 ≤ ttl. 2.5 s guarantees an integer-second delta ≥ 2.
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+            // A probe client resolves A (kept alive) but not X (expired).
+            let probe = nat_traversal::NatClient::bind(
+                binding::node_key(ValidatorIdentity([0x01; 32])),
+                coord_addr,
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), probe.lookup(a_key))
+                .await
+                .expect("bounded")
+                .expect("keepalives held A's registration past the TTL");
+            let miss = tokio::time::timeout(Duration::from_secs(1), probe.lookup(x_key)).await;
+            assert!(
+                miss.is_err() || miss.unwrap().is_err(),
+                "X registered once, sent no keepalives, and must have expired"
+            );
+        }
+
+        #[tokio::test]
+        async fn keepalives_survive_a_busy_resolve() {
+            // The keepalive lives on its own send-only task, so a resolve()
+            // that runs its full budget cannot starve it past the TTL. Rig: a
+            // 1s-TTL coordinator; X is registered (its test task readvertises
+            // every 300ms) but SILENT — it never punches — so A's resolve
+            // grinds through all its tries (~4s of continuous pump busyness,
+            // several times the TTL). Under an in-pump keepalive tick, A's
+            // registration would expire mid-resolve; with the split task it
+            // must survive.
+            let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let coord_addr = coord_sock.local_addr().unwrap();
+            let coordinator = nat_traversal::Coordinator::with_policy_and_ttl(
+                nat_traversal::AuthPolicy::Open { require_pop: false },
+                1,
+            );
+            tokio::spawn(nat_traversal::run_coordinator_with(coord_sock, coordinator));
+
+            let a_key = binding::node_key(ValidatorIdentity([0x1a; 32]));
+            let x_key = binding::node_key(ValidatorIdentity([0x1f; 32]));
+            let mut a = NatResolver::bind_with_keepalive(
+                a_key,
+                vec![coord_addr],
+                None,
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap();
+            // X: a raw client (answers nothing) kept registered by a test task.
+            let x = std::sync::Arc::new(
+                nat_traversal::NatClient::bind(x_key, coord_addr)
+                    .await
+                    .unwrap(),
+            );
+            x.register().await.unwrap();
+            let x_keepalive = x.clone();
+            tokio::spawn(async move {
+                let mut nonce = 0u64;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    nonce += 1;
+                    let _ = x_keepalive.readvertise(nonce).await;
+                }
+            });
+
+            // The busy resolve: X resolves but never punches back, so this
+            // fails only after every try's punch window closes.
+            let advertised: SocketAddr = "203.0.113.9:1".parse().unwrap();
+            let err = a
+                .resolve(x_key, advertised)
+                .await
+                .expect_err("a silent peer cannot be punched");
+            assert!(err.contains("hole-punch failed"), "unexpected error: {err}");
+
+            // A's own registration survived the busy window.
+            let probe = nat_traversal::NatClient::bind(
+                binding::node_key(ValidatorIdentity([0x11; 32])),
+                coord_addr,
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), probe.lookup(a_key))
+                .await
+                .expect("bounded")
+                .expect("keepalives must survive a busy resolve");
+        }
+
+        #[tokio::test]
+        async fn no_coordinators_still_passes_through_to_advertised() {
+            let key = binding::node_key(ValidatorIdentity([0x33; 32]));
+            let mut r = NatResolver::bind(key, Vec::new(), None).await.unwrap();
+            assert_eq!(r.reflexive(), None);
+            let advertised: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+            assert!(matches!(
+                r.resolve(key, advertised).await,
+                Ok(Resolution::Advertised)
+            ));
+        }
     }
 }

@@ -58,10 +58,11 @@ impl WireGuardKeypair {
                 path: path.display().to_string(),
                 source: e,
             })?;
-            file.write_all(encoded.as_bytes()).map_err(|e| KeyError::Io {
-                path: path.display().to_string(),
-                source: e,
-            })?;
+            file.write_all(encoded.as_bytes())
+                .map_err(|e| KeyError::Io {
+                    path: path.display().to_string(),
+                    source: e,
+                })?;
         }
         Ok((Self { secret }, true))
     }
