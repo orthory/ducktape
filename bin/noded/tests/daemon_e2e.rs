@@ -1759,3 +1759,75 @@ fn git_push_larger_than_post_buffer_uses_the_probe_path() {
         "forge HEAD must equal the pushed commit after a probed push"
     );
 }
+
+// ============================================================================
+// the FULL-STACK proof of the client transport: the `duckfs-client` checkout/
+// commit engine driven through `HttpNode` against a real spawned daemon —
+// checkout an empty prefix, write a small file AND a >1 MiB file (the stage
+// path), commit, checkout again byte-identically, then force a same-path
+// conflict and assert it surfaces a structured `ConflictReport` (never a silent
+// merge). the hand-rolled `HttpNode` contract lives in the crate's
+// `http_contract.rs`; this is the wire against the actual noded routes.
+// ============================================================================
+
+#[test]
+fn duckfs_engine_round_trips_and_reports_conflict_through_http_node() {
+    use duckfs_client::checkout::{CheckoutOptions, checkout_with};
+    use duckfs_client::commit::{CommitError, commit};
+    use duckfs_client::http::HttpNode;
+
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let base_url = format!("http://127.0.0.1:{}", daemon.port);
+    let node = HttpNode::new(base_url.clone());
+    let opts = CheckoutOptions {
+        node_url: base_url.clone(),
+        ..Default::default()
+    };
+
+    // checkout the empty prefix: base is None (nothing committed yet).
+    let dir_a = tempfile::TempDir::new().expect("checkout a");
+    let idx = checkout_with(&node, dir_a.path(), "/shared/e2e", None, &opts)
+        .expect("checkout empty prefix");
+    assert!(idx.base_snapshot.is_none(), "empty checkout has no base");
+
+    // a small (inline) file and a >1 MiB file — the latter forces the stage
+    // path through real consensus (POST /v1/files/stage per chunk).
+    std::fs::write(dir_a.path().join("small"), b"hello duckfs engine").expect("write small");
+    let big: Vec<u8> = (0..(2 * 1024 * 1024 + 7)).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir_a.path().join("big"), &big).expect("write big");
+
+    let summary = commit(&node, dir_a.path(), "seed via engine").expect("commit seed");
+    assert!(!summary.rebased, "a first commit never rebases");
+
+    // a fresh checkout elsewhere reads back byte-identical (the big file is
+    // reassembled from staged chunks and verified against its object id).
+    let dir_b = tempfile::TempDir::new().expect("checkout b");
+    checkout_with(&node, dir_b.path(), "/shared/e2e", None, &opts).expect("checkout again");
+    assert_eq!(
+        std::fs::read(dir_b.path().join("small")).unwrap(),
+        b"hello duckfs engine",
+        "small file round-trips"
+    );
+    assert_eq!(
+        std::fs::read(dir_b.path().join("big")).unwrap(),
+        big,
+        ">1 MiB file round-trips byte-identical"
+    );
+
+    // both checkouts edit the SAME path off the same base: A lands, B must
+    // surface a ConflictReport naming the clashing path — no silent merge.
+    std::fs::write(dir_a.path().join("small"), b"edit from A").expect("edit a");
+    std::fs::write(dir_b.path().join("small"), b"edit from B").expect("edit b");
+    commit(&node, dir_a.path(), "A wins").expect("A commits clean");
+    let err = commit(&node, dir_b.path(), "B loses").expect_err("B must conflict");
+    match err {
+        CommitError::Conflict(report) => {
+            assert!(
+                report.clashing.iter().any(|p| p == "/shared/e2e/small"),
+                "the conflicting path is named in the report: {report:?}"
+            );
+        }
+        other => panic!("expected a structured conflict, got {other:?}"),
+    }
+}
