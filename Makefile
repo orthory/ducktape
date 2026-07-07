@@ -54,8 +54,12 @@ app: app/node_modules
 	cd app && $(BUN) run tauri build --no-bundle
 endif
 
-app/node_modules:
+# re-run bun install whenever the manifest or lockfile changes, not just when
+# node_modules is absent; the touch keeps the dir newer than its prerequisites
+# (bun does not reliably update the dir mtime when nothing needs fetching).
+app/node_modules: app/package.json app/bun.lock
 	cd app && $(BUN) install
+	touch app/node_modules
 
 install: install-node install-app
 
