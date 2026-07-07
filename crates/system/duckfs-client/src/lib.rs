@@ -11,6 +11,8 @@
 pub mod api;
 pub mod checkout;
 pub mod chunk;
+pub mod commit;
 pub mod index;
+pub mod plan;
 pub mod scan;
 pub mod status;
