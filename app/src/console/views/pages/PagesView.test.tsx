@@ -414,6 +414,38 @@ describe("floating comment card", () => {
   });
 });
 
+describe("subpages", () => {
+  const withChild = {
+    pages: [
+      { id: "p1", title: "Launch plan", parent: null },
+      { id: "p2", title: "Retro", parent: null },
+      { id: "p3", title: "Child", parent: "p1" },
+    ],
+  };
+
+  it("lists child pages in a Subpages section and opens them", () => {
+    const { spies } = renderPagesView(withChild);
+    fireEvent.click(screen.getByRole("button", { name: "Open subpage Child" }));
+    expect(spies.openPage).toHaveBeenCalledWith("p3");
+  });
+
+  it("renders no Subpages section when the page has no children", () => {
+    renderPagesView();
+    expect(screen.queryByText("Subpages")).toBeNull();
+  });
+
+  it("creates a subpage from /page instead of converting the block", () => {
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1");
+    fireEvent.focus(area);
+    fireEvent.change(area, { target: { value: "/page" } });
+    fireEvent.mouseDown(screen.getByRole("option", { name: /new subpage/i }));
+    expect(spies.createChildPage).toHaveBeenCalledWith("p1");
+    // the block itself must NOT be converted to a "page" kind.
+    if (spies.setPageBlockKind) expect(spies.setPageBlockKind).not.toHaveBeenCalled();
+  });
+});
+
 describe("endless canvas", () => {
   const appended = expect.objectContaining({
     parent: "p1",

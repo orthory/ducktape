@@ -167,6 +167,7 @@ export interface RowHandlers {
   focusRelative(row: Row, delta: -1 | 1): void;
   registerInput(blockId: string, el: HTMLTextAreaElement | null): void;
   openComments(blockId: string, anchor: { x: number; y: number }): void;
+  createSubpage(): void;
 }
 
 export function BlockRow({
@@ -242,6 +243,11 @@ export function BlockRow({
   const pickSlash = (kind: BlockKind) => {
     setDraft("");
     setSlashDismissed(false);
+    // "page" is not a conversion — it spawns a child page of the open one.
+    if (kind === "page") {
+      handlers.createSubpage();
+      return;
+    }
     if (kind !== block.kind) handlers.setKind(block.id, kind);
   };
 

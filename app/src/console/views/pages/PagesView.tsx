@@ -30,6 +30,7 @@ import type { CommentAnchor } from "./CommentCard";
 import { DocTabs } from "./DocTabs";
 import { PageRail } from "./PageRail";
 import { CommentsPanel } from "./CommentsPanel";
+import { Subpages } from "./Subpages";
 
 export { EDIT_BOUNDARY_MS };
 
@@ -261,6 +262,9 @@ export function PagesView() {
       else inputs.current.delete(blockId);
     },
     openComments: openBlockComments,
+    // the action creates the untitled child and opens its tab (cursor lands
+    // in the title via the fresh-page focus effect above).
+    createSubpage: () => actions.createChildPage(state.activePage),
   };
 
   const commitTitle = () => {
@@ -470,6 +474,12 @@ export function PagesView() {
                       color: color.dark,
                       font: `650 30px/1.2 ${font.sans}`,
                     }}
+                  />
+
+                  <Subpages
+                    pages={state.pages}
+                    activePage={root.id}
+                    onOpen={actions.openPage}
                   />
 
                   {rows.map((row, index) => (

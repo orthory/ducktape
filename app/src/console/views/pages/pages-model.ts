@@ -101,7 +101,7 @@ export function shortcutFor(text: string): Shortcut | null {
   return null;
 }
 
-/** The slash-menu catalogue: every insertable kind (Page is CreatePage-only). */
+/** The slash-menu catalogue: every insertable kind, plus Page. */
 export const SLASH_KINDS: { kind: BlockKind; label: string; hint: string }[] = [
   { kind: "paragraph", label: "Text", hint: "plain paragraph" },
   { kind: "heading1", label: "Heading 1", hint: "# " },
@@ -115,6 +115,9 @@ export const SLASH_KINDS: { kind: BlockKind; label: string; hint: string }[] = [
   { kind: "code", label: "Code", hint: "``` " },
   { kind: "callout", label: "Callout", hint: "highlighted box" },
   { kind: "divider", label: "Divider", hint: "--- " },
+  // not a conversion: picking it creates a child page (see BlockRow.pickSlash).
+  // Last on purpose — text/heading muscle memory owns the top of the menu.
+  { kind: "page", label: "Page", hint: "new subpage" },
 ];
 
 /** Filter the slash menu by the text typed after "/". */
