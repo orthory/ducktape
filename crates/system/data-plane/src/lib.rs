@@ -46,7 +46,10 @@ pub use plane::{
     AdmissionPolicy, DataPlane, DatagramFlow, OpenError, PlaneConfig, RegisterError, SendError,
     StatsSnapshot, StreamService,
 };
-pub use real::{AddressBook, OverlaySockets};
+pub use real::{
+    AddressBook, BoxFuture, DatagramSocket, Duplex, OsSocketFactory, OverlaySockets, PlaneStream,
+    SocketFactory, StreamListener,
+};
 pub use transport::{DataPlaneTransport, PeerId, TransportError};
 pub use wire::{Hello, MAX_DATAGRAM, MAX_DATAGRAM_PAYLOAD};
 

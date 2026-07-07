@@ -68,6 +68,9 @@ wireguard-effect = { workspace = true }
 # the voice hub's transport seam: huddle audio rides data-plane datagrams over
 # the dedicated CHANNEL_VOICE mesh lane (src/voice.rs owns the mesh arm).
 data-plane = { workspace = true }
+# the overlay routing seam (ADR 2026-07-07-userspace-overlay-net): the mesh's
+# runtime context is wrapped so dial/bind route overlay ULAs by address.
+overlay-net = { workspace = true }
 futures = "0.3"
 serde_json = { workspace = true }
 # compact, url-safe text encoding for the invite blob (replaces hex-of-toml).

@@ -1,0 +1,13 @@
+[package]
+name = "overlay-net"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+commonware-runtime = { workspace = true }
+# the wrapper context implements commonware-runtime's `Clock`, whose
+# supertraits live in governor; and its rng bounds, which live in rand_core.
+# both pinned to the exact versions commonware-runtime itself depends on —
+# a different semver-major here would be a different trait.
+governor = { workspace = true }
+rand_core = { workspace = true }

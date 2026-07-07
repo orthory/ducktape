@@ -149,8 +149,19 @@ pub fn spawn_bring_up(
         let own = book.own_addr(&me);
         let datagram_bind = SocketAddr::new(own, Service::StateSync.overlay_datagram_port());
         let stream_bind = SocketAddr::new(own, Service::StateSync.overlay_stream_port());
+        // the socket seam (overlay-net ADR): the OS factory is TUN mode —
+        // the kernel routes the /128 through the wireguard interface. the
+        // userspace backend swaps this factory, nothing else here.
+        let factory = Arc::new(data_plane::OsSocketFactory);
         let sockets = loop {
-            match OverlaySockets::bind(datagram_bind, stream_bind, book.clone()).await {
+            match OverlaySockets::bind_with(
+                factory.clone(),
+                datagram_bind,
+                stream_bind,
+                book.clone(),
+            )
+            .await
+            {
                 Ok(sockets) => break sockets,
                 // the interface (or our /128) is not up yet — retry quietly.
                 Err(_) => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
