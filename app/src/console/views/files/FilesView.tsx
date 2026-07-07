@@ -232,7 +232,10 @@ function EntryRow({
       onDragStart={(event) => {
         if (!isDir) onDragStart(event);
       }}
-      onMouseEnter={() => setHover(true)}
+      onMouseEnter={() => {
+        setHover(true);
+        if (!isDir) onPrepareDownload();
+      }}
       onMouseLeave={() => setHover(false)}
       style={{
         all: "unset",
@@ -744,6 +747,7 @@ export function FilesView() {
   const { state, transport } = useDucktape();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragDownloadUrls = useRef<Map<string, string>>(new Map());
+  const dragDownloadFiles = useRef<Map<string, File>>(new Map());
   const dragDownloadRequests = useRef<Set<string>>(new Set());
 
   const [columns, setColumns] = useState<DirectoryColumn[]>([makeDirectoryColumn(DEFAULT_DIR)]);
@@ -773,6 +777,7 @@ export function FilesView() {
     () => () => {
       dragDownloadUrls.current.forEach((url) => URL.revokeObjectURL?.(url));
       dragDownloadUrls.current.clear();
+      dragDownloadFiles.current.clear();
       dragDownloadRequests.current.clear();
     },
     [],
@@ -781,6 +786,7 @@ export function FilesView() {
   useEffect(() => {
     dragDownloadUrls.current.forEach((url) => URL.revokeObjectURL?.(url));
     dragDownloadUrls.current.clear();
+    dragDownloadFiles.current.clear();
     dragDownloadRequests.current.clear();
   }, [snapshot, transport]);
 
@@ -979,9 +985,12 @@ export function FilesView() {
     readAll(transport, { path: entry.path, snapshot: snapshot ?? undefined })
       .then((bytes) => {
         const mime = entry.meta.mime || "application/octet-stream";
-        const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+        const name = basename(entry.path);
+        const file = new File([bytes], name, { type: mime });
+        const url = URL.createObjectURL(file);
         const previous = dragDownloadUrls.current.get(key);
         if (previous) URL.revokeObjectURL?.(previous);
+        dragDownloadFiles.current.set(key, file);
         dragDownloadUrls.current.set(key, url);
       })
       .catch((err) => setActionError(errMsg(err)))
@@ -992,8 +1001,13 @@ export function FilesView() {
     if (entry.kind !== "file") return;
     const name = basename(entry.path);
     const mime = entry.meta.mime || "application/octet-stream";
-    const downloadUrl = dragDownloadUrls.current.get(dragDownloadKey(entry));
+    const key = dragDownloadKey(entry);
+    const downloadUrl = dragDownloadUrls.current.get(key);
+    const downloadFile = dragDownloadFiles.current.get(key);
     event.dataTransfer.effectAllowed = "copy";
+    if (downloadFile && event.dataTransfer.items?.add) {
+      event.dataTransfer.items.add(downloadFile);
+    }
     event.dataTransfer.setData("application/x-ducktape-file-path", entry.path);
     event.dataTransfer.setData("text/plain", entry.path);
     if (downloadUrl) {
