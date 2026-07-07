@@ -69,6 +69,8 @@ mod config;
 mod lobby;
 mod oracle_pool;
 mod relay;
+mod resident_announce;
+mod resident_dispatch;
 mod statesync_plane;
 mod userkey;
 mod voice;
@@ -5827,6 +5829,33 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     }
                 }
             });
+            // ---- the RESIDENT-tier pumps -----------------------------------
+            //
+            // the state-driven twins of the validator loop's announce pump and
+            // reactor seam, adapted to a node that installs boundaries instead
+            // of executing blocks (see resident_announce.rs /
+            // resident_dispatch.rs). discovery here mirrors the validator
+            // boot: the discovered tag set is BOTH what the worker can run and
+            // what this node announces, so a resident announce can never claim
+            // more than the host provides; a broken operator spec is a boot
+            // error, not a silently dropped executor. execution is OFF-LOOP —
+            // the same DispatchPool wiring the validator runs: the gate is
+            // inline, the provider CLI runs on spawned children, completed
+            // results come back over `resident_oracle_results` and are
+            // drained by the park loop's pump pass, so a minutes-long run
+            // never stalls the serve window, boundary follow, or promotion
+            // detection.
+            let resident_provider_set = capability_host::discover()
+                .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
+            let resident_capabilities = resident_provider_set.capabilities();
+            let mut resident_announcer = resident_announce::ResidentAnnouncer::new(
+                me_bytes.clone(),
+                resident_capabilities,
+            );
+            let (resident_pool, mut resident_oracle_results) =
+                oracle_pool::build(&context, resident_provider_set, me_bytes.clone());
+            let mut resident_dispatch =
+                resident_dispatch::ResidentDispatch::new(resident_pool, me_bytes.clone());
             let (boundary, host, floor) = loop {
                 attempt += 1;
                 if attempt > 900 && !resident_standing {
@@ -6055,6 +6084,41 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     continue; // junk or a stray Submit at a resident — drop.
                                 };
                                 let Some((hold, _)) = pending_relayed.remove(&frame_id) else {
+                                    // not a held caller reply: maybe one of the
+                                    // resident-tier pumps' own frames.
+                                    let applied =
+                                        matches!(outcome, relay::RelayOutcome::Applied { .. });
+                                    if let Some(ok) =
+                                        resident_announcer.on_reply(&frame_id, applied)
+                                    {
+                                        if ok {
+                                            println!(
+                                                "[node {label}] resident: announced \
+                                                 capabilities {:?}",
+                                                resident_announcer.capabilities()
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "[node {label}] resident: capability announce \
+                                                 did not apply ({outcome:?}) — will retry"
+                                            );
+                                        }
+                                    } else if let Some((saga_id, attempt)) =
+                                        resident_dispatch.on_reply(&frame_id, applied)
+                                    {
+                                        if applied {
+                                            println!(
+                                                "[node {label}] resident: dispatch result for \
+                                                 saga {saga_id} attempt {attempt} applied"
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "[node {label}] resident: dispatch result for \
+                                                 saga {saga_id} attempt {attempt} did not apply \
+                                                 ({outcome:?}) — will retry while leased"
+                                            );
+                                        }
+                                    }
                                     continue;
                                 };
                                 match (hold, outcome) {
@@ -6305,6 +6369,88 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     "[node {label}] resident pre-sync at boundary {} failed: {e}",
                                     m.height
                                 ),
+                            }
+                        }
+                        // ---- the resident-tier pumps, one pass per poll ----
+                        //
+                        // both read the served boundary (committed state) and
+                        // write through the relay lane — the resident's only
+                        // write path. state-driven and idempotent like their
+                        // validator-loop twins: quiet once committed state
+                        // matches, deadline-based retry over the lossy lane.
+                        if let Some((_, host)) = &serving {
+                            let now = std::time::Instant::now();
+                            // CAPABILITY ANNOUNCE (resident tier): mirrors the
+                            // validator pump, including the config gate — an
+                            // `announce_capabilities = false` resident stays an
+                            // accept-lane-only provider and never enters a
+                            // tag's rendezvous pool.
+                            if announce_capabilities
+                                && let Some(msg) =
+                                    resident_announcer.maybe_announce(host, now).await
+                            {
+                                match relay_submit_frame(
+                                    &signer,
+                                    &relay_seq_file,
+                                    &mut relay_seq,
+                                    &mut relay_round,
+                                    &announce_targets,
+                                    &mut relay_tx,
+                                    msg.target,
+                                    msg.payload,
+                                ) {
+                                    Ok(id) => {
+                                        resident_announcer.sent(id, now);
+                                        println!(
+                                            "[node {label}] resident: capability announce \
+                                             relayed ({:?})",
+                                            resident_announcer.capabilities()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        resident_announcer.send_failed();
+                                        eprintln!(
+                                            "[node {label}] resident: capability announce \
+                                             relay failed: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            // DISPATCH EXECUTION (resident tier): serve the
+                            // saga attempts leased to this key, so an announced
+                            // resident never stalls an assignment. completed
+                            // off-loop runs are drained FIRST (they become due
+                            // relay sends in this same pass); the tick itself
+                            // only gates and spawns — it never awaits a
+                            // provider.
+                            while let Ok(msg) = resident_oracle_results.try_recv() {
+                                resident_dispatch.completed(msg);
+                            }
+                            for (key, msg) in resident_dispatch.tick(host, now).await {
+                                match relay_submit_frame(
+                                    &signer,
+                                    &relay_seq_file,
+                                    &mut relay_seq,
+                                    &mut relay_round,
+                                    &announce_targets,
+                                    &mut relay_tx,
+                                    msg.target,
+                                    msg.payload,
+                                ) {
+                                    Ok(id) => {
+                                        resident_dispatch.sent(&key, id, now);
+                                        println!(
+                                            "[node {label}] resident: dispatch result for \
+                                             saga {} attempt {} relayed",
+                                            key.0, key.1
+                                        );
+                                    }
+                                    Err(e) => eprintln!(
+                                        "[node {label}] resident: dispatch result relay \
+                                         failed for saga {} attempt {}: {e}",
+                                        key.0, key.1
+                                    ),
+                                }
                             }
                         }
                         continue;

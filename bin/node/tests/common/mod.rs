@@ -111,6 +111,9 @@ pub struct NetworkShapeCluster {
     pub http_ports: Vec<u16>,
     pub founder_dir: PathBuf,
     pub friend_dir: PathBuf,
+    /// extra process env per node (set before `spawn`) — the same knob
+    /// [`Cluster::env`] exposes, e.g. capability spec-dir overrides.
+    pub env: Vec<Vec<(String, String)>>,
     nodes: Vec<Option<NodeProc>>,
     dir: tempfile::TempDir,
 }
@@ -127,6 +130,7 @@ impl NetworkShapeCluster {
             http_ports: http_ports.to_vec(),
             founder_dir: dir.path().join("founder"),
             friend_dir: dir.path().join("friend"),
+            env: vec![Vec::new(), Vec::new()],
             nodes: vec![None, None],
             dir,
         }
@@ -252,6 +256,7 @@ impl NetworkShapeCluster {
         let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
             .arg("--config")
             .arg(&cfg)
+            .envs(self.env[idx].iter().map(|(k, v)| (k.clone(), v.clone())))
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
