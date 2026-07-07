@@ -77,6 +77,7 @@ install-app: app
 	mkdir -p "$(BIN_DEST)"
 	install -m 755 target/release/ducktape-desktop "$(BIN_DEST)/ducktape"
 	@echo "installed $(BIN_DEST)/ducktape"
+	bash ops/install-desktop-entry.sh "$(BIN_DEST)/ducktape"
 endif
 
 ## the full LOCAL verification gate (no hosted CI by design — run this before
