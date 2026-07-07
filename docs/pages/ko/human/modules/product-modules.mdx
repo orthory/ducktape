@@ -158,9 +158,24 @@ cluster에서는 module의 reason string이 consensus finalization을 넘어 살
 지금은 overlap을 평범한 rejection으로 보고한다). workspace RPC(`POST /v1/fs/workspaces`,
 `.../commit`, `DELETE`)는 jobs/sandbox seam이다: daemon이 자기 root 아래에서
 checkout을 관리하며 같은 engine을 actor lane으로 구동하므로 self-dial 없이 job이
-disk의 file을 편집하고 commit할 수 있다. FUSE `mount`(working copy를 live kernel
-filesystem으로)는 Phase 4로 예약되어 있고, sync `NodeApi` trait이 그 colocated
-object-store fast path가 구현할 seam이다.
+disk의 file을 편집하고 commit할 수 있다. `ducktape-fs mount <prefix> <dir>`는
+duckfs subtree를 실제 kernel filesystem으로 내세운다 — `fuse` cargo feature 뒤에
+있고(unprivileged, `fusermount3` 경유 — default build은 libfuse가 필요 없고 verb를
+"`--features fuse`로 rebuild하라"는 분명한 error로 남긴다). 기본은 read-only로,
+sync `NodeApi` 위에서 한 번 resolve해 mount 수명 동안 PIN한 snapshot을 serve한다 —
+stable하고 reproducible한 view이며, immutable한 content라 강하게 cache한다(lazy
+`ls`/`stat` inode table + bounded read-through block cache). read는 움직이는 head를
+절대 보지 않으므로, 새 commit을 보려면 remount한다. `--rw`는 REAL working copy를
+내세운다 — 숨겨진 `<dir>.duckfs-backing` 디렉터리로 checkout해 passthrough로 serve
+한다 — 그리고 write는 commit할 때만 cluster truth가 된다: 기본은 명시적(unmount
+시 commit 방법을 출력하고, 아무것도 자동으로 land하지 않는다), 또는 `--auto-commit N`
+으로 dirty할 때 N초마다 commit한다(겹치지 않는 upstream 작업은 auto-rebase; 진짜
+conflict는 크게 log하고 mount는 계속 serve한다 — silent merge 없음, write drop
+없음). SIGINT/SIGTERM은 깔끔하게 unmount한다. 문서화된 non-goal: cross-node lock/mmap
+coherence 없음; uid/gid/mode는 synthetic(단 size, mtime, exec bit은 `--rw`에서
+passthrough된다); case-insensitive host에서는 case가 충돌하는 sibling 이름을
+materialize할 수 없다; crash는 stale mountpoint를 남기며 `fusermount3 -u <dir>`로
+복구한다.
 
 ## Jobs
 

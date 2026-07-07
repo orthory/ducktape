@@ -42,7 +42,10 @@ Use this map to find the authoritative surface before editing.
 - `bin/node`: the p2p validator/mesh node (also serves the noded app surface).
 - `bin/noded`: the single embedded-host daemon behind the http/ws app surface.
 - `bin/fs`: `ducktape-fs`, the duckfs working-copy CLI (read verbs plus the
-  checkout/status/commit/pin loop over `crates/system/duckfs-client`).
+  checkout/status/commit/pin loop over `crates/system/duckfs-client`). The
+  `mount` verb (FUSE, `src/fuse/`) is gated behind the `fuse` cargo feature —
+  read-only over `NodeApi` at a pinned snapshot, `--rw` over a backing checkout —
+  so a default build pulls in no libfuse/`fuser`.
 
 ## Docs
 
