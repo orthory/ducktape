@@ -504,3 +504,44 @@ async fn files_module_rejection_is_a_verbatim_400_envelope() {
     let body = body_json(response).await;
     assert_eq!(body["error"], "files: conflict: /x changed since base");
 }
+
+// ---- duckfs workspace RPC: 503 when unconfigured, slug validation -----------
+
+#[tokio::test]
+async fn fs_workspaces_is_503_when_unconfigured() {
+    // a handle that never injected the workspace root (the fake actor's) answers
+    // the seam with a clean 503, not a panic. no actor needed: the config guard
+    // returns before any command crosses the lane.
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/fs/workspaces",
+            serde_json::json!({ "prefix": "/shared/x" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn fs_workspace_commit_rejects_a_bad_slug() {
+    // a non-`[a-z0-9]` id (here uppercase) is refused BEFORE any disk touch —
+    // the slug guard is the traversal defense on the path param.
+    let root = tempfile::tempdir().expect("workspace root");
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let handle = handle.with_duckfs_workspaces(root.path().to_path_buf());
+
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/fs/workspaces/BAD/commit",
+            serde_json::json!({ "message": "m" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["error"], "invalid workspace id");
+}

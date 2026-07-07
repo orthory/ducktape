@@ -5149,7 +5149,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     let http_handle = http_handle
         .with_forge_repo(storage.join("forge-repo"))
         .with_index_store(index.clone())
-        .with_call(voice_lane);
+        .with_call(voice_lane)
+        // the duckfs workspace RPC's managed-checkout root (disk state, separate
+        // from the module's own `<storage>/duckfs` dir).
+        .with_duckfs_workspaces(storage.join("duckfs-workspaces"));
     let blobs = http_handle.blob_handle();
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)

@@ -106,7 +106,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (handle, cmd_rx, event_tx) = NodeHandle::channel();
     let handle = handle
         .with_forge_repo(forge_repo.clone())
-        .with_index_store(index.clone());
+        .with_index_store(index.clone())
+        // the duckfs workspace RPC materializes managed checkouts here (disk
+        // state, separate from the module's own `<storage>/duckfs` dir).
+        .with_duckfs_workspaces(storage.join("duckfs-workspaces"));
 
     // the node actor gets its own thread: commonware's tokio runner owns that
     // thread's runtime, and the host must never leave it. the blob handle is

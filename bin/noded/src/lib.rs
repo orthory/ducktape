@@ -25,6 +25,11 @@ pub mod blobs;
 // public param structs stay at `noded::CommitBody` &c.
 mod files_http;
 pub use files_http::*;
+// the workspace RPC (`/v1/fs/workspaces`) and its actor-lane `NodeApi` adapter.
+// crate-internal: the router registers the handlers and the adapter is used only
+// by the workspace handlers — nothing outside the crate touches either.
+mod actor_api;
+mod workspaces;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,7 +40,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
 use files::CHUNK_SIZE;
@@ -566,6 +571,11 @@ pub struct NodeHandle {
     /// the call hub's session-request lane. `None` on daemons without a mesh
     /// (the embedded daemon, router tests) — `/v1/call/ws` answers 503 there.
     call: Option<CallLane>,
+    /// the root dir the duckfs workspace RPC materializes managed checkouts
+    /// under (`<storage>/duckfs-workspaces`). node-local disk state, threaded in
+    /// like `forge_repo`; `None` on a handle that never serves the seam (the
+    /// router tests' fake handle), which makes `/v1/fs/workspaces` a clean 503.
+    duckfs_workspaces: Option<PathBuf>,
 }
 
 impl NodeHandle {
@@ -588,6 +598,7 @@ impl NodeHandle {
             forge_repo: None,
             index: None,
             call: None,
+            duckfs_workspaces: None,
         };
         (handle, cmd_rx, event_tx)
     }
@@ -614,6 +625,14 @@ impl NodeHandle {
     /// wires one — it owns the mesh the audio/video rides.
     pub fn with_call(mut self, call: CallLane) -> Self {
         self.call = Some(call);
+        self
+    }
+
+    /// point this handle at the root dir the duckfs workspace RPC manages
+    /// checkouts under. the daemon passes `<storage>/duckfs-workspaces`; an
+    /// unset root makes `/v1/fs/workspaces` answer 503.
+    pub fn with_duckfs_workspaces(mut self, root: impl Into<PathBuf>) -> Self {
+        self.duckfs_workspaces = Some(root.into());
         self
     }
 
@@ -720,6 +739,18 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/files/refs", get(files_refs))
         .route("/v1/files/diff", get(files_diff))
         .route("/v1/files/has-chunks", get(files_has_chunks))
+        // ---- duckfs workspace RPC (the jobs/sandbox seam) ----
+        // managed checkouts under the injected root: create, commit (409 on a
+        // structured conflict), delete. `None` root → 503.
+        .route("/v1/fs/workspaces", post(workspaces::create_workspace))
+        .route(
+            "/v1/fs/workspaces/{id}/commit",
+            post(workspaces::commit_workspace),
+        )
+        .route(
+            "/v1/fs/workspaces/{id}",
+            delete(workspaces::delete_workspace),
+        )
         .route("/forge/{repo}/info/refs", get(git_info_refs))
         // git smart-HTTP: forge is a full push+fetch remote over one route pair.
         //   `git push  http://<node>/forge/<repo> main` — receive-pack (push)

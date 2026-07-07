@@ -1794,7 +1794,9 @@ fn duckfs_engine_round_trips_and_reports_conflict_through_http_node() {
     // a small (inline) file and a >1 MiB file — the latter forces the stage
     // path through real consensus (POST /v1/files/stage per chunk).
     std::fs::write(dir_a.path().join("small"), b"hello duckfs engine").expect("write small");
-    let big: Vec<u8> = (0..(2 * 1024 * 1024 + 7)).map(|i| (i % 251) as u8).collect();
+    let big: Vec<u8> = (0..(2 * 1024 * 1024 + 7))
+        .map(|i| (i % 251) as u8)
+        .collect();
     std::fs::write(dir_a.path().join("big"), &big).expect("write big");
 
     let summary = commit(&node, dir_a.path(), "seed via engine").expect("commit seed");
@@ -1830,4 +1832,116 @@ fn duckfs_engine_round_trips_and_reports_conflict_through_http_node() {
         }
         other => panic!("expected a structured conflict, got {other:?}"),
     }
+}
+
+// ============================================================================
+// workspace RPC (the jobs/sandbox seam): the daemon manages a checkout under an
+// injected root, driven entirely over http — create -> files on disk -> commit
+// -> read back over the files surface -> delete. state lives on disk under
+// `<storage>/duckfs-workspaces/<id>`, so this test reads/writes that path
+// directly (same machine). a conflicting workspace commit is a 409 carrying the
+// serialized ConflictReport.
+// ============================================================================
+
+#[test]
+fn duckfs_workspace_rpc_lifecycle_and_conflict() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    // ---- create: an empty checkout under /shared/job1 ----
+    let (code, ws) = daemon.request(
+        "POST",
+        "/v1/fs/workspaces",
+        Some(&serde_json::json!({ "prefix": "/shared/job1" })),
+    );
+    assert_eq!(code, 200, "create workspace failed: {ws}");
+    let id = ws["id"].as_str().expect("workspace id").to_string();
+    let path = ws["path"].as_str().expect("workspace path").to_string();
+    assert!(ws["snapshot"].is_null(), "empty checkout has no base: {ws}");
+    // the managed checkout wrote its .duckfs index to disk at `path`.
+    let index_json = std::path::Path::new(&path).join(".duckfs/index.json");
+    assert!(
+        index_json.exists(),
+        "the workspace index must exist at {}",
+        index_json.display()
+    );
+
+    // ---- edit on disk, then commit over rpc ----
+    std::fs::write(
+        std::path::Path::new(&path).join("hello.txt"),
+        b"workspace bytes",
+    )
+    .expect("write into the workspace");
+    let (code, done) = daemon.request(
+        "POST",
+        &format!("/v1/fs/workspaces/{id}/commit"),
+        Some(&serde_json::json!({ "message": "commit from the workspace rpc" })),
+    );
+    assert_eq!(code, 200, "workspace commit failed: {done}");
+    assert!(
+        done["snapshot"].is_string(),
+        "commit returns a snapshot id: {done}"
+    );
+    assert_eq!(done["rebased"], false, "a first commit never rebases");
+
+    // ---- read the committed file back over the files surface ----
+    let (code, read) = daemon.request("GET", "/v1/files/read?path=/shared/job1/hello.txt", None);
+    assert_eq!(code, 200, "read the committed file: {read}");
+    let bytes = STANDARD
+        .decode(read["b64"].as_str().expect("b64").as_bytes())
+        .expect("decode b64");
+    assert_eq!(bytes, b"workspace bytes", "the committed bytes round-trip");
+
+    // ---- delete: the workspace directory is gone ----
+    let (code, gone) = daemon.request("DELETE", &format!("/v1/fs/workspaces/{id}"), None);
+    assert_eq!(code, 200, "delete workspace failed: {gone}");
+    assert_eq!(gone["ok"], true);
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "the workspace dir is removed on delete"
+    );
+
+    // ---- conflict: two workspaces off the same base, same-path edits ----
+    let make_ws = || {
+        let (c, v) = daemon.request(
+            "POST",
+            "/v1/fs/workspaces",
+            Some(&serde_json::json!({ "prefix": "/shared/wsconflict" })),
+        );
+        assert_eq!(c, 200, "create conflict workspace: {v}");
+        (
+            v["id"].as_str().unwrap().to_string(),
+            v["path"].as_str().unwrap().to_string(),
+        )
+    };
+    let commit_ws = |id: &str, msg: &str| -> (u16, serde_json::Value) {
+        daemon.request(
+            "POST",
+            &format!("/v1/fs/workspaces/{id}/commit"),
+            Some(&serde_json::json!({ "message": msg })),
+        )
+    };
+
+    let (id1, path1) = make_ws();
+    std::fs::write(std::path::Path::new(&path1).join("f.txt"), b"v1").unwrap();
+    let (c, _) = commit_ws(&id1, "seed");
+    assert_eq!(c, 200, "seed commit lands");
+
+    // ws2 checks out the seeded head (its base is snapshot1).
+    let (id2, path2) = make_ws();
+
+    // ws1 advances the shared path...
+    std::fs::write(std::path::Path::new(&path1).join("f.txt"), b"from1").unwrap();
+    let (c, _) = commit_ws(&id1, "advance");
+    assert_eq!(c, 200, "ws1 advances the shared path");
+
+    // ...so ws2's same-path commit conflicts: a 409 with the clashing path.
+    std::fs::write(std::path::Path::new(&path2).join("f.txt"), b"from2").unwrap();
+    let (c, report) = commit_ws(&id2, "loses");
+    assert_eq!(c, 409, "an overlapping workspace commit is a 409: {report}");
+    let clashing = report["clashing"].as_array().expect("clashing array");
+    assert!(
+        clashing.iter().any(|p| p == "/shared/wsconflict/f.txt"),
+        "the conflict report names the clashing path: {report}"
+    );
 }
