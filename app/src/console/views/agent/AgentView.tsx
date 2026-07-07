@@ -58,6 +58,9 @@ const statusTone = {
   neutral: { text: "#7a6f9e", bg: "#f1edf5", border: "#ddd2e6" },
   blue: { text: "#5f7a9e", bg: "#edf2f7", border: "#cfdae7" },
   agent: { text: accentVar, bg: "#f9f1ea", border: "#e7d2c4" },
+  // A terminal/retired state — grey, not amber, so it never reads as merely
+  // paused. Mirrors the muted dot the roster row already draws for it.
+  muted: { text: "#75726c", bg: "#f1f0ee", border: "#dedad2" },
 } satisfies Record<string, Tone>;
 
 const inputStyle: CSSProperties = {
@@ -631,7 +634,9 @@ function AgentDetail({
                 <StatusPill label="AGENT" tone={statusTone.agent} />
                 <StatusPill
                   label={active ? "ACTIVE" : tombstoned ? "RETIRED" : "PAUSED"}
-                  tone={active ? statusTone.success : statusTone.warning}
+                  tone={
+                    active ? statusTone.success : tombstoned ? statusTone.muted : statusTone.warning
+                  }
                 />
               </div>
               <div
@@ -736,7 +741,20 @@ function ActionGrantPicker({
   checkboxName: string;
 }) {
   const [customTag, setCustomTag] = useState("");
-  const options = [...new Set<string>([...KNOWN_ACTIONS, ...allowedActions])];
+  const isCustom = (name: string) => !(KNOWN_ACTIONS as readonly string[]).includes(name);
+  // Once a custom (non-builtin) tag has been granted this session, keep its
+  // chip around even after it's unchecked — unchecking used to drop it from
+  // `options` entirely (it's not in KNOWN_ACTIONS, and no longer in
+  // `allowedActions`), so re-granting it meant retyping the tag from scratch.
+  // Component-local only: a remount forgets it, which is fine.
+  const [everSeenCustom, setEverSeenCustom] = useState<string[]>(() =>
+    allowedActions.filter(isCustom),
+  );
+  useEffect(() => {
+    const unseen = allowedActions.filter((name) => isCustom(name) && !everSeenCustom.includes(name));
+    if (unseen.length > 0) setEverSeenCustom((prev) => [...prev, ...unseen]);
+  }, [allowedActions, everSeenCustom]);
+  const options = [...new Set<string>([...KNOWN_ACTIONS, ...everSeenCustom, ...allowedActions])];
   const trimmed = customTag.trim();
   const valid = ACTION_TAG_PATTERN.test(trimmed);
   const add = () => {

@@ -40,12 +40,15 @@ const MODULE_INFO: Record<string, { label: string; desc: string }> = {
 };
 
 // The accent a lifecycle chip wears: a live package reads green, a paused one
-// amber, a tombstoned (unplugged) one falls back to muted. Presentation only —
-// the state itself is the node's, mirrored from its package registry row.
+// amber, a tombstoned (unplugged) one falls back to muted, and a still-staging
+// install reads blue — distinct from all three settled states so it never
+// gets mistaken for one. Presentation only — the state itself is the node's,
+// mirrored from its package registry row.
 const LIFECYCLE_TONE: Record<string, string> = {
   active: color.green,
   suspended: color.amber,
   inactive: color.muted2,
+  installing: color.blue,
 };
 
 const infoOf = (id: string): { label: string; desc: string } =>
@@ -124,6 +127,11 @@ function RootButton({
 // A read-only badge naming the installed package a module ships in: its id +
 // version, and a lifecycle chip. Rendered only when the node stamped a package
 // onto the row (lifecycle present); genesis/native modules show nothing.
+//
+// A still-installing package gets a visibly muted treatment — dashed border,
+// softer name color — instead of the solid, settled look active/suspended/
+// inactive share: visibility into an in-flight install without the row
+// masquerading as a confirmed, live owner.
 function PackageBadge({
   pkg,
   version,
@@ -134,6 +142,7 @@ function PackageBadge({
   lifecycle: string;
 }) {
   const tone = LIFECYCLE_TONE[lifecycle] ?? color.muted2;
+  const installing = lifecycle === "installing";
   return (
     <div
       title={version ? `${pkg} ${version} · ${lifecycle}` : `${pkg} · ${lifecycle}`}
@@ -145,14 +154,16 @@ function PackageBadge({
         minWidth: 0,
         padding: "3px 4px 3px 8px",
         borderRadius: radius.sm,
-        border: `1px solid ${color.borderSoft}`,
+        border: `1px ${installing ? "dashed" : "solid"} ${
+          installing ? color.borderStrong : color.borderSoft
+        }`,
         background: color.sunken,
       }}
     >
       <span
         style={{
           font: `500 11px ${font.mono}`,
-          color: color.muted3,
+          color: installing ? color.muted2 : color.muted3,
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",

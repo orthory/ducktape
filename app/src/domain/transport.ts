@@ -43,8 +43,9 @@ export interface ModuleStatus {
   package?: string;
   /** The owning package's version string, mirrored from its registry row. */
   packageVersion?: string;
-  /** The owning package's lifecycle: "active", "suspended", or "inactive"
-   *  (tombstoned). Absent when the module has no owning package. */
+  /** The owning package's lifecycle: "active", "suspended", "inactive"
+   *  (tombstoned), or "installing" (staged, not yet live). Absent when the
+   *  module has no owning package. */
   lifecycle?: string;
 }
 

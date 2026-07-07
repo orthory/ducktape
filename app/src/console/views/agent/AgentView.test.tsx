@@ -259,6 +259,36 @@ describe("AgentView", () => {
     );
   });
 
+  it("keeps an unchecked custom action tag visible so it can be re-granted without retyping", () => {
+    const { spies } = renderAgents();
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for summary agent/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
+
+    fireEvent.change(screen.getByLabelText("Custom action tag"), {
+      target: { value: "custom.action.tag" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+
+    const checkbox = () => screen.getByRole("checkbox", { name: "custom.action.tag" });
+    expect(checkbox()).toBeChecked();
+
+    // Unchecking used to make the whole chip vanish, forcing a retype.
+    fireEvent.click(checkbox());
+    expect(checkbox()).not.toBeChecked();
+
+    // Re-check without retyping the tag — the chip stayed put.
+    fireEvent.click(checkbox());
+    expect(checkbox()).toBeChecked();
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    expect(spies.updateAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        allowedActions: expect.arrayContaining(["custom.action.tag"]),
+      }),
+    );
+  });
+
   it("edits an agent through the inline Edit form", () => {
     const { spies } = renderAgents();
 
@@ -291,6 +321,46 @@ describe("AgentView", () => {
 
     openTab(/activity/i);
     expect(screen.getByText("on Node Bob")).toBeInTheDocument();
+  });
+
+  it("gives a retired agent's status pill a tone distinct from a paused one's", () => {
+    renderAgents({
+      agents: [
+        {
+          agent_id: "summarizer",
+          owner: "system" as const,
+          display_name: "Summary Agent",
+          capability: "alpha",
+          prompt: null,
+          allowed_actions: ["chat.post"],
+          status: "paused" as const,
+          created_at: 10,
+          updated_at: 20,
+        },
+        {
+          agent_id: "retired-agent",
+          owner: "system" as const,
+          display_name: "Retired Agent",
+          capability: "alpha",
+          prompt: null,
+          allowed_actions: ["chat.post"],
+          status: "tombstoned" as const,
+          created_at: 10,
+          updated_at: 20,
+        },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for summary agent/i }));
+    const pausedColor = getComputedStyle(screen.getByText("PAUSED")).color;
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for retired agent/i }));
+    const retiredColor = getComputedStyle(screen.getByText("RETIRED")).color;
+
+    // the list-row dot already tells paused (amber) from retired (muted) apart
+    // — the detail pill should carry that same distinction, not reuse one
+    // tone (statusTone.warning) for both.
+    expect(retiredColor).not.toBe(pausedColor);
   });
 
   it("filters the timeline to the runs I requested", () => {

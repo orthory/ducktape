@@ -303,21 +303,25 @@ pub struct ModuleStatus {
     /// the owning package's version string, mirrored from its registry row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package_version: Option<String>,
-    /// the owning package's lifecycle — `"active"`, `"suspended"`, or
-    /// `"inactive"` (tombstoned). absent when the module has no owning package.
+    /// the owning package's lifecycle — `"active"`, `"suspended"`, `"inactive"`
+    /// (tombstoned), or `"installing"` (staged, not yet live). absent when the
+    /// module has no owning package.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<String>,
 }
 
 /// Join installed-package provenance onto a set of status rows — presentation
-/// only, never consensus. For every module bound by a package in a settled
-/// lifecycle state (`Active`, `Suspended`, or `Inactive`), stamp that package's
-/// id, version, and lifecycle onto the module's row. `Installing` is transient
-/// (an install completes within its block) and `Unplugging` never commits, so
-/// neither stamps. The `package` registry module itself is never stamped — it
-/// owns the registry, no package ships it — and a module owned by no package
-/// keeps all three fields `None`, so a host with nothing installed leaves every
-/// row byte-identical to today.
+/// only, never consensus. For every module bound by a package in `Active`,
+/// `Suspended`, `Inactive`, or `Installing`, stamp that package's id, version,
+/// and lifecycle onto the module's row: an in-flight install gets its own
+/// muted `"installing"` lifecycle so operators keep visibility while it's
+/// staged, without the row reading as a settled/live owner (the app renders it
+/// with a visibly distinct, muted presentation). `Unplugging` is wire
+/// vocabulary only — v1 unplugs within a single block, so no row is ever
+/// observed in that state — and stays unstamped defensively. The `package`
+/// registry module itself is never stamped — it owns the registry, no package
+/// ships it — and a module owned by no package keeps all three fields `None`,
+/// so a host with nothing installed leaves every row byte-identical to today.
 pub fn stamp_packages(modules: &mut [ModuleStatus], packages: &[package::PackageView]) {
     use package::PackageStatus;
     use std::collections::HashMap;
@@ -331,7 +335,8 @@ pub fn stamp_packages(modules: &mut [ModuleStatus], packages: &[package::Package
             PackageStatus::Active => "active",
             PackageStatus::Suspended => "suspended",
             PackageStatus::Inactive => "inactive",
-            PackageStatus::Installing | PackageStatus::Unplugging => continue,
+            PackageStatus::Installing => "installing",
+            PackageStatus::Unplugging => continue,
         };
         for module_id in pkg.modules.values() {
             owned.insert(
@@ -349,6 +354,25 @@ pub fn stamp_packages(modules: &mut [ModuleStatus], packages: &[package::Package
             module.package_version = Some((*version).to_owned());
             module.lifecycle = Some((*lifecycle).to_owned());
         }
+    }
+}
+
+/// Query the package registry once and join its provenance onto a status
+/// projection's rows — the shared body behind `node`'s two `select!` `Status`
+/// arms (validator and observer standing), which each hold their own
+/// `host::Host` and previously duplicated this query+decode+stamp inline.
+/// Best-effort: a query failure or an undecodable reply leaves `modules`
+/// exactly as it was passed in.
+pub async fn stamp_installed_packages(host: &host::Host, modules: &mut [ModuleStatus]) {
+    if let Ok(bytes) = host
+        .query(
+            package::MODULE_PACKAGE,
+            &package::encode_query(&package::PackageQuery::List),
+        )
+        .await
+        && let Ok(package::PackageReply::Packages(packages)) = package::decode_reply(&bytes)
+    {
+        stamp_packages(modules, &packages);
     }
 }
 
@@ -2193,7 +2217,9 @@ mod tests {
                 PackageStatus::Inactive,
                 &[("main", "inbox")],
             ),
-            // an installing package must NOT stamp yet (transient state).
+            // an installing package DOES stamp now — a muted "installing"
+            // lifecycle gives operators visibility mid-install without the
+            // row reading as a settled owner.
             package_view(
                 "org.example.wip",
                 "0.0.1",
@@ -2218,10 +2244,11 @@ mod tests {
         assert_eq!(inbox.package.as_deref(), Some("org.example.old"));
         assert_eq!(inbox.lifecycle.as_deref(), Some("inactive"));
 
-        // installing is transient — memory stays unstamped until MarkActive.
+        // installing now stamps too, distinct from all three settled states.
         let memory = by_id("memory");
-        assert!(memory.package.is_none());
-        assert!(memory.lifecycle.is_none());
+        assert_eq!(memory.package.as_deref(), Some("org.example.wip"));
+        assert_eq!(memory.package_version.as_deref(), Some("0.0.1"));
+        assert_eq!(memory.lifecycle.as_deref(), Some("installing"));
 
         // the registry module itself is never stamped, even when a package
         // (mistakenly) binds a logical to it.

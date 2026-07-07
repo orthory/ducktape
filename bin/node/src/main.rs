@@ -4566,20 +4566,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                                 // presentation join over the package registry
                                                 // (never consensus; best effort). unstamped
                                                 // rows serialize byte-identical to before.
-                                                if let Ok(bytes) = host
-                                                    .query(
-                                                        ::package::MODULE_PACKAGE,
-                                                        &::package::encode_query(
-                                                            &::package::PackageQuery::List,
-                                                        ),
-                                                    )
-                                                    .await
-                                                    && let Ok(::package::PackageReply::Packages(
-                                                        packages,
-                                                    )) = ::package::decode_reply(&bytes)
-                                                {
-                                                    noded::stamp_packages(&mut modules, &packages);
-                                                }
+                                                noded::stamp_installed_packages(host, &mut modules)
+                                                    .await;
                                                 (*height, hex(&host.app_hash()), modules)
                                             }
                                             None => (0, String::new(), Vec::new()),
@@ -7123,18 +7111,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // presentation join over the package registry (never
                             // consensus; best effort). unstamped rows serialize
                             // byte-identical to before.
-                            if let Ok(bytes) = node
-                                .host()
-                                .query(
-                                    ::package::MODULE_PACKAGE,
-                                    &::package::encode_query(&::package::PackageQuery::List),
-                                )
-                                .await
-                                && let Ok(::package::PackageReply::Packages(packages)) =
-                                    ::package::decode_reply(&bytes)
-                            {
-                                noded::stamp_packages(&mut modules, &packages);
-                            }
+                            noded::stamp_installed_packages(node.host(), &mut modules).await;
                             let _ = reply.send(noded::NodeStatus {
                                 version: env!("CARGO_PKG_VERSION").into(),
                                 app_hash: hex(&node.app_hash()),

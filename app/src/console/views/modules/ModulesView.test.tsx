@@ -70,4 +70,75 @@ describe("ModulesView", () => {
     expect(screen.queryByText("AUTOMATION")).not.toBeInTheDocument();
     expect(screen.queryByText("SYSTEM")).not.toBeInTheDocument();
   });
+
+  it("gives an installing package a muted presentation, distinct from an active one", () => {
+    renderModules({
+      status: statusWith([
+        {
+          id: "chat",
+          root: "bb".repeat(32),
+          category: "workspace",
+          package: "org.example.docs",
+          packageVersion: "1.2.0",
+          lifecycle: "active",
+        },
+        {
+          id: "memory",
+          root: "cc".repeat(32),
+          category: "system",
+          package: "org.example.wip",
+          packageVersion: "0.0.1",
+          lifecycle: "installing",
+        },
+      ]),
+    });
+
+    // both still surface which package they belong to — visibility, not silence.
+    const activeBadge = screen.getByTitle("org.example.docs 1.2.0 · active");
+    const installingBadge = screen.getByTitle("org.example.wip 0.0.1 · installing");
+    expect(activeBadge).toBeInTheDocument();
+    expect(installingBadge).toBeInTheDocument();
+
+    // the installing badge reads as visibly distinct from — and more muted
+    // than — a settled, live provenance chip: a dashed border, not solid.
+    expect(activeBadge).toHaveStyle({ borderStyle: "solid" });
+    expect(installingBadge).toHaveStyle({ borderStyle: "dashed" });
+
+    // the lifecycle tag itself carries its own tone, not reused from any
+    // settled state (active/suspended/inactive).
+    const activeTone = getComputedStyle(within(activeBadge).getByText("active")).color;
+    const installingTone = getComputedStyle(
+      within(installingBadge).getByText("installing"),
+    ).color;
+    expect(installingTone).not.toBe(activeTone);
+  });
+
+  it("renders a package badge cleanly when the version is empty or missing", () => {
+    renderModules({
+      status: statusWith([
+        {
+          id: "chat",
+          root: "bb".repeat(32),
+          category: "workspace",
+          package: "org.example.docs",
+          packageVersion: "",
+          lifecycle: "active",
+        },
+        {
+          id: "pages",
+          root: "cc".repeat(32),
+          category: "workspace",
+          package: "org.example.notes",
+          lifecycle: "suspended",
+        },
+      ]),
+    });
+
+    // no dangling separator or stray trailing space — just the bare package id.
+    const emptyVersionBadge = screen.getByTitle("org.example.docs · active");
+    expect(within(emptyVersionBadge).getByText("org.example.docs")).toBeInTheDocument();
+
+    const missingVersionBadge = screen.getByTitle("org.example.notes · suspended");
+    expect(within(missingVersionBadge).getByText("org.example.notes")).toBeInTheDocument();
+  });
 });
