@@ -34,10 +34,7 @@
 //!   `config::load_or_generate_identity`).
 //!
 //! this module's CLI wiring (`user-key init/restore/unlock/reveal/encrypt/
-//! status`) lands in a follow-up task in this feature; until then nothing in
-//! `main` calls it, so the whole surface reads as dead code to clippy. it IS
-//! exercised — see the `#[cfg(test)]` matrix at the bottom of this file.
-#![allow(dead_code)]
+//! status`) lives in `main.rs`'s `user_key_*`/`cmd_user_key_*` verbs.
 
 use std::path::Path;
 
