@@ -26,7 +26,12 @@ pub fn valset_root(chain_id: &str, epoch: u64, members: &[ValidatorIdentity]) ->
 /// Distinct domain from [`valset_root`] so the two can never be confused for
 /// one another even though today they commit to the same inputs.
 pub fn admission_root(chain_id: &str, epoch: u64, members: &[ValidatorIdentity]) -> AdmissionRoot {
-    AdmissionRoot(members_commitment(ADMISSION_ROOT_NS, chain_id, epoch, members))
+    AdmissionRoot(members_commitment(
+        ADMISSION_ROOT_NS,
+        chain_id,
+        epoch,
+        members,
+    ))
 }
 
 /// The full `ActiveValidatorSet` for a cutover event: derived roots + the
@@ -138,8 +143,14 @@ mod tests {
         );
 
         // every input moves the commitment; the two domains never coincide.
-        assert_ne!(valset_root("net#1", 7, &forward), valset_root("net#2", 7, &forward));
-        assert_ne!(valset_root("net#1", 7, &forward), valset_root("net#1", 8, &forward));
+        assert_ne!(
+            valset_root("net#1", 7, &forward),
+            valset_root("net#2", 7, &forward)
+        );
+        assert_ne!(
+            valset_root("net#1", 7, &forward),
+            valset_root("net#1", 8, &forward)
+        );
         assert_ne!(
             valset_root("net#1", 7, &forward),
             valset_root("net#1", 7, &ids(&[1, 2]))
