@@ -4491,6 +4491,7 @@ fn wire_reachability_plane<S, R>(
     mesh_state_file: &std::path::Path,
     wireguard_listen: std::net::SocketAddr,
     wireguard_effect: WireGuardEffectKind,
+    overlay_slot: overlay_net::userspace::StackSlot,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
     intro_listen: Option<std::net::SocketAddr>,
@@ -4530,6 +4531,7 @@ where
                     state_file,
                     wireguard_listen,
                     wireguard_effect,
+                    overlay_slot,
                     advertised,
                     coordinators,
                     intro_listen,
@@ -4575,9 +4577,15 @@ where
                         interface,
                         peers,
                     } => match wireguard_effect {
-                        WireGuardEffectKind::Real => println!(
+                        WireGuardEffectKind::Tun => println!(
                             "[node {pump_label}] reachability: epoch {epoch} tunnels applied \
                              on {interface} ({peers} peer(s))"
+                        ),
+                        // socket mode has no OS interface: {interface} is the
+                        // orchestrator's label for the in-process backend.
+                        WireGuardEffectKind::Socket => println!(
+                            "[node {pump_label}] reachability: epoch {epoch} tunnels applied \
+                             on {interface} ({peers} peer(s); userspace socket backend)"
                         ),
                         WireGuardEffectKind::Fake => println!(
                             "[node {pump_label}] reachability: epoch {epoch} tunnel config \
@@ -4646,6 +4654,10 @@ async fn reachability_plane(
     mesh_state_file: PathBuf,
     wireguard_listen: std::net::SocketAddr,
     effect_kind: WireGuardEffectKind,
+    // the seam's stack handle (socket mode): created by the node so the mesh
+    // context and the data-plane factory hold it BEFORE this thread exists;
+    // the socket-mode effect publishes/clears the live stack through it.
+    overlay_slot: overlay_net::userspace::StackSlot,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
     // the invite intro listener: where a fresh joiner announces its keys
@@ -4736,19 +4748,84 @@ async fn reachability_plane(
         }
     }
     let me = reachability::node_key(reachability::identity_of(&signer.public_key()));
+    // socket mode owns the underlay socket from PLANE START, not first
+    // apply: the NAT client below rides it (reflexive discovery,
+    // registration, keepalives, and the punch all originate from the
+    // tunnel's own 5-tuple — the pinhole a punch opens is only good for the
+    // socket it originated from), and it survives interface rebuilds so the
+    // coordinator mapping stays warm while a tunnel is torn down/re-applied.
+    let socket_underlay = match effect_kind {
+        WireGuardEffectKind::Socket => {
+            match overlay_net::userspace::UnderlaySocket::bind(
+                &tokio::runtime::Handle::current(),
+                wireguard_listen.port(),
+            ) {
+                Ok(underlay) => Some(underlay),
+                Err(err) => {
+                    eprintln!(
+                        "[node {label}] reachability: underlay udp/{} bind failed: {err} — \
+                         plane not started",
+                        wireguard_listen.port()
+                    );
+                    return;
+                }
+            }
+        }
+        WireGuardEffectKind::Tun | WireGuardEffectKind::Fake => None,
+    };
     // authenticate every coordinator request: the node signs a
     // proof-of-possession with its identity key and, in private coordination,
     // carries the genesis-issued cap. A fully-open coordinator ignores the
     // authenticator; a public/private one requires it. With no coordinators
     // configured `bind` short-circuits to pass-through and never touches this.
-    let auth = Some((signer.clone(), coord_cap));
-    let resolver = match reachability::NatResolver::bind(me, coords.clone(), auth).await {
-        Ok(resolver) => resolver,
-        Err(err) => {
-            eprintln!(
-                "[node {label}] reachability: nat client bind failed: {err} — plane not started"
-            );
-            return;
+    let resolver = match &socket_underlay {
+        Some(underlay) if !coords.is_empty() => {
+            let bypass = underlay
+                .take_bypass()
+                .expect("a fresh underlay socket still holds its bypass lane");
+            let client =
+                nat_traversal::NatSocket::shared(underlay.sender(), bypass).and_then(|sock| {
+                    nat_traversal::NatClient::with_socket(
+                        sock,
+                        me,
+                        coords.clone(),
+                        Some(signer.clone()),
+                        coord_cap,
+                    )
+                });
+            let resolver = match client {
+                Ok(client) => {
+                    reachability::NatResolver::from_client(
+                        client,
+                        reachability::RENDEZVOUS_KEEPALIVE,
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            };
+            match resolver {
+                Ok(resolver) => resolver,
+                Err(err) => {
+                    eprintln!(
+                        "[node {label}] reachability: nat client on the shared underlay \
+                         failed: {err} — plane not started"
+                    );
+                    return;
+                }
+            }
+        }
+        _ => {
+            let auth = Some((signer.clone(), coord_cap));
+            match reachability::NatResolver::bind(me, coords.clone(), auth).await {
+                Ok(resolver) => resolver,
+                Err(err) => {
+                    eprintln!(
+                        "[node {label}] reachability: nat client bind failed: {err} — plane \
+                         not started"
+                    );
+                    return;
+                }
+            }
         }
     };
     if let Some(reflexive) = resolver.reflexive() {
@@ -4901,7 +4978,22 @@ async fn reachability_plane(
                 eprintln!("[node {label}] reachability plane exited: {err}");
             }
         }
-        WireGuardEffectKind::Real => {
+        WireGuardEffectKind::Socket => {
+            let underlay = socket_underlay.expect("bound above for socket mode");
+            println!(
+                "[node {label}] reachability: driving the userspace socket backend (TUN-less; \
+                 no interface, no privilege — overlay reachability lives inside this process)"
+            );
+            let effect = overlay_net::userspace::UserspaceWireGuardEffect::with_shared_underlay(
+                tokio::runtime::Handle::current(),
+                overlay_slot,
+                underlay,
+            );
+            if let Err(err) = reachability::run(config, effect, resolver, commands, events).await {
+                eprintln!("[node {label}] reachability plane exited: {err}");
+            }
+        }
+        WireGuardEffectKind::Tun => {
             #[cfg(unix)]
             {
                 // same name the orchestrator writes into every
@@ -5143,9 +5235,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             format!("advertising WireGuard endpoint udp/{wg}")
         };
         match wireguard_effect {
-            WireGuardEffectKind::Real => {
+            WireGuardEffectKind::Tun => {
                 println!("[node {label}] reachability plane: {advertise}")
             }
+            WireGuardEffectKind::Socket => println!(
+                "[node {label}] reachability plane: {advertise}; userspace socket backend \
+                 (TUN-less — overlay reachability lives inside this process)"
+            ),
             WireGuardEffectKind::Fake => println!(
                 "[node {label}] reachability plane: {advertise}; \
                  records, advertisements, and tunnel handshakes run for real, the interface \
@@ -5239,6 +5335,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
+    // the seam's stack handle (socket mode): one slot for the process,
+    // created HERE so every consumer — the mesh context's backend, the
+    // statesync plane's socket factory, and the reachability plane's effect
+    // (which owns the writes) — holds the same one. in tun/fake mode it just
+    // stays empty.
+    let overlay_slot = overlay_net::userspace::StackSlot::new();
+
     executor.start(|context| async move {
         // the validator's own `ducktape_*` Prometheus series, registered on the
         // SAME runtime registry `context.encode()` (GET /metrics) serves — the
@@ -5317,8 +5420,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let overlay_router = overlay_net::OverlayRouter::for_prefix48(
             wireguard_upgrade::ula_v6_prefix(&String::from_utf8_lossy(&namespace)),
         );
+        // ADR phase 3: the backend follows `wireguard_effect`. socket mode
+        // routes overlay dials/binds into the in-process virtual stack (and
+        // gives the wildcard mesh listener its virtual leg); tun AND fake
+        // keep the OS pass-through — fake stages no data plane at all, so
+        // pass-through preserves its long-standing "overlay dials just fail
+        // like a downed interface" behavior.
+        let overlay_backend = match wireguard_effect {
+            WireGuardEffectKind::Socket => {
+                overlay_net::OverlayBackend::Userspace(overlay_slot.clone())
+            }
+            WireGuardEffectKind::Tun | WireGuardEffectKind::Fake => {
+                overlay_net::OverlayBackend::Tun
+            }
+        };
         let (mut network, mut oracle) = Network::new(
-            overlay_net::OverlayContext::new(context.child("network"), overlay_router),
+            overlay_net::OverlayContext::with_backend(
+                context.child("network"),
+                overlay_router,
+                overlay_backend,
+            ),
             p2p_cfg,
         );
 
@@ -5555,6 +5676,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             &mesh_state_file,
                             wg_addr,
                             wireguard_effect,
+                            overlay_slot.clone(),
                             advertised_reach,
                             coordinators,
                             // a joiner serves no intros — only members mint
@@ -5820,6 +5942,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         book,
                         signer.public_key(),
                         std::sync::Arc::clone(&plane_slot),
+                        statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
                         None,
                     );
                 }
@@ -7164,6 +7287,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         &mesh_state_file,
                         wg_addr,
                         wireguard_effect,
+                        overlay_slot.clone(),
                         advertised_reach,
                         coordinators,
                         // members serve the invite intro: a fresh joiner's
@@ -7229,6 +7353,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         book,
                         signer.public_key(),
                         std::sync::Arc::clone(&plane_slot),
+                        statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
                         None,
                     );
                 }
@@ -7636,6 +7761,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 std::sync::Arc::clone(&book),
                 signer.public_key(),
                 std::sync::Arc::new(std::sync::OnceLock::new()),
+                statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
                 Some(bridge_tx.clone()),
             );
             book

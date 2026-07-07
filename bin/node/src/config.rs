@@ -1206,11 +1206,14 @@ pub struct NodeToml {
     /// PRESENT stages the node-driven reachability plane (node-local
     /// operator policy, like checkpoint_blocks). absent = plane off.
     pub wireguard_listen: Option<String>,
-    /// which `WireGuardEffect` the reachability plane drives: "real"
+    /// which `WireGuardEffect` the reachability plane drives: "tun"
     /// (default — configure an actual interface via the userspace WireGuard
-    /// runtime; needs root/CAP_NET_ADMIN) or "fake" (record configs in
-    /// memory; for dev/sim runs, and for several same-chain nodes on one
-    /// host, which would otherwise fight over one interface name).
+    /// runtime; needs root/CAP_NET_ADMIN; "real" is the legacy alias),
+    /// "socket" (the ADR's TUN-less in-process backend: no privilege, no
+    /// host mutation — overlay reachability exists only inside this
+    /// process), or "fake" (record configs in memory; for dev/sim runs, and
+    /// for several same-chain nodes on one host, which would otherwise
+    /// fight over one interface name).
     pub wireguard_effect: Option<String>,
     /// the UDP endpoint this node's invite intro listener binds — where a
     /// fresh joiner announces its keys (token-authenticated) so the tunnel
@@ -1710,18 +1713,24 @@ pub fn endpoint_host(
 /// which `WireGuardEffect` implementation the reachability plane drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireGuardEffectKind {
+    /// the TUN-less in-process backend (overlay-net ADR): BoringTun `Tunn`s
+    /// + smoltcp behind the overlay seam, no privilege, no host mutation.
+    Socket,
     /// configure an actual interface through the userspace WireGuard runtime.
-    Real,
+    Tun,
     /// record configurations in memory without touching the network stack.
     Fake,
 }
 
 fn parse_wireguard_effect(raw: Option<&str>) -> Result<WireGuardEffectKind, String> {
     match raw {
-        None | Some("real") => Ok(WireGuardEffectKind::Real),
+        Some("socket") => Ok(WireGuardEffectKind::Socket),
+        // "real" predates the socket backend and stays as an alias for the
+        // interface-backed path it always meant.
+        None | Some("tun") | Some("real") => Ok(WireGuardEffectKind::Tun),
         Some("fake") => Ok(WireGuardEffectKind::Fake),
         Some(other) => Err(format!(
-            "wireguard_effect: {other:?} is not \"real\" or \"fake\""
+            "wireguard_effect: {other:?} is not \"socket\", \"tun\" (alias \"real\"), or \"fake\""
         )),
     }
 }
@@ -2900,12 +2909,31 @@ bootstrapper_addr = "127.0.0.1:52200"
     }
 
     #[test]
-    fn wireguard_effect_defaults_real_and_rejects_unknown_values() {
+    fn wireguard_effect_defaults_tun_and_rejects_unknown_values() {
         let dir = tmp("wgeffect");
         let base = "id = 0\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
         std::fs::write(dir.join("node.toml"), base).expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
-        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Real);
+        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Tun);
+
+        // "real" is the legacy alias for the interface-backed path.
+        for spelled in ["tun", "real"] {
+            std::fs::write(
+                dir.join("node.toml"),
+                format!("{base}wireguard_effect = \"{spelled}\"\n"),
+            )
+            .expect("write");
+            let r = resolve(&dir.join("node.toml")).expect("resolve");
+            assert_eq!(r.wireguard_effect, WireGuardEffectKind::Tun, "{spelled}");
+        }
+
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{base}wireguard_effect = \"socket\"\n"),
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("resolve");
+        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Socket);
 
         std::fs::write(
             dir.join("node.toml"),
