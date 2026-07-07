@@ -255,9 +255,8 @@ export function SearchModal() {
             value={text}
             autoFocus
             // A search box, not prose: kill WebKit's autocorrect/-capitalize so
-            // typing "test" isn't "corrected" to "Test", and drop the native
-            // autocomplete dropdown. Matches the members search input.
-            autoComplete="off"
+            // typing "test" isn't "corrected" to "Test". Matches the members
+            // search input. (Autocomplete is off globally — see main.tsx.)
             autoCorrect="off"
             autoCapitalize="off"
             spellCheck={false}

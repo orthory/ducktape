@@ -413,7 +413,6 @@ function RunsOnField({
           id={id}
           name={id}
           type="text"
-          autoComplete="off"
           spellCheck={false}
           value={value}
           onChange={(event) => onChange(event.target.value)}
@@ -773,7 +772,6 @@ function AgentEditForm({
             id="agent-edit-display-name"
             name="agent-edit-display-name"
             type="text"
-            autoComplete="off"
             value={displayName}
             onChange={(event) => setDisplayName(event.target.value)}
             style={inputStyle}
@@ -1109,7 +1107,6 @@ function RegisterAgentForm({
                 id="agent-display-name"
                 name="agent-display-name"
                 type="text"
-                autoComplete="off"
                 value={displayName}
                 onChange={(event) => setDisplayName(event.target.value)}
                 placeholder="Triage Agent…"
@@ -1206,7 +1203,6 @@ function RegisterAgentForm({
                 id="agent-id"
                 name="agent-id"
                 type="text"
-                autoComplete="off"
                 spellCheck={false}
                 value={agentIdInput}
                 onChange={(event) => setAgentIdInput(event.target.value)}

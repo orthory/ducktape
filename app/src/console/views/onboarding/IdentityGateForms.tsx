@@ -381,7 +381,6 @@ export function ConfirmWords({
             const value = event.target.value;
             setAnswers((prev) => ({ ...prev, [i]: value }));
           }}
-          autoComplete="off"
           autoCapitalize="off"
           spellCheck={false}
           style={inputStyle}
