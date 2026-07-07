@@ -36,7 +36,8 @@ members = [
     "crates/system/blobstore",
     "crates/system/dispatch",
     "crates/system/dispatch-oracle",
-    "crates/system/tagging", 
+    "crates/system/tagging",
+    "crates/system/duckfs-client",
     # apps — product feature modules
     "crates/apps/forge",
     "crates/apps/pages",
@@ -150,6 +151,7 @@ profiles = { path = "crates/apps/profiles" }
 automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }
+duckfs-client = { path = "crates/system/duckfs-client" }
 jobs = { path = "crates/apps/jobs" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
