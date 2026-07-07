@@ -93,6 +93,9 @@ peer_seeds = [0]
 validator_seeds = [0]
 storage_dir = '{}'
 http_listen = "{}"
+# desktop nodes run the TUN-less userspace WireGuard backend (inert until a
+# `wireguard_listen` brings the reachability plane up).
+wireguard_effect = "socket"
 "#,
         storage.display(),
         http_listen,

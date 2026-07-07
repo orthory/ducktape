@@ -50,10 +50,12 @@ pub fn socket_factory(
     }
 }
 
-/// bulk ceiling for the statesync plane instance: below a typical uplink so
-/// real-time consumers on their own planes keep headroom (isolation layer 2;
-/// cross-plane coordination arrives with the second bulk consumer).
-const BULK_BYTES_PER_SEC: u64 = 8_000_000;
+/// bulk ceiling for the statesync plane instance: a static compromise between
+/// sync time (~24 MB/s ≈ 42 s/GB) and real-time headroom — on uplinks faster
+/// than 192 Mbit/s other planes keep headroom, on slower ones bulk can still
+/// crowd them (adaptive cross-plane coordination arrives with the second bulk
+/// consumer).
+const BULK_BYTES_PER_SEC: u64 = 24_000_000;
 const BULK_BURST_BYTES: u64 = 512 * 1024;
 
 /// derive a peer's overlay ULA from its raw ed25519 key bytes — the same
