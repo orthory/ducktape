@@ -431,6 +431,24 @@ async fn read_upgrade_status_raw(host: &Host) -> Option<upgrade::UpgradeStatus> 
     Some(status)
 }
 
+/// read the governance module's committed invite redemptions — the
+/// exactly-once nonce set (committed+staged projection, between drains). an
+/// unreadable reply degrades to empty: the lobby then simply cannot pre-empt
+/// a spent invite, and the in-consensus exactly-once check still holds.
+async fn read_redemptions_from_host(host: &Host) -> Vec<governance::RedemptionView> {
+    use governance::{GovQuery, GovReply, decode_reply, encode_query};
+    let Ok(reply) = host
+        .query("governance", &encode_query(&GovQuery::Redemptions))
+        .await
+    else {
+        return Vec::new();
+    };
+    match decode_reply(&reply) {
+        Ok(GovReply::Redemptions(v)) => v,
+        Ok(_) | Err(_) => Vec::new(),
+    }
+}
+
 /// the node-local worker that self-emits a validator-origin `SignalReady` op
 /// ONCE per pending upgrade this binary can execute. deliberately NOT a
 /// `reactor::Worker`: readiness must survive restart/late-join, so it polls the
@@ -4675,19 +4693,36 @@ async fn reachability_plane(
             return;
         }
     };
-    let wireguard_endpoint = match wireguard_upgrade::Endpoint::new(
-        wireguard_listen.ip(),
-        wireguard_listen.port(),
-        wireguard_upgrade::Transport::Udp,
-        &policy,
-    ) {
-        Ok(endpoint) => endpoint,
-        Err(err) => {
-            eprintln!(
-                "[node {label}] reachability: wireguard_listen rejected ({err:?}) — plane not \
-                 started"
-            );
-            return;
+    // an UNSPECIFIED wireguard_listen address (0.0.0.0/[::], cmd_join's
+    // NAT'd-joiner default) means "bind the port, advertise NO endpoint":
+    // the plane runs endpoint-less — peers install this node's tunnel
+    // without an endpoint and this node's own initiations complete it
+    // (WireGuard roams to the authenticated source). A concrete address
+    // advertises exactly as before.
+    if wireguard_listen.port() == 0 {
+        eprintln!(
+            "[node {label}] reachability: wireguard_listen needs a concrete UDP port — plane \
+             not started"
+        );
+        return;
+    }
+    let wireguard_advertised = if wireguard_listen.ip().is_unspecified() {
+        None
+    } else {
+        match wireguard_upgrade::Endpoint::new(
+            wireguard_listen.ip(),
+            wireguard_listen.port(),
+            wireguard_upgrade::Transport::Udp,
+            &policy,
+        ) {
+            Ok(endpoint) => Some(endpoint),
+            Err(err) => {
+                eprintln!(
+                    "[node {label}] reachability: wireguard_listen rejected ({err:?}) — plane \
+                     not started"
+                );
+                return;
+            }
         }
     };
     let mut coords: Vec<std::net::SocketAddr> = Vec::new();
@@ -4729,7 +4764,8 @@ async fn reachability_plane(
         chain_id,
         signer,
         wireguard_key_file,
-        wireguard_listen: wireguard_endpoint,
+        wireguard_port: wireguard_listen.port(),
+        wireguard_advertised,
         control_endpoint,
         coordinators: coords,
         port_policy: policy,
@@ -5101,12 +5137,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         }
     }
     if let Some(wg) = &wireguard_listen {
+        let advertise = if wg.ip().is_unspecified() {
+            format!("endpoint-less on udp port {} (roaming: peers learn this node's address from its own initiations)", wg.port())
+        } else {
+            format!("advertising WireGuard endpoint udp/{wg}")
+        };
         match wireguard_effect {
-            WireGuardEffectKind::Real => println!(
-                "[node {label}] reachability plane: advertising WireGuard endpoint udp/{wg}"
-            ),
+            WireGuardEffectKind::Real => {
+                println!("[node {label}] reachability plane: {advertise}")
+            }
             WireGuardEffectKind::Fake => println!(
-                "[node {label}] reachability plane: advertising WireGuard endpoint udp/{wg}; \
+                "[node {label}] reachability plane: {advertise}; \
                  records, advertisements, and tunnel handshakes run for real, the interface \
                  effect is the in-memory fake (no real tunnel)."
             ),
@@ -5695,12 +5736,26 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     while let Ok((peer, msg)) = lobby_rx.recv().await {
                         let bytes: Vec<u8> = msg.into();
                         match lobby::decode_msg(&bytes) {
-                            Ok(lobby::LobbyMsg::JoinReply { recorded, detail, cap }) => {
+                            Ok(lobby::LobbyMsg::JoinReply { recorded, detail, cap, fatal }) => {
                                 println!(
                                     "[node {label}] member {}: {}{detail}",
                                     hex_bytes(&peer.as_ref()[..4]),
                                     if recorded { "" } else { "join request refused — " },
                                 );
+                                if fatal {
+                                    // this invite can NEVER redeem (e.g. its
+                                    // single-use token is already spent by
+                                    // another key) — retrying is a silent
+                                    // forever-spin. stop loudly: the FATAL
+                                    // marker is the app/operator contract.
+                                    eprintln!(
+                                        "[node {label}] FATAL: {detail} — this invite cannot \
+                                         be redeemed (an invite admits exactly one person). \
+                                         ask the inviter for a fresh invite and re-join with \
+                                         the new blob."
+                                    );
+                                    std::process::exit(1);
+                                }
                                 // a delivered cap (private coordination): unpack
                                 // the opaque bytes and persist beside identity.
                                 if let Some(cap_bytes) = cap {
@@ -8973,8 +9028,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
                 announce = lobby_ingress.next() => {
                     let Some((peer, bytes)) = announce else { continue };
-                    let mut send_reply = |recorded: bool, detail: String, cap: Option<Vec<u8>>| {
-                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail, cap };
+                    // `fatal: true` marks the refusal PERMANENT for this
+                    // invite — the joiner stops re-announcing instead of
+                    // spinning on a token that can never redeem.
+                    let mut send_reply = |recorded: bool, detail: String, cap: Option<Vec<u8>>, fatal: bool| {
+                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail, cap, fatal };
                         let _ = lobby_tx.send(
                             Recipients::One(peer.clone()),
                             IoBuf::from(lobby::encode_msg(&msg)),
@@ -8990,7 +9048,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let verified = match lobby::verify_join_request(&msg, &namespace) {
                         Ok(v) => v,
                         Err(e) => {
-                            send_reply(false, e, None);
+                            send_reply(false, e, None, false);
                             continue;
                         }
                     };
@@ -9002,7 +9060,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let residents_now = read_valset_residents(node.host()).await;
                     let joiner_bytes = verified.joiner.as_ref().to_vec();
                     if members.contains(&joiner_bytes) {
-                        send_reply(false, "already a validator".into(), None);
+                        send_reply(false, "already a validator".into(), None, false);
                         continue;
                     }
                     if residents_now.contains(&joiner_bytes) {
@@ -9010,6 +9068,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             false,
                             "already a resident — a member promotes it into the quorum".into(),
                             None,
+                            false,
                         );
                         continue;
                     }
@@ -9018,6 +9077,38 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             false,
                             "the inviting member is no longer part of this network".into(),
                             None,
+                            false,
+                        );
+                        continue;
+                    }
+                    // SPENT-INVITE check: the token's nonce is the
+                    // exactly-once key (governance's Redeem handler). a nonce
+                    // already redeemed by ANOTHER key can never redeem again —
+                    // resubmitting the op is pointless and the joiner would
+                    // spin on "redemption not landed yet" forever. fail it
+                    // loudly and permanently on both ends instead. (redeemed
+                    // by the SAME key = standing already granted; the
+                    // validator/resident checks above answered that.)
+                    let redemptions = read_redemptions_from_host(node.host()).await;
+                    if let Some(spent) = redemptions
+                        .iter()
+                        .find(|r| r.nonce == verified.nonce.as_slice() && r.joiner != joiner_bytes)
+                    {
+                        println!(
+                            "[node {label}] lobby: {} presented an ALREADY-REDEEMED invite \
+                             (spent by {} at height {}) — refusing permanently; an invite \
+                             admits exactly one person, mint a fresh one per joiner",
+                            hex_bytes(&joiner_bytes[..4]),
+                            hex_bytes(&spent.joiner[..4.min(spent.joiner.len())]),
+                            spent.height,
+                        );
+                        send_reply(
+                            false,
+                            "invite already redeemed — an invite admits exactly one person; \
+                             ask the inviter for a fresh invite"
+                                .into(),
+                            None,
+                            true,
                         );
                         continue;
                     }
@@ -9070,6 +9161,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             true,
                             "redemption in flight — standing lands shortly".into(),
                             minted_cap,
+                            false,
                         );
                         continue;
                     }
@@ -9112,10 +9204,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                  lands at the next block"
                                     .into(),
                                 minted_cap,
+                                false,
                             );
                         }
                         Err(e) => {
-                            send_reply(false, format!("redemption submit failed: {e}"), None);
+                            send_reply(false, format!("redemption submit failed: {e}"), None, false);
                         }
                     }
                 }

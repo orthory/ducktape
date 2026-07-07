@@ -54,7 +54,7 @@ fn record(
         validator_identity: id(signer),
         wireguard_public_key: wg,
         control_endpoint: endpoint(&policy, [1, 1, 1, last_octet], 443, Transport::Tcp),
-        wireguard_endpoint: endpoint(&policy, [8, 8, 8, last_octet], 51820, Transport::Udp),
+        wireguard_endpoint: Some(endpoint(&policy, [8, 8, 8, last_octet], 51820, Transport::Udp)),
         capabilities,
         expires_at_view: 50,
         nonce,
@@ -298,13 +298,14 @@ fn both_parties_validate_but_the_plan_is_initiator_local() {
                 .record(id(&b))
                 .unwrap()
                 .wireguard_endpoint
+                .unwrap()
                 .socket_addr()
         )
     );
     assert_eq!(peer_cfg.peer.persistent_keepalive_interval, Some(25));
     assert_eq!(peer_cfg.allowed_ips, plan_a.allowed_ips());
 
-    let listen = view_a.record(id(&a)).unwrap().wireguard_endpoint;
+    let listen = view_a.record(id(&a)).unwrap().wireguard_endpoint.unwrap();
     let iface = DefguardInterfaceConfig::from_plan(
         "ducktape-wg0",
         "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy",
@@ -425,13 +426,14 @@ fn responder_derives_its_own_install_plan_from_validate_upgrade_as() {
                 .record(id(&a))
                 .unwrap()
                 .wireguard_endpoint
+                .unwrap()
                 .socket_addr()
         )
     );
     assert_eq!(peer_cfg.peer.persistent_keepalive_interval, Some(25));
     assert_eq!(peer_cfg.allowed_ips, plan_b.allowed_ips());
 
-    let listen_b = view_b.record(id(&b)).unwrap().wireguard_endpoint;
+    let listen_b = view_b.record(id(&b)).unwrap().wireguard_endpoint.unwrap();
     let iface_b = DefguardInterfaceConfig::from_plan(
         "ducktape-wg0",
         "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy",
@@ -475,7 +477,7 @@ fn mesh_version_v2_fixed_vector() {
         // alone.
         wireguard_public_key: X25519PublicKey([identity_byte ^ 0x80; 32]),
         control_endpoint: endpoint(&policy, [1, 1, 1, host_octet], 443, Transport::Tcp),
-        wireguard_endpoint: endpoint(&policy, [8, 8, 8, host_octet], 51820, Transport::Udp),
+        wireguard_endpoint: Some(endpoint(&policy, [8, 8, 8, host_octet], 51820, Transport::Udp)),
         capabilities: if relay {
             vec![MeshCapability::Relay]
         } else {
@@ -693,7 +695,7 @@ fn relay_fallback_uses_only_admitted_relay_validators() {
             mesh_version: view.mesh_version,
             observer_identity: id(&a),
             target_identity: id(&b),
-            target_wireguard_endpoint: view.record(id(&b)).unwrap().wireguard_endpoint,
+            target_wireguard_endpoint: view.record(id(&b)).unwrap().wireguard_endpoint.unwrap(),
             failed_at_view: 11,
             expires_at_view: 40,
             error_hash: [7; 32],
@@ -894,7 +896,7 @@ fn ula_v6_overlay_routes_the_tunnel_with_identity_pinned_128s() {
         assert_eq!(v6.octets()[..6], prefix[..6], "route inside the chain /48");
     }
 
-    let listen = view.record(id(&a)).unwrap().wireguard_endpoint;
+    let listen = view.record(id(&a)).unwrap().wireguard_endpoint.unwrap();
     let iface = DefguardInterfaceConfig::from_plan(
         "dt-e2e",
         "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy",

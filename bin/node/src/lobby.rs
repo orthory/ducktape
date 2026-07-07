@@ -47,6 +47,13 @@ pub enum LobbyMsg {
         detail: String,
         #[serde(default)]
         cap: Option<Vec<u8>>,
+        /// this refusal is PERMANENT for this invite (its single-use token
+        /// is already redeemed by another key): the joiner must stop
+        /// re-announcing and ask for a fresh invite. `#[serde(default)]`
+        /// keeps the wire back-compatible — an older member's reply (no
+        /// `fatal` field) deserializes as non-fatal, i.e. keep retrying.
+        #[serde(default)]
+        fatal: bool,
     },
 }
 
@@ -322,6 +329,7 @@ mod tests {
             recorded: true,
             detail: "awaiting approval".into(),
             cap: None,
+            fatal: false,
         };
         assert_eq!(decode_msg(&encode_msg(&msg)).expect("roundtrip"), msg);
     }
@@ -358,6 +366,7 @@ mod tests {
             recorded: true,
             detail: "admitted; cap delivered".into(),
             cap: Some(vec![1, 2, 3, 4, 5]),
+            fatal: false,
         };
         assert_eq!(decode_msg(&encode_msg(&msg)).expect("roundtrip"), msg);
     }
@@ -374,6 +383,7 @@ mod tests {
                 recorded: true,
                 detail: "awaiting approval".into(),
                 cap: None,
+                fatal: false,
             }
         );
     }

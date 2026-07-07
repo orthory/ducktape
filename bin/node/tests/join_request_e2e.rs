@@ -79,3 +79,48 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
     cluster.wait_marker(0, "cutover complete: epoch 2", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch 2", CONVERGE);
 }
+
+#[test]
+fn a_spent_invite_is_refused_loudly_on_both_ends() {
+    let _serial = serial();
+    let mut cluster = NetworkShapeCluster::new();
+
+    cluster.init_founder("spent-invite");
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+
+    // first redeemer: the normal flow, driven to a COMMITTED redemption so
+    // the nonce is durably spent before anyone reuses the blob.
+    let invite = cluster.invite();
+    let friend_key = cluster.join_friend(&invite);
+    cluster.spawn(1);
+    cluster.wait_marker(0, "invite redemption submitted:", Duration::from_secs(90));
+    let expected = vec![common::unhex(&friend_key)];
+    poll_until("the redemption to grant resident standing", CONVERGE, || {
+        cluster
+            .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
+            .and_then(|raw| valset::decode_reply(&raw).ok())
+            .and_then(|r| match r {
+                ValsetReply::Residents(v) if v == expected => Some(()),
+                _ => None,
+            })
+    });
+
+    // second redeemer: the SAME blob under a fresh identity — the shared-blob
+    // mistake. before the loud-failure fix this spun forever on "redemption
+    // not landed yet" while the member blindly resubmitted the doomed Redeem.
+    cluster.kill(1);
+    std::fs::remove_dir_all(&cluster.friend_dir).expect("wipe first redeemer");
+    let second_key = cluster.join_friend(&invite);
+    assert_ne!(second_key, friend_key, "a wiped dir mints a fresh identity");
+    cluster.spawn(1);
+
+    // the member refuses PERMANENTLY (never resubmits the Redeem op) ...
+    cluster.wait_marker(0, "ALREADY-REDEEMED", Duration::from_secs(120));
+    // ... and the joiner stops retrying with the app/operator FATAL marker.
+    let fatal = cluster.wait_marker(1, "FATAL", Duration::from_secs(120));
+    assert!(
+        fatal.contains("invite already redeemed"),
+        "the fatal line names the cause: {fatal}"
+    );
+}

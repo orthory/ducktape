@@ -2410,6 +2410,38 @@ mod tests {
     }
 
     #[test]
+    fn a_non_wg_joiner_resolves_with_zero_reachability_config() {
+        // the zero-config joiner contract, non-WG shape: a network-shape
+        // config with NO `advertised` and a listen that is not dialable
+        // (loopback-ephemeral — cmd_join's non-WG default plumbing) must
+        // resolve: the joiner only ever dials OUT to the descriptor's reach
+        // hints, so nothing may demand it be reachable itself.
+        let dir = tmp("nonwgjoin");
+        let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        let founder = ed25519::PrivateKey::from_seed(7).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "net#44444444".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(founder.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_bootstrap(&founder, "203.0.113.7:41000");
+        d.save(&dir.join("network.toml")).expect("save");
+        std::fs::write(
+            dir.join("node.toml"),
+            "network = \"network.toml\"\nlisten = \"127.0.0.1:0\"\n",
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect(
+            "a joiner with no advertised and a non-dialable listen must resolve",
+        );
+        assert_eq!(r.signer.public_key(), me.public_key());
+        assert_eq!(r.bootstrappers.len(), 1, "it dials the founder's hint");
+    }
+
+    #[test]
     fn admit_is_idempotent_and_sorted() {
         let a = ed25519::PrivateKey::from_seed(1).public_key();
         let b = ed25519::PrivateKey::from_seed(2).public_key();
