@@ -74,7 +74,6 @@ use identity::Identity;
 use inbox::Inbox;
 use indexer::{AppliedOp, BlockOps, IndexStore};
 use jobs::Jobs;
-use memory::Memory;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
     NodeCommand, NodeHandle, NodeStatus, WsFrame, block_row, hex_bytes, hex_root, payload_preview,
@@ -90,7 +89,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 16] = [
+const MODULE_IDS: [&str; 15] = [
     "chat",
     "saga",
     "dispatch",
@@ -104,7 +103,6 @@ const MODULE_IDS: [&str; 16] = [
     "pages",
     "forge",
     "files",
-    "memory",
     "profiles",
     "identity",
 ];
@@ -346,7 +344,7 @@ struct Sim {
     /// touching the next command, and step order mirrors that.
     oracle_queue: VecDeque<Msg>,
     workers: Vec<Box<dyn reactor::Worker>>,
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
     index: Arc<IndexStore>,
     events: broadcast::Sender<WsFrame>,
 }
@@ -356,7 +354,7 @@ fn run_sim(
     storage: PathBuf,
     forge_repo: PathBuf,
     index: Arc<IndexStore>,
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
     persona: Arc<Mutex<Persona>>,
     auto: bool,
     echo_oracle: bool,
@@ -364,6 +362,7 @@ fn run_sim(
     mut control: mpsc::Receiver<SimCommand>,
     events: broadcast::Sender<WsFrame>,
 ) {
+    let duckfs_dir = storage.join("duckfs");
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
@@ -378,7 +377,7 @@ fn run_sim(
         let tagging = TaggingModule::new("tagging");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
-        let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
+        let automations = Automations::new("automations", "chat", "tasks", "inbox");
         let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
@@ -393,8 +392,7 @@ fn run_sim(
         );
         let pages = Pages::init(context.child("pages"), "pages").await;
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
-        let files = Files::with_blobs("files", blobs.clone());
-        let memory = Memory::new("memory", "files");
+        let files = Files::open("files", duckfs_dir).expect("duckfs open");
         let profiles = Profiles::new("profiles");
         // the deterministic user->nodes binding registry — no valset, no chain
         // (the simulator has neither), matching noded's daemon wiring.
@@ -413,7 +411,6 @@ fn run_sim(
             Box::new(pages),
             Box::new(forge),
             Box::new(files),
-            Box::new(memory),
             Box::new(profiles),
             Box::new(identity),
         ])

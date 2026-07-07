@@ -48,7 +48,8 @@ identity = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
-memory = { workspace = true }
+# the node-local op-receipt blob store shared with forge + the files module.
+blobstore = { workspace = true }
 jobs = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }

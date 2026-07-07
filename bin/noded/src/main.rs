@@ -40,7 +40,6 @@ use identity::Identity;
 use inbox::Inbox;
 use indexer::IndexStore;
 use jobs::Jobs;
-use memory::Memory;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
     NodeCommand, NodeHandle, NodeMetrics, NodeStatus, WsFrame, block_row, hex_bytes, hex_root,
@@ -56,7 +55,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 16] = [
+const MODULE_IDS: [&str; 15] = [
     "chat",
     "saga",
     "dispatch",
@@ -70,7 +69,6 @@ const MODULE_IDS: [&str; 16] = [
     "pages",
     "forge",
     "files",
-    "memory",
     "profiles",
     "identity",
 ];
@@ -158,23 +156,21 @@ fn run_node(
     storage: PathBuf,
     forge_repo: PathBuf,
     index: Arc<IndexStore>,
-    blobs: files::BlobHandle,
+    blobs: noded::blobs::BlobHandle,
     oracle_cmds: mpsc::Sender<NodeCommand>,
     mut cmds: mpsc::Receiver<NodeCommand>,
     events: broadcast::Sender<WsFrame>,
 ) {
     // forge_repo is derived by the caller (shared with the http upload-pack lane).
+    let duckfs_dir = storage.join("duckfs");
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
         // genesis: the full product surface. chat/tasks/inbox as the core loop,
-        // automations bridging chat/memory events into chat/tasks/inbox
-        // follow-ups, jobs for deferred work, pages + forge for the
-        // substrate-backed stores, and files + memory for the content planes.
-        // files registers over the
-        // http layer's blob handle so uploads land in the store `serve_sync`
-        // reads — the bytes themselves never touch consensus.
+        // automations bridging chat events into chat/tasks/inbox follow-ups,
+        // jobs for deferred work, pages + forge for the substrate-backed
+        // stores, and files (duckfs) for the content plane.
         let chat = Chat::init(context.child("chat"), "chat")
             .await
             .with_tagging("tagging");
@@ -186,7 +182,7 @@ fn run_node(
         let tagging = TaggingModule::new("tagging");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
-        let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
+        let automations = Automations::new("automations", "chat", "tasks", "inbox");
         let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
@@ -209,8 +205,7 @@ fn run_node(
         // blob lane (worker follow-ups included — the http submit handler only
         // stages what clients POST).
         let op_blobs = blobs.clone();
-        let files = Files::with_blobs("files", blobs);
-        let memory = Memory::new("memory", "files");
+        let files = Files::open("files", duckfs_dir).expect("duckfs open");
         // the origin-gated display-name registry: maps each verified submit
         // origin to a chosen name so the ui can resolve authors to names.
         let profiles = Profiles::new("profiles");
@@ -232,7 +227,6 @@ fn run_node(
             Box::new(pages),
             Box::new(forge),
             Box::new(files),
-            Box::new(memory),
             Box::new(profiles),
             Box::new(identity),
         ])
@@ -364,7 +358,7 @@ async fn submit_and_drain(
     workers: &[Box<dyn reactor::Worker>],
     height: &mut u64,
     index: &IndexStore,
-    blobs: &files::BlobHandle,
+    blobs: &noded::blobs::BlobHandle,
     events: &broadcast::Sender<WsFrame>,
     metrics: &NodeMetrics,
     origin: Origin,
@@ -435,7 +429,7 @@ async fn submit_one(
     host: &mut Host,
     height: &mut u64,
     index: &IndexStore,
-    blobs: &files::BlobHandle,
+    blobs: &noded::blobs::BlobHandle,
     events: &broadcast::Sender<WsFrame>,
     metrics: &NodeMetrics,
     origin: Origin,

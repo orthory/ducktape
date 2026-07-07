@@ -39,11 +39,12 @@ forge = { workspace = true }
 # the forge module's wire types — the git smart-HTTP receive-pack bridge encodes
 # ForgeMsg::Push / ForgeQuery::HeadOf onto the actor lane (the ONE forge-specific
 # route pair; every other route stays module-agnostic opaque json).
+# the duckfs module registration plus digest-hex validation on the blob route.
 files = { workspace = true }
-memory = { workspace = true }
+# the node-local op-receipt blob store (the http blob lane): op payloads staged
+# at submit time, served back by digest. re-exported by `src/blobs.rs`.
+blobstore = { workspace = true }
 reactor = { workspace = true }
-# the blob lane shares the files wire constants (chunk cap) and, in tests, the
-# manifest verification helpers.
 # the derived read-model tier: the actor materializes per-module fluent31
 # indexes as blocks commit; /v1/index/* serves snapshot reads of them, and
 # each module registers its `::index` mapper as its own view endpoint.
@@ -74,3 +75,6 @@ tempfile = "3"
 # daemon_e2e registers agents with a live prompt doc: prompt_hash pins sha256
 # of the doc's canonical rendering, computed test-side.
 sha2 = { workspace = true }
+# the duckfs surface round-trip encodes inline file bytes and decodes read
+# replies as base64 — the same wire the module speaks.
+base64 = { workspace = true }

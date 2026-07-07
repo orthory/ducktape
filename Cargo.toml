@@ -32,8 +32,9 @@ members = [
     "crates/system/reachability",
     "crates/system/data-plane",
     "crates/system/saga",
-    "crates/system/capability", 
-    "crates/system/dispatch", 
+    "crates/system/capability",
+    "crates/system/blobstore",
+    "crates/system/dispatch",
     "crates/system/dispatch-oracle",
     "crates/system/tagging", 
     # apps — product feature modules
@@ -47,8 +48,7 @@ members = [
     "crates/apps/profiles", 
     "crates/apps/automations", 
     "crates/apps/inbox", 
-    "crates/apps/files", 
-    "crates/apps/memory", 
+    "crates/apps/files",
     "crates/apps/jobs",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
@@ -93,15 +93,17 @@ defguard_wireguard_rs = "0.10.0"
 # ed25519 signer's); static_secrets because the key persists across boots.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
+# duckfs path normalization: NFC so visually-identical names collide instead
+# of coexisting (a consensus-determinism requirement, not cosmetics).
+unicode-normalization = "0.1"
+# tests only: isolated on-disk module data dirs.
+tempfile = "3"
 # user-key v2 at-rest custody (bin/node/src/userkey.rs only): BIP39
 # wordlist + entropy checksum (the PBKDF2 `to_seed` path is deliberately
 # unused — see the identity-onboarding design doc's custody model),
 # argon2id KEK derivation, and XChaCha20-Poly1305 AEAD. zeroize scrubs the
 # derived key on drop.
 bip39 = "2"
-# chat's derived tag index normalizes hashtag labels to NFC (already in-tree
-# transitively via bip39; pinned here for the chat crate's direct use).
-unicode-normalization = "0.1"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = "1"
@@ -133,6 +135,7 @@ identity = { path = "crates/system/identity" }
 upgrade = { path = "crates/system/upgrade" }
 saga = { path = "crates/system/saga" }
 capability = { path = "crates/system/capability" }
+blobstore = { path = "crates/system/blobstore" }
 dispatch = { path = "crates/system/dispatch" }
 dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }
@@ -147,7 +150,6 @@ profiles = { path = "crates/apps/profiles" }
 automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }
-memory = { path = "crates/apps/memory" }
 jobs = { path = "crates/apps/jobs" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }

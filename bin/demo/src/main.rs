@@ -49,7 +49,6 @@ use inbox::{
     encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
 };
 use jobs::Jobs;
-use memory::Memory;
 use profiles::Profiles;
 use saga::SagaModule;
 use saga::{
@@ -68,6 +67,10 @@ fn main() {
     // genesis starts from an unborn repo (root == ZERO) and output is reproducible.
     let forge_repo = std::env::temp_dir().join("ducktape-forge-demo");
     let _ = std::fs::remove_dir_all(&forge_repo);
+    // duckfs gets the same treatment: a wiped per-run data dir keeps output
+    // reproducible (the skeleton runs in-memory; tasks 5/6 use the dir).
+    let duckfs_dir = std::env::temp_dir().join("ducktape-duckfs-demo");
+    let _ = std::fs::remove_dir_all(&duckfs_dir);
 
     deterministic::Runner::default().start(|context| async move {
         // genesis: the module registry (would be consensus state on a real chain).
@@ -88,8 +91,7 @@ fn main() {
         // a fixed demo chain id (the demo has no real network descriptor).
         let identity = Identity::new("identity", None, "demo".into());
         let inbox = Inbox::new("inbox");
-        let files = Files::new("files");
-        let memory = Memory::new("memory", "files");
+        let files = Files::open("files", duckfs_dir.clone()).expect("duckfs open");
         let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
@@ -102,7 +104,7 @@ fn main() {
             Some("tasks".into()),
             Some("jobs".into()),
         );
-        let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
+        let automations = Automations::new("automations", "chat", "tasks", "inbox");
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(directory),
@@ -118,7 +120,6 @@ fn main() {
             Box::new(identity),
             Box::new(inbox),
             Box::new(files),
-            Box::new(memory),
             Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
@@ -126,7 +127,7 @@ fn main() {
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 19 registered modules over one host ===");
+        println!("=== super-app demo — 18 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(

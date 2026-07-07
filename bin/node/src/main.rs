@@ -102,7 +102,6 @@ use identity::Identity;
 use inbox::Inbox;
 use jobs::Jobs;
 use kv::Kv;
-use memory::Memory;
 use node::OrderedNode;
 use pages::Pages;
 use profiles::Profiles;
@@ -151,10 +150,17 @@ const NUDGE_INTERVAL: Duration = Duration::from_secs(2);
 /// post-reboot catch-up should close the reboot gap, not chase a live chain
 /// forever. any tiny lag left after this cap is handled by the normal engine.
 const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
-/// max wire message size we accept on a channel (1 MiB) — generous for the small
-/// json frames + BFT metadata, and the statesync chunk size (256 KiB) plus
-/// framing stays far below it.
-const MAX_MESSAGE_SIZE: u32 = 1 << 20;
+/// max wire message size we accept on a channel (2 MiB). the tallest honest
+/// messages are (a) an op frame carrying a full 1 MiB duckfs chunk — capped at
+/// `node::MAX_FRAME_BYTES` by the submit-boundary guard, then gossiped raw on
+/// the payload channel and served (plus a small rpc envelope) on the fetch and
+/// statesync lanes — and (b) a `GetObjects` sync reply page, capped at
+/// `files::MAX_SYNC_REPLY_BYTES` (base64 wraps each 1 MiB object ~4/3x). the
+/// asserts below pin both caps under this one, envelope headroom included:
+/// commonware's sender ASSERTS on this cap, so "over" is a panic, not an error.
+const MAX_MESSAGE_SIZE: u32 = 1 << 21;
+const _: () = assert!(MAX_MESSAGE_SIZE as usize >= node::MAX_FRAME_BYTES + 1024);
+const _: () = assert!(MAX_MESSAGE_SIZE as usize >= files::MAX_SYNC_REPLY_BYTES + 1024);
 /// inbound backlog before a channel applies receive backpressure.
 const MAX_BACKLOG: usize = 128;
 /// pump drain cadence: how often the pump applies finalized frames (and runs
@@ -215,7 +221,7 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 23] = [
+const MODULE_IDS: [&str; 22] = [
     "kv",
     "pages",
     "chat",
@@ -235,7 +241,6 @@ const MODULE_IDS: [&str; 23] = [
     "directory",
     "automations",
     "files",
-    "memory",
     "jobs",
     "agent",
     "runs",
@@ -627,12 +632,13 @@ fn hex(root: &StateRoot) -> String {
 async fn genesis_host(
     context: &commonware_runtime::tokio::Context,
     forge_repo: &std::path::Path,
+    duckfs_dir: &std::path::Path,
     genesis_validators: &[ed25519::PublicKey],
     // the network binding invite tokens verify against (the genesis
     // namespace) — wired into governance identically on every node, or
     // `Redeem` settles differently across validators and the app-hash forks.
     invite_binding: &[u8],
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
     chain_id: &str,
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
@@ -640,10 +646,9 @@ async fn genesis_host(
     let chat = Chat::init(context.child("chat"), "chat")
         .await
         .with_tagging("tagging");
-    // forge shares the files body plane so a Push's packfile (staged on the blob
+    // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
-    let forge =
-        Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone()).expect("forge init");
+    let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs).expect("forge init");
     let mut valset = Valset::new("valset");
     // genesis-seed the validator set from config — deterministic and identical
     // on every node, so membership is IN consensus state from block zero (the
@@ -703,10 +708,7 @@ async fn genesis_host(
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
         Box::new(Inbox::new("inbox")),
-        Box::new(Files::with_blobs("files", blobs)),
-        // the shared agent workspace: a filesystem-shaped namespace with
-        // write-once publish, immutable generations, snapshots, and watches.
-        Box::new(Memory::new("memory", "files")),
+        Box::new(Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open")),
         Box::new(Jobs::new("jobs")),
         // the agent registry: a self-contained record book; its hook keeps
         // each agent's dispatch recipe in lockstep via the runs module.
@@ -726,13 +728,7 @@ async fn genesis_host(
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
         // events and emits chat/tasks follow-ups.
-        Box::new(Automations::new(
-            "automations",
-            "chat",
-            "tasks",
-            "inbox",
-            "memory",
-        )),
+        Box::new(Automations::new("automations", "chat", "tasks", "inbox")),
     ])
     .expect("genesis host")
 }
@@ -744,10 +740,11 @@ async fn genesis_host(
 async fn restore_host(
     context: &commonware_runtime::tokio::Context,
     forge_repo: &std::path::Path,
+    duckfs_dir: &std::path::Path,
     manifest: &Manifest,
     // see `genesis_host` — the same binding must reach every rebuild path.
     invite_binding: &[u8],
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
     chain_id: &str,
 ) -> Result<Host, String> {
     let kv = Kv::init(context.child("kv"), "kv").await;
@@ -755,8 +752,8 @@ async fn restore_host(
     let chat = Chat::init(context.child("chat"), "chat")
         .await
         .with_tagging("tagging");
-    // forge shares the files body plane (see genesis_host) for Push materialization.
-    let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs.clone())
+    // forge shares the blob plane (see genesis_host) for Push materialization.
+    let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .map_err(|e| format!("forge: {e}"))?;
     // establish the checkpoint boundary's dual-path branch selector so the
     // restored forge `root()` matches at any block the replay SKIPS (disk already
@@ -847,17 +844,14 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("inbox install: {e}"))?;
 
-    let mut files = Files::with_blobs("files", blobs);
-    let (bytes, root) = snapshot_of("files")?;
-    files
-        .install(bytes, root)
-        .map_err(|e| format!("files install: {e}"))?;
-
-    let mut memory = Memory::new("memory", "files");
-    let (bytes, root) = snapshot_of("memory")?;
-    memory
-        .install(bytes, root)
-        .map_err(|e| format!("memory install: {e}"))?;
+    // files is a duckfs-odb resolver module — NOT in the checkpoint's snapshot
+    // set (like the qmdb modules above, which `init` from their own on-disk
+    // stores). `Files::open` already recovers its committed refs, durable height,
+    // and objects from the on-disk odb/refs envelope, and recovery replays
+    // forward from that height — so a reboot needs no checkpoint bytes and no
+    // object fetch here.
+    let files =
+        Files::open("files", duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
 
     let mut jobs = Jobs::new("jobs");
     let (bytes, root) = snapshot_of("jobs")?;
@@ -890,7 +884,7 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("directory install: {e}"))?;
 
-    let mut automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
+    let mut automations = Automations::new("automations", "chat", "tasks", "inbox");
     let (bytes, root) = snapshot_of("automations")?;
     automations
         .install(bytes, root)
@@ -914,7 +908,6 @@ async fn restore_host(
         Box::new(identity),
         Box::new(inbox),
         Box::new(files),
-        Box::new(memory),
         Box::new(jobs),
         Box::new(agent),
         Box::new(runs),
@@ -922,6 +915,52 @@ async fn restore_host(
         Box::new(automations),
     ])
     .map_err(|e| format!("restore host: {e}"))
+}
+
+/// the object-store ([`statesync::ObjectFetch`]) adapter over the live `files`
+/// module: the statesync possession driver owns the loop + the full-possession
+/// gate, this owns the duckfs `serve_sync` wire (refs image + `GetObjects`).
+///
+/// SCRATCH NAMESPACE (#219): like the qmdb modules — whose `sync_from` lands
+/// under an ATTEMPT-scoped runtime child (`{name}_scratch_a{n}`) — the module
+/// this adapter wraps is opened over `files::SyncScratch`'s attempt-scoped
+/// scratch dir, NEVER the canonical `duckfs_dir`. the canonical dir is written
+/// only by the verified promotion after `sync_all_modules`' composite app-hash
+/// gate, so a failed join leaves it byte-untouched.
+struct FilesOdb<'a>(&'a mut Files);
+
+impl statesync::ObjectFetch for FilesOdb<'_> {
+    fn refs_request(&self) -> Vec<u8> {
+        files::encode_get_refs()
+    }
+
+    fn install_refs(&mut self, reply: &[u8], root: StateRoot, height: u64) -> Result<(), String> {
+        let bytes = files::decode_refs_reply(reply)?;
+        // persist the refs envelope at the SYNCED boundary height so a restart
+        // right after the join resumes replay from the boundary, not genesis.
+        self.0
+            .install(&bytes, root, height)
+            .map_err(|e| e.to_string())
+    }
+
+    fn missing_request(&self, limit: usize) -> Result<Option<Vec<u8>>, String> {
+        let ids = self.0.missing_objects(limit).map_err(|e| e.to_string())?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(files::encode_get_objects(&ids)))
+    }
+
+    fn ingest(&mut self, reply: &[u8]) -> Result<usize, String> {
+        let batch = files::decode_objects_reply(reply)?;
+        let landed = batch.len();
+        self.0.ingest_objects(&batch).map_err(|e| e.to_string())?;
+        Ok(landed)
+    }
+
+    fn possession_complete(&self) -> Result<bool, String> {
+        self.0.possession_complete().map_err(|e| e.to_string())
+    }
 }
 
 /// rebuild EVERY production module from a peer's statesync service at
@@ -937,6 +976,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     client: &C,
     manifest: &statesync::Manifest,
     forge_repo: &std::path::Path,
+    duckfs_dir: &std::path::Path,
     // see `genesis_host` — the same binding must reach every rebuild path.
     invite_binding: &[u8],
     attempt: usize,
@@ -1102,17 +1142,31 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("inbox install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("files").await?;
-    let mut files = Files::new("files");
-    files
-        .install(&bytes, root)
-        .map_err(|e| format!("files install: {e}"))?;
-
-    let (bytes, root) = snapshot_of("memory").await?;
-    let mut memory = Memory::new("memory", "files");
-    memory
-        .install(&bytes, root)
-        .map_err(|e| format!("memory install: {e}"))?;
+    // files is a duckfs-odb resolver module: its refs image AND its
+    // content-addressed objects both ride the Module/`serve_sync` lane. a fresh
+    // joiner's odb is EMPTY, so install the boundary refs (root-verified) at the
+    // sync-target height and then loop GetObjects to full object possession —
+    // the snapshot lane would leave this node refs-only (every file listed, not
+    // one byte readable). the sync lands in an ATTEMPT-scoped scratch dir
+    // (`duckfs_scratch_a{attempt}`, mirroring the qmdb scratch namespaces);
+    // the canonical `duckfs_dir` is written only by the verified promotion
+    // after the composite app-hash gate below (#219).
+    let files_scratch = files::SyncScratch::prepare(duckfs_dir, attempt)
+        .map_err(|e| format!("duckfs scratch: {e}"))?;
+    let mut files = Files::open("files", files_scratch.dir().to_path_buf())
+        .map_err(|e| format!("duckfs open: {e}"))?;
+    let files_root = entry_root("files")?;
+    let files_lane = statesync::ClientModuleLane::new(client.clone(), manifest.boundary_id());
+    statesync::sync_object_possession(
+        &files_lane,
+        "files",
+        files_root,
+        manifest.height,
+        &mut FilesOdb(&mut files),
+        files::MAX_SYNC_IDS,
+    )
+    .await
+    .map_err(|e| format!("files sync: {e}"))?;
 
     let (bytes, root) = snapshot_of("jobs").await?;
     let mut jobs = Jobs::new("jobs");
@@ -1140,7 +1194,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("runs install: {e}"))?;
 
     let (bytes, root) = snapshot_of("automations").await?;
-    let mut automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
+    let mut automations = Automations::new("automations", "chat", "tasks", "inbox");
     automations
         .install(&bytes, root)
         .map_err(|e| format!("automations install: {e}"))?;
@@ -1181,7 +1235,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(identity),
         Box::new(inbox),
         Box::new(files),
-        Box::new(memory),
         Box::new(jobs),
         Box::new(agent),
         Box::new(runs),
@@ -1199,6 +1252,31 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     if host.app_hash() != manifest.app_hash {
         return Err(format!(
             "composed {} != manifest {}",
+            hex(&host.app_hash()),
+            hex(&manifest.app_hash)
+        ));
+    }
+    // the composite gate passed — promote files' scratch into the canonical
+    // `duckfs_dir` (verify-then-replace refs + content-addressed object merge,
+    // gated on the exact files root this composition certified) and swap the
+    // registry onto a canonical-backed module. the returned host must run in
+    // place over the canonical dir: the post-reboot full-sync fallback keeps
+    // it live without a reboot, and a joiner's promotion reboot re-opens the
+    // same dir. on any error the host is discarded and the retry re-syncs —
+    // an already-promoted canonical dir is verified state, never damage.
+    files_scratch
+        .promote(files_root.0)
+        .map_err(|e| format!("duckfs promote: {e}"))?;
+    host.register(Box::new(
+        Files::open("files", duckfs_dir.to_path_buf())
+            .map_err(|e| format!("duckfs reopen: {e}"))?,
+    ));
+    // re-realize the boundary version over the swapped registry (idempotent),
+    // then re-check THE property against the canonical-backed composition.
+    host.set_active_version(manifest.current_version);
+    if host.app_hash() != manifest.app_hash {
+        return Err(format!(
+            "canonical duckfs reopen composed {} != manifest {}",
             hex(&host.app_hash()),
             hex(&manifest.app_hash)
         ));
@@ -1389,7 +1467,7 @@ fn recovery_frame_to_sync(
 /// what makes `GET /v1/files/blob/{op_hash}` answer again after a restart.
 #[allow(clippy::too_many_arguments)]
 fn explorer_block_row(
-    blobs: &files::BlobHandle,
+    blobs: &blobstore::BlobHandle,
     height: u64,
     frame_hash: &node::FrameId,
     app_hash: &StateRoot,
@@ -1425,7 +1503,7 @@ fn explorer_block_row(
 /// heartbeat nop is the deliberately-empty block the explorer hides, and a
 /// discarded frame is never journaled (the arm keeps this total anyway).
 fn sealed_frame_block_row(
-    blobs: &files::BlobHandle,
+    blobs: &blobstore::BlobHandle,
     block: &recovery::FoldedBlock<'_>,
 ) -> Option<Vec<u8>> {
     let (origin, msg) = node::decode_frame(block.frame).ok()?;
@@ -1483,12 +1561,12 @@ fn boundary_block_row(height: u64, app_hash: &StateRoot) -> Vec<u8> {
 /// `GET /v1/blocks` loses those heights for good.
 struct IndexFold<'a> {
     index: &'a indexer::IndexStore,
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
     stopped: bool,
 }
 
 impl<'a> IndexFold<'a> {
-    fn new(index: &'a indexer::IndexStore, blobs: files::BlobHandle) -> Self {
+    fn new(index: &'a indexer::IndexStore, blobs: blobstore::BlobHandle) -> Self {
         Self {
             index,
             blobs,
@@ -5310,11 +5388,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // disk, so every store opens under its canonical module id) and
             // print the greppable line the demo script asserts on.
             let forge_repo = storage_for_sync.join("forge-repo");
+            let duckfs_dir = storage_for_sync.join("duckfs");
             match sync_all_modules(
                 &context,
                 &client,
                 &manifest,
                 &forge_repo,
+                &duckfs_dir,
                 &namespace,
                 0,
                 &identity_chain_id,
@@ -5352,6 +5432,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
         };
         let forge_repo = storage_for_sync.join("forge-repo");
+        let duckfs_dir = storage_for_sync.join("duckfs");
+        // boot sweep (#219): no sync attempt is in flight yet, so any leftover
+        // `duckfs_scratch_a*` dir (a crashed attempt, or a promoted scratch
+        // whose final removal was interrupted) is safe to remove. best-effort.
+        files::SyncScratch::sweep_stale(&duckfs_dir);
 
         // ---- the JOINER: park on the mesh, sync a boundary that includes
         // this key, fabricate the equivalent recovery checkpoint, reboot ----
@@ -6316,6 +6401,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 &client,
                                 &m,
                                 &forge_repo,
+                                &duckfs_dir,
                                 &namespace,
                                 attempt,
                                 &identity_chain_id,
@@ -6497,6 +6583,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     &client,
                     &m,
                     &forge_repo,
+                    &duckfs_dir,
                     &namespace,
                     attempt,
                     &identity_chain_id,
@@ -6695,6 +6782,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 let host = genesis_host(
                     &context,
                     &forge_repo,
+                    &duckfs_dir,
                     &validators,
                     &namespace,
                     blobs.clone(),
@@ -6750,6 +6838,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 let restored = restore_host(
                     &context,
                     &forge_repo,
+                    &duckfs_dir,
                     &manifest,
                     &namespace,
                     blobs.clone(),
@@ -7221,6 +7310,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             &client,
                             &target,
                             &forge_repo,
+                            &duckfs_dir,
                             &namespace,
                             10_000 + attempts,
                             &identity_chain_id,
@@ -9353,7 +9443,7 @@ mod tests {
                 .ok_or_else(|| Error::Module("missing test value".into()))?;
             self.staged = Some(value);
             ctx.emit_msg(Msg {
-                target: "memory".into(),
+                target: "mem".into(),
                 payload: vec![value],
             });
             Ok(())
@@ -9401,7 +9491,7 @@ mod tests {
     #[async_trait::async_trait(?Send)]
     impl Module for TestMemoryModule {
         fn id(&self) -> String {
-            "memory".into()
+            "mem".into()
         }
 
         fn root(&self) -> StateRoot {
@@ -9446,10 +9536,10 @@ mod tests {
         let mut memory = TestMemoryModule::new(0);
         memory
             .install(
-                manifest.snapshot("memory").expect("memory snapshot"),
-                manifest.root("memory").expect("memory root"),
+                manifest.snapshot("mem").expect("mem snapshot"),
+                manifest.root("mem").expect("mem root"),
             )
-            .expect("memory install");
+            .expect("mem install");
         Host::genesis(vec![Box::new(TestDiskModule::new(store)), Box::new(memory)])
             .expect("restored mixed host")
     }
@@ -9814,7 +9904,7 @@ mod tests {
             .expect("write catch-up checkpoint");
             assert_eq!(ckpt.height, Some(1));
             assert_eq!(ckpt.app_hash, target.app_hash);
-            assert_eq!(ckpt.snapshot("memory"), Some([7u8].as_slice()));
+            assert_eq!(ckpt.snapshot("mem"), Some([7u8].as_slice()));
 
             let mut restored = restore_mixed_durability_host(durable_store, &ckpt);
             let recovered = recovery
@@ -10016,7 +10106,7 @@ mod tests {
         let app_hash = test_root(9);
 
         // the drain's construction: decoded parts straight from its DrainedOp.
-        let drain_blobs = files::BlobHandle::default();
+        let drain_blobs = blobstore::BlobHandle::default();
         let drain_row = explorer_block_row(
             &drain_blobs,
             7,
@@ -10030,7 +10120,7 @@ mod tests {
         );
 
         // the boot fold's construction: nothing but what the journal seals.
-        let fold_blobs = files::BlobHandle::default();
+        let fold_blobs = blobstore::BlobHandle::default();
         let fold_row = sealed_frame_block_row(
             &fold_blobs,
             &recovery::FoldedBlock {
@@ -10067,7 +10157,7 @@ mod tests {
     /// nop-filtered for exactly these).
     #[test]
     fn boot_fold_skips_nop_and_undecodable_frames() {
-        let blobs = files::BlobHandle::default();
+        let blobs = blobstore::BlobHandle::default();
         let signer = ed25519::PrivateKey::from_seed(43);
         let nop = node::encode_frame(
             &signer,
@@ -10098,7 +10188,7 @@ mod tests {
     /// decoded non-nop reject), with an empty dispatch trace.
     #[test]
     fn boot_fold_rebuilds_rejected_rows_with_empty_trace() {
-        let blobs = files::BlobHandle::default();
+        let blobs = blobstore::BlobHandle::default();
         let signer = ed25519::PrivateKey::from_seed(44);
         let frame = node::encode_frame(
             &signer,
