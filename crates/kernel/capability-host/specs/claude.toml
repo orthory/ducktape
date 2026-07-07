@@ -1,8 +1,12 @@
 # Capability spec: Claude Code CLI.
 #
 # Embedded built-in default — see codex.toml for the annotated reference and
-# docs/capability-spec.md for the full format. No --model flag by default:
-# which model runs is the operator's CLI configuration (host policy).
+# docs/capability-spec.md for the full format. The BASE tag ("claude") passes
+# no --model flag: which model runs is the operator's CLI configuration (host
+# policy). The [[variants]] below are the curated model/effort matrix — each
+# expands at load time into a finer tag `claude_<model>_<effort>` carrying
+# its own fully literal argv (base args + --model/--effort), overridable
+# per tag like any other spec.
 
 spec = 1
 
@@ -30,3 +34,70 @@ timeout_secs = 300
 [output]
 # The single `{"type":"result",...}` object from --output-format json.
 format = "json-result"
+
+# ---- curated model/effort matrix -------------------------------------------
+# Base args plus an explicit --model and --effort per variant.
+
+[[variants]]
+suffix = "fable_low"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "fable", "--effort", "low"]
+
+[[variants]]
+suffix = "fable_medium"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "fable", "--effort", "medium"]
+
+[[variants]]
+suffix = "fable_high"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "fable", "--effort", "high"]
+
+[[variants]]
+suffix = "fable_max"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "fable", "--effort", "max"]
+
+[[variants]]
+suffix = "opus_low"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "opus", "--effort", "low"]
+
+[[variants]]
+suffix = "opus_medium"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "opus", "--effort", "medium"]
+
+[[variants]]
+suffix = "opus_high"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "opus", "--effort", "high"]
+
+[[variants]]
+suffix = "opus_max"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "opus", "--effort", "max"]
+
+[[variants]]
+suffix = "sonnet_low"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "sonnet", "--effort", "low"]
+
+[[variants]]
+suffix = "sonnet_medium"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "sonnet", "--effort", "medium"]
+
+[[variants]]
+suffix = "sonnet_high"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "sonnet", "--effort", "high"]
+
+[[variants]]
+suffix = "sonnet_max"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "sonnet", "--effort", "max"]
+
+[[variants]]
+suffix = "haiku_low"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "haiku", "--effort", "low"]
+
+[[variants]]
+suffix = "haiku_medium"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "haiku", "--effort", "medium"]
+
+[[variants]]
+suffix = "haiku_high"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "haiku", "--effort", "high"]
+
+[[variants]]
+suffix = "haiku_max"
+args = ["-p", "--output-format", "json", "--max-turns", "1", "--model", "haiku", "--effort", "max"]

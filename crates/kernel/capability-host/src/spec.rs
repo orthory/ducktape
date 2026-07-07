@@ -25,8 +25,10 @@
 //! literally and completely, what running that tag means on this host (which
 //! binary, which flags, which model — all operator policy). a finer-grained
 //! need ("this executor, but with these exact flags") is a finer tag with its own
-//! spec, not a routing rule. no executor name appears anywhere in this
-//! crate's code or tests — executors exist only as spec data.
+//! spec, not a routing rule — `[[variants]]` (see [`crate::variants`]) is
+//! load-time sugar for writing a family of such finer tags in one file, each
+//! still one tag with one fixed argv. no executor name appears anywhere in
+//! this crate's code or tests — executors exist only as spec data.
 //!
 //! ## trust model — read this before adding spec sources
 //!
@@ -53,6 +55,8 @@ use std::path::Path;
 
 use capability::validate_tag;
 use serde::Deserialize;
+
+use crate::variants::{self, RawVariant};
 
 /// the one spec format version this build understands. parsing rejects any
 /// other value loudly — an operator on a newer format gets "unsupported spec
@@ -129,6 +133,10 @@ struct RawSpec {
     detect: RawDetect,
     invoke: RawInvoke,
     output: RawOutput,
+    /// optional `[[variants]]` — finer tags expanded at load time, validated
+    /// in [`crate::variants`].
+    #[serde(default)]
+    variants: Vec<RawVariant>,
 }
 
 #[derive(Deserialize)]
@@ -168,11 +176,37 @@ struct RawOutput {
 }
 
 impl CapabilitySpec {
-    /// parse and validate one spec's TOML. `origin` names the source (a file
-    /// path or "embedded:<tag>") so every error says WHICH spec is broken.
-    /// unknown fields are rejected (`deny_unknown_fields`): a typo like
-    /// `patern` fails loud instead of silently changing routing.
+    /// parse and validate one SINGLE-tag spec's TOML — the convenience for
+    /// callers holding a spec that declares no `[[variants]]` (a file that
+    /// does is a hard error here, never a silent drop of its variants; load
+    /// whole files through [`CapabilitySpec::parse_all`]).
     pub fn parse(toml_text: &str, origin: &str) -> Result<Self, String> {
+        let (base, variants) = Self::parse_raw(toml_text, origin)?;
+        if !variants.is_empty() {
+            return Err(format!(
+                "{origin}: spec declares [[variants]] and expands to multiple \
+                 tags; load it via parse_all"
+            ));
+        }
+        Ok(base)
+    }
+
+    /// parse and validate one spec FILE's TOML into every spec it defines:
+    /// the base spec first, then its `[[variants]]` expansions in declaration
+    /// order. this is the loaders' entry point — one file, 1+ tags.
+    pub fn parse_all(toml_text: &str, origin: &str) -> Result<Vec<Self>, String> {
+        let (base, raw_variants) = Self::parse_raw(toml_text, origin)?;
+        let mut specs = variants::expand(&base, &raw_variants, origin)?;
+        specs.insert(0, base);
+        Ok(specs)
+    }
+
+    /// the shared parse core: the validated base spec plus its still-raw
+    /// variant entries. `origin` names the source (a file path or
+    /// "embedded:<file>") so every error says WHICH spec is broken. unknown
+    /// fields are rejected (`deny_unknown_fields`): a typo like `patern`
+    /// fails loud instead of silently changing routing.
+    fn parse_raw(toml_text: &str, origin: &str) -> Result<(Self, Vec<RawVariant>), String> {
         let raw: RawSpec =
             toml::from_str(toml_text).map_err(|e| format!("{origin}: not a valid spec: {e}"))?;
         if raw.spec != SPEC_VERSION {
@@ -213,16 +247,19 @@ impl CapabilitySpec {
                 ));
             }
         };
-        Ok(Self {
-            tag,
-            description: raw.capability.description,
-            bin: raw.detect.bin,
-            env: raw.detect.env,
-            args: raw.invoke.args,
-            prompt,
-            timeout_secs: raw.invoke.timeout_secs,
-            output,
-        })
+        Ok((
+            Self {
+                tag,
+                description: raw.capability.description,
+                bin: raw.detect.bin,
+                env: raw.detect.env,
+                args: raw.invoke.args,
+                prompt,
+                timeout_secs: raw.invoke.timeout_secs,
+                output,
+            },
+            raw.variants,
+        ))
     }
 }
 
@@ -239,15 +276,15 @@ pub struct SpecSet {
 
 /// the built-in specs compiled into this binary — every `specs/*.toml`,
 /// globbed and embedded by build.rs, so no Rust source names an executor.
-/// parsed at runtime through the same [`CapabilitySpec::parse`] path as
-/// operator files; a unit test asserts validity so a broken embedded spec
-/// fails CI, not a node boot — the `expect` here is unreachable past that
-/// test.
+/// parsed at runtime through the same [`CapabilitySpec::parse_all`] path as
+/// operator files (one file may expand into a base tag plus `[[variants]]`);
+/// a unit test asserts validity so a broken embedded spec fails CI, not a
+/// node boot — the `expect` here is unreachable past that test.
 pub fn builtin_specs() -> Vec<CapabilitySpec> {
     include!(concat!(env!("OUT_DIR"), "/builtin_specs.rs"))
         .into_iter()
-        .map(|(origin, text): (&str, &str)| {
-            CapabilitySpec::parse(text, origin).expect("embedded specs are CI-validated")
+        .flat_map(|(origin, text): (&str, &str)| {
+            CapabilitySpec::parse_all(text, origin).expect("embedded specs are CI-validated")
         })
         .collect()
 }
@@ -287,7 +324,9 @@ impl SpecSet {
 }
 
 /// load and validate every `*.toml` in `dir`, sorted by file name for stable
-/// error ordering. duplicate tags in one dir are a hard error.
+/// error ordering. duplicate tags in one dir are a hard error — a file's
+/// `[[variants]]` expansions count like any other tag, so a variant of one
+/// file colliding with another file's tag is caught the same way.
 fn load_dir(dir: &Path) -> Result<Vec<CapabilitySpec>, String> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("capability spec dir {}: {e}", dir.display()))?
@@ -300,16 +339,17 @@ fn load_dir(dir: &Path) -> Result<Vec<CapabilitySpec>, String> {
     for path in entries {
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("capability spec {}: {e}", path.display()))?;
-        let spec = CapabilitySpec::parse(&text, &path.display().to_string())?;
-        if let Some(prev) = seen.insert(spec.tag.clone(), path.clone()) {
-            return Err(format!(
-                "duplicate capability tag {:?}: {} and {}",
-                spec.tag,
-                prev.display(),
-                path.display()
-            ));
+        for spec in CapabilitySpec::parse_all(&text, &path.display().to_string())? {
+            if let Some(prev) = seen.insert(spec.tag.clone(), path.clone()) {
+                return Err(format!(
+                    "duplicate capability tag {:?}: {} and {}",
+                    spec.tag,
+                    prev.display(),
+                    path.display()
+                ));
+            }
+            specs.push(spec);
         }
-        specs.push(spec);
     }
     Ok(specs)
 }
@@ -384,6 +424,68 @@ format = "text"
         let stale = format!("{}\n[models]\npatterns = [\"*\"]\n", spec_toml("ok"));
         let err = CapabilitySpec::parse(&stale, "t").unwrap_err();
         assert!(err.contains("not a valid spec"), "got {err:?}");
+    }
+
+    #[test]
+    fn single_spec_parse_refuses_a_variants_file() {
+        // parse() is the single-tag convenience; silently dropping a file's
+        // variants would be exactly the quiet misread this loader forbids.
+        let toml = format!(
+            "{}\n[[variants]]\nsuffix = \"m_low\"\nargs = [\"a\"]\n",
+            spec_toml("ok")
+        );
+        let err = CapabilitySpec::parse(&toml, "t").unwrap_err();
+        assert!(err.contains("parse_all"), "got {err:?}");
+    }
+
+    #[test]
+    fn operator_files_expand_variants_and_override_stays_wholesale_by_tag() {
+        let dir =
+            std::env::temp_dir().join(format!("capspec-variants-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // an operator family file expands exactly like an embedded one.
+        let family = format!(
+            "{}\n[[variants]]\nsuffix = \"m1_low\"\nargs = [\"run\", \"--fast\"]\n",
+            spec_toml("fam")
+        );
+        std::fs::write(dir.join("family.toml"), family).unwrap();
+
+        // overriding a base tag replaces THAT tag only: a variant tag is its
+        // own tag, so the embedded siblings stay. parent derived from the
+        // data, never hardcoded.
+        let builtins = builtin_specs();
+        let variant = builtins
+            .iter()
+            .find(|s| s.tag.contains('_'))
+            .expect("built-ins ship variant tags");
+        let parent = variant.tag.split('_').next().unwrap().to_string();
+        std::fs::write(dir.join("override.toml"), spec_toml(&parent)).unwrap();
+
+        let set = SpecSet::load(Some(&dir)).unwrap();
+        assert_eq!(
+            set.get("fam_m1_low").unwrap().args,
+            vec!["run", "--fast"],
+            "operator variants expand into their own tags"
+        );
+        assert_eq!(
+            set.get("fam").unwrap().bin,
+            "fam-cli",
+            "operator base loads too"
+        );
+        assert_eq!(
+            set.get(&parent).unwrap().bin,
+            format!("{parent}-cli"),
+            "operator spec replaced the base tag wholesale"
+        );
+        assert_eq!(
+            set.get(&variant.tag).unwrap().args,
+            variant.args,
+            "sibling embedded variant tags are untouched by a base override"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

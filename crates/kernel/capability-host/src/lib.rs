@@ -27,6 +27,7 @@
 //! the child never sees the node's data directory. the fence is what turns
 //! "orchestrate a coding agent" into "use it as a text oracle".
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -36,6 +37,7 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt as _;
 
 mod spec;
+mod variants;
 pub use spec::{CapabilitySpec, OutputFormat, PromptMode, SpecSet, builtin_specs};
 
 /// a machine-local executor for one capability tag. implementations do real
@@ -133,8 +135,8 @@ impl ProviderSet {
 }
 
 /// a [`Provider`] that interprets one [`CapabilitySpec`] against one resolved
-/// binary: spawn `bin` with the spec's argv (`{model}` substituted), feed the
-/// prompt on stdin, parse stdout with the spec's named format.
+/// binary: spawn `bin` with the spec's literal argv, feed the prompt on
+/// stdin, parse stdout with the spec's named format.
 pub struct CliProvider {
     spec: CapabilitySpec,
     bin: PathBuf,
@@ -276,18 +278,17 @@ fn parse_jsonl_events(stdout: &str) -> Result<String, String> {
                 .get("type")
                 .or_else(|| item.get("item_type"))
                 .and_then(Value::as_str);
-            if kind == Some("agent_message") {
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    last = Some(text.to_string());
-                }
+            if kind == Some("agent_message")
+                && let Some(text) = item.get("text").and_then(Value::as_str)
+            {
+                last = Some(text.to_string());
             }
         }
-        if let Some(msg) = v.get("msg") {
-            if msg.get("type").and_then(Value::as_str) == Some("agent_message") {
-                if let Some(text) = msg.get("message").and_then(Value::as_str) {
-                    last = Some(text.to_string());
-                }
-            }
+        if let Some(msg) = v.get("msg")
+            && msg.get("type").and_then(Value::as_str) == Some("agent_message")
+            && let Some(text) = msg.get("message").and_then(Value::as_str)
+        {
+            last = Some(text.to_string());
         }
     }
     last.ok_or_else(|| {
@@ -394,44 +395,62 @@ fn operator_spec_dir() -> Option<PathBuf> {
 
 /// the parameterized core of [`discover`]: specs in, providers out, all env
 /// access injected so tests never mutate process state.
+///
+/// probing is per unique `(bin, env-override)` identity, not per tag: a spec
+/// family (`[[variants]]`) puts dozens of tags over a handful of binaries,
+/// and each PATH walk is a stat per directory — so tags sharing a probe
+/// identity are grouped, the binary is resolved ONCE, and the result fans
+/// out to every tag in the group.
 fn discover_with(
     specs: SpecSet,
     path: Option<OsString>,
     env: &dyn Fn(&str) -> Option<OsString>,
     global_timeout: Option<Duration>,
 ) -> ProviderSet {
-    let mut providers: Vec<Box<dyn Provider>> = Vec::new();
+    let mut groups: BTreeMap<(&str, Option<&str>), Vec<&CapabilitySpec>> = BTreeMap::new();
     for spec in specs.iter() {
-        let Some(bin) = resolve_bin(spec, path.as_deref(), env) else {
+        groups
+            .entry((spec.bin.as_str(), spec.env.as_deref()))
+            .or_default()
+            .push(spec);
+    }
+    let mut providers: Vec<Box<dyn Provider>> = Vec::new();
+    for group in groups.values() {
+        let Some(bin) = resolve_bin(group, path.as_deref(), env) else {
             continue;
         };
-        let mut provider = CliProvider::from_spec(spec.clone(), bin);
-        if let Some(t) = global_timeout {
-            provider = provider.with_timeout(t);
+        for spec in group {
+            let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone());
+            if let Some(t) = global_timeout {
+                provider = provider.with_timeout(t);
+            }
+            providers.push(Box::new(provider));
         }
-        providers.push(Box::new(provider));
     }
+    drop(groups);
     ProviderSet::assemble(specs, providers)
 }
 
-/// resolve one spec's binary: the spec's env override wins (and a BROKEN
-/// override is a loud warning + absent capability, never a silent fallback to
-/// PATH — the operator said "use this", and this does not exist), else the
-/// first executable `detect.bin` on `path`.
+/// resolve the binary for one probe group — specs sharing one `(bin, env)`
+/// identity: the env override wins (and a BROKEN override is a loud warning
+/// naming every affected tag + absent capabilities, never a silent fallback
+/// to PATH — the operator said "use this", and this does not exist), else
+/// the first executable `detect.bin` on `path`.
 fn resolve_bin(
-    spec: &CapabilitySpec,
+    group: &[&CapabilitySpec],
     path: Option<&OsStr>,
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Option<PathBuf> {
+    let spec = group.first().expect("probe groups are never empty");
     if let Some(explicit) = spec.env.as_deref().and_then(env) {
         let p = PathBuf::from(&explicit);
         if is_executable(&p) {
             return Some(p);
         }
+        let tags: Vec<&str> = group.iter().map(|s| s.tag.as_str()).collect();
         eprintln!(
-            "[capability-host] override for '{}' ({}) is not an executable file; \
-             the capability will NOT be announced",
-            spec.tag,
+            "[capability-host] override for {tags:?} ({}) is not an executable file; \
+             the capabilities will NOT be announced",
             p.display()
         );
         return None;
@@ -614,6 +633,57 @@ format = "text"
             set.find("alpha").is_none(),
             "broken override must not fall back to PATH"
         );
+    }
+
+    #[test]
+    fn discovery_probes_once_per_unique_binary_and_fans_out() {
+        // a [[variants]] family puts many tags over one binary; discovery
+        // must resolve that binary ONCE and fan the result out. the env
+        // closure is the observable probe: with an env override set, every
+        // probe consults it exactly once.
+        let dir = scratch("discovery-dedup");
+        let real = fake_cli(&dir, "shared-cli", "exit 0");
+        let calls = std::cell::Cell::new(0u32);
+        let real_os = real.into_os_string();
+        let env = |k: &str| {
+            (k == "MOCK_SHARED_BIN").then(|| {
+                calls.set(calls.get() + 1);
+                real_os.clone()
+            })
+        };
+        let shared = |tag: &str| {
+            CapabilitySpec::parse(
+                &format!(
+                    r#"
+spec = 1
+[capability]
+tag = "{tag}"
+[detect]
+bin = "shared-cli"
+env = "MOCK_SHARED_BIN"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+"#
+                ),
+                "test",
+            )
+            .unwrap()
+        };
+        let set = discover_with(
+            SpecSet::from_specs(vec![shared("alpha"), shared("beta"), shared("gamma")]),
+            None,
+            &env,
+            None,
+        );
+        assert_eq!(
+            set.capabilities(),
+            vec!["alpha", "beta", "gamma"],
+            "one resolved binary serves every tag sharing it"
+        );
+        assert_eq!(calls.get(), 1, "one probe for three tags, not three");
     }
 
     #[test]

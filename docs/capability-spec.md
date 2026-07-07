@@ -40,7 +40,8 @@ A finer-grained need — "this executor, but pinned to a specific model, with
 different flags" — is a **finer tag with its own spec file**, not a routing
 rule. Define `tag = "myllm-large"` with the pinning flags in its args, have
 agents name that tag, and only hosts carrying that spec (and binary) announce
-it.
+it. [`[[variants]]`](#variants--one-file-a-family-of-finer-tags) is load-time
+sugar for writing a whole family of such finer tags in one file.
 
 ---
 
@@ -166,6 +167,7 @@ format = "text"
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `spec` | integer | yes | must be `1` |
+| `[[variants]]` | array of tables | no | load-time expansion into finer tags — see [Variants](#variants--one-file-a-family-of-finer-tags) |
 
 Unknown fields **anywhere** in the file are rejected — a typo (or a field
 from the retired model-routing era, like `[models]`) fails loud instead of
@@ -198,6 +200,85 @@ being silently ignored.
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `format` | string | yes | `"jsonl-events"` \| `"json-result"` \| `"text"` |
+
+---
+
+## Variants — one file, a family of finer tags
+
+`[[variants]]` is **load-time sugar** over the finer-tag pattern above: each
+entry registers an ADDITIONAL spec under the composed tag
+`{parent_tag}_{suffix}`, exactly as if you had written one more spec file for
+it. Nothing changes at dispatch time — **one tag still means one fixed,
+fully literal argv**.
+
+```toml
+spec = 1
+
+[capability]
+tag = "myllm"
+
+[detect]
+bin = "myllm"
+
+[invoke]
+args = ["run"]              # the base tag's argv — untouched by variants
+prompt = "stdin"
+
+[output]
+format = "text"
+
+# registers the tag "myllm_large-v2_high" with its OWN full argv.
+[[variants]]
+suffix = "large-v2_high"
+args = ["run", "--model", "large-v2", "--effort", "high"]
+```
+
+Each entry:
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `suffix` | string | yes | `<model>_<effort>`, each side `[a-z0-9.-]+` (so exactly one `_`) |
+| `args` | string array | yes | the variant's **full** argv — verbatim, complete, never merged with or derived from the parent's args |
+
+A variant **inherits** `bin`, `env`, `prompt`, `timeout_secs`, `output` (and
+`description`) from the parent spec; `args` is its own, whole, and literal.
+There is no field merging and no placeholder substitution — the "argv is
+literal" invariant holds per tag.
+
+**The tag grammar.** A composed tag is `{provider}_{model}_{effort}` and
+splits into **exactly three segments on `_`** — the contract the desktop
+app's provider/model/effort picker decomposes tags by (e.g.
+`codex_gpt-5.5_xhigh`, `claude_opus_max`). The loader enforces it fail-loud:
+
+- the parent tag must be underscore-free (a `my_llm` parent cannot declare
+  variants — write separate spec files instead);
+- the suffix must be `<model>_<effort>` with both sides non-empty
+  `[a-z0-9.-]+`;
+- the composed tag must pass the shared consensus tag rule (≤ 64 bytes);
+- duplicate suffixes in one file — and composed tags colliding with any other
+  tag in the operator dir — are hard errors, like every other duplicate tag;
+- unknown fields inside a `[[variants]]` entry are rejected, like everywhere
+  else in the format.
+
+A tag that does not follow the grammar is still a perfectly good tag — the
+app just treats it as opaque (selectable as-is, no cascading picker).
+
+**Override semantics are unchanged**: a variant tag is its own tag, and
+operator specs override **by tag, wholesale**. Overriding a built-in base tag
+(say `codex`) does NOT touch its built-in variant tags (`codex_*_*` remain);
+override those individually if you want them retuned, or shadow them with an
+operator file declaring its own `[[variants]]`.
+
+**This is NOT the removed model routing.** The retired `[models]` table and
+`{model}` argv placeholder chose flags at *dispatch time*; `[[variants]]`
+expands *once at load* into ordinary specs, each with a fixed verbatim argv.
+There is still no routing table, no pattern matching, and no substitution
+anywhere in the invoke path.
+
+The embedded built-ins use this to ship a curated model/effort matrix:
+`codex` (base) plus `codex_{gpt-5.5,gpt-5.5-codex}_{low,medium,high,xhigh}`,
+and `claude` (base) plus
+`claude_{fable,opus,sonnet,haiku}_{low,medium,high,max}`.
 
 ---
 
@@ -243,7 +324,8 @@ Restart the node. If `ollama` is executable on `PATH`:
 If the binary is missing, the capability is simply not announced — the spec
 sitting in the directory is inert, not an error. Want the same daemon under
 two tunings? Two files, two tags (`ollama`, `ollama-large`), each with its
-own literal args.
+own literal args — or one file with [`[[variants]]`](#variants--one-file-a-family-of-finer-tags)
+if the tunings follow the `provider_model_effort` grammar.
 
 ---
 
@@ -268,4 +350,7 @@ a spec means one thing, on every build that accepts it.
 
 (The retired `[models]` routing table and `{model}` argv placeholder were
 removed within v1 as a pre-release flag day: files that still carry them fail
-loudly at boot with an unknown-field error, never a silent behavior change.)
+loudly at boot with an unknown-field error, never a silent behavior change.
+`[[variants]]` was likewise added within v1 pre-release — a build older than
+it rejects a file carrying variants loudly as an unknown field, never
+misreading it as a single-tag spec.)
