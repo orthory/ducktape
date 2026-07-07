@@ -10,6 +10,7 @@ import { color, font, radius, shadow } from "../../theme/tokens";
 import { useDucktape } from "../../store/use-ducktape";
 import { LIVE_JOIN_SUPPORTED } from "../../../domain/workspace-client";
 import type { Workspace } from "../../../domain/workspace-client";
+import { ConfirmDialog } from "../../components/ConfirmDialog";
 
 type Mode = "create" | "join" | "remote";
 
@@ -74,6 +75,7 @@ export function OnboardingGate() {
   const [name, setName] = useState("");
   const [blob, setBlob] = useState("");
   const [url, setUrl] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<{ workspace: Workspace; force: boolean } | null>(null);
 
   const busy = state.onboardingBusy;
   // live join is enabled (LIVE_JOIN_SUPPORTED); joinGated is the kill-switch
@@ -95,28 +97,11 @@ export function OnboardingGate() {
   };
 
   const confirmDelete = (w: Workspace): void => {
-    const ok = window.confirm(
-      `Delete "${w.name}"?\n\n` +
-        `This stops its node and deletes the workspace locally — its ` +
-        `directory, identity key, and registry entry are removed. It is ` +
-        `refused while its node is still a current validator of a network ` +
-        `with other members (that would halt the network's quorum).`,
-    );
-    if (ok) actions.deleteWorkspace(w.id);
+    setPendingDelete({ workspace: w, force: false });
   };
 
   const confirmForceDelete = (w: Workspace): void => {
-    const ok = window.confirm(
-      `Force-delete "${w.name}"?\n\n` +
-        `Its node couldn't confirm it has left its validator set — usually ` +
-        `because it can't start or was never admitted. Forcing deletes the ` +
-        `workspace WITHOUT that confirmation: its directory, identity key, ` +
-        `and registry entry are removed for good.\n\n` +
-        `Only do this for a network you know is solo or defunct. If this ` +
-        `node is still a validator of a network with OTHER live members, ` +
-        `destroying its identity can PERMANENTLY halt that network.`,
-    );
-    if (ok) actions.deleteWorkspace(w.id, true);
+    setPendingDelete({ workspace: w, force: true });
   };
 
   const title =
@@ -341,6 +326,36 @@ export function OnboardingGate() {
           </button>
         )}
       </div>
+      {pendingDelete && (
+        <ConfirmDialog
+          title={
+            pendingDelete.force
+              ? `Force-delete ${pendingDelete.workspace.name}?`
+              : `Delete ${pendingDelete.workspace.name}?`
+          }
+          confirmLabel={pendingDelete.force ? "Force delete" : "Delete workspace"}
+          onCancel={() => setPendingDelete(null)}
+          onConfirm={() => {
+            actions.deleteWorkspace(pendingDelete.workspace.id, pendingDelete.force);
+            setPendingDelete(null);
+          }}
+        >
+          {pendingDelete.force ? (
+            <>
+              Its node could not confirm it has left its validator set. Forcing deletes
+              the workspace without that confirmation: its directory, identity key,
+              and registry entry are removed for good. Only do this for a solo or
+              defunct network.
+            </>
+          ) : (
+            <>
+              This stops its node and deletes the workspace locally: directory,
+              identity key, and registry entry. It is refused while its node is still
+              a current validator of a network with other members.
+            </>
+          )}
+        </ConfirmDialog>
+      )}
     </div>
   );
 }

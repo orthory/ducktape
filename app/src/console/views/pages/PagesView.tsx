@@ -20,6 +20,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
 
 import type { BlockKind } from "../../../domain/pages-client";
+import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
 import { opKey } from "../../store/finalization";
@@ -783,6 +784,7 @@ export function PagesView() {
   const [treeCollapsed, setTreeCollapsed] = useState<ReadonlySet<string>>(loadTreeCollapsed);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
+  const [pendingPageDelete, setPendingPageDelete] = useState<string | null>(null);
   // target (block id or page id) the new-thread composer is aimed at; null
   // hides the composer. WKWebView has no window.prompt, so composing lives
   // in the panel as a real element.
@@ -935,10 +937,7 @@ export function PagesView() {
     });
 
   const confirmThenDelete = (id: string) => {
-    const title = state.pages.find((p) => p.id === id)?.title || "Untitled";
-    if (window.confirm(`Delete "${title}" and its contents? Child pages move up a level.`)) {
-      actions.deletePage(id);
-    }
+    setPendingPageDelete(id);
   };
 
   const openBlockComments = (blockId: string) => {
@@ -1020,6 +1019,9 @@ export function PagesView() {
     const timer = setTimeout(() => commitTitleRef.current(), EDIT_BOUNDARY_MS);
     return () => clearTimeout(timer);
   }, [titleDraft, root?.text, root?.id]);
+
+  const pendingPageDeleteTitle =
+    state.pages.find((p) => p.id === pendingPageDelete)?.title || "Untitled";
 
   return (
     <div
@@ -1288,6 +1290,19 @@ export function PagesView() {
           ) : null}
         </div>
       </main>
+      {pendingPageDelete && (
+        <ConfirmDialog
+          title={`Delete ${pendingPageDeleteTitle}?`}
+          confirmLabel="Delete page"
+          onCancel={() => setPendingPageDelete(null)}
+          onConfirm={() => {
+            actions.deletePage(pendingPageDelete);
+            setPendingPageDelete(null);
+          }}
+        >
+          This deletes the page and its contents. Child pages move up a level.
+        </ConfirmDialog>
+      )}
     </div>
   );
 }

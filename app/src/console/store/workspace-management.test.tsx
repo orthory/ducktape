@@ -10,7 +10,7 @@
 //   - any workspace can be deleted from the picker by id, with the force
 //     escalation scoped to that workspace.
 
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DucktapeProvider } from "./DucktapeProvider";
@@ -433,36 +433,56 @@ describe("deleteWorkspace", () => {
 });
 
 describe("onboarding gate — delete affordance", () => {
-  it("deletes a listed workspace after an explicit confirm", async () => {
+  it("deletes a listed workspace after an in-app confirm", async () => {
     const guest = workspace({ id: "g", name: "Guest", founder: false, member: false });
     await bootGate([guest], {
       workspace_forget: () => null,
     });
-    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
 
-    await act(async () => {
-      fireEvent.click(screen.getByLabelText("Delete workspace Guest"));
-    });
+    try {
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText("Delete workspace Guest"));
+      });
+      const dialog = screen.getByRole("dialog", { name: /delete Guest/i });
+      expect(nativeConfirm).not.toHaveBeenCalled();
 
-    await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith("workspace_forget", { id: "g", force: false });
-      expect(screen.getByTestId("list").textContent).toBe("");
-    });
+      await act(async () => {
+        fireEvent.click(within(dialog).getByRole("button", { name: /delete workspace/i }));
+      });
+
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("workspace_forget", { id: "g", force: false });
+        expect(screen.getByTestId("list").textContent).toBe("");
+      });
+    } finally {
+      nativeConfirm.mockRestore();
+    }
   });
 
-  it("a declined confirm deletes nothing", async () => {
+  it("a cancelled delete dialog deletes nothing", async () => {
     const guest = workspace({ id: "g", name: "Guest", founder: false, member: false });
     await bootGate([guest], {
       workspace_forget: () => null,
     });
-    vi.spyOn(window, "confirm").mockReturnValue(false);
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(false);
 
-    await act(async () => {
-      fireEvent.click(screen.getByLabelText("Delete workspace Guest"));
-    });
+    try {
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText("Delete workspace Guest"));
+      });
+      const dialog = screen.getByRole("dialog", { name: /delete Guest/i });
+      expect(nativeConfirm).not.toHaveBeenCalled();
 
-    expect(invokeMock).not.toHaveBeenCalledWith("workspace_forget", expect.anything());
-    expect(screen.getByTestId("list").textContent).toBe("g");
+      await act(async () => {
+        fireEvent.click(within(dialog).getByRole("button", { name: /cancel/i }));
+      });
+
+      expect(invokeMock).not.toHaveBeenCalledWith("workspace_forget", expect.anything());
+      expect(screen.getByTestId("list").textContent).toBe("g");
+    } finally {
+      nativeConfirm.mockRestore();
+    }
   });
 
   it("offers force delete for the workspace a refused delete flagged", async () => {
@@ -474,22 +494,36 @@ describe("onboarding gate — delete affordance", () => {
         return null;
       },
     });
-    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
 
-    await act(async () => {
-      fireEvent.click(screen.getByLabelText("Delete workspace Guest"));
-    });
-    await waitFor(() =>
-      expect(screen.getByTestId("needs-force").textContent).toBe("g"),
-    );
+    try {
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText("Delete workspace Guest"));
+      });
+      let dialog = screen.getByRole("dialog", { name: /delete Guest/i });
+      expect(nativeConfirm).not.toHaveBeenCalled();
+      await act(async () => {
+        fireEvent.click(within(dialog).getByRole("button", { name: /delete workspace/i }));
+      });
+      await waitFor(() =>
+        expect(screen.getByTestId("needs-force").textContent).toBe("g"),
+      );
 
-    refuse = false;
-    await act(async () => {
-      fireEvent.click(screen.getByLabelText("Force delete workspace Guest"));
-    });
-    await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith("workspace_forget", { id: "g", force: true });
-      expect(screen.getByTestId("list").textContent).toBe("");
-    });
+      refuse = false;
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText("Force delete workspace Guest"));
+      });
+      dialog = screen.getByRole("dialog", { name: /force-delete Guest/i });
+      await act(async () => {
+        fireEvent.click(within(dialog).getByRole("button", { name: /force delete/i }));
+      });
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("workspace_forget", { id: "g", force: true });
+        expect(screen.getByTestId("list").textContent).toBe("");
+      });
+      expect(nativeConfirm).not.toHaveBeenCalled();
+    } finally {
+      nativeConfirm.mockRestore();
+    }
   });
 });

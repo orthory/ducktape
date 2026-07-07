@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 
@@ -138,8 +138,8 @@ describe("SettingsView", () => {
     expect(spies.setScreen).toHaveBeenCalledWith("status");
   });
 
-  it("requests an on-chain leave that keeps the node running, without tearing down", () => {
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  it("requests an on-chain leave through an in-app dialog, without tearing down", () => {
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     // A member of a set of two -> Request leave is enabled (a real majority is
     // needed, so the node must stay up through its own pending removal).
     const { spies } = renderSettings({
@@ -153,40 +153,53 @@ describe("SettingsView", () => {
       screen.queryByText(/full workspace deletion is not wired/i),
     ).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /request leave/i }));
-    expect(confirm).toHaveBeenCalledOnce();
-    expect(spies.requestLeaveWorkspace).toHaveBeenCalled();
-    // Requesting a leave never tears down: no node stop, no forget.
-    expect(spies.forgetWorkspace?.mock.calls ?? []).toHaveLength(0);
-    expect(spies.stopNode?.mock.calls ?? []).toHaveLength(0);
+    try {
+      fireEvent.click(screen.getByRole("button", { name: /request leave/i }));
+      const dialog = screen.getByRole("dialog", { name: /request to leave/i });
+      expect(nativeConfirm).not.toHaveBeenCalled();
 
-    confirm.mockRestore();
+      fireEvent.click(within(dialog).getByRole("button", { name: /request leave/i }));
+      expect(spies.requestLeaveWorkspace).toHaveBeenCalled();
+      // Requesting a leave never tears down: no node stop, no forget.
+      expect(spies.forgetWorkspace?.mock.calls ?? []).toHaveLength(0);
+      expect(spies.stopNode?.mock.calls ?? []).toHaveLength(0);
+    } finally {
+      nativeConfirm.mockRestore();
+    }
   });
 
-  it("aborts the request-leave when the confirm is dismissed", () => {
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+  it("aborts the request-leave when the dialog is cancelled", () => {
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     const { spies } = renderSettings({
       members: [workspace.pubkey, "beefbeef".repeat(8)],
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /request leave/i }));
-    expect(confirm).toHaveBeenCalledOnce();
-    // Dismissed confirm -> requestLeaveWorkspace is never referenced, so the
-    // proxy never even created a spy for it.
-    expect(spies.requestLeaveWorkspace?.mock.calls ?? []).toHaveLength(0);
+    try {
+      fireEvent.click(screen.getByRole("button", { name: /request leave/i }));
+      const dialog = screen.getByRole("dialog", { name: /request to leave/i });
+      expect(nativeConfirm).not.toHaveBeenCalled();
 
-    confirm.mockRestore();
+      fireEvent.click(within(dialog).getByRole("button", { name: /cancel/i }));
+      expect(spies.requestLeaveWorkspace?.mock.calls ?? []).toHaveLength(0);
+    } finally {
+      nativeConfirm.mockRestore();
+    }
   });
 
-  it("forgets the workspace on a confirmed forget click (guarded in the backend)", () => {
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  it("forgets the workspace from an in-app dialog (guarded in the backend)", () => {
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const { spies } = renderSettings();
 
-    fireEvent.click(screen.getByRole("button", { name: /forget workspace/i }));
-    expect(confirm).toHaveBeenCalledOnce();
-    expect(spies.forgetWorkspace).toHaveBeenCalled();
+    try {
+      fireEvent.click(screen.getByRole("button", { name: /forget workspace/i }));
+      const dialog = screen.getByRole("dialog", { name: /forget Acme Research/i });
+      expect(nativeConfirm).not.toHaveBeenCalled();
 
-    confirm.mockRestore();
+      fireEvent.click(within(dialog).getByRole("button", { name: /forget workspace/i }));
+      expect(spies.forgetWorkspace).toHaveBeenCalled();
+    } finally {
+      nativeConfirm.mockRestore();
+    }
   });
 
   it("hides force-forget until a guarded forget reveals it", () => {
@@ -201,19 +214,24 @@ describe("SettingsView", () => {
     // forgetNeedsForce is set by the store when a guarded forget can't reach the
     // node (bricked / won't start). The override then appears and forces past the
     // liveness guard.
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const { spies } = renderSettings({ forgetNeedsForce: true });
 
-    const force = screen.getByRole("button", {
-      name: /force forget workspace/i,
-    });
-    expect(force).toBeEnabled();
-    fireEvent.click(force);
-    expect(confirm).toHaveBeenCalledOnce();
-    // Forces past the guard: forgetWorkspace(true).
-    expect(spies.forgetWorkspace).toHaveBeenCalledWith(true);
+    try {
+      const force = screen.getByRole("button", {
+        name: /force forget workspace/i,
+      });
+      expect(force).toBeEnabled();
+      fireEvent.click(force);
+      const dialog = screen.getByRole("dialog", { name: /force-forget Acme Research/i });
+      expect(nativeConfirm).not.toHaveBeenCalled();
 
-    confirm.mockRestore();
+      fireEvent.click(within(dialog).getByRole("button", { name: /force forget/i }));
+      // Forces past the guard: forgetWorkspace(true).
+      expect(spies.forgetWorkspace).toHaveBeenCalledWith(true);
+    } finally {
+      nativeConfirm.mockRestore();
+    }
   });
 
   it("does not lock a validator out of leaving during the cold-start window", () => {

@@ -27,6 +27,7 @@ import {
   joinRequests as fetchJoinRequests,
   type JoinRequest,
 } from "../../../domain/workspace-client";
+import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
@@ -57,6 +58,11 @@ interface MemberVM {
   /** Executor tags this node announced to the capability registry. */
   capabilities: string[];
 }
+
+type MemberConfirm =
+  | { kind: "remove"; member: MemberVM }
+  | { kind: "promote"; member: MemberVM }
+  | { kind: "revoke"; member: MemberVM };
 
 const FILTER_TABS: ReadonlyArray<{ id: FilterId; label: string }> = [
   { id: "all", label: "All" },
@@ -1083,6 +1089,7 @@ export function MembersView() {
   const [filter, setFilter] = useState<FilterId>("all");
   const [query, setQuery] = useState("");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<MemberConfirm | null>(null);
 
   const rows = useMemo(
     () =>
@@ -1152,44 +1159,34 @@ export function MembersView() {
     // Never remove your own node — that would drop this workspace out of the
     // set it is driving governance through.
     if (member.isLocal) return;
-    const ok = window.confirm(
-      `Remove ${member.displayName} from the validator set?\n\n` +
-        `This opens a removal proposal and casts THIS node's yes-ballot. ` +
-        `It only takes effect once a strict majority of members (n / 2 + 1) ` +
-        `approve — every other member must run the same removal.`,
-    );
-    if (!ok) return;
-    actions.demoteMember(member.key);
-    if (selectedKey && normalizeKey(selectedKey) === member.keyNorm) {
-      setSelectedKey(null);
-    }
+    setPendingConfirm({ kind: "remove", member });
   };
 
   const requestPromote = (member: MemberVM): void => {
-    const ok = window.confirm(
-      `Promote ${member.displayName} into the validator set?\n\n` +
-        `This opens an AddValidator proposal and casts THIS node's yes-ballot. ` +
-        `It only takes effect once a strict majority of members (n / 2 + 1) ` +
-        `approve — every other member must run the same promotion. The ` +
-        `pre-synced resident then joins the quorum at the next epoch cutover.`,
-    );
-    if (!ok) return;
-    actions.promoteMember(member.key);
+    setPendingConfirm({ kind: "promote", member });
   };
 
   const requestRevoke = (member: MemberVM): void => {
-    const ok = window.confirm(
-      `Revoke resident standing from ${member.displayName}?\n\n` +
-        `This opens a RemoveResident proposal and casts THIS node's yes-ballot. ` +
-        `Once a strict majority of members approve, the key drops off the mesh ` +
-        `at the next epoch cutover and its node parks again — approving a new ` +
-        `join request re-grants.`,
-    );
-    if (!ok) return;
-    actions.removeResident(member.key);
-    if (selectedKey && normalizeKey(selectedKey) === member.keyNorm) {
-      setSelectedKey(null);
+    setPendingConfirm({ kind: "revoke", member });
+  };
+
+  const confirmPendingAction = () => {
+    if (!pendingConfirm) return;
+    const { kind, member } = pendingConfirm;
+    if (kind === "remove") {
+      actions.demoteMember(member.key);
+      if (selectedKey && normalizeKey(selectedKey) === member.keyNorm) {
+        setSelectedKey(null);
+      }
+    } else if (kind === "promote") {
+      actions.promoteMember(member.key);
+    } else {
+      actions.removeResident(member.key);
+      if (selectedKey && normalizeKey(selectedKey) === member.keyNorm) {
+        setSelectedKey(null);
+      }
     }
+    setPendingConfirm(null);
   };
 
   // Shared row renderer — a group's nested rows and a standalone row get the
@@ -1356,6 +1353,46 @@ export function MembersView() {
       {selected ? (
         <MemberDetailPane member={selected} onClose={() => setSelectedKey(null)} />
       ) : null}
+      {pendingConfirm && (
+        <ConfirmDialog
+          title={
+            pendingConfirm.kind === "remove"
+              ? `Remove ${pendingConfirm.member.displayName}?`
+              : pendingConfirm.kind === "promote"
+                ? `Promote ${pendingConfirm.member.displayName}?`
+                : `Revoke ${pendingConfirm.member.displayName}?`
+          }
+          confirmLabel={
+            pendingConfirm.kind === "remove"
+              ? "Remove from validators"
+              : pendingConfirm.kind === "promote"
+                ? "Promote to validator"
+                : "Revoke standing"
+          }
+          danger={pendingConfirm.kind !== "promote"}
+          onCancel={() => setPendingConfirm(null)}
+          onConfirm={confirmPendingAction}
+        >
+          {pendingConfirm.kind === "remove" ? (
+            <>
+              This opens a removal proposal and casts this node's yes ballot.
+              It only takes effect once a strict majority approves.
+            </>
+          ) : pendingConfirm.kind === "promote" ? (
+            <>
+              This opens an AddValidator proposal and casts this node's yes ballot.
+              The pre-synced resident joins quorum at the next epoch cutover after
+              majority approval.
+            </>
+          ) : (
+            <>
+              This opens a RemoveResident proposal and casts this node's yes ballot.
+              After majority approval, the key drops off the mesh at the next epoch
+              cutover and its node parks again.
+            </>
+          )}
+        </ConfirmDialog>
+      )}
     </div>
   );
 }

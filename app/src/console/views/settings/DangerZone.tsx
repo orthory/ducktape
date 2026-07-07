@@ -1,9 +1,11 @@
 // DANGER ZONE — the active workspace's destructive lifecycle: on-chain leave,
 // guarded local forget, and the force override for a node that won't start.
 
+import { useState } from "react";
 import type { ReactNode } from "react";
 
 import { normalizeKey } from "../../../domain/names";
+import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { HoverButton, SectionLabel } from "./parts";
@@ -75,6 +77,7 @@ function DangerRow({
 
 export function DangerZone() {
   const { state, actions } = useDucktape();
+  const [pendingAction, setPendingAction] = useState<"leave" | "forget" | "forceForget" | null>(null);
   const base = !state.workspace || !state.managed;
 
   // Is THIS node still a current validator, and how big is the set? Leaving is
@@ -102,32 +105,11 @@ export function DangerZone() {
   const canRequestLeave = !base && inSet && !soloKnown;
 
   const requestLeave = (): void => {
-    const name = state.workspace?.name ?? "this network";
-    const ok = window.confirm(
-      `Request to leave "${name}"?\n\n` +
-        `This submits an ON-CHAIN self-removal of this node and casts its ` +
-        `yes-ballot. Your node KEEPS RUNNING: in a set of two or more members ` +
-        `the removal stays PENDING until a strict majority (n / 2 + 1) of the ` +
-        `remaining members approve — the node must stay up through its own ` +
-        `pending removal or the network can't finalize it. Once you're removed ` +
-        `(you drop out of the validator set), you can forget the workspace.`,
-    );
-    if (!ok) return;
-    actions.requestLeaveWorkspace();
+    setPendingAction("leave");
   };
 
   const forget = (): void => {
-    const name = state.workspace?.name ?? "this workspace";
-    const ok = window.confirm(
-      `Forget "${name}"?\n\n` +
-        `This stops this node and deletes the workspace locally — its ` +
-        `directory and registry entry are removed. This is refused while this ` +
-        `node is still a current validator of a network with other members ` +
-        `(forgetting it then would halt the network's quorum). Safe once you've ` +
-        `been removed, or for a solo network only this node runs.`,
-    );
-    if (!ok) return;
-    actions.forgetWorkspace();
+    setPendingAction("forget");
   };
 
   // Revealed only after a guarded forget couldn't confirm the node left its
@@ -138,20 +120,17 @@ export function DangerZone() {
   // healthy network — but for a node that may still be one elsewhere, the honest
   // warning puts the call in the user's hands.
   const forceForget = (): void => {
-    const name = state.workspace?.name ?? "this workspace";
-    const ok = window.confirm(
-      `Force-forget "${name}"?\n\n` +
-        `The node couldn't confirm it has left its validator set — usually ` +
-        `because it can't start (a corrupt / bricked local state). Forcing ` +
-        `deletes the workspace WITHOUT that confirmation: its directory, ` +
-        `identity key, and registry entry are removed for good.\n\n` +
-        `Only do this for a network you know is solo or defunct. If this node ` +
-        `is still a validator of a network with OTHER live members, destroying ` +
-        `its identity can PERMANENTLY halt that network. This cannot be undone.`,
-    );
-    if (!ok) return;
-    actions.forgetWorkspace(true);
+    setPendingAction("forceForget");
   };
+
+  const confirmAction = () => {
+    if (pendingAction === "leave") actions.requestLeaveWorkspace();
+    else if (pendingAction === "forget") actions.forgetWorkspace();
+    else if (pendingAction === "forceForget") actions.forgetWorkspace(true);
+    setPendingAction(null);
+  };
+
+  const name = state.workspace?.name ?? "this workspace";
 
   return (
     <>
@@ -209,6 +188,46 @@ export function DangerZone() {
           />
         ) : null}
       </div>
+      {pendingAction && (
+        <ConfirmDialog
+          title={
+            pendingAction === "leave"
+              ? `Request to leave ${name}?`
+              : pendingAction === "forget"
+                ? `Forget ${name}?`
+                : `Force-forget ${name}?`
+          }
+          confirmLabel={
+            pendingAction === "leave"
+              ? "Request leave"
+              : pendingAction === "forget"
+                ? "Forget workspace"
+                : "Force forget"
+          }
+          onCancel={() => setPendingAction(null)}
+          onConfirm={confirmAction}
+        >
+          {pendingAction === "leave" ? (
+            <>
+              This submits an on-chain self-removal and casts this node's yes
+              ballot. Your node keeps running until a strict majority of remaining
+              members approve.
+            </>
+          ) : pendingAction === "forget" ? (
+            <>
+              This stops this node and deletes the workspace locally. It is refused
+              while this node is still a current validator of a network with other
+              members.
+            </>
+          ) : (
+            <>
+              This skips the liveness confirmation and deletes the workspace,
+              including directory, identity key, and registry entry. Only use this
+              for a solo or defunct network.
+            </>
+          )}
+        </ConfirmDialog>
+      )}
     </>
   );
 }

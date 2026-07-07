@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { PageBlock } from "../../../domain/pages-client";
@@ -77,6 +77,28 @@ describe("PagesView", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Open Retro" }));
     expect(spies.openPage).toHaveBeenCalledWith("p2");
+  });
+
+  it("deletes a page through an in-app dialog", () => {
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { spies } = renderPagesView();
+
+    try {
+      const retro = screen.getByRole("button", { name: "Open Retro" });
+      const row = retro.closest('[role="treeitem"]');
+      expect(row).not.toBeNull();
+      fireEvent.mouseEnter(row!);
+      fireEvent.click(screen.getByRole("button", { name: /more actions for Retro/i }));
+      fireEvent.click(screen.getByRole("menuitem", { name: /^delete$/i }));
+
+      const dialog = screen.getByRole("dialog", { name: /delete Retro/i });
+      expect(nativeConfirm).not.toHaveBeenCalled();
+      fireEvent.click(within(dialog).getByRole("button", { name: /delete page/i }));
+
+      expect(spies.deletePage).toHaveBeenCalledWith("p2");
+    } finally {
+      nativeConfirm.mockRestore();
+    }
   });
 
   it("drops the block-id/count clutter — no permanent hash chip, no block counter", () => {
