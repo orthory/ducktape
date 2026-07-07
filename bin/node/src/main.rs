@@ -8177,7 +8177,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     app_hash: hex(&d.app_hash),
                                 },
                                 node::Disposition::Rejected => relay::RelayOutcome::Rejected {
-                                    detail: "op finalized but rejected (deterministic no-op)".into(),
+                                    // carry the module's VERBATIM reason (node-
+                                    // local observability off the DrainedFrame)
+                                    // so the resident forwards it to its caller
+                                    // — the duckfs-client engine keys on the
+                                    // "files: conflict:" prefix. generic wording
+                                    // only when the drain captured no reason.
+                                    detail: d.reason.clone().unwrap_or_else(|| {
+                                        "op finalized but rejected (deterministic no-op)".into()
+                                    }),
                                 },
                                 node::Disposition::Discarded => unreachable!("filtered at the loop top"),
                             };
@@ -8197,9 +8205,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 // apply several blocks).
                                 app_hash: hex(&d.app_hash),
                             }),
-                            node::Disposition::Rejected => {
-                                Err("op finalized but rejected (deterministic no-op)".into())
-                            }
+                            node::Disposition::Rejected => Err(d.reason.clone().unwrap_or_else(
+                                || {
+                                    // the module's VERBATIM reason when the drain
+                                    // captured one (duckfs-client keys on the
+                                    // "files: conflict:" prefix); generic wording
+                                    // otherwise.
+                                    "op finalized but rejected (deterministic no-op)".into()
+                                },
+                            )),
                             // unreachable — filtered at the loop top — but
                             // stay total rather than panic.
                             node::Disposition::Discarded => continue,
