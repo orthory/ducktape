@@ -19,8 +19,8 @@ use crate::store::ObjectStore;
 use crate::tree::{Store, entry_at, snapshot_root_tree};
 use crate::wire::{
     CHUNK_SIZE, DiffEntry, DiffKind, EntryInfo, EntryKindWire, FilesQuery, FilesReply, GrepHit,
-    MAX_GREP_HITS_PER_CALL, MAX_GREP_LINE_BYTES, MAX_PAGE, MAX_READ_BYTES, RefsInfo, SnapshotInfo,
-    evidence_uri, from_hex_32, to_hex,
+    MAX_GREP_HITS_PER_CALL, MAX_GREP_LINE_BYTES, MAX_PAGE, MAX_READ_BYTES, MAX_SYNC_IDS, RefsInfo,
+    SnapshotInfo, evidence_uri, from_hex_32, to_hex,
 };
 
 /// a diff reply is capped at MAX_PAGE * 16 entries: a bounded reply, no cursor —
@@ -67,7 +67,32 @@ pub(crate) fn query<S: ObjectStore>(fs: &Fs<S>, q: FilesQuery) -> Result<FilesRe
         FilesQuery::History { limit } => history(fs, limit),
         FilesQuery::Diff { from, to, prefix } => diff(fs, &from, &to, &prefix),
         FilesQuery::Refs {} => refs(fs),
+        FilesQuery::HasChunks { ids } => has_chunks(fs, &ids),
     }
+}
+
+/// the client staging probe: for each requested chunk id, is it present — staged
+/// in the committed refs OR durable in the odb? this is exactly the commit-time
+/// availability rule (`fs.rs`, step 6) minus the in-block pending sources, which
+/// a client cannot observe. the answer is advisory: odb contents can differ per
+/// node between gc sweeps, and staging can expire, so the commit re-validates —
+/// a stale `true` costs one clean rejection, a stale `false` one redundant stage.
+///
+/// strictness mirrors the sync lane: beyond [`MAX_SYNC_IDS`] the whole request
+/// rejects, and any non-hex id rejects the WHOLE batch (a malformed batch is a
+/// client bug, not a per-id absence).
+fn has_chunks<S: ObjectStore>(fs: &Fs<S>, ids: &[String]) -> Result<FilesReply, String> {
+    if ids.len() > MAX_SYNC_IDS {
+        return Err("files: too many ids".into());
+    }
+    let refs = fs.refs_view();
+    let store = fs.store_ref();
+    let mut present = Vec::with_capacity(ids.len());
+    for hex in ids {
+        let id = from_hex_32(hex).ok_or_else(|| "files: id is not hex".to_string())?;
+        present.push(refs.staging.contains_key(&id) || store.has(&id));
+    }
+    Ok(FilesReply::HasChunks { present })
 }
 
 /// resolve the committed snapshot a read runs against. `None` reads the committed
