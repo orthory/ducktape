@@ -157,11 +157,14 @@ fn resident_posts_to_chat_with_its_own_authorship() {
         gov["ok"], false,
         "a member-gated op from a non-member resident must not apply: {gov}"
     );
+    // the reply carries the governance module's OWN rejection reason verbatim
+    // (the drain's DrainedFrame.reason lane): proof the op reached execute and
+    // was deterministically rejected there — a door refusal says "standing".
     assert!(
         gov["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("rejected"),
+            .contains("not a current validator-set member"),
         "the op finalized and was deterministically Rejected (not refused at the door): {gov}"
     );
 
