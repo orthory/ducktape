@@ -1,0 +1,440 @@
+//! the WireGuard data plane of the userspace backend: a table of boringtun
+//! `Tunn`s (one per peer, keyed by allowed-ip `/128`) pumped over ONE
+//! process-owned underlay UDP socket.
+//!
+//! this is the sans-io half of the ADR's `UserspaceOverlayNet`: it never sees
+//! a TCP stream or a virtual socket — it moves raw IP packets between the
+//! underlay (encrypted WireGuard datagrams on the UDP socket) and the
+//! [`stack`](super::stack) (plaintext IP packets over a channel pair), and it
+//! owns everything the kernel used to: cryptokey routing, endpoint roaming,
+//! and the timer machinery (handshake retry, keepalive, rekey) that
+//! boringtun's device layer would otherwise drive.
+//!
+//! locking discipline: `Tunn` is sans-io and `&mut`, so each peer's tunnel
+//! sits behind a `std::sync::Mutex` that is NEVER held across an await —
+//! every pump copies the packets a `Tunn` call produces out of the lock, then
+//! sends. the peer table itself is an `RwLock` written only by
+//! [`WgDevice::replace_peers`] (the effect's `apply`), which swaps the whole
+//! table in one write — the atomic peer-set replace the ADR requires.
+
+use std::collections::HashMap;
+use std::io;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
+use defguard_boringtun::noise::handshake::parse_handshake_anon;
+use defguard_boringtun::noise::{Packet, Tunn, TunnResult};
+use defguard_boringtun::x25519::{PublicKey, StaticSecret};
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+/// max size of one WireGuard datagram / decapsulated IP packet we handle;
+/// comfortably above the 1420 tunnel MTU plus WG overhead, and equal to what
+/// boringtun's own device layer uses.
+const MAX_PACKET: usize = u16::MAX as usize;
+
+/// how often the timer pump ticks every peer's `Tunn::update_timers` —
+/// boringtun's device layer uses 250ms, and the timer contract (rekey,
+/// keepalive, handshake retransmit) is calibrated to roughly that cadence.
+const TIMER_TICK: Duration = Duration::from_millis(250);
+
+/// one peer relationship, as the effect layer hands it to the device: the
+/// validated, decoded form of a `defguard_wireguard_rs` `Peer`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PeerConfig {
+    /// the peer's static X25519 public key.
+    pub public_key: [u8; 32],
+    /// optional preshared key (unused by this mesh today, carried for wire
+    /// fidelity with the TUN backend).
+    pub preshared_key: Option<[u8; 32]>,
+    /// where to send the peer's encrypted datagrams. `None` for a passive
+    /// relationship: the endpoint is learned from the peer's first
+    /// authenticated inbound datagram (WireGuard roaming), exactly as the
+    /// kernel/TUN path behaves for an endpoint-less peer.
+    pub endpoint: Option<SocketAddr>,
+    /// persistent keepalive seconds, driven by the timer pump.
+    pub persistent_keepalive: Option<u16>,
+    /// the peer's overlay `/128`s — cryptokey routing: outbound packets to
+    /// these addresses encrypt to this peer, and inbound packets from this
+    /// peer must carry one of them as source or they are dropped.
+    pub allowed_ips: Vec<Ipv6Addr>,
+}
+
+/// one `Tunn` invocation, named so the drain loop below can re-borrow the
+/// scratch buffer per iteration (a `TunnResult` borrows the buffer it was
+/// given; an op enum keeps each borrow scoped to its own loop pass).
+enum TunnOp<'a> {
+    Decapsulate { src: IpAddr, datagram: &'a [u8] },
+    Encapsulate { packet: &'a [u8] },
+    UpdateTimers,
+    HandshakeInitiation { force: bool },
+}
+
+/// everything one `Tunn` call (plus its drain) produced, copied out of the
+/// tunnel lock: datagrams for the underlay, plaintext packets for the stack,
+/// and whether the input authenticated against the peer's keys (drives
+/// endpoint roaming).
+#[derive(Default)]
+struct TunnOutput {
+    to_network: Vec<Vec<u8>>,
+    to_tunnel: Vec<(Vec<u8>, IpAddr)>,
+    authenticated: bool,
+}
+
+/// a live peer: its `Tunn`, its (roaming) endpoint, and the identity facts
+/// the pumps route by.
+struct PeerState {
+    config: PeerConfig,
+    /// the device-assigned 24-bit index; boringtun stamps it into the high
+    /// bits of every session id (`index << 8 | session`), so inbound
+    /// non-handshake-init packets route back here by `receiver_idx >> 8`.
+    index: u32,
+    tunn: Mutex<Tunn>,
+    /// current underlay endpoint; rewritten on every authenticated inbound
+    /// datagram (roaming), read by every outbound send.
+    endpoint: RwLock<Option<SocketAddr>>,
+}
+
+impl PeerState {
+    /// run one `Tunn` op under the lock and copy everything it produces out.
+    /// honors boringtun's drain contract: after `decapsulate` yields
+    /// `WriteToNetwork`, it must be re-called with an empty datagram until it
+    /// stops yielding (that flushes packets queued behind a completed
+    /// handshake).
+    fn tunn_call(&self, op: TunnOp<'_>, buf: &mut [u8; MAX_PACKET]) -> TunnOutput {
+        let drain = matches!(op, TunnOp::Decapsulate { .. });
+        let mut op = Some(op);
+        let mut out = TunnOutput::default();
+        let mut tunn = self.tunn.lock().expect("tunn lock poisoned");
+        loop {
+            let result = match op.take() {
+                Some(TunnOp::Decapsulate { src, datagram }) => {
+                    tunn.decapsulate(Some(src), datagram, &mut buf[..])
+                }
+                Some(TunnOp::Encapsulate { packet }) => tunn.encapsulate(packet, &mut buf[..]),
+                Some(TunnOp::UpdateTimers) => tunn.update_timers(&mut buf[..]),
+                Some(TunnOp::HandshakeInitiation { force }) => {
+                    tunn.format_handshake_initiation(&mut buf[..], force)
+                }
+                // the drain: flush whatever the completed handshake unblocked.
+                None => tunn.decapsulate(None, &[], &mut buf[..]),
+            };
+            match result {
+                TunnResult::WriteToNetwork(pkt) => {
+                    out.authenticated = true;
+                    out.to_network.push(pkt.to_vec());
+                    if !drain {
+                        break;
+                    }
+                }
+                TunnResult::WriteToTunnelV6(pkt, src) => {
+                    out.authenticated = true;
+                    out.to_tunnel.push((pkt.to_vec(), IpAddr::V6(src)));
+                    break;
+                }
+                // the overlay is ULA-v6 only; a v4 payload can only be a
+                // misconfigured peer — drop it (but it did authenticate).
+                TunnResult::WriteToTunnelV4(..) => {
+                    out.authenticated = true;
+                    break;
+                }
+                // `Done` on the first pass is an authenticated no-op (a
+                // keepalive, a cookie absorbed); on a drain pass it just ends
+                // the flush, leaving `authenticated` as the first pass set it.
+                TunnResult::Done => {
+                    out.authenticated = true;
+                    break;
+                }
+                TunnResult::Err(_) => break,
+            }
+        }
+        out
+    }
+}
+
+/// the peer table: one source of truth, three lookup keys.
+#[derive(Default)]
+struct PeerTable {
+    by_key: HashMap<[u8; 32], Arc<PeerState>>,
+    by_ip: HashMap<Ipv6Addr, Arc<PeerState>>,
+    by_index: HashMap<u32, Arc<PeerState>>,
+}
+
+/// the WireGuard device: underlay socket + peer table + pumps.
+pub struct WgDevice {
+    inner: Arc<DeviceInner>,
+    tasks: Vec<JoinHandle<()>>,
+    /// device-assigned `Tunn` indices; monotonic so a replaced peer's stale
+    /// sessions can never alias a successor's.
+    next_index: Mutex<u32>,
+}
+
+struct DeviceInner {
+    udp: UdpSocket,
+    secret: StaticSecret,
+    public: PublicKey,
+    peers: RwLock<PeerTable>,
+}
+
+impl WgDevice {
+    /// stand the device up on an already-bound underlay socket and spawn its
+    /// pumps on `handle`: inbound (UDP → decapsulate → `to_stack`), outbound
+    /// (`from_stack` → encapsulate → UDP), and the timer driver. peers start
+    /// empty; [`replace_peers`](Self::replace_peers) installs them.
+    pub fn spawn(
+        handle: &tokio::runtime::Handle,
+        udp: UdpSocket,
+        secret: StaticSecret,
+        to_stack: mpsc::Sender<Vec<u8>>,
+        from_stack: mpsc::Receiver<Vec<u8>>,
+    ) -> Self {
+        let public = PublicKey::from(&secret);
+        let inner = Arc::new(DeviceInner {
+            udp,
+            secret,
+            public,
+            peers: RwLock::new(PeerTable::default()),
+        });
+        let tasks = vec![
+            handle.spawn(inbound_pump(inner.clone(), to_stack)),
+            handle.spawn(outbound_pump(inner.clone(), from_stack)),
+            handle.spawn(timer_pump(inner.clone())),
+        ];
+        Self {
+            inner,
+            tasks,
+            next_index: Mutex::new(0),
+        }
+    }
+
+    /// the underlay address the socket actually bound (resolves port 0).
+    pub fn local_underlay_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.udp.local_addr()
+    }
+
+    /// replace the peer set atomically — the device half of
+    /// `WireGuardEffect::apply`. a peer whose `PeerConfig` is UNCHANGED keeps
+    /// its live `PeerState` (sessions, roamed endpoint, timers survive — the
+    /// property standby pre-warm's mid-epoch re-apply depends on); a changed
+    /// or new config gets a fresh `Tunn`; a peer absent from `new` is dropped
+    /// wholesale, sessions and all.
+    pub fn replace_peers(&self, new: &[PeerConfig]) {
+        let mut table = self.inner.peers.write().expect("peer table lock poisoned");
+        let mut next = PeerTable::default();
+        for config in new {
+            let state = match table.by_key.get(&config.public_key) {
+                Some(existing) if existing.config == *config => existing.clone(),
+                // a changed relationship (endpoint, keepalive, allowed ips,
+                // psk) re-tunnels: the config is authoritative over roamed
+                // state, and everything else feeds `Tunn::new`, which has no
+                // partial update.
+                _ => {
+                    let index = self.allocate_index();
+                    Arc::new(PeerState {
+                        config: config.clone(),
+                        index,
+                        tunn: Mutex::new(Tunn::new(
+                            self.inner.secret.clone(),
+                            PublicKey::from(config.public_key),
+                            config.preshared_key,
+                            config.persistent_keepalive,
+                            index,
+                            None,
+                        )),
+                        endpoint: RwLock::new(config.endpoint),
+                    })
+                }
+            };
+            next.by_index.insert(state.index, state.clone());
+            for ip in &config.allowed_ips {
+                next.by_ip.insert(*ip, state.clone());
+            }
+            next.by_key.insert(config.public_key, state);
+        }
+        *table = next;
+    }
+
+    fn allocate_index(&self) -> u32 {
+        let mut next_index = self.next_index.lock().expect("index lock poisoned");
+        let index = *next_index;
+        // 24-bit space: boringtun shifts the index into the high bits of a
+        // u32 session id, leaving 8 bits for the session ring.
+        assert!(index < (1 << 24), "peer index space exhausted");
+        *next_index += 1;
+        index
+    }
+
+    /// initiate (or with `force`, re-initiate) a handshake toward the peer
+    /// owning `peer_ip` — the manual rekey lever. WireGuard rekeys on its own
+    /// timers; this exists for callers that must not wait for them (key
+    /// rotation, and the loopback rekey proof).
+    pub async fn initiate_handshake(&self, peer_ip: Ipv6Addr, force: bool) -> io::Result<()> {
+        let peer = self
+            .peer_by_ip(peer_ip)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no peer for address"))?;
+        let mut buf = Box::new([0u8; MAX_PACKET]);
+        let out = peer.tunn_call(TunnOp::HandshakeInitiation { force }, &mut buf);
+        send_to_endpoint(&self.inner, &peer, out.to_network).await;
+        Ok(())
+    }
+
+    /// time since the peer's last completed handshake — `None` before the
+    /// first. the observable the rekey and session-preservation proofs read.
+    pub fn time_since_last_handshake(&self, peer_ip: Ipv6Addr) -> Option<Duration> {
+        let peer = self.peer_by_ip(peer_ip)?;
+        let tunn = peer.tunn.lock().expect("tunn lock poisoned");
+        tunn.time_since_last_handshake()
+    }
+
+    fn peer_by_ip(&self, ip: Ipv6Addr) -> Option<Arc<PeerState>> {
+        let table = self.inner.peers.read().expect("peer table lock poisoned");
+        table.by_ip.get(&ip).cloned()
+    }
+}
+
+impl Drop for WgDevice {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// send every staged datagram to the peer's current endpoint; endpoint-less
+/// peers simply drop them (a handshake toward an unknown endpoint cannot go
+/// anywhere — it fires once the peer roams in).
+async fn send_to_endpoint(inner: &DeviceInner, peer: &PeerState, packets: Vec<Vec<u8>>) {
+    if packets.is_empty() {
+        return;
+    }
+    let Some(endpoint) = *peer.endpoint.read().expect("endpoint lock poisoned") else {
+        return;
+    };
+    for pkt in packets {
+        // a transient underlay send failure is the medium losing a datagram —
+        // WireGuard's timers retransmit what matters.
+        let _ = inner.udp.send_to(&pkt, endpoint).await;
+    }
+}
+
+/// UDP → `Tunn::decapsulate` → stack. also owns endpoint roaming and the
+/// inbound half of cryptokey routing.
+async fn inbound_pump(inner: Arc<DeviceInner>, to_stack: mpsc::Sender<Vec<u8>>) {
+    let mut datagram = Box::new([0u8; MAX_PACKET]);
+    let mut buf = Box::new([0u8; MAX_PACKET]);
+    loop {
+        let (len, src) = match inner.udp.recv_from(&mut datagram[..]).await {
+            Ok(received) => received,
+            Err(_) => continue,
+        };
+        // route the datagram to its peer: a handshake initiation identifies
+        // the peer by its (encrypted) static key; everything else carries a
+        // receiver session id whose high bits are the device-assigned index.
+        let peer = {
+            let parsed = match Tunn::parse_incoming_packet(&datagram[..len]) {
+                Ok(parsed) => parsed,
+                Err(_) => continue,
+            };
+            let table = inner.peers.read().expect("peer table lock poisoned");
+            match parsed {
+                Packet::HandshakeInit(ref init) => {
+                    match parse_handshake_anon(&inner.secret, &inner.public, init) {
+                        Ok(half) => table.by_key.get(&half.peer_static_public).cloned(),
+                        Err(_) => None,
+                    }
+                }
+                Packet::HandshakeResponse(resp) => {
+                    table.by_index.get(&(resp.receiver_idx >> 8)).cloned()
+                }
+                Packet::PacketCookieReply(reply) => {
+                    table.by_index.get(&(reply.receiver_idx >> 8)).cloned()
+                }
+                Packet::PacketData(data) => {
+                    table.by_index.get(&(data.receiver_idx >> 8)).cloned()
+                }
+            }
+        };
+        let Some(peer) = peer else { continue };
+
+        let out = peer.tunn_call(
+            TunnOp::Decapsulate {
+                src: src.ip(),
+                datagram: &datagram[..len],
+            },
+            &mut buf,
+        );
+
+        // roaming: the datagram authenticated against this peer's tunnel, so
+        // its underlay source is the peer's endpoint now.
+        if out.authenticated {
+            *peer.endpoint.write().expect("endpoint lock poisoned") = Some(src);
+        }
+        // handshake replies / cookie messages go straight back to the source.
+        for pkt in out.to_network {
+            let _ = inner.udp.send_to(&pkt, src).await;
+        }
+        // the inbound half of cryptokey routing: a decrypted packet is only
+        // admitted if its inner source address belongs to the peer that
+        // carried it — the exact check the kernel's allowed-ips table does.
+        for (pkt, inner_src) in out.to_tunnel {
+            let admitted = match inner_src {
+                IpAddr::V6(v6) => peer.config.allowed_ips.contains(&v6),
+                IpAddr::V4(_) => false,
+            };
+            if admitted {
+                // backpressure from the stack is real backpressure: block the
+                // pump rather than grow an unbounded queue.
+                if to_stack.send(pkt).await.is_err() {
+                    return; // stack gone — the backend is shutting down.
+                }
+            }
+        }
+    }
+}
+
+/// stack → `Tunn::encapsulate` → UDP. the outbound half of cryptokey routing:
+/// the packet's destination `/128` selects the peer (and thereby the key).
+async fn outbound_pump(inner: Arc<DeviceInner>, mut from_stack: mpsc::Receiver<Vec<u8>>) {
+    let mut buf = Box::new([0u8; MAX_PACKET]);
+    while let Some(pkt) = from_stack.recv().await {
+        let Some(IpAddr::V6(dst)) = Tunn::dst_address(&pkt) else {
+            continue;
+        };
+        let peer = {
+            let table = inner.peers.read().expect("peer table lock poisoned");
+            table.by_ip.get(&dst).cloned()
+        };
+        // no peer owns the destination: the stack tried to reach an address
+        // outside the cryptokey table — drop, exactly as the kernel would
+        // (no route / no allowed-ip).
+        let Some(peer) = peer else { continue };
+        // with no live session, encapsulate queues the packet inside the
+        // tunn and yields a handshake initiation instead — either way,
+        // whatever it wants sent goes to the peer's endpoint.
+        let out = peer.tunn_call(TunnOp::Encapsulate { packet: &pkt }, &mut buf);
+        send_to_endpoint(&inner, &peer, out.to_network).await;
+    }
+}
+
+/// drive every peer's timer machinery: handshake retransmission, persistent
+/// keepalive, rekey-after-time, session expiry. this loop is what makes the
+/// `Tunn`s live objects rather than passive codecs — the "new moving part"
+/// the ADR calls out.
+async fn timer_pump(inner: Arc<DeviceInner>) {
+    let mut tick = tokio::time::interval(TIMER_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut buf = Box::new([0u8; MAX_PACKET]);
+    loop {
+        tick.tick().await;
+        let peers: Vec<Arc<PeerState>> = {
+            let table = inner.peers.read().expect("peer table lock poisoned");
+            table.by_index.values().cloned().collect()
+        };
+        for peer in peers {
+            let out = peer.tunn_call(TunnOp::UpdateTimers, &mut buf);
+            send_to_endpoint(&inner, &peer, out.to_network).await;
+        }
+    }
+}
