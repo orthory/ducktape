@@ -250,13 +250,13 @@ execute 시 member 수를 **재조회**(제안 이후 membership 변동 반영).
 
 ## 6. 알려진 이슈 / 갭
 
-1. 🐛 **busy-source admission fork (미해결, in-flight)** — 워킹트리에 uncommitted 상태.
-   `HEARTBEAT_INTERVAL=1s`의 idle nop(`main.rs:2667`)이 finalized view를 계속 틱하게 해 cutover가 무트래픽에도
-   넘어가게 하지만, 이 "never-quiescing source"가 admission 중 **JOINING validator의 state를 fork**시킨다.
-   fault line은 resolver-lane 모듈(`kv`/`document`/`chat`)의 **live qmdb target을 frozen manifest root와
-   post-hoc 대조**하는 부분(`main.rs:444,458` "live target moved past the captured boundary (busy source)").
-   snapshot-lane(directory/valset/saga/governance/tasks)은 height-pinned라 안전.
-   `handoff-blocktime-fork.md`에 "fix 랜딩+검증 전엔 heartbeat/pacing 절대 ship 금지" 명시.
+1. **busy-source admission fork (fixed)** — 초기 분석에서는 `HEARTBEAT_INTERVAL=1s`의
+   idle nop가 finalized view를 계속 틱하게 만들면서 admission 중 **JOINING validator의
+   state를 fork**시켰다. fault line은 resolver-lane 모듈(`kv`/`pages`/`chat`)의 live
+   QMDB target을 frozen manifest root와 post-hoc 대조하던 부분이었다. 현재 state sync
+   wire는 `BoundaryId { height, app_hash }`, leased captures, pinned resolver targets,
+   floor-bound manifests, post-sync revalidation, post-reboot frame catch-up을 사용한다.
+   maintained summary는 Vocs의 State Sync와 Implementation Status page에 있다.
 2. **테스트 커버리지 갭** — pre-genesis `admit` verb를 end-to-end로 구동하는 Rust e2e가 **없다.**
    `invite_e2e.rs`/`live_admission_e2e.rs`는 둘 다 post-genesis `invite-accept`(governance) 경로만 검증.
    pre-genesis는 `demo-invite.sh`(shell)와 `config.rs` 단위테스트로만 커버.

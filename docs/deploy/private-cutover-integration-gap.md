@@ -102,9 +102,9 @@ recipe above remains required for the join window).
 
 The plane's epochs still version ACTIVE members only (phase A's all-members
 rule stands — a registered-but-absent key must never stall an epoch), but
-the observer tier now rides a separate PRE-WARM layer with the opposite
+the resident tier now rides a separate PRE-WARM layer with the opposite
 trade: never versioned, never handshaked, applied live. Every `Retarget`
-carries the epoch's observer set as `standbys`; a standby's owner-signed
+carries the epoch's resident set as `standbys`; a standby's owner-signed
 `EndpointRecord` (bound to the epoch tuple, policy-checked, nonce-superseded)
 installs a tunnel by re-applying the full interface config in place — the
 same record-derived trust model as the cold-restart restore — and a

@@ -16,7 +16,7 @@
 //! `MeshView::verify`'s all-members rule says it must; the previous epoch's
 //! tunnels stay up meanwhile.
 //!
-//! STANDBY identities (the valset observer tier — registered, quorum-exempt
+//! STANDBY identities (the valset resident tier — registered, quorum-exempt
 //! keys awaiting activation) ride a separate pre-warm layer with the
 //! opposite trade: never versioned, never handshaked, applied LIVE. A
 //! standby's owner-signed `EndpointRecord` for the current epoch installs a
@@ -121,7 +121,7 @@ pub struct MeshEpochEvent {
     /// The epoch's consensus members' ed25519 public keys, this node
     /// included. Order is irrelevant — every derived commitment sorts.
     pub members: Vec<ed25519::PublicKey>,
-    /// The epoch's STANDBY identities (the valset observer tier): registered
+    /// The epoch's STANDBY identities (the valset resident tier): registered
     /// keys the pre-warm layer tunnels toward ahead of their activation.
     /// Never part of the epoch's `ActiveValidatorSet` — a standby that never
     /// shows up costs the epoch nothing.
@@ -313,14 +313,31 @@ impl NatResolver {
     /// (failing over across the coordinator hints), and register. `key` is
     /// this node's identity bytes (`binding::node_key`). An empty
     /// coordinator set yields the pass-through resolver.
-    pub async fn bind(key: NodeKey, coordinators: Vec<SocketAddr>) -> std::io::Result<Self> {
+    ///
+    /// `auth` gates how every coordinator request is presented:
+    /// - `Some((signer, cap))` authenticates each request with a
+    ///   proof-of-possession over `signer` (whose public key MUST match `key`),
+    ///   carrying `cap` for a private (genesis-gated) coordinator or `None` for
+    ///   a public PoP-only one.
+    /// - `None` sends bare requests — the legacy unauthenticated dev path for
+    ///   fully-open coordinators.
+    pub async fn bind(
+        key: NodeKey,
+        coordinators: Vec<SocketAddr>,
+        auth: Option<(commonware_cryptography::ed25519::PrivateKey, Option<nat_traversal::CoordCap>)>,
+    ) -> std::io::Result<Self> {
         if coordinators.is_empty() {
             return Ok(Self {
                 client: None,
                 reflexive: None,
             });
         }
-        let mut client = NatClient::bind_multi(key, coordinators).await?;
+        let mut client = match auth {
+            Some((signer, cap)) => {
+                NatClient::bind_multi_auth(key, coordinators, signer, cap).await?
+            }
+            None => NatClient::bind_multi(key, coordinators).await?,
+        };
         let (_idx, reflexive) = client.discover_reflexive_failover(COORD_STEP_TIMEOUT).await?;
         client.register().await?;
         Ok(Self {

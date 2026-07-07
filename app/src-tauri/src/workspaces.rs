@@ -22,6 +22,8 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::Manager as _;
@@ -91,8 +93,10 @@ pub struct PhaseReport {
 
 // ── Path + registry io ──────────────────────────────────
 
-/// `~/.ducktape` — the registry root. created on demand.
-fn root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+/// `~/.ducktape` — the registry root. created on demand. `pub(crate)` so
+/// [`crate::user_identity`] can locate `user.key` as a sibling of `workspaces/`
+/// without duplicating this lookup.
+pub(crate) fn root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let home = app
         .path()
         .home_dir()
@@ -108,16 +112,42 @@ fn registry_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(root(app)?.join("registry.json"))
 }
 
+fn empty_registry() -> Registry {
+    Registry {
+        version: 1,
+        active: None,
+        workspaces: Vec::new(),
+    }
+}
+
 fn load_registry(app: &tauri::AppHandle) -> Result<Registry, String> {
-    let path = registry_path(app)?;
-    match fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|err| format!("parse {path:?}: {err}")),
+    load_registry_at(&registry_path(app)?)
+}
+
+/// load + parse the registry, RECOVERING from a corrupt file instead of
+/// bricking. a truncated / malformed `registry.json` (a hand-edit, a partial
+/// pre-atomic save, a disk error) used to make every command fail — no list, no
+/// select, no onboarding — with the only recovery, deleting the file, never
+/// surfaced. here a parse error preserves the bad file as `registry.json.bak`
+/// and boots the empty first-run state, so the app stays usable and the
+/// workspace dirs still on disk can be re-added. a genuine READ error
+/// (permissions) still propagates — the boot path lands on the gate with it.
+pub(crate) fn load_registry_at(path: &Path) -> Result<Registry, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(reg) => Ok(reg),
+            Err(err) => {
+                let backup = path.with_extension("json.bak");
+                let _ = fs::rename(path, &backup);
+                eprintln!(
+                    "load_registry: {path:?} is corrupt ({err}); backed up to {backup:?}, \
+                     starting empty"
+                );
+                Ok(empty_registry())
+            }
+        },
         // a missing registry is the first-run empty state, not an error.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Registry {
-            version: 1,
-            active: None,
-            workspaces: Vec::new(),
-        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(empty_registry()),
         Err(err) => Err(format!("read {path:?}: {err}")),
     }
 }
@@ -125,9 +155,28 @@ fn load_registry(app: &tauri::AppHandle) -> Result<Registry, String> {
 fn save_registry(app: &tauri::AppHandle, reg: &Registry) -> Result<(), String> {
     let dir = root(app)?;
     fs::create_dir_all(&dir).map_err(|err| format!("create {dir:?}: {err}"))?;
-    let path = registry_path(app)?;
+    save_registry_at(&registry_path(app)?, reg)
+}
+
+/// write the registry ATOMICALLY: serialize to a sibling temp, fsync it, then
+/// rename over the target. a crash / ENOSPC mid-write leaves the OLD registry
+/// intact rather than a half-written, unparseable file (the corrupt-registry
+/// brick this pairs with [`load_registry_at`]'s recovery to close). rename is
+/// atomic within a directory on one filesystem, so a concurrent second instance
+/// can at worst lose its own update — never corrupt the file. (A cross-process
+/// advisory lock to also prevent the lost update is a deliberate follow-up;
+/// same-$HOME multi-instance is an edge case and the fleet isolates $HOME.)
+pub(crate) fn save_registry_at(path: &Path, reg: &Registry) -> Result<(), String> {
     let text = serde_json::to_string_pretty(reg).map_err(|err| err.to_string())?;
-    fs::write(&path, text).map_err(|err| format!("write {path:?}: {err}"))
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write as _;
+        let mut file = fs::File::create(&tmp).map_err(|err| format!("create {tmp:?}: {err}"))?;
+        file.write_all(text.as_bytes())
+            .map_err(|err| format!("write {tmp:?}: {err}"))?;
+        file.sync_all().map_err(|err| format!("fsync {tmp:?}: {err}"))?;
+    }
+    fs::rename(&tmp, path).map_err(|err| format!("rename {tmp:?} -> {path:?}: {err}"))
 }
 
 // ── Helpers ─────────────────────────────────────────────
@@ -194,33 +243,85 @@ fn reserved_ports(reg: &Registry) -> Vec<u16> {
         .collect()
 }
 
-/// run a `ducktape-node` onboarding verb to completion and return its stdout
-/// (trimmed). the verbs print the datum (chain-id, pubkey, invite blob) to
-/// stdout and human guidance to stderr; a non-zero exit surfaces stderr.
-fn run_verb(node_bin: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(node_bin)
+/// how long a single onboarding verb may run before we give up on a wedged
+/// node. generous enough for a slow admit round-trip, bounded so a hung node
+/// can't freeze forget/delete (and, on repeats, the whole Tauri worker pool).
+const VERB_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// run a `ducktape-node` onboarding verb and return its stdout (trimmed). the
+/// verbs print the datum (chain-id, pubkey, invite blob) to stdout and human
+/// guidance to stderr; a non-zero exit surfaces stderr. bounded by
+/// [`VERB_TIMEOUT`]: a wedged node (one that accepts the rpc but never replies)
+/// used to make `.output()` block FOREVER — hanging forget/delete with the
+/// spinner stuck, and exhausting the worker pool on repeats until the whole UI
+/// stopped. now it is killed on the deadline and reported. stdout/stderr are
+/// drained on threads so a chatty verb can't fill a pipe and deadlock the wait.
+/// `pub(crate)` so [`crate::user_identity`] drives the `user-key`/
+/// `user-sign-bind`/`user-sign-unbind` verbs the same way.
+pub(crate) fn run_verb(node_bin: &Path, args: &[&str]) -> Result<String, String> {
+    let verb = args.first().copied().unwrap_or("");
+    let mut child = Command::new(node_bin)
         .args(args)
-        .output()
-        .map_err(|err| format!("run ducktape-node {}: {err}", args.first().unwrap_or(&"")))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let detail = stderr.trim();
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("run ducktape-node {verb}: {err}"))?;
+
+    let mut out_pipe = child.stdout.take().expect("stdout piped");
+    let mut err_pipe = child.stderr.take().expect("stderr piped");
+    let out_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + VERB_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "ducktape-node {verb} did not respond within {}s — the node may be \
+                         wedged; retry, or force if this is a teardown",
+                        VERB_TIMEOUT.as_secs()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                return Err(format!("wait ducktape-node {verb}: {err}"));
+            }
+        }
+    };
+
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr);
+        let detail = detail.trim();
         return Err(if detail.is_empty() {
-            format!(
-                "ducktape-node {} exited {}",
-                args.first().unwrap_or(&""),
-                out.status
-            )
+            format!("ducktape-node {verb} exited {status}")
         } else {
             detail.to_string()
         });
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
 /// the last non-empty line of a verb's stdout — the datum (verbs may print a
-/// trailing summary line; the payload is always last).
-fn last_line(stdout: &str) -> String {
+/// trailing summary line; the payload is always last). `pub(crate)` — shared
+/// with [`crate::user_identity`].
+pub(crate) fn last_line(stdout: &str) -> String {
     stdout
         .lines()
         .map(str::trim)
@@ -542,16 +643,16 @@ pub fn workspace_demote(app: tauri::AppHandle, id: String, pubkey: String) -> Re
     .map(|_| ())
 }
 
-/// promote an observer into the consensus quorum by pubkey: drive the
+/// promote a resident into the consensus quorum by pubkey: drive the
 /// governance AddValidator through THIS running member node's local rpc. the
 /// second, deliberate step of staged admission — [`workspace_admit`] grants
-/// observer standing; this seats the (pre-synced, warm) key as a validator at
+/// resident standing; this seats the (pre-synced, warm) key as a validator at
 /// the next epoch cutover. same majority ceremony as every membership change.
 #[tauri::command]
 pub fn workspace_promote(app: tauri::AppHandle, id: String, pubkey: String) -> Result<(), String> {
     let pubkey = pubkey.trim().to_string();
     if pubkey.is_empty() {
-        return Err("provide the observer's public key to promote".into());
+        return Err("provide the resident's public key to promote".into());
     }
     let node_bin = crate::daemon::resolve_node_bin()?;
     let reg = load_registry(&app)?;
@@ -564,20 +665,20 @@ pub fn workspace_promote(app: tauri::AppHandle, id: String, pubkey: String) -> R
     .map(|_| ())
 }
 
-/// revoke observer standing by pubkey: drive the governance RemoveObserver
+/// revoke resident standing by pubkey: drive the governance RemoveResident
 /// through THIS running member node's local rpc. the undo of
 /// [`workspace_admit`] — the key drops off the mesh at the next epoch cutover
 /// and its node parks again; re-granting is another admit. a seated validator
 /// is [`workspace_demote`]'s job (the tiers never overlap).
 #[tauri::command]
-pub fn workspace_observer_remove(
+pub fn workspace_resident_remove(
     app: tauri::AppHandle,
     id: String,
     pubkey: String,
 ) -> Result<(), String> {
     let pubkey = pubkey.trim().to_string();
     if pubkey.is_empty() {
-        return Err("provide the observer's public key to revoke".into());
+        return Err("provide the resident's public key to revoke".into());
     }
     let node_bin = crate::daemon::resolve_node_bin()?;
     let reg = load_registry(&app)?;
@@ -585,7 +686,7 @@ pub fn workspace_observer_remove(
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
     run_verb(
         &node_bin,
-        &["observer-remove", &pubkey, "--config", &cfg.to_string_lossy()],
+        &["resident-remove", &pubkey, "--config", &cfg.to_string_lossy()],
     )
     .map(|_| ())
 }
@@ -819,17 +920,13 @@ pub fn workspace_select(app: tauri::AppHandle, id: String) -> Result<Selection, 
     let dir = workspaces_dir(&app)?.join(&ws.id);
     let http_url = format!("http://127.0.0.1:{}", ws.ports.http);
 
-    if reg.active.as_deref() != Some(&ws.id) {
-        reg.active = Some(ws.id.clone());
-        save_registry(&app, &reg)?;
-    }
-
     // already running? adopt it — never spawn a second process for one
     // workspace. we probe the p2p LISTEN port, not http: the mesh listener is
     // bound in every phase (parked, promoting, validator) on every node build,
     // while http may lag behind, so this is the one dependable liveness port.
     // a second spawn would collide on exactly this port anyway.
     if port_listening(ws.ports.listen) {
+        commit_active(&app, &mut reg, &ws.id)?;
         return Ok(Selection {
             id: ws.id,
             http_url,
@@ -850,19 +947,40 @@ pub fn workspace_select(app: tauri::AppHandle, id: String) -> Result<Selection, 
         .stdout(log)
         .stderr(log_err);
     crate::daemon::detach(&mut cmd);
-    let child = cmd
-        .spawn()
-        .map_err(|err| format!("spawn ducktape-node: {err}"))?;
+    // spawn AND verify the node survived. a bind conflict, an unparseable
+    // node.toml, or a boot panic dies in milliseconds — and used to return Ok
+    // with a dead http_url the webview would poll for 10s before giving a
+    // generic timeout. spawn_verified reads the real reason back out of
+    // daemon.log instead. http is the readiness signal for a member/founder; a
+    // parking joiner never serves it, so "still alive after the grace" carries.
+    let child = crate::daemon::spawn_verified(cmd, &log_path, Some(ws.ports.http))
+        .map_err(|failure| format!("the node for \"{}\" exited on start: {failure}", ws.name))?;
     // record the detached pid so teardown can address the process directly —
     // the http shutdown route alone can't reach a parked joiner (no surface).
     // best-effort: a failed write only degrades stop back to the pgrep sweep.
     if let Err(err) = fs::write(pidfile(&dir), child.id().to_string()) {
         eprintln!("workspace_select: could not record node pid: {err}");
     }
+    // commit `active` ONLY now the node is confirmed up: a select that fails to
+    // start the node must not repoint `active` at a workspace the next boot
+    // then can't launch (which would strand the app on that dead workspace).
+    commit_active(&app, &mut reg, &ws.id)?;
     Ok(Selection {
         id: ws.id,
         http_url,
     })
+}
+
+/// set `id` as the registry's active workspace, persisting only on a change.
+/// pulled out of [`workspace_select`] so both the adopt and the fresh-spawn
+/// success paths commit `active` at the same point — after the node is known
+/// to be up, never before.
+fn commit_active(app: &tauri::AppHandle, reg: &mut Registry, id: &str) -> Result<(), String> {
+    if reg.active.as_deref() != Some(id) {
+        reg.active = Some(id.to_string());
+        save_registry(app, reg)?;
+    }
+    Ok(())
 }
 
 /// read this workspace's onboarding phase back from `daemon.log`. a parked
@@ -873,9 +991,55 @@ pub fn workspace_select(app: tauri::AppHandle, id: String) -> Result<Selection, 
 pub fn workspace_phase(app: tauri::AppHandle, id: String) -> Result<PhaseReport, String> {
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
+    let dir = workspaces_dir(&app)?.join(&ws.id);
+    let tail = read_tail(&dir.join("daemon.log"), 64 * 1024)?;
+    let report = classify(&tail);
+    // classify only knows the node's stdout markers, so a node that crashed on
+    // boot for a reason it printed no known marker for — a bind conflict, a
+    // config parse error, an abort — reads as "starting"/"parked" FOREVER: a
+    // cheerful spinner over a corpse. cross-check the process. if the pid WE
+    // recorded is gone and neither port is held, the node is dead, not slow;
+    // report fatal with the last log line as the best reason we have. (once the
+    // node answers /v1/status the webview stops polling this, so a live node
+    // never reaches here; a healthy parked joiner keeps its pid + listen port.)
+    if report.phase != "fatal"
+        && recorded_pid_alive(&dir) == Some(false)
+        && !port_listening(ws.ports.listen)
+        && !port_listening(ws.ports.http)
+    {
+        let detail = tail
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_string())
+            .unwrap_or_else(|| "the node exited before it came up".to_string());
+        return Ok(PhaseReport {
+            phase: "fatal".into(),
+            detail: Some(detail),
+        });
+    }
+    Ok(report)
+}
+
+/// the path + tail of a workspace's `daemon.log`, so the ui can show the real
+/// startup reason and offer an "open log" affordance instead of stranding the
+/// developer with a generic timeout. reuses [`read_tail`].
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogTail {
+    pub path: String,
+    pub tail: String,
+}
+
+#[tauri::command]
+pub fn workspace_log_tail(app: tauri::AppHandle, id: String) -> Result<LogTail, String> {
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
     let log_path = workspaces_dir(&app)?.join(&ws.id).join("daemon.log");
-    let tail = read_tail(&log_path, 64 * 1024)?;
-    Ok(classify(&tail))
+    Ok(LogTail {
+        path: log_path.display().to_string(),
+        tail: read_tail(&log_path, 64 * 1024)?,
+    })
 }
 
 // ── Phase classification ────────────────────────────────
@@ -898,6 +1062,9 @@ fn classify(log: &str) -> PhaseReport {
         ("synced", "synced app_hash="),
         ("promoted", "promoted:"),
         ("fatal", "FATAL"),
+        // a raw Rust panic on boot ("thread 'main' panicked at …") prints no
+        // node marker — catch it so a crashed node stops reading as "starting".
+        ("fatal", "panicked at"),
     ];
     let mut latest: Option<(&str, String)> = None;
     for line in log.lines() {
@@ -925,7 +1092,7 @@ fn classify(log: &str) -> PhaseReport {
 }
 
 /// the last `max` bytes of a file as lossy utf-8; empty string if absent.
-fn read_tail(path: &Path, max: u64) -> Result<String, String> {
+pub(crate) fn read_tail(path: &Path, max: u64) -> Result<String, String> {
     let mut file = match fs::File::open(path) {
         Ok(f) => f,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
@@ -942,11 +1109,42 @@ fn read_tail(path: &Path, max: u64) -> Result<String, String> {
 
 /// is something accepting connections on this localhost port right now? used as
 /// a liveness probe for an already-running workspace node.
-fn port_listening(port: u16) -> bool {
+pub(crate) fn port_listening(port: u16) -> bool {
     use std::net::{SocketAddr, TcpStream};
-    use std::time::Duration;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+}
+
+/// is the node WE spawned for this workspace still alive? reads the pidfile
+/// [`workspace_select`] wrote and signal-0s it. `None` when there is no pidfile
+/// (never spawned by us, or an adopted node whose pid we don't own) — the
+/// caller must not infer death from an absent pidfile.
+fn recorded_pid_alive(dir: &Path) -> Option<bool> {
+    let raw = fs::read_to_string(pidfile(dir)).ok()?;
+    let pid = raw.trim();
+    if pid.is_empty() {
+        return None;
+    }
+    Some(pid_alive(pid))
+}
+
+/// unix `kill -0 <pid>`: succeeds iff the process exists. shells out to match
+/// the rest of this module's teardown path (no libc dep in this crate).
+#[cfg(unix)]
+fn pid_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: &str) -> bool {
+    true // best-effort on non-unix; the dev box is linux.
 }
 
 // ── Stopping a workspace's node for real ────────────────
@@ -1190,6 +1388,65 @@ mod tests {
                    [node ab] joining: awaiting redemption (epoch 0 has 1 validators)\n\
                    [node ab] promoted: validator at epoch 1 boundary 4 — rebooting\n";
         assert_eq!(classify(log).phase, "promoted");
+    }
+
+    #[test]
+    fn classify_flags_a_raw_panic_as_fatal() {
+        // a boot panic prints no node marker; the "panicked at" catch-all must
+        // still classify it fatal so the join room stops spinning over a corpse.
+        let log = "[node ab] joiner mode: parking on the mesh\n\
+                   thread 'main' panicked at bin/node/src/main.rs:42:9:\n\
+                   called `Result::unwrap()` on an `Err` value: AddrInUse\n";
+        let report = classify(log);
+        assert_eq!(report.phase, "fatal");
+        assert!(
+            report.detail.as_deref().unwrap_or("").contains("panicked"),
+            "detail: {:?}",
+            report.detail
+        );
+    }
+
+    #[test]
+    fn classify_ignores_ordinary_log_lines() {
+        // an ordinary info line must not trip any phase — only real markers do.
+        let log = "[node ab] listening on 127.0.0.1:8844\n\
+                   [node ab] indexed 12 blocks\n";
+        assert_eq!(classify(log).phase, "starting");
+    }
+
+    #[test]
+    fn corrupt_registry_recovers_to_empty_and_backs_up() {
+        let dir = std::env::temp_dir().join(format!("dt-reg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        std::fs::write(&path, b"{ this is not valid json").unwrap();
+        let reg = load_registry_at(&path).unwrap();
+        assert!(reg.workspaces.is_empty(), "recovers to an empty registry");
+        assert!(reg.active.is_none());
+        assert!(
+            path.with_extension("json.bak").exists(),
+            "the corrupt file is preserved as .bak"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_registry_is_atomic_and_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("dt-reg2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        let reg = Registry {
+            version: 1,
+            active: Some("team".into()),
+            workspaces: Vec::new(),
+        };
+        save_registry_at(&path, &reg).unwrap();
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the temp file is consumed by the rename"
+        );
+        assert_eq!(load_registry_at(&path).unwrap().active.as_deref(), Some("team"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -10,8 +10,11 @@
 //   "# " "- " …    markdown prefixes convert a paragraph's kind
 //   "/"            slash menu over every block kind
 //
-// Text commits on blur (and before any structural op) — one consensus op per
-// change, mirroring the rest of the console's server-authoritative writes.
+// Text commits on debounced edit boundaries (a typing pause), on blur, and
+// before any structural op — one consensus op per boundary, mirroring the
+// rest of the console's server-authoritative writes. A landing snapshot never
+// overwrites the draft of the block being edited; committed truth reconciles
+// through the next boundary commit instead.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
@@ -41,6 +44,9 @@ import { buildForest } from "./page-tree";
 
 const INDENT = 26;
 const TREE_COLLAPSE_KEY = "ducktape.docTreeCollapsed";
+/** A pause this long while typing is one edit boundary — one consensus op.
+ *  Exported for the tests that drive the boundary timer. */
+export const EDIT_BOUNDARY_MS = 700;
 
 const sectionLabelStyle: CSSProperties = {
   font: `600 9px ${font.mono}`,
@@ -211,8 +217,16 @@ function BlockRow({
   const [focused, setFocused] = useState(false);
   const [hover, setHover] = useState(false);
   const areaRef = useRef<HTMLTextAreaElement | null>(null);
+  // focus mirrored into a ref so the draft-sync effect below reads the live
+  // value without re-running on focus flips.
+  const focusedRef = useRef(false);
 
-  useEffect(() => setDraft(block.text), [block.text]);
+  // adopt store text only while the block is NOT being edited: a snapshot
+  // landing mid-edit (another op's completion refresh) must never clobber the
+  // live draft — the edit-boundary commit below reconciles it instead.
+  useEffect(() => {
+    if (!focusedRef.current) setDraft(block.text);
+  }, [block.text]);
 
   // auto-grow: the textarea is exactly as tall as its content.
   useEffect(() => {
@@ -232,6 +246,21 @@ function BlockRow({
   const maybeCommit = () => {
     if (dirty()) handlers.commitText(block.id, draft);
   };
+
+  // the latest commit closure lives in a ref so the boundary timer neither
+  // resets when the store re-renders (handlers is rebuilt per store change)
+  // nor commits a stale draft.
+  const commitBoundaryRef = useRef(() => {});
+  commitBoundaryRef.current = maybeCommit;
+
+  // per-edit-boundary commits: a typing pause flows one consensus op, so
+  // peers and the finalization mark track text without waiting for blur or a
+  // structural op. An open slash menu is a command in progress, not text.
+  useEffect(() => {
+    if (draft === block.text || slashOpen) return;
+    const timer = setTimeout(() => commitBoundaryRef.current(), EDIT_BOUNDARY_MS);
+    return () => clearTimeout(timer);
+  }, [draft, block.text, slashOpen]);
 
   const pickSlash = (kind: BlockKind) => {
     setDraft("");
@@ -437,8 +466,12 @@ function BlockRow({
           value={draft}
           rows={1}
           onChange={(event) => onChange(event.target.value)}
-          onFocus={() => setFocused(true)}
+          onFocus={() => {
+            focusedRef.current = true;
+            setFocused(true);
+          }}
           onBlur={() => {
+            focusedRef.current = false;
             setFocused(false);
             maybeCommit();
           }}
@@ -750,8 +783,13 @@ export function PagesView() {
   const [treeCollapsed, setTreeCollapsed] = useState<ReadonlySet<string>>(loadTreeCollapsed);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
+  // target (block id or page id) the new-thread composer is aimed at; null
+  // hides the composer. WKWebView has no window.prompt, so composing lives
+  // in the panel as a real element.
+  const [composerTarget, setComposerTarget] = useState<string | null>(null);
   const inputs = useRef(new Map<string, HTMLTextAreaElement>());
   const titleRef = useRef<HTMLInputElement | null>(null);
+  const titleFocusedRef = useRef(false);
 
   const blocks = state.activePageBlocks;
   const root =
@@ -773,10 +811,20 @@ export function PagesView() {
     actions.listPages();
   }, [actions]);
 
-  useEffect(() => setTitleDraft(root?.text ?? ""), [root?.text]);
-
-  // load comment threads when the active page changes.
+  // adopt the store title only while the input is not being edited — the
+  // same draft-protection contract as a block row...
   useEffect(() => {
+    if (!titleFocusedRef.current) setTitleDraft(root?.text ?? "");
+  }, [root?.text]);
+  // ...but a page switch resets unconditionally (declared after, so it wins
+  // when both fire): a still-focused input must never carry one page's draft
+  // onto another.
+  useEffect(() => setTitleDraft(root?.text ?? ""), [root?.id]);
+
+  // load comment threads when the active page changes; a composer aimed at
+  // the previous page's blocks must not survive the switch.
+  useEffect(() => {
+    setComposerTarget(null);
     actions.loadPageThreads();
   }, [actions, state.activePage]);
 
@@ -896,21 +944,13 @@ export function PagesView() {
   const openBlockComments = (blockId: string) => {
     setPanelOpen(true);
     const has = state.pageThreads.some((g) => g.target === blockId && g.threads.length > 0);
-    if (!has) {
-      const text = window.prompt("Comment on this block");
-      if (text && text.trim()) {
-        actions.addComment({ target: blockId, text });
-      }
-    }
+    setComposerTarget(has ? null : blockId);
   };
 
   const commentOnPage = () => {
     if (!state.activePage) return;
     setPanelOpen(true);
-    const text = window.prompt("Comment on this page");
-    if (text && text.trim()) {
-      actions.addComment({ target: state.activePage, text });
-    }
+    setComposerTarget(state.activePage);
   };
 
   const handlers: RowHandlers = {
@@ -968,6 +1008,18 @@ export function PagesView() {
       actions.updatePageBlockText({ blockId: root.id, text: titleDraft });
     }
   };
+
+  // the title rides the same edit-boundary contract as a block row: a typing
+  // pause commits the rename as one op. The ref keeps the timer from
+  // resetting on unrelated store re-renders; root?.id in the deps cancels a
+  // pending boundary when the page switches.
+  const commitTitleRef = useRef(() => {});
+  commitTitleRef.current = commitTitle;
+  useEffect(() => {
+    if (!root || titleDraft === root.text) return;
+    const timer = setTimeout(() => commitTitleRef.current(), EDIT_BOUNDARY_MS);
+    return () => clearTimeout(timer);
+  }, [titleDraft, root?.text, root?.id]);
 
   return (
     <div
@@ -1044,7 +1096,10 @@ export function PagesView() {
                       type="button"
                       aria-label={panelOpen ? "Hide comments" : "Show comments"}
                       aria-pressed={panelOpen}
-                      onClick={() => setPanelOpen((o) => !o)}
+                      onClick={() => {
+                        if (panelOpen) setComposerTarget(null);
+                        setPanelOpen((o) => !o);
+                      }}
                       style={{
                         ...headerBtn,
                         background: panelOpen ? color.hover : color.paper,
@@ -1127,7 +1182,13 @@ export function PagesView() {
                     aria-label="Page title"
                     value={titleDraft}
                     onChange={(event) => setTitleDraft(event.target.value)}
-                    onBlur={commitTitle}
+                    onFocus={() => {
+                      titleFocusedRef.current = true;
+                    }}
+                    onBlur={() => {
+                      titleFocusedRef.current = false;
+                      commitTitle();
+                    }}
                     onKeyDown={(event) => {
                       if (event.key === "Enter" || event.key === "ArrowDown") {
                         event.preventDefault();
@@ -1191,7 +1252,23 @@ export function PagesView() {
             <CommentsPanel
               threads={state.pageThreads}
               authorNames={state.authorNames}
-              onClose={() => setPanelOpen(false)}
+              composer={
+                composerTarget
+                  ? {
+                      target: composerTarget,
+                      label: composerTarget === state.activePage ? "this page" : "this block",
+                    }
+                  : null
+              }
+              onClose={() => {
+                setPanelOpen(false);
+                setComposerTarget(null);
+              }}
+              onSubmitNew={(target, text) => {
+                actions.addComment({ target, text });
+                setComposerTarget(null);
+              }}
+              onCancelNew={() => setComposerTarget(null)}
               onReply={(threadId, text) => {
                 // a reply must carry the THREAD's target (a block id or the
                 // page id) — the module rejects an append whose target differs

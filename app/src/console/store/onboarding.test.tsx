@@ -274,7 +274,12 @@ describe("onboarding gate — remote node", () => {
       expect(screen.getByTestId("ws").textContent).toBe("none");
     });
     // it dialed the remote node's surface, and never spawned/selected a local one.
-    expect(fetchMock).toHaveBeenCalledWith("http://10.0.0.5:8844/v1/status");
+    // status() now carries an AbortController signal for its deadline, so the
+    // fetch is (url, { signal }) rather than (url) alone.
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://10.0.0.5:8844/v1/status",
+      expect.objectContaining({ signal: expect.anything() }),
+    );
     expect(invokeMock).not.toHaveBeenCalledWith("workspace_select", expect.anything());
     // remembered for next launch.
     expect(localStorage.getItem("ducktape.remoteUrl")).toBe("http://10.0.0.5:8844");

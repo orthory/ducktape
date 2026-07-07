@@ -37,15 +37,15 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
     cluster.wait_marker(1, "invite announce sent to member", Duration::from_secs(90));
     cluster.wait_marker(0, "invite redemption submitted:", Duration::from_secs(90));
 
-    // the redemption lands in consensus state: the friend holds OBSERVER
+    // the redemption lands in consensus state: the friend holds RESIDENT
     // standing (a full node), while the quorum still seats only the founder.
     let expected = vec![common::unhex(&friend_key)];
-    poll_until("the redemption to grant observer standing", CONVERGE, || {
+    poll_until("the redemption to grant resident standing", CONVERGE, || {
         cluster
-            .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
+            .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
             .and_then(|raw| valset::decode_reply(&raw).ok())
             .and_then(|r| match r {
-                ValsetReply::Observers(v) if v == expected => Some(()),
+                ValsetReply::Residents(v) if v == expected => Some(()),
                 _ => None,
             })
     });
@@ -60,7 +60,7 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
     assert_eq!(validators.len(), 1, "the quorum still seats ONLY the founder");
 
     // the full node pre-syncs and serves — the whole point of the flow.
-    cluster.wait_marker(1, "observer: pre-synced boundary", CONVERGE);
+    cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 
     // a second announce cannot double-admit: the nonce is spent, standing
     // already exists, and the founder's tracker drains once settled.

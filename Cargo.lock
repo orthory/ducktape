@@ -1403,8 +1403,13 @@ dependencies = [
 name = "coordinator-bin"
 version = "0.1.0"
 dependencies = [
+ "commonware-codec",
+ "commonware-cryptography",
  "nat-traversal",
+ "serde",
+ "tempfile",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -1867,6 +1872,7 @@ dependencies = [
  "git2",
  "greeter",
  "host",
+ "identity",
  "inbox",
  "jobs",
  "kv",
@@ -3252,6 +3258,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "identity"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "commonware-codec",
+ "commonware-cryptography",
+ "futures",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+ "valset",
+]
+
+[[package]]
 name = "idna"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3876,6 +3897,7 @@ dependencies = [
 name = "nat-traversal"
 version = "0.1.0"
 dependencies = [
+ "commonware-codec",
  "commonware-cryptography",
  "thiserror 2.0.18",
  "tokio",
@@ -4036,11 +4058,13 @@ dependencies = [
  "futures",
  "governance",
  "host",
+ "identity",
  "inbox",
  "indexer",
  "jobs",
  "kv",
  "memory",
+ "nat-traversal",
  "node",
  "noded",
  "pages",
@@ -4088,6 +4112,7 @@ dependencies = [
  "git2",
  "host",
  "http-body-util",
+ "identity",
  "inbox",
  "indexer",
  "jobs",
@@ -5879,6 +5904,7 @@ dependencies = [
  "forge",
  "futures",
  "host",
+ "identity",
  "inbox",
  "indexer",
  "jobs",

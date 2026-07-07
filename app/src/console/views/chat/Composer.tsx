@@ -8,22 +8,35 @@ import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
 
 import { Icon } from "../../components/Icon";
+import type { IconName } from "../../components/Icon";
 import { HoverButton } from "./HoverButton";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 
 const DEFAULT_MAX_HEIGHT = 168;
 
-function FmtButton({ label, title, onClick }: { label: ReactNode; title: string; onClick: () => void }) {
+function FmtButton({
+  label,
+  icon,
+  title,
+  onClick,
+}: {
+  label?: ReactNode;
+  icon?: IconName;
+  title: string;
+  onClick: () => void;
+}) {
   const style: CSSProperties = {
-    minWidth: 22,
-    height: 22,
-    padding: "0 5px",
+    width: 24,
+    height: 24,
+    padding: 0,
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
+    flexShrink: 0,
     borderRadius: 5,
     color: color.muted2,
-    font: `600 12px ${font.sans}`,
+    font: `650 12px ${font.sans}`,
+    lineHeight: 1,
   };
   return (
     <HoverButton
@@ -33,7 +46,7 @@ function FmtButton({ label, title, onClick }: { label: ReactNode; title: string;
       style={style}
       hoverStyle={{ background: color.hover, color: color.ink }}
     >
-      {label}
+      {icon ? <Icon name={icon} size={14} strokeWidth={1.9} /> : label}
     </HoverButton>
   );
 }
@@ -86,6 +99,53 @@ export function Composer({
     const selected = value.slice(start, end) || placeholder;
     pendingSelection.current = [start + before.length, start + before.length + selected.length];
     onChange(value.slice(0, start) + before + selected + after + value.slice(end));
+  };
+
+  const insertLink = () => {
+    const el = ref.current;
+    if (!el) return;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const selected = value.slice(start, end);
+    const selectedUrl = /^https?:\/\/\S+$/i.test(selected.trim()) ? selected.trim() : null;
+    const label = selected && !selectedUrl ? selected : "link";
+    const href = selectedUrl ?? "https://example.com";
+    const inserted = `[${label}](${href})`;
+    const labelStart = start + 1;
+    const hrefStart = start + label.length + 3;
+    pendingSelection.current = selected
+      ? [hrefStart, hrefStart + href.length]
+      : [labelStart, labelStart + label.length];
+    onChange(value.slice(0, start) + inserted + value.slice(end));
+  };
+
+  const quote = () => {
+    const el = ref.current;
+    if (!el) return;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const selected = value.slice(start, end) || "quote";
+    const inserted = selected
+      .split("\n")
+      .map((line) => (line.startsWith(">") ? line : `> ${line}`))
+      .join("\n");
+    pendingSelection.current = value.slice(start, end)
+      ? [start, start + inserted.length]
+      : [start + 2, start + 2 + selected.length];
+    onChange(value.slice(0, start) + inserted + value.slice(end));
+  };
+
+  const insertDivider = () => {
+    const el = ref.current;
+    if (!el) return;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const before = value.slice(0, start);
+    const after = value.slice(end);
+    const prefix = before && !before.endsWith("\n") ? "\n" : "";
+    const inserted = `${prefix}---\n`;
+    pendingSelection.current = [before.length + inserted.length, before.length + inserted.length];
+    onChange(before + inserted + after);
   };
 
   const canSend = value.trim().length > 0;
@@ -155,11 +215,14 @@ export function Composer({
               label={<span style={{ fontStyle: "italic" }}>I</span>}
               onClick={() => wrap("*", "*", "italic")}
             />
+            <FmtButton title="Link  [text](https://...)" icon="link" onClick={insertLink} />
+            <FmtButton title="Quote  > text" icon="quote" onClick={quote} />
             <FmtButton
               title="Code block  ```"
-              label={<span style={{ font: `600 11px ${font.mono}` }}>{"</>"}</span>}
+              icon="code"
               onClick={() => wrap("```\n", "\n```", "code")}
             />
+            <FmtButton title="Divider  ---" icon="divider" onClick={insertDivider} />
             <div style={{ width: 1, height: 14, background: color.borderSoft, margin: "0 5px" }} />
             <span
               style={{

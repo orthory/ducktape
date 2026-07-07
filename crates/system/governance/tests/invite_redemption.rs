@@ -92,13 +92,13 @@ async fn submit_as(
     .map(|_| ())
 }
 
-async fn observers(host: &Host) -> Vec<Vec<u8>> {
+async fn residents(host: &Host) -> Vec<Vec<u8>> {
     let reply = host
-        .query("valset", &valset_query(&ValsetQuery::Observers))
+        .query("valset", &valset_query(&ValsetQuery::Residents))
         .await
         .expect("valset query");
     match valset_decode(&reply).expect("decode") {
-        ValsetReply::Observers(v) => v,
+        ValsetReply::Residents(v) => v,
         other => panic!("expected Observers, got {other:?}"),
     }
 }
@@ -126,9 +126,9 @@ fn a_valid_redemption_grants_full_node_standing_without_a_ballot() {
             .expect("redeem");
 
         assert_eq!(
-            observers(&host).await,
+            residents(&host).await,
             vec![key_bytes(&joiner)],
-            "the joiner holds full-node standing in the same block"
+            "the joiner holds resident standing in the same block"
         );
         let audit = redemptions(&host).await;
         assert_eq!(audit.len(), 1);
@@ -218,7 +218,7 @@ fn forged_or_unauthorized_redemptions_are_refused() {
             "got {err:?}"
         );
 
-        assert!(observers(&host).await.is_empty(), "nothing was admitted");
+        assert!(residents(&host).await.is_empty(), "nothing was admitted");
     });
 }
 

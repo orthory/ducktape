@@ -44,6 +44,7 @@ chat = { workspace = true }
 tasks = { workspace = true }
 vaults = { workspace = true }
 profiles = { workspace = true }
+identity = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
@@ -57,6 +58,10 @@ reactor = { workspace = true }
 # `wireguard_listen` node.toml key; wireguard-upgrade/-effect supply the
 # endpoint types and the phase-A fake effect it drives.
 reachability = { workspace = true }
+# the coordinator-auth credential types: `coord.cap` is the private-mode
+# admission token a node persists beside its descriptor (minted by a genesis
+# validator via `mint_coord_cap`, presented on each rendezvous request).
+nat-traversal = { workspace = true }
 wireguard-upgrade = { workspace = true }
 wireguard-effect = { workspace = true }
 # the voice hub's transport seam: huddle audio rides data-plane datagrams over

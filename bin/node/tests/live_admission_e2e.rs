@@ -1,5 +1,5 @@
 //! network-shape live admission: a fresh identity produced by `join` can start
-//! immediately, park as a read-only observer, and promote through the
+//! immediately, park as a read-only resident, and promote through the
 //! TWO-PHASE membership protocol once a running member admits it through
 //! governance — registration lands it STANDBY (cutover #1, quorum unchanged),
 //! the parked node proves a full state sync and announces ONLINE with its own
@@ -60,7 +60,7 @@ fn network_shape_joiner_parks_until_promote() {
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
     // direct admission: ONE cutover seats the friend; it syncs the frozen
-    // boundary and promotes there. (the staged observer flow has its own
+    // boundary and promotes there. (the staged resident flow has its own
     // leg below.)
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
     cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
@@ -69,35 +69,36 @@ fn network_shape_joiner_parks_until_promote() {
     cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
 }
 
-/// the STAGED admission flow end-to-end: invite → observer (mesh + pre-sync,
+/// the STAGED admission flow end-to-end: invite → resident (mesh + pre-sync,
 /// NO quorum seat) → promote → validator. the payoff assertions are the
 /// quorum ones the one-step flow could never make:
 ///
-///   1. while the friend holds observer standing, the valset's VALIDATOR set
+///   1. while the friend holds resident standing, the valset's VALIDATOR set
 ///      still names only the founder — committed state proves the tier split;
-///   2. the observer SERVES: local reads (rpc + http) answer from its own
-///      pre-synced boundary, a write is refused as reads-only, and a value the
-///      founder finalizes becomes readable through the observer's surface (the
-///      continuous follow);
-///   3. the chain keeps finalizing with the observer KILLED (under the old
+///   2. the resident SERVES: local reads (rpc + http) answer from its own
+///      pre-synced boundary, a write lands through the submit relay (and the
+///      resident reads its own write back), and a value the founder finalizes
+///      becomes readable through the resident's surface (the continuous
+///      follow);
+///   3. the chain keeps finalizing with the resident KILLED (under the old
 ///      one-step flow the friend would already hold a quorum seat here, and a
 ///      2-member quorum with one member down is a stall);
-///   4. a restarted observer parks straight back into observer mode (the
+///   4. a restarted resident parks straight back into resident mode (the
 ///      pre-sync writes no checkpoint manifest — a reboot is clean) and serves
 ///      again;
-///   5. `observer-remove` REVOKES standing through the same ceremony: committed
-///      observers empty, the node falls back to a parked joiner, and a second
+///   5. `resident-remove` REVOKES standing through the same ceremony: committed
+///      residents empty, the node falls back to a parked joiner, and a second
 ///      run is an honest no-op;
-///   6. `invite-accept` re-grants, and the observer resumes the follow (a
+///   6. `invite-accept` re-grants, and the resident resumes the follow (a
 ///      post-re-grant write becomes readable through its surface);
 ///   7. `promote` then seats a WARM validator through the normal path.
 ///
-/// observer ops are no longer version-gated, so admission works at v0; this
+/// resident ops are no longer version-gated, so admission works at v0; this
 /// leg still runs the v3 upgrade ceremony first (schedule → auto-signal →
 /// activate) as incidental upgrade-path coverage, not as a precondition for
-/// the observer grant below.
+/// the resident grant below.
 #[test]
-fn staged_admission_observer_presyncs_then_promotes_warm() {
+fn staged_admission_resident_presyncs_then_promotes_warm() {
     use directory::{DirMsg, DirQuery, DirReply};
     use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
     use valset::{ValsetQuery, ValsetReply};
@@ -141,14 +142,14 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     for attempt in 0..4u32 {
         let base = cluster.status(0)["height"].as_u64().unwrap_or(0);
         activation = base + lead;
-        let pid = format!("observer-tier-a{attempt}");
+        let pid = format!("resident-tier-a{attempt}");
         cluster.submit(
             0,
             "governance",
             &governance::encode_msg(&GovMsg::Propose {
                 proposal_id: pid.clone(),
                 action: GovAction::ScheduleUpgrade {
-                    name: "observer-tier".into(),
+                    name: "resident-tier".into(),
                     activation_height: activation,
                     to_version: 3,
                 },
@@ -208,12 +209,12 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
         lead *= 2;
         assert!(attempt < 3, "could not schedule the v3 upgrade (lead {lead})");
     }
-    cluster.wait_marker(0, "signaled ready name=observer-tier", CONVERGE);
-    cluster.wait_marker(0, "upgrade armed name=observer-tier to_version=3", CONVERGE);
-    cluster.wait_marker(0, "upgrade activated name=observer-tier version=3", CONVERGE);
+    cluster.wait_marker(0, "signaled ready name=resident-tier", CONVERGE);
+    cluster.wait_marker(0, "upgrade armed name=resident-tier to_version=3", CONVERGE);
+    cluster.wait_marker(0, "upgrade activated name=resident-tier version=3", CONVERGE);
     let _ = activation;
 
-    // ---- invite → park → observer grant ------------------------------------
+    // ---- invite → park → resident grant ------------------------------------
     let invite = cluster.invite();
     let friend_key = cluster.join_friend_manual(&invite);
     cluster.spawn(1);
@@ -222,16 +223,16 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     let (ok, text) = cluster.run_membership_verb("invite-accept", &friend_key);
     assert!(ok, "invite-accept failed:\n{text}");
     assert!(
-        text.contains("granted observer standing"),
+        text.contains("granted resident standing"),
         "unexpected invite-accept output:\n{text}"
     );
 
-    // the grant's boundary admits the observer to the mesh; the parked node
+    // the grant's boundary admits the resident to the mesh; the parked node
     // then pre-syncs.
-    cluster.wait_marker(1, "observer: pre-synced boundary", CONVERGE);
+    cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 
     // (1) the tier split in COMMITTED state: validators = founder only,
-    //     observers = the friend.
+    //     residents = the friend.
     let validators = cluster
         .query(0, "valset", &valset::encode_query(&ValsetQuery::Validators))
         .and_then(|raw| valset::decode_reply(&raw).ok())
@@ -241,37 +242,37 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
         })
         .expect("valset validators readable");
     assert_eq!(validators.len(), 1, "the quorum still seats ONLY the founder");
-    let observers = cluster
-        .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
+    let residents = cluster
+        .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
         .and_then(|raw| valset::decode_reply(&raw).ok())
         .map(|r| match r {
-            ValsetReply::Observers(v) => v,
-            other => panic!("expected Observers, got {other:?}"),
+            ValsetReply::Residents(v) => v,
+            other => panic!("expected Residents, got {other:?}"),
         })
-        .expect("valset observers readable");
+        .expect("valset residents readable");
     assert_eq!(
-        observers,
+        residents,
         vec![common::unhex(&friend_key)],
-        "the friend holds observer standing"
+        "the friend holds resident standing"
     );
 
-    // (2) the SERVING observer: the same local read surfaces a validator
-    //     binds, answered from the observer's own pre-synced boundary.
+    // (2) the SERVING resident: the same local read surfaces a validator
+    //     binds, answered from the resident's own pre-synced boundary.
     //     rpc status names the served boundary…
-    poll("the observer to serve rpc status", Box::new(|| {
+    poll("the resident to serve rpc status", Box::new(|| {
         let st = cluster.rpc(1, serde_json::json!({ "cmd": "status" }));
         st["ok"] == serde_json::json!(true)
             && st["status"]["height"].as_u64().is_some_and(|h| h > 0)
     }));
-    //     …module reads answer from the OBSERVER's surface (the tier split is
-    //     visible through the observer itself, not just the founder)…
-    poll("the observer to serve valset reads", Box::new(|| {
+    //     …module reads answer from the RESIDENT's surface (the tier split is
+    //     visible through the resident itself, not just the founder)…
+    poll("the resident to serve valset reads", Box::new(|| {
         cluster
-            .query(1, "valset", &valset::encode_query(&ValsetQuery::Observers))
+            .query(1, "valset", &valset::encode_query(&ValsetQuery::Residents))
             .and_then(|raw| valset::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(
                 r,
-                ValsetReply::Observers(v) if v == vec![common::unhex(&friend_key)]
+                ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
             ))
     }));
     //     …the http app surface answers its status route from the same host…
@@ -279,49 +280,65 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
         use std::io::{Read as _, Write as _};
         let mut conn =
             std::net::TcpStream::connect(("127.0.0.1", cluster.http_ports[1]))
-                .expect("connect the observer's app surface");
+                .expect("connect the resident's app surface");
         conn.set_read_timeout(Some(Duration::from_secs(15))).expect("http timeout");
         conn.write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .expect("http write");
         let mut raw = String::new();
         conn.read_to_string(&mut raw).expect("http read");
-        assert!(raw.starts_with("HTTP/1.1 200"), "observer /v1/status must answer 200:\n{raw}");
-        assert!(raw.contains("\"height\""), "observer /v1/status carries a height:\n{raw}");
+        assert!(raw.starts_with("HTTP/1.1 200"), "resident /v1/status must answer 200:\n{raw}");
+        assert!(raw.contains("\"height\""), "resident /v1/status carries a height:\n{raw}");
     }
-    //     …a write is refused as reads-only…
-    let refused = cluster.rpc(
+    //     …a write LANDS through the submit relay: the resident signs with its
+    //     own key, ships the frame to the validator, and the rpc reply holds
+    //     until the frame finalizes (ok == Applied)…
+    let landed = cluster.rpc(
         1,
         serde_json::json!({
             "cmd": "submit",
             "target": "directory",
             "payload_hex": common::hex(&directory::encode_msg(&DirMsg::Set {
-                key: "observer-no-writes".into(),
-                value: "refused".into(),
+                key: "resident-writes".into(),
+                value: "landed".into(),
             })),
         }),
     );
-    assert_eq!(refused["ok"], serde_json::json!(false), "observer must refuse writes: {refused}");
-    assert!(
-        refused["error"].as_str().unwrap_or_default().contains("reads only"),
-        "the refusal names the reads-only contract: {refused}"
+    assert_eq!(
+        landed["ok"],
+        serde_json::json!(true),
+        "the resident submit should relay + finalize (ok == Applied): {landed}"
     );
-    //     …and the follow is CONTINUOUS: a value the founder finalizes now
-    //     becomes readable through the observer within a few boundaries.
-    cluster.submit(
-        0,
-        "directory",
-        &directory::encode_msg(&DirMsg::Set {
-            key: "observer-follow".into(),
-            value: "fresh".into(),
-        }),
-    );
-    poll("the observer to serve the followed write", Box::new(|| {
+    //     …and the resident READS ITS OWN WRITE once its follow arm crosses
+    //     the boundary that carries it…
+    poll("the resident to serve its own relayed write", Box::new(|| {
         cluster
             .query(
                 1,
                 "directory",
                 &directory::encode_query(&DirQuery::Get {
-                    key: "observer-follow".into(),
+                    key: "resident-writes".into(),
+                }),
+            )
+            .and_then(|raw| directory::decode_reply(&raw).ok())
+            .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "landed"))
+    }));
+    //     …and the follow is CONTINUOUS: a value the founder finalizes now
+    //     becomes readable through the resident within a few boundaries.
+    cluster.submit(
+        0,
+        "directory",
+        &directory::encode_msg(&DirMsg::Set {
+            key: "resident-follow".into(),
+            value: "fresh".into(),
+        }),
+    );
+    poll("the resident to serve the followed write", Box::new(|| {
+        cluster
+            .query(
+                1,
+                "directory",
+                &directory::encode_query(&DirQuery::Get {
+                    key: "resident-follow".into(),
                 }),
             )
             .and_then(|raw| directory::decode_reply(&raw).ok())
@@ -330,7 +347,7 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     //     …and the DERIVED tier follows the boundary too: the explorer
     //     records the followed boundary (an honest boundary row — verified
     //     height + app-hash, frame-derived fields empty)…
-    poll("the observer explorer to record a followed boundary", Box::new(|| {
+    poll("the resident explorer to record a followed boundary", Box::new(|| {
         let (status, body) = common::http_request(cluster.http_ports[1], "GET", "/v1/blocks", None);
         status == 200
             && body["blocks"].as_array().is_some_and(|rows| {
@@ -346,7 +363,7 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     //     (the backfill floor), with the store healthy. polled: a heal drops
     //     the watermark FIRST (crash-safety by re-trigger), so a read racing
     //     an in-flight heal legitimately sees 0 for a moment.
-    poll("the observer index to report boundary-stamped watermarks", Box::new(|| {
+    poll("the resident index to report boundary-stamped watermarks", Box::new(|| {
         let (status, index_status) =
             common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
         let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
@@ -356,84 +373,84 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             && index_status["backfilled"]["directory"].as_u64() == Some(watermark)
     }));
 
-    // (3) quorum untouched: kill the observer; the founder keeps finalizing.
+    // (3) quorum untouched: kill the resident; the founder keeps finalizing.
     cluster.kill(1);
     cluster.submit(
         0,
         "directory",
         &directory::encode_msg(&DirMsg::Set {
-            key: "observer-down-liveness".into(),
+            key: "resident-down-liveness".into(),
             value: "alive".into(),
         }),
     );
-    poll("a finalized op with the observer down", Box::new(|| {
+    poll("a finalized op with the resident down", Box::new(|| {
         cluster
             .query(
                 0,
                 "directory",
                 &directory::encode_query(&DirQuery::Get {
-                    key: "observer-down-liveness".into(),
+                    key: "resident-down-liveness".into(),
                 }),
             )
             .and_then(|raw| directory::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(r, DirReply::Value(Some(_))))
     }));
 
-    // (4) a restarted observer parks straight back into observer mode — the
+    // (4) a restarted resident parks straight back into resident mode — the
     //     pre-sync left NO checkpoint manifest behind. (the config-time
     //     joiner banner may not reprint: the first run's recovery-journal
     //     files flip the cheap boot probe, and the runtime then re-decides
-    //     from the real store — the observer marker alone is the proof.)
+    //     from the real store — the resident marker alone is the proof.)
     //     it then SERVES again from a fresh pre-sync.
     cluster.spawn(1);
-    cluster.wait_marker(1, "observer: pre-synced boundary", CONVERGE);
-    poll("the restarted observer to serve reads again", Box::new(|| {
+    cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
+    poll("the restarted resident to serve reads again", Box::new(|| {
         cluster.rpc(1, serde_json::json!({ "cmd": "status" }))["ok"]
             == serde_json::json!(true)
     }));
 
-    // (5) observer-remove: the ceremony verb revokes standing. committed
-    //     state clears, and the observer — whose respawned log is fresh, so
+    // (5) resident-remove: the ceremony verb revokes standing. committed
+    //     state clears, and the resident — whose respawned log is fresh, so
     //     the parked marker is unambiguously post-revoke — falls back to a
     //     parked joiner at the boundary whose manifest drops it.
-    let (ok, out) = cluster.run_membership_verb("observer-remove", &friend_key);
-    assert!(ok, "observer-remove failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb("resident-remove", &friend_key);
+    assert!(ok, "resident-remove failed:\n{out}");
     assert!(
-        out.contains("revoked observer standing"),
-        "unexpected observer-remove output:\n{out}"
+        out.contains("revoked resident standing"),
+        "unexpected resident-remove output:\n{out}"
     );
-    poll("the revoke to clear observer standing", Box::new(|| {
+    poll("the revoke to clear resident standing", Box::new(|| {
         cluster
-            .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
+            .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
             .and_then(|raw| valset::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, ValsetReply::Observers(v) if v.is_empty()))
+            .is_some_and(|r| matches!(r, ValsetReply::Residents(v) if v.is_empty()))
     }));
     cluster.wait_marker(1, "joining: awaiting redemption", CONVERGE);
     //     a second run is an honest no-op — the inverted guard, end to end.
-    let (ok, out) = cluster.run_membership_verb("observer-remove", &friend_key);
-    assert!(ok, "observer-remove (no standing) failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb("resident-remove", &friend_key);
+    assert!(ok, "resident-remove (no standing) failed:\n{out}");
     assert!(
-        out.contains("holds no observer standing"),
-        "unexpected no-op observer-remove output:\n{out}"
+        out.contains("holds no resident standing"),
+        "unexpected no-op resident-remove output:\n{out}"
     );
 
-    // (6) re-grant: invite-accept restores standing and the observer resumes
+    // (6) re-grant: invite-accept restores standing and the resident resumes
     //     the follow — a write finalized AFTER the re-grant becomes readable
-    //     through the observer's own surface (stale serves can't fake this:
+    //     through the resident's own surface (stale serves can't fake this:
     //     the revoked node never synced a boundary carrying this key).
     let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
     assert!(ok, "re-grant invite-accept failed:\n{out}");
     assert!(
-        out.contains("granted observer standing"),
+        out.contains("granted resident standing"),
         "unexpected re-grant output:\n{out}"
     );
-    poll("the re-grant to restore observer standing", Box::new(|| {
+    poll("the re-grant to restore resident standing", Box::new(|| {
         cluster
-            .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
+            .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
             .and_then(|raw| valset::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(
                 r,
-                ValsetReply::Observers(v) if v == vec![common::unhex(&friend_key)]
+                ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
             ))
     }));
     cluster.submit(
@@ -444,7 +461,7 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             value: "back".into(),
         }),
     );
-    poll("the re-granted observer to resume the follow", Box::new(|| {
+    poll("the re-granted resident to resume the follow", Box::new(|| {
         cluster
             .query(
                 1,
@@ -457,24 +474,24 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "back"))
     }));
 
-    // (7) promote: the warm observer becomes a validator through the normal
-    //     promotion path; valset Join clears its observer standing.
+    // (7) promote: the warm resident becomes a validator through the normal
+    //     promotion path; valset Join clears its resident standing.
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected promote output:\n{out}");
     cluster.wait_marker(1, "admitted at epoch", CONVERGE);
     cluster.wait_marker(1, "synced app_hash=", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
-    let observers = cluster
-        .query(0, "valset", &valset::encode_query(&ValsetQuery::Observers))
+    let residents = cluster
+        .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
         .and_then(|raw| valset::decode_reply(&raw).ok())
         .map(|r| match r {
-            ValsetReply::Observers(v) => v,
-            other => panic!("expected Observers, got {other:?}"),
+            ValsetReply::Residents(v) => v,
+            other => panic!("expected Residents, got {other:?}"),
         })
-        .expect("valset observers readable");
+        .expect("valset residents readable");
     assert!(
-        observers.is_empty(),
-        "promotion must clear observer standing (got {observers:?})"
+        residents.is_empty(),
+        "promotion must clear resident standing (got {residents:?})"
     );
 }

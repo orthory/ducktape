@@ -396,7 +396,7 @@ fn cluster_lifecycle() {
 
     // 10. the sync-only joiner rebuilds EVERY module over the statesync
     // channel from node 0 and must compose the identical app-hash. node 3's
-    // slot is reused as a FRESH observer: kill the promoted validator
+    // slot is reused as a FRESH resident: kill the promoted validator
     // (quorum(4) = 3 keeps the network live — nops move heights, not state,
     // so the step-9 boundary hash stands) and wipe its state.
     cluster.kill(3);

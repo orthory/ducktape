@@ -68,7 +68,10 @@ pub fn unhex(s: &str) -> Result<Vec<u8>, String> {
 
 /// load the identity at `path`, or generate one there from OS randomness.
 /// returns the signer and whether it was freshly generated. written 0600 on
-/// unix — it is the node's (and for now the user's) whole identity.
+/// unix — this is the NODE's identity (mesh/valset/frame-signing key) only.
+/// the user's identity is a separate keypair held by the app
+/// (`~/.ducktape/user.key`) and bound to this node's key through the
+/// `identity` module (`crates/system/identity`); this file never holds it.
 pub fn load_or_generate_identity(path: &Path) -> Result<(ed25519::PrivateKey, bool), String> {
     if path.exists() {
         return load_identity(path).map(|k| (k, false));
@@ -114,6 +117,42 @@ pub fn load_identity(path: &Path) -> Result<ed25519::PrivateKey, String> {
         .map_err(|e| format!("{path:?} is not an ed25519 secret: {e}"))
 }
 
+/// mint a bind certificate: the USER key's signature over
+/// [`identity::bind_preimage`] in the [`identity::IDENTITY_BIND_NS`] domain --
+/// the consent artifact `IdentityMsg::BindNode` carries as `user_sig`. chain-
+/// and nonce-scoped, so a certificate can never replay across networks or
+/// after an unbind bumps the nonce.
+pub fn mint_bind_cert(
+    user: &ed25519::PrivateKey,
+    chain_id: &str,
+    node_pub: &[u8],
+    nonce: u64,
+) -> Vec<u8> {
+    user.sign(
+        identity::IDENTITY_BIND_NS,
+        &identity::bind_preimage(chain_id, node_pub, nonce),
+    )
+    .as_ref()
+    .to_vec()
+}
+
+/// mint an unbind certificate (same shape as [`mint_bind_cert`], but signed
+/// over [`identity::unbind_preimage`] in the [`identity::IDENTITY_UNBIND_NS`]
+/// domain -- the consent artifact `IdentityMsg::UnbindNode` carries).
+pub fn mint_unbind_cert(
+    user: &ed25519::PrivateKey,
+    chain_id: &str,
+    node_pub: &[u8],
+    nonce: u64,
+) -> Vec<u8> {
+    user.sign(
+        identity::IDENTITY_UNBIND_NS,
+        &identity::unbind_preimage(chain_id, node_pub, nonce),
+    )
+    .as_ref()
+    .to_vec()
+}
+
 /// mint a chain-id: the human-readable name plus a short salt, so two
 /// unrelated networks that pick the same name still get distinct namespaces
 /// (their handshakes fail cleanly instead of colliding). the salt hashes the
@@ -156,6 +195,11 @@ pub struct NetworkDescriptor {
     /// synthesises all-`Direct` hints from `bootstrap`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reach: Vec<String>,
+    /// Coordination privacy for the reachability plane. `None` => `Private`
+    /// (the safer default). Operational policy, parsed like the reach hints —
+    /// NOT part of `genesis_namespace` (validator identity only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordination: Option<String>,
 }
 
 impl NetworkDescriptor {
@@ -353,6 +397,25 @@ impl NetworkDescriptor {
     }
 }
 
+/// coordination privacy for the reachability plane — per-network operational
+/// policy (like `checkpoint_blocks`), NOT part of the genesis fingerprint.
+/// `Public` = the coordinator admits any proof-of-possession request;
+/// `Private` (the default) also requires a genesis-issued `CoordCap`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coordination {
+    Public,
+    Private,
+}
+
+impl NetworkDescriptor {
+    pub fn coordination(&self) -> Coordination {
+        match self.coordination.as_deref() {
+            Some("public") => Coordination::Public,
+            _ => Coordination::Private,
+        }
+    }
+}
+
 /// a reach hint resolved to how the mesh actually reaches a member. `Direct`
 /// dials the ingress and authenticates `expected_key` end-to-end (a fronted
 /// path is transparent, so it looks the same to the dialer); `Coordinated`
@@ -520,6 +583,63 @@ pub fn load_invite_wireguard(dir: &Path) -> Result<Option<StoredInviteWireGuard>
     toml::from_str(&text)
         .map(Some)
         .map_err(|e| format!("{path:?}: {e}"))
+}
+
+// ============================================================================
+// coordinator capability — the private-mode admission token a node presents on
+// each rendezvous request. Minted by a genesis validator (`mint_coord_cap`),
+// persisted 0600 beside the descriptor like `invite.token`. Genesis validators
+// need none (the coordinator's pinned set covers them).
+// ============================================================================
+
+const COORD_CAP_FILE: &str = "coord.cap";
+const COORD_CAP_LEN: usize = 32 + 8 + 64;
+
+pub fn pack_coord_cap(cap: &nat_traversal::CoordCap) -> Vec<u8> {
+    let mut out = Vec::with_capacity(COORD_CAP_LEN);
+    out.extend_from_slice(cap.issuer.as_ref());
+    out.extend_from_slice(&cap.not_after.to_be_bytes());
+    out.extend_from_slice(cap.issuer_sig.encode().as_ref());
+    out
+}
+
+pub fn unpack_coord_cap(bytes: &[u8]) -> Result<nat_traversal::CoordCap, String> {
+    if bytes.len() != COORD_CAP_LEN {
+        return Err(format!(
+            "coord cap must be {COORD_CAP_LEN} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let issuer =
+        ed25519::PublicKey::decode(&bytes[..32]).map_err(|e| format!("coord cap issuer: {e}"))?;
+    let mut na = [0u8; 8];
+    na.copy_from_slice(&bytes[32..40]);
+    let not_after = u64::from_be_bytes(na);
+    let issuer_sig =
+        ed25519::Signature::decode(&bytes[40..]).map_err(|e| format!("coord cap sig: {e}"))?;
+    Ok(nat_traversal::CoordCap { issuer, not_after, issuer_sig })
+}
+
+pub fn save_coord_cap(dir: &Path, cap: &nat_traversal::CoordCap) -> Result<(), String> {
+    use std::io::Write as _;
+    let path = dir.join(COORD_CAP_FILE);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path).map_err(|e| format!("create {path:?}: {e}"))?;
+    f.write_all(format!("{}\n", hex_bytes(&pack_coord_cap(cap))).as_bytes())
+        .map_err(|e| format!("write {path:?}: {e}"))
+}
+
+pub fn load_coord_cap(dir: &Path) -> Option<nat_traversal::CoordCap> {
+    let path = dir.join(COORD_CAP_FILE);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let bytes = unhex(raw.trim()).ok()?;
+    unpack_coord_cap(&bytes).ok()
 }
 
 // ============================================================================
@@ -894,6 +1014,15 @@ fn pack_invite(
         None => out.push(0),
     }
 
+    // the coordination-mode echo: one byte inside the SIGNED envelope,
+    // sourced from the descriptor (None resolves to Private, the safe
+    // default) — a fresh joiner learns off the invite alone whether the
+    // coordinator is private, so it knows to expect (and present) a CoordCap.
+    out.push(match d.coordination() {
+        Coordination::Public => 0,
+        Coordination::Private => 1,
+    });
+
     out.extend_from_slice(&expires_unix_secs.to_le_bytes());
     out.extend_from_slice(&pack_invite_token(token));
     Ok(out)
@@ -961,6 +1090,14 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         other => return Err(format!("unknown wireguard flag {other} in invite")),
     };
 
+    // the coordination-mode echo — decoded back into the descriptor so the
+    // joiner's workspace records whether the coordinator expects a CoordCap.
+    let coordination = match r.u8()? {
+        0 => Some("public".to_string()),
+        1 => Some("private".to_string()),
+        other => return Err(format!("unknown coordination mode {other} in invite")),
+    };
+
     let expires_unix_secs = u64::from_le_bytes(r.take(8)?.try_into().expect("8 bytes"));
     if now_unix_secs >= expires_unix_secs {
         return Err("this invite has expired — ask for a fresh one".into());
@@ -978,6 +1115,7 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
             // stays empty and both feed one dial source via `reach_hints`.
             bootstrap: Vec::new(),
             reach,
+            coordination,
         },
         token,
         wireguard,
@@ -1309,6 +1447,15 @@ pub struct Resolved {
     pub label: String,
     /// the chain-id (network shape) or legacy namespace bytes.
     pub namespace: Vec<u8>,
+    /// this network's chain id — the descriptor's own `chain_id` field (network
+    /// shape) or the raw configured namespace (dev shape, which has no
+    /// fingerprint appended). NOT `namespace`: the network shape's `namespace`
+    /// is `genesis_namespace()`, i.e. `chain_id@fingerprint` — a DIFFERENT
+    /// string. This is the exact string the desktop app records as
+    /// `Workspace.chain_id` (the `init` verb's last stdout line), so modules
+    /// that must agree with the app on "this network's id" (e.g. `identity`'s
+    /// certificate domain separation) use this field, never `namespace`.
+    pub chain_id: String,
     /// the authorized mesh set (unsorted here; the caller builds the ordered
     /// Set discovery tracks).
     pub mesh: Vec<ed25519::PublicKey>,
@@ -1360,6 +1507,23 @@ pub struct Resolved {
     /// publish the discovered provider set into the capability registry; see
     /// `NodeToml::announce_capabilities`.
     pub announce_capabilities: bool,
+    /// the reachability plane's coordination privacy (per-network operational
+    /// policy). `Private` (the default) requires a genesis-issued `CoordCap`
+    /// for a node outside the genesis validator set; `Public` accepts any
+    /// proof-of-possession. The dev shape is always `Private` (it never uses a
+    /// real coordinator).
+    pub coordination: Coordination,
+    /// the genesis-issued admission capability this node presents on every
+    /// coordinator request (loaded from `coord.cap` beside the identity).
+    /// `None` for a genesis validator (admitted by membership), the dev shape,
+    /// or a node that has not been issued one.
+    pub coord_cap: Option<nat_traversal::CoordCap>,
+    /// the workspace base directory — where `identity.key`, `network.toml`,
+    /// `wireguard.key` and `coord.cap` live (the network shape's config
+    /// directory; the dev shape's `storage_dir`). Threaded so a parked
+    /// joiner's lobby-reply task can persist a `coord.cap` delivered over its
+    /// `JoinReply` via `save_coord_cap`.
+    pub workspace: PathBuf,
 }
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
@@ -1454,6 +1618,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
         namespace: descriptor.genesis_namespace().into_bytes(),
+        chain_id: descriptor.chain_id.clone(),
         signer,
         mesh,
         validators,
@@ -1474,6 +1639,14 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         invite_wireguard: load_invite_wireguard(base)?,
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
+        coordination: descriptor.coordination(),
+        // the reachability plane presents this on every coordinator request; a
+        // genesis validator needs none (admitted by membership), a joiner is
+        // issued one beside its identity.
+        coord_cap: load_coord_cap(base),
+        // the config directory: identity.key / network.toml / coord.cap live
+        // here, so a joiner persists a delivered cap into it.
+        workspace: base.to_path_buf(),
     })
 }
 
@@ -1663,6 +1836,9 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
+        // the dev shape's namespace carries no fingerprint suffix (unlike the
+        // network shape's `genesis_namespace()`), so it IS the chain id here.
+        chain_id: namespace.clone(),
         namespace: namespace.into_bytes(),
         mesh,
         validators,
@@ -1674,6 +1850,9 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         // the dev shape has no identity.key directory; the wireguard key
         // lives with the node's other per-process state.
         wireguard_key_file: storage_dir.join("wireguard.key"),
+        // the dev shape has no config directory; its per-process state dir
+        // stands in as the workspace base (it never delivers a real cap).
+        workspace: storage_dir.clone(),
         storage_dir,
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
@@ -1688,6 +1867,10 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         invite_wireguard: None,
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
+        // the dev shape wires direct sockets only — no real coordinator, so
+        // the coordination mode defaults to Private and no cap is presented.
+        coordination: Coordination::Private,
+        coord_cap: None,
     })
 }
 
@@ -1703,6 +1886,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create test dir");
         dir
+    }
+
+    #[test]
+    fn coord_cap_roundtrips_through_pack_and_files() {
+        use commonware_cryptography::{Signer as _, ed25519};
+        use nat_traversal::{NodeKey, mint_coord_cap};
+        let g = ed25519::PrivateKey::from_seed(7);
+        let subject = NodeKey([0x11; 32]);
+        let cap = mint_coord_cap(&g, subject, 4_000_000);
+        let bytes = pack_coord_cap(&cap);
+        assert_eq!(bytes.len(), 32 + 8 + 64);
+        assert_eq!(unpack_coord_cap(&bytes).unwrap(), cap);
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_coord_cap(dir.path()).is_none());
+        save_coord_cap(dir.path(), &cap).unwrap();
+        assert_eq!(load_coord_cap(dir.path()).unwrap(), cap);
+    }
+
+    #[test]
+    fn coordination_defaults_to_private_and_parses_public() {
+        let mut d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        // default (field unset) -> Private
+        assert_eq!(d.coordination(), Coordination::Private);
+        d.coordination = Some("public".to_string());
+        assert_eq!(d.coordination(), Coordination::Public);
+        d.coordination = Some("private".to_string());
+        assert_eq!(d.coordination(), Coordination::Private);
     }
 
     #[test]
@@ -1729,6 +1947,124 @@ mod tests {
         encode_invite(d, &token, wireguard, u64::MAX, issuer).expect("encode")
     }
 
+    // ---- user-key bind/unbind certificates ---------------------------------
+
+    #[test]
+    fn mint_bind_cert_verifies_against_module_preimage() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(1);
+        let node_pub = [9u8; 32];
+        let cert = mint_bind_cert(&user, "chain-a", &node_pub, 0);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage = identity::bind_preimage("chain-a", &node_pub, 0);
+        assert!(user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage, &sig));
+    }
+
+    #[test]
+    fn mint_bind_cert_is_chain_scoped() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(1);
+        let node_pub = [9u8; 32];
+        let cert = mint_bind_cert(&user, "chain-a", &node_pub, 0);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        // a cert minted for chain-a must NOT verify against chain-b's preimage.
+        let preimage_b = identity::bind_preimage("chain-b", &node_pub, 0);
+        assert!(!user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage_b, &sig));
+    }
+
+    #[test]
+    fn mint_bind_cert_does_not_verify_under_unbind_namespace() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(1);
+        let node_pub = [9u8; 32];
+        let cert = mint_bind_cert(&user, "chain-a", &node_pub, 0);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage = identity::bind_preimage("chain-a", &node_pub, 0);
+        // signed under IDENTITY_BIND_NS -- must NOT verify under the unbind ns.
+        assert!(!user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage, &sig));
+    }
+
+    #[test]
+    fn mint_unbind_cert_verifies_against_module_preimage() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(2);
+        let node_pub = [11u8; 32];
+        let cert = mint_unbind_cert(&user, "chain-a", &node_pub, 3);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage = identity::unbind_preimage("chain-a", &node_pub, 3);
+        assert!(user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage, &sig));
+    }
+
+    #[test]
+    fn mint_unbind_cert_is_chain_scoped() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(2);
+        let node_pub = [11u8; 32];
+        let cert = mint_unbind_cert(&user, "chain-a", &node_pub, 3);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage_b = identity::unbind_preimage("chain-b", &node_pub, 3);
+        assert!(!user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage_b, &sig));
+    }
+
+    #[test]
+    fn mint_unbind_cert_does_not_verify_under_bind_namespace() {
+        use commonware_cryptography::{
+            Verifier as _,
+            ed25519::Signature,
+        };
+        let user = ed25519::PrivateKey::from_seed(2);
+        let node_pub = [11u8; 32];
+        let cert = mint_unbind_cert(&user, "chain-a", &node_pub, 3);
+        let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
+        let preimage = identity::unbind_preimage("chain-a", &node_pub, 3);
+        // signed under IDENTITY_UNBIND_NS -- must NOT verify under the bind ns.
+        assert!(!user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage, &sig));
+    }
+
+    /// mirrors exactly what `cmd_user_sign_bind`/`cmd_user_sign_unbind` build,
+    /// so this is a stand-in for hand-verifying the CLI's JSON output: encode
+    /// through `identity::encode_msg`, decode through `identity::decode_msg`,
+    /// and check the message the module actually consumes round-trips.
+    #[test]
+    fn user_sign_messages_round_trip_through_identity_codec() {
+        let user = ed25519::PrivateKey::from_seed(3);
+        let node_pub = [42u8; 32];
+
+        let bind_sig = mint_bind_cert(&user, "test@abc", &node_pub, 0);
+        let bind_msg = identity::IdentityMsg::BindNode {
+            user_key: user.public_key().as_ref().to_vec(),
+            user_sig: bind_sig,
+        };
+        let encoded = identity::encode_msg(&bind_msg);
+        // the wire contract: a single utf-8 JSON line, decodable as-is.
+        assert_eq!(String::from_utf8(encoded.clone()).unwrap().lines().count(), 1);
+        assert_eq!(identity::decode_msg(&encoded).unwrap(), bind_msg);
+
+        let unbind_sig = mint_unbind_cert(&user, "test@abc", &node_pub, 1);
+        let unbind_msg = identity::IdentityMsg::UnbindNode {
+            node_key: node_pub.to_vec(),
+            user_sig: unbind_sig,
+        };
+        let encoded = identity::encode_msg(&unbind_msg);
+        assert_eq!(String::from_utf8(encoded.clone()).unwrap().lines().count(), 1);
+        assert_eq!(identity::decode_msg(&encoded).unwrap(), unbind_msg);
+    }
+
     #[test]
     fn invite_blob_roundtrips_and_verifies() {
         let issuer = ed25519::PrivateKey::from_seed(7);
@@ -1739,6 +2075,7 @@ mod tests {
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
         // decode NORMALISES bootstrap hints into typed Direct reach hints, so
@@ -1792,6 +2129,10 @@ mod tests {
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            // a token invite now packs v4, which echoes the coordination mode;
+            // a `None` source resolves to Private, so it decodes as an EXPLICIT
+            // "private" (semantically identical — see `coordination()`).
+            coordination: Some("private".into()),
         };
         let wg = InviteWireGuard {
             public_key: [42u8; 32],
@@ -1812,6 +2153,7 @@ mod tests {
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
 
@@ -1845,6 +2187,103 @@ mod tests {
     }
 
     #[test]
+    fn invite_echoes_the_coordination_mode() {
+        // the mode byte rides the SIGNED envelope: a joiner learns off the
+        // invite alone whether the coordinator expects a CoordCap.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let base = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        for (mode, expect) in [("public", Coordination::Public), ("private", Coordination::Private)]
+        {
+            let mut d = base.clone();
+            d.coordination = Some(mode.to_string());
+            let invite =
+                decode_invite(&encode_test_invite(&d, &issuer, None)).expect("roundtrip");
+            assert_eq!(
+                invite.descriptor.coordination(),
+                expect,
+                "the {mode} mode byte roundtrips"
+            );
+            assert_eq!(invite.descriptor.coordination.as_deref(), Some(mode));
+        }
+        // an unset source resolves to Private, the safe default, and decodes
+        // as the EXPLICIT "private" (semantically identical).
+        let invite =
+            decode_invite(&encode_test_invite(&base, &issuer, None)).expect("roundtrip");
+        assert_eq!(invite.descriptor.coordination.as_deref(), Some("private"));
+    }
+
+    /// the FULL delivery chain at the crypto level: a genesis validator mints a
+    /// cap for a joiner, it is packed for the wire (`pack_coord_cap`), the
+    /// joiner unpacks it (`unpack_coord_cap`) and presents it on an
+    /// authenticated request — and the coordinator's private `verify_request`
+    /// admits the joiner off that delivered cap. Proves the cap the member
+    /// hands over its `JoinReply` actually authorizes the holder.
+    #[test]
+    fn delivered_cap_admits_the_joiner_under_private_policy() {
+        use commonware_cryptography::Signer as _;
+        use nat_traversal::{
+            mint_coord_cap, now_secs, sign_authenticator, verify_request, AuthPolicy, NodeKey,
+            COORD_CAP_TTL_SECS, DEFAULT_FRESHNESS_WINDOW_SECS,
+        };
+
+        let genesis = ed25519::PrivateKey::from_seed(1);
+        let joiner = ed25519::PrivateKey::from_seed(2);
+        let mut subj = [0u8; 32];
+        subj.copy_from_slice(joiner.public_key().as_ref());
+        let subject = NodeKey(subj);
+
+        let now = now_secs();
+        // MINT (member side) -> PACK (wire) -> UNPACK (joiner side).
+        let minted = mint_coord_cap(&genesis, subject, now + COORD_CAP_TTL_SECS);
+        let wire = pack_coord_cap(&minted);
+        let delivered = unpack_coord_cap(&wire).expect("joiner unpacks the delivered cap");
+        assert_eq!(delivered, minted, "the cap survives the wire byte-for-byte");
+
+        // the joiner builds an authenticated request carrying the delivered cap.
+        let inner = b"\x03register-request-bytes";
+        let auth = sign_authenticator(&joiner, inner, now, Some(delivered));
+
+        // the coordinator, pinned to this genesis key, admits the joiner.
+        let policy = AuthPolicy::Private {
+            genesis_set: vec![genesis.public_key()],
+        };
+        assert_eq!(
+            verify_request(
+                &policy,
+                now,
+                DEFAULT_FRESHNESS_WINDOW_SECS,
+                subject,
+                inner,
+                &auth
+            ),
+            Ok(()),
+            "the delivered cap admits the joiner"
+        );
+
+        // control: WITHOUT the cap the same private policy rejects the joiner.
+        let bare = sign_authenticator(&joiner, inner, now, None);
+        assert!(
+            verify_request(
+                &policy,
+                now,
+                DEFAULT_FRESHNESS_WINDOW_SECS,
+                subject,
+                inner,
+                &bare
+            )
+            .is_err(),
+            "a joiner with no cap is not admitted to a private network"
+        );
+    }
+
+    #[test]
     fn invite_token_file_roundtrips() {
         let dir = tmp("invitetoken");
         assert_eq!(load_invite_token(&dir).expect("absent is fine"), None);
@@ -1870,6 +2309,7 @@ mod tests {
                 hex_bytes(me.public_key().as_ref())
             )],
             reach: vec![],
+            coordination: None,
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1908,6 +2348,7 @@ mod tests {
                 )],
                 bootstrap: vec![],
                 reach: vec![],
+                coordination: None,
             };
             d.save(&dir.join("network.toml")).expect("save");
         }
@@ -1951,6 +2392,7 @@ mod tests {
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1977,6 +2419,7 @@ mod tests {
             validators: vec![],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.admit(&a);
         d.admit(&b);
@@ -2002,6 +2445,7 @@ mod tests {
             ],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.add_bootstrap(&other, "127.0.0.1:52200");
         d.save(&dir.join("network.toml")).expect("save descriptor");
@@ -2024,6 +2468,9 @@ mod tests {
         assert!(!r.dev_demo);
         assert_eq!(r.signer.public_key(), me.public_key());
         assert_eq!(r.storage_dir, dir.join("storage"));
+        // the workspace base is the config directory — where a joiner would
+        // persist a `coord.cap` delivered over its JoinReply.
+        assert_eq!(r.workspace, dir);
     }
 
     #[test]
@@ -2037,6 +2484,7 @@ mod tests {
             validators: vec![hex_bytes(other.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -2071,6 +2519,7 @@ mod tests {
             validators: vec![hex_bytes(a.as_ref()), hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         assert!(
             d.validator_keys().is_err(),
@@ -2088,6 +2537,7 @@ mod tests {
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         let founder_only = d.genesis_namespace();
         assert!(founder_only.starts_with("net#00000000@"));
@@ -2160,6 +2610,7 @@ mod tests {
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // empty dir: anything goes.
         assert!(guard_join_descriptor(&dir, &ours).is_ok());
@@ -2234,6 +2685,7 @@ mod tests {
             validators: vec![lower, upper],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         assert!(
             d.validator_keys().is_err(),
@@ -2251,6 +2703,7 @@ mod tests {
             validators: vec![hex_bytes(a.as_ref()), hex_bytes(b.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // a hand-edited twin: uppercase, whitespace, different order.
         let messy = NetworkDescriptor {
@@ -2262,6 +2715,7 @@ mod tests {
             ],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // identical decoded sets MUST run under the identical namespace.
         assert_eq!(messy.genesis_namespace(), canonical.genesis_namespace());
@@ -2292,6 +2746,7 @@ mod tests {
                 format!("{}@127.0.0.1:52200", hex_bytes(b.as_ref())),
             ],
             reach: vec![],
+            coordination: None,
         };
         let entries = d.bootstrap_entries().expect("well-formed hints parse");
         assert_eq!(
@@ -2304,6 +2759,7 @@ mod tests {
         let bad = NetworkDescriptor {
             bootstrap: vec!["nope".into()],
             reach: vec![],
+            coordination: None,
             ..d
         };
         assert!(bad.bootstrap_entries().is_err());
@@ -2319,13 +2775,13 @@ mod tests {
     #[test]
     fn sync_source_prefers_validator_hints_and_never_self() {
         let me = ed25519::PrivateKey::from_seed(31).public_key();
-        let observer = ed25519::PrivateKey::from_seed(32).public_key();
+        let resident = ed25519::PrivateKey::from_seed(32).public_key();
         let validator = ed25519::PrivateKey::from_seed(33).public_key();
         let addr: SocketAddr = "127.0.0.1:52200".parse().unwrap();
         let validators = vec![me.clone(), validator.clone()];
 
         // a non-validator hint sorts first but can never serve — skipped.
-        let hints = vec![(observer.clone(), addr), (validator.clone(), addr)];
+        let hints = vec![(resident.clone(), addr), (validator.clone(), addr)];
         assert_eq!(
             choose_sync_source(&hints, &validators, &me),
             Some(validator.clone())
@@ -2508,6 +2964,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // an existing network.toml without a [reach] array still parses (serde default),
         // and an empty reach is not serialised (skip_serializing_if).
@@ -2526,6 +2983,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.add_bootstrap(&a, "127.0.0.1:52200");
         let hints = d.reach_hints().expect("hints");
@@ -2543,6 +3001,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("1.1.1.1:1".into()) });
         // same expected_key, different reach — replaces, never duplicates.
@@ -2567,6 +3026,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(v.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         let ns0 = base.genesis_namespace();
 
@@ -2597,6 +3057,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(target.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // a coordinated hint routes through the coordinator, but the identity
         // we expect end-to-end is the TARGET; the coordinator's own ingress and
@@ -2626,6 +3087,7 @@ bootstrapper_addr = "127.0.0.1:52200"
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
+            coordination: None,
         };
         // a bootstrap hint alone synthesises a Direct reach ingress...
         d.add_bootstrap(&a, "127.0.0.1:52200");

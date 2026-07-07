@@ -37,12 +37,12 @@ pub enum GovAction {
     /// AUTHORIZE clearing a pending upgrade before its boundary: emits
     /// `UpgradeMsg::Cancel { name }` on execution.
     CancelUpgrade { name: String },
-    /// grant OBSERVER standing (mesh + statesync, no quorum seat — the
+    /// grant RESIDENT standing (mesh + statesync, no quorum seat — the
     /// staged-admission tier): emits `ValsetMsg::Grant { key }` on execution.
-    AddObserver { key: Vec<u8> },
-    /// revoke observer standing: emits `ValsetMsg::Revoke { key }` on
+    AddResident { key: Vec<u8> },
+    /// revoke resident standing: emits `ValsetMsg::Revoke { key }` on
     /// execution.
-    RemoveObserver { key: Vec<u8> },
+    RemoveResident { key: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

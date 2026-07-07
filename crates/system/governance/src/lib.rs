@@ -166,16 +166,16 @@ impl Governance {
         }
     }
 
-    /// the CURRENT observer set (valset's staged-over-committed projection) —
+    /// the CURRENT resident set (valset's staged-over-committed projection) —
     /// the standing a redeemed joiner already holds.
-    async fn observers(&self, ctx: &dyn Ctx) -> Result<Vec<Vec<u8>>, Error> {
+    async fn residents(&self, ctx: &dyn Ctx) -> Result<Vec<Vec<u8>>, Error> {
         let reply = ctx
-            .query(&self.valset_id, &valset_encode_query(&ValsetQuery::Observers))
+            .query(&self.valset_id, &valset_encode_query(&ValsetQuery::Residents))
             .await?;
         match valset_decode_reply(&reply).map_err(Error::Module)? {
-            ValsetReply::Observers(observers) => Ok(observers),
+            ValsetReply::Residents(residents) => Ok(residents),
             other => Err(Error::Module(format!(
-                "valset answered an Observers query with {other:?}"
+                "valset answered a Residents query with {other:?}"
             ))),
         }
     }
@@ -229,11 +229,11 @@ impl Governance {
                     out.push(4);
                     push_bytes(&mut out, name.as_bytes());
                 }
-                GovAction::AddObserver { key } => {
+                GovAction::AddResident { key } => {
                     out.push(5);
                     push_bytes(&mut out, key);
                 }
-                GovAction::RemoveObserver { key } => {
+                GovAction::RemoveResident { key } => {
                     out.push(6);
                     push_bytes(&mut out, key);
                 }
@@ -317,8 +317,8 @@ impl Governance {
         }
         if let GovAction::AddValidator { key }
         | GovAction::RemoveValidator { key }
-        | GovAction::AddObserver { key }
-        | GovAction::RemoveObserver { key } = &action
+        | GovAction::AddResident { key }
+        | GovAction::RemoveResident { key } = &action
         {
             // shape-check the key here so a proposal that can never execute is
             // rejected at the door, not at tally time.
@@ -471,11 +471,11 @@ impl Governance {
                 // the staged-admission grant/revoke: valset re-gates on the
                 // protocol version (defense in depth for direct submits) and
                 // owns the validator-overlap rule.
-                GovAction::AddObserver { key } => ctx.emit_msg(Msg {
+                GovAction::AddResident { key } => ctx.emit_msg(Msg {
                     target: self.valset_id.clone(),
                     payload: valset_encode_msg(&ValsetMsg::Grant { key: key.clone() }),
                 }),
-                GovAction::RemoveObserver { key } => ctx.emit_msg(Msg {
+                GovAction::RemoveResident { key } => ctx.emit_msg(Msg {
                     target: self.valset_id.clone(),
                     payload: valset_encode_msg(&ValsetMsg::Revoke { key: key.clone() }),
                 }),
@@ -553,8 +553,8 @@ impl Governance {
         if members.iter().any(|m| m == &joiner) {
             return Err(Error::Module("joiner is already a validator".into()));
         }
-        if self.observers(ctx).await?.iter().any(|o| o == &joiner) {
-            return Err(Error::Module("joiner already holds full-node standing".into()));
+        if self.residents(ctx).await?.iter().any(|o| o == &joiner) {
+            return Err(Error::Module("joiner already holds resident standing".into()));
         }
         // exactly-once: the nonce is the single-use key (pending-over-committed
         // read, so two redemptions in one block settle first-wins too).
@@ -757,10 +757,10 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
             4 => GovAction::CancelUpgrade {
                 name: take_string(&mut buf)?,
             },
-            5 => GovAction::AddObserver {
+            5 => GovAction::AddResident {
                 key: take_vec(&mut buf)?,
             },
-            6 => GovAction::RemoveObserver {
+            6 => GovAction::RemoveResident {
                 key: take_vec(&mut buf)?,
             },
             other => return Err(Error::Module(format!("snapshot: bad action tag {other}"))),
