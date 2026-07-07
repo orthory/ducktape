@@ -3,16 +3,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
-import { createInitialState } from "../../store/state";
+import { createInitialState, type ConsoleState } from "../../store/state";
 import { ForgeView } from "./ForgeView";
 
 const forgeGit = vi.hoisted(() => ({
   isForgeGitAvailable: vi.fn(() => true),
   forgeListRepos: vi.fn(),
   forgeHead: vi.fn(),
+  forgeListBranches: vi.fn(),
   forgeLog: vi.fn(),
   forgeTree: vi.fn(),
   forgeReadFile: vi.fn(),
+  forgeCompare: vi.fn(),
+  forgeBuildMerge: vi.fn(),
 }));
 
 vi.mock("../../../domain/forge-git-client", () => forgeGit);
@@ -33,7 +36,7 @@ const COMMITS = [
   },
 ];
 
-function renderForge() {
+function renderForge(stateOverrides: Partial<ConsoleState> = {}) {
   const commitForge = vi.fn();
   const noop = vi.fn();
   const actions = new Proxy(
@@ -51,6 +54,7 @@ function renderForge() {
           ...createInitialState(),
           forgeHead: HEAD,
           connected: true,
+          ...stateOverrides,
         },
         actions,
       }}
@@ -89,6 +93,19 @@ describe("ForgeView", () => {
       ),
     );
     forgeGit.forgeReadFile.mockResolvedValue("# Ducktape\n");
+    forgeGit.forgeListBranches.mockResolvedValue([{ name: "main", head: HEAD }]);
+    forgeGit.forgeCompare.mockResolvedValue({
+      mergeBase: HEAD,
+      files: [],
+      totalAdditions: 0,
+      totalDeletions: 0,
+      commits: [],
+    });
+    forgeGit.forgeBuildMerge.mockResolvedValue({
+      mergeOid: null,
+      packHex: null,
+      conflicts: [],
+    });
   });
 
   it("starts at a repositories overview and does not render commit controls", async () => {
@@ -122,5 +139,30 @@ describe("ForgeView", () => {
     expect(await screen.findByText("older cleanup")).toBeInTheDocument();
     expect(screen.queryByText("FILES")).not.toBeInTheDocument();
     expect(screen.queryByText("NEW COMMIT")).not.toBeInTheDocument();
+  });
+
+  it("adds Issues and Pull requests tabs that render the tracker lists", async () => {
+    renderForge({
+      forgeRepo: "ducktape",
+      forgeItems: [
+        {
+          number: 1,
+          kind: "issue",
+          title: "Login button broken",
+          state: "open",
+          author: { user: Array.from(new TextEncoder().encode("operator")) },
+          created_at: 1_800_000_000,
+          updated_at: 1_800_000_000,
+        },
+      ],
+    });
+
+    fireEvent.click(await screen.findByText("ducktape/ducktape"));
+
+    fireEvent.click(await screen.findByRole("button", { name: "Issues" }));
+    expect(await screen.findByText("Login button broken")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Pull requests" }));
+    expect(await screen.findByText("No pull requests yet")).toBeInTheDocument();
   });
 });

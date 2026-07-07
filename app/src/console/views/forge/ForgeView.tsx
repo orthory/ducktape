@@ -4,32 +4,48 @@ import {
   useMemo,
   useRef,
   useState,
-  type CSSProperties,
-  type ReactNode,
 } from "react";
 
 import {
   forgeHead as readLocalHead,
+  forgeListBranches,
   forgeListRepos,
   forgeLog,
   forgeReadFile,
   forgeTree,
   isForgeGitAvailable,
+  type BranchInfo,
   type CommitInfo,
   type RepoInfo,
   type TreeEntry,
 } from "../../../domain/forge-git-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
+import { BranchSelector } from "./BranchSelector";
 import { CodeView } from "./CodeView";
 import { fileIcon } from "./file-icons";
+import { IssuesTab } from "./items/IssuesTab";
+import { PullsTab } from "./items/PullsTab";
 import { MarkdownPreview } from "./MarkdownPreview";
+import {
+  CenterNote,
+  CommitRow,
+  ErrorNote,
+  errMsg,
+  InlineNote,
+  panelLabel,
+  relTime,
+  SegButton,
+  shortHash,
+  StatusPill,
+  TabButton,
+} from "./ui";
 import { opKey } from "../../store/finalization";
 import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 
-type ForgeTab = "code" | "commits";
+type ForgeTab = "code" | "commits" | "issues" | "pulls";
 
 // remark parses markdown synchronously on the main thread and is superlinear on
 // long flat lists, so a very large .md/.mdx doc would freeze the webview. Above
@@ -44,44 +60,6 @@ interface TreeRow {
   isDir: boolean;
   depth: number;
   open: boolean;
-}
-
-const panelLabel: CSSProperties = {
-  font: `700 9px ${font.mono}`,
-  letterSpacing: ".08em",
-  color: color.muted2,
-};
-
-const statusTone = {
-  success: { text: color.green, bg: "#eef5f0", border: "#cfe3d7" },
-  warning: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
-  neutral: { text: color.purple, bg: "#f1edf5", border: "#ddd2e6" },
-  info: { text: color.blue, bg: "#f1f4f8", border: "#d7e0eb" },
-  danger: { text: color.red, bg: "#fbeeec", border: "#eccfc9" },
-} as const;
-
-function errMsg(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
-
-function shortHash(value: string | null | undefined): string {
-  return value ? `${value.slice(0, 10)}...` : "unborn";
-}
-
-function relTime(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "";
-  // The node's commit time is genesis-relative today (not wall-clock), so a
-  // small value would render an absurd "20637d ago". Omit it until the node
-  // stamps real time (> 2001); ordering/history are unaffected.
-  if (seconds <= 978_307_200) return "";
-  const diff = Math.max(0, Date.now() - seconds * 1000);
-  const minute = 60 * 1000;
-  const hour = 60 * minute;
-  const day = 24 * hour;
-  if (diff < minute) return "now";
-  if (diff < hour) return `${Math.floor(diff / minute)}m ago`;
-  if (diff < day) return `${Math.floor(diff / hour)}h ago`;
-  return `${Math.floor(diff / day)}d ago`;
 }
 
 function sortEntries(entries: TreeEntry[]): TreeEntry[] {
@@ -110,7 +88,7 @@ function buildRows(
 }
 
 export function ForgeView() {
-  const { state } = useDucktape();
+  const { state, actions } = useDucktape();
   const desktop = isForgeGitAvailable();
 
   const [repos, setRepos] = useState<RepoInfo[] | null>(null);
@@ -131,17 +109,35 @@ export function ForgeView() {
   const [fileLoading, setFileLoading] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
 
+  // Local branches (refs/heads/*) + the one being browsed. `branch` null means
+  // the repo default — tree/log/file reads then omit the reference.
+  const [branches, setBranches] = useState<BranchInfo[]>([]);
+  const [branch, setBranch] = useState<string | null>(null);
+  const [branchMenuOpen, setBranchMenuOpen] = useState(false);
+
   const fileRequestRef = useRef(0);
   const dirTokenRef = useRef(0);
-  // the repo the tree/file readers target — the real on-disk name of the
-  // currently-opened repo, so lazy dir/file loads read the right repo.
+  // the repo/reference the tree/file readers target — the real on-disk name of
+  // the currently-opened repo plus the browsed branch, so lazy dir/file loads
+  // read the right tree.
   const activeRepoRef = useRef<string | null>(null);
+  const activeRefRef = useRef<string | null>(null);
 
   const selectedRepo = useMemo(
     () => repos?.find((repo) => repo.id === selectedRepoId) ?? null,
     [repos, selectedRepoId],
   );
-  const displayHead = localHead ?? selectedRepo?.head ?? state.forgeHead;
+  const branchHead = branch
+    ? branches.find((b) => b.name === branch)?.head ?? null
+    : null;
+  const displayHead = branch ? branchHead : localHead ?? selectedRepo?.head ?? state.forgeHead;
+
+  const openIssues = state.forgeItems.filter(
+    (item) => item.kind === "issue" && item.state === "open",
+  ).length;
+  const openPulls = state.forgeItems.filter(
+    (item) => item.kind === "pr" && item.state === "open",
+  ).length;
 
   const loadFile = useCallback((filePath: string) => {
     const repo = activeRepoRef.current;
@@ -151,7 +147,7 @@ export function ForgeView() {
     setFileText(null);
     setFileError(null);
     setFileLoading(true);
-    forgeReadFile(repo, filePath)
+    forgeReadFile(repo, filePath, activeRefRef.current ?? undefined)
       .then((text) => {
         if (fileRequestRef.current !== req) return;
         setFileText(text);
@@ -169,7 +165,7 @@ export function ForgeView() {
     const repo = activeRepoRef.current;
     if (!repo) return;
     const token = dirTokenRef.current;
-    forgeTree(repo, dir)
+    forgeTree(repo, dir, activeRefRef.current ?? undefined)
       .then((entries) => {
         if (dirTokenRef.current !== token) return;
         setTreeCache((cache) => ({ ...cache, [dir]: entries }));
@@ -209,6 +205,43 @@ export function ForgeView() {
     };
   }, [desktop, state.forgeHead]);
 
+  // A repo switch always lands back on the default branch.
+  useEffect(() => {
+    setBranch(null);
+    setBranchMenuOpen(false);
+  }, [selectedRepoId]);
+
+  // Local branch heads for the picker; refreshed per committed forge write
+  // (every tracker/merge op advances the forge HEAD).
+  useEffect(() => {
+    if (!desktop || !selectedRepo) {
+      setBranches([]);
+      return;
+    }
+    let alive = true;
+    forgeListBranches(selectedRepo.name)
+      .then((next) => {
+        if (alive) setBranches(next);
+      })
+      .catch(() => {
+        if (alive) setBranches([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [desktop, selectedRepo, state.forgeHead]);
+
+  // The tracker's per-screen slices (issues/PRs + consensus branch heads) —
+  // loaded on open/repo switch and re-pulled per forge HEAD advance, since a
+  // tracker write IS a forge commit.
+  useEffect(() => {
+    if (!selectedRepo) return;
+    void actions.loadForgeItems(selectedRepo.name);
+    void actions.loadForgeBranches(selectedRepo.name);
+    // actions is the store's stable facade — repo identity is the real dep.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRepo?.name, state.forgeHead]);
+
   useEffect(() => {
     if (!desktop || !selectedRepo) return;
 
@@ -217,6 +250,7 @@ export function ForgeView() {
     dirTokenRef.current = token;
     fileRequestRef.current += 1;
     activeRepoRef.current = selectedRepo.name;
+    activeRefRef.current = branch;
     setRootLoading(true);
     setLocalHead(selectedRepo.head);
     setTreeError(null);
@@ -235,14 +269,15 @@ export function ForgeView() {
       };
     }
 
+    const reference = branch ?? undefined;
     Promise.allSettled([
       readLocalHead(selectedRepo.name),
-      forgeTree(selectedRepo.name, ""),
-      forgeLog(selectedRepo.name),
+      forgeTree(selectedRepo.name, "", reference),
+      forgeLog(selectedRepo.name, undefined, reference),
     ])
       .then(([headResult, treeResult, logResult]) => {
         if (!alive || dirTokenRef.current !== token) return;
-        if (headResult.status === "fulfilled") setLocalHead(headResult.value);
+        if (headResult.status === "fulfilled" && !branch) setLocalHead(headResult.value);
         if (logResult.status === "fulfilled") setCommits(logResult.value);
         else setCommits([]);
         if (treeResult.status === "fulfilled") {
@@ -259,7 +294,7 @@ export function ForgeView() {
     return () => {
       alive = false;
     };
-  }, [desktop, selectedRepo, state.forgeHead, loadFile]);
+  }, [desktop, selectedRepo, branch, state.forgeHead, loadFile]);
 
   const rows = useMemo(() => {
     const next: TreeRow[] = [];
@@ -284,6 +319,11 @@ export function ForgeView() {
     setRepoMenuOpen(false);
   };
 
+  const selectBranch = (name: string) => {
+    setBranchMenuOpen(false);
+    setBranch(selectedRepo && name === selectedRepo.defaultBranch ? null : name);
+  };
+
   return (
     <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", background: color.paper }}>
       {!desktop ? (
@@ -304,12 +344,19 @@ export function ForgeView() {
             fileText={fileText}
             fileLoading={fileLoading}
             fileError={fileError}
+            branches={branches}
+            branch={branch}
+            branchMenuOpen={branchMenuOpen}
+            openIssues={openIssues}
+            openPulls={openPulls}
             onOpenRepo={openRepo}
             onGoRepos={goRepos}
             onToggleRepoMenu={() => setRepoMenuOpen((value) => !value)}
             onTab={setTab}
             onToggleDir={toggleDir}
             onSelectFile={loadFile}
+            onToggleBranchMenu={() => setBranchMenuOpen((value) => !value)}
+            onSelectBranch={selectBranch}
           />
         ) : (
           <CenterNote title={reposLoading ? "Loading repository..." : "Repository not found"} />
@@ -456,12 +503,19 @@ function RepoListing({
   fileText,
   fileLoading,
   fileError,
+  branches,
+  branch,
+  branchMenuOpen,
+  openIssues,
+  openPulls,
   onOpenRepo,
   onGoRepos,
   onToggleRepoMenu,
   onTab,
   onToggleDir,
   onSelectFile,
+  onToggleBranchMenu,
+  onSelectBranch,
 }: {
   repo: RepoInfo;
   repos: RepoInfo[];
@@ -476,14 +530,22 @@ function RepoListing({
   fileText: string | null;
   fileLoading: boolean;
   fileError: string | null;
+  branches: BranchInfo[];
+  branch: string | null;
+  branchMenuOpen: boolean;
+  openIssues: number;
+  openPulls: number;
   onOpenRepo: (repoId: string) => void;
   onGoRepos: () => void;
   onToggleRepoMenu: () => void;
   onTab: (tab: ForgeTab) => void;
   onToggleDir: (dir: string) => void;
   onSelectFile: (path: string) => void;
+  onToggleBranchMenu: () => void;
+  onSelectBranch: (branch: string) => void;
 }) {
   const latest = commits[0] ?? null;
+  const browsing = tab === "code" || tab === "commits";
 
   return (
     <>
@@ -506,7 +568,17 @@ function RepoListing({
           <Breadcrumb label="ducktape" onClick={onGoRepos} />
           <span style={{ font: `400 15px ${font.sans}`, color: color.iconIdle }}>/</span>
           <RepoMenuButton name={repo.name} onClick={onToggleRepoMenu} open={repoMenuOpen} />
-          <StatusPill label={repo.defaultBranch} tone={repo.browsable ? "success" : "warning"} />
+          {browsing && repo.browsable ? (
+            <BranchSelector
+              branches={branches}
+              current={branch ?? repo.defaultBranch}
+              open={branchMenuOpen}
+              onToggle={onToggleBranchMenu}
+              onSelect={onSelectBranch}
+            />
+          ) : (
+            <StatusPill label={repo.defaultBranch} tone={repo.browsable ? "success" : "warning"} />
+          )}
           <span
             title={head ?? "unborn repo"}
             style={{
@@ -540,10 +612,12 @@ function RepoListing({
         >
           <TabButton label="Code" active={tab === "code"} onClick={() => onTab("code")} />
           <TabButton label="Commits" active={tab === "commits"} onClick={() => onTab("commits")} badge={commits.length} />
+          <TabButton label="Issues" active={tab === "issues"} onClick={() => onTab("issues")} badge={openIssues} />
+          <TabButton label="Pull requests" active={tab === "pulls"} onClick={() => onTab("pulls")} badge={openPulls} />
         </div>
       </div>
 
-      {tab === "code" ? (
+      {tab === "code" && (
         repo.browsable ? (
           <CodeBrowser
             rows={rows}
@@ -561,9 +635,12 @@ function RepoListing({
         ) : (
           <RepoUnavailable />
         )
-      ) : (
+      )}
+      {tab === "commits" && (
         <CommitHistory commits={commits} loading={rootLoading} browsable={repo.browsable} />
       )}
+      {tab === "issues" && <IssuesTab repo={repo.name} />}
+      {tab === "pulls" && <PullsTab repo={repo.name} />}
     </>
   );
 }
@@ -801,27 +878,6 @@ function FileViewer({
   );
 }
 
-function SegButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      style={{
-        all: "unset",
-        cursor: "pointer",
-        padding: "3px 9px",
-        font: `600 10px ${font.mono}`,
-        letterSpacing: ".04em",
-        textTransform: "uppercase",
-        color: active ? color.ink : color.muted2,
-        background: active ? color.panel : "transparent",
-      }}
-    >
-      {label}
-    </button>
-  );
-}
-
 function CommitHistory({
   commits,
   loading,
@@ -858,43 +914,6 @@ function CommitHistory({
           ))}
         </div>
       )}
-    </div>
-  );
-}
-
-function CommitRow({ commit }: { commit: CommitInfo }) {
-  return (
-    <div
-      title={commit.id}
-      style={{
-        display: "flex",
-        gap: 13,
-        padding: "13px 0",
-        borderBottom: `1px solid ${color.borderSoft}`,
-      }}
-    >
-      <span
-        style={{
-          width: 24,
-          height: 24,
-          borderRadius: radius.sm,
-          background: statusTone.info.bg,
-          border: `1px solid ${statusTone.info.border}`,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          flexShrink: 0,
-          marginTop: 1,
-        }}
-      >
-        <Icon name="forge" size={13} color={statusTone.info.text} strokeWidth={1.7} />
-      </span>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ font: `600 14px ${font.sans}`, color: color.ink }}>{commit.summary}</div>
-        <div style={{ marginTop: 4, font: `400 11px ${font.mono}`, color: color.muted2 }}>
-          {[shortHash(commit.id), commit.author, relTime(commit.time)].filter(Boolean).join(" · ")}
-        </div>
-      </div>
     </div>
   );
 }
@@ -1009,54 +1028,6 @@ function RepoMenuButton({ name, open, onClick }: { name: string; open: boolean; 
   );
 }
 
-function TabButton({
-  label,
-  active,
-  onClick,
-  badge,
-}: {
-  label: string;
-  active: boolean;
-  onClick: () => void;
-  badge?: number;
-}) {
-  return (
-    <button
-      type="button"
-      aria-label={label}
-      onClick={onClick}
-      style={{
-        all: "unset",
-        cursor: "pointer",
-        display: "flex",
-        alignItems: "center",
-        gap: 7,
-        font: `600 13px ${font.sans}`,
-        color: active ? color.ink : color.muted2,
-        padding: "10px 0",
-        borderBottom: `2px solid ${active ? color.dark : "transparent"}`,
-        marginBottom: -1,
-      }}
-    >
-      {label}
-      {badge !== undefined && (
-        <span
-          aria-hidden="true"
-          style={{
-            font: `600 10px ${font.mono}`,
-            color: color.muted2,
-            background: color.panel,
-            borderRadius: 9,
-            padding: "1px 7px",
-          }}
-        >
-          {badge}
-        </span>
-      )}
-    </button>
-  );
-}
-
 function RepoUnavailable() {
   return (
     <div style={{ flex: 1, minHeight: 0, borderTop: `1px solid ${color.borderSoft}` }}>
@@ -1132,72 +1103,5 @@ function HeadCard({ head, op }: { head: string | null; op: OpRecord | undefined 
         <FinalizationMark op={op} />
       </span>
     </div>
-  );
-}
-
-function CenterNote({ title, detail }: { title: string; detail?: string }) {
-  return (
-    <div
-      style={{
-        height: "100%",
-        minHeight: 180,
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        justifyContent: "center",
-        textAlign: "center",
-        padding: 24,
-      }}
-    >
-      <div style={{ font: `600 12.5px ${font.sans}`, color: color.muted2 }}>{title}</div>
-      {detail && <div style={{ marginTop: 5, font: `400 11.5px ${font.sans}`, color: color.muted2, maxWidth: 360 }}>{detail}</div>}
-    </div>
-  );
-}
-
-function InlineNote({ children }: { children: ReactNode }) {
-  return <div style={{ padding: "9px 16px", font: `400 11px ${font.sans}`, color: color.muted2 }}>{children}</div>;
-}
-
-function ErrorNote({ message, padded = false }: { message: string; padded?: boolean }) {
-  return (
-    <div style={{ padding: padded ? 18 : "8px 14px" }}>
-      <div
-        style={{
-          border: `1px solid ${statusTone.danger.border}`,
-          borderRadius: radius.sm,
-          background: statusTone.danger.bg,
-          color: statusTone.danger.text,
-          font: `500 11px ${font.sans}`,
-          padding: "7px 9px",
-          wordBreak: "break-word",
-        }}
-      >
-        {message}
-      </div>
-    </div>
-  );
-}
-
-function StatusPill({ label, tone }: { label: string; tone: keyof typeof statusTone }) {
-  const styles = statusTone[tone];
-  return (
-    <span
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        height: 20,
-        padding: "0 8px",
-        borderRadius: radius.sm,
-        border: `1px solid ${styles.border}`,
-        background: styles.bg,
-        color: styles.text,
-        font: `700 9px ${font.mono}`,
-        letterSpacing: ".06em",
-        textTransform: "uppercase",
-      }}
-    >
-      {label}
-    </span>
   );
 }
