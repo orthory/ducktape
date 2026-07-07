@@ -17,6 +17,15 @@ product depth다.
   respawn하고 channel을 rotate한다.
 - **Governance and vaults.** member-gated proposal이 membership을 drive하고, vault는
   owner-gated write integrity를 가진 opaque secret ciphertext를 replicate한다.
+- **duckfs (real filesystem으로서의 files).** Phase 1–2 shipped. `files` module은
+  이제 consensus-replicated, copy-on-write, content-addressed filesystem이다 —
+  모든 byte가 restart를 견디는 consensus state이고, staged upload, atomic
+  per-path-CAS commit, pinned snapshot, snapshot-addressed read,
+  full possession까지 가는 resolver-backed state sync, noded HTTP surface를
+  갖췄다. `memory` module은 제거되었다 — duckfs가 흡수했다(generation은
+  snapshot이 되고, `duck://memory/...` URI는 `duck://files/...`가 되었다).
+  client stack — checkout/commit engine, CLI, FUSE mount, app FilesView
+  rebuild — 은 Phase 3–5이고 아직 open이다.
 
 ## Durability And Promotion
 
