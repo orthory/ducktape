@@ -174,21 +174,17 @@ impl NetworkShapeCluster {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// the token-less invite: the joiner's pubkey travels out-of-band and no
-    /// lobby announce happens — the pre-token manual flow, kept working.
-    pub fn invite_manual(&self) -> String {
-        let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
-            .args(["invite", "--manual", "--config"])
-            .arg(cfg)
-            .output()
-            .expect("run invite --manual");
-        assert!(
-            out.status.success(),
-            "invite --manual failed:\n{}",
-            command_output(&out)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    /// a MANUAL-flow join: every invite is tokened now (mint is the
+    /// admission), so the manual path is made by joining normally and then
+    /// dropping the stored credential — the node parks with no announce and
+    /// admission stays a member verb, which is exactly what the staged
+    /// admission tests exercise.
+    pub fn join_friend_manual(&self, invite: &str) -> String {
+        let key = self.join_friend(invite);
+        for stale in ["invite.token", "invite-wireguard.toml"] {
+            let _ = std::fs::remove_file(self.friend_dir.join(stale));
+        }
+        key
     }
 
     /// the founder's verified join-request queue, parsed from the

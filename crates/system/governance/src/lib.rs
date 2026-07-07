@@ -31,9 +31,14 @@
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
+// the invite capability: token types + verification, shared by the node's
+// mint/lobby paths and the in-consensus `Redeem` handler below.
+pub mod invite;
 
 use std::collections::BTreeMap;
 
+use commonware_codec::DecodeExt as _;
+use commonware_cryptography::ed25519;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use upgrade::{UpgradeMsg, encode_msg as upgrade_encode_msg};
@@ -57,6 +62,15 @@ struct Proposal {
     votes: BTreeMap<Vec<u8>, bool>,
 }
 
+/// one settled invite redemption — the single-use record plus the audit
+/// trail (who invited whom, when).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Redemption {
+    joiner: Vec<u8>,
+    issuer: Vec<u8>,
+    height: u64,
+}
+
 pub struct Governance {
     id: ModuleId,
     /// the id of the valset module this governance instance gates. genesis
@@ -65,11 +79,22 @@ pub struct Governance {
     /// the id of the upgrade module a passing `ScheduleUpgrade`/`CancelUpgrade`
     /// authorizes. genesis wiring — identical on every node.
     upgrade_id: ModuleId,
+    /// the network binding invite tokens sign over (the genesis namespace).
+    /// genesis wiring — identical on every node of the same network. `None`
+    /// (a shape without a descriptor) refuses every `Redeem` with a clear
+    /// error, deterministically.
+    invite_binding: Option<Vec<u8>>,
     /// committed proposals — what `root()` commits to.
     proposals: BTreeMap<String, Proposal>,
     /// this block's staged writes (whole-proposal overwrite granularity),
     /// read ahead of committed state, merged at `commit_block`.
     pending: BTreeMap<String, Proposal>,
+    /// committed invite redemptions by token nonce — the exactly-once set.
+    /// folded into `root()`/`snapshot()` only when non-empty, so every
+    /// pre-invite state keeps its historical root bytes.
+    redeemed: BTreeMap<Vec<u8>, Redemption>,
+    /// this block's staged redemptions, same discipline as `pending`.
+    pending_redeemed: BTreeMap<Vec<u8>, Redemption>,
 }
 
 impl Governance {
@@ -82,9 +107,20 @@ impl Governance {
             id: id.into(),
             valset_id: valset_id.into(),
             upgrade_id: upgrade_id.into(),
+            invite_binding: None,
             proposals: BTreeMap::new(),
             pending: BTreeMap::new(),
+            redeemed: BTreeMap::new(),
+            pending_redeemed: BTreeMap::new(),
         }
+    }
+
+    /// wire the network binding invite tokens verify against (the genesis
+    /// namespace). every node of a network must wire the same bytes — a node
+    /// without it rejects `Redeem` ops its peers accept, which forks.
+    pub fn with_invite_binding(mut self, binding: impl Into<Vec<u8>>) -> Self {
+        self.invite_binding = Some(binding.into());
+        self
     }
 
     fn get(&self, id: &str) -> Option<&Proposal> {
@@ -130,6 +166,20 @@ impl Governance {
         }
     }
 
+    /// the CURRENT resident set (valset's staged-over-committed projection) —
+    /// the standing a redeemed joiner already holds.
+    async fn residents(&self, ctx: &dyn Ctx) -> Result<Vec<Vec<u8>>, Error> {
+        let reply = ctx
+            .query(&self.valset_id, &valset_encode_query(&ValsetQuery::Residents))
+            .await?;
+        match valset_decode_reply(&reply).map_err(Error::Module)? {
+            ValsetReply::Residents(residents) => Ok(residents),
+            other => Err(Error::Module(format!(
+                "valset answered a Residents query with {other:?}"
+            ))),
+        }
+    }
+
     fn view_of(id: &str, p: &Proposal) -> ProposalView {
         ProposalView {
             proposal_id: id.to_string(),
@@ -144,7 +194,10 @@ impl Governance {
 
     // ---- canonical state bytes (root preimage + snapshot format) -----------
 
-    fn encode_state(proposals: &BTreeMap<String, Proposal>) -> Vec<u8> {
+    fn encode_state(
+        proposals: &BTreeMap<String, Proposal>,
+        redeemed: &BTreeMap<Vec<u8>, Redemption>,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(proposals.len() as u64).to_le_bytes());
         for (id, p) in proposals {
@@ -199,33 +252,49 @@ impl Governance {
                 out.push(u8::from(*approve));
             }
         }
+        // the redemption section rides ONLY when non-empty: every pre-invite
+        // state keeps its exact historical root and snapshot bytes.
+        if !redeemed.is_empty() {
+            out.extend_from_slice(&(redeemed.len() as u64).to_le_bytes());
+            for (nonce, r) in redeemed {
+                push_bytes(&mut out, nonce);
+                push_bytes(&mut out, &r.joiner);
+                push_bytes(&mut out, &r.issuer);
+                out.extend_from_slice(&r.height.to_le_bytes());
+            }
+        }
         out
     }
 
-    fn root_of(proposals: &BTreeMap<String, Proposal>) -> StateRoot {
-        if proposals.is_empty() {
+    fn root_of(
+        proposals: &BTreeMap<String, Proposal>,
+        redeemed: &BTreeMap<Vec<u8>, Redemption>,
+    ) -> StateRoot {
+        if proposals.is_empty() && redeemed.is_empty() {
             return StateRoot::ZERO;
         }
         let mut h = Sha256::new();
-        h.update(Self::encode_state(proposals));
+        h.update(Self::encode_state(proposals, redeemed));
         StateRoot(h.finalize().into())
     }
 
     /// canonical bytes of COMMITTED state — the exact preimage of `root()`.
     pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode_state(&self.proposals)
+        Self::encode_state(&self.proposals, &self.redeemed)
     }
 
     /// verify-then-adopt a peer snapshot: decode into a temporary, recompute
     /// the root, refuse on mismatch — committed state and stage untouched on
     /// any error. success drops the stage (it belonged to the replaced state).
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let decoded = decode_state(bytes)?;
-        if Self::root_of(&decoded) != expected {
+        let (proposals, redeemed) = decode_state(bytes)?;
+        if Self::root_of(&proposals, &redeemed) != expected {
             return Err(Error::Module("snapshot root mismatch".into()));
         }
-        self.proposals = decoded;
+        self.proposals = proposals;
+        self.redeemed = redeemed;
         self.pending.clear();
+        self.pending_redeemed.clear();
         Ok(())
     }
 
@@ -418,6 +487,94 @@ impl Governance {
         self.pending.insert(proposal_id, proposal);
         Ok(())
     }
+
+    /// redeem an invite — no ballot, the mint WAS the admission decision.
+    /// verification is fully in-consensus so every validator settles the op
+    /// identically: token signature and join proof against the wired binding,
+    /// issuer against CURRENT membership, nonce against the redeemed set
+    /// (single-use — a second redemption of the same token deterministically
+    /// rejects). success emits the observer grant in the same block.
+    async fn handle_redeem(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        issuer: Vec<u8>,
+        nonce: Vec<u8>,
+        token_sig: Vec<u8>,
+        joiner: Vec<u8>,
+        proof: Vec<u8>,
+    ) -> Result<(), Error> {
+        // the submitter must be an authenticated frame origin, but is NOT
+        // required to be a member — the token authorizes the admission, not
+        // the relaying node.
+        Self::external_origin(ctx)?;
+        let Some(binding) = self.invite_binding.as_deref() else {
+            return Err(Error::Module(
+                "this network is not wired for invite redemption (no binding)".into(),
+            ));
+        };
+        let issuer_key = ed25519::PublicKey::decode(issuer.as_slice())
+            .map_err(|e| Error::Module(format!("issuer key: {e}")))?;
+        let joiner_key = ed25519::PublicKey::decode(joiner.as_slice())
+            .map_err(|e| Error::Module(format!("joiner key: {e}")))?;
+        if nonce.len() != invite::INVITE_NONCE_LEN {
+            return Err(Error::Module(format!(
+                "nonce must be {} bytes",
+                invite::INVITE_NONCE_LEN
+            )));
+        }
+        let mut nonce_arr = [0u8; invite::INVITE_NONCE_LEN];
+        nonce_arr.copy_from_slice(&nonce);
+        let sig = ed25519::Signature::decode(token_sig.as_slice())
+            .map_err(|e| Error::Module(format!("token signature: {e}")))?;
+        let proof_sig = ed25519::Signature::decode(proof.as_slice())
+            .map_err(|e| Error::Module(format!("join proof: {e}")))?;
+        let token = invite::InviteToken {
+            issuer: issuer_key,
+            nonce: nonce_arr,
+            sig,
+        };
+        if !invite::verify_invite_token(&token, binding) {
+            return Err(Error::Module(
+                "invite token signature does not verify for this network".into(),
+            ));
+        }
+        if !invite::verify_join_proof(&joiner_key, binding, &token, &proof_sig) {
+            return Err(Error::Module(
+                "joiner proof-of-possession does not verify".into(),
+            ));
+        }
+        // a removed member's outstanding invites die with it.
+        let members = self.members(ctx).await?;
+        if !members.iter().any(|m| m == &issuer) {
+            return Err(Error::Module(
+                "the inviting member is no longer part of this network".into(),
+            ));
+        }
+        if members.iter().any(|m| m == &joiner) {
+            return Err(Error::Module("joiner is already a validator".into()));
+        }
+        if self.residents(ctx).await?.iter().any(|o| o == &joiner) {
+            return Err(Error::Module("joiner already holds resident standing".into()));
+        }
+        // exactly-once: the nonce is the single-use key (pending-over-committed
+        // read, so two redemptions in one block settle first-wins too).
+        if self.pending_redeemed.contains_key(&nonce) || self.redeemed.contains_key(&nonce) {
+            return Err(Error::Module("invite already redeemed".into()));
+        }
+        self.pending_redeemed.insert(
+            nonce,
+            Redemption {
+                joiner: joiner.clone(),
+                issuer,
+                height: ctx.env().height,
+            },
+        );
+        ctx.emit_msg(Msg {
+            target: self.valset_id.clone(),
+            payload: valset_encode_msg(&ValsetMsg::Grant { key: joiner }),
+        });
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -426,10 +583,11 @@ impl Module for Governance {
         self.id.clone()
     }
 
-    /// sha256 over the canonical encoding of COMMITTED proposals; `ZERO` when
-    /// none exist (the sdk's uninitialized-module sentinel).
+    /// sha256 over the canonical encoding of COMMITTED proposals (plus the
+    /// redemption section when non-empty); `ZERO` when none exist (the sdk's
+    /// uninitialized-module sentinel).
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.proposals)
+        Self::root_of(&self.proposals, &self.redeemed)
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -451,6 +609,16 @@ impl Module for Governance {
                 approve,
             } => self.handle_vote(ctx, proposal_id, approve).await,
             GovMsg::Execute { proposal_id } => self.handle_execute(ctx, proposal_id).await,
+            GovMsg::Redeem {
+                issuer,
+                nonce,
+                token_sig,
+                joiner,
+                proof,
+            } => {
+                self.handle_redeem(ctx, issuer, nonce, token_sig, joiner, proof)
+                    .await
+            }
         }
     }
 
@@ -469,6 +637,22 @@ impl Module for Governance {
                 self.get(&proposal_id)
                     .map(|p| Self::view_of(&proposal_id, p)),
             ))),
+            GovQuery::Redemptions => {
+                let mut merged = self.redeemed.clone();
+                for (nonce, r) in &self.pending_redeemed {
+                    merged.insert(nonce.clone(), r.clone());
+                }
+                let views = merged
+                    .iter()
+                    .map(|(nonce, r)| RedemptionView {
+                        nonce: nonce.clone(),
+                        joiner: r.joiner.clone(),
+                        issuer: r.issuer.clone(),
+                        height: r.height,
+                    })
+                    .collect();
+                Ok(encode_reply(&GovReply::Redemptions(views)))
+            }
         }
     }
 
@@ -476,11 +660,15 @@ impl Module for Governance {
         for (id, p) in std::mem::take(&mut self.pending) {
             self.proposals.insert(id, p);
         }
+        for (nonce, r) in std::mem::take(&mut self.pending_redeemed) {
+            self.redeemed.insert(nonce, r);
+        }
         Ok(())
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.pending.clear();
+        self.pending_redeemed.clear();
         Ok(())
     }
 }
@@ -531,7 +719,9 @@ fn take_string(buf: &mut &[u8]) -> Result<String, Error> {
     String::from_utf8(take_vec(buf)?).map_err(|_| Error::Module("snapshot: bad utf-8".into()))
 }
 
-fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Proposal>, Error> {
+type DecodedState = (BTreeMap<String, Proposal>, BTreeMap<Vec<u8>, Redemption>);
+
+fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
     let mut buf = bytes;
     let count = take_u64(&mut buf)?;
     // every proposal costs at least its id length prefix — a forged count can
@@ -618,8 +808,45 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Proposal>, Error> {
             },
         );
     }
+    // the OPTIONAL redemption section — present iff non-empty (the encoder
+    // omits an empty one, so an explicit empty section has no legal encoding).
+    let mut redeemed = BTreeMap::new();
+    if !buf.is_empty() {
+        let rcount = take_u64(&mut buf)?;
+        if rcount == 0 {
+            return Err(Error::Module(
+                "snapshot carries an explicit empty redemption section".into(),
+            ));
+        }
+        if rcount > (buf.len() / 8) as u64 {
+            return Err(Error::Module(
+                "snapshot redemption count exceeds buffer".into(),
+            ));
+        }
+        let mut prev_nonce: Option<Vec<u8>> = None;
+        for _ in 0..rcount {
+            let nonce = take_vec(&mut buf)?;
+            if prev_nonce.as_deref().is_some_and(|p| p >= nonce.as_slice()) {
+                return Err(Error::Module(
+                    "snapshot redemption nonces must be strictly increasing".into(),
+                ));
+            }
+            let joiner = take_vec(&mut buf)?;
+            let issuer = take_vec(&mut buf)?;
+            let height = take_u64(&mut buf)?;
+            prev_nonce = Some(nonce.clone());
+            redeemed.insert(
+                nonce,
+                Redemption {
+                    joiner,
+                    issuer,
+                    height,
+                },
+            );
+        }
+    }
     if !buf.is_empty() {
         return Err(Error::Module("snapshot carries trailing bytes".into()));
     }
-    Ok(proposals)
+    Ok((proposals, redeemed))
 }

@@ -216,7 +216,7 @@ fn cluster_lifecycle() {
     // widens the quorum to 4. node 3 boots as a parked joiner, sees itself
     // in the participant set at the boundary, syncs, and promotes.
     cluster.spawn(3);
-    cluster.wait_marker(3, "joiner mode: parking", Duration::from_secs(60));
+    cluster.wait_marker(3, "joiner mode:", Duration::from_secs(60));
 
     // 7. ADMISSION CUTOVER. finalized views only advance with ops, so push
     // fillers through the boundary. fillers go through the raw rpc and

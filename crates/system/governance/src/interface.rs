@@ -63,6 +63,21 @@ pub enum GovMsg {
     /// majority of the CURRENT member count. passing membership actions emit
     /// their valset op as a follow-up in the same block.
     Execute { proposal_id: String },
+    /// redeem an invite: no ballot — MINTING was the admission decision. the
+    /// op carries the token's fields plus the joiner key and its
+    /// proof-of-possession (all raw bytes, mirroring the lobby announce);
+    /// the module re-verifies both signatures against the network binding,
+    /// requires the issuer to be a CURRENT member, and enforces single-use
+    /// via the redeemed-nonce set in consensus state. success emits
+    /// `ValsetMsg::Grant { key: joiner }` in the same block — the joiner
+    /// becomes a full node (mesh + statesync standing, no quorum seat).
+    Redeem {
+        issuer: Vec<u8>,
+        nonce: Vec<u8>,
+        token_sig: Vec<u8>,
+        joiner: Vec<u8>,
+        proof: Vec<u8>,
+    },
 }
 
 /// a proposal's lifecycle. `Open` accepts votes; the rest are terminal.
@@ -87,6 +102,20 @@ pub struct ProposalView {
     pub votes: Vec<(Vec<u8>, bool)>,
 }
 
+/// the readable projection of one settled invite redemption — the audit
+/// trail of who invited whom.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RedemptionView {
+    /// the redeemed token's nonce (the single-use key).
+    pub nonce: Vec<u8>,
+    /// the admitted key.
+    pub joiner: Vec<u8>,
+    /// the member whose token authorized the admission.
+    pub issuer: Vec<u8>,
+    /// the block height the redemption landed at.
+    pub height: u64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GovQuery {
@@ -94,6 +123,8 @@ pub enum GovQuery {
     Proposals,
     /// one proposal by id.
     Proposal { proposal_id: String },
+    /// every settled invite redemption, sorted by nonce.
+    Redemptions,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -101,6 +132,7 @@ pub enum GovQuery {
 pub enum GovReply {
     Proposals(Vec<ProposalView>),
     Proposal(Option<ProposalView>),
+    Redemptions(Vec<RedemptionView>),
 }
 
 pub fn encode_msg(m: &GovMsg) -> Vec<u8> {

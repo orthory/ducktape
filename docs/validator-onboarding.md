@@ -1,12 +1,22 @@
 # Validator Onboarding — Invites, Join Requests, Approval
 
+> **SUPERSEDED (2026-07-07): the approval step is gone.** Minting an invite
+> IS the admission decision: a joiner redeems its single-use token
+> automatically (governance `Redeem`), comes up as a full node, and only the
+> quorum seat (`promote`) remains a deliberate member act. Invites are also
+> tunnel-first — the blob carries the inviter's WireGuard bootstrap, and the
+> join rides the VPN before any p2p. The current recipe lives in
+> [deploy/private-cutover-integration-gap.md](deploy/private-cutover-integration-gap.md);
+> the approval mechanics below (`invite-accept`, join-request queues) survive
+> only as the manual fallback for token-less joins.
+
 How a new node joins a running Ducktape network, what the invite token does
 (and deliberately does not do), and the consensus constraints every operator
 should know before growing the validator set.
 
 For the historical analysis of the pre-token flow see
 [invitation-protocol-deep-dive.md](invitation-protocol-deep-dive.md); this
-document describes the current protocol.
+document describes the pre-redemption protocol.
 
 ## The flow at a glance
 

@@ -1052,14 +1052,16 @@ pub fn workspace_log_tail(app: tauri::AppHandle, id: String) -> Result<LogTail, 
 fn classify(log: &str) -> PhaseReport {
     // (phase, marker substring). the strings are a contract with
     // bin/node/src/main.rs (asserted by bin/node/tests/invite_e2e.rs).
+    // "parked" is the phase id the webview already maps; since auto-
+    // redemption the underlying markers read "joining:" (no member approval
+    // step — the invite redeems itself).
     const MARKERS: &[(&str, &str)] = &[
-        ("parked", "joiner mode: parking"),
-        ("parked", "parked:"),
+        ("parked", "joiner mode:"),
+        ("parked", "joining:"),
         ("admitted", "admitted at epoch"),
         ("synced", "synced app_hash="),
         ("promoted", "promoted:"),
         ("fatal", "FATAL"),
-        ("fatal", "not admitted after"),
         // a raw Rust panic on boot ("thread 'main' panicked at …") prints no
         // node marker — catch it so a crashed node stops reading as "starting".
         ("fatal", "panicked at"),
@@ -1365,11 +1367,11 @@ mod tests {
 
     #[test]
     fn classify_parked_holds_until_admitted() {
-        let log = "[node ab] joiner mode: parking on the mesh\n\
-                   [node ab] parked: awaiting admission (epoch 0 has 1 validators)\n";
+        let log = "[node ab] joiner mode: announcing this key with the invite token\n\
+                   [node ab] joining: awaiting redemption (epoch 0 has 1 validators)\n";
         let r = classify(log);
         assert_eq!(r.phase, "parked");
-        assert!(r.detail.unwrap().contains("awaiting admission"));
+        assert!(r.detail.unwrap().contains("awaiting redemption"));
     }
 
     #[test]
@@ -1381,9 +1383,9 @@ mod tests {
     fn classify_recovers_from_a_stale_fatal() {
         // an old fatal, then a restart that reparks and promotes on the same
         // appended log — the latest line wins, not the scariest one.
-        let log = "[node ab] FATAL: still not admitted after 900 attempts\n\
-                   [node ab] joiner mode: parking on the mesh\n\
-                   [node ab] parked: awaiting admission (epoch 0 has 1 validators)\n\
+        let log = "[node ab] FATAL: still no standing after 900 attempts\n\
+                   [node ab] joiner mode: announcing this key with the invite token\n\
+                   [node ab] joining: awaiting redemption (epoch 0 has 1 validators)\n\
                    [node ab] promoted: validator at epoch 1 boundary 4 — rebooting\n";
         assert_eq!(classify(log).phase, "promoted");
     }

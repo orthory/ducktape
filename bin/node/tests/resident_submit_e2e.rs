@@ -58,14 +58,14 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     });
 
     // invite + join a fresh identity, spawn it; it parks with NO standing.
-    let invite = cluster.invite_manual();
-    let friend_key = cluster.join_friend(&invite);
+    let invite = cluster.invite();
+    let friend_key = cluster.join_friend_manual(&invite);
     assert_eq!(friend_key.len(), 64, "join prints the friend's pubkey hex");
     cluster.spawn(1);
-    cluster.wait_marker(1, "parked:", Duration::from_secs(60));
+    cluster.wait_marker(1, "joining:", Duration::from_secs(60));
 
-    // (1) WHILE PARKED (no standing): a write is refused, and the refusal names
-    //     the parked/no-standing contract — refused for the RIGHT reason.
+    // (1) WHILE JOINING (no standing): a write is refused, and the refusal
+    //     names the no-standing contract — refused for the RIGHT reason.
     let refused = cluster.rpc(
         1,
         serde_json::json!({
@@ -76,14 +76,14 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     );
     assert_eq!(
         refused["ok"], false,
-        "a parked node (no standing) must refuse writes: {refused}"
+        "a joining node (no standing) must refuse writes: {refused}"
     );
     assert!(
         refused["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("parked"),
-        "the refusal names the parked/no-standing contract: {refused}"
+            .contains("joining"),
+        "the refusal names the joining/no-standing contract: {refused}"
     );
 
     // grant RESIDENT standing (invite-accept = AddResident), then wait for the

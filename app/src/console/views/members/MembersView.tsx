@@ -661,9 +661,10 @@ function EmptyState({ filter }: { filter: FilterId }) {
   );
 }
 
-/** One parked joiner's delivered request: who asks, who invited, one-click
- *  approve. Approval routes through the SAME governance ballot as the manual
- *  paste box — this list only removes the copy/paste. */
+/** One joining node's in-flight redemption: who is joining, who invited it.
+ *  Invites redeem automatically (minting was the approval), so rows clear on
+ *  their own once standing lands — the button forces the manual ballot as a
+ *  fallback (a token-less join, or a network mid-upgrade). */
 function PendingJoinRequests({
   requests,
   onApprove,
@@ -691,13 +692,14 @@ function PendingJoinRequests({
         }}
       >
         <div style={{ font: `600 12.5px ${font.sans}`, color: color.inkSoft }}>
-          Pending Join Requests
+          Joining Nodes
         </div>
         <span style={{ font: `500 11px ${font.mono}`, color: color.muted2 }}>
           {requests.length}
         </span>
         <span style={{ marginLeft: "auto", font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
-          Approving grants resident standing by majority ballot — Promote seats it in the quorum.
+          Invites redeem automatically into resident standing; rows clear once it lands. Approve
+          forces the ballot manually.
         </span>
       </div>
       {requests.map((request) => (
