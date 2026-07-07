@@ -4147,6 +4147,7 @@ dependencies = [
  "directory",
  "dispatch",
  "dispatch-oracle",
+ "duckfs-client",
  "files",
  "forge",
  "futures",
