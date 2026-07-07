@@ -31,6 +31,7 @@ members = [
     "crates/system/nat-traversal",
     "crates/system/reachability",
     "crates/system/data-plane",
+    "crates/system/overlay-net",
     "crates/system/saga",
     "crates/system/capability",
     "crates/system/blobstore",
@@ -159,3 +160,11 @@ wireguard-effect = { path = "crates/system/wireguard-effect" }
 nat-traversal = { path = "crates/system/nat-traversal" }
 reachability = { path = "crates/system/reachability" }
 data-plane = { path = "crates/system/data-plane" }
+overlay-net = { path = "crates/system/overlay-net" }
+
+# overlay-net's wrapper context implements commonware-runtime's `Clock` and
+# rng bounds, whose supertraits live in these crates — pinned to the exact
+# versions commonware-runtime 2026.5.0 depends on (a different semver-major
+# would be a different trait).
+governor = "0.10.2"
+rand_core = "0.6.4"

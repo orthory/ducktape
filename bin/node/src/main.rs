@@ -5260,7 +5260,23 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             bootstrappers,
             MAX_MESSAGE_SIZE,
         );
-        let (mut network, mut oracle) = Network::new(context.child("network"), p2p_cfg);
+        // the overlay-net seam (ADR 2026-07-07): the mesh dials/binds through
+        // a wrapper context whose Network routes BY ADDRESS — sockets on this
+        // chain's ULA /48 go to the active overlay backend (today: the TUN
+        // pass-through, i.e. the same OS socket the kernel routes through the
+        // wireguard interface), everything else straight to the OS. the p2p
+        // dialer never connect()s an overlay ULA on a raw OS socket as an
+        // assumption again; the userspace backend lands behind this seam.
+        // the prefix derives from the SAME namespace string statesync_plane's
+        // OverlayBook and the reachability plane use, so all three agree on
+        // what "overlay" means.
+        let overlay_router = overlay_net::OverlayRouter::for_prefix48(
+            wireguard_upgrade::ula_v6_prefix(&String::from_utf8_lossy(&namespace)),
+        );
+        let (mut network, mut oracle) = Network::new(
+            overlay_net::OverlayContext::new(context.child("network"), overlay_router),
+            p2p_cfg,
+        );
 
         let quota = Quota::per_second(NZU32!(128));
 

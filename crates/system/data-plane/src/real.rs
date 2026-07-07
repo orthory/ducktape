@@ -1,11 +1,14 @@
 //! The real overlay-socket transport arm: the plane's medium on a live node.
 //!
 //! Twin of [`sim`](crate::sim) — where the sim arm is a deterministic
-//! in-memory network for the isolation proofs, this arm binds real tokio
-//! sockets on the reachability plane's WireGuard overlay:
-//! - **datagrams** = one [`UdpSocket`] on the node's overlay `/128`,
-//! - **streams** = a [`TcpListener`] on that same `/128`, dialled with a
-//!   source-bound [`TcpSocket`].
+//! in-memory network for the isolation proofs, this arm binds real sockets
+//! on the reachability plane's WireGuard overlay, minted by an injected
+//! [`SocketFactory`] (the overlay-net ADR's socket seam; [`OsSocketFactory`]
+//! is today's only arm — plain tokio sockets the kernel routes through the
+//! TUN interface):
+//! - **datagrams** = one [`DatagramSocket`] on the node's overlay `/128`,
+//! - **streams** = a [`StreamListener`] on that same `/128`, dialled with
+//!   the source bound to it.
 //!
 //! Identity is the transport's, exactly as [`crate::transport`] promises: a
 //! packet's source `/128` is bound by WireGuard cryptokey routing to exactly
@@ -24,14 +27,140 @@
 //! cover. The constructor takes explicit bind addresses; the node passes the
 //! `/128`.
 
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpSocket, UdpSocket};
 
 use crate::transport::{DataPlaneTransport, PeerId, TransportError};
 use crate::wire::MAX_DATAGRAM;
+
+// ── The socket seam ─────────────────────────────────────
+//
+// where the plane's sockets come from is INJECTED (the overlay-net ADR's
+// socket-factory seam, docs/adr/2026-07-07-userspace-overlay-net.mdx): the
+// node passes a factory, and this arm never names an OS socket type in its
+// own signatures. today's only factory is [`OsSocketFactory`] (the TUN
+// backend: the kernel routes overlay ULAs through the WireGuard interface,
+// so plain OS sockets carry them); the userspace backend supplies a factory
+// whose sockets terminate in an in-process stack instead — with no change
+// here or in any consumer.
+//
+// object-safe by boxed futures (not RPITIT) on purpose: the factory crosses
+// the node boundary as `Arc<dyn SocketFactory>` exactly like [`AddressBook`],
+// and a per-call vtable hop is noise next to the syscall (or virtual-stack
+// poll) behind it.
+
+/// a boxed future — the object-safe shape of this seam's async methods.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// the duplex byte stream every factory yields: exactly the bounds
+/// [`DataPlaneTransport::Stream`] demands, boxed.
+pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+
+/// the plane's stream type under the seam.
+pub type PlaneStream = Box<dyn Duplex>;
+
+/// an unconnected datagram socket bound to the node's overlay `/128`.
+pub trait DatagramSocket: Send + Sync {
+    fn send_to<'a>(&'a self, buf: &'a [u8], dest: SocketAddr) -> BoxFuture<'a, io::Result<usize>>;
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>>;
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+}
+
+/// a stream acceptor bound to the node's overlay `/128`.
+pub trait StreamListener: Send + Sync {
+    fn accept(&self) -> BoxFuture<'_, io::Result<(PlaneStream, SocketAddr)>>;
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+}
+
+/// mints the plane's sockets. `dial_from` binds the stream's source to
+/// `local_ip` — the far side authenticates the connection by that source
+/// `/128`, so the factory owns source binding, not the caller.
+pub trait SocketFactory: Send + Sync {
+    fn bind_udp(&self, addr: SocketAddr) -> BoxFuture<'_, io::Result<Box<dyn DatagramSocket>>>;
+    fn bind_listener(&self, addr: SocketAddr)
+    -> BoxFuture<'_, io::Result<Box<dyn StreamListener>>>;
+    fn dial_from<'a>(
+        &'a self,
+        local_ip: IpAddr,
+        dest: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<PlaneStream>>;
+}
+
+/// the OS arm: plain tokio sockets (under TUN mode the kernel makes these
+/// overlay-capable; see the seam comment above).
+pub struct OsSocketFactory;
+
+impl DatagramSocket for UdpSocket {
+    fn send_to<'a>(&'a self, buf: &'a [u8], dest: SocketAddr) -> BoxFuture<'a, io::Result<usize>> {
+        Box::pin(UdpSocket::send_to(self, buf, dest))
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
+        Box::pin(UdpSocket::recv_from(self, buf))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        UdpSocket::local_addr(self)
+    }
+}
+
+impl StreamListener for TcpListener {
+    fn accept(&self) -> BoxFuture<'_, io::Result<(PlaneStream, SocketAddr)>> {
+        Box::pin(async {
+            let (stream, addr) = TcpListener::accept(self).await?;
+            Ok((Box::new(stream) as PlaneStream, addr))
+        })
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        TcpListener::local_addr(self)
+    }
+}
+
+impl SocketFactory for OsSocketFactory {
+    fn bind_udp(&self, addr: SocketAddr) -> BoxFuture<'_, io::Result<Box<dyn DatagramSocket>>> {
+        Box::pin(async move {
+            Ok(Box::new(UdpSocket::bind(addr).await?) as Box<dyn DatagramSocket>)
+        })
+    }
+
+    fn bind_listener(
+        &self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'_, io::Result<Box<dyn StreamListener>>> {
+        Box::pin(async move {
+            Ok(Box::new(TcpListener::bind(addr).await?) as Box<dyn StreamListener>)
+        })
+    }
+
+    fn dial_from<'a>(
+        &'a self,
+        local_ip: IpAddr,
+        dest: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<PlaneStream>> {
+        Box::pin(async move {
+            let socket = match local_ip {
+                IpAddr::V4(_) => TcpSocket::new_v4()?,
+                IpAddr::V6(_) => TcpSocket::new_v6()?,
+            };
+            socket.bind(SocketAddr::new(local_ip, 0))?;
+            Ok(Box::new(socket.connect(dest).await?) as PlaneStream)
+        })
+    }
+}
 
 /// The node-supplied `PeerId ↔ overlay-address` mapping. Forward resolution
 /// (`*_addr`) returns the FULL socket address per class — the peer's `/128`
@@ -59,20 +188,35 @@ pub trait AddressBook: Send + Sync + 'static {
 
 /// The real transport: overlay UDP + TCP bound to the node's `/128`.
 pub struct OverlaySockets {
-    udp: Arc<UdpSocket>,
-    listener: TcpListener,
+    udp: Arc<dyn DatagramSocket>,
+    listener: Box<dyn StreamListener>,
     /// The overlay `/128` this node presents as its source. Dialled streams
     /// bind their source here so the far side authenticates us by it.
     local_ip: IpAddr,
     addresses: Arc<dyn AddressBook>,
+    /// Retained for per-connect dials (see [`SocketFactory::dial_from`]).
+    factory: Arc<dyn SocketFactory>,
 }
 
 impl OverlaySockets {
+    /// Bind on plain OS sockets — [`bind_with`](OverlaySockets::bind_with)
+    /// over [`OsSocketFactory`], the arm every current caller means.
+    pub async fn bind(
+        datagram_bind: SocketAddr,
+        stream_bind: SocketAddr,
+        addresses: Arc<dyn AddressBook>,
+    ) -> io::Result<Self> {
+        Self::bind_with(Arc::new(OsSocketFactory), datagram_bind, stream_bind, addresses).await
+    }
+
     /// Bind the datagram and stream sockets to the given overlay addresses and
     /// wire in the address book. `datagram_bind` and `stream_bind` MUST carry
     /// the same overlay `/128` (this node's) — a port of `0` lets the OS pick,
-    /// which is how the tests stand two endpoints on one loopback IP.
-    pub async fn bind(
+    /// which is how the tests stand two endpoints on one loopback IP. the
+    /// factory owns what a "socket" is — see the socket-seam comment atop
+    /// this module.
+    pub async fn bind_with(
+        factory: Arc<dyn SocketFactory>,
         datagram_bind: SocketAddr,
         stream_bind: SocketAddr,
         addresses: Arc<dyn AddressBook>,
@@ -83,13 +227,14 @@ impl OverlaySockets {
                 "datagram and stream sockets must share the node's overlay /128",
             ));
         }
-        let udp = UdpSocket::bind(datagram_bind).await?;
-        let listener = TcpListener::bind(stream_bind).await?;
+        let udp = factory.bind_udp(datagram_bind).await?;
+        let listener = factory.bind_listener(stream_bind).await?;
         Ok(OverlaySockets {
-            udp: Arc::new(udp),
+            udp: udp.into(),
             listener,
             local_ip: datagram_bind.ip(),
             addresses,
+            factory,
         })
     }
 
@@ -105,18 +250,13 @@ impl OverlaySockets {
 
     /// Dial `dest` with the source bound to this node's overlay `/128`, so the
     /// acceptor authenticates the connection by our source address.
-    async fn dial(&self, dest: SocketAddr) -> io::Result<TcpStream> {
-        let socket = match self.local_ip {
-            IpAddr::V4(_) => TcpSocket::new_v4()?,
-            IpAddr::V6(_) => TcpSocket::new_v6()?,
-        };
-        socket.bind(SocketAddr::new(self.local_ip, 0))?;
-        socket.connect(dest).await
+    async fn dial(&self, dest: SocketAddr) -> io::Result<PlaneStream> {
+        self.factory.dial_from(self.local_ip, dest).await
     }
 }
 
 impl DataPlaneTransport for OverlaySockets {
-    type Stream = TcpStream;
+    type Stream = PlaneStream;
 
     fn max_datagram(&self) -> usize {
         MAX_DATAGRAM
