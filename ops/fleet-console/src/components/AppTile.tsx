@@ -13,6 +13,14 @@ function AheadBehind({ ahead, behind }: { ahead: number; behind: number }) {
   );
 }
 
+function AgentBadge({ ready }: { ready: boolean }) {
+  return (
+    <span className="agent-badge" data-ready={ready}>
+      agent {ready ? "ready" : "pending"}
+    </span>
+  );
+}
+
 // One worktree = one live, view-only app view. Clicking opens the interactive
 // drawer. The RFB canvas has pointer-events:none (see css) so the click lands on
 // the tile, not the (input-disabled) remote screen.
@@ -44,6 +52,7 @@ export function AppTile({
         <span className="branch">{node.branch}</span>
         <span className="sha">{node.head.sha}</span>
         <AheadBehind ahead={node.ahead} behind={node.behind} />
+        {node.agent && <AgentBadge ready={node.agent.endpointReady} />}
       </div>
       {!collapsed && (
         <div className="tile-screen">

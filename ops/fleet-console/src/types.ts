@@ -21,6 +21,23 @@ export interface FleetActivity {
   commits: FleetCommit[];
 }
 
+export interface FleetAgentObserve {
+  protocol: "tauri-agent-observe-ndjson";
+  cwd: string;
+  env: {
+    XDG_RUNTIME_DIR: string;
+  };
+  argv: string[];
+}
+
+export interface FleetAgent {
+  appId: string;
+  runtimeDir: string;
+  endpointPath: string;
+  endpointReady: boolean;
+  observe: FleetAgentObserve;
+}
+
 export interface FleetNode {
   id: string;
   branch: string;
@@ -35,6 +52,7 @@ export interface FleetNode {
   display?: string;
   vncPort?: number;
   token?: string;
+  agent?: FleetAgent;
 }
 
 export interface Fleet {
