@@ -44,8 +44,14 @@ pub use spec::{CapabilitySpec, OutputFormat, PromptMode, SpecSet, builtin_specs}
 /// invocation (binary, flags, model) is the spec's literal argv. rendering
 /// (conversation -> text) is the CALLER's business — this crate is
 /// deliberately ignorant of chat shapes and saga specs.
-#[async_trait::async_trait(?Send)]
-pub trait Provider {
+///
+/// `Send + Sync` (and a Send `run` future) on purpose: provider execution is
+/// long (a CLI call can run minutes) and hosts run it on SPAWNED background
+/// tasks, never inline on their event loop — so the provider surface must be
+/// shareable across tasks. this is a Rust seam bound only; the provider CLI
+/// contract (spec argv, stdin prompt, stdout answer) is untouched.
+#[async_trait::async_trait]
+pub trait Provider: Send + Sync {
     /// the capability tag this provider serves — matches the capability
     /// module's registry entries, so "what i can run" and "what i announce"
     /// cannot drift apart.
@@ -183,7 +189,7 @@ impl CliProvider {
     }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl Provider for CliProvider {
     fn capability(&self) -> &str {
         &self.spec.tag
