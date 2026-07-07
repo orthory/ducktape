@@ -5,8 +5,8 @@ product module은 platform이 호스팅하는 업무용 surface다. 같은 modul
 
 ## Built or Started
 
-- `document`는 QMDB 위에 block-based document를 저장하고 QMDB state sync를
-  노출한다.
+- `pages`는 QMDB 위에 nested block page, page tab, comment thread를 저장하고
+  QMDB state sync를 노출한다.
 - `forge`는 git-backed project state를 저장하고, git head에서 root를 계산하며
   connectivity verification으로 pack install을 보호한다.
 - `chat`은 storage를 소유하는 chat module이다: channel, thread, edit, reaction,
@@ -23,8 +23,53 @@ product module은 platform이 호스팅하는 업무용 surface다. 같은 modul
 - `memory`는 immutable generation을 가진 filesystem 모양의 shared agent
   workspace다.
 - `jobs`는 first-claim-wins claim을 쓰는 consensus-native work board다.
+- `identity`는 node key를 user key에 묶는다 — 여러 node를 굴리는 한 사람이
+  mesh/valset 위에서 하나의 identity로 resolve되게 하는 replicated registry다.
 - `kv`, `valset`, `saga`, `governance`, `directory`, `greeter`는 infrastructure,
   example, test를 지원한다.
+
+## Chat And Huddles
+
+chat은 channel, message thread, edit, reaction, membership, hook fan-out을
+소유한다. hot channel이 commit bomb이 되지 않도록 whole-history value 하나가
+아니라 entity당 QMDB record 하나를 저장하고, computed key로 page한다.
+
+huddle은 chat channel에 붙는다. consensus는 `join_huddle`, `leave_huddle`,
+`sweep_huddle`로 roster만 저장한다. mute, camera, peer beacon 같은 media state는
+ephemeral이다. live node에는 typed call socket과 voice/video hub가 있다. audio와
+control은 voice lane을 타고, camera fragment는 별도 video lane을 타며, app은 docked
+또는 popped-out huddle card를 렌더링한다. 현재 admission은 local-live-flow 기반이고,
+roster-derived media admission은 남은 security hardening seam이다.
+
+## Pages
+
+pages는 block editor module이다. page root, nested page parent, block, comment
+thread를 같은 QMDB-backed module에 저장하므로 page content와 comment가 함께
+state-sync된다. write는 `CreatePage`, `SetPageParent`, `DeletePage`,
+`InsertBlock`, `UpdateText`, `SetKind`, `SetChecked`, `MoveBlock`, `RemoveBlock`,
+`AddComment`, `EditComment`, `DeleteComment`, `ResolveThread`로 간다. read는 page와
+block lookup, page list, page 또는 visible block set의 comment-thread query를
+포함한다.
+
+UI도 같은 형태를 따른다: nested page tree, `openTabs` 기반 page tab,
+focus-light block editing, block별 comment affordance, 오른쪽 comments panel.
+comment는 현재 plain text이고 별도 `comments` crate가 아니라 `pages` 안에 산다.
+이것이 이전 redesign plan과 다른 구현 결과다.
+
+## Agents And Runs
+
+agent stack은 의도적으로 나뉘어 있다. `agent`는 registry다: display name, executor
+requirement, prompt pin, permission, status, watch, run record를 담는다. `runs`는
+chat context로 prompt를 compose하고, dispatch recipe를 submit하고, response를
+record하며, channel을 watch하고, jobs board에 opt in할 수 있다. `dispatch`와
+`saga`는 capability-routed execution과 strict lease를 소유하므로 model output은
+숨은 local state가 아니라 ordered data로 돌아온다.
+
+node는 operator spec에서 local capability provider를 discover하고, truthful tag set을
+`capability` module에 announce하며, 자기 key에 assign된 lease만 dispatch worker로
+실행한다. console은 이 상태를 다시 join한다. member row는 announced executor tag를
+보여주고, agent form은 registry-backed **Runs on** picker를 쓰며, in-flight run은
+saga lease를 잡은 node를 표시할 수 있다.
 
 ## Inbox
 
@@ -138,6 +183,42 @@ follow-up 하나를 emit한다. 이 fan-out도 host의 block dispatch budget을 
 claim하면, 두 번째 `Claim`은 첫 번째 staged claim을 보고 reject하며 P2에 따라
 전체 submit block을 abort한다. `MAX_WORKERS`는 나중의 off-cascade 전략을 위한
 상한이지, 같은 kind를 여러 worker가 in-cascade로 claim하라는 뜻이 아니다.
+
+## Identity
+
+identity는 user/node binding registry다(`crates/system/identity`). user는
+사람이 app에서 들고 있는 ed25519 keypair이고, node는 workspace의 mesh/valset
+identity다. 이 module은 user마다 display name, replay-guard nonce, 그리고
+bound node key 집합을 저장한다 — 한 사람이 여러 node를 같은 user에 bind할 수
+있다.
+
+`BindNode`는 SUBMIT하는 node(검증된 origin이며 절대 payload field가 아니다)를
+user에 bind하며, chain-id ‖ node-key ‖ nonce preimage 위의 user-key
+signature로 동의를 증명한다 — certificate는 다른 network로 절대 replay될 수
+없고, node A를 위해 mint된 cert는 node B를 절대 bind할 수 없으며, stale
+nonce(이전 bind/unbind에서 남은)는 reject된다. 네트워크에 연결된
+node에서는 `BindNode`가 추가로 현재 member에게 gate된다: origin이 validator나
+observer여야 하므로, 아무 standing도 없는 node는 스스로에게 user를 mint할 수
+없다. `UnbindNode`는 이런 gate가 없고 어떤 external origin에서든 accept된다 —
+살아남은 device가 잃어버린 device를 evict할 수 있다는 뜻이다 — 그리고
+user의 nonce를 bump해서 evict된 node를 위해 잡혀 있던 bind certificate를
+영원히 죽인다. user의 마지막 node를 unbind해도 user record는 남는다 — name과
+nonce가 zero node로 persist하므로, 나중의 bind는 같은 identity로 resolve된다.
+`SetUserName`은 origin-gated일 뿐이다(bound node는 신뢰된
+hardware이므로 user signature가 필요 없다): submit하는 node가 bound된 user의
+display name을 profiles와 같은 64바이트 한도로 설정하며, nonce는 bump하지
+않는다 — user signature를 소비하지 않기 때문이다.
+
+bind는 per-node로 남는 것들을 바꾸지 않는다: mesh tracking, valset seat,
+quorum arithmetic은 이 module의 영향을 받지 않는다. validator 셋을 굴리는
+user는 여전히 세 자리를 차지하고 세 표를 던진다 — identity는 display와
+authorship resolution을 위해 key를 사람에게 매핑할 뿐, consensus weight를
+합치지 않는다.
+
+identity가 없던 network에 이를 추가하는 것은 다른 module-set 변경과
+마찬가지다: genesis app-hash가 옮겨가므로, 이미 돌고 있는 network가 이를
+적용하려면 coordinated rebuild — rolling이 아닌, 모든 validator에 걸친
+lockstep upgrade — 가 필요하다.
 
 ## Interface Shape
 

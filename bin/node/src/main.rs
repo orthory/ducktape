@@ -90,11 +90,11 @@ use capability::CapabilityRegistry;
 use chat::Chat;
 use directory::Directory;
 use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
-use document::Document;
 use files::Files;
 use forge::Forge;
 use governance::Governance;
 use host::Host;
+use identity::Identity;
 use inbox::Inbox;
 use jobs::Jobs;
 use kv::Kv;
@@ -213,7 +213,6 @@ const CUTOVER_DELAY: u64 = 3;
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
 const MODULE_IDS: [&str; 23] = [
     "kv",
-    "document",
     "pages",
     "chat",
     "forge",
@@ -227,6 +226,7 @@ const MODULE_IDS: [&str; 23] = [
     "tasks",
     "vaults",
     "profiles",
+    "identity",
     "inbox",
     "directory",
     "automations",
@@ -625,9 +625,9 @@ async fn genesis_host(
     forge_repo: &std::path::Path,
     genesis_validators: &[ed25519::PublicKey],
     blobs: files::BlobHandle,
+    chain_id: &str,
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
-    let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
     let chat = Chat::init(context.child("chat"), "chat")
         .await
@@ -645,7 +645,6 @@ async fn genesis_host(
     }
     Host::genesis(vec![
         Box::new(kv),
-        Box::new(document),
         Box::new(pages),
         Box::new(chat),
         Box::new(forge),
@@ -684,6 +683,13 @@ async fn genesis_host(
         // the origin-gated display-name registry: each verified submit origin
         // may set its own name, so the ui can resolve authors to names.
         Box::new(Profiles::new("profiles")),
+        // the deterministic user->nodes binding registry: certificates are
+        // chain-scoped (this network's chain id), member-gated binds via valset.
+        Box::new(Identity::new(
+            "identity",
+            Some("valset".into()),
+            chain_id.to_string(),
+        )),
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
         Box::new(Inbox::new("inbox")),
@@ -706,7 +712,6 @@ async fn genesis_host(
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-            Some("document".into()),
         )),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
@@ -731,9 +736,9 @@ async fn restore_host(
     forge_repo: &std::path::Path,
     manifest: &Manifest,
     blobs: files::BlobHandle,
+    chain_id: &str,
 ) -> Result<Host, String> {
     let kv = Kv::init(context.child("kv"), "kv").await;
-    let document = Document::init(context.child("document"), "document").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
     let chat = Chat::init(context.child("chat"), "chat")
         .await
@@ -817,6 +822,12 @@ async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("profiles install: {e}"))?;
 
+    let mut identity = Identity::new("identity", Some("valset".into()), chain_id.to_string());
+    let (bytes, root) = snapshot_of("identity")?;
+    identity
+        .install(bytes, root)
+        .map_err(|e| format!("identity install: {e}"))?;
+
     let mut inbox = Inbox::new("inbox");
     let (bytes, root) = snapshot_of("inbox")?;
     inbox
@@ -855,7 +866,6 @@ async fn restore_host(
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-        Some("document".into()),
     );
     let (bytes, root) = snapshot_of("runs")?;
     runs.install(bytes, root)
@@ -875,7 +885,6 @@ async fn restore_host(
 
     Host::genesis(vec![
         Box::new(kv),
-        Box::new(document),
         Box::new(pages),
         Box::new(chat),
         Box::new(forge),
@@ -889,6 +898,7 @@ async fn restore_host(
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
+        Box::new(identity),
         Box::new(inbox),
         Box::new(files),
         Box::new(memory),
@@ -915,6 +925,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     manifest: &statesync::Manifest,
     forge_repo: &std::path::Path,
     attempt: usize,
+    chain_id: &str,
 ) -> Result<Host, String> {
     let entry_root = |module: &str| -> Result<StateRoot, String> {
         Ok(manifest
@@ -959,15 +970,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     let kv = Kv::sync_from(
         scratch_context.child(child_label("kv")),
         "kv",
-        target,
-        resolver,
-    )
-    .await?;
-
-    let (target, resolver) = fetch_target("document").await?;
-    let document = Document::sync_from(
-        scratch_context.child(child_label("document")),
-        "document",
         target,
         resolver,
     )
@@ -1072,6 +1074,12 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("profiles install: {e}"))?;
 
+    let (bytes, root) = snapshot_of("identity").await?;
+    let mut identity = Identity::new("identity", Some("valset".into()), chain_id.to_string());
+    identity
+        .install(&bytes, root)
+        .map_err(|e| format!("identity install: {e}"))?;
+
     let (bytes, root) = snapshot_of("inbox").await?;
     let mut inbox = Inbox::new("inbox");
     inbox
@@ -1111,7 +1119,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-        Some("document".into()),
     );
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
@@ -1142,7 +1149,6 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     // composes a different app-hash and the join fails its final check.
     let host = Host::genesis(vec![
         Box::new(kv),
-        Box::new(document),
         Box::new(pages),
         Box::new(chat),
         Box::new(forge),
@@ -1156,6 +1162,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(tasks),
         Box::new(vaults),
         Box::new(profiles),
+        Box::new(identity),
         Box::new(inbox),
         Box::new(files),
         Box::new(memory),
@@ -2316,10 +2323,27 @@ fn spawn_rpc_listener(
     });
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    // Convert any terminal error into the same stable `FATAL:` marker the node
+    // already prints for its other fatal paths (recovery, admission, promotion),
+    // plus a non-zero exit. This closes the run-path boot failures (bind
+    // conflict, config parse) that used to propagate as a bare `Error: …` the
+    // desktop app's classify() didn't recognize — now the app surfaces the
+    // reason immediately instead of inferring death. (Onboarding subcommands
+    // still surface their own stderr via run_verb; the prefix is harmless there.)
+    if let Err(err) = run() {
+        eprintln!("FATAL: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("keygen") => return cmd_keygen(&args[1..]),
+        Some("user-key") => return cmd_user_key(&args[1..]),
+        Some("user-sign-bind") => return cmd_user_sign_bind(&args[1..]),
+        Some("user-sign-unbind") => return cmd_user_sign_unbind(&args[1..]),
         Some("init") => return cmd_init(&args[1..]),
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
@@ -2348,7 +2372,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
-                     keygen|init|invite|admit|invite-accept|promote|resident-remove|\
+                     keygen|user-key|user-sign-bind|user-sign-unbind|init|invite|admit|\
+                     invite-accept|promote|resident-remove|\
                      join-requests|member-remove|member-leave|member-status|join|\
                      upgrade-status — or \
                      --config <path> | -n/--network <chain id> [--sync-only])"
@@ -2446,6 +2471,114 @@ fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `user-key [--out <path>]` — generate (or reuse) a persisted ed25519 USER
+/// identity: the human's app-side keypair (distinct from `keygen`'s per-node
+/// identity), a bare hex ed25519 seed file under the same load-or-generate
+/// discipline. pubkey on stdout (scriptable — the desktop shell's `run_verb`
+/// takes the LAST stdout line as the value), provenance on stderr.
+fn cmd_user_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let out = PathBuf::from(flags.get("out").map(String::as_str).unwrap_or("user.key"));
+    let (key, generated) = config::load_or_generate_identity(&out)?;
+    println!("{}", hex_bytes(key.public_key().as_ref()));
+    eprintln!(
+        "{} user identity at {}",
+        if generated { "generated" } else { "reusing" },
+        out.display()
+    );
+    Ok(())
+}
+
+/// `user-sign-bind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
+/// — mint a bind certificate binding `node-pub` to the user identity at
+/// `--key` (generated there if absent), at `chain-id`/`nonce`, and print the
+/// ready-to-submit `IdentityMsg::BindNode` JSON as the last (only) stdout
+/// line. `user_key` rides the payload — the node being bound is the verified
+/// submit ORIGIN, never a payload field; the module resolves it from the rpc
+/// transport, not from this CLI.
+fn cmd_user_sign_bind(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use identity::{IdentityMsg, encode_msg};
+
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-sign-bind needs --key <path>")?);
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-sign-bind needs --chain-id <id>")?;
+    let node_pub_hex = flags
+        .get("node-pub")
+        .ok_or("user-sign-bind needs --node-pub <hex>")?;
+    let node_pub = config::decode_key(node_pub_hex)?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-sign-bind needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+
+    let (user, generated) = config::load_or_generate_identity(&key_path)?;
+    if generated {
+        eprintln!("generated user identity at {}", key_path.display());
+    }
+    let user_sig = config::mint_bind_cert(&user, chain_id, node_pub.as_ref(), nonce);
+    let msg = IdentityMsg::BindNode {
+        user_key: user.public_key().as_ref().to_vec(),
+        user_sig,
+    };
+    println!(
+        "{}",
+        String::from_utf8(encode_msg(&msg)).expect("json is utf-8")
+    );
+    Ok(())
+}
+
+/// `user-sign-unbind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
+/// — mint an unbind certificate evicting `node-pub` from the user identity at
+/// `--key`, and print the ready-to-submit `IdentityMsg::UnbindNode` JSON as
+/// the last stdout line. `node_key` (not `user_key`) rides the payload:
+/// unbind carries no origin restriction — a surviving device evicts a lost
+/// one by naming it directly, identified via the existing binding.
+fn cmd_user_sign_unbind(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use identity::{IdentityMsg, encode_msg};
+
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-sign-unbind needs --key <path>")?);
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-sign-unbind needs --chain-id <id>")?;
+    let node_pub_hex = flags
+        .get("node-pub")
+        .ok_or("user-sign-unbind needs --node-pub <hex>")?;
+    let node_pub = config::decode_key(node_pub_hex)?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-sign-unbind needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+
+    let (user, generated) = config::load_or_generate_identity(&key_path)?;
+    if generated {
+        eprintln!("generated user identity at {}", key_path.display());
+    }
+    let user_sig = config::mint_unbind_cert(&user, chain_id, node_pub.as_ref(), nonce);
+    let msg = IdentityMsg::UnbindNode {
+        node_key: node_pub.as_ref().to_vec(),
+        user_sig,
+    };
+    println!(
+        "{}",
+        String::from_utf8(encode_msg(&msg)).expect("json is utf-8")
+    );
+    Ok(())
+}
+
 /// `init --name <human name> [--dir .] [--listen a] [--advertised a] [--http a]
 /// [--rpc a]` — found a network: mint the chain-id, write the descriptor +
 /// node config, seed the genesis validator set with this identity.
@@ -2488,6 +2621,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         validators: vec![hex_bytes(me.as_ref())],
         bootstrap: Vec::new(),
         reach: Vec::new(),
+        coordination: None,
     };
     if let Some(addr) = config::dialable(plumbing.advertised.as_deref(), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -3433,6 +3567,10 @@ fn wire_reachability_plane<S, R>(
     wireguard_effect: WireGuardEffectKind,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
+    // the genesis-issued admission capability presented on every coordinator
+    // request (private coordination); `None` for a genesis validator, a public
+    // coordinator, or the dev shape.
+    coord_cap: Option<nat_traversal::CoordCap>,
     reach_p2p_tx: S,
     mut reach_p2p_rx: R,
 ) -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>
@@ -3445,6 +3583,7 @@ where
 
     let thread_label = label.to_string();
     let reach_signer = signer.clone();
+    let reach_coord_cap = coord_cap;
     let plane_chain_id = chain_id.to_string();
     let key_file = wireguard_key_file.to_path_buf();
     let state_file = mesh_state_file.to_path_buf();
@@ -3466,6 +3605,7 @@ where
                     wireguard_effect,
                     advertised,
                     coordinators,
+                    reach_coord_cap,
                     cmd_rx,
                     nudge_tx,
                     ev_tx,
@@ -3561,6 +3701,7 @@ where
     cmd_tx
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reachability_plane(
     label: String,
     chain_id: String,
@@ -3573,6 +3714,10 @@ async fn reachability_plane(
     effect_kind: WireGuardEffectKind,
     advertised: Ingress,
     coordinators: Vec<Ingress>,
+    // the genesis-issued admission capability presented on every coordinator
+    // request (private coordination); `None` for a genesis validator, a public
+    // coordinator, or the dev shape.
+    coord_cap: Option<nat_traversal::CoordCap>,
     commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
     // a clone of the `commands` sender, for the plane's own nudge ticker.
     nudges: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
@@ -3637,7 +3782,13 @@ async fn reachability_plane(
         }
     }
     let me = reachability::node_key(reachability::identity_of(&signer.public_key()));
-    let resolver = match reachability::NatResolver::bind(me, coords.clone()).await {
+    // authenticate every coordinator request: the node signs a
+    // proof-of-possession with its identity key and, in private coordination,
+    // carries the genesis-issued cap. A fully-open coordinator ignores the
+    // authenticator; a public/private one requires it. With no coordinators
+    // configured `bind` short-circuits to pass-through and never touches this.
+    let auth = Some((signer.clone(), coord_cap));
+    let resolver = match reachability::NatResolver::bind(me, coords.clone(), auth).await {
         Ok(resolver) => resolver,
         Err(err) => {
             eprintln!(
@@ -3762,6 +3913,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         signer,
         label,
         namespace,
+        // the descriptor's own chain-id (network shape) or the raw dev-shape
+        // namespace — NOT `namespace` below, which is `genesis_namespace()`
+        // (chain_id@fingerprint) on the network shape. this is the string the
+        // desktop app records as `Workspace.chain_id`; threaded into
+        // `identity`'s certificate domain separation.
+        chain_id: identity_chain_id,
         mesh: peers,
         validators,
         bootstrappers,
@@ -3779,6 +3936,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         invite_token,
         sync_index,
         announce_capabilities,
+        coordination,
+        coord_cap,
+        workspace,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
@@ -3831,6 +3991,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // the plane's to surface at its restore; here they just mean no seeds.
     let chain_id = String::from_utf8_lossy(&namespace).to_string();
     let mesh_state_file = storage.join("mesh-state.json");
+    // fail-closed check for private coordination: a node that is neither a
+    // genesis validator (admitted by membership) nor holding a `coord.cap`
+    // will have every rendezvous request silently dropped by a private
+    // coordinator. Surface that loudly instead of pretending the plane is
+    // healthy — the tunnels never come up, and the operator needs to know it
+    // is a missing credential, not a network fault.
+    if wireguard_listen.is_some()
+        && !coordinated.is_empty()
+        && coordination == config::Coordination::Private
+        && coord_cap.is_none()
+        && !validators.contains(&signer.public_key())
+    {
+        eprintln!(
+            "[node {label}] reachability: private coordination but no coord.cap and not a \
+             genesis validator — rendezvous will be denied; provide coord.cap or use a \
+             fronted/direct reach hint"
+        );
+    }
     let mesh_dial_seeds: Vec<(ed25519::PublicKey, Ingress)> =
         match reachability::store::load(&mesh_state_file, &chain_id) {
             Ok(Some(mesh)) => {
@@ -4204,7 +4382,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // disk, so every store opens under its canonical module id) and
             // print the greppable line the demo script asserts on.
             let forge_repo = storage_for_sync.join("forge-repo");
-            match sync_all_modules(&context, &client, &manifest, &forge_repo, 0).await {
+            match sync_all_modules(
+                &context,
+                &client,
+                &manifest,
+                &forge_repo,
+                0,
+                &identity_chain_id,
+            )
+            .await
+            {
                 Ok(host) => {
                     println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
                 }
@@ -4296,6 +4483,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             wireguard_effect,
                             advertised_reach,
                             coordinators,
+                            coord_cap.clone(),
                             reach_tx,
                             reach_rx,
                         ))
@@ -4340,15 +4528,45 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let (mut lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
             {
                 let label = label.clone();
+                // the parked joiner persists a coord.cap delivered over a
+                // JoinReply into its workspace, so a later boot presents it to
+                // the private coordinator (loaded via `load_coord_cap`).
+                let cap_dir = workspace.clone();
                 context.child("lobby_replies").spawn(move |_ctx| async move {
                     while let Ok((peer, msg)) = lobby_rx.recv().await {
                         let bytes: Vec<u8> = msg.into();
                         match lobby::decode_msg(&bytes) {
-                            Ok(lobby::LobbyMsg::JoinReply { recorded, detail }) => println!(
-                                "[node {label}] member {}: {}{detail}",
-                                hex_bytes(&peer.as_ref()[..4]),
-                                if recorded { "" } else { "join request refused — " },
-                            ),
+                            Ok(lobby::LobbyMsg::JoinReply { recorded, detail, cap }) => {
+                                println!(
+                                    "[node {label}] member {}: {}{detail}",
+                                    hex_bytes(&peer.as_ref()[..4]),
+                                    if recorded { "" } else { "join request refused — " },
+                                );
+                                // a delivered cap (private coordination): unpack
+                                // the opaque bytes and persist beside identity.
+                                if let Some(cap_bytes) = cap {
+                                    match config::unpack_coord_cap(&cap_bytes) {
+                                        Ok(cap) => match config::save_coord_cap(&cap_dir, &cap) {
+                                            Ok(()) => println!(
+                                                "[node {label}] coordinator cap delivered by \
+                                                 member {} — saved (issuer {}, expires {})",
+                                                hex_bytes(&peer.as_ref()[..4]),
+                                                hex_bytes(&cap.issuer.as_ref()[..4]),
+                                                cap.not_after,
+                                            ),
+                                            Err(e) => eprintln!(
+                                                "[node {label}] coordinator cap delivered but \
+                                                 could not be saved: {e}"
+                                            ),
+                                        },
+                                        Err(e) => eprintln!(
+                                            "[node {label}] member {} sent a malformed \
+                                             coordinator cap: {e}",
+                                            hex_bytes(&peer.as_ref()[..4]),
+                                        ),
+                                    }
+                                }
+                            }
                             Ok(_) | Err(_) => {}
                         }
                     }
@@ -4949,8 +5167,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // handle may exist. reads queue in the serve window
                             // until the fresh host lands.
                             serving = None;
-                            match sync_all_modules(&context, &client, &m, &forge_repo, attempt)
-                                .await
+                            match sync_all_modules(
+                                &context,
+                                &client,
+                                &m,
+                                &forge_repo,
+                                attempt,
+                                &identity_chain_id,
+                            )
+                            .await
                             {
                                 Ok(host) => {
                                     let root = host.app_hash();
@@ -5040,7 +5265,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // a promoted resident stops serving: drop the served host
                 // before the promotion sync reopens the same partitions.
                 serving = None;
-                match sync_all_modules(&context, &client, &m, &forge_repo, attempt).await {
+                match sync_all_modules(
+                    &context,
+                    &client,
+                    &m,
+                    &forge_repo,
+                    attempt,
+                    &identity_chain_id,
+                )
+                .await
+                {
                     Ok(host) => {
                         let latest = match fetch_manifest(&client).await {
                             Ok(latest) => latest,
@@ -5230,7 +5464,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     std::process::exit(1);
                 }
-                let host = genesis_host(&context, &forge_repo, &validators, blobs.clone()).await;
+                let host = genesis_host(
+                    &context,
+                    &forge_repo,
+                    &validators,
+                    blobs.clone(),
+                    &identity_chain_id,
+                )
+                .await;
                 let pos = recovery.oplog_pos().await;
                 let genesis_participants: Vec<Vec<u8>> =
                     validators.iter().map(|k| k.as_ref().to_vec()).collect();
@@ -5277,7 +5518,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     );
                     std::process::exit(1);
                 }
-                let restored = restore_host(&context, &forge_repo, &manifest, blobs.clone()).await;
+                let restored = restore_host(
+                    &context,
+                    &forge_repo,
+                    &manifest,
+                    blobs.clone(),
+                    &identity_chain_id,
+                )
+                .await;
                 let mut host = match restored {
                     Ok(h) => h,
                     Err(e) => {
@@ -5525,6 +5773,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         wireguard_effect,
                         advertised_reach,
                         coordinators,
+                        coord_cap.clone(),
                         reach_p2p_tx,
                         reach_p2p_rx,
                     ))
@@ -5719,6 +5968,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             &target,
                             &forge_repo,
                             10_000 + attempts,
+                            &identity_chain_id,
                         )
                         .await
                         {
@@ -7297,8 +7547,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
                 announce = lobby_ingress.next() => {
                     let Some((peer, bytes)) = announce else { continue };
-                    let mut send_reply = |recorded: bool, detail: String| {
-                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail };
+                    let mut send_reply = |recorded: bool, detail: String, cap: Option<Vec<u8>>| {
+                        let msg = lobby::LobbyMsg::JoinReply { recorded, detail, cap };
                         let _ = lobby_tx.send(
                             Recipients::One(peer.clone()),
                             IoBuf::from(lobby::encode_msg(&msg)),
@@ -7314,7 +7564,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let verified = match lobby::verify_join_request(&msg, &namespace) {
                         Ok(v) => v,
                         Err(e) => {
-                            send_reply(false, e);
+                            send_reply(false, e, None);
                             continue;
                         }
                     };
@@ -7326,13 +7576,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     let residents_now = read_valset_residents(node.host()).await;
                     let joiner_bytes = verified.joiner.as_ref().to_vec();
                     if members.contains(&joiner_bytes) {
-                        send_reply(false, "already a validator".into());
+                        send_reply(false, "already a validator".into(), None);
                         continue;
                     }
                     if residents_now.contains(&joiner_bytes) {
                         send_reply(
                             false,
                             "already a resident — a member promotes it into the quorum".into(),
+                            None,
                         );
                         continue;
                     }
@@ -7340,6 +7591,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         send_reply(
                             false,
                             "the inviting member is no longer part of this network".into(),
+                            None,
                         );
                         continue;
                     }
@@ -7362,9 +7614,35 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             hex_bytes(verified.joiner.as_ref())
                         );
                     }
+                    // MINT the coordinator capability for the joiner, additive
+                    // and side-effect-free (a pure ed25519 sign — no consensus,
+                    // no valset change). Gated: only a GENESIS validator on a
+                    // PRIVATE network issues one — its key is in the
+                    // coordinator's pinned genesis set, so the cap it signs
+                    // actually admits. A public network needs no cap; a
+                    // non-genesis member cannot mint one the coordinator trusts.
+                    // The cap cannot ride the invite (the joiner's key did not
+                    // exist at invite-mint time), so this JoinReply is its only
+                    // delivery channel. Rotation is DEFERRED — the cap is
+                    // long-lived (COORD_CAP_TTL_SECS).
+                    let minted_cap = if coordination == config::Coordination::Private
+                        && validators.contains(&signer.public_key())
+                    {
+                        let mut subj = [0u8; 32];
+                        subj.copy_from_slice(verified.joiner.as_ref());
+                        let cap = nat_traversal::mint_coord_cap(
+                            &signer,
+                            nat_traversal::NodeKey(subj),
+                            nat_traversal::now_secs() + nat_traversal::COORD_CAP_TTL_SECS,
+                        );
+                        Some(config::pack_coord_cap(&cap))
+                    } else {
+                        None
+                    };
                     send_reply(
                         true,
                         "join request recorded — awaiting member approval".into(),
+                        minted_cap,
                     );
                 }
                 relayed = relay_ingress.next() => {

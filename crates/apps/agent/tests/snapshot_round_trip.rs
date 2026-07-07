@@ -72,7 +72,6 @@ fn register(agent_id: &str, actions: &[&str]) -> AgentMsg {
         display_name: agent_id.to_uppercase(),
         capability: "model-1".into(),
         prompt_hash: vec![7u8; 32],
-        prompt_doc: None,
         allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
     }
 }
@@ -259,13 +258,12 @@ fn minimal_snapshot() -> Vec<u8> {
             display_name: "A".into(),
             capability: "m".into(),
             prompt_hash: vec![7u8; 32],
-            prompt_doc: None,
             allowed_actions: Vec::new(),
         },
     );
     commit(&mut m);
     let snap = m.snapshot();
-    assert_eq!(snap.len(), 111, "the minimal layout this test indexes into");
+    assert_eq!(snap.len(), 110, "the minimal layout this test indexes into");
     snap
 }
 
@@ -278,7 +276,7 @@ fn unknown_discriminants_and_tags_are_rejected() {
     // their known values — a state has ONE valid encoding.
     for (index, what) in [
         (17usize, "owner origin discriminant"),
-        (94, "agent status"),
+        (93, "agent status"),
     ] {
         let mut bad = snap.clone();
         bad[index] = 9;
@@ -313,7 +311,6 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
                 display_name: id.to_uppercase(),
                 capability: "m".into(),
                 prompt_hash: vec![7u8; 32],
-                prompt_doc: None,
                 allowed_actions: Vec::new(),
             },
         );
@@ -321,18 +318,18 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     commit(&mut m);
     let snap = m.snapshot();
     let good_root = m.root();
-    // agents section: count 8, then two 103-byte bodies.
-    assert_eq!(snap.len(), 8 + 103 * 2);
-    let body_a = snap[8..111].to_vec();
-    let body_b = snap[111..214].to_vec();
+    // agents section: count 8, then two 102-byte bodies.
+    assert_eq!(snap.len(), 8 + 102 * 2);
+    let body_a = snap[8..110].to_vec();
+    let body_b = snap[110..212].to_vec();
 
     for (first, second, what) in [
         (&body_b, &body_a, "descending ids"),
         (&body_a, &body_a, "duplicate ids"),
     ] {
         let mut bytes = snap.clone();
-        bytes[8..111].copy_from_slice(first);
-        bytes[111..214].copy_from_slice(second);
+        bytes[8..110].copy_from_slice(first);
+        bytes[110..212].copy_from_slice(second);
         let mut dst = module();
         let err = dst.install(&bytes, StateRoot::ZERO).unwrap_err();
         assert!(matches!(err, Error::Module(_)), "{what} must be rejected");

@@ -33,7 +33,21 @@ pub enum LobbyMsg {
     },
     /// a member's answer, purely informational for the parked node's logs:
     /// `recorded` means the request now awaits approval on that member.
-    JoinReply { recorded: bool, detail: String },
+    ///
+    /// `cap` carries an OPAQUE genesis-issued coordinator capability (packed
+    /// `CoordCap` bytes) minted for the joiner when this network coordinates
+    /// PRIVATELY and the answering member is a genesis validator — the joiner
+    /// cannot receive it on the invite (its key does not exist at invite-mint
+    /// time), so the lobby reply is its only delivery channel. lobby.rs stays
+    /// crypto-agnostic: it moves bytes and never depends on the cap types.
+    /// `#[serde(default)]` keeps the wire back-compatible — an older peer's
+    /// reply (no `cap` field) deserializes with `cap == None`.
+    JoinReply {
+        recorded: bool,
+        detail: String,
+        #[serde(default)]
+        cap: Option<Vec<u8>>,
+    },
 }
 
 pub fn encode_msg(m: &LobbyMsg) -> Vec<u8> {
@@ -182,7 +196,35 @@ mod tests {
         let msg = LobbyMsg::JoinReply {
             recorded: true,
             detail: "awaiting approval".into(),
+            cap: None,
         };
         assert_eq!(decode_msg(&encode_msg(&msg)).expect("roundtrip"), msg);
+    }
+
+    #[test]
+    fn a_reply_carrying_a_cap_roundtrips() {
+        // the cap is opaque bytes to lobby.rs — any blob roundtrips verbatim.
+        let msg = LobbyMsg::JoinReply {
+            recorded: true,
+            detail: "admitted; cap delivered".into(),
+            cap: Some(vec![1, 2, 3, 4, 5]),
+        };
+        assert_eq!(decode_msg(&encode_msg(&msg)).expect("roundtrip"), msg);
+    }
+
+    #[test]
+    fn a_reply_missing_the_cap_field_defaults_to_none() {
+        // an OLD peer (pre-cap wire) omits `cap` entirely; serde default fills
+        // it as None so the new joiner stays back-compatible.
+        let wire = br#"{"join_reply":{"recorded":true,"detail":"awaiting approval"}}"#;
+        let decoded = decode_msg(wire).expect("old-wire reply decodes");
+        assert_eq!(
+            decoded,
+            LobbyMsg::JoinReply {
+                recorded: true,
+                detail: "awaiting approval".into(),
+                cap: None,
+            }
+        );
     }
 }

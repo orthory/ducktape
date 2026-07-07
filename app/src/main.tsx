@@ -15,6 +15,7 @@ import "./console/theme/global.css";
 import { DucktapeConsole } from "./console/DucktapeConsole";
 import { HuddleWindow } from "./console/views/huddle/HuddleWindow";
 import { TrayPopover } from "./console/views/tray/TrayPopover";
+import { ErrorBoundary } from "./console/layout/ErrorBoundary";
 
 // Auxiliary windows pick their surface via `?view=`: the frameless menu-bar
 // popover (macOS, `view=tray`) and the popped-out huddle card (`view=huddle`).
@@ -32,6 +33,11 @@ if (import.meta.env.DEV) {
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    {view === "tray" ? <TrayPopover /> : view === "huddle" ? <HuddleWindow /> : <DucktapeConsole />}
+    {/* Outermost boundary: catches a throw in the provider/frame itself (above
+        WindowFrame's inner boundary) and funnels global unhandled errors /
+        rejections — so nothing ends in a blank white window or a silent drop. */}
+    <ErrorBoundary global>
+      {view === "tray" ? <TrayPopover /> : view === "huddle" ? <HuddleWindow /> : <DucktapeConsole />}
+    </ErrorBoundary>
   </React.StrictMode>,
 );

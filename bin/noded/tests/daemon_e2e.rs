@@ -11,11 +11,9 @@
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-
-use sha2::{Digest as _, Sha256};
 
 /// a running daemon, killed on drop so failures never leak an orphan (the
 /// REAL orphan lifecycle — outliving a client — is the desktop shell's
@@ -43,13 +41,6 @@ impl Daemon {
 
     fn spawn_with_echo_oracle(storage: &Path) -> Self {
         Self::spawn_inner(storage, true, &[])
-    }
-
-    /// spawn with extra process env — how a test puts REAL script-backed
-    /// providers (an operator spec dir plus detect overrides) on the daemon's
-    /// in-process dispatch worker.
-    fn spawn_with_env(storage: &Path, env: &[(String, String)]) -> Self {
-        Self::spawn_inner(storage, false, env)
     }
 
     fn spawn_inner(storage: &Path, echo_oracle: bool, env: &[(String, String)]) -> Self {
@@ -393,12 +384,12 @@ fn full_surface_blocks_authorship_and_ws() {
             "jobs",
             "agent",
             "runs",
-            "document",
             "pages",
             "forge",
             "files",
             "memory",
-            "profiles"
+            "profiles",
+            "identity"
         ]
     );
     let genesis_hash = status["appHash"].as_str().expect("appHash").to_string();
@@ -571,296 +562,6 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
         text.starts_with("echo: handling dispatch "),
         "the reply is the echo worker's dispatch-lane answer, normalized \
          into a paragraph by the runs module: {text}"
-    );
-}
-
-// ============================================================================
-// consensus-resident prompts, live: an agent registered with `prompt_doc`
-// composes every dispatch payload from a REAL document-module doc, verified
-// against the registered prompt_hash. the providers are script CLIs wired
-// through the full capability-host path (operator spec dir -> discovery ->
-// the daemon's in-process dispatch worker -> spawned CLI) that CAPTURE their
-// stdin — the verbatim payload the dispatch plane fed them — so the
-// composition rule (doc text leads, contract follows) is asserted on the
-// exact bytes a real provider receives, for the chat lane AND the job lane.
-// ============================================================================
-
-/// one script-backed provider staged into the shared operator spec dir: the
-/// script keeps its stdin as `payload_file` (the composition evidence), then
-/// answers `stdout`. the spec's `detect.env` names a per-tag variable, so the
-/// daemon provides this tag exactly when its process env points at the script.
-struct CaptureProvider {
-    env_var: String,
-    script: PathBuf,
-    payload_file: PathBuf,
-}
-
-impl CaptureProvider {
-    fn stage(root: &Path, spec_dir: &Path, tag: &str, stdout: &str) -> Self {
-        let payload_file = root.join(format!("{tag}.payload"));
-        let script = root.join(format!("{tag}.sh"));
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 # a test executor: keep the payload as evidence, then answer.\n\
-                 cat > {payload}\n\
-                 printf '%s\\n' '{stdout}'\n",
-                payload = payload_file.display(),
-            ),
-        )
-        .expect("write provider script");
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&script)
-            .expect("script metadata")
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).expect("chmod provider script");
-
-        let env_var = format!(
-            "DUCKTAPE_TEST_{}_BIN",
-            tag.replace(['-', '.'], "_").to_uppercase()
-        );
-        std::fs::write(
-            spec_dir.join(format!("{tag}.toml")),
-            format!(
-                "spec = 1\n\
-                 [capability]\n\
-                 tag = \"{tag}\"\n\
-                 description = \"prompt-doc e2e script executor\"\n\
-                 [detect]\n\
-                 bin = \"{tag}-nonexistent-cli\"\n\
-                 env = \"{env_var}\"\n\
-                 [invoke]\n\
-                 args = []\n\
-                 prompt = \"stdin\"\n\
-                 timeout_secs = 30\n\
-                 [output]\n\
-                 format = \"text\"\n"
-            ),
-        )
-        .expect("write provider spec");
-        Self {
-            env_var,
-            script,
-            payload_file,
-        }
-    }
-
-    /// the detect override that makes the daemon provide this tag.
-    fn env(&self) -> (String, String) {
-        (self.env_var.clone(), self.script.display().to_string())
-    }
-
-    /// the verbatim payload the dispatch worker piped into the script.
-    fn payload(&self) -> String {
-        std::fs::read_to_string(&self.payload_file).expect("provider captured a payload")
-    }
-}
-
-#[test]
-fn prompt_doc_composes_live_payloads_for_chat_and_job_runs() {
-    let storage = tempfile::TempDir::new().expect("storage dir");
-    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
-    let spec_dir = fixtures.path().join("specs");
-    std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-
-    // two providers, one per lane: the chat lane answers plain text (a normal
-    // chat reply); the job lane answers an actions-only response — job runs
-    // drop reply blocks, so a bare-text answer would fail-finalize the job.
-    let chat_provider = CaptureProvider::stage(
-        fixtures.path(),
-        &spec_dir,
-        "duck-chat-model",
-        "the doc led my payload",
-    );
-    let job_provider = CaptureProvider::stage(
-        fixtures.path(),
-        &spec_dir,
-        "duck-job-model",
-        r#"{"reply_blocks":[],"actions":[{"create_task":{"task_id":"t-from-job","title":"filed by the job run"}}]}"#,
-    );
-
-    // hermetic: hide any host claude/codex CLIs behind a missing path so this
-    // daemon provides exactly the two staged tags (the dispatch_e2e rule).
-    let missing = fixtures.path().join("missing-executor");
-    let daemon = Daemon::spawn_with_env(
-        storage.path(),
-        &[
-            (
-                "DUCKTAPE_CAPABILITY_DIR".into(),
-                spec_dir.display().to_string(),
-            ),
-            ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-            ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
-            chat_provider.env(),
-            job_provider.env(),
-        ],
-    );
-
-    // the consensus-resident prompt: a REAL document-module doc. two blocks of
-    // different kinds pin the canonical rendering (kind-agnostic block texts
-    // joined by blank lines) — prompt_hash is sha256 of exactly that string.
-    let heading = "You are DUCK-LIVE, a terse consensus-resident reviewer.";
-    let body = "Reply in one short sentence.";
-    let prompt_text = format!("{heading}\n\n{body}");
-    let prompt_hash = Sha256::digest(prompt_text.as_bytes()).to_vec();
-    let (code, block) = daemon.submit(
-        "document",
-        serde_json::json!({ "create_doc": { "doc_id": "prompts/duck" } }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "create doc failed: {block}");
-    let inserts = [
-        serde_json::json!({ "insert_block": {
-            "doc_id": "prompts/duck",
-            "after": null,
-            "block": { "id": "b1", "kind": "heading", "text": heading },
-        } }),
-        serde_json::json!({ "insert_block": {
-            "doc_id": "prompts/duck",
-            "after": "b1",
-            "block": { "id": "b2", "kind": "paragraph", "text": body },
-        } }),
-    ];
-    for op in inserts {
-        let (code, block) = daemon.submit("document", op, Some("owner"));
-        assert_eq!(code, 200, "insert block failed: {block}");
-    }
-
-    // ---- the chat lane ------------------------------------------------------
-
-    let (code, block) = daemon.submit(
-        "chat",
-        serde_json::json!({
-            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "create channel failed: {block}");
-    let (code, block) = daemon.submit(
-        "agent",
-        serde_json::json!({
-            "register_agent": {
-                "agent_id": "duck-live",
-                "display_name": "Duck Live",
-                "capability": "duck-chat-model",
-                "prompt_hash": prompt_hash.clone(),
-                "prompt_doc": "prompts/duck",
-                "allowed_actions": ["chat.post"],
-            }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "register chat agent failed: {block}");
-    let (code, block) = daemon.submit(
-        "runs",
-        serde_json::json!({ "watch_channel": { "channel_id": "general", "policy": "mention" } }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "watch channel failed: {block}");
-
-    // one msg = one committed block, and the submit reply lands only after the
-    // FULL drain — mention, provider execution, result, delivery — so the
-    // captured payload is complete the moment this returns.
-    let (code, block) = daemon.submit(
-        "chat",
-        post_mention("general", "m1", "duck-live"),
-        Some("eddy"),
-    );
-    assert_eq!(code, 200, "mention post failed: {block}");
-
-    // THE assertion: the payload the provider actually received leads with the
-    // doc's canonical text, with the strict-output contract right behind it.
-    let payload = chat_provider.payload();
-    assert!(
-        payload.starts_with(&format!("{prompt_text}\n\nReturn ONLY a JSON object")),
-        "the chat payload must lead with the prompt doc text: {payload}"
-    );
-    assert!(
-        payload.contains("can you handle this?"),
-        "the pinned transcript rides behind the prompt: {payload}"
-    );
-
-    // and the loop closed: the provider's stdout posted as the agent's reply.
-    let run_id = runs::run_id_for("general", 1, "duck-live");
-    let reply = daemon.query(
-        "chat",
-        serde_json::json!({ "messages_latest": { "channel_id": "general", "limit": 16 } }),
-    );
-    let messages = reply["messages"].as_array().expect("Messages reply");
-    let agent_reply = &messages.last().expect("mention plus reply")["head"];
-    assert_eq!(agent_reply["message_id"], format!("agent/{run_id}"));
-    assert_eq!(
-        agent_reply["blocks"][0]["paragraph"][0]["text"],
-        "the doc led my payload"
-    );
-
-    // ---- the job lane -------------------------------------------------------
-
-    let (code, block) = daemon.submit(
-        "agent",
-        serde_json::json!({
-            "register_agent": {
-                "agent_id": "duck-jobs",
-                "display_name": "Duck Jobs",
-                "capability": "duck-job-model",
-                "prompt_hash": prompt_hash,
-                "prompt_doc": "prompts/duck",
-                "allowed_actions": ["tasks.create"],
-            }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "register job agent failed: {block}");
-    let (code, block) = daemon.submit(
-        "runs",
-        serde_json::json!({ "enable_job_worker": { "enabled": true } }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "enable job worker failed: {block}");
-    let (code, block) = daemon.submit(
-        "jobs",
-        serde_json::json!({ "submit": {
-            "job_id": "job-1",
-            "kind": "agent/duck-jobs",
-            "spec": "summarize the duck ledger",
-        } }),
-        Some("eddy"),
-    );
-    assert_eq!(code, 200, "job submit failed: {block}");
-
-    // the same composition rule on the job lane: doc text first, contract
-    // next, then the job's coordinates and its full spec.
-    let payload = job_provider.payload();
-    assert!(
-        payload.starts_with(&format!("{prompt_text}\n\nReturn ONLY a JSON object")),
-        "the job payload must lead with the prompt doc text: {payload}"
-    );
-    assert!(
-        payload.contains("Job job-1"),
-        "the job coordinates ride the payload: {payload}"
-    );
-    assert!(
-        payload.contains("summarize the duck ledger"),
-        "the full job spec rides the payload: {payload}"
-    );
-
-    // the run finalized the job off the actions-only response...
-    let reply = daemon.query("jobs", serde_json::json!({ "get": { "job_id": "job-1" } }));
-    let job = &reply["job"];
-    assert_eq!(
-        job["status"], "done",
-        "the job run must finalize ok: {reply}"
-    );
-    assert_eq!(job["result"]["ok"], true, "the run succeeded: {reply}");
-
-    // ...and the response's action actually executed.
-    let reply = daemon.query("tasks", serde_json::json!("list"));
-    let tasks = reply["tasks"].as_array().expect("Tasks reply");
-    assert!(
-        tasks.iter().any(|t| t["id"] == "t-from-job"),
-        "the CreateTask action landed: {reply}"
     );
 }
 

@@ -97,13 +97,9 @@ pub struct AgentRecord {
     /// the capability registry tag this agent's runs are dispatched on.
     pub capability: String,
     /// sha256 of the agent's prompt content (exactly [`PROMPT_HASH_LEN`] bytes).
+    /// the content itself is content-addressed in the blob store under this
+    /// digest; consensus pins only the hash, and the host resolves the prompt.
     pub prompt_hash: Vec<u8>,
-    /// the document module doc holding the prompt CONTENT, when the prompt is
-    /// consensus-resident. the canonical rendering (block texts joined by
-    /// blank lines) must hash to `prompt_hash` — verified at dispatch time,
-    /// so a drifted document fails the run's staging, never the block.
-    /// `None` = no stored prompt; runs use generic instructions.
-    pub prompt_doc: Option<String>,
     /// granted action names, each from [`KNOWN_ACTIONS`], sorted and deduped.
     pub allowed_actions: Vec<String>,
     pub status: AgentStatus,
@@ -179,19 +175,16 @@ pub enum AgentMsg {
         display_name: String,
         capability: String,
         prompt_hash: Vec<u8>,
-        prompt_doc: Option<String>,
         allowed_actions: Vec<String>,
     },
-    /// owner-gated partial update; `None` fields keep their current value
-    /// (clearing `prompt_doc` means re-registering). a capability change also
-    /// notifies the hook target ([`AgentEvent::CapabilityChanged`]) in the
-    /// same block.
+    /// owner-gated partial update; `None` fields keep their current value. a
+    /// capability change also notifies the hook target
+    /// ([`AgentEvent::CapabilityChanged`]) in the same block.
     UpdateAgent {
         agent_id: String,
         display_name: Option<String>,
         capability: Option<String>,
         prompt_hash: Option<Vec<u8>>,
-        prompt_doc: Option<String>,
         allowed_actions: Option<Vec<String>>,
     },
     /// owner-gated: stop the agent from engaging new runs.

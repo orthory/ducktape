@@ -20,7 +20,6 @@ const MODULE_INFO: Record<string, { label: string; desc: string }> = {
   chat: { label: "Chat", desc: "Channels, messages, threads, and reactions." },
   tasks: { label: "Tasks", desc: "A shared, ordered task list." },
   forge: { label: "Forge", desc: "A git-backed repository (one commit per block)." },
-  document: { label: "Documents", desc: "Block-structured collaborative documents." },
   agent: { label: "Agents", desc: "The agent collaboration loop and run ledger." },
   governance: { label: "Governance", desc: "Validator-set proposals and quorum voting." },
   vaults: { label: "Vaults", desc: "Encrypted team secrets with an owner/reader ACL." },

@@ -1,7 +1,7 @@
 # Ducktape
 
-Ducktape는 합의 기반 업무용 슈퍼앱이다. 하나의 BFT 복제 상태 머신이
-document, forge, chat, agent workflow 같은 격리된 제품 모듈을 호스팅한다.
+Ducktape는 합의 기반 업무용 슈퍼앱이다. 하나의 BFT 복제 상태 머신이 pages,
+forge, chat, agent workflow 같은 격리된 제품 모듈을 호스팅한다.
 각 모듈은 자기 인증 상태 저장소를 소유하고, 호스트에는 32바이트 root만
 노출한다. 호스트는 그 module root들을 전역 app-hash로 합성한다.
 
@@ -18,11 +18,11 @@ follow-up op로 drain한다.
 - demo는 platform module과 product module을 함께 등록하고, 하나의 합성
   app-hash 아래에서 root가 움직이는 것을 보여준다.
 - QMDB-backed module, forge, snapshot-style module의 state sync가 존재한다.
-  capstone test는 joiner가 모든 module을 재구축해 source app-hash에 도달함을
-  증명한다.
-- 남은 일은 주로 live orchestration이다. network-backed sync path, dynamic
-  valset wiring, running node의 snapshot serving, 더 깊은 product module
-  구현이 필요하다.
+  node e2e suite는 joiner가 live state-sync wire로 모든 module을 재구축해
+  source app-hash에 도달함을 증명한다.
+- dynamic valset wiring, live admission, restart recovery, video huddle,
+  no-downtime upgrade module은 구현되어 있다. 남은 일은 주로 product depth,
+  demotion behavior, replay nonce, WireGuard runtime wiring이다.
 
 ## 다음에 읽을 문서
 

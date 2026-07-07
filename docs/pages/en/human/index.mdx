@@ -1,7 +1,7 @@
 # Ducktape
 
 Ducktape is a consensus-based workplace super-app: a single BFT-replicated state
-machine that hosts isolated product modules such as documents, forge, chat, and
+machine that hosts isolated product modules such as pages, forge, chat, and
 agent workflows. Each module owns its authenticated state substrate and exposes
 only a 32-byte root to the host. The host composes those module roots into the
 global app-hash that consensus commits.
@@ -20,11 +20,11 @@ ops.
 - The demo registers the platform modules and product modules together, then
   shows their roots moving under one composed app-hash.
 - State sync exists for QMDB-backed modules, forge, and snapshot-style modules;
-  the capstone test proves a joiner can rebuild every module and land on the
-  source app-hash.
-- The remaining work is mostly live orchestration: network-backed sync paths,
-  dynamic valset wiring, serving snapshots from a running node, and fuller
-  product modules.
+  the node e2e suite proves joiners can rebuild over the live state-sync wire and
+  land on the source app-hash.
+- Dynamic valset wiring, live admission, restart recovery, video huddles, and
+  the no-downtime upgrade module are implemented. The remaining work is mostly
+  product depth, demotion behavior, replay nonces, and WireGuard runtime wiring.
 
 ## Read Next
 

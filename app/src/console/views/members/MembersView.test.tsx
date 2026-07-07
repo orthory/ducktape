@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
+import { shortKey } from "../../../domain/names";
 import type { Workspace } from "../../../domain/workspace-client";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
@@ -248,6 +249,51 @@ describe("MembersView", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "All" }));
     expect(screen.getByText("Olive Resident")).toBeInTheDocument();
+  });
+
+  it("groups a multi-device user under one header with device-key rows, collapsing single-device users flat", () => {
+    const deviceAKey = "e".repeat(64);
+    const deviceBKey = "f".repeat(64);
+    const soloBoundKey = "9".repeat(64);
+    const unboundKey = "7".repeat(64);
+    renderMembers({
+      members: [deviceAKey, deviceBKey, soloBoundKey, unboundKey],
+      // Mirror the provider overlay: a bound node's authorNames entry IS the
+      // user's display name (identity overlays profiles at each bound key).
+      authorNames: {
+        [deviceAKey]: "Casey",
+        [deviceBKey]: "Casey",
+        [soloBoundKey]: "Solo Sam",
+      },
+      nodeUsers: {
+        [deviceAKey]: { userKey: "user-casey", name: "Casey" },
+        [deviceBKey]: { userKey: "user-casey", name: "Casey" },
+        [soloBoundKey]: { userKey: "user-sam", name: "Solo Sam" },
+      },
+    });
+
+    // Two-device user: exactly ONE "Casey" — the group header. The nested
+    // rows label by device key, so the name never doubles up.
+    expect(screen.getAllByText("Casey")).toHaveLength(1);
+    expect(screen.getByText("2 devices")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: `Open member ${shortKey(deviceAKey)}` }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: `Open member ${shortKey(deviceBKey)}` }),
+    ).toBeInTheDocument();
+
+    // Single-device user: flat row with the display name, NO group header.
+    expect(
+      screen.getByRole("button", { name: "Open member Solo Sam" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("Solo Sam")).toHaveLength(1);
+    expect(screen.queryByText("1 device")).not.toBeInTheDocument();
+
+    // The unbound key renders exactly as today — standalone, no group.
+    expect(
+      screen.getByRole("button", { name: `Open member ${shortKey(unboundKey)}` }),
+    ).toBeInTheDocument();
   });
 
   it("shows each node's announced capabilities as chips", () => {

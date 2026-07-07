@@ -170,17 +170,31 @@ function renderSpan(span: Span, names: AuthorNames, key: number): ReactNode {
     );
   }
   const linkMark = span.marks.find((m): m is { link: string } => typeof m === "object" && "link" in m);
+  const linkHref = linkMark && /^https?:\/\//i.test(linkMark.link) ? linkMark.link : null;
   const style: CSSProperties = {
     fontWeight: span.marks.includes("bold") ? 600 : 400,
     fontStyle: span.marks.includes("italic") ? "italic" : "normal",
-    color: linkMark ? accentVar : undefined,
-    textDecoration: linkMark ? "underline" : undefined,
+    color: linkHref ? accentVar : undefined,
+    textDecoration: linkHref ? "underline" : undefined,
     overflowWrap: "anywhere",
     wordBreak: "break-word",
   };
-  // No real Mark::Mention crosses the wire from `postMessage` yet (it only
-  // ever sends unmarked Paragraph spans) — fall back to sniffing @/# tokens
-  // in plain text so mentions/channel refs still read visually distinct.
+  if (linkHref) {
+    return (
+      <a
+        key={key}
+        href={linkHref}
+        target="_blank"
+        rel="noreferrer"
+        style={{ ...style, cursor: "pointer" }}
+      >
+        {span.text}
+      </a>
+    );
+  }
+  // No real Mark::Mention crosses the wire from the composer yet. Fall back to
+  // sniffing @/# tokens in plain text so mentions/channel refs still read
+  // visually distinct.
   const parts = span.text.split(/(\s+)/);
   return (
     <span key={key} style={style}>
@@ -228,6 +242,7 @@ function renderBlocks(blocks: ChatBlock[], names: AuthorNames): ReactNode {
             margin: "3px 0",
             color: color.muted3,
             fontStyle: "italic",
+            whiteSpace: "pre-wrap",
             overflowWrap: "anywhere",
             wordBreak: "break-word",
             maxWidth: "100%",

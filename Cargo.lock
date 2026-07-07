@@ -1403,8 +1403,13 @@ dependencies = [
 name = "coordinator-bin"
 version = "0.1.0"
 dependencies = [
+ "commonware-codec",
+ "commonware-cryptography",
  "nat-traversal",
+ "serde",
+ "tempfile",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -1861,13 +1866,13 @@ dependencies = [
  "commonware-storage",
  "directory",
  "dispatch",
- "document",
  "files",
  "forge",
  "futures",
  "git2",
  "greeter",
  "host",
+ "identity",
  "inbox",
  "jobs",
  "kv",
@@ -2049,27 +2054,6 @@ name = "doctest-file"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
-
-[[package]]
-name = "document"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "commonware-codec",
- "commonware-cryptography",
- "commonware-parallel",
- "commonware-runtime",
- "commonware-storage",
- "commonware-utils",
- "indexer",
- "sdk",
- "serde",
- "serde_json",
- "state",
- "statesync",
- "tempfile",
- "tokio",
-]
 
 [[package]]
 name = "dom_query"
@@ -3274,6 +3258,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "identity"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "commonware-codec",
+ "commonware-cryptography",
+ "futures",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+ "valset",
+]
+
+[[package]]
 name = "idna"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3898,6 +3897,7 @@ dependencies = [
 name = "nat-traversal"
 version = "0.1.0"
 dependencies = [
+ "commonware-codec",
  "commonware-cryptography",
  "thiserror 2.0.18",
  "tokio",
@@ -4053,17 +4053,18 @@ dependencies = [
  "directory",
  "dispatch",
  "dispatch-oracle",
- "document",
  "files",
  "forge",
  "futures",
  "governance",
  "host",
+ "identity",
  "inbox",
  "indexer",
  "jobs",
  "kv",
  "memory",
+ "nat-traversal",
  "node",
  "noded",
  "pages",
@@ -4104,7 +4105,6 @@ dependencies = [
  "commonware-runtime",
  "dispatch",
  "dispatch-oracle",
- "document",
  "files",
  "flate2",
  "forge",
@@ -4112,6 +4112,7 @@ dependencies = [
  "git2",
  "host",
  "http-body-util",
+ "identity",
  "inbox",
  "indexer",
  "jobs",
@@ -5441,7 +5442,6 @@ dependencies = [
  "chat",
  "commonware-runtime",
  "dispatch",
- "document",
  "futures",
  "host",
  "jobs",
@@ -5900,11 +5900,11 @@ dependencies = [
  "chat",
  "commonware-runtime",
  "dispatch",
- "document",
  "files",
  "forge",
  "futures",
  "host",
+ "identity",
  "inbox",
  "indexer",
  "jobs",

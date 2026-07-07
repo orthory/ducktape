@@ -54,6 +54,14 @@ export interface PhaseReport {
   detail: string | null;
 }
 
+/** A workspace's daemon.log path + tail — the real startup reason (bind
+ *  conflict, config error, panic) the node wrote but nothing in the UI read.
+ *  Powers the "Node failed to start" surface and its "Open daemon.log". */
+export interface LogTail {
+  path: string;
+  tail: string;
+}
+
 /** One pending join request a parked joiner delivered over the lobby channel.
  *  Snake_case: these rows pass through verbatim from the NODE's
  *  `join-requests` JSON (not the registry's camelCase structs). */
@@ -70,6 +78,21 @@ export interface JoinRequest {
 
 /** The registry is desktop-only; the web build never calls these. */
 export const isDesktop = (): boolean => isTauri();
+
+// ── User identity (Settings > Devices) ──────────────────
+
+/** This machine's user identity (`~/.ducktape/user.key`) — a sibling of the
+ *  workspace registry, not part of it: this key is shared across every
+ *  workspace rather than scoped to one. Rejects with the underlying node
+ *  verb's error string when the key file exists but is corrupt — that file is
+ *  never overwritten silently, so the error is the operator's only signal
+ *  (surfaced verbatim in Settings > Devices). */
+export interface UserIdentity {
+  pubkey: string;
+}
+
+export const userIdentityStatus = (): Promise<UserIdentity> =>
+  invoke<UserIdentity>("user_identity_status");
 
 // Live join/admit — joining a RUNNING network (post-genesis, network shape) and
 // admitting a joiner into it. The node's live-admission path landed in PR #77:
@@ -89,6 +112,11 @@ export const activeWorkspace = (): Promise<Workspace | null> =>
 
 export const workspacePhase = (id: string): Promise<PhaseReport> =>
   invoke<PhaseReport>("workspace_phase", { id });
+
+/** The daemon.log path + last 64 KB for a workspace — called when a managed
+ *  node fails to answer, to surface the real reason and back "Open daemon.log". */
+export const workspaceLogTail = (id: string): Promise<LogTail> =>
+  invoke<LogTail>("workspace_log_tail", { id });
 
 export const inviteBlob = (id: string): Promise<string> =>
   invoke<string>("workspace_invite_blob", { id });

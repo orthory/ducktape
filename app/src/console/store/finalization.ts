@@ -135,6 +135,29 @@ export const hasFreshPending = (ops: OpLedger, now: number): boolean =>
     (op) => op.phase === "pending" && now - op.startedAt < OP_STALE_MS,
   );
 
+/** Entity-key prefixes whose optimistic projections live in the pages slices
+ *  (`pages`, `activePageBlocks`). */
+const PAGE_KEY_PREFIXES = ["page/", "page-block/"] as const;
+
+/** Is a snapshot whose fetch began at `fetchStartedAt` already superseded by
+ *  page ops? True while any page-scoped op is in flight (a fresh pending —
+ *  the snapshot cannot reflect it) or began after the fetch started (it may
+ *  even have settled since, but this snapshot predates it). The holder never
+ *  starves: every such op ends in its own completion/rollback refresh, whose
+ *  later fetch clears both conditions. A stale pending (a presumed-lost
+ *  submit) stops superseding, mirroring hasFreshPending. */
+export const pageSnapshotSuperseded = (
+  ops: OpLedger,
+  fetchStartedAt: number,
+  now: number,
+): boolean =>
+  Object.entries(ops).some(([key, op]) => {
+    if (!PAGE_KEY_PREFIXES.some((prefix) => key.startsWith(prefix))) return false;
+    return op.phase === "pending"
+      ? now - op.startedAt < OP_STALE_MS
+      : op.startedAt >= fetchStartedAt;
+  });
+
 // ── Reading the ledger ──────────────────────────────────
 
 /** Pull the finalization facts out of whatever a client write resolved to.

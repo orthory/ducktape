@@ -16,8 +16,6 @@ use chat::Chat;
 use chat::{Block as ChatBlock, ChatMsg, PostPolicy, encode_msg as chat_encode_msg};
 use directory::Directory;
 use directory::{DirMsg, encode_msg as dir_encode_msg};
-use document::Document;
-use document::{Block, BlockKind, DocMsg, encode_msg as doc_encode_msg};
 use forge::Forge;
 use greeter::Greeter;
 use host::{FinalizedBlock, Host};
@@ -102,12 +100,10 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
     deterministic::Runner::default().start(|context| async move {
         // ---- SOURCE: the full module set behind one Host, real op path ------
         let kv = Kv::init(context.child("source_kv"), "kv").await;
-        let document = Document::init(context.child("source_document"), "document").await;
         let chat = Chat::init(context.child("source_chat"), "chat").await;
         let forge = Forge::init("forge", source_dir.clone()).expect("forge init");
         let mut host = Host::genesis(vec![
             Box::new(kv),
-            Box::new(document),
             Box::new(chat),
             Box::new(forge),
             Box::new(Directory::new("directory")),
@@ -131,24 +127,6 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 payload: kv_encode(&KvMsg::Set {
                     key: b"motd".to_vec(),
                     value: b"final".to_vec(),
-                }),
-            },
-            Msg {
-                target: "document".into(),
-                payload: doc_encode_msg(&DocMsg::CreateDoc {
-                    doc_id: "readme".into(),
-                }),
-            },
-            Msg {
-                target: "document".into(),
-                payload: doc_encode_msg(&DocMsg::InsertBlock {
-                    doc_id: "readme".into(),
-                    after: None,
-                    block: Block {
-                        id: "title".into(),
-                        kind: BlockKind::Heading,
-                        text: "ducktape".into(),
-                    },
                 }),
             },
             Msg {
@@ -251,12 +229,12 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             assert_eq!(manifest.app_hash, finalized.app_hash);
             assert_eq!(
                 manifest.entries.len(),
-                8,
+                7,
                 "every registered module is listed"
             );
             let boundary = manifest.boundary_id();
 
-            // --- resolver lane: kv, document, chat -----------------------------
+            // --- resolver lane: kv, chat ---------------------------------------
             let kv_entry = manifest.entry("kv").unwrap();
             let kv_root = kv_entry.root;
             let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "kv");
@@ -279,21 +257,6 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 join_kv.get(b"motd").await.as_deref(),
                 Some(b"final".as_ref())
             );
-
-            let doc_entry = manifest.entry("document").unwrap();
-            let doc_root = doc_entry.root;
-            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "document");
-            let target = pinned_target(doc_entry);
-            assert_eq!(StateRoot(target.root.0), doc_root);
-            let join_document = Document::sync_from(
-                joiner_ctx.child("joiner_document"),
-                "document-rebuilt",
-                target,
-                resolver,
-            )
-            .await
-            .expect("sync_from");
-            assert_eq!(join_document.root(), doc_root);
 
             let chat_entry = manifest.entry("chat").unwrap();
             let chat_root = chat_entry.root;
@@ -383,17 +346,12 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
                 id: "kv",
                 root: join_kv.root(),
             };
-            let doc_at = AtId {
-                id: "document",
-                root: join_document.root(),
-            };
             let chat_at = AtId {
                 id: "chat",
                 root: join_chat.root(),
             };
-            let mods: [&dyn Module; 8] = [
+            let mods: [&dyn Module; 7] = [
                 &kv_at,
-                &doc_at,
                 &chat_at,
                 &join_directory,
                 &join_valset,
