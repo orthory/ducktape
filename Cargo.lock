@@ -394,7 +394,6 @@ dependencies = [
  "futures",
  "host",
  "inbox",
- "memory",
  "sdk",
  "serde",
  "serde_json",
@@ -592,6 +591,13 @@ dependencies = [
  "constant_time_eq",
  "cpufeatures 0.3.0",
  "zeroize",
+]
+
+[[package]]
+name = "blobstore"
+version = "0.1.0"
+dependencies = [
+ "sha2",
 ]
 
 [[package]]
@@ -883,6 +889,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -2367,12 +2374,15 @@ name = "files"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "futures",
  "host",
  "sdk",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -2469,7 +2479,7 @@ name = "forge"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "files",
+ "blobstore",
  "futures",
  "git2",
  "sdk",
@@ -4103,6 +4113,7 @@ dependencies = [
  "automations",
  "base64 0.22.1",
  "bip39",
+ "blobstore",
  "capability",
  "capability-host",
  "chacha20poly1305",
@@ -4171,6 +4182,8 @@ dependencies = [
  "async-trait",
  "automations",
  "axum",
+ "base64 0.22.1",
+ "blobstore",
  "capability-host",
  "chat",
  "commonware-runtime",
@@ -6037,6 +6050,7 @@ dependencies = [
  "async-trait",
  "automations",
  "axum",
+ "blobstore",
  "chat",
  "commonware-runtime",
  "dispatch",
@@ -6192,6 +6206,7 @@ name = "statesync"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-p2p",
@@ -6200,6 +6215,7 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "data-plane",
+ "files",
  "futures",
  "host",
  "indexer",

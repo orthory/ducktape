@@ -223,11 +223,12 @@ pub fn digest_of(bytes: &[u8]) -> Digest {
 /// past the cap the OLDEST cached entry is evicted FIFO. own submissions are
 /// PINNED instead (never evicted) until finalization demotes them, so this
 /// node's proposals always resolve locally and always remain servable to a
-/// fetching peer while in flight. sizing: worst case cap × max payload
-/// (1 MiB on the node's mesh) bounds cache memory; ops are typically small
-/// json frames, so in practice this holds thousands of blocks of history for
-/// peers catching up. a peer that has fallen further behind than the cache
-/// window must rebuild through module state sync, not per-op fetch.
+/// fetching peer while in flight. sizing: worst case cap × max message
+/// (2 MiB on the node's mesh) bounds cache memory; honest frames are capped
+/// at ~1 MiB (`node::MAX_FRAME_BYTES`) and typically far smaller, so in
+/// practice this holds thousands of blocks of history for peers catching up.
+/// a peer that has fallen further behind than the cache window must rebuild
+/// through module state sync, not per-op fetch.
 pub const PAYLOAD_CACHE_CAP: usize = 16_384;
 
 /// digest->bytes map: resolves the opaque digests simplex finalizes back into

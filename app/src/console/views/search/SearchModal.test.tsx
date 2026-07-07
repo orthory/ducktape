@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ChatSearchHit } from "../../../domain/chat-client";
-import type { Manifest } from "../../../domain/files-client";
+import type { FileEntry } from "../../../domain/files-client";
 import type { PageSearchHit } from "../../../domain/pages-client";
 import { shortKey } from "../../../domain/names";
 import type { ConsoleActions } from "../../store/actions";
@@ -24,16 +24,13 @@ const makeActions = () => {
   return { actions, spies };
 };
 
-const fileOf = (name: string, id: string): Manifest => ({
-  file_id: id,
-  name,
-  mime: "text/plain",
+const fileOf = (name: string): FileEntry => ({
+  path: `/${name}`,
+  kind: "file",
   size: 1,
-  chunk_size: 1,
-  chunks: [],
-  digest: "",
-  owner: "",
-  created_at_height: 0,
+  exec: false,
+  object: "",
+  meta: {},
 });
 
 const renderModal = (patch: Partial<ConsoleState> = {}) => {
@@ -41,7 +38,7 @@ const renderModal = (patch: Partial<ConsoleState> = {}) => {
     ...createInitialState(),
     members: ["aa".repeat(32), "bb".repeat(32)],
     authorNames: { ["aa".repeat(32)]: "Alice", ["bb".repeat(32)]: "Bob" },
-    files: [fileOf("roadmap.md", "f1"), fileOf("budget.csv", "f2")],
+    files: [fileOf("roadmap.md"), fileOf("budget.csv")],
     searchOpen: true,
     ...patch,
   };

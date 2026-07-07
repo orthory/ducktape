@@ -142,20 +142,17 @@ mod tests {
     fn door_refuses_a_signature_tampered_frame_that_still_parses() {
         let author = sk(7);
         let me = author.public_key().as_ref().to_vec();
-        let frame = node::encode_frame(&author, 0, &msg());
+        let mut tampered = node::encode_frame(&author, 0, &msg());
 
-        // flip a byte INSIDE the signature: the frame still PARSES as json (the
-        // envelope is intact) but the ed25519 verification no longer binds, so
-        // this exercises the signature gate — not the json parser. (flipping the
-        // last raw byte, as a naive tamper would, only breaks the envelope.)
-        let mut v: serde_json::Value = serde_json::from_slice(&frame).expect("frame is json");
-        let sig = v["sig"].as_array_mut().expect("sig is a byte array");
-        let b = sig[0].as_u64().expect("sig byte");
-        sig[0] = serde_json::Value::from(b ^ 0x01);
-        let tampered = serde_json::to_vec(&v).expect("re-serialize");
+        // flip a bit INSIDE the trailing 64-byte ed25519 signature: the binary
+        // envelope (the length-prefixed origin/seq/target/payload preimage) is
+        // untouched, so the frame still PARSES — only the signature binding
+        // breaks. this exercises the signature gate, not the envelope parser.
+        let sig_start = tampered.len() - 64;
+        tampered[sig_start] ^= 0x01;
 
         // it fails at signature verification, NOT as a parse error: a genuine
-        // junk-json envelope errors with different wording.
+        // junk envelope errors with different wording.
         let junk = verify_relay_submit(b"not a frame", &[me.clone()]).unwrap_err();
         let err = verify_relay_submit(&tampered, &[me.clone()]).unwrap_err();
         assert_ne!(err, junk, "tamper must fail at the signature, not the parser");

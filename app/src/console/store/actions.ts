@@ -3,8 +3,6 @@ import type { Dispatch } from "react";
 import * as agentClient from "../../domain/agent-client";
 import * as chatClient from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
-import * as filesClient from "../../domain/files-client";
-import type { Manifest } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import * as identityClient from "../../domain/identity-client";
@@ -47,6 +45,7 @@ import {
   channelIdOf,
   clearRemoteUrl,
   removeTab,
+  saveAccent,
   saveDocTabs,
   saveRemoteUrl,
   saveViewMode,
@@ -72,6 +71,17 @@ const promptPath = (agentId: string): string => `/agents/prompts/${agentId}`;
  *  module, then return the PromptRef pinning exactly that content: the
  *  freshly-published `<path>@<generation>` plus sha256(text). The runs module
  *  resolves and pin-verifies the ref at every compose. */
+/** sha256(text) as 64-char lowercase hex — the PromptRef content pin. dev's
+ *  duckfs files-client rewrite dropped the shared `filesClient.digestHex`; the
+ *  prompt plane is its only remaining consumer, so it computes the pin locally
+ *  over Web Crypto (identical bytes to the former helper). */
+const promptSha256Hex = async (text: string): Promise<string> => {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+};
+
 const publishPromptRef = async (
   live: NodeTransport,
   path: string,
@@ -88,7 +98,7 @@ const publishPromptRef = async (
     "stat",
   );
   if (!stat) throw new Error(`prompt publish did not land at ${path}`);
-  const sha256Hex = await filesClient.digestHex(new TextEncoder().encode(text));
+  const sha256Hex = await promptSha256Hex(text);
   return agentClient.memoryPromptRef({
     path,
     generation: stat.latest_generation,
@@ -282,17 +292,24 @@ export interface ConsoleActions {
   openSearch(): void;
   closeSearch(): void;
 
-  // ── Files (content-addressed manifests over the `files` module) ──
-  /** Chunk + stage a file's bytes into the blob store, then commit its manifest. */
-  uploadFile(params: { name: string; mime: string; bytes: Uint8Array<ArrayBuffer> }): void;
-  /** Remove a manifest (owner-gated; rides the daemon identity that added it). */
-  removeFile(fileId: string): void;
-  /** Reassemble a file's bytes, verifying every chunk against the manifest.
-   *  Returns the manifest + bytes for the view to hand to a browser download,
-   *  or null when the file/node is unavailable. */
-  downloadFile(
-    fileId: string,
-  ): Promise<{ manifest: Manifest; bytes: Uint8Array<ArrayBuffer> } | null>;
+  // ── Chat tags (the chat index's derived #tag view) ──
+  /** Filter the active channel by a #tag (leading `#` optional — the display
+   *  form as clicked): runs the chat index's tagSearch and shows its hits
+   *  instead of the live message slice until cleared. Channel-scoped, so a
+   *  channel switch clears it. */
+  setTagFilter(tag: string): void;
+  /** Drop the tag filter and return to the live view. */
+  clearTagFilter(): void;
+  /** Load the active channel's tag catalog into `state.channelTags` for the
+   *  header's tag dropdown. Best-effort: a node without the index tier just
+   *  leaves the list empty. */
+  loadChannelTags(): void;
+
+  // ── Files (duckfs) ──
+  // The files browser drives duckfs reads/writes directly off the live
+  // transport (context.transport) via domain/files-client — no store action,
+  // like the forge browser. The per-block Find projection into `state.files`
+  // (DucktapeProvider) is all the store keeps, feeding the command palette.
 
   /** Ask the managed daemon to exit (desktop only). */
   stopNode(): void;
@@ -394,6 +411,10 @@ export function createActions({
   // current — so a slow or out-of-order response can never clobber a newer
   // query's results (or repopulate a cleared palette).
   let searchToken = 0;
+
+  // The tag filter's own token, same discipline: setTagFilter/clearTagFilter
+  // (and a channel switch) bump it so a stale tagSearch can't land.
+  let tagToken = 0;
 
   // The live call session (the browser audio graph + camera + ws), or null when
   // not in a huddle. Ephemeral and per-client — it lives here, not in state;
@@ -525,14 +546,20 @@ export function createActions({
       });
   };
 
-  // switching channels means: new active channel, thread panel closed, and
-  // THAT channel's messages loaded — every path into a channel goes here
+  // switching channels means: new active channel, thread panel closed, any
+  // channel-scoped tag filter/catalog dropped, and THAT channel's messages
+  // loaded — every path into a channel goes here
   const enterChannel = (channelId: string) => {
     const live = getNode();
     if (!live) return;
+    tagToken += 1; // supersede any in-flight tagSearch so it can't repopulate
     patch({
       activeChannel: channelId,
       activeThread: null,
+      tagFilter: null,
+      tagHits: [],
+      tagHitsPending: false,
+      channelTags: [],
     });
     Promise.resolve()
       .then(() => chatClient.latestMessages(live, channelId))
@@ -853,7 +880,10 @@ export function createActions({
       });
     },
 
-    setAccent: (accent) => patch({ accent }),
+    setAccent: (accent) => {
+      saveAccent(accent);
+      patch({ accent });
+    },
     setAuthor: (author) => patch({ author }),
 
     readMetrics: () => {
@@ -1556,46 +1586,45 @@ export function createActions({
 
     closeSearch: () => patch({ searchOpen: false }),
 
-    // ── Files ──
-    uploadFile: ({ name, mime, bytes }) => {
-      const cleanName = name.trim();
-      if (!cleanName) return;
-      const fileId = crypto.randomUUID();
-      submitTracked(opKey.file(fileId), (live) =>
-        filesClient.uploadFile(live, {
-          fileId,
-          name: cleanName,
-          mime: mime || "application/octet-stream",
-          bytes,
-        }),
-      );
-    },
-
-    removeFile: (fileId) => {
-      if (!fileId) return;
-      submitTracked(
-        opKey.file(fileId),
-        (live) => filesClient.removeManifest(live, fileId),
-        (prev) => optimistic.fileRemoved(prev, fileId),
-      );
-    },
-
-    downloadFile: (fileId) => {
+    // ── Chat tags (derived-index view) ──
+    setTagFilter: (tag) => {
       const live = getNode();
-      if (!live || !fileId) return Promise.resolve(null);
-      return Promise.resolve()
-        .then(() => filesClient.stat(live, fileId))
-        .then((manifest) =>
-          manifest
-            ? filesClient
-                .downloadFile(live, manifest)
-                .then((bytes) => ({ manifest, bytes }))
-            : null,
-        )
+      // keep the as-typed display form for the bar; the node normalizes.
+      const clean = tag.trim().replace(/^#+/, "");
+      const channelId = getState().activeChannel;
+      if (!live || !clean) return;
+      const token = ++tagToken;
+      patch({ tagFilter: { tag: clean, channelId }, tagHits: [], tagHitsPending: true });
+      chatClient
+        .tagSearch(live, { tag: clean, channelId: channelId ?? undefined, limit: 100 })
+        .then((hits) => {
+          if (token !== tagToken) return; // superseded by a newer filter/clear
+          patch({ tagHits: hits, tagHitsPending: false });
+        })
         .catch((err) => {
+          if (token !== tagToken) return;
+          patch({ tagHitsPending: false });
           fail(err);
-          return null;
         });
+    },
+
+    clearTagFilter: () => {
+      tagToken += 1; // supersede any in-flight tagSearch so it can't repopulate
+      patch({ tagFilter: null, tagHits: [], tagHitsPending: false });
+    },
+
+    loadChannelTags: () => {
+      const live = getNode();
+      const channelId = getState().activeChannel;
+      if (!live || !channelId) return;
+      chatClient
+        .tags(live, { channelId, limit: 20 })
+        .then((rows) => {
+          // only land on the channel the load was asked for.
+          if (getState().activeChannel === channelId) patch({ channelTags: rows });
+        })
+        // best-effort: an older node without the index tier 404s the view.
+        .catch(() => {});
     },
 
     stopNode: () => {

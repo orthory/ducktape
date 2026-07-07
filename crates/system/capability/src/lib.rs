@@ -13,8 +13,10 @@
 //! announced identity is the verified external submit origin, never payload
 //! data, so a node can only speak for itself. an empty set removes the node.
 //! when constructed with a valset id, announcements are additionally gated to
-//! current members (mirroring upgrade's `SignalReady`); without one (the
-//! single-node daemon has no valset) any external key may self-announce.
+//! current validators UNION residents (mirroring identity's `BindNode` gate):
+//! a joined-but-not-promoted node provides real executors too, and its
+//! announce is what lets dispatch route work to it. without a valset (the
+//! single-node daemon) any external key may self-announce.
 //!
 //! state model mirrors valset's host-lent staging seam: `execute` STAGES into
 //! a `pending` overlay (committed state untouched); `query` reads
@@ -92,18 +94,39 @@ impl CapabilityRegistry {
         Ok(set)
     }
 
-    /// the CURRENT member set from the valset module's staged-over-committed
-    /// projection — the same view upgrade gates `SignalReady` on.
-    async fn members(&self, ctx: &dyn Ctx, valset_id: &str) -> Result<Vec<Vec<u8>>, Error> {
-        let reply = ctx
-            .query(valset_id, &valset_encode_query(&ValsetQuery::Validators))
-            .await?;
-        match valset_decode_reply(&reply).map_err(Error::Module)? {
-            ValsetReply::Validators(v) => Ok(v),
-            other => Err(Error::Module(format!(
-                "valset answered a Validators query with {other:?}"
-            ))),
-        }
+    /// the CURRENT validator set UNION resident set, both queried live from
+    /// the valset module's staged-over-committed projection — exactly
+    /// identity's `BindNode` gate: an announce is admitted for either
+    /// standing, so a joined (not-yet-promoted) node can publish the
+    /// executors it really provides.
+    async fn members(&self, ctx: &dyn Ctx, valset_id: &str) -> Result<BTreeSet<Vec<u8>>, Error> {
+        let validators = match valset_decode_reply(
+            &ctx.query(valset_id, &valset_encode_query(&ValsetQuery::Validators))
+                .await?,
+        )
+        .map_err(Error::Module)?
+        {
+            ValsetReply::Validators(v) => v,
+            other => {
+                return Err(Error::Module(format!(
+                    "valset answered a Validators query with {other:?}"
+                )));
+            }
+        };
+        let residents = match valset_decode_reply(
+            &ctx.query(valset_id, &valset_encode_query(&ValsetQuery::Residents))
+                .await?,
+        )
+        .map_err(Error::Module)?
+        {
+            ValsetReply::Residents(o) => o,
+            other => {
+                return Err(Error::Module(format!(
+                    "valset answered a Residents query with {other:?}"
+                )));
+            }
+        };
+        Ok(validators.into_iter().chain(residents).collect())
     }
 
     /// the committed registry with this block's staged replacements applied —
@@ -304,11 +327,13 @@ impl Module for CapabilityRegistry {
             }
         };
         if let Some(valset_id) = self.valset_id.clone() {
-            // member-gated like upgrade's SignalReady: only current members
-            // populate the registry, so lookups resolve to known peers.
+            // member-gated like identity's BindNode: validators UNION
+            // residents populate the registry, so lookups resolve to known
+            // peers — including a joined node that has not been promoted yet.
             if !self.members(ctx, &valset_id).await?.contains(&node) {
                 return Err(Error::Module(
-                    "capability announcer is not a current validator-set member".into(),
+                    "capability announcer holds no current standing (validator or resident)"
+                        .into(),
                 ));
             }
         }
@@ -380,11 +405,13 @@ mod tests {
     use crate::{MAX_TAG_LEN, encode_msg, encode_query};
     use valset::encode_reply as valset_encode_reply;
 
-    /// a minimal Ctx: origin-configurable, and (optionally) answers the valset
-    /// membership query so the member gate is testable.
+    /// a minimal Ctx: origin-configurable, and (optionally) answers BOTH the
+    /// valset Validators and Residents queries so the member gate is testable
+    /// for either standing (mirrors identity's test stub).
     struct TestCtx {
         env: sdk::Env,
         members: Option<Vec<Vec<u8>>>,
+        residents: Option<Vec<Vec<u8>>>,
     }
     impl TestCtx {
         fn external(key: &[u8]) -> Self {
@@ -400,12 +427,20 @@ mod tests {
                     me: "capability".into(),
                 },
                 members: None,
+                residents: None,
             }
         }
-        fn with_members(key: &[u8], members: Vec<Vec<u8>>) -> Self {
+        fn gated(key: &[u8], validators: Vec<Vec<u8>>, residents: Vec<Vec<u8>>) -> Self {
             let mut ctx = Self::external(key);
-            ctx.members = Some(members);
+            ctx.members = Some(validators);
+            ctx.residents = Some(residents);
             ctx
+        }
+        fn with_members(key: &[u8], members: Vec<Vec<u8>>) -> Self {
+            Self::gated(key, members, Vec::new())
+        }
+        fn with_residents(key: &[u8], residents: Vec<Vec<u8>>) -> Self {
+            Self::gated(key, Vec::new(), residents)
         }
     }
     #[async_trait::async_trait(?Send)]
@@ -416,11 +451,18 @@ mod tests {
         fn module_root(&self, _t: &str) -> Option<StateRoot> {
             None
         }
-        async fn query(&self, t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
-            match (&self.members, t) {
-                (Some(m), "valset") => Ok(valset_encode_reply(&ValsetReply::Validators(
-                    m.clone(),
-                ))),
+        async fn query(&self, t: &str, r: &[u8]) -> Result<Vec<u8>, Error> {
+            if t != "valset" {
+                return Err(Error::QueryUnsupported);
+            }
+            let q = valset::decode_query(r).map_err(Error::Module)?;
+            match (q, &self.members, &self.residents) {
+                (ValsetQuery::Validators, Some(m), _) => {
+                    Ok(valset_encode_reply(&ValsetReply::Validators(m.clone())))
+                }
+                (ValsetQuery::Residents, _, Some(o)) => {
+                    Ok(valset_encode_reply(&ValsetReply::Residents(o.clone())))
+                }
                 _ => Err(Error::QueryUnsupported),
             }
         }
@@ -548,7 +590,7 @@ mod tests {
         let err =
             futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap_err();
         assert!(
-            matches!(err, Error::Module(ref m) if m.contains("not a current validator-set member")),
+            matches!(err, Error::Module(ref m) if m.contains("no current standing")),
             "got {err:?}"
         );
 
@@ -556,6 +598,42 @@ mod tests {
         futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap();
         futures::executor::block_on(c.commit_block()).unwrap();
         assert_eq!(providers(&c, "codex"), vec![member]);
+    }
+
+    #[test]
+    fn member_gate_admits_residents_and_still_rejects_outsiders() {
+        let validator = vec![20u8; 32];
+        let resident = vec![21u8; 32];
+        let outsider = vec![22u8; 32];
+        let mut c = CapabilityRegistry::new("capability", Some("valset".into()));
+
+        // a RESIDENT (joined, admitted, not promoted) announces: admitted —
+        // the whole point of the resident-announce path.
+        let mut ctx = TestCtx::gated(&resident, vec![validator.clone()], vec![resident.clone()]);
+        futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap();
+        futures::executor::block_on(c.commit_block()).unwrap();
+        assert_eq!(providers(&c, "codex"), vec![resident.clone()]);
+
+        // a key with NEITHER standing is still rejected, even alongside a
+        // populated resident set.
+        let mut ctx = TestCtx::gated(
+            &outsider,
+            vec![validator.clone()],
+            vec![resident.clone()],
+        );
+        let err =
+            futures::executor::block_on(c.execute(&mut ctx, &announce(&["claude"]))).unwrap_err();
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("no current standing")),
+            "got {err:?}"
+        );
+
+        // resident-only standing (no validator overlap) also admits — the
+        // gate is a true union, not an intersection.
+        let mut ctx = TestCtx::with_residents(&resident, vec![resident.clone()]);
+        futures::executor::block_on(c.execute(&mut ctx, &announce(&["claude"]))).unwrap();
+        futures::executor::block_on(c.commit_block()).unwrap();
+        assert_eq!(providers(&c, "claude"), vec![resident]);
     }
 
     #[test]

@@ -102,6 +102,96 @@ export interface BlockRecord {
   opHash?: string;
 }
 
+// ── duckfs (the `files` module's CoW filesystem) ────────
+//
+// Wire shapes for the daemon's `/v1/files/*` surface. duckfs replaced the old
+// CAS manifest plane with a path-addressed, snapshot-versioned filesystem, so
+// these are the exact json the noded `files_*` handlers emit/accept: snake_case
+// like the module wire, except the commit reply, which is the camelCase block
+// envelope (BlockEvent). files-client.ts re-exports these and layers the
+// operations + consensus caps on top — one home for the whole files plane.
+
+export type FileEntryKind = "file" | "dir" | "symlink";
+
+/** One directory entry / stat result — the module's `EntryInfo`. `object` is
+ *  the content object id (64-char hex); `meta` is a free-form string map. */
+export interface FileEntry {
+  path: string;
+  kind: FileEntryKind;
+  size: number;
+  exec: boolean;
+  object: string;
+  meta: Record<string, string>;
+}
+
+/** One commit in the bounded history window — the module's `SnapshotInfo`. */
+export interface FileSnapshot {
+  id: string;
+  parent: string | null;
+  root_tree: string;
+  author: string;
+  height: number;
+  consensus_time: number;
+  message: string;
+}
+
+/** The refs image — live head, named pins, and the history window length
+ *  (`RefsInfo`). `head` is null on an empty filesystem (no commits yet). */
+export interface FileRefs {
+  head: string | null;
+  pins: Record<string, string>;
+  window_len: number;
+}
+
+export type FileDiffKind = "added" | "removed" | "modified";
+
+export interface FileDiffEntry {
+  path: string;
+  kind: FileDiffKind;
+}
+
+/** A file's bytes in a commit: small files ride inline (b64, ≤256 KiB total
+ *  inline per commit); large files reference chunks staged via `filesStage`. */
+export type FileContent =
+  | { inline: { b64: string } }
+  | { chunks: { size: number; chunks: string[] } };
+
+/** One path mutation in a commit — the module's `Change` enum. */
+export type FileChange =
+  | {
+      put: {
+        path: string;
+        exec: boolean;
+        meta: Record<string, string>;
+        content: FileContent;
+      };
+    }
+  | { mkdir: { path: string } }
+  | { rm: { path: string } }
+  | { mv: { from: string; to: string } }
+  | { symlink: { path: string; target: string } };
+
+/** POST /v1/files/commit body — snake_case, the `FilesMsg::Commit` spec.
+ *  `base_snapshot` null means the empty tree (a first commit). */
+export interface FilesCommitBody {
+  base_snapshot: string | null;
+  message: string;
+  changes: FileChange[];
+}
+
+/** One page of a directory listing (or find): entries plus a `next` cursor to
+ *  echo as the following `after`, null once the listing is exhausted. */
+export interface FilePage {
+  entries: FileEntry[];
+  next: string | null;
+}
+
+/** A byte range read: base64 bytes plus whether the range reached end-of-file. */
+export interface FileReadRange {
+  b64: string;
+  eof: boolean;
+}
+
 export interface NodeTransport {
   /**
    * Submit one module msg — one block. Resolves once the block is committed.
@@ -132,11 +222,62 @@ export interface NodeTransport {
   /**
    * Read raw bytes back out of the node's content-addressed blob store by their
    * sha256 `digest` (64 lowercase hex) — the GET counterpart to `putBlob`. This
-   * is how the files module's chunks are fetched for reassembly; the caller MUST
-   * still `verifyChunk` the bytes against a committed manifest before trusting
-   * them. Rejects when the digest is absent (the node replies 404).
+   * is the node-local op-receipt store (a submit's `opHash` bytes); it is NOT
+   * the duckfs chunk plane (that rides `filesStage`/`filesRead`). Rejects when
+   * the digest is absent (the node replies 404).
    */
   getBlob(digest: string): Promise<Uint8Array<ArrayBuffer>>;
+
+  // ── duckfs (`files` module) ──
+  //
+  // The typed `/v1/files/*` surface. These wrap the daemon's dedicated files
+  // routes; refs + diff have no route yet and ride the generic `query` lane
+  // (see files-client). This is a DIFFERENT plane from putBlob/getBlob (the
+  // node-local op-receipt store): `filesStage` moves consensus state.
+
+  /**
+   * Stage raw chunk bytes as a duckfs op (POST /v1/files/stage): the chunk
+   * lands in the object store + the staging table (staging IS consensus state,
+   * so a stage moves the files root) and its object-id `digest` (64-char hex)
+   * comes back for a later `filesCommit` to reference. Body ≤ 1 MiB
+   * (`CHUNK_SIZE`). Bytes must be plain-ArrayBuffer backed for the fetch body.
+   */
+  filesStage(bytes: Uint8Array<ArrayBuffer>): Promise<{ digest: string }>;
+  /**
+   * Commit an atomic multi-path change set (POST /v1/files/commit). Resolves to
+   * the block that included it; a module rejection — notably a per-path CAS
+   * conflict (`files: conflict: <path> changed since base`) — throws a NodeError
+   * carrying that detail so the ui can surface it.
+   */
+  filesCommit(body: FilesCommitBody): Promise<BlockEvent>;
+  /**
+   * The entry at `path` (GET /v1/files/stat), or null when nothing is there
+   * (the node's 404). `snapshot` reads a historical tree; omitted reads head.
+   */
+  filesStat(params: { path: string; snapshot?: string }): Promise<FileEntry | null>;
+  /**
+   * One page of a directory's entries in name order (GET /v1/files/ls), with a
+   * `next` cursor to echo as the following `after`.
+   */
+  filesLs(params: {
+    path: string;
+    snapshot?: string;
+    after?: string;
+    limit?: number;
+  }): Promise<FilePage>;
+  /**
+   * A byte range of a file (GET /v1/files/read); `len` is clamped by the module
+   * to its 1 MiB read cap, and `eof` marks the range reaching end-of-file.
+   */
+  filesRead(params: {
+    path: string;
+    snapshot?: string;
+    offset?: number;
+    len?: number;
+  }): Promise<FileReadRange>;
+  /** The bounded commit history, newest-first (GET /v1/files/history). */
+  filesHistory(params?: { limit?: number }): Promise<FileSnapshot[]>;
+
   status(): Promise<NodeStatus>;
   /**
    * The node's Prometheus/OpenMetrics scrape (`GET /metrics`) as raw text —
@@ -245,6 +386,33 @@ const postJson = async <T>(url: string, body: unknown): Promise<T> => {
   } catch {
     throw new NodeError("badBody", `${url} returned an invalid or empty response`);
   }
+};
+
+/** GET → json with the SAME deadline + error envelope as postJson: a non-2xx
+ *  surfaces the node's `{error}` detail (so a `files: …` rejection reads
+ *  through), a 2xx with an unparseable body is a `badBody`. */
+const getJson = async <T>(url: string): Promise<T> => {
+  const res = await fetchDeadline(url);
+  if (!res.ok) {
+    throw new NodeError("httpError", (await errorDetail(res)) || `node replied ${res.status}`, res.status);
+  }
+  try {
+    return (await res.json()) as T;
+  } catch {
+    throw new NodeError("badBody", `${url} returned an invalid or empty response`);
+  }
+};
+
+/** Build a `?a=1&b=2` query string, dropping undefined values. `path` and other
+ *  present values are encoded verbatim — an empty string IS a value the caller
+ *  chose (never elided), so the root path `/` and a deliberate `""` both ride. */
+const queryString = (params: Record<string, string | number | undefined>): string => {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined) search.set(key, String(value));
+  }
+  const rendered = search.toString();
+  return rendered ? `?${rendered}` : "";
 };
 
 /** A node base url in its websocket form: trailing slash stripped, http→ws
@@ -356,6 +524,54 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
             .catch(() => "");
           throw new Error(detail || `node replied ${res.status}`);
         }),
+    // ── duckfs (`files` module) ──
+    // raw chunk bytes in, `{"digest":"<64-hex>"}` out — octet-stream, not json
+    // in, so it bypasses postJson; the error envelope is still the node's json
+    // `{error}` shape (413 on an oversized body, a module rejection otherwise).
+    filesStage: async (bytes) => {
+      const res = await fetchDeadline(`${base}/v1/files/stage`, {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream" },
+        body: bytes,
+      });
+      if (!res.ok) {
+        throw new NodeError(
+          "httpError",
+          (await errorDetail(res)) || `node replied ${res.status}`,
+          res.status,
+        );
+      }
+      try {
+        return (await res.json()) as { digest: string };
+      } catch {
+        throw new NodeError("badBody", "/v1/files/stage returned an invalid response");
+      }
+    },
+    filesCommit: (body) => postJson<BlockEvent>(`${base}/v1/files/commit`, body),
+    filesStat: async ({ path, snapshot }) => {
+      try {
+        return await getJson<FileEntry>(
+          `${base}/v1/files/stat${queryString({ path, snapshot })}`,
+        );
+      } catch (err) {
+        // the module answers a 404 for an absent path — the caller's "no entry"
+        // signal, mapped to null (the CAS-era stat's absent shape), not an error.
+        if (err instanceof NodeError && err.status === 404) return null;
+        throw err;
+      }
+    },
+    filesLs: ({ path, snapshot, after, limit }) =>
+      getJson<FilePage>(`${base}/v1/files/ls${queryString({ path, snapshot, after, limit })}`),
+    filesRead: ({ path, snapshot, offset, len }) =>
+      getJson<FileReadRange>(
+        `${base}/v1/files/read${queryString({ path, snapshot, offset, len })}`,
+      ),
+    filesHistory: async (params) => {
+      const body = await getJson<{ snapshots: FileSnapshot[] }>(
+        `${base}/v1/files/history${queryString({ limit: params?.limit })}`,
+      );
+      return body.snapshots;
+    },
     status: async () => {
       const res = await fetchDeadline(`${base}/v1/status`, undefined, STATUS_TIMEOUT_MS);
       if (!res.ok) throw new NodeError("httpError", `node replied ${res.status}`, res.status);

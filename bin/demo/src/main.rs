@@ -66,6 +66,10 @@ fn main() {
     // genesis starts from an unborn repo (root == ZERO) and output is reproducible.
     let forge_repo = std::env::temp_dir().join("ducktape-forge-demo");
     let _ = std::fs::remove_dir_all(&forge_repo);
+    // duckfs gets the same treatment: a wiped per-run data dir keeps output
+    // reproducible (the skeleton runs in-memory; tasks 5/6 use the dir).
+    let duckfs_dir = std::env::temp_dir().join("ducktape-duckfs-demo");
+    let _ = std::fs::remove_dir_all(&duckfs_dir);
 
     deterministic::Runner::default().start(|context| async move {
         // genesis: the module registry (would be consensus state on a real chain).
@@ -86,8 +90,7 @@ fn main() {
         // a fixed demo chain id (the demo has no real network descriptor).
         let identity = Identity::new("identity", None, "demo".into());
         let inbox = Inbox::new("inbox");
-        let files = Files::new("files");
-        let memory = Memory::new("memory", "files");
+        let files = Files::open("files", duckfs_dir.clone()).expect("duckfs open");
         let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
@@ -100,7 +103,14 @@ fn main() {
             "package",
             Some("jobs".into()),
         );
-        let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
+        // dev dropped automations' memory-watch trigger (files is now duckfs);
+        // automations no longer binds memory.
+        let automations = Automations::new("automations", "chat", "tasks", "inbox");
+        // memory: the quack epic's prompt plane — package seeds prompt bodies
+        // into memory paths; runs resolves generations via memory Stat. dev
+        // removed memory's product UI (notes moved to duckfs); this is pure
+        // prompt plumbing, no app surface.
+        let memory = Memory::new("memory", "files");
         // the quack package registry: builtin task actions seeded as routes;
         // prompt seeds publish into "memory".
         let package = PackageModule::new(
@@ -126,16 +136,16 @@ fn main() {
             Box::new(identity),
             Box::new(inbox),
             Box::new(files),
-            Box::new(memory),
             Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
             Box::new(automations),
+            Box::new(memory),
             Box::new(package),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 19 registered modules over one host ===");
+        println!("=== super-app demo — 20 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(

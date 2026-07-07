@@ -6,11 +6,13 @@
 
 use std::collections::BTreeMap;
 
-use files::Files;
+// dev rewrote files into duckfs: entries are path-addressed and `Stat` returns
+// an `EntryInfo` carrying the content digest (`object`) + size. these tests fake
+// only the committed-entry surface memory's pin-at-publish probe reads (see the
+// `FakeFiles` stand-in below); duckfs's real stage/commit blob lane can't run in
+// a host-only test.
 use files::{
-    FilesMsg, FilesQuery, FilesReply, Manifest, decode_reply as files_decode_reply,
-    digest_hex as file_digest_hex, encode_msg as files_encode_msg,
-    encode_query as files_encode_query, encode_reply as files_encode_reply,
+    EntryInfo, EntryKindWire, FilesQuery, FilesReply, encode_reply as files_encode_reply,
 };
 use futures::executor::block_on;
 use host::{BlockContext, Host};
@@ -30,7 +32,8 @@ struct TestCtx {
     env: sdk::Env,
     /// module ids `module_root` reports as registered (watch targets).
     known_modules: Vec<String>,
-    file_manifests: BTreeMap<String, Manifest>,
+    /// committed duckfs entries by path — what the `Stat` probe reads.
+    file_entries: BTreeMap<String, EntryInfo>,
     /// follow-up msgs emitted during execute, in order.
     emitted: Vec<Msg>,
 }
@@ -46,7 +49,7 @@ impl TestCtx {
                 me: MEMORY.into(),
             },
             known_modules: Vec::new(),
-            file_manifests: BTreeMap::new(),
+            file_entries: BTreeMap::new(),
             emitted: Vec::new(),
         }
     }
@@ -60,9 +63,8 @@ impl TestCtx {
         self
     }
 
-    fn with_file_manifest(mut self, manifest: Manifest) -> Self {
-        self.file_manifests
-            .insert(manifest.file_id.clone(), manifest);
+    fn with_file_entry(mut self, entry: EntryInfo) -> Self {
+        self.file_entries.insert(entry.path.clone(), entry);
         self
     }
 }
@@ -85,10 +87,10 @@ impl Ctx for TestCtx {
             return Err(Error::QueryUnsupported);
         }
         let reply = match files::decode_query(req).map_err(Error::Module)? {
-            FilesQuery::Stat { file_id } => {
-                FilesReply::Stat(self.file_manifests.get(&file_id).cloned())
+            FilesQuery::Stat { path, .. } => {
+                FilesReply::Stat(self.file_entries.get(&path).cloned())
             }
-            FilesQuery::List { .. } => FilesReply::List(Vec::new()),
+            _ => return Err(Error::QueryUnsupported),
         };
         Ok(files_encode_reply(&reply))
     }
@@ -98,6 +100,110 @@ impl Ctx for TestCtx {
     }
     fn emit_event(&mut self, _ev: Event) {}
     fn request_effect(&mut self, _eff: sdk::Effect) {}
+}
+
+/// a minimal stand-in for the (duckfs) files module, registered alongside memory
+/// in the through-the-host integration tests. duckfs stages bytes over a blob
+/// lane no host-only test can exercise, so this models only the committed-entry
+/// surface memory's pin-at-publish probe reads: it answers `FilesQuery::Stat`
+/// from a path -> `EntryInfo` map and takes two test-only ops (set/remove) so
+/// the tests drive it through the host exactly as they drove the old files
+/// module. its `root()` is constant — the tests assert memory's root and the
+/// app-hash for memory, never the files module's.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum FakeFilesOp {
+    Set {
+        path: String,
+        object: String,
+        size: u64,
+    },
+    Remove {
+        path: String,
+    },
+}
+
+#[derive(Clone, Default)]
+struct FakeFilesState {
+    entries: BTreeMap<String, EntryInfo>,
+}
+
+struct FakeFiles {
+    id: ModuleId,
+    committed: FakeFilesState,
+    pending: Option<FakeFilesState>,
+}
+
+impl FakeFiles {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.into(),
+            committed: FakeFilesState::default(),
+            pending: None,
+        }
+    }
+
+    fn stage(&mut self) -> &mut FakeFilesState {
+        if self.pending.is_none() {
+            self.pending = Some(self.committed.clone());
+        }
+        self.pending.as_mut().unwrap()
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for FakeFiles {
+    fn id(&self) -> ModuleId {
+        self.id.clone()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        let op: FakeFilesOp =
+            serde_json::from_slice(&msg.payload).map_err(|e| Error::Module(e.to_string()))?;
+        match op {
+            FakeFilesOp::Set { path, object, size } => {
+                self.stage().entries.insert(
+                    path.clone(),
+                    EntryInfo {
+                        path,
+                        kind: EntryKindWire::File,
+                        size,
+                        exec: false,
+                        object,
+                        meta: BTreeMap::new(),
+                    },
+                );
+            }
+            FakeFilesOp::Remove { path } => {
+                self.stage().entries.remove(&path);
+            }
+        }
+        Ok(())
+    }
+
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        match files::decode_query(req).map_err(Error::Module)? {
+            FilesQuery::Stat { path, .. } => Ok(files_encode_reply(&FilesReply::Stat(
+                self.committed.entries.get(&path).cloned(),
+            ))),
+            _ => Err(Error::QueryUnsupported),
+        }
+    }
+
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        if let Some(pending) = self.pending.take() {
+            self.committed = pending;
+        }
+        Ok(())
+    }
+
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.pending = None;
+        Ok(())
+    }
 }
 
 fn module_msg(payload: MemoryMsg) -> Msg {
@@ -154,33 +260,29 @@ fn file_body(record: &Generation) -> (&str, &str, u64) {
     }
 }
 
-fn file_manifest(file_id: &str, size: u64) -> Manifest {
-    let chunk_digest = file_digest_hex(&vec![b'x'; size as usize]);
-    let mut raw = Vec::new();
-    raw.extend_from_slice(&hex32(&chunk_digest));
-    Manifest {
-        file_id: file_id.into(),
-        name: format!("{file_id}.bin"),
-        mime: "application/octet-stream".into(),
-        size,
-        chunk_size: size,
-        chunks: vec![chunk_digest],
-        digest: file_digest_hex(&raw),
-        owner: "system".into(),
-        created_at_height: 1,
-    }
-}
-
-fn hex32(s: &str) -> [u8; 32] {
-    let bytes = s.as_bytes();
-    assert_eq!(bytes.len(), 64, "digest fixture length");
-    let mut out = [0u8; 32];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let hi = (bytes[2 * i] as char).to_digit(16).unwrap() as u8;
-        let lo = (bytes[2 * i + 1] as char).to_digit(16).unwrap() as u8;
-        *slot = (hi << 4) | lo;
+/// a deterministic 64-char lowercase-hex digest for a seed. memory's
+/// `validate_digest_hex` checks the shape only, not that it hashes real bytes.
+fn fake_digest(seed: &str) -> String {
+    let mut out = String::with_capacity(64);
+    let bytes = seed.as_bytes();
+    for i in 0..32 {
+        let b = bytes.get(i % bytes.len().max(1)).copied().unwrap_or(0) ^ (i as u8);
+        out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+/// a committed duckfs file entry fixture at `path` with the given size — the
+/// surface memory's pin-at-publish probe reads (`object` is the content digest).
+fn file_entry(path: &str, size: u64) -> EntryInfo {
+    EntryInfo {
+        path: path.into(),
+        kind: EntryKindWire::File,
+        size,
+        exec: false,
+        object: fake_digest(path),
+        meta: BTreeMap::new(),
+    }
 }
 
 async fn query(module: &Memory, req: MemoryQuery) -> MemoryReply {
@@ -256,22 +358,25 @@ async fn find(
     }
 }
 
-fn files_module_msg(payload: FilesMsg) -> Msg {
+/// stage a committed duckfs entry at `path` (size `size`) into the `FakeFiles`
+/// stand-in — the modern replacement for the old files `AddManifest` op.
+fn fake_files_set(path: &str, size: u64) -> Msg {
     Msg {
         target: FILES.into(),
-        payload: files_encode_msg(&payload),
+        payload: serde_json::to_vec(&FakeFilesOp::Set {
+            path: path.into(),
+            object: fake_digest(path),
+            size,
+        })
+        .unwrap(),
     }
 }
 
-fn add_manifest(file_id: &str, bytes: &[u8]) -> FilesMsg {
-    assert!(bytes.len() >= 4096, "files module chunk_size minimum");
-    FilesMsg::AddManifest {
-        file_id: file_id.into(),
-        name: format!("{file_id}.bin"),
-        mime: "application/octet-stream".into(),
-        size: bytes.len() as u64,
-        chunk_size: bytes.len() as u64,
-        chunks: vec![file_digest_hex(bytes)],
+/// remove a committed duckfs entry at `path` from the `FakeFiles` stand-in.
+fn fake_files_remove(path: &str) -> Msg {
+    Msg {
+        target: FILES.into(),
+        payload: serde_json::to_vec(&FakeFilesOp::Remove { path: path.into() }).unwrap(),
     }
 }
 
@@ -284,18 +389,19 @@ fn block_ctx(height: u64) -> BlockContext {
     }
 }
 
-async fn host_files_stat(host: &Host, file_id: &str) -> Option<Manifest> {
+async fn host_files_stat(host: &Host, path: &str) -> Option<EntryInfo> {
     let bytes = host
         .query(
             FILES,
-            &files_encode_query(&FilesQuery::Stat {
-                file_id: file_id.into(),
+            &files::encode_query(&FilesQuery::Stat {
+                path: path.into(),
+                snapshot: None,
             }),
         )
         .await
         .expect("files stat");
-    match files_decode_reply(&bytes).expect("files reply") {
-        FilesReply::Stat(manifest) => manifest,
+    match files::decode_reply(&bytes).expect("files reply") {
+        FilesReply::Stat(entry) => entry,
         other => panic!("unexpected files reply: {other:?}"),
     }
 }
@@ -1029,20 +1135,16 @@ fn snapshot_pins_survive_delete_and_drop_releases_retention() {
 fn file_publish_pins_manifest_digest_and_survives_manifest_removal() {
     block_on(async {
         let mut host = Host::genesis(vec![
-            Box::new(Files::new(FILES)),
+            Box::new(FakeFiles::new(FILES)),
             Box::new(Memory::new(MEMORY, FILES)),
         ])
         .expect("genesis");
         let file_id = "large/body";
-        let bytes = vec![0x42; 4096];
 
-        host.submit_at(
-            block_ctx(1),
-            files_module_msg(add_manifest(file_id, &bytes)),
-        )
-        .await
-        .expect("add manifest");
-        let manifest = host_files_stat(&host, file_id).await.expect("manifest");
+        host.submit_at(block_ctx(1), fake_files_set(file_id, 4096))
+            .await
+            .expect("set files entry");
+        let entry = host_files_stat(&host, file_id).await.expect("entry");
 
         host.submit_at(block_ctx(2), module_msg(publish_file("/large", file_id)))
             .await
@@ -1053,29 +1155,20 @@ fn file_publish_pins_manifest_digest_and_survives_manifest_removal() {
             .expect("record");
         assert_eq!(
             file_body(&record),
-            (
-                manifest.file_id.as_str(),
-                manifest.digest.as_str(),
-                manifest.size
-            ),
-            "memory stores the manifest digest/size at publish time"
+            (entry.path.as_str(), entry.object.as_str(), entry.size),
+            "memory stores the files entry digest/size at publish time"
         );
         assert_eq!(
             host_stat(&host, "/large").await.unwrap().body_len,
-            manifest.size
+            entry.size
         );
 
-        host.submit_at(
-            block_ctx(3),
-            files_module_msg(FilesMsg::RemoveManifest {
-                file_id: file_id.into(),
-            }),
-        )
-        .await
-        .expect("remove manifest");
+        host.submit_at(block_ctx(3), fake_files_remove(file_id))
+            .await
+            .expect("remove files entry");
         assert!(
             host_files_stat(&host, file_id).await.is_none(),
-            "the files manifest is gone"
+            "the files entry is gone"
         );
 
         let pinned = host_read(&host, "/large", None, None)
@@ -1083,12 +1176,8 @@ fn file_publish_pins_manifest_digest_and_survives_manifest_removal() {
             .expect("pinned generation");
         assert_eq!(
             file_body(&pinned),
-            (
-                manifest.file_id.as_str(),
-                manifest.digest.as_str(),
-                manifest.size
-            ),
-            "manifest removal must not rewrite or invalidate the generation"
+            (entry.path.as_str(), entry.object.as_str(), entry.size),
+            "files entry removal must not rewrite or invalidate the generation"
         );
     });
 }
@@ -1097,7 +1186,7 @@ fn file_publish_pins_manifest_digest_and_survives_manifest_removal() {
 fn file_publish_rejects_missing_manifest_before_staging() {
     block_on(async {
         let mut host = Host::genesis(vec![
-            Box::new(Files::new(FILES)),
+            Box::new(FakeFiles::new(FILES)),
             Box::new(Memory::new(MEMORY, FILES)),
         ])
         .expect("genesis");
@@ -1105,7 +1194,7 @@ fn file_publish_rejects_missing_manifest_before_staging() {
 
         host.submit_at(block_ctx(1), module_msg(publish_file("/missing", "ghost")))
             .await
-            .expect_err("missing manifest rejects the publish");
+            .expect_err("missing files entry rejects the publish");
 
         assert_eq!(
             host.module_root(MEMORY).expect("memory root"),
@@ -1120,20 +1209,16 @@ fn file_publish_rejects_missing_manifest_before_staging() {
 fn grep_skips_file_bodies_and_stats_use_their_sizes() {
     block_on(async {
         let mut host = Host::genesis(vec![
-            Box::new(Files::new(FILES)),
+            Box::new(FakeFiles::new(FILES)),
             Box::new(Memory::new(MEMORY, FILES)),
         ])
         .expect("genesis");
         let file_id = "notes/blob";
-        let bytes = vec![0x77; 8192];
 
-        host.submit_at(
-            block_ctx(1),
-            files_module_msg(add_manifest(file_id, &bytes)),
-        )
-        .await
-        .expect("add manifest");
-        let manifest = host_files_stat(&host, file_id).await.expect("manifest");
+        host.submit_at(block_ctx(1), fake_files_set(file_id, 8192))
+            .await
+            .expect("set files entry");
+        let entry = host_files_stat(&host, file_id).await.expect("entry");
         host.submit_at(
             block_ctx(2),
             module_msg(publish_file("/notes/blob", file_id)),
@@ -1158,7 +1243,7 @@ fn grep_skips_file_bodies_and_stats_use_their_sizes() {
         );
         assert_eq!(
             host_stat(&host, "/notes/blob").await.unwrap().body_len,
-            manifest.size
+            entry.size
         );
         assert_eq!(
             host_stat(&host, "/notes/inline").await.unwrap().body_len,
@@ -1186,7 +1271,7 @@ fn grep_skips_file_bodies_and_stats_use_their_sizes() {
         assert_eq!(
             lengths,
             vec![
-                ("/notes/blob", manifest.size),
+                ("/notes/blob", entry.size),
                 ("/notes/inline", "needle is inline".len() as u64),
             ]
         );
@@ -1196,13 +1281,13 @@ fn grep_skips_file_bodies_and_stats_use_their_sizes() {
 #[test]
 fn snapshot_pin_retains_file_body_generation_after_delete() {
     block_on(async {
-        let manifest = file_manifest("snapshot/blob", 8192);
+        let entry = file_entry("snapshot/blob", 8192);
         let mut module = Memory::new(MEMORY, FILES);
 
         module
             .execute(
-                &mut TestCtx::at(1).with_file_manifest(manifest.clone()),
-                &module_msg(publish_file("/blob", &manifest.file_id)),
+                &mut TestCtx::at(1).with_file_entry(entry.clone()),
+                &module_msg(publish_file("/blob", &entry.path)),
             )
             .await
             .expect("publish file body");
@@ -1231,11 +1316,7 @@ fn snapshot_pin_retains_file_body_generation_after_delete() {
             .expect("snapshot pin");
         assert_eq!(
             file_body(&pinned),
-            (
-                manifest.file_id.as_str(),
-                manifest.digest.as_str(),
-                manifest.size
-            )
+            (entry.path.as_str(), entry.object.as_str(), entry.size)
         );
     });
 }
@@ -1733,7 +1814,7 @@ fn query_with_serves_staged_over_committed_while_the_bare_query_primitive_stays_
 fn snapshot_install_round_trips_and_rejects_tampering() {
     block_on(async {
         let mut source = Memory::new(MEMORY, FILES);
-        let manifest = file_manifest("snap/blob", 8192);
+        let entry = file_entry("snap/blob", 8192);
         // a state exercising every encoded section: files with several
         // generations, a file-backed body, a snapshot that RETAINS a deleted
         // file's generation, and registered watches.
@@ -1743,8 +1824,8 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
             .unwrap();
         source
             .execute(
-                &mut TestCtx::at(1).with_file_manifest(manifest.clone()),
-                &module_msg(publish_file("/blob", &manifest.file_id)),
+                &mut TestCtx::at(1).with_file_entry(entry.clone()),
+                &module_msg(publish_file("/blob", &entry.path)),
             )
             .await
             .unwrap();
@@ -1814,11 +1895,7 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
         );
         assert_eq!(
             file_body(&read(&target, "/blob", None, None).await.unwrap()),
-            (
-                manifest.file_id.as_str(),
-                manifest.digest.as_str(),
-                manifest.size
-            ),
+            (entry.path.as_str(), entry.object.as_str(), entry.size),
             "the file-backed generation transferred verbatim"
         );
         assert_eq!(

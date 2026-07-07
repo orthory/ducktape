@@ -230,6 +230,12 @@ pub enum SagaQuery {
     /// a host-side crank pump polls: when the committed next expiry is at or
     /// past the current view, submitting a `Crank` will transition something.
     NextExpiry,
+    /// every PENDING saga whose current attempt is leased to `assignee`,
+    /// projected as the [`WorkerRequest`]s the effect lane would have carried
+    /// — the state-driven read a node that does NOT execute blocks (a synced
+    /// RESIDENT) polls to discover its own assigned work. sorted by saga id;
+    /// terminal sagas and other nodes' leases are excluded.
+    AssignedPending { assignee: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -237,6 +243,7 @@ pub enum SagaQuery {
 pub enum SagaReply {
     Saga(Option<SagaView>),
     NextExpiry(Option<u64>),
+    AssignedPending(Vec<WorkerRequest>),
 }
 
 /// a saga's observable state — the full read projection.

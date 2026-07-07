@@ -28,8 +28,7 @@ const MODULE_INFO: Record<string, { label: string; desc: string }> = {
   inbox: { label: "Inbox", desc: "Per-member notification queues." },
   automations: { label: "Automations", desc: "Event-triggered rules over module events." },
   jobs: { label: "Jobs", desc: "A consensus-native job / claim board." },
-  memory: { label: "Memory", desc: "A shared, filesystem-shaped agent workspace." },
-  files: { label: "Files", desc: "Content-addressed file manifests + chunk sync." },
+  files: { label: "Files", desc: "A copy-on-write, content-addressed filesystem (duckfs)." },
   saga: { label: "Saga", desc: "The deterministic async-RPC ledger behind agents." },
   package: {
     label: "Packages",

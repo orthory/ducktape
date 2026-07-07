@@ -47,6 +47,12 @@ const stubTransport = (
   status: vi.fn(),
   metrics: vi.fn(),
   blocks: vi.fn(),
+  filesStage: vi.fn(),
+  filesCommit: vi.fn(),
+  filesStat: vi.fn(),
+  filesLs: vi.fn(),
+  filesRead: vi.fn(),
+  filesHistory: vi.fn(),
   onBlock: vi.fn(),
 });
 

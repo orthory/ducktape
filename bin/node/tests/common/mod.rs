@@ -111,6 +111,9 @@ pub struct NetworkShapeCluster {
     pub http_ports: Vec<u16>,
     pub founder_dir: PathBuf,
     pub friend_dir: PathBuf,
+    /// extra process env per node (set before `spawn`) — the same knob
+    /// [`Cluster::env`] exposes, e.g. capability spec-dir overrides.
+    pub env: Vec<Vec<(String, String)>>,
     nodes: Vec<Option<NodeProc>>,
     dir: tempfile::TempDir,
 }
@@ -127,6 +130,7 @@ impl NetworkShapeCluster {
             http_ports: http_ports.to_vec(),
             founder_dir: dir.path().join("founder"),
             friend_dir: dir.path().join("friend"),
+            env: vec![Vec::new(), Vec::new()],
             nodes: vec![None, None],
             dir,
         }
@@ -252,6 +256,7 @@ impl NetworkShapeCluster {
         let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
             .arg("--config")
             .arg(&cfg)
+            .envs(self.env[idx].iter().map(|(k, v)| (k.clone(), v.clone())))
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
@@ -743,18 +748,24 @@ impl Cluster {
     /// submit an op via node `idx`'s rpc and assert the lane accepted it
     /// (accepted != finalized — follow with a query poll).
     pub fn submit(&self, idx: usize, target: &str, payload: &[u8]) {
-        let reply = self.rpc(
+        let reply = self.try_submit(idx, target, payload);
+        assert_eq!(
+            reply["ok"], true,
+            "submit to {target} via node idx {idx} rejected: {reply}"
+        );
+    }
+
+    /// submit an op via node `idx`'s rpc and return the raw reply — for tests
+    /// that assert a submit is REJECTED (cleanly, with the node still live).
+    pub fn try_submit(&self, idx: usize, target: &str, payload: &[u8]) -> serde_json::Value {
+        self.rpc(
             idx,
             serde_json::json!({
                 "cmd": "submit",
                 "target": target,
                 "payload_hex": hex(payload),
             }),
-        );
-        assert_eq!(
-            reply["ok"], true,
-            "submit to {target} via node idx {idx} rejected: {reply}"
-        );
+        )
     }
 
     /// query a module through node `idx`'s rpc. `None` on a module error —

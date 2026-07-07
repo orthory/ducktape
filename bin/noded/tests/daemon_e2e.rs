@@ -15,6 +15,11 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use sha2::{Digest as _, Sha256};
+
+
 /// a running daemon, killed on drop so failures never leak an orphan (the
 /// REAL orphan lifecycle — outliving a client — is the desktop shell's
 /// contract with a detached spawn; this harness owns its child instead).
@@ -785,7 +790,7 @@ fn per_module_index_serves_ops_and_views() {
 }
 
 #[test]
-fn files_blob_seam_round_trips_and_ties_into_consensus() {
+fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
     let genesis_hash = daemon.status()["appHash"]
@@ -793,10 +798,17 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
         .expect("appHash")
         .to_string();
 
-    // upload: binary, non-utf8, deliberately smaller than the chunk size so
-    // the manifest's tail-length rule is exercised below.
-    let chunk: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
-    let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", &chunk);
+    // sha256 as 64-char lowercase hex — the digest rendering the lane returns.
+    let digest_hex = |bytes: &[u8]| -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+
+    // upload: binary, non-utf8 receipt bytes.
+    let receipt: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+    let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", &receipt);
     assert_eq!(
         code,
         200,
@@ -807,35 +819,35 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
     let digest = reply["digest"].as_str().expect("digest").to_string();
     assert_eq!(
         digest,
-        files::digest_hex(&chunk),
+        digest_hex(&receipt),
         "the returned digest is sha256 of the exact uploaded bytes"
     );
 
     // fetch round-trips byte-identical.
     let (code, fetched) = daemon.request_bytes("GET", &format!("/v1/files/blob/{digest}"), &[]);
     assert_eq!(code, 200);
-    assert_eq!(fetched, chunk, "fetched bytes must be byte-identical");
+    assert_eq!(fetched, receipt, "fetched bytes must be byte-identical");
 
     // a well-formed digest nobody uploaded is a 404; a malformed digest
     // (uppercase hex included) is a 400, not a miss.
-    let absent = files::digest_hex(b"never uploaded");
+    let absent = digest_hex(b"never uploaded");
     let (code, _) = daemon.request_bytes("GET", &format!("/v1/files/blob/{absent}"), &[]);
-    assert_eq!(code, 404, "absent chunk must be a 404");
+    assert_eq!(code, 404, "absent receipt must be a 404");
     let upper = digest.to_uppercase();
     let (code, _) = daemon.request_bytes("GET", &format!("/v1/files/blob/{upper}"), &[]);
     assert_eq!(code, 400, "digest must be lowercase hex");
 
-    // the cap is MAX_CHUNK_SIZE inclusive: exactly 4 MiB lands...
-    let max = vec![0xABu8; files::MAX_CHUNK_SIZE as usize];
+    // the receipt-lane body cap is 4 MiB inclusive: exactly 4 MiB lands...
+    let max = vec![0xABu8; 4 * 1024 * 1024];
     let (code, _) = daemon.request_bytes("POST", "/v1/files/blob", &max);
-    assert_eq!(code, 200, "a chunk of exactly MAX_CHUNK_SIZE must land");
+    assert_eq!(code, 200, "a body of exactly the cap must land");
     // ...and one byte more is a 413 in the daemon's error envelope.
-    let over = vec![0xCDu8; files::MAX_CHUNK_SIZE as usize + 1];
+    let over = vec![0xCDu8; 4 * 1024 * 1024 + 1];
     let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", &over);
     assert_eq!(
         code,
         413,
-        "oversized chunk must be rejected: {}",
+        "oversized body must be rejected: {}",
         String::from_utf8_lossy(&body)
     );
     let err: serde_json::Value = serde_json::from_slice(&body).expect("413 body is json");
@@ -852,31 +864,202 @@ fn files_blob_seam_round_trips_and_ties_into_consensus() {
         Some(genesis_hash.as_str()),
         "blob puts must not move the app hash"
     );
+}
 
-    // the consensus tie-in: ONLY the digest crosses /v1/submit. the committed
-    // manifest then verifies the fetched bytes end to end.
-    let (code, block) = daemon.submit(
-        "files",
-        serde_json::json!({
-            "add_manifest": {
-                "file_id": "f1",
-                "name": "blob.bin",
-                "mime": "application/octet-stream",
-                "size": 3000,
-                "chunk_size": 4096,
-                "chunks": [digest],
-            }
-        }),
-        Some("eddy"),
+// ============================================================================
+// duckfs product surface: the stage -> commit -> read round trip against a real
+// daemon. two chunks staged over POST /v1/files/stage, a commit that references
+// them (Chunks content) alongside an inline file, then ls/read/stat/history read
+// it all back — read byte-exact. a rejected op (dangling chunk, oversized stage)
+// is a clean 4xx, never a 500/panic. distinct from the op-receipt /v1/files/blob
+// lane, which its own test above keeps green.
+// ============================================================================
+
+#[test]
+fn duckfs_surface_stage_commit_and_reads_round_trip() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let genesis_hash = daemon.status()["appHash"]
+        .as_str()
+        .expect("appHash")
+        .to_string();
+
+    // a duckfs chunk digest is the chunk object id: sha256 over the chunk kind
+    // tag byte (0x00) followed by the bytes — what the module stages under and a
+    // commit references. the stage endpoint returns it; we recompute it here to
+    // prove the returned digest is exactly that.
+    let chunk_digest = |bytes: &[u8]| -> String {
+        let mut h = Sha256::new();
+        h.update([0u8]);
+        h.update(bytes);
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+
+    // ---- stage two chunks -> digests ----
+    let chunk_a: Vec<u8> = (0..64u32).map(|i| (i * 7 % 256) as u8).collect();
+    let chunk_b: Vec<u8> = (0..48u32).map(|i| (200 - i) as u8).collect();
+
+    let (code, body) = daemon.request_bytes("POST", "/v1/files/stage", &chunk_a);
+    assert_eq!(
+        code,
+        200,
+        "stage a failed: {}",
+        String::from_utf8_lossy(&body)
     );
-    assert_eq!(code, 200, "AddManifest failed: {block}");
-    assert_eq!(block["height"], 1, "the manifest IS a block");
+    let digest_a =
+        serde_json::from_slice::<serde_json::Value>(&body).expect("stage a json")["digest"]
+            .as_str()
+            .expect("digest a")
+            .to_string();
+    assert_eq!(
+        digest_a,
+        chunk_digest(&chunk_a),
+        "stage returns the chunk object id"
+    );
 
-    let reply = daemon.query("files", serde_json::json!({ "stat": { "file_id": "f1" } }));
-    let manifest: files::Manifest =
-        serde_json::from_value(reply["stat"].clone()).expect("Stat carries the manifest");
-    files::verify_chunk(&manifest, 0, &fetched)
-        .expect("fetched bytes verify against the committed manifest");
+    let (code, body) = daemon.request_bytes("POST", "/v1/files/stage", &chunk_b);
+    assert_eq!(
+        code,
+        200,
+        "stage b failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let digest_b =
+        serde_json::from_slice::<serde_json::Value>(&body).expect("stage b json")["digest"]
+            .as_str()
+            .expect("digest b")
+            .to_string();
+    assert_eq!(digest_b, chunk_digest(&chunk_b));
+
+    // a stage is a real block: staging IS consensus state, so two stages commit
+    // two blocks and the module root moves off genesis.
+    let after_stage = daemon.status();
+    assert_eq!(after_stage["height"], 2, "two stages committed two blocks");
+    assert_ne!(
+        after_stage["appHash"].as_str(),
+        Some(genesis_hash.as_str()),
+        "staging moves the module root"
+    );
+
+    // ---- commit: two chunk-backed files referencing the digests + an inline
+    // file, all under /shared (auto-created parent) ----
+    let inline_bytes: &[u8] = b"hello duckfs";
+    let commit_body = serde_json::json!({
+        "base_snapshot": null,
+        "message": "seed duckfs",
+        "changes": [
+            { "put": { "path": "/shared/a.bin", "exec": false,
+                "content": { "chunks": { "size": chunk_a.len() as u64, "chunks": [digest_a] } } } },
+            { "put": { "path": "/shared/b.bin", "exec": false,
+                "content": { "chunks": { "size": chunk_b.len() as u64, "chunks": [digest_b] } } } },
+            { "put": { "path": "/shared/hello.txt", "exec": false,
+                "content": { "inline": { "b64": STANDARD.encode(inline_bytes) } } } },
+        ],
+    });
+    let (code, block) = daemon.request("POST", "/v1/files/commit", Some(&commit_body));
+    assert_eq!(code, 200, "commit failed: {block}");
+    assert_eq!(block["height"], 3, "commit is the third block");
+
+    // ---- ls shows all three, in name order ----
+    let (code, ls) = daemon.request("GET", "/v1/files/ls?path=/shared", None);
+    assert_eq!(code, 200, "ls failed: {ls}");
+    let names: Vec<&str> = ls["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .map(|e| e["path"].as_str().expect("entry path"))
+        .collect();
+    assert_eq!(
+        names,
+        ["/shared/a.bin", "/shared/b.bin", "/shared/hello.txt"]
+    );
+
+    // ---- read returns the exact bytes (b64-decoded), eof set for a whole-file
+    // read ----
+    let read_bytes = |path: &str| -> Vec<u8> {
+        let (code, r) = daemon.request("GET", &format!("/v1/files/read?path={path}"), None);
+        assert_eq!(code, 200, "read {path} failed: {r}");
+        assert_eq!(r["eof"], true, "a whole-file read reaches eof: {r}");
+        STANDARD
+            .decode(r["b64"].as_str().expect("read b64"))
+            .expect("read b64 decodes")
+    };
+    assert_eq!(
+        read_bytes("/shared/a.bin"),
+        chunk_a,
+        "chunk file a round-trips byte-exact"
+    );
+    assert_eq!(
+        read_bytes("/shared/b.bin"),
+        chunk_b,
+        "chunk file b round-trips byte-exact"
+    );
+    assert_eq!(
+        read_bytes("/shared/hello.txt"),
+        inline_bytes,
+        "inline file round-trips byte-exact"
+    );
+
+    // ---- stat shows the right kind + size ----
+    let (code, st) = daemon.request("GET", "/v1/files/stat?path=/shared/a.bin", None);
+    assert_eq!(code, 200, "stat failed: {st}");
+    assert_eq!(st["kind"], "file");
+    assert_eq!(st["size"].as_u64(), Some(chunk_a.len() as u64));
+    assert_eq!(st["exec"], false);
+    let (code, st) = daemon.request("GET", "/v1/files/stat?path=/shared", None);
+    assert_eq!(code, 200);
+    assert_eq!(st["kind"], "dir", "a directory stats as a dir");
+    // an absent path is the natural 404.
+    let (code, _) = daemon.request("GET", "/v1/files/stat?path=/shared/nope", None);
+    assert_eq!(code, 404, "an absent path stats 404");
+
+    // ---- history shows the commit ----
+    let (code, hist) = daemon.request("GET", "/v1/files/history", None);
+    assert_eq!(code, 200, "history failed: {hist}");
+    let snaps = hist["snapshots"].as_array().expect("snapshots array");
+    assert_eq!(snaps.len(), 1, "one commit lands in history: {hist}");
+    assert_eq!(snaps[0]["message"], "seed duckfs");
+
+    // ---- a rejected op is a clean 4xx carrying the error, not a 500/panic ----
+    // a commit referencing a never-staged chunk digest: the module cannot
+    // resolve the bytes, so it rejects with a 400.
+    let bogus = "11".repeat(32); // 64 hex chars, valid shape, never staged
+    let bad_commit = serde_json::json!({
+        "base_snapshot": null,
+        "message": "dangling chunk",
+        "changes": [
+            { "put": { "path": "/shared/dangling.bin", "exec": false,
+                "content": { "chunks": { "size": 10, "chunks": [bogus] } } } },
+        ],
+    });
+    let (code, err) = daemon.request("POST", "/v1/files/commit", Some(&bad_commit));
+    assert_eq!(code, 400, "a dangling-chunk commit must reject: {err}");
+    assert!(
+        err["error"].is_string(),
+        "the reject carries the module error: {err}"
+    );
+
+    // an oversized stage trips the single-chunk body cap: one byte past
+    // CHUNK_SIZE is a 413 in the daemon's error envelope, not a panic.
+    let over = vec![0u8; 1024 * 1024 + 1]; // CHUNK_SIZE + 1
+    let (code, body) = daemon.request_bytes("POST", "/v1/files/stage", &over);
+    assert_eq!(
+        code,
+        413,
+        "an oversized stage is a 413: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let err: serde_json::Value = serde_json::from_slice(&body).expect("413 body is json");
+    assert!(
+        err["error"].is_string(),
+        "413 uses the error envelope: {err}"
+    );
+
+    // the daemon is still alive and answering after the rejections.
+    daemon.status();
 }
 
 #[test]
@@ -925,6 +1108,278 @@ fn metrics_endpoint_exposes_ducktape_and_runtime_series() {
         text.trim_end().ends_with("# EOF"),
         "OpenMetrics EOF terminator"
     );
+}
+
+// ============================================================================
+// off-loop oracle execution: REAL script-backed providers through the full
+// capability-host path, proving the daemon's command loop no longer awaits
+// provider execution — the fix for the status heartbeat starving (and the
+// desktop "reconnecting" banner) during long agent runs.
+// ============================================================================
+
+/// stage one script-backed capability provider for a spawned daemon: an
+/// operator spec dir with a single `text`-format spec whose `detect.env`
+/// points at `body`'s script. returns the daemon env that provides the tag —
+/// including detect overrides that HIDE the embedded executor specs, so a dev
+/// box with a real `claude`/`codex` on PATH runs these tests identically to CI.
+fn stage_script_provider(root: &Path, tag: &str, body: &str) -> Vec<(String, String)> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let spec_dir = root.join("specs");
+    std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
+    let script = root.join(format!("{tag}.sh"));
+    std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("write provider script");
+    let mut perms = std::fs::metadata(&script).expect("script metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).expect("chmod provider script");
+
+    let env_var = format!(
+        "DUCKTAPE_TEST_{}_BIN",
+        tag.replace(['-', '.'], "_").to_uppercase()
+    );
+    std::fs::write(
+        spec_dir.join(format!("{tag}.toml")),
+        format!(
+            "spec = 1\n\
+             [capability]\n\
+             tag = \"{tag}\"\n\
+             description = \"daemon e2e script executor\"\n\
+             [detect]\n\
+             bin = \"{tag}-nonexistent-cli\"\n\
+             env = \"{env_var}\"\n\
+             [invoke]\n\
+             args = []\n\
+             prompt = \"stdin\"\n\
+             timeout_secs = 60\n\
+             [output]\n\
+             format = \"text\"\n"
+        ),
+    )
+    .expect("write provider spec");
+
+    let missing = root.join("missing-executor");
+    vec![
+        (
+            "DUCKTAPE_CAPABILITY_DIR".into(),
+            spec_dir.display().to_string(),
+        ),
+        (env_var, script.display().to_string()),
+        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
+        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
+    ]
+}
+
+/// channel + registered agent + mention watch: the client-side trigger stack
+/// for one agent run in `channel`.
+fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "create_channel": { "channel_id": channel, "name": channel, "post_policy": "open" }
+        }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+    let (code, block) = daemon.submit(
+        "agent",
+        serde_json::json!({
+            "register_agent": {
+                "agent_id": agent_id,
+                "display_name": agent_id,
+                "capability": tag,
+                "allowed_actions": ["chat.post"]
+            }
+        }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "register agent failed: {block}");
+    let (code, block) = daemon.submit(
+        "runs",
+        serde_json::json!({
+            "watch_channel": { "channel_id": channel, "policy": "mention" }
+        }),
+        Some("owner"),
+    );
+    assert_eq!(code, 200, "watch channel failed: {block}");
+}
+
+/// the plain texts of `channel`'s agent-authored replies.
+fn agent_replies(daemon: &Daemon, channel: &str) -> Vec<String> {
+    let reply = daemon.query(
+        "chat",
+        serde_json::json!({ "messages_latest": { "channel_id": channel, "limit": 32 } }),
+    );
+    reply["messages"]
+        .as_array()
+        .expect("Messages reply")
+        .iter()
+        .filter(|m| m["head"]["author"].get("agent").is_some())
+        .map(|m| {
+            m["head"]["blocks"][0]["paragraph"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+fn pending_run_count(daemon: &Daemon) -> usize {
+    let pending = daemon.query("runs", serde_json::json!("pending_runs"));
+    pending["pending_runs"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+/// poll `probe` until it returns Some, panicking past `budget`.
+fn poll_until<T>(what: &str, budget: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(v) = probe() {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// THE HEADLINE FIX, asserted directly: submit a run whose provider sleeps,
+/// then Status and Query answer BEFORE the run completes. on the pre-fix
+/// inline path the mention's submit itself blocked through provider
+/// execution AND delivery, so "submit returned, reply not posted yet" was
+/// unreachable — this test is red there without any wall-clock assertion.
+#[test]
+fn status_answers_while_a_slow_run_is_in_flight() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
+    let env = stage_script_provider(
+        fixtures.path(),
+        "slow-quack",
+        "cat > /dev/null\nsleep 6\nprintf 'slow answer\\n'",
+    );
+    let daemon = Daemon::spawn_inner(storage.path(), false, &env);
+    arm_agent(&daemon, "general", "sloth", "slow-quack");
+
+    let (code, block) = daemon.submit("chat", post_mention("general", "m1", "sloth"), Some("eddy"));
+    assert_eq!(code, 200, "mention post failed: {block}");
+
+    // the provider is asleep for ~6s. the daemon answers NOW:
+    let status = daemon.status();
+    assert!(status["height"].as_u64().is_some(), "status is live: {status}");
+    assert_eq!(
+        pending_run_count(&daemon),
+        1,
+        "the run is in flight while status answered"
+    );
+    assert!(
+        agent_replies(&daemon, "general").is_empty(),
+        "status/query answered BEFORE the run completed"
+    );
+
+    // ... and the run still lands: the result re-enters as a submit, the
+    // mailbox delivers next block, the reply posts, the pending entry prunes.
+    poll_until("the slow run's reply to post", Duration::from_secs(30), || {
+        let replies = agent_replies(&daemon, "general");
+        (!replies.is_empty()).then_some(replies)
+    });
+    assert_eq!(agent_replies(&daemon, "general"), ["slow answer"]);
+    poll_until("the pending entry to prune", Duration::from_secs(30), || {
+        (pending_run_count(&daemon) == 0).then_some(())
+    });
+}
+
+/// two slow runs execute CONCURRENTLY: the second child starts while the
+/// first is still asleep — the in-flight log carries start,start before any
+/// end. on the pre-fix path the second mention's submit queued behind the
+/// first run, so the log serialized (start,end,start,end).
+#[test]
+fn two_slow_runs_overlap() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
+    let log = fixtures.path().join("exec.log");
+    let env = stage_script_provider(
+        fixtures.path(),
+        "slow-pair",
+        &format!(
+            "cat > /dev/null\n\
+             echo start >> {log}\n\
+             sleep 3\n\
+             echo end >> {log}\n\
+             printf 'done\\n'",
+            log = log.display()
+        ),
+    );
+    let daemon = Daemon::spawn_inner(storage.path(), false, &env);
+    // two channels, one agent each: two independent runs.
+    arm_agent(&daemon, "left", "pair-a", "slow-pair");
+    arm_agent(&daemon, "right", "pair-b", "slow-pair");
+
+    let (code, block) = daemon.submit("chat", post_mention("left", "m1", "pair-a"), Some("eddy"));
+    assert_eq!(code, 200, "first mention failed: {block}");
+    let (code, block) = daemon.submit("chat", post_mention("right", "m2", "pair-b"), Some("eddy"));
+    assert_eq!(code, 200, "second mention failed: {block}");
+
+    for channel in ["left", "right"] {
+        poll_until("both slow runs to reply", Duration::from_secs(30), || {
+            let replies = agent_replies(&daemon, channel);
+            (!replies.is_empty()).then_some(())
+        });
+    }
+    let lines: Vec<String> = std::fs::read_to_string(&log)
+        .expect("exec log written")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines[..2],
+        ["start", "start"],
+        "both children started before either finished — the runs overlapped: {lines:?}"
+    );
+    assert_eq!(lines.len(), 4, "two complete executions: {lines:?}");
+}
+
+/// the failure path is unchanged: a provider that exits non-zero still
+/// produces the failure OracleResult, the saga burns its attempts, the
+/// failed delivery prunes the pending entry without posting a reply — and
+/// the daemon answers throughout.
+#[test]
+fn a_failing_provider_still_fails_the_run_cleanly() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
+    let log = fixtures.path().join("exec.log");
+    let env = stage_script_provider(
+        fixtures.path(),
+        "kaboom",
+        &format!(
+            "cat > /dev/null\n\
+             echo ran >> {log}\n\
+             echo 'provider exploded' >&2\n\
+             exit 3",
+            log = log.display()
+        ),
+    );
+    let daemon = Daemon::spawn_inner(storage.path(), false, &env);
+    arm_agent(&daemon, "general", "boomer", "kaboom");
+
+    let (code, block) = daemon.submit("chat", post_mention("general", "m1", "boomer"), Some("eddy"));
+    assert_eq!(code, 200, "mention post failed: {block}");
+
+    // the terminal failure delivers (that is what prunes the entry) — the
+    // saga's retry cycle ran through the pool to completion.
+    poll_until("the failed run to prune", Duration::from_secs(30), || {
+        (pending_run_count(&daemon) == 0).then_some(())
+    });
+    assert!(
+        agent_replies(&daemon, "general").is_empty(),
+        "a failed run posts no reply"
+    );
+    let executions = std::fs::read_to_string(&log)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    assert!(
+        executions >= 1,
+        "the provider actually ran (got {executions} executions)"
+    );
+    daemon.status(); // still alive, still answering.
 }
 
 // ============================================================================

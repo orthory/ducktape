@@ -16,12 +16,13 @@
 //! appends generation `latest + 1` (1 for a brand-new file). a `(path,
 //! generation)` pair is a stable, hash-pinned reference.
 //!
-//! large bodies can be published through the files module: memory probes a
-//! committed files manifest, then copies its digest and size into the immutable
-//! generation. that is pin-at-publish semantics — removing the files manifest
-//! later does not rewrite or invalidate the memory generation. the generation's
-//! copied digest/size are its consensus truth; body bytes remain fetched over
-//! the files chunk lane and receiver-verified with `files::verify_chunk`.
+//! large bodies can be published through the files (duckfs) module: memory
+//! probes a committed duckfs entry by path, then copies its content digest
+//! (`EntryInfo.object`) and size into the immutable generation. that is
+//! pin-at-publish semantics — removing the duckfs entry later does not rewrite
+//! or invalidate the memory generation. the generation's copied digest/size are
+//! its consensus truth; body bytes remain fetched over the files object lane
+//! and receiver-verified with `files::verify_chunk_len`.
 //!
 //! ## snapshots & the retention mechanism (design decision)
 //!
@@ -60,9 +61,14 @@ pub use interface::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+// dev rewrote files into duckfs (a real filesystem): entries are addressed by
+// PATH, `Stat` returns an `EntryInfo` carrying the content digest (`object`)
+// and byte size, and the old flat `MAX_FILE_ID_BYTES`/`file_id`/manifest shapes
+// are gone. memory's pin-at-publish path adapts to this: the epic's `file_id`
+// IS a duckfs path, and the file cap is duckfs's `MAX_PATH_BYTES`.
 use files::{
-    FilesQuery, FilesReply, MAX_FILE_ID_BYTES, decode_reply as decode_files_reply,
-    encode_query as encode_files_query,
+    FilesQuery, FilesReply, MAX_PATH_BYTES as MAX_FILE_ID_BYTES,
+    decode_reply as decode_files_reply, encode_query as encode_files_query,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
@@ -224,36 +230,38 @@ impl Memory {
             }
             PublishBody::File { file_id } => {
                 validate_file_id(&file_id)?;
+                // probe the committed duckfs entry at this path; copy its
+                // content digest + size into the immutable generation
+                // (pin-at-publish). `snapshot: None` reads the live head.
                 let req = encode_files_query(&FilesQuery::Stat {
-                    file_id: file_id.clone(),
+                    path: file_id.clone(),
+                    snapshot: None,
                 });
                 let bytes = ctx
                     .query(&self.files_module_id, &req)
                     .await
                     .map_err(|e| Error::Module(format!("files stat probe failed: {e}")))?;
-                let manifest = match decode_files_reply(&bytes).map_err(Error::Module)? {
-                    FilesReply::Stat(Some(manifest)) => manifest,
+                let entry = match decode_files_reply(&bytes).map_err(Error::Module)? {
+                    FilesReply::Stat(Some(entry)) => entry,
                     FilesReply::Stat(None) => {
-                        return Err(Error::Module(format!(
-                            "files manifest not found: {file_id}"
-                        )));
+                        return Err(Error::Module(format!("files entry not found: {file_id}")));
                     }
-                    FilesReply::List(_) => {
+                    _ => {
                         return Err(Error::Module(
                             "files stat probe returned an unexpected reply".into(),
                         ));
                     }
                 };
-                if manifest.file_id != file_id {
+                if entry.path != file_id {
                     return Err(Error::Module(
-                        "files stat probe returned a mismatched file_id".into(),
+                        "files stat probe returned a mismatched path".into(),
                     ));
                 }
-                validate_digest_hex(&manifest.digest)?;
+                validate_digest_hex(&entry.object)?;
                 Ok(Body::File {
                     file_id,
-                    digest: manifest.digest,
-                    size: manifest.size,
+                    digest: entry.object,
+                    size: entry.size,
                 })
             }
         }

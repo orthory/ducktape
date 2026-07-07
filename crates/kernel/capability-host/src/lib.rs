@@ -44,8 +44,14 @@ pub use spec::{CapabilitySpec, OutputFormat, PromptMode, SpecSet, builtin_specs}
 /// invocation (binary, flags, model) is the spec's literal argv. rendering
 /// (conversation -> text) is the CALLER's business — this crate is
 /// deliberately ignorant of chat shapes and saga specs.
-#[async_trait::async_trait(?Send)]
-pub trait Provider {
+///
+/// `Send + Sync` (and a Send `run` future) on purpose: provider execution is
+/// long (a CLI call can run minutes) and hosts run it on SPAWNED background
+/// tasks, never inline on their event loop — so the provider surface must be
+/// shareable across tasks. this is a Rust seam bound only; the provider CLI
+/// contract (spec argv, stdin prompt, stdout answer) is untouched.
+#[async_trait::async_trait]
+pub trait Provider: Send + Sync {
     /// the capability tag this provider serves — matches the capability
     /// module's registry entries, so "what i can run" and "what i announce"
     /// cannot drift apart.
@@ -183,7 +189,7 @@ impl CliProvider {
     }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl Provider for CliProvider {
     fn capability(&self) -> &str {
         &self.spec.tag
@@ -468,7 +474,9 @@ mod tests {
     }
 
     /// write an executable /bin/sh script standing in for an arbitrary
-    /// executor CLI.
+    /// executor CLI. discovery tests probe it (`is_executable`, hence the
+    /// chmod); run() tests must NOT exec it directly — see [`sh_provider`]
+    /// for why they run it through `/bin/sh` instead.
     fn fake_cli(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join(name);
@@ -506,9 +514,25 @@ format = "{format}"
         .unwrap()
     }
 
-    fn mock_provider(tag: &str, format: &str, bin: PathBuf, wd: &str) -> CliProvider {
-        CliProvider::from_spec(mock_spec(tag, &tag.to_string(), format), bin)
-            .with_workdir(scratch(wd))
+    /// a provider that runs `spec` by exec'ing `/bin/sh` with `script`
+    /// prepended to the spec's argv — NEVER by exec'ing the script itself.
+    ///
+    /// exec'ing a script this process just wrote races under parallel tests
+    /// (#226): while one test holds the script's write fd open, another
+    /// test's `Command::spawn` forks, and the forked child inherits a copy
+    /// of that fd (O_CLOEXEC drops it only at that child's own exec). if
+    /// the writer then execs its script inside that fork→exec window, the
+    /// kernel refuses with ETXTBSY ("Text file busy"). which test loses is
+    /// pure scheduling — the rotating single failure. `/bin/sh` is never
+    /// open for writing, and ETXTBSY guards only the exec'd image, not the
+    /// script it reads as data.
+    fn sh_provider(mut spec: CapabilitySpec, script: PathBuf, wd: &str) -> CliProvider {
+        spec.args.insert(0, script.display().to_string());
+        CliProvider::from_spec(spec, PathBuf::from("/bin/sh")).with_workdir(scratch(wd))
+    }
+
+    fn mock_provider(tag: &str, format: &str, script: PathBuf, wd: &str) -> CliProvider {
+        sh_provider(mock_spec(tag, tag, format), script, wd)
     }
 
     // ---- discovery ----------------------------------------------------------
@@ -770,7 +794,9 @@ format = "text"
             r#"cat > /dev/null
 echo "arg=$1""#,
         );
-        let p = CliProvider::from_spec(spec, bin).with_workdir(scratch("arg-verbatim-wd"));
+        // run via sh_provider: the script becomes $0 and the spec's
+        // untouched args follow, so "{model}" still arrives as $1.
+        let p = sh_provider(spec, bin, "arg-verbatim-wd");
         assert_eq!(p.run("q").await.unwrap(), "arg={model}", "argv is literal");
     }
 

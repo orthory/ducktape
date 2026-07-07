@@ -12,7 +12,8 @@ import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 
 import type { ChatSearchHit } from "../../../domain/chat-client";
-import type { Manifest } from "../../../domain/files-client";
+import { basename } from "../../../domain/files-client";
+import type { FileEntry } from "../../../domain/files-client";
 import type { PageSearchHit } from "../../../domain/pages-client";
 import { displayNameForKey, shortKey } from "../../../domain/names";
 import { Icon } from "../../components/Icon";
@@ -209,8 +210,8 @@ export function SearchModal() {
 
   const fileHits = useMemo(() => {
     const q = query.toLowerCase();
-    if (!q) return [] as Manifest[];
-    return state.files.filter((f) => f.name.toLowerCase().includes(q)).slice(0, RESULT_CAP);
+    if (!q) return [] as FileEntry[];
+    return state.files.filter((f) => f.path.toLowerCase().includes(q)).slice(0, RESULT_CAP);
   }, [query, state.files]);
 
   // Only surface node-index hits when they belong to the CURRENT input — a
@@ -329,9 +330,9 @@ export function SearchModal() {
             <Group title="Files" count={fileHits.length}>
               {fileHits.map((hit) => (
                 <HitButton
-                  key={hit.file_id}
-                  meta={hit.mime || "file"}
-                  text={hit.name}
+                  key={hit.path}
+                  meta={hit.path}
+                  text={basename(hit.path)}
                   onOpen={() => goto("files")}
                 />
               ))}

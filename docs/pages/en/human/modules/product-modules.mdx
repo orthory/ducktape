@@ -19,9 +19,8 @@ that fits its job.
 - `vaults` replicates opaque secret ciphertext with owner-gated writes.
 - `inbox` stores per-member notification queues delivered as follow-up ops.
 - `automations` stores operator-defined rules that run over the chat hook seam.
-- `files` commits content-addressed file manifests; chunk bytes stay node-local.
-- `memory` is a filesystem-shaped shared agent workspace with immutable
-  generations.
+- `files` is duckfs: a consensus-replicated, copy-on-write, content-addressed
+  filesystem — every node holds every byte, and bytes survive restart.
 - `jobs` is a consensus-native work board with first-claim-wins claims.
 - `identity` binds node keys to user keys — a replicated registry so a person
   running several nodes still resolves to one identity above mesh/valset.
@@ -114,50 +113,42 @@ commits or aborts with the triggering post as one atomic unit (P2).
 
 ## Files
 
-Files keeps two planes that never blur. The metadata control plane is consensus
-state: manifests keyed by `file_id`, each pinning the file name, size, ordered
-per-chunk sha256 digests, and a whole-file digest-of-digests. That is the only
-files state folded into the root and the only thing state sync transfers. The
-body store is node-local: chunk bytes keyed by their own sha256, never in the op
-stream and never in consensus. Writes go through `AddManifest` and
-`RemoveManifest`; reads through `Stat` and `List`; chunk bytes move peer-to-peer
-over a dedicated `serve_sync` lane. Size caps are enforced at execute with
-rejection, so an oversized value never enters the root preimage.
+Files is duckfs: a consensus-replicated, copy-on-write, content-addressed
+filesystem. Every node holds every byte as consensus state — bytes travel
+through blocks and survive restart — so a committed file is readable on any
+node, not a promise pinned to whichever node happened to hold the chunks. State
+splits into an immutable object store (chunks, files, trees, and snapshots, all
+content-addressed) and a small mutable refs cell (the live head, the pin table,
+a bounded history window, the staging table, and the watch set); the root
+hashes the refs cell alone and commits to the whole tree transitively. Two
+writable roots gate authority: `/home/<owner>/**` is writable only by the
+matching origin-derived owner, `/shared/**` by any member; reads are
+cluster-visible everywhere — `/home` gates writes only.
 
-The receiver contract makes a dishonest server harmless: every fetched chunk
-goes through `verify_chunk`, which checks both the sha256 digest and the exact
-length the manifest implies for that position. The length check is load-bearing,
-not belt-and-braces — digest equality alone would accept a zero-byte chunk whose
-digest matches and reconstruct the wrong file.
+Writes stage, then commit. `PutBlob` stages one raw chunk (a binary op frame,
+quota'd per owner, expiring deterministically if never referenced); `Commit` is
+the atomic unit — a batch of path changes (`Put`, `Mkdir`, `Rm`, `Mv`,
+`Symlink`) under per-path compare-and-swap against a base snapshot: every
+changed path must be untouched between the base and the live head or the whole
+commit rejects, so disjoint concurrent commits interleave without false
+conflicts and overlapping ones fail loudly. A successful commit appends an
+immutable snapshot — copy-on-write, so unchanged subtrees are shared by hash
+across versions — advances the head, and fans out watch notifications to
+subscribed modules in the same block (P2). `Pin` and `Unpin` keep named
+snapshots alive past the bounded history window. Caps are enforced at execute
+with rejection, so an oversized value never enters the root preimage.
 
-## Memory
-
-Memory is a shared agent workspace shaped like a filesystem — the NoKV
-philosophy: agents want filesystems, not key-value stores. The namespace is a
-set of absolute paths with implicit directories; every file is a stack of
-immutable generations, and a publish is write-once — it appends the next
-generation rather than editing anything in place. A `(path, generation)` pair is
-a stable, hash-pinned reference that is never rebound or reused while anything
-still pins it. Writes go through `Publish`, `Delete`, `Snapshot`,
-`DropSnapshot`, `RegisterWatch`, and `UnregisterWatch`; reads are the
-progressive-disclosure verbs `Ls`, `Stat`, `Read`, `Find`, and `Grep`, and grep
-hits carry citable `duck://memory/<path>@<generation>#L<line>` evidence URIs.
-Large bodies can be published by reference to a files manifest: memory probes
-the committed manifest, copies its digest and size into the immutable
-generation, and treats those copied values as the generation's truth. Removing
-the manifest later does not invalidate the generation; bytes remain fetched over
-the files chunk lane and receiver-verified with `verify_chunk`. `Grep` scans
-inline bodies only and skips file-backed bodies deterministically.
-
-`Snapshot` pins the current path-to-generation mapping of the whole namespace —
-the mapping only, never a copy of the bodies. `Delete` retains any generation a
-snapshot still pins; a generation record is dropped exactly when neither a live
-file nor a snapshot references it. Watches subscribe a module to a canonical
-path prefix with segment-aware matching (`/a` matches `/a/b`, never `/ab`), and
-each successful publish emits one follow-up event per matching watcher in the
-same block (P2). Skills sharing rides the same namespace: a shared skill is a
-document under `/skills/<name>` with `kind=skill` meta, discovered with `Find`
-over `/skills/`.
+Reads are snapshot-addressable pure functions: `Stat`, `Ls`, `Read`
+(byte-range), `Find`, `Grep`, `History`, `Diff`, and `Refs`, each cursor-paged
+and answerable at the head or at any resolvable snapshot. duckfs is also the
+agent memory — it absorbed the deleted `memory` module, and what memory did
+with immutable generations, duckfs does with snapshots. Agent workspaces are
+ordinary files under `/home` and `/shared`; `Grep` hits carry citable
+`duck://files/<path>@<snapshot>#L<line>` evidence URIs; per-file meta powers
+conventions like `kind=skill` (shared skills live under `/shared/skills/`); and
+prefix watches with segment-aware matching (`/a` matches `/a/b`, never `/ab`)
+give any module change notifications delivered atomically with the triggering
+commit.
 
 ## Jobs
 
@@ -252,6 +243,6 @@ share typed messages and queries, not implementation APIs.
 The currently useful pressure points are clear from the checked-in modules:
 chat exercises live product reads over QMDB-backed channel storage, forge
 exercises authenticated project state, and the module wave — inbox, automations,
-files, memory, jobs — exercises follow-up atomicity, hook fan-out, and the
-consensus-metadata/node-local-bytes split that fuller collaboration features
-will lean on.
+files, jobs — exercises follow-up atomicity, hook fan-out, and fully replicated
+consensus bytes with snapshot history that fuller collaboration features will
+lean on.

@@ -35,6 +35,7 @@ members = [
     "crates/system/saga",
     "crates/system/capability",
     "crates/system/package",
+    "crates/system/blobstore",
     "crates/system/dispatch",
     "crates/system/dispatch-oracle",
     "crates/system/tagging", 
@@ -48,9 +49,13 @@ members = [
     "crates/apps/vaults", 
     "crates/apps/profiles", 
     "crates/apps/automations", 
-    "crates/apps/inbox", 
-    "crates/apps/files", 
-    "crates/apps/memory", 
+    "crates/apps/inbox",
+    "crates/apps/files",
+    # memory — kept as prompt-plane infrastructure for the quack package epic
+    # (package install seeds prompt bodies into memory paths; runs/harness
+    # resolve generations via memory Stat). dev removed its product UI surface;
+    # this crate carries no app-side UI. see merge-report-2.
+    "crates/apps/memory",
     "crates/apps/jobs",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
@@ -98,6 +103,11 @@ defguard_wireguard_rs = "0.10.0"
 # ed25519 signer's); static_secrets because the key persists across boots.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
+# duckfs path normalization: NFC so visually-identical names collide instead
+# of coexisting (a consensus-determinism requirement, not cosmetics).
+unicode-normalization = "0.1"
+# tests only: isolated on-disk module data dirs.
+tempfile = "3"
 # user-key v2 at-rest custody (bin/node/src/userkey.rs only): BIP39
 # wordlist + entropy checksum (the PBKDF2 `to_seed` path is deliberately
 # unused — see the identity-onboarding design doc's custody model),
@@ -139,6 +149,7 @@ upgrade = { path = "crates/system/upgrade" }
 saga = { path = "crates/system/saga" }
 capability = { path = "crates/system/capability" }
 package = { path = "crates/system/package" }
+blobstore = { path = "crates/system/blobstore" }
 dispatch = { path = "crates/system/dispatch" }
 dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }
@@ -153,6 +164,7 @@ profiles = { path = "crates/apps/profiles" }
 automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }
+# prompt-plane infrastructure for the quack epic (no app UI); see merge-report-2.
 memory = { path = "crates/apps/memory" }
 jobs = { path = "crates/apps/jobs" }
 directory = { path = "crates/examples/directory" }

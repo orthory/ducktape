@@ -10,12 +10,6 @@ use automations::{
 use chat::{AuthorRef, ChatEvent, encode_event};
 use futures::executor::block_on;
 use host::{BlockContext, Host};
-use inbox::Inbox;
-use inbox::{
-    InboxQuery, InboxReply, decode_reply as inbox_decode_reply, encode_query as inbox_encode_query,
-};
-use memory::Memory;
-use memory::{MemoryMsg, Meta, PublishBody, encode_msg as memory_encode_msg};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use tasks::Tasks;
 use tasks::{
@@ -26,8 +20,6 @@ const AUTO: &str = "automations";
 const CHAT: &str = "chat";
 const TASKS: &str = "tasks";
 const INBOX: &str = "inbox";
-const MEMORY: &str = "memory";
-const FILES: &str = "files";
 
 /// a stand-in for chat that relays its payload to automations as a hook
 /// follow-up. because it is registered under the id "chat", the host stamps the
@@ -53,7 +45,8 @@ impl Module for RelayChat {
 
 fn from_user(payload: Msg) -> (BlockContext, Msg) {
     (
-        BlockContext { protocol_version: 0,
+        BlockContext {
+            protocol_version: 0,
             height: 1,
             consensus_time: 100,
             origin: Origin::External(b"operator".to_vec()),
@@ -113,174 +106,13 @@ async fn run_history(host: &Host, rule_id: &str) -> Vec<RunRecord> {
     }
 }
 
-async fn inbox_items(host: &Host, member: &str) -> Vec<inbox::Notification> {
-    let bytes = host
-        .query(
-            INBOX,
-            &inbox_encode_query(&InboxQuery::List {
-                member: member.into(),
-                from_seq: 0,
-                limit: 16,
-            }),
-        )
-        .await
-        .expect("query inbox");
-    match inbox_decode_reply(&bytes).expect("inbox reply") {
-        InboxReply::Items(items) => items,
-        other => panic!("expected Items, got {other:?}"),
-    }
-}
-
 fn genesis() -> Host {
     Host::genesis(vec![
         Box::new(Tasks::new(TASKS)),
         Box::new(RelayChat),
-        Box::new(Inbox::new(INBOX)),
-        Box::new(Memory::new(MEMORY, FILES)),
-        Box::new(Automations::new(AUTO, CHAT, TASKS, INBOX, MEMORY)),
+        Box::new(Automations::new(AUTO, CHAT, TASKS, INBOX)),
     ])
     .expect("genesis")
-}
-
-fn memory_msg(payload: MemoryMsg) -> Msg {
-    Msg {
-        target: MEMORY.into(),
-        payload: memory_encode_msg(&payload),
-    }
-}
-
-#[test]
-fn memory_publish_fires_rule_and_delivers_inbox_atomically() {
-    block_on(async {
-        let mut host = genesis();
-
-        let (ctx, msg) = from_user(create_rule_msg(
-            "memory-inbox",
-            Trigger::MemoryPublished {
-                prefix: Some("/docs".into()),
-                meta_kind: Some("decision".into()),
-                author_contains: None,
-            },
-            Action::DeliverInbox {
-                member_template: "mem-{author}".into(),
-                kind: "memory-watch".into(),
-                body_template:
-                    "path={path} generation={generation} author={author} channel=[{channel}]".into(),
-            },
-        ));
-        host.submit_at(ctx, msg).await.expect("create rule");
-
-        host.submit_at(
-            BlockContext { protocol_version: 0,
-                height: 2,
-                consensus_time: 200,
-                origin: Origin::External(b"operator".to_vec()),
-            },
-            memory_msg(MemoryMsg::RegisterWatch {
-                prefix: "/docs".into(),
-                module_id: AUTO.into(),
-            }),
-        )
-        .await
-        .expect("register watch");
-
-        let app_before = host.app_hash();
-        let mut meta = Meta::new();
-        meta.insert("kind".into(), "decision".into());
-        let out = host
-            .submit_at(
-                BlockContext { protocol_version: 0,
-                    height: 3,
-                    consensus_time: 300,
-                    origin: Origin::External(vec![0xaa]),
-                },
-                memory_msg(MemoryMsg::Publish {
-                    path: "/docs/a".into(),
-                    body: PublishBody::Inline("body".into()),
-                    meta,
-                }),
-            )
-            .await
-            .expect("publish fires");
-        assert_ne!(
-            out.app_hash, app_before,
-            "the same block moved the app hash"
-        );
-
-        let items = inbox_items(&host, "mem-ext:aa").await;
-        assert_eq!(items.len(), 1, "one notification landed");
-        assert_eq!(items[0].kind, "memory-watch");
-        assert_eq!(
-            items[0].body,
-            "path=/docs/a generation=1 author=ext:aa channel=[]"
-        );
-        assert_eq!(items[0].source, AUTO, "deliver came from automations");
-
-        let recs = run_history(&host, "memory-inbox").await;
-        assert_eq!(recs.len(), 1);
-        assert!(recs[0].action_ok);
-        assert_eq!(recs[0].channel_id, "/docs/a");
-        assert_eq!(recs[0].seq, 1);
-    });
-}
-
-#[test]
-fn memory_event_authored_by_automations_does_not_fire() {
-    block_on(async {
-        let mut host = genesis();
-        let (ctx, msg) = from_user(create_rule_msg(
-            "memory-loop",
-            Trigger::MemoryPublished {
-                prefix: Some("/".into()),
-                meta_kind: None,
-                author_contains: None,
-            },
-            Action::DeliverInbox {
-                member_template: "alice".into(),
-                kind: "memory-watch".into(),
-                body_template: "path={path}".into(),
-            },
-        ));
-        host.submit_at(ctx, msg).await.expect("create rule");
-
-        host.submit_at(
-            BlockContext { protocol_version: 0,
-                height: 2,
-                consensus_time: 200,
-                origin: Origin::External(b"operator".to_vec()),
-            },
-            memory_msg(MemoryMsg::RegisterWatch {
-                prefix: "/".into(),
-                module_id: AUTO.into(),
-            }),
-        )
-        .await
-        .expect("register watch");
-
-        host.submit_at(
-            BlockContext { protocol_version: 0,
-                height: 3,
-                consensus_time: 300,
-                origin: Origin::Module(AUTO.into()),
-            },
-            memory_msg(MemoryMsg::Publish {
-                path: "/docs/self".into(),
-                body: PublishBody::Inline("body".into()),
-                meta: Meta::new(),
-            }),
-        )
-        .await
-        .expect("self-authored publish commits");
-
-        assert!(
-            inbox_items(&host, "alice").await.is_empty(),
-            "no notification from self-authored memory event"
-        );
-        assert!(
-            run_history(&host, "memory-loop").await.is_empty(),
-            "loop-guarded event leaves no run record"
-        );
-    });
 }
 
 #[test]
@@ -307,7 +139,8 @@ fn user_post_fires_rule_and_creates_task_atomically() {
         let app_before = host.app_hash();
         let out = host
             .submit_at(
-                BlockContext { protocol_version: 0,
+                BlockContext {
+                    protocol_version: 0,
                     height: 2,
                     consensus_time: 200,
                     origin: Origin::External(b"poster".to_vec()),
@@ -350,7 +183,8 @@ fn module_authored_post_does_not_fire() {
 
         // a module-authored post (loop-prevention target) must not fire.
         host.submit_at(
-            BlockContext { protocol_version: 0,
+            BlockContext {
+                protocol_version: 0,
                 height: 2,
                 consensus_time: 200,
                 origin: Origin::External(b"poster".to_vec()),
@@ -388,7 +222,8 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
         // squat the deterministic id the next fire will compose: without the
         // probe, tasks would reject the duplicate and abort the posting block.
         host.submit_at(
-            BlockContext { protocol_version: 0,
+            BlockContext {
+                protocol_version: 0,
                 height: 2,
                 consensus_time: 200,
                 origin: Origin::External(b"squatter".to_vec()),
@@ -406,7 +241,8 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
 
         // the fire is downgraded to a run record; the user's post commits.
         host.submit_at(
-            BlockContext { protocol_version: 0,
+            BlockContext {
+                protocol_version: 0,
                 height: 3,
                 consensus_time: 300,
                 origin: Origin::External(b"poster".to_vec()),
@@ -451,7 +287,8 @@ fn post_probe_collision_still_aborts_the_block() {
 
         let err = host
             .submit_at(
-                BlockContext { protocol_version: 0,
+                BlockContext {
+                    protocol_version: 0,
                     height: 2,
                     consensus_time: 200,
                     origin: Origin::External(b"poster".to_vec()),

@@ -29,7 +29,6 @@ use automations::Automations;
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
-use dispatch_oracle::DispatchWorker;
 use files::Files;
 use forge::Forge;
 use futures::StreamExt as _;
@@ -81,6 +80,8 @@ const MODULE_IDS: [&str; 17] = [
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 
+mod oracle_pool;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: SocketAddr = "127.0.0.1:8844".parse()?;
     let mut storage: Option<PathBuf> = None;
@@ -121,6 +122,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor_forge_repo = forge_repo.clone();
     let actor_index = index.clone();
     let blobs = handle.blob_handle();
+    // the oracle pool's re-entry lane: completed provider runs inject their
+    // results as Submit commands, exactly as the http layer does.
+    let oracle_cmds = handle.command_sender();
     std::thread::Builder::new()
         .name("node-actor".into())
         .spawn(move || {
@@ -129,6 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 actor_forge_repo,
                 actor_index,
                 blobs,
+                oracle_cmds,
                 cmd_rx,
                 event_tx,
             )
@@ -157,22 +162,21 @@ fn run_node(
     storage: PathBuf,
     forge_repo: PathBuf,
     index: Arc<IndexStore>,
-    blobs: files::BlobHandle,
+    blobs: noded::blobs::BlobHandle,
+    oracle_cmds: mpsc::Sender<NodeCommand>,
     mut cmds: mpsc::Receiver<NodeCommand>,
     events: broadcast::Sender<WsFrame>,
 ) {
     // forge_repo is derived by the caller (shared with the http upload-pack lane).
+    let duckfs_dir = storage.join("duckfs");
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
         // genesis: the full product surface. chat/tasks/inbox as the core loop,
-        // automations bridging chat/memory events into chat/tasks/inbox
-        // follow-ups, jobs for deferred work, pages + forge for the
-        // substrate-backed stores, and files + memory for the content planes.
-        // files registers over the
-        // http layer's blob handle so uploads land in the store `serve_sync`
-        // reads — the bytes themselves never touch consensus.
+        // automations bridging chat events into chat/tasks/inbox follow-ups,
+        // jobs for deferred work, pages + forge for the substrate-backed
+        // stores, and files (duckfs) for the content plane.
         let chat = Chat::init(context.child("chat"), "chat")
             .await
             .with_tagging("tagging");
@@ -184,7 +188,7 @@ fn run_node(
         let tagging = TaggingModule::new("tagging");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
-        let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
+        let automations = Automations::new("automations", "chat", "tasks", "inbox");
         let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
@@ -207,8 +211,7 @@ fn run_node(
         // blob lane (worker follow-ups included — the http submit handler only
         // stages what clients POST).
         let op_blobs = blobs.clone();
-        let files = Files::with_blobs("files", blobs);
-        let memory = Memory::new("memory", "files");
+        let files = Files::open("files", duckfs_dir).expect("duckfs open");
         // the origin-gated display-name registry: maps each verified submit
         // origin to a chosen name so the ui can resolve authors to names.
         let profiles = Profiles::new("profiles");
@@ -216,6 +219,10 @@ fn run_node(
         // daemon carries no valset (ungated binds) and no chain (dev-only,
         // chain-unscoped certs are an acceptable surface here).
         let identity = Identity::new("identity", None, String::new());
+        // memory: the quack epic's prompt plane (package seeds prompt bodies
+        // here; runs resolves generations via memory Stat). dev removed memory's
+        // product UI; this daemon carries it purely as prompt plumbing.
+        let memory = Memory::new("memory", "files");
         // the quack package registry: install lifecycle rows plus the
         // tag -> owner action-route table, with the built-in task actions
         // seeded as routes; prompt seeds publish into "memory".
@@ -255,7 +262,12 @@ fn run_node(
         // runtime metrics. the handles are retained for the block loop's life.
         let metrics = NodeMetrics::register(&context);
 
-        let workers = oracle_workers();
+        // OFF-LOOP execution: the pool gates effects inline but runs the
+        // provider CLI on spawned tasks; a completed run re-enters as a
+        // Submit command on `oracle_cmds`, so this serial command loop
+        // never awaits a provider and Query/Status stay responsive while
+        // runs are in flight.
+        let workers = oracle_pool::oracle_workers(&context, oracle_cmds);
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would
         // re-use indexed heights — every new block silently skipped.
@@ -375,26 +387,6 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn oracle_workers() -> Vec<Box<dyn reactor::Worker>> {
-    #[cfg(debug_assertions)]
-    {
-        if std::env::var_os("DUCKTAPE_NODED_ECHO_ORACLE").is_some() {
-            return vec![Box::new(EchoWorker)];
-        }
-    }
-    vec![Box::new(DispatchWorker::new(
-        // BYO: run whatever executor CLIs the capability specs describe and
-        // this host has installed — no credential handling here (see
-        // docs/capability-spec.md). a broken operator spec is a boot error.
-        capability_host::discover()
-            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
-        // the daemon's oracle identity: its worker follow-ups are
-        // submitted under ORACLE_ORIGIN, so an Accept claim records that
-        // key as the assignee and the re-emitted request must match it.
-        ORACLE_ORIGIN.to_vec(),
-    ))]
-}
-
 /// commit the caller's op, then drain worker follow-ups (each its own block).
 /// the returned summary is the block that INCLUDED the caller's op — follow-up
 /// blocks reach clients over the ws stream, not this reply.
@@ -403,7 +395,7 @@ async fn submit_and_drain(
     workers: &[Box<dyn reactor::Worker>],
     height: &mut u64,
     index: &IndexStore,
-    blobs: &files::BlobHandle,
+    blobs: &noded::blobs::BlobHandle,
     events: &broadcast::Sender<WsFrame>,
     metrics: &NodeMetrics,
     origin: Origin,
@@ -473,7 +465,7 @@ async fn submit_one(
     host: &mut Host,
     height: &mut u64,
     index: &IndexStore,
-    blobs: &files::BlobHandle,
+    blobs: &noded::blobs::BlobHandle,
     events: &broadcast::Sender<WsFrame>,
     metrics: &NodeMetrics,
     origin: Origin,
@@ -607,29 +599,3 @@ async fn offer_effects(
     }
 }
 
-#[cfg(debug_assertions)]
-struct EchoWorker;
-
-#[cfg(debug_assertions)]
-#[async_trait::async_trait(?Send)]
-impl reactor::Worker for EchoWorker {
-    async fn run(&self, effect: &Effect) -> Result<reactor::WorkOutcome, reactor::Error> {
-        let request = match saga::decode_worker_request(&effect.0) {
-            Ok(request) => request,
-            Err(_) => return Ok(reactor::WorkOutcome::NotMine),
-        };
-        // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
-        // module judged a Text contract; the agent module normalizes).
-        let Ok(work) = dispatch::decode_work_spec(&request.spec) else {
-            return Ok(reactor::WorkOutcome::NotMine);
-        };
-        Ok(reactor::WorkOutcome::Handled(Some(Msg {
-            target: "saga".into(),
-            payload: saga::encode_msg(&saga::SagaMsg::OracleResult {
-                saga_id: request.saga_id,
-                attempt: request.attempt,
-                outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id).into_bytes()),
-            }),
-        })))
-    }
-}

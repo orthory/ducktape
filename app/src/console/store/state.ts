@@ -8,10 +8,11 @@ import type { PendingRun, WatchView } from "../../domain/runs-client";
 import type {
   Channel,
   ChatSearchHit,
+  ChatTagRow,
   ChatThread,
   MessageView,
 } from "../../domain/chat-client";
-import type { Manifest } from "../../domain/files-client";
+import type { FileEntry } from "../../domain/files-client";
 import type { ProposalView } from "../../domain/governance-client";
 import type {
   PageBlock,
@@ -57,6 +58,15 @@ export interface SearchResults {
   query: string;
   chat: ChatSearchHit[];
   docs: PageSearchHit[];
+}
+
+/** The active #tag filter on the chat surface: while set, the message pane
+ *  renders the tag's `tagSearch` hits instead of the live slice. `tag` keeps
+ *  the as-typed display form (the node's index normalizes); `channelId` is
+ *  the channel the filter was set in — switching channels clears it. */
+export interface TagFilter {
+  tag: string;
+  channelId: string | null;
 }
 
 /** A managed (app-spawned) node failed to START or CONNECT — the dedicated
@@ -113,6 +123,16 @@ export interface ConsoleState {
   /** Messages of the active channel only (all sequences; views filter). */
   messages: MessageView[];
   activeThread: ChatThread | null;
+  /** The active #tag filter (see TagFilter), or null for the live view. */
+  tagFilter: TagFilter | null;
+  /** The active tag filter's hits (newest first) — query-driven, like
+   *  `search`; never part of the per-block snapshot. */
+  tagHits: ChatSearchHit[];
+  /** A tagSearch round-trip is in flight. */
+  tagHitsPending: boolean;
+  /** The active channel's tag catalog (count-ordered), loaded on demand for
+   *  the header's tag dropdown. Cleared on channel switch. */
+  channelTags: ChatTagRow[];
   /** hex(user key bytes) → display name, from the `profiles` module; threaded
    *  into author rendering so messages show chosen names, not hex handles.
    *  OVERLAID by `identity`'s per-user display name for every node it binds —
@@ -189,9 +209,11 @@ export interface ConsoleState {
   /** The ⌘K command-palette search overlay is open. Global UI, not per-block. */
   searchOpen: boolean;
 
-  // ── Files (content-addressed manifests) ──
-  /** Every file manifest (List, prefix ""), re-queried per block. */
-  files: Manifest[];
+  // ── Files (duckfs) ──
+  /** A flat index of file entries under the tree root (Find, prefix "/"),
+   *  re-queried per block. Feeds the command palette's file filter; the files
+   *  browser pages the tree live off the transport instead. */
+  files: FileEntry[];
 
   /** The newest finalized height seen on the ws block stream — updated
    *  UNGATED (unlike the refresh the same stream drives, which is held while
@@ -250,6 +272,29 @@ export interface ConsoleState {
 }
 
 export const DEFAULT_ACCENT = "#a05a3c";
+
+// ── Accent persistence ──────────────────────────────────
+//
+// The chosen accent survives restarts. Values are validated as #rrggbb on
+// load so a corrupt/foreign string can never reach inline styles.
+const ACCENT_KEY = "ducktape.accent";
+
+export const loadAccent = (): string => {
+  try {
+    const raw = localStorage.getItem(ACCENT_KEY);
+    return raw && /^#[0-9a-f]{6}$/i.test(raw) ? raw : DEFAULT_ACCENT;
+  } catch {
+    return DEFAULT_ACCENT; // storage unavailable (private mode / quota)
+  }
+};
+
+export const saveAccent = (accent: string): void => {
+  try {
+    localStorage.setItem(ACCENT_KEY, accent);
+  } catch {
+    // persistence is best-effort; a failed write just doesn't survive restart.
+  }
+};
 
 // ── View-mode persistence ───────────────────────────────
 //
@@ -359,7 +404,7 @@ export const createInitialState = (): ConsoleState => {
   return {
     screen: viewMode === "operator" ? DEFAULT_OPERATOR_SCREEN : DEFAULT_USER_SCREEN,
     viewMode,
-    accent: DEFAULT_ACCENT,
+    accent: loadAccent(),
     author: "operator",
     connected: false,
     nodeUrl: null,
@@ -369,6 +414,10 @@ export const createInitialState = (): ConsoleState => {
     activeChannel: null,
     messages: [],
     activeThread: null,
+    tagFilter: null,
+    tagHits: [],
+    tagHitsPending: false,
+    channelTags: [],
     authorNames: {},
     nodeUsers: {},
     voice: {
@@ -437,7 +486,7 @@ export interface ConsoleSnapshot {
   pendingRuns: PendingRun[];
   capabilitiesByNode: Map<string, string[]>;
   runAssignee: Map<string, string>;
-  files: Manifest[];
+  files: FileEntry[];
   blocks: BlockRecord[];
 }
 

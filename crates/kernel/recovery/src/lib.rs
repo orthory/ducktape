@@ -28,7 +28,11 @@
 //!   synced, which also makes every earlier append durable). boot ROLLS it
 //!   FORWARD: if the live roots still equal the pre-block vector the frame
 //!   re-applies; if they moved, the apply completed before the crash and the
-//!   block is sealed from the observed roots.
+//!   block is sealed from the observed roots. a POWER CUT flavor of this
+//!   window — the disk substrate committed the block but the un-fsync'd seal
+//!   was lost — is bound-and-verified through the substrate's per-commit
+//!   height cursor (see `trailing.rs`): the cursor must claim exactly the
+//!   trailing WAL height, or the state stays fail-closed as [`Error::Torn`].
 //! - a TORN SEALED block: a block whose commit spans substrates with different
 //!   durability — a qmdb store commits to disk PER BLOCK, while the in-memory
 //!   cohort only persists at the periodic checkpoint. a crash (or a hard kill)
@@ -67,6 +71,8 @@
 //!   pinned at submit time ([`Record::Pinned`]), before the engine can ever
 //!   propose their digest. boot seeds the consensus content store from these
 //!   records so the re-reported finalization resolves and applies.
+
+mod trailing;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
@@ -1157,6 +1163,62 @@ where
             }
         }
 
+        // forward pre-scan — seed each per-block-durable disk substrate's
+        // "durable floor". a disk-cohort (ResolverBacked) module commits to its
+        // OWN disk every block, but the checkpoint only persists on a cadence
+        // (default 32 blocks), so at boot a disk module can legitimately sit N
+        // blocks AHEAD of the checkpoint: its live root equals a recorded
+        // post-root well above the last checkpoint, matching NEITHER the
+        // checkpoint pre-root NOR the first replayed block's post-root. the
+        // sequential per-height classifier has no forward lookahead, so it would
+        // false-Torn (BRICK) such a module at the first replayed height. so here,
+        // BEFORE the loop, record for each disk module the LATEST sealed height
+        // whose recorded post-root EXACTLY equals the module's live root, and let
+        // the loop treat every block up to that height as already-durable for it,
+        // replaying only STRICTLY above it. exact-match only: a disk module whose
+        // live root matches NO recorded post-root keeps no floor and still
+        // fail-stops as `Error::Torn` below (genuine corruption / a torn write) —
+        // recovery never heals from a nearest/approximate record. the disk cohort
+        // is single-path (no ResolverBacked module overrides `set_active_version`),
+        // so `root()` is version-independent and needs no version selector here;
+        // were that to change, a mis-read root could only mis-seed a floor and
+        // trip the final app-hash recompose (fail-stop), never fork.
+        let disk_cohort = host.resolver_backed_ids();
+        let mut disk_floor: BTreeMap<ModuleId, u64> = BTreeMap::new();
+        if !disk_cohort.is_empty() {
+            for record in &records {
+                let Record::Seal { height, roots, .. } = record else {
+                    continue;
+                };
+                if manifest.height.is_some_and(|h| *height <= h) {
+                    continue; // pre-checkpoint remnant, not this replay window.
+                }
+                for (id, root) in roots {
+                    if disk_cohort.contains(id) && host.module_root(id) == Some(*root) {
+                        // ascending replay order: a later match overwrites, so
+                        // this ends at the LATEST height the disk root matches.
+                        disk_floor.insert(id.clone(), *height);
+                    }
+                }
+            }
+        }
+        // TRAILING bound-and-verify (see `trailing.rs`): a power cut can lose
+        // the tip block's seal (a plain append; only the NEXT pre-apply syncs
+        // it) after a disk module already committed that block — leaving its
+        // live root matching NO recorded post-root, which the exact-match scan
+        // above rightly refuses to floor. a disk module carrying a per-commit
+        // height cursor (persisted atomically with its own commit) is floored
+        // AT the trailing unsealed WAL height iff the cursor claims exactly
+        // that height — binding the live root to the one finalized frame the
+        // WAL still holds durably. everything else stays floorless (Torn).
+        let trailing_claims = trailing::seed_trailing_claims(
+            host,
+            &disk_cohort,
+            &expected,
+            trailing::trailing_wal_height(&records, manifest.height),
+            &mut disk_floor,
+        );
+
         for record in records {
             match record {
                 Record::Pinned { frame } => frames.push(frame),
@@ -1259,20 +1321,46 @@ where
                         // DIFFERENT selectors — evaluate each under its own.
                         let pre_version =
                             host.effective_version(height.saturating_sub(1)).await;
+                        // classify each CHANGED module once, under its own selector.
                         host.set_active_version(pre_version);
-                        let at_pre = changed
+                        let at_pre_of: Vec<bool> = changed
                             .iter()
-                            .all(|(id, _)| host.module_root(id) == expected.get(id).copied());
+                            .map(|(id, _)| host.module_root(id) == expected.get(id).copied())
+                            .collect();
                         host.set_active_version(protocol_version);
-                        let at_post = changed
+                        let at_post_of: Vec<bool> = changed
                             .iter()
-                            .all(|(id, root)| host.module_root(id) == Some(*root));
-                        if at_post {
-                            skipped += 1; // a disk substrate already holds it.
+                            .map(|(id, root)| host.module_root(id) == Some(*root))
+                            .collect();
+                        // a disk-cohort module whose live root exactly matches a
+                        // recorded post-root STRICTLY ABOVE this height raced past
+                        // this block (its durable floor, seeded by the forward
+                        // pre-scan). the checkpoint-to-tip gap for a per-block-
+                        // durable disk substrate is bounded only by checkpoint
+                        // cadence, so recovery must trust the disk module's own
+                        // self-durable root and replay only strictly above it;
+                        // re-committing it here would move its op-log root and fork.
+                        // (`at_post_of`, floor == height, is the single-block-ahead
+                        // special case; this generalizes it to N blocks ahead.)
+                        let ahead_of: Vec<bool> = changed
+                            .iter()
+                            .map(|(id, _)| disk_floor.get(id).is_some_and(|m| *m > height))
+                            .collect();
+                        // "durable" = already at this block's post-root OR raced
+                        // strictly past it: either way a per-block-durable disk
+                        // substrate committed here and must NOT be re-committed.
+                        let all_durable =
+                            (0..changed.len()).all(|i| at_post_of[i] || ahead_of[i]);
+                        let all_pre = at_pre_of.iter().all(|&b| b);
+                        if all_durable {
+                            // nothing to re-commit: the disk cohort already holds
+                            // this block at or beyond its post-root. (subsumes the
+                            // old all-at-post fast path; adds the N-ahead case.)
+                            skipped += 1;
                             if let Some(sink) = sink.as_deref_mut() {
                                 sink.opaque_block(height);
                             }
-                        } else if at_pre {
+                        } else if all_pre {
                             let (_, dispatches) =
                                 apply_block(host, height, &frame, protocol_version, Some(disposition))
                                     .await?;
@@ -1298,69 +1386,62 @@ where
                         } else {
                             // a TORN block: some changed modules are at their
                             // pre-root (rolled back to the checkpoint — the
-                            // in-memory cohort), others already at their sealed
-                            // post-root (per-block-durable disk substrates that
-                            // committed before the crash). re-run the sealed
+                            // in-memory cohort), others durable on their own disk
+                            // (per-block-durable substrates already at, or raced
+                            // past, their sealed post-root). re-run the sealed
                             // frame but commit ONLY the still-at-pre cohort and
-                            // ABORT the already-durable ones — re-committing a
-                            // qmdb store would move its op-log root and fork us.
+                            // ABORT the durable ones — re-committing a qmdb store
+                            // would move its op-log root and fork us.
                             let mut commit_only: BTreeSet<ModuleId> = BTreeSet::new();
-                            let mut already_post = 0usize;
-                            for (id, root) in &changed {
-                                // classify each changed module under the SAME split
-                                // version selectors the bulk at_pre/at_post checks
-                                // above use: "still at pre" is read under the
-                                // PREVIOUS height's version, "already at post" under
-                                // THIS block's. a dual-path module's root() switches
-                                // format at an activation boundary, so a single
-                                // selector would misclassify a rolled-back in-memory
-                                // module as neither-pre-nor-post (false Torn brick).
-                                host.set_active_version(pre_version);
-                                let at_pre_root =
-                                    host.module_root(id) == expected.get(id).copied();
-                                host.set_active_version(protocol_version);
-                                let at_post_root = host.module_root(id) == Some(*root);
-                                if at_pre_root {
+                            let mut durable = 0usize;
+                            for (i, (id, _root)) in changed.iter().enumerate() {
+                                // the split selectors were evaluated above:
+                                // `at_pre_of` under the PREVIOUS height's version,
+                                // `at_post_of` under THIS block's; `ahead_of` from
+                                // the exact-match forward floor. a rolled-back
+                                // in-memory module is at pre; a disk substrate at or
+                                // past its post-root is durable.
+                                if at_pre_of[i] {
                                     commit_only.insert(id.clone());
-                                } else if at_post_root {
-                                    already_post += 1;
+                                } else if at_post_of[i] || ahead_of[i] {
+                                    durable += 1;
                                 }
+                                // else: neither — genuine damage, caught below.
                             }
                             // re-execute and verify under this block's version,
-                            // matching the at_pre replay path above.
+                            // matching the all_pre replay path above.
                             host.set_active_version(protocol_version);
                             // MULTI-DISK atomicity limit — fail-stop EXPLICITLY.
-                            // only a per-block-durable disk substrate can be at
-                            // its POST root after a crash (the in-memory cohort
-                            // always rolls back to the checkpoint pre-root), so
-                            // `already_post` counts exactly the disk substrates
-                            // that committed before the crash. two or more of
-                            // them is a changed set spanning >1 disk substrate at
-                            // mixed roots: the classic multi-store atomicity zone
-                            // whose sealed state may not be internally consistent
-                            // and whose single-frame re-execution can read a
-                            // partially-committed world. selective replay's
-                            // assumption (only the in-memory cohort was rolled
-                            // back) no longer holds, so we refuse it up front
-                            // rather than heal-and-hope the per-module verify
-                            // catches a divergence. no block commits to >1 disk
-                            // substrate today, so this is unreachable in prod;
+                            // only a per-block-durable disk substrate can be
+                            // durable after a crash (the in-memory cohort always
+                            // rolls back to the checkpoint pre-root), so `durable`
+                            // counts exactly the disk substrates that committed
+                            // this block. two or more of them is a changed set
+                            // spanning >1 disk substrate at mixed roots: the classic
+                            // multi-store atomicity zone whose sealed state may not
+                            // be internally consistent and whose single-frame
+                            // re-execution can read a partially-committed world.
+                            // selective replay's assumption (only the in-memory
+                            // cohort was rolled back) no longer holds, so we refuse
+                            // it up front rather than heal-and-hope the per-module
+                            // verify catches a divergence. no block commits to >1
+                            // disk substrate today, so this is unreachable in prod;
                             // the real fix if that changes is a per-commit height
                             // cursor in the disk substrate's commit metadata.
-                            if already_post >= 2 {
+                            if durable >= 2 {
                                 return Err(Error::Torn(format!(
-                                    "block {height}: changed set spans {already_post} \
+                                    "block {height}: changed set spans {durable} \
                                      per-block-durable disk substrates at mixed roots — the \
                                      multi-store atomicity limit; single-frame selective replay \
                                      cannot safely reconcile this. wipe app state and re-sync \
                                      (keep the consensus journal)"
                                 )));
                             }
-                            // a changed module at NEITHER pre nor post is
+                            // a changed module at NEITHER pre nor durable is
                             // genuine damage — still fail-stop. so is a torn
                             // block with nothing left to re-commit (it should
-                            // have been caught by the all-at-post fast path).
-                            if commit_only.len() + already_post != changed.len()
+                            // have been caught by the all-durable fast path).
+                            if commit_only.len() + durable != changed.len()
                                 || commit_only.is_empty()
                             {
                                 return Err(Error::Torn(format!(
@@ -1391,10 +1472,17 @@ where
                                     dispatches: &dispatches,
                                 });
                             }
-                            // every changed module — the re-committed cohort AND
-                            // the already-durable ones left untouched — must now
-                            // stand at its sealed post-root.
-                            for (id, root) in &changed {
+                            // every re-committed and exact-post module must now
+                            // stand at its sealed post-root. a disk substrate that
+                            // raced STRICTLY PAST this block sits at a later
+                            // post-root (a stale intermediate here), so skip its
+                            // per-block verify — it is verified at its own floor
+                            // height, and the final app-hash recompose backstops it
+                            // against the sealed tip.
+                            for (i, (id, root)) in changed.iter().enumerate() {
+                                if ahead_of[i] {
+                                    continue;
+                                }
                                 let live = host.module_root(id);
                                 if live != Some(*root) {
                                     return Err(Error::Verify(format!(
@@ -1427,12 +1515,14 @@ where
             let protocol_version = host.effective_version(height).await;
             let pre_version = host.effective_version(height.saturating_sub(1)).await;
             host.set_active_version(pre_version);
-            let at_pre = host
+            let moved: BTreeSet<ModuleId> = host
                 .module_roots()
                 .iter()
-                .all(|(id, root)| expected.get(id) == Some(root));
+                .filter(|(id, root)| expected.get(id) != Some(root))
+                .map(|(id, _)| id.clone())
+                .collect();
             host.set_active_version(protocol_version);
-            let disposition = if at_pre {
+            let disposition = if moved.is_empty() {
                 let (disposition, dispatches) =
                     apply_block(host, height, &frame, protocol_version, None).await?;
                 if let Some(sink) = sink.as_deref_mut() {
@@ -1448,13 +1538,72 @@ where
                 }
                 disposition
             } else {
-                // the apply completed before the crash; the roots that moved
-                // are its outcome. (single-disk-substrate blocks make this
-                // exact — see the crate doc on the multi-store limit.)
-                if let Some(sink) = sink.as_deref_mut() {
-                    sink.opaque_block(height);
+                match trailing::classify_trailing(height, &moved, &trailing_claims)? {
+                    // no verified trailing claim among the movers: the apply
+                    // completed before the crash; the roots that moved are its
+                    // outcome. (single-disk-substrate blocks make this exact —
+                    // see the crate doc on the multi-store limit.)
+                    trailing::TrailingPlan::AssumeApplied => {
+                        if let Some(sink) = sink.as_deref_mut() {
+                            sink.opaque_block(height);
+                        }
+                        Disposition::Applied
+                    }
+                    // exactly one disk module verifiably committed this block
+                    // (its height cursor claims the trailing WAL height) and
+                    // everything else is still at pre: re-execute the durable
+                    // frame committing ONLY the at-pre cohort — restoring any
+                    // writes the block fanned out to the in-memory cohort
+                    // (lost with RAM) — and aborting the claimant, whose
+                    // re-commit would move its op-log root and fork us.
+                    trailing::TrailingPlan::SelectiveReplay => {
+                        let commit_only: BTreeSet<ModuleId> = host
+                            .module_roots()
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .filter(|id| !moved.contains(id))
+                            .collect();
+                        let (disposition, dispatches) = apply_block_committing(
+                            host,
+                            height,
+                            &frame,
+                            protocol_version,
+                            None,
+                            &commit_only,
+                        )
+                        .await?;
+                        // consistency backstops: a claimant whose commit this
+                        // frame cannot explain is damage, not a roll-forward.
+                        if disposition != Disposition::Applied {
+                            return Err(Error::Torn(format!(
+                                "trailing block {height} re-landed as {disposition:?}, but a \
+                                 disk module's height cursor claims its durable commit — the \
+                                 claimed state cannot come from this frame. wipe app state \
+                                 and re-sync (keep the consensus journal)"
+                            )));
+                        }
+                        for id in &moved {
+                            if !dispatches.iter().any(|d| d.module == *id) {
+                                return Err(Error::Torn(format!(
+                                    "trailing block {height} never dispatched module {id}, \
+                                     which claims to have committed it — the claimed state \
+                                     cannot come from this frame. wipe app state and re-sync \
+                                     (keep the consensus journal)"
+                                )));
+                            }
+                        }
+                        if let Some(sink) = sink.as_deref_mut() {
+                            sink.folded_block(&FoldedBlock {
+                                height,
+                                frame: &frame,
+                                disposition,
+                                app_hash: host.app_hash(),
+                                dispatches: &dispatches,
+                            });
+                        }
+                        disposition
+                    }
                 }
-                Disposition::Applied
             };
             let seal = BlockSeal {
                 height,

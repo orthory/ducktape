@@ -794,9 +794,14 @@ pub fn decode_rpc(bytes: &[u8]) -> Result<(u64, &[u8]), WireError> {
 enum CapturedPayload {
     Stateless,
     Snapshot(Vec<u8>),
-    /// the module serves its own resolver lane live; the capture only records
-    /// that fact (and the boundary root, in the entry).
+    /// the module serves its own qmdb resolver lane live; the capture records the
+    /// pinned op-range target (and the boundary root, in the entry).
     Resolver(ResolverTarget),
+    /// an object-store resolver (duckfs-odb): the module serves its refs image
+    /// and content-addressed objects live over `serve_sync`, with NO qmdb
+    /// op-range target to pin — the boundary root in the entry is all the joiner
+    /// needs to root-verify the refs it fetches over the same Module lane.
+    ObjectResolver,
     Unsupported,
 }
 
@@ -805,7 +810,10 @@ impl CapturedPayload {
         match self {
             Self::Stateless => PayloadKind::Stateless,
             Self::Snapshot(_) => PayloadKind::Snapshot,
-            Self::Resolver(_) => PayloadKind::Resolver,
+            // both resolver flavors advertise the same wire kind; a joiner
+            // distinguishes them by whether the entry pins a qmdb target
+            // (`resolver_target: Some` for qmdb, `None` for an object resolver).
+            Self::Resolver(_) | Self::ObjectResolver => PayloadKind::Resolver,
             Self::Unsupported => PayloadKind::Unsupported,
         }
     }
@@ -1097,7 +1105,12 @@ impl SyncServer {
                 let module = capture.modules.get(&module_id).ok_or_else(|| {
                     format!("no module {module_id} in capture {}", boundary.height)
                 })?;
-                if !matches!(module.payload, CapturedPayload::Resolver(_)) {
+                // both resolver flavors serve their bytes live through the
+                // module's `serve_sync` (qmdb op ranges, or duckfs refs/objects).
+                if !matches!(
+                    module.payload,
+                    CapturedPayload::Resolver(_) | CapturedPayload::ObjectResolver
+                ) {
                     return Err(format!("module {module_id} has no resolver payload"));
                 }
                 host.serve_sync(&module_id, &body)
@@ -1208,6 +1221,14 @@ impl SyncServer {
             let payload = match m.state_sync {
                 StateSyncHandle::Stateless => CapturedPayload::Stateless,
                 StateSyncHandle::SnapshotBytes(bytes) => CapturedPayload::Snapshot(bytes),
+                // an object-store resolver has no qmdb op-range target to pin: its
+                // refs image + content-addressed objects are served live over
+                // `serve_sync`, root-verified by the joiner against the boundary
+                // root already recorded in the entry. keep the qmdb arm below
+                // UNCHANGED.
+                StateSyncHandle::ResolverBacked { backend, .. } if backend == "duckfs-odb" => {
+                    CapturedPayload::ObjectResolver
+                }
                 StateSyncHandle::ResolverBacked { .. } => {
                     let target = host
                         .resolver_sync_target(&m.id)
@@ -1477,6 +1498,153 @@ pub async fn fetch_frames<C: SyncClient>(
         }
     }
     Ok(out)
+}
+
+// ============================================================================
+// OBJECT-RESOLVER DRIVER — the duckfs-odb ("object possession") sync path.
+// ============================================================================
+//
+// unlike the qmdb resolver (a merkle op-range engine), an object-store module
+// syncs by CONTENT-ADDRESSED FETCH: install the boundary refs image, then walk
+// the reachable-but-absent object set (a BFS whose children are only revealed as
+// their parents arrive), fetching each layer over the module's `serve_sync` lane
+// until every reachable object is present. this crate is platform surface below
+// the module crates, so it cannot name the module's types — the loop is generic
+// over two seams the module (or the node glue) supplies:
+//
+//   * [`ModuleLane`]  — move one `serve_sync` request/response for the module.
+//   * [`ObjectFetch`] — the module's install / missing / ingest / possession ops
+//                       and its own request/response wire (encode/decode).
+//
+// the driver owns ONLY the control flow + the full-possession gate, so a joiner
+// reports READY only once it holds every object — never on the refs alone.
+
+/// move one `serve_sync` request to the serving peer for `module_id` and bring
+/// its response bytes back. deliberately NOT [`SyncClient`]: this lane is driven
+/// sequentially and need not be `Send` (an object-store module's `serve_sync`
+/// future is `?Send`), so a test can back it with a source module in-process.
+pub trait ModuleLane {
+    fn fetch(
+        &self,
+        module_id: &str,
+        body: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, SyncError>>;
+}
+
+/// a lane backed by a real [`SyncClient`] pinned at a manifest boundary: every
+/// fetch is a boundary-scoped [`SyncRequest::Module`] round trip, exactly the
+/// lane the server routes to `host.serve_sync`.
+#[derive(Clone)]
+pub struct ClientModuleLane<C> {
+    client: C,
+    boundary: BoundaryId,
+}
+
+impl<C> ClientModuleLane<C> {
+    pub fn new(client: C, boundary: BoundaryId) -> Self {
+        Self { client, boundary }
+    }
+}
+
+impl<C: SyncClient> ModuleLane for ClientModuleLane<C> {
+    async fn fetch(&self, module_id: &str, body: Vec<u8>) -> Result<Vec<u8>, SyncError> {
+        match self
+            .client
+            .request(SyncRequest::Module {
+                boundary: self.boundary,
+                module_id: module_id.to_string(),
+                body,
+            })
+            .await?
+        {
+            SyncResponse::Module(bytes) => Ok(bytes),
+            SyncResponse::Error(e) => Err(qmdb::module_lane_error(module_id, e)),
+            other => Err(SyncError::UnexpectedResponse(other.kind_name())),
+        }
+    }
+}
+
+/// the joiner-side seam an object-store ("duckfs-odb") module presents to the
+/// generic possession driver: the module owns its `serve_sync` WIRE (encode the
+/// request bodies, decode the replies) and its verify-then-store ops; the driver
+/// owns the loop. all ops are sync — an object-store module's install / walk /
+/// ingest touch only local durable state.
+pub trait ObjectFetch {
+    /// the `serve_sync` body requesting the boundary refs image.
+    fn refs_request(&self) -> Vec<u8>;
+
+    /// verify-then-install a served refs reply against `root`, persisting the
+    /// durable envelope at the SYNC-TARGET `height` (a fresh joiner must not
+    /// persist height 0 — a restart would replay from a pruned genesis).
+    fn install_refs(&mut self, reply: &[u8], root: StateRoot, height: u64) -> Result<(), String>;
+
+    /// the `serve_sync` body requesting up to `limit` reachable-but-absent
+    /// objects, or `None` when possession is already complete (nothing missing).
+    fn missing_request(&self, limit: usize) -> Result<Option<Vec<u8>>, String>;
+
+    /// verify-then-store a served object reply (each id re-hashed inside);
+    /// returns how many objects LANDED. a batch that lands zero while objects are
+    /// still missing means the source pruned below the boundary — the driver
+    /// stops rather than livelock.
+    fn ingest(&mut self, reply: &[u8]) -> Result<usize, String>;
+
+    /// whether every object the committed refs reach is now present.
+    fn possession_complete(&self) -> Result<bool, String>;
+}
+
+/// drive an object-store module to FULL object possession at a manifest
+/// boundary: install the boundary refs (root-verified) at `height`, then loop
+/// { missing -> fetch -> ingest } until nothing is missing, and gate READY on
+/// possession being genuinely complete. `batch` bounds the objects requested per
+/// round (must not exceed the module's `serve_sync` id cap).
+pub async fn sync_object_possession<L, M>(
+    lane: &L,
+    module_id: &str,
+    root: StateRoot,
+    height: u64,
+    module: &mut M,
+    batch: usize,
+) -> Result<(), SyncError>
+where
+    L: ModuleLane,
+    M: ObjectFetch,
+{
+    let module_err = |reason: String| SyncError::Module {
+        module: module_id.to_string(),
+        reason,
+    };
+
+    // 1. install the boundary refs image (root-verified) at the sync-target
+    //    height. a mismatch (the source advanced past the captured boundary)
+    //    fails here — the caller refetches the manifest and retries.
+    let refs_reply = lane.fetch(module_id, module.refs_request()).await?;
+    module
+        .install_refs(&refs_reply, root, height)
+        .map_err(module_err)?;
+
+    // 2. the possession walk. each round reveals at least the newly-arrived
+    //    layer's children, so the store strictly grows; the loop terminates when
+    //    the reachable set is fully present (`missing_request` -> None).
+    while let Some(body) = module.missing_request(batch).map_err(module_err)? {
+        let reply = lane.fetch(module_id, body).await?;
+        let landed = module.ingest(&reply).map_err(module_err)?;
+        if landed == 0 {
+            return Err(module_err(
+                "source served no requested object (pruned below the boundary); \
+                 refetch the manifest"
+                    .into(),
+            ));
+        }
+    }
+
+    // 3. the full-possession gate — READY only when every reachable object is
+    //    held, never on the refs image alone.
+    if !module.possession_complete().map_err(module_err)? {
+        return Err(module_err(
+            "object fetch loop terminated before full possession".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn hex_root(root: &StateRoot) -> String {

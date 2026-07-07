@@ -52,10 +52,24 @@ agent execution loop; it is richer operator UX and package-level behavior:
 packaged agents and harnesses, broader action vocabularies, task obligations,
 and durable agent workflows that feel native rather than a debug surface.
 
+## duckfs Client Stack
+
+duckfs Phases 1–2 are shipped: the rebuilt `files` module (staging, atomic
+per-path-CAS commits, snapshots, pins, watches, snapshot-addressed reads),
+resolver-backed state sync to full possession, restart durability, and the
+noded HTTP surface. Do not list those as missing. Nothing mounts it yet: the
+checkout/commit engine (`duckfs-client`, the `.duckfs/` index), the CLI, the
+FUSE mount, and the app FilesView rebuilt on duckfs verbs are Phases 3–5 and
+remain open. The `memory` module was deleted — absorbed by duckfs (generations
+became snapshots, `duck://memory/...` became `duck://files/...`). The
+automations memory-watch trigger was removed with it; filesystem-change
+automations would return as a new duckfs-watch trigger, a fresh feature, not a
+migration.
+
 ## Module Integration Wave
 
 The next module wave is integration work across modules that already exist:
-automations deliver to inbox via `Deliver`; automations can trigger from memory
-watches; memory bodies over 64 KiB ride through files manifests; package
-harnesses can own agents and action routes; and tasks can become obligations
-with deadline state, cure/escalation lineage, and atomic cross-module creation.
+automations deliver to inbox via `Deliver`; automations can trigger from duckfs
+(files) watches; agents can claim jobs; package harnesses can own agents and
+action routes; and tasks can become obligations with deadline state,
+cure/escalation lineage, and atomic cross-module creation.
