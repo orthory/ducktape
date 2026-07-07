@@ -1,4 +1,4 @@
-# duckfs — the files module as a real, fully replicated filesystem
+# duckfs — the files module as a reproducible execution filesystem
 
 **Date:** 2026-07-06
 **Status:** approved (brainstorm complete; implementation plan next)
@@ -8,16 +8,32 @@
 ## Summary
 
 Rebuild `files` as **duckfs**: a consensus-replicated, copy-on-write,
-content-addressed filesystem. Every node holds every byte as consensus state
-(full replication — bytes travel through blocks). CoW snapshots give pinned,
-reproducible checkouts for sandboxed workloads; a checkout/commit engine
-materializes subtrees onto the real OS filesystem; a FUSE mount fronts a
-working copy. The `memory` module's filesystem-shaped verb surface (ls / stat /
-read / find / grep, watches, generations, citable URIs) is absorbed into
-duckfs and `memory` is deleted.
+content-addressed filesystem whose product role is reproducible execution, not
+generic storage. Every node holds every byte as consensus state (full
+replication — bytes travel through blocks). CoW snapshots define byte-exact
+inputs for sandboxed workloads; commits define atomic output diffs; the history
+answers what a job saw, what it changed, and how to reproduce or audit it. A
+checkout/commit engine materializes subtrees onto the real OS filesystem; a
+FUSE mount fronts a working copy. The `memory` module's filesystem-shaped verb
+surface (ls / stat / read / find / grep, watches, generations, citable URIs) is
+absorbed into duckfs and `memory` is deleted.
 
 Naming: the wire module id stays `files`; the filesystem is called **duckfs**
 everywhere humans see it (mount type, `.duckfs/` working-copy dir, CLI, docs).
+
+Product boundary:
+
+- `forge` owns code repositories, Git history, branches, review workflows, and
+  smart-HTTP clone/fetch/push. duckfs may hold artifacts referenced by a repo,
+  but it is not a Git substrate.
+- `jobs` owns scheduling, claiming, retry, and runner orchestration. duckfs owns
+  the byte-exact workspace state those jobs consume and produce.
+- FUSE, SMB, NFS, and WebDAV-style access are compatibility adapters over a
+  checkout or pinned snapshot, not the product identity. A read-write adapter is
+  a working-copy editor followed by a duckfs commit, not a coherent shared disk.
+- Git-LFS-style use is a pointer/manifest pattern: a forge repo may reference
+  duckfs snapshots or objects for large artifacts, but duckfs stays the
+  execution evidence layer rather than becoming a blob CDN.
 
 Sharding and KZG-style data-availability commitments are **out of scope** for
 this wave, but the object model is chosen so that adopting them later is a
@@ -56,8 +72,10 @@ Alternatives weighed:
   refs, and authority (the hard part) would still have to be built here;
   availability would rest on pinning policy, not consensus-verified
   possession.
-- **NFS from one node; CRDT filesystems** — single point of failure;
-  merge semantics meaningless for arbitrary bytes.
+- **NFS/NAS as the product shape; CRDT filesystems** — single point of
+  failure, coherence/lock semantics pull the design toward mutable shared disk,
+  and merge semantics are meaningless for arbitrary bytes. duckfs can expose
+  adapters, but its core is snapshot inputs plus committed output diffs.
 
 Every off-the-shelf option either cannot be consensus state or solves only the
 storage half while leaving the namespace/snapshot/authority layer to us
@@ -74,6 +92,25 @@ over it is the product decision that sandboxed agent workspaces are real.
 | Wave scope | Consensus module + checkout/commit engine + FUSE mount |
 | Write authority | Owner-gated home subtrees: `/home/<owner>/**` (owner only), `/shared/**` (any member), system writes anywhere |
 | Name | duckfs (module id `files` unchanged) |
+| Product identity | Reproducible execution filesystem: snapshot inputs, atomic output diffs, citable history; not NAS, Git, or a generic blob store |
+| Operation layer boundary | Runners execute outside the consensus hot path against pinned snapshots; duckfs records inputs, outputs, diffs, and operation receipts through ordinary commits |
+
+## Execution filesystem framing
+
+duckfs treats a file tree as the boundary of work. A job or agent receives a
+pinned snapshot as its input workspace, runs in a sandbox owned by `jobs` /
+runner code, and returns a commit against that base. The commit message and/or
+result files can carry the operation id/version, runner identity, logs, and
+receipt hashes, but the consensus module does not run expensive
+transformations itself. Consensus verifies bytes, paths, authority, per-path
+CAS, and object possession; execution stays outside `execute`.
+
+This keeps the "storage plus operations" idea without turning duckfs into a
+second VM inside every validator. The operation layer is
+file-native rather than KV-native: `stat`, `read`, `ls`, `find`, `grep`, `diff`,
+and commit receipts are the substrate. The durable fact is not "a remote
+process ran"; it is "this snapshot was transformed into that snapshot by this
+declared operation, with this auditable diff."
 
 ## Determinism boundary (the rule everything hangs on)
 
@@ -356,7 +393,7 @@ Rust crate shared by CLI, daemon, and sandbox runner; TS mirror for the app.
 
 1. A `--rw` FUSE mount is not a shared disk: writes are invisible cluster-wide
    until commit; concurrent same-path edits meet as commit conflicts. duckfs
-   is git-with-a-mount, not NFS.
+   is an execution workspace with commit discipline, not NFS.
 2. Ingest speed is consensus speed: capacity is disk-limited but throughput is
    block-limited; every uploaded byte is paid by every validator's disk and
    bandwidth. Reads are local and free. (Sharding/KZG later changes exactly
