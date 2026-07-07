@@ -135,6 +135,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
       "files",
       "memory",
       "profiles",
+      "identity",
       "package",
     ]);
     // no package is installed at genesis, so every row omits the package

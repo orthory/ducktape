@@ -39,6 +39,7 @@ use forge::{
 };
 use greeter::Greeter;
 use host::{BlockContext, Host};
+use identity::Identity;
 use inbox::Inbox;
 use inbox::{
     InboxMsg, InboxQuery, InboxReply, decode_reply as inbox_decode_reply,
@@ -81,6 +82,9 @@ fn main() {
         let tagging = tagging::TaggingModule::new("tagging");
         let tasks = Tasks::new("tasks");
         let profiles = Profiles::new("profiles");
+        // the deterministic user->nodes binding registry: no valset gating and
+        // a fixed demo chain id (the demo has no real network descriptor).
+        let identity = Identity::new("identity", None, "demo".into());
         let inbox = Inbox::new("inbox");
         let files = Files::new("files");
         let memory = Memory::new("memory", "files");
@@ -119,6 +123,7 @@ fn main() {
             Box::new(tagging),
             Box::new(tasks),
             Box::new(profiles),
+            Box::new(identity),
             Box::new(inbox),
             Box::new(files),
             Box::new(memory),
@@ -587,6 +592,7 @@ fn main() {
             "files",
             "forge",
             "greeter",
+            "identity",
             "inbox",
             "jobs",
             "kv",

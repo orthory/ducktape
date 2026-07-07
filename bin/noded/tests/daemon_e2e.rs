@@ -385,6 +385,7 @@ fn full_surface_blocks_authorship_and_ws() {
             "files",
             "memory",
             "profiles",
+            "identity",
             "package"
         ]
     );

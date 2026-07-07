@@ -216,7 +216,7 @@ fn cluster_lifecycle() {
     // widens the quorum to 4. node 3 boots as a parked joiner, sees itself
     // in the participant set at the boundary, syncs, and promotes.
     cluster.spawn(3);
-    cluster.wait_marker(3, "joiner mode: parking", Duration::from_secs(60));
+    cluster.wait_marker(3, "joiner mode:", Duration::from_secs(60));
 
     // 7. ADMISSION CUTOVER. finalized views only advance with ops, so push
     // fillers through the boundary. fillers go through the raw rpc and
@@ -396,7 +396,7 @@ fn cluster_lifecycle() {
 
     // 10. the sync-only joiner rebuilds EVERY module over the statesync
     // channel from node 0 and must compose the identical app-hash. node 3's
-    // slot is reused as a FRESH observer: kill the promoted validator
+    // slot is reused as a FRESH resident: kill the promoted validator
     // (quorum(4) = 3 keeps the network live — nops move heights, not state,
     // so the step-9 boundary hash stands) and wipe its state.
     cluster.kill(3);

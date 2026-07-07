@@ -21,7 +21,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use tauri::Manager as _;
 
@@ -63,8 +65,11 @@ pub fn daemon_spawn(app: tauri::AppHandle, listen: String) -> Result<String, Str
     };
     cmd.stdin(Stdio::null()).stdout(log).stderr(log_err);
     detach(&mut cmd);
-    cmd.spawn()
-        .map_err(|err| format!("spawn {:?}: {err}", cmd.get_program()))?;
+    // verify the node survived instead of returning the log path over a corpse.
+    // `listen` is the http surface, so its port is the readiness signal.
+    let ready_port = listen.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+    spawn_verified(cmd, &log_path, ready_port)
+        .map_err(|failure| format!("the node exited on start: {failure}"))?;
 
     Ok(log_path.display().to_string())
 }
@@ -110,8 +115,8 @@ enum NodeBinary {
 /// build.rs's EMPTY placeholder — spawning it fails with a baffling
 /// permission-denied. reject it here with an actionable message instead.
 fn node_binary() -> Result<NodeBinary, String> {
-    if let Ok(explicit) = std::env::var("DUCKTAPE_NODE_BIN") {
-        return Ok(NodeBinary::Node(PathBuf::from(explicit)));
+    if let Some(explicit) = env_node_bin()? {
+        return Ok(NodeBinary::Node(explicit));
     }
     let exe = std::env::current_exe().map_err(|err| err.to_string())?;
     let dir = exe
@@ -140,8 +145,8 @@ fn node_binary() -> Result<NodeBinary, String> {
 /// unlike [`node_binary`] there is no legacy-noded fallback — workspaces always
 /// run the network-shape node (real identity, real descriptor).
 pub(crate) fn resolve_node_bin() -> Result<PathBuf, String> {
-    if let Ok(explicit) = std::env::var("DUCKTAPE_NODE_BIN") {
-        return Ok(PathBuf::from(explicit));
+    if let Some(explicit) = env_node_bin()? {
+        return Ok(explicit);
     }
     let exe = std::env::current_exe().map_err(|err| err.to_string())?;
     let dir = exe
@@ -156,6 +161,36 @@ pub(crate) fn resolve_node_bin() -> Result<PathBuf, String> {
          (or `make sidecar` at the repo root), or set DUCKTAPE_NODE_BIN",
         sibling.display()
     ))
+}
+
+/// the `DUCKTAPE_NODE_BIN` override, trimmed and validated: `Ok(None)` when
+/// unset or empty (fall through to the sibling), `Ok(Some(path))` when it names
+/// a usable binary, and an actionable `Err` when it is set but points at a
+/// missing / empty / non-executable file. that last case is the dev trap the
+/// old code walked straight into: `tauri dev`'s build.rs can leave a 0-byte
+/// placeholder at the pinned path, and spawning it fails with a baffling
+/// `Exec format error` / `Permission denied` far from the cause. reject it here
+/// with a message that names the fix, and never silently substitute the sibling
+/// for an explicitly-pinned (if broken) path.
+fn env_node_bin() -> Result<Option<PathBuf>, String> {
+    let raw = match std::env::var("DUCKTAPE_NODE_BIN") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(trimmed);
+    if usable(&path) {
+        Ok(Some(path))
+    } else {
+        Err(format!(
+            "DUCKTAPE_NODE_BIN={trimmed} is empty or not executable \
+             (a mid-rebuild or 0-byte placeholder?) — run `cargo build -p node-bin`, \
+             wait for the rebuild to finish, or unset it"
+        ))
+    }
 }
 
 /// a real node binary: present, non-empty, executable.
@@ -177,6 +212,93 @@ fn usable(path: &PathBuf) -> bool {
     }
 }
 
+/// A verified-spawn failure: the node forked (or failed to) but did not survive
+/// the grace window, carrying a human reason and the tail of `daemon.log` so the
+/// real cause — a bind conflict, a config parse error, a boot panic — reaches
+/// the caller instead of a silent `Ok`.
+#[derive(Debug)]
+pub struct SpawnFailure {
+    pub reason: String,
+    pub log_tail: String,
+}
+
+impl std::fmt::Display for SpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.log_tail.trim().is_empty() {
+            write!(f, "{}", self.reason)
+        } else {
+            write!(f, "{}\n{}", self.reason, self.log_tail.trim_end())
+        }
+    }
+}
+
+/// Spawn `cmd` detached, then VERIFY the child did not die within a short grace
+/// window (~1.5s) — the missing check that lets a node crash on boot yet report
+/// success. `ready_port`, when `Some`, is polled as a fast success signal (the
+/// member/founder http surface); a joiner passes `None` — it serves no http
+/// while parked, so "still alive after the grace" is the only available signal.
+/// On an immediate exit the last lines of `log_path` are read back into the
+/// error. The initial spawn is retried a few times on ETXTBSY/ENOEXEC — a
+/// hot-reload rewriting the binary as we exec it.
+pub fn spawn_verified(
+    mut cmd: Command,
+    log_path: &Path,
+    ready_port: Option<u16>,
+) -> Result<Child, SpawnFailure> {
+    let tail = || crate::workspaces::read_tail(log_path, 8 * 1024).unwrap_or_default();
+
+    // exec, tolerating the hot-reload binary-rewrite race for a few tries.
+    let mut child = {
+        let mut attempt = 0;
+        loop {
+            match cmd.spawn() {
+                Ok(child) => break child,
+                Err(err) => {
+                    // 26 = ETXTBSY (binary open for writing), 8 = ENOEXEC
+                    // (half-written) — both transient during a hot rebuild.
+                    let transient = matches!(err.raw_os_error(), Some(26) | Some(8));
+                    if transient && attempt < 3 {
+                        attempt += 1;
+                        sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    return Err(SpawnFailure {
+                        reason: format!("could not spawn {:?}: {err}", cmd.get_program()),
+                        log_tail: tail(),
+                    });
+                }
+            }
+        }
+    };
+
+    // grace window: catch a node that dies milliseconds after fork.
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(SpawnFailure {
+                    reason: format!("the node exited on start ({status})"),
+                    log_tail: tail(),
+                });
+            }
+            Ok(None) => {} // still alive
+            Err(err) => {
+                return Err(SpawnFailure {
+                    reason: format!("could not check the node process: {err}"),
+                    log_tail: tail(),
+                });
+            }
+        }
+        if ready_port.map_or(false, crate::workspaces::port_listening) {
+            return Ok(child); // confirmed serving its port
+        }
+        if Instant::now() >= deadline {
+            return Ok(child); // alive but not yet serving — let the caller poll
+        }
+        sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn detach(cmd: &mut Command) {
     use std::os::unix::process::CommandExt as _;
@@ -190,4 +312,44 @@ pub(crate) fn detach(cmd: &mut Command) {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dt-daemon-{tag}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn spawn_verified_catches_insta_death_with_log_tail() {
+        let log = scratch("insta").join("daemon.log");
+        fs::write(&log, b"boom: bind 127.0.0.1:8844: address already in use\n").unwrap();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("exit 3");
+        let err = spawn_verified(cmd, &log, None).err().expect("insta-exit must be an error");
+        assert!(err.reason.contains("exited"), "reason: {}", err.reason);
+        assert!(err.log_tail.contains("boom"), "tail: {}", err.log_tail);
+    }
+
+    #[test]
+    fn spawn_verified_ok_for_a_live_child() {
+        let log = scratch("live").join("daemon.log");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 5");
+        let mut child = spawn_verified(cmd, &log, None).expect("a still-alive child is Ok");
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    #[test]
+    fn usable_rejects_empty_and_zero_byte() {
+        assert!(!usable(&PathBuf::from("")), "empty path is not usable");
+        let zero = scratch("zero").join("node");
+        fs::write(&zero, b"").unwrap();
+        assert!(!usable(&zero), "a 0-byte file is not usable");
+    }
 }

@@ -2290,6 +2290,7 @@ mod tests {
             "memory",
             "saga",
             "profiles",
+            "identity",
             "kv",
             "valset",
             "governance",

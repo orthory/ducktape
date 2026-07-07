@@ -9,6 +9,7 @@ import {
   hasFreshPending,
   opForMessage,
   opKey,
+  pageSnapshotSuperseded,
   receiptOf,
 } from "./finalization";
 import type { OpLedger } from "./finalization";
@@ -69,6 +70,32 @@ describe("the op ledger", () => {
     expect(hasFreshPending(finalizeOp(ops, opKey.file("t1"), { height: 1 }), 1_001)).toBe(
       false,
     );
+  });
+});
+
+describe("pageSnapshotSuperseded", () => {
+  it("a fresh pending page op supersedes any snapshot", () => {
+    const ops = beginOp({}, opKey.pageBlock("b1"), 1_000);
+    expect(pageSnapshotSuperseded(ops, 500, 1_500)).toBe(true);
+    // the overlap shape: the snapshot was fetched AFTER the op began (an
+    // earlier op's completion refresh) — still superseded while it pends.
+    expect(pageSnapshotSuperseded(ops, 2_000, 2_500)).toBe(true);
+  });
+
+  it("an op settled after the fetch began supersedes that snapshot only", () => {
+    let ops = beginOp({}, opKey.page("p1"), 1_000);
+    ops = finalizeOp(ops, opKey.page("p1"), { height: 4 });
+    // fetched before the op began → predates it.
+    expect(pageSnapshotSuperseded(ops, 900, 1_100)).toBe(true);
+    // fetched after (the op's own completion refresh) → applies.
+    expect(pageSnapshotSuperseded(ops, 1_001, 1_100)).toBe(false);
+  });
+
+  it("non-page ops and stale pendings never supersede", () => {
+    const chat = beginOp({}, opKey.channel("general"), 1_000);
+    expect(pageSnapshotSuperseded(chat, 500, 1_100)).toBe(false);
+    const hung = beginOp({}, opKey.pageBlock("b1"), 1_000);
+    expect(pageSnapshotSuperseded(hung, 500, 1_000 + OP_STALE_MS)).toBe(false);
   });
 });
 

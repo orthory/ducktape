@@ -1,11 +1,20 @@
 //! the p2p transport binding: a [`SyncClient`] over one commonware p2p channel.
 //!
 //! requests ride the rpc envelope (`id || frame`) addressed to ONE serving
-//! peer; a background dispatch task drains the channel receiver and routes
-//! each response to its awaiting request by id. responses claiming to be from
-//! any other peer than the chosen server are dropped — the mesh is
+//! peer at a time; a background dispatch task drains the channel receiver and
+//! routes each response to its awaiting request by id. responses claiming to
+//! be from a peer outside the candidate SOURCE set are dropped — the mesh is
 //! authenticated, and installable payloads are root-verified anyway, but there
 //! is no reason to let an unrelated peer complete someone else's request.
+//!
+//! SOURCE ROTATION: the client holds a candidate list, not a pinned server.
+//! every payload is verified against consensus-agreed roots, so which peer
+//! serves is purely an availability question — a request that fails at the
+//! transport (unreachable send, reaper timeout) advances the cursor to the
+//! next candidate and surfaces the error, and the caller's existing retry
+//! (manifest loops, the qmdb refetch ladder) lands on the new source. one
+//! failure advances the cursor once, no matter how many concurrent requests
+//! observed it.
 //!
 //! every request is TIMED OUT by the dispatch task's reaper: p2p sends to a
 //! peer whose link is not (or no longer) up are silently dropped by the mesh,
@@ -16,7 +25,7 @@
 //! owns the only clock, and the request future itself stays runtime-free.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -46,10 +55,36 @@ struct Shared {
     next_id: AtomicU64,
 }
 
-/// a [`SyncClient`] whose requests cross a real p2p channel to one server peer.
+/// the rotating candidate source set (see the module doc's SOURCE ROTATION).
+struct Sources<P> {
+    candidates: Vec<P>,
+    cursor: AtomicUsize,
+}
+
+impl<P: Clone + PartialEq> Sources<P> {
+    fn current(&self) -> (usize, P) {
+        let at = self.cursor.load(Ordering::Relaxed) % self.candidates.len();
+        (at, self.candidates[at].clone())
+    }
+
+    /// advance past the source at `observed` — exactly once per failure wave:
+    /// a concurrent request that saw the same source fail leaves the cursor
+    /// where the first advance put it.
+    fn advance_past(&self, observed: usize) {
+        let _ = self.cursor.compare_exchange(
+            observed,
+            observed + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// a [`SyncClient`] whose requests cross a real p2p channel to one of a
+/// candidate set of serving peers, failing over on transport failure.
 pub struct P2pSyncClient<S: Sender> {
     sender: S,
-    server: S::PublicKey,
+    sources: Arc<Sources<S::PublicKey>>,
     shared: Arc<Shared>,
 }
 
@@ -57,7 +92,7 @@ impl<S: Sender> Clone for P2pSyncClient<S> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
-            server: self.server.clone(),
+            sources: Arc::clone(&self.sources),
             shared: Arc::clone(&self.shared),
         }
     }
@@ -67,13 +102,35 @@ impl<S> P2pSyncClient<S>
 where
     S: Sender,
 {
-    /// bind a client to `server` over a registered channel pair, spawning the
-    /// dispatch + reaper task on `context` (consumed — contexts are move-only).
-    pub fn new<E, R>(context: E, sender: S, mut receiver: R, server: S::PublicKey) -> Self
+    /// bind a client to one `server` — [`P2pSyncClient::with_sources`] with a
+    /// single candidate.
+    pub fn new<E, R>(context: E, sender: S, receiver: R, server: S::PublicKey) -> Self
     where
         E: Spawner + Clock + Send + 'static,
         R: Receiver<PublicKey = S::PublicKey> + Send + 'static,
     {
+        Self::with_sources(context, sender, receiver, vec![server])
+    }
+
+    /// bind a client to a non-empty ordered candidate set over a registered
+    /// channel pair, spawning the dispatch + reaper task on `context`
+    /// (consumed — contexts are move-only). requests go to the cursor's
+    /// candidate; a transport failure advances the cursor.
+    pub fn with_sources<E, R>(
+        context: E,
+        sender: S,
+        mut receiver: R,
+        candidates: Vec<S::PublicKey>,
+    ) -> Self
+    where
+        E: Spawner + Clock + Send + 'static,
+        R: Receiver<PublicKey = S::PublicKey> + Send + 'static,
+    {
+        assert!(!candidates.is_empty(), "at least one sync source");
+        let sources = Arc::new(Sources {
+            candidates,
+            cursor: AtomicUsize::new(0),
+        });
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
             tick: AtomicU64::new(0),
@@ -81,7 +138,7 @@ where
         });
         let task_shared = Arc::clone(&shared);
         let reap_shared = Arc::clone(&shared);
-        let expected = server.clone();
+        let expected = Arc::clone(&sources);
         context.spawn(move |ctx| async move {
             // the REAPER runs as its own task: the dispatch loop below must be
             // a bare `recv().await` loop — select-dropping an actor-backed p2p
@@ -102,8 +159,8 @@ where
                 }
             });
             while let Ok((peer, msg)) = receiver.recv().await {
-                // only the chosen server may complete requests.
-                if peer != expected {
+                // only a candidate source may complete requests.
+                if !expected.candidates.contains(&peer) {
                     continue;
                 }
                 let bytes: Vec<u8> = msg.into();
@@ -129,7 +186,7 @@ where
         });
         Self {
             sender,
-            server,
+            sources,
             shared,
         }
     }
@@ -144,9 +201,10 @@ where
         req: SyncRequest,
     ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
         let mut sender = self.sender.clone();
-        let server = self.server.clone();
+        let sources = Arc::clone(&self.sources);
         let shared = Arc::clone(&self.shared);
         async move {
+            let (at, server) = sources.current();
             let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = oneshot::channel();
             {
@@ -162,21 +220,54 @@ where
             let frame = encode_rpc(id, &encode_request(&req));
             let attempted = sender.send(Recipients::One(server), IoBuf::from(frame), false);
             if attempted.is_empty() {
-                // the server peer is offline/unreachable right now — fail fast
-                // instead of waiting out the reaper.
+                // the source is offline/unreachable right now — fail fast
+                // instead of waiting out the reaper, and rotate.
                 shared.pending.lock().expect("pending poisoned").remove(&id);
+                sources.advance_past(at);
                 return Err(SyncError::Transport(
-                    "server peer unreachable (send attempted no recipients)".into(),
+                    "sync source unreachable (send attempted no recipients)".into(),
                 ));
             }
             // resolves when the response routes back — or errs when the reaper
-            // drops the slot (dropped send / dead server) so callers can retry.
-            let bytes = rx.await.map_err(|_| {
-                SyncError::Transport(format!(
-                    "request {id} timed out (send dropped by the mesh or server dead)"
-                ))
-            })?;
+            // drops the slot (dropped send / dead server), rotating so the
+            // caller's retry lands on the next candidate.
+            let bytes = match rx.await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    sources.advance_past(at);
+                    return Err(SyncError::Transport(format!(
+                        "request {id} timed out (send dropped by the mesh or source dead)"
+                    )));
+                }
+            };
             Ok(decode_response(&bytes)?)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failure_wave_advances_the_cursor_exactly_once() {
+        let sources = Sources {
+            candidates: vec!["a", "b", "c"],
+            cursor: AtomicUsize::new(0),
+        };
+        let (at, first) = sources.current();
+        assert_eq!((at, first), (0, "a"));
+
+        // three concurrent requests all observed source 0 fail — one advance.
+        sources.advance_past(at);
+        sources.advance_past(at);
+        sources.advance_past(at);
+        assert_eq!(sources.current().1, "b");
+
+        // the list wraps: a dead tail rotates back to the head.
+        sources.advance_past(1);
+        assert_eq!(sources.current().1, "c");
+        sources.advance_past(2);
+        assert_eq!(sources.current().1, "a");
     }
 }

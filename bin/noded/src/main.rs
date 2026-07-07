@@ -35,6 +35,7 @@ use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::{BlockContext, DispatchRecord, Host, SubmitError};
+use identity::Identity;
 use inbox::Inbox;
 use indexer::IndexStore;
 use jobs::Jobs;
@@ -59,7 +60,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 16] = [
+const MODULE_IDS: [&str; 17] = [
     "chat",
     "saga",
     "dispatch",
@@ -75,6 +76,7 @@ const MODULE_IDS: [&str; 16] = [
     "files",
     "memory",
     "profiles",
+    "identity",
     "package",
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
@@ -210,6 +212,10 @@ fn run_node(
         // the origin-gated display-name registry: maps each verified submit
         // origin to a chosen name so the ui can resolve authors to names.
         let profiles = Profiles::new("profiles");
+        // the deterministic user->nodes binding registry. the single-node
+        // daemon carries no valset (ungated binds) and no chain (dev-only,
+        // chain-unscoped certs are an acceptable surface here).
+        let identity = Identity::new("identity", None, String::new());
         // the quack package registry: install lifecycle rows plus the
         // tag -> owner action-route table, with the built-in task actions
         // seeded as routes; prompt seeds publish into "memory".
@@ -237,6 +243,7 @@ fn run_node(
             Box::new(files),
             Box::new(memory),
             Box::new(profiles),
+            Box::new(identity),
             Box::new(package),
         ])
         .expect("genesis");

@@ -24,7 +24,8 @@ members = [
     "crates/system/kv", 
     "crates/system/valset", 
     
-    "crates/system/governance", 
+    "crates/system/governance",
+    "crates/system/identity",
     "crates/system/upgrade", 
     "crates/system/wireguard-upgrade",
     "crates/system/wireguard-effect",
@@ -97,6 +98,15 @@ defguard_wireguard_rs = "0.10.0"
 # ed25519 signer's); static_secrets because the key persists across boots.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
+# user-key v2 at-rest custody (bin/node/src/userkey.rs only): BIP39
+# wordlist + entropy checksum (the PBKDF2 `to_seed` path is deliberately
+# unused — see the identity-onboarding design doc's custody model),
+# argon2id KEK derivation, and XChaCha20-Poly1305 AEAD. zeroize scrubs the
+# derived key on drop.
+bip39 = "2"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = "1"
 
 # fluent31 — the derived read-model engine (LSM + MVCC snapshots) behind the
 # per-module indexer tier ONLY: nothing the app-hash commits to may live in it
@@ -124,6 +134,7 @@ quack = { path = "crates/kernel/quack" }
 kv = { path = "crates/system/kv" }
 valset = { path = "crates/system/valset" }
 governance = { path = "crates/system/governance" }
+identity = { path = "crates/system/identity" }
 upgrade = { path = "crates/system/upgrade" }
 saga = { path = "crates/system/saga" }
 capability = { path = "crates/system/capability" }

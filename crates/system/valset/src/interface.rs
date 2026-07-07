@@ -2,7 +2,7 @@
 //!
 //! valset is the ed25519 membership registry as replicated state: VALIDATORS
 //! (the consensus quorum) via [`ValsetMsg::Join`] / [`ValsetMsg::Leave`], and
-//! OBSERVERS (mesh + statesync standing, NO consensus participation) via
+//! RESIDENTS (mesh + statesync standing, NO consensus participation) via
 //! [`ValsetMsg::Grant`] / [`ValsetMsg::Revoke`] — the staged-admission tier a
 //! joiner syncs in before promotion. reads go via [`ValsetQuery`] ->
 //! [`ValsetReply`]. each `key` is a 32-byte ed25519 public key encoding (the
@@ -14,16 +14,16 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ValsetMsg {
     /// add a validator. `key` MUST be a 32-byte ed25519 public key; the impl
-    /// rejects a malformed key with `Error::Module`. a key holding observer
-    /// standing is PROMOTED: the same op removes it from the observer set —
+    /// rejects a malformed key with `Error::Module`. a key holding resident
+    /// standing is PROMOTED: the same op removes it from the resident set —
     /// one boundary carries the whole transition.
     Join { key: Vec<u8> },
     /// remove a validator by key. a no-op if the key is not in the set.
     Leave { key: Vec<u8> },
-    /// grant OBSERVER standing: mesh + statesync access, no quorum seat.
+    /// grant RESIDENT standing: mesh + statesync access, no quorum seat.
     Grant { key: Vec<u8> },
-    /// revoke observer standing by key. a no-op if the key is not an
-    /// observer.
+    /// revoke resident standing by key. a no-op if the key is not a
+    /// resident.
     Revoke { key: Vec<u8> },
 }
 
@@ -32,8 +32,8 @@ pub enum ValsetMsg {
 pub enum ValsetQuery {
     /// the full committed validator set.
     Validators,
-    /// the full committed observer set.
-    Observers,
+    /// the full committed resident set.
+    Residents,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -41,8 +41,8 @@ pub enum ValsetQuery {
 pub enum ValsetReply {
     /// the committed validators, sorted (order-independent).
     Validators(Vec<Vec<u8>>),
-    /// the committed observers, sorted (order-independent).
-    Observers(Vec<Vec<u8>>),
+    /// the committed residents, sorted (order-independent).
+    Residents(Vec<Vec<u8>>),
 }
 
 pub fn encode_msg(m: &ValsetMsg) -> Vec<u8> {

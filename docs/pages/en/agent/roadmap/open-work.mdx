@@ -19,13 +19,13 @@ WireGuard interface is still deliberately descoped.
 ## Demotion And Promotion Edges
 
 A validator removed at epoch cutover still halts instead of staying online as a
-sync/observer. Joiner promotion itself has shipped: a parked joiner can sync an
+sync/resident. Joiner promotion itself has shipped: a parked joiner can sync an
 admitting boundary, write a promotion checkpoint, reboot, and vote. Do not list
 that as missing.
 
 The remaining promotion-adjacent operator work is the stale local-state story:
 pre-recovery or damaged recovery directories fail loudly rather than migrating,
-and demoted nodes do not yet fall back into an observer role automatically.
+and demoted nodes do not yet fall back into a resident role automatically.
 
 ## Replay Nonces
 

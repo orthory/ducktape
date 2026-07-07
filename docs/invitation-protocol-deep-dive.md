@@ -1,5 +1,13 @@
 # Ducktape Invitation Protocol — Deep Dive
 
+> **HISTORICAL (2026-07-07).** This analysis predates Invitation V2: the
+> `ducktape-invite-v*` blob generations were replaced by one signed
+> `ducktape:` format carrying a WireGuard bootstrap and a single-use token
+> that redeems AUTOMATICALLY (governance `Redeem` — minting is the
+> admission; no `invite-accept` step). See
+> [deploy/private-cutover-integration-gap.md](deploy/private-cutover-integration-gap.md)
+> for the current join recipe.
+
 > 노드 초대(invitation) 프로토콜의 구조 분석. `bin/node`(CLI + joiner 런타임), `crates/system`(on-chain admission),
 > `crates/kernel/consensus`(epoch cutover), `app/src-tauri`(desktop 래퍼)를 가로질러 추적한 결과.
 > 모든 `path:line` 참조는 분석 시점 기준.

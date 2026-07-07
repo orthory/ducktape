@@ -285,9 +285,9 @@ pub enum Record {
         epoch: u64,
         view_base: u64,
         participants: Vec<Vec<u8>>,
-        /// the epoch's OBSERVER set (transport standing, no quorum seat) —
+        /// the epoch's RESIDENT set (transport standing, no quorum seat) —
         /// empty on records written before the staged-admission tier.
-        observers: Vec<Vec<u8>>,
+        residents: Vec<Vec<u8>>,
     },
 }
 
@@ -325,13 +325,13 @@ impl Record {
                 epoch,
                 view_base,
                 participants,
-                observers,
+                residents,
             } => {
                 out.push(TAG_CUTOVER);
                 put_u64(&mut out, *epoch);
                 put_u64(&mut out, *view_base);
                 put_keys(&mut out, participants);
-                put_keys(&mut out, observers);
+                put_keys(&mut out, residents);
             }
         }
         out
@@ -366,15 +366,15 @@ impl Record {
                 let epoch = c.u64()?;
                 let view_base = c.u64()?;
                 let participants = get_keys(&mut c)?;
-                // ADDITIVE tail: a record written before the observer tier
+                // ADDITIVE tail: a record written before the resident tier
                 // ends here — map the missing set to empty, like the
                 // manifest's version tail.
-                let observers = if c.at_end() { Vec::new() } else { get_keys(&mut c)? };
+                let residents = if c.at_end() { Vec::new() } else { get_keys(&mut c)? };
                 Record::Cutover {
                     epoch,
                     view_base,
                     participants,
-                    observers,
+                    residents,
                 }
             }
             t => return Err(Error::Corrupt(format!("unknown record tag {t}"))),
@@ -406,10 +406,10 @@ pub struct Manifest {
     /// set: the checkpointed valset snapshot may already hold a membership
     /// change whose cutover had not happened yet.
     pub participants: Vec<Vec<u8>>,
-    /// the epoch's OBSERVER set (transport standing, no quorum seat) — same
+    /// the epoch's RESIDENT set (transport standing, no quorum seat) — same
     /// epoch-scoped discipline as `participants`. empty on checkpoints
     /// written before the staged-admission tier (tolerant decode).
-    pub observers: Vec<Vec<u8>>,
+    pub residents: Vec<Vec<u8>>,
     /// an epoch cutover armed but not yet crossed at checkpoint time (the
     /// ordered lane's discard-ceiling view). a restart re-arms the same
     /// deterministic boundary its peers are converging on.
@@ -487,9 +487,9 @@ impl Manifest {
             None => out.push(0),
         }
         put_u32(&mut out, self.required_min_version);
-        // --- ADDITIVE observer tail (after the version tail, same tolerant
+        // --- ADDITIVE resident tail (after the version tail, same tolerant
         // discipline) ---
-        put_keys(&mut out, &self.observers);
+        put_keys(&mut out, &self.residents);
         out
     }
 
@@ -548,16 +548,16 @@ impl Manifest {
             let required_min_version = c.u32()?;
             (current_version, pending_upgrade, required_min_version)
         };
-        // ADDITIVE observer tail — absent on checkpoints written before the
+        // ADDITIVE resident tail — absent on checkpoints written before the
         // staged-admission tier.
-        let observers = if c.at_end() { Vec::new() } else { get_keys(&mut c)? };
+        let residents = if c.at_end() { Vec::new() } else { get_keys(&mut c)? };
         c.done()?;
         Ok(Self {
             height,
             epoch,
             view_base,
             participants,
-            observers,
+            residents,
             pending_cutover_view,
             app_hash,
             roots,
@@ -596,7 +596,7 @@ impl Manifest {
         epoch: u64,
         view_base: u64,
         participants: Vec<Vec<u8>>,
-        observers: Vec<Vec<u8>>,
+        residents: Vec<Vec<u8>>,
         pending_cutover_view: Option<u64>,
         current_version: u32,
         pending_upgrade: Option<UpgradeCoords>,
@@ -635,7 +635,7 @@ impl Manifest {
             epoch,
             view_base,
             participants,
-            observers,
+            residents,
             pending_cutover_view,
             app_hash: host.app_hash(),
             roots,
@@ -1012,13 +1012,13 @@ where
         epoch: u64,
         view_base: u64,
         participants: &[Vec<u8>],
-        observers: &[Vec<u8>],
+        residents: &[Vec<u8>],
     ) -> impl std::future::Future<Output = Result<(), node::Error>> {
         let record = Record::Cutover {
             epoch,
             view_base,
             participants: participants.to_vec(),
-            observers: observers.to_vec(),
+            residents: residents.to_vec(),
         }
         .encode();
         async move {
@@ -1081,8 +1081,8 @@ pub struct Recovered {
     /// the epoch's engine participant set: the manifest's, superseded by any
     /// newer [`Record::Cutover`] the journal retained.
     pub participants: Vec<Vec<u8>>,
-    /// the epoch's observer set, recovered with the same precedence.
-    pub observers: Vec<Vec<u8>>,
+    /// the epoch's resident set, recovered with the same precedence.
+    pub residents: Vec<Vec<u8>>,
     /// every retained frame's bytes (pins and blocks) — the boot path seeds
     /// the consensus content store with these so re-reported finalizations
     /// resolve locally instead of wedging the ordered gate.
@@ -1133,7 +1133,7 @@ where
         let mut epoch = manifest.epoch;
         let mut view_base = manifest.view_base;
         let mut participants = manifest.participants.clone();
-        let mut observers = manifest.observers.clone();
+        let mut residents = manifest.residents.clone();
         let mut frames: Vec<Vec<u8>> = Vec::new();
         let mut blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)> = Vec::new();
         let mut pending: Option<(u64, Vec<u8>)> = None;
@@ -1164,7 +1164,7 @@ where
                     epoch: e,
                     view_base: b,
                     participants: p,
-                    observers: o,
+                    residents: o,
                 } => {
                     // monotone: a stale record retained from below the
                     // checkpoint must not regress the manifest's values.
@@ -1172,7 +1172,7 @@ where
                         epoch = e;
                         view_base = b;
                         participants = p;
-                        observers = o;
+                        residents = o;
                     }
                 }
                 Record::Block { height, frame } => {
@@ -1497,7 +1497,7 @@ where
             epoch,
             view_base,
             participants,
-            observers,
+            residents,
             frames,
             blocks,
             applied,
@@ -1646,7 +1646,7 @@ mod tests {
                 epoch: 2,
                 view_base: 40,
                 participants: vec![vec![7u8; 32], vec![8u8; 32]],
-                observers: vec![vec![9u8; 32]],
+                residents: vec![vec![9u8; 32]],
             },
         ];
         for r in records {
@@ -1680,7 +1680,7 @@ mod tests {
             epoch: 1,
             view_base: 30,
             participants: vec![vec![7u8; 32], vec![8u8; 32]],
-            observers: vec![vec![9u8; 32]],
+            residents: vec![vec![9u8; 32]],
             pending_cutover_view: Some(15),
             app_hash: StateRoot([1; 32]),
             roots: roots(&[("directory", 2), ("valset", 3)]),
@@ -1723,14 +1723,14 @@ mod tests {
     fn manifest_decode_tolerates_old_format() {
         // an on-disk checkpoint written before the version fields existed: the
         // encoding truncated at `next_seq`. a new binary must map BOTH missing
-        // tails (version fields, observer set) to baseline defaults.
+        // tails (version fields, resident set) to baseline defaults.
         let m = Manifest {
-            observers: vec![],
+            residents: vec![],
             ..sample_manifest()
         };
         let full = m.encode();
         // the tails are `u32 current + 1-byte pending tag(None) + u32 required`
-        // = 9 bytes, then the empty observer keys = 8 bytes; drop both to
+        // = 9 bytes, then the empty resident keys = 8 bytes; drop both to
         // simulate the pre-version format.
         let old = &full[..full.len() - 17];
         let decoded = Manifest::decode(old).expect("old format decodes");
@@ -1740,9 +1740,9 @@ mod tests {
         // everything before the tails survives unchanged.
         assert_eq!(decoded, m);
 
-        // the MIDDLE format — version tail present, observer tail absent (a
+        // the MIDDLE format — version tail present, resident tail absent (a
         // checkpoint from the version era, before the staged-admission tier):
-        // observers default to empty, version fields survive.
+        // residents default to empty, version fields survive.
         let middle = &full[..full.len() - 8];
         let decoded = Manifest::decode(middle).expect("middle format decodes");
         assert_eq!(decoded, m);
@@ -1751,19 +1751,19 @@ mod tests {
     #[test]
     fn manifest_decode_rejects_truncated_version_tail() {
         // a present-but-malformed tail (one byte into the version fields) must
-        // fail loud, never silently default. the observer tail sits after the
+        // fail loud, never silently default. the resident tail sits after the
         // version tail, so to tear inside the version fields drop the whole
-        // (empty) observer section — 8 bytes — plus half the required_min u32.
+        // (empty) resident section — 8 bytes — plus half the required_min u32.
         let m = Manifest {
-            observers: vec![],
+            residents: vec![],
             ..sample_manifest()
         };
         let full = m.encode();
         let torn = &full[..full.len() - 8 - 4];
         assert!(Manifest::decode(torn).is_err());
-        // and a torn OBSERVER tail fails loud too.
+        // and a torn RESIDENT tail fails loud too.
         let full = sample_manifest().encode();
-        let torn = &full[..full.len() - 4]; // inside the observer key bytes.
+        let torn = &full[..full.len() - 4]; // inside the resident key bytes.
         assert!(Manifest::decode(torn).is_err());
     }
 

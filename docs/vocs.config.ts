@@ -16,6 +16,7 @@ const humanEn = [
   },
   { text: 'Network and Membership', link: '/en/human/network/network-and-membership' },
   { text: 'Node Upgrades', link: '/en/human/network/node-upgrades' },
+  { text: 'Coordination', link: '/en/human/network/coordination' },
   { text: 'Product Modules', link: '/en/human/modules/product-modules' },
   { text: 'What Is Left', link: '/en/human/roadmap/what-is-left' },
   {
@@ -45,6 +46,7 @@ const humanKo = [
   },
   { text: 'Network and Membership', link: '/ko/human/network/network-and-membership' },
   { text: 'Node Upgrades', link: '/ko/human/network/node-upgrades' },
+  { text: 'Coordination', link: '/ko/human/network/coordination' },
   { text: 'Product Modules', link: '/ko/human/modules/product-modules' },
   { text: 'What Is Left', link: '/ko/human/roadmap/what-is-left' },
   {

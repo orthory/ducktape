@@ -70,6 +70,7 @@ use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use futures::select;
 use host::{BlockContext, DispatchRecord, Host, SubmitError};
+use identity::Identity;
 use inbox::Inbox;
 use indexer::{AppliedOp, BlockOps, IndexStore};
 use jobs::Jobs;
@@ -90,7 +91,7 @@ use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 16] = [
+const MODULE_IDS: [&str; 17] = [
     "chat",
     "saga",
     "dispatch",
@@ -106,6 +107,7 @@ const MODULE_IDS: [&str; 16] = [
     "files",
     "memory",
     "profiles",
+    "identity",
     "package",
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
@@ -396,6 +398,9 @@ fn run_sim(
         let files = Files::with_blobs("files", blobs.clone());
         let memory = Memory::new("memory", "files");
         let profiles = Profiles::new("profiles");
+        // the deterministic user->nodes binding registry — no valset, no chain
+        // (the simulator has neither), matching noded's daemon wiring.
+        let identity = Identity::new("identity", None, String::new());
         // the quack package registry (noded's exact wiring): builtin task
         // actions seeded as routes; prompt seeds publish into "memory".
         let package = PackageModule::new(
@@ -422,6 +427,7 @@ fn run_sim(
             Box::new(files),
             Box::new(memory),
             Box::new(profiles),
+            Box::new(identity),
             Box::new(package),
         ])
         .expect("genesis");
