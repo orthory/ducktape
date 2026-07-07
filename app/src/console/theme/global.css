@@ -29,6 +29,23 @@ textarea {
   background: none;
 }
 
+/* Safari / WKWebView (the macOS app's engine) ignore autocomplete="off" for
+   AutoFill: they inject a Contacts / Passwords AutoFill button — and its
+   dropdown — into inputs from name/placeholder/label heuristics, regardless of
+   the attribute. Hide those buttons so the AutoFill UI can't surface. Scoped to
+   spare the identity gate's deliberate password-manager fields (autocomplete=
+   new-password / current-password), which SHOULD offer the password manager. */
+input:not([autocomplete="new-password"]):not([autocomplete="current-password"])::-webkit-contacts-auto-fill-button,
+input:not([autocomplete="new-password"]):not([autocomplete="current-password"])::-webkit-credentials-auto-fill-button {
+  visibility: hidden !important;
+  pointer-events: none !important;
+  position: absolute !important;
+  right: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+}
+
 button {
   font-family: inherit;
 }
