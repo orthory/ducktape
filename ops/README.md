@@ -21,10 +21,10 @@ ops/fleet.sh down                 # tear it all down
 ```
 
 The dashboard shows one live tile per worktree (branch, sha, ahead/behind vs
-`dev`, status, and an **agent activity** line — uncommitted-file count + latest
-commit). Toggle **Grid** ⇄ **Graph** (the git branch tree via `@xyflow/react`;
-`?view=graph` deep-links it). Click a tile to open a full-size **interactive**
-session plus that worktree's commit trail.
+`dev`, status, an agent observe readiness badge, and an **agent activity** line
+— uncommitted-file count + latest commit). Toggle **Grid** ⇄ **Graph** (the git
+branch tree via `@xyflow/react`; `?view=graph` deep-links it). Click a tile to
+open a full-size **interactive** session plus that worktree's commit trail.
 
 ## How it works
 
@@ -33,10 +33,18 @@ browser ──http/ws :6090 (ONLY exposed port)──▶ one websockify
                                                ├─ --web fleet-console/dist  (UI + fleet.json)
                                                └─ ?token=<worktree> ─▶ 127.0.0.1:<vncPort>
 per worktree:  Xvfb :11x → tauri dev (isolated $HOME) → x11vnc 127.0.0.1:591x
+                                             └─ tauri-agent endpoint in $STATE/<id>
 ```
 
 - **One exposed port** (`:6090`). Every worktree's x11vnc binds `127.0.0.1`; the
   browser reaches them only through websockify's token router.
+- **Human screen vs agent stream**: people watch the VNC/noVNC tile. Agents use
+  the per-worktree tauri-agent endpoint. `fleet.json` includes an `agent`
+  object with `runtimeDir`, `endpointPath`, `endpointReady`, and an
+  aggregation-ready `observe` command contract (`XDG_RUNTIME_DIR=$STATE/<id>`
+  plus `app/scripts/tauri-agent observe --app com.ducktape.app --format
+  ndjson`). A later aggregator can consume those fields without changing the
+  fleet launcher.
 - **Isolation**: each app runs with its own `$HOME` AND `up_one` seeds a solo
   workspace there (active, camelCase `registry.json`) + passes a stable
   `DUCKTAPE_NODE_BIN` (staged outside `target/`, which `tauri dev`'s build.rs

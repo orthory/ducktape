@@ -59,6 +59,12 @@ body {
 .aheadbehind { margin-left: auto; display: flex; gap: 6px; font-size: 12px; font-variant-numeric: tabular-nums; }
 .ahead { color: var(--up); }
 .behind { color: var(--building); }
+.agent-badge {
+  margin-left: auto; padding: 1px 6px; border: 1px solid var(--line); border-radius: 999px;
+  color: var(--building); font-size: 11px; white-space: nowrap;
+}
+.agent-badge[data-ready="true"] { color: var(--up); border-color: color-mix(in srgb, var(--up), var(--line) 65%); }
+.aheadbehind + .agent-badge { margin-left: 0; }
 
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--down); }
 .dot.up { background: var(--up); box-shadow: 0 0 6px var(--up); }
