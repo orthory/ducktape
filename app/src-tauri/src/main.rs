@@ -36,6 +36,7 @@ fn main() {
             workspaces::workspace_forget,
             workspaces::workspace_select,
             workspaces::workspace_phase,
+            workspaces::workspace_log_tail,
             user_identity::user_identity_status,
             user_identity::user_sign_bind,
             user_identity::user_sign_unbind,

@@ -38,7 +38,9 @@ const stubTransport = (
   queryImpl: (target: string, query: unknown) => unknown,
 ): NodeTransport => ({
   submit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
-  query: vi.fn(queryImpl),
+  // wrap the sync stub so the mock's type matches NodeTransport.query's
+  // Promise<unknown> return (await already coerces the plain value at runtime).
+  query: vi.fn((target: string, query: unknown) => Promise.resolve(queryImpl(target, query))),
   view: vi.fn(),
   putBlob: vi.fn(),
   getBlob: vi.fn(),

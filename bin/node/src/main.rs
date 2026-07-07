@@ -2313,7 +2313,21 @@ fn spawn_rpc_listener(
     });
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    // Convert any terminal error into the same stable `FATAL:` marker the node
+    // already prints for its other fatal paths (recovery, admission, promotion),
+    // plus a non-zero exit. This closes the run-path boot failures (bind
+    // conflict, config parse) that used to propagate as a bare `Error: …` the
+    // desktop app's classify() didn't recognize — now the app surfaces the
+    // reason immediately instead of inferring death. (Onboarding subcommands
+    // still surface their own stderr via run_verb; the prefix is harmless there.)
+    if let Err(err) = run() {
+        eprintln!("FATAL: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("keygen") => return cmd_keygen(&args[1..]),

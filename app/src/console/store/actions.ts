@@ -265,6 +265,10 @@ export interface ConsoleActions {
   stopNode(): void;
   /** Re-spawn / re-adopt the managed daemon after a stop (desktop only). */
   startNode(): void;
+  /** Retry connecting the SAME workspace after a boot failure (from the
+   *  "Node failed to start" surface). Idempotent — re-runs connectActive
+   *  against the existing workspace, never re-minting one. */
+  retryConnect(): void;
   /** Scrape + parse the node's `/metrics`. Null when no node is resolved or the
    *  scrape fails — best-effort, for the poll-driven Metrics view. */
   readMetrics(): Promise<NodeMetrics | null>;
@@ -621,6 +625,12 @@ export function createActions({
       forgetNeedsForce: false,
       deleteNeedsForce: null,
       inviteBlob: null,
+      // a fresh connect/retry starts from a clean slate — clear any prior boot
+      // failure, mid-session-down banner, and error so a stale reason can't
+      // linger over the new attempt.
+      bootError: null,
+      connectionDown: null,
+      error: null,
       // per-node observability belonging to the workspace we're leaving; the
       // node effect re-hydrates blocks and re-follows the block stream once
       // the new node is set below.
@@ -727,10 +737,43 @@ export function createActions({
         return tick();
       })
       .catch((err) => {
-        if (!stale()) {
-          patch({ onboardingBusy: false });
-          fail(err);
-        }
+        if (stale()) return;
+        patch({ onboardingBusy: false });
+        const reason =
+          typeof err === "object" && err && "message" in err
+            ? String((err as { message?: unknown }).message)
+            : String(err);
+        // Best-effort: pull the node's daemon.log so even a plain "did not come
+        // up" boot timeout carries the real reason the node wrote to disk (bind
+        // conflict, bad config, panic) — the file nothing in the UI used to read.
+        Promise.resolve()
+          .then(() => ws.workspaceLogTail(target.id))
+          .then(
+            (log): { path: string | null; tail: string } => ({ path: log.path, tail: log.tail }),
+            () => ({ path: null, tail: "" }),
+          )
+          .then((log) => {
+            if (stale()) return;
+            if (target.member) {
+              // member/founder: route to the dedicated "Node failed to start"
+              // body with the reason, the log, and an idempotent Retry — never
+              // a hollow disconnected console whose toast then vanishes.
+              patch({
+                bootError: {
+                  workspaceId: target.id,
+                  reason,
+                  logPath: log.path,
+                  logTail: log.tail,
+                },
+              });
+            } else {
+              // joiner: surface it IN the waiting room as a fatal phase instead
+              // of leaving the "ask a member to approve" spinner up over a node
+              // that never started.
+              patch({ onboardingPhase: { phase: "fatal", detail: reason } });
+            }
+            fail(reason);
+          });
       });
   };
 
@@ -1538,6 +1581,21 @@ export function createActions({
 
     dismissError: () => patch({ error: null }),
 
+    retryConnect: () => {
+      const st = getState();
+      const id = st.bootError?.workspaceId ?? st.workspace?.id ?? null;
+      const target =
+        (id ? st.workspaces.find((w) => w.id === id) : undefined) ?? st.workspace ?? null;
+      if (!target) {
+        // nothing to reconnect to — fall back to the front door.
+        patch({ bootError: null, needsOnboarding: true });
+        return;
+      }
+      // connectActive clears bootError/error at the start; re-drive the SAME
+      // workspace (idempotent — never mints a new one).
+      connectActive(target).catch(fail);
+    },
+
     // ── Onboarding / workspaces ──
     createWorkspace: (name) => {
       if (!name.trim()) return;
@@ -1858,7 +1916,7 @@ export function createActions({
         });
     },
 
-    newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null }),
+    newWorkspace: () => patch({ needsOnboarding: true, inviteBlob: null, bootError: null }),
 
     dismissOnboarding: () =>
       // Closable when there's a connection to return to — a local workspace or a
