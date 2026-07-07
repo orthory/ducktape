@@ -118,6 +118,15 @@ impl UnderlaySocket {
     /// send one datagram from the shared socket — the tunnel's exact
     /// 5-tuple, which is the property the NAT punch shares it for.
     pub async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {
+        // the socket is dual-stack `[::]` — a V4 destination (a configured
+        // v4 endpoint, a punched v4 reflexive) must be sent as v4-MAPPED v6,
+        // or the send is EINVAL on macOS (and family-mismatched everywhere).
+        let dst = match dst {
+            SocketAddr::V4(v4) => {
+                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+            }
+            SocketAddr::V6(_) => dst,
+        };
         self.udp.send_to(buf, dst).await
     }
 
@@ -175,6 +184,16 @@ async fn demux_pump(udp: Arc<UdpSocket>, wg_lane: WgLane, bypass: mpsc::Sender<D
         let (len, src) = match udp.recv_from(&mut buf[..]).await {
             Ok(received) => received,
             Err(_) => continue,
+        };
+        // a v4 sender observed through the dual-stack socket reports as
+        // `::ffff:a.b.c.d` — canonicalize to V4 so roamed endpoints compare
+        // equal to the V4 addresses configs and coordinators carry.
+        let src = match src {
+            SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+                Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
+                None => src,
+            },
+            SocketAddr::V4(_) => src,
         };
         if Tunn::parse_incoming_packet(&buf[..len]).is_ok() {
             let lane = wg_lane.read().expect("wg lane lock poisoned").clone();

@@ -151,6 +151,35 @@ async fn handshake_and_datagram_echo() {
     );
 }
 
+/// the family seam every real deployment crosses: the underlay binds
+/// dual-stack `[::]`, but configured endpoints (adverts, punched
+/// reflexives) are V4 literals. the initiator's handshake toward a V4
+/// endpoint must ride the v6 socket as v4-mapped v6 (EINVAL on macOS
+/// otherwise), and the passive side's roamed endpoint must canonicalize
+/// back to V4 — the all-v6-loopback tests above never cross it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handshake_completes_toward_a_v4_endpoint() {
+    let (mut a, mut b) = (stand_up(0x51, 0xa), stand_up(0x62, 0xb));
+    // a dials b at its V4 loopback literal, not the v6 form.
+    let b_v4 = SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        b.endpoint.port(),
+    );
+    let (a_port, b_port) = (a.endpoint.port(), b.endpoint.port());
+    let peers_for_a = vec![peer_entry(&b, Some(b_v4))];
+    let peers_for_b = vec![peer_entry(&a, None)];
+    a.effect
+        .apply(&config(&a, a_port, peers_for_a))
+        .expect("peered re-apply on a");
+    b.effect
+        .apply(&config(&b, b_port, peers_for_b))
+        .expect("peered re-apply on b");
+
+    tokio::time::timeout(Duration::from_secs(10), udp_round_trip(&a, &b, b"v4quack"))
+        .await
+        .expect("echo within deadline across the v4-configured endpoint");
+}
+
 /// TCP dial/listen through the tunnel: the virtual stack's stream surface,
 /// authenticated by overlay source address, carrying bytes both ways.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
