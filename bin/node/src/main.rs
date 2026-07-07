@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use agent::AgentModule;
 use runs::RunsModule;
-use commonware_codec::DecodeExt as _;
+use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Signer, ed25519};
@@ -70,6 +70,7 @@ mod config;
 mod lobby;
 mod relay;
 mod statesync_plane;
+mod userkey;
 mod voice;
 use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
 
@@ -2354,9 +2355,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("keygen") => return cmd_keygen(&args[1..]),
-        Some("user-key") => return cmd_user_key(&args[1..]),
-        Some("user-sign-bind") => return cmd_user_sign_bind(&args[1..]),
-        Some("user-sign-unbind") => return cmd_user_sign_unbind(&args[1..]),
+        Some("user-key") => {
+            return cmd_user_key(&args[1..], &mut std::io::BufReader::new(std::io::stdin()));
+        }
+        Some("user-sign-bind") => {
+            return cmd_user_sign_bind(&args[1..], &mut std::io::BufReader::new(std::io::stdin()));
+        }
+        Some("user-sign-unbind") => {
+            return cmd_user_sign_unbind(
+                &args[1..],
+                &mut std::io::BufReader::new(std::io::stdin()),
+            );
+        }
         Some("init") => return cmd_init(&args[1..]),
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
@@ -2484,12 +2494,343 @@ fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// ============================================================================
+// user-key lifecycle verbs (init/restore/unlock/reveal/encrypt/status) — see
+// docs/superpowers/specs/2026-07-07-identity-onboarding-design.md's "CLI
+// verbs" section for the binding stdin/stdout contract. every secret
+// (password, mnemonic) crosses the process boundary via STDIN ONLY, one
+// newline-delimited field per line in the documented order — never argv/env,
+// which would leak into shell history / `ps`. each verb below is split into
+// a `user_key_*` core (takes the parsed stdin, returns the value to print —
+// directly unit-testable without capturing stdout) and a thin `cmd_user_key_*`
+// wrapper that prints it; the wrapper is what `run()`'s dispatch calls.
+// ============================================================================
+
+/// read one line from `stdin`, minus its trailing newline — the stdin-only
+/// convention every secret field crosses the process boundary through.
+/// errors only on true EOF (nothing at all, not even a newline): a caller
+/// that doesn't pipe the expected field. an explicit empty line (just `\n`)
+/// is NOT an error here — callers that need a non-empty value (passwords)
+/// reject that on their own terms (`check_password_len`), with a clearer
+/// message than a generic "missing" would give.
+fn read_stdin_line(stdin: &mut impl std::io::BufRead, field: &str) -> Result<String, String> {
+    let mut line = String::new();
+    let n = stdin
+        .read_line(&mut line)
+        .map_err(|e| format!("read {field} from stdin: {e}"))?;
+    if n == 0 {
+        return Err(format!("missing {field} on stdin"));
+    }
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    Ok(line)
+}
+
+/// the design spec's floor for NEW passwords (`init`/`restore`/`encrypt`),
+/// enforced before any file is touched. counts scalar chars, not bytes, so a
+/// multi-byte-but-short password isn't laundered past the floor.
+const MIN_PASSWORD_LEN: usize = 8;
+
+fn check_password_len(password: &str) -> Result<(), String> {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(format!(
+            "password must be at least {MIN_PASSWORD_LEN} characters"
+        ));
+    }
+    Ok(())
+}
+
+/// `path`'s raw trimmed line — the exact text [`userkey::open_user_key`]
+/// parses, as opposed to [`userkey::read_user_key_file`]'s already-decoded
+/// shape. verbs that must hand a v2 line to `open_user_key` read it via this.
+fn read_key_line(path: &std::path::Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
+    let line = text.trim();
+    if line.is_empty() {
+        return Err(format!("{path:?} is empty"));
+    }
+    Ok(line.to_string())
+}
+
+/// resolve the USER signer at `key_path` for the sign verbs: a v2
+/// (encrypted) file decrypts with a password read as the FIRST stdin line;
+/// anything else (legacy plaintext, or absent — freshly generated) falls
+/// through to [`config::load_or_generate_identity`] UNCHANGED, reading no
+/// stdin at all — byte-identical to the pre-onboarding sign-verb behavior.
+fn load_user_signer(
+    key_path: &std::path::Path,
+    stdin: &mut impl std::io::BufRead,
+) -> Result<ed25519::PrivateKey, Box<dyn std::error::Error>> {
+    if let Ok(text) = std::fs::read_to_string(key_path)
+        && text.trim().starts_with(userkey::USER_KEY_V2_PREFIX)
+    {
+        let password = read_stdin_line(stdin, "password")?;
+        return Ok(userkey::open_user_key(text.trim(), &password)?);
+    }
+    let (user, generated) = config::load_or_generate_identity(key_path)?;
+    if generated {
+        eprintln!("generated user identity at {}", key_path.display());
+    }
+    Ok(user)
+}
+
+/// `user-key init` core — see [`cmd_user_key_init`] for the print contract.
+/// returns `(mnemonic, pubkey-hex)` so tests can assert both independently.
+fn user_key_init(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let out = PathBuf::from(flags.get("out").map(String::as_str).unwrap_or("user.key"));
+    let password = read_stdin_line(stdin, "password")?;
+    check_password_len(&password)?;
+
+    let mut seed = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+    let words = userkey::mnemonic_of_seed(&seed);
+    let line = userkey::seal_user_key(&seed, &password)?;
+    userkey::write_user_key_new(&out, &line)?;
+
+    let key = ed25519::PrivateKey::decode(seed.as_slice()).expect("32 random bytes decode");
+    Ok((words, hex_bytes(key.public_key().as_ref())))
+}
+
+/// `user-key init --out <path>` — stdin: password. Generates a fresh seed,
+/// writes v2 (refuses to overwrite via `create_new`), and prints the 24-word
+/// mnemonic line THEN the pubkey-hex line — pubkey is the LAST stdout line
+/// (the `run_verb`/`last_line` contract), mnemonic is the line before it.
+fn cmd_user_key_init(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (words, pubkey_hex) = user_key_init(args, stdin)?;
+    println!("{words}");
+    println!("{pubkey_hex}");
+    Ok(())
+}
+
+/// `user-key restore` core — see [`cmd_user_key_restore`].
+fn user_key_restore(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let out = PathBuf::from(flags.get("out").map(String::as_str).unwrap_or("user.key"));
+    let mnemonic = read_stdin_line(stdin, "mnemonic")?;
+    let password = read_stdin_line(stdin, "password")?;
+    check_password_len(&password)?;
+
+    let seed = userkey::seed_of_mnemonic(&mnemonic)?;
+    let line = userkey::seal_user_key(&seed, &password)?;
+    userkey::write_user_key_new(&out, &line)?;
+
+    let key = ed25519::PrivateKey::decode(seed.as_slice())
+        .map_err(|e| format!("restored seed is not a valid ed25519 secret: {e}"))?;
+    Ok(hex_bytes(key.public_key().as_ref()))
+}
+
+/// `user-key restore --out <path>` — stdin: mnemonic line, then password
+/// line. Validates the BIP39 checksum, writes v2 (refuses to overwrite),
+/// prints the pubkey (the only stdout line).
+fn cmd_user_key_restore(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_key_restore(args, stdin)?);
+    Ok(())
+}
+
+/// `user-key unlock` core — see [`cmd_user_key_unlock`].
+fn user_key_unlock(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-key unlock needs --key <path>")?);
+    let password = read_stdin_line(stdin, "password")?;
+
+    let key = match userkey::read_user_key_file(&key_path)? {
+        userkey::UserKeyFile::Plaintext(key) => key,
+        userkey::UserKeyFile::Encrypted(_) => {
+            let line = read_key_line(&key_path)?;
+            userkey::open_user_key(&line, &password)?
+        }
+    };
+    Ok(hex_bytes(key.public_key().as_ref()))
+}
+
+/// `user-key unlock --key <path>` — stdin: password. Pure verification
+/// (nothing persists); prints the pubkey on success, a clean error + nonzero
+/// exit on a wrong password or a corrupt file.
+fn cmd_user_key_unlock(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_key_unlock(args, stdin)?);
+    Ok(())
+}
+
+/// `user-key reveal` core — see [`cmd_user_key_reveal`].
+fn user_key_reveal(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-key reveal needs --key <path>")?);
+
+    // legacy plaintext tolerates an absent/empty password line; only an
+    // encrypted file actually needs one. read leniently (empty on EOF) so a
+    // caller revealing a legacy key doesn't have to pipe an unused line.
+    let mut password = String::new();
+    let _ = stdin.read_line(&mut password);
+    while password.ends_with('\n') || password.ends_with('\r') {
+        password.pop();
+    }
+
+    let key = match userkey::read_user_key_file(&key_path)? {
+        userkey::UserKeyFile::Plaintext(key) => key,
+        userkey::UserKeyFile::Encrypted(_) => {
+            let line = read_key_line(&key_path)?;
+            userkey::open_user_key(&line, &password)?
+        }
+    };
+    let seed_bytes = key.encode();
+    let seed: [u8; 32] = seed_bytes
+        .as_ref()
+        .try_into()
+        .map_err(|_| "decoded key is not a 32-byte seed".to_string())?;
+    Ok(userkey::mnemonic_of_seed(&seed))
+}
+
+/// `user-key reveal --key <path>` — stdin: password (empty/absent tolerated
+/// for legacy plaintext, required to decrypt v2). Prints the 24-word
+/// mnemonic — the SAME encoding `init`/`restore` use, so it round-trips
+/// through `user-key restore` to the identical pubkey.
+fn cmd_user_key_reveal(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_key_reveal(args, stdin)?);
+    Ok(())
+}
+
+/// `user-key encrypt` core — see [`cmd_user_key_encrypt`].
+fn user_key_encrypt(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-key encrypt needs --key <path>")?);
+    let password = read_stdin_line(stdin, "password")?;
+    check_password_len(&password)?;
+
+    let key = match userkey::read_user_key_file(&key_path)? {
+        userkey::UserKeyFile::Plaintext(key) => key,
+        userkey::UserKeyFile::Encrypted(_) => {
+            return Err(format!("{} is already encrypted", key_path.display()).into());
+        }
+    };
+    let seed_bytes = key.encode();
+    let seed: [u8; 32] = seed_bytes
+        .as_ref()
+        .try_into()
+        .map_err(|_| "decoded key is not a 32-byte seed".to_string())?;
+    let line = userkey::seal_user_key(&seed, &password)?;
+    userkey::rewrite_user_key(&key_path, &line)?;
+    Ok(hex_bytes(key.public_key().as_ref()))
+}
+
+/// `user-key encrypt --key <path>` — stdin: password. Migrates a legacy v1
+/// plaintext file to v2 in place (temp file + rename, the same atomicity as
+/// every other in-place rewrite); errors (no-op) if the file is already v2.
+/// Prints the pubkey (unchanged by the migration).
+fn cmd_user_key_encrypt(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_key_encrypt(args, stdin)?);
+    Ok(())
+}
+
+/// `user-key status` core — see [`cmd_user_key_status`].
+fn user_key_status(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-key status needs --key <path>")?);
+    if !key_path.exists() {
+        return Ok("absent".to_string());
+    }
+    Ok(match userkey::read_user_key_file(&key_path)? {
+        userkey::UserKeyFile::Plaintext(key) => {
+            format!("plaintext {}", hex_bytes(key.public_key().as_ref()))
+        }
+        userkey::UserKeyFile::Encrypted(enc) => format!("encrypted {}", hex_bytes(&enc.pubkey)),
+    })
+}
+
+/// `user-key status --key <path>` — no stdin. Prints exactly one of `absent`
+/// | `plaintext <pubkey-hex>` | `encrypted <pubkey-hex>`; never touches a
+/// password, so it's safe to poll from the app on every launch.
+fn cmd_user_key_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_key_status(args)?);
+    Ok(())
+}
+
+/// `user-key [init|restore|unlock|reveal|encrypt|status]` — dispatches to the
+/// v2 lifecycle verbs (see the design spec's "CLI verbs" section); a bare
+/// `user-key [--out <path>]` (no recognized subcommand) falls through to the
+/// legacy v1 generate-or-reuse shape from #205, kept working unchanged for
+/// the app/tests until the app migrates onto the v2 verbs.
+fn cmd_user_key(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match args.first().map(String::as_str) {
+        Some("init") => return cmd_user_key_init(&args[1..], stdin),
+        Some("restore") => return cmd_user_key_restore(&args[1..], stdin),
+        Some("unlock") => return cmd_user_key_unlock(&args[1..], stdin),
+        Some("reveal") => return cmd_user_key_reveal(&args[1..], stdin),
+        Some("encrypt") => return cmd_user_key_encrypt(&args[1..], stdin),
+        Some("status") => return cmd_user_key_status(&args[1..]),
+        Some(other) if !other.starts_with("--") => {
+            return Err(format!(
+                "unknown user-key subcommand {other:?} (want \
+                 init|restore|unlock|reveal|encrypt|status, or a bare \
+                 `user-key [--out <path>]` to generate/reuse a legacy key)"
+            )
+            .into());
+        }
+        _ => {}
+    }
+    cmd_user_key_generate_legacy(args)
+}
+
 /// `user-key [--out <path>]` — generate (or reuse) a persisted ed25519 USER
 /// identity: the human's app-side keypair (distinct from `keygen`'s per-node
 /// identity), a bare hex ed25519 seed file under the same load-or-generate
 /// discipline. pubkey on stdout (scriptable — the desktop shell's `run_verb`
-/// takes the LAST stdout line as the value), provenance on stderr.
-fn cmd_user_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+/// takes the LAST stdout line as the value), provenance on stderr. the
+/// legacy v1 shape (#205), kept working verbatim; `init` is the v2
+/// replacement `cmd_user_key` dispatches to instead.
+fn cmd_user_key_generate_legacy(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
@@ -2505,14 +2846,11 @@ fn cmd_user_key(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `user-sign-bind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
-/// — mint a bind certificate binding `node-pub` to the user identity at
-/// `--key` (generated there if absent), at `chain-id`/`nonce`, and print the
-/// ready-to-submit `IdentityMsg::BindNode` JSON as the last (only) stdout
-/// line. `user_key` rides the payload — the node being bound is the verified
-/// submit ORIGIN, never a payload field; the module resolves it from the rpc
-/// transport, not from this CLI.
-fn cmd_user_sign_bind(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+/// `user-sign-bind` core — see [`cmd_user_sign_bind`].
+fn user_sign_bind(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
     use identity::{IdentityMsg, encode_msg};
 
     let (pos, flags) = parse_flags(args)?;
@@ -2533,29 +2871,36 @@ fn cmd_user_sign_bind(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         .parse()
         .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
 
-    let (user, generated) = config::load_or_generate_identity(&key_path)?;
-    if generated {
-        eprintln!("generated user identity at {}", key_path.display());
-    }
+    let user = load_user_signer(&key_path, stdin)?;
     let user_sig = config::mint_bind_cert(&user, chain_id, node_pub.as_ref(), nonce);
     let msg = IdentityMsg::BindNode {
         user_key: user.public_key().as_ref().to_vec(),
         user_sig,
     };
-    println!(
-        "{}",
-        String::from_utf8(encode_msg(&msg)).expect("json is utf-8")
-    );
+    Ok(String::from_utf8(encode_msg(&msg)).expect("json is utf-8"))
+}
+
+/// `user-sign-bind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
+/// — mint a bind certificate binding `node-pub` to the user identity at
+/// `--key` (generated there if absent, or decrypted with stdin's password
+/// line if it's a v2 file — see [`load_user_signer`]), at `chain-id`/`nonce`,
+/// and print the ready-to-submit `IdentityMsg::BindNode` JSON as the last
+/// (only) stdout line. `user_key` rides the payload — the node being bound is
+/// the verified submit ORIGIN, never a payload field; the module resolves it
+/// from the rpc transport, not from this CLI.
+fn cmd_user_sign_bind(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_sign_bind(args, stdin)?);
     Ok(())
 }
 
-/// `user-sign-unbind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
-/// — mint an unbind certificate evicting `node-pub` from the user identity at
-/// `--key`, and print the ready-to-submit `IdentityMsg::UnbindNode` JSON as
-/// the last stdout line. `node_key` (not `user_key`) rides the payload:
-/// unbind carries no origin restriction — a surviving device evicts a lost
-/// one by naming it directly, identified via the existing binding.
-fn cmd_user_sign_unbind(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+/// `user-sign-unbind` core — see [`cmd_user_sign_unbind`].
+fn user_sign_unbind(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
     use identity::{IdentityMsg, encode_msg};
 
     let (pos, flags) = parse_flags(args)?;
@@ -2576,20 +2921,423 @@ fn cmd_user_sign_unbind(args: &[String]) -> Result<(), Box<dyn std::error::Error
         .parse()
         .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
 
-    let (user, generated) = config::load_or_generate_identity(&key_path)?;
-    if generated {
-        eprintln!("generated user identity at {}", key_path.display());
-    }
+    let user = load_user_signer(&key_path, stdin)?;
     let user_sig = config::mint_unbind_cert(&user, chain_id, node_pub.as_ref(), nonce);
     let msg = IdentityMsg::UnbindNode {
         node_key: node_pub.as_ref().to_vec(),
         user_sig,
     };
-    println!(
-        "{}",
-        String::from_utf8(encode_msg(&msg)).expect("json is utf-8")
-    );
+    Ok(String::from_utf8(encode_msg(&msg)).expect("json is utf-8"))
+}
+
+/// `user-sign-unbind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
+/// — mint an unbind certificate evicting `node-pub` from the user identity at
+/// `--key`, and print the ready-to-submit `IdentityMsg::UnbindNode` JSON as
+/// the last stdout line. `node_key` (not `user_key`) rides the payload:
+/// unbind carries no origin restriction — a surviving device evicts a lost
+/// one by naming it directly, identified via the existing binding.
+fn cmd_user_sign_unbind(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_sign_unbind(args, stdin)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod userkey_verb_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// build the `&[String]` verb args from string-literal parts.
+    fn args_of(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// a stdin double: one line per element, in order.
+    fn stdin_of(lines: &[&str]) -> Cursor<Vec<u8>> {
+        let mut s = String::new();
+        for l in lines {
+            s.push_str(l);
+            s.push('\n');
+        }
+        Cursor::new(s.into_bytes())
+    }
+
+    fn empty_stdin() -> Cursor<Vec<u8>> {
+        Cursor::new(Vec::new())
+    }
+
+    fn write_legacy(path: &std::path::Path, seed: &[u8; 32]) {
+        userkey::write_user_key_new(path, &hex_bytes(seed)).unwrap();
+    }
+
+    fn pubkey_of(seed: &[u8; 32]) -> String {
+        hex_bytes(
+            ed25519::PrivateKey::decode(seed.as_slice())
+                .unwrap()
+                .public_key()
+                .as_ref(),
+        )
+    }
+
+    #[test]
+    fn init_writes_v2_and_outputs_mnemonic_then_pubkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.key");
+        let mut stdin = stdin_of(&["correct horse battery"]);
+
+        let (words, pubkey_hex) = user_key_init(
+            &args_of(&["--out", &path.to_string_lossy()]),
+            &mut stdin,
+        )
+        .unwrap();
+
+        assert_eq!(words.split_whitespace().count(), 24);
+        assert_eq!(pubkey_hex.len(), 64);
+        match userkey::read_user_key_file(&path).unwrap() {
+            userkey::UserKeyFile::Encrypted(enc) => {
+                assert_eq!(hex_bytes(&enc.pubkey), pubkey_hex);
+            }
+            userkey::UserKeyFile::Plaintext(_) => panic!("expected v2/Encrypted"),
+        }
+    }
+
+    #[test]
+    fn restore_round_trips_init_mnemonic_to_identical_pubkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let init_path = dir.path().join("a.key");
+        let mut init_stdin = stdin_of(&["password one"]);
+        let (words, pubkey_hex) = user_key_init(
+            &args_of(&["--out", &init_path.to_string_lossy()]),
+            &mut init_stdin,
+        )
+        .unwrap();
+
+        let restore_path = dir.path().join("b.key");
+        let mut restore_stdin = stdin_of(&[&words, "password two"]);
+        let restored_pubkey = user_key_restore(
+            &args_of(&["--out", &restore_path.to_string_lossy()]),
+            &mut restore_stdin,
+        )
+        .unwrap();
+
+        assert_eq!(restored_pubkey, pubkey_hex);
+    }
+
+    #[test]
+    fn unlock_verifies_and_rejects_wrong_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.key");
+        let mut init_stdin = stdin_of(&["right password"]);
+        let (_, pubkey_hex) = user_key_init(
+            &args_of(&["--out", &path.to_string_lossy()]),
+            &mut init_stdin,
+        )
+        .unwrap();
+
+        let mut ok_stdin = stdin_of(&["right password"]);
+        let unlocked =
+            user_key_unlock(&args_of(&["--key", &path.to_string_lossy()]), &mut ok_stdin).unwrap();
+        assert_eq!(unlocked, pubkey_hex);
+
+        let mut bad_stdin = stdin_of(&["wrong password"]);
+        assert!(
+            user_key_unlock(&args_of(&["--key", &path.to_string_lossy()]), &mut bad_stdin)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reveal_returns_same_words_for_v2_and_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // v2: reveal requires the password.
+        let v2_path = dir.path().join("v2.key");
+        let mut init_stdin = stdin_of(&["a password"]);
+        let (words, _) = user_key_init(
+            &args_of(&["--out", &v2_path.to_string_lossy()]),
+            &mut init_stdin,
+        )
+        .unwrap();
+        let mut reveal_stdin = stdin_of(&["a password"]);
+        let revealed = user_key_reveal(
+            &args_of(&["--key", &v2_path.to_string_lossy()]),
+            &mut reveal_stdin,
+        )
+        .unwrap();
+        assert_eq!(revealed, words);
+
+        // legacy: reveal tolerates an absent password line entirely.
+        let legacy_path = dir.path().join("legacy.key");
+        let seed = [42u8; 32];
+        write_legacy(&legacy_path, &seed);
+        let legacy_words = userkey::mnemonic_of_seed(&seed);
+
+        let mut stdin = empty_stdin();
+        let revealed_legacy = user_key_reveal(
+            &args_of(&["--key", &legacy_path.to_string_lossy()]),
+            &mut stdin,
+        )
+        .unwrap();
+        assert_eq!(revealed_legacy, legacy_words);
+    }
+
+    #[test]
+    fn encrypt_migrates_legacy_to_v2_preserving_pubkey_and_mnemonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.key");
+        let seed = [9u8; 32];
+        write_legacy(&path, &seed);
+        let expected_pubkey = pubkey_of(&seed);
+
+        let mut before_stdin = empty_stdin();
+        let words_before =
+            user_key_reveal(&args_of(&["--key", &path.to_string_lossy()]), &mut before_stdin)
+                .unwrap();
+
+        let mut encrypt_stdin = stdin_of(&["fresh password"]);
+        let pubkey_after = user_key_encrypt(
+            &args_of(&["--key", &path.to_string_lossy()]),
+            &mut encrypt_stdin,
+        )
+        .unwrap();
+        assert_eq!(pubkey_after, expected_pubkey);
+
+        // already-v2 encrypt is a hard error, not a silent no-op.
+        let mut second_stdin = stdin_of(&["another password"]);
+        assert!(
+            user_key_encrypt(&args_of(&["--key", &path.to_string_lossy()]), &mut second_stdin)
+                .is_err()
+        );
+
+        let mut after_stdin = stdin_of(&["fresh password"]);
+        let words_after =
+            user_key_reveal(&args_of(&["--key", &path.to_string_lossy()]), &mut after_stdin)
+                .unwrap();
+        assert_eq!(words_after, words_before);
+    }
+
+    #[test]
+    fn status_reports_all_three_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let absent_path = dir.path().join("absent.key");
+        assert_eq!(
+            user_key_status(&args_of(&["--key", &absent_path.to_string_lossy()])).unwrap(),
+            "absent"
+        );
+
+        let plaintext_path = dir.path().join("plaintext.key");
+        let seed = [3u8; 32];
+        write_legacy(&plaintext_path, &seed);
+        assert_eq!(
+            user_key_status(&args_of(&["--key", &plaintext_path.to_string_lossy()])).unwrap(),
+            format!("plaintext {}", pubkey_of(&seed))
+        );
+
+        let encrypted_path = dir.path().join("encrypted.key");
+        let mut stdin = stdin_of(&["a password"]);
+        let (_, init_pubkey_hex) = user_key_init(
+            &args_of(&["--out", &encrypted_path.to_string_lossy()]),
+            &mut stdin,
+        )
+        .unwrap();
+        assert_eq!(
+            user_key_status(&args_of(&["--key", &encrypted_path.to_string_lossy()])).unwrap(),
+            format!("encrypted {init_pubkey_hex}")
+        );
+    }
+
+    #[test]
+    fn short_password_rejected_in_init_restore_encrypt() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let init_path = dir.path().join("init.key");
+        let mut stdin = stdin_of(&["short1"]);
+        assert!(
+            user_key_init(&args_of(&["--out", &init_path.to_string_lossy()]), &mut stdin)
+                .is_err()
+        );
+        assert!(
+            !init_path.exists(),
+            "a rejected password must not write a file"
+        );
+
+        let words = userkey::mnemonic_of_seed(&[1u8; 32]);
+        let restore_path = dir.path().join("restore.key");
+        let mut stdin = stdin_of(&[&words, "short1"]);
+        assert!(
+            user_key_restore(&args_of(&["--out", &restore_path.to_string_lossy()]), &mut stdin)
+                .is_err()
+        );
+        assert!(!restore_path.exists());
+
+        let legacy_path = dir.path().join("legacy.key");
+        let seed = [5u8; 32];
+        write_legacy(&legacy_path, &seed);
+        let mut stdin = stdin_of(&["short1"]);
+        assert!(
+            user_key_encrypt(&args_of(&["--key", &legacy_path.to_string_lossy()]), &mut stdin)
+                .is_err()
+        );
+        // a rejected password must not have migrated the file.
+        match userkey::read_user_key_file(&legacy_path).unwrap() {
+            userkey::UserKeyFile::Plaintext(_) => {}
+            userkey::UserKeyFile::Encrypted(_) => panic!("still-plaintext expected"),
+        }
+    }
+
+    /// same seed, two custody shapes (legacy plaintext vs v2+password) must
+    /// mint byte-identical bind JSON (ed25519 signing is deterministic), and
+    /// that JSON must decode via `identity::decode_msg`.
+    #[test]
+    fn sign_bind_v2_password_matches_legacy_and_decodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = [77u8; 32];
+        // an arbitrary but VALID ed25519 point — a public key derived from a
+        // seed, not raw bytes (not every 32-byte string is on-curve).
+        let node_pub_hex = pubkey_of(&[100u8; 32]);
+
+        let legacy_path = dir.path().join("legacy.key");
+        write_legacy(&legacy_path, &seed);
+        let mut stdin = empty_stdin();
+        let legacy_json = user_sign_bind(
+            &args_of(&[
+                "--key",
+                &legacy_path.to_string_lossy(),
+                "--chain-id",
+                "test-chain",
+                "--node-pub",
+                &node_pub_hex,
+                "--nonce",
+                "0",
+            ]),
+            &mut stdin,
+        )
+        .unwrap();
+
+        let v2_path = dir.path().join("v2.key");
+        let line = userkey::seal_user_key(&seed, "a password").unwrap();
+        userkey::write_user_key_new(&v2_path, &line).unwrap();
+        let mut stdin = stdin_of(&["a password"]);
+        let v2_json = user_sign_bind(
+            &args_of(&[
+                "--key",
+                &v2_path.to_string_lossy(),
+                "--chain-id",
+                "test-chain",
+                "--node-pub",
+                &node_pub_hex,
+                "--nonce",
+                "0",
+            ]),
+            &mut stdin,
+        )
+        .unwrap();
+
+        assert_eq!(legacy_json, v2_json);
+
+        match identity::decode_msg(legacy_json.as_bytes()).unwrap() {
+            identity::IdentityMsg::BindNode { user_key, .. } => {
+                assert_eq!(user_key, pubkey_bytes(&seed));
+            }
+            other => panic!("expected BindNode, got {other:?}"),
+        }
+
+        // wrong password fails cleanly (and never silently falls back to
+        // auto-generating a fresh legacy key underneath the v2 file).
+        let mut bad_stdin = stdin_of(&["wrong password"]);
+        assert!(
+            user_sign_bind(
+                &args_of(&[
+                    "--key",
+                    &v2_path.to_string_lossy(),
+                    "--chain-id",
+                    "test-chain",
+                    "--node-pub",
+                    &node_pub_hex,
+                    "--nonce",
+                    "0",
+                ]),
+                &mut bad_stdin,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sign_unbind_v2_password_matches_legacy_and_decodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = [88u8; 32];
+        let node_pub_hex = pubkey_of(&[101u8; 32]);
+
+        let legacy_path = dir.path().join("legacy.key");
+        write_legacy(&legacy_path, &seed);
+        let mut stdin = empty_stdin();
+        let legacy_json = user_sign_unbind(
+            &args_of(&[
+                "--key",
+                &legacy_path.to_string_lossy(),
+                "--chain-id",
+                "test-chain",
+                "--node-pub",
+                &node_pub_hex,
+                "--nonce",
+                "1",
+            ]),
+            &mut stdin,
+        )
+        .unwrap();
+
+        let v2_path = dir.path().join("v2.key");
+        let line = userkey::seal_user_key(&seed, "a password").unwrap();
+        userkey::write_user_key_new(&v2_path, &line).unwrap();
+        let mut stdin = stdin_of(&["a password"]);
+        let v2_json = user_sign_unbind(
+            &args_of(&[
+                "--key",
+                &v2_path.to_string_lossy(),
+                "--chain-id",
+                "test-chain",
+                "--node-pub",
+                &node_pub_hex,
+                "--nonce",
+                "1",
+            ]),
+            &mut stdin,
+        )
+        .unwrap();
+
+        assert_eq!(legacy_json, v2_json);
+        assert!(identity::decode_msg(legacy_json.as_bytes()).is_ok());
+    }
+
+    fn pubkey_bytes(seed: &[u8; 32]) -> Vec<u8> {
+        ed25519::PrivateKey::decode(seed.as_slice())
+            .unwrap()
+            .public_key()
+            .as_ref()
+            .to_vec()
+    }
+
+    #[test]
+    fn legacy_bare_generate_verb_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.key");
+        cmd_user_key_generate_legacy(&args_of(&["--out", &path.to_string_lossy()])).unwrap();
+        match userkey::read_user_key_file(&path).unwrap() {
+            userkey::UserKeyFile::Plaintext(_) => {}
+            userkey::UserKeyFile::Encrypted(_) => panic!("legacy generate must write v1"),
+        }
+    }
+
+    #[test]
+    fn unknown_subcommand_errors_cleanly() {
+        let mut stdin = empty_stdin();
+        let err = cmd_user_key(&args_of(&["bogus"]), &mut stdin).unwrap_err();
+        assert!(err.to_string().contains("unknown user-key subcommand"));
+    }
 }
 
 /// `init --name <human name> [--dir .] [--listen a] [--advertised a] [--http a]

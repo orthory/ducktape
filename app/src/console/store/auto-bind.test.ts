@@ -63,8 +63,13 @@ describe("autoBindUserIdentity", () => {
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
-  it("short-circuits to 'already' when the node is already bound, no invoke calls", async () => {
+  it("short-circuits to 'already' when the node is already bound, no sign/status invoke calls", async () => {
     markTauri();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_state")
+        return Promise.resolve({ state: "plaintext", mnemonicConfirmed: true });
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
     const transport = stubTransport(() => ({ user: wireUser() }));
 
     await expect(autoBindUserIdentity(transport, workspace)).resolves.toBe(
@@ -74,14 +79,43 @@ describe("autoBindUserIdentity", () => {
     expect(transport.query).toHaveBeenCalledWith("identity", {
       user_of: { node_key: [171, 18] }, // hexToBytes("ab12")
     });
-    expect(invokeMock).not.toHaveBeenCalled();
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith("user_identity_state");
+  });
+
+  it("returns 'locked' and makes no further calls when the identity is encrypted and locked", async () => {
+    markTauri();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_state")
+        return Promise.resolve({
+          state: "locked",
+          pubkey: "cd34",
+          mnemonicConfirmed: true,
+        });
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+    const transport = stubTransport(() => {
+      throw new Error("must not query the node when locked");
+    });
+
+    await expect(autoBindUserIdentity(transport, workspace)).resolves.toBe(
+      "locked",
+    );
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith("user_identity_state");
+    expect(transport.query).not.toHaveBeenCalled();
+    expect(transport.submit).not.toHaveBeenCalled();
   });
 
   it("walks a fresh bind with nonce 0 when no user is bound anywhere yet", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status")
-        return Promise.resolve({ pubkey: "cd34" });
+      if (cmd === "user_identity_state")
+        return Promise.resolve({
+          state: "unlocked",
+          pubkey: "cd34",
+          mnemonicConfirmed: true,
+        });
       if (cmd === "user_sign_bind") return Promise.resolve(boundMsg([9, 9, 9]));
       throw new Error(`unexpected invoke ${cmd}`);
     });
@@ -96,7 +130,9 @@ describe("autoBindUserIdentity", () => {
       "bound",
     );
 
-    expect(invokeMock).toHaveBeenCalledWith("user_identity_status");
+    // No legacy user_identity_status call — the pubkey to sign with comes
+    // straight off identityState()'s own reply.
+    expect(invokeMock).not.toHaveBeenCalledWith("user_identity_status");
     expect(transport.query).toHaveBeenCalledWith("identity", {
       get: { user_key: [205, 52] }, // hexToBytes("cd34")
     });
@@ -113,8 +149,12 @@ describe("autoBindUserIdentity", () => {
   it("signs with the existing user's nonce (3), not 0", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status")
-        return Promise.resolve({ pubkey: "cd34" });
+      if (cmd === "user_identity_state")
+        return Promise.resolve({
+          state: "unlocked",
+          pubkey: "cd34",
+          mnemonicConfirmed: true,
+        });
       if (cmd === "user_sign_bind") return Promise.resolve(boundMsg([7, 7, 7]));
       throw new Error(`unexpected invoke ${cmd}`);
     });
@@ -139,8 +179,12 @@ describe("autoBindUserIdentity", () => {
   it("resolves 'failed' (not a throw) when the node rejects the submit", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "user_identity_status")
-        return Promise.resolve({ pubkey: "cd34" });
+      if (cmd === "user_identity_state")
+        return Promise.resolve({
+          state: "unlocked",
+          pubkey: "cd34",
+          mnemonicConfirmed: true,
+        });
       if (cmd === "user_sign_bind") return Promise.resolve(boundMsg([9, 9, 9]));
       throw new Error(`unexpected invoke ${cmd}`);
     });
@@ -154,7 +198,31 @@ describe("autoBindUserIdentity", () => {
     );
   });
 
-  it("resolves 'failed' when the tauri shell has no user key yet", async () => {
+  it("resolves 'failed' when unlocked/plaintext but identityState() carries no pubkey", async () => {
+    // Shouldn't happen in practice (unlocked/plaintext always carry a pubkey
+    // in the clear) — but if it ever did, there is nothing to sign a bind
+    // with once we know the node isn't already bound, so this must resolve
+    // 'failed' rather than throw, and never reach the sign/submit calls.
+    markTauri();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_state")
+        return Promise.resolve({ state: "unlocked", mnemonicConfirmed: true });
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+    const transport = stubTransport((_target, q) => {
+      const query = q as Record<string, unknown>;
+      if ("user_of" in query) return { user: null };
+      throw new Error(`unexpected query ${JSON.stringify(q)}`);
+    });
+
+    await expect(autoBindUserIdentity(transport, workspace)).resolves.toBe(
+      "failed",
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith("user_sign_bind", expect.anything());
+    expect(transport.submit).not.toHaveBeenCalled();
+  });
+
+  it("resolves 'failed' when identityState() rejects (e.g. the shell can't read the user key)", async () => {
     markTauri();
     invokeMock.mockRejectedValue(new Error("no machine user key"));
     const transport = stubTransport(() => ({ user: null }));

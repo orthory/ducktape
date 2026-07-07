@@ -13,8 +13,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { getUser, submitRawMsg, userOf } from "../../domain/identity-client";
 import { isTauri } from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
+import { identityState } from "../../domain/user-identity-client";
 
-export type AutoBindResult = "bound" | "already" | "skipped" | "failed";
+export type AutoBindResult =
+  | "bound"
+  | "already"
+  | "skipped"
+  | "failed"
+  | "locked";
 
 export const autoBindUserIdentity = (
   transport: NodeTransport,
@@ -24,23 +30,36 @@ export const autoBindUserIdentity = (
   // offer and no `user_sign_bind` command to sign with.
   if (!isTauri()) return Promise.resolve("skipped");
 
-  return Promise.resolve()
-    .then(() => userOf(transport, workspace.pubkey))
-    .then((bound) => {
-      if (bound) return "already" as const;
-      return invoke<{ pubkey: string }>("user_identity_status")
-        .then(({ pubkey: userKey }) =>
-          getUser(transport, userKey).then((user) => user?.nonce ?? 0),
-        )
-        .then((nonce) =>
-          invoke<string>("user_sign_bind", {
-            chainId: workspace.chainId,
-            nodePub: workspace.pubkey,
-            nonce,
-          }),
-        )
-        .then((msg) => submitRawMsg(transport, msg))
-        .then(() => "bound" as const);
+  return identityState()
+    .then(({ state, pubkey: userKey }) => {
+      // Only a readable key can sign a bind. An absent key has nothing to
+      // offer yet; an encrypted-and-locked key needs a password this
+      // fire-and-forget call never has — signing would just fail with
+      // "identity-locked" downstream, so short-circuit here instead of
+      // burning a node query on it. The identity gate (onboarding/unlock UI)
+      // owns getting the user out of "locked"; the next connect retries.
+      if (state !== "unlocked" && state !== "plaintext") {
+        return "locked" as const;
+      }
+
+      return userOf(transport, workspace.pubkey).then((bound) => {
+        if (bound) return "already" as const;
+        // Belt-and-suspenders: "unlocked"/"plaintext" always carry a pubkey
+        // in the clear (v2 files included), so this should never trip in
+        // practice. No pubkey means nothing to sign a bind with, either way.
+        if (!userKey) return "failed" as const;
+        return getUser(transport, userKey)
+          .then((user) => user?.nonce ?? 0)
+          .then((nonce) =>
+            invoke<string>("user_sign_bind", {
+              chainId: workspace.chainId,
+              nodePub: workspace.pubkey,
+              nonce,
+            }),
+          )
+          .then((msg) => submitRawMsg(transport, msg))
+          .then(() => "bound" as const);
+      });
     })
     .catch((): AutoBindResult => "failed");
 };
