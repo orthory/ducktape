@@ -36,7 +36,8 @@ members = [
     "crates/system/blobstore",
     "crates/system/dispatch",
     "crates/system/dispatch-oracle",
-    "crates/system/tagging", 
+    "crates/system/tagging",
+    "crates/system/duckfs-client",
     # apps — product feature modules
     "crates/apps/forge",
     "crates/apps/pages",
@@ -54,6 +55,7 @@ members = [
     "crates/examples/directory", "crates/examples/greeter",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
+    "bin/fs",
     # app — the desktop shell of the react client (web twin ships from app/)
     "app/src-tauri",
 ]
@@ -150,6 +152,7 @@ profiles = { path = "crates/apps/profiles" }
 automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }
+duckfs-client = { path = "crates/system/duckfs-client" }
 jobs = { path = "crates/apps/jobs" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }

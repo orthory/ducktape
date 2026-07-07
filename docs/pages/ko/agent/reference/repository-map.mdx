@@ -18,6 +18,9 @@
 - `crates/system/valset`: validator membership state.
 - `crates/system/saga`: deterministic continuation state.
 - `crates/system/governance`: valset 위의 validator-set governance.
+- `crates/system/duckfs-client`: OS-side duckfs checkout/commit engine — chunk
+  hashing, versioned `.duckfs` index, worktree scan/status, change planning, 그리고
+  sync `NodeApi` transport(HTTP). consensus path에는 절대 오르지 않는다.
 - wire surface: 각 module의 typed payload와 query shape는 crate root(`src/interface.rs`)에 있다.
 
 ## Apps
@@ -33,6 +36,13 @@
 - `crates/apps/files`: node-local chunk byte 위의 consensus manifest.
 - `crates/apps/memory`: filesystem 모양의 shared agent workspace.
 - `crates/apps/jobs`: consensus-native work board.
+
+## Binaries
+
+- `bin/node`: p2p validator/mesh node (noded app surface도 함께 제공).
+- `bin/noded`: http/ws app surface 뒤의 single embedded-host daemon.
+- `bin/fs`: `ducktape-fs`, duckfs working-copy CLI — read verb과
+  `crates/system/duckfs-client` 위의 checkout/status/commit/pin loop.
 
 ## Docs
 

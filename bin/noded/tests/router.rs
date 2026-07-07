@@ -157,7 +157,11 @@ async fn submit_receipt_op_hash_addresses_the_committed_payload() {
     let body = body_json(response).await;
     let op_hash = body["opHash"].as_str().expect("receipt carries opHash");
     assert_eq!(op_hash.len(), 64);
-    assert!(op_hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    assert!(
+        op_hash
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    );
 
     // the hash is ADDRESSABLE, not just informational: the blob lane serves the
     // committed op bytes back under it.
@@ -363,4 +367,181 @@ async fn the_old_voice_ws_route_is_gone() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ---- duckfs read/probe surface: refs / diff / has-chunks --------------------
+
+use std::collections::BTreeMap;
+
+use files::{DiffEntry, DiffKind, FilesQuery, FilesReply, RefsInfo};
+
+/// a scripted files actor: decodes each `FilesQuery` and answers the matching
+/// canned `FilesReply`, or fails a submit with `submit_err` (the 400-envelope
+/// contract test). proves the router forwards `target = "files"` and translates
+/// the typed reply to json without a live module.
+fn spawn_files_actor(
+    mut cmds: futures::channel::mpsc::Receiver<NodeCommand>,
+    submit_err: Option<&'static str>,
+) {
+    tokio::spawn(async move {
+        while let Some(cmd) = cmds.next().await {
+            match cmd {
+                NodeCommand::Query { target, req, reply } => {
+                    assert_eq!(target, "files");
+                    let q = files::decode_query(&req).expect("files query decodes");
+                    let bytes = match q {
+                        FilesQuery::Refs {} => files::encode_reply(&FilesReply::Refs(RefsInfo {
+                            head: Some("ab".repeat(32)),
+                            pins: BTreeMap::new(),
+                            window_len: 4,
+                        })),
+                        FilesQuery::Diff { .. } => {
+                            files::encode_reply(&FilesReply::Diff(vec![DiffEntry {
+                                path: "/a".into(),
+                                kind: DiffKind::Modified,
+                            }]))
+                        }
+                        FilesQuery::HasChunks { ids } => {
+                            // present iff the id starts with "aa" — proves the reply
+                            // order maps back to the request order over the wire.
+                            let present = ids.iter().map(|id| id.starts_with("aa")).collect();
+                            files::encode_reply(&FilesReply::HasChunks { present })
+                        }
+                        other => panic!("unexpected files query: {other:?}"),
+                    };
+                    let _ = reply.send(Ok(bytes));
+                }
+                NodeCommand::Submit { target, reply, .. } => {
+                    assert_eq!(target, "files");
+                    let result = match submit_err {
+                        Some(err) => Err(err.to_string()),
+                        None => Ok(BlockSummary {
+                            height: 9,
+                            app_hash: "ab".repeat(32),
+                        }),
+                    };
+                    let _ = reply.send(result);
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+fn get(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn files_refs_route_returns_head() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_files_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(get("/v1/files/refs"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["head"], "ab".repeat(32));
+    assert_eq!(body["window_len"], 4);
+}
+
+#[tokio::test]
+async fn files_diff_route_returns_entries() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_files_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(get("/v1/files/diff?from=aa&to=bb&prefix=/"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["entries"][0]["path"], "/a");
+    assert_eq!(body["entries"][0]["kind"], "modified");
+}
+
+#[tokio::test]
+async fn files_has_chunks_route_preserves_request_order() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_files_actor(cmd_rx, None);
+
+    let present = "aa".repeat(32);
+    let absent = "bb".repeat(32);
+    let response = noded::router(handle)
+        .oneshot(get(&format!("/v1/files/has-chunks?ids={present},{absent}")))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["present"], serde_json::json!([true, false]));
+}
+
+#[tokio::test]
+async fn files_module_rejection_is_a_verbatim_400_envelope() {
+    // the engine's conflict taxonomy keys on the module error string arriving
+    // untouched inside a 400 {"error": "files: ..."} — pin the envelope here.
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_files_actor(cmd_rx, Some("files: conflict: /x changed since base"));
+
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/files/commit",
+            serde_json::json!({ "message": "m", "changes": [] }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["error"], "files: conflict: /x changed since base");
+}
+
+// ---- duckfs workspace RPC: 503 when unconfigured, slug validation -----------
+
+#[tokio::test]
+async fn fs_workspaces_is_503_when_unconfigured() {
+    // a handle that never injected the workspace root (the fake actor's) answers
+    // the seam with a clean 503, not a panic. no actor needed: the config guard
+    // returns before any command crosses the lane.
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/fs/workspaces",
+            serde_json::json!({ "prefix": "/shared/x" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn fs_workspace_commit_rejects_a_bad_slug() {
+    // a non-`[a-z0-9]` id (here uppercase) is refused BEFORE any disk touch —
+    // the slug guard is the traversal defense on the path param.
+    let root = tempfile::tempdir().expect("workspace root");
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let handle = handle.with_duckfs_workspaces(root.path().to_path_buf());
+
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/fs/workspaces/BAD/commit",
+            serde_json::json!({ "message": "m" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["error"], "invalid workspace id");
 }

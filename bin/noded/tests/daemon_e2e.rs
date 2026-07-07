@@ -19,7 +19,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest as _, Sha256};
 
-
 /// a running daemon, killed on drop so failures never leak an orphan (the
 /// REAL orphan lifecycle — outliving a client — is the desktop shell's
 /// contract with a detached spawn; this harness owns its child instead).
@@ -266,8 +265,7 @@ impl Daemon {
     /// a refusal leaves the connection open (keep-alive), so the read is
     /// timeout-bounded instead of read-to-close.
     fn ws_upgrade_refusal(&self, path: &str) -> (u16, String) {
-        let mut stream =
-            TcpStream::connect(("127.0.0.1", self.port)).expect("daemon reachable");
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("daemon reachable");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout");
@@ -352,10 +350,7 @@ fn call_ws_without_a_hub_refuses_with_a_reason() {
 
     let (status, raw) = daemon.ws_upgrade_refusal("/v1/call/ws?channel=general");
     assert_eq!(status, 503, "no call hub → refused at upgrade: {raw}");
-    assert!(
-        raw.contains("no mesh call hub"),
-        "refusal says WHY: {raw}"
-    );
+    assert!(raw.contains("no mesh call hub"), "refusal says WHY: {raw}");
 
     let (status, _raw) = daemon.ws_upgrade_refusal("/v1/voice/ws?channel=general");
     assert_eq!(status, 404, "the old voice route is unrouted, not refused");
@@ -873,6 +868,16 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
         .expect("appHash")
         .to_string();
 
+    // refs on a fresh module: no head (the empty filesystem) and an empty window,
+    // the base state the checkout engine starts from.
+    let (code, refs0) = daemon.request("GET", "/v1/files/refs", None);
+    assert_eq!(code, 200, "empty refs failed: {refs0}");
+    assert!(
+        refs0["head"].is_null(),
+        "no head before any commit: {refs0}"
+    );
+    assert_eq!(refs0["window_len"], 0, "empty window before any commit");
+
     // a duckfs chunk digest is the chunk object id: sha256 over the chunk kind
     // tag byte (0x00) followed by the bytes — what the module stages under and a
     // commit references. the stage endpoint returns it; we recompute it here to
@@ -1011,6 +1016,75 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
     let snaps = hist["snapshots"].as_array().expect("snapshots array");
     assert_eq!(snaps.len(), 1, "one commit lands in history: {hist}");
     assert_eq!(snaps[0]["message"], "seed duckfs");
+    let seed_snapshot = snaps[0]["id"]
+        .as_str()
+        .expect("seed snapshot id")
+        .to_string();
+
+    // ---- refs: head advanced from None (checked empty above) to the seed
+    // snapshot, and the window now holds one commit ----
+    let (code, refs) = daemon.request("GET", "/v1/files/refs", None);
+    assert_eq!(code, 200, "refs failed: {refs}");
+    assert_eq!(
+        refs["head"].as_str(),
+        Some(seed_snapshot.as_str()),
+        "refs head is the seed snapshot: {refs}"
+    );
+    assert_eq!(refs["window_len"], 1, "one commit in the window");
+
+    // ---- has-chunks flips false -> true across a stage; order is preserved ----
+    let chunk_c: Vec<u8> = (0..32u32).map(|i| (i * 3 + 1) as u8).collect();
+    let digest_c = chunk_digest(&chunk_c);
+    let (code, probe) =
+        daemon.request("GET", &format!("/v1/files/has-chunks?ids={digest_c}"), None);
+    assert_eq!(code, 200, "has-chunks failed: {probe}");
+    assert_eq!(
+        probe["present"],
+        serde_json::json!([false]),
+        "an unstaged chunk is absent: {probe}"
+    );
+    let (code, _) = daemon.request_bytes("POST", "/v1/files/stage", &chunk_c);
+    assert_eq!(code, 200, "stage c failed");
+    let absent = "22".repeat(32);
+    let (code, probe) = daemon.request(
+        "GET",
+        &format!("/v1/files/has-chunks?ids={digest_c},{absent}"),
+        None,
+    );
+    assert_eq!(code, 200, "has-chunks re-probe failed: {probe}");
+    assert_eq!(
+        probe["present"],
+        serde_json::json!([true, false]),
+        "the staged chunk flips present, request order intact: {probe}"
+    );
+
+    // ---- diff between the seed snapshot and a follow-up edit ----
+    let commit2 = serde_json::json!({
+        "base_snapshot": seed_snapshot,
+        "message": "edit hello",
+        "changes": [
+            { "put": { "path": "/shared/hello.txt", "exec": false,
+                "content": { "inline": { "b64": STANDARD.encode(b"HELLO AGAIN") } } } },
+        ],
+    });
+    let (code, block2) = daemon.request("POST", "/v1/files/commit", Some(&commit2));
+    assert_eq!(code, 200, "second commit failed: {block2}");
+    let (code, refs2) = daemon.request("GET", "/v1/files/refs", None);
+    assert_eq!(code, 200, "refs2 failed: {refs2}");
+    let head2 = refs2["head"].as_str().expect("head2 set").to_string();
+    let (code, diff) = daemon.request(
+        "GET",
+        &format!("/v1/files/diff?from={seed_snapshot}&to={head2}&prefix=/shared"),
+        None,
+    );
+    assert_eq!(code, 200, "diff failed: {diff}");
+    let entries = diff["entries"].as_array().expect("diff entries array");
+    assert_eq!(entries.len(), 1, "exactly one path changed: {diff}");
+    assert_eq!(entries[0]["path"], "/shared/hello.txt");
+    assert_eq!(
+        entries[0]["kind"], "modified",
+        "the edited file is modified"
+    );
 
     // ---- a rejected op is a clean 4xx carrying the error, not a 500/panic ----
     // a commit referencing a never-staged chunk digest: the module cannot
@@ -1117,7 +1191,9 @@ fn stage_script_provider(root: &Path, tag: &str, body: &str) -> Vec<(String, Str
     std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
     let script = root.join(format!("{tag}.sh"));
     std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("write provider script");
-    let mut perms = std::fs::metadata(&script).expect("script metadata").permissions();
+    let mut perms = std::fs::metadata(&script)
+        .expect("script metadata")
+        .permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).expect("chmod provider script");
 
@@ -1254,7 +1330,10 @@ fn status_answers_while_a_slow_run_is_in_flight() {
 
     // the provider is asleep for ~6s. the daemon answers NOW:
     let status = daemon.status();
-    assert!(status["height"].as_u64().is_some(), "status is live: {status}");
+    assert!(
+        status["height"].as_u64().is_some(),
+        "status is live: {status}"
+    );
     assert_eq!(
         pending_run_count(&daemon),
         1,
@@ -1267,14 +1346,20 @@ fn status_answers_while_a_slow_run_is_in_flight() {
 
     // ... and the run still lands: the result re-enters as a submit, the
     // mailbox delivers next block, the reply posts, the pending entry prunes.
-    poll_until("the slow run's reply to post", Duration::from_secs(30), || {
-        let replies = agent_replies(&daemon, "general");
-        (!replies.is_empty()).then_some(replies)
-    });
+    poll_until(
+        "the slow run's reply to post",
+        Duration::from_secs(30),
+        || {
+            let replies = agent_replies(&daemon, "general");
+            (!replies.is_empty()).then_some(replies)
+        },
+    );
     assert_eq!(agent_replies(&daemon, "general"), ["slow answer"]);
-    poll_until("the pending entry to prune", Duration::from_secs(30), || {
-        (pending_run_count(&daemon) == 0).then_some(())
-    });
+    poll_until(
+        "the pending entry to prune",
+        Duration::from_secs(30),
+        || (pending_run_count(&daemon) == 0).then_some(()),
+    );
 }
 
 /// two slow runs execute CONCURRENTLY: the second child starts while the
@@ -1350,7 +1435,11 @@ fn a_failing_provider_still_fails_the_run_cleanly() {
     let daemon = Daemon::spawn_inner(storage.path(), false, &env);
     arm_agent(&daemon, "general", "boomer", "kaboom");
 
-    let (code, block) = daemon.submit("chat", post_mention("general", "m1", "boomer"), Some("eddy"));
+    let (code, block) = daemon.submit(
+        "chat",
+        post_mention("general", "m1", "boomer"),
+        Some("eddy"),
+    );
     assert_eq!(code, 200, "mention post failed: {block}");
 
     // the terminal failure delivers (that is what prunes the entry) — the
@@ -1668,5 +1757,191 @@ fn git_push_larger_than_post_buffer_uses_the_probe_path() {
         forge_head(&daemon, "probed"),
         Some(rev_parse_head(wd)),
         "forge HEAD must equal the pushed commit after a probed push"
+    );
+}
+
+// ============================================================================
+// the FULL-STACK proof of the client transport: the `duckfs-client` checkout/
+// commit engine driven through `HttpNode` against a real spawned daemon —
+// checkout an empty prefix, write a small file AND a >1 MiB file (the stage
+// path), commit, checkout again byte-identically, then force a same-path
+// conflict and assert it surfaces a structured `ConflictReport` (never a silent
+// merge). the hand-rolled `HttpNode` contract lives in the crate's
+// `http_contract.rs`; this is the wire against the actual noded routes.
+// ============================================================================
+
+#[test]
+fn duckfs_engine_round_trips_and_reports_conflict_through_http_node() {
+    use duckfs_client::checkout::{CheckoutOptions, checkout_with};
+    use duckfs_client::commit::{CommitError, commit};
+    use duckfs_client::http::HttpNode;
+
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let base_url = format!("http://127.0.0.1:{}", daemon.port);
+    let node = HttpNode::new(base_url.clone());
+    let opts = CheckoutOptions {
+        node_url: base_url.clone(),
+        ..Default::default()
+    };
+
+    // checkout the empty prefix: base is None (nothing committed yet).
+    let dir_a = tempfile::TempDir::new().expect("checkout a");
+    let idx = checkout_with(&node, dir_a.path(), "/shared/e2e", None, &opts)
+        .expect("checkout empty prefix");
+    assert!(idx.base_snapshot.is_none(), "empty checkout has no base");
+
+    // a small (inline) file and a >1 MiB file — the latter forces the stage
+    // path through real consensus (POST /v1/files/stage per chunk).
+    std::fs::write(dir_a.path().join("small"), b"hello duckfs engine").expect("write small");
+    let big: Vec<u8> = (0..(2 * 1024 * 1024 + 7))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(dir_a.path().join("big"), &big).expect("write big");
+
+    let summary = commit(&node, dir_a.path(), "seed via engine").expect("commit seed");
+    assert!(!summary.rebased, "a first commit never rebases");
+
+    // a fresh checkout elsewhere reads back byte-identical (the big file is
+    // reassembled from staged chunks and verified against its object id).
+    let dir_b = tempfile::TempDir::new().expect("checkout b");
+    checkout_with(&node, dir_b.path(), "/shared/e2e", None, &opts).expect("checkout again");
+    assert_eq!(
+        std::fs::read(dir_b.path().join("small")).unwrap(),
+        b"hello duckfs engine",
+        "small file round-trips"
+    );
+    assert_eq!(
+        std::fs::read(dir_b.path().join("big")).unwrap(),
+        big,
+        ">1 MiB file round-trips byte-identical"
+    );
+
+    // both checkouts edit the SAME path off the same base: A lands, B must
+    // surface a ConflictReport naming the clashing path — no silent merge.
+    std::fs::write(dir_a.path().join("small"), b"edit from A").expect("edit a");
+    std::fs::write(dir_b.path().join("small"), b"edit from B").expect("edit b");
+    commit(&node, dir_a.path(), "A wins").expect("A commits clean");
+    let err = commit(&node, dir_b.path(), "B loses").expect_err("B must conflict");
+    match err {
+        CommitError::Conflict(report) => {
+            assert!(
+                report.clashing.iter().any(|p| p == "/shared/e2e/small"),
+                "the conflicting path is named in the report: {report:?}"
+            );
+        }
+        other => panic!("expected a structured conflict, got {other:?}"),
+    }
+}
+
+// ============================================================================
+// workspace RPC (the jobs/sandbox seam): the daemon manages a checkout under an
+// injected root, driven entirely over http — create -> files on disk -> commit
+// -> read back over the files surface -> delete. state lives on disk under
+// `<storage>/duckfs-workspaces/<id>`, so this test reads/writes that path
+// directly (same machine). a conflicting workspace commit is a 409 carrying the
+// serialized ConflictReport.
+// ============================================================================
+
+#[test]
+fn duckfs_workspace_rpc_lifecycle_and_conflict() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    // ---- create: an empty checkout under /shared/job1 ----
+    let (code, ws) = daemon.request(
+        "POST",
+        "/v1/fs/workspaces",
+        Some(&serde_json::json!({ "prefix": "/shared/job1" })),
+    );
+    assert_eq!(code, 200, "create workspace failed: {ws}");
+    let id = ws["id"].as_str().expect("workspace id").to_string();
+    let path = ws["path"].as_str().expect("workspace path").to_string();
+    assert!(ws["snapshot"].is_null(), "empty checkout has no base: {ws}");
+    // the managed checkout wrote its .duckfs index to disk at `path`.
+    let index_json = std::path::Path::new(&path).join(".duckfs/index.json");
+    assert!(
+        index_json.exists(),
+        "the workspace index must exist at {}",
+        index_json.display()
+    );
+
+    // ---- edit on disk, then commit over rpc ----
+    std::fs::write(
+        std::path::Path::new(&path).join("hello.txt"),
+        b"workspace bytes",
+    )
+    .expect("write into the workspace");
+    let (code, done) = daemon.request(
+        "POST",
+        &format!("/v1/fs/workspaces/{id}/commit"),
+        Some(&serde_json::json!({ "message": "commit from the workspace rpc" })),
+    );
+    assert_eq!(code, 200, "workspace commit failed: {done}");
+    assert!(
+        done["snapshot"].is_string(),
+        "commit returns a snapshot id: {done}"
+    );
+    assert_eq!(done["rebased"], false, "a first commit never rebases");
+
+    // ---- read the committed file back over the files surface ----
+    let (code, read) = daemon.request("GET", "/v1/files/read?path=/shared/job1/hello.txt", None);
+    assert_eq!(code, 200, "read the committed file: {read}");
+    let bytes = STANDARD
+        .decode(read["b64"].as_str().expect("b64").as_bytes())
+        .expect("decode b64");
+    assert_eq!(bytes, b"workspace bytes", "the committed bytes round-trip");
+
+    // ---- delete: the workspace directory is gone ----
+    let (code, gone) = daemon.request("DELETE", &format!("/v1/fs/workspaces/{id}"), None);
+    assert_eq!(code, 200, "delete workspace failed: {gone}");
+    assert_eq!(gone["ok"], true);
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "the workspace dir is removed on delete"
+    );
+
+    // ---- conflict: two workspaces off the same base, same-path edits ----
+    let make_ws = || {
+        let (c, v) = daemon.request(
+            "POST",
+            "/v1/fs/workspaces",
+            Some(&serde_json::json!({ "prefix": "/shared/wsconflict" })),
+        );
+        assert_eq!(c, 200, "create conflict workspace: {v}");
+        (
+            v["id"].as_str().unwrap().to_string(),
+            v["path"].as_str().unwrap().to_string(),
+        )
+    };
+    let commit_ws = |id: &str, msg: &str| -> (u16, serde_json::Value) {
+        daemon.request(
+            "POST",
+            &format!("/v1/fs/workspaces/{id}/commit"),
+            Some(&serde_json::json!({ "message": msg })),
+        )
+    };
+
+    let (id1, path1) = make_ws();
+    std::fs::write(std::path::Path::new(&path1).join("f.txt"), b"v1").unwrap();
+    let (c, _) = commit_ws(&id1, "seed");
+    assert_eq!(c, 200, "seed commit lands");
+
+    // ws2 checks out the seeded head (its base is snapshot1).
+    let (id2, path2) = make_ws();
+
+    // ws1 advances the shared path...
+    std::fs::write(std::path::Path::new(&path1).join("f.txt"), b"from1").unwrap();
+    let (c, _) = commit_ws(&id1, "advance");
+    assert_eq!(c, 200, "ws1 advances the shared path");
+
+    // ...so ws2's same-path commit conflicts: a 409 with the clashing path.
+    std::fs::write(std::path::Path::new(&path2).join("f.txt"), b"from2").unwrap();
+    let (c, report) = commit_ws(&id2, "loses");
+    assert_eq!(c, 409, "an overlapping workspace commit is a 409: {report}");
+    let clashing = report["clashing"].as_array().expect("clashing array");
+    assert!(
+        clashing.iter().any(|p| p == "/shared/wsconflict/f.txt"),
+        "the conflict report names the clashing path: {report}"
     );
 }

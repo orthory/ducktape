@@ -685,3 +685,78 @@ fn queries_never_see_a_staged_but_uncommitted_write() {
         "the ghost never existed"
     );
 }
+
+// ---- HasChunks: the client staging probe ------------------------------------
+
+fn has_chunks(f: &files::Files, ids: &[String]) -> Vec<bool> {
+    let reply = block_on(f.query(&encode_query(&FilesQuery::HasChunks { ids: ids.to_vec() })))
+        .map(|r| decode_reply(&r).unwrap())
+        .expect("has_chunks query ok");
+    match reply {
+        FilesReply::HasChunks { present } => present,
+        other => panic!("expected a HasChunks reply, got {other:?}"),
+    }
+}
+
+fn has_chunks_err(f: &files::Files, ids: &[String]) -> String {
+    match block_on(f.query(&encode_query(&FilesQuery::HasChunks { ids: ids.to_vec() }))) {
+        Err(sdk::Error::Module(m)) => m,
+        other => panic!("expected a Module error, got {other:?}"),
+    }
+}
+
+#[test]
+fn has_chunks_reports_staged_committed_and_absent() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+
+    // a staged-only chunk: putblob stages it into refs.staging (never committed
+    // into a tree), then the block adopts so it lives in the COMMITTED refs view.
+    let staged_bytes = b"staged-and-uncommitted";
+    putblob(&mut f, sdk::Origin::System, 1, staged_bytes);
+    commit_block(&mut f);
+    let staged = chunk_hex(staged_bytes);
+
+    // a committed chunk: an inline commit chunks + stores the file's bytes in the
+    // odb (present via `store.has`, not via staging).
+    let committed_bytes = b"committed-inline-body";
+    commit(
+        &mut f,
+        sdk::Origin::System,
+        2,
+        None,
+        vec![put_inline("/shared/c", committed_bytes)],
+    )
+    .expect("inline commit");
+    commit_block(&mut f);
+    let committed = chunk_hex(committed_bytes);
+
+    // an absent chunk: never staged, never committed.
+    let absent = to_hex(&files::objects::object_id(
+        files::Kind::Chunk,
+        b"never-seen",
+    ));
+
+    let present = has_chunks(&f, &[staged.clone(), committed.clone(), absent.clone()]);
+    assert_eq!(
+        present,
+        vec![true, true, false],
+        "order matches the request: staged, committed, absent"
+    );
+}
+
+#[test]
+fn has_chunks_rejects_over_cap_and_bad_hex() {
+    let d = tempfile::tempdir().unwrap();
+    let f = open_files(&d);
+
+    // MAX_SYNC_IDS (256) is fine; one past it rejects the whole request.
+    let over = vec!["00".repeat(32); files::MAX_SYNC_IDS + 1];
+    let err = has_chunks_err(&f, &over);
+    assert!(err.contains("too many ids"), "got: {err}");
+
+    // a non-hex id rejects the whole request (a malformed batch is a client bug).
+    let bad = vec!["zz".repeat(32)];
+    let err = has_chunks_err(&f, &bad);
+    assert!(err.contains("not hex"), "got: {err}");
+}

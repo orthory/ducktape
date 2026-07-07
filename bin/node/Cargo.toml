@@ -113,3 +113,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 async-trait = { workspace = true }
 tempfile = "3"
+# the phase-3 proof: duckfs_client_e2e drives the checkout/commit engine (as a
+# library, over each node's real http surface) across a two-validator cluster.
+duckfs-client = { workspace = true }

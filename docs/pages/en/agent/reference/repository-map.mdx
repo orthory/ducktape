@@ -18,6 +18,9 @@ Use this map to find the authoritative surface before editing.
 - `crates/system/valset`: validator membership state.
 - `crates/system/saga`: deterministic continuation state.
 - `crates/system/governance`: validator-set governance over valset.
+- `crates/system/duckfs-client`: OS-side duckfs checkout/commit engine — chunk
+  hashing, the versioned `.duckfs` index, worktree scan/status, change planning,
+  and the sync `NodeApi` transport (HTTP). Never on the consensus path.
 - wire surfaces: each module's typed payload and query shapes live at its crate root (`src/interface.rs`).
 
 ## Apps
@@ -33,6 +36,13 @@ Use this map to find the authoritative surface before editing.
 - `crates/apps/files`: consensus manifests over node-local chunk bytes.
 - `crates/apps/memory`: filesystem-shaped shared agent workspace.
 - `crates/apps/jobs`: consensus-native work board.
+
+## Binaries
+
+- `bin/node`: the p2p validator/mesh node (also serves the noded app surface).
+- `bin/noded`: the single embedded-host daemon behind the http/ws app surface.
+- `bin/fs`: `ducktape-fs`, the duckfs working-copy CLI (read verbs plus the
+  checkout/status/commit/pin loop over `crates/system/duckfs-client`).
 
 ## Docs
 

@@ -198,6 +198,14 @@ pub enum FilesQuery {
         prefix: String,
     },
     Refs {},
+    /// the client staging probe: which of these chunk ids the cluster already
+    /// holds (staged in refs OR durable in the odb). advisory — the reply can go
+    /// stale between a gc sweep and the commit, which re-validates; a stale answer
+    /// costs one redundant stage or one clean rejection, never corruption. capped
+    /// at [`MAX_SYNC_IDS`] ids per request (the batch-page convention).
+    HasChunks {
+        ids: Vec<DigestHex>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -284,6 +292,10 @@ pub enum FilesReply {
     History(Vec<SnapshotInfo>),
     Diff(Vec<DiffEntry>),
     Refs(RefsInfo),
+    /// per-id presence, in request order — `present[i]` answers `ids[i]`.
+    HasChunks {
+        present: Vec<bool>,
+    },
 }
 
 // ---- off-block object fetch (state sync / self-heal lane) ----

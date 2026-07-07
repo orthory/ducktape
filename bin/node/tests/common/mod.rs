@@ -811,6 +811,12 @@ impl Cluster {
         http_text_request(self.http_ports[idx], path)
     }
 
+    /// the http base url of node `idx`'s app surface — what a `duckfs-client`
+    /// `HttpNode` (or any plain http client) dials.
+    pub fn http_base(&self, idx: usize) -> String {
+        format!("http://127.0.0.1:{}", self.http_ports[idx])
+    }
+
     /// every running node's log tail — the panic payload that makes a stalled
     /// mesh diagnosable from a CI failure alone.
     pub fn all_log_tails(&self, lines: usize) -> String {

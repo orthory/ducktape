@@ -143,6 +143,25 @@ duckfs는 snapshot으로 한다. agent workspace는 `/home`과 `/shared` 아래�
 `/ab`에는 절대 match하지 않는다)가 어느 module에든 trigger한 commit과
 atomic하게 배달되는 change notification을 준다.
 
+client 절반은 OS-side checkout/commit engine(`crates/system/duckfs-client`)과
+`ducktape-fs` CLI다. checkout은 duckfs subtree를 실제 working directory로
+materialize하고 그 옆에 `.duckfs/index.json`을 둔다 — git의 index discipline:
+working copy가 내려온 base snapshot, 대화하는 node, 그리고 per-path
+hash/size/mtime record. `ducktape-fs`는 read verb(`ls`, `cat`, `stat`,
+`history`, `diff`)과 working-copy loop(`checkout`, `status`, `commit`, `pin`)을
+갖는다. engine은 모든 object를 client-side에서 hash하고 이름 붙이며(validator가
+derive하는 것과 byte-identical), cluster에 없는 chunk만 stage하고, 하나의 atomic
+`Commit`을 submit한다. conflict 처리는 구조적으로 안전하다: CAS rejection에서
+engine은 겹치지 않는 upstream 작업만 auto-rebase하고(절대 silent merge가 아니다),
+겹치는 edit에는 structured conflict report를 낸다(single daemon 기준; multi-validator
+cluster에서는 module의 reason string이 consensus finalization을 넘어 살아남지 못해
+지금은 overlap을 평범한 rejection으로 보고한다). workspace RPC(`POST /v1/fs/workspaces`,
+`.../commit`, `DELETE`)는 jobs/sandbox seam이다: daemon이 자기 root 아래에서
+checkout을 관리하며 같은 engine을 actor lane으로 구동하므로 self-dial 없이 job이
+disk의 file을 편집하고 commit할 수 있다. FUSE `mount`(working copy를 live kernel
+filesystem으로)는 Phase 4로 예약되어 있고, sync `NodeApi` trait이 그 colocated
+object-store fast path가 구현할 seam이다.
+
 ## Jobs
 
 jobs는 on-platform actor를 위한 consensus-native work board다: 사람과 agent

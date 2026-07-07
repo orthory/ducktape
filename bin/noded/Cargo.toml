@@ -49,6 +49,12 @@ reactor = { workspace = true }
 # indexes as blocks commit; /v1/index/* serves snapshot reads of them, and
 # each module registers its `::index` mapper as its own view endpoint.
 indexer = { workspace = true }
+# the duckfs checkout/commit engine: the workspace RPC (/v1/fs/workspaces) drives
+# it over an actor-lane `NodeApi` adapter, so the daemon manages checkouts with
+# no self-dial. NOT a consensus-path crate — a client engine, OS-side only.
+duckfs-client = { workspace = true }
+# the workspace RPC decodes file-read replies (base64) off the actor lane.
+base64 = { workspace = true }
 
 commonware-runtime = { workspace = true }
 
@@ -75,6 +81,6 @@ tempfile = "3"
 # daemon_e2e registers agents with a live prompt doc: prompt_hash pins sha256
 # of the doc's canonical rendering, computed test-side.
 sha2 = { workspace = true }
-# the duckfs surface round-trip encodes inline file bytes and decodes read
-# replies as base64 — the same wire the module speaks.
-base64 = { workspace = true }
+# (duckfs-client and base64 are now direct deps above — daemon_e2e drives the
+# `HttpNode` transport through them as the full-stack proof of the client
+# transport, alongside the workspace RPC that uses them at runtime.)
