@@ -9,11 +9,11 @@
 // the store keeps only a flat Find projection for the command palette.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ChangeEvent } from "react";
+import type { ChangeEvent, FormEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react";
 
 import { deletePath, joinPath, ls, mkdir, refs, uploadFile } from "../../../domain/files-client";
 import type { FileEntry } from "../../../domain/files-client";
-import { Icon } from "../../components/Icon";
+import { Icon, type IconName } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { FilePreview } from "./FilePreview";
@@ -29,6 +29,12 @@ interface UploadState {
   total: number;
 }
 
+interface ContextMenuState {
+  x: number;
+  y: number;
+  entry: FileEntry | null;
+}
+
 /** dirs before files, then case-insensitive by name — a stable browse order on
  *  top of the module's raw name-order page. */
 const sortEntries = (entries: FileEntry[]): FileEntry[] =>
@@ -38,6 +44,7 @@ const sortEntries = (entries: FileEntry[]): FileEntry[] =>
   });
 
 const writeTargetDir = (dir: string): string => (dir === "/" ? DEFAULT_DIR : dir);
+const basename = (path: string): string => path.split("/").pop() || path;
 
 function CenterState({ title, detail, muted }: { title: string; detail: string; muted?: boolean }) {
   return (
@@ -163,19 +170,22 @@ function EntryRow({
   entry,
   selected,
   onOpen,
+  onContextMenu,
 }: {
   entry: FileEntry;
   selected: boolean;
   onOpen: () => void;
+  onContextMenu: (event: ReactMouseEvent<HTMLButtonElement>) => void;
 }) {
   const [hover, setHover] = useState(false);
   const isDir = entry.kind === "dir";
-  const name = entry.path.split("/").pop() || entry.path;
+  const name = basename(entry.path);
   return (
     <button
       type="button"
       aria-label={`${isDir ? "Open folder" : "Open file"} ${name}`}
       onClick={onOpen}
+      onContextMenu={onContextMenu}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
@@ -231,6 +241,340 @@ function EntryRow({
   );
 }
 
+function ContextMenuItem({
+  label,
+  icon,
+  danger,
+  disabled,
+  onSelect,
+}: {
+  label: string;
+  icon: IconName;
+  danger?: boolean;
+  disabled?: boolean;
+  onSelect: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      disabled={disabled}
+      onClick={(event) => {
+        event.stopPropagation();
+        if (!disabled) onSelect();
+      }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        all: "unset",
+        boxSizing: "border-box",
+        width: "100%",
+        minHeight: 30,
+        padding: "0 9px",
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        borderRadius: radius.sm,
+        background: hover && !disabled ? (danger ? color.dangerSoft : color.hover) : "transparent",
+        color: disabled ? color.muted2 : danger ? color.danger : color.inkSoft,
+        cursor: disabled ? "default" : "pointer",
+        font: `500 12.5px ${font.sans}`,
+      }}
+    >
+      <Icon name={icon} size={13} strokeWidth={1.8} />
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function FilesContextMenu({
+  menu,
+  readOnly,
+  onClose,
+  onOpen,
+  onNewFolder,
+  onUpload,
+  onDelete,
+  onRefresh,
+}: {
+  menu: ContextMenuState;
+  readOnly: boolean;
+  onClose: () => void;
+  onOpen: (entry: FileEntry) => void;
+  onNewFolder: () => void;
+  onUpload: () => void;
+  onDelete: (entry: FileEntry) => void;
+  onRefresh: () => void;
+}) {
+  const entry = menu.entry;
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    const timer = setTimeout(() => document.addEventListener("click", onClose), 0);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("click", onClose);
+      clearTimeout(timer);
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      role="menu"
+      aria-label="File actions"
+      onClick={(event) => event.stopPropagation()}
+      style={{
+        position: "fixed",
+        left: Math.max(8, menu.x),
+        top: Math.max(8, menu.y),
+        zIndex: 60,
+        width: 184,
+        padding: 4,
+        border: `1px solid ${color.border}`,
+        borderRadius: radius.md,
+        background: color.paper,
+        boxShadow: shadow.pop,
+      }}
+    >
+      {entry && (
+        <>
+          <ContextMenuItem
+            label="Open"
+            icon={entry.kind === "dir" ? "modules" : "files"}
+            onSelect={() => {
+              onOpen(entry);
+              onClose();
+            }}
+          />
+          <ContextMenuItem
+            label="Delete"
+            icon="close"
+            danger
+            disabled={readOnly}
+            onSelect={() => {
+              onDelete(entry);
+              onClose();
+            }}
+          />
+          <div style={{ height: 1, margin: "4px 6px", background: color.borderSoft }} />
+        </>
+      )}
+      <ContextMenuItem
+        label="New folder"
+        icon="modules"
+        disabled={readOnly}
+        onSelect={() => {
+          onNewFolder();
+          onClose();
+        }}
+      />
+      <ContextMenuItem
+        label="Upload"
+        icon="plus"
+        disabled={readOnly}
+        onSelect={() => {
+          onUpload();
+          onClose();
+        }}
+      />
+      <ContextMenuItem
+        label="Refresh"
+        icon="refresh"
+        onSelect={() => {
+          onRefresh();
+          onClose();
+        }}
+      />
+    </div>
+  );
+}
+
+function DialogButton({
+  label,
+  variant,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  variant?: "primary" | "danger";
+  disabled?: boolean;
+  onClick?: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  const activeBg = variant === "danger" ? color.danger : color.green;
+  return (
+    <button
+      type={onClick ? "button" : "submit"}
+      disabled={disabled}
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        all: "unset",
+        boxSizing: "border-box",
+        height: 32,
+        minWidth: 74,
+        padding: "0 12px",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        borderRadius: radius.sm,
+        border: `1px solid ${variant ? activeBg : color.borderStrong}`,
+        background: disabled
+          ? color.sunken
+          : variant
+            ? activeBg
+            : hover
+              ? color.hover
+              : color.paper,
+        color: disabled ? color.muted2 : variant ? "#fff" : color.inkSoft,
+        cursor: disabled ? "default" : "pointer",
+        font: `600 12px ${font.sans}`,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+function ModalShell({ children }: { children: ReactNode }) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 70,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 20,
+        background: "rgba(38, 37, 31, 0.18)",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function NewFolderDialog({
+  value,
+  busy,
+  onChange,
+  onSubmit,
+  onCancel,
+}: {
+  value: string;
+  busy: boolean;
+  onChange: (value: string) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <ModalShell>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="new-folder-title"
+        style={{
+          width: "min(360px, 100%)",
+          borderRadius: radius.lg,
+          border: `1px solid ${color.border}`,
+          background: color.paper,
+          boxShadow: shadow.pop,
+          padding: 16,
+        }}
+      >
+        <form onSubmit={onSubmit}>
+          <div id="new-folder-title" style={{ font: `700 15px ${font.sans}`, color: color.dark }}>
+            New folder
+          </div>
+          <label
+            htmlFor="new-folder-name"
+            style={{
+              display: "block",
+              marginTop: 14,
+              marginBottom: 6,
+              font: `600 11px ${font.sans}`,
+              color: color.muted3,
+            }}
+          >
+            Folder name
+          </label>
+          <input
+            id="new-folder-name"
+            autoFocus
+            value={value}
+            disabled={busy}
+            onChange={(event) => onChange(event.target.value)}
+            style={{
+              boxSizing: "border-box",
+              width: "100%",
+              height: 36,
+              borderRadius: radius.sm,
+              border: `1px solid ${color.borderStrong}`,
+              background: color.paper,
+              color: color.ink,
+              padding: "0 10px",
+              font: `500 13px ${font.sans}`,
+              outline: "none",
+            }}
+          />
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+            <DialogButton label="Cancel" disabled={busy} onClick={onCancel} />
+            <DialogButton label="Create folder" variant="primary" disabled={busy || value.trim() === ""} />
+          </div>
+        </form>
+      </div>
+    </ModalShell>
+  );
+}
+
+function DeleteEntryDialog({
+  entry,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  entry: FileEntry;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const name = basename(entry.path);
+  return (
+    <ModalShell>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="delete-entry-title"
+        style={{
+          width: "min(360px, 100%)",
+          borderRadius: radius.lg,
+          border: `1px solid ${color.dangerBorder}`,
+          background: color.paper,
+          boxShadow: shadow.pop,
+          padding: 16,
+        }}
+      >
+        <div id="delete-entry-title" style={{ font: `700 15px ${font.sans}`, color: color.dark }}>
+          Delete {name}
+        </div>
+        <div style={{ marginTop: 8, font: `400 12px ${font.sans}`, color: color.muted3, lineHeight: 1.5 }}>
+          This removes the selected {entry.kind === "dir" ? "folder" : "file"} from the live filesystem.
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+          <DialogButton label="Cancel" disabled={busy} onClick={onCancel} />
+          <DialogButton label="Delete" variant="danger" disabled={busy} onClick={onConfirm} />
+        </div>
+      </div>
+    </ModalShell>
+  );
+}
+
 export function FilesView() {
   const { state, transport } = useDucktape();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -247,6 +591,11 @@ export function FilesView() {
   const [deleting, setDeleting] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [newFolderOpen, setNewFolderOpen] = useState(false);
+  const [newFolderName, setNewFolderName] = useState("");
+  const [creatingFolder, setCreatingFolder] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<FileEntry | null>(null);
 
   const backed = Boolean(state.status?.modules.some((m) => m.id === "files"));
   const readOnly = snapshot !== null;
@@ -301,6 +650,7 @@ export function FilesView() {
   }, [transport, dir, snapshot, reloadToken]);
 
   const navigate = (path: string) => {
+    setContextMenu(null);
     setSelected(null);
     setDir(path);
   };
@@ -318,6 +668,40 @@ export function FilesView() {
         setCursor(page.next);
       })
       .catch((err) => setError(errMsg(err)));
+  };
+
+  const openEntry = (entry: FileEntry) => {
+    setContextMenu(null);
+    if (entry.kind === "dir") {
+      navigate(entry.path);
+    } else {
+      setSelected(entry);
+    }
+  };
+
+  const openContextMenu = (event: ReactMouseEvent, entry: FileEntry | null) => {
+    if (!transport || !backed) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({ x: event.clientX, y: event.clientY, entry });
+  };
+
+  const openNewFolderDialog = () => {
+    if (!transport || readOnly) return;
+    setContextMenu(null);
+    setNewFolderName("");
+    setNewFolderOpen(true);
+  };
+
+  const openUploadPicker = () => {
+    if (!transport || readOnly) return;
+    setContextMenu(null);
+    fileInputRef.current?.click();
+  };
+
+  const refreshDirectory = () => {
+    setContextMenu(null);
+    bumpReload();
   };
 
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -343,31 +727,43 @@ export function FilesView() {
     }
   };
 
-  const handleNewFolder = async () => {
+  const handleNewFolderSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
     if (!transport || readOnly) return;
-    const name = window.prompt("New folder name")?.trim();
+    const name = newFolderName.trim();
     if (!name) return;
     setError(null);
+    setCreatingFolder(true);
     try {
       await mkdir(transport, { path: joinPath(writeTargetDir(dir), name) });
+      setNewFolderOpen(false);
+      setNewFolderName("");
       bumpReload();
     } catch (err) {
       setError(errMsg(err));
+    } finally {
+      setCreatingFolder(false);
     }
   };
 
-  const handleDelete = async () => {
-    if (!transport || !selected || readOnly) return;
+  const deleteEntry = async (entry: FileEntry) => {
+    if (!transport || readOnly) return;
     setDeleting(true);
     try {
-      await deletePath(transport, { path: selected.path });
-      setSelected(null);
+      await deletePath(transport, { path: entry.path });
+      setSelected((current) => (current?.path === entry.path ? null : current));
+      setDeleteTarget(null);
       bumpReload();
     } catch (err) {
       setError(errMsg(err));
     } finally {
       setDeleting(false);
     }
+  };
+
+  const handleDelete = async () => {
+    if (!selected) return;
+    await deleteEntry(selected);
   };
 
   const rows = sortEntries(entries);
@@ -419,13 +815,13 @@ export function FilesView() {
             label="New folder"
             icon="modules"
             disabled={!backed || readOnly}
-            onClick={handleNewFolder}
+            onClick={openNewFolderDialog}
           />
           <HeaderButton
             label="Upload"
             icon="plus"
             disabled={!backed || readOnly}
-            onClick={() => fileInputRef.current?.click()}
+            onClick={openUploadPicker}
           />
           <HeaderButton
             label="History"
@@ -440,6 +836,7 @@ export function FilesView() {
       <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
         <div style={{ flex: 1, minWidth: 0, minHeight: 0, overflowY: "auto", padding: 18, background: color.sidebar }}>
           <div
+            onContextMenu={(event) => openContextMenu(event, null)}
             style={{
               minHeight: "100%",
               borderRadius: radius.lg,
@@ -511,9 +908,8 @@ export function FilesView() {
                         key={entry.path}
                         entry={entry}
                         selected={selected?.path === entry.path}
-                        onOpen={() =>
-                          entry.kind === "dir" ? navigate(entry.path) : setSelected(entry)
-                        }
+                        onOpen={() => openEntry(entry)}
+                        onContextMenu={(event) => openContextMenu(event, entry)}
                       />
                     ))}
                     {cursor && (
@@ -550,6 +946,44 @@ export function FilesView() {
             deleting={deleting}
             onClose={() => setSelected(null)}
             onDelete={handleDelete}
+          />
+        )}
+
+        {contextMenu && (
+          <FilesContextMenu
+            menu={contextMenu}
+            readOnly={readOnly}
+            onClose={() => setContextMenu(null)}
+            onOpen={openEntry}
+            onNewFolder={openNewFolderDialog}
+            onUpload={openUploadPicker}
+            onDelete={setDeleteTarget}
+            onRefresh={refreshDirectory}
+          />
+        )}
+
+        {newFolderOpen && (
+          <NewFolderDialog
+            value={newFolderName}
+            busy={creatingFolder}
+            onChange={setNewFolderName}
+            onSubmit={handleNewFolderSubmit}
+            onCancel={() => {
+              if (creatingFolder) return;
+              setNewFolderOpen(false);
+              setNewFolderName("");
+            }}
+          />
+        )}
+
+        {deleteTarget && (
+          <DeleteEntryDialog
+            entry={deleteTarget}
+            busy={deleting}
+            onCancel={() => {
+              if (!deleting) setDeleteTarget(null);
+            }}
+            onConfirm={() => void deleteEntry(deleteTarget)}
           />
         )}
 

@@ -138,6 +138,30 @@ describe("FilesView", () => {
     expect(transport.filesStage).not.toHaveBeenCalled();
   });
 
+  it("creates new folders through an in-app dialog", async () => {
+    const transport = makeTransport();
+    const promptSpy = vi.spyOn(window, "prompt").mockImplementation(() => {
+      throw new Error("New folder must not use native prompt");
+    });
+    try {
+      renderView(transport);
+      await screen.findByText("readme.md");
+
+      fireEvent.click(screen.getByRole("button", { name: /new folder/i }));
+
+      expect(await screen.findByRole("dialog", { name: /new folder/i })).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText(/folder name/i), { target: { value: "notes" } });
+      fireEvent.click(screen.getByRole("button", { name: /create folder/i }));
+
+      await waitFor(() => expect(transport.filesCommit).toHaveBeenCalled());
+      const body = (transport.filesCommit as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(body.changes).toEqual([{ mkdir: { path: "/shared/notes" } }]);
+      expect(promptSpy).not.toHaveBeenCalled();
+    } finally {
+      promptSpy.mockRestore();
+    }
+  });
+
   it("creates new folders under /shared even before /shared exists", async () => {
     const transport = makeTransport({
       filesLs: vi.fn(({ path }: { path: string }) =>
@@ -146,19 +170,33 @@ describe("FilesView", () => {
           : Promise.resolve({ entries: [], next: null }),
       ),
     });
-    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue("docs");
-    try {
-      renderView(transport);
-      await screen.findByText("Empty directory");
+    renderView(transport);
+    await screen.findByText("Empty directory");
 
-      fireEvent.click(screen.getByRole("button", { name: /new folder/i }));
+    fireEvent.click(screen.getByRole("button", { name: /new folder/i }));
+    fireEvent.change(await screen.findByLabelText(/folder name/i), { target: { value: "docs" } });
+    fireEvent.click(screen.getByRole("button", { name: /create folder/i }));
 
-      await waitFor(() => expect(transport.filesCommit).toHaveBeenCalled());
-      const body = (transport.filesCommit as ReturnType<typeof vi.fn>).mock.calls[0][0];
-      expect(body.changes).toEqual([{ mkdir: { path: "/shared/docs" } }]);
-    } finally {
-      promptSpy.mockRestore();
-    }
+    await waitFor(() => expect(transport.filesCommit).toHaveBeenCalled());
+    const body = (transport.filesCommit as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(body.changes).toEqual([{ mkdir: { path: "/shared/docs" } }]);
+  });
+
+  it("opens file actions from the right-click menu", async () => {
+    const transport = makeTransport();
+    renderView(transport);
+    const fileRow = await screen.findByRole("button", { name: /open file readme\.md/i });
+
+    fireEvent.contextMenu(fileRow, { clientX: 80, clientY: 120 });
+
+    expect(await screen.findByRole("menu")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /^open$/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /^new folder$/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /^upload$/i })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /^delete$/i })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /^open$/i }));
+    expect(await screen.findByText("readme body")).toBeInTheDocument();
   });
 
   it("deletes the open file after a two-step confirm", async () => {
