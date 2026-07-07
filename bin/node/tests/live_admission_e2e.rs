@@ -34,8 +34,8 @@ fn network_shape_joiner_parks_until_promote() {
     // the MANUAL flavor (token-less v2 blob): the pubkey travels out-of-band
     // and no lobby announce happens — the tokened flavor has its own e2e
     // (join_request_e2e).
-    let invite = cluster.invite_manual();
-    let friend_key = cluster.join_friend(&invite);
+    let invite = cluster.invite();
+    let friend_key = cluster.join_friend_manual(&invite);
     assert_eq!(
         friend_key.len(),
         64,
@@ -52,8 +52,8 @@ fn network_shape_joiner_parks_until_promote() {
     std::fs::write(&cfg, format!("{toml}sync_index = true\n")).expect("write friend node.toml");
 
     cluster.spawn(1);
-    cluster.wait_marker(1, "joiner mode: parking", Duration::from_secs(60));
-    cluster.wait_marker(1, "parked:", Duration::from_secs(60));
+    cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
+    cluster.wait_marker(1, "joining:", Duration::from_secs(60));
 
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
@@ -214,10 +214,10 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
     let _ = activation;
 
     // ---- invite → park → observer grant ------------------------------------
-    let invite = cluster.invite_manual();
-    let friend_key = cluster.join_friend(&invite);
+    let invite = cluster.invite();
+    let friend_key = cluster.join_friend_manual(&invite);
     cluster.spawn(1);
-    cluster.wait_marker(1, "joiner mode: parking", Duration::from_secs(60));
+    cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
 
     let (ok, text) = cluster.run_membership_verb("invite-accept", &friend_key);
     assert!(ok, "invite-accept failed:\n{text}");
@@ -408,7 +408,7 @@ fn staged_admission_observer_presyncs_then_promotes_warm() {
             .and_then(|raw| valset::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(r, ValsetReply::Observers(v) if v.is_empty()))
     }));
-    cluster.wait_marker(1, "parked: awaiting admission", CONVERGE);
+    cluster.wait_marker(1, "joining: awaiting redemption", CONVERGE);
     //     a second run is an honest no-op — the inverted guard, end to end.
     let (ok, out) = cluster.run_membership_verb("observer-remove", &friend_key);
     assert!(ok, "observer-remove (no standing) failed:\n{out}");

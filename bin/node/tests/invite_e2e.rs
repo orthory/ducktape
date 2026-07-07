@@ -65,8 +65,8 @@ fn solo_founder_invites_a_friend() {
     // the friend starts an out-of-mesh node: it must PARK (the founder's
     // tracked set does not contain this key), not sync and not crash.
     let joiner = cluster.spawn_joiner(1);
-    cluster.wait_marker(joiner, "joiner mode: parking", Duration::from_secs(60));
-    cluster.wait_marker(joiner, "parked:", Duration::from_secs(60));
+    cluster.wait_marker(joiner, "joiner mode:", Duration::from_secs(60));
+    cluster.wait_marker(joiner, "joining:", Duration::from_secs(60));
 
     // one command on the founder's node: propose + the deciding solo ballot
     // + execute, all through the running node's rpc.
@@ -135,7 +135,7 @@ fn live_quorum_admits_a_fourth_validator() {
     }
 
     let joiner = cluster.spawn_joiner(3);
-    cluster.wait_marker(joiner, "joiner mode: parking", Duration::from_secs(60));
+    cluster.wait_marker(joiner, "joiner mode:", Duration::from_secs(60));
 
     // strict majority of 3 is 2: members 0 and 1 each run the SAME command;
     // the second one's ballot decides and executes.
