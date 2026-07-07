@@ -40,6 +40,153 @@ const MAX_PACKET: usize = u16::MAX as usize;
 /// keepalive, handshake retransmit) is calibrated to roughly that cadence.
 const TIMER_TICK: Duration = Duration::from_millis(250);
 
+/// capacity of each demux lane (WG datagrams to the device, everything else
+/// to the bypass); overflow drops the datagram, exactly as a full kernel
+/// UDP receive buffer would.
+const LANE_CHANNEL: usize = 1024;
+
+/// one raw datagram off the underlay, tagged with its source.
+pub type Datagram = (Vec<u8>, SocketAddr);
+
+/// the WG lane's re-installable sender: each spawned device attaches its own.
+type WgLane = Arc<RwLock<Option<mpsc::Sender<Datagram>>>>;
+
+// ── the underlay socket ─────────────────────────────────
+
+/// the ADR's "one process-owned underlay UDP socket per node": the bound WG
+/// listen socket plus its single receive pump, demuxing inbound datagrams
+/// between the WireGuard device and a BYPASS lane.
+///
+/// the bypass lane is why this exists as its own object (ADR phase 3): the
+/// NAT punch must originate from the same 5-tuple the tunnel runs on, so the
+/// nat-traversal client sends through [`send_to`](Self::send_to) and
+/// receives whatever the pump classifies as not-WireGuard. classification is
+/// deterministic, not heuristic: a WireGuard datagram starts with a message
+/// type 1–4 followed by three reserved zero bytes and a type-specific length
+/// (`Tunn::parse_incoming_packet`), while every inbound nat-traversal reply
+/// (tags 2/5/6/7) fails that parse by construction — tag 2 is followed by an
+/// address-family byte (4 or 6, never 0), the rest are tags above 4.
+///
+/// the socket outlives interface rebuilds when shared (the effect's
+/// socket-mode wiring): rendezvous keepalives keep flowing — and the NAT
+/// pinhole stays open — while the tunnel itself is torn down and re-applied.
+pub struct UnderlaySocket {
+    udp: Arc<UdpSocket>,
+    /// the WG lane's sender — installed by each [`WgDevice`] at spawn, so a
+    /// rebuilt device re-attaches to the same socket; `None` (or a closed
+    /// sender) while no device is live, when WG datagrams are dropped
+    /// exactly as they would be on a downed interface.
+    wg_lane: WgLane,
+    /// the bypass lane's receiver, handed out once via
+    /// [`take_bypass`](Self::take_bypass).
+    bypass: Mutex<Option<mpsc::Receiver<Datagram>>>,
+    pump: JoinHandle<()>,
+}
+
+impl UnderlaySocket {
+    /// bind the underlay socket (dual-stack `[::]:port`, so a peer endpoint
+    /// of either family reaches it) and spawn its receive pump on `handle`.
+    ///
+    /// binding absorbs a predecessor's asynchronous teardown: a replace
+    /// cycle (remove→create→apply, or a rebuild inside `apply`) drops the
+    /// old backend, but its pump tasks release the socket only when the
+    /// runtime collects them — a same-port rebind can race that by a few
+    /// milliseconds. bounded retry, loud on genuine conflicts; the Defguard
+    /// effect's `remove_interface` polls the same way (10ms steps, 2s cap)
+    /// for its TUN teardown.
+    pub fn bind(handle: &tokio::runtime::Handle, port: u16) -> io::Result<Arc<Self>> {
+        let std_socket = bind_retrying(port)?;
+        std_socket.set_nonblocking(true)?;
+        let _runtime = handle.enter();
+        let udp = Arc::new(UdpSocket::from_std(std_socket)?);
+        let wg_lane: WgLane = Arc::new(RwLock::new(None));
+        let (bypass_tx, bypass_rx) = mpsc::channel(LANE_CHANNEL);
+        let pump = handle.spawn(demux_pump(udp.clone(), wg_lane.clone(), bypass_tx));
+        Ok(Arc::new(Self {
+            udp,
+            wg_lane,
+            bypass: Mutex::new(Some(bypass_rx)),
+            pump,
+        }))
+    }
+
+    /// the underlay address the socket actually bound (resolves port 0).
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.udp.local_addr()
+    }
+
+    /// send one datagram from the shared socket — the tunnel's exact
+    /// 5-tuple, which is the property the NAT punch shares it for.
+    pub async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {
+        self.udp.send_to(buf, dst).await
+    }
+
+    /// the bypass lane: every inbound datagram that is not WireGuard.
+    /// consumable once — the nat-traversal client is its single reader.
+    pub fn take_bypass(&self) -> Option<mpsc::Receiver<Datagram>> {
+        self.bypass.lock().expect("bypass lock poisoned").take()
+    }
+
+    /// a SEND handle on the raw socket, for the bypass lane's consumer (the
+    /// NAT client sends its protocol from the tunnel's 5-tuple). sends only:
+    /// the receive side belongs to the demux pump, and a caller that
+    /// `recv_from`s this handle races it for datagrams.
+    pub fn sender(&self) -> Arc<UdpSocket> {
+        self.udp.clone()
+    }
+
+    /// attach a device's WG lane (replacing any predecessor's — a rebuilt
+    /// device re-attaches to the same socket).
+    fn set_wg_lane(&self, sender: mpsc::Sender<Datagram>) {
+        *self.wg_lane.write().expect("wg lane lock poisoned") = Some(sender);
+    }
+}
+
+impl Drop for UnderlaySocket {
+    fn drop(&mut self) {
+        self.pump.abort();
+    }
+}
+
+/// see [`UnderlaySocket::bind`].
+fn bind_retrying(port: u16) -> io::Result<std::net::UdpSocket> {
+    let mut last = None;
+    for _ in 0..200 {
+        match std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)) {
+            Ok(socket) => return Ok(socket),
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                last = Some(err);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.expect("retried only on AddrInUse"))
+}
+
+/// the single owner of the socket's receive side: WireGuard datagrams to the
+/// live device's lane, everything else to the bypass. `try_send` on both —
+/// overflow is a full kernel receive buffer (WG retransmits what matters,
+/// the NAT protocol's own retries absorb a lost reply), and a blocking send
+/// would let one congested lane starve the other.
+async fn demux_pump(udp: Arc<UdpSocket>, wg_lane: WgLane, bypass: mpsc::Sender<Datagram>) {
+    let mut buf = Box::new([0u8; MAX_PACKET]);
+    loop {
+        let (len, src) = match udp.recv_from(&mut buf[..]).await {
+            Ok(received) => received,
+            Err(_) => continue,
+        };
+        if Tunn::parse_incoming_packet(&buf[..len]).is_ok() {
+            let lane = wg_lane.read().expect("wg lane lock poisoned").clone();
+            if let Some(lane) = lane {
+                let _ = lane.try_send((buf[..len].to_vec(), src));
+            }
+        } else {
+            let _ = bypass.try_send((buf[..len].to_vec(), src));
+        }
+    }
+}
+
 /// one peer relationship, as the effect layer hands it to the device: the
 /// validated, decoded form of a `defguard_wireguard_rs` `Peer`.
 #[derive(Clone, PartialEq, Eq)]
@@ -172,33 +319,36 @@ pub struct WgDevice {
 }
 
 struct DeviceInner {
-    udp: UdpSocket,
+    underlay: Arc<UnderlaySocket>,
     secret: StaticSecret,
     public: PublicKey,
     peers: RwLock<PeerTable>,
 }
 
 impl WgDevice {
-    /// stand the device up on an already-bound underlay socket and spawn its
-    /// pumps on `handle`: inbound (UDP → decapsulate → `to_stack`), outbound
-    /// (`from_stack` → encapsulate → UDP), and the timer driver. peers start
-    /// empty; [`replace_peers`](Self::replace_peers) installs them.
+    /// stand the device up on the underlay socket and spawn its pumps on
+    /// `handle`: inbound (the underlay's WG lane → decapsulate → `to_stack`),
+    /// outbound (`from_stack` → encapsulate → UDP), and the timer driver.
+    /// peers start empty; [`replace_peers`](Self::replace_peers) installs
+    /// them.
     pub fn spawn(
         handle: &tokio::runtime::Handle,
-        udp: UdpSocket,
+        underlay: Arc<UnderlaySocket>,
         secret: StaticSecret,
         to_stack: mpsc::Sender<Vec<u8>>,
         from_stack: mpsc::Receiver<Vec<u8>>,
     ) -> Self {
         let public = PublicKey::from(&secret);
+        let (wg_tx, wg_rx) = mpsc::channel(LANE_CHANNEL);
+        underlay.set_wg_lane(wg_tx);
         let inner = Arc::new(DeviceInner {
-            udp,
+            underlay,
             secret,
             public,
             peers: RwLock::new(PeerTable::default()),
         });
         let tasks = vec![
-            handle.spawn(inbound_pump(inner.clone(), to_stack)),
+            handle.spawn(inbound_pump(inner.clone(), wg_rx, to_stack)),
             handle.spawn(outbound_pump(inner.clone(), from_stack)),
             handle.spawn(timer_pump(inner.clone())),
         ];
@@ -211,7 +361,7 @@ impl WgDevice {
 
     /// the underlay address the socket actually bound (resolves port 0).
     pub fn local_underlay_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.udp.local_addr()
+        self.inner.underlay.local_addr()
     }
 
     /// replace the peer set atomically — the device half of
@@ -315,25 +465,24 @@ async fn send_to_endpoint(inner: &DeviceInner, peer: &PeerState, packets: Vec<Ve
     for pkt in packets {
         // a transient underlay send failure is the medium losing a datagram —
         // WireGuard's timers retransmit what matters.
-        let _ = inner.udp.send_to(&pkt, endpoint).await;
+        let _ = inner.underlay.send_to(&pkt, endpoint).await;
     }
 }
 
-/// UDP → `Tunn::decapsulate` → stack. also owns endpoint roaming and the
-/// inbound half of cryptokey routing.
-async fn inbound_pump(inner: Arc<DeviceInner>, to_stack: mpsc::Sender<Vec<u8>>) {
-    let mut datagram = Box::new([0u8; MAX_PACKET]);
+/// the underlay's WG lane → `Tunn::decapsulate` → stack. also owns endpoint
+/// roaming and the inbound half of cryptokey routing.
+async fn inbound_pump(
+    inner: Arc<DeviceInner>,
+    mut wg_lane: mpsc::Receiver<Datagram>,
+    to_stack: mpsc::Sender<Vec<u8>>,
+) {
     let mut buf = Box::new([0u8; MAX_PACKET]);
-    loop {
-        let (len, src) = match inner.udp.recv_from(&mut datagram[..]).await {
-            Ok(received) => received,
-            Err(_) => continue,
-        };
+    while let Some((datagram, src)) = wg_lane.recv().await {
         // route the datagram to its peer: a handshake initiation identifies
         // the peer by its (encrypted) static key; everything else carries a
         // receiver session id whose high bits are the device-assigned index.
         let peer = {
-            let parsed = match Tunn::parse_incoming_packet(&datagram[..len]) {
+            let parsed = match Tunn::parse_incoming_packet(&datagram) {
                 Ok(parsed) => parsed,
                 Err(_) => continue,
             };
@@ -351,9 +500,7 @@ async fn inbound_pump(inner: Arc<DeviceInner>, to_stack: mpsc::Sender<Vec<u8>>) 
                 Packet::PacketCookieReply(reply) => {
                     table.by_index.get(&(reply.receiver_idx >> 8)).cloned()
                 }
-                Packet::PacketData(data) => {
-                    table.by_index.get(&(data.receiver_idx >> 8)).cloned()
-                }
+                Packet::PacketData(data) => table.by_index.get(&(data.receiver_idx >> 8)).cloned(),
             }
         };
         let Some(peer) = peer else { continue };
@@ -361,7 +508,7 @@ async fn inbound_pump(inner: Arc<DeviceInner>, to_stack: mpsc::Sender<Vec<u8>>) 
         let out = peer.tunn_call(
             TunnOp::Decapsulate {
                 src: src.ip(),
-                datagram: &datagram[..len],
+                datagram: &datagram,
             },
             &mut buf,
         );
@@ -373,7 +520,7 @@ async fn inbound_pump(inner: Arc<DeviceInner>, to_stack: mpsc::Sender<Vec<u8>>) 
         }
         // handshake replies / cookie messages go straight back to the source.
         for pkt in out.to_network {
-            let _ = inner.udp.send_to(&pkt, src).await;
+            let _ = inner.underlay.send_to(&pkt, src).await;
         }
         // the inbound half of cryptokey routing: a decrypted packet is only
         // admitted if its inner source address belongs to the peer that

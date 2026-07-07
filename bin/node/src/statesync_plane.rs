@@ -32,6 +32,24 @@ pub fn enabled() -> bool {
     std::env::var("DUCKTAPE_STATESYNC_PLANE").is_ok_and(|v| v == "1")
 }
 
+/// the socket seam's factory selection, in one place for every
+/// [`spawn_bring_up`] caller: the plane's backend follows `wireguard_effect`
+/// exactly as the mesh context's does (fake stages no data plane, so it
+/// keeps the OS factory's downed-interface behavior).
+pub fn socket_factory(
+    kind: crate::config::WireGuardEffectKind,
+    slot: &overlay_net::userspace::StackSlot,
+) -> Arc<dyn data_plane::SocketFactory> {
+    match kind {
+        crate::config::WireGuardEffectKind::Socket => Arc::new(
+            overlay_net::userspace::VirtualSocketFactory::new(slot.clone()),
+        ),
+        crate::config::WireGuardEffectKind::Tun | crate::config::WireGuardEffectKind::Fake => {
+            Arc::new(data_plane::OsSocketFactory)
+        }
+    }
+}
+
 /// bulk ceiling for the statesync plane instance: below a typical uplink so
 /// real-time consumers on their own planes keep headroom (isolation layer 2;
 /// cross-plane coordination arrives with the second bulk consumer).
@@ -143,16 +161,18 @@ pub fn spawn_bring_up(
     book: Arc<OverlayBook>,
     me: ed25519::PublicKey,
     slot: PlaneSlot,
+    // the socket seam (overlay-net ADR): `OsSocketFactory` in tun mode (the
+    // kernel routes the /128 through the wireguard interface),
+    // `VirtualSocketFactory` in socket mode (the /128 lives in the
+    // in-process stack). either way its bind errors while the overlay is
+    // down are absorbed by the retry loop below.
+    factory: Arc<dyn data_plane::SocketFactory>,
     serve: Option<futures::channel::mpsc::Sender<SyncJob>>,
 ) {
     tokio::spawn(async move {
         let own = book.own_addr(&me);
         let datagram_bind = SocketAddr::new(own, Service::StateSync.overlay_datagram_port());
         let stream_bind = SocketAddr::new(own, Service::StateSync.overlay_stream_port());
-        // the socket seam (overlay-net ADR): the OS factory is TUN mode —
-        // the kernel routes the /128 through the wireguard interface. the
-        // userspace backend swaps this factory, nothing else here.
-        let factory = Arc::new(data_plane::OsSocketFactory);
         let sockets = loop {
             match OverlaySockets::bind_with(
                 factory.clone(),
