@@ -125,3 +125,131 @@ fn mount_is_a_reserved_phase_4_stub() {
         "mount points at phase 4: {stderr}"
     );
 }
+
+// ---- the working-copy loop: checkout / status / commit --------------------
+
+#[test]
+fn checkout_status_commit_loop() {
+    let h = Harness::start();
+    seed(&h.node_url());
+
+    let work = tempfile::tempdir().expect("work dir");
+    let wd = work.path().to_str().unwrap();
+
+    // checkout records the node in the .duckfs index.
+    let out = h
+        .cli(&["checkout", "/shared", wd])
+        .output()
+        .expect("checkout");
+    assert!(out.status.success(), "checkout exits 0: {:?}", out);
+    assert!(
+        work.path().join(".duckfs/index.json").exists(),
+        "checkout wrote the index"
+    );
+    assert_eq!(
+        std::fs::read(work.path().join("note.txt")).unwrap(),
+        b"hello"
+    );
+
+    // edit / add / remove — the three status classes. remove a TOP-LEVEL file
+    // (removing the last child of `sub/` would leave an empty dir the planner
+    // re-Mkdirs — a known engine edge, out of scope for the CLI loop).
+    std::fs::write(work.path().join("note.txt"), b"edited").unwrap();
+    std::fs::write(work.path().join("new.txt"), b"brand new").unwrap();
+    std::fs::remove_file(work.path().join("big.bin")).unwrap();
+
+    // status is dirty → exit 1, one A/M/D line per path.
+    let out = h.cli_bare(&["status", wd]).output().expect("status dirty");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a dirty status exits 1: {:?}",
+        out
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("M\t/shared/note.txt"), "modified line: {s}");
+    assert!(s.contains("A\t/shared/new.txt"), "added line: {s}");
+    assert!(s.contains("D\t/shared/big.bin"), "removed line: {s}");
+
+    // commit reads the node from the index (no --node needed); prints the snapshot.
+    let out = h
+        .cli_bare(&["commit", wd, "--message", "cli working-copy commit"])
+        .env_remove("DUCKTAPE_NODE")
+        .output()
+        .expect("commit");
+    assert!(out.status.success(), "commit exits 0: {:?}", out);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "commit prints the new snapshot id"
+    );
+
+    // status is now clean → exit 0.
+    let out = h.cli_bare(&["status", wd]).output().expect("status clean");
+    assert!(out.status.success(), "a clean status exits 0: {:?}", out);
+
+    // a fresh checkout elsewhere matches the committed working copy.
+    let work2 = tempfile::tempdir().expect("work dir 2");
+    assert!(
+        h.cli(&["checkout", "/shared", work2.path().to_str().unwrap()])
+            .output()
+            .expect("checkout 2")
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read(work2.path().join("note.txt")).unwrap(),
+        b"edited"
+    );
+    assert_eq!(
+        std::fs::read(work2.path().join("new.txt")).unwrap(),
+        b"brand new"
+    );
+    assert!(
+        !work2.path().join("big.bin").exists(),
+        "the removed file is gone"
+    );
+}
+
+#[test]
+fn commit_conflict_exits_2_and_names_the_path() {
+    let h = Harness::start();
+    seed(&h.node_url());
+
+    let a = tempfile::tempdir().expect("a");
+    let b = tempfile::tempdir().expect("b");
+    for dir in [&a, &b] {
+        assert!(
+            h.cli(&["checkout", "/shared", dir.path().to_str().unwrap()])
+                .output()
+                .expect("checkout")
+                .status
+                .success()
+        );
+    }
+
+    std::fs::write(a.path().join("note.txt"), b"from A").unwrap();
+    std::fs::write(b.path().join("note.txt"), b"from B").unwrap();
+
+    // A lands first.
+    assert!(
+        h.cli_bare(&["commit", a.path().to_str().unwrap(), "--message", "A wins"])
+            .env_remove("DUCKTAPE_NODE")
+            .output()
+            .expect("commit a")
+            .status
+            .success()
+    );
+
+    // B commits the same path → conflict: exit 2, the clashing path on stderr.
+    let out = h
+        .cli_bare(&["commit", b.path().to_str().unwrap(), "--message", "B loses"])
+        .env_remove("DUCKTAPE_NODE")
+        .output()
+        .expect("commit b");
+    assert_eq!(out.status.code(), Some(2), "a conflict exits 2: {:?}", out);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("/shared/note.txt"),
+        "the conflict report names the clashing path: {err}"
+    );
+}

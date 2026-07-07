@@ -71,9 +71,34 @@ impl From<ApiError> for CommitError {
     }
 }
 
-/// commit the working copy at `dir` with `message`. see the module doc for the
-/// stage/probe/submit sequence.
+/// commit knobs. `auto_rebase` (the CLI default) rebases disjoint upstream work
+/// before reporting a conflict; the CLI's `--no-rebase` turns it off, so the
+/// FIRST CAS conflict surfaces as a report instead of silently rebasing.
+#[derive(Debug, Clone)]
+pub struct CommitOptions {
+    pub auto_rebase: bool,
+}
+
+impl Default for CommitOptions {
+    fn default() -> Self {
+        CommitOptions { auto_rebase: true }
+    }
+}
+
+/// commit the working copy at `dir` with `message`, auto-rebasing disjoint
+/// upstream work. see [`commit_with`] to disable the rebase.
 pub fn commit(api: &dyn NodeApi, dir: &Path, message: &str) -> Result<CommitSummary, CommitError> {
+    commit_with(api, dir, message, &CommitOptions::default())
+}
+
+/// [`commit`] with explicit options. see the module doc for the stage/probe/
+/// submit sequence.
+pub fn commit_with(
+    api: &dyn NodeApi,
+    dir: &Path,
+    message: &str,
+    opts: &CommitOptions,
+) -> Result<CommitSummary, CommitError> {
     let index = Index::load(dir)?;
     let st = status(dir).map_err(|e| CommitError::Io(e.to_string()))?;
     if st.clean {
@@ -85,7 +110,7 @@ pub fn commit(api: &dyn NodeApi, dir: &Path, message: &str) -> Result<CommitSumm
     ensure_staged(api, &planned.blobs)?;
     ensure_staged(api, &planned.blobs)?;
 
-    let (receipt, rebased) = submit_with_rebase(api, &index, message, &planned)?;
+    let (receipt, rebased) = submit_with_rebase(api, &index, message, &planned, opts.auto_rebase)?;
 
     let snapshot = resolve_snapshot(api, receipt.height)?;
     rebuild_index(&index, &st, dir, &snapshot)?;
@@ -108,6 +133,7 @@ fn submit_with_rebase(
     index: &Index,
     message: &str,
     planned: &Plan,
+    auto_rebase: bool,
 ) -> Result<(CommitReceipt, bool), CommitError> {
     let ours = change_paths(&planned.changes);
     let mut base = index.base_snapshot.clone();
@@ -145,10 +171,25 @@ fn submit_with_rebase(
                 };
                 let clashing: BTreeSet<String> = ours.intersection(&theirs).cloned().collect();
                 if clashing.is_empty() {
-                    // disjoint upstream work: rebase onto the new head and retry.
-                    base = Some(head_id);
-                    rebased = true;
-                    continue;
+                    if auto_rebase {
+                        // disjoint upstream work: rebase onto the new head and retry.
+                        base = Some(head_id);
+                        rebased = true;
+                        continue;
+                    }
+                    // `--no-rebase`: a disjoint conflict the caller declined to
+                    // auto-rebase — report it (no clashing paths, but the head
+                    // moved) rather than silently rebase.
+                    return Err(CommitError::Conflict(Box::new(ConflictReport {
+                        base: index.base_snapshot.clone(),
+                        head,
+                        ours: sorted(&ours),
+                        theirs: sorted(&theirs),
+                        clashing: Vec::new(),
+                        remedy: "upstream advanced with disjoint changes; re-run \
+                                 without --no-rebase to auto-rebase, or re-checkout"
+                            .into(),
+                    })));
                 }
                 return Err(CommitError::Conflict(Box::new(ConflictReport {
                     base: index.base_snapshot.clone(),

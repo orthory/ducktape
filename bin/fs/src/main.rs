@@ -10,6 +10,7 @@
 
 mod args;
 mod read_cmds;
+mod work_cmds;
 
 use std::process::ExitCode;
 
@@ -26,6 +27,12 @@ read verbs (need --node <http-url> or the DUCKTAPE_NODE env):
   stat <path> [--snapshot S]               print an entry's facts
   history [--limit N]                      the commit window, newest-first
   diff <from> <to> [--prefix P]            changed leaves between two snapshots
+
+working-copy verbs (the node comes from --node/DUCKTAPE_NODE or the .duckfs index):
+  checkout <prefix> <dir> [--snapshot S]   materialize a subtree + .duckfs index
+  status [dir]                             show A/M/D (exit 1 when dirty)
+  commit [dir] --message <m> [--no-rebase] commit the working copy (exit 2 on conflict)
+  pin <snapshot> <name>                    pin a snapshot so gc keeps it
 
   mount <prefix> <dir>                     (phase 4 — not available yet)
 ";
@@ -54,6 +61,10 @@ fn dispatch(verb: &str, rest: &[String]) -> Result<(), CliError> {
         "stat" => read_cmds::stat(rest),
         "history" => read_cmds::history(rest),
         "diff" => read_cmds::diff(rest),
+        "checkout" => work_cmds::checkout(rest),
+        "status" => work_cmds::status(rest),
+        "commit" => work_cmds::commit(rest),
+        "pin" => work_cmds::pin(rest),
         // reserved: the FUSE mount is phase 4 (#221). the verb is claimed now so
         // its name is stable, but it fails clearly rather than pretend to work.
         "mount" => Err(CliError::usage(
