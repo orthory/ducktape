@@ -150,6 +150,26 @@ prefix watches with segment-aware matching (`/a` matches `/a/b`, never `/ab`)
 give any module change notifications delivered atomically with the triggering
 commit.
 
+The client half is the OS-side checkout/commit engine (`crates/system/duckfs-client`)
+and the `ducktape-fs` CLI. A checkout materializes a duckfs subtree into a real
+working directory beside a `.duckfs/index.json` — git's index discipline: the
+base snapshot the copy descends from, the node it talks to, and a per-path
+hash/size/mtime record. `ducktape-fs` has read verbs (`ls`, `cat`, `stat`,
+`history`, `diff`) and the working-copy loop (`checkout`, `status`, `commit`,
+`pin`); the engine hashes and names every object client-side (byte-identical to
+what validators derive), stages only the chunks the cluster lacks, and submits
+one atomic `Commit`. Conflict handling is safe by construction: on a CAS
+rejection the engine auto-rebases **only** disjoint upstream work (never a silent
+merge) and surfaces a structured conflict report for overlapping edits (over a
+single daemon; a multi-validator cluster currently reports overlaps as a plain
+rejection, since the module's reason string does not survive consensus
+finalization). The workspace RPC (`POST /v1/fs/workspaces`, `.../commit`,
+`DELETE`) is the jobs/sandbox seam: the daemon manages checkouts under its own
+root, driving the same engine over the actor lane so a job can edit files on disk
+and commit them without a self-dial. A FUSE `mount` (the working copy as a live
+kernel filesystem) is reserved for Phase 4; the sync `NodeApi` trait is the seam
+its colocated-object-store fast path will implement.
+
 ## Jobs
 
 Jobs is a consensus-native work board for on-platform actors: humans and agent
