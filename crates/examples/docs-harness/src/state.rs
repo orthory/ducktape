@@ -37,6 +37,28 @@ pub(crate) struct Installed {
 pub(crate) struct Store {
     pub(crate) installed: Option<Installed>,
     /// idempotency keys of already-minted jobs (`<comment>\x1f<agent>`).
+    ///
+    /// ## growth is unbounded — deliberately
+    ///
+    /// this set grows ONE entry per real (comment, agent) engagement: every
+    /// genuine mention a live network ever sees adds a key, for as long as
+    /// the package stays installed, and NEVER shrinks. that is accepted, not
+    /// an oversight — unlike [`FailureRow`]'s bounded, evictable log, EVERY
+    /// entry here is load-bearing for as long as pages could still redeliver
+    /// (or a hook replay could resubmit) the write that minted it: evicting
+    /// an old key would let a redelivered `PageEvent` re-mint a duplicate job
+    /// for a comment that already got one — the exact bug this set exists to
+    /// prevent. there is no natural "this key is now safe to forget" horizon
+    /// short of the package's own lifetime, so the set rides the package's
+    /// full install-to-unplug span instead of a bounded window.
+    ///
+    /// `unplug` does NOT clear it: unplug tombstones the agents and drops
+    /// the pages hook (mint-time inputs), but user data and the harness's
+    /// own audit trail are preserve-by-default — `minted` freezes at
+    /// whatever it held the moment unplug landed and stays exactly that from
+    /// then on (no new writes reach it: the hook is gone, so `on_page_event`
+    /// never fires again). that frozen set is itself useful post-mortem:
+    /// "every (comment, agent) pair this installation ever engaged."
     pub(crate) minted: BTreeSet<String>,
     /// bounded error-row log (oldest evicted past [`MAX_FAILURE_ROWS`]).
     pub(crate) failures: Vec<FailureRow>,

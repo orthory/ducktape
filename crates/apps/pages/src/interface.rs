@@ -177,6 +177,40 @@ pub const MAX_COMMENTS_PER_THREAD: usize = 4096;
 pub const MAX_THREADS_PER_TARGET: usize = 1024;
 pub const MAX_QUERY_TARGETS: usize = 512;
 
+/// hard cap on every externally-supplied pages id: [`PageMsg::CreatePage`]'s
+/// `page_id`, [`NewBlock::id`], and [`PageMsg::AddComment`]'s `thread_id` /
+/// `comment_id` / `target` — enforced at creation/first-use (see
+/// `crate::limits::check_id_len`), before any storage touch. this is a
+/// flag-day change to an unmerged module: no migration, no pre-cap state to
+/// grandfather. matches the platform-wide `MAX_ID_BYTES` convention already
+/// used by `dispatch` and `tagging` (both 128).
+///
+/// ## the arithmetic
+///
+/// this repo's reference packaged module, `docs-harness`, embeds pages ids
+/// VERBATIM in a job id shaped `docs:<agent_id>:<comment_id>`
+/// (`docs_harness::engagement_job_id`), submitted to the jobs board capped at
+/// `jobs::MAX_JOB_ID` = 256 bytes. the literal framing (`"docs:"` + `":"`) is
+/// 6 bytes.
+///
+/// `agent_id` is NOT bounded by `agent::MAX_AGENT_RECORD_BYTES` in any tight
+/// way (that caps the WHOLE registration record, 4 KiB, of which `agent_id`
+/// is only one field) — but `runs`' registry hook re-derives the agent's
+/// dispatch recipe id as `format!("agent/{agent_id}")` and REJECTS the
+/// registration outright when that exceeds `dispatch::MAX_ID_BYTES` (128).
+/// that is a hard, already-enforced consensus invariant: no agent can ever
+/// exist with `agent_id.len() > 128 - "agent/".len() == 122`.
+///
+/// so the worst case is: `6 ("docs:" + ":") + 122 (max agent_id) +
+/// comment_id.len() <= 256`, i.e. `comment_id.len() <= 128`. capping every
+/// pages id at exactly 128 makes the WORST-CASE job id exactly 256 bytes —
+/// fits `jobs::MAX_JOB_ID` with zero slack to spare, for any agent id the
+/// network could ever register. (the docs-harness intake pre-check is the
+/// belt to this suspenders: it re-measures the ASSEMBLED job id / spec
+/// against the jobs caps at submit time, which also covers state from before
+/// this cap existed, or a foreign module that skips it.)
+pub const MAX_ID_BYTES: usize = 128;
+
 /// cap on the module-wide [`PageMsg::RegisterHook`] subscriber set (consensus
 /// constant) — every extra hook is one more same-block follow-up per write.
 pub const MAX_PAGE_HOOKS: usize = 8;

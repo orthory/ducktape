@@ -51,9 +51,41 @@ impl DocsHarness {
                 );
                 continue;
             }
+            let job_id = engagement_job_id(agent_id, &comment_id);
+            let spec = encode_engagement_spec(&EngagementSpec {
+                page_id: page_id.clone(),
+                target: target.clone(),
+                thread_id: thread_id.clone(),
+                comment_id: comment_id.clone(),
+                // a bounded excerpt, NEVER the full comment: a near-cap
+                // comment would push the spec past the jobs cap and abort
+                // the commenter's block.
+                text: engagement_excerpt(&text),
+            });
+            // pre-check the ASSEMBLED job id / spec against the jobs board's
+            // own caps BEFORE emitting. pages now bounds its OWN ids at
+            // creation (pages::MAX_ID_BYTES), but `agent_id` here is
+            // harness/package-controlled (not a pages id), and a
+            // pre-existing store or a foreign event source could still carry
+            // an id minted before any cap applied — so this stays as
+            // defense-in-depth even with the pages-side cap in place. either
+            // way, a Submit over jobs::MAX_JOB_ID/MAX_SPEC would abort the
+            // COMMENTER's block when the jobs module rejects it; this arm is
+            // no-fail, so skip loudly instead.
+            if job_id.len() > jobs::MAX_JOB_ID || spec.len() > jobs::MAX_SPEC {
+                self.breadcrumb(
+                    ctx,
+                    format!(
+                        "engagement for comment {comment_id}/{agent_id} skipped: oversized \
+                         (job_id {} bytes, spec {} bytes)",
+                        job_id.len(),
+                        spec.len()
+                    ),
+                );
+                continue;
+            }
             // probe-before-emit: a squatted job id would make the Submit
             // follow-up abort the COMMENTER's block (this arm is no-fail).
-            let job_id = engagement_job_id(agent_id, &comment_id);
             match self.job_exists(ctx, &job_id).await {
                 Ok(false) => {
                     self.store_mut().minted.insert(key);
@@ -62,16 +94,7 @@ impl DocsHarness {
                         payload: jobs_encode_msg(&JobsMsg::Submit {
                             job_id,
                             kind: format!("agent/{agent_id}"),
-                            spec: encode_engagement_spec(&EngagementSpec {
-                                page_id: page_id.clone(),
-                                target: target.clone(),
-                                thread_id: thread_id.clone(),
-                                comment_id: comment_id.clone(),
-                                // a bounded excerpt, NEVER the full comment: a
-                                // near-cap comment would push the spec past
-                                // the jobs cap and abort the commenter's block.
-                                text: engagement_excerpt(&text),
-                            }),
+                            spec,
                         }),
                     });
                 }
@@ -247,5 +270,89 @@ mod tests {
         assert!(ctx.events.iter().any(|e| e.contains("undecodable")));
         commit(&mut m);
         assert_eq!(m.root(), root, "nothing staged");
+    }
+
+    // pages now caps ids at creation (MAX_ID_BYTES), so a huge id should
+    // never exist in a live network — but this intake pre-check is
+    // defense-in-depth for state minted before that cap existed, or from a
+    // foreign module that skips it. either way, the JOBS-side abort must
+    // never happen: this rides the COMMENTER's block, and a rejected Submit
+    // follow-up would abort it (see the crate's Submit-abort commentary).
+    #[test]
+    fn an_oversized_job_id_is_skipped_with_a_breadcrumb_and_never_aborts() {
+        let mut m = module();
+        installed(&mut m);
+        let root = m.root();
+
+        // comment_id alone is enough to push "docs:<agent>:<comment_id>"
+        // past jobs::MAX_JOB_ID.
+        let huge_comment_id = "c".repeat(jobs::MAX_JOB_ID);
+        let event = comment_event(&huge_comment_id, "@docs.editor please");
+        let mut ctx = TestCtx::at(Origin::Module("pages".into()));
+        exec(&mut m, &mut ctx, event)
+            .expect("the no-fail intake must not abort on an oversized job id");
+        assert!(
+            ctx.emitted.is_empty(),
+            "an oversized job id must never reach Submit"
+        );
+        assert!(
+            ctx.events.iter().any(|e| e.contains("oversized")),
+            "a breadcrumb must record the skip: {:?}",
+            ctx.events
+        );
+        commit(&mut m);
+        assert_eq!(
+            m.root(),
+            root,
+            "a skipped engagement must leave the commenter's block untouched"
+        );
+        assert!(
+            m.committed.minted.is_empty(),
+            "a skipped engagement must not burn the idempotency key"
+        );
+    }
+
+    #[test]
+    fn an_oversized_spec_is_skipped_with_a_breadcrumb_and_never_aborts() {
+        let mut m = module();
+        installed(&mut m);
+        let root = m.root();
+
+        // `target` doesn't enter the job id at all (only agent_id and
+        // comment_id do) but is embedded VERBATIM in the EngagementSpec — a
+        // huge one alone blows the encoded spec past jobs::MAX_SPEC. this is
+        // the exact vector the brief describes: a third party's huge
+        // block/thread id, embedded in an innocent commenter's mention.
+        let huge_target = "t".repeat(jobs::MAX_SPEC);
+        let event = pages::encode_page_event(&PageEvent::CommentAdded {
+            page_id: "p1".into(),
+            target: huge_target,
+            thread_id: "t1".into(),
+            comment_id: "c1".into(),
+            author: AuthorRef::User(vec![7; 32]),
+            text: "@docs.editor please".into(),
+        });
+        let mut ctx = TestCtx::at(Origin::Module("pages".into()));
+        exec(&mut m, &mut ctx, event)
+            .expect("the no-fail intake must not abort on an oversized spec");
+        assert!(
+            ctx.emitted.is_empty(),
+            "an oversized spec must never reach Submit"
+        );
+        assert!(
+            ctx.events.iter().any(|e| e.contains("oversized")),
+            "a breadcrumb must record the skip: {:?}",
+            ctx.events
+        );
+        commit(&mut m);
+        assert_eq!(
+            m.root(),
+            root,
+            "a skipped engagement must leave the commenter's block untouched"
+        );
+        assert!(
+            m.committed.minted.is_empty(),
+            "a skipped engagement must not burn the idempotency key"
+        );
     }
 }

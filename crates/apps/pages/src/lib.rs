@@ -49,6 +49,8 @@ mod interface;
 pub use interface::*;
 // the derived-tier materialized view; registered only by serving binaries.
 pub mod index;
+// id-length enforcement for the op validation path (see MAX_ID_BYTES above).
+mod limits;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
@@ -229,6 +231,9 @@ enum PageError {
     Corrupt,
     /// an op named the reserved [`PAGE_INDEX_KEY`] sentinel.
     ReservedId,
+    /// an op named an id over [`MAX_ID_BYTES`] — see the constant's doc for
+    /// the arithmetic behind the cap.
+    IdTooLong,
     /// a create/set-parent named a `parent` that is not an existing page root.
     ParentPageNotFound,
     /// set-parent/delete targeted an id that is not an existing page root.
@@ -281,6 +286,7 @@ impl core::fmt::Display for PageError {
             PageError::BlockTooLarge => "block too large",
             PageError::Corrupt => "stored page state is corrupt",
             PageError::ReservedId => "reserved block id",
+            PageError::IdTooLong => "id too long",
             PageError::ParentPageNotFound => "parent page not found",
             PageError::NotAPage => "not a page",
             PageError::PageCycle => "page cycle",
@@ -656,6 +662,10 @@ where
         if named.iter().any(|id| id.starts_with('\u{0}')) {
             return Err(PageError::ReservedId);
         }
+        // every id an op names is length-capped at MAX_ID_BYTES — see
+        // `limits::check_id_len` for why checking references (not just new
+        // mints) is deliberate and harmless.
+        limits::check_id_len(&named)?;
 
         match msg {
             PageMsg::CreatePage {
@@ -2394,6 +2404,77 @@ mod tests {
         });
     }
 
+    // a third party minting a huge id is the abort vector this cap closes:
+    // capped at CREATION means the id never lands, so it can never later
+    // surface (verbatim, in a downstream consumer's own spec) to abort an
+    // unrelated commenter's block. see MAX_ID_BYTES for the arithmetic.
+    #[test]
+    fn oversized_page_and_block_ids_are_rejected_at_cap_boundary() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+
+            // at-cap page_id: accepted.
+            let at_cap = "p".repeat(MAX_ID_BYTES);
+            apply_commit(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: at_cap.clone(),
+                    title: "ok".into(),
+                    parent: None,
+                },
+            )
+            .await;
+            assert!(get_page(&p, &at_cap).await.is_some());
+            let r_before = p.root();
+
+            // over-cap page_id: rejected, nothing staged, root unmoved.
+            let over_cap = "q".repeat(MAX_ID_BYTES + 1);
+            apply_expect_err(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: over_cap.clone(),
+                    title: "evil".into(),
+                    parent: None,
+                },
+                "id too long",
+            )
+            .await;
+            assert!(p.pending.is_empty(), "a rejected op must stage nothing");
+            assert_eq!(p.root(), r_before, "a rejected op must not move the root");
+            assert!(get_page(&p, &over_cap).await.is_none());
+
+            // at-cap block id under InsertBlock: accepted.
+            let at_cap_block = "b".repeat(MAX_ID_BYTES);
+            apply_commit(
+                &mut p,
+                &PageMsg::InsertBlock {
+                    parent: at_cap.clone(),
+                    after: None,
+                    block: para(&at_cap_block, "fine"),
+                },
+            )
+            .await;
+            assert!(get_block(&p, &at_cap_block).await.is_some());
+            let r_before = p.root();
+
+            // over-cap block id under InsertBlock: rejected.
+            let over_cap_block = "c".repeat(MAX_ID_BYTES + 1);
+            apply_expect_err(
+                &mut p,
+                &PageMsg::InsertBlock {
+                    parent: at_cap,
+                    after: None,
+                    block: para(&over_cap_block, "evil"),
+                },
+                "id too long",
+            )
+            .await;
+            assert!(p.pending.is_empty(), "a rejected op must stage nothing");
+            assert_eq!(p.root(), r_before, "a rejected op must not move the root");
+            assert!(get_block(&p, &over_cap_block).await.is_none());
+        });
+    }
+
     // ── nested pages (folder relation in the index) ──
 
     #[test]
@@ -2872,6 +2953,56 @@ mod tests {
                     .await
                     .is_err()
             );
+        });
+    }
+
+    // AddComment mints two ids outright (thread_id on open, comment_id
+    // always) and takes `target` as a free-form anchor with no existence
+    // requirement — all three are first-use ids, so all three are
+    // MAX_ID_BYTES-capped. this is the field the brief calls out as the
+    // simplest lever: an attacker never has to pre-create a block to mint a
+    // huge anchor id, `target` is whatever the comment names.
+    #[test]
+    fn comment_thread_comment_and_target_ids_are_capped() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut p = Pages::init(context, "pages").await;
+            seed_page(&mut p, "p1").await;
+            let r_before = p.root();
+
+            let over_cap = "x".repeat(MAX_ID_BYTES + 1);
+            let at_cap = "y".repeat(MAX_ID_BYTES);
+
+            // over-cap thread_id.
+            apply_err_as(
+                &mut p,
+                &add(&over_cap, "m1", "b1", "hi"),
+                user("alice"),
+                "id too long",
+            )
+            .await;
+            // over-cap comment_id.
+            apply_err_as(
+                &mut p,
+                &add("t1", &over_cap, "b1", "hi"),
+                user("alice"),
+                "id too long",
+            )
+            .await;
+            // over-cap target — no pre-existing block needed to trigger this;
+            // `target` is a free-form anchor, not a block reference.
+            apply_err_as(
+                &mut p,
+                &add("t1", "m1", &over_cap, "hi"),
+                user("alice"),
+                "id too long",
+            )
+            .await;
+            assert!(p.pending.is_empty(), "every rejected op stages nothing");
+            assert_eq!(p.root(), r_before, "every rejected op leaves the root untouched");
+
+            // at-cap on all three: accepted.
+            apply_commit_as(&mut p, &add(&at_cap, &at_cap, &at_cap, "hi"), user("alice")).await;
+            assert!(query_thread(&p, &at_cap).await.is_some());
         });
     }
 
