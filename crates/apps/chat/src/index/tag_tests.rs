@@ -402,6 +402,76 @@ fn invalid_tag_queries_are_view_errors() {
     }
 }
 
+#[test]
+fn slash_channel_ids_do_not_leak_across_tag_scopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    // channel "g/0" nests INSIDE "g"'s key prefixes (`tag/{label}/g/`,
+    // `tagcat/g/`), and its posting keys even sort AHEAD of g's own (the
+    // sub-channel's '0' < the rseq's leading hex 'f') — the worst case for
+    // prefix-structural scoping. its #shared lands at seq 2 in its own
+    // channel, so any leak is value-distinguishable from g's seq-1 posting.
+    apply(&store, 1, vec![post("g", "m1", "#shared")]);
+    apply(&store, 2, vec![post("g/0", "m2", "#subonly")]);
+    apply(&store, 3, vec![post("g/0", "m3", "#shared")]);
+
+    // Tags scoped to g: no bogus "0/shared" label off the sub-channel's
+    // catalog row, no count leak, and last_seq reads g's OWN newest posting
+    // (a structural-prefix leak would report the sub-channel's seq 2).
+    assert_eq!(
+        tag_rows(&store, serde_json::json!({"tags": {"channelId": "g"}})),
+        vec![TagRow {
+            tag: "shared".into(),
+            count: 1,
+            last_seq: 1
+        }]
+    );
+    // Tags scoped to the sub-channel see exactly its own rows.
+    assert_eq!(
+        tag_rows(&store, serde_json::json!({"tags": {"channelId": "g/0"}})),
+        vec![
+            TagRow {
+                tag: "shared".into(),
+                count: 1,
+                last_seq: 2
+            },
+            TagRow {
+                tag: "subonly".into(),
+                count: 1,
+                last_seq: 1
+            },
+        ]
+    );
+
+    // TagSearch scopes on the STORED channel id, exactly like Search.
+    assert_eq!(
+        ids(&hits(
+            &store,
+            serde_json::json!({"tagSearch": {"tag": "shared", "channelId": "g"}})
+        )),
+        ["m1"]
+    );
+    assert_eq!(
+        ids(&hits(
+            &store,
+            serde_json::json!({"tagSearch": {"tag": "shared", "channelId": "g/0"}})
+        )),
+        ["m3"]
+    );
+
+    // no channel scope still aggregates both channels.
+    let all = tag_rows(&store, serde_json::json!({"tags": {}}));
+    let shared = all.iter().find(|r| r.tag == "shared").expect("aggregated");
+    assert_eq!((shared.count, shared.last_seq), (2, 2));
+    assert_eq!(
+        ids(&hits(
+            &store,
+            serde_json::json!({"tagSearch": {"tag": "shared"}})
+        )),
+        ["m3", "m1"]
+    );
+}
+
 // ── fold vs rebuild parity ──────────────────────────────────────────────────
 
 /// canonical chat state standing in for the module's query surface, paging

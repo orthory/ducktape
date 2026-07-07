@@ -240,14 +240,40 @@ fn decode_tok(value: &[u8]) -> Result<TokRef> {
     serde_json::from_slice(value).map_err(|e| Error::Mapper(e.to_string()))
 }
 
-/// a label's newest live seq in one channel: the FIRST posting under its
-/// channel prefix (reversed-seq keys), or None when no posting is live.
+/// a label's newest live seq in one channel: the first posting under the
+/// channel prefix WHOSE STORED REF names that channel, or None when no such
+/// posting is live. the prefix alone is not scope — `tag/{label}/g/` also
+/// matches a sub-channel like `g/0`, whose keys can even sort AHEAD of `g`'s
+/// own hex rseqs — but same-channel keys keep their newest-first order
+/// relative to each other, so the first stored-channel match IS the max.
+/// bounded by the posting cap like every tag walk; a prefix that exhausts the
+/// cap without a match reports none.
 fn newest_seq(reader: &ViewReader, label: &str, channel: &str) -> Result<Option<u64>> {
-    let page = reader.scan(tag_channel_prefix(label, channel).as_bytes(), None, 1)?;
-    match page.entries.first() {
-        Some((_, value)) => Ok(Some(decode_tok(value)?.seq)),
-        None => Ok(None),
+    let prefix = tag_channel_prefix(label, channel);
+    let mut cursor: Option<String> = None;
+    let mut walked = 0usize;
+    loop {
+        let page = reader.scan(
+            prefix.as_bytes(),
+            cursor.as_deref().map(str::as_bytes),
+            indexer::MAX_SCAN_LIMIT,
+        )?;
+        for (_, value) in &page.entries {
+            if walked == DEFAULT_POSTING_CAP {
+                return Ok(None);
+            }
+            walked += 1;
+            let r = decode_tok(value)?;
+            if r.channel_id == channel {
+                return Ok(Some(r.seq));
+            }
+        }
+        match page.next_after {
+            Some(next) if page.has_more => cursor = Some(next),
+            _ => break,
+        }
     }
+    Ok(None)
 }
 
 /// the `Tags` query: the catalog of one channel (or, with no channel, every
@@ -273,7 +299,17 @@ pub(super) fn serve_tags(
         // a label never contains `/` (tag chars only), so the LAST segment is
         // the label and everything before it is the channel.
         let (channel, label) = match &channel_id {
-            Some(channel) => (channel.clone(), rest.into_owned()),
+            Some(channel) => {
+                let label = rest.into_owned();
+                // the prefix also matches SUB-channels — `tagcat/g/` catches
+                // channel `g/0`, whose rows would otherwise surface as bogus
+                // labels like `0/shared`. a real label is tag chars only, so
+                // anything that fails the grammar is another channel's row.
+                if !label.chars().all(is_tag_char) {
+                    return Ok(());
+                }
+                (channel.clone(), label)
+            }
             None => match rest.rsplit_once('/') {
                 Some((channel, label)) => (channel.to_string(), label.to_string()),
                 None => return Ok(()),
@@ -314,9 +350,11 @@ pub(super) fn serve_tags(
 
 /// the `TagSearch` query: every live message carrying EXACTLY `tag` (the
 /// query normalizes like the indexer, so `#Rust` finds `#rust`), newest
-/// first, clamped like search. channel-scoped pages stream straight off the
-/// reversed-seq key order; the cross-channel walk collects up to the posting
-/// cap and ranks by time like `Search`.
+/// first, clamped like search. one walk over the label's postings — a
+/// channel scope narrows the scan prefix but the SCOPE ITSELF is the stored
+/// ref's channel id, exactly like `Search`: the prefix alone also matches
+/// sub-channels (`tag/{label}/g/` catches channel `g/0`). collects up to the
+/// posting cap and ranks by time like `Search`.
 pub(super) fn serve_tag_search(
     reader: &ViewReader,
     tag: &str,
@@ -331,44 +369,38 @@ pub(super) fn serve_tag_search(
     let limit = limit
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_SEARCH_LIMIT);
+    let prefix = match &channel_id {
+        Some(channel) => tag_channel_prefix(&label, channel),
+        None => tag_prefix(&label),
+    };
     let mut refs: Vec<TokRef> = Vec::new();
-    match &channel_id {
-        Some(channel) => {
-            let page = reader.scan(tag_channel_prefix(&label, channel).as_bytes(), None, limit)?;
-            for (_, value) in &page.entries {
-                refs.push(decode_tok(value)?);
+    let mut cursor: Option<String> = None;
+    let mut walked = 0usize;
+    'walk: loop {
+        let page = reader.scan(
+            prefix.as_bytes(),
+            cursor.as_deref().map(str::as_bytes),
+            indexer::MAX_SCAN_LIMIT,
+        )?;
+        for (_, value) in &page.entries {
+            if walked == DEFAULT_POSTING_CAP {
+                break 'walk;
+            }
+            walked += 1;
+            let r = decode_tok(value)?;
+            if channel_id.as_ref().is_none_or(|c| &r.channel_id == c) {
+                refs.push(r);
             }
         }
-        None => {
-            let prefix = tag_prefix(&label);
-            let mut cursor: Option<String> = None;
-            let mut walked = 0usize;
-            'walk: loop {
-                let page = reader.scan(
-                    prefix.as_bytes(),
-                    cursor.as_deref().map(str::as_bytes),
-                    indexer::MAX_SCAN_LIMIT,
-                )?;
-                for (_, value) in &page.entries {
-                    if walked == DEFAULT_POSTING_CAP {
-                        break 'walk;
-                    }
-                    walked += 1;
-                    refs.push(decode_tok(value)?);
-                }
-                match page.next_after {
-                    Some(next) if page.has_more => cursor = Some(next),
-                    _ => break,
-                }
-            }
-            // newest first; (channel, seq) tiebreak for a stable order —
-            // exactly `Search`'s ranking.
-            refs.sort_by(|a, b| {
-                (b.time, &b.channel_id, b.seq).cmp(&(a.time, &a.channel_id, a.seq))
-            });
-            refs.truncate(limit);
+        match page.next_after {
+            Some(next) if page.has_more => cursor = Some(next),
+            _ => break,
         }
     }
+    // newest first; (channel, seq) tiebreak for a stable order — exactly
+    // `Search`'s ranking.
+    refs.sort_by(|a, b| (b.time, &b.channel_id, b.seq).cmp(&(a.time, &a.channel_id, a.seq)));
+    refs.truncate(limit);
     let mut hits = Vec::with_capacity(refs.len());
     for r in refs {
         if let Some(bytes) = reader.get(msg_key(&r.channel_id, r.seq).as_bytes())? {
