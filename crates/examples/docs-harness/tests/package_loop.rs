@@ -12,7 +12,9 @@
 //! - fake provider output requesting `pages.block.update_text` edits the
 //!   intended block (guarded by `expected_hash`);
 //! - unauthorized or malformed actions mutate nothing and record failure
-//!   (runs drop log + the harness's committed error rows);
+//!   (the runs drop log; duplicate action_ids dedupe upstream in runs and
+//!   never reach the owner — the harness's committed error rows are its
+//!   Apply-arm defense in depth, exercised in the actions unit tests);
 //! - malformed page events are no-op observations, not block aborts;
 //! - suspend stops new jobs while preserving pages and comments; unplug
 //!   removes hooks/action routes and tombstones agents while preserving user
@@ -441,10 +443,27 @@ fn unauthorized_and_malformed_actions_mutate_nothing_and_record_failure() {
         assert_eq!(block_text(&bed, "b1").await, "Draft intro.");
         bed.assert_failure_breadcrumb("runs", "expected_hash mismatch");
 
-        // turn 4 — a DUPLICATED action_id (the one same-block conflict the
-        // probe cannot see): the first comment lands, the duplicate drops
-        // with a COMMITTED error row on the harness.
+        // turn 4 — a DUPLICATED action_id: the runs pipeline dedupes it
+        // upstream (first occurrence wins, breadcrumbed at the pipeline),
+        // so the duplicate NEVER reaches the owner — the first comment
+        // lands and the harness records no error row. the harness's own
+        // Apply-arm dedupe stays as defense in depth, exercised directly
+        // in the actions unit tests.
         comment(&mut bed, "t4", "c4", "@docs.editor reply twice").await;
+        let reply = bed
+            .query("runs", &runs::encode_query(&runs::RunsQuery::PendingRuns))
+            .await
+            .expect("runs query");
+        let pending = match runs::decode_reply(&reply).expect("runs reply") {
+            runs::RunsReply::PendingRuns(runs) => runs,
+            other => panic!("unexpected runs reply: {other:?}"),
+        };
+        let run_id = pending
+            .iter()
+            .find(|r| r.agent_id == AGENT)
+            .expect("the mention minted a pending run")
+            .run_id
+            .clone();
         bed.oracle_response_json(&json!({
             "reply_blocks": [],
             "actions": [
@@ -459,12 +478,25 @@ fn unauthorized_and_malformed_actions_mutate_nothing_and_record_failure() {
         bed.deliver()
             .await
             .expect("the duplicate must not abort the delivery block");
-        bed.assert_failure_breadcrumb(HARNESS, "duplicate action_id");
+        bed.assert_failure_breadcrumb("runs", "duplicate action_id");
+        // the FIRST occurrence won: its minted comment landed with its text.
+        let minted = docs_harness::minted_comment_id(&run_id, "dup");
+        let landed = bed
+            .query_json("pages", &json!({"get_comment": {"comment_id": minted}}))
+            .await
+            .unwrap();
+        assert_eq!(
+            landed["comment"]["text"],
+            json!("first"),
+            "the first occurrence's comment landed: {landed}"
+        );
+        // the duplicate never reached the owner: no committed error row.
         let failures = bed.query_json(HARNESS, &json!("failures")).await.unwrap();
-        let rows = failures["failures"].as_array().expect("failure rows");
-        assert_eq!(rows.len(), 1, "one committed error row");
-        assert_eq!(rows[0]["action_id"], json!("dup"));
-        assert_eq!(rows[0]["tag"], json!(ACTION_COMMENT_ADD));
+        assert_eq!(
+            failures["failures"],
+            json!([]),
+            "the runs-level dedup keeps the duplicate away from the owner"
+        );
         bed.assert_job_status(
             &docs_harness::engagement_job_id(AGENT, "c4"),
             jobs::JobStatus::Done,
