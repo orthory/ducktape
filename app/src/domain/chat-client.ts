@@ -100,6 +100,13 @@ const TARGET = "chat";
 /** Query page bound mirrored from the interface crate (MAX_QUERY_LIMIT). */
 export const MAX_QUERY_LIMIT = 256;
 
+/** Module-reserved channel? A ":" in the id marks a channel a module minted
+ *  for its own surface (forge's per-item discussion channels are
+ *  `forge:<repo>:<number>`) — user-created ids can never carry one
+ *  (channelIdOf strips to [a-z0-9-]). These are HIDDEN from the chat UI: the
+ *  rail, default-channel selection, and search results all filter on this. */
+export const isModuleChannel = (id: string): boolean => id.includes(":");
+
 // ── Rendering helpers (wire → display) ──────────────────
 
 /** hex(User key bytes) → display name — the resolved `profiles` registry, keyed

@@ -4,6 +4,11 @@ import * as agentClient from "../../domain/agent-client";
 import * as chatClient from "../../domain/chat-client";
 import type { PostPolicy } from "../../domain/chat-client";
 import * as forgeClient from "../../domain/forge-client";
+import type {
+  ForgeItemDetail,
+  ForgeReviewComment,
+  ForgeReviewVerdict,
+} from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import * as identityClient from "../../domain/identity-client";
 import { normalizeKey } from "../../domain/names";
@@ -140,6 +145,62 @@ export interface ConsoleActions {
   popInHuddle(): void;
 
   commitForge(params: { path: string; content: string; message: string }): void;
+
+  // ── Forge tracker (issues / PRs / reviews over the `forge` module) ──
+  //
+  // Per-screen data: the forge view owns repo selection (component-local), so
+  // it calls these imperatively — loaders on open/repo switch, tracked writes
+  // from its forms. The loaders land in `state.forgeItems`/`forgeBranches`
+  // stamped with `state.forgeRepo`; nothing here rides the per-block refresh.
+
+  /** Load `repo`'s issue/PR summaries into `state.forgeItems` (and stamp
+   *  `state.forgeRepo`). Awaitable; a load for a repo the view has since left
+   *  is dropped. */
+  loadForgeItems(repo: string): Promise<void>;
+  /** Load `repo`'s branch heads into `state.forgeBranches` — same stamping and
+   *  staleness contract as loadForgeItems. */
+  loadForgeBranches(repo: string): Promise<void>;
+  /** One item in full (body, reviews, PR branches), resolved to the caller —
+   *  detail is view-local (like the files browser's reads), never store state. */
+  getForgeItem(repo: string, number: number): Promise<ForgeItemDetail | null>;
+  /** Open an issue on `repo`; reloads the repo's item list once committed. */
+  openForgeIssue(params: { repo: string; title: string; body: string }): Promise<void>;
+  /** Open a PR from `sourceBranch` into `targetBranch` ("" → the repo's main). */
+  openForgePr(params: {
+    repo: string;
+    title: string;
+    body: string;
+    sourceBranch: string;
+    targetBranch: string;
+  }): Promise<void>;
+  /** Retitle/rebody an item; null leaves that field untouched. */
+  editForgeItem(params: {
+    repo: string;
+    number: number;
+    title: string | null;
+    body: string | null;
+  }): Promise<void>;
+  /** Close (open: false) or reopen (open: true) an issue or PR. */
+  setForgeItemState(params: { repo: string; number: number; open: boolean }): Promise<void>;
+  /** Merge a PR: CAS against both heads, referencing a pack already staged via
+   *  forge-client's uploadMergePack (`packDigest`). */
+  mergeForgePr(params: {
+    repo: string;
+    number: number;
+    prevTargetOid: string;
+    expectedSourceOid: string;
+    mergeOid: string;
+    packDigest: string;
+  }): Promise<void>;
+  /** Submit a review on a PR, pinned to the source head it looked at. */
+  submitForgeReview(params: {
+    repo: string;
+    number: number;
+    verdict: ForgeReviewVerdict;
+    body: string;
+    commitOid: string;
+    comments: ForgeReviewComment[];
+  }): Promise<void>;
 
   // ── Docs (block-tree notebook over the `pages` module) ──
   /** Re-query the page enumeration into `state.pages`. */
@@ -614,6 +675,43 @@ export function createActions({
       activePage: active,
       ...(active ? {} : { activePageBlocks: [], pageThreads: [] }),
     });
+  };
+
+  // ── Forge tracker loaders ──
+  // Per-screen data (never in the per-block refresh): the forge view calls
+  // these on open/repo switch. Stamp the repo synchronously — clearing the
+  // previous repo's slices on a switch — then land the fetch ONLY while the
+  // stamp still matches, so a slow load for a repo the view has since left
+  // can never clobber the current one (loadChannelTags' guard, repo-keyed).
+  const enterForgeRepo = (repo: string): void =>
+    update((prev) =>
+      prev.forgeRepo === repo
+        ? {}
+        : { forgeRepo: repo, forgeItems: [], forgeBranches: [] },
+    );
+
+  const loadForgeItems = (repo: string): Promise<void> => {
+    const live = getNode();
+    if (!live || !repo) return Promise.resolve();
+    enterForgeRepo(repo);
+    return forgeClient
+      .listItems(live, repo)
+      .then((items) =>
+        update((prev) => (prev.forgeRepo === repo ? { forgeItems: items } : {})),
+      )
+      .catch(fail);
+  };
+
+  const loadForgeBranches = (repo: string): Promise<void> => {
+    const live = getNode();
+    if (!live || !repo) return Promise.resolve();
+    enterForgeRepo(repo);
+    return forgeClient
+      .listRefs(live, repo)
+      .then((refs) =>
+        update((prev) => (prev.forgeRepo === repo ? { forgeBranches: refs } : {})),
+      )
+      .catch(fail);
   };
 
   // Connect the app to a workspace's node: select it (Rust spawns/adopts),
@@ -1190,6 +1288,95 @@ export function createActions({
           origin: getState().author,
         }),
       );
+    },
+
+    // ── Forge tracker ──
+    // Writes follow the one tracked path (preconfirm-less — the tracker has no
+    // optimistic projection yet), then re-load the repo's per-screen item list,
+    // since the global refresh deliberately excludes it. Detail (getForgeItem)
+    // resolves to the caller: the item panel re-fetches after its own writes.
+    loadForgeItems,
+    loadForgeBranches,
+
+    getForgeItem: (repo, number) => {
+      const live = getNode();
+      if (!live || !repo) return Promise.resolve(null);
+      return forgeClient.getItem(live, { repo, number }).catch((err) => {
+        fail(err);
+        return null;
+      });
+    },
+
+    openForgeIssue: ({ repo, title, body }) => {
+      if (!repo || !title.trim()) return Promise.resolve();
+      return submitTracked(opKey.forgeItemOpen(repo), (live) =>
+        forgeClient.openIssue(live, {
+          repo,
+          title: title.trim(),
+          body,
+          origin: getState().author,
+        }),
+      ).then(() => loadForgeItems(repo));
+    },
+
+    openForgePr: ({ repo, title, body, sourceBranch, targetBranch }) => {
+      if (!repo || !title.trim() || !sourceBranch) return Promise.resolve();
+      return submitTracked(opKey.forgeItemOpen(repo), (live) =>
+        forgeClient.openPr(live, {
+          repo,
+          title: title.trim(),
+          body,
+          sourceBranch,
+          targetBranch,
+          origin: getState().author,
+        }),
+      ).then(() => loadForgeItems(repo));
+    },
+
+    editForgeItem: ({ repo, number, title, body }) => {
+      // an all-null edit is a wire no-op — don't spend a block on it.
+      if (!repo || (title === null && body === null)) return Promise.resolve();
+      return submitTracked(opKey.forgeItem(repo, number), (live) =>
+        forgeClient.editItem(live, { repo, number, title, body, origin: getState().author }),
+      ).then(() => loadForgeItems(repo));
+    },
+
+    setForgeItemState: ({ repo, number, open }) => {
+      if (!repo) return Promise.resolve();
+      return submitTracked(opKey.forgeItem(repo, number), (live) =>
+        forgeClient.setItemState(live, { repo, number, open, origin: getState().author }),
+      ).then(() => loadForgeItems(repo));
+    },
+
+    mergeForgePr: ({ repo, number, prevTargetOid, expectedSourceOid, mergeOid, packDigest }) => {
+      if (!repo) return Promise.resolve();
+      return submitTracked(opKey.forgeItem(repo, number), (live) =>
+        forgeClient.mergePr(live, {
+          repo,
+          number,
+          prevTargetOid,
+          expectedSourceOid,
+          mergeOid,
+          packDigest,
+          origin: getState().author,
+        }),
+        // a merge moves the target branch head too — reload both slices.
+      ).then(() => Promise.all([loadForgeItems(repo), loadForgeBranches(repo)])).then(() => {});
+    },
+
+    submitForgeReview: ({ repo, number, verdict, body, commitOid, comments }) => {
+      if (!repo) return Promise.resolve();
+      return submitTracked(opKey.forgeItem(repo, number), (live) =>
+        forgeClient.submitReview(live, {
+          repo,
+          number,
+          verdict,
+          body,
+          commitOid,
+          comments,
+          origin: getState().author,
+        }),
+      ).then(() => loadForgeItems(repo));
     },
 
     // ── Docs ──
