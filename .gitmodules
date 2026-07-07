@@ -1,0 +1,3 @@
+[submodule "third_party/tauri-agent-plugin"]
+	path = third_party/tauri-agent-plugin
+	url = https://github.com/byeongsu-hong/tauri-agent-plugin

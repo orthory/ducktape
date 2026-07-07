@@ -65,23 +65,18 @@ fn main() {
             Ok(())
         });
 
-    // dev-only debug bridge (tauri-plugin-mcp): opens a local unix socket so a
-    // helper can screenshot the window, run JS in the webview, and drive input —
-    // the way to see/verify the real native UI on a headless box. gated to
-    // debug + desktop; a release runtime never opens it. socket path overridable
-    // via DUCKTAPE_TAURI_MCP_SOCKET (default /tmp/ducktape-tauri-mcp.sock — a
-    // ducktape-specific name so a second Tauri app on the same box doesn't fight
-    // over the generic /tmp/tauri-mcp.sock).
+    // dev-only debug bridge (tauri-plugin-agent): registers our agent debugger
+    // so the `tauri-agent` CLI / MCP server can drive the real native UI —
+    // semantic tree, input, DOM-SVG screenshots, logs — over an app-scoped
+    // endpoint registry. Gated to debug + desktop; a release runtime never
+    // registers it (and the inline server refuses to bind without the
+    // allowReleaseSocket opt-in, which we never set). Inline-server config lives
+    // in tauri.conf.json under `plugins.agent`. The endpoint publishes to
+    // ${XDG_RUNTIME_DIR|TMPDIR|TMP}/tauri-agent/com.ducktape.app/endpoint.json;
+    // set XDG_RUNTIME_DIR per instance to isolate parallel worktree apps.
     #[cfg(all(debug_assertions, desktop))]
     {
-        let socket_path = std::env::var_os("DUCKTAPE_TAURI_MCP_SOCKET")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/ducktape-tauri-mcp.sock"));
-        builder = builder.plugin(tauri_plugin_mcp::init_with_config(
-            tauri_plugin_mcp::PluginConfig::new("ducktape".to_string())
-                .start_socket_server(true)
-                .socket_path(socket_path),
-        ));
+        builder = builder.plugin(tauri_plugin_agent::init());
     }
 
     let app = builder
