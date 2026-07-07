@@ -140,7 +140,7 @@ fn load_registry(app: &tauri::AppHandle) -> Result<Registry, String> {
 /// and boots the empty first-run state, so the app stays usable and the
 /// workspace dirs still on disk can be re-added. a genuine READ error
 /// (permissions) still propagates — the boot path lands on the gate with it.
-pub(crate) fn load_registry_at(path: &Path) -> Result<Registry, String> {
+fn load_registry_at(path: &Path) -> Result<Registry, String> {
     match fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str(&text) {
             Ok(reg) => Ok(reg),
@@ -174,7 +174,7 @@ fn save_registry(app: &tauri::AppHandle, reg: &Registry) -> Result<(), String> {
 /// can at worst lose its own update — never corrupt the file. (A cross-process
 /// advisory lock to also prevent the lost update is a deliberate follow-up;
 /// same-$HOME multi-instance is an edge case and the fleet isolates $HOME.)
-pub(crate) fn save_registry_at(path: &Path, reg: &Registry) -> Result<(), String> {
+fn save_registry_at(path: &Path, reg: &Registry) -> Result<(), String> {
     let text = serde_json::to_string_pretty(reg).map_err(|err| err.to_string())?;
     let tmp = path.with_extension("json.tmp");
     {
@@ -1384,6 +1384,26 @@ fn stop_workspace_node(
     Ok(())
 }
 
+/// Stop the active workspace's local node while the desktop app exits. This is
+/// best-effort at the UI boundary, but the underlying stop still verifies pids
+/// and ports so a half-stopped process is visible in stderr instead of silently
+/// surviving.
+pub(crate) fn stop_active_workspace_node(app: &tauri::AppHandle) -> Result<(), String> {
+    stop_active_workspace_node_at(&root(app)?, std::time::Duration::from_secs(2))
+}
+
+fn stop_active_workspace_node_at(root: &Path, grace: std::time::Duration) -> Result<(), String> {
+    let reg = load_registry_at(&root.join("registry.json"))?;
+    let Some(active) = reg.active.as_deref() else {
+        return Ok(());
+    };
+    let Some(ws) = reg.workspaces.iter().find(|ws| ws.id == active) else {
+        return Ok(());
+    };
+    let dir = root.join("workspaces").join(&ws.id);
+    stop_workspace_node(&dir, &ws.ports, grace)
+}
+
 /// is anything still listening on the ports this workspace owns? the mesh
 /// listener is bound in every phase (parked included); http only once serving.
 fn ports_held(ports: &Ports) -> bool {
@@ -1756,6 +1776,45 @@ mod tests {
             assert!(err.contains("still running"), "{err}");
             drop(listener);
             let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn stops_the_active_workspace_on_app_exit() {
+            let root = scratch_dir("app-exit-root");
+            let id = "active";
+            let dir = root.join("workspaces").join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let ports = closed_ports();
+            let mut child = spawn_fake_node(&dir);
+            fs::write(pidfile(&dir), child.id().to_string()).unwrap();
+
+            let reg = Registry {
+                version: 1,
+                active: Some(id.into()),
+                workspaces: vec![Workspace {
+                    id: id.into(),
+                    name: "Active".into(),
+                    chain_id: "test".into(),
+                    pubkey: "pub".into(),
+                    founder: true,
+                    member: true,
+                    ports,
+                }],
+                mnemonic_confirmed: false,
+            };
+            save_registry_at(&root.join("registry.json"), &reg).unwrap();
+
+            stop_active_workspace_node_at(&root, Duration::from_millis(600)).unwrap();
+
+            assert!(
+                died(&mut child, Duration::from_secs(2)),
+                "the app-exit hook must stop the active workspace node"
+            );
+            assert!(
+                !pidfile(&dir).exists(),
+                "the active workspace pidfile should be cleared after shutdown"
+            );
+            let _ = fs::remove_dir_all(&root);
         }
     }
 }
