@@ -1,9 +1,9 @@
-// Local console preferences: the desktop daemon toggle and the accent picker.
+// Local console preferences. Daemon start/stop lives on the Node view — the
+// operator surface that owns it — not here.
 
 import { useDucktape } from "../../store/use-ducktape";
 import { color } from "../../theme/tokens";
 import { ControlRow, GroupCard, SectionLabel } from "./parts";
-import { Toggle } from "./Toggle";
 
 const ACCENTS = [
   color.accent,
@@ -53,25 +53,6 @@ export function PreferencesSection() {
     <>
       <SectionLabel>PREFERENCES</SectionLabel>
       <GroupCard>
-        <ControlRow
-          title="Local node"
-          desc={
-            state.managed
-              ? "Start or stop the desktop-managed daemon."
-              : "Remote nodes are controlled outside this console."
-          }
-          control={
-            <Toggle
-              on={state.connected}
-              disabled={!state.managed}
-              label="Local node"
-              onToggle={() => {
-                if (state.connected) actions.stopNode();
-                else actions.startNode();
-              }}
-            />
-          }
-        />
         <ControlRow
           title="Accent"
           desc="Used for active navigation, focus, and primary controls."

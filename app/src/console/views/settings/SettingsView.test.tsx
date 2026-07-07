@@ -106,6 +106,8 @@ describe("SettingsView", () => {
       screen.queryByRole("button", { name: /reveal invite/i }),
     ).not.toBeInTheDocument();
     expect(screen.queryByLabelText(/joiner pubkey/i)).not.toBeInTheDocument();
+    // The daemon toggle moved to the Node view with the rest of the ops surface.
+    expect(screen.queryByText("Local node")).not.toBeInTheDocument();
 
     expect(screen.getByText("YOUR IDENTITY")).toBeInTheDocument();
     expect(screen.getByText(/abcdef012345/)).toBeInTheDocument();
