@@ -1169,11 +1169,11 @@ mod tests {
 
     #[test]
     fn classify_parked_holds_until_admitted() {
-        let log = "[node ab] joiner mode: parking on the mesh\n\
-                   [node ab] parked: awaiting admission (epoch 0 has 1 validators)\n";
+        let log = "[node ab] joiner mode: announcing this key with the invite token\n\
+                   [node ab] joining: awaiting redemption (epoch 0 has 1 validators)\n";
         let r = classify(log);
         assert_eq!(r.phase, "parked");
-        assert!(r.detail.unwrap().contains("awaiting admission"));
+        assert!(r.detail.unwrap().contains("awaiting redemption"));
     }
 
     #[test]
@@ -1185,9 +1185,9 @@ mod tests {
     fn classify_recovers_from_a_stale_fatal() {
         // an old fatal, then a restart that reparks and promotes on the same
         // appended log — the latest line wins, not the scariest one.
-        let log = "[node ab] FATAL: still not admitted after 900 attempts\n\
-                   [node ab] joiner mode: parking on the mesh\n\
-                   [node ab] parked: awaiting admission (epoch 0 has 1 validators)\n\
+        let log = "[node ab] FATAL: still no standing after 900 attempts\n\
+                   [node ab] joiner mode: announcing this key with the invite token\n\
+                   [node ab] joining: awaiting redemption (epoch 0 has 1 validators)\n\
                    [node ab] promoted: validator at epoch 1 boundary 4 — rebooting\n";
         assert_eq!(classify(log).phase, "promoted");
     }
