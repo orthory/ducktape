@@ -14,6 +14,7 @@ chat = { workspace = true }
 saga = { workspace = true }
 tagging = { workspace = true }
 dispatch = { workspace = true }
+files = { workspace = true }
 tasks = { workspace = true }
 jobs = { workspace = true }
 sha2 = { workspace = true }

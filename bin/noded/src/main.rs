@@ -204,7 +204,8 @@ fn run_node(
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-        );
+        )
+        .with_files("files");
         let pages = Pages::init(context.child("pages"), "pages").await;
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the

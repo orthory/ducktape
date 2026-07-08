@@ -19,6 +19,7 @@
 //! prompt for the generic instructions — is exactly the quiet corruption
 //! this format exists to kill.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use capability_host::RunContext;
@@ -26,25 +27,28 @@ use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::Value;
 
-/// the one envelope version this worker assembles. the runs module bumps the
-/// marker on semantic change (a payload flag day for workers, not for
-/// consensus state).
-pub const RUN_ENVELOPE_VERSION: u64 = 2;
+/// the newest envelope version this worker assembles. v2 remains accepted for
+/// in-flight legacy runs; v3 is the portable duckfs-workspace runner contract.
+pub const RUN_ENVELOPE_VERSION: u64 = 3;
+const LEGACY_RUN_ENVELOPE_VERSION: u64 = 2;
+const RUNNER_RESULT_VERSION: u64 = 1;
 
 /// resolve one 32-byte content address to its blob bytes, `None` when this
 /// node does not hold it. injected by the embedding binary (the node-local
 /// blob store the app's putBlob lane feeds); the pool itself stays
 /// storage-agnostic like its spawn/deliver seams.
-pub type BlobResolver =
-    Arc<dyn Fn(&[u8; 32]) -> BoxFuture<'static, Option<Vec<u8>>> + Send + Sync>;
+pub type BlobResolver = Arc<dyn Fn(&[u8; 32]) -> BoxFuture<'static, Option<Vec<u8>>> + Send + Sync>;
 
-/// the wire shape of a version-2 envelope. field ORDER is the composer's
+/// the wire shape shared by supported envelopes. field ORDER is the composer's
 /// business (committed bytes); decoding here is by name. unknown fields are
 /// tolerated on purpose — an ADDITIVE field under the same version must not
 /// kill in-flight runs mid-upgrade; semantic changes bump the marker instead.
 #[derive(Deserialize)]
 struct WireEnvelope {
-    #[allow(dead_code, reason = "the version routed decoding; carried for completeness")]
+    #[allow(
+        dead_code,
+        reason = "the version routed decoding; carried for completeness"
+    )]
     ducktape_run: u64,
     agent_id: String,
     /// lowercase 64-hex of the agent's prompt pin, or null when the record
@@ -54,6 +58,32 @@ struct WireEnvelope {
     instructions: String,
     contract: String,
     conversation: String,
+    workspace: Option<WireWorkspace>,
+    base_tools: Option<Vec<WireBaseTool>>,
+    result_contract: Option<WireResultContract>,
+}
+
+#[derive(Deserialize)]
+struct WireWorkspace {
+    source_prefix: String,
+    source_snapshot: Option<String>,
+    mount_path: String,
+}
+
+#[derive(Deserialize)]
+struct WireBaseTool {
+    name: String,
+    version: String,
+    #[allow(
+        dead_code,
+        reason = "exposure is validated by manifest presence, not interpreted"
+    )]
+    exposure: String,
+}
+
+#[derive(Deserialize)]
+struct WireResultContract {
+    ducktape_runner_result: u64,
 }
 
 /// turn one dispatch payload into the provider's input and per-run context.
@@ -80,14 +110,15 @@ pub async fn prepare(
         .get("ducktape_run")
         .and_then(Value::as_u64)
         .ok_or_else(|| "run envelope's ducktape_run marker is not an integer".to_string())?;
-    if version != RUN_ENVELOPE_VERSION {
+    if !matches!(version, LEGACY_RUN_ENVELOPE_VERSION | RUN_ENVELOPE_VERSION) {
         return Err(format!(
             "run envelope version {version} is not supported by this worker \
-             (understands {RUN_ENVELOPE_VERSION}); upgrade the executing node"
+             (understands {LEGACY_RUN_ENVELOPE_VERSION} and {RUN_ENVELOPE_VERSION}); \
+             upgrade the executing node"
         ));
     }
-    let envelope: WireEnvelope = serde_json::from_value(claimed)
-        .map_err(|e| format!("run envelope is malformed: {e}"))?;
+    let envelope: WireEnvelope =
+        serde_json::from_value(claimed).map_err(|e| format!("run envelope is malformed: {e}"))?;
 
     let prompt = match &envelope.prompt_hash {
         None => envelope.instructions.clone(),
@@ -124,14 +155,75 @@ pub async fn prepare(
         }
     };
 
-    let ctx = RunContext {
+    let mut ctx = RunContext {
         agent_id: Some(envelope.agent_id),
         thread_key: envelope.thread_key,
+        ..RunContext::default()
     };
+    if version == RUN_ENVELOPE_VERSION {
+        apply_portable_context(
+            &mut ctx,
+            envelope.workspace,
+            envelope.base_tools,
+            envelope.result_contract,
+        )?;
+    }
     Ok((
-        format!("{prompt}\n\n{}\n\n{}", envelope.contract, envelope.conversation),
+        format!(
+            "{prompt}\n\n{}\n\n{}",
+            envelope.contract, envelope.conversation
+        ),
         ctx,
     ))
+}
+
+fn apply_portable_context(
+    ctx: &mut RunContext,
+    workspace: Option<WireWorkspace>,
+    base_tools: Option<Vec<WireBaseTool>>,
+    result_contract: Option<WireResultContract>,
+) -> Result<(), String> {
+    let workspace = workspace.ok_or_else(|| "v3 run envelope is missing workspace".to_string())?;
+    if workspace.source_prefix.is_empty() {
+        return Err("v3 run envelope workspace.source_prefix must not be empty".into());
+    }
+    if workspace.mount_path.is_empty() {
+        return Err("v3 run envelope workspace.mount_path must not be empty".into());
+    }
+    let result_contract =
+        result_contract.ok_or_else(|| "v3 run envelope is missing result_contract".to_string())?;
+    if result_contract.ducktape_runner_result != RUNNER_RESULT_VERSION {
+        return Err(format!(
+            "v3 run envelope requests runner result version {}, but this worker understands {RUNNER_RESULT_VERSION}",
+            result_contract.ducktape_runner_result
+        ));
+    }
+    let base_tools =
+        base_tools.ok_or_else(|| "v3 run envelope is missing base_tools".to_string())?;
+
+    ctx.portable = true;
+    ctx.workdir_override = Some(PathBuf::from(&workspace.mount_path));
+    ctx.env.insert(
+        "DUCKTAPE_RUN_WORKSPACE".into(),
+        workspace.mount_path.clone(),
+    );
+    ctx.env.insert(
+        "DUCKTAPE_RUN_WORKSPACE_PREFIX".into(),
+        workspace.source_prefix,
+    );
+    if let Some(snapshot) = workspace.source_snapshot {
+        ctx.env
+            .insert("DUCKTAPE_RUN_WORKSPACE_SNAPSHOT".into(), snapshot);
+    }
+    ctx.env.insert(
+        "DUCKTAPE_RUN_BASE_TOOLS".into(),
+        base_tools
+            .into_iter()
+            .map(|tool| format!("{}@{}", tool.name, tool.version))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    Ok(())
 }
 
 /// 64 lowercase-or-uppercase hex chars → 32 bytes. strict charset first:
@@ -167,6 +259,30 @@ mod tests {
             "instructions": "GENERIC",
             "contract": "CONTRACT",
             "conversation": "CONVERSATION",
+        })
+        .to_string()
+    }
+
+    fn v3_envelope_json(prompt_hash: Option<&str>) -> String {
+        serde_json::json!({
+            "ducktape_run": 3,
+            "agent_id": "bot",
+            "prompt_hash": prompt_hash,
+            "thread_key": "general#7",
+            "instructions": "GENERIC",
+            "contract": "CONTRACT",
+            "conversation": "CONVERSATION",
+            "workspace": {
+                "source_prefix": "/shared/agent-workspaces/bot",
+                "source_snapshot": "aa".repeat(32),
+                "mount_path": "/tmp/ducktape-workspace"
+            },
+            "base_tools": [
+                {"name":"ducktape-files","version":"1","exposure":"cli"},
+                {"name":"ducktape-index","version":"1","exposure":"cli"},
+                {"name":"ducktape-chain","version":"1","exposure":"cli"}
+            ],
+            "result_contract": {"ducktape_runner_result": 1}
         })
         .to_string()
     }
@@ -250,8 +366,8 @@ mod tests {
     #[tokio::test]
     async fn claimed_but_broken_envelopes_are_loud_errors_not_passthrough() {
         // an unknown version is a mixed-network signal, never model input.
-        let err = prepare(r#"{"ducktape_run":3}"#, None).await.unwrap_err();
-        assert!(err.contains("version 3"), "got {err:?}");
+        let err = prepare(r#"{"ducktape_run":99}"#, None).await.unwrap_err();
+        assert!(err.contains("version 99"), "got {err:?}");
 
         // a non-integer marker.
         let err = prepare(r#"{"ducktape_run":"2"}"#, None).await.unwrap_err();
@@ -289,5 +405,40 @@ mod tests {
         let (_, ctx) = prepare(&v.to_string(), None).await.unwrap();
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert_eq!(ctx.thread_key, None);
+    }
+
+    #[tokio::test]
+    async fn v3_envelopes_prepare_a_portable_workspace_context() {
+        let (input, ctx) = prepare(&v3_envelope_json(None), None).await.unwrap();
+        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+        assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
+        assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
+        assert!(
+            ctx.portable,
+            "v3 runs are portable and cannot resume host-local sessions"
+        );
+        assert_eq!(
+            ctx.workdir_override.as_deref(),
+            Some(std::path::Path::new("/tmp/ducktape-workspace"))
+        );
+        assert_eq!(
+            ctx.env.get("DUCKTAPE_RUN_WORKSPACE").map(String::as_str),
+            Some("/tmp/ducktape-workspace")
+        );
+        assert_eq!(
+            ctx.env
+                .get("DUCKTAPE_RUN_WORKSPACE_SNAPSHOT")
+                .map(String::as_str),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_envelopes_remain_non_portable_for_legacy_in_flight_runs() {
+        let (_, ctx) = prepare(&envelope_json(None), None).await.unwrap();
+        assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
+        assert!(!ctx.portable);
+        assert!(ctx.workdir_override.is_none());
+        assert!(ctx.env.is_empty());
     }
 }
