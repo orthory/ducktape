@@ -1020,6 +1020,7 @@ pub fn workspace_select(app: tauri::AppHandle, id: String) -> Result<Selection, 
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(log_err);
+    crate::daemon::prepare_node_command_env(&mut cmd);
     crate::daemon::detach(&mut cmd);
     // spawn AND verify the node survived. a bind conflict, an unparseable
     // node.toml, or a boot panic dies in milliseconds — and used to return Ok

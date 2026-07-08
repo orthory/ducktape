@@ -19,6 +19,7 @@
 //! to a log file under app-data. the tauri shell plugin's sidecar API is NOT
 //! used on purpose — it kills children when the app exits.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -63,11 +64,15 @@ pub fn daemon_spawn(app: tauri::AppHandle, listen: String) -> Result<String, Str
             cmd
         }
     };
+    prepare_node_command_env(&mut cmd);
     cmd.stdin(Stdio::null()).stdout(log).stderr(log_err);
     detach(&mut cmd);
     // verify the node survived instead of returning the log path over a corpse.
     // `listen` is the http surface, so its port is the readiness signal.
-    let ready_port = listen.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+    let ready_port = listen
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok());
     spawn_verified(cmd, &log_path, ready_port)
         .map_err(|failure| format!("the node exited on start: {failure}"))?;
 
@@ -215,6 +220,75 @@ fn usable(path: &PathBuf) -> bool {
     }
 }
 
+/// macOS GUI apps inherit launchd's sparse PATH (`/usr/bin:/bin:/usr/sbin:/sbin`),
+/// not the user's shell PATH. Without repair, a desktop-spawned node cannot
+/// discover agent executors installed under Homebrew, ~/.local/bin, or NVM.
+pub(crate) fn prepare_node_command_env(cmd: &mut Command) {
+    if let Some(path) = node_launch_path(std::env::var_os("PATH"), std::env::var_os("HOME")) {
+        cmd.env("PATH", path);
+    }
+}
+
+fn node_launch_path(current: Option<OsString>, home: Option<OsString>) -> Option<OsString> {
+    let mut dirs: Vec<PathBuf> = current
+        .as_deref()
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect();
+
+    for dir in [
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/opt/homebrew/sbin"),
+        PathBuf::from("/usr/local/bin"),
+    ] {
+        add_existing_path_dir(&mut dirs, dir);
+    }
+
+    if let Some(home) = home {
+        let home = PathBuf::from(home);
+        for rel in [
+            ".local/bin",
+            ".cargo/bin",
+            ".bun/bin",
+            ".volta/bin",
+            ".asdf/shims",
+            ".nodenv/shims",
+        ] {
+            add_existing_path_dir(&mut dirs, home.join(rel));
+        }
+        add_nvm_node_bins(&mut dirs, &home);
+    }
+
+    if dirs.is_empty() {
+        None
+    } else {
+        std::env::join_paths(dirs).ok()
+    }
+}
+
+fn add_nvm_node_bins(dirs: &mut Vec<PathBuf>, home: &Path) {
+    let versions = home.join(".nvm/versions/node");
+    let Ok(entries) = fs::read_dir(versions) else {
+        return;
+    };
+    let mut bins: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("bin"))
+        .filter(|path| path.is_dir())
+        .collect();
+    bins.sort();
+    for bin in bins {
+        add_existing_path_dir(dirs, bin);
+    }
+}
+
+fn add_existing_path_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    if dir.is_dir() && !dirs.iter().any(|existing| existing == &dir) {
+        dirs.push(dir);
+    }
+}
+
 /// A verified-spawn failure: the node forked (or failed to) but did not survive
 /// the grace window, carrying a human reason and the tail of `daemon.log` so the
 /// real cause — a bind conflict, a config parse error, a boot panic — reaches
@@ -292,7 +366,7 @@ pub fn spawn_verified(
                 });
             }
         }
-        if ready_port.map_or(false, crate::workspaces::port_listening) {
+        if ready_port.is_some_and(crate::workspaces::port_listening) {
             return Ok(child); // confirmed serving its port
         }
         if Instant::now() >= deadline {
@@ -333,7 +407,7 @@ mod tests {
         fs::write(&log, b"boom: bind 127.0.0.1:8844: address already in use\n").unwrap();
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg("exit 3");
-        let err = spawn_verified(cmd, &log, None).err().expect("insta-exit must be an error");
+        let err = spawn_verified(cmd, &log, None).expect_err("insta-exit must be an error");
         assert!(err.reason.contains("exited"), "reason: {}", err.reason);
         assert!(err.log_tail.contains("boom"), "tail: {}", err.log_tail);
     }
@@ -346,6 +420,29 @@ mod tests {
         let mut child = spawn_verified(cmd, &log, None).expect("a still-alive child is Ok");
         child.kill().ok();
         child.wait().ok();
+    }
+
+    #[test]
+    fn node_launch_path_adds_developer_bins_for_gui_spawn() {
+        let home = scratch("node-path-home");
+        let nvm_bin = home.join(".nvm/versions/node/v24.13.1/bin");
+        let local_bin = home.join(".local/bin");
+        fs::create_dir_all(&nvm_bin).unwrap();
+        fs::create_dir_all(&local_bin).unwrap();
+
+        let path = node_launch_path(
+            Some(std::ffi::OsString::from("/usr/bin:/bin:/usr/sbin:/sbin")),
+            Some(home.as_os_str().to_os_string()),
+        )
+        .expect("path");
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+
+        assert!(dirs.contains(&PathBuf::from("/usr/bin")));
+        assert!(dirs.contains(&PathBuf::from("/bin")));
+        assert!(dirs.contains(&local_bin));
+        assert!(dirs.contains(&nvm_bin));
+
+        fs::remove_dir_all(&home).ok();
     }
 
     #[test]
