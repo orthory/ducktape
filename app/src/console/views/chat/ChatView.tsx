@@ -8,6 +8,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
+import { isModuleChannel } from "../../../domain/chat-client";
 import type { PostPolicy } from "../../../domain/chat-client";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
@@ -77,6 +78,10 @@ function ChannelRail() {
   const [draft, setDraft] = useState("");
   const [policy, setPolicy] = useState<PostPolicy>("open");
   const [creating, setCreating] = useState(false);
+  // module-reserved channels (forge's per-item discussion threads,
+  // `forge:<repo>:<n>`) are hidden from the chat surface — their messages
+  // render inside the owning module's view, never in this rail.
+  const channels = state.channels.filter((channel) => !isModuleChannel(channel.id));
 
   const create = (event: FormEvent) => {
     event.preventDefault();
@@ -168,7 +173,7 @@ function ChannelRail() {
       )}
 
       <div style={{ overflowY: "auto", flex: 1 }}>
-        {state.channels.map((channel) => {
+        {channels.map((channel) => {
           const active = channel.id === state.activeChannel;
           return (
             <button
@@ -198,7 +203,7 @@ function ChannelRail() {
             </button>
           );
         })}
-        {state.channels.length === 0 && (
+        {channels.length === 0 && (
           <div style={{ padding: "6px 15px", font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
             No channels yet — create one.
           </div>
@@ -214,7 +219,9 @@ function EmptyChannelState() {
   const { state, actions } = useDucktape();
   const [draft, setDraft] = useState("");
   const [policy, setPolicy] = useState<PostPolicy>("open");
-  const hasChannels = state.channels.length > 0;
+  // module-reserved channels are hidden (see ChannelRail) — a workspace whose
+  // only channels are module-owned still reads "No channels yet".
+  const hasChannels = state.channels.some((channel) => !isModuleChannel(channel.id));
 
   const create = (event: FormEvent) => {
     event.preventDefault();

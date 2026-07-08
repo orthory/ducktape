@@ -11,6 +11,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 
+import { isModuleChannel } from "../../../domain/chat-client";
 import type { ChatSearchHit } from "../../../domain/chat-client";
 import { basename } from "../../../domain/files-client";
 import type { FileEntry } from "../../../domain/files-client";
@@ -220,7 +221,12 @@ export function SearchModal() {
   // round-trip), and drives the "Searching…" line instead of a false empty
   // state. Client-side member/file hits are always live off the input.
   const matched = query !== "" && results?.query === query;
-  const chatHits: ChatSearchHit[] = matched ? (results?.chat ?? []) : [];
+  // Hits in module-reserved channels (forge's hidden `forge:<repo>:<n>` item
+  // threads) are dropped: opening them would land the chat surface on a hidden
+  // channel. A follow-up will deep-link these into the forge view instead.
+  const chatHits: ChatSearchHit[] = matched
+    ? (results?.chat ?? []).filter((hit) => !isModuleChannel(hit.channelId))
+    : [];
   const docHits: PageSearchHit[] = matched ? (results?.docs ?? []) : [];
   const searching = query !== "" && !matched;
   const total = chatHits.length + docHits.length + memberHits.length + fileHits.length;

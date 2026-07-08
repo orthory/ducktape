@@ -2423,6 +2423,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "blobstore",
+ "chat",
  "futures",
  "git2",
  "sdk",

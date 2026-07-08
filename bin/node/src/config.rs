@@ -2789,6 +2789,83 @@ mod tests {
         assert_eq!(invite.descriptor.coordination.as_deref(), Some("private"));
     }
 
+    /// helper: a descriptor whose only validator is `issuer` (the minimal
+    /// well-formed shape the invite tests need).
+    fn front_test_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
+        NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        }
+    }
+
+    #[test]
+    fn invite_blob_roundtrips_member_fronts() {
+        // (a) two fronts — one with a direct endpoint, one reachable only by
+        // identity (endpoint None) — survive the signed envelope byte-for-byte.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_test_descriptor(&issuer);
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+        let fronts = vec![
+            Front {
+                member_key: [11u8; 32],
+                wireguard_public_key: [12u8; 32],
+                mesh_port: 52210,
+                endpoint: Some("198.51.100.9:51820".into()),
+            },
+            Front {
+                member_key: [21u8; 32],
+                wireguard_public_key: [22u8; 32],
+                mesh_port: 52211,
+                endpoint: None,
+            },
+        ];
+        let blob =
+            encode_invite(&d, &token, None, &fronts, u64::MAX, &issuer).expect("encode");
+        let invite = decode_invite(&blob).expect("decode");
+        assert_eq!(invite.fronts, fronts, "fronts roundtrip through the envelope");
+    }
+
+    #[test]
+    fn a_pre_feature_blob_decodes_to_empty_fronts() {
+        // (b) the fronts block is OMITTED when empty, so a zero-fronts encode is
+        // byte-identical to a blob minted BEFORE this feature (which ended at
+        // the token). such a blob must decode to `fronts: vec![]`, never error
+        // on a "missing" block.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_test_descriptor(&issuer);
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+
+        let empty_blob =
+            encode_invite(&d, &token, None, &[], u64::MAX, &issuer).expect("encode");
+        let invite = decode_invite(&empty_blob).expect("decode pre-feature-shaped blob");
+        assert!(invite.fronts.is_empty(), "no fronts block => empty fronts");
+
+        // and the omission is real: adding a front lengthens the blob, proving
+        // the empty case appended nothing (i.e. matches the old wire).
+        let with_front = encode_invite(
+            &d,
+            &token,
+            None,
+            &[Front {
+                member_key: [1u8; 32],
+                wireguard_public_key: [2u8; 32],
+                mesh_port: 1,
+                endpoint: None,
+            }],
+            u64::MAX,
+            &issuer,
+        )
+        .expect("encode");
+        assert!(
+            with_front.len() > empty_blob.len(),
+            "a front appends bytes the empty blob lacks"
+        );
+    }
+
     /// the FULL delivery chain at the crypto level: a genesis validator mints a
     /// cap for a joiner, it is packed for the wire (`pack_coord_cap`), the
     /// joiner unpacks it (`unpack_coord_cap`) and presents it on an

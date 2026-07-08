@@ -18,12 +18,21 @@
 
 use serde::{Deserialize, Serialize};
 
-/// a write intent at forge: either the file-by-file [`ForgeMsg::Commit`] (forge
-/// builds the commit object itself) or [`ForgeMsg::Push`] — a git-faithful ref
-/// update that adopts a client's REAL commit history by oid, with the objects
-/// carried out-of-band in a node-local packfile (never in consensus).
+use crate::tracker_iface::{RefUpdate, ReviewComment, ReviewVerdict};
+
+/// a write intent at forge.
 ///
-/// both variants name their target repo via `repo`. the field is
+/// the git surface: the file-by-file [`ForgeMsg::Commit`] (forge builds the
+/// commit object itself), the legacy single-`main` [`ForgeMsg::Push`], and the
+/// atomic multi-branch [`ForgeMsg::PushRefs`] — git-faithful ref updates that
+/// adopt a client's REAL commit history by oid, with the objects carried
+/// out-of-band in a node-local packfile (never in consensus).
+///
+/// the tracker surface: GitHub-shaped issues / pull requests / reviews
+/// ([`ForgeMsg::OpenIssue`] .. [`ForgeMsg::SubmitReview`]) — see
+/// [`crate::tracker`].
+///
+/// every variant names its target repo via `repo`. the field is
 /// `#[serde(default)]`, so an omitted/empty `repo` deserializes to `""` and the
 /// module maps it to the `"default"` repo (see the module docstring) — the
 /// single-repo wire needs no `repo` key at all.
@@ -59,6 +68,88 @@ pub enum ForgeMsg {
         /// state; this 32-byte locator has ZERO effect on root/accept-reject.
         pack_digest: Vec<u8>,
     },
+    /// the atomic multi-branch push: every [`RefUpdate`] is a per-branch CAS
+    /// against that branch's COMMITTED head, and the whole list stages or the
+    /// whole op rejects. `pack_digest` (sha256, 32 raw bytes) locates the ONE
+    /// packfile carrying the closure of every updated head; a delete-only push
+    /// carries `None`. this is what a stock `git push` lands as (the smart-HTTP
+    /// bridge translates the command list).
+    PushRefs {
+        #[serde(default)]
+        repo: String,
+        updates: Vec<RefUpdate>,
+        pack_digest: Option<Vec<u8>>,
+    },
+    /// open an issue. assigns the repo's next shared number, stores title/body
+    /// on the record (authorship is origin-derived), and emits a follow-up
+    /// creating the hidden discussion channel `forge:<repo>:<n>` — atomic with
+    /// the record.
+    OpenIssue {
+        #[serde(default)]
+        repo: String,
+        title: String,
+        #[serde(default)]
+        body: String,
+    },
+    /// open a pull request from a born `source_branch` onto `target_branch`
+    /// (empty -> "main"). same number space + discussion channel as issues.
+    OpenPr {
+        #[serde(default)]
+        repo: String,
+        title: String,
+        #[serde(default)]
+        body: String,
+        source_branch: String,
+        #[serde(default)]
+        target_branch: String,
+    },
+    /// edit an item's title and/or body — author-only.
+    EditItem {
+        #[serde(default)]
+        repo: String,
+        number: u64,
+        title: Option<String>,
+        body: Option<String>,
+    },
+    /// close (`open: false`) or reopen (`open: true`) an item. merged PRs are
+    /// terminal; an unchanged state is a deterministic no-op.
+    SetItemState {
+        #[serde(default)]
+        repo: String,
+        number: u64,
+        open: bool,
+    },
+    /// merge an open PR. the merge commit is CLIENT-COMPUTED (validators may
+    /// not hold the objects — same trust model as `Push`): the merging client
+    /// builds it locally, uploads its pack, then submits this op. consensus
+    /// gates on a double CAS — the target branch must still be at
+    /// `prev_target_oid` AND the source at `expected_source_oid` — then moves
+    /// the target to `merge_oid` and marks the PR merged, atomically. oids are
+    /// 40-char sha1 hex; `pack_digest` is 64-char sha256 hex (this surface is
+    /// app-facing, unlike the raw-byte push lane).
+    MergePr {
+        #[serde(default)]
+        repo: String,
+        number: u64,
+        prev_target_oid: String,
+        expected_source_oid: String,
+        merge_oid: String,
+        pack_digest: String,
+    },
+    /// submit a batched review on a PR: one verdict, an optional body, and
+    /// line-anchored diff comments, anchored at `commit_oid` (the source head
+    /// the reviewer saw). approvals are advisory — never merge-blocking.
+    SubmitReview {
+        #[serde(default)]
+        repo: String,
+        number: u64,
+        verdict: ReviewVerdict,
+        #[serde(default)]
+        body: String,
+        commit_oid: String,
+        #[serde(default)]
+        comments: Vec<ReviewComment>,
+    },
 }
 
 /// reads over the repo namespace.
@@ -72,6 +163,12 @@ pub enum ForgeQuery {
     HeadOf { repo: String },
     /// every repo in the namespace with its committed head, sorted by name.
     ListRepos,
+    /// every born branch of a repo, sorted by name.
+    ListRefs { repo: String },
+    /// every issue/PR of a repo, ascending by number (team-scale: no paging).
+    ListItems { repo: String },
+    /// one item in full — body, branches, reviews, discussion channel id.
+    GetItem { repo: String, number: u64 },
 }
 
 /// the git oid hex of a repo's HEAD (a 40-char sha1 oid), or `None` on an unborn
@@ -87,6 +184,13 @@ pub enum ForgeReply {
     /// the whole namespace: one [`RepoHead`] per repo, sorted by name (the reply
     /// to [`ForgeQuery::ListRepos`]).
     Repos(Vec<RepoHead>),
+    /// a repo's born branches (the reply to [`ForgeQuery::ListRefs`]).
+    Refs(Vec<crate::tracker_iface::RefHead>),
+    /// a repo's items (the reply to [`ForgeQuery::ListItems`]).
+    Items(Vec<crate::tracker_iface::ItemSummary>),
+    /// one full item (the reply to [`ForgeQuery::GetItem`]). boxed: an
+    /// ItemDetail dwarfs the other variants.
+    Item(Option<Box<crate::tracker_iface::ItemDetail>>),
 }
 
 /// one repo's committed head in a [`ForgeReply::Repos`] listing.

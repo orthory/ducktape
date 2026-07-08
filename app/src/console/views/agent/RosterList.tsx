@@ -7,7 +7,7 @@ import { FinalizationMark } from "../../components/FinalizationMark";
 import { opKey } from "../../store/finalization";
 import type { OpLedger, OpRecord } from "../../store/finalization";
 import { accentVar, color, font } from "../../theme/tokens";
-import { AgentAvatar, EmptyState, SectionLabel, StatusPill, statusTone } from "./parts";
+import { AgentAvatar, capabilityShort, EmptyState, SectionLabel } from "./parts";
 
 function AgentListButton({
   agent,
@@ -35,52 +35,40 @@ function AgentListButton({
         display: "flex",
         alignItems: "center",
         gap: 12,
-        padding: "13px 14px",
-        background: selected ? color.paper : "transparent",
+        padding: "12px 14px",
+        background: selected ? "#faf4ef" : "transparent",
         cursor: "pointer",
         textAlign: "left",
         boxShadow: selected ? `inset 3px 0 0 ${accentVar}` : undefined,
       }}
     >
-      <AgentAvatar name={agent.display_name} />
+      <AgentAvatar name={agent.display_name} size={36} />
       <span style={{ flex: 1, minWidth: 0 }}>
         <span style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
           <span
             style={{
+              flex: 1,
               minWidth: 0,
               overflow: "hidden",
               textOverflow: "ellipsis",
               whiteSpace: "nowrap",
               font: `600 13.5px ${font.sans}`,
-              color: color.ink,
+              color: selected ? color.dark : color.ink,
             }}
           >
             {agent.display_name}
           </span>
-          <StatusPill label="AGENT" tone={statusTone.agent} />
+          <FinalizationMark op={op} />
         </span>
         <span
           style={{
             marginTop: 3,
             display: "flex",
             alignItems: "center",
-            gap: 7,
+            gap: 6,
             minWidth: 0,
           }}
         >
-          <span
-            translate="no"
-            style={{
-              minWidth: 0,
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-              font: `400 10.5px ${font.mono}`,
-              color: color.muted2,
-            }}
-          >
-            {agent.agent_id}
-          </span>
           <span
             style={{
               width: 6,
@@ -90,10 +78,24 @@ function AgentListButton({
               flexShrink: 0,
             }}
           />
-          <span style={{ font: `500 10.5px ${font.sans}`, color: color.muted3 }}>
+          <span style={{ font: `500 10.5px ${font.sans}`, color: color.muted3, flexShrink: 0 }}>
             {active ? "Active" : "Paused"}
           </span>
-          <FinalizationMark op={op} />
+          <span style={{ color: color.iconIdle, flexShrink: 0 }}>·</span>
+          <span
+            translate="no"
+            title={agent.capability}
+            style={{
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              font: `500 10.5px ${font.mono}`,
+              color: color.muted2,
+            }}
+          >
+            {capabilityShort(agent.capability)}
+          </span>
         </span>
       </span>
     </button>

@@ -193,6 +193,10 @@ pub struct Thread {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatMsg {
+    /// `channel_id`s containing `:` are a reserved module namespace: an
+    /// external (user) origin may not create one, and a module origin `m`
+    /// may only create ids prefixed `"{m}:"` (forge's per-issue/PR discussion
+    /// channels are `forge:<repo>:<n>`). system origin is unrestricted.
     CreateChannel {
         channel_id: String,
         name: String,

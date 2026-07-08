@@ -103,7 +103,10 @@ fn source(tag: &str) -> (PathBuf, Forge) {
 /// `name_len` (4) + `name`. valid only for a container with >= 1 repo.
 fn first_oid_offset(bytes: &[u8]) -> usize {
     let name_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    8 + name_len
+    // count(4) name_len(4) name ref_count(4) branch_len(4) branch [oid]
+    let p = 8 + name_len + 4;
+    let branch_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+    p + 4 + branch_len
 }
 
 /// byte offset of the FIRST repo's pack (after its oid + a 4-byte pack length).
@@ -111,15 +114,30 @@ fn first_pack_offset(bytes: &[u8]) -> usize {
     first_oid_offset(bytes) + OID_LEN + 4
 }
 
-/// assemble a one-repo container: `[count=1][name_len name][oid][pack_len pack]`.
+/// assemble a one-repo, one-branch (`main`) container with an EMPTY tracker
+/// section: `[count=1][name][ref_count=1]["main" oid][pack_len pack][tracker]`.
 fn build_container(name: &str, oid: &[u8], pack: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&1u32.to_le_bytes());
     out.extend_from_slice(&(name.len() as u32).to_le_bytes());
     out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&4u32.to_le_bytes());
+    out.extend_from_slice(b"main");
     out.extend_from_slice(oid);
     out.extend_from_slice(&(pack.len() as u32).to_le_bytes());
     out.extend_from_slice(pack);
+    out.extend_from_slice(&empty_tracker_section());
+    out
+}
+
+/// the trailing tracker section of a tracker-less snapshot: `u32(len=8)` +
+/// the TRK1 magic + a zero repo count.
+fn empty_tracker_section() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&8u32.to_le_bytes());
+    out.extend_from_slice(b"TRK\x01");
+    out.extend_from_slice(&0u32.to_le_bytes());
     out
 }
 
@@ -266,10 +284,11 @@ fn empty_snapshot_round_trips_the_unborn_state() {
     let src_base = tmp_base("empty-src");
     let src = Forge::init("forge", src_base.clone()).unwrap();
     let bytes = src.snapshot().unwrap();
+    let mut expected = vec![0u8; 4]; // zero repo count
+    expected.extend_from_slice(&empty_tracker_section());
     assert_eq!(
-        bytes,
-        vec![0u8; 4],
-        "an empty namespace must serialize as the zero-count marker"
+        bytes, expected,
+        "an empty namespace must serialize as the zero-count marker + empty tracker"
     );
 
     let dst_base = tmp_base("empty-dst");

@@ -113,6 +113,24 @@ describe("SearchModal", () => {
     expect(screen.getByText(new RegExp(shortKey(unknown)))).toBeInTheDocument();
   });
 
+  it("drops chat hits from module-reserved channels (forge:* item threads)", () => {
+    renderModal({
+      search: {
+        query: "ship",
+        chat: [
+          { channelId: "general", seq: 3, author: "Alice", edited: false, text: "ship it" } as ChatSearchHit,
+          { channelId: "forge:ducktape:1", seq: 1, author: "Alice", edited: false, text: "ship the fix" } as ChatSearchHit,
+        ],
+        docs: [],
+      },
+    });
+    fireEvent.change(screen.getByLabelText("Search"), { target: { value: "ship" } });
+    // hidden discussion channels never surface as chat hits — a follow-up will
+    // deep-link them into the forge view instead.
+    expect(screen.getByText("ship it")).toBeInTheDocument();
+    expect(screen.queryByText("ship the fix")).not.toBeInTheDocument();
+  });
+
   it("hides node-index results whose query does not match the current input", () => {
     renderModal({
       search: {

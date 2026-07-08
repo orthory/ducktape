@@ -11,10 +11,11 @@
 // The pure pieces (payload builder, command mapping) are exported for tests;
 // the Tauri emit/listen wiring lives in DucktapeProvider.
 
-import { authorName } from "../../domain/chat-client";
 import type { Channel } from "../../domain/chat-client";
 import { isTauri } from "../../domain/node-bootstrap";
 import type { VoiceError } from "../../domain/voice-session";
+import { buildParticipants } from "./huddle-roster";
+import type { HuddleParticipant } from "./huddle-roster";
 import type { VoiceSlice } from "./state";
 
 export const HUDDLE_STATE_EVENT = "ducktape://huddle-state";
@@ -37,28 +38,34 @@ export const closeHuddleWindow = (): void => {
     .catch(() => {});
 };
 
-/** Everything the popped window renders — resolved display names only; the
- *  window has no member records or profile registry of its own. */
+/** Everything the popped window renders — fully-resolved participant rows (the
+ *  window has no member records or profile registry of its own), so the same
+ *  mute + stale-sweep affordances work there as in the in-app dock. */
 export interface HuddleWindowState {
   channelName: string;
   status: VoiceSlice["status"];
   error: VoiceError | null;
   muted: boolean;
-  participants: string[];
+  participants: HuddleParticipant[];
 }
 
 export type HuddleWindowCmd =
   | { op: "ready" }
   | { op: "set-muted"; muted: boolean }
   | { op: "leave" }
-  | { op: "retry" };
+  | { op: "retry" }
+  | { op: "sweep"; user: number[] };
 
 /** Project the voice slice + committed roster into the window's display state.
- *  Null when not in a huddle — the caller closes the window instead. */
+ *  Null when not in a huddle — the caller closes the window instead. `selfNodeHex`
+ *  + `now` drive the self/mute/stale computation (staleness is time-based, so the
+ *  sender re-pushes on a tick). */
 export const buildHuddleWindowState = (
   voice: VoiceSlice,
   channels: Channel[],
   authorNames: Record<string, string>,
+  selfNodeHex: string,
+  now: number,
 ): HuddleWindowState | null => {
   if (!voice.channelId) return null;
   const channel = channels.find((c) => c.id === voice.channelId);
@@ -67,9 +74,16 @@ export const buildHuddleWindowState = (
     status: voice.status,
     error: voice.error,
     muted: voice.muted,
-    participants: (channel?.huddle ?? []).map((member) =>
-      authorName({ user: member.user }, authorNames),
-    ),
+    participants: buildParticipants({
+      roster: channel?.huddle ?? [],
+      peers: voice.peers,
+      selfNodeHex,
+      authorNames,
+      selfMuted: voice.muted,
+      selfSpeaking: voice.speaking,
+      sessionStartMs: voice.sessionStartMs,
+      now,
+    }),
   };
 };
 
@@ -81,6 +95,7 @@ export const applyHuddleWindowCmd = (
     setHuddleMuted(muted: boolean): void;
     leaveHuddle(): void;
     joinHuddle(channelId: string): void;
+    sweepHuddle(channelId: string, user: number[]): void;
   },
   currentChannelId: string | null,
 ): void => {
@@ -93,6 +108,9 @@ export const applyHuddleWindowCmd = (
       return;
     case "retry":
       if (currentChannelId) actions.joinHuddle(currentChannelId);
+      return;
+    case "sweep":
+      if (currentChannelId) actions.sweepHuddle(currentChannelId, cmd.user);
       return;
     case "ready":
       // handled by the wiring (replays the current state); nothing to do here.

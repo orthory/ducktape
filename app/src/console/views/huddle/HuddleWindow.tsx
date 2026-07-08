@@ -62,6 +62,7 @@ export function HuddleWindow() {
           onSetMuted={(muted) => send({ op: "set-muted", muted })}
           onLeave={() => send({ op: "leave" })}
           onRetry={() => send({ op: "retry" })}
+          onSweep={(user) => send({ op: "sweep", user })}
           onPopIn={() => void getCurrentWindow().close()}
         />
       ) : (

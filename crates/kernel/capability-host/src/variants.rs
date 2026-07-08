@@ -459,8 +459,8 @@ resume_args = ["resume", "stale-id"]
             crate::ResumeArgv::Append(vec!["--resume".into(), "{session_id}".into()]),
         );
 
-        // the full matrix is present: 8 codex + 16 claude variants + 2 bases.
-        for model in ["gpt-5.5", "gpt-5.5-codex"] {
+        // the full matrix is present: 16 codex + 16 claude variants + 2 bases.
+        for model in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] {
             for effort in ["low", "medium", "high", "xhigh"] {
                 get(&format!("codex_{model}_{effort}"));
             }
@@ -470,6 +470,6 @@ resume_args = ["resume", "stale-id"]
                 get(&format!("claude_{model}_{effort}"));
             }
         }
-        assert_eq!(specs.len(), 26, "2 bases + 8 codex + 16 claude variants");
+        assert_eq!(specs.len(), 34, "2 bases + 16 codex + 16 claude variants");
     }
 }
