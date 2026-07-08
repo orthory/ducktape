@@ -64,6 +64,12 @@ export const opKey = {
    *  optimistic roster change carries a finalization record. */
   huddle: (channelId: string) => `chat/huddle/${channelId}`,
   forgeHead: () => "forge/head",
+  /** An op on an EXISTING forge issue/PR (edit/state/merge/review) — keyed by
+   *  the repo-scoped item number the row renders. */
+  forgeItem: (repo: string, number: number) => `forge/${repo}/item/${number}`,
+  /** An OpenIssue/OpenPr submit — the item number is minted by the module, so
+   *  the mark anchors to the repo's tracker list instead (cf. runRequest). */
+  forgeItemOpen: (repo: string) => `forge/${repo}/item/open`,
   page: (pageId: string) => `page/${pageId}`,
   /** Page block ids are module-global — no page qualifier needed. */
   pageBlock: (blockId: string) => `page-block/${blockId}`,

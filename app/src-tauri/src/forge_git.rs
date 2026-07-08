@@ -1,8 +1,10 @@
 //! read-only local git view over the node's on-disk forge repository.
 //!
 //! Writes still go through the node's consensus `forge` module. These commands
-//! only open the active workspace's local repo and project committed
-//! `refs/heads/main` into browser-friendly shapes.
+//! only open the active workspace's local repo and project committed refs
+//! (`refs/heads/*`, defaulting to `main`) into browser-friendly shapes. The one
+//! exception is `forge_build_merge`, which builds a CLIENT-COMPUTED merge
+//! commit in a throwaway repo — the node repo itself is never written.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -10,7 +12,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use git2::{Commit, Delta, DiffOptions, ErrorCode, ObjectType, Oid, Repository, Sort, Tree};
+use git2::{
+    BranchType, Buf, Commit, Delta, DiffOptions, ErrorCode, ObjectType, Oid, Patch, Repository,
+    Signature, Sort, Tree,
+};
 use serde::{Deserialize, Serialize};
 use tauri::Manager as _;
 
@@ -21,6 +26,8 @@ const MAIN_REF: &str = "refs/heads/main";
 pub struct CommitInfo {
     id: String,
     summary: String,
+    message: String,
+    parent_ids: Vec<String>,
     author: String,
     time: i64,
 }
@@ -30,6 +37,15 @@ pub struct CommitInfo {
 pub struct TreeEntry {
     name: String,
     kind: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilePage {
+    text: String,
+    offset: usize,
+    next_offset: Option<usize>,
+    total_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -63,6 +79,49 @@ pub struct RepoMeta {
     head: Option<String>,
 }
 
+/// one local branch — the `refs/heads/<name>` SHORT name and its 40-hex head.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchInfo {
+    name: String,
+    head: String,
+}
+
+/// one changed file in a compare — a PR "files changed" row. `patch` is the
+/// unified patch text for this file (empty for binary deltas).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompareFile {
+    path: String,
+    status: String,
+    additions: u32,
+    deletions: u32,
+    patch: String,
+}
+
+/// GitHub-style three-dot compare payload: the diff from `merge_base(base,
+/// head)` to `head`, plus the commits on `head` not reachable from `base`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompareResult {
+    merge_base: String,
+    files: Vec<CompareFile>,
+    total_additions: u32,
+    total_deletions: u32,
+    commits: Vec<CommitInfo>,
+}
+
+/// outcome of a client-computed merge: either the merge commit oid + a pack of
+/// the NEW objects (hex-encoded — this crate carries no base64 dependency), or
+/// the conflicting paths and NO merge.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeBuildResult {
+    merge_oid: Option<String>,
+    pack_hex: Option<String>,
+    conflicts: Vec<String>,
+}
+
 #[derive(Deserialize)]
 struct Registry {
     active: Option<String>,
@@ -89,36 +148,80 @@ pub fn forge_head(app: tauri::AppHandle, repo: String) -> Result<Option<String>,
     Ok(main_oid(&git)?.map(|oid| oid.to_string()))
 }
 
-/// Read the commit log of `refs/heads/main`, newest first. `limit` is optional:
-/// `None` walks the WHOLE history (the Forge view browses the full repo), `Some(n)`
-/// caps to the newest `n`. There is no built-in ceiling — a local git browser
-/// over a real repo (e.g. 740 commits) walks it all fine.
+/// Every local branch (`refs/heads/*`) by SHORT name with its 40-hex head,
+/// sorted by name — the PR pickers' branch list.
+#[tauri::command]
+pub fn forge_list_branches(app: tauri::AppHandle, repo: String) -> Result<Vec<BranchInfo>, String> {
+    let Some(repo) = open_named_repo(&app, &repo)? else {
+        return Ok(Vec::new());
+    };
+    let mut branches = Vec::new();
+    for branch in repo.branches(Some(BranchType::Local)).map_err(err)? {
+        let (branch, _) = branch.map_err(err)?;
+        let Some(name) = branch.name().map_err(err)?.map(str::to_owned) else {
+            continue;
+        };
+        // an unborn/symbolic branch has no direct target — nothing to browse.
+        let Some(head) = branch.get().target() else {
+            continue;
+        };
+        branches.push(BranchInfo {
+            name,
+            head: head.to_string(),
+        });
+    }
+    branches.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(branches)
+}
+
+/// Read a commit log, newest first. `reference` picks the starting point — a
+/// branch short name or 40-hex oid, `None` for main. `after` is an exclusive
+/// commit cursor from the same walk. `limit` is optional: `None` walks the
+/// whole reachable history, `Some(n)` caps to the newest `n`.
 #[tauri::command]
 pub fn forge_log(
     app: tauri::AppHandle,
     repo: String,
     limit: Option<usize>,
+    reference: Option<String>,
+    after: Option<String>,
 ) -> Result<Vec<CommitInfo>, String> {
     let Some(repo) = open_named_repo(&app, &repo)? else {
         return Ok(Vec::new());
     };
-    let Some(head) = main_oid(&repo)? else {
+    let Some(head) = commit_at(&repo, reference.as_deref())? else {
         return Ok(Vec::new());
     };
 
     let mut walk = repo.revwalk().map_err(err)?;
-    walk.push(head).map_err(err)?;
+    walk.push(head.id()).map_err(err)?;
     walk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL)
         .map_err(err)?;
 
+    let after_oid = after
+        .as_deref()
+        .map(str::trim)
+        .filter(|cursor| !cursor.is_empty())
+        .map(|cursor| {
+            Oid::from_str(cursor).map_err(|e| format!("invalid commit cursor {cursor:?}: {e}"))
+        })
+        .transpose()?;
+    let mut cursor_seen = after_oid.is_none();
     let mut commits = Vec::new();
     for oid in walk {
-        let commit = repo.find_commit(oid.map_err(err)?).map_err(err)?;
-        commits.push(commit_info(&commit));
-        if let Some(limit) = limit {
-            if commits.len() >= limit {
-                break;
+        let oid = oid.map_err(err)?;
+        if !cursor_seen {
+            if after_oid.as_ref().is_some_and(|cursor| *cursor == oid) {
+                cursor_seen = true;
             }
+            continue;
+        }
+        let commit = repo.find_commit(oid).map_err(err)?;
+        commits.push(commit_info(&commit));
+        if let Some(limit) = limit
+            && commits.len() >= limit
+        {
+            break;
         }
     }
     Ok(commits)
@@ -129,12 +232,13 @@ pub fn forge_tree(
     app: tauri::AppHandle,
     repo: String,
     path: String,
+    reference: Option<String>,
 ) -> Result<Vec<TreeEntry>, String> {
     let path = clean_repo_path(&path, true)?;
     let Some(repo) = open_named_repo(&app, &repo)? else {
         return Ok(Vec::new());
     };
-    let Some(commit) = main_commit(&repo)? else {
+    let Some(commit) = commit_at(&repo, reference.as_deref())? else {
         return Ok(Vec::new());
     };
 
@@ -171,12 +275,13 @@ pub fn forge_read_file(
     app: tauri::AppHandle,
     repo: String,
     path: String,
+    reference: Option<String>,
 ) -> Result<Option<String>, String> {
     let path = clean_repo_path(&path, false)?;
     let Some(repo) = open_named_repo(&app, &repo)? else {
         return Ok(None);
     };
-    let Some(commit) = main_commit(&repo)? else {
+    let Some(commit) = commit_at(&repo, reference.as_deref())? else {
         return Ok(None);
     };
 
@@ -194,6 +299,38 @@ pub fn forge_read_file(
         .map_err(|_| format!("{path} is not utf-8 text"))?
         .to_string();
     Ok(Some(text))
+}
+
+#[tauri::command]
+pub fn forge_read_file_page(
+    app: tauri::AppHandle,
+    repo: String,
+    path: String,
+    reference: Option<String>,
+    offset: usize,
+    limit: usize,
+) -> Result<Option<FilePage>, String> {
+    let path = clean_repo_path(&path, false)?;
+    let Some(repo) = open_named_repo(&app, &repo)? else {
+        return Ok(None);
+    };
+    let Some(commit) = commit_at(&repo, reference.as_deref())? else {
+        return Ok(None);
+    };
+
+    let tree = commit.tree().map_err(err)?;
+    let entry = match tree.get_path(Path::new(&path)) {
+        Ok(entry) => entry,
+        Err(e) if e.code() == ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(err(e)),
+    };
+    if entry.kind() != Some(ObjectType::Blob) {
+        return Ok(None);
+    }
+    let blob = repo.find_blob(entry.id()).map_err(err)?;
+    utf8_text_page(blob.content(), offset, limit)
+        .map(Some)
+        .map_err(|e| format!("{path}: {e}"))
 }
 
 #[tauri::command]
@@ -286,6 +423,206 @@ pub fn forge_diff(
     Ok(files.into_inner())
 }
 
+/// GitHub-style compare between `base` and `head` (branch short names or 40-hex
+/// oids): the diff runs from `merge_base(base, head)` to `head` (three-dot),
+/// and `commits` are the commits on `head` NOT reachable from `base` — the PR
+/// "files changed" payload.
+#[tauri::command]
+pub fn forge_compare(
+    app: tauri::AppHandle,
+    repo: String,
+    base: String,
+    head: String,
+) -> Result<CompareResult, String> {
+    let repo = require_named_repo(&app, &repo)?;
+    let base_oid = require_ref_spec(&repo, &base)?;
+    let head_oid = require_ref_spec(&repo, &head)?;
+    let merge_base = repo
+        .merge_base(base_oid, head_oid)
+        .map_err(|e| format!("no merge base between {base:?} and {head:?}: {e}"))?;
+
+    let base_tree = repo
+        .find_commit(merge_base)
+        .and_then(|commit| commit.tree())
+        .map_err(err)?;
+    let head_tree = repo
+        .find_commit(head_oid)
+        .and_then(|commit| commit.tree())
+        .map_err(err)?;
+
+    let mut opts = DiffOptions::new();
+    opts.context_lines(3).interhunk_lines(0);
+    let mut diff = repo
+        .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut opts))
+        .map_err(err)?;
+    // surface renames the way GitHub's compare does, not as add+delete pairs.
+    diff.find_similar(None).map_err(err)?;
+
+    let mut files = Vec::new();
+    let mut total_additions = 0u32;
+    let mut total_deletions = 0u32;
+    for (index, delta) in diff.deltas().enumerate() {
+        let path = delta_path(&delta);
+        let status = delta_status(delta.status()).to_string();
+        let (additions, deletions, patch) = match Patch::from_diff(&diff, index).map_err(err)? {
+            Some(mut patch) => {
+                let (_context, additions, deletions) = patch.line_stats().map_err(err)?;
+                let text = patch.to_buf().map_err(err)?;
+                (additions as u32, deletions as u32, text_lossy(&text))
+            }
+            // binary/unrepresentable deltas still list, with no text patch.
+            None => (0, 0, String::new()),
+        };
+        total_additions += additions;
+        total_deletions += deletions;
+        files.push(CompareFile {
+            path,
+            status,
+            additions,
+            deletions,
+            patch,
+        });
+    }
+
+    let mut walk = repo.revwalk().map_err(err)?;
+    walk.push(head_oid).map_err(err)?;
+    walk.hide(base_oid).map_err(err)?;
+    walk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL)
+        .map_err(err)?;
+    let mut commits = Vec::new();
+    for oid in walk {
+        let commit = repo.find_commit(oid.map_err(err)?).map_err(err)?;
+        commits.push(commit_info(&commit));
+    }
+
+    Ok(CompareResult {
+        merge_base: merge_base.to_string(),
+        files,
+        total_additions,
+        total_deletions,
+        commits,
+    })
+}
+
+/// Build the CLIENT-COMPUTED merge commit for `MergePr`: merge `theirs` (the
+/// source head) into `ours` (the target head) in a TEMPORARY bare repo wired to
+/// the node repo's objects through a disk alternate, and return the new commit
+/// oid plus a minimal pack of the objects the node does not have yet. The node
+/// repo is opened read-only and never written — consensus only CASes the oid,
+/// because client-computed merges are ordinary git commits. Conflicts return
+/// the conflicting paths and NO merge.
+#[tauri::command]
+pub fn forge_build_merge(
+    app: tauri::AppHandle,
+    repo: String,
+    ours: String,
+    theirs: String,
+    message: String,
+) -> Result<MergeBuildResult, String> {
+    let node_repo = require_named_repo(&app, &repo)?;
+    let ours_oid = require_ref_spec(&node_repo, &ours)?;
+    let theirs_oid = require_ref_spec(&node_repo, &theirs)?;
+
+    // throwaway bare repo; its odb reads the node repo's objects through a
+    // disk alternate, so parents resolve without copying anything.
+    let scratch = ScratchDir::create()?;
+    let temp = Repository::init_bare(scratch.path()).map_err(err)?;
+    let objects = node_repo.path().join("objects");
+    let objects = objects
+        .to_str()
+        .ok_or_else(|| format!("non-utf8 objects path {}", objects.display()))?;
+    temp.odb()
+        .map_err(err)?
+        .add_disk_alternate(objects)
+        .map_err(err)?;
+
+    let ours_commit = temp.find_commit(ours_oid).map_err(err)?;
+    let theirs_commit = temp.find_commit(theirs_oid).map_err(err)?;
+    let mut index = temp
+        .merge_commits(&ours_commit, &theirs_commit, None)
+        .map_err(err)?;
+
+    if index.has_conflicts() {
+        let mut conflicts = Vec::new();
+        for conflict in index.conflicts().map_err(err)? {
+            let conflict = conflict.map_err(err)?;
+            let Some(entry) = conflict.our.or(conflict.their).or(conflict.ancestor) else {
+                continue;
+            };
+            conflicts.push(text_lossy(&entry.path));
+        }
+        conflicts.sort();
+        conflicts.dedup();
+        return Ok(MergeBuildResult {
+            merge_oid: None,
+            pack_hex: None,
+            conflicts,
+        });
+    }
+
+    let tree_oid = index.write_tree_to(&temp).map_err(err)?;
+    let tree = temp.find_tree(tree_oid).map_err(err)?;
+    let signature = Signature::now("ducktape", "ducktape@localhost").map_err(err)?;
+    let merge_oid = temp
+        .commit(
+            None,
+            &signature,
+            &signature,
+            &message,
+            &tree,
+            &[&ours_commit, &theirs_commit],
+        )
+        .map_err(err)?;
+
+    // MINIMAL pack: only objects reachable from the merge but from NEITHER
+    // parent — the hidden commits mark their trees uninteresting.
+    let mut builder = temp.packbuilder().map_err(err)?;
+    let mut walk = temp.revwalk().map_err(err)?;
+    walk.push(merge_oid).map_err(err)?;
+    walk.hide(ours_oid).map_err(err)?;
+    walk.hide(theirs_oid).map_err(err)?;
+    builder.insert_walk(&mut walk).map_err(err)?;
+    let mut buf = Buf::new();
+    builder.write_buf(&mut buf).map_err(err)?;
+
+    Ok(MergeBuildResult {
+        merge_oid: Some(merge_oid.to_string()),
+        pack_hex: Some(hex_encode(&buf)),
+        conflicts: Vec::new(),
+    })
+}
+
+/// Process-unique throwaway directory under the OS temp dir, removed
+/// (best-effort) on drop. `tempfile` is not a dependency of this crate and a
+/// one-shot merge scratch does not justify adding one.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn create() -> Result<Self, String> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ducktape-forge-merge-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("create merge scratch dir {}: {e}", dir.display()))?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Validate a caller-supplied forge repo NAME: a single normal path segment (no
 /// `/` or `\`, not `.`/`..`, no absolute root), so `base.join(name)` can never
 /// escape the forge base. This is the `repo` arg's boundary — the analogue of
@@ -324,6 +661,13 @@ fn open_named_repo(app: &tauri::AppHandle, repo: &str) -> Result<Option<Reposito
         }
     }
     Ok(None)
+}
+
+/// Like [`open_named_repo`] but the repo MUST be materialized — compare/merge
+/// have no meaningful empty shape.
+fn require_named_repo(app: &tauri::AppHandle, repo: &str) -> Result<Repository, String> {
+    open_named_repo(app, repo)?
+        .ok_or_else(|| format!("forge repo {repo:?} is not materialized on this node"))
 }
 
 /// Enumerate every repo materialized under the forge base(s), by its REAL on-disk
@@ -433,16 +777,62 @@ fn main_oid(repo: &Repository) -> Result<Option<Oid>, String> {
     }
 }
 
-fn main_commit(repo: &Repository) -> Result<Option<Commit<'_>>, String> {
-    main_oid(repo)?
-        .map(|oid| repo.find_commit(oid).map_err(err))
-        .transpose()
+/// Resolve a caller-supplied `reference` to an oid: `None`/empty/`"main"` ->
+/// committed main, a 40-hex string -> that commit oid verbatim, anything else
+/// -> `refs/heads/<reference>`. An unknown branch resolves to `None` rather
+/// than erroring, so the browse commands degrade to their existing empty
+/// shapes (the same way an unborn main does).
+fn resolve_ref_spec(repo: &Repository, reference: Option<&str>) -> Result<Option<Oid>, String> {
+    let spec = reference.unwrap_or("").trim();
+    if spec.is_empty() || spec == "main" || spec == MAIN_REF {
+        return main_oid(repo);
+    }
+    if spec.len() == 40 && spec.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Oid::from_str(spec).map(Some).map_err(err);
+    }
+    match repo.refname_to_id(&format!("refs/heads/{spec}")) {
+        Ok(oid) => Ok(Some(oid)),
+        Err(e)
+            if matches!(
+                e.code(),
+                ErrorCode::NotFound | ErrorCode::UnbornBranch | ErrorCode::InvalidSpec
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(err(e)),
+    }
+}
+
+/// Like [`resolve_ref_spec`] but the reference MUST resolve — compare/merge
+/// have no meaningful empty shape.
+fn require_ref_spec(repo: &Repository, spec: &str) -> Result<Oid, String> {
+    resolve_ref_spec(repo, Some(spec))?
+        .ok_or_else(|| format!("cannot resolve {spec:?} to a commit"))
+}
+
+/// The commit `reference` points at (see [`resolve_ref_spec`]); a resolvable
+/// oid that is not a commit in this repo reads as absent, not as an error.
+fn commit_at<'repo>(
+    repo: &'repo Repository,
+    reference: Option<&str>,
+) -> Result<Option<Commit<'repo>>, String> {
+    let Some(oid) = resolve_ref_spec(repo, reference)? else {
+        return Ok(None);
+    };
+    match repo.find_commit(oid) {
+        Ok(commit) => Ok(Some(commit)),
+        Err(e) if e.code() == ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(err(e)),
+    }
 }
 
 fn commit_info(commit: &Commit<'_>) -> CommitInfo {
     CommitInfo {
         id: commit.id().to_string(),
         summary: commit.summary().unwrap_or("(no summary)").to_string(),
+        message: commit.message().unwrap_or("").to_string(),
+        parent_ids: commit.parent_ids().map(|oid| oid.to_string()).collect(),
         author: commit.author().name().unwrap_or("ducktape").to_string(),
         time: commit.time().seconds(),
     }
@@ -530,6 +920,41 @@ fn clean_repo_path(raw: &str, allow_empty: bool) -> Result<String, String> {
     Ok(path.to_string())
 }
 
+fn utf8_text_page(content: &[u8], offset: usize, limit: usize) -> Result<FilePage, String> {
+    if limit == 0 {
+        return Err("file page limit must be greater than 0".into());
+    }
+    let text = std::str::from_utf8(content).map_err(|_| "file is not utf-8 text".to_string())?;
+    let total_bytes = text.len();
+    if offset > total_bytes {
+        return Err(format!(
+            "file page offset {offset} exceeds file size {total_bytes}"
+        ));
+    }
+    if !text.is_char_boundary(offset) {
+        return Err(format!("file page offset {offset} is not a utf-8 boundary"));
+    }
+
+    let mut end = offset.saturating_add(limit).min(total_bytes);
+    while end > offset && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == offset && offset < total_bytes {
+        end = text[offset..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| offset + index)
+            .unwrap_or(total_bytes);
+    }
+
+    Ok(FilePage {
+        text: text[offset..end].to_string(),
+        offset,
+        next_offset: (end < total_bytes).then_some(end),
+        total_bytes,
+    })
+}
+
 fn delta_path(delta: &git2::DiffDelta<'_>) -> String {
     let file = match delta.status() {
         Delta::Deleted => delta.old_file(),
@@ -561,18 +986,34 @@ fn text_lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// Lowercase hex — the pack transport encoding (this crate has no base64 dep,
+/// and the TS side just forwards the bytes to the node).
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[usize::from(byte >> 4)] as char);
+        out.push(HEX[usize::from(byte & 0xf)] as char);
+    }
+    out
+}
+
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::clean_repo_name;
+    use super::{clean_repo_name, utf8_text_page};
 
     #[test]
     fn accepts_real_forge_repo_slugs() {
         for name in ["ducktape", "default", "my-repo", "a.b_c-1", "x"] {
-            assert_eq!(clean_repo_name(name).unwrap(), name, "{name} should be valid");
+            assert_eq!(
+                clean_repo_name(name).unwrap(),
+                name,
+                "{name} should be valid"
+            );
         }
     }
 
@@ -595,5 +1036,26 @@ mod tests {
                 "{name:?} must be rejected as a repo name"
             );
         }
+    }
+
+    #[test]
+    fn text_page_reports_next_offset() {
+        let page = utf8_text_page("hello world".as_bytes(), 0, 5).unwrap();
+        assert_eq!(page.text, "hello");
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.next_offset, Some(5));
+        assert_eq!(page.total_bytes, 11);
+    }
+
+    #[test]
+    fn text_page_ends_on_utf8_boundary() {
+        let text = "a🙂b";
+        let first = utf8_text_page(text.as_bytes(), 0, 2).unwrap();
+        assert_eq!(first.text, "a");
+        assert_eq!(first.next_offset, Some(1));
+
+        let second = utf8_text_page(text.as_bytes(), first.next_offset.unwrap(), 4).unwrap();
+        assert_eq!(second.text, "🙂");
+        assert_eq!(second.next_offset, Some(5));
     }
 }

@@ -203,10 +203,14 @@ export function DucktapeProvider({
         const members = validators.map(valsetClient.validatorHex);
         const residents = residentKeys.map(valsetClient.validatorHex);
         const current = stateRef.current.activeChannel;
+        // Default-channel selection skips module-reserved channels (forge's
+        // hidden `forge:<repo>:<n>` discussion threads) — the chat surface must
+        // never land on one by default. A deliberately-selected id survives
+        // as long as it exists, whatever its shape (future module deep-links).
         const active =
           current && channels.some((c) => c.id === current)
             ? current
-            : (channels[0]?.id ?? null);
+            : (channels.find((c) => !chatClient.isModuleChannel(c.id))?.id ?? null);
         // A pages snapshot that predates a page op must not be applied: it
         // would clobber the op's preconfirmed projection — an optimistically
         // inserted block unmounts (dropping the focused textarea with it) and

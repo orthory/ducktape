@@ -77,7 +77,9 @@ fn main() {
         let kv = kv::Kv::init(context.child("kv"), "kv").await;
         let directory = Directory::new("directory");
         let greeter = Greeter::new("greeter");
-        let forge = Forge::init("forge", forge_repo.clone()).expect("forge init");
+        let forge = Forge::init("forge", forge_repo.clone())
+            .expect("forge init")
+            .with_chat("chat");
         let chat = Chat::init(context.child("chat"), "chat")
             .await
             .with_tagging("tagging");

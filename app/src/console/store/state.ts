@@ -13,6 +13,7 @@ import type {
   MessageView,
 } from "../../domain/chat-client";
 import type { FileEntry } from "../../domain/files-client";
+import type { ForgeItemSummary, ForgeRefHead } from "../../domain/forge-client";
 import type { ProposalView } from "../../domain/governance-client";
 import type {
   PageBlock,
@@ -162,6 +163,17 @@ export interface ConsoleState {
   // ── Forge ──
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
   forgeHead: string | null;
+  /** The repo whose tracker slices below are loaded. Repo SELECTION lives in
+   *  the forge view (component-local); the loaders stamp this so a slow load
+   *  for a repo the view has since left can never land (see loadForgeItems).
+   *  Null until the first load. */
+  forgeRepo: string | null;
+  /** `forgeRepo`'s issues/PRs (ListItems). Per-screen loaded — the forge view
+   *  calls loadForgeItems on open/repo switch; never in the per-block refresh. */
+  forgeItems: ForgeItemSummary[];
+  /** `forgeRepo`'s branch heads (ListRefs) — the PR forms' branch pickers and
+   *  the branches rail. Per-screen loaded like forgeItems. */
+  forgeBranches: ForgeRefHead[];
 
   // ── Docs (block-tree notebook over the `pages` module) ──
   /** Every page (id + live title), from ListPages, re-queried per block.
@@ -433,6 +445,9 @@ export const createInitialState = (): ConsoleState => {
     residents: [],
     proposals: [],
     forgeHead: null,
+    forgeRepo: null,
+    forgeItems: [],
+    forgeBranches: [],
     pages: [],
     activePage: null,
     activePageBlocks: [],

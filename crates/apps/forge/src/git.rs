@@ -103,17 +103,40 @@ pub fn update_ref(repo: &Repository, name: &str, target: Oid) -> Result<(), git2
 /// the raw width of a sha1 oid — the snapshot's head-oid header size.
 pub const OID_RAW_LEN: usize = 20;
 
-/// pack the FULL object closure reachable from `head` into a self-contained
-/// packfile: a revwalk over every reachable commit, each inserted with its
-/// completed tree and blobs (`insert_commit` pulls the whole closure; the
-/// builder dedups objects shared between commits). single-threaded, because
-/// multi-threaded delta selection is schedule-dependent and the pack bytes
-/// should be a pure function of the closure.
-pub fn pack_closure(repo: &Repository, head: Oid) -> Result<Vec<u8>, git2::Error> {
+/// the ref namespace forge manages — every branch lives under it and the wire
+/// carries SHORT names ("main", "feature/x"); this prefix is a local detail.
+pub const HEADS_PREFIX: &str = "refs/heads/";
+
+/// every born branch as `(short_name, oid)`, sorted by name (glob iteration is
+/// alphabetical in libgit2, but sort explicitly — the caller composes state
+/// from this). the multi-ref analogue of `resolve_ref(MAIN_REF)` for restart
+/// re-adopt.
+pub fn list_branches(repo: &Repository) -> Result<Vec<(String, Oid)>, git2::Error> {
+    let mut out = Vec::new();
+    for r in repo.references_glob(&format!("{HEADS_PREFIX}*"))? {
+        let r = r?;
+        let (Some(name), Some(oid)) = (r.name(), r.target()) else {
+            continue; // symbolic or non-utf8 ref — not one forge writes
+        };
+        let Some(short) = name.strip_prefix(HEADS_PREFIX) else {
+            continue;
+        };
+        out.push((short.to_string(), oid));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// pack the FULL object closure reachable from EVERY head into one
+/// self-contained packfile — the multi-ref snapshot pack. same determinism
+/// posture as [`pack_closure`]: single-threaded, revwalk-inserted, deduped.
+pub fn pack_closure_many(repo: &Repository, heads: &[Oid]) -> Result<Vec<u8>, git2::Error> {
     let mut pb = repo.packbuilder()?;
     pb.set_threads(1);
     let mut walk = repo.revwalk()?;
-    walk.push(head)?;
+    for head in heads {
+        walk.push(*head)?;
+    }
     for oid in walk {
         pb.insert_commit(oid?)?;
     }
