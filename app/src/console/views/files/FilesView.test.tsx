@@ -166,7 +166,7 @@ describe("FilesView", () => {
     expect(transport.filesStage).not.toHaveBeenCalled();
   });
 
-  it("uploads files dropped onto a browser column into that column's directory", async () => {
+  it("uploads files dropped anywhere in the browser into the active directory", async () => {
     const transport = makeTransport();
     renderView(transport);
     const sharedColumn = await screen.findByRole("region", { name: /column \/shared/i });
@@ -176,6 +176,8 @@ describe("FilesView", () => {
       value: () => Promise.resolve(new TextEncoder().encode("drop me").buffer),
     });
 
+    // Drop lands on a column but is handled at the browser-card level (it
+    // bubbles), so it always targets the active directory.
     fireEvent.drop(sharedColumn, {
       dataTransfer: { files: [file], types: ["Files"], dropEffect: "copy" },
     });
@@ -185,18 +187,45 @@ describe("FilesView", () => {
     expect(body.changes[0].put.path).toBe("/shared/drop.txt");
   });
 
-  it("shows a prominent upload card while a file is dragged over a browser column", async () => {
+  it("shows the upload drop-zone overlay while a file is dragged over the browser", async () => {
     renderView(makeTransport());
     const sharedColumn = await screen.findByRole("region", { name: /column \/shared/i });
-    const file = new File(["drop me"], "drop.txt", { type: "text/plain" });
 
     fireEvent.dragOver(sharedColumn, {
-      dataTransfer: { files: [file], types: ["Files"], dropEffect: "none" },
+      dataTransfer: { files: [], types: ["Files"], dropEffect: "none" },
     });
 
-    const uploadCard = screen.getByRole("status", { name: /upload file/i });
-    expect(within(uploadCard).getByText("Upload file")).toBeInTheDocument();
-    expect(within(uploadCard).getByText(/drop 1 file to \/shared/i)).toBeInTheDocument();
+    const overlay = screen.getByRole("dialog", { name: /drop files to upload/i });
+    expect(within(overlay).getByText(/drop files to upload/i)).toBeInTheDocument();
+    expect(within(overlay).getByText(/\/shared/)).toBeInTheDocument();
+  });
+
+  it("hides the drop-zone overlay once the drag leaves the browser", async () => {
+    renderView(makeTransport());
+    const sharedColumn = await screen.findByRole("region", { name: /column \/shared/i });
+    const dataTransfer = { files: [], types: ["Files"], dropEffect: "none" };
+
+    fireEvent.dragEnter(sharedColumn, { dataTransfer });
+    expect(screen.getByRole("dialog", { name: /drop files to upload/i })).toBeInTheDocument();
+
+    fireEvent.dragLeave(sharedColumn, { dataTransfer });
+    expect(screen.queryByRole("dialog", { name: /drop files to upload/i })).not.toBeInTheDocument();
+  });
+
+  it("ignores an internal file-download drag (no upload overlay)", async () => {
+    renderView(makeTransport());
+    const sharedColumn = await screen.findByRole("region", { name: /column \/shared/i });
+
+    // Dragging a file OUT carries our own path type alongside "Files".
+    fireEvent.dragOver(sharedColumn, {
+      dataTransfer: {
+        files: [],
+        types: ["Files", "application/x-ducktape-file-path"],
+        dropEffect: "none",
+      },
+    });
+
+    expect(screen.queryByRole("dialog", { name: /drop files to upload/i })).not.toBeInTheDocument();
   });
 
   it("marks file rows as draggable download sources", async () => {

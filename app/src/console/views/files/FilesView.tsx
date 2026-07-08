@@ -36,11 +36,6 @@ interface UploadState {
   total: number;
 }
 
-interface DragUploadState {
-  targetDir: string;
-  count: number;
-}
-
 interface ContextMenuState {
   x: number;
   y: number;
@@ -169,27 +164,11 @@ function HeaderButton({
   );
 }
 
-function UploadNotice({
-  upload,
-  dropTarget,
-}: {
-  upload: UploadState | null;
-  dropTarget: DragUploadState | null;
-}) {
-  if (!upload && !dropTarget) return null;
+function UploadNotice({ upload }: { upload: UploadState | null }) {
+  if (!upload) return null;
 
-  const progress = upload && upload.total > 0 ? Math.min(1, upload.staged / upload.total) : 0;
-  let detail: string;
-  if (upload) {
-    detail = `${upload.name} to ${upload.targetDir}`;
-  } else {
-    const target = dropTarget;
-    if (!target) return null;
-    detail =
-      target.count > 0
-        ? `Drop ${target.count} file${target.count === 1 ? "" : "s"} to ${target.targetDir}`
-        : `Drop files to ${target.targetDir}`;
-  }
+  const progress = upload.total > 0 ? Math.min(1, upload.staged / upload.total) : 0;
+  const detail = `${upload.name} to ${upload.targetDir}`;
 
   return (
     <div
@@ -227,7 +206,7 @@ function UploadNotice({
             flexShrink: 0,
           }}
         >
-          <Icon name={upload ? "refresh" : "plus"} size={16} strokeWidth={1.9} />
+          <Icon name="refresh" size={16} strokeWidth={1.9} />
         </span>
         <div style={{ minWidth: 0 }}>
           <div style={{ font: `700 14px ${font.sans}`, color: color.dark }}>Upload file</div>
@@ -245,31 +224,100 @@ function UploadNotice({
           </div>
         </div>
       </div>
-      {upload && (
-        <div style={{ marginTop: 12 }}>
+      <div style={{ marginTop: 12 }}>
+        <div
+          style={{
+            height: 6,
+            borderRadius: 999,
+            background: color.sunken,
+            overflow: "hidden",
+            border: `1px solid ${color.borderSoft}`,
+          }}
+        >
           <div
             style={{
-              height: 6,
+              width: upload.total > 0 ? `${progress * 100}%` : "28%",
+              height: "100%",
               borderRadius: 999,
-              background: color.sunken,
-              overflow: "hidden",
-              border: `1px solid ${color.borderSoft}`,
+              background: color.green,
             }}
-          >
-            <div
-              style={{
-                width: upload.total > 0 ? `${progress * 100}%` : "28%",
-                height: "100%",
-                borderRadius: 999,
-                background: color.green,
-              }}
-            />
-          </div>
-          <div style={{ marginTop: 6, font: `600 10.5px ${font.mono}`, color: color.muted2 }}>
-            {upload.total > 0 ? `chunk ${upload.staged}/${upload.total}` : "preparing upload"}
-          </div>
+          />
         </div>
-      )}
+        <div style={{ marginTop: 6, font: `600 10.5px ${font.mono}`, color: color.muted2 }}>
+          {upload.total > 0 ? `chunk ${upload.staged}/${upload.total}` : "preparing upload"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The prominent drop-zone shown over the whole file browser while an OS file
+ *  drag is in flight — the reaction that replaced the old flickery top hint.
+ *  Purely visual: `pointerEvents:none` lets the drag/drop bubble to the card's
+ *  own handlers (and stops a freshly-mounted overlay from firing spurious
+ *  dragenter/dragleave that would break the depth counter). */
+function UploadDropOverlay({ targetDir }: { targetDir: string }) {
+  return (
+    <div
+      role="dialog"
+      aria-label="Drop files to upload"
+      style={{
+        position: "absolute",
+        inset: 0,
+        zIndex: 60,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 24,
+        background: "rgba(38, 37, 31, 0.16)",
+        pointerEvents: "none",
+      }}
+    >
+      <div
+        style={{
+          boxSizing: "border-box",
+          width: "min(420px, 100%)",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          gap: 14,
+          padding: "34px 28px",
+          borderRadius: radius.lg,
+          border: `2px dashed ${color.green}`,
+          background: "rgba(255, 255, 255, 0.97)",
+          boxShadow: shadow.pop,
+          textAlign: "center",
+        }}
+      >
+        <span
+          style={{
+            width: 52,
+            height: 52,
+            borderRadius: radius.md,
+            border: `1px solid ${color.border}`,
+            background: "#eef5f0",
+            color: color.green,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="plus" size={24} strokeWidth={1.9} />
+        </span>
+        <div style={{ font: `700 16px ${font.sans}`, color: color.dark }}>Drop files to upload</div>
+        <div
+          style={{
+            font: `500 13px ${font.sans}`,
+            color: color.muted3,
+            maxWidth: "100%",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          Release to add them to {targetDir}
+        </div>
+      </div>
     </div>
   );
 }
@@ -410,9 +458,6 @@ function DirectoryColumnView({
   onLoadMore,
   onPrepareDownload,
   onFileDragStart,
-  onDragOverFiles,
-  onDragLeaveFiles,
-  onDropFiles,
 }: {
   column: DirectoryColumn;
   selectedPath: string | null;
@@ -425,9 +470,6 @@ function DirectoryColumnView({
   onLoadMore: (path: string) => void;
   onPrepareDownload: (entry: FileEntry) => void;
   onFileDragStart: (event: ReactDragEvent<HTMLButtonElement>, entry: FileEntry) => void;
-  onDragOverFiles: (event: ReactDragEvent<HTMLElement>, path: string) => void;
-  onDragLeaveFiles: (event: ReactDragEvent<HTMLElement>, path: string) => void;
-  onDropFiles: (event: ReactDragEvent<HTMLElement>, path: string) => void;
 }) {
   const rows = sortEntries(column.entries);
   const label = column.path === "/" ? "root" : basename(column.path);
@@ -437,9 +479,6 @@ function DirectoryColumnView({
       role="region"
       aria-label={`Column ${column.path}`}
       onContextMenu={(event) => onContextMenu(event, null)}
-      onDragOver={(event) => onDragOverFiles(event, column.path)}
-      onDragLeave={(event) => onDragLeaveFiles(event, column.path)}
-      onDrop={(event) => onDropFiles(event, column.path)}
       style={{
         width: 286,
         flex: "0 0 286px",
@@ -863,7 +902,9 @@ export function FilesView() {
   const dragDownloadUrls = useRef<Map<string, string>>(new Map());
   const dragDownloadFiles = useRef<Map<string, File>>(new Map());
   const dragDownloadRequests = useRef<Set<string>>(new Set());
-  const dragUploadClearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // dragenter/dragleave fire per descendant, so we count entry depth instead of
+  // toggling on each one — the overlay stays put as the pointer crosses columns.
+  const dragDepth = useRef(0);
 
   const [columns, setColumns] = useState<DirectoryColumn[]>([makeDirectoryColumn(DEFAULT_DIR)]);
   const [snapshot, setSnapshot] = useState<string | null>(null);
@@ -871,7 +912,7 @@ export function FilesView() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [selected, setSelected] = useState<FileEntry | null>(null);
   const [upload, setUpload] = useState<UploadState | null>(null);
-  const [dragUpload, setDragUpload] = useState<DragUploadState | null>(null);
+  const [dragActive, setDragActive] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
@@ -891,7 +932,6 @@ export function FilesView() {
 
   useEffect(
     () => () => {
-      if (dragUploadClearTimer.current) clearTimeout(dragUploadClearTimer.current);
       dragDownloadUrls.current.forEach((url) => URL.revokeObjectURL?.(url));
       dragDownloadUrls.current.clear();
       dragDownloadFiles.current.clear();
@@ -1077,48 +1117,48 @@ export function FilesView() {
     await uploadBrowserFiles([file], dir);
   };
 
-  const hasDroppedFiles = (event: ReactDragEvent<HTMLElement>): boolean =>
-    Array.from(event.dataTransfer.types ?? []).includes("Files") || event.dataTransfer.files.length > 0;
+  const canUpload = Boolean(transport) && !readOnly && backed;
 
-  const clearDragUploadTimer = () => {
-    if (!dragUploadClearTimer.current) return;
-    clearTimeout(dragUploadClearTimer.current);
-    dragUploadClearTimer.current = null;
+  // An inbound OS file drag. Internal file-download drags also expose "Files"
+  // (we add a File to the dataTransfer), so exclude anything carrying our own
+  // file-path type — dragging a file out must not trigger the upload overlay.
+  const isUploadDrag = (event: ReactDragEvent<HTMLElement>): boolean => {
+    const types = Array.from(event.dataTransfer?.types ?? []);
+    return types.includes("Files") && !types.includes("application/x-ducktape-file-path");
   };
 
-  const hideDragUploadSoon = (delay = 180) => {
-    clearDragUploadTimer();
-    dragUploadClearTimer.current = setTimeout(() => {
-      setDragUpload(null);
-      dragUploadClearTimer.current = null;
-    }, delay);
+  const handleZoneDragEnter = (event: ReactDragEvent<HTMLElement>) => {
+    if (!canUpload || !isUploadDrag(event)) return;
+    event.preventDefault();
+    dragDepth.current += 1;
+    setDragActive(true);
   };
 
-  const handleColumnDragOver = (event: ReactDragEvent<HTMLElement>, targetDir: string) => {
-    if (!transport || readOnly || !backed || !hasDroppedFiles(event)) return;
+  const handleZoneDragOver = (event: ReactDragEvent<HTMLElement>) => {
+    if (!canUpload || !isUploadDrag(event)) return;
+    // preventDefault marks this a valid drop target; without it the browser
+    // rejects the drop. Re-assert visibility in case dragenter was missed.
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    if (!dragActive) setDragActive(true);
+  };
+
+  const handleZoneDragLeave = (event: ReactDragEvent<HTMLElement>) => {
+    if (!isUploadDrag(event)) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragActive(false);
+  };
+
+  const handleZoneDrop = (event: ReactDragEvent<HTMLElement>) => {
+    if (!isUploadDrag(event)) return;
     event.preventDefault();
     event.stopPropagation();
-    event.dataTransfer.dropEffect = "copy";
-    clearDragUploadTimer();
-    setDragUpload({ targetDir: writeTargetDir(targetDir), count: event.dataTransfer.files.length });
-    hideDragUploadSoon(650);
-  };
-
-  const handleColumnDragLeave = (event: ReactDragEvent<HTMLElement>) => {
-    if (!hasDroppedFiles(event)) return;
-    const nextTarget = event.relatedTarget;
-    if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
-    hideDragUploadSoon();
-  };
-
-  const handleColumnDrop = (event: ReactDragEvent<HTMLElement>, targetDir: string) => {
-    if (!transport || readOnly || !backed || !hasDroppedFiles(event)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.dataTransfer.dropEffect = "copy";
-    clearDragUploadTimer();
-    setDragUpload(null);
-    void uploadBrowserFiles(Array.from(event.dataTransfer.files), targetDir);
+    dragDepth.current = 0;
+    setDragActive(false);
+    if (!canUpload) return;
+    const files = Array.from(event.dataTransfer.files ?? []);
+    if (files.length === 0) return;
+    void uploadBrowserFiles(files, dir);
   };
 
   const prepareDragDownload = (entry: FileEntry) => {
@@ -1277,6 +1317,10 @@ export function FilesView() {
         <div style={{ flex: 1, minWidth: 0, minHeight: 0, overflowY: "auto", padding: 18, background: color.sidebar }}>
           <div
             onContextMenu={(event) => openContextMenu(event, null)}
+            onDragEnter={handleZoneDragEnter}
+            onDragOver={handleZoneDragOver}
+            onDragLeave={handleZoneDragLeave}
+            onDrop={handleZoneDrop}
             style={{
               position: "relative",
               height: "100%",
@@ -1302,7 +1346,7 @@ export function FilesView() {
               />
             ) : (
               <>
-                <UploadNotice upload={upload} dropTarget={dragUpload} />
+                <UploadNotice upload={upload} />
                 {error && (
                   <div
                     style={{
@@ -1337,9 +1381,6 @@ export function FilesView() {
                       onLoadMore={loadMore}
                       onPrepareDownload={prepareDragDownload}
                       onFileDragStart={handleFileDragStart}
-                      onDragOverFiles={handleColumnDragOver}
-                      onDragLeaveFiles={handleColumnDragLeave}
-                      onDropFiles={handleColumnDrop}
                     />
                   ))}
                   {selected && transport && (
@@ -1356,6 +1397,7 @@ export function FilesView() {
                 </div>
               </>
             )}
+            {dragActive && <UploadDropOverlay targetDir={writeTargetDir(dir)} />}
           </div>
         </div>
 
