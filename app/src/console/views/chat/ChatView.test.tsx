@@ -62,6 +62,41 @@ const noopActions = {
   toggleReaction: vi.fn(),
 } as unknown as ConsoleActions;
 
+describe("ChatView channel rail", () => {
+  it("hides module-reserved channels (forge:* item threads) from the rail", () => {
+    const base = stateWithMessages([]);
+    render(
+      <ConsoleContext.Provider
+        value={{
+          state: {
+            ...base,
+            channels: [
+              ...base.channels,
+              {
+                id: "forge:ducktape:1",
+                name: "ducktape#1",
+                created_at: 2,
+                head_seq: 0,
+                post_policy: "open",
+                hooks: [],
+                pinned: [],
+              },
+            ],
+          },
+          actions: noopActions,
+        }}
+      >
+        <ChatView />
+      </ConsoleContext.Provider>,
+    );
+
+    // the user channel renders in the rail; the forge item's hidden discussion
+    // channel must not (its messages belong to the forge view).
+    expect(screen.getAllByText("general").length).toBeGreaterThan(0);
+    expect(screen.queryByText("ducktape#1")).not.toBeInTheDocument();
+  });
+});
+
 describe("ChatView layout", () => {
   it("keeps the message stream inset and confines long content to the chat column", () => {
     const longUrl = `https://example.test/${"very-long-segment".repeat(16)}`;

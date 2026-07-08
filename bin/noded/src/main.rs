@@ -209,7 +209,9 @@ fn run_node(
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the
         // pack bytes never enter consensus (root stays sha256(head oid)).
-        let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
+        let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
+            .expect("forge init")
+            .with_chat("chat");
         // the block loop's own handle: each block's root payload is staged as
         // its explorer row is built, so op hashes stay dereferencable via the
         // blob lane (worker follow-ups included — the http submit handler only

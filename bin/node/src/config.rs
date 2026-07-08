@@ -333,29 +333,43 @@ impl NetworkDescriptor {
     /// `Direct` hint (so a v2/legacy descriptor yields all-`Direct` hints with
     /// no data duplicated and no double-dial).
     pub fn reach_hints(&self) -> Result<Vec<ReachHint>, String> {
-        // the UNION of typed `reach` and `bootstrap`, keyed by expected pubkey:
-        // a typed reach hint wins over a bootstrap-synthesised Direct for the
-        // same member, but a member present only in `bootstrap` (e.g. a
-        // second-generation inviter that ran `add_bootstrap`) is never dropped.
-        // returning `reach` XOR `bootstrap` would silently lose that inviter's
-        // own dial hint from every re-issued invite.
-        let mut by_key: std::collections::BTreeMap<Vec<u8>, ReachHint> =
+        // the UNION of typed `reach` and legacy `bootstrap`: explicit typed
+        // hints win over bootstrap-synthesised Direct hints for the same
+        // member, but typed entries are a route set, not a per-key map. A
+        // node may need both a rendezvous route and a tunnel-overlay route for
+        // the same expected key.
+        let mut bootstrap_by_key: std::collections::BTreeMap<Vec<u8>, ReachHint> =
             std::collections::BTreeMap::new();
         for entry in &self.bootstrap {
             let (k, addr) = entry
                 .split_once('@')
                 .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
             let expected_key = decode_key(k)?;
-            by_key.insert(
+            bootstrap_by_key.insert(
                 expected_key.as_ref().to_vec(),
                 ReachHint { expected_key, reach: Reach::Direct(addr.to_string()) },
             );
         }
+        let mut typed = Vec::new();
+        let mut typed_keys = std::collections::BTreeSet::new();
         for s in &self.reach {
             let hint = ReachHint::parse(s)?;
-            by_key.insert(hint.expected_key.as_ref().to_vec(), hint);
+            // only a typed DIRECT/FRONTED route supersedes a bootstrap-
+            // synthesised Direct for the same key (the member's dial address
+            // moved/upgraded). a Coordinated route is an ADDITIONAL rendezvous
+            // path, not a replacement — it must not erase a real direct dial
+            // hint, or a founder that advertises a public address AND enables a
+            // coordinator would ship coordinator-only reach and lose its direct
+            // fallback (terminal once a punch fails, since there is no relay).
+            if matches!(hint.reach, Reach::Direct(_) | Reach::Fronted(_)) {
+                typed_keys.insert(hint.expected_key.as_ref().to_vec());
+            }
+            typed.push(hint);
         }
-        Ok(by_key.into_values().collect())
+        bootstrap_by_key.retain(|k, _| !typed_keys.contains(k));
+        let mut out: Vec<_> = bootstrap_by_key.into_values().chain(typed).collect();
+        out.sort_by_key(|h| h.to_canonical());
+        Ok(out)
     }
 
     /// record a reach hint for a member, replacing any previous hint for the
@@ -370,6 +384,17 @@ impl NetworkDescriptor {
         });
         self.reach.push(hint.to_canonical());
         self.reach.sort();
+    }
+
+    /// record one explicit typed reach route without collapsing other typed
+    /// routes for the same expected key. Use this when the descriptor needs a
+    /// real route set, such as rendezvous plus a tunnel-overlay ingress.
+    pub fn add_reach_route(&mut self, hint: &ReachHint) {
+        let canonical = hint.to_canonical();
+        if !self.reach.contains(&canonical) {
+            self.reach.push(canonical);
+            self.reach.sort();
+        }
     }
 
     /// reach hints resolved to typed dial routes, hostname-native: `Direct`/
@@ -407,6 +432,33 @@ pub enum Coordination {
     Private,
 }
 
+/// Shared public rendezvous coordinator used when a network is created without
+/// an explicit direct-only override.
+pub const DEFAULT_PRIMARY_COORDINATOR: &str = "p2p.ducktape.byeongsu.dev:3478";
+
+/// The typed invite format still carries a coordinator key, but the deployed
+/// coordinator is intentionally keyless. Keep one stable valid key in the
+/// signed envelope until coordinator response signing exists.
+pub fn keyless_coordinator_placeholder_key() -> ed25519::PublicKey {
+    ed25519::PrivateKey::from_seed(0).public_key()
+}
+
+/// Resolve the primary coordinator option. `None` means "use the product
+/// default"; `"none"`/`"off"` keeps the old direct-only posture.
+pub fn primary_coordinator_or_default(raw: Option<&str>) -> Result<Option<String>, String> {
+    let coord = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_PRIMARY_COORDINATOR);
+    if matches!(coord, "none" | "off" | "direct") {
+        return Ok(None);
+    }
+    match ingress_of(coord)? {
+        Some(_) => Ok(Some(coord.to_string())),
+        None => Err(format!("primary coordinator {coord:?} is not dialable")),
+    }
+}
+
 impl NetworkDescriptor {
     pub fn coordination(&self) -> Coordination {
         match self.coordination.as_deref() {
@@ -414,6 +466,39 @@ impl NetworkDescriptor {
             _ => Coordination::Private,
         }
     }
+
+    /// Make `key` reachable through the configured public coordinator. This is
+    /// advisory reachability state, not part of the genesis fingerprint.
+    pub fn apply_primary_coordinator(
+        &mut self,
+        key: &ed25519::PublicKey,
+        coord_addr: &str,
+    ) -> Result<(), String> {
+        let coord_addr = primary_coordinator_or_default(Some(coord_addr))?
+            .ok_or("primary coordinator cannot be disabled here")?;
+        self.coordination = Some("public".into());
+        self.add_reach(&ReachHint {
+            expected_key: key.clone(),
+            reach: Reach::Coordinated(CoordRef {
+                coord_addr,
+                coord_key: keyless_coordinator_placeholder_key(),
+            }),
+        });
+        Ok(())
+    }
+
+    pub fn has_coordinated_reach(&self) -> Result<bool, String> {
+        Ok(self
+            .reach_hints()?
+            .iter()
+            .any(|h| matches!(h.reach, Reach::Coordinated(_))))
+    }
+}
+
+/// Joining through coordinated reach needs the local reachability plane even
+/// when the invite does not contain a direct inviter-hosted tunnel bootstrap.
+pub fn invite_requires_reachability_defaults(invite: &Invite) -> bool {
+    invite.wireguard.is_some() || invite.descriptor.has_coordinated_reach().unwrap_or(false)
 }
 
 /// a reach hint resolved to how the mesh actually reaches a member. `Direct`
@@ -532,10 +617,14 @@ pub struct StoredInviteWireGuard {
     pub issuer: String,
     /// the inviter's X25519 WireGuard public key, hex.
     pub public_key: String,
-    /// the inviter's underlay WireGuard UDP endpoint, `host:port`.
-    pub endpoint: String,
-    /// the inviter's underlay UDP intro endpoint, `host:port`.
-    pub intro: String,
+    /// the inviter's underlay WireGuard UDP endpoint, `host:port`. Absent for
+    /// coordinated invites, where the endpoint is resolved through the
+    /// rendezvous coordinator at run time.
+    pub endpoint: Option<String>,
+    /// the inviter's underlay UDP intro endpoint, `host:port`. Absent for
+    /// coordinated invites; the intro rides the shared WireGuard underlay
+    /// socket after rendezvous.
+    pub intro: Option<String>,
     /// the inviter's control-mesh listen port on the overlay.
     pub mesh_port: u16,
 }
@@ -867,10 +956,13 @@ const INVITE_B64: base64::engine::GeneralPurpose = base64::engine::general_purpo
 pub struct InviteWireGuard {
     /// the inviter's X25519 WireGuard public key, raw.
     pub public_key: [u8; 32],
-    /// the inviter's underlay WireGuard UDP endpoint, `host:port`.
-    pub endpoint: String,
-    /// the inviter's underlay UDP intro endpoint, `host:port`.
-    pub intro: String,
+    /// the inviter's underlay WireGuard UDP endpoint, `host:port`. `None`
+    /// means the invite uses coordinated rendezvous instead of baking in a
+    /// direct endpoint.
+    pub endpoint: Option<String>,
+    /// the inviter's underlay UDP intro endpoint, `host:port`. `None` means
+    /// the intro is sent over the coordinated WireGuard underlay socket.
+    pub intro: Option<String>,
     /// the inviter's control-mesh listen port, dialed at its overlay ULA.
     pub mesh_port: u16,
 }
@@ -1031,13 +1123,19 @@ fn pack_invite(
     }
 
     match wireguard {
-        Some(wg) => {
+        Some(wg) if wg.endpoint.is_some() && wg.intro.is_some() => {
             out.push(1);
             out.extend_from_slice(&wg.public_key);
-            put_str_u8(&mut out, &wg.endpoint)?;
-            put_str_u8(&mut out, &wg.intro)?;
+            put_str_u8(&mut out, wg.endpoint.as_ref().expect("checked"))?;
+            put_str_u8(&mut out, wg.intro.as_ref().expect("checked"))?;
             out.extend_from_slice(&wg.mesh_port.to_le_bytes());
         }
+        Some(wg) if wg.endpoint.is_none() && wg.intro.is_none() => {
+            out.push(2);
+            out.extend_from_slice(&wg.public_key);
+            out.extend_from_slice(&wg.mesh_port.to_le_bytes());
+        }
+        Some(_) => return Err("wireguard invite must carry both endpoint and intro, or neither".into()),
         None => out.push(0),
     }
 
@@ -1132,8 +1230,19 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
             let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
             Some(InviteWireGuard {
                 public_key,
-                endpoint,
-                intro,
+                endpoint: Some(endpoint),
+                intro: Some(intro),
+                mesh_port,
+            })
+        }
+        2 => {
+            let mut public_key = [0u8; 32];
+            public_key.copy_from_slice(r.take(32)?);
+            let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
+            Some(InviteWireGuard {
+                public_key,
+                endpoint: None,
+                intro: None,
                 mesh_port,
             })
         }
@@ -1348,12 +1457,16 @@ pub struct Plumbing {
     /// merged from an existing file only (no flag); a WireGuard join seeds a
     /// default AFTER the merge when the invite carries a tunnel bootstrap.
     pub wireguard_listen: Option<String>,
+    /// merged from explicit flags or existing file; defaults from
+    /// `wireguard_listen` when absent.
+    pub invite_listen: Option<String>,
     /// merged like the rest — a hand-set value survives; the desktop app
     /// passes "socket" here (overlay-net ADR phase 4) while the parse
     /// default for a file without the key stays `tun`.
     pub wireguard_effect: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn merged_plumbing(
     dir: &Path,
     listen: Option<&str>,
@@ -1361,6 +1474,8 @@ pub fn merged_plumbing(
     http_listen: Option<&str>,
     rpc_listen: Option<&str>,
     wireguard_effect: Option<&str>,
+    wireguard_listen: Option<&str>,
+    invite_listen: Option<&str>,
 ) -> Result<Plumbing, String> {
     let path = dir.join("node.toml");
     let existing: Option<NodeToml> = if path.exists() {
@@ -1389,7 +1504,12 @@ pub fn merged_plumbing(
         storage_dir: e
             .and_then(|r| r.storage_dir.clone())
             .unwrap_or_else(|| "storage".into()),
-        wireguard_listen: e.and_then(|r| r.wireguard_listen.clone()),
+        wireguard_listen: wireguard_listen
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.wireguard_listen.clone())),
+        invite_listen: invite_listen
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.invite_listen.clone())),
         wireguard_effect: wireguard_effect
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.wireguard_effect.clone())),
@@ -1418,6 +1538,9 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     }
     if let Some(w) = &p.wireguard_listen {
         s += &format!("wireguard_listen = \"{w}\"\n");
+    }
+    if let Some(i) = &p.invite_listen {
+        s += &format!("invite_listen = \"{i}\"\n");
     }
     if let Some(w) = &p.wireguard_effect {
         s += &format!("wireguard_effect = \"{w}\"\n");
@@ -2023,6 +2146,64 @@ mod tests {
     }
 
     #[test]
+    fn primary_coordinator_defaults_to_deployed_public_rendezvous() {
+        let coord = primary_coordinator_or_default(None).expect("default coordinator");
+        assert_eq!(coord.as_deref(), Some("p2p.ducktape.byeongsu.dev:3478"));
+
+        let disabled = primary_coordinator_or_default(Some("none")).expect("disabled");
+        assert_eq!(disabled, None);
+    }
+
+    #[test]
+    fn apply_primary_coordinator_records_public_coordinated_self_hint() {
+        let me = ed25519::PrivateKey::from_seed(7).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+
+        d.apply_primary_coordinator(&me, "p2p.ducktape.byeongsu.dev:3478")
+            .expect("coordinator hint");
+
+        assert_eq!(d.coordination(), Coordination::Public);
+        let hints = d.reach_hints().expect("hints");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].expected_key, me);
+        match &hints[0].reach {
+            Reach::Coordinated(coord) => {
+                assert_eq!(coord.coord_addr, "p2p.ducktape.byeongsu.dev:3478");
+                assert_eq!(coord.coord_key, keyless_coordinator_placeholder_key());
+            }
+            other => panic!("expected coordinated reach hint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coordinated_invite_needs_reachability_defaults_without_tunnel_bootstrap() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let mut d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.apply_primary_coordinator(&issuer.public_key(), "p2p.ducktape.byeongsu.dev:3478")
+            .expect("coordinator hint");
+        let invite = decode_invite(&encode_test_invite(&d, &issuer, None)).expect("decode");
+
+        assert!(
+            invite_requires_reachability_defaults(&invite),
+            "a coordinated invite must start the joiner's reachability plane even without a direct tunnel bootstrap"
+        );
+    }
+
+    #[test]
     fn identity_roundtrips_and_reuses() {
         let dir = tmp("identity");
         let path = dir.join("identity.key");
@@ -2235,8 +2416,8 @@ mod tests {
         };
         let wg = InviteWireGuard {
             public_key: [42u8; 32],
-            endpoint: "203.0.113.7:51820".into(),
-            intro: "203.0.113.7:51821".into(),
+            endpoint: Some("203.0.113.7:51820".into()),
+            intro: Some("203.0.113.7:51821".into()),
             mesh_port: 52200,
         };
         let invite = decode_invite(&encode_test_invite(&d, &issuer, Some(&wg))).expect("decode");
@@ -3053,8 +3234,17 @@ mod tests {
         .expect("write");
         // one flag overrides ONLY its field; the http port AND a hand-edited
         // storage_dir survive.
-        let p = merged_plumbing(&dir, Some("127.0.0.1:53000"), None, None, None, None)
-            .expect("merge");
+        let p = merged_plumbing(
+            &dir,
+            Some("127.0.0.1:53000"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
         assert_eq!(p.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(p.storage_dir, "/data/ducktape");
@@ -3072,20 +3262,24 @@ mod tests {
     fn plumbing_wireguard_effect_flag_wins_absence_preserves_and_typos_abort() {
         let dir = tmp("plumbing-wg-effect");
         // fresh dir + flag (the desktop app's init/join): written to disk.
-        let p = merged_plumbing(&dir, None, None, None, None, Some("socket")).expect("merge");
+        let p =
+            merged_plumbing(&dir, None, None, None, None, Some("socket"), None, None)
+                .expect("merge");
         assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
         write_node_toml(&dir, &p).expect("write");
 
         // no flag: the hand-settable value on disk survives a re-merge.
-        let p = merged_plumbing(&dir, None, None, None, None, None).expect("re-merge");
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None)
+            .expect("re-merge");
         assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
 
         // the flag wins over the file (merged_plumbing's standing precedence).
-        let p = merged_plumbing(&dir, None, None, None, None, Some("tun")).expect("override");
+        let p = merged_plumbing(&dir, None, None, None, None, Some("tun"), None, None)
+            .expect("override");
         assert_eq!(p.wireguard_effect.as_deref(), Some("tun"));
 
         // a typo aborts the verb before anything is written.
-        let err = merged_plumbing(&dir, None, None, None, None, Some("sokcet"))
+        let err = merged_plumbing(&dir, None, None, None, None, Some("sokcet"), None, None)
             .err()
             .expect("a bad effect value must abort the merge");
         assert!(err.contains("wireguard_effect"), "{err}");
@@ -3301,6 +3495,101 @@ bootstrapper_addr = "127.0.0.1:52200"
         let mut sorted = d.reach.clone();
         sorted.sort();
         assert_eq!(d.reach, sorted);
+    }
+
+    #[test]
+    fn add_reach_route_keeps_coordinated_and_overlay_routes_for_same_key() {
+        let a = ed25519::PrivateKey::from_seed(25).public_key();
+        let coord = ed25519::PrivateKey::from_seed(26).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "r#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_reach(&ReachHint {
+            expected_key: a.clone(),
+            reach: Reach::Coordinated(CoordRef {
+                coord_addr: "127.0.0.1:3478".into(),
+                coord_key: coord,
+            }),
+        });
+        d.add_reach_route(&ReachHint {
+            expected_key: a.clone(),
+            reach: Reach::Direct("[fd87::1]:52200".into()),
+        });
+
+        let hints = d.reach_hints().expect("hints");
+        assert_eq!(hints.len(), 2);
+        assert!(hints.iter().any(|h| matches!(h.reach, Reach::Coordinated(_))));
+        assert!(hints.iter().any(|h| matches!(h.reach, Reach::Direct(_))));
+
+        let entries = d.reach_entries().expect("entries");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|(_, r)| matches!(r, ReachDial::Coordinated { .. })));
+        assert!(entries.iter().any(|(_, r)| matches!(r, ReachDial::Direct(_))));
+    }
+
+    #[test]
+    fn a_coordinated_hint_does_not_suppress_a_founders_direct_bootstrap_route() {
+        // a founder that advertises a real dial address AND enables a
+        // coordinator must keep BOTH: the direct bootstrap route (punch-free
+        // first choice) and the coordinated rendezvous route. a Coordinated
+        // typed hint must not erase the bootstrap-synthesised Direct for the
+        // same key — otherwise every invite ships coordinator-only reach and a
+        // failed punch is terminal (no relay fallback).
+        let me = ed25519::PrivateKey::from_seed(41).public_key();
+        let coord = ed25519::PrivateKey::from_seed(42).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "fp#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_bootstrap(&me, "203.0.113.7:52200");
+        d.add_reach(&ReachHint {
+            expected_key: me.clone(),
+            reach: Reach::Coordinated(CoordRef {
+                coord_addr: "127.0.0.1:3478".into(),
+                coord_key: coord,
+            }),
+        });
+
+        let hints = d.reach_hints().expect("hints");
+        assert_eq!(
+            hints.len(),
+            2,
+            "the direct bootstrap route must survive alongside the coordinated hint"
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|h| matches!(&h.reach, Reach::Direct(a) if a == "203.0.113.7:52200")),
+            "the founder's advertised direct route was dropped"
+        );
+        assert!(hints.iter().any(|h| matches!(h.reach, Reach::Coordinated(_))));
+
+        // a typed DIRECT hint for the same key still supersedes the bootstrap
+        // Direct (the member's dial address moved) — no stale duplicate.
+        d.add_reach_route(&ReachHint {
+            expected_key: me.clone(),
+            reach: Reach::Direct("[fd87::2]:52200".into()),
+        });
+        let hints = d.reach_hints().expect("hints");
+        let directs: Vec<_> = hints
+            .iter()
+            .filter(|h| matches!(h.reach, Reach::Direct(_)))
+            .collect();
+        assert_eq!(
+            directs.len(),
+            1,
+            "a typed Direct supersedes the bootstrap Direct for the same key"
+        );
+        assert!(matches!(&directs[0].reach, Reach::Direct(a) if a == "[fd87::2]:52200"));
     }
 
     #[test]

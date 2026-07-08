@@ -1,7 +1,7 @@
 //! module-level behavior of the chat store: origin-derived authorship,
 //! per-channel monotonic sequences, threads, edits/revisions, tombstones,
-//! reactions, membership policy, hooks, pagination, write-time caps, and
-//! two-instance determinism.
+//! reactions, membership policy, hooks, pagination, write-time caps, the
+//! reserved `:` channel-id namespace, and two-instance determinism.
 
 use chat::Chat;
 use chat::{
@@ -1751,5 +1751,109 @@ fn sweep_huddle_rejects_module_origin() {
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("external users"));
+    });
+}
+
+#[test]
+fn external_users_cannot_create_reserved_colon_channel_ids() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+
+        // ':' anywhere in the id is the module namespace — squatting rejected.
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(10, user(1)),
+                &module_msg(create_channel("forge:demo:1")),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("reserved for modules"));
+
+        // plain user channel ids keep working.
+        module
+            .execute(
+                &mut TestCtx::with_origin(11, user(1)),
+                &module_msg(create_channel("general")),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("user channel must exist");
+        };
+        assert_eq!(channel.id, "general");
+    });
+}
+
+#[test]
+fn module_channels_must_use_the_modules_own_prefix() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = Chat::init(context, "chat").await;
+
+        // forge minting under its own namespace is the supported shape.
+        module
+            .execute(
+                &mut TestCtx::with_origin(10, Origin::Module("forge".into())),
+                &module_msg(create_channel("forge:demo:1")),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "forge:demo:1".into(),
+            },
+        )
+        .await
+        else {
+            panic!("module channel must exist");
+        };
+        assert_eq!(channel.id, "forge:demo:1");
+
+        // another module cannot mint inside forge's namespace...
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(11, Origin::Module("agent".into())),
+                &module_msg(create_channel("forge:demo:2")),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("prefixed 'agent:'"));
+
+        // ...a module cannot mint an unprefixed id in the user plane...
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(12, Origin::Module("forge".into())),
+                &module_msg(create_channel("announcements")),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("prefixed 'forge:'"));
+
+        // ...and a shared string prefix is not the namespace: the colon must
+        // immediately follow the module's own id.
+        let err = module
+            .execute(
+                &mut TestCtx::with_origin(13, Origin::Module("forge".into())),
+                &module_msg(create_channel("forgery:demo:1")),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("prefixed 'forge:'"));
+
+        // system origin stays unrestricted (genesis/system-internal writes).
+        module
+            .execute(&mut TestCtx::at(14), &module_msg(create_channel("sys:ops")))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
     });
 }

@@ -68,7 +68,9 @@ fn oid_hex(raw: &[u8]) -> String {
     git2::Oid::from_bytes(raw).unwrap().to_string()
 }
 
-/// parse forge's multi-repo snapshot container into `(name, head_oid, pack)`.
+/// parse forge's multi-branch snapshot container into `(name, main_oid, pack)`
+/// (per repo: name, ref_count, per-ref branch+oid, pack; trailing tracker
+/// section ignored here).
 fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     fn u32_at(bytes: &[u8], p: &mut usize) -> usize {
         let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap()) as usize;
@@ -82,12 +84,22 @@ fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
         let nl = u32_at(bytes, &mut p);
         let name = String::from_utf8(bytes[p..p + nl].to_vec()).unwrap();
         p += nl;
-        let oid = bytes[p..p + OID_LEN].to_vec();
-        p += OID_LEN;
+        let ref_count = u32_at(bytes, &mut p);
+        let mut main_oid = Vec::new();
+        for _ in 0..ref_count {
+            let bl = u32_at(bytes, &mut p);
+            let branch = String::from_utf8(bytes[p..p + bl].to_vec()).unwrap();
+            p += bl;
+            let oid = bytes[p..p + OID_LEN].to_vec();
+            p += OID_LEN;
+            if branch == "main" {
+                main_oid = oid;
+            }
+        }
         let pl = u32_at(bytes, &mut p);
         let pack = bytes[p..p + pl].to_vec();
         p += pl;
-        out.push((name, oid, pack));
+        out.push((name, main_oid, pack));
     }
     out
 }

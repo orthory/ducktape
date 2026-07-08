@@ -50,11 +50,15 @@ fn main() {
             user_identity::user_sign_bind,
             user_identity::user_sign_unbind,
             forge_git::forge_list_repos,
+            forge_git::forge_list_branches,
             forge_git::forge_head,
             forge_git::forge_log,
             forge_git::forge_tree,
             forge_git::forge_read_file,
+            forge_git::forge_read_file_page,
             forge_git::forge_diff,
+            forge_git::forge_compare,
+            forge_git::forge_build_merge,
             tray::tray_open_console,
             tray::tray_quit,
             huddle::huddle_pop_out,
@@ -86,10 +90,10 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
     app.run(|app, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
-            if let Err(err) = workspaces::stop_active_workspace_node(app) {
-                eprintln!("app exit: could not stop active workspace node: {err}");
-            }
+        if let tauri::RunEvent::ExitRequested { .. } = event
+            && let Err(err) = workspaces::stop_active_workspace_node(app)
+        {
+            eprintln!("app exit: could not stop active workspace node: {err}");
         }
     });
 }

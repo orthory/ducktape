@@ -9,6 +9,7 @@ import {
   blocksText,
   channels,
   createChannel,
+  isModuleChannel,
   joinHuddle,
   keyBytes,
   keyHex,
@@ -203,6 +204,15 @@ describe("chat queries", () => {
     await expect(latestMessages(transport, "general")).rejects.toThrow(
       "unexpected module reply: wanted messages",
     );
+  });
+});
+
+describe("isModuleChannel", () => {
+  it("reserves ':' ids for modules and passes user ids through", () => {
+    expect(isModuleChannel("forge:ducktape:1")).toBe(true);
+    expect(isModuleChannel("forge:my-repo:42")).toBe(true);
+    expect(isModuleChannel("general")).toBe(false);
+    expect(isModuleChannel("release-2026")).toBe(false);
   });
 });
 

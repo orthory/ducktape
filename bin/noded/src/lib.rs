@@ -1360,9 +1360,9 @@ const GIT_PACK_BODY_LIMIT: usize = 512 * 1024 * 1024;
 /// id, plus the 4-byte pkt length header, this yields a 65520-byte line — git's
 /// `LARGE_PACKET_MAX`, the ceiling a side-band-64k client accepts.
 const GIT_SIDE_BAND_CHUNK: usize = 65515;
-/// the only ref this MVP applies a push to; multi-branch is future work. both
-/// `git push <remote> main` and `git push <remote> HEAD:main` send this ref.
-const GIT_MAIN_REF: &str = "refs/heads/main";
+/// the ref namespace pushes may touch: any branch. a command outside
+/// `refs/heads/*` (tags, notes) is refused with a per-ref `ng`.
+const GIT_HEADS_PREFIX: &str = "refs/heads/";
 /// 40 ascii zeros: git's "null" oid — the old value of a ref being created, and
 /// the head advertised for an unborn repo.
 const GIT_ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -1438,10 +1438,10 @@ fn norm_repo(repo: &str) -> Option<String> {
         .then(|| repo.to_string())
 }
 
-/// query the forge module for a repo's committed HEAD oid hex (`None` == unborn).
+/// query the forge module for a repo's committed branches (`[]` == unborn).
 /// errors surface as an http `Response` so callers can early-return them.
-async fn forge_head(handle: &NodeHandle, repo: &str) -> Result<Option<String>, Response> {
-    let req = forge::encode_query(&forge::ForgeQuery::HeadOf {
+async fn forge_refs(handle: &NodeHandle, repo: &str) -> Result<Vec<forge::RefHead>, Response> {
+    let req = forge::encode_query(&forge::ForgeQuery::ListRefs {
         repo: repo.to_string(),
     });
     let (reply, rx) = oneshot::channel();
@@ -1457,27 +1457,30 @@ async fn forge_head(handle: &NodeHandle, repo: &str) -> Result<Option<String>, R
         .map_err(|_| actor_gone())?
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, &err))?;
     match forge::decode_reply(&bytes) {
-        Ok(forge::ForgeReply::Head(head)) => Ok(head),
+        Ok(forge::ForgeReply::Refs(refs)) => Ok(refs),
         Ok(_) => Err(error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "unexpected forge reply to HeadOf",
+            "unexpected forge reply to ListRefs",
         )),
         Err(err) => Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, &err)),
     }
 }
 
-/// build a receive-pack `report-status` body: `unpack ok`, one ref status line,
-/// then a flush. `err` is `None` for success (`ok <ref>`) or `Some(reason)` for
-/// a rejection (`ng <ref> <reason>`). the pack is always received by the time we
-/// answer, so `unpack ok` is unconditional (we don't verify closure here).
-fn git_report_status(refname: &str, err: Option<&str>) -> Response {
+/// build a receive-pack `report-status` body: `unpack ok`, one status line per
+/// ref, then a flush. each entry is `(full refname, None == ok | Some(reason)
+/// == ng)`. forge's PushRefs is ATOMIC, so callers report one shared fate for
+/// every ref of a push. the pack is always received by the time we answer, so
+/// `unpack ok` is unconditional (we don't verify closure here).
+fn git_report_status(results: &[(String, Option<String>)]) -> Response {
     let mut body = Vec::new();
     body.extend_from_slice(&pkt_line(b"unpack ok\n"));
-    let status_line = match err {
-        None => format!("ok {refname}\n"),
-        Some(reason) => format!("ng {refname} {reason}\n"),
-    };
-    body.extend_from_slice(&pkt_line(status_line.as_bytes()));
+    for (refname, err) in results {
+        let status_line = match err {
+            None => format!("ok {refname}\n"),
+            Some(reason) => format!("ng {refname} {reason}\n"),
+        };
+        body.extend_from_slice(&pkt_line(status_line.as_bytes()));
+    }
     body.extend_from_slice(GIT_FLUSH_PKT);
     (
         StatusCode::OK,
@@ -1560,13 +1563,13 @@ async fn git_info_refs(
 /// build the smart-HTTP ref advertisement for `service`: the service banner, a
 /// flush, the ref line(s), then a flush. an unborn repo advertises the null oid
 /// against the magic `capabilities^{}` ref (so caps ride along with no real ref)
-/// — a clone then reports an empty repository. a born repo advertises its head
-/// against refs/heads/main with caps after a NUL; a fetch advertisement ALSO
-/// emits a `HEAD` line at the same oid so `git clone` resolves the branch to
-/// check out (git matches HEAD's oid to refs/heads/main).
+/// — a clone then reports an empty repository. a born repo advertises EVERY
+/// committed branch; a fetch advertisement leads with a `HEAD` line at main's
+/// oid so `git clone` resolves the default branch to check out. capabilities
+/// ride the first emitted line after a NUL, per the v0 protocol.
 async fn git_advertise_refs(handle: &NodeHandle, repo: &str, service: GitService) -> Response {
-    let head = match forge_head(handle, repo).await {
-        Ok(head) => head,
+    let refs = match forge_refs(handle, repo).await {
+        Ok(refs) => refs,
         Err(resp) => return resp,
     };
     let caps = service.caps();
@@ -1576,19 +1579,26 @@ async fn git_advertise_refs(handle: &NodeHandle, repo: &str, service: GitService
         format!("# service={}\n", service.name()).as_bytes(),
     ));
     body.extend_from_slice(GIT_FLUSH_PKT);
-    match head {
-        Some(oid) => {
-            body.extend_from_slice(&pkt_line(
-                format!("{oid} {GIT_MAIN_REF}\0{caps}\n").as_bytes(),
-            ));
-            if matches!(service, GitService::Upload) {
-                body.extend_from_slice(&pkt_line(format!("{oid} HEAD\n").as_bytes()));
-            }
+    if refs.is_empty() {
+        body.extend_from_slice(&pkt_line(
+            format!("{GIT_ZERO_OID} capabilities^{{}}\0{caps}\n").as_bytes(),
+        ));
+    } else {
+        let mut lines: Vec<String> = Vec::new();
+        if matches!(service, GitService::Upload)
+            && let Some(main) = refs.iter().find(|r| r.name == "main")
+        {
+            lines.push(format!("{} HEAD", main.head));
         }
-        None => {
-            body.extend_from_slice(&pkt_line(
-                format!("{GIT_ZERO_OID} capabilities^{{}}\0{caps}\n").as_bytes(),
-            ));
+        for r in &refs {
+            lines.push(format!("{} {GIT_HEADS_PREFIX}{}", r.head, r.name));
+        }
+        for (i, line) in lines.iter().enumerate() {
+            if i == 0 {
+                body.extend_from_slice(&pkt_line(format!("{line}\0{caps}\n").as_bytes()));
+            } else {
+                body.extend_from_slice(&pkt_line(format!("{line}\n").as_bytes()));
+            }
         }
     }
     body.extend_from_slice(GIT_FLUSH_PKT);
@@ -1624,8 +1634,9 @@ fn decode_git_body(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> 
 
 /// POST /forge/{repo}/git-receive-pack — receive a push: parse the ref-update
 /// command list + packfile, stash the whole pack in the node-local blob store,
-/// and CAS the repo head through forge's `Push` op (one submit == one block).
-/// the response is a git `report-status` reflecting whether the CAS committed.
+/// and CAS every branch through ONE atomic forge `PushRefs` op (one submit ==
+/// one block). branch deletions (`:feature`) ride the same op pack-free. the
+/// response is a git `report-status` reflecting the push's shared fate.
 async fn git_receive_pack(
     State(handle): State<NodeHandle>,
     Path(repo): Path<String>,
@@ -1655,7 +1666,7 @@ async fn git_receive_pack(
             );
         }
     };
-    let Some(first) = commands.first() else {
+    if commands.is_empty() {
         // a push whose pack exceeds git's `http.postBuffer` (1 MiB default) is
         // preceded by a flush-only PROBE POST (Content-Length: 4, body `0000`,
         // zero commands) before git streams the real chunked request. an empty
@@ -1674,49 +1685,77 @@ async fn git_receive_pack(
             GIT_FLUSH_PKT.to_vec(),
         )
             .into_response();
-    };
-
-    // the first command carries the ref update, with capabilities after a NUL.
-    // strip the caps (from the first NUL on) and any trailing newline.
-    let nul = first.iter().position(|&b| b == 0).unwrap_or(first.len());
-    let line = std::str::from_utf8(&first[..nul])
-        .map(str::trim_end)
-        .unwrap_or("");
-    let mut parts = line.split(' ');
-    let (Some(old), Some(new), Some(refname)) = (parts.next(), parts.next(), parts.next()) else {
-        return error_response(StatusCode::BAD_REQUEST, "malformed ref-update command");
-    };
-
-    if refname != GIT_MAIN_REF {
-        // consume-and-refuse: the pack was fully received; we just don't apply
-        // it. reporting `ng` (not an http error) lets git print a clean reason.
-        return git_report_status(refname, Some(&format!("only {GIT_MAIN_REF} is supported")));
     }
 
-    // old == the null oid means "create" (unborn -> prev_oid None); otherwise it
-    // is the 40-hex prev the forge CAS must match. new is always a real oid.
-    let prev_oid = if old == GIT_ZERO_OID {
-        None
+    // each command line is `<old> <new> <refname>`, with capabilities after a
+    // NUL on the FIRST line. parse every command — one push may update several
+    // branches, and forge applies them ATOMICALLY.
+    let mut cmds: Vec<(String, String, String)> = Vec::new();
+    for raw in &commands {
+        let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let line = std::str::from_utf8(&raw[..nul])
+            .map(str::trim_end)
+            .unwrap_or("");
+        let mut parts = line.split(' ');
+        let (Some(old), Some(new), Some(refname)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return error_response(StatusCode::BAD_REQUEST, "malformed ref-update command");
+        };
+        cmds.push((old.to_string(), new.to_string(), refname.to_string()));
+    }
+
+    // only branches are pushable (no tags/notes). consume-and-refuse: the pack
+    // was fully received; reporting `ng` (not an http error) lets git print a
+    // clean per-ref reason.
+    if cmds.iter().any(|(_, _, r)| !r.starts_with(GIT_HEADS_PREFIX)) {
+        let results: Vec<(String, Option<String>)> = cmds
+            .into_iter()
+            .map(|(_, _, r)| (r, Some(format!("only {GIT_HEADS_PREFIX}* is supported"))))
+            .collect();
+        return git_report_status(&results);
+    }
+
+    // old/new == the null oid mean "create" (prev_oid None) / "delete" (new_oid
+    // None); otherwise 40-hex oids the forge per-branch CAS must match.
+    let mut updates = Vec::new();
+    for (old, new, refname) in &cmds {
+        let prev_oid = if old == GIT_ZERO_OID {
+            None
+        } else {
+            match hex_to_bytes(old).filter(|b| b.len() == GIT_OID_RAW_LEN) {
+                Some(bytes) => Some(bytes),
+                None => return error_response(StatusCode::BAD_REQUEST, "malformed old oid"),
+            }
+        };
+        let new_oid = if new == GIT_ZERO_OID {
+            None
+        } else {
+            match hex_to_bytes(new).filter(|b| b.len() == GIT_OID_RAW_LEN) {
+                Some(bytes) => Some(bytes),
+                None => return error_response(StatusCode::BAD_REQUEST, "malformed new oid"),
+            }
+        };
+        updates.push(forge::RefUpdate {
+            ref_name: refname[GIT_HEADS_PREFIX.len()..].to_string(),
+            prev_oid,
+            new_oid,
+        });
+    }
+
+    // stash the WHOLE packfile as one node-local blob, keyed by its sha256;
+    // forge materializes it by this digest (the bytes never cross consensus).
+    // a delete-only push carries no objects, so nothing is stashed.
+    let pack_digest = if updates.iter().any(|u| u.new_oid.is_some()) {
+        Some(handle.blobs.put_chunk(pack.to_vec()).to_vec())
     } else {
-        match hex_to_bytes(old).filter(|b| b.len() == GIT_OID_RAW_LEN) {
-            Some(bytes) => Some(bytes),
-            None => return error_response(StatusCode::BAD_REQUEST, "malformed old oid"),
-        }
-    };
-    let Some(new_oid) = hex_to_bytes(new).filter(|b| b.len() == GIT_OID_RAW_LEN) else {
-        return error_response(StatusCode::BAD_REQUEST, "malformed new oid");
+        None
     };
 
-    // stash the WHOLE packfile as one node-local blob, keyed by its sha256; forge
-    // materializes it by this digest. the bytes never cross consensus.
-    let pack_digest = handle.blobs.put_chunk(pack.to_vec());
-
-    // CAS the head through a forge Push op and await the block result.
-    let payload = forge::encode_msg(&forge::ForgeMsg::Push {
+    // CAS every branch through ONE atomic PushRefs op and await the block.
+    let payload = forge::encode_msg(&forge::ForgeMsg::PushRefs {
         repo,
-        prev_oid,
-        new_oid,
-        pack_digest: pack_digest.to_vec(),
+        updates,
+        pack_digest,
     });
     let (reply, rx) = oneshot::channel();
     if let Err(resp) = handle
@@ -1730,18 +1769,28 @@ async fn git_receive_pack(
     {
         return resp;
     }
+    let refnames: Vec<String> = cmds.into_iter().map(|(_, _, r)| r).collect();
     match rx.await {
-        Ok(Ok(_block)) => git_report_status(GIT_MAIN_REF, None),
+        Ok(Ok(_block)) => {
+            let results: Vec<(String, Option<String>)> =
+                refnames.into_iter().map(|r| (r, None)).collect();
+            git_report_status(&results)
+        }
         Ok(Err(reason)) => {
             // a CAS mismatch's rejection carries "non-fast-forward" — surface
             // exactly that token so git prints its standard "fetch first" hint.
-            // any other rejection passes through as a single-line reason.
+            // any other rejection passes through as a single-line reason. the
+            // op is atomic, so every ref shares the fate.
             let reason = if reason.contains("non-fast-forward") {
                 "non-fast-forward".to_string()
             } else {
                 reason.replace('\n', " ")
             };
-            git_report_status(GIT_MAIN_REF, Some(&reason))
+            let results: Vec<(String, Option<String>)> = refnames
+                .into_iter()
+                .map(|r| (r, Some(reason.clone())))
+                .collect();
+            git_report_status(&results)
         }
         Err(_) => actor_gone(),
     }
