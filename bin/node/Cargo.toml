@@ -119,3 +119,10 @@ tempfile = "3"
 # the phase-3 proof: duckfs_client_e2e drives the checkout/commit engine (as a
 # library, over each node's real http surface) across a two-validator cluster.
 duckfs-client = { workspace = true }
+# coordinated_invite_cli seeds a signed mesh-state.json so `invite` bundles
+# member fronts — it builds the persisted adverts with the same crates the node
+# does (reachability::store persistence + the wireguard-upgrade advert types),
+# and recomputes the genesis namespace with commonware's Sha256.
+reachability = { workspace = true }
+wireguard-upgrade = { workspace = true }
+commonware-cryptography = { workspace = true }

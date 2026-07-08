@@ -70,10 +70,34 @@ credential, and the join window's carrier is the invite tunnel itself.
 4. Seating it in the quorum stays a separate, deliberate act (`promote`) —
    the existing standby → online → activation machinery unchanged.
 
-Deliberate bounds, for now: the intro listener is inviter-hosted UDP, so
-the INVITER's WG/intro ports must be underlay-reachable (one forwarded UDP
-port suffices; the joiner needs nothing). A coordinator-relayed intro for a
-fully-NATed inviter is the named follow-up on the coordinator-auth thread.
+**Fully-NATed inviter — ADDRESSED (unified all-paths invite + fronts;
+coordinator ambient).** The blob is no longer just the inviter's own paths: it
+bundles EVERY entry the inviter offers as ONE candidate set — `{inviter} ∪
+{fronts}`, where each front is a reachable member the inviter already meshes
+with (read from persisted `mesh-state.json` at mint), carrying that member's WG
+key, mesh port, and its underlay endpoint when it has one (else `None`, reached
+by identity). The joiner races the whole union: a candidate with an endpoint is
+dialed directly and announced at `wg_port + 1`; an endpoint-less one is driven
+through `BootstrapCoordinatedInvitePeer` (rendezvous → install → intro over the
+punched socket). First `IntroAck.installed` wins, the rest are cancelled, and
+exhaustion is an HONEST terminal (a distinct non-zero exit with a mode-naming
+FATAL — never a silent success). So a fully-NATed (incl. symmetric) inviter
+still onboards as long as ONE offered path — itself via its coordinator, or any
+reachable front — comes up. The coordinator is AMBIENT: the joiner's resolver
+binds `config::primary_coordinator_or_default` (public default), never an
+address baked into the blob; `invite` embeds no coordinator address at all.
+`fronts` live OUTSIDE the genesis fingerprint (advisory reachability, not
+validator identity — proven by a fingerprint-exclusion test), so this is ZERO
+consensus change. No coordinator data relay (that was removed 2026-07-06, and
+the design here needs none).
+
+Deliberate bounds, for now: a DIRECT candidate's intro listener is the peer's
+own UDP (`wg_port + 1`), so a direct path needs that member's port
+underlay-reachable (one forwarded UDP port suffices; the joiner needs nothing) —
+but a coordinated path needs no forwarded port at all. Under a real kernel-TUN
+effect the userspace rendezvous is inactive, so coordinated candidates are
+dropped from the race (an all-coordinated invite on a TUN node then hits the
+honest terminal immediately rather than hanging).
 
 The two-node real-WireGuard container smoke that proved mesh-over-tunnels
 (and its cold-restart leg) lives at `ops/wg-smoke/run-smoke.sh`; extending
@@ -143,8 +167,10 @@ socket) and reflexive-bearing endpoint advertisements.
    rendezvous messages still carry no token; a compromised coordinator can
    deny service (never substitute keys — records pin WireGuard keys under
    the owner's ed25519 signature). Extending the intro's token discipline to
-   the rendezvous — and a coordinator-RELAYED intro for a fully-NATed
-   inviter — remains open.
+   the rendezvous remains open. (A coordinator-RELAYED intro for a
+   fully-NATed inviter is NO LONGER needed — the unified all-paths invite
+   above onboards a fully-NATed inviter through its ambient coordinator and
+   its reachable fronts, with no relay.)
 
 (The former item 2 — the relay-bind caveat — dissolved when the DERP-style
 relay was removed on 2026-07-06: a wildcard-bound coordinator is now fully
