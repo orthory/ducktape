@@ -6,7 +6,26 @@ are driving and QAing each branch.
 
 ```
 ops/
-  fleet.sh          fleet manager (userspace, no root)
+  dev.sh            compatibility shim for make dev
+  dev.py            desktop dev loop with hot-reloading node
+  dev.test.sh       compatibility shim for the dev helper tests
+  dev_test.py       dev loop unit tests
+  fleet.sh          compatibility shim for the stable operator command
+  fleet.py          fleet manager (userspace, no root)
+  dogfood-forge.sh  compatibility shim for make dogfood-forge
+  dogfood_forge.py  local forge dogfood helper
+  install-desktop-entry.sh
+                    compatibility shim for install-app desktop integration
+  install_desktop_entry.py
+                    freedesktop desktop file + icon installer
+  wg-smoke/run-interop.sh
+                    compatibility shim for the backend interop smoke
+  wg-smoke/run_interop.py
+                    backend interop smoke runner
+  wg-smoke/run-smoke.sh
+                    compatibility shim for the mixed-mode cold-restart smoke
+  wg-smoke/run_smoke.py
+                    mixed-mode cold-restart smoke runner
   fleet-console/    the dashboard (Vite + React + @novnc/novnc, @xyflow/react)
 ```
 
