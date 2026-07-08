@@ -459,6 +459,16 @@ pub fn primary_coordinator_or_default(raw: Option<&str>) -> Result<Option<String
     }
 }
 
+/// Resolve the ambient coordinator to a dial [`Ingress`] — the AMBIENT source
+/// a joiner's NAT resolver binds (config/default), never one carried in an
+/// invite. `None` when coordination is disabled (`"none"`/`"off"`/`"direct"`).
+pub fn coordinator_ingress(raw: Option<&str>) -> Result<Option<Ingress>, String> {
+    match primary_coordinator_or_default(raw)? {
+        Some(addr) => ingress_of(&addr),
+        None => Ok(None),
+    }
+}
+
 impl NetworkDescriptor {
     pub fn coordination(&self) -> Coordination {
         match self.coordination.as_deref() {
@@ -672,6 +682,70 @@ pub fn load_invite_wireguard(dir: &Path) -> Result<Option<StoredInviteWireGuard>
     toml::from_str(&text)
         .map(Some)
         .map_err(|e| format!("{path:?}: {e}"))
+}
+
+const INVITE_FRONTS_FILE: &str = "invite-fronts.json";
+
+/// the on-disk shape of a persisted [`Front`] — raw key arrays as hex so the
+/// file is human-readable and stable, mirroring [`StoredInviteWireGuard`].
+#[derive(Serialize, Deserialize)]
+struct StoredFront {
+    member_key: String,
+    wireguard_public_key: String,
+    mesh_port: u16,
+    endpoint: Option<String>,
+}
+
+/// persist the invite's fronts beside the token so a later `run` can race the
+/// whole union of first-contact paths, not just the inviter. Empty fronts write
+/// nothing (absence decodes as empty). Overwrites — a re-join replaces them.
+pub fn save_invite_fronts(dir: &Path, fronts: &[Front]) -> Result<(), String> {
+    let path = dir.join(INVITE_FRONTS_FILE);
+    if fronts.is_empty() {
+        // a re-join with a front-less invite must not leave a stale set behind.
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+    let stored: Vec<StoredFront> = fronts
+        .iter()
+        .map(|f| StoredFront {
+            member_key: hex_bytes(&f.member_key),
+            wireguard_public_key: hex_bytes(&f.wireguard_public_key),
+            mesh_port: f.mesh_port,
+            endpoint: f.endpoint.clone(),
+        })
+        .collect();
+    let text = serde_json::to_string_pretty(&stored).map_err(|e| format!("encode {path:?}: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("write {path:?}: {e}"))
+}
+
+/// the fronts a previous `join` stored; empty when absent. Fail-closed decode.
+pub fn load_invite_fronts(dir: &Path) -> Result<Vec<Front>, String> {
+    let path = dir.join(INVITE_FRONTS_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {path:?}: {e}")),
+    };
+    let stored: Vec<StoredFront> =
+        serde_json::from_str(&text).map_err(|e| format!("decode {path:?}: {e}"))?;
+    stored
+        .into_iter()
+        .map(|s| {
+            let member_key = unhex(&s.member_key)?
+                .try_into()
+                .map_err(|_| "front member_key must be 32 bytes".to_string())?;
+            let wireguard_public_key = unhex(&s.wireguard_public_key)?
+                .try_into()
+                .map_err(|_| "front wireguard_public_key must be 32 bytes".to_string())?;
+            Ok(Front {
+                member_key,
+                wireguard_public_key,
+                mesh_port: s.mesh_port,
+                endpoint: s.endpoint,
+            })
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -967,26 +1041,59 @@ pub struct InviteWireGuard {
     pub mesh_port: u16,
 }
 
-/// a member "front" a joiner races against the inviter during first contact:
-/// the member's REAL node identity, its WireGuard PUBLIC key + control-mesh
-/// port for the coordinated path, and an OPTIONAL direct underlay endpoint
-/// (present when the member is directly dialable, absent when it is reachable
-/// only by identity via the coordinator). Only PUBLIC keys ever travel — the
-/// WG private key never leaves the node. Fronts ride the SIGNED invite
-/// envelope but sit OUTSIDE `genesis_namespace` (advisory reach, zero
-/// consensus), exactly like the descriptor's `reach` hints.
+/// one member the inviter offers as an ADDITIONAL first-contact path: the
+/// joiner may bring its tunnel up against this member instead of the inviter
+/// (the unified all-paths invite — `docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md`).
+/// Only PUBLIC keys ever ride the wire; the WireGuard private key never leaves
+/// the node. `endpoint` is the member's routable WireGuard UNDERLAY endpoint
+/// (`host:wg_port`) when it is host-capable — the joiner dials it directly and
+/// announces its intro at `wg_port + 1` (the product-wide `invite_listen`
+/// default). `None` means the member is only reachable BY IDENTITY through the
+/// joiner's ambient coordinator (a punchable, NAT'd member).
+///
+/// Fronts live OUTSIDE the genesis fingerprint (they are advisory reachability,
+/// never validator identity) — see the fingerprint-exclusion test.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Front {
-    /// the member's ed25519 identity, raw — the key the joiner authenticates
-    /// end-to-end regardless of which path reached it.
+    /// the member's real ed25519 node identity the joiner authenticates.
     pub member_key: [u8; 32],
     /// the member's X25519 WireGuard public key, raw.
     pub wireguard_public_key: [u8; 32],
-    /// the member's control-mesh listen port, dialed at its overlay ULA.
+    /// the member's control-mesh listen port, dialed at its overlay ULA once
+    /// the tunnel routes.
     pub mesh_port: u16,
-    /// the member's direct underlay endpoint (`host:port`) when it is directly
-    /// dialable; `None` means "reach me by identity via the coordinator".
+    /// the member's routable WireGuard underlay endpoint `host:wg_port`, or
+    /// `None` for a punchable member reached by identity via the coordinator.
     pub endpoint: Option<String>,
+}
+
+/// Map a persisted mesh's signed adverts to invite [`Front`]s, skipping the
+/// inviter's own advert (`own`, its raw ed25519 identity — it already rides
+/// the invite as the `wireguard` bootstrap). A member with a concrete routable
+/// WireGuard underlay endpoint becomes a DIRECT front (`endpoint:
+/// Some(host:wg_port)` — the joiner dials it and announces its intro at
+/// `wg_port + 1`); a member with no dialable underlay becomes a COORDINATED
+/// front (`endpoint: None`, reached BY IDENTITY through the joiner's ambient
+/// coordinator). Every registered member is at least punchable, so all
+/// non-self adverts are offered as fronts.
+pub fn fronts_from_adverts(
+    adverts: &[wireguard_upgrade::EndpointAdvertisement],
+    own: &[u8; 32],
+) -> Vec<Front> {
+    adverts
+        .iter()
+        .map(|advert| &advert.record)
+        .filter(|record| &record.validator_identity.0 != own)
+        .map(|record| Front {
+            member_key: record.validator_identity.0,
+            wireguard_public_key: record.wireguard_public_key.0,
+            mesh_port: record.control_endpoint.port,
+            endpoint: record
+                .wireguard_endpoint
+                .as_ref()
+                .map(|ep| ep.socket_addr().to_string()),
+        })
+        .collect()
 }
 
 /// a decoded, VERIFIED invite — the only constructor is [`decode_invite`].
@@ -997,8 +1104,9 @@ pub struct Invite {
     /// `None` when the inviter runs no reachability plane (a TCP-reachable
     /// network) — the joiner then rides the descriptor's reach hints alone.
     pub wireguard: Option<InviteWireGuard>,
-    /// the member fronts the inviter offers as additional first-contact
-    /// candidates; empty for a pre-feature blob or an inviter that offers none.
+    /// additional first-contact paths the inviter offers (its reachable
+    /// members). Empty on a pre-feature blob or when the inviter has no
+    /// persisted mesh state. Never part of `genesis_namespace`.
     pub fronts: Vec<Front>,
     pub expires_unix_secs: u64,
 }
@@ -1151,23 +1259,21 @@ fn pack_invite(
     out.extend_from_slice(&expires_unix_secs.to_le_bytes());
     out.extend_from_slice(&pack_invite_token(token));
 
-    // the fronts block — APPENDED last, after every pre-feature field, so it
-    // stays inside the issuer-signed envelope yet OUTSIDE `genesis_namespace`
-    // (which hashes scheme + validators only). OMITTED entirely when empty:
-    // a modern zero-fronts blob is then byte-identical to a pre-feature one,
-    // and the decoder treats "no bytes after the token" as `fronts: vec![]`.
+    // the fronts block rides AFTER the fixed-length token, inside the signed
+    // envelope, but is NEVER fed to `genesis_namespace` (advisory reachability,
+    // not validator identity). Absent when empty, so an invite with no fronts
+    // stays BYTE-IDENTICAL to a pre-feature blob and old blobs still decode
+    // (the reader treats "nothing after the token" as `fronts: []`).
     if !fronts.is_empty() {
-        out.push(
-            u8::try_from(fronts.len()).map_err(|_| format!("too many fronts ({})", fronts.len()))?,
-        );
+        out.push(u8::try_from(fronts.len()).map_err(|_| format!("too many fronts ({})", fronts.len()))?);
         for f in fronts {
             out.extend_from_slice(&f.member_key);
             out.extend_from_slice(&f.wireguard_public_key);
             out.extend_from_slice(&f.mesh_port.to_le_bytes());
             match &f.endpoint {
-                Some(e) => {
+                Some(endpoint) => {
                     out.push(1);
-                    put_str_u8(&mut out, e)?;
+                    put_str_u8(&mut out, endpoint)?;
                 }
                 None => out.push(0),
             }
@@ -1263,10 +1369,9 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
     }
     let token = unpack_invite_token(r.take(INVITE_TOKEN_LEN)?)?;
 
-    // the fronts block — appended after this feature landed. a PRE-FEATURE
-    // blob ends exactly at the token (`r.done()`), decoding to an empty fronts
-    // list; a modern blob carries a u8 count followed by that many fronts.
-    // fail-closed on any malformed remainder.
+    // the optional fronts block. A pre-feature blob has nothing after the
+    // token (`r.done()`), decoding to an empty set; a feature blob carries a
+    // u8 count then each front. Fail-closed on a malformed entry.
     let fronts = if r.done() {
         Vec::new()
     } else {
@@ -1290,12 +1395,11 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
                 endpoint,
             });
         }
-        if !r.done() {
-            return Err("invite payload has trailing bytes".into());
-        }
         fronts
     };
-
+    if !r.done() {
+        return Err("invite payload has trailing bytes".into());
+    }
     Ok(Invite {
         descriptor: NetworkDescriptor {
             chain_id,
@@ -1718,6 +1822,10 @@ pub struct Resolved {
     /// the joining node brings up BEFORE any p2p. always `None` for the dev
     /// shape and for members.
     pub invite_wireguard: Option<StoredInviteWireGuard>,
+    /// the inviter's offered member fronts a `join` stored, if any — the
+    /// ADDITIONAL first-contact paths the joiner races alongside the inviter.
+    /// Empty for the dev shape, for members, and for pre-feature invites.
+    pub invite_fronts: Vec<Front>,
     /// opt-in shipped-index warm start when joining; see `NodeToml::sync_index`.
     pub sync_index: bool,
     /// publish the discovered provider set into the capability registry; see
@@ -1853,6 +1961,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: load_invite_token(base)?,
         invite_wireguard: load_invite_wireguard(base)?,
+        invite_fronts: load_invite_fronts(base)?,
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
         coordination: descriptor.coordination(),
@@ -2087,6 +2196,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: None,
         invite_wireguard: None,
+        invite_fronts: Vec::new(),
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
         // the dev shape wires direct sockets only — no real coordinator, so
@@ -2422,6 +2532,186 @@ mod tests {
         };
         let invite = decode_invite(&encode_test_invite(&d, &issuer, Some(&wg))).expect("decode");
         assert_eq!(invite.wireguard, Some(wg));
+        // a wireguard invite with no fronts decodes to an empty set.
+        assert!(invite.fronts.is_empty());
+    }
+
+    /// mint + encode with the test defaults, carrying a set of fronts.
+    fn encode_test_invite_with_fronts(
+        d: &NetworkDescriptor,
+        issuer: &ed25519::PrivateKey,
+        wireguard: Option<&InviteWireGuard>,
+        fronts: &[Front],
+    ) -> String {
+        let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes());
+        encode_invite(d, &token, wireguard, fronts, u64::MAX, issuer).expect("encode")
+    }
+
+    fn front_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
+        NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: Some("private".into()),
+        }
+    }
+
+    #[test]
+    fn invite_blob_roundtrips_fronts() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_descriptor(&issuer);
+        // one host-capable member (direct endpoint), one punchable (coordinated).
+        let fronts = vec![
+            Front {
+                member_key: [11u8; 32],
+                wireguard_public_key: [12u8; 32],
+                mesh_port: 52201,
+                endpoint: Some("198.51.100.9:51820".into()),
+            },
+            Front {
+                member_key: [21u8; 32],
+                wireguard_public_key: [22u8; 32],
+                mesh_port: 52202,
+                endpoint: None,
+            },
+        ];
+        let blob = encode_test_invite_with_fronts(&d, &issuer, None, &fronts);
+        let invite = decode_invite(&blob).expect("decode");
+        assert_eq!(invite.fronts, fronts);
+    }
+
+    #[test]
+    fn pre_feature_invite_decodes_to_empty_fronts() {
+        use base64::Engine as _;
+        // an invite minted WITHOUT fronts carries NO fronts block — its signed
+        // payload ends at the fixed-length token, byte-for-byte like a
+        // pre-feature blob — so an old blob (nothing after the token) decodes
+        // to an empty set. Token nonces are random, so we compare the ENCODED
+        // LENGTH (identical when the fronts block is absent), not the bytes.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_descriptor(&issuer);
+        let empty = encode_test_invite_with_fronts(&d, &issuer, None, &[]);
+        let baseline = encode_test_invite(&d, &issuer, None);
+        let len = |blob: &str| {
+            INVITE_B64
+                .decode(blob.strip_prefix(INVITE_PREFIX).unwrap())
+                .unwrap()
+                .len()
+        };
+        assert_eq!(
+            len(&empty),
+            len(&baseline),
+            "an empty-fronts invite adds no bytes over a pre-feature blob"
+        );
+        assert!(decode_invite(&empty).expect("decode").fronts.is_empty());
+    }
+
+    fn sample_advert(
+        seed: u64,
+        octet: u8,
+        wireguard_endpoint: Option<u16>,
+    ) -> wireguard_upgrade::EndpointAdvertisement {
+        use std::net::{IpAddr, Ipv4Addr};
+        use wireguard_upgrade::{
+            AdmissionRoot, Endpoint, EndpointRecord, MeshVersion, PortPolicy, Root, Transport,
+            ValidatorIdentity, X25519PublicKey,
+        };
+        let policy = PortPolicy::production();
+        let signer = ed25519::PrivateKey::from_seed(seed);
+        let endpoint = |port: u16, transport| {
+            Endpoint::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, octet)), port, transport, &policy)
+                .unwrap()
+        };
+        let record = EndpointRecord {
+            namespace: "net#fronts".into(),
+            epoch: 3,
+            valset_root: Root([1; 32]),
+            admission_root: AdmissionRoot([2; 32]),
+            validator_identity: ValidatorIdentity::try_from(signer.public_key().as_ref()).unwrap(),
+            wireguard_public_key: X25519PublicKey([octet; 32]),
+            control_endpoint: endpoint(443, Transport::Tcp),
+            wireguard_endpoint: wireguard_endpoint.map(|port| endpoint(port, Transport::Udp)),
+            capabilities: vec![],
+            expires_at_view: 50,
+            nonce: 1,
+        };
+        wireguard_upgrade::EndpointAdvertisement::sign(record, MeshVersion([7; 32]), &signer)
+    }
+
+    #[test]
+    fn fronts_from_adverts_maps_reachable_members_and_skips_self() {
+        // three adverts: self (skipped), a host-capable member (direct
+        // endpoint), and a punchable member (no underlay endpoint → coordinated).
+        let me = ed25519::PrivateKey::from_seed(1);
+        let host_capable = sample_advert(2, 20, Some(51820));
+        let punchable = sample_advert(3, 30, None);
+        let adverts = vec![sample_advert(1, 10, Some(51820)), host_capable.clone(), punchable.clone()];
+
+        let own: [u8; 32] = me.public_key().as_ref().try_into().unwrap();
+        let fronts = fronts_from_adverts(&adverts, &own);
+
+        assert_eq!(fronts.len(), 2, "the inviter's own advert is skipped");
+        let direct = fronts
+            .iter()
+            .find(|f| f.member_key == host_capable.record.validator_identity.0)
+            .expect("host-capable front");
+        assert_eq!(direct.endpoint.as_deref(), Some("8.8.8.20:51820"));
+        assert_eq!(direct.mesh_port, 443);
+        assert_eq!(direct.wireguard_public_key, [20u8; 32]);
+        let coordinated = fronts
+            .iter()
+            .find(|f| f.member_key == punchable.record.validator_identity.0)
+            .expect("punchable front");
+        assert_eq!(coordinated.endpoint, None);
+    }
+
+    #[test]
+    fn fronts_are_excluded_from_the_genesis_fingerprint() {
+        // two invites that differ ONLY in their fronts must fingerprint
+        // identically: fronts are advisory reachability, never validator
+        // identity, so `genesis_namespace` cannot see them.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_descriptor(&issuer);
+        let a = decode_invite(&encode_test_invite_with_fronts(&d, &issuer, None, &[]))
+            .expect("decode a");
+        let b = decode_invite(&encode_test_invite_with_fronts(
+            &d,
+            &issuer,
+            None,
+            &[Front {
+                member_key: [11u8; 32],
+                wireguard_public_key: [12u8; 32],
+                mesh_port: 52201,
+                endpoint: Some("198.51.100.9:51820".into()),
+            }],
+        ))
+        .expect("decode b");
+        assert_ne!(a.fronts, b.fronts, "the two invites differ only in fronts");
+        assert_eq!(
+            a.descriptor.genesis_namespace(),
+            b.descriptor.genesis_namespace(),
+            "fronts must not perturb the genesis fingerprint"
+        );
+        // Non-tautological both ways: the round-tripped fingerprint equals the
+        // source descriptor's (fronts on the wire never fold into it), AND the
+        // fingerprint IS sensitive to validator identity — proving it tracks the
+        // consensus set, not the advisory reachability payload.
+        assert_eq!(
+            a.descriptor.genesis_namespace(),
+            d.genesis_namespace(),
+            "encoding/decoding fronts must not change the source fingerprint"
+        );
+        let mut with_extra_validator = front_descriptor(&issuer);
+        with_extra_validator
+            .validators
+            .push(hex_bytes(ed25519::PrivateKey::from_seed(8).public_key().as_ref()));
+        assert_ne!(
+            d.genesis_namespace(),
+            with_extra_validator.genesis_namespace(),
+            "the fingerprint must change when the validator set changes"
+        );
     }
 
     #[test]
@@ -2573,42 +2863,6 @@ mod tests {
         assert!(
             with_front.len() > empty_blob.len(),
             "a front appends bytes the empty blob lacks"
-        );
-    }
-
-    #[test]
-    fn fronts_are_excluded_from_the_genesis_fingerprint() {
-        // (c) two invites differing ONLY in fronts yield the SAME
-        // genesis_namespace: fronts ride the signed envelope but never feed the
-        // fingerprint (scheme + validators only), so they are ZERO-consensus.
-        let issuer = ed25519::PrivateKey::from_seed(7);
-        let d = front_test_descriptor(&issuer);
-        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
-
-        let no_fronts =
-            encode_invite(&d, &token, None, &[], u64::MAX, &issuer).expect("encode");
-        let with_fronts = encode_invite(
-            &d,
-            &token,
-            None,
-            &[Front {
-                member_key: [9u8; 32],
-                wireguard_public_key: [8u8; 32],
-                mesh_port: 4242,
-                endpoint: Some("203.0.113.4:51820".into()),
-            }],
-            u64::MAX,
-            &issuer,
-        )
-        .expect("encode");
-        assert_ne!(no_fronts, with_fronts, "fronts really change the blob bytes");
-
-        let a = decode_invite(&no_fronts).expect("decode");
-        let b = decode_invite(&with_fronts).expect("decode");
-        assert_eq!(
-            a.descriptor.genesis_namespace(),
-            b.descriptor.genesis_namespace(),
-            "fronts are outside the genesis fingerprint"
         );
     }
 

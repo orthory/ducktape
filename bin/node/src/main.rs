@@ -66,6 +66,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
 
 mod config;
+mod first_contact_join;
 mod lobby;
 mod oracle_pool;
 mod relay;
@@ -3710,6 +3711,59 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // the fronts: every reachable member the inviter already meshes with, read
+    // from the persisted mesh state so a joiner can bring its tunnel up against
+    // ANY of them, not just the inviter (the unified all-paths invite). A
+    // host-capable member rides as a direct front, a NAT'd-but-registered one
+    // as a coordinated (by-identity) front. No mesh state yet → no fronts.
+    let storage = base.join(raw.storage_dir.as_deref().unwrap_or("storage"));
+    let mesh_state_file = storage.join("mesh-state.json");
+    let chain_id = descriptor.genesis_namespace();
+    let own: [u8; 32] = key
+        .public_key()
+        .as_ref()
+        .try_into()
+        .expect("ed25519 public key is 32 bytes");
+    let fronts = match reachability::store::load(&mesh_state_file, &chain_id) {
+        Ok(Some(mesh)) => {
+            let fronts = config::fronts_from_adverts(&mesh.adverts, &own);
+            if fronts.is_empty() {
+                eprintln!(
+                    "[invite] persisted mesh at {} holds no other members — the invite \
+                     carries only the inviter's own paths",
+                    mesh_state_file.display()
+                );
+            }
+            fronts
+        }
+        Ok(None) => {
+            eprintln!(
+                "[invite] no persisted mesh state at {} — the invite carries no member \
+                 fronts (only the inviter's own paths); mint again once the mesh has peers",
+                mesh_state_file.display()
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            eprintln!(
+                "[invite] mesh state at {} unreadable ({e}) — the invite carries no member \
+                 fronts",
+                mesh_state_file.display()
+            );
+            Vec::new()
+        }
+    };
+
+    // stop embedding a coordinator address in the invite: the joiner reaches
+    // every path through its OWN ambient coordinator (config/default), never a
+    // coordinator baked into the blob. The inviter still registers with its own
+    // coordinator via its own config; here we only strip Coordinated reach
+    // hints from the ENCODED copy — the on-disk descriptor keeps its config.
+    let mut invite_descriptor = descriptor.clone();
+    invite_descriptor
+        .reach
+        .retain(|hint| !hint.trim_start().starts_with("coordinated:"));
+
     let expires = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock is past the epoch")
@@ -3718,7 +3772,14 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes());
     println!(
         "{}",
-        config::encode_invite(&descriptor, &token, wireguard.as_ref(), &[], expires, &key)?
+        config::encode_invite(
+            &invite_descriptor,
+            &token,
+            wireguard.as_ref(),
+            &fronts,
+            expires,
+            &key
+        )?
     );
     Ok(())
 }
@@ -4552,6 +4613,25 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 reach: config::Reach::Direct(format!("[{inviter_ula}]:{}", wg.mesh_port)),
             });
         }
+        // every offered front gets the same overlay-ULA Direct hint the inviter
+        // does: once ANY candidate's tunnel comes up, the mesh dialer can reach
+        // that member's overlay ULA and ride the mesh from there. A hint whose
+        // tunnel never comes up simply fails to dial — harmless.
+        for front in &invite.fronts {
+            let Ok(member) = ed25519::PublicKey::decode(&front.member_key[..]) else {
+                continue;
+            };
+            let Ok(identity) = wireguard_upgrade::ValidatorIdentity::try_from(&front.member_key[..])
+            else {
+                continue;
+            };
+            let ula =
+                wireguard_upgrade::ula_v6_member_addr(&descriptor.genesis_namespace(), identity);
+            descriptor.add_reach_route(&config::ReachHint {
+                expected_key: member,
+                reach: config::Reach::Direct(format!("[{ula}]:{}", front.mesh_port)),
+            });
+        }
     }
     descriptor.save(&dir.join("network.toml"))?;
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
@@ -4560,6 +4640,9 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // the capability the joining node redeems automatically; a re-join with a
     // fresh invite replaces a stale/spent one.
     config::save_invite_token(&dir, &invite.token)?;
+    // the offered fronts, kept beside the token so `run_node` can race the
+    // whole union of first-contact paths. Empty clears any stale set.
+    config::save_invite_fronts(&dir, &invite.fronts)?;
     if let Some(wg) = &invite.wireguard {
         // the tunnel bootstrap the joining node dials BEFORE any p2p; kept
         // beside the token so `run_node` can bring the interface up first.
@@ -4944,12 +5027,25 @@ async fn reachability_plane(
             };
             match resolver {
                 Ok(resolver) => resolver,
+                // An unreachable coordinator must NOT take down the whole plane.
+                // The WireGuard underlay is already bound, and DIRECT / front
+                // candidates (InstallInvitePeer + this node's own initiations)
+                // need no rendezvous at all. Degrade to the pass-through
+                // resolver so those paths still come up; only COORDINATED
+                // (by-identity) candidates go dark until a coordinator responds.
+                // This keeps a fully-direct / self-hosted join working even when
+                // the ambient default coordinator is firewalled, down, or a
+                // founder disabled coordination outright.
                 Err(err) => {
                     eprintln!(
-                        "[node {label}] reachability: nat client on the shared underlay \
-                         failed: {err} — plane not started"
+                        "[node {label}] reachability: coordinator rendezvous unavailable \
+                         ({err}) — continuing WITHOUT rendezvous (direct/front paths still \
+                         work; coordinated-by-identity paths disabled until a coordinator \
+                         responds)"
                     );
-                    return;
+                    reachability::NatResolver::bind(me, Vec::new(), None)
+                        .await
+                        .expect("empty-coordinator pass-through resolver is infallible")
                 }
             }
         }
@@ -4957,12 +5053,18 @@ async fn reachability_plane(
             let auth = Some((signer.clone(), coord_cap));
             match reachability::NatResolver::bind(me, coords.clone(), auth).await {
                 Ok(resolver) => resolver,
+                // Same degrade-don't-die rule on the TUN/fake path: a dead
+                // coordinator disables coordinated candidates, never direct ones.
                 Err(err) => {
                     eprintln!(
-                        "[node {label}] reachability: nat client bind failed: {err} — plane \
-                         not started"
+                        "[node {label}] reachability: coordinator rendezvous unavailable \
+                         ({err}) — continuing WITHOUT rendezvous (direct/front paths still \
+                         work; coordinated-by-identity paths disabled until a coordinator \
+                         responds)"
                     );
-                    return;
+                    reachability::NatResolver::bind(me, Vec::new(), None)
+                        .await
+                        .expect("empty-coordinator pass-through resolver is infallible")
                 }
             }
         }
@@ -5264,6 +5366,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         checkpoint_blocks,
         invite_token,
         invite_wireguard,
+        invite_fronts,
         sync_index,
         announce_capabilities,
         coordination,
@@ -5871,8 +5974,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
                 match wireguard_listen {
                     Some(wg_addr) => {
-                        let coordinators: Vec<Ingress> =
-                            coordinated.iter().map(|(_, c, _)| c.clone()).collect();
+                        // AMBIENT coordinator: the joiner resolves coordinated
+                        // rendezvous through its OWN configured/default
+                        // coordinator, NEVER one baked into the invite (the
+                        // unified invite carries no coordinator address). See
+                        // docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md.
+                        let coordinators: Vec<Ingress> = match config::coordinator_ingress(None) {
+                            Ok(Some(ingress)) => vec![ingress],
+                            Ok(None) => Vec::new(),
+                            Err(e) => {
+                                eprintln!(
+                                    "[node {label}] invite: ambient coordinator unusable ({e}) — \
+                                     coordinated first-contact paths disabled"
+                                );
+                                Vec::new()
+                            }
+                        };
                         Some(wire_reachability_plane(
                             &context,
                             &label,
@@ -5912,221 +6029,101 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // inviter's overlay ULA (the join-minted Direct hint) the moment
             // the tunnel routes, and everything else — lobby announce,
             // redemption, statesync — rides it.
-            if let (Some(reach), Some(wg), Some(token)) =
-                (&reach_cmd, &invite_wireguard, &invite_token)
-            {
-                use std::net::ToSocketAddrs as _;
-                let install = wg.issuer_key().and_then(|issuer| {
-                    let public_key = wg.public_key_bytes()?;
-                    Ok((issuer, public_key))
+            // the TUNNEL-FIRST join window races the invite's UNIFIED path
+            // set: the inviter PLUS every offered front, in one candidate list.
+            // The first candidate to install this joiner's token-signed intro
+            // wins and the rest are cancelled; the mesh dialer below then
+            // reaches that member's overlay ULA (the join-minted Direct hints)
+            // the moment the tunnel routes, and everything else — lobby
+            // announce, redemption, statesync — rides it. If every offered path
+            // is exhausted the race is HONEST-terminal (a distinct exit, never
+            // a silent success). The mechanics live in `first_contact_join`;
+            // this is just the glue.
+            if let (Some(reach), Some(token)) = (&reach_cmd, &invite_token) {
+                let inviter = invite_wireguard.as_ref().and_then(|wg| {
+                    match (wg.issuer_key(), wg.public_key_bytes()) {
+                        (Ok(key), Ok(wg_key)) => Some(first_contact_join::InviterContact {
+                            key,
+                            wg: wg_key,
+                            mesh_port: wg.mesh_port,
+                            // the inviter's underlay endpoint; `None` => the
+                            // inviter is coordinated-only (reached by identity).
+                            endpoint: wg.endpoint.clone(),
+                            // the inviter's explicitly-advertised intro listener
+                            // (honors a custom `invite_listen`); the direct path
+                            // uses it verbatim instead of re-deriving wg_port+1.
+                            intro: wg.intro.clone(),
+                        }),
+                        _ => {
+                            eprintln!(
+                                "[node {label}] invite: inviter wireguard bootstrap is malformed \
+                                 — racing the offered fronts alone"
+                            );
+                            None
+                        }
+                    }
                 });
-                match install {
-                    Ok((issuer, public_key)) => match (&wg.endpoint, &wg.intro) {
-                        (Some(endpoint_raw), Some(intro_dest)) => {
-                            let endpoint = match endpoint_raw.to_socket_addrs() {
-                                Ok(mut addrs) => addrs.next(),
-                                Err(e) => {
-                                    eprintln!(
-                                        "[node {label}] invite: wireguard endpoint \
-                                         {endpoint_raw:?} unusable ({e}) — falling back to \
-                                         the descriptor's reach hints"
-                                    );
-                                    None
-                                }
-                            };
-                            if let Some(endpoint) = endpoint {
-                                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                                let _ = reach
-                                    .send(reachability::ReachabilityCommand::InstallInvitePeer {
-                                        peer: issuer,
-                                        wireguard_public_key:
-                                            wireguard_upgrade::X25519PublicKey(public_key),
-                                        endpoint,
-                                        reply: reachability::InstallReply(reply_tx),
-                                    })
-                                    .await;
-                                match reply_rx.await {
-                                    Ok(Ok(())) => println!(
-                                        "[node {label}] invite: tunnel to the inviter configured \
-                                         (endpoint {endpoint})"
+                let raw = first_contact_join::build_candidates(inviter, &invite_fronts);
+                if raw.is_empty() {
+                    // the invite offered no wireguard/front bootstrap — the join
+                    // rides the descriptor's reach hints, exactly as before.
+                } else {
+                    let candidates = first_contact_join::plan_race(
+                        raw,
+                        matches!(wireguard_effect, config::WireGuardEffectKind::Tun),
+                    );
+                    match reachability::WireGuardKeypair::load_or_generate(&wireguard_key_file) {
+                        Ok((keypair, _)) => {
+                            // this joiner's own token-signed intro, built once
+                            // and reused across every candidate in the race.
+                            let intro = lobby::encode_intro(&lobby::intro_request(
+                                &signer,
+                                &namespace,
+                                token,
+                                keypair.public_key().0,
+                            ));
+                            let token_nonce = token.nonce.to_vec();
+                            let reach = reach.clone();
+                            let race_label = label.clone();
+                            context.child("first_contact").spawn(move |_ctx| async move {
+                                let outcome = first_contact_join::drive_first_contact(
+                                    reach,
+                                    candidates,
+                                    intro,
+                                    token_nonce,
+                                    race_label.clone(),
+                                    std::time::Duration::from_secs(90),
+                                )
+                                .await;
+                                match outcome {
+                                    first_contact_join::FirstContactOutcome::Installed {
+                                        key,
+                                        via,
+                                    } => println!(
+                                        "[node {race_label}] invite: first contact via {via} to \
+                                         {} — join rides the overlay",
+                                        hex_bytes(&key.as_ref()[..4])
                                     ),
-                                    Ok(Err(e)) => eprintln!(
-                                        "[node {label}] invite: inviter tunnel not configured: {e}"
-                                    ),
-                                    Err(_) => {}
+                                    first_contact_join::FirstContactOutcome::Terminal {
+                                        tried,
+                                        reason,
+                                    } => {
+                                        eprintln!(
+                                            "[node {race_label}] FATAL: first contact failed \
+                                             across all {tried} offered path(s) — {reason}. ask \
+                                             the inviter for a fresh invite once the mesh is \
+                                             reachable."
+                                        );
+                                        std::process::exit(3);
+                                    }
                                 }
-                                // the announcer: a plain blocking UDP loop on its own OS
-                                // thread (nothing here touches the runtime) — re-sends
-                                // the intro every 2s until the inviter acks an install.
-                                let announce_label = label.clone();
-                                let announce_signer = signer.clone();
-                                let announce_namespace = namespace.clone();
-                                let announce_token = token.clone();
-                                let intro_dest = intro_dest.clone();
-                                let key_file = wireguard_key_file.clone();
-                                std::thread::Builder::new()
-                                    .name("invite-intro".into())
-                                    .spawn(move || {
-                                        let Ok((keypair, _)) =
-                                            reachability::WireGuardKeypair::load_or_generate(&key_file)
-                                        else {
-                                            eprintln!(
-                                                "[node {announce_label}] invite: wireguard key unreadable — \
-                                                 intro not announced"
-                                            );
-                                            return;
-                                        };
-                                        let request = lobby::encode_intro(&lobby::intro_request(
-                                            &announce_signer,
-                                            &announce_namespace,
-                                            &announce_token,
-                                            keypair.public_key().0,
-                                        ));
-                                        let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
-                                            return;
-                                        };
-                                        let _ = socket
-                                            .set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                                        let mut announced = false;
-                                        let mut buf = [0u8; 2048];
-                                        loop {
-                                            let Ok(dest) = intro_dest.to_socket_addrs() else {
-                                                std::thread::sleep(std::time::Duration::from_secs(2));
-                                                continue;
-                                            };
-                                            let Some(dest) = dest.into_iter().next() else {
-                                                std::thread::sleep(std::time::Duration::from_secs(2));
-                                                continue;
-                                            };
-                                            if socket.send_to(&request, dest).is_ok() && !announced {
-                                                announced = true;
-                                                println!(
-                                                    "[node {announce_label}] invite: introducing this \
-                                                     node to the inviter at udp/{dest}"
-                                                );
-                                            }
-                                            if let Ok((n, _)) = socket.recv_from(&mut buf)
-                                                && let Ok(ack) = lobby::decode_intro_ack(&buf[..n])
-                                                && ack.nonce == announce_token.nonce.to_vec()
-                                            {
-                                                if ack.installed {
-                                                    println!(
-                                                        "[node {announce_label}] invite: inviter \
-                                                         installed our tunnel — join rides the overlay"
-                                                    );
-                                                    return;
-                                                }
-                                                eprintln!(
-                                                    "[node {announce_label}] invite: inviter refused \
-                                                     the intro: {}",
-                                                    ack.detail
-                                                );
-                                            }
-                                            std::thread::sleep(std::time::Duration::from_secs(2));
-                                        }
-                                    })
-                                    .expect("spawn invite-intro thread");
-                            }
+                            });
                         }
-                        (None, None) => {
-                            if let Ok((keypair, _)) =
-                                reachability::WireGuardKeypair::load_or_generate(&wireguard_key_file)
-                            {
-                                let intro = lobby::encode_intro(&lobby::intro_request(
-                                    &signer,
-                                    &namespace,
-                                    token,
-                                    keypair.public_key().0,
-                                ));
-                                let expected_nonce = token.nonce.to_vec();
-                                let reach = reach.clone();
-                                let announce_label = label.clone();
-                                context.child("coordinated_invite_intro").spawn(
-                                    move |ctx| async move {
-                                        let mut reported_pending = false;
-                                        for _ in 0..30 {
-                                            let (reply_tx, reply_rx) =
-                                                tokio::sync::oneshot::channel();
-                                            if reach
-                                                .send(
-                                                    reachability::ReachabilityCommand::BootstrapCoordinatedInvitePeer {
-                                                        peer: issuer.clone(),
-                                                        wireguard_public_key:
-                                                            wireguard_upgrade::X25519PublicKey(public_key),
-                                                        intro: intro.clone(),
-                                                        reply: reachability::CoordinatedInviteReply(reply_tx),
-                                                    },
-                                                )
-                                                .await
-                                                .is_err()
-                                            {
-                                                return;
-                                            }
-                                            match reply_rx.await {
-                                                Ok(Ok(bytes)) => match lobby::decode_intro_ack(&bytes) {
-                                                    Ok(ack)
-                                                        if ack.nonce == expected_nonce
-                                                            && ack.installed =>
-                                                    {
-                                                        println!(
-                                                            "[node {announce_label}] invite: coordinated \
-                                                     intro accepted through the rendezvous underlay"
-                                                        );
-                                                        return;
-                                                    }
-                                                    Ok(ack) if ack.nonce == expected_nonce => {
-                                                        eprintln!(
-                                                            "[node {announce_label}] invite: coordinated \
-                                                     intro refused by inviter: {}",
-                                                            ack.detail
-                                                        );
-                                                    }
-                                                    Ok(_) if !reported_pending => {
-                                                        reported_pending = true;
-                                                        eprintln!(
-                                                            "[node {announce_label}] invite: coordinated \
-                                                     intro ack did not match this invite"
-                                                        );
-                                                    }
-                                                    Ok(_) => {}
-                                                    Err(e) if !reported_pending => {
-                                                        reported_pending = true;
-                                                        eprintln!(
-                                                            "[node {announce_label}] invite: coordinated \
-                                                     intro ack was malformed: {e}"
-                                                        );
-                                                    }
-                                                    Err(_) => {}
-                                                },
-                                                Ok(Err(e)) if !reported_pending => {
-                                                    reported_pending = true;
-                                                    eprintln!(
-                                                        "[node {announce_label}] invite: coordinated \
-                                                     tunnel not ready yet: {e}"
-                                                    );
-                                                }
-                                                Ok(Err(_)) | Err(_) => {}
-                                            }
-                                            ctx.sleep(Duration::from_secs(2)).await;
-                                        }
-                                    },
-                                );
-                            } else {
-                                eprintln!(
-                                    "[node {label}] invite: wireguard key unreadable — \
-                                     coordinated intro not announced"
-                                );
-                            }
-                        }
-                        _ => eprintln!(
-                            "[node {label}] invite: wireguard bootstrap is malformed — falling \
-                             back to the descriptor's reach hints"
+                        Err(e) => eprintln!(
+                            "[node {label}] invite: wireguard key unreadable ({e}) — first \
+                             contact not started; falling back to the descriptor's reach hints"
                         ),
-                    },
-                    Err(e) => eprintln!(
-                        "[node {label}] invite: wireguard bootstrap unusable ({e}) — falling \
-                         back to the descriptor's reach hints"
-                    ),
+                    }
                 }
             }
             // the voice lane: a parked joiner serves no huddle audio, but the

@@ -7,6 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,7 +22,7 @@ use reachability::{
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use wireguard_effect::{FakeWireGuardEffect, FakeWireGuardEffectError, WireGuardEffect};
-use wireguard_upgrade::{Endpoint, PortPolicy, Transport, ValidatorIdentity};
+use wireguard_upgrade::{Endpoint, PortPolicy, Transport, ValidatorIdentity, X25519PublicKey};
 
 /// `run()` owns its effect; tests need to inspect it afterwards — a shared
 /// handle delegating to the fake underneath.
@@ -1694,6 +1695,163 @@ async fn standby_persists_the_member_mesh_for_its_promotion_reboot() {
                     "restored peer for each member"
                 );
             }
+        })
+        .await;
+}
+
+/// A [`StaticResolver`] that ALSO answers the coordinated invite's intro
+/// datagram: `resolve` returns the punched underlay endpoint from the fixed
+/// map (so `resolve_rendezvous_endpoint` succeeds), and `send_datagram_and_recv`
+/// hands back a canned ack — the inviter's `IntroAck` riding home over the same
+/// punched socket. Lets an orchestrator test drive
+/// [`ReachabilityCommand::BootstrapCoordinatedInvitePeer`] end to end
+/// (resolve -> install -> ack) with no real UDP.
+/// what the resolver's `send_datagram_and_recv` observed — `(dest, intro
+/// bytes)`, shared back to the test that drove the bootstrap.
+type SentIntro = Rc<RefCell<Option<(SocketAddr, Vec<u8>)>>>;
+
+struct CoordinatedAckResolver {
+    inner: StaticResolver,
+    ack: Vec<u8>,
+    sent: SentIntro,
+}
+
+impl reachability::EndpointResolver for CoordinatedAckResolver {
+    async fn resolve(
+        &mut self,
+        peer: NodeKey,
+        advertised: SocketAddr,
+    ) -> Result<Resolution, String> {
+        self.inner.resolve(peer, advertised).await
+    }
+
+    async fn send_datagram_and_recv(
+        &mut self,
+        peer: SocketAddr,
+        bytes: Vec<u8>,
+        _timeout: Duration,
+    ) -> Result<Vec<u8>, String> {
+        *self.sent.borrow_mut() = Some((peer, bytes));
+        Ok(self.ack.clone())
+    }
+}
+
+/// `BootstrapCoordinatedInvitePeer` over a [`StaticResolver`]: the inviter's
+/// node-key resolves to a punched underlay endpoint, the orchestrator installs
+/// it as a join-window tunnel peer, sends the intro over that same socket, and
+/// the reply carries the inviter's ack back. Proves the whole
+/// resolve -> install -> ack path #260 built, with no real WireGuard or UDP.
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_coordinated_invite_resolves_installs_and_acks() {
+    let dir = tempfile::tempdir().expect("orchestrator tempdir");
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let me = PrivateKey::from_seed(1);
+            let inviter = PrivateKey::from_seed(2);
+            let inviter_pk = inviter.public_key();
+
+            // the resolver punches the inviter's node-key to a concrete underlay
+            // endpoint and answers its intro with a canned ack.
+            let punched: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+            let mut map = HashMap::new();
+            map.insert(
+                binding::node_key(binding::identity_of(&inviter_pk)),
+                Resolution::Punched(punched),
+            );
+            let ack = b"coordinated-intro-ack".to_vec();
+            let sent = Rc::new(RefCell::new(None));
+            let resolver = CoordinatedAckResolver {
+                inner: StaticResolver(map),
+                ack: ack.clone(),
+                sent: sent.clone(),
+            };
+
+            let policy = PortPolicy::production();
+            let effect = SharedFake::default();
+            let config = ReachabilityConfig {
+                chain_id: CHAIN.into(),
+                signer: me.clone(),
+                wireguard_key_file: dir.path().join("wg-me.key"),
+                wireguard_port: 51820,
+                wireguard_advertised: Some(endpoint(&policy, 10, 51820, Transport::Udp)),
+                control_endpoint: endpoint(&policy, 10, 443, Transport::Tcp),
+                coordinators: vec![],
+                port_policy: policy.clone(),
+                persist_file: None,
+                gossip_ingress: None,
+            };
+            let (cmd_tx, cmd_rx) = mpsc::channel(8);
+            let (ev_tx, mut ev_rx) = mpsc::channel(64);
+            tokio::task::spawn_local(reachability::run(
+                config,
+                effect.clone(),
+                resolver,
+                cmd_rx,
+                ev_tx,
+            ));
+
+            // drive the coordinated bootstrap.
+            let inviter_wg = X25519PublicKey([9u8; 32]);
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            cmd_tx
+                .send(ReachabilityCommand::BootstrapCoordinatedInvitePeer {
+                    peer: inviter_pk.clone(),
+                    wireguard_public_key: inviter_wg,
+                    intro: b"intro-request".to_vec(),
+                    reply: reachability::CoordinatedInviteReply(reply_tx),
+                })
+                .await
+                .expect("bootstrap command accepted");
+
+            // the reply carries the ack the resolver sent back over the punched
+            // underlay — resolve -> install -> ack completed.
+            let got = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+                .await
+                .expect("coordinated bootstrap replied in time")
+                .expect("reply channel intact")
+                .expect("coordinated bootstrap succeeded");
+            assert_eq!(got, ack, "the bootstrap returns the inviter's IntroAck bytes");
+
+            // the intro went to the RESOLVED punched endpoint, not the advertised
+            // one — the coordinated path used rendezvous, not a baked address.
+            let (dest, intro) = sent.borrow().clone().expect("resolver saw the intro send");
+            assert_eq!(dest, punched, "intro sent to the coordinator-punched endpoint");
+            assert_eq!(intro, b"intro-request", "the joiner's own intro rode across");
+
+            // the inviter is now a join-window peer on the interface.
+            let installed = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match ev_rx.recv().await.expect("event stream open") {
+                        ReachabilityEvent::InvitePeerInstalled { peer, .. } => break peer,
+                        _ => continue,
+                    }
+                }
+            })
+            .await
+            .expect("InvitePeerInstalled emitted");
+            assert_eq!(installed, inviter_pk, "the inviter identity was installed");
+
+            // inspect the applied interface in a tight scope so the mutex guard
+            // is released before the shutdown await below.
+            {
+                let fake = effect.0.lock().unwrap();
+                let last = fake
+                    .applied
+                    .last()
+                    .expect("the coordinated install applied an interface config");
+                assert!(
+                    last.peers
+                        .iter()
+                        .any(|p| p.public_key.as_array() == [9u8; 32]),
+                    "the inviter's wireguard key is a peer on the applied interface"
+                );
+            }
+
+            cmd_tx
+                .send(ReachabilityCommand::Shutdown)
+                .await
+                .expect("shutdown accepted");
         })
         .await;
 }
