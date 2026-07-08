@@ -373,7 +373,7 @@ async fn the_old_voice_ws_route_is_gone() {
 
 use std::collections::BTreeMap;
 
-use files::{DiffEntry, DiffKind, FilesQuery, FilesReply, RefsInfo};
+use duckfs_core::{DiffEntry, DiffKind, FilesQuery, FilesReply, RefsInfo};
 
 /// a scripted files actor: decodes each `FilesQuery` and answers the matching
 /// canned `FilesReply`, or fails a submit with `submit_err` (the 400-envelope
@@ -388,15 +388,15 @@ fn spawn_files_actor(
             match cmd {
                 NodeCommand::Query { target, req, reply } => {
                     assert_eq!(target, "files");
-                    let q = files::decode_query(&req).expect("files query decodes");
+                    let q = duckfs_core::decode_query(&req).expect("files query decodes");
                     let bytes = match q {
-                        FilesQuery::Refs {} => files::encode_reply(&FilesReply::Refs(RefsInfo {
+                        FilesQuery::Refs {} => duckfs_core::encode_reply(&FilesReply::Refs(RefsInfo {
                             head: Some("ab".repeat(32)),
                             pins: BTreeMap::new(),
                             window_len: 4,
                         })),
                         FilesQuery::Diff { .. } => {
-                            files::encode_reply(&FilesReply::Diff(vec![DiffEntry {
+                            duckfs_core::encode_reply(&FilesReply::Diff(vec![DiffEntry {
                                 path: "/a".into(),
                                 kind: DiffKind::Modified,
                             }]))
@@ -405,7 +405,7 @@ fn spawn_files_actor(
                             // present iff the id starts with "aa" — proves the reply
                             // order maps back to the request order over the wire.
                             let present = ids.iter().map(|id| id.starts_with("aa")).collect();
-                            files::encode_reply(&FilesReply::HasChunks { present })
+                            duckfs_core::encode_reply(&FilesReply::HasChunks { present })
                         }
                         other => panic!("unexpected files query: {other:?}"),
                     };

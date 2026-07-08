@@ -48,6 +48,10 @@ identity = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
+# duckfs reusable core and disk scratch helpers; the `files` crate above remains
+# the consensus module adapter.
+duckfs-core = { workspace = true }
+duckfs-disk = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
 jobs = { workspace = true }

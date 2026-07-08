@@ -23,9 +23,8 @@ fuse = ["dep:fuser", "dep:libc"]
 # the checkout/commit engine + the `HttpNode` transport the verbs drive.
 duckfs-client = { workspace = true }
 # the pure core: the wire display types (EntryInfo/DiffEntry/...) the read verbs
-# format. a DIRECT path dep with default-features off (cargo forbids flipping an
-# inherited dep's default-features) — the CLI never needs the native module glue.
-files = { path = "../../crates/apps/files", default-features = false }
+# format. the CLI never needs the native module glue for its production code.
+duckfs-core = { workspace = true }
 serde_json = { workspace = true }
 # FUSE mount only (feature `fuse`): the userspace filesystem driver and the libc
 # bindings for errno/uid/gid + SIGINT/SIGTERM handling. both optional so a

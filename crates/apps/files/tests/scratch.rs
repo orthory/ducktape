@@ -269,7 +269,10 @@ fn promotion_rejects_a_root_mismatch_and_leaves_canonical_untouched() {
     let err = scratch
         .promote([0xAB; 32])
         .expect_err("a mismatched root must reject");
-    assert!(err.contains("root"), "the error names the root check: {err}");
+    assert!(
+        err.contains("root"),
+        "the error names the root check: {err}"
+    );
     assert!(!canonical.exists(), "canonical untouched by the rejection");
 
     // an empty scratch (nothing synced) rejects too.

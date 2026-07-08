@@ -91,7 +91,7 @@ fn checkout_prefix(id: &str, requested: &str) -> Result<String, String> {
     } else {
         format!("/{trimmed}")
     };
-    let segs = files::paths::canonical(&absolute)
+    let segs = duckfs_core::paths::canonical(&absolute)
         .map_err(|e| format!("duckfs workspace prefix is invalid: {e}"))?;
     match segs.first().map(String::as_str) {
         Some("workspace") => Ok(managed_prefix(id, &segs[1..])),

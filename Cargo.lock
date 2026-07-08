@@ -2132,6 +2132,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "duckfs-core",
  "files",
  "futures",
  "reqwest 0.12.28",
@@ -2141,6 +2142,27 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "duckfs-core"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "duckfs-disk"
+version = "0.1.0"
+dependencies = [
+ "duckfs-core",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2333,14 +2355,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "duckfs-core",
+ "duckfs-disk",
  "futures",
  "host",
  "sdk",
- "serde",
  "serde_json",
  "sha2",
  "tempfile",
- "unicode-normalization",
 ]
 
 [[package]]
@@ -2447,6 +2469,7 @@ name = "fs-bin"
 version = "0.1.0"
 dependencies = [
  "duckfs-client",
+ "duckfs-core",
  "files",
  "fuser",
  "futures",
@@ -4099,6 +4122,8 @@ dependencies = [
  "dispatch",
  "dispatch-oracle",
  "duckfs-client",
+ "duckfs-core",
+ "duckfs-disk",
  "files",
  "forge",
  "futures",
@@ -4155,6 +4180,7 @@ dependencies = [
  "dispatch",
  "dispatch-oracle",
  "duckfs-client",
+ "duckfs-core",
  "files",
  "flate2",
  "forge",
@@ -6233,6 +6259,7 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "data-plane",
+ "duckfs-core",
  "files",
  "futures",
  "host",

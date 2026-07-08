@@ -18,8 +18,8 @@ use axum::extract::rejection::BytesRejection;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use files::objects::object_id;
-use files::{
+use duckfs_core::objects::object_id;
+use duckfs_core::{
     Change, FilesMsg, FilesQuery, FilesReply, Kind, MAX_PAGE, MAX_READ_BYTES, decode_reply,
     encode_msg, encode_putblob, encode_query, to_hex,
 };
