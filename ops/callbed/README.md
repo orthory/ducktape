@@ -82,10 +82,39 @@ Teardown: `docker compose -f ops/callbed/docker-compose.yml down -v`.
 Nodes bind `0.0.0.0` but **advertise their compose service name** (`node0`,
 `node1`) so peers dial by DNS on the compose network.
 
-## The app profile (follow-up, not yet wired)
+## App-layer huddle tests — does the real app actually huddle?
 
-To drive the **real desktop app** against this network instead of the scripted
-driver, two things are needed that this bed documents but doesn't yet ship as a
+The transport test above proves media crosses the mesh. These three thin layers
+prove the **app's own call path** on top of it — the glue between "click Join"
+and "media flows" — all against the same live callbed:
+
+```bash
+docker compose -f ops/callbed/docker-compose.yml up -d --wait node0 node1
+ops/callbed/run-app-tests.sh        # runs L1 + L2 + L3
+```
+
+| Layer | Proves | How | Files |
+|---|---|---|---|
+| **L1** | `huddleRecipients` picks the right fan-out set (self excluded, deduped) | `bun test` on the **real** function | `tests/recipients.test.ts` |
+| **L2** | a `join_huddle` op on one node lands the joiner's mesh key in the **other** node's consensus roster → recipients populate from finalized state, not a hand-push | real `/v1/submit` + `/v1/query`, then real `huddleRecipients` over the queried roster | `joinhuddle-rpc.ts` |
+| **L3** | the app's **real call client** (`call-session.ts`, unmodified) crosses **audio + video** — mic/cam capture → Opus/**WebCodecs VP8** encode → mesh → decode → canvas | two **headless Chromium** (fake mic+camera) driving the real client via CDP against the two nodes | `browser-harness/` + `run-app-e2e.sh` |
+
+**Verified green** (reproduced, not just asserted): L1 6/6; L2 rosters converge
+byte-identical on both nodes and `huddleRecipients` yields the peer key; L3 both
+pages receive peer audio (RMS ~910, non-silent) **and** peer video (163 frames,
+the real WebCodecs decoder drawing a changing 1280×720 canvas), both directions.
+
+L3 is the elegant unlock: **Chromium supplies fake mic+camera and has WebCodecs**,
+so the real client runs end-to-end headless — no PulseAudio, no VNC, no Tauri
+shell — and it even exercises VP8 encode/decode that WebKitGTK can't. So the
+heavy "containerized app" profile below is **not needed for verification**; only
+a final native-window smoke remains.
+
+## The app profile (optional — a manual native-window smoke)
+
+The layered tests above already verify the app's call path headless. If you
+additionally want to drive the **real Tauri desktop window** against this
+network, two things are needed that this bed documents but doesn't ship as a
 service:
 
 1. **A virtual mic.** Headless WebKitGTK has no audio input, so
