@@ -23,6 +23,7 @@ import type {
 } from "../../domain/pages-client";
 import type { BlockRecord, NodeStatus } from "../../domain/transport";
 import type { VoiceError } from "../../domain/voice-session";
+import type { VideoCapability } from "../../domain/video-capability";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
@@ -146,6 +147,11 @@ export interface ConsoleState {
   /** This client's live voice-huddle session — ephemeral, never in the
    *  committed snapshot (see VoiceSlice). */
   voice: VoiceSlice;
+  /** Runtime VP8 encode/decode support, resolved once from a real codec probe.
+   *  Stable (a device capability, not session state), so it lives OUTSIDE the
+   *  voice slice — the huddle-reset paths must never wipe it. `canEncode` gates
+   *  the camera control; `canDecode` gates peer-tile rendering. */
+  videoCapability: VideoCapability;
 
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
@@ -441,6 +447,7 @@ export const createInitialState = (): ConsoleState => {
       cameraOn: false,
       peers: {},
     },
+    videoCapability: { canEncode: false, canDecode: false },
     members: [],
     residents: [],
     proposals: [],

@@ -25,10 +25,10 @@ import { callSocketUrl } from "../../domain/transport";
 // camera video + control on one socket); this store drives it via CallEvent.
 import {
   createCallSession,
-  supportsVideoCalls,
   MAX_VIDEO_PARTICIPANTS,
 } from "../../domain/call-session";
 import type { CallSession, CallEvent } from "../../domain/call-session";
+import { probeVideoCapability } from "../../domain/video-capability";
 import { huddleRecipients } from "../../domain/voice-session";
 import { keyBytes, keyHex } from "../../domain/chat-client";
 import * as valsetClient from "../../domain/valset-client";
@@ -438,6 +438,11 @@ export function createActions({
   // not in a huddle. Ephemeral and per-client — it lives here, not in state;
   // the `voice` slice mirrors only its status + camera/peer beacons for the ui.
   let voice: CallSession | null = null;
+
+  // Resolve real VP8 encode/decode support ONCE (isConfigSupported is async, and
+  // API presence lies on WebKitGTK). Until it lands, videoCapability stays
+  // {false,false} so the camera toggle never appears as a dead control.
+  void probeVideoCapability().then((capability) => patch({ videoCapability: capability }));
 
   /** Our own node key hex — the fan-out set excludes it. Empty on a daemon
    *  that can't do voice. */
@@ -1281,7 +1286,7 @@ export function createActions({
 
     setCamera: (on) => {
       if (!voice) return;
-      if (on && !supportsVideoCalls()) return; // capability-gated UI should prevent this
+      if (on && !getState().videoCapability.canEncode) return; // capability-gated UI should prevent this
       const channel = getState().channels.find((c) => c.id === getState().voice.channelId);
       // block turning the camera on once the roster EXCEEDS the video cap — the
       // grid can't render more tiles, so those huddles stay audio-only.
@@ -1290,7 +1295,7 @@ export function createActions({
       update((prev) => ({ voice: { ...prev.voice, cameraOn: on } }));
     },
 
-    videoSupported: () => supportsVideoCalls(),
+    videoSupported: () => getState().videoCapability.canEncode,
 
     sweepHuddle: (channelId, user) => {
       submitTracked(

@@ -84,15 +84,9 @@ export interface CallSession {
   /** Tear the whole session down: ws, audio graph, camera, every decoder. */
   stop(): void;
 }
-
-/** Whether this runtime can do video calls (Chromium companion window on Linux;
- *  WebKitGTK lacks WebCodecs). Audio-only huddles work without it. */
-export const supportsVideoCalls = (): boolean =>
-  typeof VideoEncoder !== "undefined" &&
-  typeof VideoDecoder !== "undefined" &&
-  typeof (HTMLVideoElement.prototype as { requestVideoFrameCallback?: unknown })
-    .requestVideoFrameCallback === "function" &&
-  !!navigator.mediaDevices?.getUserMedia;
+// Runtime video capability now lives in domain/video-capability.ts (a REAL codec
+// probe via isConfigSupported — WebKitGTK exposes the WebCodecs API but may not
+// register a vp8 encoder, and encode/decode capability can diverge).
 
 /** A hub → webview control frame — camelCase tags and fields, mirroring the
  *  node's `CallServerControl` serde attributes. */
