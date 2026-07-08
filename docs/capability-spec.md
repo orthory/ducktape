@@ -40,7 +40,8 @@ A finer-grained need — "this executor, but pinned to a specific model, with
 different flags" — is a **finer tag with its own spec file**, not a routing
 rule. Define `tag = "myllm-large"` with the pinning flags in its args, have
 agents name that tag, and only hosts carrying that spec (and binary) announce
-it.
+it. [`[[variants]]`](#variants--one-file-a-family-of-finer-tags) is load-time
+sugar for writing a whole family of such finer tags in one file.
 
 ---
 
@@ -60,10 +61,12 @@ in the same trust class as a shell profile or a systemd unit:
   interpretation** — no placeholders, no quoting, no expansion. The prompt
   reaches the child only via stdin, so job content cannot inject flags or
   commands.
-- The child process runs **fenced**: an empty scratch working directory (never
-  the node's data dir), one-shot non-interactive mode, and whatever sandbox
-  flags the spec's argv encodes. Fence flags live in the spec — audit them
-  when you audit the spec.
+- The child process runs **fenced**: a working directory the spec's
+  `[workspace]` policy picks — an empty scratch dir by default, or a
+  per-agent persistent dir under the host's agent-workspaces root (never the
+  node's data dir itself) — non-interactive mode, and whatever sandbox flags
+  the spec's argv encodes. Fence flags live in the spec — audit them when you
+  audit the spec.
 
 **BYO auth is the point.** The node never reads, writes, or refreshes any
 credential file. If the executor needs a login or an API key in *its* config,
@@ -166,6 +169,9 @@ format = "text"
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `spec` | integer | yes | must be `1` |
+| `[workspace]` | table | no | per-agent persistent working directory — see [Workspace](#workspace--a-persistent-per-agent-working-directory) |
+| `[session]` | table | no | thread-continuity capture/resume — see [Session](#session--thread-continuity) |
+| `[[variants]]` | array of tables | no | load-time expansion into finer tags — see [Variants](#variants--one-file-a-family-of-finer-tags) |
 
 Unknown fields **anywhere** in the file are rejected — a typo (or a field
 from the retired model-routing era, like `[models]`) fails loud instead of
@@ -198,6 +204,175 @@ being silently ignored.
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `format` | string | yes | `"jsonl-events"` \| `"json-result"` \| `"text"` |
+
+### `[workspace]`
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `mode` | string | yes (when the section is present) | must be `"persistent"`; omit the whole section for the scratch default |
+
+### `[session]`
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `capture` | string | yes | `"jsonl-events"` \| `"json-result-field:<field>"` |
+| `resume_args` | string array | exactly one of the two | FULL replacement resume argv; must carry the `{session_id}` slot |
+| `resume_args_append` | string array | exactly one of the two | appended to the spec's own `args`; must carry the `{session_id}` slot |
+
+---
+
+## Workspace — a persistent per-agent working directory
+
+The v1 fence ran every provider child in an **empty scratch directory**. An
+agentic run wants the opposite: a stable directory the executor can read and
+write across runs, so work accumulates instead of vanishing per invocation.
+
+```toml
+[workspace]
+mode = "persistent"
+```
+
+With `persistent`, a run that carries an agent identity (composed by the
+runs module's envelope — legacy envelope-less runs carry none) executes in
+`<data>/agent-workspaces/<agent_id>/`, created on demand. Everything else —
+no `[workspace]` section, a legacy run, an embedder that wired no workspaces
+root — keeps the scratch fence unchanged. The child still never sees the
+node's data directory itself, and the agent id is defensively rejected as a
+path component if it carries separators or traversal tokens.
+
+The workspaces root is host policy: the node binaries derive it from their
+data dir; `DUCKTAPE_AGENT_WORKSPACES` overrides it. Host-local state, never
+consensus — two nodes running the same agent have independent workspaces.
+
+---
+
+## Session — thread continuity
+
+Agentic CLIs keep their own conversation state keyed by a **session id**.
+`[session]` teaches the host to capture that id from a successful run's
+stdout and to resume it on the next run of the same conversation thread:
+
+```toml
+[session]
+capture = "jsonl-events"                        # or "json-result-field:session_id"
+resume_args = ["exec", "resume", "{session_id}", "--json", "-"]
+# or, for flag-style CLIs:
+# resume_args_append = ["--resume", "{session_id}"]
+```
+
+- **capture** — how the id is read: `"jsonl-events"` scans the event stream
+  (`thread.started`.`thread_id`, a top-level `session_id`, or the older
+  `session_configured` envelope); `"json-result-field:<field>"` reads the
+  named string field of the single result object. Capture is **tolerant**:
+  no id in the output means no session is stored — never an error.
+- **resume** — how a stored id becomes the next invocation's argv. `resume_args`
+  REPLACES the argv wholesale (for CLIs where resuming is a subcommand);
+  `resume_args_append` appends to the spec's own `args` (for flag-style
+  resuming — every variant keeps its model/effort pins for free). Exactly one
+  of the two, and it must use the `{session_id}` slot.
+
+`{session_id}` is the **one substitution in the whole format**, filled
+host-side with an id the executor itself minted (validated: short, printable,
+space-free) — job content can never reach argv. This is host-local plumbing,
+NOT the removed dispatch-time model routing: nothing here touches consensus,
+and every tag still resolves to fixed argv shapes known at load time.
+
+Mechanics (all host-local):
+
+- Session ids live in `<data>/agent-sessions/<agent_id>/<sha256(thread_key)>`
+  (`DUCKTAPE_AGENT_SESSIONS` overrides the root). The thread key is hashed,
+  so any key content is filesystem-safe.
+- A **stale session degrades to a cold start**: if the resumed invocation
+  fails, the session file is deleted and the run retries ONCE cold before
+  reporting failure. Store writes are best-effort (a failure warns and costs
+  continuity, never the answer).
+- Sessions are **assignee-local by design**: another node executing the same
+  thread's next run finds no session file and starts cold — correct, because
+  the run envelope carries the full transcript either way.
+
+---
+
+## Variants — one file, a family of finer tags
+
+`[[variants]]` is **load-time sugar** over the finer-tag pattern above: each
+entry registers an ADDITIONAL spec under the composed tag
+`{parent_tag}_{suffix}`, exactly as if you had written one more spec file for
+it. Nothing changes at dispatch time — **one tag still means one fixed,
+fully literal argv**.
+
+```toml
+spec = 1
+
+[capability]
+tag = "myllm"
+
+[detect]
+bin = "myllm"
+
+[invoke]
+args = ["run"]              # the base tag's argv — untouched by variants
+prompt = "stdin"
+
+[output]
+format = "text"
+
+# registers the tag "myllm_large-v2_high" with its OWN full argv.
+[[variants]]
+suffix = "large-v2_high"
+args = ["run", "--model", "large-v2", "--effort", "high"]
+```
+
+Each entry:
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `suffix` | string | yes | `<model>_<effort>`, each side `[a-z0-9.-]+` (so exactly one `_`) |
+| `args` | string array | yes | the variant's **full** argv — verbatim, complete, never merged with or derived from the parent's args |
+| `resume_args` | string array | no | FULL replacement for the inherited `[session]` resume argv (`{session_id}` slot required; parent must declare `[session]`) |
+
+A variant **inherits** `bin`, `env`, `prompt`, `timeout_secs`, `output`,
+`[workspace]`, and `[session]` (and `description`) from the parent spec;
+`args` is its own, whole, and literal. There is no field merging and no
+placeholder substitution — the "argv is literal" invariant holds per tag.
+The one nuance is subcommand-style resuming: an inherited `resume_args`
+replacement cannot carry a per-variant model flag, so a variant may declare
+its own `resume_args` (the embedded codex family does; append-style families
+like claude never need to — the appended flags ride each variant's own args).
+
+**The tag grammar.** A composed tag is `{provider}_{model}_{effort}` and
+splits into **exactly three segments on `_`** — the contract the desktop
+app's provider/model/effort picker decomposes tags by (e.g.
+`codex_gpt-5.5_xhigh`, `claude_opus_max`). The loader enforces it fail-loud:
+
+- the parent tag must be underscore-free (a `my_llm` parent cannot declare
+  variants — write separate spec files instead);
+- the suffix must be `<model>_<effort>` with both sides non-empty
+  `[a-z0-9.-]+`;
+- the composed tag must pass the shared consensus tag rule (≤ 64 bytes);
+- duplicate suffixes in one file — and composed tags colliding with any other
+  tag in the operator dir — are hard errors, like every other duplicate tag;
+- unknown fields inside a `[[variants]]` entry are rejected, like everywhere
+  else in the format.
+
+A tag that does not follow the grammar is still a perfectly good tag — the
+app just treats it as opaque (selectable as-is, no cascading picker).
+
+**Override semantics are unchanged**: a variant tag is its own tag, and
+operator specs override **by tag, wholesale**. Overriding a built-in base tag
+(say `codex`) does NOT touch its built-in variant tags (`codex_*_*` remain);
+override those individually if you want them retuned, or shadow them with an
+operator file declaring its own `[[variants]]`.
+
+**This is NOT the removed model routing.** The retired `[models]` table and
+`{model}` argv placeholder chose flags at *dispatch time*; `[[variants]]`
+expands *once at load* into ordinary specs, each with a fixed verbatim argv.
+There is still no routing table, no pattern matching, and no substitution
+anywhere in the invoke path.
+
+The embedded built-ins use this to ship a curated model/effort matrix:
+`codex` (base) plus `codex_{gpt-5.5,gpt-5.5-codex}_{low,medium,high,xhigh}`,
+and `claude` (base) plus
+`claude_{fable,opus,sonnet,haiku}_{low,medium,high,max}`.
 
 ---
 
@@ -243,7 +418,8 @@ Restart the node. If `ollama` is executable on `PATH`:
 If the binary is missing, the capability is simply not announced — the spec
 sitting in the directory is inert, not an error. Want the same daemon under
 two tunings? Two files, two tags (`ollama`, `ollama-large`), each with its
-own literal args.
+own literal args — or one file with [`[[variants]]`](#variants--one-file-a-family-of-finer-tags)
+if the tunings follow the `provider_model_effort` grammar.
 
 ---
 
@@ -254,6 +430,8 @@ own literal args.
 | `DUCKTAPE_CAPABILITY_DIR` | operator spec directory (explicit; missing dir = boot error) |
 | *(per spec)* `[detect].env` | each spec may name its own explicit-binary override var — see the embedded specs for theirs |
 | `DUCKTAPE_PROVIDER_TIMEOUT_SECS` | overrides **every** spec's `timeout_secs` at once |
+| `DUCKTAPE_AGENT_WORKSPACES` | overrides the persistent-workspaces root (default `<data>/agent-workspaces`) |
+| `DUCKTAPE_AGENT_SESSIONS` | overrides the session-store root (default `<data>/agent-sessions`) |
 
 ---
 
@@ -268,4 +446,9 @@ a spec means one thing, on every build that accepts it.
 
 (The retired `[models]` routing table and `{model}` argv placeholder were
 removed within v1 as a pre-release flag day: files that still carry them fail
-loudly at boot with an unknown-field error, never a silent behavior change.)
+loudly at boot with an unknown-field error, never a silent behavior change.
+`[[variants]]` was likewise added within v1 pre-release — a build older than
+it rejects a file carrying variants loudly as an unknown field, never
+misreading it as a single-tag spec. `[workspace]` and `[session]` follow the
+same pre-release precedent: an older build rejects a file carrying them as
+unknown fields rather than silently running scratch-and-cold.)

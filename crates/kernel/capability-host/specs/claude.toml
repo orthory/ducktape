@@ -1,8 +1,25 @@
 # Capability spec: Claude Code CLI.
 #
 # Embedded built-in default — see codex.toml for the annotated reference and
-# docs/capability-spec.md for the full format. No --model flag by default:
-# which model runs is the operator's CLI configuration (host policy).
+# docs/capability-spec.md for the full format. The BASE tag ("claude") passes
+# no --model flag: which model runs is the operator's CLI configuration (host
+# policy). The [[variants]] below are the curated model/effort matrix — each
+# expands at load time into a finer tag `claude_<model>_<effort>` carrying
+# its own fully literal argv (base args + --model/--effort), overridable
+# per tag like any other spec.
+#
+# Agentic posture: no --max-turns cap and `--permission-mode acceptEdits`
+# (verified present in claude 2.1.202), so the CLI may run tool-use loops and
+# edit files — confined to its cwd, which [workspace] pins to the agent's
+# persistent dir under the host's agent-workspaces root. [session] adds
+# thread continuity: the session id rides the --output-format json result
+# object (`session_id`), and later runs of the same thread append
+# `--resume <id>` to the SAME argv — the append style keeps each variant's
+# --model/--effort pins on the resume path for free. The `{session_id}` slot
+# is the one host-side substitution in the format, filled with an id the CLI
+# itself minted — host-local plumbing, NOT the removed consensus model
+# routing. Sessions are assignee-local: another node picking up the thread
+# just starts cold.
 
 spec = 1
 
@@ -15,18 +32,102 @@ bin = "claude"
 env = "DUCKTAPE_CLAUDE_BIN"
 
 [invoke]
-# Print mode with a single JSON result object; one turn so the agent answers
-# instead of embarking on tool-use loops. Prompt arrives on stdin.
+# Print mode with a single JSON result object; edits auto-accepted inside the
+# workspace cwd. Prompt arrives on stdin.
 args = [
     "-p",
     "--output-format",
     "json",
-    "--max-turns",
-    "1",
+    "--permission-mode",
+    "acceptEdits",
 ]
 prompt = "stdin"
-timeout_secs = 300
+# Agentic runs (tool-use loops in a real workspace) are slower than one-shot
+# answers; operators override per tag by shadowing the spec, or globally via
+# DUCKTAPE_PROVIDER_TIMEOUT_SECS.
+timeout_secs = 600
 
 [output]
 # The single `{"type":"result",...}` object from --output-format json.
 format = "json-result"
+
+[workspace]
+# Persistent per-agent cwd (<data>/agent-workspaces/<agent_id>); omit this
+# section for the empty-scratch-dir fence.
+mode = "persistent"
+
+[session]
+# The result object carries the session id; resuming is a flag, so the
+# resume argv is the spec's own args plus --resume <id> — inherited by every
+# variant with its model/effort pins intact.
+capture = "json-result-field:session_id"
+resume_args_append = ["--resume", "{session_id}"]
+
+# ---- curated model/effort matrix -------------------------------------------
+# Base args plus an explicit --model and --effort per variant. The inherited
+# [session] append style adds --resume <id> after each variant's own args on
+# the resume path.
+
+[[variants]]
+suffix = "fable_low"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "fable", "--effort", "low"]
+
+[[variants]]
+suffix = "fable_medium"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "fable", "--effort", "medium"]
+
+[[variants]]
+suffix = "fable_high"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "fable", "--effort", "high"]
+
+[[variants]]
+suffix = "fable_max"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "fable", "--effort", "max"]
+
+[[variants]]
+suffix = "opus_low"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "opus", "--effort", "low"]
+
+[[variants]]
+suffix = "opus_medium"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "opus", "--effort", "medium"]
+
+[[variants]]
+suffix = "opus_high"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "opus", "--effort", "high"]
+
+[[variants]]
+suffix = "opus_max"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "opus", "--effort", "max"]
+
+[[variants]]
+suffix = "sonnet_low"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "sonnet", "--effort", "low"]
+
+[[variants]]
+suffix = "sonnet_medium"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "sonnet", "--effort", "medium"]
+
+[[variants]]
+suffix = "sonnet_high"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "sonnet", "--effort", "high"]
+
+[[variants]]
+suffix = "sonnet_max"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "sonnet", "--effort", "max"]
+
+[[variants]]
+suffix = "haiku_low"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "haiku", "--effort", "low"]
+
+[[variants]]
+suffix = "haiku_medium"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "haiku", "--effort", "medium"]
+
+[[variants]]
+suffix = "haiku_high"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "haiku", "--effort", "high"]
+
+[[variants]]
+suffix = "haiku_max"
+args = ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--model", "haiku", "--effort", "max"]

@@ -22,9 +22,11 @@
 //!   registry record and its dispatch recipe land (or abort) as one unit.
 //! - **P4 — anchored generation.** the ENTIRE model input is composed in
 //!   consensus — transcript window, prompt framing, output contract — and
-//!   rides the dispatch as committed payload data, so any validator holds the
-//!   exact prompt input as ordered state, and the reply is never presented as
-//!   ordered before its anchor.
+//!   rides the dispatch as committed payload data (the structured envelope in
+//!   [`envelope`]; the agent's prompt rides as its committed hash, resolved
+//!   from the content-addressed blob store by the host), so any validator
+//!   holds the exact prompt input as ordered state, and the reply is never
+//!   presented as ordered before its anchor.
 //! - **P6 — callback adjacency.** on the dispatch plane this becomes
 //!   next-block delivery: the ResultEvent, the validated reply, the task
 //!   writes, and a job-backed run's finalize all commit in the one delivery
@@ -109,6 +111,10 @@
 mod interface;
 pub use interface::*;
 
+// dispatch payload composition: the structured run envelope.
+mod envelope;
+pub use envelope::RUN_ENVELOPE_VERSION;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use agent::{
@@ -118,7 +124,7 @@ use agent::{
     encode_query as agent_encode_query, encode_response,
 };
 use chat::{
-    AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
+    Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };
@@ -202,111 +208,8 @@ pub fn dispatch_id_for(run_id: &str) -> String {
     hex(&Sha256::digest(run_id.as_bytes()))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-// ---- dispatch payload composition ------------------------------------------------
-// the dispatch plane's rule: the DISPATCHER composes the entire model input,
-// in consensus, and the host-side worker feeds it to the provider verbatim.
-
-/// generic instructions when the agent has no consensus-resident prompt.
-const DEFAULT_PROMPT: &str =
-    "You are a Ducktape agent. Reply helpfully and return only the requested JSON output.";
-
-/// the strict output contract appended to every composed payload — exactly
-/// the [`AgentResponse`] wire shape.
-const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
-{"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[]}
-Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Do not include markdown fences around the JSON."#;
-
-/// flatten a chat run into the single payload a non-interactive CLI takes:
-/// the system instructions, the strict-output contract, then the conversation.
-/// the host resolves the agent's real prompt (pinned by `prompt_hash`) from
-/// the blob store; the deterministic payload carries the generic default.
-fn render_payload(
-    module_id: &str,
-    agent_id: &str,
-    transcript: &[MessageView],
-) -> String {
-    let mut out = String::new();
-    out.push_str(DEFAULT_PROMPT);
-    out.push_str("\n\n");
-    out.push_str(STRICT_OUTPUT_INSTRUCTION);
-    out.push_str("\n\n");
-    if transcript.is_empty() {
-        out.push_str("No transcript was embedded for this run. Answer the user helpfully.");
-        return out;
-    }
-    out.push_str("Conversation so far:\n");
-    for message in transcript {
-        let speaker = match &message.head.author {
-            AuthorRef::Agent { module, agent_id: author }
-                if module == module_id && author == agent_id =>
-            {
-                "you"
-            }
-            _ => "them",
-        };
-        out.push_str(&format!("[{speaker}] {}\n", render_message(message)));
-    }
-    out.push_str("\nReply as the agent.");
-    out
-}
-
-/// flatten a job-backed run the same way: instructions, contract, then the
-/// job's coordinates and its FULL submitted spec.
-fn render_job_payload(job_id: &str, spec: &str) -> String {
-    let mut out = String::new();
-    out.push_str(DEFAULT_PROMPT);
-    out.push_str("\n\n");
-    out.push_str(STRICT_OUTPUT_INSTRUCTION);
-    out.push_str(&format!(
-        "\n\nJob {job_id} — chat replies are not delivered for job runs; respond with actions only.\n\nJob spec:\n{spec}"
-    ));
-    out
-}
-
-fn render_message(message: &MessageView) -> String {
-    format!(
-        "{} @{}: {}",
-        render_author(&message.head.author),
-        message.seq,
-        message
-            .head
-            .blocks
-            .iter()
-            .map(render_block)
-            .collect::<Vec<_>>()
-            .join("\n")
-    )
-}
-
-fn render_author(author: &AuthorRef) -> String {
-    match author {
-        AuthorRef::User(bytes) => format!("user:{}", hex(bytes)),
-        AuthorRef::Agent { module, agent_id } => format!("agent:{module}/{agent_id}"),
-        AuthorRef::Module(module) => format!("module:{module}"),
-        AuthorRef::System => "system".into(),
-    }
-}
-
-fn render_block(block: &Block) -> String {
-    match block {
-        Block::Paragraph(spans) => spans.iter().map(|s| s.text.as_str()).collect(),
-        Block::Code { lang, text } => match lang {
-            Some(lang) if !lang.is_empty() => format!("```{lang}\n{text}\n```"),
-            _ => format!("```\n{text}\n```"),
-        },
-        Block::Quote(spans) => {
-            let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-            text.lines()
-                .map(|line| format!("> {line}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        Block::Divider => "---".into(),
-    }
 }
 
 // ---- response normalization ---------------------------------------------------------
@@ -325,7 +228,7 @@ const REPLY_KIND_CODE: &str = "code";
 /// reply as the fallback for prose. job runs never carry reply blocks — there
 /// is no channel to deliver them to.
 fn agent_response_from_text(text: &str, job_run: bool) -> AgentResponse {
-    let parsed = serde_json::from_str::<AgentResponse>(text).unwrap_or_else(|_| AgentResponse {
+    let parsed = parse_strict_response(text).unwrap_or_else(|| AgentResponse {
         reply_blocks: if job_run {
             Vec::new()
         } else {
@@ -334,6 +237,49 @@ fn agent_response_from_text(text: &str, job_run: bool) -> AgentResponse {
         actions: Vec::new(),
     });
     normalize_response(parsed, text, job_run)
+}
+
+/// decode the strict-output contract's [`AgentResponse`] from a provider's
+/// final message. the contract asks for a bare JSON object, but LLMs routinely
+/// wrap it in a ```` ```json ```` markdown fence (agentic multi-turn CLIs
+/// especially) or pad it with a line of prose — so parse tolerantly: bare
+/// first, then de-fenced, then the outermost `{…}` span. without this a
+/// perfectly well-formed reply reaches chat as a raw ```` ```json ```` code
+/// block instead of the prose the model actually wrote.
+fn parse_strict_response(text: &str) -> Option<AgentResponse> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    [
+        Some(trimmed),
+        strip_code_fence(trimmed),
+        outermost_json_object(trimmed),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|candidate| serde_json::from_str::<AgentResponse>(candidate.trim()).ok())
+}
+
+/// strip a single surrounding markdown code fence, returning the inner body.
+/// tolerant of an info string (```` ```json ````) and of a missing close.
+fn strip_code_fence(text: &str) -> Option<&str> {
+    // the opening fence's info string runs to the first newline (```json\n…).
+    let body = text.strip_prefix("```")?.split_once('\n').map(|(_, b)| b)?;
+    let body = body.trim();
+    Some(body.strip_suffix("```").unwrap_or(body).trim())
+}
+
+/// the span from the first `{` to the last `}` — JSON the model buried in
+/// prose. required fields keep a non-object span from parsing; an object with
+/// no known fields decodes empty and degrades to the raw-text paragraph, so
+/// over-matching is harmless.
+fn outermost_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    // lazily — a `}` before the first `{` gives start > end, and slicing that
+    // range panics; `then` must not evaluate the slice unless the range holds.
+    (start < end).then(|| &text[start..=end])
 }
 
 fn paragraph_block(text: String) -> ReplyBlock {
@@ -418,6 +364,20 @@ fn truncate_utf8(text: &str, max: usize) -> String {
         keep -= 1;
     }
     format!("{}…", &text[..keep])
+}
+
+/// byte bound on the error excerpt a failure reply carries — same order as
+/// the host's diagnostic excerpts (capability-host bounds stderr to 400).
+const FAILURE_EXCERPT_BYTES: usize = 400;
+
+/// a failed run's error as ONE bounded chat line: whitespace runs (newlines
+/// included) collapse to single spaces, then the excerpt bound applies.
+fn failure_excerpt(reason: &str) -> String {
+    let line = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        return "no error detail".into();
+    }
+    truncate_utf8(&line, FAILURE_EXCERPT_BYTES)
 }
 
 /// the canonical state form of a dispatch origin (see [`SagaOrigin`]).
@@ -1076,8 +1036,15 @@ impl RunsModule {
         anchor_seq: u64,
     ) -> Result<PreparedDispatch, String> {
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
-        let payload =
-            render_payload(&self.id, &agent.agent_id, &transcript).into_bytes();
+        let payload = envelope::render_payload(
+            &self.id,
+            agent,
+            channel_id,
+            anchor_seq,
+            thread_root,
+            &transcript,
+        )
+        .into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(format!(
                 "composed payload is {} bytes; the dispatch cap is {MAX_PAYLOAD_BYTES}",
@@ -1237,15 +1204,16 @@ impl RunsModule {
             );
             return Ok(());
         }
-        match self.active_agent(&*ctx, agent_id).await {
-            Ok(Some(_)) => {}
+        // the record rides into the envelope below (agent id + prompt pin).
+        let agent = match self.active_agent(&*ctx, agent_id).await {
+            Ok(Some(agent)) => agent,
             // an unknown or paused agent leaves the job on the board.
             Ok(None) => return Ok(()),
             Err(reason) => {
                 self.note(ctx, format!("dropped jobs event for {job_id}: {reason}"));
                 return Ok(());
             }
-        }
+        };
         let Some(jobs) = self.jobs.clone() else {
             self.note(
                 ctx,
@@ -1275,7 +1243,7 @@ impl RunsModule {
         // compose BEFORE claiming: a job whose payload cannot be composed
         // (an oversized spec) is left unclaimed on the board, not claimed
         // into a run that could never execute.
-        let payload = render_job_payload(&job_id, &spec).into_bytes();
+        let payload = envelope::render_job_payload(&agent, &job_id, &spec).into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
             self.note(
                 ctx,
@@ -1486,10 +1454,11 @@ impl RunsModule {
                             .await;
                     }
                     // deterministically invalid response: the run fails —
-                    // breadcrumb, job finalize, pruned entry — the delivery
-                    // block commits.
+                    // breadcrumb, threaded failure reply, job finalize,
+                    // pruned entry — the delivery block commits.
                     Err(reason) => {
                         self.note(ctx, format!("run {run_id} failed: {reason}"));
+                        self.emit_failure_reply(ctx, &run_id, &entry, &reason).await;
                         self.emit_job_finalize_if_current_claimant(ctx, &entry, false, reason)
                             .await;
                     }
@@ -1497,6 +1466,7 @@ impl RunsModule {
             }
             Err(reason) => {
                 self.note(ctx, format!("run {run_id} failed: {reason}"));
+                self.emit_failure_reply(ctx, &run_id, &entry, &reason).await;
                 self.emit_job_finalize_if_current_claimant(ctx, &entry, false, reason)
                     .await;
             }
@@ -1546,53 +1516,7 @@ impl RunsModule {
                     reply_bytes.len()
                 ));
             }
-            // message ids are client-chosen, so anyone could squat the reply
-            // id before the result lands; chat would reject the duplicate and
-            // abort the block. fail the run instead.
-            let message_id = reply_message_id(run_id);
-            let reply = ctx
-                .query(
-                    &self.chat,
-                    &chat_encode_query(&ChatQuery::Message {
-                        message_id: message_id.clone(),
-                    }),
-                )
-                .await
-                .map_err(|e| format!("chat message lookup failed: {e}"))?;
-            match chat_decode_reply(&reply) {
-                Ok(ChatReply::Message(None)) => {}
-                Ok(ChatReply::Message(Some(_))) => {
-                    return Err(format!("reply message id already taken: {message_id}"));
-                }
-                _ => return Err("unexpected chat reply for a message lookup".into()),
-            }
-            // a threaded reply must still fit under chat's thread cap.
-            if let Some(root_seq) = entry.thread_root {
-                let reply = ctx
-                    .query(
-                        &self.chat,
-                        &chat_encode_query(&ChatQuery::MessagesRange {
-                            channel_id: entry.channel_id.clone(),
-                            from_seq: root_seq,
-                            limit: 1,
-                        }),
-                    )
-                    .await
-                    .map_err(|e| format!("chat thread lookup failed: {e}"))?;
-                let Ok(ChatReply::Messages(views)) = chat_decode_reply(&reply) else {
-                    return Err("unexpected chat reply for a thread lookup".into());
-                };
-                let root = views
-                    .first()
-                    .filter(|v| v.seq == root_seq)
-                    .ok_or_else(|| format!("thread root does not exist: {root_seq}"))?;
-                if root.head.reply_count >= MAX_THREAD_REPLIES as u64 {
-                    return Err(format!(
-                        "thread reply cap reached: {}/{root_seq}",
-                        entry.channel_id
-                    ));
-                }
-            }
+            self.probe_reply_postable(ctx, run_id, entry).await?;
         }
 
         if !response.actions.is_empty() {
@@ -1630,6 +1554,128 @@ impl RunsModule {
         }
 
         Ok(response)
+    }
+
+    /// prove a reply under the run's message id could land in chat RIGHT NOW
+    /// — the no-fail rule again: an emitted post must be valid by
+    /// construction, so anything chat would reject is probed first.
+    async fn probe_reply_postable(
+        &self,
+        ctx: &dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+    ) -> Result<(), String> {
+        // message ids are client-chosen, so anyone could squat the reply
+        // id before the result lands; chat would reject the duplicate and
+        // abort the block. fail the run instead.
+        let message_id = reply_message_id(run_id);
+        let reply = ctx
+            .query(
+                &self.chat,
+                &chat_encode_query(&ChatQuery::Message {
+                    message_id: message_id.clone(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("chat message lookup failed: {e}"))?;
+        match chat_decode_reply(&reply) {
+            Ok(ChatReply::Message(None)) => {}
+            Ok(ChatReply::Message(Some(_))) => {
+                return Err(format!("reply message id already taken: {message_id}"));
+            }
+            _ => return Err("unexpected chat reply for a message lookup".into()),
+        }
+        // a threaded reply must still fit under chat's thread cap.
+        if let Some(root_seq) = entry.thread_root {
+            let reply = ctx
+                .query(
+                    &self.chat,
+                    &chat_encode_query(&ChatQuery::MessagesRange {
+                        channel_id: entry.channel_id.clone(),
+                        from_seq: root_seq,
+                        limit: 1,
+                    }),
+                )
+                .await
+                .map_err(|e| format!("chat thread lookup failed: {e}"))?;
+            let Ok(ChatReply::Messages(views)) = chat_decode_reply(&reply) else {
+                return Err("unexpected chat reply for a thread lookup".into());
+            };
+            let root = views
+                .first()
+                .filter(|v| v.seq == root_seq)
+                .ok_or_else(|| format!("thread root does not exist: {root_seq}"))?;
+            if root.head.reply_count >= MAX_THREAD_REPLIES as u64 {
+                return Err(format!(
+                    "thread reply cap reached: {}/{root_seq}",
+                    entry.channel_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// surface a failed CHAT run as a threaded reply authored by the agent —
+    /// same message id as a success reply would use, so the one-reply-per-run
+    /// dedup holds and a redelivered result (entry already pruned) can never
+    /// double-post. anything that keeps the post from being valid by
+    /// construction (job run, unregistered agent, missing chat.post grant,
+    /// squatted id, full thread) degrades to the pre-existing breadcrumb-only
+    /// silence — never an error on this no-fail arm.
+    async fn emit_failure_reply(
+        &self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        reason: &str,
+    ) {
+        if entry.job_id.is_some() {
+            // job runs have no channel; the finalize payload carries the error.
+            return;
+        }
+        match self.failure_reply(&*ctx, run_id, entry, reason).await {
+            Ok(msg) => ctx.emit_msg(msg),
+            Err(why) => self.note(ctx, format!("run {run_id} failure not surfaced: {why}")),
+        }
+    }
+
+    /// the failure post, or the reason it must stay unposted.
+    async fn failure_reply(
+        &self,
+        ctx: &dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        reason: &str,
+    ) -> Result<Msg, String> {
+        let agent = self
+            .agent_record(ctx, &entry.agent_id)
+            .await?
+            .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
+        // posting the failure is a chat post like any reply — ungranted
+        // agents keep the old silent-fail.
+        if !allows(&agent, ACTION_CHAT_POST) {
+            return Err(format!(
+                "agent {} is not allowed to {ACTION_CHAT_POST}",
+                entry.agent_id
+            ));
+        }
+        self.probe_reply_postable(ctx, run_id, entry).await?;
+        let name = if agent.display_name.is_empty() {
+            agent.agent_id.as_str()
+        } else {
+            agent.display_name.as_str()
+        };
+        let text = format!("⚠ {name} failed: {}", failure_excerpt(reason));
+        Ok(Msg {
+            target: self.chat.clone(),
+            payload: chat_encode_msg(&ChatMsg::PostMessage {
+                channel_id: entry.channel_id.clone(),
+                message_id: reply_message_id(run_id),
+                blocks: vec![Block::paragraph(text)],
+                thread: entry.thread_root,
+                as_agent: Some(entry.agent_id.clone()),
+            }),
+        })
     }
 
     async fn task_ids(&self, ctx: &dyn Ctx, tasks: &str) -> Result<BTreeSet<String>, String> {
@@ -2086,7 +2132,7 @@ mod tests {
         ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, PROMPT_HASH_LEN,
         encode_event as agent_encode_event, encode_reply as agent_encode_reply,
     };
-    use chat::{MessageHead, decode_msg as chat_decode_msg};
+    use chat::{AuthorRef, MessageHead, decode_msg as chat_decode_msg};
     use dispatch::{
         DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
         encode_reply as dispatch_encode_reply, encode_result_event,
@@ -2837,7 +2883,8 @@ mod tests {
         assert_eq!(get_pending(&m, &run_id_for("general", 3, "bot2")), None);
 
         // exactly one dispatch, under the agent's own recipe, carrying the
-        // fully composed payload — prompt framing, contract, transcript.
+        // fully composed envelope — prompt pin, thread key, contract,
+        // transcript.
         let dispatches = ctx.dispatch_msgs();
         assert_eq!(dispatches.len(), 1);
         let DispatchMsg::Dispatch {
@@ -2850,18 +2897,119 @@ mod tests {
         };
         assert_eq!(*dispatch_id, dispatch_id_for(&run_id));
         assert_eq!(*recipe_id, recipe_id_for("bot1"));
-        let text = String::from_utf8(payload.clone()).unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_slice(payload).expect("the payload is a JSON envelope");
+        assert_eq!(envelope["ducktape_run"], RUN_ENVELOPE_VERSION);
+        assert_eq!(envelope["agent_id"], "bot1");
+        assert_eq!(
+            envelope["prompt_hash"],
+            "07".repeat(PROMPT_HASH_LEN),
+            "the registry's prompt pin rides the envelope"
+        );
+        assert_eq!(
+            envelope["thread_key"], "general#3",
+            "a non-thread anchor keys the thread by itself"
+        );
         assert!(
-            text.contains("Return ONLY a JSON object"),
+            envelope["contract"]
+                .as_str()
+                .unwrap()
+                .contains("Return ONLY a JSON object"),
             "the strict output contract rides the payload"
         );
         assert!(
-            text.contains("msg 3"),
+            envelope["conversation"].as_str().unwrap().contains("msg 3"),
             "the pinned transcript rides the payload verbatim"
         );
         assert!(
-            text.starts_with("You are a Ducktape agent."),
-            "the generic instructions lead the deterministic payload"
+            envelope["instructions"]
+                .as_str()
+                .unwrap()
+                .starts_with("You are a Ducktape agent."),
+            "the generic fallback instructions ride the envelope"
+        );
+    }
+
+    #[test]
+    fn the_envelope_tracks_the_registrys_live_prompt_pin() {
+        // runs never mirrors the pin: composition queries the registry at
+        // dispatch time (staged same-block registrations included), so an
+        // UpdateAgent prompt rotation is picked up by the very next run
+        // without any hook payload carrying it, and a capability retune
+        // never disturbs it.
+        let mut registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        let mut m = watched(TurnPolicy::All, &registry);
+
+        // the registration hook fires as it would in the record's block.
+        let mut hook_ctx = CaptureCtx::new().from_agent().with_registry(&registry);
+        exec(
+            &mut m,
+            &mut hook_ctx,
+            &agent_event(&AgentEvent::Registered {
+                agent_id: "bot".into(),
+                capability: "model-1".into(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        let ctx = engage_post(&mut m, &registry, 2, &[]);
+        commit(&mut m);
+        let DispatchMsg::Dispatch { payload, .. } = &ctx.dispatch_msgs()[0] else {
+            panic!("expected a dispatch");
+        };
+        let envelope: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(envelope["prompt_hash"], "07".repeat(PROMPT_HASH_LEN));
+
+        // the owner rotates the prompt; the registry hook only ever carries
+        // capability retunes — process one to show it is orthogonal.
+        registry.get_mut("bot").unwrap().prompt_hash = vec![9u8; PROMPT_HASH_LEN];
+        let mut hook_ctx = CaptureCtx::new().from_agent().with_registry(&registry);
+        exec(
+            &mut m,
+            &mut hook_ctx,
+            &agent_event(&AgentEvent::CapabilityChanged {
+                agent_id: "bot".into(),
+                capability: "model-2".into(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        let ctx = engage_post(&mut m, &registry, 3, &[]);
+        commit(&mut m);
+        let DispatchMsg::Dispatch { payload, .. } = &ctx.dispatch_msgs()[0] else {
+            panic!("expected a dispatch");
+        };
+        let envelope: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(
+            envelope["prompt_hash"],
+            "09".repeat(PROMPT_HASH_LEN),
+            "the next run composes from the updated record"
+        );
+        assert_eq!(envelope["agent_id"], "bot");
+    }
+
+    #[test]
+    fn an_agent_without_a_prompt_pin_dispatches_a_null_prompt_hash() {
+        let mut registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        registry.get_mut("bot").unwrap().prompt_hash = Vec::new();
+        let mut m = watched(TurnPolicy::All, &registry);
+        let ctx = engage_post(&mut m, &registry, 2, &[]);
+        commit(&mut m);
+        let DispatchMsg::Dispatch { payload, .. } = &ctx.dispatch_msgs()[0] else {
+            panic!("expected a dispatch");
+        };
+        let envelope: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert!(
+            envelope["prompt_hash"].is_null(),
+            "no pin composes as null — the host falls back to instructions"
+        );
+        assert!(
+            envelope["instructions"]
+                .as_str()
+                .unwrap()
+                .starts_with("You are a Ducktape agent.")
         );
     }
 
@@ -3361,6 +3509,13 @@ mod tests {
         commit(&mut m);
         let run_id = run_id_for("general", 3, "bot");
         assert_eq!(get_pending(&m, &run_id).unwrap().thread_root, Some(1));
+        // the envelope keys thread continuity by the ROOT, not the anchor.
+        let dispatches = ctx.dispatch_msgs();
+        let DispatchMsg::Dispatch { payload, .. } = &dispatches[0] else {
+            panic!("expected a dispatch");
+        };
+        let envelope: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(envelope["thread_key"], "general#1");
 
         let mut ctx = CaptureCtx::new()
             .at(9)
@@ -3383,11 +3538,12 @@ mod tests {
     }
 
     #[test]
-    fn invalid_responses_fail_the_run_and_emit_no_follow_ups() {
+    fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
         // normalization already absorbed shape problems (prose, fences,
         // oversize); what remains failable is POLICY: task validity and
-        // grants. every case still emits NOTHING, leaves a breadcrumb, and
-        // prunes the entry — never the block.
+        // grants. every case emits NO follow-up except the ⚠ failure reply
+        // (the agent here holds chat.post), leaves a breadcrumb, and prunes
+        // the entry — never the block.
         let cases: Vec<(&str, Vec<u8>)> = vec![
             (
                 "task already exists: t0",
@@ -3460,8 +3616,38 @@ mod tests {
                 .with_task("t0");
             exec(&mut m, &mut ctx, &result_event(&run_id, Ok(bytes))).unwrap();
             assert!(
-                ctx.msgs.is_empty(),
-                "an invalid response must emit NOTHING ({fragment})"
+                ctx.task_msgs().is_empty(),
+                "an invalid response must emit no task writes ({fragment})"
+            );
+            let posts = ctx.chat_msgs();
+            assert_eq!(posts.len(), 1, "exactly one failure reply ({fragment})");
+            let ChatMsg::PostMessage {
+                message_id,
+                blocks,
+                as_agent,
+                ..
+            } = &posts[0]
+            else {
+                panic!("expected a post");
+            };
+            assert_eq!(
+                *message_id,
+                reply_message_id(&run_id),
+                "the failure reply holds the run's one reply id ({fragment})"
+            );
+            assert_eq!(*as_agent, Some("bot".into()));
+            assert_eq!(blocks.len(), 1, "one ⚠ paragraph ({fragment})");
+            let Block::Paragraph(spans) = &blocks[0] else {
+                panic!("expected a paragraph");
+            };
+            let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+            assert!(
+                text.starts_with("⚠ BOT failed: "),
+                "the reply names the agent's display name: {text}"
+            );
+            assert!(
+                text.contains(fragment),
+                "the reply carries the reason excerpt: {text}"
             );
             let breadcrumbs: Vec<String> = ctx
                 .events
@@ -3539,6 +3725,81 @@ mod tests {
     }
 
     #[test]
+    fn a_fenced_json_reply_is_parsed_into_prose_not_dumped_as_a_code_block() {
+        // the observed failure: an agentic CLI wraps its AgentResponse in a
+        // ```json fence despite the contract, the bare parse fails, and the
+        // whole fenced string lands in chat as a raw code block. the tolerant
+        // parser must recover the real prose.
+        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+        let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"QUACKTEST! Hello there.\"}],\"actions\":[]}\n```";
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .from_dispatch()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(raw.as_bytes().to_vec())),
+        )
+        .unwrap();
+        let posts = ctx.chat_msgs();
+        let ChatMsg::PostMessage { blocks, .. } = &posts[0] else {
+            panic!("expected a post");
+        };
+        assert_eq!(
+            *blocks,
+            vec![Block::paragraph("QUACKTEST! Hello there.")],
+            "a fenced AgentResponse is decoded to its prose, never posted as raw JSON"
+        );
+    }
+
+    #[test]
+    fn parse_strict_response_tolerates_the_shapes_llms_actually_emit() {
+        let bare = r#"{"reply_blocks":[{"kind":"paragraph","text":"hi"}],"actions":[]}"#;
+        assert_eq!(parse_strict_response(bare).unwrap().reply_blocks[0].text, "hi");
+
+        // a fence with an info string (```json), the reproduced case.
+        let fenced = format!("```json\n{bare}\n```");
+        assert_eq!(
+            parse_strict_response(&fenced).unwrap().reply_blocks[0].text,
+            "hi"
+        );
+
+        // a bare fence (```), no info string.
+        let bare_fence = format!("```\n{bare}\n```");
+        assert_eq!(
+            parse_strict_response(&bare_fence).unwrap().reply_blocks[0].text,
+            "hi"
+        );
+
+        // JSON with a trailing line of prose the model tacked on.
+        let trailing = format!("{fenced}\nHope that helps!");
+        assert_eq!(
+            parse_strict_response(&trailing).unwrap().reply_blocks[0].text,
+            "hi"
+        );
+
+        // genuine prose (no JSON object) does NOT parse — it must fall back to
+        // the raw-text paragraph, not be swallowed.
+        assert!(parse_strict_response("just a plain hello, no json here").is_none());
+        assert!(parse_strict_response("   ").is_none());
+
+        // a `}` before the first `{` must not panic the outermost-object span.
+        assert!(parse_strict_response("close } then open { please").is_none());
+    }
+
+    #[test]
+    fn a_fenced_job_response_still_yields_actions_only() {
+        // job runs drop reply_blocks; the fenced-parse path must still recover
+        // the actions inside the fence.
+        let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"noise\"}],\"actions\":[{\"create_task\":{\"task_id\":\"t1\",\"title\":\"did it\"}}]}\n```";
+        let parsed = agent_response_from_text(raw, true);
+        assert!(parsed.reply_blocks.is_empty(), "job runs post no chat reply");
+        assert_eq!(parsed.actions.len(), 1, "the fenced action is recovered");
+    }
+
+    #[test]
     fn responses_beyond_the_agents_grants_fail_the_run() {
         // an agent granted ONLY chat.post must not create tasks...
         let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
@@ -3561,11 +3822,28 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(ctx.msgs.is_empty(), "a disallowed action emits NOTHING");
+        assert!(
+            ctx.task_msgs().is_empty(),
+            "a disallowed action emits no task writes"
+        );
+        // the agent holds chat.post, so the failure surfaces as the ⚠ reply.
+        let posts = ctx.chat_msgs();
+        assert_eq!(posts.len(), 1);
+        let ChatMsg::PostMessage { blocks, .. } = &posts[0] else {
+            panic!("expected a post");
+        };
+        assert_eq!(
+            *blocks,
+            vec![Block::paragraph(format!(
+                "⚠ BOT failed: agent bot is not allowed to {ACTION_TASKS_CREATE}"
+            ))]
+        );
         commit(&mut m);
         assert_eq!(get_pending(&m, &run_id), None);
 
-        // ...and an agent granted only tasks.create must not post replies.
+        // ...and an agent granted only tasks.create must not post replies —
+        // and without chat.post the failure CANNOT surface in chat either:
+        // the old breadcrumb-only silence holds.
         let (mut m, registry, run_id) = awaiting_run(&[ACTION_TASKS_CREATE]);
         let mut ctx = CaptureCtx::new()
             .from_dispatch()
@@ -3640,7 +3918,9 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(ctx.msgs.is_empty());
+        assert!(ctx.task_msgs().is_empty(), "no task write may escape");
+        // the failure still surfaces in chat — the agent holds chat.post.
+        assert_eq!(ctx.chat_msgs().len(), 1);
         let breadcrumbs: Vec<String> = ctx
             .events
             .iter()
@@ -3718,29 +3998,122 @@ mod tests {
     }
 
     #[test]
-    fn failed_dispatch_outcomes_prune_the_entry_without_follow_ups() {
+    fn a_failed_dispatch_outcome_posts_a_threaded_failure_reply_and_prunes_the_entry() {
+        // the anchor is a thread reply, so the failure reply must join the
+        // same thread a success reply would have.
         let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
         let mut m = watched(TurnPolicy::All, &registry);
-        for seq in [2, 3] {
-            engage_post(&mut m, &registry, seq, &[]);
-        }
+        let mut thread_transcript = transcript(1);
+        thread_transcript.push(message_in(
+            "general",
+            2,
+            AuthorRef::User(vec![1; 32]),
+            "in thread",
+            Some(1),
+        ));
+        let mut ctx = CaptureCtx::new()
+            .at(2)
+            .from_tagging()
+            .with_registry(&registry)
+            .with_transcript("general", thread_transcript.clone());
+        exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
         commit(&mut m);
+        let run_id = run_id_for("general", 2, "bot");
 
         // the dispatch plane already folded saga failures, timeouts, and
-        // contract violations into the Err lane — one shape lands here.
-        for (seq, reason) in [(2u64, "worker exploded"), (3, "timed out")] {
-            let run_id = run_id_for("general", seq, "bot");
-            let mut ctx = CaptureCtx::new().at(20).from_dispatch().with_registry(&registry);
-            exec(
-                &mut m,
-                &mut ctx,
-                &result_event(&run_id, Err(reason.into())),
-            )
-            .unwrap();
-            assert!(ctx.msgs.is_empty(), "terminal failures emit nothing");
-            commit(&mut m);
-            assert_eq!(get_pending(&m, &run_id), None, "the entry pruned");
-        }
+        // contract violations into the Err lane — one shape lands here. the
+        // reason's newlines collapse into the single-paragraph excerpt.
+        let mut ctx = CaptureCtx::new()
+            .at(20)
+            .from_dispatch()
+            .with_registry(&registry)
+            .with_transcript("general", thread_transcript.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Err("worker exploded\nstack line two".into())),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.chat_msgs(),
+            vec![ChatMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: reply_message_id(&run_id),
+                blocks: vec![Block::paragraph(
+                    "⚠ BOT failed: worker exploded stack line two"
+                )],
+                thread: Some(1),
+                as_agent: Some("bot".into()),
+            }],
+            "one threaded ⚠ reply, authored as the agent"
+        );
+        commit(&mut m);
+        assert_eq!(get_pending(&m, &run_id), None, "the entry pruned");
+
+        // a redelivered result finds no entry: no second post, breadcrumb
+        // only — the one-reply-per-run dedup holds.
+        let mut ctx = CaptureCtx::new()
+            .at(21)
+            .from_dispatch()
+            .with_registry(&registry)
+            .with_transcript("general", thread_transcript);
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Err("worker exploded\nstack line two".into())),
+        )
+        .unwrap();
+        assert!(ctx.msgs.is_empty(), "a redelivery must never double-post");
+        let breadcrumbs: Vec<String> = ctx
+            .events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect();
+        assert!(breadcrumbs.iter().any(|b| b.contains("unknown dispatch")));
+    }
+
+    #[test]
+    fn a_failure_reply_requires_the_chat_post_grant() {
+        // without chat.post the pre-existing silence holds: breadcrumbs only,
+        // never a post the validator could not have proven postable.
+        let (mut m, registry, run_id) = awaiting_run(&[]);
+        let mut ctx = CaptureCtx::new()
+            .at(20)
+            .from_dispatch()
+            .with_registry(&registry);
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Err("timed out".into())),
+        )
+        .unwrap();
+        assert!(ctx.msgs.is_empty(), "no grant, no failure post");
+        let breadcrumbs: Vec<String> = ctx
+            .events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect();
+        assert!(
+            breadcrumbs
+                .iter()
+                .any(|b| b.contains("failure not surfaced") && b.contains(ACTION_CHAT_POST)),
+            "the silence leaves its reason as a breadcrumb: {breadcrumbs:?}"
+        );
+        commit(&mut m);
+        assert_eq!(get_pending(&m, &run_id), None, "the entry still pruned");
+    }
+
+    #[test]
+    fn failure_excerpts_are_single_line_and_bounded() {
+        assert_eq!(
+            failure_excerpt("line one\n\n  line two\tend"),
+            "line one line two end"
+        );
+        assert_eq!(failure_excerpt("  \n \t "), "no error detail");
+        let long = "x".repeat(FAILURE_EXCERPT_BYTES * 2);
+        let bounded = failure_excerpt(&long);
+        assert!(bounded.len() <= FAILURE_EXCERPT_BYTES + '…'.len_utf8());
+        assert!(bounded.ends_with('…'));
     }
 
     // ---- the jobs lane ----------------------------------------------------------
@@ -3784,19 +4157,65 @@ mod tests {
         };
         assert_eq!(*dispatch_id, dispatch_id_for(&run_id));
         assert_eq!(*recipe_id, recipe_id_for("duck"));
-        let text = String::from_utf8(payload.clone()).unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_slice(payload).expect("the payload is a JSON envelope");
+        assert_eq!(envelope["ducktape_run"], RUN_ENVELOPE_VERSION);
+        assert_eq!(envelope["agent_id"], "duck", "the claiming agent");
+        assert_eq!(
+            envelope["prompt_hash"],
+            "07".repeat(PROMPT_HASH_LEN),
+            "the claiming agent's prompt pin rides along"
+        );
         assert!(
-            text.contains("summarize this work item"),
+            envelope["thread_key"].is_null(),
+            "job runs have no channel, so no thread key"
+        );
+        let conversation = envelope["conversation"].as_str().unwrap();
+        assert!(
+            conversation.contains("summarize this work item"),
             "the FULL job spec rides the payload"
         );
-        assert!(text.contains("Return ONLY a JSON object"));
-        assert!(text.contains("actions only"), "job framing rides along");
+        assert!(
+            envelope["contract"]
+                .as_str()
+                .unwrap()
+                .contains("Return ONLY a JSON object")
+        );
+        assert!(
+            conversation.contains("chat replies are not delivered for job runs"),
+            "job framing rides along"
+        );
 
         let entry = get_pending(&m, &run_id).expect("job entry staged");
         assert_eq!(entry.job_id, Some("job-1".into()));
         assert_eq!(entry.job_claim_height, 3);
         assert_eq!(entry.agent_id, "duck");
         assert_eq!(entry.requester, SagaOrigin::Module("jobs".into()));
+    }
+
+    #[test]
+    fn an_oversized_job_spec_is_left_unclaimed_by_the_payload_cap() {
+        // the envelope wraps the spec, so a spec at the dispatch cap must
+        // overflow it — the job stays on the board, breadcrumb only.
+        let registry = job_registry();
+        let mut m = module();
+        let spec = "x".repeat(MAX_PAYLOAD_BYTES);
+        let mut ctx = CaptureCtx::new().at(3).from_jobs().with_registry(&registry);
+        exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", &spec)).unwrap();
+        assert!(ctx.msgs.is_empty(), "no claim and no dispatch may land");
+        let breadcrumbs: Vec<String> = ctx
+            .events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect();
+        assert!(
+            breadcrumbs
+                .iter()
+                .any(|b| b.contains("payload exceeds the dispatch cap")),
+            "the skip leaves a breadcrumb: {breadcrumbs:?}"
+        );
+        commit(&mut m);
+        assert!(pending_runs(&m).is_empty());
     }
 
     #[test]
@@ -3900,6 +4319,10 @@ mod tests {
         commit(&mut m);
 
         assert_eq!(get_pending(&m, &run_id), None);
+        assert!(
+            ctx.chat_msgs().is_empty(),
+            "a job run has no channel — failures never post to chat"
+        );
         assert_eq!(
             ctx.job_msgs(),
             vec![JobsMsg::Finalize {
@@ -4106,7 +4529,9 @@ mod tests {
         commit(&mut m);
         assert!(get_pending(&m, &run_id).is_some(), "still pending delivery");
 
-        // the plane's Err("cancelled") delivery prunes the entry.
+        // the plane's Err("cancelled") delivery prunes the entry. it rides
+        // the ONE result path, so it surfaces like any failed run — a
+        // threaded ⚠ reply, never silence.
         let mut ctx = CaptureCtx::new().from_dispatch().with_registry(&registry);
         exec(
             &mut m,
@@ -4114,7 +4539,16 @@ mod tests {
             &result_event(&run_id, Err("cancelled".into())),
         )
         .unwrap();
-        assert!(ctx.msgs.is_empty());
+        assert_eq!(
+            ctx.chat_msgs(),
+            vec![ChatMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: reply_message_id(&run_id),
+                blocks: vec![Block::paragraph("⚠ BOT failed: cancelled")],
+                thread: None,
+                as_agent: Some("bot".into()),
+            }]
+        );
         commit(&mut m);
         assert_eq!(get_pending(&m, &run_id), None);
 

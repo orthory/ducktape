@@ -3,15 +3,19 @@
 //! the dispatch module stages a saga whose spec is a self-described
 //! [`WorkSpec`]. this crate is the impure host-side counterpart: it resolves
 //! the spec's capability tag to a machine-local [`capability_host::Provider`]
-//! (whichever executor CLI the operator brought), feeds the payload to it
-//! VERBATIM, and submits the raw answer as a saga `OracleResult` op.
+//! (whichever executor CLI the operator brought), feeds the payload to it,
+//! and submits the raw answer as a saga `OracleResult` op.
 //!
-//! deliberately opinion-free: NO prompt text is composed here (the payload IS
-//! the entire input — the dispatcher composed it), NO output shape is parsed
-//! here (the dispatch module judges the recipe's output contract in
-//! consensus), and NO credentials are touched (BYO CLI auth). foreign leases
-//! are skipped: under the strict policy someone else's assignment would be a
-//! no-op result, so not spawning is what turns
+//! the payload comes in two shapes (see [`envelope`]): a legacy flat string
+//! is fed to the provider VERBATIM, and a run ENVELOPE (marker
+//! `ducktape_run`) is assembled host-side — the agent's registered prompt
+//! resolved from the node's blob store by its committed content hash, plus
+//! the contract and conversation the dispatcher composed. beyond that
+//! assembly the crate stays opinion-free: NO prompt text is authored here,
+//! NO output shape is parsed here (the dispatch module judges the recipe's
+//! output contract in consensus), and NO credentials are touched (BYO CLI
+//! auth). foreign leases are skipped: under the strict policy someone else's
+//! assignment would be a no-op result, so not spawning is what turns
 //! N-nodes-each-paying-for-the-same-call into one call.
 //!
 //! two workers share ONE gate ([`gate`], so their verdicts can never drift):
@@ -28,7 +32,9 @@ use reactor::{WorkOutcome, Worker};
 use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Effect, Msg};
 
+mod envelope;
 mod pool;
+pub use envelope::{BlobResolver, RUN_ENVELOPE_VERSION};
 pub use pool::{
     DEFAULT_MAX_CONCURRENT_RUNS, DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env,
 };
@@ -133,6 +139,9 @@ pub struct DispatchWorker {
     /// this node's external submit key — compared against a request's
     /// `assignee` to decide whether the lease is ours to execute.
     node_key: Vec<u8>,
+    /// blob reads for envelope prompt resolution; `None` (the default) fails
+    /// prompt-pinned envelopes loudly — see [`envelope::prepare`].
+    resolver: Option<BlobResolver>,
 }
 
 impl DispatchWorker {
@@ -140,7 +149,13 @@ impl DispatchWorker {
         Self {
             providers,
             node_key,
+            resolver: None,
         }
+    }
+
+    pub fn with_resolver(mut self, resolver: BlobResolver) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
 
     async fn answer(&self, capability: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
@@ -149,7 +164,10 @@ impl DispatchWorker {
         let input = String::from_utf8(payload.to_vec())
             .map_err(|_| "dispatch payload is not utf-8; providers take text".to_string())?;
         let provider = self.providers.resolve(capability)?;
-        let text = provider.run(&input).await?;
+        // envelope payloads assemble (real prompt, run context); legacy flat
+        // strings pass through verbatim with a default context.
+        let (input, ctx) = envelope::prepare(&input, self.resolver.as_ref()).await?;
+        let text = provider.run(&input, &ctx).await?;
         Ok(text.into_bytes())
     }
 }
@@ -316,7 +334,11 @@ format = "text"
         fn capability(&self) -> &str {
             "alpha"
         }
-        async fn run(&self, _prompt: &str) -> Result<String, String> {
+        async fn run(
+            &self,
+            _prompt: &str,
+            _ctx: &capability_host::RunContext,
+        ) -> Result<String, String> {
             Ok("stub answer".into())
         }
     }

@@ -365,6 +365,85 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
   );
 
   it(
+    "a composer @mention auto-watches the channel and the agent's reply lands",
+    { timeout: 30_000 },
+    async () => {
+      const { sim } = await boot({ echoOracle: true });
+
+      // channel + agent registration land as peer blocks — committed
+      // immediately and (nothing pending) refreshed straight into provider
+      // state, so the roster feeds the composer's mention resolver.
+      await sim.peerBlock("chat", peerChannel("general", "General"));
+      await sim.peerBlock("agent", {
+        register_agent: {
+          agent_id: "quackbot",
+          display_name: "Quackbot",
+          capability: "echo",
+          prompt_hash: Array(32).fill(7),
+          allowed_actions: ["chat.post"],
+        },
+      });
+      await waitFor(() =>
+        expect(capturedState!.agents.some((a) => a.agent_id === "quackbot")).toBe(true),
+      );
+      act(() => capturedActions!.selectChannel("general"));
+      await waitFor(() => expect(capturedState!.activeChannel).toBe("general"));
+      expect(capturedState!.watches).toEqual([]);
+
+      // the REAL composer send path: parseMessageInput with the resolver
+      // marks the mention, the unwatched channel gets its "mention" watch
+      // FIRST, and only after that ack does the post submit.
+      act(() => capturedActions!.sendMessage("hey @quackbot can you handle this?"));
+
+      await waitFor(async () => expect((await sim.state()).held).toBe(1));
+      const watchCommit = await sim.step();
+      expect(watchCommit.committed?.target).toBe("runs");
+
+      await waitFor(async () => expect((await sim.state()).held).toBe(1));
+      const postCommit = await sim.step();
+      expect(postCommit.committed?.target).toBe("chat");
+
+      await waitFor(() =>
+        expect(capturedState!.watches).toEqual([
+          { channel_id: "general", policy: "mention" },
+        ]),
+      );
+
+      // the mention engaged the echo worker — its follow-up commits the
+      // result into the dispatch mailbox as its own block…
+      expect((await sim.state()).oracleQueued).toBe(1);
+      const oracle = await sim.step();
+      expect(oracle.committed?.kind).toBe("oracle");
+
+      // …and the never-pop-stack tail means the reply posts when the NEXT
+      // block flushes the mailbox. A second mention send in the now-watched
+      // channel is that block — and it also proves the existing watch is
+      // respected: only the post submits, no second watch op.
+      act(() => capturedActions!.sendMessage("thanks @quackbot"));
+      await waitFor(async () => expect((await sim.state()).held).toBe(1));
+      const second = await sim.step();
+      expect(second.committed?.target).toBe("chat");
+
+      // the agent-authored threaded reply reaches the app over the refresh.
+      await waitFor(() =>
+        expect(
+          capturedState!.messages.some((m) => {
+            const author = m.head.author;
+            return (
+              typeof author === "object" &&
+              "agent" in author &&
+              author.agent.agent_id === "quackbot"
+            );
+          }),
+        ).toBe(true),
+      );
+      expect(capturedState!.watches).toEqual([
+        { channel_id: "general", policy: "mention" },
+      ]);
+    },
+  );
+
+  it(
     "explorer renders live ring data and consumes the cross-link focus",
     { timeout: 30_000 },
     async () => {

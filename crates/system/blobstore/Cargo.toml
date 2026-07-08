@@ -8,3 +8,6 @@ version.workspace = true
 # module, and forge — never consensus state, never in any root.
 [dependencies]
 sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

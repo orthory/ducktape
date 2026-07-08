@@ -592,6 +592,7 @@ name = "blobstore"
 version = "0.1.0"
 dependencies = [
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -742,6 +743,7 @@ dependencies = [
  "capability",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml 0.8.23",
 ]
@@ -2019,6 +2021,8 @@ dependencies = [
  "reactor",
  "saga",
  "sdk",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

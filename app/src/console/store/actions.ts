@@ -2,7 +2,7 @@ import type { Dispatch } from "react";
 
 import * as agentClient from "../../domain/agent-client";
 import * as chatClient from "../../domain/chat-client";
-import type { PostPolicy } from "../../domain/chat-client";
+import type { ChatBlock, PostPolicy } from "../../domain/chat-client";
 import * as forgeClient from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import * as identityClient from "../../domain/identity-client";
@@ -30,6 +30,7 @@ import * as valsetClient from "../../domain/valset-client";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
+import { hasAgentMention, mentionResolverOf } from "../views/chat/mention";
 import {
   defaultScreenForSection,
   sectionForScreen,
@@ -523,6 +524,26 @@ export function createActions({
       .catch(fail);
   };
 
+  // A first agent mention in an UNWATCHED channel creates the runs watch the
+  // engagement pipeline requires (policy "mention") and awaits its ack BEFORE
+  // the post — otherwise the mention commits with nothing routing it to the
+  // agent. An existing watch of ANY policy is respected, never overwritten.
+  const ensureMentionWatch = (channelId: string, blocks: ChatBlock[]): Promise<unknown> => {
+    if (!hasAgentMention(blocks)) return Promise.resolve();
+    if (getState().watches.some((watch) => watch.channel_id === channelId))
+      return Promise.resolve();
+    return submitTracked(
+      opKey.watch(channelId),
+      (live) =>
+        runsClient.watchChannel(live, {
+          channelId,
+          policy: "mention",
+          origin: getState().author,
+        }),
+      (prev) => optimistic.watchSet(prev, { channelId, policy: "mention" }),
+    );
+  };
+
   // Re-pull the open thread's own ChatThread snapshot after a write that may
   // have touched the root or a reply. `submitTracked` already refreshed the
   // flat `state.messages` (every sequence, replies included), but the thread
@@ -905,21 +926,23 @@ export function createActions({
       const channelId = getState().activeChannel;
       if (!channelId || !body.trim()) return;
       const messageId = crypto.randomUUID();
-      const blocks = parseMessageInput(body);
+      const blocks = parseMessageInput(body, mentionResolverOf(getState().agents));
       const author = getState().author;
-      submitTracked(
-        opKey.message(channelId, messageId),
-        (live) =>
-          chatClient.postMessage(live, { channelId, messageId, blocks, origin: author }),
-        (prev) =>
-          optimistic.postedMessage(prev, {
-            channelId,
-            messageId,
-            blocks,
-            author,
-            at: Date.now(),
-            thread: null,
-          }),
+      void ensureMentionWatch(channelId, blocks).then(() =>
+        submitTracked(
+          opKey.message(channelId, messageId),
+          (live) =>
+            chatClient.postMessage(live, { channelId, messageId, blocks, origin: author }),
+          (prev) =>
+            optimistic.postedMessage(prev, {
+              channelId,
+              messageId,
+              blocks,
+              author,
+              at: Date.now(),
+              thread: null,
+            }),
+        ),
       );
     },
 
@@ -945,39 +968,43 @@ export function createActions({
       const root = getState().activeThread?.root;
       if (!channelId || !root || !body.trim()) return;
       const messageId = crypto.randomUUID();
-      const blocks = parseMessageInput(body);
+      const blocks = parseMessageInput(body, mentionResolverOf(getState().agents));
       const author = getState().author;
-      submitTracked(
-        opKey.message(channelId, messageId),
-        (live) =>
-          chatClient.postMessage(live, {
-            channelId,
-            messageId,
-            blocks,
-            origin: author,
-            thread: root.seq,
-          }),
-        (prev) =>
-          optimistic.postedMessage(prev, {
-            channelId,
-            messageId,
-            blocks,
-            author,
-            at: Date.now(),
-            thread: root.seq,
-          }),
-      ).then(() => {
-        const live = getNode();
-        if (!live) return;
-        return chatClient
-          .thread(live, { channelId, rootSeq: root.seq })
-          .then((activeThread) =>
-            update((prev) =>
-              prev.activeThread?.root.seq === root.seq ? { activeThread } : {},
-            ),
-          )
-          .catch(fail);
-      });
+      void ensureMentionWatch(channelId, blocks)
+        .then(() =>
+          submitTracked(
+            opKey.message(channelId, messageId),
+            (live) =>
+              chatClient.postMessage(live, {
+                channelId,
+                messageId,
+                blocks,
+                origin: author,
+                thread: root.seq,
+              }),
+            (prev) =>
+              optimistic.postedMessage(prev, {
+                channelId,
+                messageId,
+                blocks,
+                author,
+                at: Date.now(),
+                thread: root.seq,
+              }),
+          ),
+        )
+        .then(() => {
+          const live = getNode();
+          if (!live) return;
+          return chatClient
+            .thread(live, { channelId, rootSeq: root.seq })
+            .then((activeThread) =>
+              update((prev) =>
+                prev.activeThread?.root.seq === root.seq ? { activeThread } : {},
+              ),
+            )
+            .catch(fail);
+        });
     },
 
     editMessage: (seq, body) => {
@@ -989,7 +1016,11 @@ export function createActions({
         (activeThread?.root.seq === seq
           ? activeThread.root
           : activeThread?.replies.find((m) => m.seq === seq));
-      const blocks = parseMessageInput(body);
+      // The resolver keeps an edited mention's mark intact: blocksToInput
+      // seeded the editor with "@agent_id", so re-parsing must resolve it
+      // back or the edit silently strips the mention. No auto-watch here —
+      // engagement is a post-time concern.
+      const blocks = parseMessageInput(body, mentionResolverOf(getState().agents));
       submitTracked(
         opKey.messageSeq(channelId, seq),
         (live) =>

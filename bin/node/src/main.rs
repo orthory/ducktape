@@ -5287,6 +5287,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
     let http_handle = http_handle
+        // persist node-local blobs (op receipts, agent prompt pins) under
+        // <storage>/blobstore so a daemon restart keeps serving them.
+        .with_blob_root(storage.join("blobstore"))?
         .with_forge_repo(storage.join("forge-repo"))
         .with_index_store(index.clone())
         .with_call(voice_lane)
@@ -5335,6 +5338,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
     let storage_for_sync = storage.clone();
+    // per-agent host state under the same storage root: persistent executor
+    // workspaces + session files (DUCKTAPE_AGENT_WORKSPACES / _SESSIONS
+    // override — see capability-host). host-local only, never consensus.
+    let agent_dirs = capability_host::AgentDirs::under(&storage);
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
@@ -6130,15 +6137,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // drained by the park loop's pump pass, so a minutes-long run
             // never stalls the serve window, boundary follow, or promotion
             // detection.
-            let resident_provider_set = capability_host::discover()
+            let resident_provider_set = capability_host::discover_with_dirs(agent_dirs.clone())
                 .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
             let resident_capabilities = resident_provider_set.capabilities();
             let mut resident_announcer = resident_announce::ResidentAnnouncer::new(
                 me_bytes.clone(),
                 resident_capabilities,
             );
-            let (resident_pool, mut resident_oracle_results) =
-                oracle_pool::build(&context, resident_provider_set, me_bytes.clone());
+            let (resident_pool, mut resident_oracle_results) = oracle_pool::build(
+                &context,
+                resident_provider_set,
+                me_bytes.clone(),
+                blobs.clone(),
+            );
             let mut resident_dispatch =
                 resident_dispatch::ResidentDispatch::new(resident_pool, me_bytes.clone());
             let (boundary, host, floor) = loop {
@@ -8111,7 +8122,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // announced set to nothing — never the reverse). routing and
         // default models live in the specs (docs/capability-spec.md); a broken
         // operator spec is a boot error, not a silently dropped executor.
-        let providers = capability_host::discover()
+        let providers = capability_host::discover_with_dirs(agent_dirs.clone())
             .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
         let my_capabilities = providers.capabilities();
         // OFF-LOOP execution: the pool gates effects inline (lease check —
@@ -8125,6 +8136,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             &context,
             providers,
             signer.public_key().as_ref().to_vec(),
+            blobs.clone(),
         );
         let workers: Vec<Box<dyn reactor::Worker>> = vec![oracle_worker];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains

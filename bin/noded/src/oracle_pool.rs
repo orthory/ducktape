@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
-use dispatch_oracle::{DeliverFn, DispatchPool, SpawnFn};
+use dispatch_oracle::{BlobResolver, DeliverFn, DispatchPool, SpawnFn};
 use futures::SinkExt as _;
 use futures::channel::mpsc;
 use noded::NodeCommand;
@@ -22,9 +22,16 @@ use crate::ORACLE_ORIGIN;
 
 /// the daemon's worker set: the dispatch pool (or, in debug builds under
 /// `DUCKTAPE_NODED_ECHO_ORACLE`, the inline echo stand-in).
+///
+/// `blobs` is the daemon's node-local content-addressed store (the app's
+/// putBlob lane) — run-envelope prompt pins resolve through its read path.
+/// `agent_dirs` roots persistent agent workspaces + session files under the
+/// daemon's storage dir (host-local, never consensus).
 pub(crate) fn oracle_workers<C>(
     context: &C,
     cmds: mpsc::Sender<NodeCommand>,
+    blobs: noded::blobs::BlobHandle,
+    agent_dirs: capability_host::AgentDirs,
 ) -> Vec<Box<dyn reactor::Worker>>
 where
     C: Spawner + Supervisor + 'static,
@@ -35,7 +42,7 @@ where
             return vec![Box::new(EchoWorker)];
         }
     }
-    let providers = capability_host::discover()
+    let providers = capability_host::discover_with_dirs(agent_dirs)
         // BYO: run whatever executor CLIs the capability specs describe and
         // this host has installed — no credential handling here (see
         // docs/capability-spec.md). a broken operator spec is a boot error.
@@ -76,15 +83,27 @@ where
         })
     });
 
-    vec![Box::new(DispatchPool::new(
-        Arc::new(providers),
-        // the daemon's oracle identity: its worker follow-ups are
-        // submitted under ORACLE_ORIGIN, so an Accept claim records that
-        // key as the assignee and the re-emitted request must match it.
-        ORACLE_ORIGIN.to_vec(),
-        spawn,
-        deliver,
-    ))]
+    // prompt resolution: a synchronous in-memory read behind the pool's
+    // async seam. `None` (blob absent on this node) fails the run loudly in
+    // the worker — never a silent fallback to the generic instructions.
+    let resolver: BlobResolver = Arc::new(move |digest: &[u8; 32]| {
+        let blobs = blobs.clone();
+        let digest = *digest;
+        Box::pin(async move { blobs.get_chunk(&digest) })
+    });
+
+    vec![Box::new(
+        DispatchPool::new(
+            Arc::new(providers),
+            // the daemon's oracle identity: its worker follow-ups are
+            // submitted under ORACLE_ORIGIN, so an Accept claim records that
+            // key as the assignee and the re-emitted request must match it.
+            ORACLE_ORIGIN.to_vec(),
+            spawn,
+            deliver,
+        )
+        .with_resolver(resolver),
+    )]
 }
 
 /// a debug-only stand-in that answers every dispatch WorkSpec inline with a

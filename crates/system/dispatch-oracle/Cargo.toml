@@ -4,19 +4,23 @@ edition.workspace = true
 version.workspace = true
 
 # host-side worker for dispatch WorkSpec saga effects: resolve the capability
-# to a local provider, feed the payload VERBATIM, submit the raw answer. no
-# prompt text, no output parsing opinions, no credential handling — contract
-# enforcement is the dispatch module's consensus-side validation.
+# to a local provider, assemble the run-envelope input (or feed a legacy flat
+# payload verbatim), submit the raw answer. no prompt text is AUTHORED here,
+# no output parsing opinions, no credential handling — contract enforcement
+# is the dispatch module's consensus-side validation.
 [dependencies]
 async-trait = { workspace = true }
 capability-host = { workspace = true }
 dispatch = { workspace = true }
-# the pool's spawn/deliver seams are boxed futures; the semaphore caps
-# concurrent provider runs (tokio::sync is runtime-agnostic).
+# the pool's spawn/deliver/resolver seams are boxed futures; the semaphore
+# caps concurrent provider runs (tokio::sync is runtime-agnostic).
 futures = "0.3"
 reactor = { workspace = true }
 saga = { workspace = true }
 sdk = { workspace = true }
+# the run envelope is JSON (see src/envelope.rs).
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
