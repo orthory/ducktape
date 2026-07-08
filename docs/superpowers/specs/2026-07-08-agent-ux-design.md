@@ -182,6 +182,29 @@ sequenced after WS-B lands in the same files):**
 
 ## Rollout
 
-No app-hash movement, no lockstep concern: consensus modules untouched.
-Operator-dropped spec files continue to override built-ins by tag. Existing
-agents with bare `codex`/`claude` tags keep working (base tags remain).
+**WS-D1 is lockstep-class.** The runs envelope + ⚠ failure posts change
+consensus **execution**: `render_payload` commits different payload bytes,
+and `on_result_event` writes chat posts that old validators never write — so
+mixed-version validators app-hash-fork at the first agent dispatch (or the
+first failed-run delivery). State *shape* and snapshot codecs are untouched
+(no migration, forward-only), but live networks (Ducktape-2 class) must take
+the height-gated lockstep upgrade path — same class as PR #232; the
+no-downtime upgrade machinery covers it. Secondary hazard even with
+validators in lockstep: an OLD node's oracle worker fed a NEW envelope
+payload has no `ducktape_run` handling and passes the raw JSON to the
+provider CLI verbatim — degraded (but non-forking) output until every
+*executing* node is upgraded too.
+
+WS-A/B/C remain rollout-neutral: operator-dropped spec files continue to
+override built-ins by tag, and existing agents with bare `codex`/`claude`
+tags keep working (base tags remain).
+
+**Prompt-blob durability (known gap, partially closed).** The envelope
+commits only the prompt *hash*; the bytes live in the node-local blob store.
+That store now writes through to disk (`<storage>/blobstore/`,
+content-addressed and self-verifying), so a daemon **restart** no longer
+loses every registered prompt. Still open: a run leased by a node that never
+held the blob (cross-node assignees — the app only uploads to the node it is
+connected to) fails loudly until the owner re-saves the prompt there.
+Follow-up options: blob replication between nodes, or a consensus lane for
+prompt bytes (size-capped, like duckfs chunks).
