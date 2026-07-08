@@ -333,29 +333,34 @@ impl NetworkDescriptor {
     /// `Direct` hint (so a v2/legacy descriptor yields all-`Direct` hints with
     /// no data duplicated and no double-dial).
     pub fn reach_hints(&self) -> Result<Vec<ReachHint>, String> {
-        // the UNION of typed `reach` and `bootstrap`, keyed by expected pubkey:
-        // a typed reach hint wins over a bootstrap-synthesised Direct for the
-        // same member, but a member present only in `bootstrap` (e.g. a
-        // second-generation inviter that ran `add_bootstrap`) is never dropped.
-        // returning `reach` XOR `bootstrap` would silently lose that inviter's
-        // own dial hint from every re-issued invite.
-        let mut by_key: std::collections::BTreeMap<Vec<u8>, ReachHint> =
+        // the UNION of typed `reach` and legacy `bootstrap`: explicit typed
+        // hints win over bootstrap-synthesised Direct hints for the same
+        // member, but typed entries are a route set, not a per-key map. A
+        // node may need both a rendezvous route and a tunnel-overlay route for
+        // the same expected key.
+        let mut bootstrap_by_key: std::collections::BTreeMap<Vec<u8>, ReachHint> =
             std::collections::BTreeMap::new();
         for entry in &self.bootstrap {
             let (k, addr) = entry
                 .split_once('@')
                 .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
             let expected_key = decode_key(k)?;
-            by_key.insert(
+            bootstrap_by_key.insert(
                 expected_key.as_ref().to_vec(),
                 ReachHint { expected_key, reach: Reach::Direct(addr.to_string()) },
             );
         }
+        let mut typed = Vec::new();
+        let mut typed_keys = std::collections::BTreeSet::new();
         for s in &self.reach {
             let hint = ReachHint::parse(s)?;
-            by_key.insert(hint.expected_key.as_ref().to_vec(), hint);
+            typed_keys.insert(hint.expected_key.as_ref().to_vec());
+            typed.push(hint);
         }
-        Ok(by_key.into_values().collect())
+        bootstrap_by_key.retain(|k, _| !typed_keys.contains(k));
+        let mut out: Vec<_> = bootstrap_by_key.into_values().chain(typed).collect();
+        out.sort_by_key(|h| h.to_canonical());
+        Ok(out)
     }
 
     /// record a reach hint for a member, replacing any previous hint for the
@@ -370,6 +375,17 @@ impl NetworkDescriptor {
         });
         self.reach.push(hint.to_canonical());
         self.reach.sort();
+    }
+
+    /// record one explicit typed reach route without collapsing other typed
+    /// routes for the same expected key. Use this when the descriptor needs a
+    /// real route set, such as rendezvous plus a tunnel-overlay ingress.
+    pub fn add_reach_route(&mut self, hint: &ReachHint) {
+        let canonical = hint.to_canonical();
+        if !self.reach.contains(&canonical) {
+            self.reach.push(canonical);
+            self.reach.sort();
+        }
     }
 
     /// reach hints resolved to typed dial routes, hostname-native: `Direct`/
@@ -592,10 +608,14 @@ pub struct StoredInviteWireGuard {
     pub issuer: String,
     /// the inviter's X25519 WireGuard public key, hex.
     pub public_key: String,
-    /// the inviter's underlay WireGuard UDP endpoint, `host:port`.
-    pub endpoint: String,
-    /// the inviter's underlay UDP intro endpoint, `host:port`.
-    pub intro: String,
+    /// the inviter's underlay WireGuard UDP endpoint, `host:port`. Absent for
+    /// coordinated invites, where the endpoint is resolved through the
+    /// rendezvous coordinator at run time.
+    pub endpoint: Option<String>,
+    /// the inviter's underlay UDP intro endpoint, `host:port`. Absent for
+    /// coordinated invites; the intro rides the shared WireGuard underlay
+    /// socket after rendezvous.
+    pub intro: Option<String>,
     /// the inviter's control-mesh listen port on the overlay.
     pub mesh_port: u16,
 }
@@ -927,10 +947,13 @@ const INVITE_B64: base64::engine::GeneralPurpose = base64::engine::general_purpo
 pub struct InviteWireGuard {
     /// the inviter's X25519 WireGuard public key, raw.
     pub public_key: [u8; 32],
-    /// the inviter's underlay WireGuard UDP endpoint, `host:port`.
-    pub endpoint: String,
-    /// the inviter's underlay UDP intro endpoint, `host:port`.
-    pub intro: String,
+    /// the inviter's underlay WireGuard UDP endpoint, `host:port`. `None`
+    /// means the invite uses coordinated rendezvous instead of baking in a
+    /// direct endpoint.
+    pub endpoint: Option<String>,
+    /// the inviter's underlay UDP intro endpoint, `host:port`. `None` means
+    /// the intro is sent over the coordinated WireGuard underlay socket.
+    pub intro: Option<String>,
     /// the inviter's control-mesh listen port, dialed at its overlay ULA.
     pub mesh_port: u16,
 }
@@ -1064,13 +1087,19 @@ fn pack_invite(
     }
 
     match wireguard {
-        Some(wg) => {
+        Some(wg) if wg.endpoint.is_some() && wg.intro.is_some() => {
             out.push(1);
             out.extend_from_slice(&wg.public_key);
-            put_str_u8(&mut out, &wg.endpoint)?;
-            put_str_u8(&mut out, &wg.intro)?;
+            put_str_u8(&mut out, wg.endpoint.as_ref().expect("checked"))?;
+            put_str_u8(&mut out, wg.intro.as_ref().expect("checked"))?;
             out.extend_from_slice(&wg.mesh_port.to_le_bytes());
         }
+        Some(wg) if wg.endpoint.is_none() && wg.intro.is_none() => {
+            out.push(2);
+            out.extend_from_slice(&wg.public_key);
+            out.extend_from_slice(&wg.mesh_port.to_le_bytes());
+        }
+        Some(_) => return Err("wireguard invite must carry both endpoint and intro, or neither".into()),
         None => out.push(0),
     }
 
@@ -1142,8 +1171,19 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
             let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
             Some(InviteWireGuard {
                 public_key,
-                endpoint,
-                intro,
+                endpoint: Some(endpoint),
+                intro: Some(intro),
+                mesh_port,
+            })
+        }
+        2 => {
+            let mut public_key = [0u8; 32];
+            public_key.copy_from_slice(r.take(32)?);
+            let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
+            Some(InviteWireGuard {
+                public_key,
+                endpoint: None,
+                intro: None,
                 mesh_port,
             })
         }
@@ -2285,8 +2325,8 @@ mod tests {
         };
         let wg = InviteWireGuard {
             public_key: [42u8; 32],
-            endpoint: "203.0.113.7:51820".into(),
-            intro: "203.0.113.7:51821".into(),
+            endpoint: Some("203.0.113.7:51820".into()),
+            intro: Some("203.0.113.7:51821".into()),
             mesh_port: 52200,
         };
         let invite = decode_invite(&encode_test_invite(&d, &issuer, Some(&wg))).expect("decode");
@@ -3251,6 +3291,41 @@ bootstrapper_addr = "127.0.0.1:52200"
         let mut sorted = d.reach.clone();
         sorted.sort();
         assert_eq!(d.reach, sorted);
+    }
+
+    #[test]
+    fn add_reach_route_keeps_coordinated_and_overlay_routes_for_same_key() {
+        let a = ed25519::PrivateKey::from_seed(25).public_key();
+        let coord = ed25519::PrivateKey::from_seed(26).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "r#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_reach(&ReachHint {
+            expected_key: a.clone(),
+            reach: Reach::Coordinated(CoordRef {
+                coord_addr: "127.0.0.1:3478".into(),
+                coord_key: coord,
+            }),
+        });
+        d.add_reach_route(&ReachHint {
+            expected_key: a.clone(),
+            reach: Reach::Direct("[fd87::1]:52200".into()),
+        });
+
+        let hints = d.reach_hints().expect("hints");
+        assert_eq!(hints.len(), 2);
+        assert!(hints.iter().any(|h| matches!(h.reach, Reach::Coordinated(_))));
+        assert!(hints.iter().any(|h| matches!(h.reach, Reach::Direct(_))));
+
+        let entries = d.reach_entries().expect("entries");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|(_, r)| matches!(r, ReachDial::Coordinated { .. })));
+        assert!(entries.iter().any(|(_, r)| matches!(r, ReachDial::Direct(_))));
     }
 
     #[test]

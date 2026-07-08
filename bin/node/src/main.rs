@@ -3664,6 +3664,14 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // the joiner dials this member's overlay ULA once the tunnel routes.
     let wireguard = match config::resolved_wireguard_listen(raw.wireguard_listen.as_deref())? {
         Some(wg_listen) => {
+            let (wg_keypair, _) =
+                reachability::WireGuardKeypair::load_or_generate(&base.join("wireguard.key"))
+                    .map_err(|e| format!("wireguard key: {e}"))?;
+            let mesh_port: u16 = raw
+                .listen
+                .parse::<std::net::SocketAddr>()
+                .map(|a| a.port())
+                .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
             let host =
                 match config::endpoint_host(raw.advertised.as_deref(), &raw.listen, wg_listen) {
                     Ok(host) => Some(host),
@@ -3674,29 +3682,25 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         None
                     }
                     Err(err) => return Err(err.into()),
-                };
+            };
             match host {
                 Some(host) => {
-                    let (wg_keypair, _) = reachability::WireGuardKeypair::load_or_generate(
-                        &base.join("wireguard.key"),
-                    )
-                    .map_err(|e| format!("wireguard key: {e}"))?;
                     let intro_port =
                         config::resolved_invite_listen(raw.invite_listen.as_deref(), wg_listen)?
                             .port();
-                    let mesh_port: u16 = raw
-                        .listen
-                        .parse::<std::net::SocketAddr>()
-                        .map(|a| a.port())
-                        .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
                     Some(config::InviteWireGuard {
                         public_key: wg_keypair.public_key().0,
-                        endpoint: format!("{host}:{}", wg_listen.port()),
-                        intro: format!("{host}:{intro_port}"),
+                        endpoint: Some(format!("{host}:{}", wg_listen.port())),
+                        intro: Some(format!("{host}:{intro_port}")),
                         mesh_port,
                     })
                 }
-                None => None,
+                None => Some(config::InviteWireGuard {
+                    public_key: wg_keypair.public_key().0,
+                    endpoint: None,
+                    intro: None,
+                    mesh_port,
+                }),
             }
         }
         None => None,
@@ -4539,7 +4543,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 &descriptor.genesis_namespace(),
                 issuer_identity,
             );
-            descriptor.add_reach(&config::ReachHint {
+            descriptor.add_reach_route(&config::ReachHint {
                 expected_key: invite.token.issuer.clone(),
                 reach: config::Reach::Direct(format!("[{inviter_ula}]:{}", wg.mesh_port)),
             });
@@ -4896,6 +4900,13 @@ async fn reachability_plane(
         }
         WireGuardEffectKind::Tun | WireGuardEffectKind::Fake => None,
     };
+    let (invite_intro_tx, mut invite_intro_rx) =
+        if socket_underlay.is_some() && intro_listen.is_some() {
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
     // authenticate every coordinator request: the node signs a
     // proof-of-possession with its identity key and, in private coordination,
     // carries the genesis-issued cap. A fully-open coordinator ignores the
@@ -4918,9 +4929,10 @@ async fn reachability_plane(
                 });
             let resolver = match client {
                 Ok(client) => {
-                    reachability::NatResolver::from_client(
+                    reachability::NatResolver::from_client_with_datagram_sink(
                         client,
                         reachability::RENDEZVOUS_KEEPALIVE,
+                        invite_intro_tx,
                     )
                     .await
                 }
@@ -5050,6 +5062,66 @@ async fn reachability_plane(
                     Ok(Err(e)) => ack(false, e).await,
                     Err(_) => ack(false, "plane exited".into()).await,
                 }
+            }
+        });
+    }
+    if let Some(mut invite_intro_rx) = invite_intro_rx.take() {
+        let intro_cmds = nudges.clone().downgrade();
+        let intro_label = label.clone();
+        let binding = config.chain_id.clone().into_bytes();
+        tokio::spawn(async move {
+            while let Some((src, bytes)) = invite_intro_rx.recv().await {
+                let Ok(msg) = lobby::decode_intro(&bytes) else {
+                    continue;
+                };
+                let verified = match lobby::verify_intro(&msg, &binding) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(cmds) = intro_cmds.upgrade() else { break };
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let install = reachability::ReachabilityCommand::InstallInvitePeer {
+                    peer: verified.joiner.clone(),
+                    wireguard_public_key: wireguard_upgrade::X25519PublicKey(
+                        verified.wg_public_key,
+                    ),
+                    endpoint: src,
+                    reply: reachability::InstallReply(reply_tx),
+                };
+                if cmds.send(install).await.is_err() {
+                    break;
+                }
+                let ack = match reply_rx.await {
+                    Ok(Ok(())) => {
+                        println!(
+                            "[node {intro_label}] invite intro: coordinated tunnel peer \
+                             installed for {}",
+                            config::hex_bytes(&verified.joiner.as_ref()[..4])
+                        );
+                        lobby::IntroAck {
+                            nonce: msg.nonce.clone(),
+                            installed: true,
+                            detail: "tunnel installed".into(),
+                        }
+                    }
+                    Ok(Err(e)) => lobby::IntroAck {
+                        nonce: msg.nonce.clone(),
+                        installed: false,
+                        detail: e,
+                    },
+                    Err(_) => lobby::IntroAck {
+                        nonce: msg.nonce.clone(),
+                        installed: false,
+                        detail: "plane exited".into(),
+                    },
+                };
+                let bytes = lobby::encode_intro_ack(&ack);
+                let _ = cmds
+                    .send(reachability::ReachabilityCommand::SendResolverDatagram {
+                        endpoint: src,
+                        bytes,
+                    })
+                    .await;
             }
         });
     }
@@ -5841,108 +5913,212 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             {
                 use std::net::ToSocketAddrs as _;
                 let install = wg.issuer_key().and_then(|issuer| {
-                    let endpoint = wg
-                        .endpoint
-                        .to_socket_addrs()
-                        .map_err(|e| format!("invite wireguard endpoint {:?}: {e}", wg.endpoint))?
-                        .next()
-                        .ok_or_else(|| format!("invite wireguard endpoint {:?} did not resolve", wg.endpoint))?;
                     let public_key = wg.public_key_bytes()?;
-                    Ok((issuer, public_key, endpoint))
+                    Ok((issuer, public_key))
                 });
                 match install {
-                    Ok((issuer, public_key, endpoint)) => {
-                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                        let _ = reach
-                            .send(reachability::ReachabilityCommand::InstallInvitePeer {
-                                peer: issuer,
-                                wireguard_public_key: wireguard_upgrade::X25519PublicKey(public_key),
-                                endpoint,
-                                reply: reachability::InstallReply(reply_tx),
-                            })
-                            .await;
-                        match reply_rx.await {
-                            Ok(Ok(())) => println!(
-                                "[node {label}] invite: tunnel to the inviter configured \
-                                 (endpoint {endpoint})"
-                            ),
-                            Ok(Err(e)) => eprintln!(
-                                "[node {label}] invite: inviter tunnel not configured: {e}"
-                            ),
-                            Err(_) => {}
-                        }
-                        // the announcer: a plain blocking UDP loop on its own OS
-                        // thread (nothing here touches the runtime) — re-sends
-                        // the intro every 2s until the inviter acks an install.
-                        let announce_label = label.clone();
-                        let announce_signer = signer.clone();
-                        let announce_namespace = namespace.clone();
-                        let announce_token = token.clone();
-                        let intro_dest = wg.intro.clone();
-                        let key_file = wireguard_key_file.clone();
-                        std::thread::Builder::new()
-                            .name("invite-intro".into())
-                            .spawn(move || {
-                                let Ok((keypair, _)) =
-                                    reachability::WireGuardKeypair::load_or_generate(&key_file)
-                                else {
+                    Ok((issuer, public_key)) => match (&wg.endpoint, &wg.intro) {
+                        (Some(endpoint_raw), Some(intro_dest)) => {
+                            let endpoint = match endpoint_raw.to_socket_addrs() {
+                                Ok(mut addrs) => addrs.next(),
+                                Err(e) => {
                                     eprintln!(
-                                        "[node {announce_label}] invite: wireguard key unreadable — \
-                                         intro not announced"
+                                        "[node {label}] invite: wireguard endpoint \
+                                         {endpoint_raw:?} unusable ({e}) — falling back to \
+                                         the descriptor's reach hints"
                                     );
-                                    return;
-                                };
-                                let request = lobby::encode_intro(&lobby::intro_request(
-                                    &announce_signer,
-                                    &announce_namespace,
-                                    &announce_token,
-                                    keypair.public_key().0,
-                                ));
-                                let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
-                                    return;
-                                };
-                                let _ = socket
-                                    .set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                                let mut announced = false;
-                                let mut buf = [0u8; 2048];
-                                loop {
-                                    let Ok(dest) = intro_dest.to_socket_addrs() else {
-                                        std::thread::sleep(std::time::Duration::from_secs(2));
-                                        continue;
-                                    };
-                                    let Some(dest) = dest.into_iter().next() else {
-                                        std::thread::sleep(std::time::Duration::from_secs(2));
-                                        continue;
-                                    };
-                                    if socket.send_to(&request, dest).is_ok() && !announced {
-                                        announced = true;
-                                        println!(
-                                            "[node {announce_label}] invite: introducing this \
-                                             node to the inviter at udp/{dest}"
-                                        );
-                                    }
-                                    if let Ok((n, _)) = socket.recv_from(&mut buf)
-                                        && let Ok(ack) = lobby::decode_intro_ack(&buf[..n])
-                                        && ack.nonce == announce_token.nonce.to_vec()
-                                    {
-                                        if ack.installed {
-                                            println!(
-                                                "[node {announce_label}] invite: inviter \
-                                                 installed our tunnel — join rides the overlay"
+                                    None
+                                }
+                            };
+                            if let Some(endpoint) = endpoint {
+                                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                                let _ = reach
+                                    .send(reachability::ReachabilityCommand::InstallInvitePeer {
+                                        peer: issuer,
+                                        wireguard_public_key:
+                                            wireguard_upgrade::X25519PublicKey(public_key),
+                                        endpoint,
+                                        reply: reachability::InstallReply(reply_tx),
+                                    })
+                                    .await;
+                                match reply_rx.await {
+                                    Ok(Ok(())) => println!(
+                                        "[node {label}] invite: tunnel to the inviter configured \
+                                         (endpoint {endpoint})"
+                                    ),
+                                    Ok(Err(e)) => eprintln!(
+                                        "[node {label}] invite: inviter tunnel not configured: {e}"
+                                    ),
+                                    Err(_) => {}
+                                }
+                                // the announcer: a plain blocking UDP loop on its own OS
+                                // thread (nothing here touches the runtime) — re-sends
+                                // the intro every 2s until the inviter acks an install.
+                                let announce_label = label.clone();
+                                let announce_signer = signer.clone();
+                                let announce_namespace = namespace.clone();
+                                let announce_token = token.clone();
+                                let intro_dest = intro_dest.clone();
+                                let key_file = wireguard_key_file.clone();
+                                std::thread::Builder::new()
+                                    .name("invite-intro".into())
+                                    .spawn(move || {
+                                        let Ok((keypair, _)) =
+                                            reachability::WireGuardKeypair::load_or_generate(&key_file)
+                                        else {
+                                            eprintln!(
+                                                "[node {announce_label}] invite: wireguard key unreadable — \
+                                                 intro not announced"
                                             );
                                             return;
+                                        };
+                                        let request = lobby::encode_intro(&lobby::intro_request(
+                                            &announce_signer,
+                                            &announce_namespace,
+                                            &announce_token,
+                                            keypair.public_key().0,
+                                        ));
+                                        let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+                                            return;
+                                        };
+                                        let _ = socket
+                                            .set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                                        let mut announced = false;
+                                        let mut buf = [0u8; 2048];
+                                        loop {
+                                            let Ok(dest) = intro_dest.to_socket_addrs() else {
+                                                std::thread::sleep(std::time::Duration::from_secs(2));
+                                                continue;
+                                            };
+                                            let Some(dest) = dest.into_iter().next() else {
+                                                std::thread::sleep(std::time::Duration::from_secs(2));
+                                                continue;
+                                            };
+                                            if socket.send_to(&request, dest).is_ok() && !announced {
+                                                announced = true;
+                                                println!(
+                                                    "[node {announce_label}] invite: introducing this \
+                                                     node to the inviter at udp/{dest}"
+                                                );
+                                            }
+                                            if let Ok((n, _)) = socket.recv_from(&mut buf)
+                                                && let Ok(ack) = lobby::decode_intro_ack(&buf[..n])
+                                                && ack.nonce == announce_token.nonce.to_vec()
+                                            {
+                                                if ack.installed {
+                                                    println!(
+                                                        "[node {announce_label}] invite: inviter \
+                                                         installed our tunnel — join rides the overlay"
+                                                    );
+                                                    return;
+                                                }
+                                                eprintln!(
+                                                    "[node {announce_label}] invite: inviter refused \
+                                                     the intro: {}",
+                                                    ack.detail
+                                                );
+                                            }
+                                            std::thread::sleep(std::time::Duration::from_secs(2));
                                         }
-                                        eprintln!(
-                                            "[node {announce_label}] invite: inviter refused \
-                                             the intro: {}",
-                                            ack.detail
-                                        );
-                                    }
-                                    std::thread::sleep(std::time::Duration::from_secs(2));
-                                }
-                            })
-                            .expect("spawn invite-intro thread");
-                    }
+                                    })
+                                    .expect("spawn invite-intro thread");
+                            }
+                        }
+                        (None, None) => {
+                            if let Ok((keypair, _)) =
+                                reachability::WireGuardKeypair::load_or_generate(&wireguard_key_file)
+                            {
+                                let intro = lobby::encode_intro(&lobby::intro_request(
+                                    &signer,
+                                    &namespace,
+                                    token,
+                                    keypair.public_key().0,
+                                ));
+                                let expected_nonce = token.nonce.to_vec();
+                                let reach = reach.clone();
+                                let announce_label = label.clone();
+                                context.child("coordinated_invite_intro").spawn(
+                                    move |ctx| async move {
+                                        let mut reported_pending = false;
+                                        for _ in 0..30 {
+                                            let (reply_tx, reply_rx) =
+                                                tokio::sync::oneshot::channel();
+                                            if reach
+                                                .send(
+                                                    reachability::ReachabilityCommand::BootstrapCoordinatedInvitePeer {
+                                                        peer: issuer.clone(),
+                                                        wireguard_public_key:
+                                                            wireguard_upgrade::X25519PublicKey(public_key),
+                                                        intro: intro.clone(),
+                                                        reply: reachability::CoordinatedInviteReply(reply_tx),
+                                                    },
+                                                )
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                            match reply_rx.await {
+                                                Ok(Ok(bytes)) => match lobby::decode_intro_ack(&bytes) {
+                                                    Ok(ack)
+                                                        if ack.nonce == expected_nonce
+                                                            && ack.installed =>
+                                                    {
+                                                        println!(
+                                                            "[node {announce_label}] invite: coordinated \
+                                                     intro accepted through the rendezvous underlay"
+                                                        );
+                                                        return;
+                                                    }
+                                                    Ok(ack) if ack.nonce == expected_nonce => {
+                                                        eprintln!(
+                                                            "[node {announce_label}] invite: coordinated \
+                                                     intro refused by inviter: {}",
+                                                            ack.detail
+                                                        );
+                                                    }
+                                                    Ok(_) if !reported_pending => {
+                                                        reported_pending = true;
+                                                        eprintln!(
+                                                            "[node {announce_label}] invite: coordinated \
+                                                     intro ack did not match this invite"
+                                                        );
+                                                    }
+                                                    Ok(_) => {}
+                                                    Err(e) if !reported_pending => {
+                                                        reported_pending = true;
+                                                        eprintln!(
+                                                            "[node {announce_label}] invite: coordinated \
+                                                     intro ack was malformed: {e}"
+                                                        );
+                                                    }
+                                                    Err(_) => {}
+                                                },
+                                                Ok(Err(e)) if !reported_pending => {
+                                                    reported_pending = true;
+                                                    eprintln!(
+                                                        "[node {announce_label}] invite: coordinated \
+                                                     tunnel not ready yet: {e}"
+                                                    );
+                                                }
+                                                Ok(Err(_)) | Err(_) => {}
+                                            }
+                                            ctx.sleep(Duration::from_secs(2)).await;
+                                        }
+                                    },
+                                );
+                            } else {
+                                eprintln!(
+                                    "[node {label}] invite: wireguard key unreadable — \
+                                     coordinated intro not announced"
+                                );
+                            }
+                        }
+                        _ => eprintln!(
+                            "[node {label}] invite: wireguard bootstrap is malformed — falling \
+                             back to the descriptor's reach hints"
+                        ),
+                    },
                     Err(e) => eprintln!(
                         "[node {label}] invite: wireguard bootstrap unusable ({e}) — falling \
                          back to the descriptor's reach hints"

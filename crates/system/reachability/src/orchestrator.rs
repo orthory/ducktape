@@ -41,7 +41,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use commonware_cryptography::{Signer as _, ed25519};
-use nat_traversal::{NatClient, NodeKey};
+use nat_traversal::{ClientEvent, NatClient, NodeKey, SocketEvent};
 use tokio::sync::mpsc;
 use wireguard_effect::{
     PeerTunnelConfig, WireGuardEffect, apply_peer_tunnels, plan_peer_configs, update_peer_tunnels,
@@ -139,6 +139,8 @@ pub struct MeshEpochEvent {
 /// The apply outcome an [`ReachabilityCommand::InstallInvitePeer`] caller
 /// awaits — wrapped so the command enum keeps its `Debug`.
 pub struct InstallReply(pub tokio::sync::oneshot::Sender<Result<(), String>>);
+#[derive(Debug)]
+pub struct CoordinatedInviteReply(pub tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>);
 
 impl std::fmt::Debug for InstallReply {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -173,6 +175,21 @@ pub enum ReachabilityCommand {
         /// Resolved with the apply outcome (the inviter acks the intro only
         /// after the peer is really on the interface).
         reply: InstallReply,
+    },
+    /// Resolve a coordinated invite's inviter through the rendezvous plane,
+    /// install the inviter as a join-window tunnel peer, then send the
+    /// authenticated intro datagram over the same punched underlay socket.
+    BootstrapCoordinatedInvitePeer {
+        peer: ed25519::PublicKey,
+        wireguard_public_key: wireguard_upgrade::X25519PublicKey,
+        intro: Vec<u8>,
+        reply: CoordinatedInviteReply,
+    },
+    /// Send one datagram over the resolver socket. Used for invite intro ACKs
+    /// after the receiving side has installed the join-window peer.
+    SendResolverDatagram {
+        endpoint: SocketAddr,
+        bytes: Vec<u8>,
     },
     /// A reachability-channel message arrived from a mesh peer.
     Deliver {
@@ -280,6 +297,36 @@ pub trait EndpointResolver {
         peer: NodeKey,
         advertised: SocketAddr,
     ) -> Result<Resolution, String>;
+
+    /// Resolve a peer strictly through rendezvous. Callers use this when
+    /// there is no trusted advertised endpoint in the protocol payload.
+    async fn resolve_rendezvous_endpoint(&mut self, peer: NodeKey) -> Result<SocketAddr, String> {
+        let placeholder = SocketAddr::from(([0, 0, 0, 0], 0));
+        match self.resolve(peer, placeholder).await? {
+            Resolution::Punched(endpoint) => Ok(endpoint),
+            Resolution::Advertised => {
+                Err("coordinated invite requires a coordinator-resolved endpoint".into())
+            }
+        }
+    }
+
+    /// Send one datagram from the same socket the resolver uses. Only the
+    /// production rendezvous resolver supports this; tests may no-op.
+    async fn send_datagram(&mut self, _peer: SocketAddr, _bytes: Vec<u8>) -> Result<(), String> {
+        Err("resolver datagram sending unavailable".into())
+    }
+
+    /// Send one datagram and wait for the first non-rendezvous datagram from
+    /// that same endpoint. Used by invite bootstrap so "sent" does not get
+    /// mistaken for "the inviter installed us".
+    async fn send_datagram_and_recv(
+        &mut self,
+        _peer: SocketAddr,
+        _bytes: Vec<u8>,
+        _timeout: Duration,
+    ) -> Result<Vec<u8>, String> {
+        Err("resolver datagram responses unavailable".into())
+    }
 }
 
 /// Test resolver: a fixed map, `Advertised` for anything unlisted.
@@ -293,6 +340,10 @@ impl EndpointResolver for StaticResolver {
         _advertised: SocketAddr,
     ) -> Result<Resolution, String> {
         Ok(self.0.get(&peer).copied().unwrap_or(Resolution::Advertised))
+    }
+
+    async fn send_datagram(&mut self, _peer: SocketAddr, _bytes: Vec<u8>) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -338,9 +389,22 @@ pub struct NatResolver {
     reflexive: Option<SocketAddr>,
 }
 
-struct ResolveCmd {
-    peer: NodeKey,
-    reply: tokio::sync::oneshot::Sender<Result<Resolution, String>>,
+enum ResolveCmd {
+    Resolve {
+        peer: NodeKey,
+        reply: tokio::sync::oneshot::Sender<Result<Resolution, String>>,
+    },
+    SendDatagram {
+        peer: SocketAddr,
+        bytes: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    SendDatagramAndRecv {
+        peer: SocketAddr,
+        bytes: Vec<u8>,
+        timeout: Duration,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
+    },
 }
 
 impl NatResolver {
@@ -383,7 +447,19 @@ impl NatResolver {
     /// (`nat_traversal::NatSocket::Shared`) so the punch originates from the
     /// tunnel's own 5-tuple. Discovers the reflexive, registers, and spawns
     /// the pump exactly like [`Self::bind`].
-    pub async fn from_client(mut client: NatClient, keepalive: Duration) -> std::io::Result<Self> {
+    pub async fn from_client(client: NatClient, keepalive: Duration) -> std::io::Result<Self> {
+        Self::from_client_with_datagram_sink(client, keepalive, None).await
+    }
+
+    /// [`Self::from_client`] plus an explicit datagram sink. Non-rendezvous
+    /// datagrams received on the socket are forwarded to `datagrams`, which
+    /// lets invite-intro bootstrap share the WireGuard underlay socket without
+    /// changing the default rendezvous-only event stream.
+    pub async fn from_client_with_datagram_sink(
+        mut client: NatClient,
+        keepalive: Duration,
+        datagrams: Option<tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+    ) -> std::io::Result<Self> {
         let (_idx, reflexive) = client
             .discover_reflexive_failover(COORD_STEP_TIMEOUT)
             .await?;
@@ -400,7 +476,7 @@ impl NatResolver {
             keepalive,
         ));
         let (commands, rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(rendezvous_pump(client, rx));
+        tokio::spawn(rendezvous_pump(client, rx, datagrams));
         Ok(Self {
             commands: Some(commands),
             reflexive: Some(reflexive),
@@ -425,7 +501,43 @@ impl EndpointResolver for NatResolver {
         };
         let (reply, rx) = tokio::sync::oneshot::channel();
         commands
-            .send(ResolveCmd { peer, reply })
+            .send(ResolveCmd::Resolve { peer, reply })
+            .await
+            .map_err(|_| "rendezvous pump terminated".to_string())?;
+        rx.await
+            .map_err(|_| "rendezvous pump terminated".to_string())?
+    }
+
+    async fn send_datagram(&mut self, peer: SocketAddr, bytes: Vec<u8>) -> Result<(), String> {
+        let Some(commands) = &self.commands else {
+            return Err("no coordinator socket available for resolver datagram".into());
+        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        commands
+            .send(ResolveCmd::SendDatagram { peer, bytes, reply })
+            .await
+            .map_err(|_| "rendezvous pump terminated".to_string())?;
+        rx.await
+            .map_err(|_| "rendezvous pump terminated".to_string())?
+    }
+
+    async fn send_datagram_and_recv(
+        &mut self,
+        peer: SocketAddr,
+        bytes: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, String> {
+        let Some(commands) = &self.commands else {
+            return Err("no coordinator socket available for resolver datagram response".into());
+        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        commands
+            .send(ResolveCmd::SendDatagramAndRecv {
+                peer,
+                bytes,
+                timeout,
+                reply,
+            })
             .await
             .map_err(|_| "rendezvous pump terminated".to_string())?;
         rx.await
@@ -466,20 +578,53 @@ async fn rendezvous_keepalive(client: std::sync::Weak<NatClient>, keepalive: Dur
 async fn rendezvous_pump(
     client: std::sync::Arc<NatClient>,
     mut commands: tokio::sync::mpsc::Receiver<ResolveCmd>,
+    datagrams: Option<tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
 ) {
     loop {
         tokio::select! {
             cmd = commands.recv() => {
-                let Some(ResolveCmd { peer, reply }) = cmd else { return };
-                let _ = reply.send(do_resolve(&client, peer).await);
+                let Some(cmd) = cmd else { return };
+                match cmd {
+                    ResolveCmd::Resolve { peer, reply } => {
+                        let _ = reply.send(do_resolve(&client, peer, datagrams.as_ref()).await);
+                    }
+                    ResolveCmd::SendDatagram { peer, bytes, reply } => {
+                        let _ = reply.send(
+                            client
+                                .send_datagram_to(&bytes, peer)
+                                .await
+                                .map_err(|e| e.to_string()),
+                        );
+                    }
+                    ResolveCmd::SendDatagramAndRecv {
+                        peer,
+                        bytes,
+                        timeout,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            send_datagram_and_recv(
+                                &client,
+                                peer,
+                                bytes,
+                                timeout,
+                                datagrams.as_ref(),
+                            )
+                            .await,
+                        );
+                    }
+                }
             }
-            ev = client.recv_event() => match ev {
-                Ok(nat_traversal::ClientEvent::PunchSync { peer_reflexive, .. }) => {
+            ev = client.recv_socket_event() => match ev {
+                Ok(SocketEvent::Rendezvous(ClientEvent::PunchSync { peer_reflexive, .. })) => {
                     // The passive half of a peer's rendezvous: open our
                     // pinhole toward the address the coordinator vouched for.
                     // Bounded — one punch per coordinator-sourced PunchSync
                     // (the active side's per-try re-Lookup drives repeats).
                     let _ = client.send_punch_to(peer_reflexive).await;
+                }
+                Ok(SocketEvent::Datagram { src, bytes }) => {
+                    forward_datagram(&datagrams, src, bytes);
                 }
                 Ok(_) => {}
                 Err(_) => {
@@ -497,6 +642,16 @@ async fn rendezvous_pump(
     }
 }
 
+fn forward_datagram(
+    datagrams: &Option<tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+    src: SocketAddr,
+    bytes: Vec<u8>,
+) {
+    if let Some(datagrams) = datagrams {
+        let _ = datagrams.try_send((src, bytes));
+    }
+}
+
 /// One resolve: per TRY, a fresh `Lookup` (each one re-fans `PunchSync` to
 /// BOTH sides — the retry is what absorbs a lost fan-out datagram or a
 /// momentarily busy peer pump), then a punch exchange bounded by
@@ -505,8 +660,11 @@ async fn rendezvous_pump(
 /// pair's rendezvous. No relay fallback exists — a failed punch is surfaced
 /// as an error so the peer rides its advertised endpoint and a `PeerFailed`
 /// is emitted for observability.
-async fn do_resolve(client: &NatClient, peer: NodeKey) -> Result<Resolution, String> {
-    use nat_traversal::ClientEvent;
+async fn do_resolve(
+    client: &NatClient,
+    peer: NodeKey,
+    datagrams: Option<&tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+) -> Result<Resolution, String> {
     let mut lookup_timeouts = 0usize;
     for _ in 0..PUNCH_TRIES {
         client
@@ -515,12 +673,21 @@ async fn do_resolve(client: &NatClient, peer: NodeKey) -> Result<Resolution, Str
             .map_err(|e| format!("coordinator lookup: {e}"))?;
         let looked_up = tokio::time::timeout(COORD_STEP_TIMEOUT, async {
             loop {
-                match client.recv_event().await {
-                    Ok(ClientEvent::LookupResponse { key, reflexive }) if key == peer => {
+                match client.recv_socket_event().await {
+                    Ok(SocketEvent::Rendezvous(ClientEvent::LookupResponse { key, reflexive }))
+                        if key == peer =>
+                    {
                         return Ok(reflexive);
                     }
-                    Ok(ClientEvent::PunchSync { peer_reflexive, .. }) => {
+                    Ok(SocketEvent::Rendezvous(ClientEvent::PunchSync {
+                        peer_reflexive, ..
+                    })) => {
                         let _ = client.send_punch_to(peer_reflexive).await;
+                    }
+                    Ok(SocketEvent::Datagram { src, bytes }) => {
+                        if let Some(datagrams) = datagrams {
+                            let _ = datagrams.try_send((src, bytes));
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => return Err(format!("coordinator lookup: {e}")),
@@ -542,13 +709,22 @@ async fn do_resolve(client: &NatClient, peer: NodeKey) -> Result<Resolution, Str
         }
         let punched = tokio::time::timeout(PUNCH_STEP_TIMEOUT, async {
             loop {
-                match client.recv_event().await {
-                    Ok(ClientEvent::Punch { src, .. }) if src == peer_reflexive => return Ok(()),
-                    Ok(ClientEvent::PunchSync {
+                match client.recv_socket_event().await {
+                    Ok(SocketEvent::Rendezvous(ClientEvent::Punch { src, .. }))
+                        if src == peer_reflexive =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(SocketEvent::Rendezvous(ClientEvent::PunchSync {
                         peer_reflexive: sync_to,
                         ..
-                    }) => {
+                    })) => {
                         let _ = client.send_punch_to(sync_to).await;
+                    }
+                    Ok(SocketEvent::Datagram { src, bytes }) => {
+                        if let Some(datagrams) = datagrams {
+                            let _ = datagrams.try_send((src, bytes));
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => return Err(format!("punch recv: {e}")),
@@ -566,6 +742,38 @@ async fn do_resolve(client: &NatClient, peer: NodeKey) -> Result<Resolution, Str
         return Err("coordinator lookup timed out".to_string());
     }
     Err(format!("hole-punch failed after {PUNCH_TRIES} tries"))
+}
+
+async fn send_datagram_and_recv(
+    client: &NatClient,
+    peer: SocketAddr,
+    bytes: Vec<u8>,
+    timeout: Duration,
+    datagrams: Option<&tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+) -> Result<Vec<u8>, String> {
+    client
+        .send_datagram_to(&bytes, peer)
+        .await
+        .map_err(|e| format!("resolver datagram send: {e}"))?;
+    tokio::time::timeout(timeout, async {
+        loop {
+            match client.recv_socket_event().await {
+                Ok(SocketEvent::Datagram { src, bytes }) if src == peer => return Ok(bytes),
+                Ok(SocketEvent::Datagram { src, bytes }) => {
+                    if let Some(datagrams) = datagrams {
+                        let _ = datagrams.try_send((src, bytes));
+                    }
+                }
+                Ok(SocketEvent::Rendezvous(ClientEvent::PunchSync { peer_reflexive, .. })) => {
+                    let _ = client.send_punch_to(peer_reflexive).await;
+                }
+                Ok(_) => {}
+                Err(e) => return Err(format!("resolver datagram recv: {e}")),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "resolver datagram response timed out".to_string())?
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -825,6 +1033,19 @@ where
                 driver
                     .install_invite_peer(peer, wireguard_public_key, endpoint, reply)
                     .await?
+            }
+            ReachabilityCommand::BootstrapCoordinatedInvitePeer {
+                peer,
+                wireguard_public_key,
+                intro,
+                reply,
+            } => {
+                driver
+                    .bootstrap_coordinated_invite_peer(peer, wireguard_public_key, intro, reply)
+                    .await?
+            }
+            ReachabilityCommand::SendResolverDatagram { endpoint, bytes } => {
+                let _ = driver.resolver.send_datagram(endpoint, bytes).await;
             }
             ReachabilityCommand::Deliver { from, bytes } => driver.deliver(from, bytes).await?,
             ReachabilityCommand::ViewTick(view) => driver.view = driver.view.max(view),
@@ -2188,6 +2409,67 @@ where
                 Ok(())
             }
         }
+    }
+
+    /// Coordinated invite bootstrap: rendezvous the inviter's WireGuard
+    /// underlay endpoint, install it as the local join-window peer, and send
+    /// the authenticated intro over that same punched socket so the inviter
+    /// can install this node in return.
+    async fn bootstrap_coordinated_invite_peer(
+        &mut self,
+        peer: ed25519::PublicKey,
+        wireguard_public_key: wireguard_upgrade::X25519PublicKey,
+        intro: Vec<u8>,
+        reply: CoordinatedInviteReply,
+    ) -> Result<(), ReachabilityError> {
+        let identity = binding::identity_of(&peer);
+        let endpoint = match self
+            .resolver
+            .resolve_rendezvous_endpoint(binding::node_key(identity))
+            .await
+        {
+            Ok(endpoint) => endpoint,
+            Err(reason) => {
+                let _ = reply.0.send(Err(format!(
+                    "coordinated invite endpoint resolution: {reason}"
+                )));
+                return Ok(());
+            }
+        };
+
+        let (install_tx, install_rx) = tokio::sync::oneshot::channel();
+        self.install_invite_peer(
+            peer,
+            wireguard_public_key,
+            endpoint,
+            InstallReply(install_tx),
+        )
+        .await?;
+        match install_rx.await {
+            Ok(Ok(())) => {
+                match self
+                    .resolver
+                    .send_datagram_and_recv(endpoint, intro, Duration::from_secs(2))
+                    .await
+                {
+                    Ok(bytes) => {
+                        let _ = reply.0.send(Ok(bytes));
+                    }
+                    Err(reason) => {
+                        let _ = reply
+                            .0
+                            .send(Err(format!("coordinated invite intro ack: {reason}")));
+                    }
+                }
+            }
+            Ok(Err(reason)) => {
+                let _ = reply.0.send(Err(reason));
+            }
+            Err(_) => {
+                let _ = reply.0.send(Err("invite peer installer exited".into()));
+            }
+        }
+        Ok(())
     }
 
     async fn sync_prewarm(&mut self) -> Result<(), ReachabilityError> {
