@@ -22,7 +22,9 @@ pub use auth::{
     AuthError, AuthPolicy, Authenticator, COORD_CAP_NS, COORD_CAP_TTL_SECS, COORD_REQ_NS, CoordCap,
     DEFAULT_FRESHNESS_WINDOW_SECS, mint_coord_cap, now_secs, sign_authenticator, verify_request,
 };
-pub use client::{ClientEvent, NatClient, NatSocket, run_coordinator, run_coordinator_with};
+pub use client::{
+    ClientEvent, NatClient, NatSocket, SocketEvent, run_coordinator, run_coordinator_with,
+};
 pub use coordinator::Coordinator;
 #[cfg(any(test, feature = "simnat"))]
 pub use punch::{PunchError, PunchPlan, RebindProof, drive_rebind_reconnect, drive_simulated};

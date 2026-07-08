@@ -386,6 +386,15 @@ impl NatClient {
         Ok(())
     }
 
+    /// Send one non-rendezvous datagram from this client's socket. Consumers
+    /// that need this also consume [`Self::recv_socket_event`] so these
+    /// datagrams have an explicit owner instead of changing the default
+    /// rendezvous-only event stream.
+    pub async fn send_datagram_to(&self, buf: &[u8], peer: SocketAddr) -> std::io::Result<()> {
+        self.sock.send_to(buf, peer).await?;
+        Ok(())
+    }
+
     /// Receive a `Punch` datagram, but only accept it if it actually arrived
     /// from `expected` — the peer's rendezvous-resolved socket address.
     /// Discarding the sender address here would let any third party forge a
@@ -423,34 +432,55 @@ impl NatClient {
     /// consumer sees EVERY datagram, so an unsolicited PunchSync arriving
     /// between operations is delivered instead of eaten.
     pub async fn recv_event(&self) -> std::io::Result<ClientEvent> {
-        let mut buf = [0u8; 128];
+        loop {
+            match self.recv_socket_event().await? {
+                SocketEvent::Rendezvous(ev) => return Ok(ev),
+                SocketEvent::Datagram { .. } => continue,
+            }
+        }
+    }
+
+    /// Receive the next datagram classified either as rendezvous control or
+    /// as a caller-owned non-rendezvous datagram. This is the opt-in API for
+    /// protocols that intentionally share the NAT socket; callers that only
+    /// want coordinator traffic should use [`Self::recv_event`].
+    pub async fn recv_socket_event(&self) -> std::io::Result<SocketEvent> {
+        let mut buf = [0u8; 4096];
         loop {
             let (n, from) = self.sock.recv_from(&mut buf).await?;
             let Ok(msg) = Msg::decode(&buf[..n]) else {
-                continue;
+                return Ok(SocketEvent::Datagram {
+                    src: from,
+                    bytes: buf[..n].to_vec(),
+                });
             };
             let from_coord = from == self.coord;
             match msg {
                 Msg::BindResponse { reflexive } if from_coord => {
-                    return Ok(ClientEvent::BindResponse { reflexive });
+                    return Ok(SocketEvent::Rendezvous(ClientEvent::BindResponse {
+                        reflexive,
+                    }));
                 }
                 Msg::LookupResponse { key, reflexive } if from_coord => {
-                    return Ok(ClientEvent::LookupResponse { key, reflexive });
+                    return Ok(SocketEvent::Rendezvous(ClientEvent::LookupResponse {
+                        key,
+                        reflexive,
+                    }));
                 }
                 Msg::PunchSync {
                     peer,
                     peer_reflexive,
                 } if from_coord => {
-                    return Ok(ClientEvent::PunchSync {
+                    return Ok(SocketEvent::Rendezvous(ClientEvent::PunchSync {
                         peer,
                         peer_reflexive,
-                    });
+                    }));
                 }
                 Msg::Punch { from: peer } => {
-                    return Ok(ClientEvent::Punch {
+                    return Ok(SocketEvent::Rendezvous(ClientEvent::Punch {
                         from: peer,
                         src: from,
-                    });
+                    }));
                 }
                 _ => continue,
             }
@@ -481,6 +511,14 @@ pub enum ClientEvent {
         from: NodeKey,
         src: SocketAddr,
     },
+}
+
+/// A datagram received from a NAT client socket when the caller has opted
+/// into sharing that socket with a non-rendezvous protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SocketEvent {
+    Rendezvous(ClientEvent),
+    Datagram { src: SocketAddr, bytes: Vec<u8> },
 }
 
 /// The coordinator event loop: decode control datagrams (authenticated or, under
@@ -1241,6 +1279,55 @@ mod tests {
                 assert_eq!(peer_reflexive.port(), b.local_addr().await.unwrap().port());
             }
             other => panic!("expected the coordinator fan-out PunchSync first, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_event_surfaces_datagrams_without_polluting_recv_event() {
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        let client = NatClient::bind(NodeKey([0xaa; 32]), coord_addr)
+            .await
+            .unwrap();
+        let client_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            client.local_addr().await.unwrap().port(),
+        );
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        peer.send_to(b"invite-intro", client_addr).await.unwrap();
+        match timeout(Duration::from_secs(2), client.recv_socket_event())
+            .await
+            .expect("bounded")
+            .expect("socket event")
+        {
+            SocketEvent::Datagram { src, bytes } => {
+                assert_eq!(src, peer_addr);
+                assert_eq!(bytes, b"invite-intro");
+            }
+            other => panic!("expected caller-owned datagram, got {other:?}"),
+        }
+
+        peer.send_to(b"another-intro", client_addr).await.unwrap();
+        coord_sock
+            .send_to(
+                &Msg::BindResponse {
+                    reflexive: client_addr,
+                }
+                .encode(),
+                client_addr,
+            )
+            .await
+            .unwrap();
+
+        match timeout(Duration::from_secs(2), client.recv_event())
+            .await
+            .expect("bounded")
+            .expect("rendezvous event")
+        {
+            ClientEvent::BindResponse { reflexive } => assert_eq!(reflexive, client_addr),
+            other => panic!("expected coordinator BindResponse, got {other:?}"),
         }
     }
 }

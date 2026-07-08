@@ -1,6 +1,6 @@
-# Coordinator Deployment Recipe (`p2p.ducktape.industries`)
+# Coordinator Deployment Recipe (`p2p.ducktape.byeongsu.dev`)
 
-How to run `bin/coordinator` as `p2p.ducktape.industries`: an **untrusted,
+How to run `bin/coordinator` as `p2p.ducktape.byeongsu.dev`: an **untrusted,
 non-validator reachability helper** that lets two NAT'd validators find each
 other and hole-punch a direct path. It is rendezvous-only: it never carries
 peer traffic (the DERP-style ciphertext relay was removed 2026-07-06). This
@@ -10,14 +10,12 @@ source of record for the trust model and operating contract.
 > **Scope honesty.** Everything on this page **works today**: `bin/coordinator`
 > runs as-is and its `--listen` invocation is regression-proven by
 > `bin/coordinator/tests/deploy_smoke.rs`. On the other end, the node-side
-> reachability plane is wired but **staged**: `bin/node` constructs a
+> reachability plane is wired behind `wireguard_listen`: `bin/node` constructs a
 > `reachability::NatResolver` (reflexive discovery, `register`, hole-punch
 > against the configured coordinators) only when `wireguard_listen` is
-> configured. What still does not work end-to-end (v3 `Coordinated` hint
-> consumption, coordinator-auth) is tracked in
-> [the integration-gap handoff](private-cutover-integration-gap.md); the
-> cross-machine procedure is
-> [the runbook](cross-machine-zero-exposure-runbook.md).
+> configured. v3 `Coordinated` hints are now consumed as reachability routes;
+> successful punching is still NAT-dependent because there is no relay fallback.
+> The cross-machine procedure is [the runbook](cross-machine-zero-exposure-runbook.md).
 
 ## Why this is safe (untrusted by design)
 
@@ -175,7 +173,7 @@ does.
 
 ## DNS + firewall
 
-- Point an `A` record `p2p.ducktape.industries` → the VPS IP.
+- Point an `A` record `p2p.ducktape.byeongsu.dev` → the VPS IP.
 - Open **inbound UDP 3478**. No TCP port is needed at all, and no other UDP
   port either — the coordinator never binds a second socket.
 
@@ -191,15 +189,15 @@ and is a single point of failure for the validator it fronts: an out-of-path
 coordinator is where the "established connections survive; only new ones depend
 on it" framing actually holds.
 
-## What this recipe does NOT do (forward reference)
+## What this recipe does NOT do
 
 The coordinator deployed here is live and correct, and the node-side
-reachability plane (staged behind `wireguard_listen`) drives it: `bin/node`
+reachability plane (behind `wireguard_listen`) drives it: `bin/node`
 constructs a `NatResolver` that discovers its reflexive, `register`s, and
-hole-punches against the configured coordinators. What this page still does
-**not** claim is a demonstrated end-to-end zero-exposure tunnel: a v3
-`Coordinated` invite hint is not yet consumed as a reachability path, and
-coordinator-auth remains open. For the exact works-today line, see
-[`private-cutover-integration-gap.md`](private-cutover-integration-gap.md);
-the cross-machine procedure is
+hole-punches against the configured coordinators, and v3 `Coordinated` invite
+hints route into that path instead of being dialed as mesh peers.
+
+What this page does **not** promise is universal zero-exposure connectivity:
+the coordinator is rendezvous-only, so NAT pairs that cannot punch fail
+honestly rather than falling back to a relay. The cross-machine procedure is
 [`cross-machine-zero-exposure-runbook.md`](cross-machine-zero-exposure-runbook.md).
