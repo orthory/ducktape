@@ -90,10 +90,10 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
     app.run(|app, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
-            if let Err(err) = workspaces::stop_active_workspace_node(app) {
-                eprintln!("app exit: could not stop active workspace node: {err}");
-            }
+        if let tauri::RunEvent::ExitRequested { .. } = event
+            && let Err(err) = workspaces::stop_active_workspace_node(app)
+        {
+            eprintln!("app exit: could not stop active workspace node: {err}");
         }
     });
 }
