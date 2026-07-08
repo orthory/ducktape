@@ -6,23 +6,22 @@ import { useState } from "react";
 
 import type { AgentRecord } from "../../../domain/agent-client";
 import { Icon } from "../../components/Icon";
-import { color, font, radius } from "../../theme/tokens";
+import { color, font, radius, shadow } from "../../theme/tokens";
 import { AgentEditForm } from "./AgentEditForm";
 import {
   ACTION_LABEL,
   AgentAvatar,
+  CapabilityStrip,
   Chip,
   EmptyState,
   GroupCard,
   InfoRow,
+  onDarkButton,
   ownerText,
   primaryButton,
-  secondaryButton,
   SectionLabel,
   shortHex,
   statusTone,
-  StatusPill,
-  titleCase,
 } from "./parts";
 
 export function AgentDetail({
@@ -64,75 +63,129 @@ export function AgentDetail({
   const active = agent.status === "active";
   return (
     <section aria-label="Agent detail" style={{ minWidth: 0 }}>
-      <SectionLabel>AGENT DETAIL</SectionLabel>
-      <GroupCard style={{ marginTop: 9 }}>
-        <div style={{ padding: 16 }}>
-          <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
-            <AgentAvatar name={agent.display_name} size={52} />
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
-                <h2
-                  style={{
-                    margin: 0,
-                    minWidth: 0,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                    font: `600 16px ${font.sans}`,
-                    color: color.dark,
-                  }}
-                >
-                  {agent.display_name}
-                </h2>
-                <StatusPill label="AGENT" tone={statusTone.agent} />
-                <StatusPill
-                  label={active ? "ACTIVE" : "PAUSED"}
-                  tone={active ? statusTone.success : statusTone.warning}
-                />
-              </div>
-              <div
+      <div
+        style={{
+          border: `1px solid ${color.border}`,
+          borderRadius: radius.lg,
+          background: color.paper,
+          boxShadow: shadow.card,
+          overflow: "hidden",
+        }}
+      >
+        {/* Identity band — a dark plate so the agent reads as a first-class actor,
+            not a form row. The accent avatar is the one bright object on it. */}
+        <div
+          style={{
+            background: color.dark,
+            padding: "18px 18px 17px",
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 14,
+          }}
+        >
+          <AgentAvatar name={agent.display_name} size={50} tone="accent" />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <h2
+              style={{
+                margin: 0,
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                font: `650 20px ${font.sans}`,
+                letterSpacing: "-.01em",
+                color: color.onDark,
+              }}
+            >
+              {agent.display_name}
+            </h2>
+            <div
+              style={{
+                marginTop: 6,
+                display: "flex",
+                alignItems: "center",
+                gap: 9,
+                flexWrap: "wrap",
+              }}
+            >
+              <span
                 translate="no"
-                style={{
-                  marginTop: 4,
-                  font: `400 11px ${font.mono}`,
-                  color: color.muted2,
-                  overflowWrap: "anywhere",
-                }}
+                style={{ font: `400 11px ${font.mono}`, color: "rgba(239,239,239,.5)" }}
               >
                 {agent.agent_id}
-              </div>
-            </div>
-            <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-              <button
-                type="button"
-                onClick={() => setEditing((open) => !open)}
-                aria-expanded={editing}
-                style={secondaryButton}
-              >
-                {editing ? "Close edit" : "Edit"}
-              </button>
-              <button
-                type="button"
-                onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
+              </span>
+              <span
                 style={{
-                  ...secondaryButton,
-                  color: active ? color.amber : color.green,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 5,
+                  padding: "2px 9px",
+                  borderRadius: 999,
+                  background: "rgba(239,239,239,.08)",
+                  border: "1px solid rgba(239,239,239,.16)",
+                  font: `700 9px ${font.mono}`,
+                  letterSpacing: ".07em",
+                  textTransform: "uppercase",
+                  color: active ? "#86cf9a" : "#e0b978",
                 }}
               >
-                {active ? "Pause agent" : "Resume agent"}
-              </button>
+                <span
+                  style={{
+                    width: 5,
+                    height: 5,
+                    borderRadius: "50%",
+                    background: "currentColor",
+                  }}
+                />
+                {active ? "Active" : "Paused"}
+              </span>
             </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+            <button
+              type="button"
+              onClick={() => setEditing((open) => !open)}
+              aria-expanded={editing}
+              style={onDarkButton}
+            >
+              {editing ? "Close edit" : "Edit"}
+            </button>
+            <button
+              type="button"
+              onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
+              style={{ ...onDarkButton, color: active ? "#e0b978" : "#86cf9a" }}
+            >
+              {active ? "Pause agent" : "Resume agent"}
+            </button>
+          </div>
+        </div>
+
+        {/* Body */}
+        <div style={{ padding: 18 }}>
+          <SectionLabel>RUNS ON</SectionLabel>
+          <div
+            style={{
+              marginTop: 8,
+              padding: "12px 14px",
+              borderRadius: radius.md,
+              border: `1px solid ${color.border}`,
+              background: color.sunken,
+              display: "flex",
+              alignItems: "center",
+              minWidth: 0,
+            }}
+          >
+            <CapabilityStrip capability={agent.capability} />
           </div>
 
           <div
             style={{
               marginTop: 15,
               display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))",
+              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 170px), 1fr))",
               gap: 8,
             }}
           >
-            <InfoRow label="runs on" value={titleCase(agent.capability)} />
             <InfoRow label="owner" value={ownerText(agent.owner)} />
             <InfoRow label="prompt" value={shortHex(agent.prompt_hash)} />
             <InfoRow label="updated" value={String(agent.updated_at)} />
@@ -167,7 +220,7 @@ export function AgentDetail({
             />
           )}
         </div>
-      </GroupCard>
+      </div>
     </section>
   );
 }

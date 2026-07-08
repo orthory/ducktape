@@ -80,8 +80,8 @@ violations, suffix collisions, composed tags failing `validate_tag`
 
 **Curated matrix (built-in):**
 
-- `codex.toml`: models `gpt-5.5`, `gpt-5.5-codex` × efforts `low medium high
-  xhigh` → args `["exec","--json","--sandbox","read-only",
+- `codex.toml`: models `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
+  `gpt-5.3-codex-spark` × efforts `low medium high xhigh` → args `["exec","--json","--sandbox","read-only",
   "--skip-git-repo-check","-m","<model>","-c",
   "model_reasoning_effort=\"<effort>\"","-"]` (8 variants).
 - `claude.toml`: models `fable`, `opus`, `sonnet`, `haiku` × efforts `low

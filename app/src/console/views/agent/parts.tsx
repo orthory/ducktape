@@ -72,13 +72,25 @@ export const secondaryButton: CSSProperties = {
   touchAction: "manipulation",
 };
 
+// The module's decisive accent moment: primary actions carry the terracotta,
+// not the flat dark, so "Add agent" / "Register" read as THE thing to do.
 export const primaryButton = (enabled: boolean): CSSProperties => ({
   ...secondaryButton,
-  borderColor: enabled ? color.dark : color.chip,
-  background: enabled ? color.dark : color.chip,
-  color: enabled ? color.onDark : color.muted2,
+  borderColor: enabled ? accentVar : color.chip,
+  background: enabled ? accentVar : color.chip,
+  color: enabled ? "#fff" : color.muted2,
   cursor: enabled ? "pointer" : "default",
+  boxShadow: enabled ? "0 1px 2px rgba(160,90,60,.30)" : undefined,
 });
+
+// A control styled to sit on the agent card's dark identity band.
+export const onDarkButton: CSSProperties = {
+  ...secondaryButton,
+  minHeight: 30,
+  border: "1px solid rgba(239,239,239,.22)",
+  background: "rgba(239,239,239,.07)",
+  color: color.onDark,
+};
 
 // ── Wire → display helpers ──────────────────────────────
 
@@ -208,7 +220,17 @@ export function StatusPill({ label, tone }: { label: string; tone: Tone }) {
   );
 }
 
-export function AgentAvatar({ name, size = 34 }: { name: string; size?: number }) {
+export function AgentAvatar({
+  name,
+  size = 34,
+  tone = "dark",
+}: {
+  name: string;
+  size?: number;
+  /** "accent" pops the avatar on the card's dark identity band. */
+  tone?: "dark" | "accent";
+}) {
+  const accent = tone === "accent";
   return (
     <span
       aria-hidden="true"
@@ -216,9 +238,10 @@ export function AgentAvatar({ name, size = 34 }: { name: string; size?: number }
         width: size,
         height: size,
         flexShrink: 0,
-        borderRadius: Math.max(7, Math.round(size * 0.22)),
-        background: color.dark,
-        color: color.onDark,
+        borderRadius: Math.max(7, Math.round(size * 0.24)),
+        background: accent ? accentVar : color.dark,
+        color: accent ? "#fff" : color.onDark,
+        boxShadow: accent ? "inset 0 0 0 1px rgba(255,255,255,.16)" : undefined,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -227,6 +250,72 @@ export function AgentAvatar({ name, size = 34 }: { name: string; size?: number }
       }}
     >
       {initialsOf(name)}
+    </span>
+  );
+}
+
+/** Split a stored capability tag into provider / model / effort (the picker's
+ *  3-part `provider_model_effort` grammar; anything else is shown whole as the
+ *  provider). */
+const parseCap = (
+  tag: string,
+): { provider: string; model: string | null; effort: string | null } => {
+  const parts = tag.split("_");
+  if (parts.length === 3 && parts.every(Boolean)) {
+    return { provider: parts[0], model: parts[1], effort: parts[2] };
+  }
+  return { provider: tag, model: null, effort: null };
+};
+
+/** Compact one-line executor label for dense rows: "Codex · gpt-5.5", or just
+ *  "Codex" for a bare/opaque tag. */
+export const capabilityShort = (tag: string): string => {
+  const { provider, model } = parseCap(tag);
+  return model ? `${titleCase(provider)} · ${model}` : titleCase(provider);
+};
+
+/** The agent's executor shown as a spec — PROVIDER › model · EFFORT — instead
+ *  of a raw, truncation-prone tag like `Codex_gpt-5.5_h…`. */
+export function CapabilityStrip({ capability }: { capability: string }) {
+  const { provider, model, effort } = parseCap(capability);
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 8,
+        minWidth: 0,
+        flexWrap: "wrap",
+      }}
+    >
+      <span style={{ font: `700 12.5px ${font.sans}`, color: accentVar, letterSpacing: ".01em" }}>
+        {titleCase(provider)}
+      </span>
+      {model && (
+        <>
+          <span style={{ color: color.iconIdle, font: `400 12px ${font.mono}` }}>›</span>
+          <span translate="no" style={{ font: `600 11.5px ${font.mono}`, color: color.ink }}>
+            {model}
+          </span>
+        </>
+      )}
+      {effort && (
+        <span
+          translate="no"
+          style={{
+            padding: "1px 7px",
+            borderRadius: 999,
+            background: statusTone.agent.bg,
+            border: `1px solid ${statusTone.agent.border}`,
+            font: `700 9px ${font.mono}`,
+            letterSpacing: ".06em",
+            color: accentVar,
+            textTransform: "uppercase",
+          }}
+        >
+          {effort}
+        </span>
+      )}
     </span>
   );
 }

@@ -17,6 +17,10 @@ import {
 } from "react";
 
 import {
+  providersOf,
+  type ProviderGroup,
+} from "../../../domain/capability-client";
+import {
   displayNameForKey,
   normalizeKey,
   sameKey,
@@ -309,6 +313,52 @@ function Pill({
   );
 }
 
+/** A node runs one tag per model×effort combo, so a busy node announces dozens.
+ *  The row only needs to say WHICH providers it runs: one pill per provider,
+ *  with a badge counting its distinct models when there's more than one. The
+ *  model list rides the native tooltip, one hover away. */
+function ProviderPill({ group }: { group: ProviderGroup }) {
+  const count = group.models.length;
+  return (
+    <span
+      title={(count ? group.models : group.tags).join("\n")}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 5,
+        padding: count > 1 ? "2px 5px 2px 9px" : "2px 9px",
+        borderRadius: 999,
+        background: color.sunken,
+        border: `1px solid ${color.border}`,
+        whiteSpace: "nowrap",
+      }}
+    >
+      <span style={{ font: `600 10.5px ${font.sans}`, color: color.inkSoft }}>
+        {group.label}
+      </span>
+      {count > 1 && (
+        <span
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            minWidth: 16,
+            height: 15,
+            padding: "0 4px",
+            borderRadius: 999,
+            background: color.paper,
+            border: `1px solid ${color.borderSoft}`,
+            font: `600 9px ${font.mono}`,
+            color: color.muted3,
+          }}
+        >
+          {count}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function Avatar({ member, size = 32 }: { member: MemberVM; size?: number }) {
   const bg = member.isFounder ? color.dark : member.isLocal ? "#dfeee4" : color.chip;
   const fg = member.isFounder ? color.onDark : member.isLocal ? color.accentAlt2 : color.muted3;
@@ -558,21 +608,9 @@ function MemberRow({
             {member.shortKey} · {member.status}
           </div>
           {member.capabilities.length > 0 && (
-            <div style={{ marginTop: 5, display: "flex", flexWrap: "wrap", gap: 4 }}>
-              {member.capabilities.map((tag) => (
-                <span
-                  key={tag}
-                  style={{
-                    padding: "1px 6px",
-                    borderRadius: 4,
-                    background: color.paper,
-                    border: `1px solid ${color.borderStrong}`,
-                    font: `500 9.5px ${font.mono}`,
-                    color: color.muted2,
-                  }}
-                >
-                  {tag}
-                </span>
+            <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 5 }}>
+              {providersOf(member.capabilities).map((group) => (
+                <ProviderPill key={group.provider} group={group} />
               ))}
             </div>
           )}
@@ -1070,14 +1108,51 @@ function MemberDetailPane({
           <InfoRow label="genesis" value={member.isFounder ? "yes" : "no"} />
           <InfoRow label="this node" value={member.isLocal ? "yes" : "no"} />
           <InfoRow label="presence" value="not exposed by this node" />
-          <InfoRow
-            label="capabilities"
-            value={
-              member.capabilities.length
-                ? member.capabilities.join(", ")
-                : "none announced"
-            }
-          />
+        </div>
+
+        <div style={{ marginTop: 18 }}>
+          <div style={{ ...sectionLabel, marginBottom: 9 }}>RUNS ON</div>
+          {member.capabilities.length === 0 ? (
+            <div style={{ font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
+              No executors announced by this node.
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {providersOf(member.capabilities).map((group) => (
+                <div key={group.provider}>
+                  <div style={{ font: `600 11.5px ${font.sans}`, color: color.inkSoft }}>
+                    {group.label}
+                  </div>
+                  {group.models.length > 0 ? (
+                    <div
+                      style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 4 }}
+                    >
+                      {group.models.map((model) => (
+                        <span
+                          key={model}
+                          translate="no"
+                          style={{
+                            padding: "2px 8px",
+                            borderRadius: 999,
+                            background: color.paper,
+                            border: `1px solid ${color.border}`,
+                            font: `500 10px ${font.mono}`,
+                            color: color.muted3,
+                          }}
+                        >
+                          {model}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 4, font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
+                      default executor
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </aside>

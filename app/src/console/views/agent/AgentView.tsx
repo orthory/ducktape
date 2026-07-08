@@ -17,7 +17,7 @@ import { opKey } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
 import { AgentDetail, NoAgentsPane } from "./AgentDetail";
-import { primaryButton, runIsMine, secondaryButton } from "./parts";
+import { primaryButton, runIsMine, secondaryButton, statusTone } from "./parts";
 import { RegisterAgentForm } from "./RegisterAgentForm";
 import { RosterList } from "./RosterList";
 import { JobsWorkerRow, RunsTimeline } from "./RunsTimeline";
@@ -58,12 +58,22 @@ function TabButton({
         alignItems: "center",
         gap: 7,
         font: `600 12px ${font.sans}`,
-        color: active ? color.dark : color.muted2,
+        color: active ? accentVar : color.muted2,
         whiteSpace: "nowrap",
       }}
     >
       {label}
-      <span style={{ font: `600 10px ${font.mono}`, color: active ? accentVar : color.muted2 }}>
+      <span
+        style={{
+          minWidth: 16,
+          padding: "0 5px",
+          borderRadius: 999,
+          textAlign: "center",
+          background: active ? statusTone.agent.bg : color.sidebar,
+          font: `600 10px ${font.mono}`,
+          color: active ? accentVar : color.muted2,
+        }}
+      >
         {count}
       </span>
     </button>
@@ -136,7 +146,16 @@ export function AgentView() {
         >
           <Icon name="agent" size={16} color="currentColor" strokeWidth={1.7} />
         </span>
-        <h1 style={{ margin: 0, font: `600 16px ${font.sans}`, color: color.dark }}>Agents</h1>
+        <h1
+          style={{
+            margin: 0,
+            font: `650 18px ${font.sans}`,
+            letterSpacing: "-.01em",
+            color: color.dark,
+          }}
+        >
+          Agents
+        </h1>
 
         <div
           role="tablist"
