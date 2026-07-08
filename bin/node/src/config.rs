@@ -459,6 +459,16 @@ pub fn primary_coordinator_or_default(raw: Option<&str>) -> Result<Option<String
     }
 }
 
+/// Resolve the ambient coordinator to a dial [`Ingress`] — the AMBIENT source
+/// a joiner's NAT resolver binds (config/default), never one carried in an
+/// invite. `None` when coordination is disabled (`"none"`/`"off"`/`"direct"`).
+pub fn coordinator_ingress(raw: Option<&str>) -> Result<Option<Ingress>, String> {
+    match primary_coordinator_or_default(raw)? {
+        Some(addr) => ingress_of(&addr),
+        None => Ok(None),
+    }
+}
+
 impl NetworkDescriptor {
     pub fn coordination(&self) -> Coordination {
         match self.coordination.as_deref() {
@@ -672,6 +682,70 @@ pub fn load_invite_wireguard(dir: &Path) -> Result<Option<StoredInviteWireGuard>
     toml::from_str(&text)
         .map(Some)
         .map_err(|e| format!("{path:?}: {e}"))
+}
+
+const INVITE_FRONTS_FILE: &str = "invite-fronts.json";
+
+/// the on-disk shape of a persisted [`Front`] — raw key arrays as hex so the
+/// file is human-readable and stable, mirroring [`StoredInviteWireGuard`].
+#[derive(Serialize, Deserialize)]
+struct StoredFront {
+    member_key: String,
+    wireguard_public_key: String,
+    mesh_port: u16,
+    endpoint: Option<String>,
+}
+
+/// persist the invite's fronts beside the token so a later `run` can race the
+/// whole union of first-contact paths, not just the inviter. Empty fronts write
+/// nothing (absence decodes as empty). Overwrites — a re-join replaces them.
+pub fn save_invite_fronts(dir: &Path, fronts: &[Front]) -> Result<(), String> {
+    let path = dir.join(INVITE_FRONTS_FILE);
+    if fronts.is_empty() {
+        // a re-join with a front-less invite must not leave a stale set behind.
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+    let stored: Vec<StoredFront> = fronts
+        .iter()
+        .map(|f| StoredFront {
+            member_key: hex_bytes(&f.member_key),
+            wireguard_public_key: hex_bytes(&f.wireguard_public_key),
+            mesh_port: f.mesh_port,
+            endpoint: f.endpoint.clone(),
+        })
+        .collect();
+    let text = serde_json::to_string_pretty(&stored).map_err(|e| format!("encode {path:?}: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("write {path:?}: {e}"))
+}
+
+/// the fronts a previous `join` stored; empty when absent. Fail-closed decode.
+pub fn load_invite_fronts(dir: &Path) -> Result<Vec<Front>, String> {
+    let path = dir.join(INVITE_FRONTS_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {path:?}: {e}")),
+    };
+    let stored: Vec<StoredFront> =
+        serde_json::from_str(&text).map_err(|e| format!("decode {path:?}: {e}"))?;
+    stored
+        .into_iter()
+        .map(|s| {
+            let member_key = unhex(&s.member_key)?
+                .try_into()
+                .map_err(|_| "front member_key must be 32 bytes".to_string())?;
+            let wireguard_public_key = unhex(&s.wireguard_public_key)?
+                .try_into()
+                .map_err(|_| "front wireguard_public_key must be 32 bytes".to_string())?;
+            Ok(Front {
+                member_key,
+                wireguard_public_key,
+                mesh_port: s.mesh_port,
+                endpoint: s.endpoint,
+            })
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -1748,6 +1822,10 @@ pub struct Resolved {
     /// the joining node brings up BEFORE any p2p. always `None` for the dev
     /// shape and for members.
     pub invite_wireguard: Option<StoredInviteWireGuard>,
+    /// the inviter's offered member fronts a `join` stored, if any — the
+    /// ADDITIONAL first-contact paths the joiner races alongside the inviter.
+    /// Empty for the dev shape, for members, and for pre-feature invites.
+    pub invite_fronts: Vec<Front>,
     /// opt-in shipped-index warm start when joining; see `NodeToml::sync_index`.
     pub sync_index: bool,
     /// publish the discovered provider set into the capability registry; see
@@ -1883,6 +1961,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: load_invite_token(base)?,
         invite_wireguard: load_invite_wireguard(base)?,
+        invite_fronts: load_invite_fronts(base)?,
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
         coordination: descriptor.coordination(),
@@ -2117,6 +2196,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: None,
         invite_wireguard: None,
+        invite_fronts: Vec::new(),
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
         // the dev shape wires direct sockets only — no real coordinator, so
