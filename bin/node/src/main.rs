@@ -331,6 +331,36 @@ async fn read_valset_residents(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
+/// the transport-mesh set a parked joiner tracks at a manifest's epoch. it MUST
+/// be the same set every member tracks at that epoch — a validator tracks
+/// `descriptor_mesh ∪ members ∪ residents` (see the `mesh_at` closure in the
+/// validator boot below) — because `authenticated::discovery` KILLS a peer
+/// whose bit-vector length disagrees at a shared index. the manifest carries
+/// members (`participants`) and residents (`residents`) as separate lists, so a
+/// joiner that folds only `participants` tracks a SHORTER set than every member
+/// the moment any resident is granted, and discovery tears the link down on
+/// every gossip round (a resident redeeming its own grant is exactly this case:
+/// the founder counts it, the joiner does not). the descriptor mesh already
+/// carries the lobby key. undecodable keys are dropped (dead serving hints).
+fn joiner_epoch_mesh(
+    descriptor_mesh: &[ed25519::PublicKey],
+    participants: &[Vec<u8>],
+    residents: &[Vec<u8>],
+) -> Set<ed25519::PublicKey> {
+    let mut union: std::collections::BTreeSet<ed25519::PublicKey> =
+        descriptor_mesh.iter().cloned().collect();
+    // fold BOTH lists: members AND residents. every validator tracks the epoch
+    // as `descriptor_mesh ∪ members ∪ residents`; omitting residents here would
+    // leave the joiner one short and get it killed on every discovery round.
+    for k in participants.iter().chain(residents.iter()) {
+        if let Ok(pk) = ed25519::PublicKey::decode(k.as_slice()) {
+            union.insert(pk);
+        }
+    }
+    Set::try_from(union.into_iter().collect::<Vec<_>>())
+        .expect("a btree-set union has no duplicates")
+}
+
 /// read the upgrade module's committed state as the boundary snapshot the
 /// orchestrator reads at a finalized boundary (committed state — called between
 /// drains, outside any block). the readiness keys are projected into decoded
@@ -3436,6 +3466,45 @@ mod userkey_verb_tests {
         let err = cmd_user_key(&args_of(&["bogus"]), &mut stdin).unwrap_err();
         assert!(err.to_string().contains("unknown user-key subcommand"));
     }
+
+    // regression: a parked joiner must track the SAME epoch mesh as every
+    // member — `descriptor_mesh ∪ participants ∪ residents`. discovery kills a
+    // peer whose bit-vector length disagrees at a shared index, so a joiner that
+    // drops the manifest's residents (its own grant included) tracks a shorter
+    // set and is torn down on every gossip round — the churn the sentry +
+    // coordinator resident hit (`bit vector length mismatch expected=2 actual=3`).
+    #[test]
+    fn joiner_epoch_mesh_folds_members_and_residents() {
+        let founder = ed25519::PrivateKey::decode([1u8; 32].as_slice())
+            .unwrap()
+            .public_key();
+        let lobby = ed25519::PrivateKey::decode([2u8; 32].as_slice())
+            .unwrap()
+            .public_key();
+        let resident = ed25519::PrivateKey::decode([3u8; 32].as_slice())
+            .unwrap()
+            .public_key();
+        // the descriptor mesh every member carries: founder + derived lobby key.
+        let descriptor_mesh = vec![founder, lobby];
+        // the manifest a member serves once the resident's grant has committed:
+        // participants = validators, residents = the granted resident (itself).
+        let participants = vec![pubkey_bytes(&[1u8; 32])]; // founder
+        let residents = vec![pubkey_bytes(&[3u8; 32])]; // the resident
+
+        let set = joiner_epoch_mesh(&descriptor_mesh, &participants, &residents);
+
+        assert!(
+            set.position(&resident).is_some(),
+            "joiner dropped the manifest resident — discovery will kill the link \
+             on a bit-vector length mismatch"
+        );
+        assert_eq!(
+            set.len(),
+            3,
+            "every member tracks 3 (founder, lobby, resident); a shorter joiner \
+             set is torn down every discovery round"
+        );
+    }
 }
 
 /// `init --name <human name> [--dir .] [--listen a] [--advertised a] [--http a]
@@ -6511,17 +6580,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             m.epoch
                         );
                     }
-                    let mut union: std::collections::BTreeSet<ed25519::PublicKey> =
-                        peers.iter().cloned().collect();
-                    for k in &m.participants {
-                        if let Ok(pk) = ed25519::PublicKey::decode(k.as_slice()) {
-                            union.insert(pk);
-                        }
-                    }
                     oracle.track(
                         m.epoch,
-                        Set::try_from(union.into_iter().collect::<Vec<_>>())
-                            .expect("a btree-set union has no duplicates"),
+                        joiner_epoch_mesh(&peers, &m.participants, &m.residents),
                     );
                     last_tracked = m.epoch;
                 }
