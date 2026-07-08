@@ -20,7 +20,8 @@ Chosen shape (decided in brainstorming):
 - **Depth:** full native adoption — retire `app/scripts/tauri-debug.mjs`, drive
   the app through the plugin's own `tauri-agent` CLI and `tauri-agent-mcp`
   server, and rewrite both skills around that surface.
-- **Vendoring:** git submodule at `third_party/tauri-agent-plugin`.
+- **Dependency shape:** released crates.io/npm packages at `0.0.1`; no vendored
+  submodule is needed.
 
 ## Why this plugin
 
@@ -110,19 +111,17 @@ the registry, and the app and its driver must share the same value.
 
 ### Component changes
 
-**Vendor.** `third_party/tauri-agent-plugin` as a pinned git submodule.
-- Rust consumes it by `path` (cargo builds from source).
-- The CLI/MCP run straight off the submodule's TS entrypoints with `bun`
-  (`bun third_party/tauri-agent-plugin/bin/tauri-agent.ts` /
-  `.../bin/tauri-agent-mcp.ts`) — no `dist` build needed.
-- The guest binding resolves to the submodule's `guest-js/index.ts` source via a
-  dev-only Vite alias — again no build step, and tree-shaken out of release.
-- Follow-up (not this task): once the package is published to npm + crates.io,
-  swap the `path`/alias for versioned deps.
+**Package dependency.** Use the released crates.io/npm packages at `0.0.1`.
+- Rust consumes `tauri-plugin-agent = "0.0.1"` from crates.io.
+- The CLI/MCP run through the npm package binaries installed under `app/`
+  (`tauri-agent` / `tauri-agent-mcp`) via the repo shims.
+- The guest binding imports `@byeongsu-hong/tauri-plugin-agent` directly; the
+  package carries the compiled JS and types. The import remains dev-only and is
+  tree-shaken out of release.
 
 **Rust (`app/src-tauri/`).**
 - `Cargo.toml`: remove `tauri-plugin-mcp`; add
-  `tauri-plugin-agent = { path = "../../third_party/tauri-agent-plugin" }`.
+  `tauri-plugin-agent = "0.0.1"`.
 - `src/main.rs`: replace the `tauri_plugin_mcp::init_with_config(...)` block with
   `builder = builder.plugin(tauri_plugin_agent::init());`, **keeping the exact
   `#[cfg(all(debug_assertions, desktop))]` guard**. Release still registers
@@ -154,31 +153,25 @@ the registry, and the app and its driver must share the same value.
   ```
   Installs one instrumentation per webview, labelled by the real window label
   (`main`/`tray`/`huddle`), still gated by `import.meta.env.DEV`.
-- `vite.config.ts`: add a `resolve.alias` mapping
-  `@byeongsu-hong/tauri-plugin-agent` → the submodule's `guest-js/index.ts`.
-  The alias can be unconditional: because the only import of it is behind
-  `import.meta.env.DEV` (statically `false` in a release build), Vite
-  dead-code-eliminates the dynamic `import()` before resolution, so the alias
-  target is never bundled into release.
-- `package.json`: remove the `tauri-plugin-mcp` devDep. (No new JS dep entry is
-  required — the alias resolves the guest source, and the CLI/MCP run via `bun`
-  on the submodule. Lockfile updated to drop `tauri-plugin-mcp`.)
+- `vite.config.ts`: no alias is required; resolve the package normally.
+- `package.json`: remove the `tauri-plugin-mcp` devDep; add
+  `@byeongsu-hong/tauri-plugin-agent = "0.0.1"` as a dev dependency.
 
 **Driver → native CLI.**
 - Delete `app/scripts/tauri-debug.mjs`.
 - Add a thin **path shim** `app/scripts/tauri-agent` (executable) that execs
-  `bun <repo>/third_party/tauri-agent-plugin/bin/tauri-agent.ts "$@"` and
-  defaults `--app com.ducktape.app` when no `--app`/`--from-html`/`--port` is
-  given. This is a path/ergonomics shim, not a reimplemented protocol — the
-  native CLI does all the work. Skills call `app/scripts/tauri-agent tree`,
+  the package `tauri-agent` binary through `bunx --no-install` and defaults
+  `--app com.ducktape.app` when no `--app`/`--from-html`/`--port` is given. This
+  is a path/ergonomics shim, not a reimplemented protocol — the native CLI does
+  all the work. Skills call `app/scripts/tauri-agent tree`,
   `... shot out.svg`, `... find --role button --name Forge`, etc.
 
 **MCP (Claude Code).**
 - Add repo-root `.mcp.json`:
   ```json
   { "mcpServers": { "tauri-agent": {
-    "command": "bun",
-    "args": ["third_party/tauri-agent-plugin/bin/tauri-agent-mcp.ts"]
+    "command": "app/scripts/tauri-agent-mcp",
+    "args": []
   } } }
   ```
   Gives the main agent native `tauri_*` tools (`tauri_tree`, `tauri_find`,
@@ -246,8 +239,8 @@ Headless (Xvfb) bring-up per the tauri-debug recipe, then:
 
 ## Blast radius summary
 
-- **Add:** `third_party/tauri-agent-plugin` (submodule), `.gitmodules`,
-  `.mcp.json`, `app/scripts/tauri-agent`.
+- **Add:** `.mcp.json`, `app/scripts/tauri-agent`, and npm/crates.io package
+  dependencies for `tauri-plugin-agent` / `@byeongsu-hong/tauri-plugin-agent`.
 - **Modify:** `app/src-tauri/Cargo.toml`, `.../src/main.rs`,
   `.../tauri.conf.json`, `.../capabilities/default.json`, `app/src/main.tsx`,
   `app/vite.config.ts`, `app/package.json` (+ lockfile), `ops/fleet.sh`,

@@ -24,5 +24,5 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 # dev-only debug bridge: the tauri-agent debugger plugin the app/scripts/tauri-agent
 # CLI / tauri-agent MCP server drive (semantic tree / input / DOM-SVG shot / logs).
 # registration is cfg-gated to debug + desktop in main.rs so a release runtime
-# registers nothing; vendored as a submodule under third_party/.
-tauri-plugin-agent = { path = "../../third_party/tauri-agent-plugin" }
+# registers nothing.
+tauri-plugin-agent = "0.0.1"

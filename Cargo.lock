@@ -6581,9 +6581,12 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-agent"
-version = "0.1.0"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd8200d23d339b924c3bbdaf36be8080a04fa8173f79c456da1647262b937b8b"
 dependencies = [
  "base64 0.22.1",
+ "getrandom 0.3.4",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

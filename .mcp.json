@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "tauri-agent": {
-      "command": "bun",
-      "args": ["third_party/tauri-agent-plugin/bin/tauri-agent-mcp.ts"]
+      "command": "app/scripts/tauri-agent-mcp",
+      "args": []
     }
   }
 }

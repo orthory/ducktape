@@ -28,6 +28,7 @@
     "shiki": "^4.3.1"
   },
   "devDependencies": {
+    "@byeongsu-hong/tauri-plugin-agent": "0.0.1",
     "@tailwindcss/vite": "^4.3.0",
     "@tauri-apps/cli": "^2.11.2",
     "@testing-library/jest-dom": "^6.9.1",
