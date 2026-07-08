@@ -17,8 +17,17 @@ import type {
   ReactNode,
 } from "react";
 
-import { deletePath, joinPath, ls, mkdir, readAll, refs, uploadFile } from "../../../domain/files-client";
-import type { FileEntry } from "../../../domain/files-client";
+import {
+  deletePath,
+  joinPath,
+  ls,
+  mkdir,
+  readAll,
+  refs,
+  uploadFile,
+  uploadFiles,
+} from "../../../domain/files-client";
+import type { FileEntry, FileUploadEntry } from "../../../domain/files-client";
 import { Icon, type IconName } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
@@ -34,6 +43,32 @@ interface UploadState {
   targetDir: string;
   staged: number;
   total: number;
+}
+
+type BrowserUploadEntry =
+  | { kind: "file"; file: File; relativePath: string }
+  | { kind: "dir"; relativePath: string };
+
+interface WebkitFileSystemEntry {
+  isFile: boolean;
+  isDirectory: boolean;
+  name: string;
+  fullPath: string;
+}
+
+interface WebkitFileSystemFileEntry extends WebkitFileSystemEntry {
+  file: (success: (file: File) => void, error?: (err: DOMException) => void) => void;
+}
+
+interface WebkitFileSystemDirectoryReader {
+  readEntries: (
+    success: (entries: WebkitFileSystemEntry[]) => void,
+    error?: (err: DOMException) => void,
+  ) => void;
+}
+
+interface WebkitFileSystemDirectoryEntry extends WebkitFileSystemEntry {
+  createReader: () => WebkitFileSystemDirectoryReader;
 }
 
 interface ContextMenuState {
@@ -60,6 +95,25 @@ const sortEntries = (entries: FileEntry[]): FileEntry[] =>
 
 const writeTargetDir = (dir: string): string => (dir === "/" ? DEFAULT_DIR : dir);
 const basename = (path: string): string => path.split("/").pop() || path;
+const uploadRelativePath = (file: File): string => {
+  const candidate = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+  return candidate && candidate.length > 0 ? candidate : file.name;
+};
+const uploadTopName = (entries: { relativePath: string }[]): string | null => {
+  if (entries.length === 0) return null;
+  const top = entries[0].relativePath.split("/").filter(Boolean)[0] ?? null;
+  if (!top) return null;
+  return entries.every((entry) => entry.relativePath.split("/").filter(Boolean)[0] === top)
+    ? top
+    : null;
+};
+const uploadMessage = (entries: { relativePath: string }[]): string => {
+  const top = uploadTopName(entries);
+  if (top && entries.some((entry) => entry.relativePath.includes("/"))) {
+    return `upload folder ${top}`;
+  }
+  return entries.length === 1 ? `upload ${basename(entries[0].relativePath)}` : `upload ${entries.length} files`;
+};
 const makeDirectoryColumn = (path: string): DirectoryColumn => ({
   path,
   entries: [],
@@ -80,6 +134,56 @@ const columnPathsFor = (path: string): string[] => {
     acc += `/${segment}`;
     return acc;
   });
+};
+const fileFromEntry = (entry: WebkitFileSystemFileEntry): Promise<File> =>
+  new Promise((resolve, reject) => entry.file(resolve, reject));
+const readDirectoryEntries = async (
+  reader: WebkitFileSystemDirectoryReader,
+): Promise<WebkitFileSystemEntry[]> => {
+  const out: WebkitFileSystemEntry[] = [];
+  for (;;) {
+    const batch = await new Promise<WebkitFileSystemEntry[]>((resolve, reject) =>
+      reader.readEntries(resolve, reject),
+    );
+    if (batch.length === 0) return out;
+    out.push(...batch);
+  }
+};
+const stripEntryPath = (path: string): string => path.replace(/^\/+/, "");
+const collectEntryUploads = async (
+  entry: WebkitFileSystemEntry,
+): Promise<BrowserUploadEntry[]> => {
+  if (entry.isFile) {
+    const file = await fileFromEntry(entry as WebkitFileSystemFileEntry);
+    return [{ kind: "file", file, relativePath: stripEntryPath(entry.fullPath) || file.name }];
+  }
+  if (!entry.isDirectory) return [];
+  const dir = entry as WebkitFileSystemDirectoryEntry;
+  const children = await readDirectoryEntries(dir.createReader());
+  if (children.length === 0) {
+    return [{ kind: "dir", relativePath: stripEntryPath(entry.fullPath) || entry.name }];
+  }
+  const nested = await Promise.all(children.map((child) => collectEntryUploads(child)));
+  return nested.flat();
+};
+const collectDroppedUploads = async (dataTransfer: DataTransfer): Promise<BrowserUploadEntry[]> => {
+  const items = Array.from(dataTransfer.items ?? []);
+  const entries = items
+    .map(
+      (item) =>
+        (item as { webkitGetAsEntry?: () => WebkitFileSystemEntry | null }).webkitGetAsEntry?.() ??
+        null,
+    )
+    .filter((entry): entry is WebkitFileSystemEntry => entry !== null);
+  if (entries.length > 0) {
+    const nested = await Promise.all(entries.map((entry) => collectEntryUploads(entry)));
+    return nested.flat();
+  }
+  return Array.from(dataTransfer.files ?? []).map((file) => ({
+    kind: "file",
+    file,
+    relativePath: uploadRelativePath(file),
+  }));
 };
 
 function CenterState({ title, detail, muted }: { title: string; detail: string; muted?: boolean }) {
@@ -127,7 +231,7 @@ function HeaderButton({
   onClick,
 }: {
   label: string;
-  icon: "plus" | "modules" | "metrics";
+  icon: IconName;
   disabled?: boolean;
   active?: boolean;
   onClick: () => void;
@@ -616,6 +720,7 @@ function FilesContextMenu({
   onOpen,
   onNewFolder,
   onUpload,
+  onUploadFolder,
   onDelete,
   onRefresh,
 }: {
@@ -625,6 +730,7 @@ function FilesContextMenu({
   onOpen: (entry: FileEntry) => void;
   onNewFolder: () => void;
   onUpload: () => void;
+  onUploadFolder: () => void;
   onDelete: (entry: FileEntry) => void;
   onRefresh: () => void;
 }) {
@@ -698,6 +804,15 @@ function FilesContextMenu({
         disabled={readOnly}
         onSelect={() => {
           onUpload();
+          onClose();
+        }}
+      />
+      <ContextMenuItem
+        label="Upload folder"
+        icon="files"
+        disabled={readOnly}
+        onSelect={() => {
+          onUploadFolder();
           onClose();
         }}
       />
@@ -899,6 +1014,7 @@ function DeleteEntryDialog({
 export function FilesView() {
   const { state, transport } = useDucktape();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
   const dragDownloadUrls = useRef<Map<string, string>>(new Map());
   const dragDownloadFiles = useRef<Map<string, File>>(new Map());
   const dragDownloadRequests = useRef<Set<string>>(new Set());
@@ -1081,17 +1197,28 @@ export function FilesView() {
     fileInputRef.current?.click();
   };
 
+  const openFolderUploadPicker = () => {
+    if (!transport || readOnly) return;
+    setContextMenu(null);
+    folderInputRef.current?.click();
+  };
+
   const refreshDirectory = () => {
     setContextMenu(null);
     bumpReload();
   };
 
-  const uploadBrowserFiles = async (files: File[], targetDir: string) => {
-    if (!transport || readOnly || files.length === 0) return;
+  const uploadBrowserEntries = async (entries: BrowserUploadEntry[], targetDir: string) => {
+    if (!transport || readOnly || entries.length === 0) return;
     const writeDir = writeTargetDir(targetDir);
     setActionError(null);
     try {
-      for (const file of files) {
+      if (
+        entries.length === 1 &&
+        entries[0].kind === "file" &&
+        entries[0].relativePath === entries[0].file.name
+      ) {
+        const file = entries[0].file;
         setUpload({ name: file.name, targetDir: writeDir, staged: 0, total: 0 });
         const bytes = new Uint8Array(await file.arrayBuffer());
         await uploadFile(transport, {
@@ -1099,6 +1226,30 @@ export function FilesView() {
           bytes,
           meta: file.type ? { mime: file.type } : {},
           onProgress: (staged, total) => setUpload({ name: file.name, targetDir: writeDir, staged, total }),
+        });
+      } else {
+        const uploadEntries: FileUploadEntry[] = [];
+        for (const entry of entries) {
+          if (entry.kind === "dir") {
+            uploadEntries.push({ kind: "dir", relativePath: entry.relativePath });
+            continue;
+          }
+          setUpload({ name: entry.relativePath, targetDir: writeDir, staged: 0, total: 0 });
+          uploadEntries.push({
+            kind: "file",
+            relativePath: entry.relativePath,
+            bytes: new Uint8Array(await entry.file.arrayBuffer()),
+            meta: entry.file.type ? { mime: entry.file.type } : {},
+          });
+        }
+        const message = uploadMessage(uploadEntries);
+        setUpload({ name: uploadTopName(uploadEntries) ?? message, targetDir: writeDir, staged: 0, total: 0 });
+        await uploadFiles(transport, {
+          targetDir: writeDir,
+          entries: uploadEntries,
+          message,
+          onProgress: ({ relativePath, staged, total }) =>
+            setUpload({ name: relativePath, targetDir: writeDir, staged, total }),
         });
       }
       setUpload(null);
@@ -1111,10 +1262,24 @@ export function FilesView() {
 
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const input = event.target;
-    const file = input.files?.[0] ?? null;
+    const files = Array.from(input.files ?? []);
     input.value = "";
-    if (!file) return;
-    await uploadBrowserFiles([file], dir);
+    if (files.length === 0) return;
+    await uploadBrowserEntries(
+      files.map((file) => ({ kind: "file", file, relativePath: file.name })),
+      dir,
+    );
+  };
+
+  const handleFolderChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.target;
+    const files = Array.from(input.files ?? []);
+    input.value = "";
+    if (files.length === 0) return;
+    await uploadBrowserEntries(
+      files.map((file) => ({ kind: "file", file, relativePath: uploadRelativePath(file) })),
+      dir,
+    );
   };
 
   const canUpload = Boolean(transport) && !readOnly && backed;
@@ -1156,9 +1321,10 @@ export function FilesView() {
     dragDepth.current = 0;
     setDragActive(false);
     if (!canUpload) return;
-    const files = Array.from(event.dataTransfer.files ?? []);
-    if (files.length === 0) return;
-    void uploadBrowserFiles(files, dir);
+    event.dataTransfer.dropEffect = "copy";
+    void collectDroppedUploads(event.dataTransfer)
+      .then((entries) => uploadBrowserEntries(entries, dir))
+      .catch((err) => setActionError(errMsg(err)));
   };
 
   const prepareDragDownload = (entry: FileEntry) => {
@@ -1290,7 +1456,23 @@ export function FilesView() {
         )}
 
         <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-          <input ref={fileInputRef} type="file" onChange={handleFileChange} style={{ display: "none" }} />
+          <input
+            ref={fileInputRef}
+            data-upload-kind="file"
+            type="file"
+            multiple
+            onChange={handleFileChange}
+            style={{ display: "none" }}
+          />
+          <input
+            ref={folderInputRef}
+            data-upload-kind="folder"
+            type="file"
+            multiple
+            onChange={handleFolderChange}
+            style={{ display: "none" }}
+            {...({ directory: "", webkitdirectory: "" } as Record<string, string>)}
+          />
           <HeaderButton
             label="New folder"
             icon="modules"
@@ -1302,6 +1484,12 @@ export function FilesView() {
             icon="plus"
             disabled={!backed || readOnly}
             onClick={openUploadPicker}
+          />
+          <HeaderButton
+            label="Folder"
+            icon="files"
+            disabled={!backed || readOnly}
+            onClick={openFolderUploadPicker}
           />
           <HeaderButton
             label="History"
@@ -1409,6 +1597,7 @@ export function FilesView() {
             onOpen={openEntry}
             onNewFolder={openNewFolderDialog}
             onUpload={openUploadPicker}
+            onUploadFolder={openFolderUploadPicker}
             onDelete={setDeleteTarget}
             onRefresh={refreshDirectory}
           />

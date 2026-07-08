@@ -113,6 +113,130 @@ describe("uploadFile", () => {
   });
 });
 
+describe("uploadFiles", () => {
+  it("commits a folder as one atomic change set with preserved relative paths", async () => {
+    const digests = ["11".repeat(32), "22".repeat(32)];
+    let served = 0;
+    const filesStage = vi
+      .fn()
+      .mockImplementation(() => Promise.resolve({ digest: digests[served++] }));
+    const filesCommit = vi.fn().mockResolvedValue({ height: 10, appHash: "44".repeat(32) });
+    const query = vi
+      .fn()
+      .mockResolvedValue({ refs: { head: "55".repeat(32), pins: {}, window_len: 2 } });
+    const transport = fakeTransport({ filesStage, filesCommit, query });
+
+    await files.uploadFiles(transport, {
+      targetDir: "/shared",
+      entries: [
+        {
+          kind: "file",
+          relativePath: "Project/readme.txt",
+          bytes: new Uint8Array([1, 2, 3]),
+          meta: { mime: "text/plain" },
+        },
+        {
+          kind: "file",
+          relativePath: "Project/docs/plan.md",
+          bytes: new Uint8Array([4, 5]),
+          meta: { mime: "text/markdown" },
+        },
+      ],
+      message: "upload folder Project",
+    });
+
+    expect(filesStage).toHaveBeenCalledTimes(2);
+    expect(filesStage.mock.calls.map(([chunk]) => Array.from(chunk as Uint8Array))).toEqual([
+      [1, 2, 3],
+      [4, 5],
+    ]);
+
+    const body = filesCommit.mock.calls[0][0];
+    expect(body.base_snapshot).toBe("55".repeat(32));
+    expect(body.message).toBe("upload folder Project");
+    expect(body.changes).toEqual([
+      {
+        put: {
+          path: "/shared/Project/readme.txt",
+          exec: false,
+          meta: { mime: "text/plain" },
+          content: { chunks: { size: 3, chunks: [digests[0]] } },
+        },
+      },
+      {
+        put: {
+          path: "/shared/Project/docs/plan.md",
+          exec: false,
+          meta: { mime: "text/markdown" },
+          content: { chunks: { size: 2, chunks: [digests[1]] } },
+        },
+      },
+    ]);
+  });
+
+  it("can include an empty directory and an empty file in the same folder commit", async () => {
+    const filesStage = vi.fn();
+    const filesCommit = vi.fn().mockResolvedValue({ height: 11, appHash: "66".repeat(32) });
+    const transport = fakeTransport({ filesStage, filesCommit });
+
+    await files.uploadFiles(transport, {
+      targetDir: "/shared",
+      entries: [
+        { kind: "dir", relativePath: "EmptyFolder" },
+        { kind: "file", relativePath: "EmptyFolder/.keep", bytes: new Uint8Array() },
+      ],
+    });
+
+    expect(filesStage).not.toHaveBeenCalled();
+    expect(filesCommit.mock.calls[0][0].changes).toEqual([
+      { mkdir: { path: "/shared/EmptyFolder" } },
+      {
+        put: {
+          path: "/shared/EmptyFolder/.keep",
+          exec: false,
+          meta: {},
+          content: { chunks: { size: 0, chunks: [] } },
+        },
+      },
+    ]);
+  });
+
+  it("rejects duplicate target paths before staging any chunks", async () => {
+    const filesStage = vi.fn();
+    const filesCommit = vi.fn();
+    const transport = fakeTransport({ filesStage, filesCommit });
+
+    await expect(
+      files.uploadFiles(transport, {
+        targetDir: "/shared",
+        entries: [
+          { kind: "file", relativePath: "Project/readme.txt", bytes: new Uint8Array([1]) },
+          { kind: "file", relativePath: "Project/readme.txt", bytes: new Uint8Array([2]) },
+        ],
+      }),
+    ).rejects.toThrow(/duplicate upload path: \/shared\/Project\/readme\.txt/);
+
+    expect(filesStage).not.toHaveBeenCalled();
+    expect(filesCommit).not.toHaveBeenCalled();
+  });
+
+  it("rejects an over-cap full target path before staging any chunks", async () => {
+    const filesStage = vi.fn();
+    const filesCommit = vi.fn();
+    const transport = fakeTransport({ filesStage, filesCommit });
+
+    await expect(
+      files.uploadFiles(transport, {
+        targetDir: `/${"a".repeat(files.MAX_PATH_BYTES)}`,
+        entries: [{ kind: "file", relativePath: "x.txt", bytes: new Uint8Array([1]) }],
+      }),
+    ).rejects.toThrow(/upload target path exceeds the byte cap/);
+
+    expect(filesStage).not.toHaveBeenCalled();
+    expect(filesCommit).not.toHaveBeenCalled();
+  });
+});
+
 describe("readAll", () => {
   it("pages read calls until eof and concatenates the bytes", async () => {
     const pages: FileReadRange[] = [
