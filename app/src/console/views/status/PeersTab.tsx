@@ -8,6 +8,7 @@
 
 import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
 
+import { providersOf } from "../../../domain/capability-client";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { buildPeers, proposalWindow, type PeerVM } from "./node-health";
@@ -138,16 +139,24 @@ function ShareBar({ share }: { share: number }) {
   );
 }
 
+// One chip per provider, not per announced tag: a node lists a tag for every
+// model×effort combo, so the raw set floods the row. Show WHICH providers it
+// runs (with a model count), the model list on hover.
 function CapChips({ tags }: { tags: string[] }) {
-  if (tags.length === 0) return null;
-  const shown = tags.slice(0, 3);
-  const extra = tags.length - shown.length;
+  const groups = providersOf(tags);
+  if (groups.length === 0) return null;
+  const shown = groups.slice(0, 4);
+  const extra = groups.length - shown.length;
   return (
     <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-      {shown.map((tag) => (
+      {shown.map((group) => (
         <span
-          key={tag}
+          key={group.provider}
+          title={(group.models.length ? group.models : group.tags).join("\n")}
           style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 4,
             font: `500 9.5px ${font.mono}`,
             color: color.muted3,
             background: color.sunken,
@@ -156,7 +165,10 @@ function CapChips({ tags }: { tags: string[] }) {
             padding: "1px 6px",
           }}
         >
-          {tag}
+          {group.label}
+          {group.models.length > 1 && (
+            <span style={{ color: color.muted2 }}>{group.models.length}</span>
+          )}
         </span>
       ))}
       {extra > 0 && (

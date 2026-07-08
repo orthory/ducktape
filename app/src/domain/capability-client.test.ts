@@ -5,7 +5,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import { capabilities, capabilitiesByNode } from "./capability-client";
+import { capabilities, capabilitiesByNode, providersOf } from "./capability-client";
 import type { NodeTransport } from "./transport";
 
 const stubTransport = (reply?: unknown): NodeTransport => ({
@@ -60,5 +60,63 @@ describe("capabilitiesByNode", () => {
   it("reads an empty registry as an empty map", async () => {
     const transport = stubTransport({ all: [] });
     expect((await capabilitiesByNode(transport)).size).toBe(0);
+  });
+});
+
+describe("providersOf", () => {
+  it("collapses provider×model×effort tags to one title-cased entry per provider", () => {
+    const groups = providersOf([
+      "claude",
+      "claude_opus_high",
+      "claude_fable_low",
+      "codex",
+      "codex_gpt-5.5-high",
+    ]);
+    expect(groups.map((g) => g.provider)).toEqual(["claude", "codex"]);
+    expect(groups.map((g) => g.label)).toEqual(["Claude", "Codex"]);
+    expect(groups[0].tags).toEqual(["claude", "claude_opus_high", "claude_fable_low"]);
+    expect(groups[1].tags).toEqual(["codex", "codex_gpt-5.5-high"]);
+  });
+
+  it("names distinct models with the effort suffix dropped, not the raw combos", () => {
+    const groups = providersOf([
+      "claude",
+      "claude_fable_high",
+      "claude_fable_low",
+      "claude_haiku_max",
+      "claude_opus_medium",
+      "claude_sonnet_high",
+    ]);
+    // The bare `claude` tag names no model; each model appears once, no effort.
+    expect(groups[0].models).toEqual(["fable", "haiku", "opus", "sonnet"]);
+  });
+
+  it("strips effort from hyphenated codex tails and buckets them under codex", () => {
+    const groups = providersOf([
+      "codex_gpt-5.5-codex-xhigh",
+      "codex_gpt-5.5-codex-low",
+      "codex_gpt-5.5-high",
+    ]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].provider).toBe("codex");
+    expect(groups[0].models).toEqual(["gpt-5.5-codex", "gpt-5.5"]);
+    expect(groups[0].tags).toHaveLength(3);
+  });
+
+  it("preserves first-seen provider order and dedupes repeated tags", () => {
+    const groups = providersOf(["codex", "claude_opus_high", "codex", "claude_opus_high"]);
+    expect(groups.map((g) => g.provider)).toEqual(["codex", "claude"]);
+    expect(groups[0].tags).toEqual(["codex"]);
+    expect(groups[1].models).toEqual(["opus"]);
+  });
+
+  it("treats an underscore-free tag as its own model-less provider", () => {
+    const groups = providersOf(["gpu", "oracle"]);
+    expect(groups.map((g) => g.provider)).toEqual(["gpu", "oracle"]);
+    expect(groups.every((g) => g.models.length === 0)).toBe(true);
+  });
+
+  it("returns nothing for a node that announced no executors", () => {
+    expect(providersOf([])).toEqual([]);
   });
 });

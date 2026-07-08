@@ -296,12 +296,35 @@ describe("MembersView", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows each node's announced capabilities as chips", () => {
+  it("collapses a node's announced executors to one pill per provider", () => {
     renderMembers({
-      capabilitiesByNode: new Map([[peerKey, ["codex", "claude"]]]),
+      capabilitiesByNode: new Map([
+        [peerKey, ["claude", "claude_opus_high", "claude_fable_low", "codex"]],
+      ]),
     });
-    // The peer announced two executors — both render as chips on its row.
-    expect(screen.getByText("codex")).toBeInTheDocument();
-    expect(screen.getByText("claude")).toBeInTheDocument();
+    // Four tags, two providers — the row shows the providers, not every combo.
+    const claudePill = screen.getByText("Claude").parentElement as HTMLElement;
+    expect(screen.getByText("Codex")).toBeInTheDocument();
+    // The Claude pill counts its distinct models (opus, fable → 2) and the raw
+    // combo tags never render as chips on the row.
+    expect(claudePill.textContent).toBe("Claude2");
+    expect(claudePill).toHaveAttribute("title", expect.stringContaining("opus"));
+    expect(screen.queryByText("claude_opus_high")).not.toBeInTheDocument();
+  });
+
+  it("lists a node's models (not effort permutations) in the detail pane", () => {
+    renderMembers({
+      capabilitiesByNode: new Map([
+        [peerKey, ["claude_opus_high", "claude_opus_low", "claude_fable_max", "codex"]],
+      ]),
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open member Ben Validator" }));
+    // Distinct models surface once; the effort suffix never does.
+    expect(screen.getByText("opus")).toBeInTheDocument();
+    expect(screen.getByText("fable")).toBeInTheDocument();
+    expect(screen.queryByText("opus_high")).not.toBeInTheDocument();
+    expect(screen.queryByText("claude_opus_high")).not.toBeInTheDocument();
+    // A base-only provider (codex) reads as its default executor, no models.
+    expect(screen.getByText("default executor")).toBeInTheDocument();
   });
 });
