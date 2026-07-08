@@ -2694,6 +2694,24 @@ mod tests {
             b.descriptor.genesis_namespace(),
             "fronts must not perturb the genesis fingerprint"
         );
+        // Non-tautological both ways: the round-tripped fingerprint equals the
+        // source descriptor's (fronts on the wire never fold into it), AND the
+        // fingerprint IS sensitive to validator identity — proving it tracks the
+        // consensus set, not the advisory reachability payload.
+        assert_eq!(
+            a.descriptor.genesis_namespace(),
+            d.genesis_namespace(),
+            "encoding/decoding fronts must not change the source fingerprint"
+        );
+        let mut with_extra_validator = front_descriptor(&issuer);
+        with_extra_validator
+            .validators
+            .push(hex_bytes(ed25519::PrivateKey::from_seed(8).public_key().as_ref()));
+        assert_ne!(
+            d.genesis_namespace(),
+            with_extra_validator.genesis_namespace(),
+            "the fingerprint must change when the validator set changes"
+        );
     }
 
     #[test]

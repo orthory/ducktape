@@ -120,9 +120,7 @@ tempfile = "3"
 # library, over each node's real http surface) across a two-validator cluster.
 duckfs-client = { workspace = true }
 # coordinated_invite_cli seeds a signed mesh-state.json so `invite` bundles
-# member fronts — it builds the persisted adverts with the same crates the node
-# does (reachability::store persistence + the wireguard-upgrade advert types),
-# and recomputes the genesis namespace with commonware's Sha256.
-reachability = { workspace = true }
-wireguard-upgrade = { workspace = true }
-commonware-cryptography = { workspace = true }
+# member fronts, building the persisted adverts with the same crates the node
+# already depends on (reachability::store + wireguard-upgrade advert types +
+# commonware's Sha256) — all normal [dependencies] above, so the integration
+# tests see them without a redundant [dev-dependencies] re-listing.
