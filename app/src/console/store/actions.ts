@@ -63,6 +63,17 @@ const JOIN_POLL_MS = 1500;
 const wait = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+const hasValsetStanding = (transport: NodeTransport, pubkey: string): Promise<boolean> =>
+  Promise.all([
+    valsetClient.validators(transport).catch((): number[][] => []),
+    valsetClient.residents(transport).catch((): number[][] => []),
+  ]).then(([validators, residents]) => {
+    const wanted = pubkey.toLowerCase();
+    return validators
+      .concat(residents)
+      .some((key) => keyHex(key).toLowerCase() === wanted);
+  });
+
 /** Replace a workspace by id, else append — keeps the registry list current. */
 const mergeWorkspace = (list: Workspace[], next: Workspace): Workspace[] =>
   list.some((w) => w.id === next.id)
@@ -845,10 +856,11 @@ export function createActions({
           });
         }
         // joiner: the node parks until a member admits it and the epoch cuts
-        // over; it then promotes into the validator set. Poll until that
-        // happens. NOTE a parked joiner may well serve its http surface
-        // (newer node builds do) — a mere status answer is NOT admission, so
-        // adoption additionally requires OUR key in the committed valset.
+        // over. It may stop at resident standing (mesh + statesync, no quorum
+        // seat) or later promote into the validator set. NOTE a parked joiner
+        // may serve its http surface — a mere status answer is NOT admission,
+        // so adoption additionally requires OUR key in either committed valset
+        // tier.
         const park = (): Promise<void> =>
           ws.workspacePhase(target.id).then((report) => {
             if (stale()) return;
@@ -865,23 +877,11 @@ export function createActions({
             (s) => {
               if (stale()) return;
               if (!identityMatches(s.publicKey)) return rejectImpostor();
-              return valsetClient
-                .validators(transport)
-                .then(
-                  (keys) =>
-                    keys.some(
-                      (key) =>
-                        valsetClient.validatorHex(key).toLowerCase() ===
-                        target.pubkey.toLowerCase(),
-                    ),
-                  // an unreadable valset proves nothing — keep waiting.
-                  () => false,
-                )
-                .then((seated) => {
-                  if (stale()) return;
-                  if (!seated) return park();
-                  adopt(transport);
-                });
+              return hasValsetStanding(transport, target.pubkey).then((seated) => {
+                if (stale()) return;
+                if (!seated) return park();
+                adopt(transport);
+              });
             },
             () => park(),
           );

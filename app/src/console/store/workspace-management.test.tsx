@@ -78,14 +78,22 @@ afterEach(() => {
 });
 
 /** A stubbed node surface: /v1/status answers with `pubkey` as the node's
- *  identity, the valset query answers `valset`, everything else is generic. */
-const nodeFetch = (valset: { validators: number[][] }, pubkey = "ab12") =>
+ *  identity, valset queries answer by variant, everything else is generic. */
+const nodeFetch = (
+  valset: { validators: number[][]; residents?: number[][] },
+  pubkey = "ab12",
+) =>
   vi.fn((url: string, init?: RequestInit) => {
     const u = String(url);
     if (u.endsWith("/v1/status")) return Promise.resolve(jsonResponse(200, status(pubkey)));
     if (u.endsWith("/v1/query")) {
-      const body = JSON.parse(String(init?.body ?? "{}")) as { target?: string };
-      if (body.target === "valset") return Promise.resolve(jsonResponse(200, valset));
+      const body = JSON.parse(String(init?.body ?? "{}")) as { target?: string; query?: unknown };
+      if (body.target === "valset" && body.query === "validators") {
+        return Promise.resolve(jsonResponse(200, { validators: valset.validators }));
+      }
+      if (body.target === "valset" && body.query === "residents") {
+        return Promise.resolve(jsonResponse(200, { residents: valset.residents ?? [] }));
+      }
       return Promise.resolve(jsonResponse(200, { channels: [] }));
     }
     return Promise.resolve(jsonResponse(200, { channels: [] }));
@@ -252,6 +260,38 @@ describe("join flow", () => {
     expect(screen.getByTestId("gate").textContent).toBe("false");
     expect(screen.getByTestId("phase").textContent).toBe("parked");
     expect(screen.getByTestId("ws").textContent).toBe("Guest");
+  });
+
+  it("opens the console when the joined node has resident standing", async () => {
+    const guest = workspace({
+      id: "g",
+      name: "Guest",
+      founder: false,
+      member: false,
+      pubkey: "ab12",
+      ports: { listen: 1, http: 9002, rpc: 3 },
+    });
+    await bootGate([], {
+      workspace_join: () => guest,
+      workspace_select: () => ({ id: "g", httpUrl: "http://127.0.0.1:9002" }),
+      workspace_phase: () => ({
+        phase: "synced",
+        detail: "resident: pre-synced boundary 9",
+      }),
+    });
+    vi.stubGlobal(
+      "fetch",
+      nodeFetch({ validators: [[0xff, 0x99]], residents: [[0xab, 0x12]] }),
+    );
+
+    await act(async () => {
+      actions!.joinWorkspace("Guest", "ducktape-invite-v2:blob");
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("phase").textContent).toBe("none");
+      expect(screen.getByTestId("ws").textContent).toBe("Guest");
+    });
   });
 
   it("holds the waiting room when the parked surface rejects reads outright", async () => {

@@ -1152,10 +1152,10 @@ pub fn user_identity_confirm_mnemonic(app: tauri::AppHandle) -> Result<(), Strin
 // ── Phase classification ────────────────────────────────
 
 /// map the node's stable stdout markers to a phase. the log only appends and,
-/// within a boot, prints these markers in phase order — so the LAST line that
-/// matches any marker is the current phase. last-match (not highest-rank) is
-/// deliberate: an old `FATAL` from a prior boot must not outrank a later
-/// successful restart that reparks and promotes on the same appended log.
+/// within a boot, prints these markers in phase order — so the latest
+/// non-regressing marker is the current phase. fatal still wins when it is
+/// latest, but late `joining:` retry noise cannot move an already admitted /
+/// synced / promoted boot back to the first step.
 fn classify(log: &str) -> PhaseReport {
     // (phase, marker substring). the strings are a contract with
     // bin/node/src/main.rs (asserted by bin/node/tests/invite_e2e.rs).
@@ -1166,7 +1166,9 @@ fn classify(log: &str) -> PhaseReport {
         ("parked", "joiner mode:"),
         ("parked", "joining:"),
         ("admitted", "admitted at epoch"),
+        ("admitted", "resident: standing granted"),
         ("synced", "synced app_hash="),
+        ("synced", "resident: pre-synced boundary"),
         ("promoted", "promoted:"),
         ("fatal", "FATAL"),
         // a raw Rust panic on boot ("thread 'main' panicked at …") prints no
@@ -1176,6 +1178,14 @@ fn classify(log: &str) -> PhaseReport {
     let mut latest: Option<(&str, String)> = None;
     for line in log.lines() {
         if let Some((phase, _)) = MARKERS.iter().find(|(_, needle)| line.contains(needle)) {
+            if *phase == "parked"
+                && matches!(
+                    latest.as_ref().map(|(phase, _)| *phase),
+                    Some("admitted" | "synced" | "promoted")
+                )
+            {
+                continue;
+            }
             let detail = line
                 .split_once("] ")
                 .map(|(_, rest)| rest)
@@ -1517,6 +1527,38 @@ mod tests {
                    [node ab] joining: awaiting redemption (epoch 0 has 1 validators)\n\
                    [node ab] promoted: validator at epoch 1 boundary 4 — rebooting\n";
         assert_eq!(classify(log).phase, "promoted");
+    }
+
+    #[test]
+    fn classify_does_not_regress_after_sync_retry_noise() {
+        let log = "[node ab] joiner mode: announcing this key with the invite token\n\
+                   [node ab] admitted at epoch 1 boundary 4 — syncing 16 modules\n\
+                   [node ab] synced app_hash=deadbeef\n\
+                   [node ab] joining: redemption not landed yet (or the mesh is unreachable) — \
+                   the announce keeps retrying and a member node redeems it automatically. \
+                   retrying (server error: no finalized boundary to serve yet)\n";
+        let report = classify(log);
+        assert_eq!(report.phase, "synced");
+        assert!(report.detail.as_deref().unwrap_or("").contains("app_hash"));
+    }
+
+    #[test]
+    fn classify_resident_presync_as_synced() {
+        let log = "[node ab] joiner mode: announcing this key with the invite token\n\
+                   [node ab] resident: standing granted — following boundaries and serving local reads\n\
+                   [node ab] resident: pre-synced boundary 9 app_hash=deadbeef\n\
+                   [node ab] joining: redemption not landed yet (or the mesh is unreachable) — \
+                   the announce keeps retrying and a member node redeems it automatically. \
+                   retrying (server error: no finalized boundary to serve yet)\n";
+        let report = classify(log);
+        assert_eq!(report.phase, "synced");
+        assert!(
+            report
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("pre-synced")
+        );
     }
 
     #[test]
