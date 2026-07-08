@@ -2,7 +2,8 @@
 
 대부분의 독자는 temporary planning file보다 Vocs page에서 시작해야 한다. 아래
 파일은 main tour에 넣기엔 길지만, decision, protocol boundary, operator procedure를
-아직 담고 있어서 유지한다.
+아직 담고 있어서 유지한다. 아직 이 page로 접히지 않은 reviewed active record는
+`docs/superpowers` 아래에 둔다.
 
 ## Maintained Records
 
@@ -18,17 +19,17 @@
 | Validator onboarding | `docs/validator-onboarding.md`, `docs/invitation-protocol-deep-dive.md` | 현재 invite/join/admit flow와 이전 invite blob의 historical protocol note. |
 | WireGuard tunnel protocol | `docs/wireguard-tunnel-upgrade.md` | validator-owned tunnel plan의 implemented protocol boundary. |
 | Reachability and private cutover | `docs/sentry-deployment.md`, `docs/deploy/*`, `ops/coordinator/*` | sentry/coordinator entry와 남은 node wiring boundary. |
+| Working design/planning records | `docs/superpowers/README.md`, `docs/superpowers/specs/*`, `docs/superpowers/plans/*` | Vocs나 ADR로 아직 접히지 않은 reviewed active spec과 live plan. |
 
 ## Historical Material
 
 implementation plan은 code가 ship된 뒤 product documentation으로 유지하지 않는다.
 오래 살아야 하는 내용은 Vocs page, ADR, module comment, test로 옮긴다.
 
-이번 pass는 pages/comment, agent visibility, agent setup simplification, chat
-polish, huddle pop-out, video call, node-upgrade implementation plan을 prune한다.
-admission-boundary fork와 restart recovery의 historical root-cause/spec note도
-현재는 Vocs와 checked-in test가 소유하므로 삭제한다. 유지되는 사실은 다음 위치에
-있다.
+현재 reviewed prune set은 의도적으로 좁다: 완료된 sentry phase-1 implementation
+plan, 명시적으로 historical인 coordinator-relay-era plan 세 개, 해결된
+fleet-isolation finding, non-binding librarian idea만 prune한다. durable fact는
+다음 위치로 옮긴다.
 
 - [Product Modules](/ko/human/modules/product-modules): pages, comments, agents,
   jobs, module wave.
@@ -38,6 +39,7 @@ admission-boundary fork와 restart recovery의 historical root-cause/spec note�
   [agent upgrade operations](/ko/agent/network/node-upgrades): upgrade policy와
   runbook.
 - 위 ADR들: implementation branch보다 오래 살아야 하는 decision.
+- `docs/superpowers/README.md`: reviewed working-record retention policy.
 
 ## Housekeeping Rules
 

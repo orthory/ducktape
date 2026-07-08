@@ -3,7 +3,8 @@
 Most readers should start with the Vocs pages, not temporary planning files.
 The files below are the maintained records that still carry decisions,
 protocol boundaries, or operator procedures that are too detailed for the main
-tour.
+tour. Reviewed active records that have not been folded into these pages yet
+live under `docs/superpowers`.
 
 ## Maintained Records
 
@@ -19,6 +20,7 @@ tour.
 | Validator onboarding | `docs/validator-onboarding.md` and `docs/invitation-protocol-deep-dive.md` | Current invite/join/admit flow plus historical protocol notes for the older invite blob. |
 | WireGuard tunnel protocol | `docs/wireguard-tunnel-upgrade.md` | Implemented protocol boundary for validator-owned tunnel plans. |
 | Reachability and private cutover | `docs/sentry-deployment.md`, `docs/deploy/*`, `ops/coordinator/*` | Maintained operator docs for sentry/coordinator entry and the remaining node wiring boundary. |
+| Working design/planning records | `docs/superpowers/README.md`, `docs/superpowers/specs/*`, `docs/superpowers/plans/*` | Reviewed active specs and live plans that are not yet folded into Vocs or ADRs. |
 
 ## Historical Material
 
@@ -26,11 +28,10 @@ Implementation plans are not maintained as product documentation after the code
 ships. The durable parts move into Vocs pages, ADRs, or the module comments and
 tests that now prove the behavior.
 
-This pass prunes shipped step-by-step plans for pages/comments, agent visibility,
-agent setup simplification, chat polish, huddle pop-out, video calls, and the
-node-upgrade implementation plan. It also removes historical root-cause/spec
-notes for the admission-boundary fork and restart recovery now that those facts
-are covered by Vocs and checked-in tests. The maintained facts now live in:
+The current reviewed prune set is intentionally narrow: the completed sentry
+phase-1 implementation plan, three explicitly historical coordinator-relay-era
+plans, the solved fleet-isolation finding, and the non-binding librarian idea.
+Durable facts should move into:
 
 - [Product Modules](/en/human/modules/product-modules) for pages, comments,
   agents, jobs, and the module wave;
@@ -40,7 +41,8 @@ are covered by Vocs and checked-in tests. The maintained facts now live in:
   [agent upgrade operations](/en/agent/network/node-upgrades) for the upgrade
   policy and runbook;
 - the ADRs listed above for decisions that should outlive the implementation
-  branch.
+  branch;
+- `docs/superpowers/README.md` for the reviewed working-record retention policy.
 
 ## Housekeeping Rules
 

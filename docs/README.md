@@ -27,9 +27,11 @@ content is intentionally reader-specific.
   should outlive an implementation branch.
 - Keep operator runbooks as standalone Markdown only when an operator still
   executes them directly.
-- Do not keep temporary planning archives or speculative design snapshots in
-  this repo. Once useful facts ship, fold them into Vocs, ADRs, maintained
-  runbooks, tests, or code comments and prune the source planning document.
+- Keep `docs/superpowers` small and reviewed: active design records, approved
+  specs, and execution plans may stay there until durable facts are folded into
+  Vocs, ADRs, maintained runbooks, tests, or code comments. Do not prune a
+  document just because it lives under `docs/superpowers`; prune it only after a
+  content review identifies its replacement owner or shows it is obsolete.
 
 The Vocs reference page `reference/design-records` in each track lists the
 non-page records that are still maintained and explains the current pruning

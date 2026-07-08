@@ -1,8 +1,9 @@
 # Design Records
 
 Use this page to decide whether to read, update, or prune a non-page doc.
-Maintained reader docs belong in `docs/pages`; temporary planning notes should
-not stay in the repo once code, tests, runbooks, or ADRs own the durable facts.
+Maintained reader docs belong in `docs/pages`; `docs/superpowers` is for
+reviewed active design records, approved specs, and live execution plans that
+have not yet been folded into reader docs, ADRs, runbooks, tests, or code.
 
 ## Read These First
 
@@ -17,10 +18,11 @@ not stay in the repo once code, tests, runbooks, or ADRs own the durable facts.
 | Touch WireGuard tunnel plans | `docs/wireguard-tunnel-upgrade.md` and `crates/system/wireguard-upgrade`. |
 | Touch sentry/coordinator/private cutover | `docs/sentry-deployment.md`, `docs/deploy/*`, and `ops/coordinator/*`. |
 | Touch video huddles | `docs/adr/2026-07-06-video-call-module.mdx`, `bin/node/src/voice.rs`, and `app/src/console/views/chat/Huddle.tsx`. |
+| Audit working design/planning records | `docs/superpowers/README.md`, then the relevant `docs/superpowers/specs/*` or `docs/superpowers/plans/*` file. |
 
 ## Pruning Test
 
-Before keeping a temporary plan in the repo, ask four questions:
+Before pruning a temporary plan or spec, ask four questions:
 
 1. Does an operator still execute it?
 2. Does a future implementer need unresolved decisions from it?
@@ -31,11 +33,9 @@ If the answer is only the fourth item, fold the durable summary into Vocs and
 delete the plan. If a code comment points at the plan, retarget it to the ADR,
 test, runbook, code owner, or Vocs page that now owns the fact.
 
-## Current Pruned Set
+## Current Reviewed Prune Set
 
-This housekeeping pass folds shipped plans for pages/comments, agent visibility,
-agent setup simplification, chat polish, huddle pop-out, video calls, and the
-upgrade implementation into the maintained docs. It also deletes historical
-admission-boundary and restart-recovery notes that are now represented by Vocs
-summaries and tests. The deleted files were task execution scaffolds, not active
-contracts.
+The current reviewed prune set is intentionally narrow: the completed sentry
+phase-1 implementation plan, three explicitly historical coordinator-relay-era
+plans, the solved fleet-isolation finding, and the non-binding librarian idea.
+See `docs/superpowers/README.md` for file-by-file rationale.
