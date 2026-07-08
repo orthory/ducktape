@@ -31,7 +31,7 @@ use defguard_wireguard_rs::{InterfaceConfiguration, key::Key};
 use tokio::sync::mpsc;
 use wireguard_effect::WireGuardEffect;
 
-use super::device::{PeerConfig, WgDevice};
+use super::device::{PeerConfig, UnderlaySocket, WgDevice};
 use super::stack::{StackSlot, VirtualStack};
 
 /// the chain overlay's on-link scope: member `/128`s live in the chain's ULA
@@ -65,6 +65,12 @@ pub enum UserspaceEffectError {
     UnsupportedAllowedIp(String),
     /// binding the underlay UDP socket failed.
     Bind(io::Error),
+    /// the configuration names a listen port other than the one the shared
+    /// underlay socket is bound to. the shared socket is bound once at plane
+    /// start (the NAT punch rides it), so a port change cannot be honored —
+    /// and the two values come from the same `wireguard_listen` config, so
+    /// divergence is a wiring bug to surface, not roll with.
+    PortMismatch { configured: u16, bound: u16 },
 }
 
 /// what `apply` needs, decoded and validated out of defguard's
@@ -143,6 +149,11 @@ pub struct UserspaceWireGuardEffect {
     /// the seam's handle to the live stack (ADR phase 2): published on the
     /// `apply` that stands a backend up, cleared whenever the backend drops.
     slot: StackSlot,
+    /// a node-owned underlay socket shared with the NAT punch (ADR phase 3),
+    /// reused across interface rebuilds instead of binding per backend;
+    /// `None` = each backend binds its own (the standalone posture the
+    /// loopback proofs and the interop probe use).
+    shared_underlay: Option<Arc<UnderlaySocket>>,
 }
 
 impl UserspaceWireGuardEffect {
@@ -151,6 +162,25 @@ impl UserspaceWireGuardEffect {
             handle,
             live: None,
             slot: StackSlot::new(),
+            shared_underlay: None,
+        }
+    }
+
+    /// the node wiring (ADR phase 3): the seam's slot is created by the node
+    /// before the reachability plane's thread exists (the mesh context and
+    /// the data-plane factory consume it), and the underlay socket is bound
+    /// at plane start so the NAT client shares the tunnel's 5-tuple — this
+    /// effect attaches every backend it builds to both.
+    pub fn with_shared_underlay(
+        handle: tokio::runtime::Handle,
+        slot: StackSlot,
+        underlay: Arc<UnderlaySocket>,
+    ) -> Self {
+        Self {
+            handle,
+            live: None,
+            slot,
+            shared_underlay: Some(underlay),
         }
     }
 
@@ -185,18 +215,20 @@ impl UserspaceWireGuardEffect {
 fn build_backend(
     handle: &tokio::runtime::Handle,
     parsed: &ParsedConfig,
+    shared_underlay: Option<&Arc<UnderlaySocket>>,
 ) -> Result<Backend, UserspaceEffectError> {
     // one process-owned underlay socket per node: the WG listen endpoint,
-    // dual-stack so a peer endpoint of either family reaches it. bound
-    // sync (std) so this stays a plain `&mut self` effect call, then
-    // handed to tokio inside the runtime context.
-    let std_socket = bind_underlay(parsed.port)?;
-    std_socket
-        .set_nonblocking(true)
-        .map_err(UserspaceEffectError::Bind)?;
-    let _runtime = handle.enter();
-    let udp = tokio::net::UdpSocket::from_std(std_socket).map_err(UserspaceEffectError::Bind)?;
-    let port = udp.local_addr().map_err(UserspaceEffectError::Bind)?.port();
+    // dual-stack so a peer endpoint of either family reaches it — the
+    // node-owned shared socket (which the NAT punch also rides) when
+    // injected, a fresh bind per backend in the standalone posture.
+    let underlay = match shared_underlay {
+        Some(underlay) => underlay.clone(),
+        None => UnderlaySocket::bind(handle, parsed.port).map_err(UserspaceEffectError::Bind)?,
+    };
+    let port = underlay
+        .local_addr()
+        .map_err(UserspaceEffectError::Bind)?
+        .port();
 
     let (to_stack, from_device) = mpsc::channel(PACKET_CHANNEL);
     let (to_device, from_stack) = mpsc::channel(PACKET_CHANNEL);
@@ -207,37 +239,19 @@ fn build_backend(
         from_device,
         to_device,
     ));
-    let device = WgDevice::spawn(handle, udp, parsed.private_key.into(), to_stack, from_stack);
+    let device = WgDevice::spawn(
+        handle,
+        underlay,
+        parsed.private_key.into(),
+        to_stack,
+        from_stack,
+    );
     Ok(Backend {
         device,
         stack,
         port,
         private_key: parsed.private_key,
     })
-}
-
-/// bind the underlay socket, absorbing the predecessor's asynchronous
-/// teardown: a replace cycle (remove→create→apply, or a rebuild inside
-/// `apply`) drops the old backend, but its pump tasks release the socket
-/// only when the runtime collects them — a same-port rebind can race that
-/// by a few milliseconds. bounded retry, loud on genuine conflicts; the
-/// Defguard effect's `remove_interface` polls the same way (10ms steps,
-/// 2s cap) for its TUN teardown.
-fn bind_underlay(port: u16) -> Result<std::net::UdpSocket, UserspaceEffectError> {
-    let mut last = None;
-    for _ in 0..200 {
-        match std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)) {
-            Ok(socket) => return Ok(socket),
-            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-                last = Some(err);
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(err) => return Err(UserspaceEffectError::Bind(err)),
-        }
-    }
-    Err(UserspaceEffectError::Bind(
-        last.expect("retried only on AddrInUse"),
-    ))
 }
 
 impl WireGuardEffect for UserspaceWireGuardEffect {
@@ -256,6 +270,22 @@ impl WireGuardEffect for UserspaceWireGuardEffect {
             return Err(UserspaceEffectError::NotCreated);
         };
         let parsed = parse_config(config)?;
+
+        // a shared underlay's port is fixed for the process life (the NAT
+        // punch rides it): refuse a diverging config up front, before any
+        // teardown.
+        if let Some(underlay) = &self.shared_underlay {
+            let bound = underlay
+                .local_addr()
+                .map_err(UserspaceEffectError::Bind)?
+                .port();
+            if parsed.port != 0 && parsed.port != bound {
+                return Err(UserspaceEffectError::PortMismatch {
+                    configured: parsed.port,
+                    bound,
+                });
+            }
+        }
 
         // a changed listen port or identity key is an interface replacement,
         // not a reconfiguration: rebuild the backend. (drop first, so a
@@ -278,7 +308,7 @@ impl WireGuardEffect for UserspaceWireGuardEffect {
                     .set_local_ip(parsed.ula, OVERLAY_ONLINK_PREFIX);
             }
             None => {
-                let backend = build_backend(&self.handle, &parsed)?;
+                let backend = build_backend(&self.handle, &parsed, self.shared_underlay.as_ref())?;
                 backend.device.replace_peers(&parsed.peers);
                 self.slot.publish(backend.stack.clone());
                 *live = Some(backend);

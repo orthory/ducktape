@@ -107,6 +107,15 @@ pub struct PeerTunnelConfig {
     pub keepalive_seconds: Option<u16>,
 }
 
+/// The tunnel MTU every applied interface gets: the conventional WireGuard
+/// value (1500 minus WG overhead), and the same constant the userspace
+/// backend's smoltcp host is built on. `None` would leave a TUN at the
+/// kernel's 1500 — every full-size inner packet then rides a FRAGMENTED
+/// outer UDP datagram on a 1500-MTU underlay, and overruns the userspace
+/// stack's device MTU on mixed tun↔socket pairs (phase-4 bench,
+/// docs/adr/2026-07-07-userspace-overlay-net.mdx).
+pub const TUNNEL_MTU: u32 = 1420;
+
 /// The parts-level core both appliers share: ONE interface (own overlay
 /// addresses, listen port, private key) carrying every peer relationship.
 /// [`apply_tunnel_plans`] reduces validated plans to these parts; a mesh
@@ -205,7 +214,7 @@ fn interface_config(
         addresses,
         port: listen_port,
         peers,
-        mtu: None,
+        mtu: Some(TUNNEL_MTU),
         fwmark: None,
     }
 }

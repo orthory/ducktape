@@ -1,14 +1,117 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use tokio::net::UdpSocket;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::AuthRequest;
 use crate::auth::{AuthPolicy, CoordCap, now_secs, sign_authenticator};
 use crate::{Coordinator, Msg, NodeKey};
 use commonware_cryptography::ed25519;
 
+/// where a [`NatClient`]'s datagrams ride.
+///
+/// hole punching only works when the punch and the tunnel share one
+/// 5-tuple: the pinhole a punch opens admits traffic to the ADDRESS AND
+/// PORT it originated from, so a punch sent from a socket the tunnel does
+/// not use vouches for nothing. `Shared` is that fix (the overlay-net
+/// ADR's phase 3): the client rides the node's own WireGuard underlay
+/// socket — sends go out through it directly, and receives are the
+/// underlay demux's non-WireGuard lane. `Owned` is the standalone posture
+/// (a socket of this client's own), kept for the TUN backend, whose
+/// in-device socket cannot be shared.
+pub enum NatSocket {
+    Owned(UdpSocket),
+    Shared {
+        /// the underlay socket, for sends (concurrent-safe by itself).
+        socket: Arc<UdpSocket>,
+        /// the demux's bypass lane: every inbound datagram on the underlay
+        /// that is not WireGuard. behind a `Mutex` only to keep `&self`
+        /// receive methods — the receive side has a single consumer (the
+        /// rendezvous pump) by construction.
+        bypass: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+        /// what `local_addr` answers: the shared socket's bound address.
+        local: SocketAddr,
+    },
+}
+
+impl NatSocket {
+    /// wrap a shared underlay socket + its bypass lane.
+    pub fn shared(
+        socket: Arc<UdpSocket>,
+        bypass: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    ) -> std::io::Result<Self> {
+        let local = socket.local_addr()?;
+        Ok(Self::Shared {
+            socket,
+            bypass: Mutex::new(bypass),
+            local,
+        })
+    }
+
+    async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> std::io::Result<usize> {
+        match self {
+            Self::Owned(sock) => sock.send_to(buf, dst).await,
+            Self::Shared { socket, local, .. } => {
+                // the shared underlay binds dual-stack `[::]` — a V4
+                // destination (a v4 coordinator, a v4 reflexive) must ride
+                // it as v4-MAPPED v6, or the send is EINVAL on macOS (and
+                // family-mismatched everywhere).
+                let dst = match (local, dst) {
+                    (SocketAddr::V6(_), SocketAddr::V4(v4)) => SocketAddr::new(
+                        std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()),
+                        v4.port(),
+                    ),
+                    _ => dst,
+                };
+                socket.send_to(buf, dst).await
+            }
+        }
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        match self {
+            Self::Owned(sock) => sock.recv_from(buf).await,
+            Self::Shared { bypass, .. } => {
+                let mut lane = bypass.lock().await;
+                let (datagram, src) = lane.recv().await.ok_or_else(|| {
+                    // the underlay (and its demux pump) is gone — the socket
+                    // this client rode no longer exists.
+                    std::io::Error::new(std::io::ErrorKind::NotConnected, "underlay demux closed")
+                })?;
+                let len = datagram.len().min(buf.len());
+                buf[..len].copy_from_slice(&datagram[..len]);
+                // a v4 peer observed through the dual-stack underlay reports
+                // as `::ffff:a.b.c.d` — canonicalize to V4 so reply/punch
+                // source validation matches the V4 addresses the coordinator
+                // hands out.
+                Ok((len, canonical_v4(src)))
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Owned(sock) => sock.local_addr(),
+            Self::Shared { local, .. } => Ok(*local),
+        }
+    }
+}
+
+/// collapse a v4-mapped v6 address (`::ffff:a.b.c.d`) to its canonical V4
+/// form; anything else passes through.
+fn canonical_v4(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(std::net::IpAddr::V4(v4), v6.port()),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
+}
+
 pub struct NatClient {
-    sock: UdpSocket,
+    sock: NatSocket,
     key: NodeKey,
     coord: SocketAddr,
     coords: Vec<SocketAddr>,
@@ -17,8 +120,31 @@ pub struct NatClient {
 }
 
 impl NatClient {
+    /// Build a client over an explicit transport — the shared-underlay path
+    /// (see [`NatSocket`]); the `bind*` constructors below cover the owned
+    /// one. Authenticates like [`Self::bind_multi_auth`] when `signer` is
+    /// set, sends bare requests otherwise.
+    pub fn with_socket(
+        sock: NatSocket,
+        key: NodeKey,
+        coords: Vec<SocketAddr>,
+        signer: Option<ed25519::PrivateKey>,
+        cap: Option<CoordCap>,
+    ) -> std::io::Result<Self> {
+        let coord = *coords.first().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty coordinator set")
+        })?;
+        Ok(Self {
+            sock,
+            key,
+            coord,
+            coords,
+            signer,
+            cap,
+        })
+    }
     pub async fn bind(key: NodeKey, coord: SocketAddr) -> std::io::Result<Self> {
-        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        let sock = NatSocket::Owned(UdpSocket::bind("0.0.0.0:0").await?);
         Ok(Self {
             sock,
             key,
@@ -36,7 +162,7 @@ impl NatClient {
         let coord = *coords.first().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty coordinator set")
         })?;
-        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        let sock = NatSocket::Owned(UdpSocket::bind("0.0.0.0:0").await?);
         Ok(Self {
             sock,
             key,
@@ -59,7 +185,7 @@ impl NatClient {
         let coord = *coords.first().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty coordinator set")
         })?;
-        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        let sock = NatSocket::Owned(UdpSocket::bind("0.0.0.0:0").await?);
         Ok(Self {
             sock,
             key,
@@ -702,6 +828,178 @@ mod tests {
             .await
             .expect("no timeout")
             .expect("recv");
+        assert_eq!(got, Msg::Punch { from: a_key });
+    }
+
+    /// the shared transport (socket mode's wiring): a client over
+    /// `NatSocket::Shared` sends from the GIVEN socket and receives through
+    /// the bypass lane — so the coordinator observes the shared socket's
+    /// mapping (the reflexive IS the tunnel endpoint) and a punch exchange
+    /// completes with the punch originating from that same 5-tuple.
+    #[tokio::test]
+    async fn shared_transport_rides_the_given_socket_for_reflexive_and_punch() {
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        tokio::spawn(run_coordinator(
+            coord_sock,
+            crate::auth::AuthPolicy::Open { require_pop: false },
+        ));
+
+        // the "underlay": a plain socket whose receive side is pumped into
+        // the bypass lane wholesale — the overlay-net demux with every
+        // datagram classified as not-WireGuard, which is exactly what the
+        // NAT protocol's inbound looks like to it.
+        let underlay = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let underlay_addr = underlay.local_addr().unwrap();
+        let (bypass_tx, bypass_rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn({
+            let sock = underlay.clone();
+            async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let Ok((n, src)) = sock.recv_from(&mut buf).await else {
+                        break;
+                    };
+                    if bypass_tx.send((buf[..n].to_vec(), src)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let a_key = NodeKey([0xaa; 32]);
+        let a = NatClient::with_socket(
+            NatSocket::shared(underlay.clone(), bypass_rx).unwrap(),
+            a_key,
+            vec![coord_addr],
+            None,
+            None,
+        )
+        .unwrap();
+
+        // the coordinator's observation is the SHARED socket's mapping.
+        let reflexive = timeout(Duration::from_secs(2), a.discover_reflexive())
+            .await
+            .expect("no timeout")
+            .expect("reflexive");
+        assert_eq!(
+            reflexive, underlay_addr,
+            "the reflexive is the shared socket's own address — punch and tunnel share the 5-tuple"
+        );
+        a.register().await.unwrap();
+
+        // a punch exchange both ways with an owned-socket peer.
+        let b_key = NodeKey([0xbb; 32]);
+        let b = NatClient::bind(b_key, coord_addr).await.unwrap();
+        let b_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            b.local_addr().await.unwrap().port(),
+        );
+
+        b.send_punch_to(underlay_addr).await.unwrap();
+        let got = timeout(Duration::from_secs(2), a.recv_punch_from(b_addr))
+            .await
+            .expect("no timeout")
+            .expect("recv via the bypass lane");
+        assert_eq!(got, Msg::Punch { from: b_key });
+
+        a.send_punch_to(b_addr).await.unwrap();
+        let got = timeout(Duration::from_secs(2), b.recv_punch_from(underlay_addr))
+            .await
+            .expect("no timeout")
+            .expect("recv at b");
+        assert_eq!(
+            got,
+            Msg::Punch { from: a_key },
+            "a's punch left from the shared socket (b saw the underlay address as its source)"
+        );
+    }
+
+    /// the PRODUCTION underlay shape: socket mode binds dual-stack `[::]`
+    /// (`overlay_net::userspace::UnderlaySocket`), while coordinators and
+    /// punched reflexives are V4. Sends must ride the v6 socket as v4-MAPPED
+    /// v6 (a plain V4 destination is EINVAL on macOS) and received sources
+    /// must canonicalize `::ffff:a.b.c.d` back to V4, or reply/punch source
+    /// validation never matches. The v4-loopback test above cannot catch
+    /// this — its underlay is a V4 socket.
+    #[tokio::test]
+    async fn dual_stack_shared_transport_reaches_a_v4_coordinator() {
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        tokio::spawn(run_coordinator(
+            coord_sock,
+            crate::auth::AuthPolicy::Open { require_pop: false },
+        ));
+
+        // bind exactly like the production underlay: a std dual-stack
+        // `[::]:0` socket handed to tokio.
+        let std_sock =
+            std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).unwrap();
+        std_sock.set_nonblocking(true).unwrap();
+        let underlay = std::sync::Arc::new(UdpSocket::from_std(std_sock).unwrap());
+        let underlay_port = underlay.local_addr().unwrap().port();
+        let (bypass_tx, bypass_rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn({
+            let sock = underlay.clone();
+            async move {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let Ok((n, src)) = sock.recv_from(&mut buf).await else {
+                        break;
+                    };
+                    if bypass_tx.send((buf[..n].to_vec(), src)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let a_key = NodeKey([0xaa; 32]);
+        let a = NatClient::with_socket(
+            NatSocket::shared(underlay.clone(), bypass_rx).unwrap(),
+            a_key,
+            vec![coord_addr],
+            None,
+            None,
+        )
+        .unwrap();
+
+        // reflexive discovery crosses the family seam twice: a v4-mapped
+        // send out of the v6 socket, and a reply whose observed source must
+        // canonicalize back to the dialed V4 coordinator to be accepted.
+        let reflexive = timeout(Duration::from_secs(2), a.discover_reflexive())
+            .await
+            .expect("no timeout")
+            .expect("reflexive discovery over the dual-stack underlay");
+        assert_eq!(
+            reflexive,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), underlay_port),
+            "the v4 coordinator observes the dual-stack socket's V4 mapping"
+        );
+        a.register().await.unwrap();
+
+        // a punch exchange with an owned V4 peer: a's inbound arrives as
+        // `::ffff:127.0.0.1` and must match b's V4 address; a's outbound
+        // punch must reach b's V4 socket from the v6 underlay.
+        let b_key = NodeKey([0xbb; 32]);
+        let b = NatClient::bind(b_key, coord_addr).await.unwrap();
+        let b_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            b.local_addr().await.unwrap().port(),
+        );
+
+        b.send_punch_to(reflexive).await.unwrap();
+        let got = timeout(Duration::from_secs(2), a.recv_punch_from(b_addr))
+            .await
+            .expect("no timeout")
+            .expect("recv canonicalized to V4 via the bypass lane");
+        assert_eq!(got, Msg::Punch { from: b_key });
+
+        a.send_punch_to(b_addr).await.unwrap();
+        let got = timeout(Duration::from_secs(2), b.recv_punch_from(reflexive))
+            .await
+            .expect("no timeout")
+            .expect("recv at b");
         assert_eq!(got, Msg::Punch { from: a_key });
     }
 

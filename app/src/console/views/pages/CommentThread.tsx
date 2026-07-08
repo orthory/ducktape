@@ -1,0 +1,243 @@
+// Shared comment-thread pieces: one thread's card (comments, reply, resolve,
+// edit/delete) and the new-thread composer. Rendered by both the full
+// CommentsPanel and the floating per-target CommentCard.
+
+import { useState } from "react";
+import { authorName } from "../../../domain/chat-client";
+import type { AuthorNames } from "../../../domain/chat-client";
+import type { ThreadView } from "../../../domain/pages-client";
+import { color, font, radius } from "../../theme/tokens";
+
+/** What the new-thread composer is aimed at: the target id the thread will
+ *  anchor to, plus a human label ("this page" / "this block") for the header. */
+export interface ComposerTarget {
+  target: string;
+  label: string;
+}
+
+/** Composer for opening a NEW thread on a block or the page. Autofocused so
+ *  the "Comment" affordances drop the user straight into typing; Enter
+ *  submits, Shift+Enter breaks a line (comments render pre-wrap). */
+export function NewThreadComposer({
+  composer,
+  onSubmit,
+  onCancel,
+}: {
+  composer: ComposerTarget;
+  onSubmit: (target: string, text: string) => void;
+  onCancel: () => void;
+}) {
+  const [text, setText] = useState("");
+  const submit = () => {
+    if (text.trim()) onSubmit(composer.target, text);
+  };
+  return (
+    <div
+      role="form"
+      aria-label={`New comment on ${composer.label}`}
+      style={{
+        margin: "8px 12px",
+        padding: "10px 12px",
+        border: `1px solid ${color.borderStrong}`,
+        borderRadius: radius.md,
+        background: color.paper,
+      }}
+    >
+      <div style={{ font: `600 11.5px ${font.sans}`, color: color.ink, marginBottom: 6 }}>
+        New comment on {composer.label}
+      </div>
+      <textarea
+        aria-label="New comment text"
+        autoFocus
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            submit();
+          }
+          if (e.key === "Escape") onCancel();
+        }}
+        rows={3}
+        placeholder="Write a comment…"
+        style={composerStyle}
+      />
+      <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+        <button type="button" aria-label="Add comment" onClick={submit} style={primaryBtn}>
+          Comment
+        </button>
+        <button type="button" aria-label="Cancel new comment" onClick={onCancel} style={ghostBtn}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function ThreadCard({
+  view,
+  authorNames,
+  onReply,
+  onResolve,
+  onEdit,
+  onDelete,
+}: {
+  view: ThreadView;
+  authorNames: AuthorNames;
+  onReply: (threadId: string, text: string) => void;
+  onResolve: (threadId: string, resolved: boolean) => void;
+  onEdit: (commentId: string, text: string) => void;
+  onDelete: (commentId: string) => void;
+}) {
+  const { thread, comments } = view;
+  const [reply, setReply] = useState("");
+  const [editing, setEditing] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  return (
+    <div
+      style={{
+        margin: "8px 12px",
+        border: `1px solid ${color.border}`,
+        borderRadius: radius.md,
+        background: color.paper,
+        opacity: thread.resolved ? 0.65 : 1,
+      }}
+    >
+      <div style={{ padding: "10px 12px 4px" }}>
+        {comments.map((c) => (
+          <div key={c.id} style={{ marginBottom: 8 }}>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+              <span style={{ font: `600 11.5px ${font.sans}`, color: color.ink }}>
+                {authorName(c.author, authorNames)}
+              </span>
+              {c.edited_at ? (
+                <span style={{ font: `400 9.5px ${font.mono}`, color: color.muted2 }}>edited</span>
+              ) : null}
+              <div style={{ marginLeft: "auto", display: "flex", gap: 2 }}>
+                <button
+                  type="button"
+                  aria-label="Edit comment"
+                  onClick={() => {
+                    setEditing(c.id);
+                    setEditText(c.text);
+                  }}
+                  style={miniBtn}
+                >
+                  Edit
+                </button>
+                <button
+                  type="button"
+                  aria-label="Delete comment"
+                  onClick={() => onDelete(c.id)}
+                  style={miniBtn}
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+            {editing === c.id ? (
+              <div style={{ marginTop: 4 }}>
+                <textarea
+                  aria-label="Edit comment text"
+                  value={editText}
+                  onChange={(e) => setEditText(e.target.value)}
+                  rows={2}
+                  style={composerStyle}
+                />
+                <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (editText.trim()) onEdit(c.id, editText);
+                      setEditing(null);
+                    }}
+                    style={primaryBtn}
+                  >
+                    Save
+                  </button>
+                  <button type="button" onClick={() => setEditing(null)} style={ghostBtn}>
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div style={{ marginTop: 2, font: `400 12.5px/1.5 ${font.sans}`, color: color.ink, whiteSpace: "pre-wrap" }}>
+                {c.text}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          padding: "6px 12px 10px",
+        }}
+      >
+        <input
+          aria-label="Reply to thread"
+          value={reply}
+          onChange={(e) => setReply(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && reply.trim()) {
+              onReply(thread.id, reply);
+              setReply("");
+            }
+          }}
+          placeholder="Reply…"
+          style={{ ...composerStyle, height: 30, flex: 1 }}
+        />
+        <button
+          type="button"
+          aria-label={thread.resolved ? "Reopen thread" : "Resolve thread"}
+          onClick={() => onResolve(thread.id, !thread.resolved)}
+          style={ghostBtn}
+        >
+          {thread.resolved ? "Reopen" : "Resolve"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+const miniBtn = {
+  all: "unset" as const,
+  cursor: "pointer",
+  padding: "1px 5px",
+  borderRadius: 4,
+  font: `500 10.5px ${font.sans}`,
+  color: color.muted2,
+};
+const composerStyle = {
+  width: "100%",
+  boxSizing: "border-box" as const,
+  border: `1px solid ${color.borderStrong}`,
+  borderRadius: radius.sm,
+  background: color.paper,
+  padding: "6px 9px",
+  font: `400 12px ${font.sans}`,
+  color: color.ink,
+  outline: "none",
+  resize: "none" as const,
+};
+const primaryBtn = {
+  all: "unset" as const,
+  cursor: "pointer",
+  padding: "4px 10px",
+  borderRadius: radius.sm,
+  background: color.dark,
+  color: color.onDark,
+  font: `600 11px ${font.sans}`,
+};
+const ghostBtn = {
+  all: "unset" as const,
+  cursor: "pointer",
+  padding: "4px 10px",
+  borderRadius: radius.sm,
+  border: `1px solid ${color.border}`,
+  color: color.muted3,
+  font: `500 11px ${font.sans}`,
+};

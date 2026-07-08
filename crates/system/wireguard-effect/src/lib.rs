@@ -14,7 +14,7 @@ pub use defguard_effect::DefguardWireGuardEffect;
 
 mod wiring;
 pub use wiring::{
-    PeerTunnelConfig, apply_peer_tunnels, apply_tunnel_plan, apply_tunnel_plans,
+    PeerTunnelConfig, TUNNEL_MTU, apply_peer_tunnels, apply_tunnel_plan, apply_tunnel_plans,
     plan_peer_configs, update_peer_tunnels,
 };
 

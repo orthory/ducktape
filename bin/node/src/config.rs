@@ -1206,11 +1206,14 @@ pub struct NodeToml {
     /// PRESENT stages the node-driven reachability plane (node-local
     /// operator policy, like checkpoint_blocks). absent = plane off.
     pub wireguard_listen: Option<String>,
-    /// which `WireGuardEffect` the reachability plane drives: "real"
+    /// which `WireGuardEffect` the reachability plane drives: "tun"
     /// (default — configure an actual interface via the userspace WireGuard
-    /// runtime; needs root/CAP_NET_ADMIN) or "fake" (record configs in
-    /// memory; for dev/sim runs, and for several same-chain nodes on one
-    /// host, which would otherwise fight over one interface name).
+    /// runtime; needs root/CAP_NET_ADMIN; "real" is the legacy alias),
+    /// "socket" (the ADR's TUN-less in-process backend: no privilege, no
+    /// host mutation — overlay reachability exists only inside this
+    /// process), or "fake" (record configs in memory; for dev/sim runs, and
+    /// for several same-chain nodes on one host, which would otherwise
+    /// fight over one interface name).
     pub wireguard_effect: Option<String>,
     /// the UDP endpoint this node's invite intro listener binds — where a
     /// fresh joiner announces its keys (token-authenticated) so the tunnel
@@ -1263,7 +1266,9 @@ pub struct Plumbing {
     /// merged from an existing file only (no flag); a WireGuard join seeds a
     /// default AFTER the merge when the invite carries a tunnel bootstrap.
     pub wireguard_listen: Option<String>,
-    /// merged from an existing file only — a hand-set "fake" survives.
+    /// merged like the rest — a hand-set value survives; the desktop app
+    /// passes "socket" here (overlay-net ADR phase 4) while the parse
+    /// default for a file without the key stays `tun`.
     pub wireguard_effect: Option<String>,
 }
 
@@ -1273,6 +1278,7 @@ pub fn merged_plumbing(
     advertised: Option<&str>,
     http_listen: Option<&str>,
     rpc_listen: Option<&str>,
+    wireguard_effect: Option<&str>,
 ) -> Result<Plumbing, String> {
     let path = dir.join("node.toml");
     let existing: Option<NodeToml> = if path.exists() {
@@ -1281,6 +1287,9 @@ pub fn merged_plumbing(
         None
     };
     let e = existing.as_ref();
+    // reject a typo'd effect value at the verb, before anything lands on disk
+    // — resolve() would only catch it on the node's NEXT boot.
+    parse_wireguard_effect(wireguard_effect)?;
     Ok(Plumbing {
         listen: listen
             .map(str::to_string)
@@ -1299,7 +1308,9 @@ pub fn merged_plumbing(
             .and_then(|r| r.storage_dir.clone())
             .unwrap_or_else(|| "storage".into()),
         wireguard_listen: e.and_then(|r| r.wireguard_listen.clone()),
-        wireguard_effect: e.and_then(|r| r.wireguard_effect.clone()),
+        wireguard_effect: wireguard_effect
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.wireguard_effect.clone())),
     })
 }
 
@@ -1710,18 +1721,24 @@ pub fn endpoint_host(
 /// which `WireGuardEffect` implementation the reachability plane drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireGuardEffectKind {
+    /// the TUN-less in-process backend (overlay-net ADR): BoringTun `Tunn`s
+    /// + smoltcp behind the overlay seam, no privilege, no host mutation.
+    Socket,
     /// configure an actual interface through the userspace WireGuard runtime.
-    Real,
+    Tun,
     /// record configurations in memory without touching the network stack.
     Fake,
 }
 
 fn parse_wireguard_effect(raw: Option<&str>) -> Result<WireGuardEffectKind, String> {
     match raw {
-        None | Some("real") => Ok(WireGuardEffectKind::Real),
+        Some("socket") => Ok(WireGuardEffectKind::Socket),
+        // "real" predates the socket backend and stays as an alias for the
+        // interface-backed path it always meant.
+        None | Some("tun") | Some("real") => Ok(WireGuardEffectKind::Tun),
         Some("fake") => Ok(WireGuardEffectKind::Fake),
         Some(other) => Err(format!(
-            "wireguard_effect: {other:?} is not \"real\" or \"fake\""
+            "wireguard_effect: {other:?} is not \"socket\", \"tun\" (alias \"real\"), or \"fake\""
         )),
     }
 }
@@ -2841,7 +2858,8 @@ mod tests {
         .expect("write");
         // one flag overrides ONLY its field; the http port AND a hand-edited
         // storage_dir survive.
-        let p = merged_plumbing(&dir, Some("127.0.0.1:53000"), None, None, None).expect("merge");
+        let p = merged_plumbing(&dir, Some("127.0.0.1:53000"), None, None, None, None)
+            .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
         assert_eq!(p.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(p.storage_dir, "/data/ducktape");
@@ -2853,6 +2871,29 @@ mod tests {
         assert_eq!(raw.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(raw.listen, "127.0.0.1:53000");
         assert_eq!(raw.storage_dir.as_deref(), Some("/data/ducktape"));
+    }
+
+    #[test]
+    fn plumbing_wireguard_effect_flag_wins_absence_preserves_and_typos_abort() {
+        let dir = tmp("plumbing-wg-effect");
+        // fresh dir + flag (the desktop app's init/join): written to disk.
+        let p = merged_plumbing(&dir, None, None, None, None, Some("socket")).expect("merge");
+        assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
+        write_node_toml(&dir, &p).expect("write");
+
+        // no flag: the hand-settable value on disk survives a re-merge.
+        let p = merged_plumbing(&dir, None, None, None, None, None).expect("re-merge");
+        assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
+
+        // the flag wins over the file (merged_plumbing's standing precedence).
+        let p = merged_plumbing(&dir, None, None, None, None, Some("tun")).expect("override");
+        assert_eq!(p.wireguard_effect.as_deref(), Some("tun"));
+
+        // a typo aborts the verb before anything is written.
+        let err = merged_plumbing(&dir, None, None, None, None, Some("sokcet"))
+            .err()
+            .expect("a bad effect value must abort the merge");
+        assert!(err.contains("wireguard_effect"), "{err}");
     }
 
     #[test]
@@ -2900,12 +2941,31 @@ bootstrapper_addr = "127.0.0.1:52200"
     }
 
     #[test]
-    fn wireguard_effect_defaults_real_and_rejects_unknown_values() {
+    fn wireguard_effect_defaults_tun_and_rejects_unknown_values() {
         let dir = tmp("wgeffect");
         let base = "id = 0\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
         std::fs::write(dir.join("node.toml"), base).expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
-        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Real);
+        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Tun);
+
+        // "real" is the legacy alias for the interface-backed path.
+        for spelled in ["tun", "real"] {
+            std::fs::write(
+                dir.join("node.toml"),
+                format!("{base}wireguard_effect = \"{spelled}\"\n"),
+            )
+            .expect("write");
+            let r = resolve(&dir.join("node.toml")).expect("resolve");
+            assert_eq!(r.wireguard_effect, WireGuardEffectKind::Tun, "{spelled}");
+        }
+
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{base}wireguard_effect = \"socket\"\n"),
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("resolve");
+        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Socket);
 
         std::fs::write(
             dir.join("node.toml"),

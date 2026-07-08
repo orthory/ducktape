@@ -15,11 +15,19 @@
 //! Noise handshake, the wire format, cryptokey routing, and both transport
 //! surfaces match across backends.
 //!
+//! both modes also serve a TCP bulk SINK (port 7004: drain to EOF, print
+//! bytes + elapsed), and `--bulk <bytes>` pushes that many bytes at the
+//! peer's sink through the same factory — the overlay-net ADR's phase-4
+//! throughput probe. it measures the raw stack (kernel TCP over TUN vs
+//! smoltcp), deliberately NOT a `DataPlane`: no bulk token bucket in the
+//! path. the sink's first-byte→EOF rate is the number that matters; the
+//! push side prints its own as a cross-check.
+//!
 //! subcommands:
 //!   keygen <seed-byte>                      print a deterministic keypair
 //!   serve --mode tun|socket --priv <b64> --ula <v6> --wg-port <port>
 //!         --peer-pub <b64> --peer-ula <v6> [--peer-endpoint <ip:port>]
-//!         [--dial]                          bring the tunnel up and serve
+//!         [--dial] [--bulk <bytes>]         bring the tunnel up and serve
 //!   client tcp|udp <[v6]:port>              plain-OS echo client (run inside
 //!                                           the tun container: the kernel
 //!                                           routes it through the tunnel)
@@ -36,17 +44,21 @@ use wireguard_effect::{DefguardWireGuardEffect, WireGuardEffect};
 
 const TCP_ECHO_PORT: u16 = 7000;
 const UDP_ECHO_PORT: u16 = 7002;
+const TCP_BULK_PORT: u16 = 7004;
 const TCP_PING: &[u8] = b"interop-tcp-ping";
 const UDP_PING: &[u8] = b"interop-udp-ping";
 /// how long the dial legs keep retrying: covers handshake latency and the
 /// far side still coming up.
 const DIAL_DEADLINE: Duration = Duration::from_secs(60);
+/// bulk push chunk: large enough that the syscall/poll overhead is not what
+/// the probe measures, small enough to keep write_all latency bounded.
+const BULK_CHUNK: usize = 256 * 1024;
 
 fn usage() -> ! {
     eprintln!("usage: wg_interop keygen <seed-byte>");
     eprintln!("       wg_interop serve --mode tun|socket --priv <b64> --ula <v6> \\");
     eprintln!("                        --wg-port <port> --peer-pub <b64> --peer-ula <v6> \\");
-    eprintln!("                        [--peer-endpoint <ip:port>] [--dial]");
+    eprintln!("                        [--peer-endpoint <ip:port>] [--dial] [--bulk <bytes>]");
     eprintln!("       wg_interop client tcp|udp <[v6]:port>");
     std::process::exit(2);
 }
@@ -85,11 +97,13 @@ struct ServeArgs {
     peer_ula: Ipv6Addr,
     peer_endpoint: Option<SocketAddr>,
     dial: bool,
+    bulk: Option<u64>,
 }
 
 fn parse_serve(args: &[String]) -> Option<ServeArgs> {
     let (mut mode, mut prvkey, mut ula, mut wg_port) = (None, None, None, None);
     let (mut peer_pub, mut peer_ula, mut peer_endpoint, mut dial) = (None, None, None, false);
+    let mut bulk = None;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -101,6 +115,7 @@ fn parse_serve(args: &[String]) -> Option<ServeArgs> {
             "--peer-ula" => peer_ula = it.next()?.parse().ok(),
             "--peer-endpoint" => peer_endpoint = Some(it.next()?.parse().ok()?),
             "--dial" => dial = true,
+            "--bulk" => bulk = Some(it.next()?.parse().ok()?),
             _ => return None,
         }
     }
@@ -113,6 +128,7 @@ fn parse_serve(args: &[String]) -> Option<ServeArgs> {
         peer_ula: peer_ula?,
         peer_endpoint,
         dial,
+        bulk,
     })
 }
 
@@ -129,7 +145,11 @@ fn interface_config(args: &ServeArgs) -> InterfaceConfiguration {
         addresses: vec![IpAddrMask::new(IpAddr::V6(args.ula), 128)],
         port: args.wg_port,
         peers: vec![peer],
-        mtu: None,
+        // the same tunnel MTU production applies (`wiring::TUNNEL_MTU`) —
+        // `None` leaves the TUN at 1500, and every full-size inner packet
+        // then rides a FRAGMENTED outer UDP datagram (and overruns the
+        // userspace stack's 1420 device MTU on mixed pairs).
+        mtu: Some(wireguard_effect::TUNNEL_MTU),
         fwmark: None,
     }
 }
@@ -174,13 +194,17 @@ fn serve(args: &[String]) {
 
         spawn_tcp_echo(factory.clone(), args.ula).await;
         spawn_udp_echo(factory.clone(), args.ula).await;
+        spawn_tcp_bulk_sink(factory.clone(), args.ula).await;
         println!("INTEROP: serving at {}", args.ula);
 
         if args.dial {
             tcp_echo_client(factory.clone(), args.ula, args.peer_ula).await;
             println!("INTEROP: tcp echo PASS");
-            udp_echo_client(factory, args.ula, args.peer_ula).await;
+            udp_echo_client(factory.clone(), args.ula, args.peer_ula).await;
             println!("INTEROP: udp echo PASS");
+        }
+        if let Some(bytes) = args.bulk {
+            bulk_push_client(factory, args.ula, args.peer_ula, bytes).await;
         }
         // stay up: the peer dials us on its own schedule.
         std::future::pending::<()>().await;
@@ -228,6 +252,84 @@ async fn spawn_udp_echo(factory: Arc<dyn SocketFactory>, ula: Ipv6Addr) {
             let _ = socket.send_to(&buf[..n], from).await;
         }
     });
+}
+
+/// bind the TCP bulk sink at the ULA: drain every accepted stream to EOF and
+/// print the first-byte→EOF rate — the receive-side throughput number the
+/// bench harness greps for.
+async fn spawn_tcp_bulk_sink(factory: Arc<dyn SocketFactory>, ula: Ipv6Addr) {
+    let bind = SocketAddr::new(IpAddr::V6(ula), TCP_BULK_PORT);
+    let listener = bind_retry(|| factory.bind_listener(bind)).await;
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _remote)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; BULK_CHUNK];
+                let mut total: u64 = 0;
+                let mut started: Option<tokio::time::Instant> = None;
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            started.get_or_insert_with(tokio::time::Instant::now);
+                            total += n as u64;
+                        }
+                    }
+                }
+                let secs = started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+                println!("{}", bulk_report("sink", total, secs));
+            });
+        }
+    });
+}
+
+/// push `bytes` at the peer's bulk sink through the factory and print the
+/// send-side rate (connect excluded, final flush included).
+async fn bulk_push_client(
+    factory: Arc<dyn SocketFactory>,
+    own: Ipv6Addr,
+    peer: Ipv6Addr,
+    bytes: u64,
+) {
+    let dest = SocketAddr::new(IpAddr::V6(peer), TCP_BULK_PORT);
+    let deadline = tokio::time::Instant::now() + DIAL_DEADLINE;
+    let mut stream = loop {
+        match factory.dial_from(IpAddr::V6(own), dest).await {
+            Ok(stream) => break stream,
+            Err(err) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "bulk dial did not land within {DIAL_DEADLINE:?}: {err}"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    };
+    let chunk = vec![0xd7u8; BULK_CHUNK];
+    let started = tokio::time::Instant::now();
+    let mut sent: u64 = 0;
+    while sent < bytes {
+        let n = BULK_CHUNK.min((bytes - sent) as usize);
+        stream.write_all(&chunk[..n]).await.expect("bulk write");
+        sent += n as u64;
+    }
+    stream.flush().await.expect("bulk flush");
+    // dropping the stream sends FIN — the sink's EOF and end-of-measurement.
+    drop(stream);
+    println!("{}", bulk_report("push", sent, started.elapsed().as_secs_f64()));
+}
+
+/// one line per measurement, fixed shape for the harness:
+/// `INTEROP: bulk <side> <bytes> bytes in <secs>s = <rate> MB/s`
+fn bulk_report(side: &str, bytes: u64, secs: f64) -> String {
+    let rate = if secs > 0.0 {
+        bytes as f64 / secs / 1_000_000.0
+    } else {
+        0.0
+    };
+    format!("INTEROP: bulk {side} {bytes} bytes in {secs:.2}s = {rate:.1} MB/s")
 }
 
 /// retry a factory bind until it lands: right after `apply` the address can

@@ -369,12 +369,21 @@ impl NatResolver {
                 reflexive: None,
             });
         }
-        let mut client = match auth {
+        let client = match auth {
             Some((signer, cap)) => {
                 NatClient::bind_multi_auth(key, coordinators, signer, cap).await?
             }
             None => NatClient::bind_multi(key, coordinators).await?,
         };
+        Self::from_client(client, keepalive).await
+    }
+
+    /// Stand the resolver up over an ALREADY-CONSTRUCTED client — socket
+    /// mode's path, where the client rides the WireGuard underlay socket
+    /// (`nat_traversal::NatSocket::Shared`) so the punch originates from the
+    /// tunnel's own 5-tuple. Discovers the reflexive, registers, and spawns
+    /// the pump exactly like [`Self::bind`].
+    pub async fn from_client(mut client: NatClient, keepalive: Duration) -> std::io::Result<Self> {
         let (_idx, reflexive) = client
             .discover_reflexive_failover(COORD_STEP_TIMEOUT)
             .await?;
