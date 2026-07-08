@@ -30,6 +30,11 @@ pub fn huddle_pop_out<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     .resizable(false)
     .maximizable(false)
     .minimizable(false)
+    // A huddle is glanceable state you keep in view while working, so the popped
+    // card floats above other windows and stays out of the taskbar/dock — a
+    // proper always-on-top pill rather than another window to hunt for.
+    .always_on_top(true)
+    .skip_taskbar(true)
     .build()
     .map_err(|e| e.to_string())?;
 

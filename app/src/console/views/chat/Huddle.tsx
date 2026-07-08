@@ -18,6 +18,7 @@ import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "./HoverButton";
 import { HuddleCard } from "./HuddleCard";
+import { HuddleStage } from "../huddle/HuddleStage";
 
 // ── Local glyph (Icon.tsx isn't ours to extend — same pattern as MessageItem) ──
 
@@ -48,6 +49,14 @@ function CameraGlyph({ size = 15, off = false }: { size?: number; off?: boolean 
       <rect x="2.5" y="6.5" width="12" height="11" rx="2.2" />
       <path d="M14.5 10.5l6-3v9l-6-3z" />
       {off && <path d="M4 4l16 16" strokeWidth={1.9} />}
+    </svg>
+  );
+}
+
+function ExpandGlyph({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
     </svg>
   );
 }
@@ -357,10 +366,19 @@ function HuddleDockCard() {
     return () => clearInterval(id);
   }, [voice.popped]);
 
+  // The in-app "stage" — expand the compact dock into a full-window gallery /
+  // spotlight. Local state, so it resets on join (the card is keyed by channel)
+  // and never conflicts with the popped window (which owns its own surface).
+  const [expanded, setExpanded] = useState(false);
+
   // Yield to the popped-out window (it mirrors the same HuddleCard). Every hook
   // above runs first, so this early return is rules-of-hooks safe.
   if (!voice.channelId || voice.popped) return null;
   const channelId = voice.channelId;
+
+  // Expanded: the stage OWNS the tile/preview bindings, so the compact dock must
+  // not also render its tiles — return the stage alone.
+  if (expanded) return <HuddleStage onCollapse={() => setExpanded(false)} />;
 
   const participants = buildParticipants({
     roster,
@@ -413,11 +431,30 @@ function HuddleDockCard() {
         onPopOut={isTauri() ? () => actions.popOutHuddle() : undefined}
       />
 
-      {/* Camera toggle lives in the dock next to the card (never forked into
-          HuddleCard, so the popped window keeps rendering it unmodified). Gated
-          on ENCODE capability + live + cap-8. */}
-      {canEncode && (
-        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+      {/* Dock controls next to the card (never forked into HuddleCard, so the
+          popped window keeps rendering it unmodified): expand-to-stage (always)
+          and the camera toggle (encode-capable + live + cap-8). */}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 8 }}>
+        <HoverButton
+          onClick={() => setExpanded(true)}
+          title="Expand to full stage"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: 30,
+            height: 28,
+            borderRadius: radius.sm,
+            border: `1px solid ${color.borderSoft}`,
+            background: color.sunken,
+            color: color.muted2,
+          }}
+          hoverStyle={{ background: color.hover, color: color.ink }}
+        >
+          <ExpandGlyph size={15} />
+        </HoverButton>
+
+        {canEncode && (
           <HoverButton
             onClick={() => actions.setCamera(!voice.cameraOn)}
             title={
@@ -443,8 +480,8 @@ function HuddleDockCard() {
           >
             <CameraGlyph size={15} off={!voice.cameraOn} />
           </HoverButton>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }
