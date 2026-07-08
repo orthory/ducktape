@@ -58,6 +58,38 @@ export const huddleRecipients = (
   );
 };
 
+// ── Self active-speaker detection ───────────────────────
+
+/** Root-mean-square amplitude of a mono frame — a cheap "how loud" signal used
+ *  to drive the self speaking indicator (and the "you're muted while talking"
+ *  banner). Computed on the capture frames the worklet already posts, so it runs
+ *  even while muted (mute only stops FORWARDING, not capturing). */
+export const rms = (samples: Float32Array): number => {
+  if (samples.length === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+  return Math.sqrt(sum / samples.length);
+};
+
+/** Speaking threshold (RMS, ~-34 dBFS) — above this we consider the mic active. */
+export const SPEAKING_RMS = 0.02;
+/** Keep the indicator on this long after the last supra-threshold frame, so
+ *  natural gaps between words don't make it flicker. */
+export const SPEAKING_HOLD_MS = 600;
+
+/** Fold one frame's RMS into the speaking state: active immediately on a
+ *  supra-threshold frame (and extends the hold), otherwise still "speaking"
+ *  until the hold window elapses. Pure so it is unit-tested directly. */
+export const nextSpeaking = (
+  frameRms: number,
+  now: number,
+  holdUntil: number,
+): { speaking: boolean; holdUntil: number } => {
+  const active = frameRms >= SPEAKING_RMS;
+  const nextHold = active ? now + SPEAKING_HOLD_MS : holdUntil;
+  return { speaking: active || now < holdUntil, holdUntil: nextHold };
+};
+
 /** Classify a capture-graph failure by DOMException name. macOS never
  *  re-prompts once mic access is denied, so `mic-denied` must send the user to
  *  System Settings — a generic "failed" would leave them retrying into a wall. */

@@ -35,7 +35,7 @@ import {
   encodeCapturedVideo,
   decodeServerFrame,
 } from "./call-frames";
-import { SAMPLE_RATE, floatToPcm16, pcm16ToFloat, voiceErrorOf } from "./voice-session";
+import { SAMPLE_RATE, floatToPcm16, nextSpeaking, pcm16ToFloat, rms, voiceErrorOf } from "./voice-session";
 import type { VoiceStatus, VoiceError } from "./voice-session";
 
 export type { VoiceStatus, VoiceError };
@@ -63,7 +63,11 @@ const MAX_BITRATE_KBPS = 1200;
 
 export type CallEvent =
   | { kind: "status"; status: VoiceStatus; error?: VoiceError }
-  | { kind: "peerBeacon"; peer: string; muted: boolean; cameraOn: boolean; atMs: number };
+  | { kind: "peerBeacon"; peer: string; muted: boolean; cameraOn: boolean; atMs: number }
+  // Our own mic went above/below the speaking threshold — drives the self
+  // speaking ring and the "you're muted while talking" banner. Emitted only on a
+  // change (mute keeps capturing, so this fires even while muted).
+  | { kind: "selfSpeaking"; speaking: boolean };
 
 export interface CallSession {
   /** Open the mic graph and dial the call ws. Idempotent — a second call while
@@ -84,15 +88,9 @@ export interface CallSession {
   /** Tear the whole session down: ws, audio graph, camera, every decoder. */
   stop(): void;
 }
-
-/** Whether this runtime can do video calls (Chromium companion window on Linux;
- *  WebKitGTK lacks WebCodecs). Audio-only huddles work without it. */
-export const supportsVideoCalls = (): boolean =>
-  typeof VideoEncoder !== "undefined" &&
-  typeof VideoDecoder !== "undefined" &&
-  typeof (HTMLVideoElement.prototype as { requestVideoFrameCallback?: unknown })
-    .requestVideoFrameCallback === "function" &&
-  !!navigator.mediaDevices?.getUserMedia;
+// Runtime video capability now lives in domain/video-capability.ts (a REAL codec
+// probe via isConfigSupported — WebKitGTK exposes the WebCodecs API but may not
+// register a vp8 encoder, and encode/decode capability can diverge).
 
 /** A hub → webview control frame — camelCase tags and fields, mirroring the
  *  node's `CallServerControl` serde attributes. */
@@ -118,6 +116,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   let muted = false;
   let started = false;
   let stopped = false;
+  // Self active-speaker detection off the capture frames (runs even while muted).
+  let speaking = false;
+  let speakingHoldUntil = 0;
   // recipients requested before the socket was open — flushed on open.
   let pendingRecipients: string[] | null = null;
 
@@ -472,8 +473,16 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
           numberOfOutputs: 0,
         });
         cap.port.onmessage = (event) => {
+          const frame = event.data as Float32Array;
+          // Speaking detection first, so it fires even when muted (below).
+          const detected = nextSpeaking(rms(frame), Date.now(), speakingHoldUntil);
+          speakingHoldUntil = detected.holdUntil;
+          if (detected.speaking !== speaking) {
+            speaking = detected.speaking;
+            onEvent({ kind: "selfSpeaking", speaking });
+          }
           if (muted || !socket || socket.readyState !== WebSocket.OPEN) return;
-          socket.send(encodeAudioFrame(floatToPcm16(event.data as Float32Array)));
+          socket.send(encodeAudioFrame(floatToPcm16(frame)));
         };
         source.connect(cap);
         capture = cap;

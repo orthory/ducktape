@@ -23,6 +23,7 @@ import type {
 } from "../../domain/pages-client";
 import type { BlockRecord, NodeStatus } from "../../domain/transport";
 import type { VoiceError } from "../../domain/voice-session";
+import type { VideoCapability } from "../../domain/video-capability";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
@@ -50,6 +51,14 @@ export interface VoiceSlice {
   /** Per-peer ephemeral call state from 1 Hz beacons, keyed by NODE hex.
    *  Staleness (no beacon for >10 s) drives the sweep affordance. */
   peers: Record<string, { muted: boolean; cameraOn: boolean; atMs: number }>;
+  /** Epoch ms our current session started (set on join, null when idle) — the
+   *  staleness baseline for a never-beaconed member. Shared so the dock and the
+   *  popped window agree on who is sweepable. */
+  sessionStartMs: number | null;
+  /** Whether OUR mic is currently above the speaking threshold (drives the self
+   *  speaking ring + the "you're muted while talking" banner). Detected off the
+   *  capture frames, so it's true even while muted. */
+  speaking: boolean;
 }
 
 /** One search round-trip across the modules that ship materialized views —
@@ -146,6 +155,11 @@ export interface ConsoleState {
   /** This client's live voice-huddle session — ephemeral, never in the
    *  committed snapshot (see VoiceSlice). */
   voice: VoiceSlice;
+  /** Runtime VP8 encode/decode support, resolved once from a real codec probe.
+   *  Stable (a device capability, not session state), so it lives OUTSIDE the
+   *  voice slice — the huddle-reset paths must never wipe it. `canEncode` gates
+   *  the camera control; `canDecode` gates peer-tile rendering. */
+  videoCapability: VideoCapability;
 
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
@@ -440,7 +454,10 @@ export const createInitialState = (): ConsoleState => {
       popped: false,
       cameraOn: false,
       peers: {},
+      sessionStartMs: null,
+      speaking: false,
     },
+    videoCapability: { canEncode: false, canDecode: false },
     members: [],
     residents: [],
     proposals: [],
