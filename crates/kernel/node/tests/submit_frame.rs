@@ -53,6 +53,8 @@ fn submit_frame_takes_custody_and_keeps_signer_authorship() {
         let id = node.submit_frame(frame).await.expect("submit_frame");
         assert_eq!(id, expected_id, "the returned id is the frame's content address");
 
+        // enqueued at submit_frame; flush packs it into a batch, then it drains.
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(get(&node, "k").await.as_deref(), Some("v"));
 

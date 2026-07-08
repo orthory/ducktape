@@ -79,6 +79,7 @@ fn oversized_submit_rejects_cleanly_and_node_stays_live() {
             }),
         };
         node.submit(&sk(1), 1, set).await.expect("normal submit");
+        node.flush_batch().await.expect("flush");
         let mut applied = 0;
         loop {
             let n = node.drain_delivered().await.expect("drain");

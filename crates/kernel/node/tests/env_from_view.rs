@@ -92,9 +92,10 @@ fn env_reflects_agreed_view_height_time_and_real_origin() {
         }
 
         // PHASE 1: every validator proposes the SAME op (submitter "alice"),
-        // then drains. one frame per round -> agreed view 0.
+        // FLUSHES it into a batch, then drains. one op per batch -> agreed view 0.
         for node in nodes.iter_mut() {
             node.submit(&sk(10), 0, op(b"first")).await.expect("submit");
+            node.flush_batch().await.expect("flush");
             drain_to_fixpoint(node).await;
         }
 
@@ -103,6 +104,7 @@ fn env_reflects_agreed_view_height_time_and_real_origin() {
             node.submit(&sk(11), 0, op(b"second"))
                 .await
                 .expect("submit");
+            node.flush_batch().await.expect("flush");
             drain_to_fixpoint(node).await;
         }
 

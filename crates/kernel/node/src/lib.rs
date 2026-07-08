@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use host::{BlockContext, BlockOutcome, Host};
+use host::{BlockContext, BlockOutcome, Host, MemberOutcome};
 use sdk::{Effect, Msg, StateRoot};
 
 /// the bytes delivered on the inbound channel: a serialized msg-batch.
@@ -84,6 +84,11 @@ impl From<host::SubmitError> for Error {
 // is a private serde mirror of the two public `Msg` fields; a batch is a plain
 // `Vec<WireMsg>` over serde_json. only the app-hash has to match across nodes,
 // not the wire bytes, so a json envelope is free to evolve independently.
+//
+// NB: this is the GOSSIP-lane msg batch (`encode_msg_batch`/`decode_msg_batch`),
+// distinct from the ordered-lane op-frame batch super-frame
+// (`encode_batch`/`decode_batch`, defined near the frame codec below) — same
+// word "batch", two unrelated wire units.
 
 #[derive(Serialize, Deserialize)]
 struct WireMsg {
@@ -109,14 +114,15 @@ impl From<WireMsg> for Msg {
     }
 }
 
-/// serialize a msg-batch to bytes. infallible — the fields are plain data.
-pub fn encode_batch(msgs: &[Msg]) -> Vec<u8> {
+/// serialize a GOSSIP-lane msg-batch to bytes. infallible — the fields are plain
+/// data. (the ordered-lane op-frame batch is [`encode_batch`], unrelated.)
+pub fn encode_msg_batch(msgs: &[Msg]) -> Vec<u8> {
     let wire: Vec<WireMsg> = msgs.iter().map(WireMsg::from).collect();
     serde_json::to_vec(&wire).expect("msg batch serializes")
 }
 
-/// deserialize a msg-batch from bytes.
-pub fn decode_batch(bytes: &[u8]) -> Result<Vec<Msg>, Error> {
+/// deserialize a GOSSIP-lane msg-batch from bytes.
+pub fn decode_msg_batch(bytes: &[u8]) -> Result<Vec<Msg>, Error> {
     let wire: Vec<WireMsg> = serde_json::from_slice(bytes)?;
     Ok(wire.into_iter().map(Msg::from).collect())
 }
@@ -233,7 +239,7 @@ impl<T: Transport> Node<T> {
     /// `Msg` is `Clone`, so — unlike the legacy `!Clone` op — we simply clone for
     /// the wire and submit the original; no encode-first dance, no re-decode.
     pub async fn apply_local(&mut self, msg: Msg) -> Result<BlockOutcome, Error> {
-        let bytes = encode_batch(std::slice::from_ref(&msg));
+        let bytes = encode_msg_batch(std::slice::from_ref(&msg));
         let outcome = self.host.submit(msg).await?;
         // propagate AFTER the local apply so a slow peer never stalls our block.
         let _ = self.transport.send(bytes).await;
@@ -251,7 +257,7 @@ impl<T: Transport> Node<T> {
         let batches: Vec<Inbound> = std::iter::from_fn(|| self.inbound.try_recv().ok()).collect();
         let mut applied = 0usize;
         for bytes in batches {
-            for msg in decode_batch(&bytes)? {
+            for msg in decode_msg_batch(&bytes)? {
                 self.host.submit(msg).await?;
                 applied += 1;
             }
@@ -303,7 +309,7 @@ mod tests {
                 payload: vec![],
             },
         ];
-        let decoded = decode_batch(&encode_batch(&msgs)).expect("roundtrips");
+        let decoded = decode_msg_batch(&encode_msg_batch(&msgs)).expect("roundtrips");
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].target, "directory");
         assert_eq!(decoded[0].payload, b"hello");
@@ -513,6 +519,179 @@ pub fn frame_origin_seq(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
     Some((origin.to_vec(), seq))
 }
 
+// ============================================================================
+// the batch super-frame codec — pack N signed op-frames into ONE ordered unit.
+// ============================================================================
+//
+// a block now carries a BATCH of op-frames. the batch super-frame is an
+// UNSIGNED CONTAINER: `varint(N)` then, per member, `varint(len) || bytes`. its
+// members are the existing signed op-frames, UNCHANGED — the signature and
+// authenticated authorship live on each member, never on the container. the
+// container's own content address is `frame_id(&batch_bytes)`; the orderer
+// orders these containers, and [`OrderedNode::drain_delivered`] decodes one into
+// its members and applies them as ONE block at ONE height under ONE app-hash.
+// (this is the ORDERED-lane batch — unrelated to the gossip-lane
+// [`encode_msg_batch`] above, which shares only the word "batch".)
+
+/// hard cap on ONE encoded batch super-frame — the packing target for
+/// [`OrderedNode::flush_batch`]. equal to [`MAX_FRAME_BYTES`]: a single member
+/// (itself `<= MAX_FRAME_BYTES`) is NEVER split, so a one-member batch plus the
+/// tiny length envelope can edge just over this — the real mesh 2 MiB p2p
+/// message cap gives the envelope headroom over this packing target.
+pub const MAX_BATCH_BYTES: usize = MAX_FRAME_BYTES;
+
+/// encoded length of `n` as canonical unsigned LEB128.
+fn varint_len(mut n: u64) -> usize {
+    let mut len = 1;
+    while n >= 0x80 {
+        n >>= 7;
+        len += 1;
+    }
+    len
+}
+
+/// append `n` to `out` as canonical unsigned LEB128 (minimal, no overlong tail).
+fn put_varint(out: &mut Vec<u8>, mut n: u64) {
+    loop {
+        let byte = (n & 0x7f) as u8;
+        n >>= 7;
+        if n == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// read a canonical unsigned LEB128 off the front of `buf`, advancing it.
+/// rejects an overlong encoding (a non-minimal trailing-zero group) and any
+/// value that would overflow a u64 — a forged length can never drive
+/// allocation or slicing past the input.
+fn get_varint(buf: &mut &[u8]) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        let (&byte, rest) = buf.split_first()?;
+        *buf = rest;
+        if shift >= 64 {
+            return None; // an 11th group cannot fit a u64.
+        }
+        let low = (byte & 0x7f) as u64;
+        // the top group carries only bit 63; anything above it overflows.
+        if shift == 63 && low > 1 {
+            return None;
+        }
+        result |= low << shift;
+        if byte & 0x80 == 0 {
+            // canonical: a multi-byte encoding whose final group is zero is
+            // overlong — the value could have been written shorter.
+            if byte == 0 && shift != 0 {
+                return None;
+            }
+            return Some(result);
+        }
+        shift += 7;
+    }
+}
+
+/// encode member frames into ONE batch super-frame: `varint(N)` then, per
+/// member, `varint(len) || bytes`. member order is PRESERVED (the applied
+/// order). infallible — the members are opaque bytes.
+pub fn encode_batch(members: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_varint(&mut out, members.len() as u64);
+    for m in members {
+        put_varint(&mut out, m.len() as u64);
+        out.extend_from_slice(m);
+    }
+    out
+}
+
+/// decode a batch super-frame back to its member frames. CANONICAL: rejects a
+/// trailing-byte suffix, an overlong varint, and any member length that
+/// overruns the buffer or exceeds [`MAX_FRAME_BYTES`]. a corrupt blob is an
+/// `Err` — the drain treats a whole undecodable batch as one Rejected block.
+pub fn decode_batch(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    let corrupt = || Error::Host(sdk::Error::Module("batch super-frame does not parse".into()));
+    let mut buf = bytes;
+    let n = usize::try_from(get_varint(&mut buf).ok_or_else(corrupt)?).map_err(|_| corrupt())?;
+    // every member costs at least one length byte, so N can never exceed the
+    // bytes that remain — cap the pre-allocation so a forged count cannot OOM.
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(n.min(buf.len()));
+    for _ in 0..n {
+        let len =
+            usize::try_from(get_varint(&mut buf).ok_or_else(corrupt)?).map_err(|_| corrupt())?;
+        // a member can never be larger than a single frame's cap.
+        if len > MAX_FRAME_BYTES {
+            return Err(corrupt());
+        }
+        let (head, rest) = buf.split_at_checked(len).ok_or_else(corrupt)?;
+        out.push(head.to_vec());
+        buf = rest;
+    }
+    if !buf.is_empty() {
+        // a trailing suffix after the declared members is not canonical.
+        return Err(corrupt());
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod batch_codec_tests {
+    use super::*;
+
+    #[test]
+    fn batch_roundtrips_zero_one_and_many_members() {
+        let cases: Vec<Vec<Vec<u8>>> = vec![
+            vec![],
+            vec![b"solo".to_vec()],
+            vec![
+                b"".to_vec(),           // an empty member is legal bytes.
+                b"one".to_vec(),
+                vec![7u8; 300],         // >127 bytes: a multi-byte length varint.
+                b"last".to_vec(),
+            ],
+        ];
+        for members in cases {
+            let enc = encode_batch(&members);
+            let dec = decode_batch(&enc).expect("batch roundtrips");
+            assert_eq!(dec, members, "decoded members match, in order");
+        }
+    }
+
+    #[test]
+    fn batch_rejects_trailing_bytes() {
+        let mut enc = encode_batch(&[b"x".to_vec()]);
+        enc.push(0xff); // one stray byte past the last member.
+        assert!(
+            decode_batch(&enc).is_err(),
+            "a trailing suffix is not a canonical batch"
+        );
+    }
+
+    #[test]
+    fn batch_rejects_length_overrunning_buffer() {
+        // N=1 declaring a 100-byte member, but only 3 bytes follow.
+        let mut bytes = Vec::new();
+        put_varint(&mut bytes, 1);
+        put_varint(&mut bytes, 100);
+        bytes.extend_from_slice(b"abc");
+        assert!(
+            decode_batch(&bytes).is_err(),
+            "a member length past the buffer end must reject"
+        );
+    }
+
+    #[test]
+    fn batch_rejects_overlong_varint() {
+        // the count N written overlong as [0x80, 0x00] (canonical 0 is [0x00]).
+        assert!(
+            decode_batch(&[0x80, 0x00]).is_err(),
+            "an overlong varint is not canonical"
+        );
+    }
+}
+
 /// total-order broadcast over opaque op frames. `submit` proposes a frame into
 /// the agreed sequence (it does NOT apply anything locally); `poll_delivered`
 /// yields the SAME sequence, in the SAME order, on EVERY validator. domain-
@@ -671,15 +850,23 @@ pub struct DrainedFrame {
 }
 
 /// the verbatim, submitter-facing string for a deterministic rejection.
-/// [`sdk::Error::Module`] surfaces its raw string UNWRAPPED — the duckfs-client
+///
+/// on the batch path the host has ALREADY stringified the reject error with its
+/// WRAPPED `Display` (`Module(<verbatim>)` for a module rejection, since
+/// [`sdk::Error`]'s `Display` renders like its `Debug`). the duckfs-client
 /// engine string-matches the module's `"files: conflict:"` prefix on the FRONT
-/// of the reply detail, so no `op rejected:` / `Module(..)` wrapper may precede
-/// it. every other rejection kind uses its `Display`. node-local observability
-/// only: this string is never journaled, sealed, or hashed.
-fn reject_reason(e: &sdk::Error) -> String {
-    match e {
-        sdk::Error::Module(m) => m.clone(),
-        other => other.to_string(),
+/// of the reply detail, so no `Module(..)` wrapper may precede it — reverse
+/// exactly that one wrapper. the strip is an EXACT inverse (`Debug` for `Module`
+/// is `write!("Module({m})")`, no escaping), and it correctly leaves any other
+/// kind (e.g. `UnknownModule(..)`) untouched. node-local observability only:
+/// this string is never journaled, sealed, or hashed.
+fn member_reason(reason: String) -> String {
+    match reason
+        .strip_prefix("Module(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        Some(inner) => inner.to_string(),
+        None => reason,
     }
 }
 
@@ -868,6 +1055,20 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// loses accepted-but-unfinalized ops (the pre-existing crash window);
     /// the cutover is the NON-crash path this closes.
     outstanding: std::collections::HashMap<FrameId, (u64, Vec<u8>)>,
+    /// ENQUEUED member frames awaiting a flush, in FIFO (enqueue) order.
+    /// [`OrderedNode::submit_frame`] appends here (custody also begins in
+    /// `outstanding`); [`OrderedNode::flush_batch`] drains it, greedily packs
+    /// the members into batch super-frames, and proposes each to the orderer.
+    /// FIFO order is the applied order, so per-node qmdb roots are well-defined.
+    /// always a subset of `outstanding` (an un-flushed member is still in
+    /// custody), so a cutover rebuilds it from `outstanding` and re-flushes.
+    pending_batch: Vec<(FrameId, Vec<u8>)>,
+    /// per-MEMBER exactly-once APPLY guard: a member [`FrameId`] lands here the
+    /// instant its op APPLIES (never for a rejected, decode-failed, or
+    /// discarded member), so a re-reported finalized batch never double-applies
+    /// a member. process-lifetime like `seen` and deterministic across nodes —
+    /// a pure function of the finalized batch sequence.
+    applied_frames: std::collections::HashSet<FrameId>,
 }
 
 impl<O: Orderer> OrderedNode<O> {
@@ -894,6 +1095,8 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             watch_module: None,
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
+            pending_batch: Vec::new(),
+            applied_frames: std::collections::HashSet::new(),
         }
     }
 
@@ -923,6 +1126,8 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             watch_module: None,
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
+            pending_batch: Vec::new(),
+            applied_frames: std::collections::HashSet::new(),
         }
     }
 
@@ -977,8 +1182,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         // the ceiling, so any leftover here was past the ceiling (a discard);
         // the bytes of locally-accepted ones survive via the carry below.
         self.deferred.clear();
-        // resubmit in `seq` order so this origin's ops keep the order their
-        // submitter observed them acked in.
+        // rebuild the pending queue from custody: every un-flushed member is
+        // already in `outstanding` (a superset of `pending_batch`), so clearing
+        // and rebuilding from `outstanding` carries BOTH the finalized-past-
+        // ceiling discards AND anything accepted-but-never-flushed, with no
+        // double-enqueue. resubmit in `seq` order so this origin's ops keep the
+        // order their submitter observed them acked in.
+        self.pending_batch.clear();
         let mut carried: Vec<(FrameId, u64, Vec<u8>)> = self
             .outstanding
             .drain()
@@ -987,12 +1197,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         carried.sort_unstable_by_key(|(_, seq, _)| *seq);
         let count = carried.len();
         for (id, seq, frame) in carried {
-            self.sink.pin(&frame).await?;
-            self.orderer.submit(frame.clone()).await?;
+            self.pending_batch.push((id, frame.clone()));
             // custody continues: a second cutover before this frame resolves
             // carries it again.
             self.outstanding.insert(id, (seq, frame));
         }
+        // ONE flush re-pins + re-proposes the carried members to the NEW
+        // orderer as fresh batches (the carry's durability: pinned before
+        // cutover returns), preserving FIFO/`seq` order across the boundary.
+        self.flush_batch().await?;
         Ok(count)
     }
 
@@ -1046,34 +1259,98 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         }
         decode_frame(&frame)?;
         let id = frame_id(&frame);
-        // durably pin the bytes BEFORE the orderer may propose their digest:
-        // once the engine journals a finalization, these bytes are the only
-        // thing standing between a crash and an unrecoverable finalized op
-        // (the content store is memory; the engine journals votes, not
-        // payloads; a solo network has no peer to refetch from).
-        self.sink.pin(&frame).await?;
-        self.orderer.submit(frame.clone()).await?;
-        // custody begins only on FULL acceptance (pinned + proposed): an
-        // errored submit is reported to the caller, who retries — tracking
-        // it would double the op when the retry lands and a cutover carries
-        // the failed original too.
+        // ENQUEUE, don't propose: the frame joins `pending_batch` (FIFO) and
+        // enters custody. it is not pinned or proposed until [`flush_batch`]
+        // packs it into a batch super-frame — that is where the durable pin +
+        // orderer proposal happen, once per batch. custody begins HERE so a
+        // cutover before the flush still carries the accepted-but-unflushed op
+        // (the accept contract holds without a flush having run).
         let (_, seq) = frame_origin_seq(&frame).expect("decode_frame verified the envelope");
+        self.pending_batch.push((id, frame.clone()));
         self.outstanding.insert(id, (seq, frame));
         Ok(id)
     }
 
-    /// DRAIN — apply every frame the order delivered, STRICTLY in agreed order,
-    /// via `host.submit`. returns the count applied (0 when idle) so a test can
-    /// drive to a fixpoint deterministically.
+    /// how many member frames are enqueued awaiting the next [`flush_batch`].
+    pub fn pending_batch_len(&self) -> usize {
+        self.pending_batch.len()
+    }
+
+    /// FLUSH — drain `pending_batch` (FIFO), greedily pack the member frames
+    /// into batch super-frames up to [`MAX_BATCH_BYTES`], and for each batch
+    /// PIN its bytes then PROPOSE it to the orderer. returns the number of
+    /// batches submitted (`Ok(0)` when nothing was pending).
+    ///
+    /// FIFO order is preserved end-to-end: a member's position in a batch is
+    /// its enqueue order, which is the applied order — reordering would fork a
+    /// single node's own op-log-order-dependent (qmdb) root. members stay in
+    /// custody (`outstanding`); they leave only when a batch finalizes and the
+    /// member resolves in [`drain_delivered`]. a new batch is started when
+    /// adding the next member would push the encoded batch past the cap; a
+    /// single member is never split (it is `<= MAX_FRAME_BYTES`, so it always
+    /// forms at least its own batch even if that batch edges over the packing
+    /// target — the mesh cap has the headroom).
+    pub async fn flush_batch(&mut self) -> Result<usize, Error> {
+        if self.pending_batch.is_empty() {
+            return Ok(0);
+        }
+        let pending = std::mem::take(&mut self.pending_batch);
+        let mut batches = 0usize;
+        let mut members: Vec<Vec<u8>> = Vec::new();
+        // running encoded size of the members already in `members` (each
+        // member's `varint(len) || bytes`); the `varint(N)` header is added
+        // when projecting whether the next member still fits.
+        let mut members_bytes: usize = 0;
+        for (_id, frame) in pending {
+            let contrib = varint_len(frame.len() as u64) + frame.len();
+            let projected = varint_len(members.len() as u64 + 1) + members_bytes + contrib;
+            if !members.is_empty() && projected > MAX_BATCH_BYTES {
+                // adding this member would overflow the cap — seal the current
+                // batch and start a fresh one with this member.
+                self.propose_batch(&members).await?;
+                batches += 1;
+                members.clear();
+                members_bytes = 0;
+            }
+            members.push(frame);
+            members_bytes += contrib;
+        }
+        if !members.is_empty() {
+            self.propose_batch(&members).await?;
+            batches += 1;
+        }
+        Ok(batches)
+    }
+
+    /// encode one batch super-frame, durably PIN it, then PROPOSE it to the
+    /// orderer. the pin lands BEFORE the proposal (the same WAL-before-propose
+    /// discipline the single-frame path used): once the engine journals a
+    /// finalization these bytes are the only thing standing between a crash and
+    /// an unrecoverable finalized batch.
+    async fn propose_batch(&mut self, members: &[Vec<u8>]) -> Result<(), Error> {
+        let batch = encode_batch(members);
+        self.sink.pin(&batch).await?;
+        self.orderer.submit(batch).await?;
+        Ok(())
+    }
+
+    /// DRAIN — apply every BATCH the order delivered, STRICTLY in agreed order.
+    /// each delivered `(view, frame)` is ONE batch super-frame applied via
+    /// `host.submit_block` as ONE block at ONE height under ONE app-hash, with
+    /// per-member outcomes surfaced as N [`DrainedFrame`]s (all sharing that
+    /// app-hash). returns the count of BATCHES processed (0 when idle) so a test
+    /// can drive to a fixpoint deterministically.
     ///
     /// ## rejected vs fatal
     ///
-    /// a DETERMINISTIC rejection (decode failure, module error, blown budget) is
-    /// a no-op: every honest validator finalized the identical op and rejects it
-    /// identically — the drain keeps going. a FATAL boundary fault
+    /// a DETERMINISTIC rejection (a member's decode failure or module error, an
+    /// undecodable whole batch, a rejected System injection) is a no-op: every
+    /// honest validator finalized the identical bytes and rejects them
+    /// identically — the drain keeps going, and the block-level seal disposition
+    /// is Applied iff the batch MOVED state. a FATAL boundary fault
     /// ([`host::SubmitError::Fatal`]) is node-local: this registry is now
     /// indeterminate, so the drain STOPS and surfaces [`Error::Fatal`] — applying
-    /// even one more finalized op would compound a state no validator agreed on.
+    /// even one more finalized batch would compound a state no validator agreed on.
     pub async fn drain_delivered(&mut self) -> Result<usize, Error> {
         // fresh deliveries queue BEHIND anything a previous observation
         // barrier deferred — agreed order is preserved.
@@ -1110,149 +1387,230 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             {
                 continue;
             }
-            let id = frame_id(&frame);
-            // the CUTOVER CEILING: frames finalized at or past the agreed
-            // cutover view are DISCARDED — the same view-based rule on every
-            // honest node, so a straggler finalizing during teardown on only
-            // some nodes cannot fork app state. never journaled: a discarded
-            // frame leaves no state for a restart to recover.
+            let batch_id = frame_id(&frame);
+            // the CUTOVER CEILING: a batch finalized at or past the agreed
+            // cutover view is DISCARDED WHOLE — the same view-based rule on
+            // every honest node, so a straggler batch finalizing during
+            // teardown on only some nodes cannot fork app state. never
+            // journaled: a discard leaves no state for a restart to recover.
             if let Some(ceiling) = self.view_ceiling
                 && view >= ceiling
             {
-                // a locally-accepted discard stays in `outstanding`: it
-                // never applied anywhere, so the cutover carries it into
-                // the new epoch (see [`OrderedNode::cutover`]).
-                self.drained.push(DrainedFrame {
-                    id,
-                    height,
-                    disposition: Disposition::Discarded,
-                    app_hash: self.host.app_hash(),
-                    op: None,
-                    reason: None,
-                });
+                // one Discarded outcome per member (a caller correlates by its
+                // own member FrameId), and KEEP every member in `outstanding`:
+                // none applied anywhere, so the cutover carries them into the
+                // new epoch (see [`OrderedNode::cutover`]). an undecodable
+                // discarded batch has no members to name and nothing in custody
+                // to carry — one record under the batch's own id.
+                match decode_batch(&frame) {
+                    Ok(members) => {
+                        for member in &members {
+                            self.drained.push(DrainedFrame {
+                                id: frame_id(member),
+                                height,
+                                disposition: Disposition::Discarded,
+                                app_hash: self.host.app_hash(),
+                                op: None,
+                                reason: None,
+                            });
+                        }
+                    }
+                    Err(_) => self.drained.push(DrainedFrame {
+                        id: batch_id,
+                        height,
+                        disposition: Disposition::Discarded,
+                        app_hash: self.host.app_hash(),
+                        op: None,
+                        reason: None,
+                    }),
+                }
                 continue;
             }
-            // below the ceiling this frame RESOLVES here — applied, or
-            // rejected as a deterministic no-op — so custody ends (a frame
-            // this node never submitted is simply absent).
-            self.outstanding.remove(&id);
-            // WAL discipline: the frame is finalized and about to mutate state
-            // — journal its bytes FIRST, so a crash mid-apply rolls forward
-            // from this record instead of losing a finalized op.
+            // below the ceiling this batch RESOLVES here as ONE block at ONE
+            // height. WAL discipline: the batch bytes are finalized and about to
+            // mutate state — journal them ONCE FIRST, so a crash mid-apply rolls
+            // forward from this record instead of losing a finalized batch.
             self.sink.pre_apply(height, &frame).await?;
-            // one that fails to decode, or that a module rejects, is a DETERMINISTIC
-            // no-op: every honest validator finalized the identical op and handles it
-            // identically (host-lent rolls back a rejected block, root unchanged), so
-            // the chain cannot fork — AND a byzantine proposer cannot HALT honest nodes
-            // by getting a malformed op finalized. (the `?`-propagate that used to be
-            // here stalled the whole drain on one bad op — the liveness gap.)
-            let Ok((origin, msg)) = decode_frame(&frame) else {
-                self.drained.push(DrainedFrame {
-                    id,
-                    height,
-                    disposition: Disposition::Rejected,
-                    app_hash: self.host.app_hash(),
-                    op: None,
-                    // node-local observability only; the seal below stays
-                    // byte-identical to the applied/rejected cases.
-                    reason: Some("frame decode/signature check failed".to_string()),
-                });
-                self.seal(height, Disposition::Rejected).await?;
-                last_sealed_view = Some(view);
-                continue;
+            // an undecodable batch is a DETERMINISTIC whole-block no-op: every
+            // honest node finalized the identical bytes and rejects them
+            // identically (no fork), and a byzantine proposer cannot halt honest
+            // nodes with one corrupt batch.
+            let members = match decode_batch(&frame) {
+                Ok(m) => m,
+                Err(_) => {
+                    self.drained.push(DrainedFrame {
+                        id: batch_id,
+                        height,
+                        disposition: Disposition::Rejected,
+                        app_hash: self.host.app_hash(),
+                        op: None,
+                        reason: Some("batch decode failed".to_string()),
+                    });
+                    self.seal(height, Disposition::Rejected).await?;
+                    last_sealed_view = Some(view);
+                    continue;
+                }
             };
-            // capture the op's identity for the drained record now — the msg
-            // is consumed by the dispatch below and never comes back.
-            let op_origin = origin.clone();
-            let op_target = msg.target.clone();
-            let op_payload = msg.payload.clone();
+            // decode each member into the ops the block applies. an already-
+            // APPLIED member (re-reported after a restart, or a byzantine
+            // replay) is SKIPPED — the per-member exactly-once guard,
+            // deterministic across nodes. a member that fails to decode is a
+            // deterministic no-op: EXCLUDED from the ops and recorded Rejected
+            // after the block settles (it shares the block app-hash). the rest
+            // carry their identity parallel to `ops`, in member (= applied,
+            // = enqueue/FIFO) order, for building the drained records.
+            let mut ops: Vec<(Origin, Msg)> = Vec::new();
+            let mut op_meta: Vec<(FrameId, Origin, sdk::ModuleId, Vec<u8>)> = Vec::new();
+            let mut decode_fail: Vec<FrameId> = Vec::new();
+            for member in &members {
+                let mid = frame_id(member);
+                if self.applied_frames.contains(&mid) {
+                    continue;
+                }
+                match decode_frame(member) {
+                    Ok((origin, msg)) => {
+                        op_meta.push((
+                            mid,
+                            origin.clone(),
+                            msg.target.clone(),
+                            msg.payload.clone(),
+                        ));
+                        ops.push((origin, msg));
+                    }
+                    Err(_) => decode_fail.push(mid),
+                }
+            }
             // stamp the block's dispatch version as the PURE derivation
             // effective_version(height) — never the raw stored current_version —
             // so dispatch and hashing agree on the version for block `height`.
-            // baseline (unchanged behavior) until the upgrade module is registered
-            // and a pending upgrade arms at its activation height.
             let protocol_version = self.host.effective_version(height).await;
-            let ctx = BlockContext {
-                height,
-                consensus_time: height,
-                origin,
-                protocol_version,
-            };
-            // the observation barrier compares the watched root across the
-            // apply — only an APPLIED block can move it (rejected blocks roll
+            let pre_hash = self.host.app_hash();
+            // the observation barrier compares the watched root across the WHOLE
+            // batch — only an applied member can move it (rejected members roll
             // back, discards never run).
             let watched_before = self
                 .watch_module
                 .as_deref()
                 .map(|m| self.host.module_root(m));
-            // surface each finalized block's effects for the reactor's worker
-            // driver. a rejected op yields no outcome (deterministic no-op) and so
-            // contributes no effects — same on every validator.
+            // apply the members as ONE block. ctx.origin is UNUSED on the batch
+            // path — each member carries its own origin in `ops`, which the host
+            // stamps into that member's Env.
             let started = std::time::Instant::now();
-            let result = self.host.submit_at(ctx, msg).await;
-            // node-local apply cost — the metrics plane's one non-consensus
-            // signal, timed HERE in the effectful node layer (never inside the
-            // clock-free host). tight span: no `.await` between start and stop.
-            let latency_us = started.elapsed().as_micros() as u64;
-            match result {
-                Ok(outcome) => {
-                    self.effects.extend(outcome.effects);
-                    self.drained.push(DrainedFrame {
-                        id,
+            let result = self
+                .host
+                .submit_block(
+                    BlockContext {
                         height,
-                        disposition: Disposition::Applied,
-                        app_hash: self.host.app_hash(),
-                        op: Some(DrainedOp {
-                            origin: op_origin,
-                            target: op_target,
-                            payload: op_payload,
-                            dispatches: outcome.dispatches,
-                            latency_us,
-                        }),
-                        reason: None,
-                    });
-                    self.seal(height, Disposition::Applied).await?;
-                    last_sealed_view = Some(view);
-                    if let Some(before) = watched_before {
-                        let module = self
-                            .watch_module
-                            .as_deref()
-                            .expect("watched_before implies watch_module");
-                        if self.host.module_root(module) != before {
-                            // end the batch AT the changing block: the
-                            // remainder stays deferred so a once-per-drain
-                            // observer sees this block's view — the same
-                            // observation point on every validator.
-                            break;
-                        }
-                    }
-                }
+                        consensus_time: height,
+                        origin: Origin::System,
+                        protocol_version,
+                    },
+                    ops,
+                )
+                .await;
+            // node-local apply cost of the WHOLE batch — the metrics plane's one
+            // non-consensus signal, timed HERE in the effectful node layer (never
+            // inside the clock-free host). shared by every member's record.
+            let latency_us = started.elapsed().as_micros() as u64;
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                // a boundary fault is node-local: this registry is now
+                // indeterminate, so STOP — applying more finalized ops would
+                // compound a state no validator agreed on.
+                Err(e @ host::SubmitError::Fatal(_)) => return Err(e.into()),
+                // submit_block folds a MEMBER rejection into its MemberOutcome
+                // and never errors the whole batch for one; a whole-batch
+                // Rejected can only come from a once-per-block System injection
+                // (`Advance` / `DeliverPending`) rejecting — a deterministic
+                // no-op. record it batch-level and keep draining.
                 Err(host::SubmitError::Rejected(e)) => {
-                    // capture the module's VERBATIM rejection string for the
-                    // in-memory DrainedFrame — a submitter's held reply carries
-                    // it (e.g. duckfs's "files: conflict: <path> ..."). the seal
-                    // below and everything journaled/hashed stay byte-identical:
-                    // a rejection is a deterministic no-op and the reason is
-                    // node-local observability, never consensus state.
-                    let reason = reject_reason(&e);
                     self.drained.push(DrainedFrame {
-                        id,
+                        id: batch_id,
                         height,
                         disposition: Disposition::Rejected,
                         app_hash: self.host.app_hash(),
-                        op: Some(DrainedOp {
-                            origin: op_origin,
-                            target: op_target,
-                            payload: op_payload,
-                            dispatches: Vec::new(),
-                            latency_us,
-                        }),
-                        reason: Some(reason),
+                        op: None,
+                        reason: Some(member_reason(e.to_string())),
                     });
                     self.seal(height, Disposition::Rejected).await?;
                     last_sealed_view = Some(view);
+                    continue;
                 }
-                Err(e @ host::SubmitError::Fatal(_)) => return Err(e.into()),
+            };
+            // N DrainedFrames per batch, all sharing the ONE post-batch app-hash.
+            let batch_hash = outcome.app_hash;
+            self.effects.extend(outcome.effects);
+            // one record per applying member, in member (input/FIFO) order; the
+            // host guarantees `members` is 1:1 with `ops` in input order. custody
+            // ends for each resolved member; only APPLIED members enter the
+            // exactly-once guard.
+            for ((mid, op_origin, op_target, op_payload), member_outcome) in
+                op_meta.into_iter().zip(outcome.members)
+            {
+                self.outstanding.remove(&mid);
+                let (disposition, dispatches, reason) = match member_outcome {
+                    MemberOutcome::Applied { dispatches } => {
+                        self.applied_frames.insert(mid);
+                        (Disposition::Applied, dispatches, None)
+                    }
+                    // the host stringifies the reject error with its WRAPPED
+                    // Display (`Module(<verbatim>)`); unwrap it so a submitter's
+                    // held reply keeps matching the module's own prefix (duckfs-
+                    // client keys on "files: conflict:"). node-local only.
+                    MemberOutcome::Rejected { reason } => {
+                        (Disposition::Rejected, Vec::new(), Some(member_reason(reason)))
+                    }
+                };
+                self.drained.push(DrainedFrame {
+                    id: mid,
+                    height,
+                    disposition,
+                    app_hash: batch_hash,
+                    op: Some(DrainedOp {
+                        origin: op_origin,
+                        target: op_target,
+                        payload: op_payload,
+                        dispatches,
+                        latency_us,
+                    }),
+                    reason,
+                });
+            }
+            // members that failed to decode: recorded AFTER the outcome so they
+            // share the block app-hash. custody ends — a decode-fail can never
+            // apply, so it must not be carried at a cutover.
+            for mid in decode_fail {
+                self.outstanding.remove(&mid);
+                self.drained.push(DrainedFrame {
+                    id: mid,
+                    height,
+                    disposition: Disposition::Rejected,
+                    app_hash: batch_hash,
+                    op: None,
+                    reason: Some("frame decode/signature check failed".to_string()),
+                });
+            }
+            // the block-level seal disposition mirrors today's nop rule: Applied
+            // iff the batch MOVED state, else Rejected. exactly one seal per batch.
+            let block_disp = if batch_hash != pre_hash {
+                Disposition::Applied
+            } else {
+                Disposition::Rejected
+            };
+            self.seal(height, block_disp).await?;
+            last_sealed_view = Some(view);
+            // OBSERVATION BARRIER (once per batch): end the drain right after a
+            // batch that moved the watched root, so a once-per-drain observer
+            // sees this batch's view — the same observation point on every
+            // validator, regardless of how deliveries batched locally.
+            if let Some(before) = watched_before {
+                let module = self
+                    .watch_module
+                    .as_deref()
+                    .expect("watched_before implies watch_module");
+                if self.host.module_root(module) != before {
+                    break;
+                }
             }
         }
         if let Some(view) = last_view {

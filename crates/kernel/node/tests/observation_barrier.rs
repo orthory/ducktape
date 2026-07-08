@@ -40,34 +40,42 @@ async fn get(node: &OrderedNode<RoundOrderer>, module: &str, key: &str) -> Optio
     }
 }
 
-/// two order-independent modules; "watched" stands in for valset. ops that
-/// change the watched root end their batch; ops that leave every root of the
-/// watched module unchanged (including a same-value overwrite) do not.
+/// two order-independent modules; "dir_b" stands in for valset (the watched
+/// module). ops that change the watched root end their batch; ops that leave
+/// every root of the watched module unchanged (including a same-value
+/// overwrite) do not.
+///
+/// each op is submitted then FLUSHED into its OWN single-member batch, so the
+/// observation barrier (now once per BATCH) still splits per op. the module
+/// names ("dir_a"/"dir_b", both 5 bytes), 2-byte keys and 1-byte values keep
+/// EVERY member frame the SAME length, so the orderer's byte-sort over the
+/// single-member batch super-frames is exactly `seq` order — the per-view
+/// structure the pre-batch per-op frames had.
 #[test]
 fn batch_ends_at_the_block_that_moves_the_watched_root() {
     block_on(async {
         let host = Host::genesis(vec![
-            Box::new(Directory::new("directory")),
-            Box::new(Directory::new("watched")),
+            Box::new(Directory::new("dir_a")),
+            Box::new(Directory::new("dir_b")),
         ])
         .expect("genesis");
         let mut node = OrderedNode::new(host, RoundOrderer::new());
-        node.watch_module("watched");
+        node.watch_module("dir_b");
 
-        // four frames finalize in ONE round: bystander, watched-change,
+        // four one-op batches finalize in ONE round: bystander, watched-change,
         // bystander, bystander. the drain must stop AT the watched change.
-        node.submit(&sk(1), 0, set("directory", "d0", "x"))
-            .await
-            .expect("submit");
-        node.submit(&sk(1), 1, set("watched", "w0", "joined"))
-            .await
-            .expect("submit");
-        node.submit(&sk(1), 2, set("directory", "d1", "x"))
-            .await
-            .expect("submit");
-        node.submit(&sk(1), 3, set("directory", "d2", "x"))
-            .await
-            .expect("submit");
+        for (seq, op) in [
+            set("dir_a", "d0", "x"),
+            set("dir_b", "w0", "j"),
+            set("dir_a", "d1", "x"),
+            set("dir_a", "d2", "x"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            node.submit(&sk(1), seq as u64, op).await.expect("submit");
+            node.flush_batch().await.expect("flush");
+        }
 
         assert_eq!(
             node.drain_delivered().await.expect("drain"),
@@ -79,45 +87,50 @@ fn batch_ends_at_the_block_that_moves_the_watched_root() {
             Some(1),
             "the observer sees exactly the changing block's view"
         );
-        assert_eq!(get(&node, "watched", "w0").await.as_deref(), Some("joined"));
+        assert_eq!(get(&node, "dir_b", "w0").await.as_deref(), Some("j"));
         assert_eq!(
-            get(&node, "directory", "d1").await,
+            get(&node, "dir_a", "d1").await,
             None,
             "the remainder is deferred"
         );
 
         // the deferred remainder drains next call, ahead of fresh deliveries.
-        node.submit(&sk(1), 4, set("directory", "d3", "x"))
+        node.submit(&sk(1), 4, set("dir_a", "d3", "x"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 3);
         assert_eq!(node.last_engine_view(), Some(4));
-        assert_eq!(get(&node, "directory", "d1").await.as_deref(), Some("x"));
-        assert_eq!(get(&node, "directory", "d3").await.as_deref(), Some("x"));
+        assert_eq!(get(&node, "dir_a", "d1").await.as_deref(), Some("x"));
+        assert_eq!(get(&node, "dir_a", "d3").await.as_deref(), Some("x"));
 
         // a root-idempotent write to the watched module (same key, same value)
-        // is NOT a change — no barrier, the whole batch drains.
-        node.submit(&sk(1), 5, set("watched", "w0", "joined"))
+        // is NOT a change — no barrier, both batches drain.
+        node.submit(&sk(1), 5, set("dir_b", "w0", "j"))
             .await
             .expect("submit");
-        node.submit(&sk(1), 6, set("directory", "d4", "x"))
+        node.flush_batch().await.expect("flush");
+        node.submit(&sk(1), 6, set("dir_a", "d4", "x"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(
             node.drain_delivered().await.expect("drain"),
             2,
             "idempotent write does not split"
         );
-        assert_eq!(get(&node, "directory", "d4").await.as_deref(), Some("x"));
+        assert_eq!(get(&node, "dir_a", "d4").await.as_deref(), Some("x"));
 
         // two watched changes in one round: each ends its own batch, so each
         // is observed at its own view.
-        node.submit(&sk(1), 7, set("watched", "w1", "a"))
+        node.submit(&sk(1), 7, set("dir_b", "w1", "a"))
             .await
             .expect("submit");
-        node.submit(&sk(1), 8, set("watched", "w2", "b"))
+        node.flush_batch().await.expect("flush");
+        node.submit(&sk(1), 8, set("dir_b", "w2", "b"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(node.last_engine_view(), Some(7));
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);

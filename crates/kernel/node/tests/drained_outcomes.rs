@@ -51,6 +51,9 @@ fn drained_outcomes_correlate_submits_with_dispositions() {
             .expect("submit rejectable op");
         assert_ne!(ok_id, bad_id, "distinct frames get distinct ids");
 
+        // both ops flush into ONE batch -> ONE block at ONE height with TWO
+        // member outcomes sharing the block app-hash.
+        node.flush_batch().await.expect("flush");
         node.drain_delivered().await.expect("drain");
         let drained = node.take_drained();
         assert_eq!(drained.len(), 2, "every finalized frame gets an outcome");
@@ -127,6 +130,7 @@ fn frames_past_the_ceiling_drain_as_discarded() {
             .submit(&signer, 0, dir_set("k", "v"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         node.set_view_ceiling(0); // every view >= 0 is past the cutover.
 
         node.drain_delivered().await.expect("drain");
