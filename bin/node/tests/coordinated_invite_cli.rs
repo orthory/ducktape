@@ -385,3 +385,89 @@ fn coordinated_only_invite_on_a_tun_node_fails_honestly() {
         "the honest terminal exits with a distinct non-zero code (never a silent success):\n{log}"
     );
 }
+
+/// Regression: an UNREACHABLE ambient coordinator must NOT take down the whole
+/// reachability plane. A socket-mode node whose only coordinator is a blackhole
+/// used to hard-fail at plane bring-up ("plane not started"), which then made
+/// every subsequent first-contact send fail with "reachability plane is gone" —
+/// killing even DIRECT joins that never needed a coordinator (and silently
+/// overriding a founder's `--primary-coordinator none`). The plane must instead
+/// degrade to pass-through: rendezvous off, direct/front paths still live, node
+/// stays up.
+#[test]
+fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let founder = dir.path().join("founder");
+
+    // a socket-mode network whose only coordinator is an unroutable blackhole
+    // (RFC5737 TEST-NET-3 — guaranteed never to answer).
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        .args([
+            "init",
+            "--name",
+            "coordinator-degrade",
+            "--dir",
+            founder.to_str().expect("utf-8 founder dir"),
+            "--wireguard-effect",
+            "socket",
+            "--primary-coordinator",
+            "203.0.113.1:3478",
+        ])
+        .output()
+        .expect("run init");
+    assert!(
+        init.status.success(),
+        "init failed:\n{}",
+        command_output(&init)
+    );
+
+    // the node never exits on its own here (a healthy solo founder runs
+    // forever), so we drive our own deadline: poll the log until the plane
+    // either DEGRADES (pass) or refuses to start (fail), then tear the node
+    // down. Returning on the first decisive line keeps the test fast.
+    let log_path = dir.path().join("founder-run.log");
+    let out = std::fs::File::create(&log_path).expect("create node log");
+    let err = out.try_clone().expect("clone node log handle");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        .arg("--config")
+        .arg(founder.join("node.toml"))
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .expect("spawn ducktape-node");
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut log = String::new();
+    let degraded = loop {
+        log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains("coordinator rendezvous unavailable") {
+            break true;
+        }
+        if log.contains("plane not started") {
+            break false;
+        }
+        if Instant::now() >= deadline || child.try_wait().expect("poll node").is_some() {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let still_running = child.try_wait().expect("poll node").is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        degraded,
+        "an unreachable coordinator must DEGRADE the plane (\"coordinator rendezvous \
+         unavailable\"), never refuse to start it:\n{log}"
+    );
+    assert!(
+        !log.contains("plane not started"),
+        "the reachability plane must START (degraded), never hard-fail, on a dead \
+         coordinator — else direct/front joins break:\n{log}"
+    );
+    assert!(
+        still_running,
+        "the node must keep running to serve direct/front paths, not exit, on a dead \
+         coordinator:\n{log}"
+    );
+}

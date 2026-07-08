@@ -5023,12 +5023,25 @@ async fn reachability_plane(
             };
             match resolver {
                 Ok(resolver) => resolver,
+                // An unreachable coordinator must NOT take down the whole plane.
+                // The WireGuard underlay is already bound, and DIRECT / front
+                // candidates (InstallInvitePeer + this node's own initiations)
+                // need no rendezvous at all. Degrade to the pass-through
+                // resolver so those paths still come up; only COORDINATED
+                // (by-identity) candidates go dark until a coordinator responds.
+                // This keeps a fully-direct / self-hosted join working even when
+                // the ambient default coordinator is firewalled, down, or a
+                // founder disabled coordination outright.
                 Err(err) => {
                     eprintln!(
-                        "[node {label}] reachability: nat client on the shared underlay \
-                         failed: {err} — plane not started"
+                        "[node {label}] reachability: coordinator rendezvous unavailable \
+                         ({err}) — continuing WITHOUT rendezvous (direct/front paths still \
+                         work; coordinated-by-identity paths disabled until a coordinator \
+                         responds)"
                     );
-                    return;
+                    reachability::NatResolver::bind(me, Vec::new(), None)
+                        .await
+                        .expect("empty-coordinator pass-through resolver is infallible")
                 }
             }
         }
@@ -5036,12 +5049,18 @@ async fn reachability_plane(
             let auth = Some((signer.clone(), coord_cap));
             match reachability::NatResolver::bind(me, coords.clone(), auth).await {
                 Ok(resolver) => resolver,
+                // Same degrade-don't-die rule on the TUN/fake path: a dead
+                // coordinator disables coordinated candidates, never direct ones.
                 Err(err) => {
                     eprintln!(
-                        "[node {label}] reachability: nat client bind failed: {err} — plane \
-                         not started"
+                        "[node {label}] reachability: coordinator rendezvous unavailable \
+                         ({err}) — continuing WITHOUT rendezvous (direct/front paths still \
+                         work; coordinated-by-identity paths disabled until a coordinator \
+                         responds)"
                     );
-                    return;
+                    reachability::NatResolver::bind(me, Vec::new(), None)
+                        .await
+                        .expect("empty-coordinator pass-through resolver is infallible")
                 }
             }
         }
