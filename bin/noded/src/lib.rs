@@ -603,6 +603,18 @@ impl NodeHandle {
         (handle, cmd_rx, event_tx)
     }
 
+    /// swap the blob store for a persistent one rooted at `root` (write-
+    /// through to `<root>/<sha256-hex>`, disk fallback on a memory miss) so
+    /// node-local blobs — an agent's registered prompt above all — survive a
+    /// daemon restart. still never consensus state, never in any root. must
+    /// run BEFORE any [`Self::blob_handle`] clone is handed out (the daemons
+    /// chain it right after [`Self::channel`]); an unusable root is a loud
+    /// startup error, not a silently-forgetful store.
+    pub fn with_blob_root(mut self, root: impl Into<PathBuf>) -> std::io::Result<Self> {
+        self.blobs = crate::blobs::BlobHandle::persistent(root)?;
+        Ok(self)
+    }
+
     /// point this handle at the forge module's on-disk repo base dir so the git
     /// upload-pack (clone/fetch) handler can open `<forge_repo>/<name>` and serve
     /// its objects. the daemon passes the SAME base it hands `Forge::with_blobs`,

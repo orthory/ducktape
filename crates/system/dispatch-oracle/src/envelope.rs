@@ -110,7 +110,8 @@ pub async fn prepare(
             let bytes = resolver(&hash).await.ok_or_else(|| {
                 format!(
                     "agent {:?}'s prompt blob {hex} is not in this node's blob \
-                     store; refusing to run on the generic instructions instead",
+                     store; refusing to run on the generic instructions instead \
+                     — re-save the agent's prompt from the app to restore it",
                     envelope.agent_id
                 )
             })?;
@@ -233,6 +234,10 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("not in this node's blob store"), "got {err:?}");
         assert!(err.contains(&hex), "names the blob: {err:?}");
+        assert!(
+            err.contains("re-save the agent's prompt from the app to restore it"),
+            "ends with the remedy: {err:?}"
+        );
 
         // a blob that is not utf-8.
         let resolver = resolver_with([7u8; 32], vec![0xff, 0xfe]);

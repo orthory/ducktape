@@ -105,6 +105,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (handle, cmd_rx, event_tx) = NodeHandle::channel();
     let handle = handle
+        // persist node-local blobs (op receipts, agent prompt pins) under
+        // <storage>/blobstore so a daemon restart keeps serving them.
+        .with_blob_root(storage.join("blobstore"))?
         .with_forge_repo(forge_repo.clone())
         .with_index_store(index.clone())
         // the duckfs workspace RPC materializes managed checkouts here (disk

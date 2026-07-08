@@ -5284,6 +5284,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
     let http_handle = http_handle
+        // persist node-local blobs (op receipts, agent prompt pins) under
+        // <storage>/blobstore so a daemon restart keeps serving them.
+        .with_blob_root(storage.join("blobstore"))?
         .with_forge_repo(storage.join("forge-repo"))
         .with_index_store(index.clone())
         .with_call(voice_lane)
