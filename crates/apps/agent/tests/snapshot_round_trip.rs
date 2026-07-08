@@ -339,6 +339,6 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     // the untouched stream still installs — the rejection above is the
     // ordering check, not an artifact of the splicing.
     let mut dst = module();
-    dst.install(&snap, good_root.clone()).unwrap();
+    dst.install(&snap, good_root).unwrap();
     assert_eq!(dst.root(), good_root);
 }

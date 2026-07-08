@@ -548,7 +548,7 @@ fn signed_record_verifies_owner_and_rejects_tamper_and_cross_domain() {
 
     // an advertisement signature over the same record must not verify under
     // the record domain.
-    let version = compute_mesh_version(&[record.clone()]).unwrap();
+    let version = compute_mesh_version(std::slice::from_ref(&record)).unwrap();
     let ad = EndpointAdvertisement::sign(record.clone(), version, &a);
     let grafted = SignedEndpointRecord {
         record,

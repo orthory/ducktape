@@ -437,17 +437,16 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
         .expect("spawn ducktape-node");
 
     let deadline = Instant::now() + Duration::from_secs(25);
-    let mut log = String::new();
-    let degraded = loop {
-        log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let (degraded, log) = loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
         if log.contains("coordinator rendezvous unavailable") {
-            break true;
+            break (true, log);
         }
         if log.contains("plane not started") {
-            break false;
+            break (false, log);
         }
         if Instant::now() >= deadline || child.try_wait().expect("poll node").is_some() {
-            break false;
+            break (false, log);
         }
         std::thread::sleep(Duration::from_millis(100));
     };

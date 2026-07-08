@@ -1023,6 +1023,7 @@ impl statesync::ObjectFetch for FilesOdb<'_> {
 /// retries (a busy source moves its qmdb targets past the captured boundary;
 /// the caller refetches the manifest and tries again, and metrics labels
 /// must not collide).
+#[allow(clippy::too_many_arguments)]
 async fn sync_all_modules<C: statesync::SyncClient>(
     context: &commonware_runtime::tokio::Context,
     client: &C,
@@ -2278,10 +2279,10 @@ fn resume_resident_keys(
 
 fn advance_next_seq_from_frames(next_seq: &mut u64, frames: &[Vec<u8>], me: &[u8]) {
     for frame in frames {
-        if let Some((origin, seq)) = node::frame_origin_seq(frame) {
-            if origin == me {
-                *next_seq = (*next_seq).max(seq + 1);
-            }
+        if let Some((origin, seq)) = node::frame_origin_seq(frame)
+            && origin == me
+        {
+            *next_seq = (*next_seq).max(seq + 1);
         }
     }
 }
@@ -4686,7 +4687,6 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// in-memory fake when `wireguard_effect = "fake"` opts out. every failure
 /// path prints and returns — the plane is an overlay on a working node,
 /// never a reason to take the node down.
-#[allow(clippy::too_many_arguments)]
 /// Wire the staged WireGuard reachability plane onto an already-registered
 /// mesh channel: the orchestrator runs on its own plain-tokio OS thread (the
 /// app-surface split exactly), and two pump tasks bridge it — mesh datagrams
@@ -5476,7 +5476,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     let bootstrappers: Vec<(ed25519::PublicKey, _)> = bootstrappers
         .into_iter()
         .chain(mesh_dial_seeds)
-        .map(|(k, a)| (k, a.into()))
         .collect();
 
     for (i, pk) in peers.iter().enumerate() {
@@ -6164,53 +6163,56 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 context.child("lobby_replies").spawn(move |_ctx| async move {
                     while let Ok((peer, msg)) = lobby_rx.recv().await {
                         let bytes: Vec<u8> = msg.into();
-                        match lobby::decode_msg(&bytes) {
-                            Ok(lobby::LobbyMsg::JoinReply { recorded, detail, cap, fatal }) => {
-                                println!(
-                                    "[node {label}] member {}: {}{detail}",
-                                    hex_bytes(&peer.as_ref()[..4]),
-                                    if recorded { "" } else { "join request refused — " },
+                        if let Ok(lobby::LobbyMsg::JoinReply {
+                            recorded,
+                            detail,
+                            cap,
+                            fatal,
+                        }) = lobby::decode_msg(&bytes)
+                        {
+                            println!(
+                                "[node {label}] member {}: {}{detail}",
+                                hex_bytes(&peer.as_ref()[..4]),
+                                if recorded { "" } else { "join request refused — " },
+                            );
+                            if fatal {
+                                // this invite can NEVER redeem (e.g. its
+                                // single-use token is already spent by
+                                // another key) — retrying is a silent
+                                // forever-spin. stop loudly: the FATAL
+                                // marker is the app/operator contract.
+                                eprintln!(
+                                    "[node {label}] FATAL: {detail} — this invite cannot \
+                                     be redeemed (an invite admits exactly one person). \
+                                     ask the inviter for a fresh invite and re-join with \
+                                     the new blob."
                                 );
-                                if fatal {
-                                    // this invite can NEVER redeem (e.g. its
-                                    // single-use token is already spent by
-                                    // another key) — retrying is a silent
-                                    // forever-spin. stop loudly: the FATAL
-                                    // marker is the app/operator contract.
-                                    eprintln!(
-                                        "[node {label}] FATAL: {detail} — this invite cannot \
-                                         be redeemed (an invite admits exactly one person). \
-                                         ask the inviter for a fresh invite and re-join with \
-                                         the new blob."
-                                    );
-                                    std::process::exit(1);
-                                }
-                                // a delivered cap (private coordination): unpack
-                                // the opaque bytes and persist beside identity.
-                                if let Some(cap_bytes) = cap {
-                                    match config::unpack_coord_cap(&cap_bytes) {
-                                        Ok(cap) => match config::save_coord_cap(&cap_dir, &cap) {
-                                            Ok(()) => println!(
-                                                "[node {label}] coordinator cap delivered by \
-                                                 member {} — saved (issuer {}, expires {})",
-                                                hex_bytes(&peer.as_ref()[..4]),
-                                                hex_bytes(&cap.issuer.as_ref()[..4]),
-                                                cap.not_after,
-                                            ),
-                                            Err(e) => eprintln!(
-                                                "[node {label}] coordinator cap delivered but \
-                                                 could not be saved: {e}"
-                                            ),
-                                        },
-                                        Err(e) => eprintln!(
-                                            "[node {label}] member {} sent a malformed \
-                                             coordinator cap: {e}",
+                                std::process::exit(1);
+                            }
+                            // a delivered cap (private coordination): unpack
+                            // the opaque bytes and persist beside identity.
+                            if let Some(cap_bytes) = cap {
+                                match config::unpack_coord_cap(&cap_bytes) {
+                                    Ok(cap) => match config::save_coord_cap(&cap_dir, &cap) {
+                                        Ok(()) => println!(
+                                            "[node {label}] coordinator cap delivered by \
+                                             member {} — saved (issuer {}, expires {})",
                                             hex_bytes(&peer.as_ref()[..4]),
+                                            hex_bytes(&cap.issuer.as_ref()[..4]),
+                                            cap.not_after,
                                         ),
-                                    }
+                                        Err(e) => eprintln!(
+                                            "[node {label}] coordinator cap delivered but \
+                                             could not be saved: {e}"
+                                        ),
+                                    },
+                                    Err(e) => eprintln!(
+                                        "[node {label}] member {} sent a malformed \
+                                         coordinator cap: {e}",
+                                        hex_bytes(&peer.as_ref()[..4]),
+                                    ),
                                 }
                             }
-                            Ok(_) | Err(_) => {}
                         }
                     }
                 });
@@ -6340,6 +6342,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // one seq number, never a reuse), ship to one current validator
             // round-robin. Err is immediate — nothing is held on it, and
             // `relay_round` advances only on an actual send attempt.
+            #[allow(clippy::too_many_arguments)]
             fn relay_submit_frame<S: P2pSender<PublicKey = ed25519::PublicKey>>(
                 signer: &ed25519::PrivateKey,
                 relay_seq_file: &std::path::Path,
@@ -6821,35 +6824,35 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // ViewTicks run — within the advert TTL's generous window).
                 // Nothing is sent before standing: no member would admit the
                 // gossip yet.
-                if let Some(cmd) = &reach_cmd {
-                    if m.residents.iter().any(|k| k == &me_bytes) {
-                        let clock = m.view_base.max(m.height);
+                if let Some(cmd) = &reach_cmd
+                    && m.residents.iter().any(|k| k == &me_bytes)
+                {
+                    let clock = m.view_base.max(m.height);
+                    let _ = cmd
+                        .send(reachability::ReachabilityCommand::ViewTick(clock))
+                        .await;
+                    if last_plane_epoch != Some(m.epoch) {
+                        let members: Vec<ed25519::PublicKey> = m
+                            .participants
+                            .iter()
+                            .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                            .collect();
+                        let standbys: Vec<ed25519::PublicKey> = m
+                            .residents
+                            .iter()
+                            .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                            .collect();
                         let _ = cmd
-                            .send(reachability::ReachabilityCommand::ViewTick(clock))
+                            .send(reachability::ReachabilityCommand::Retarget(
+                                reachability::MeshEpochEvent {
+                                    epoch: m.epoch,
+                                    members,
+                                    standbys,
+                                    current_view: clock,
+                                },
+                            ))
                             .await;
-                        if last_plane_epoch != Some(m.epoch) {
-                            let members: Vec<ed25519::PublicKey> = m
-                                .participants
-                                .iter()
-                                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-                                .collect();
-                            let standbys: Vec<ed25519::PublicKey> = m
-                                .residents
-                                .iter()
-                                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-                                .collect();
-                            let _ = cmd
-                                .send(reachability::ReachabilityCommand::Retarget(
-                                    reachability::MeshEpochEvent {
-                                        epoch: m.epoch,
-                                        members,
-                                        standbys,
-                                        current_view: clock,
-                                    },
-                                ))
-                                .await;
-                            last_plane_epoch = Some(m.epoch);
-                        }
+                        last_plane_epoch = Some(m.epoch);
                     }
                 }
                 if !m.participants.iter().any(|k| k == &me_bytes) {
@@ -6879,7 +6882,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         // no checkpoint manifest is written (a restart parks
                         // again cleanly), and `promote` catches up only a
                         // small delta.
-                        if serving.as_ref().map_or(true, |(h, _)| m.height > *h) {
+                        if serving.as_ref().is_none_or(|(h, _)| m.height > *h) {
                             if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
                                 eprintln!(
                                     "[node {label}] FATAL: cannot observe this network — {e}"
@@ -7222,11 +7225,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 eprintln!("[node {label}] FATAL: promotion checkpoint write: {e}");
                 std::process::exit(1);
             }
-            if let Some(fc) = &floor {
-                if let Err(e) = recovery.write_floor_cert(fc).await {
-                    eprintln!("[node {label}] FATAL: promotion floor-cert write: {e}");
-                    std::process::exit(1);
-                }
+            if let Some(fc) = &floor
+                && let Err(e) = recovery.write_floor_cert(fc).await
+            {
+                eprintln!("[node {label}] FATAL: promotion floor-cert write: {e}");
+                std::process::exit(1);
             }
             // tear the pre-warm interface down cleanly before the exec: the
             // in-process boringtun device dies with the process either way,
@@ -7255,19 +7258,20 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         let mut boot_fold = IndexFold::new(&index, blobs.clone());
         // (height, oplog position) for the pump's prune bookkeeping, and the
         // manifest that recovery used as its replay baseline).
+        type BootState = (
+            Host,
+            Option<recovery::Recovered>,
+            u64,
+            (Option<u64>, u64),
+            Option<Manifest>,
+        );
         let (
             mut host,
             mut resumed,
             mut next_seq,
             mut prev_ckpt,
             mut recovery_manifest_for_resume,
-        ): (
-            Host,
-            Option<recovery::Recovered>,
-            u64,
-            (Option<u64>, u64),
-            Option<Manifest>,
-        ) = match manifest.clone() {
+        ): BootState = match manifest.clone() {
             None => {
                 // a journal without a checkpoint is damage, not a fresh dir —
                 // booting genesis over it would silently fork this node.
@@ -7708,8 +7712,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 std::process::exit(1);
                             }
                         };
-                        if target.epoch > resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0) {
-                            if let Err(e) = node::BlockSink::cutover(
+                        if target.epoch > resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0)
+                            && let Err(e) = node::BlockSink::cutover(
                                 &mut recovery,
                                 target.epoch,
                                 target.view_base,
@@ -7717,12 +7721,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 &target.residents,
                             )
                             .await
-                            {
+                        {
                                 eprintln!(
                                     "[node {label}] FATAL: catch-up cutover journal write: {e}"
                                 );
                                 std::process::exit(1);
-                            }
                         }
                         let me_bytes = signer.public_key().as_ref().to_vec();
                         advance_next_seq_from_frames(
@@ -7830,10 +7833,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                         };
                         host = synced;
-                        if target.epoch
-                            > resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0)
-                        {
-                            if let Err(e) = node::BlockSink::cutover(
+                        if target.epoch > resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0)
+                            && let Err(e) = node::BlockSink::cutover(
                                 &mut recovery,
                                 target.epoch,
                                 target.view_base,
@@ -7841,12 +7842,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 &target.residents,
                             )
                             .await
-                            {
+                        {
                                 eprintln!(
                                     "[node {label}] FATAL: full-sync cutover journal write: {e}"
                                 );
                                 std::process::exit(1);
-                            }
                         }
                         let pos = recovery.oplog_pos().await;
                         let ckpt = match Manifest::capture(
@@ -8007,17 +8007,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // pending upgrade at the same deterministic activation boundary an
         // uninterrupted node would use. This runs after post-reboot catch-up, so
         // it reads the freshest recovered host/record.
-        if pending_boot.is_none() {
-            if let Some(rec) = resumed.as_ref() {
-                pending_boot = read_upgrade_state(&host).await.pending.and_then(|p| {
-                    let crossed = rec.height.is_some_and(|h| h >= p.activation_height);
-                    if crossed {
-                        None
-                    } else {
-                        p.activation_height.checked_sub(rec.view_base)
-                    }
-                });
-            }
+        if pending_boot.is_none()
+            && let Some(rec) = resumed.as_ref()
+        {
+            pending_boot = read_upgrade_state(&host).await.pending.and_then(|p| {
+                let crossed = rec.height.is_some_and(|h| h >= p.activation_height);
+                if crossed {
+                    None
+                } else {
+                    p.activation_height.checked_sub(rec.view_base)
+                }
+            });
         }
 
         // the statesync INGRESS task: owns the channel receiver and loops a
@@ -8769,14 +8769,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // drain loop above already folded each block into the
                     // metrics series; this tip seam carries the ws block
                     // summary only — it fires once per drain.
-                    if let Some(f) = node.finalized() {
-                        if last_published != Some(f.height) {
-                            let _ = http_events.send(noded::WsFrame::Block(noded::BlockSummary {
-                                height: f.height,
-                                app_hash: hex(&f.app_hash),
-                            }));
-                            last_published = Some(f.height);
-                        }
+                    if let Some(f) = node.finalized()
+                        && last_published != Some(f.height)
+                    {
+                        let _ = http_events.send(noded::WsFrame::Block(noded::BlockSummary {
+                            height: f.height,
+                            app_hash: hex(&f.app_hash),
+                        }));
+                        last_published = Some(f.height);
                     }
 
                     // persist the finalization floor once everything at or
@@ -8785,24 +8785,25 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // zero gate proves the cert's view is fully applied — a
                     // floor ahead of app state would suppress replay of
                     // finalized ops a restart still needs.
-                    if let Some((view, cert)) = node.orderer().latest_finalization() {
-                        if view != 0 && node.orderer().unreleased_len() == 0 {
-                            let height = orchestrator.app_height(view);
-                            if last_cert_height.is_none_or(|h| height > h) {
-                                let fc = recovery::FloorCert {
-                                    epoch: orchestrator.epoch(),
-                                    height,
-                                    cert,
-                                };
-                                match node.sink_mut().write_floor_cert(&fc).await {
-                                    Ok(()) => {
-                                        last_cert_height = Some(height);
-                                        latest_floor = Some(fc);
-                                    }
-                                    Err(e) => eprintln!(
-                                        "[node {label}] floor cert write failed (will retry): {e}"
-                                    ),
+                    if let Some((view, cert)) = node.orderer().latest_finalization()
+                        && view != 0
+                        && node.orderer().unreleased_len() == 0
+                    {
+                        let height = orchestrator.app_height(view);
+                        if last_cert_height.is_none_or(|h| height > h) {
+                            let fc = recovery::FloorCert {
+                                epoch: orchestrator.epoch(),
+                                height,
+                                cert,
+                            };
+                            match node.sink_mut().write_floor_cert(&fc).await {
+                                Ok(()) => {
+                                    last_cert_height = Some(height);
+                                    latest_floor = Some(fc);
                                 }
+                                Err(e) => eprintln!(
+                                    "[node {label}] floor cert write failed (will retry): {e}"
+                                ),
                             }
                         }
                     }
@@ -8811,51 +8812,48 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // prune the op journal below the PREVIOUS checkpoint once
                     // the persisted floor has passed it (pruned frames must
                     // never be needed to resolve a re-reported finalization).
-                    if blocks_since_checkpoint >= checkpoint_blocks {
-                        if let Some(f) = node.finalized() {
-                            let pos = node.sink_mut().oplog_pos().await;
-                            let (cv, pu) = read_upgrade_version_fields(node.host()).await;
-                            let captured = Manifest::capture(
-                                node.host(),
-                                Some(f.height),
-                                orchestrator.epoch(),
-                                orchestrator.epoch_base(),
-                                participant_bytes(&orchestrator),
-                                resident_bytes(&orchestrator),
-                                orchestrator.pending_cutover().map(|c| c.cutover_view()),
-                                cv,
-                                pu,
-                                pos,
-                                next_seq,
-                            );
-                            match captured {
-                                Ok(m) => match node.sink_mut().write_manifest(&m).await {
-                                    Ok(()) => {
-                                        blocks_since_checkpoint = 0;
-                                        let floor_passed = matches!(
-                                            node.sink_mut().floor_cert(),
-                                            Ok(Some(fc))
-                                                if prev_ckpt.0.is_none_or(|h| fc.height >= h)
-                                        );
-                                        if floor_passed {
-                                            if let Err(e) =
-                                                node.sink_mut().prune_oplog(prev_ckpt.1).await
-                                            {
-                                                eprintln!(
-                                                    "[node {label}] oplog prune failed: {e}"
-                                                );
-                                            }
-                                        }
-                                        prev_ckpt = (m.height, pos);
+                    if blocks_since_checkpoint >= checkpoint_blocks
+                        && let Some(f) = node.finalized()
+                    {
+                        let pos = node.sink_mut().oplog_pos().await;
+                        let (cv, pu) = read_upgrade_version_fields(node.host()).await;
+                        let captured = Manifest::capture(
+                            node.host(),
+                            Some(f.height),
+                            orchestrator.epoch(),
+                            orchestrator.epoch_base(),
+                            participant_bytes(&orchestrator),
+                            resident_bytes(&orchestrator),
+                            orchestrator.pending_cutover().map(|c| c.cutover_view()),
+                            cv,
+                            pu,
+                            pos,
+                            next_seq,
+                        );
+                        match captured {
+                            Ok(m) => match node.sink_mut().write_manifest(&m).await {
+                                Ok(()) => {
+                                    blocks_since_checkpoint = 0;
+                                    let floor_passed = matches!(
+                                        node.sink_mut().floor_cert(),
+                                        Ok(Some(fc))
+                                            if prev_ckpt.0.is_none_or(|h| fc.height >= h)
+                                    );
+                                    if floor_passed
+                                        && let Err(e) =
+                                            node.sink_mut().prune_oplog(prev_ckpt.1).await
+                                    {
+                                        eprintln!("[node {label}] oplog prune failed: {e}");
                                     }
-                                    Err(e) => eprintln!(
-                                        "[node {label}] checkpoint write failed (will retry): {e}"
-                                    ),
-                                },
+                                    prev_ckpt = (m.height, pos);
+                                }
                                 Err(e) => eprintln!(
-                                    "[node {label}] checkpoint capture failed (will retry): {e}"
+                                    "[node {label}] checkpoint write failed (will retry): {e}"
                                 ),
-                            }
+                            },
+                            Err(e) => eprintln!(
+                                "[node {label}] checkpoint capture failed (will retry): {e}"
+                            ),
                         }
                     }
 
@@ -8924,19 +8922,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         // boundary read in `respawn_if_due`. inert until the module is
                         // registered (`read_upgrade_state` returns baseline/no-pending).
                         let boundary_upgrade = read_upgrade_state(node.host()).await;
-                        if let Some(pending) = &boundary_upgrade.pending {
-                            if let consensus::ObservationOutcome::Scheduled(cutover) =
+                        if let Some(pending) = &boundary_upgrade.pending
+                            && let consensus::ObservationOutcome::Scheduled(cutover) =
                                 orchestrator.observe_upgrade(engine_view, pending.activation_height)
-                            {
-                                println!(
-                                    "[node {label}] upgrade '{}' armed — cutover to epoch {} at view {} (activation height {})",
-                                    pending.name,
-                                    cutover.next_epoch(),
-                                    cutover.cutover_view(),
-                                    pending.activation_height
-                                );
-                                node.set_view_ceiling(cutover.cutover_view());
-                            }
+                        {
+                            println!(
+                                "[node {label}] upgrade '{}' armed — cutover to epoch {} at view {} (activation height {})",
+                                pending.name,
+                                cutover.next_epoch(),
+                                cutover.cutover_view(),
+                                pending.activation_height
+                            );
+                            node.set_view_ceiling(cutover.cutover_view());
                         }
                         if let Some(plan) = orchestrator.respawn_if_due(
                             engine_view,
@@ -9820,11 +9817,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // nothing. an unleased boundary cannot hold an
                             // attachment — handle() below answers it with the
                             // proper refetch error either way.
-                            if let statesync::SyncRequest::IndexModules { boundary } = &req {
-                                if !sync_server.index_attached(*boundary) {
-                                    let _ = sync_server
-                                        .attach_index(*boundary, ship_index_blobs(&index, &label));
-                                }
+                            if let statesync::SyncRequest::IndexModules { boundary } = &req
+                                && !sync_server.index_attached(*boundary)
+                            {
+                                let _ = sync_server
+                                    .attach_index(*boundary, ship_index_blobs(&index, &label));
                             }
                             // the boundary's consensus coordinates ride the manifest.
                             // the floor certificate is served only when it certifies

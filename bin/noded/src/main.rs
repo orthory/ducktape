@@ -366,6 +366,7 @@ fn unix_millis() -> u64 {
 /// commit the caller's op, then drain worker follow-ups (each its own block).
 /// the returned summary is the block that INCLUDED the caller's op — follow-up
 /// blocks reach clients over the ws stream, not this reply.
+#[allow(clippy::too_many_arguments)]
 async fn submit_and_drain(
     host: &mut Host,
     workers: &[Box<dyn reactor::Worker>],
@@ -438,6 +439,7 @@ async fn submit_and_drain(
     Ok(included)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_one(
     host: &mut Host,
     height: &mut u64,
@@ -575,4 +577,3 @@ async fn offer_effects(
         }
     }
 }
-

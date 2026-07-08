@@ -621,10 +621,10 @@ fn take_count(buf: &mut &[u8], min_entry_bytes: u64, what: &str) -> Result<u64, 
 
 /// enforce strictly-ascending map keys while inserting.
 fn insert_ascending<V>(map: &mut BTreeMap<String, V>, key: String, value: V) -> Result<(), String> {
-    if let Some((last, _)) = map.iter().next_back() {
-        if last.as_str() >= key.as_str() {
-            return Err("snapshot keys not strictly ascending".into());
-        }
+    if let Some((last, _)) = map.iter().next_back()
+        && last.as_str() >= key.as_str()
+    {
+        return Err("snapshot keys not strictly ascending".into());
     }
     map.insert(key, value);
     Ok(())
@@ -798,11 +798,9 @@ impl RunsModule {
             agent.clone(),
         ]);
         let mut expected = 6;
-        for optional in [&tasks, &jobs] {
-            if let Some(module) = optional {
-                ids.insert(module.clone());
-                expected += 1;
-            }
+        for module in [&tasks, &jobs].into_iter().flatten() {
+            ids.insert(module.clone());
+            expected += 1;
         }
         assert_eq!(
             ids.len(),
@@ -1061,6 +1059,7 @@ impl RunsModule {
     /// it (P2). the recipe is the agent's own (`agent/{agent_id}`, registered
     /// by the registry hook); the result lands as a next-block `ResultEvent`
     /// keyed by the dispatch id, which prunes the entry staged here.
+    #[allow(clippy::too_many_arguments)]
     fn stage_dispatch_run(
         &mut self,
         ctx: &mut dyn Ctx,
@@ -1825,17 +1824,16 @@ impl RunsModule {
                 Self::admin_origin(&ctx.env().origin)?;
                 Self::validate_non_empty("channel_id", &channel_id)?;
                 reject_run_separator("channel_id", &channel_id)?;
-                if let TurnPolicy::Assigned(assignee) = &policy {
-                    if self
+                if let TurnPolicy::Assigned(assignee) = &policy
+                    && self
                         .agent_record(&*ctx, assignee)
                         .await
                         .map_err(Error::Module)?
                         .is_none()
-                    {
-                        return Err(Error::Module(format!(
-                            "assigned agent is not registered: {assignee}"
-                        )));
-                    }
+                {
+                    return Err(Error::Module(format!(
+                        "assigned agent is not registered: {assignee}"
+                    )));
                 }
                 // the watch and the plane subscription are ONE atomic unit
                 // (P2): if the tagging plane rejects the subscription (bad
@@ -2199,21 +2197,21 @@ mod tests {
             self.env.consensus_time = view;
             self
         }
-        fn from_origin(mut self, origin: Origin) -> Self {
+        fn with_origin(mut self, origin: Origin) -> Self {
             self.env.origin = origin;
             self
         }
-        fn from_tagging(self) -> Self {
-            self.from_origin(Origin::Module("tagging".into()))
+        fn with_tagging_origin(self) -> Self {
+            self.with_origin(Origin::Module("tagging".into()))
         }
-        fn from_dispatch(self) -> Self {
-            self.from_origin(Origin::Module("dispatch".into()))
+        fn with_dispatch_origin(self) -> Self {
+            self.with_origin(Origin::Module("dispatch".into()))
         }
-        fn from_jobs(self) -> Self {
-            self.from_origin(Origin::Module("jobs".into()))
+        fn with_jobs_origin(self) -> Self {
+            self.with_origin(Origin::Module("jobs".into()))
         }
-        fn from_agent(self) -> Self {
-            self.from_origin(Origin::Module("agent".into()))
+        fn with_agent_origin(self) -> Self {
+            self.with_origin(Origin::Module("agent".into()))
         }
         fn with_registry(mut self, registry: &Registry) -> Self {
             self.agents = registry.clone();
@@ -2561,7 +2559,7 @@ mod tests {
     fn watched(policy: TurnPolicy, registry: &Registry) -> RunsModule {
         let mut m = module();
         let mut ctx = CaptureCtx::new()
-            .from_origin(user(9))
+            .with_origin(user(9))
             .with_registry(registry);
         exec(
             &mut m,
@@ -2585,7 +2583,7 @@ mod tests {
     ) -> CaptureCtx {
         let mut ctx = CaptureCtx::new()
             .at(seq)
-            .from_tagging()
+            .with_tagging_origin()
             .with_registry(registry)
             .with_transcript("general", transcript(seq));
         let tags = mentioned.iter().map(|a| agent_tag(a)).collect();
@@ -2612,7 +2610,7 @@ mod tests {
     #[test]
     fn a_registered_agent_event_registers_the_dispatch_recipe() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().from_agent();
+        let mut ctx = CaptureCtx::new().with_agent_origin();
         exec(
             &mut m,
             &mut ctx,
@@ -2652,7 +2650,7 @@ mod tests {
     #[test]
     fn a_capability_change_event_retunes_the_dispatch_recipe() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().from_agent();
+        let mut ctx = CaptureCtx::new().with_agent_origin();
         exec(
             &mut m,
             &mut ctx,
@@ -2683,7 +2681,7 @@ mod tests {
         // hook ERRORS, aborting the registration block — the atomic recipe
         // seam (the registry record must never land without its recipe).
         let oversized = "x".repeat(dispatch::MAX_ID_BYTES);
-        let mut ctx = CaptureCtx::new().from_agent();
+        let mut ctx = CaptureCtx::new().with_agent_origin();
         let err = exec(
             &mut m,
             &mut ctx,
@@ -2697,7 +2695,7 @@ mod tests {
 
         // malformed bytes from the registry origin error the same way — the
         // registry is genesis-trusted code, so this is a bug, not traffic.
-        let mut ctx = CaptureCtx::new().from_agent();
+        let mut ctx = CaptureCtx::new().with_agent_origin();
         let err = exec(
             &mut m,
             &mut ctx,
@@ -2717,7 +2715,7 @@ mod tests {
         let registry = registry(&[]);
         let mut m = module();
         let mut ctx = CaptureCtx::new()
-            .from_origin(user(9))
+            .with_origin(user(9))
             .with_registry(&registry);
         exec(
             &mut m,
@@ -2740,7 +2738,7 @@ mod tests {
 
         // an Assigned policy must name a registered agent.
         let mut ctx = CaptureCtx::new()
-            .from_origin(user(9))
+            .with_origin(user(9))
             .with_registry(&registry);
         let err = exec(
             &mut m,
@@ -2755,7 +2753,7 @@ mod tests {
         abort(&mut m);
 
         // unwatch removes the watch and drops the plane subscription.
-        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        let mut ctx = CaptureCtx::new().with_origin(user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -2775,7 +2773,7 @@ mod tests {
 
         // unwatching an unwatched channel stages and emits NOTHING.
         let before = m.root();
-        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        let mut ctx = CaptureCtx::new().with_origin(user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -2793,7 +2791,7 @@ mod tests {
     fn enable_job_worker_is_admin_gated_and_emits_self_registration() {
         let mut m = module();
 
-        let mut intruder = CaptureCtx::new().from_origin(Origin::System);
+        let mut intruder = CaptureCtx::new().with_origin(Origin::System);
         let err = exec(
             &mut m,
             &mut intruder,
@@ -2803,7 +2801,7 @@ mod tests {
         assert!(matches!(err, Error::Module(_)));
         abort(&mut m);
 
-        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        let mut ctx = CaptureCtx::new().with_origin(user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -2813,7 +2811,7 @@ mod tests {
         assert_eq!(ctx.job_msgs(), vec![JobsMsg::RegisterWorker {}]);
         commit(&mut m);
 
-        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        let mut ctx = CaptureCtx::new().with_origin(user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -2833,7 +2831,7 @@ mod tests {
             Some("tasks".into()),
             None,
         );
-        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        let mut ctx = CaptureCtx::new().with_origin(user(9));
         let err = exec(
             &mut without_jobs,
             &mut ctx,
@@ -2854,7 +2852,7 @@ mod tests {
         // unregistered agent — only bot1 engages.
         let mut ctx = CaptureCtx::new()
             .at(3)
-            .from_tagging()
+            .with_tagging_origin()
             .with_registry(&registry)
             .with_transcript("general", transcript(3));
         exec(
@@ -2941,7 +2939,7 @@ mod tests {
         let mut m = watched(TurnPolicy::All, &registry);
 
         // the registration hook fires as it would in the record's block.
-        let mut hook_ctx = CaptureCtx::new().from_agent().with_registry(&registry);
+        let mut hook_ctx = CaptureCtx::new().with_agent_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut hook_ctx,
@@ -2964,7 +2962,7 @@ mod tests {
         // the owner rotates the prompt; the registry hook only ever carries
         // capability retunes — process one to show it is orthogonal.
         registry.get_mut("bot").unwrap().prompt_hash = vec![9u8; PROMPT_HASH_LEN];
-        let mut hook_ctx = CaptureCtx::new().from_agent().with_registry(&registry);
+        let mut hook_ctx = CaptureCtx::new().with_agent_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut hook_ctx,
@@ -3082,7 +3080,7 @@ mod tests {
         let before = m.root();
 
         // an engagement whose source is not chat: dropped with a breadcrumb.
-        let mut ctx = CaptureCtx::new().at(2).from_tagging().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(2).with_tagging_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -3103,7 +3101,7 @@ mod tests {
 
         // a direct chat-origin follow-up (no hook is ever registered now):
         // dead-lettered, never an abort of the posting block.
-        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("chat".into()));
+        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("chat".into()));
         exec(
             &mut m,
             &mut ctx,
@@ -3117,7 +3115,7 @@ mod tests {
 
         // a saga-origin callback (a foreign trigger's reply_to pointed here):
         // dead-lettered — an Err would abort the saga's terminal block.
-        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("saga".into()));
+        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("saga".into()));
         exec(
             &mut m,
             &mut ctx,
@@ -3143,7 +3141,7 @@ mod tests {
         // within a block): no-op, never an error.
         let mut ctx = CaptureCtx::new()
             .at(2)
-            .from_tagging()
+            .with_tagging_origin()
             .with_registry(&registry)
             .with_transcript("random", transcript(2));
         exec(&mut m, &mut ctx, &engagement("random", 2, vec![])).unwrap();
@@ -3151,7 +3149,7 @@ mod tests {
 
         // a failing context pin (the ctx serves NO transcript at all — the
         // chat query errors) must not poison the posting block: Ok, no run.
-        let mut ctx = CaptureCtx::new().at(2).from_tagging().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(2).with_tagging_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
         assert!(ctx.dispatch_msgs().is_empty(), "no dispatch on a failed pin");
         assert!(!ctx.events.is_empty(), "the skip leaves a breadcrumb event");
@@ -3176,7 +3174,7 @@ mod tests {
         // staged no-op (first in consensus order won)...
         let mut ctx = CaptureCtx::new()
             .at(2)
-            .from_origin(user(5))
+            .with_origin(user(5))
             .with_registry(&registry)
             .with_transcript("general", transcript(2));
         exec(
@@ -3219,7 +3217,7 @@ mod tests {
 
         let mut ctx = CaptureCtx::new()
             .at(9)
-            .from_tagging()
+            .with_tagging_origin()
             .with_registry(&registry)
             .with_transcript("general", transcript(2))
             .with_taken_dispatch(&taken);
@@ -3228,7 +3226,7 @@ mod tests {
 
         let mut ctx = CaptureCtx::new()
             .at(9)
-            .from_origin(user(5))
+            .with_origin(user(5))
             .with_registry(&registry)
             .with_transcript("general", transcript(2))
             .with_taken_dispatch(&taken);
@@ -3259,7 +3257,7 @@ mod tests {
         let mut m = watched(TurnPolicy::All, &registry);
         let root = m.root();
 
-        let mut ctx = CaptureCtx::new().from_origin(user(9)).with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_origin(user(9)).with_registry(&registry);
         let err = exec(
             &mut m,
             &mut ctx,
@@ -3273,7 +3271,7 @@ mod tests {
         abort(&mut m);
 
         let mut ctx = CaptureCtx::new()
-            .from_origin(user(1))
+            .with_origin(user(1))
             .with_registry(&registry)
             .with_transcript("bad\u{1f}channel", transcript(1));
         let err = exec(
@@ -3289,7 +3287,7 @@ mod tests {
         assert!(matches!(err, Error::Module(message) if message.contains("unit separator")));
         abort(&mut m);
 
-        let mut ctx = CaptureCtx::new().from_jobs().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_jobs_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -3299,7 +3297,7 @@ mod tests {
         assert!(ctx.msgs.is_empty(), "no claim emitted for a bad job id");
 
         // a spec that does not hash to spec_hash is dropped the same way.
-        let mut ctx = CaptureCtx::new().from_jobs().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_jobs_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -3329,7 +3327,7 @@ mod tests {
         let before = m.root();
 
         // garbage from the tagging origin: the posting block must survive.
-        let mut ctx = CaptureCtx::new().from_tagging();
+        let mut ctx = CaptureCtx::new().with_tagging_origin();
         exec(
             &mut m,
             &mut ctx,
@@ -3343,7 +3341,7 @@ mod tests {
         assert!(!ctx.events.is_empty(), "the drop leaves a breadcrumb");
 
         // garbage from the dispatch origin: the delivery block must survive.
-        let mut ctx = CaptureCtx::new().from_dispatch();
+        let mut ctx = CaptureCtx::new().with_dispatch_origin();
         exec(
             &mut m,
             &mut ctx,
@@ -3356,7 +3354,7 @@ mod tests {
         assert!(ctx.msgs.is_empty());
 
         // garbage from the jobs origin: the submit block must survive.
-        let mut ctx = CaptureCtx::new().from_jobs();
+        let mut ctx = CaptureCtx::new().with_jobs_origin();
         exec(
             &mut m,
             &mut ctx,
@@ -3369,7 +3367,7 @@ mod tests {
         assert!(ctx.msgs.is_empty());
 
         // a well-formed result event for an UNKNOWN dispatch: staged no-op.
-        let mut ctx = CaptureCtx::new().from_dispatch();
+        let mut ctx = CaptureCtx::new().with_dispatch_origin();
         exec(&mut m, &mut ctx, &result_event("ghost-run", Ok(Vec::new()))).unwrap();
 
         commit(&mut m);
@@ -3385,7 +3383,7 @@ mod tests {
         // RunsMsg decoder and fail there — no run is ever created.
         let mut ctx = CaptureCtx::new()
             .at(2)
-            .from_origin(user(1))
+            .with_origin(user(1))
             .with_registry(&registry)
             .with_transcript("general", transcript(2));
         let err = exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap_err();
@@ -3397,7 +3395,7 @@ mod tests {
         engage_post(&mut m, &registry, 2, &[]);
         commit(&mut m);
         let run_id = run_id_for("general", 2, "bot");
-        let mut ctx = CaptureCtx::new().from_origin(user(1));
+        let mut ctx = CaptureCtx::new().with_origin(user(1));
         let err = exec(&mut m, &mut ctx, &result_event(&run_id, Ok(Vec::new()))).unwrap_err();
         assert!(matches!(err, Error::Module(_)));
         abort(&mut m);
@@ -3428,7 +3426,7 @@ mod tests {
         ]);
         let mut ctx = CaptureCtx::new()
             .at(8)
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_transcript("general", transcript(2));
         exec(
@@ -3502,7 +3500,7 @@ mod tests {
         ));
         let mut ctx = CaptureCtx::new()
             .at(3)
-            .from_tagging()
+            .with_tagging_origin()
             .with_registry(&registry)
             .with_transcript("general", thread_transcript.clone());
         exec(&mut m, &mut ctx, &engagement("general", 3, vec![])).unwrap();
@@ -3519,7 +3517,7 @@ mod tests {
 
         let mut ctx = CaptureCtx::new()
             .at(9)
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_transcript("general", thread_transcript);
         exec(
@@ -3610,7 +3608,7 @@ mod tests {
             ]);
             let mut ctx = CaptureCtx::new()
                 .at(8)
-                .from_dispatch()
+                .with_dispatch_origin()
                 .with_registry(&registry)
                 .with_transcript("general", transcript(2))
                 .with_task("t0");
@@ -3681,7 +3679,7 @@ mod tests {
             let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
             let mut ctx = CaptureCtx::new()
                 .at(8)
-                .from_dispatch()
+                .with_dispatch_origin()
                 .with_registry(&registry)
                 .with_transcript("general", transcript(2));
             exec(&mut m, &mut ctx, &result_event(&run_id, Ok(bytes))).unwrap();
@@ -3698,7 +3696,7 @@ mod tests {
         let raw = r#"{"reply_blocks":[{"id":"b1","kind":"paragraph","text":"hello"},{"kind":"code","lang":"rust","text":"fn main() {}"},{"kind":"Alien","text":"dropped"},{"kind":"paragraph","text":"  "}],"actions":[]}"#;
         let mut ctx = CaptureCtx::new()
             .at(8)
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_transcript("general", transcript(2));
         exec(
@@ -3734,7 +3732,7 @@ mod tests {
         let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"QUACKTEST! Hello there.\"}],\"actions\":[]}\n```";
         let mut ctx = CaptureCtx::new()
             .at(8)
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_transcript("general", transcript(2));
         exec(
@@ -3804,7 +3802,7 @@ mod tests {
         // an agent granted ONLY chat.post must not create tasks...
         let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
         let mut ctx = CaptureCtx::new()
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_transcript("general", transcript(2));
         exec(
@@ -3846,7 +3844,7 @@ mod tests {
         // the old breadcrumb-only silence holds.
         let (mut m, registry, run_id) = awaiting_run(&[ACTION_TASKS_CREATE]);
         let mut ctx = CaptureCtx::new()
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_transcript("general", transcript(2));
         exec(
@@ -3883,7 +3881,7 @@ mod tests {
             None,
         );
         let mut ctx = CaptureCtx::new()
-            .from_origin(user(9))
+            .with_origin(user(9))
             .with_registry(&registry);
         exec(
             &mut m,
@@ -3900,7 +3898,7 @@ mod tests {
         let run_id = run_id_for("general", 2, "bot");
 
         let mut ctx = CaptureCtx::new()
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_transcript("general", transcript(2));
         exec(
@@ -3938,7 +3936,7 @@ mod tests {
         let mut squatted = transcript(2);
         squatted[1].head.message_id = reply_message_id(&run_id);
         let mut ctx = CaptureCtx::new()
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_transcript("general", squatted);
         exec(
@@ -3969,7 +3967,7 @@ mod tests {
         let full = vec![root, anchor];
         let mut ctx = CaptureCtx::new()
             .at(2)
-            .from_tagging()
+            .with_tagging_origin()
             .with_registry(&registry)
             .with_transcript("general", full.clone());
         exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
@@ -3977,7 +3975,7 @@ mod tests {
         let run_id = run_id_for("general", 2, "bot");
 
         let mut ctx = CaptureCtx::new()
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_transcript("general", full);
         exec(
@@ -4013,7 +4011,7 @@ mod tests {
         ));
         let mut ctx = CaptureCtx::new()
             .at(2)
-            .from_tagging()
+            .with_tagging_origin()
             .with_registry(&registry)
             .with_transcript("general", thread_transcript.clone());
         exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
@@ -4025,7 +4023,7 @@ mod tests {
         // reason's newlines collapse into the single-paragraph excerpt.
         let mut ctx = CaptureCtx::new()
             .at(20)
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_transcript("general", thread_transcript.clone());
         exec(
@@ -4054,7 +4052,7 @@ mod tests {
         // only — the one-reply-per-run dedup holds.
         let mut ctx = CaptureCtx::new()
             .at(21)
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_transcript("general", thread_transcript);
         exec(
@@ -4079,7 +4077,7 @@ mod tests {
         let (mut m, registry, run_id) = awaiting_run(&[]);
         let mut ctx = CaptureCtx::new()
             .at(20)
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry);
         exec(
             &mut m,
@@ -4127,7 +4125,7 @@ mod tests {
     fn a_job_submit_claims_and_dispatches_with_the_spec_payload() {
         let registry = job_registry();
         let mut m = module();
-        let mut ctx = CaptureCtx::new().at(3).from_jobs().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -4200,7 +4198,7 @@ mod tests {
         let registry = job_registry();
         let mut m = module();
         let spec = "x".repeat(MAX_PAYLOAD_BYTES);
-        let mut ctx = CaptureCtx::new().at(3).from_jobs().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", &spec)).unwrap();
         assert!(ctx.msgs.is_empty(), "no claim and no dispatch may land");
         let breadcrumbs: Vec<String> = ctx
@@ -4225,18 +4223,18 @@ mod tests {
         let root = m.root();
 
         // an unregistered agent kind: no claim, no dispatch, no entry.
-        let mut ctx = CaptureCtx::new().at(2).from_jobs().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(2).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("j", "agent/ghost", "s")).unwrap();
         assert!(ctx.msgs.is_empty());
 
         // a non-agent kind is somebody else's job.
-        let mut ctx = CaptureCtx::new().at(2).from_jobs().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(2).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("j", "render/video", "s")).unwrap();
         assert!(ctx.msgs.is_empty());
 
         // a paused agent never claims.
         pause(&mut registry, "duck");
-        let mut ctx = CaptureCtx::new().at(2).from_jobs().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(2).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("j", "agent/duck", "s")).unwrap();
         assert!(ctx.msgs.is_empty());
         commit(&mut m);
@@ -4248,7 +4246,7 @@ mod tests {
     fn a_job_result_finalizes_the_board_and_emits_actions() {
         let registry = job_registry();
         let mut m = module();
-        let mut ctx = CaptureCtx::new().at(3).from_jobs().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
         commit(&mut m);
         let run_id = job_run_id_for("job-1", "duck", 3);
@@ -4262,7 +4260,7 @@ mod tests {
         );
         let mut ctx = CaptureCtx::new()
             .at(10)
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_claimed_job("job-1", 3);
         exec(&mut m, &mut ctx, &result_event(&run_id, Ok(bytes.clone()))).unwrap();
@@ -4300,14 +4298,14 @@ mod tests {
     fn a_failed_job_result_finalizes_with_error_detail() {
         let registry = job_registry();
         let mut m = module();
-        let mut ctx = CaptureCtx::new().at(3).from_jobs().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
         commit(&mut m);
         let run_id = job_run_id_for("job-1", "duck", 3);
 
         let mut ctx = CaptureCtx::new()
             .at(10)
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_claimed_job("job-1", 3);
         exec(
@@ -4340,14 +4338,14 @@ mod tests {
         // finalizes the job as failed.
         let registry = job_registry();
         let mut m = module();
-        let mut ctx = CaptureCtx::new().at(3).from_jobs().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
         commit(&mut m);
         let run_id = job_run_id_for("job-1", "duck", 3);
 
         let mut ctx = CaptureCtx::new()
             .at(10)
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_claimed_job("job-1", 3);
         exec(
@@ -4375,14 +4373,14 @@ mod tests {
         // stale run's delivery must not finalize the new episode.
         let registry = job_registry();
         let mut m = module();
-        let mut ctx = CaptureCtx::new().at(3).from_jobs().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
         commit(&mut m);
         let run_id = job_run_id_for("job-1", "duck", 3);
 
         let mut ctx = CaptureCtx::new()
             .at(2000)
-            .from_dispatch()
+            .with_dispatch_origin()
             .with_registry(&registry)
             .with_claimed_job("job-1", 1005);
         exec(
@@ -4425,19 +4423,19 @@ mod tests {
 
         // unknown agent, empty origin, missing anchor, anchor 0: all errors.
         let mut ctx = CaptureCtx::new()
-            .from_origin(user(1))
+            .with_origin(user(1))
             .with_registry(&registry)
             .with_transcript("general", transcript(3));
         assert!(exec(&mut m, &mut ctx, &request("ghost", 3)).is_err());
         abort(&mut m);
         let mut ctx = CaptureCtx::new()
-            .from_origin(Origin::External(Vec::new()))
+            .with_origin(Origin::External(Vec::new()))
             .with_registry(&registry)
             .with_transcript("general", transcript(3));
         assert!(exec(&mut m, &mut ctx, &request("bot", 3)).is_err());
         abort(&mut m);
         let mut ctx = CaptureCtx::new()
-            .from_origin(user(1))
+            .with_origin(user(1))
             .with_registry(&registry)
             .with_transcript("general", transcript(3));
         assert!(
@@ -4451,7 +4449,7 @@ mod tests {
         // a paused agent cannot be explicitly run either.
         pause(&mut registry, "bot");
         let mut ctx = CaptureCtx::new()
-            .from_origin(user(1))
+            .with_origin(user(1))
             .with_registry(&registry)
             .with_transcript("general", transcript(3));
         assert!(exec(&mut m, &mut ctx, &request("bot", 3)).is_err());
@@ -4462,7 +4460,7 @@ mod tests {
         registry.get_mut("bot").unwrap().status = AgentStatus::Active;
         let mut ctx = CaptureCtx::new()
             .at(6)
-            .from_origin(user(1))
+            .with_origin(user(1))
             .with_registry(&registry)
             .with_transcript("general", transcript(3));
         exec(&mut m, &mut ctx, &request("bot", 3)).unwrap();
@@ -4478,7 +4476,7 @@ mod tests {
         let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
         let mut m = watched(TurnPolicy::Mention, &registry);
         let mut ctx = CaptureCtx::new()
-            .from_origin(user(1))
+            .with_origin(user(1))
             .with_registry(&registry)
             .with_transcript("general", transcript(3));
         exec(
@@ -4498,11 +4496,11 @@ mod tests {
         });
 
         // a foreign origin (neither requester user(1) nor owner user(9)).
-        let mut ctx = CaptureCtx::new().from_origin(user(2)).with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_origin(user(2)).with_registry(&registry);
         assert!(exec(&mut m, &mut ctx, &cancel).is_err());
         abort(&mut m);
         // an unknown run is an error too.
-        let mut ctx = CaptureCtx::new().from_origin(user(1)).with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_origin(user(1)).with_registry(&registry);
         assert!(
             exec(
                 &mut m,
@@ -4518,7 +4516,7 @@ mod tests {
         // the REQUESTER cancels: the dispatch plane is told; the entry STAYS
         // pending — the plane's Err("cancelled") delivery is the one result
         // path that prunes it.
-        let mut ctx = CaptureCtx::new().at(7).from_origin(user(1)).with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(7).with_origin(user(1)).with_registry(&registry);
         exec(&mut m, &mut ctx, &cancel).unwrap();
         assert_eq!(
             ctx.dispatch_msgs(),
@@ -4532,7 +4530,7 @@ mod tests {
         // the plane's Err("cancelled") delivery prunes the entry. it rides
         // the ONE result path, so it surfaces like any failed run — a
         // threaded ⚠ reply, never silence.
-        let mut ctx = CaptureCtx::new().from_dispatch().with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_dispatch_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -4555,7 +4553,7 @@ mod tests {
         // cancelling the now-delivered run is an idempotent no-op (the
         // dispatch record proves it existed); a truly unknown one errors.
         let mut ctx = CaptureCtx::new()
-            .from_origin(user(1))
+            .with_origin(user(1))
             .with_registry(&registry)
             .with_taken_dispatch(&dispatch_id_for(&run_id));
         exec(&mut m, &mut ctx, &cancel).unwrap();
@@ -4566,7 +4564,7 @@ mod tests {
         engage_post(&mut m, &registry, 2, &["bot"]);
         commit(&mut m);
         let engaged_run = run_id_for("general", 2, "bot");
-        let mut ctx = CaptureCtx::new().from_origin(user(9)).with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_origin(user(9)).with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -4590,7 +4588,7 @@ mod tests {
             // block 1: watch.
             let mut ctx = CaptureCtx::new()
                 .at(1)
-                .from_origin(user(9))
+                .with_origin(user(9))
                 .with_registry(&registry);
             exec(
                 &mut m,
@@ -4606,7 +4604,7 @@ mod tests {
             // block 2: an engagement engages bot.
             let mut ctx = CaptureCtx::new()
                 .at(2)
-                .from_tagging()
+                .with_tagging_origin()
                 .with_registry(&registry)
                 .with_transcript("general", transcript(2));
             exec(
@@ -4620,7 +4618,7 @@ mod tests {
             // block 3: the dispatch result lands and prunes.
             let mut ctx = CaptureCtx::new()
                 .at(3)
-                .from_dispatch()
+                .with_dispatch_origin()
                 .with_registry(&registry)
                 .with_transcript("general", transcript(2));
             exec(
@@ -4634,7 +4632,7 @@ mod tests {
             // block 4: a second watch.
             let mut ctx = CaptureCtx::new()
                 .at(4)
-                .from_origin(user(9))
+                .with_origin(user(9))
                 .with_registry(&registry);
             exec(
                 &mut m,
@@ -4661,7 +4659,7 @@ mod tests {
         let registry = registry(&[("a", &[]), ("b", &[])]);
         let mut m = watched(TurnPolicy::All, &registry);
         // watch a second channel and create runs in both.
-        let mut ctx = CaptureCtx::new().from_origin(user(9)).with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_origin(user(9)).with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -4675,7 +4673,7 @@ mod tests {
         engage_post(&mut m, &registry, 2, &[]);
         let mut ctx = CaptureCtx::new()
             .at(3)
-            .from_tagging()
+            .with_tagging_origin()
             .with_registry(&registry)
             .with_transcript(
                 "dev",

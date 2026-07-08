@@ -136,27 +136,24 @@ impl BlockSink for PinRecorder {
         self.0.borrow_mut().push(frame.to_vec());
         async { Ok(()) }
     }
-    fn pre_apply(
+    async fn pre_apply(
         &mut self,
         _height: u64,
         _frame: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        async { Ok(()) }
+    ) -> Result<(), node::Error> {
+        Ok(())
     }
-    fn seal(
-        &mut self,
-        _seal: &node::BlockSeal,
-    ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        async { Ok(()) }
+    async fn seal(&mut self, _seal: &node::BlockSeal) -> Result<(), node::Error> {
+        Ok(())
     }
-    fn cutover(
+    async fn cutover(
         &mut self,
         _epoch: u64,
         _view_base: u64,
         _participants: &[Vec<u8>],
         _residents: &[Vec<u8>],
-    ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        async { Ok(()) }
+    ) -> Result<(), node::Error> {
+        Ok(())
     }
 }
 

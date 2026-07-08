@@ -685,14 +685,14 @@ impl Host {
                 // fault — the node is stopping either way.
                 let mut fatal: Option<FatalError> = None;
                 for id in &touched {
-                    if let Some(m) = self.registry.get_mut(id) {
-                        if let Err(source) = m.abort_block().await {
-                            fatal.get_or_insert(FatalError {
-                                module: id.clone(),
-                                phase: BoundaryPhase::Abort,
-                                source,
-                            });
-                        }
+                    if let Some(m) = self.registry.get_mut(id)
+                        && let Err(source) = m.abort_block().await
+                    {
+                        fatal.get_or_insert(FatalError {
+                            module: id.clone(),
+                            phase: BoundaryPhase::Abort,
+                            source,
+                        });
                     }
                 }
                 match fatal {
@@ -771,14 +771,14 @@ impl Host {
                 // deterministic rejection.
                 let mut fatal: Option<FatalError> = None;
                 for id in &touched {
-                    if let Some(m) = self.registry.get_mut(id) {
-                        if let Err(source) = m.abort_block().await {
-                            fatal.get_or_insert(FatalError {
-                                module: id.clone(),
-                                phase: BoundaryPhase::Abort,
-                                source,
-                            });
-                        }
+                    if let Some(m) = self.registry.get_mut(id)
+                        && let Err(source) = m.abort_block().await
+                    {
+                        fatal.get_or_insert(FatalError {
+                            module: id.clone(),
+                            phase: BoundaryPhase::Abort,
+                            source,
+                        });
                     }
                 }
                 match fatal {

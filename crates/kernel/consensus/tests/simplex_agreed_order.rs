@@ -252,7 +252,7 @@ where
         // whole op-set — NOT on drain==0 (drain is 0 before the first finalization,
         // so a per-node "drain to 0" fixpoint would complete at genesis and fork).
         let target = ops.len();
-        let mut applied = vec![0usize; N];
+        let mut applied = [0usize; N];
         loop {
             context.sleep(Duration::from_millis(50)).await;
             for (i, n) in nodes.iter_mut().enumerate() {

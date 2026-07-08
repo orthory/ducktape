@@ -138,22 +138,22 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     const MIN_SCOPE_BYTES: u64 = 8 + 8;
     if scopes
         .checked_mul(MIN_SCOPE_BYTES)
-        .map_or(true, |need| need > buf.len() as u64)
+        .is_none_or(|need| need > buf.len() as u64)
     {
         return Err("snapshot scope count exceeds input".into());
     }
     for _ in 0..scopes {
         let key = take_lp_string(&mut buf)?;
-        if let Some((last, _)) = c.subscriptions.iter().next_back() {
-            if last.as_str() >= key.as_str() {
-                return Err("snapshot keys not strictly ascending".into());
-            }
+        if let Some((last, _)) = c.subscriptions.iter().next_back()
+            && last.as_str() >= key.as_str()
+        {
+            return Err("snapshot keys not strictly ascending".into());
         }
         let count = take_u64(&mut buf)?;
         const MIN_SUBSCRIBER_BYTES: u64 = 8;
         if count
             .checked_mul(MIN_SUBSCRIBER_BYTES)
-            .map_or(true, |need| need > buf.len() as u64)
+            .is_none_or(|need| need > buf.len() as u64)
         {
             return Err("snapshot subscriber count exceeds input".into());
         }
@@ -497,7 +497,7 @@ mod tests {
                 registered: vec!["chat", "agent", "pages", "tagging"],
             }
         }
-        fn from_origin(mut self, origin: Origin) -> Self {
+        fn with_origin(mut self, origin: Origin) -> Self {
             self.env.origin = origin;
             self
         }
@@ -536,7 +536,7 @@ mod tests {
         block_on(m.commit_block()).unwrap();
     }
     fn from_module(id: &str) -> CaptureCtx {
-        CaptureCtx::new().from_origin(Origin::Module(id.into()))
+        CaptureCtx::new().with_origin(Origin::Module(id.into()))
     }
     fn subscribe(source: &str, container: &str) -> TaggingMsg {
         TaggingMsg::Subscribe {
@@ -563,7 +563,7 @@ mod tests {
     fn ops_are_module_origin_only() {
         let mut m = module();
         for origin in [Origin::External(b"user".to_vec()), Origin::System] {
-            let mut ctx = CaptureCtx::new().from_origin(origin);
+            let mut ctx = CaptureCtx::new().with_origin(origin);
             assert!(exec(&mut m, &mut ctx, &subscribe("chat", "general")).is_err());
             assert!(exec(&mut m, &mut ctx, &user_tag("general", 1, vec![])).is_err());
         }
@@ -573,7 +573,7 @@ mod tests {
             target: "tagging".into(),
             payload: b"not json".to_vec(),
         };
-        let mut ctx = CaptureCtx::new().from_origin(Origin::External(b"user".to_vec()));
+        let mut ctx = CaptureCtx::new().with_origin(Origin::External(b"user".to_vec()));
         assert!(block_on(m.execute(&mut ctx, &garbage)).is_err());
         let mut ctx = from_module("chat");
         block_on(m.execute(&mut ctx, &garbage)).unwrap();

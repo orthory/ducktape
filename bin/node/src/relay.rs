@@ -126,7 +126,7 @@ mod tests {
         let me = author.public_key().as_ref().to_vec();
         let frame = node::encode_frame(&author, 3, &msg());
         // the sending peer is never consulted — standing rides on the ORIGIN.
-        let id = verify_relay_submit(&frame, &[me.clone()]).expect("accepted");
+        let id = verify_relay_submit(&frame, std::slice::from_ref(&me)).expect("accepted");
         assert_eq!(id, node::frame_id(&frame));
     }
 
@@ -153,8 +153,8 @@ mod tests {
 
         // it fails at signature verification, NOT as a parse error: a genuine
         // junk envelope errors with different wording.
-        let junk = verify_relay_submit(b"not a frame", &[me.clone()]).unwrap_err();
-        let err = verify_relay_submit(&tampered, &[me.clone()]).unwrap_err();
+        let junk = verify_relay_submit(b"not a frame", std::slice::from_ref(&me)).unwrap_err();
+        let err = verify_relay_submit(&tampered, std::slice::from_ref(&me)).unwrap_err();
         assert_ne!(err, junk, "tamper must fail at the signature, not the parser");
         assert!(err.contains("signature"), "{err}");
     }

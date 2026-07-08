@@ -182,10 +182,10 @@ fn collect_mentions(blocks: &[Block]) -> Vec<AuthorRef> {
         };
         for span in spans {
             for mark in &span.marks {
-                if let Mark::Mention(author) = mark {
-                    if !mentions.contains(author) {
-                        mentions.push(author.clone());
-                    }
+                if let Mark::Mention(author) = mark
+                    && !mentions.contains(author)
+                {
+                    mentions.push(author.clone());
                 }
             }
         }

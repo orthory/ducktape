@@ -560,11 +560,9 @@ impl RoundOrderer {
 }
 
 impl Orderer for RoundOrderer {
-    fn submit(&mut self, frame: Vec<u8>) -> impl std::future::Future<Output = Result<(), Error>> {
-        async move {
-            self.pending.push(frame);
-            Ok(())
-        }
+    async fn submit(&mut self, frame: Vec<u8>) -> Result<(), Error> {
+        self.pending.push(frame);
+        Ok(())
     }
 
     fn poll_delivered(&mut self) -> Vec<(u64, Vec<u8>)> {
@@ -605,11 +603,9 @@ impl ArrivalOrderer {
 }
 
 impl Orderer for ArrivalOrderer {
-    fn submit(&mut self, frame: Vec<u8>) -> impl std::future::Future<Output = Result<(), Error>> {
-        async move {
-            self.pending.push(frame);
-            Ok(())
-        }
+    async fn submit(&mut self, frame: Vec<u8>) -> Result<(), Error> {
+        self.pending.push(frame);
+        Ok(())
     }
 
     fn poll_delivered(&mut self) -> Vec<(u64, Vec<u8>)> {
@@ -779,27 +775,23 @@ pub trait BlockSink {
 pub struct NullSink;
 
 impl BlockSink for NullSink {
-    fn pin(&mut self, _frame: &[u8]) -> impl std::future::Future<Output = Result<(), Error>> {
-        async { Ok(()) }
+    async fn pin(&mut self, _frame: &[u8]) -> Result<(), Error> {
+        Ok(())
     }
-    fn pre_apply(
-        &mut self,
-        _height: u64,
-        _frame: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), Error>> {
-        async { Ok(()) }
+    async fn pre_apply(&mut self, _height: u64, _frame: &[u8]) -> Result<(), Error> {
+        Ok(())
     }
-    fn seal(&mut self, _seal: &BlockSeal) -> impl std::future::Future<Output = Result<(), Error>> {
-        async { Ok(()) }
+    async fn seal(&mut self, _seal: &BlockSeal) -> Result<(), Error> {
+        Ok(())
     }
-    fn cutover(
+    async fn cutover(
         &mut self,
         _epoch: u64,
         _view_base: u64,
         _participants: &[Vec<u8>],
         _residents: &[Vec<u8>],
-    ) -> impl std::future::Future<Output = Result<(), Error>> {
-        async { Ok(()) }
+    ) -> Result<(), Error> {
+        Ok(())
     }
 }
 
@@ -1113,10 +1105,10 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // frame (it was applied and sealed before the restart); the engine
             // re-reported it from its reopened journal. dropping it by agreed
             // height is the same deterministic no-op everywhere.
-            if let Some(floor) = self.applied_floor {
-                if height <= floor {
-                    continue;
-                }
+            if let Some(floor) = self.applied_floor
+                && height <= floor
+            {
+                continue;
             }
             let id = frame_id(&frame);
             // the CUTOVER CEILING: frames finalized at or past the agreed
@@ -1124,21 +1116,21 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // honest node, so a straggler finalizing during teardown on only
             // some nodes cannot fork app state. never journaled: a discarded
             // frame leaves no state for a restart to recover.
-            if let Some(ceiling) = self.view_ceiling {
-                if view >= ceiling {
-                    // a locally-accepted discard stays in `outstanding`: it
-                    // never applied anywhere, so the cutover carries it into
-                    // the new epoch (see [`OrderedNode::cutover`]).
-                    self.drained.push(DrainedFrame {
-                        id,
-                        height,
-                        disposition: Disposition::Discarded,
-                        app_hash: self.host.app_hash(),
-                        op: None,
-                        reason: None,
-                    });
-                    continue;
-                }
+            if let Some(ceiling) = self.view_ceiling
+                && view >= ceiling
+            {
+                // a locally-accepted discard stays in `outstanding`: it
+                // never applied anywhere, so the cutover carries it into
+                // the new epoch (see [`OrderedNode::cutover`]).
+                self.drained.push(DrainedFrame {
+                    id,
+                    height,
+                    disposition: Disposition::Discarded,
+                    app_hash: self.host.app_hash(),
+                    op: None,
+                    reason: None,
+                });
+                continue;
             }
             // below the ceiling this frame RESOLVES here — applied, or
             // rejected as a deterministic no-op — so custody ends (a frame

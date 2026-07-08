@@ -203,7 +203,7 @@ async fn run_late_join(mut context: deterministic::Context) {
     // PUMP to convergence: stop only when EVERY node (incl. the starved one, which
     // must FETCH four of five ops) has applied the whole op-set.
     let target = ops.len();
-    let mut applied = vec![0usize; N];
+    let mut applied = [0usize; N];
     loop {
         context.sleep(Duration::from_millis(50)).await;
         for (i, n) in nodes.iter_mut().enumerate() {

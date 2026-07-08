@@ -197,10 +197,10 @@ fn take_count(buf: &mut &[u8], min_entry_bytes: u64, what: &str) -> Result<u64, 
 
 /// enforce strictly-ascending map keys while inserting.
 fn insert_ascending<V>(map: &mut BTreeMap<String, V>, key: String, value: V) -> Result<(), String> {
-    if let Some((last, _)) = map.iter().next_back() {
-        if last.as_str() >= key.as_str() {
-            return Err("snapshot keys not strictly ascending".into());
-        }
+    if let Some((last, _)) = map.iter().next_back()
+        && last.as_str() >= key.as_str()
+    {
+        return Err("snapshot keys not strictly ascending".into());
     }
     map.insert(key, value);
     Ok(())
@@ -231,10 +231,10 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
         let actions = take_count(&mut buf, 8, "action")?;
         for _ in 0..actions {
             let action = take_lp_string(&mut buf)?;
-            if let Some(last) = allowed_actions.iter().next_back() {
-                if last.as_str() >= action.as_str() {
-                    return Err("snapshot actions not strictly ascending".into());
-                }
+            if let Some(last) = allowed_actions.iter().next_back()
+                && last.as_str() >= action.as_str()
+            {
+                return Err("snapshot actions not strictly ascending".into());
             }
             allowed_actions.insert(action);
         }
@@ -693,7 +693,7 @@ mod tests {
             self.env.consensus_time = view;
             self
         }
-        fn from_origin(mut self, origin: Origin) -> Self {
+        fn with_origin(mut self, origin: Origin) -> Self {
             self.env.origin = origin;
             self
         }
@@ -791,7 +791,7 @@ mod tests {
     #[test]
     fn register_validates_stages_an_active_agent_and_notifies_the_hook() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().at(3).from_origin(user(9));
+        let mut ctx = CaptureCtx::new().at(3).with_origin(user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -902,7 +902,7 @@ mod tests {
             ),
         ];
         for (origin, op) in cases {
-            let mut ctx = CaptureCtx::new().from_origin(origin.clone());
+            let mut ctx = CaptureCtx::new().with_origin(origin.clone());
             let err = exec(&mut m, &mut ctx, &admin(&op)).unwrap_err();
             assert!(matches!(err, Error::Module(_)), "{origin:?} / {op:?}");
             assert!(
@@ -917,7 +917,7 @@ mod tests {
     #[test]
     fn update_pause_resume_are_owner_gated() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        let mut ctx = CaptureCtx::new().with_origin(user(9));
         exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
         commit(&mut m);
 
@@ -937,14 +937,14 @@ mod tests {
                 agent_id: "bot".into(),
             },
         ] {
-            let mut ctx = CaptureCtx::new().from_origin(user(2));
+            let mut ctx = CaptureCtx::new().with_origin(user(2));
             let err = exec(&mut m, &mut ctx, &admin(&op)).unwrap_err();
             assert!(matches!(err, Error::Module(_)));
             abort(&mut m);
         }
 
         // the owner updates fields selectively and toggles status.
-        let mut ctx = CaptureCtx::new().at(5).from_origin(user(9));
+        let mut ctx = CaptureCtx::new().at(5).with_origin(user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -986,7 +986,7 @@ mod tests {
         assert_eq!(record.updated_at, 5);
 
         // an update that keeps the capability does NOT notify the hook.
-        let mut ctx = CaptureCtx::new().at(6).from_origin(user(9));
+        let mut ctx = CaptureCtx::new().at(6).with_origin(user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -1004,7 +1004,7 @@ mod tests {
 
         // pausing a paused agent stages nothing: root byte-identical.
         let paused_root = m.root();
-        let mut ctx = CaptureCtx::new().at(7).from_origin(user(9));
+        let mut ctx = CaptureCtx::new().at(7).with_origin(user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -1016,7 +1016,7 @@ mod tests {
         commit(&mut m);
         assert_eq!(m.root(), paused_root, "an idempotent pause is a no-op");
 
-        let mut ctx = CaptureCtx::new().at(8).from_origin(user(9));
+        let mut ctx = CaptureCtx::new().at(8).with_origin(user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -1033,7 +1033,7 @@ mod tests {
     fn a_direct_saga_callback_is_a_dead_letter() {
         let mut m = module();
         let root0 = m.root();
-        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("saga".into()));
+        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("saga".into()));
         // arbitrary (non-AgentMsg) bytes: the callback-poison rule says this
         // must be swallowed, never abort the saga's terminal block.
         exec(
@@ -1053,7 +1053,7 @@ mod tests {
     #[test]
     fn a_module_origin_may_own_an_agent() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("automations".into()));
+        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("automations".into()));
         exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
         commit(&mut m);
         assert_eq!(
@@ -1065,7 +1065,7 @@ mod tests {
     #[test]
     fn without_a_hook_registration_stages_but_notifies_nobody() {
         let mut m = AgentModule::new("agent", "saga", None);
-        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        let mut ctx = CaptureCtx::new().with_origin(user(9));
         exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
         assert!(ctx.msgs.is_empty(), "no hook, no follow-ups");
         commit(&mut m);
@@ -1077,7 +1077,7 @@ mod tests {
     #[test]
     fn queries_list_agents_staged_over_committed() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        let mut ctx = CaptureCtx::new().with_origin(user(9));
         exec(&mut m, &mut ctx, &admin(&register("alpha", &[]))).unwrap();
         commit(&mut m);
         exec(&mut m, &mut ctx, &admin(&register("beta", &[]))).unwrap();
@@ -1117,7 +1117,7 @@ mod tests {
         let run = || {
             let mut m = module();
             for (i, (origin, op)) in ops.iter().enumerate() {
-                let mut ctx = CaptureCtx::new().at(i as u64 + 1).from_origin(origin.clone());
+                let mut ctx = CaptureCtx::new().at(i as u64 + 1).with_origin(origin.clone());
                 exec(&mut m, &mut ctx, &admin(op)).unwrap();
                 commit(&mut m);
             }
@@ -1131,7 +1131,7 @@ mod tests {
     #[test]
     fn snapshots_install_only_under_their_own_root() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().at(1).from_origin(user(9));
+        let mut ctx = CaptureCtx::new().at(1).with_origin(user(9));
         exec(&mut m, &mut ctx, &admin(&register("alpha", &[ACTION_CHAT_POST]))).unwrap();
         exec(&mut m, &mut ctx, &admin(&register("beta", &[]))).unwrap();
         commit(&mut m);
@@ -1140,7 +1140,7 @@ mod tests {
         let root = m.root();
 
         let mut joiner = module();
-        joiner.install(&bytes, root.clone()).unwrap();
+        joiner.install(&bytes, root).unwrap();
         assert_eq!(joiner.root(), root);
         assert_eq!(
             list_agents(&joiner).len(),
@@ -1151,7 +1151,7 @@ mod tests {
         // a snapshot under a foreign root is rejected, leaving no trace.
         let mut fresh = module();
         let before = fresh.root();
-        assert!(fresh.install(&bytes, before.clone()).is_err());
+        assert!(fresh.install(&bytes, before).is_err());
         assert_eq!(fresh.root(), before);
 
         // truncated bytes never land.
@@ -1162,7 +1162,7 @@ mod tests {
     #[test]
     fn state_sync_handle_exposes_the_snapshot_bytes() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().from_origin(user(9));
+        let mut ctx = CaptureCtx::new().with_origin(user(9));
         exec(&mut m, &mut ctx, &admin(&register("alpha", &[]))).unwrap();
         commit(&mut m);
         match m.state_sync_handle().unwrap() {

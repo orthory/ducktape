@@ -216,9 +216,7 @@ impl Daemon {
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("ws read timeout");
         let mut stream = stream;
-        let req = format!(
-            "GET /v1/ws HTTP/1.1\r\nhost: 127.0.0.1\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-key: ZHVja3RhcGUtZTJlLXdzLWtleQ==\r\nsec-websocket-version: 13\r\n\r\n"
-        );
+        let req = "GET /v1/ws HTTP/1.1\r\nhost: 127.0.0.1\r\nupgrade: websocket\r\nconnection: upgrade\r\nsec-websocket-key: ZHVja3RhcGUtZTJlLXdzLWtleQ==\r\nsec-websocket-version: 13\r\n\r\n".to_string();
         stream
             .write_all(req.as_bytes())
             .expect("ws handshake write");

@@ -107,6 +107,7 @@ struct Handshake {
 
 /// the full signed a->b conversation: request (initiator), response
 /// (responder, optionally with relay fallback), ack (initiator).
+#[allow(clippy::too_many_arguments)]
 fn handshake(
     initiator: &PrivateKey,
     responder: &PrivateKey,

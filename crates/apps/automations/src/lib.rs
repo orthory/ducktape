@@ -388,10 +388,9 @@ impl Automations {
                 text_contains: Some(want),
                 ..
             } = &rule.trigger
+                && !text.contains(want.as_str())
             {
-                if !text.contains(want.as_str()) {
-                    continue;
-                }
+                continue;
             }
             if budget >= MAX_ACTIONS_PER_EVENT {
                 records.push(record(false, "action budget exceeded".into()));
@@ -609,18 +608,17 @@ impl Automations {
             mention,
             ..
         } = &rule.trigger;
-        if let Some(want) = trig_channel {
-            if want != channel_id {
-                return false;
-            }
+        if let Some(want) = trig_channel
+            && want != channel_id
+        {
+            return false;
         }
-        if let Some(want) = mention {
-            if !mentions
+        if let Some(want) = mention
+            && !mentions
                 .iter()
                 .any(|author| display_author(author).contains(want.as_str()))
-            {
-                return false;
-            }
+        {
+            return false;
         }
         true
     }
@@ -1225,12 +1223,12 @@ mod tests {
                 fail_query: false,
             }
         }
-        fn from_origin(mut self, origin: Origin) -> Self {
+        fn with_origin(mut self, origin: Origin) -> Self {
             self.env.origin = origin;
             self
         }
-        fn from_chat(self) -> Self {
-            self.from_origin(Origin::Module(CHAT.into()))
+        fn with_chat_origin(self) -> Self {
+            self.with_origin(Origin::Module(CHAT.into()))
         }
         fn with_transcript(mut self, channel: &str, messages: Vec<MessageView>) -> Self {
             self.channels.insert(channel.into());
@@ -1671,7 +1669,7 @@ mod tests {
     fn hook_event_from_non_chat_origin_is_rejected() {
         let mut m = module();
         // an explicit HookEvent wrapper from an external submitter is a spoof.
-        let mut ext = CaptureCtx::new().from_origin(Origin::External(vec![9; 4]));
+        let mut ext = CaptureCtx::new().with_origin(Origin::External(vec![9; 4]));
         let err = exec(
             &mut m,
             &mut ext,
@@ -1701,7 +1699,7 @@ mod tests {
         block_on(m.commit_block()).expect("commit");
 
         // a module-authored post (e.g. our own follow-up) never fires.
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut chat_ctx,
@@ -1737,7 +1735,7 @@ mod tests {
         .expect("create");
         block_on(m.commit_block()).expect("commit");
 
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut chat_ctx,
@@ -1777,7 +1775,7 @@ mod tests {
         .expect("create");
         block_on(m.commit_block()).expect("commit");
 
-        let mut chat_ctx = CaptureCtx::new().from_chat().with_channel("announce");
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_channel("announce");
         exec(
             &mut m,
             &mut chat_ctx,
@@ -1816,7 +1814,7 @@ mod tests {
         block_on(m.commit_block()).expect("commit");
 
         // wrong channel: no fire.
-        let mut wrong = CaptureCtx::new().from_chat();
+        let mut wrong = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut wrong,
@@ -1826,7 +1824,7 @@ mod tests {
         assert!(wrong.msgs.is_empty());
 
         // right channel: fires.
-        let mut right = CaptureCtx::new().from_chat();
+        let mut right = CaptureCtx::new().with_chat_origin();
         exec(&mut m, &mut right, &posted("ops", 1, user(1), Vec::new())).expect("fire");
         assert_eq!(right.task_msgs().len(), 1);
     }
@@ -1856,7 +1854,7 @@ mod tests {
             agent_id: "helper".into(),
         };
         // mention present -> fire.
-        let mut hit = CaptureCtx::new().from_chat();
+        let mut hit = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut hit,
@@ -1866,7 +1864,7 @@ mod tests {
         assert_eq!(hit.task_msgs().len(), 1);
 
         // no matching mention -> no fire.
-        let mut miss = CaptureCtx::new().from_chat();
+        let mut miss = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut miss,
@@ -1899,7 +1897,7 @@ mod tests {
             vec![Block::paragraph("please deploy now")],
         );
         let mut hit = CaptureCtx::new()
-            .from_chat()
+            .with_chat_origin()
             .with_transcript("general", vec![msg_hit]);
         exec(&mut m, &mut hit, &posted("general", 1, user(1), Vec::new())).expect("fire");
         let tasks = hit.task_msgs();
@@ -1917,7 +1915,7 @@ mod tests {
             vec![Block::paragraph("just chatting")],
         );
         let mut miss = CaptureCtx::new()
-            .from_chat()
+            .with_chat_origin()
             .with_transcript("general", vec![msg_miss]);
         exec(
             &mut m,
@@ -1959,7 +1957,7 @@ mod tests {
             vec![Block::paragraph("please review")],
         );
         let mut chat_ctx = CaptureCtx::new()
-            .from_chat()
+            .with_chat_origin()
             .with_transcript("general", vec![msg]);
         exec(
             &mut m,
@@ -2000,7 +1998,7 @@ mod tests {
         // the fetch fails -> the text-needing rule cannot be evaluated: a
         // recorded failure (never empty-text guessing), no emit, and crucially
         // the block is NOT aborted.
-        let mut ctx = CaptureCtx::new().failing_query().from_chat();
+        let mut ctx = CaptureCtx::new().failing_query().with_chat_origin();
         exec(&mut m, &mut ctx, &posted("general", 1, user(1), Vec::new()))
             .expect("no-fail arm survives a failed fetch");
         assert!(ctx.msgs.is_empty());
@@ -2032,7 +2030,7 @@ mod tests {
 
         let empty_body = message("general", 1, user(1), vec![Block::paragraph("")]);
         let mut chat_ctx = CaptureCtx::new()
-            .from_chat()
+            .with_chat_origin()
             .with_transcript("general", vec![empty_body]);
         exec(
             &mut m,
@@ -2062,7 +2060,7 @@ mod tests {
         .expect("create");
         block_on(m.commit_block()).expect("commit");
 
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut chat_ctx,
@@ -2102,7 +2100,7 @@ mod tests {
         // chat does not bound channel-id length, so a `{channel}` member can be
         // substituted past the inbox member cap.
         let long_channel = "c".repeat(MAX_MEMBER_BYTES + 1);
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut chat_ctx,
@@ -2137,7 +2135,7 @@ mod tests {
 
         // an unbounded `{channel}` body substitutes past the inbox body cap.
         let long_channel = "c".repeat(INBOX_MAX_BODY_BYTES + 1);
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut chat_ctx,
@@ -2174,7 +2172,7 @@ mod tests {
         }
         block_on(m.commit_block()).expect("commit");
 
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut chat_ctx,
@@ -2222,7 +2220,7 @@ mod tests {
         .expect("disable");
         block_on(m.commit_block()).expect("commit");
 
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut chat_ctx,
@@ -2247,7 +2245,7 @@ mod tests {
         block_on(m.commit_block()).expect("commit");
 
         // "ghost" is not a known channel: the probe records, never emits.
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut chat_ctx,
@@ -2281,7 +2279,7 @@ mod tests {
         let mut squatted = message("general", 1, user(9), vec![Block::paragraph("squat")]);
         squatted.head.message_id = "auto-r-general-1".into();
         let mut chat_ctx = CaptureCtx::new()
-            .from_chat()
+            .with_chat_origin()
             .with_transcript("general", vec![squatted]);
         exec(
             &mut m,
@@ -2309,7 +2307,7 @@ mod tests {
         .expect("create");
         block_on(m.commit_block()).expect("commit");
 
-        let mut chat_ctx = CaptureCtx::new().from_chat().with_task("auto-general-5");
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_task("auto-general-5");
         exec(
             &mut m,
             &mut chat_ctx,
@@ -2338,7 +2336,7 @@ mod tests {
 
         // an event channel long enough to push the composed id over the cap.
         let long_channel = "c".repeat(MAX_ID_BYTES);
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut chat_ctx,
@@ -2384,7 +2382,7 @@ mod tests {
         let mut m = module();
         m.install(&bytes, root).expect("install crafted state");
 
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut chat_ctx,
@@ -2463,7 +2461,7 @@ mod tests {
         let root1 = m.root();
 
         // stage a fire then abort.
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin();
         exec(
             &mut m,
             &mut chat_ctx,
@@ -2525,7 +2523,7 @@ mod tests {
 
         // fire r1 to populate the run-history ring (the transcript provides the
         // channel for the probe and text for r2's filter, which does not match).
-        let mut chat_ctx = CaptureCtx::new().from_chat().with_transcript(
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_transcript(
             "general",
             vec![message(
                 "general",
@@ -2603,7 +2601,7 @@ mod tests {
         block_on(source.commit_block()).expect("commit rule");
 
         let long_channel = "c".repeat(MAX_ID_BYTES * 2);
-        let mut chat_ctx = CaptureCtx::new().from_chat();
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin();
         exec(
             &mut source,
             &mut chat_ctx,

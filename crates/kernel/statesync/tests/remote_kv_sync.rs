@@ -414,18 +414,17 @@ fn shipped_index_round_trips_over_the_wire_protocol() {
             while let Some((frame, reply)) = rx.next().await {
                 if let Ok(SyncRequest::IndexModules { boundary }) =
                     statesync::decode_request(&frame)
+                    && !server.index_attached(boundary)
                 {
-                    if !server.index_attached(boundary) {
-                        let mut blobs = std::collections::BTreeMap::new();
-                        for db in ["chat", "tasks", indexer::BLOCKS_DB_ID] {
-                            let files = source_for_serve.checkpoint_files(db).expect("cut");
-                            blobs.insert(
-                                db.to_string(),
-                                statesync::encode_index_archive(&files),
-                            );
-                        }
-                        server.attach_index(boundary, blobs).expect("attach");
+                    let mut blobs = std::collections::BTreeMap::new();
+                    for db in ["chat", "tasks", indexer::BLOCKS_DB_ID] {
+                        let files = source_for_serve.checkpoint_files(db).expect("cut");
+                        blobs.insert(
+                            db.to_string(),
+                            statesync::encode_index_archive(&files),
+                        );
                     }
+                    server.attach_index(boundary, blobs).expect("attach");
                 }
                 let resp = server
                     .handle_frame(&host, Some(finalized), &coords, &frame)

@@ -1,12 +1,12 @@
-//! #215 — files >1 MiB over the REAL submit/consensus path.
+//! #215 — files larger than 1 MiB over the REAL submit/consensus path.
 //!
 //! the duckfs chunk invariant (`verify_chunk_len`) requires every interior
 //! chunk of a multi-chunk file to be EXACTLY `CHUNK_SIZE` (1 MiB), so a file
-//! >1 MiB forces full-CHUNK_SIZE putblob ops through the ordered lane and the
+//! larger than 1 MiB forces full-CHUNK_SIZE putblob ops through the ordered lane and the
 //! p2p payload gossip. this is exactly the op the old json frame codec
 //! expanded ~3.57x past the p2p message cap, tripping commonware's internal
 //! size assert on the proposer's gossip task (a panic, not a rejection) —
-//! which made every file >1 MiB uncommittable.
+//! which made every file larger than 1 MiB uncommittable.
 //!
 //! NOT the in-process `duckfs_resolver` shortcut: a real two-validator
 //! cluster of OS processes over real sockets, submitting via rpc, reading

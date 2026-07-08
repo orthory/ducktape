@@ -283,21 +283,16 @@ impl<M> PlaneFallbackClient<M> {
 }
 
 impl<M: SyncClient + Sync> SyncClient for PlaneFallbackClient<M> {
-    fn request(
-        &self,
-        req: SyncRequest,
-    ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
-        async move {
-            if let Some(svc) = self.plane.get() {
-                let client = DataPlaneSyncClient::new(Arc::clone(svc), self.server);
-                match client.request(req.clone()).await {
-                    // a transport-level failure (tunnel down, peer refused)
-                    // falls back; protocol-level outcomes are authoritative.
-                    Err(SyncError::Transport(_)) => {}
-                    outcome => return outcome,
-                }
+    async fn request(&self, req: SyncRequest) -> Result<SyncResponse, SyncError> {
+        if let Some(svc) = self.plane.get() {
+            let client = DataPlaneSyncClient::new(Arc::clone(svc), self.server);
+            match client.request(req.clone()).await {
+                // a transport-level failure (tunnel down, peer refused)
+                // falls back; protocol-level outcomes are authoritative.
+                Err(SyncError::Transport(_)) => {}
+                outcome => return outcome,
             }
-            self.mesh.request(req).await
         }
+        self.mesh.request(req).await
     }
 }

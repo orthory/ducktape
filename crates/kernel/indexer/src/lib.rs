@@ -724,13 +724,13 @@ impl IndexStore {
         // the explorer row lands AFTER the module folds: a visible block row
         // never precedes its op rows. same idempotent-skip and one-batch-with-
         // watermark discipline, on the blocks database's own watermark.
-        if let Some(record) = &block.record {
-            if read_height(&self.blocks)? < block.height {
-                let mut batch = WriteBatch::new();
-                batch.put(block_key(block.height), record.clone());
-                batch.put(META_HEIGHT, block.height.to_be_bytes());
-                self.blocks.write(batch)?;
-            }
+        if let Some(record) = &block.record
+            && read_height(&self.blocks)? < block.height
+        {
+            let mut batch = WriteBatch::new();
+            batch.put(block_key(block.height), record.clone());
+            batch.put(META_HEIGHT, block.height.to_be_bytes());
+            self.blocks.write(batch)?;
         }
         Ok(())
     }

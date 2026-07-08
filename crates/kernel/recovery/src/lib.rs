@@ -55,7 +55,7 @@
 //!   substrate can be at its post-root after a crash (the in-memory cohort
 //!   always rolls back to the checkpoint), so two-or-more changed modules at
 //!   post means two-or-more disk substrates committed — a changed set spanning
-//!   >1 disk substrate at mixed roots. selective replay's premise (only the
+//!   more than one disk substrate at mixed roots. selective replay's premise (only the
 //!   in-memory cohort rolled back) no longer holds and its single-frame
 //!   re-execution could read a partially-committed world, so boot fail-stops
 //!   with [`Error::Torn`] at the point it detects this rather than healing and
@@ -871,13 +871,13 @@ where
                 "invalid frame range ({after_height}, {up_to_height}]"
             )));
         }
-        if let Some(retained_start) = self.manifest()?.and_then(|m| m.height) {
-            if after_height < retained_start {
-                return Err(Error::RangePruned {
-                    after_height,
-                    retained_start,
-                });
-            }
+        if let Some(retained_start) = self.manifest()?.and_then(|m| m.height)
+            && after_height < retained_start
+        {
+            return Err(Error::RangePruned {
+                after_height,
+                retained_start,
+            });
         }
         if after_height == up_to_height {
             return Ok(Vec::new());
@@ -1294,7 +1294,7 @@ where
                         // to redo (re-applying could MOVE a history-committed
                         // root and fork us).
                         skipped += 1;
-                        if let Some(sink) = sink.as_deref_mut() {
+                        if let Some(sink) = sink.as_mut() {
                             match disposition {
                                 // a rejected block never had content anywhere.
                                 Disposition::Rejected => sink.folded_block(&FoldedBlock {
@@ -1357,14 +1357,14 @@ where
                             // this block at or beyond its post-root. (subsumes the
                             // old all-at-post fast path; adds the N-ahead case.)
                             skipped += 1;
-                            if let Some(sink) = sink.as_deref_mut() {
+                            if let Some(sink) = sink.as_mut() {
                                 sink.opaque_block(height);
                             }
                         } else if all_pre {
                             let (_, dispatches) =
                                 apply_block(host, height, &frame, protocol_version, Some(disposition))
                                     .await?;
-                            if let Some(sink) = sink.as_deref_mut() {
+                            if let Some(sink) = sink.as_mut() {
                                 sink.folded_block(&FoldedBlock {
                                     height,
                                     frame: &frame,
@@ -1460,7 +1460,7 @@ where
                                 &commit_only,
                             )
                             .await?;
-                            if let Some(sink) = sink.as_deref_mut() {
+                            if let Some(sink) = sink.as_mut() {
                                 // the dispatch trace is the full deterministic
                                 // re-execution; only the COMMIT scope was
                                 // selective.
@@ -1525,7 +1525,7 @@ where
             let disposition = if moved.is_empty() {
                 let (disposition, dispatches) =
                     apply_block(host, height, &frame, protocol_version, None).await?;
-                if let Some(sink) = sink.as_deref_mut() {
+                if let Some(sink) = sink.as_mut() {
                     sink.folded_block(&FoldedBlock {
                         height,
                         frame: &frame,
@@ -1544,7 +1544,7 @@ where
                     // outcome. (single-disk-substrate blocks make this exact —
                     // see the crate doc on the multi-store limit.)
                     trailing::TrailingPlan::AssumeApplied => {
-                        if let Some(sink) = sink.as_deref_mut() {
+                        if let Some(sink) = sink.as_mut() {
                             sink.opaque_block(height);
                         }
                         Disposition::Applied
@@ -1592,7 +1592,7 @@ where
                                 )));
                             }
                         }
-                        if let Some(sink) = sink.as_deref_mut() {
+                        if let Some(sink) = sink.as_mut() {
                             sink.folded_block(&FoldedBlock {
                                 height,
                                 frame: &frame,
@@ -1700,12 +1700,12 @@ async fn apply_block(
         // a frame that never decoded was a deterministic no-op at runtime too.
         Err(_) => Disposition::Rejected,
     };
-    if let Some(expect) = expect {
-        if outcome != expect {
-            return Err(Error::Verify(format!(
-                "replayed block {height} landed as {outcome:?}, sealed as {expect:?}"
-            )));
-        }
+    if let Some(expect) = expect
+        && outcome != expect
+    {
+        return Err(Error::Verify(format!(
+            "replayed block {height} landed as {outcome:?}, sealed as {expect:?}"
+        )));
     }
     Ok((outcome, dispatches))
 }
@@ -1748,12 +1748,12 @@ async fn apply_block_committing(
         }
         Err(_) => Disposition::Rejected,
     };
-    if let Some(expect) = expect {
-        if outcome != expect {
-            return Err(Error::Verify(format!(
-                "torn-block replay {height} landed as {outcome:?}, sealed as {expect:?}"
-            )));
-        }
+    if let Some(expect) = expect
+        && outcome != expect
+    {
+        return Err(Error::Verify(format!(
+            "torn-block replay {height} landed as {outcome:?}, sealed as {expect:?}"
+        )));
     }
     Ok((outcome, dispatches))
 }

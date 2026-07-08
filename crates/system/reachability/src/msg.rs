@@ -28,6 +28,9 @@ pub struct MsgError(#[from] serde_json::Error);
 /// first, then signed advertisements over the agreed set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// This enum is the reachability channel's serde protocol surface. Keep direct
+// variant payloads so callers match and construct the signed messages verbatim.
+#[allow(clippy::large_enum_variant)]
 pub enum ReachabilityMsg {
     /// Pre-version gossip: a member's OWNER-SIGNED record for the current
     /// epoch — self-signed so a relaying member can neither forge nor alter

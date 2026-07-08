@@ -241,7 +241,7 @@ impl NodeMetrics {
             apply_latency: context.histogram(
                 "ducktape_block_apply_latency_seconds",
                 "node-local wall-clock cost of applying one block",
-                LATENCY_BUCKETS.into_iter(),
+                LATENCY_BUCKETS,
             ),
             dispatch_total: context.family(
                 "ducktape_dispatch",
@@ -1041,11 +1041,12 @@ struct IndexOpsResponse {
     next_after: Option<String>,
 }
 
-fn index_store(handle: &NodeHandle) -> Result<&Arc<indexer::IndexStore>, Response> {
-    handle
-        .index
-        .as_ref()
-        .ok_or_else(|| error_response(StatusCode::SERVICE_UNAVAILABLE, "no index store configured"))
+fn index_store(handle: &NodeHandle) -> Option<&Arc<indexer::IndexStore>> {
+    handle.index.as_ref()
+}
+
+fn no_index_store_response() -> Response {
+    error_response(StatusCode::SERVICE_UNAVAILABLE, "no index store configured")
 }
 
 fn index_error(err: indexer::Error) -> Response {
@@ -1064,9 +1065,8 @@ fn index_error(err: indexer::Error) -> Response {
 /// was never folded from ops (heights are boundary-stamped, the op log
 /// starts above it) — the gap stays visible instead of papered over.
 async fn index_status(State(handle): State<NodeHandle>) -> Response {
-    let store = match index_store(&handle) {
-        Ok(store) => store,
-        Err(resp) => return resp,
+    let Some(store) = index_store(&handle) else {
+        return no_index_store_response();
     };
     let mut modules = serde_json::Map::new();
     let mut backfilled = serde_json::Map::new();
@@ -1101,9 +1101,8 @@ async fn index_ops(
     Path(module): Path<String>,
     Query(params): Query<IndexScanParams>,
 ) -> Response {
-    let store = match index_store(&handle) {
-        Ok(store) => store,
-        Err(resp) => return resp,
+    let Some(store) = index_store(&handle) else {
+        return no_index_store_response();
     };
     let page = match store.scan(
         &module,
@@ -1146,9 +1145,8 @@ async fn index_view(
     Path(module): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> Response {
-    let store = match index_store(&handle) {
-        Ok(store) => store,
-        Err(resp) => return resp,
+    let Some(store) = index_store(&handle) else {
+        return no_index_store_response();
     };
     let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
     match store.view(&module, &req_bytes) {
@@ -1168,9 +1166,8 @@ async fn index_scan(
     Path(module): Path<String>,
     Query(params): Query<IndexScanParams>,
 ) -> Response {
-    let store = match index_store(&handle) {
-        Ok(store) => store,
-        Err(resp) => return resp,
+    let Some(store) = index_store(&handle) else {
+        return no_index_store_response();
     };
     let prefix = params.prefix.unwrap_or_default();
     let page = match store.scan(

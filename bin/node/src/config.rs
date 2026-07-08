@@ -53,7 +53,7 @@ pub fn unhex(s: &str) -> Result<Vec<u8>, String> {
     if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("hex string contains non-hex characters".into());
     }
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("hex string has odd length".into());
     }
     (0..s.len())
@@ -293,6 +293,7 @@ impl NetworkDescriptor {
     /// config error; an unspecified ip / port 0 is advisory and skipped. the
     /// live dial path is [`NetworkDescriptor::reach_entries`], which folds these
     /// Direct entries in alongside the typed `reach` hints.
+    #[cfg(test)]
     pub fn bootstrap_entries(&self) -> Result<Vec<(ed25519::PublicKey, Ingress)>, String> {
         let mut out = Vec::new();
         for entry in &self.bootstrap {
@@ -1660,6 +1661,7 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
 /// key is in the validator set — otherwise a joiner pins a peer that can
 /// never answer and retries forever. preference: first validator bootstrap
 /// hint, else any validator that is not us. None = nobody can serve (solo).
+#[cfg(test)]
 pub fn choose_sync_source<A>(
     bootstrappers: &[(ed25519::PublicKey, A)],
     validators: &[ed25519::PublicKey],
@@ -3474,7 +3476,7 @@ mod tests {
         );
 
         // solo network: nobody can serve.
-        assert_eq!(choose_sync_source(no_hints, &[me.clone()], &me), None);
+        assert_eq!(choose_sync_source(no_hints, std::slice::from_ref(&me), &me), None);
     }
 
     #[test]

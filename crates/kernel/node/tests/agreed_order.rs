@@ -110,8 +110,8 @@ fn n_validators_converge_under_agreed_order_including_qmdb_root() {
 
         // stand up N validators on isolated child contexts.
         let mut nodes: Vec<OrderedNode<RoundOrderer>> = Vec::new();
-        for i in 0..N {
-            let host = genesis_host(context.child(LABELS[i])).await;
+        for label in LABELS.iter().take(N) {
+            let host = genesis_host(context.child(label)).await;
             nodes.push(OrderedNode::new(host, RoundOrderer::new()));
         }
 

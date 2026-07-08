@@ -1629,6 +1629,7 @@ where
     /// `(initiator, responder)` with stage supersession, and fan out to every
     /// peer except the delivering one and the message's signer — this node
     /// cannot know which peer holds the working link to the addressee.
+    #[allow(clippy::too_many_arguments)]
     async fn relay(
         &mut self,
         via: ValidatorIdentity,

@@ -817,6 +817,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn canonical_view(
         channel: &str,
         seq: u64,

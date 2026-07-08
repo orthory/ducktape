@@ -240,6 +240,9 @@ pub enum SagaQuery {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+// Query replies are the public serde wire surface; keep the ergonomic variant
+// payloads instead of boxing only to shrink this in-memory enum.
+#[allow(clippy::large_enum_variant)]
 pub enum SagaReply {
     Saga(Option<SagaView>),
     NextExpiry(Option<u64>),
