@@ -254,8 +254,7 @@ coordinated rebuild — a lockstep upgrade across every validator, not a rolling
 one — to adopt it.
 
 The module stores keys; custody of the user key itself is a desktop-app
-concern layered on top (`bin/node`'s `user-key` verbs; see
-`docs/superpowers/specs/2026-07-07-identity-onboarding-design.md`). The
+concern layered on top through `bin/node`'s `user-key` verbs. The
 24-word mnemonic is an entropy-preserving, identity-preserving encoding of the
 raw ed25519 seed, so it recovers the identity exactly rather than deriving a
 new one. The password is local-encryption only — argon2id wraps a key that

@@ -11,8 +11,7 @@ members.** A conversation's content must be readable by its participants and
 by no one else — including every other member node in the same private
 network, each of which replicates the full consensus state. The network
 perimeter (WireGuard data plane, E2E-encrypted authenticated mesh,
-rendezvous-only coordinator, no third-party services — see
-`docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`)
+rendezvous-only coordinator, no third-party services)
 is necessary but is NOT the read barrier; the read barrier must be
 cryptographic, because state replication hands every member node every byte.
 
@@ -110,9 +109,7 @@ unauthenticated origin — privacy claims only ever hold on the signed-frame
 
 ## Full design detail
 
-The complete spec this ADR condenses (threat-model table, slice plan,
-test/acceptance list, app-surface notes, code anchors) lived at
-`docs/superpowers/specs/2026-07-06-private-team-messaging-design.md` and is
-preserved in this file's git history (removed in the same commit that added
-this ADR; see also branch `feat/private-messaging-design` history
-9db8c06/8177fde).
+The complete draft this ADR condensed (threat-model table, slice plan,
+test/acceptance list, app-surface notes, code anchors) is preserved in this
+file's git history (removed in the same commit that added this ADR; see also
+branch `feat/private-messaging-design` history 9db8c06/8177fde).

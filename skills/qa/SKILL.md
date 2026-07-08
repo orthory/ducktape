@@ -64,14 +64,14 @@ Tiles used to look un-isolated (all like the shared `8844`) because the headless
 never reached its workspace: a **React StrictMode boot race** in `DucktapeProvider`
 dropped `connectActive`. Fixed in **PR #90** (merged to `dev`). To make a tile show a
 **live isolated** workspace, the fleet worktree must be on `dev` (for #90) and
-`fleet.sh up_one` must seed a workspace + set `DUCKTAPE_NODE_BIN` per instance — see
-`docs/superpowers/specs/2026-07-03-fleet-isolation-finding.md`. Until a given tile has
-that, its node-backed data is shared, not isolated (DOM/UI QA is valid regardless).
+`fleet.sh up_one` must seed a workspace + set `DUCKTAPE_NODE_BIN` per instance.
+Until a given tile has that, its node-backed data is shared, not isolated
+(DOM/UI QA is valid regardless).
 
 ## Notes
 
 - **Dev only.** The debug endpoint rides the same dev-only `tauri-plugin-agent` seam
   as [[tauri-debug]]; a release build registers nothing.
 - Bring instances up/down with `ops/fleet.sh` (see `ops/README.md`); this skill never
-  manages lifecycle itself — it drives what the fleet already runs. Pair with [[work]]
-  for the worktrees.
+  manages lifecycle itself — it drives what the fleet already runs. Pair it with
+  the repo worktree workflow for branch isolation.

@@ -3,10 +3,9 @@
 How to front a Ducktape validator with a **sentry** so it never exposes a
 public inbound port, while joiners still enter, sync, and promote through it.
 
-This is the operator-facing companion to the design of record,
-[Pluggable Network Entry — Reachability Plane](superpowers/specs/2026-07-04-pluggable-network-entry-design.md).
-Read that for the *why* (authority vs. reachability, the trust model, the
-roadmap to coordinator/private-cutover phases). This document is the *how*.
+This runbook is the maintained source of record for the sentry deployment
+contract: authority vs. reachability, the trust model, and the current operator
+steps.
 
 ## Why this is safe
 
@@ -154,5 +153,4 @@ Phase 1 ships **no consensus/production behavior change** — it converts an
 already-working, configuration-only capability into a regression-guarded,
 documented one (`bin/node/tests/sentry_e2e.rs`). The typed reach hint
 (`Direct`/`Fronted`), coordinator/STUN rendezvous, and the private (WireGuard)
-cutover are later phases; see the
-[design of record](superpowers/specs/2026-07-04-pluggable-network-entry-design.md).
+cutover are later phases.

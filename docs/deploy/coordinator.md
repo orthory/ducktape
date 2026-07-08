@@ -3,11 +3,9 @@
 How to run `bin/coordinator` as `p2p.ducktape.industries`: an **untrusted,
 non-validator reachability helper** that lets two NAT'd validators find each
 other and hole-punch a direct path. It is rendezvous-only: it never carries
-peer traffic (the DERP-style ciphertext relay was removed 2026-07-06). This is
-the operator-facing companion to the design of record,
-[Private Cutover — Coordinator](../superpowers/specs/2026-07-05-private-cutover-coordinator-design.md).
-Read that for the *why* (the trust model, the reachability plane, the epic
-roadmap). This document is the *how*.
+peer traffic (the DERP-style ciphertext relay was removed 2026-07-06). This
+runbook, the coordinator code, and the regression tests are the maintained
+source of record for the trust model and operating contract.
 
 > **Scope honesty.** Everything on this page **works today**: `bin/coordinator`
 > runs as-is and its `--listen` invocation is regression-proven by

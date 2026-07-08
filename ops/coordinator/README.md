@@ -4,9 +4,8 @@ Three ready-to-use artifacts for running `bin/coordinator` as
 `p2p.ducktape.industries`. The coordinator is the private-cutover reachability
 helper: STUN reflexive + rendezvous over a single UDP socket — rendezvous
 only, it never carries peer traffic. It **holds no keys, serves no state, and
-is untrusted by design** — see
-`docs/deploy/coordinator.md` for the full recipe and the design of record at
-`docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`.
+is untrusted by design** — see `docs/deploy/coordinator.md` for the maintained
+operator recipe and trust-model notes.
 
 - **`ducktape-coordinator.service`** — hardened systemd unit (DynamicUser,
   empty capability set, read-only filesystem, UDP-only address families).
