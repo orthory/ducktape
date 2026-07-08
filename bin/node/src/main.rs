@@ -3706,6 +3706,59 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // the fronts: every reachable member the inviter already meshes with, read
+    // from the persisted mesh state so a joiner can bring its tunnel up against
+    // ANY of them, not just the inviter (the unified all-paths invite). A
+    // host-capable member rides as a direct front, a NAT'd-but-registered one
+    // as a coordinated (by-identity) front. No mesh state yet → no fronts.
+    let storage = base.join(raw.storage_dir.as_deref().unwrap_or("storage"));
+    let mesh_state_file = storage.join("mesh-state.json");
+    let chain_id = descriptor.genesis_namespace();
+    let own: [u8; 32] = key
+        .public_key()
+        .as_ref()
+        .try_into()
+        .expect("ed25519 public key is 32 bytes");
+    let fronts = match reachability::store::load(&mesh_state_file, &chain_id) {
+        Ok(Some(mesh)) => {
+            let fronts = config::fronts_from_adverts(&mesh.adverts, &own);
+            if fronts.is_empty() {
+                eprintln!(
+                    "[invite] persisted mesh at {} holds no other members — the invite \
+                     carries only the inviter's own paths",
+                    mesh_state_file.display()
+                );
+            }
+            fronts
+        }
+        Ok(None) => {
+            eprintln!(
+                "[invite] no persisted mesh state at {} — the invite carries no member \
+                 fronts (only the inviter's own paths); mint again once the mesh has peers",
+                mesh_state_file.display()
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            eprintln!(
+                "[invite] mesh state at {} unreadable ({e}) — the invite carries no member \
+                 fronts",
+                mesh_state_file.display()
+            );
+            Vec::new()
+        }
+    };
+
+    // stop embedding a coordinator address in the invite: the joiner reaches
+    // every path through its OWN ambient coordinator (config/default), never a
+    // coordinator baked into the blob. The inviter still registers with its own
+    // coordinator via its own config; here we only strip Coordinated reach
+    // hints from the ENCODED copy — the on-disk descriptor keeps its config.
+    let mut invite_descriptor = descriptor.clone();
+    invite_descriptor
+        .reach
+        .retain(|hint| !hint.trim_start().starts_with("coordinated:"));
+
     let expires = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock is past the epoch")
@@ -3714,7 +3767,14 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes());
     println!(
         "{}",
-        config::encode_invite(&descriptor, &token, wireguard.as_ref(), &[], expires, &key)?
+        config::encode_invite(
+            &invite_descriptor,
+            &token,
+            wireguard.as_ref(),
+            &fronts,
+            expires,
+            &key
+        )?
     );
     Ok(())
 }

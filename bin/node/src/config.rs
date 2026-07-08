@@ -993,6 +993,35 @@ pub struct Front {
     pub endpoint: Option<String>,
 }
 
+/// Map a persisted mesh's signed adverts to invite [`Front`]s, skipping the
+/// inviter's own advert (`own`, its raw ed25519 identity — it already rides
+/// the invite as the `wireguard` bootstrap). A member with a concrete routable
+/// WireGuard underlay endpoint becomes a DIRECT front (`endpoint:
+/// Some(host:wg_port)` — the joiner dials it and announces its intro at
+/// `wg_port + 1`); a member with no dialable underlay becomes a COORDINATED
+/// front (`endpoint: None`, reached BY IDENTITY through the joiner's ambient
+/// coordinator). Every registered member is at least punchable, so all
+/// non-self adverts are offered as fronts.
+pub fn fronts_from_adverts(
+    adverts: &[wireguard_upgrade::EndpointAdvertisement],
+    own: &[u8; 32],
+) -> Vec<Front> {
+    adverts
+        .iter()
+        .map(|advert| &advert.record)
+        .filter(|record| &record.validator_identity.0 != own)
+        .map(|record| Front {
+            member_key: record.validator_identity.0,
+            wireguard_public_key: record.wireguard_public_key.0,
+            mesh_port: record.control_endpoint.port,
+            endpoint: record
+                .wireguard_endpoint
+                .as_ref()
+                .map(|ep| ep.socket_addr().to_string()),
+        })
+        .collect()
+}
+
 /// a decoded, VERIFIED invite — the only constructor is [`decode_invite`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Invite {
@@ -2497,6 +2526,65 @@ mod tests {
             "an empty-fronts invite adds no bytes over a pre-feature blob"
         );
         assert!(decode_invite(&empty).expect("decode").fronts.is_empty());
+    }
+
+    fn sample_advert(
+        seed: u64,
+        octet: u8,
+        wireguard_endpoint: Option<u16>,
+    ) -> wireguard_upgrade::EndpointAdvertisement {
+        use std::net::{IpAddr, Ipv4Addr};
+        use wireguard_upgrade::{
+            AdmissionRoot, Endpoint, EndpointRecord, MeshVersion, PortPolicy, Root, Transport,
+            ValidatorIdentity, X25519PublicKey,
+        };
+        let policy = PortPolicy::production();
+        let signer = ed25519::PrivateKey::from_seed(seed);
+        let endpoint = |port: u16, transport| {
+            Endpoint::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, octet)), port, transport, &policy)
+                .unwrap()
+        };
+        let record = EndpointRecord {
+            namespace: "net#fronts".into(),
+            epoch: 3,
+            valset_root: Root([1; 32]),
+            admission_root: AdmissionRoot([2; 32]),
+            validator_identity: ValidatorIdentity::try_from(signer.public_key().as_ref()).unwrap(),
+            wireguard_public_key: X25519PublicKey([octet; 32]),
+            control_endpoint: endpoint(443, Transport::Tcp),
+            wireguard_endpoint: wireguard_endpoint.map(|port| endpoint(port, Transport::Udp)),
+            capabilities: vec![],
+            expires_at_view: 50,
+            nonce: 1,
+        };
+        wireguard_upgrade::EndpointAdvertisement::sign(record, MeshVersion([7; 32]), &signer)
+    }
+
+    #[test]
+    fn fronts_from_adverts_maps_reachable_members_and_skips_self() {
+        // three adverts: self (skipped), a host-capable member (direct
+        // endpoint), and a punchable member (no underlay endpoint → coordinated).
+        let me = ed25519::PrivateKey::from_seed(1);
+        let host_capable = sample_advert(2, 20, Some(51820));
+        let punchable = sample_advert(3, 30, None);
+        let adverts = vec![sample_advert(1, 10, Some(51820)), host_capable.clone(), punchable.clone()];
+
+        let own: [u8; 32] = me.public_key().as_ref().try_into().unwrap();
+        let fronts = fronts_from_adverts(&adverts, &own);
+
+        assert_eq!(fronts.len(), 2, "the inviter's own advert is skipped");
+        let direct = fronts
+            .iter()
+            .find(|f| f.member_key == host_capable.record.validator_identity.0)
+            .expect("host-capable front");
+        assert_eq!(direct.endpoint.as_deref(), Some("8.8.8.20:51820"));
+        assert_eq!(direct.mesh_port, 443);
+        assert_eq!(direct.wireguard_public_key, [20u8; 32]);
+        let coordinated = fronts
+            .iter()
+            .find(|f| f.member_key == punchable.record.validator_identity.0)
+            .expect("punchable front");
+        assert_eq!(coordinated.endpoint, None);
     }
 
     #[test]
