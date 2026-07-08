@@ -37,9 +37,10 @@ if (import.meta.env.DEV) {
   })().catch(() => {});
 }
 
-// No autocomplete/history dropdown on inputs by default — see the module. Runs
-// before render so the observer is live for every field React mounts. Applies
-// to whichever surface this window is (console / tray / huddle).
+// No autocomplete/autocorrect/autocapitalize on inputs by default (kills the
+// history dropdown and macOS WKWebView's as-you-type completion) — see the
+// module. Runs before render so the observer is live for every field React
+// mounts. Applies to whichever surface this window is (console / tray / huddle).
 installAutocompleteDefault();
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

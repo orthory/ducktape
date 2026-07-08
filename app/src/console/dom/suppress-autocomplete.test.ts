@@ -23,12 +23,40 @@ describe("installAutocompleteDefault", () => {
     expect(document.getElementById("b")).toHaveAttribute("autocomplete", "off");
   });
 
+  it("stamps autocorrect=off and autocapitalize=off (macOS WKWebView completion)", () => {
+    document.body.innerHTML = `<input id="a" /><textarea id="b"></textarea>`;
+
+    dispose = installAutocompleteDefault();
+
+    for (const id of ["a", "b"]) {
+      expect(document.getElementById(id)).toHaveAttribute("autocorrect", "off");
+      expect(document.getElementById(id)).toHaveAttribute("autocapitalize", "off");
+    }
+  });
+
   it("preserves an explicit autocomplete value (deliberate opt-in)", () => {
     document.body.innerHTML = `<input id="pw" autocomplete="new-password" />`;
 
     dispose = installAutocompleteDefault();
 
     expect(document.getElementById("pw")).toHaveAttribute("autocomplete", "new-password");
+  });
+
+  it("preserves explicit autocorrect/autocapitalize values (prose opt-in)", () => {
+    document.body.innerHTML = `<textarea id="prose" autocorrect="on" autocapitalize="sentences"></textarea>`;
+
+    dispose = installAutocompleteDefault();
+
+    expect(document.getElementById("prose")).toHaveAttribute("autocorrect", "on");
+    expect(document.getElementById("prose")).toHaveAttribute("autocapitalize", "sentences");
+  });
+
+  it("never touches spellcheck — squiggles stay a per-field prose choice", () => {
+    document.body.innerHTML = `<textarea id="plain"></textarea>`;
+
+    dispose = installAutocompleteDefault();
+
+    expect(document.getElementById("plain")).not.toHaveAttribute("spellcheck");
   });
 
   it("stamps inputs mounted after install", async () => {
