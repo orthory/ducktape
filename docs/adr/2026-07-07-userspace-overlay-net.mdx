@@ -168,3 +168,48 @@ throughout (phase 0 explicitly preserves it).
 - **Phase 4 — defaults + gate.** Desktop-spawned sidecars default to
   `socket`; self-managed/server config keeps `tun`; run and document the
   statesync bulk benchmark; revisit server defaults only on its results.
+
+## Phase-4 gate results (2026-07-08)
+
+Raw bulk TCP over one WireGuard tunnel per backend pair —
+`ops/wg-smoke/run-bench.sh` (release probe, 256 MiB/leg, receiver
+first-byte→EOF, rootless podman, 24 cpus, linux 7.1.2; deliberately no
+`DataPlane` in the path, so no bulk token bucket — this measures the
+stack, which is what gates a default):
+
+| sender → receiver | rate        |
+|-------------------|-------------|
+| tun → tun         | 0.7 MB/s    |
+| socket → socket   | 521.3 MB/s  |
+| tun → socket      | 2.3 MB/s    |
+| socket → tun      | 0.5 MB/s    |
+
+The gate's question inverted: smoltcp is not the bulk bottleneck — the
+**TUN backend is**, on every leg it touches. Mid-transfer TCP vitals on
+the tun pair show no device drops but ~5% out-of-order arrival
+(`rcv_ooopack` 1022/21k segments), spurious fast-retransmits, base RTT
+~5 ms smoothed to ~111 ms, cwnd pinned ≈ 50 — BoringTun's multithreaded
+encrypt/forward pipeline reorders a single flow, and TCP reads the
+reordering as loss. Build-independent (debug/release within 0.1 MB/s).
+
+Two defects this surfaced:
+
+- **Production TUN MTU (fixed with this phase).** Every production
+  `InterfaceConfiguration` passed `mtu: None`, leaving the TUN at the
+  kernel's 1500 — full-size inner packets fragment the outer UDP on
+  1500-MTU underlays, and overrun the userspace stack's 1420 device MTU
+  on mixed pairs. `wiring::TUNNEL_MTU` (1420, the conventional
+  WireGuard value and the smoltcp host's constant) is now minted into
+  every applied config. Note it was NOT the throughput ceiling below.
+- **BoringTun pipeline reordering** is the tun bulk ceiling
+  (single-digit Mbit/s in-container) — an open follow-up. Worth its own
+  investigation only if bulk must stay on `tun` nodes somewhere; the
+  numbers above argue the opposite default direction.
+
+Consequence for defaults: the desktop flip to `socket` stands on UX
+grounds alone and the perf gate now *supports* rather than merely
+tolerates it. Server/self-managed configs keep `tun` for its
+host-routable overlay (the `ss`/`ip`/debugging surface and any
+non-ducktape consumers), not for throughput. The statesync plane's bulk
+ceiling (`BULK_BYTES_PER_SEC`, 24 MB/s) is comfortably inside
+socket-mode headroom and far above what tun-mode bulk achieves today.

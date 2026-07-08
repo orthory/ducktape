@@ -3439,8 +3439,9 @@ mod userkey_verb_tests {
 }
 
 /// `init --name <human name> [--dir .] [--listen a] [--advertised a] [--http a]
-/// [--rpc a]` — found a network: mint the chain-id, write the descriptor +
-/// node config, seed the genesis validator set with this identity.
+/// [--rpc a] [--wireguard-effect socket|tun|fake]` — found a network: mint the
+/// chain-id, write the descriptor + node config, seed the genesis validator
+/// set with this identity.
 fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
@@ -3469,6 +3470,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("advertised").map(String::as_str),
         flags.get("http").map(String::as_str),
         flags.get("rpc").map(String::as_str),
+        flags.get("wireguard-effect").map(String::as_str),
     )?;
 
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
@@ -4360,9 +4362,9 @@ fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// `join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a]
-/// [--rpc a]` — materialize a workspace from an invite: descriptor + identity
-/// (kept across re-joins) + node config. prints this identity for the
-/// inviter's pre-genesis `admit`.
+/// [--rpc a] [--wireguard-effect socket|tun|fake]` — materialize a workspace
+/// from an invite: descriptor + identity (kept across re-joins) + node
+/// config. prints this identity for the inviter's pre-genesis `admit`.
 fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     let [blob] = pos.as_slice() else {
@@ -4385,6 +4387,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("advertised").map(String::as_str),
         flags.get("http").map(String::as_str),
         flags.get("rpc").map(String::as_str),
+        flags.get("wireguard-effect").map(String::as_str),
     )?;
     if let Some(wg) = &invite.wireguard {
         // a WireGuard invite makes the tunnel the dial path, so the joiner's

@@ -185,6 +185,20 @@ describe("FilesView", () => {
     expect(body.changes[0].put.path).toBe("/shared/drop.txt");
   });
 
+  it("shows a prominent upload card while a file is dragged over a browser column", async () => {
+    renderView(makeTransport());
+    const sharedColumn = await screen.findByRole("region", { name: /column \/shared/i });
+    const file = new File(["drop me"], "drop.txt", { type: "text/plain" });
+
+    fireEvent.dragOver(sharedColumn, {
+      dataTransfer: { files: [file], types: ["Files"], dropEffect: "none" },
+    });
+
+    const uploadCard = screen.getByRole("status", { name: /upload file/i });
+    expect(within(uploadCard).getByText("Upload file")).toBeInTheDocument();
+    expect(within(uploadCard).getByText(/drop 1 file to \/shared/i)).toBeInTheDocument();
+  });
+
   it("marks file rows as draggable download sources", async () => {
     const originalCreateObjectURL = URL.createObjectURL;
     const originalRevokeObjectURL = URL.revokeObjectURL;

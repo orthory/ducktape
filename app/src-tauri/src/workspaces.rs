@@ -496,6 +496,9 @@ pub fn workspace_create(app: tauri::AppHandle, name: String) -> Result<Workspace
     let http = format!("127.0.0.1:{}", ports.http);
     let rpc = format!("127.0.0.1:{}", ports.rpc);
     let dir_s = dir.to_string_lossy().to_string();
+    // desktop-spawned nodes run the TUN-less userspace WireGuard backend
+    // (overlay-net ADR phase 4): no /dev/net/tun, no setcap, no host
+    // mutation. self-managed configs keep the parse default (`tun`).
     let chain_id = run_verb(
         &node_bin,
         &[
@@ -512,6 +515,8 @@ pub fn workspace_create(app: tauri::AppHandle, name: String) -> Result<Workspace
             &http,
             "--rpc",
             &rpc,
+            "--wireguard-effect",
+            "socket",
         ],
     )
     .map(|out| last_line(&out))?;
@@ -579,6 +584,8 @@ pub fn workspace_join(
     let rpc = format!("127.0.0.1:{}", ports.rpc);
     let dir_s = dir.to_string_lossy().to_string();
     // join prints this identity's pubkey (for the inviter's admit) on stdout.
+    // --wireguard-effect socket: the desktop default (overlay-net ADR phase
+    // 4) — a WG-invite join brings the plane up TUN-less, no privileges.
     let pubkey = run_verb(
         &node_bin,
         &[
@@ -592,6 +599,8 @@ pub fn workspace_join(
             &http,
             "--rpc",
             &rpc,
+            "--wireguard-effect",
+            "socket",
         ],
     )
     .map(|out| last_line(&out))?;

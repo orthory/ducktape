@@ -1,794 +1,57 @@
 // The Docs surface over the node's `pages` module: a Notion-like block-tree
-// editor with a nested page tree, document tabs, and comment threads. Editing
-// is KEYBOARD-FIRST:
-//
-//   Enter          split: a fresh sibling below (lists continue their kind)
-//   Backspace      on an empty block: remove it, focus the previous one
-//   Tab / S-Tab    indent under the previous sibling / outdent to grandparent
-//   Alt+Up/Down    move among siblings
-//   Up/Down        at the draft's edges: hop between blocks
-//   "# " "- " …    markdown prefixes convert a paragraph's kind
-//   "/"            slash menu over every block kind
-//
-// Text commits on debounced edit boundaries (a typing pause), on blur, and
-// before any structural op — one consensus op per boundary, mirroring the
-// rest of the console's server-authoritative writes. A landing snapshot never
-// overwrites the draft of the block being edited; committed truth reconciles
-// through the next boundary commit instead.
+// editor with a nested page tree, document tabs, and comment threads. This
+// file is the orchestrator — store wiring, focus management, keyboard
+// shortcuts, layout. The editable row (and its keyboard grammar) lives in
+// BlockRow.tsx, the rail in PageRail.tsx.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
+import type { CSSProperties } from "react";
 
 import type { BlockKind } from "../../../domain/pages-client";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
-import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
 import { opKey } from "../../store/finalization";
-import type { OpRecord } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
-import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius } from "../../theme/tokens";
 import {
+  EDIT_BOUNDARY_MS,
   buildRows,
   continuationKind,
-  filterSlashKinds,
   indentTarget,
   moveDownTarget,
   moveUpTarget,
   outdentTarget,
-  shortcutFor,
 } from "./pages-model";
 import type { Row } from "./pages-model";
+import { BlockRow } from "./BlockRow";
+import type { RowHandlers } from "./BlockRow";
+import { CommentCard } from "./CommentCard";
+import type { CommentAnchor } from "./CommentCard";
 import { DocTabs } from "./DocTabs";
-import { PageTree } from "./PageTree";
+import { PageRail } from "./PageRail";
 import { CommentsPanel } from "./CommentsPanel";
-import { buildForest } from "./page-tree";
+import { Subpages } from "./Subpages";
 
-const INDENT = 26;
-const TREE_COLLAPSE_KEY = "ducktape.docTreeCollapsed";
-/** A pause this long while typing is one edit boundary — one consensus op.
- *  Exported for the tests that drive the boundary timer. */
-export const EDIT_BOUNDARY_MS = 700;
-
-const sectionLabelStyle: CSSProperties = {
-  font: `600 9px ${font.mono}`,
-  letterSpacing: ".11em",
-  color: color.muted2,
-  textTransform: "uppercase",
-};
-
-/** Per-kind typography for the block textarea. */
-function kindFont(kind: BlockKind): string {
-  switch (kind) {
-    case "heading1":
-      return `650 24px/1.25 ${font.sans}`;
-    case "heading2":
-      return `650 19px/1.3 ${font.sans}`;
-    case "heading3":
-      return `600 16px/1.35 ${font.sans}`;
-    case "code":
-      return `400 12.5px/1.55 ${font.mono}`;
-    case "quote":
-      return `400 14.5px/1.6 ${font.sans}`;
-    default:
-      return `400 14.5px/1.6 ${font.sans}`;
-  }
-}
-
-/** The placeholder shown ONLY on a focused, empty block. */
-function focusPlaceholder(kind: BlockKind): string {
-  switch (kind) {
-    case "heading1":
-    case "heading2":
-    case "heading3":
-      return "Heading";
-    case "todo":
-      return "To-do";
-    case "bulleted":
-    case "numbered":
-      return "List item";
-    case "toggle":
-      return "Toggle";
-    case "quote":
-      return "Quote";
-    case "code":
-      return "Code";
-    case "callout":
-      return "Callout";
-    default:
-      return "Write, or press '/' for commands";
-  }
-}
-
-// ── Slash menu ───────────────────────────────────────────
-
-function SlashMenu({
-  query,
-  activeIndex,
-  onPick,
-}: {
-  query: string;
-  activeIndex: number;
-  onPick: (kind: BlockKind) => void;
-}) {
-  const options = filterSlashKinds(query);
-  if (options.length === 0) return null;
-  return (
-    <div
-      role="listbox"
-      aria-label="Block kind menu"
-      style={{
-        position: "absolute",
-        zIndex: 20,
-        top: "100%",
-        left: 0,
-        marginTop: 4,
-        width: 240,
-        maxHeight: 280,
-        overflowY: "auto",
-        border: `1px solid ${color.border}`,
-        borderRadius: radius.md,
-        background: color.paper,
-        boxShadow: shadow.card,
-        padding: 4,
-      }}
-    >
-      {options.map((option, i) => (
-        <button
-          key={option.kind}
-          type="button"
-          role="option"
-          aria-selected={i === activeIndex}
-          onMouseDown={(event) => {
-            // mousedown, not click: the textarea must not blur-commit first.
-            event.preventDefault();
-            onPick(option.kind);
-          }}
-          style={{
-            all: "unset",
-            cursor: "pointer",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            width: "100%",
-            boxSizing: "border-box",
-            padding: "6px 9px",
-            borderRadius: radius.sm,
-            background: i === activeIndex ? color.hover : "transparent",
-          }}
-        >
-          <span style={{ font: `600 12px ${font.sans}`, color: color.ink }}>
-            {option.label}
-          </span>
-          <span
-            style={{
-              marginLeft: "auto",
-              font: `400 10.5px ${font.mono}`,
-              color: color.muted2,
-            }}
-          >
-            {option.hint}
-          </span>
-        </button>
-      ))}
-    </div>
-  );
-}
-
-// ── One editable block row ───────────────────────────────
-
-interface RowHandlers {
-  commitText(blockId: string, text: string): void;
-  split(row: Row, draftLeft: string): void;
-  removeEmpty(row: Row): void;
-  indent(row: Row): void;
-  outdent(row: Row): void;
-  moveUp(row: Row): void;
-  moveDown(row: Row): void;
-  setKind(blockId: string, kind: BlockKind): void;
-  setChecked(blockId: string, checked: boolean): void;
-  remove(blockId: string): void;
-  toggleCollapse(blockId: string): void;
-  focusRelative(row: Row, delta: -1 | 1): void;
-  registerInput(blockId: string, el: HTMLTextAreaElement | null): void;
-  openComments(blockId: string): void;
-}
-
-function BlockRow({
-  row,
-  index,
-  expanded,
-  op,
-  threadCount,
-  handlers,
-}: {
-  row: Row;
-  index: number;
-  /** Only meaningful for Toggle rows: whether children are shown. */
-  expanded: boolean;
-  /** The block's finalization record — only rendered while pending/failed. */
-  op: OpRecord | undefined;
-  /** Number of live comment threads on this block. */
-  threadCount: number;
-  handlers: RowHandlers;
-}) {
-  const { block, depth } = row;
-  const [draft, setDraft] = useState(block.text);
-  const [slashDismissed, setSlashDismissed] = useState(false);
-  const [slashIndex, setSlashIndex] = useState(0);
-  const [focused, setFocused] = useState(false);
-  const [hover, setHover] = useState(false);
-  const areaRef = useRef<HTMLTextAreaElement | null>(null);
-  // focus mirrored into a ref so the draft-sync effect below reads the live
-  // value without re-running on focus flips.
-  const focusedRef = useRef(false);
-
-  // adopt store text only while the block is NOT being edited: a snapshot
-  // landing mid-edit (another op's completion refresh) must never clobber the
-  // live draft — the edit-boundary commit below reconciles it instead.
-  useEffect(() => {
-    if (!focusedRef.current) setDraft(block.text);
-  }, [block.text]);
-
-  // auto-grow: the textarea is exactly as tall as its content.
-  useEffect(() => {
-    const el = areaRef.current;
-    if (el) {
-      el.style.height = "0";
-      el.style.height = `${el.scrollHeight}px`;
-    }
-  }, [draft, block.kind]);
-
-  const slashOpen =
-    draft.startsWith("/") && !slashDismissed && block.kind !== "code";
-  const slashQuery = slashOpen ? draft.slice(1) : "";
-  const slashOptions = filterSlashKinds(slashQuery);
-
-  const dirty = () => draft !== block.text;
-  const maybeCommit = () => {
-    if (dirty()) handlers.commitText(block.id, draft);
-  };
-
-  // the latest commit closure lives in a ref so the boundary timer neither
-  // resets when the store re-renders (handlers is rebuilt per store change)
-  // nor commits a stale draft.
-  const commitBoundaryRef = useRef(() => {});
-  commitBoundaryRef.current = maybeCommit;
-
-  // per-edit-boundary commits: a typing pause flows one consensus op, so
-  // peers and the finalization mark track text without waiting for blur or a
-  // structural op. An open slash menu is a command in progress, not text.
-  useEffect(() => {
-    if (draft === block.text || slashOpen) return;
-    const timer = setTimeout(() => commitBoundaryRef.current(), EDIT_BOUNDARY_MS);
-    return () => clearTimeout(timer);
-  }, [draft, block.text, slashOpen]);
-
-  const pickSlash = (kind: BlockKind) => {
-    setDraft("");
-    setSlashDismissed(false);
-    if (kind !== block.kind) handlers.setKind(block.id, kind);
-  };
-
-  const onChange = (next: string) => {
-    if (!next.startsWith("/")) setSlashDismissed(false);
-    if (slashOpen || next.startsWith("/")) {
-      setSlashIndex(0);
-    }
-    // markdown prefixes convert only a plain paragraph — conversions never
-    // chain, so "# " typed into a heading stays literal text.
-    if (block.kind === "paragraph") {
-      const shortcut = shortcutFor(next);
-      if (shortcut) {
-        handlers.setKind(block.id, shortcut.kind);
-        if (shortcut.kind === "divider") {
-          handlers.commitText(block.id, "");
-          setDraft("");
-        } else {
-          setDraft(shortcut.rest);
-        }
-        return;
-      }
-    }
-    setDraft(next);
-  };
-
-  const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    const el = event.currentTarget;
-
-    if (slashOpen && slashOptions.length > 0) {
-      if (event.key === "ArrowDown") {
-        event.preventDefault();
-        setSlashIndex((i) => (i + 1) % slashOptions.length);
-        return;
-      }
-      if (event.key === "ArrowUp") {
-        event.preventDefault();
-        setSlashIndex((i) => (i - 1 + slashOptions.length) % slashOptions.length);
-        return;
-      }
-      if (event.key === "Enter") {
-        event.preventDefault();
-        pickSlash(slashOptions[slashIndex].kind);
-        return;
-      }
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setSlashDismissed(true);
-        return;
-      }
-    }
-
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      // an empty list item exits the list instead of continuing it.
-      if (draft.trim() === "" && continuationKind(block.kind) === block.kind
-          && block.kind !== "paragraph") {
-        handlers.setKind(block.id, "paragraph");
-        return;
-      }
-      maybeCommit();
-      handlers.split(row, draft);
-      return;
-    }
-    if (event.key === "Backspace" && draft === "") {
-      event.preventDefault();
-      handlers.removeEmpty(row);
-      return;
-    }
-    if (event.key === "Tab") {
-      event.preventDefault();
-      maybeCommit();
-      if (event.shiftKey) handlers.outdent(row);
-      else handlers.indent(row);
-      return;
-    }
-    if (event.altKey && event.key === "ArrowUp") {
-      event.preventDefault();
-      maybeCommit();
-      handlers.moveUp(row);
-      return;
-    }
-    if (event.altKey && event.key === "ArrowDown") {
-      event.preventDefault();
-      maybeCommit();
-      handlers.moveDown(row);
-      return;
-    }
-    if (
-      event.key === "ArrowUp" &&
-      el.selectionStart === 0 &&
-      el.selectionEnd === 0
-    ) {
-      event.preventDefault();
-      handlers.focusRelative(row, -1);
-      return;
-    }
-    if (
-      event.key === "ArrowDown" &&
-      el.selectionStart === el.value.length &&
-      el.selectionEnd === el.value.length
-    ) {
-      event.preventDefault();
-      handlers.focusRelative(row, 1);
-    }
-  };
-
-  const code = block.kind === "code";
-  const quote = block.kind === "quote";
-  const callout = block.kind === "callout";
-  const todoDone = block.kind === "todo" && block.checked;
-  const blockNumber = index + 1;
-
-  // the left gutter marker per kind (bullet, number, checkbox, chevron).
-  const marker: ReactNode =
-    block.kind === "bulleted" ? (
-      <span style={{ font: `700 14px ${font.sans}`, color: color.muted3 }}>•</span>
-    ) : block.kind === "numbered" ? (
-      <span style={{ font: `500 12.5px ${font.mono}`, color: color.muted3 }}>
-        {row.listIndex ?? 1}.
-      </span>
-    ) : block.kind === "todo" ? (
-      <button
-        type="button"
-        aria-label={`${block.checked ? "Uncheck" : "Check"} to-do block ${blockNumber}`}
-        onClick={() => handlers.setChecked(block.id, !block.checked)}
-        style={{
-          all: "unset",
-          cursor: "pointer",
-          width: 15,
-          height: 15,
-          borderRadius: 4,
-          border: `1.5px solid ${block.checked ? accentVar : color.borderStrong}`,
-          background: block.checked ? accentVar : "transparent",
-          color: "#fff",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-        }}
-      >
-        {block.checked ? <Icon name="check" size={10} strokeWidth={2.4} /> : null}
-      </button>
-    ) : block.kind === "toggle" ? (
-      <button
-        type="button"
-        aria-label={`${expanded ? "Collapse" : "Expand"} toggle block ${blockNumber}`}
-        aria-expanded={expanded}
-        onClick={() => handlers.toggleCollapse(block.id)}
-        style={{
-          all: "unset",
-          cursor: "pointer",
-          width: 16,
-          height: 16,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          color: color.muted3,
-        }}
-      >
-        <Icon
-          name="chevronRight"
-          size={13}
-          strokeWidth={2}
-          style={{ transform: `rotate(${expanded ? 90 : 0}deg)` }}
-        />
-      </button>
-    ) : null;
-
-  const content =
-    block.kind === "divider" ? (
-      <div
-        aria-label={`Divider block ${blockNumber}`}
-        style={{ padding: "10px 0" }}
-      >
-        <div style={{ height: 1, background: color.borderStrong }} />
-      </div>
-    ) : (
-      <div
-        style={{
-          position: "relative",
-          borderLeft: quote ? `3px solid ${color.borderStrong}` : "none",
-          paddingLeft: quote ? 12 : 0,
-          background: code ? color.sunken : callout ? color.sidebar : "transparent",
-          border: code
-            ? `1px solid ${color.border}`
-            : callout
-              ? `1px solid ${color.border}`
-              : undefined,
-          borderRadius: code || callout ? radius.md : 0,
-          padding: code ? "11px 13px" : callout ? "11px 13px" : undefined,
-        }}
-      >
-        <textarea
-          ref={(el) => {
-            areaRef.current = el;
-            handlers.registerInput(block.id, el);
-          }}
-          aria-label={`Edit ${block.kind} block ${blockNumber}`}
-          value={draft}
-          rows={1}
-          onChange={(event) => onChange(event.target.value)}
-          onFocus={() => {
-            focusedRef.current = true;
-            setFocused(true);
-          }}
-          onBlur={() => {
-            focusedRef.current = false;
-            setFocused(false);
-            maybeCommit();
-          }}
-          onKeyDown={onKeyDown}
-          placeholder={focused && draft === "" ? focusPlaceholder(block.kind) : ""}
-          spellCheck={!code}
-          style={{
-            display: "block",
-            width: "100%",
-            boxSizing: "border-box",
-            border: "none",
-            outline: "none",
-            resize: "none",
-            overflow: "hidden",
-            background: "transparent",
-            padding: 0,
-            color: todoDone ? color.muted2 : color.ink,
-            textDecoration: todoDone ? "line-through" : "none",
-            font: kindFont(block.kind),
-          }}
-        />
-        {slashOpen ? (
-          <SlashMenu
-            query={slashQuery}
-            activeIndex={slashIndex}
-            onPick={pickSlash}
-          />
-        ) : null}
-      </div>
-    );
-
-  return (
-    <div
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      style={{
-        display: "flex",
-        alignItems: "flex-start",
-        gap: 8,
-        padding: "2.5px 0",
-        marginLeft: depth * INDENT,
-      }}
-    >
-      <div
-        style={{
-          flexShrink: 0,
-          width: 20,
-          minHeight: 24,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          paddingTop: block.kind === "heading1" ? 6 : block.kind === "heading2" ? 3 : 0,
-        }}
-      >
-        {marker}
-      </div>
-      <div style={{ flex: 1, minWidth: 0 }}>{content}</div>
-      <div
-        style={{
-          flexShrink: 0,
-          display: "flex",
-          alignItems: "center",
-          gap: 3,
-          paddingTop: 3,
-          minWidth: 44,
-          justifyContent: "flex-end",
-        }}
-      >
-        <FinalizationMark op={op} />
-        {threadCount > 0 || hover ? (
-          <button
-            type="button"
-            aria-label={`Comment on block ${blockNumber}`}
-            title={threadCount > 0 ? `${threadCount} comment thread(s)` : "Comment"}
-            onClick={() => handlers.openComments(block.id)}
-            style={{
-              all: "unset",
-              cursor: "pointer",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 2,
-              padding: "2px 4px",
-              borderRadius: 5,
-              color: threadCount > 0 ? accentVar : color.muted2,
-              font: `600 9.5px ${font.mono}`,
-            }}
-          >
-            <Icon name="chat" size={12} strokeWidth={1.8} />
-            {threadCount > 0 ? threadCount : null}
-          </button>
-        ) : null}
-        {hover ? (
-          <button
-            type="button"
-            aria-label={`Copy link to block ${blockNumber}`}
-            title="Copy block link"
-            onClick={() => {
-              void navigator.clipboard?.writeText(block.id);
-            }}
-            style={{
-              all: "unset",
-              cursor: "pointer",
-              width: 20,
-              height: 20,
-              borderRadius: 5,
-              color: color.muted2,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}
-          >
-            <Icon name="hash" size={11} />
-          </button>
-        ) : null}
-        {hover ? (
-          <button
-            type="button"
-            aria-label={`Remove block ${blockNumber}`}
-            title="Remove block (and its subtree)"
-            onClick={() => handlers.remove(block.id)}
-            style={{
-              all: "unset",
-              cursor: "pointer",
-              width: 20,
-              height: 20,
-              borderRadius: 5,
-              color: color.muted2,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}
-          >
-            <Icon name="close" size={11} />
-          </button>
-        ) : null}
-      </div>
-    </div>
-  );
-}
-
-// ── Page rail (nested page tree) ─────────────────────────
-
-function PageRail({
-  pages,
-  activePage,
-  collapsed,
-  onToggleCollapse,
-  onNewPage,
-  onAddChild,
-  onOpen,
-  onDelete,
-  onMove,
-  onRefresh,
-}: {
-  pages: { id: string; title: string; parent: string | null }[];
-  activePage: string | null;
-  collapsed: ReadonlySet<string>;
-  onToggleCollapse: (id: string) => void;
-  onNewPage: () => void;
-  onAddChild: (id: string) => void;
-  onOpen: (id: string) => void;
-  onDelete: (id: string) => void;
-  onMove: (id: string, parent: string | null) => void;
-  onRefresh: () => void;
-}) {
-  const forest = useMemo(() => buildForest(pages), [pages]);
-  return (
-    <aside
-      style={{
-        width: 272,
-        flexShrink: 0,
-        borderRight: `1px solid ${color.borderSoft}`,
-        background: color.sidebar,
-        display: "flex",
-        flexDirection: "column",
-        color: color.muted3,
-      }}
-    >
-      <div
-        style={{
-          height: 56,
-          flexShrink: 0,
-          padding: "0 15px",
-          display: "flex",
-          alignItems: "center",
-          gap: 9,
-          borderBottom: `1px solid ${color.borderSoft}`,
-        }}
-      >
-        <span
-          style={{
-            width: 26,
-            height: 26,
-            borderRadius: 8,
-            background: color.dark,
-            color: color.onDark,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            flexShrink: 0,
-          }}
-        >
-          <Icon name="pages" size={14} strokeWidth={1.7} />
-        </span>
-        <div style={{ font: `600 13.5px ${font.sans}`, color: color.ink }}>Pages</div>
-        <button
-          type="button"
-          aria-label="Refresh pages"
-          title="Refresh pages"
-          onClick={onRefresh}
-          style={{
-            all: "unset",
-            cursor: "pointer",
-            marginLeft: "auto",
-            width: 26,
-            height: 26,
-            borderRadius: 6,
-            border: `1px solid ${color.border}`,
-            background: color.paper,
-            color: color.muted3,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >
-          <Icon name="refresh" size={13} strokeWidth={1.7} />
-        </button>
-      </div>
-
-      <button
-        type="button"
-        aria-label="New page"
-        onClick={onNewPage}
-        style={{
-          all: "unset",
-          cursor: "pointer",
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          margin: "12px 12px 6px",
-          padding: "8px 10px",
-          borderRadius: radius.sm,
-          background: color.dark,
-          color: color.onDark,
-          font: `600 12.5px ${font.sans}`,
-        }}
-      >
-        <Icon name="plus" size={14} strokeWidth={1.9} /> New page
-      </button>
-
-      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "6px 0 13px" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 14px 8px" }}>
-          <div style={sectionLabelStyle}>All pages</div>
-        </div>
-        {pages.length === 0 ? (
-          <div
-            style={{
-              margin: "7px 14px",
-              padding: "13px 12px",
-              border: `1px dashed ${color.borderStrong}`,
-              borderRadius: radius.md,
-              background: color.paper,
-              font: `400 12px/1.45 ${font.sans}`,
-              color: color.muted2,
-            }}
-          >
-            No pages on this node yet. Create one above to start writing.
-          </div>
-        ) : (
-          <PageTree
-            nodes={forest}
-            activeId={activePage}
-            collapsed={collapsed}
-            onOpen={onOpen}
-            onToggle={onToggleCollapse}
-            onAddChild={onAddChild}
-            onDelete={onDelete}
-            onMove={onMove}
-          />
-        )}
-      </div>
-    </aside>
-  );
-}
+export { EDIT_BOUNDARY_MS };
 
 // ── The view ─────────────────────────────────────────────
-
-const loadTreeCollapsed = (): Set<string> => {
-  try {
-    const raw = localStorage.getItem(TREE_COLLAPSE_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
-    return new Set(Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : []);
-  } catch {
-    return new Set();
-  }
-};
-const saveTreeCollapsed = (set: ReadonlySet<string>): void => {
-  try {
-    localStorage.setItem(TREE_COLLAPSE_KEY, JSON.stringify([...set]));
-  } catch {
-    // best-effort
-  }
-};
 
 export function PagesView() {
   const { state, actions } = useDucktape();
   const [titleDraft, setTitleDraft] = useState("");
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
-  const [treeCollapsed, setTreeCollapsed] = useState<ReadonlySet<string>>(loadTreeCollapsed);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
   const [pendingPageDelete, setPendingPageDelete] = useState<string | null>(null);
-  // target (block id or page id) the new-thread composer is aimed at; null
-  // hides the composer. WKWebView has no window.prompt, so composing lives
-  // in the panel as a real element.
-  const [composerTarget, setComposerTarget] = useState<string | null>(null);
+  // the floating comment card's aim: ONE target (a block id or the page id),
+  // the label naming it, and the viewport anchor of the affordance that
+  // opened it. Null = no card. The aside panel stays as the all-threads
+  // overview behind the header toggle; composing happens in the card.
+  const [commentCard, setCommentCard] = useState<{
+    target: string;
+    label: string;
+    anchor: CommentAnchor;
+  } | null>(null);
   const inputs = useRef(new Map<string, HTMLTextAreaElement>());
   const titleRef = useRef<HTMLInputElement | null>(null);
   const titleFocusedRef = useRef(false);
@@ -823,10 +86,10 @@ export function PagesView() {
   // onto another.
   useEffect(() => setTitleDraft(root?.text ?? ""), [root?.id]);
 
-  // load comment threads when the active page changes; a composer aimed at
-  // the previous page's blocks must not survive the switch.
+  // load comment threads when the active page changes; a card aimed at the
+  // previous page's blocks must not survive the switch.
   useEffect(() => {
-    setComposerTarget(null);
+    setCommentCard(null);
     actions.loadPageThreads();
   }, [actions, state.activePage]);
 
@@ -850,14 +113,13 @@ export function PagesView() {
   // Docs screen is mounted, so it never leaks into other modules:
   //   ⌘/Ctrl + ⇧ + [ / ]   previous / next tab (cycles, wraps at the ends)
   //   ⌘/Ctrl + T or N       new top-level page
-  //   ⌘/Ctrl + W            deliberately NOT handled — it must fall through to
-  //                         the window (close-to-tray), never close a doc tab.
+  //   ⌘/Ctrl + W            close the active doc tab — browser muscle memory.
+  //                         With no doc open it falls through to the window
+  //                         untouched (close-to-tray).
   // Bracket keys are matched on `event.code` (physical key), so the shift-
   // produced "{"/"}" characters don't matter.
   useEffect(() => {
-    // DocumentEventMap["keydown"] is the DOM KeyboardEvent; the bare name is
-    // shadowed here by React's KeyboardEvent import used above in BlockRow.
-    const onKey = (event: DocumentEventMap["keydown"]) => {
+    const onKey = (event: KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
 
       if (
@@ -871,6 +133,13 @@ export function PagesView() {
         const current = state.activePage ? tabs.indexOf(state.activePage) : -1;
         const base = current === -1 ? 0 : current;
         actions.openPage(tabs[(base + step + tabs.length) % tabs.length]);
+        return;
+      }
+
+      if (!event.shiftKey && event.code === "KeyW") {
+        if (!state.activePage) return;
+        event.preventDefault();
+        actions.closeTab(state.activePage);
         return;
       }
 
@@ -927,29 +196,30 @@ export function PagesView() {
     }
   };
 
-  const toggleTreeCollapse = (id: string) =>
-    setTreeCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      saveTreeCollapsed(next);
-      return next;
-    });
-
   const confirmThenDelete = (id: string) => {
     setPendingPageDelete(id);
   };
 
-  const openBlockComments = (blockId: string) => {
-    setPanelOpen(true);
-    const has = state.pageThreads.some((g) => g.target === blockId && g.threads.length > 0);
-    setComposerTarget(has ? null : blockId);
+  const openBlockComments = (blockId: string, anchor: CommentAnchor) => {
+    setCommentCard({ target: blockId, label: "this block", anchor });
   };
 
-  const commentOnPage = () => {
+  const commentOnPage = (anchor: CommentAnchor) => {
     if (!state.activePage) return;
-    setPanelOpen(true);
-    setComposerTarget(state.activePage);
+    setCommentCard({ target: state.activePage, label: "this page", anchor });
+  };
+
+  // a reply must carry the THREAD's target (a block id or the page id) — the
+  // module rejects an append whose target differs from the thread's. Never
+  // assume the page here. Shared by the card and the panel.
+  const replyToThread = (threadId: string, text: string) => {
+    const target =
+      state.pageThreads
+        .flatMap((g) => g.threads)
+        .find((v) => v.thread.id === threadId)?.thread.target ??
+      state.activePage ??
+      "";
+    actions.addComment({ threadId, target, text });
   };
 
   const handlers: RowHandlers = {
@@ -1000,6 +270,9 @@ export function PagesView() {
       else inputs.current.delete(blockId);
     },
     openComments: openBlockComments,
+    // the action creates the untitled child and opens its tab (cursor lands
+    // in the title via the fresh-page focus effect above).
+    createSubpage: () => actions.createChildPage(state.activePage),
   };
 
   const commitTitle = () => {
@@ -1037,8 +310,6 @@ export function PagesView() {
       <PageRail
         pages={state.pages}
         activePage={state.activePage}
-        collapsed={treeCollapsed}
-        onToggleCollapse={toggleTreeCollapse}
         onNewPage={() => actions.createChildPage(null)}
         onAddChild={(id) => actions.createChildPage(id)}
         onOpen={actions.openPage}
@@ -1089,7 +360,10 @@ export function PagesView() {
                     <button
                       type="button"
                       aria-label="Comment on page"
-                      onClick={commentOnPage}
+                      onClick={(event) => {
+                        const rect = event.currentTarget.getBoundingClientRect();
+                        commentOnPage({ x: rect.left, y: rect.bottom });
+                      }}
                       style={headerBtn}
                     >
                       <Icon name="chat" size={13} strokeWidth={1.8} /> Comment
@@ -1098,10 +372,7 @@ export function PagesView() {
                       type="button"
                       aria-label={panelOpen ? "Hide comments" : "Show comments"}
                       aria-pressed={panelOpen}
-                      onClick={() => {
-                        if (panelOpen) setComposerTarget(null);
-                        setPanelOpen((o) => !o);
-                      }}
+                      onClick={() => setPanelOpen((o) => !o)}
                       style={{
                         ...headerBtn,
                         background: panelOpen ? color.hover : color.paper,
@@ -1119,12 +390,14 @@ export function PagesView() {
             </header>
 
             <div
+              data-testid="doc-scroll"
               style={{
                 flex: 1,
                 minHeight: 0,
+                display: "flex",
+                flexDirection: "column",
                 overflowY: "auto",
-                background: color.sidebar,
-                padding: root ? "22px 26px" : 0,
+                background: color.paper,
               }}
             >
               {!root ? (
@@ -1165,17 +438,15 @@ export function PagesView() {
                   </div>
                 </div>
               ) : (
+                // the Notion-style endless canvas: a plain centered column on
+                // the paper, no card chrome, and a click-to-append filler
+                // below so the page has no visible bottom end.
                 <div
                   style={{
+                    width: "100%",
                     maxWidth: 820,
                     margin: "0 auto",
-                    minHeight: "100%",
-                    border: `1px solid ${color.border}`,
-                    borderRadius: radius.lg,
-                    background: color.paper,
-                    boxShadow: shadow.card,
-                    overflow: "visible",
-                    padding: "36px 44px 44px",
+                    padding: "36px 44px 0",
                     boxSizing: "border-box",
                   }}
                 >
@@ -1213,6 +484,12 @@ export function PagesView() {
                     }}
                   />
 
+                  <Subpages
+                    pages={state.pages}
+                    activePage={root.id}
+                    onOpen={actions.openPage}
+                  />
+
                   {rows.map((row, index) => (
                     <BlockRow
                       key={row.block.id}
@@ -1228,7 +505,20 @@ export function PagesView() {
                   <button
                     type="button"
                     aria-label="Add a block"
-                    onClick={appendBlock}
+                    // mousedown, not click: pressing while a block is focused
+                    // must append BEFORE the blur commit re-renders the tree
+                    // out from under the click (same dodge as the SlashMenu).
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      appendBlock();
+                    }}
+                    // keyboard activation (Enter/Space) synthesizes a click
+                    // with detail 0 and no mousedown — only that path appends
+                    // here; a pointer's trailing click (detail ≥ 1) was
+                    // already handled above.
+                    onClick={(event) => {
+                      if (event.detail === 0) appendBlock();
+                    }}
                     style={{
                       all: "unset",
                       cursor: "text",
@@ -1237,7 +527,7 @@ export function PagesView() {
                       gap: 8,
                       width: "100%",
                       boxSizing: "border-box",
-                      padding: "8px 0 24px 28px",
+                      padding: "8px 0 8px 28px",
                       color: color.muted2,
                       font: `400 13px ${font.sans}`,
                     }}
@@ -1247,6 +537,17 @@ export function PagesView() {
                   </button>
                 </div>
               )}
+              {root ? (
+                <div
+                  data-testid="page-canvas-filler"
+                  aria-hidden="true"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    appendBlock();
+                  }}
+                  style={{ flex: 1, minHeight: "40vh", cursor: "text" }}
+                />
+              ) : null}
             </div>
           </div>
 
@@ -1254,35 +555,11 @@ export function PagesView() {
             <CommentsPanel
               threads={state.pageThreads}
               authorNames={state.authorNames}
-              composer={
-                composerTarget
-                  ? {
-                      target: composerTarget,
-                      label: composerTarget === state.activePage ? "this page" : "this block",
-                    }
-                  : null
-              }
-              onClose={() => {
-                setPanelOpen(false);
-                setComposerTarget(null);
-              }}
-              onSubmitNew={(target, text) => {
-                actions.addComment({ target, text });
-                setComposerTarget(null);
-              }}
-              onCancelNew={() => setComposerTarget(null)}
-              onReply={(threadId, text) => {
-                // a reply must carry the THREAD's target (a block id or the
-                // page id) — the module rejects an append whose target differs
-                // from the thread's. Never assume the page here.
-                const target =
-                  state.pageThreads
-                    .flatMap((g) => g.threads)
-                    .find((v) => v.thread.id === threadId)?.thread.target ??
-                  state.activePage ??
-                  "";
-                actions.addComment({ threadId, target, text });
-              }}
+              composer={null}
+              onClose={() => setPanelOpen(false)}
+              onSubmitNew={(target, text) => actions.addComment({ target, text })}
+              onCancelNew={() => {}}
+              onReply={replyToThread}
               onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
               onEdit={(commentId, text) => actions.editComment({ commentId, text })}
               onDelete={(commentId) => actions.deleteComment(commentId)}
@@ -1290,6 +567,23 @@ export function PagesView() {
           ) : null}
         </div>
       </main>
+      {commentCard ? (
+        <CommentCard
+          target={commentCard.target}
+          label={commentCard.label}
+          anchor={commentCard.anchor}
+          threads={
+            state.pageThreads.find((g) => g.target === commentCard.target)?.threads ?? []
+          }
+          authorNames={state.authorNames}
+          onClose={() => setCommentCard(null)}
+          onSubmitNew={(target, text) => actions.addComment({ target, text })}
+          onReply={replyToThread}
+          onResolve={(threadId, resolved) => actions.resolveThread({ threadId, resolved })}
+          onEdit={(commentId, text) => actions.editComment({ commentId, text })}
+          onDelete={(commentId) => actions.deleteComment(commentId)}
+        />
+      ) : null}
       {pendingPageDelete && (
         <ConfirmDialog
           title={`Delete ${pendingPageDeleteTitle}?`}

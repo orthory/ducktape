@@ -1266,7 +1266,9 @@ pub struct Plumbing {
     /// merged from an existing file only (no flag); a WireGuard join seeds a
     /// default AFTER the merge when the invite carries a tunnel bootstrap.
     pub wireguard_listen: Option<String>,
-    /// merged from an existing file only — a hand-set "fake" survives.
+    /// merged like the rest — a hand-set value survives; the desktop app
+    /// passes "socket" here (overlay-net ADR phase 4) while the parse
+    /// default for a file without the key stays `tun`.
     pub wireguard_effect: Option<String>,
 }
 
@@ -1276,6 +1278,7 @@ pub fn merged_plumbing(
     advertised: Option<&str>,
     http_listen: Option<&str>,
     rpc_listen: Option<&str>,
+    wireguard_effect: Option<&str>,
 ) -> Result<Plumbing, String> {
     let path = dir.join("node.toml");
     let existing: Option<NodeToml> = if path.exists() {
@@ -1284,6 +1287,9 @@ pub fn merged_plumbing(
         None
     };
     let e = existing.as_ref();
+    // reject a typo'd effect value at the verb, before anything lands on disk
+    // — resolve() would only catch it on the node's NEXT boot.
+    parse_wireguard_effect(wireguard_effect)?;
     Ok(Plumbing {
         listen: listen
             .map(str::to_string)
@@ -1302,7 +1308,9 @@ pub fn merged_plumbing(
             .and_then(|r| r.storage_dir.clone())
             .unwrap_or_else(|| "storage".into()),
         wireguard_listen: e.and_then(|r| r.wireguard_listen.clone()),
-        wireguard_effect: e.and_then(|r| r.wireguard_effect.clone()),
+        wireguard_effect: wireguard_effect
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.wireguard_effect.clone())),
     })
 }
 
@@ -2850,7 +2858,8 @@ mod tests {
         .expect("write");
         // one flag overrides ONLY its field; the http port AND a hand-edited
         // storage_dir survive.
-        let p = merged_plumbing(&dir, Some("127.0.0.1:53000"), None, None, None).expect("merge");
+        let p = merged_plumbing(&dir, Some("127.0.0.1:53000"), None, None, None, None)
+            .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
         assert_eq!(p.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(p.storage_dir, "/data/ducktape");
@@ -2862,6 +2871,29 @@ mod tests {
         assert_eq!(raw.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(raw.listen, "127.0.0.1:53000");
         assert_eq!(raw.storage_dir.as_deref(), Some("/data/ducktape"));
+    }
+
+    #[test]
+    fn plumbing_wireguard_effect_flag_wins_absence_preserves_and_typos_abort() {
+        let dir = tmp("plumbing-wg-effect");
+        // fresh dir + flag (the desktop app's init/join): written to disk.
+        let p = merged_plumbing(&dir, None, None, None, None, Some("socket")).expect("merge");
+        assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
+        write_node_toml(&dir, &p).expect("write");
+
+        // no flag: the hand-settable value on disk survives a re-merge.
+        let p = merged_plumbing(&dir, None, None, None, None, None).expect("re-merge");
+        assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
+
+        // the flag wins over the file (merged_plumbing's standing precedence).
+        let p = merged_plumbing(&dir, None, None, None, None, Some("tun")).expect("override");
+        assert_eq!(p.wireguard_effect.as_deref(), Some("tun"));
+
+        // a typo aborts the verb before anything is written.
+        let err = merged_plumbing(&dir, None, None, None, None, Some("sokcet"))
+            .err()
+            .expect("a bad effect value must abort the merge");
+        assert!(err.contains("wireguard_effect"), "{err}");
     }
 
     #[test]

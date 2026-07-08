@@ -31,8 +31,14 @@ const DEFAULT_DIR = "/shared";
 
 interface UploadState {
   name: string;
+  targetDir: string;
   staged: number;
   total: number;
+}
+
+interface DragUploadState {
+  targetDir: string;
+  count: number;
 }
 
 interface ContextMenuState {
@@ -160,6 +166,111 @@ function HeaderButton({
       <Icon name={icon} size={13} strokeWidth={1.9} />
       {label}
     </button>
+  );
+}
+
+function UploadNotice({
+  upload,
+  dropTarget,
+}: {
+  upload: UploadState | null;
+  dropTarget: DragUploadState | null;
+}) {
+  if (!upload && !dropTarget) return null;
+
+  const progress = upload && upload.total > 0 ? Math.min(1, upload.staged / upload.total) : 0;
+  let detail: string;
+  if (upload) {
+    detail = `${upload.name} to ${upload.targetDir}`;
+  } else {
+    const target = dropTarget;
+    if (!target) return null;
+    detail =
+      target.count > 0
+        ? `Drop ${target.count} file${target.count === 1 ? "" : "s"} to ${target.targetDir}`
+        : `Drop files to ${target.targetDir}`;
+  }
+
+  return (
+    <div
+      role="status"
+      aria-label="Upload file"
+      aria-live="polite"
+      style={{
+        position: "absolute",
+        top: 18,
+        left: "50%",
+        transform: "translateX(-50%)",
+        zIndex: 30,
+        pointerEvents: "none",
+        boxSizing: "border-box",
+        width: "min(360px, calc(100% - 32px))",
+        borderRadius: radius.lg,
+        border: `1px solid ${color.borderStrong}`,
+        background: "rgba(255, 255, 255, 0.96)",
+        boxShadow: shadow.pop,
+        padding: 14,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <span
+          style={{
+            width: 34,
+            height: 34,
+            borderRadius: radius.md,
+            border: `1px solid ${color.border}`,
+            background: "#eef5f0",
+            color: color.green,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name={upload ? "refresh" : "plus"} size={16} strokeWidth={1.9} />
+        </span>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ font: `700 14px ${font.sans}`, color: color.dark }}>Upload file</div>
+          <div
+            style={{
+              marginTop: 3,
+              font: `500 12px ${font.sans}`,
+              color: color.muted3,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {detail}
+          </div>
+        </div>
+      </div>
+      {upload && (
+        <div style={{ marginTop: 12 }}>
+          <div
+            style={{
+              height: 6,
+              borderRadius: 999,
+              background: color.sunken,
+              overflow: "hidden",
+              border: `1px solid ${color.borderSoft}`,
+            }}
+          >
+            <div
+              style={{
+                width: upload.total > 0 ? `${progress * 100}%` : "28%",
+                height: "100%",
+                borderRadius: 999,
+                background: color.green,
+              }}
+            />
+          </div>
+          <div style={{ marginTop: 6, font: `600 10.5px ${font.mono}`, color: color.muted2 }}>
+            {upload.total > 0 ? `chunk ${upload.staged}/${upload.total}` : "preparing upload"}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -300,6 +411,7 @@ function DirectoryColumnView({
   onPrepareDownload,
   onFileDragStart,
   onDragOverFiles,
+  onDragLeaveFiles,
   onDropFiles,
 }: {
   column: DirectoryColumn;
@@ -314,6 +426,7 @@ function DirectoryColumnView({
   onPrepareDownload: (entry: FileEntry) => void;
   onFileDragStart: (event: ReactDragEvent<HTMLButtonElement>, entry: FileEntry) => void;
   onDragOverFiles: (event: ReactDragEvent<HTMLElement>, path: string) => void;
+  onDragLeaveFiles: (event: ReactDragEvent<HTMLElement>, path: string) => void;
   onDropFiles: (event: ReactDragEvent<HTMLElement>, path: string) => void;
 }) {
   const rows = sortEntries(column.entries);
@@ -325,6 +438,7 @@ function DirectoryColumnView({
       aria-label={`Column ${column.path}`}
       onContextMenu={(event) => onContextMenu(event, null)}
       onDragOver={(event) => onDragOverFiles(event, column.path)}
+      onDragLeave={(event) => onDragLeaveFiles(event, column.path)}
       onDrop={(event) => onDropFiles(event, column.path)}
       style={{
         width: 286,
@@ -749,6 +863,7 @@ export function FilesView() {
   const dragDownloadUrls = useRef<Map<string, string>>(new Map());
   const dragDownloadFiles = useRef<Map<string, File>>(new Map());
   const dragDownloadRequests = useRef<Set<string>>(new Set());
+  const dragUploadClearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [columns, setColumns] = useState<DirectoryColumn[]>([makeDirectoryColumn(DEFAULT_DIR)]);
   const [snapshot, setSnapshot] = useState<string | null>(null);
@@ -756,6 +871,7 @@ export function FilesView() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [selected, setSelected] = useState<FileEntry | null>(null);
   const [upload, setUpload] = useState<UploadState | null>(null);
+  const [dragUpload, setDragUpload] = useState<DragUploadState | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
@@ -775,6 +891,7 @@ export function FilesView() {
 
   useEffect(
     () => () => {
+      if (dragUploadClearTimer.current) clearTimeout(dragUploadClearTimer.current);
       dragDownloadUrls.current.forEach((url) => URL.revokeObjectURL?.(url));
       dragDownloadUrls.current.clear();
       dragDownloadFiles.current.clear();
@@ -931,16 +1048,17 @@ export function FilesView() {
 
   const uploadBrowserFiles = async (files: File[], targetDir: string) => {
     if (!transport || readOnly || files.length === 0) return;
+    const writeDir = writeTargetDir(targetDir);
     setActionError(null);
     try {
       for (const file of files) {
+        setUpload({ name: file.name, targetDir: writeDir, staged: 0, total: 0 });
         const bytes = new Uint8Array(await file.arrayBuffer());
-        setUpload({ name: file.name, staged: 0, total: 0 });
         await uploadFile(transport, {
-          path: joinPath(writeTargetDir(targetDir), file.name),
+          path: joinPath(writeDir, file.name),
           bytes,
           meta: file.type ? { mime: file.type } : {},
-          onProgress: (staged, total) => setUpload({ name: file.name, staged, total }),
+          onProgress: (staged, total) => setUpload({ name: file.name, targetDir: writeDir, staged, total }),
         });
       }
       setUpload(null);
@@ -962,11 +1080,35 @@ export function FilesView() {
   const hasDroppedFiles = (event: ReactDragEvent<HTMLElement>): boolean =>
     Array.from(event.dataTransfer.types ?? []).includes("Files") || event.dataTransfer.files.length > 0;
 
-  const handleColumnDragOver = (event: ReactDragEvent<HTMLElement>) => {
+  const clearDragUploadTimer = () => {
+    if (!dragUploadClearTimer.current) return;
+    clearTimeout(dragUploadClearTimer.current);
+    dragUploadClearTimer.current = null;
+  };
+
+  const hideDragUploadSoon = (delay = 180) => {
+    clearDragUploadTimer();
+    dragUploadClearTimer.current = setTimeout(() => {
+      setDragUpload(null);
+      dragUploadClearTimer.current = null;
+    }, delay);
+  };
+
+  const handleColumnDragOver = (event: ReactDragEvent<HTMLElement>, targetDir: string) => {
     if (!transport || readOnly || !backed || !hasDroppedFiles(event)) return;
     event.preventDefault();
     event.stopPropagation();
     event.dataTransfer.dropEffect = "copy";
+    clearDragUploadTimer();
+    setDragUpload({ targetDir: writeTargetDir(targetDir), count: event.dataTransfer.files.length });
+    hideDragUploadSoon(650);
+  };
+
+  const handleColumnDragLeave = (event: ReactDragEvent<HTMLElement>) => {
+    if (!hasDroppedFiles(event)) return;
+    const nextTarget = event.relatedTarget;
+    if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
+    hideDragUploadSoon();
   };
 
   const handleColumnDrop = (event: ReactDragEvent<HTMLElement>, targetDir: string) => {
@@ -974,6 +1116,8 @@ export function FilesView() {
     event.preventDefault();
     event.stopPropagation();
     event.dataTransfer.dropEffect = "copy";
+    clearDragUploadTimer();
+    setDragUpload(null);
     void uploadBrowserFiles(Array.from(event.dataTransfer.files), targetDir);
   };
 
@@ -1134,6 +1278,7 @@ export function FilesView() {
           <div
             onContextMenu={(event) => openContextMenu(event, null)}
             style={{
+              position: "relative",
               height: "100%",
               minHeight: 360,
               display: "flex",
@@ -1157,24 +1302,7 @@ export function FilesView() {
               />
             ) : (
               <>
-                {upload && (
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 9,
-                      padding: "10px 16px",
-                      borderBottom: `1px solid ${color.borderSoft}`,
-                      background: color.sunken,
-                      font: `500 12px ${font.sans}`,
-                      color: color.muted3,
-                    }}
-                  >
-                    <Icon name="refresh" size={13} strokeWidth={1.9} />
-                    uploading {upload.name}
-                    {upload.total > 0 ? ` — chunk ${upload.staged}/${upload.total}` : "…"}
-                  </div>
-                )}
+                <UploadNotice upload={upload} dropTarget={dragUpload} />
                 {error && (
                   <div
                     style={{
@@ -1210,6 +1338,7 @@ export function FilesView() {
                       onPrepareDownload={prepareDragDownload}
                       onFileDragStart={handleFileDragStart}
                       onDragOverFiles={handleColumnDragOver}
+                      onDragLeaveFiles={handleColumnDragLeave}
                       onDropFiles={handleColumnDrop}
                     />
                   ))}
