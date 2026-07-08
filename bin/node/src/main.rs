@@ -1376,6 +1376,33 @@ enum PromotionBoundary<'a> {
     Retry,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestFetchRetry {
+    log_line: String,
+    announce: bool,
+}
+
+fn joiner_manifest_fetch_retry(
+    label: &str,
+    resident_standing: bool,
+    error: impl std::fmt::Display,
+) -> ManifestFetchRetry {
+    if resident_standing {
+        return ManifestFetchRetry {
+            log_line: format!("[node {label}] resident: boundary fetch retrying ({error})"),
+            announce: false,
+        };
+    }
+    ManifestFetchRetry {
+        log_line: format!(
+            "[node {label}] joining: redemption not landed yet (or the mesh is unreachable) — \
+             the announce keeps retrying and a member node redeems it automatically. retrying \
+             ({error})"
+        ),
+        announce: true,
+    }
+}
+
 fn latest_boundary_has_floor(latest: &statesync::Manifest) -> bool {
     latest.height <= latest.view_base || latest.floor_cert.is_some()
 }
@@ -6782,19 +6809,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 let m = match fetch_manifest(&client).await {
                     Ok(m) => m,
                     Err(e) => {
-                        // two causes look identical on the wire here: this key is
-                        // not admitted yet (the server's p2p bouncer rejects an
-                        // un-tracked peer — the common case), or the bootstrap addr
-                        // is genuinely unreachable. lead with admission and demote
-                        // the raw transport error: the old "mesh unreachable /
-                        // server dead" wording read as a crash and misdirected
-                        // debugging.
-                        println!(
-                            "[node {label}] joining: redemption not landed yet (or the mesh \
-                             is unreachable) — the announce keeps retrying and a member node \
-                             redeems it automatically. retrying ({e})"
-                        );
-                        send_announce(&announce_targets, attempt);
+                        let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
+                        println!("{}", retry.log_line);
+                        if retry.announce {
+                            send_announce(&announce_targets, attempt);
+                        }
                         continue;
                     }
                 };
@@ -10118,6 +10137,53 @@ mod tests {
         match decode_reply(&reply).expect("decode") {
             DirReply::Value(v) => v,
         }
+    }
+
+    #[test]
+    fn resident_manifest_fetch_retry_stays_resident_and_does_not_reannounce() {
+        let retry = joiner_manifest_fetch_retry(
+            "9f7bae44",
+            true,
+            "server error: no finalized boundary to serve yet",
+        );
+
+        assert!(
+            !retry.announce,
+            "a resident should not re-announce the invite after standing is known"
+        );
+        assert!(
+            retry.log_line.contains("[node 9f7bae44] resident:"),
+            "post-standing retry should be logged as resident follow noise: {}",
+            retry.log_line
+        );
+        assert!(
+            retry
+                .log_line
+                .contains("no finalized boundary to serve yet"),
+            "the source fetch detail should remain visible: {}",
+            retry.log_line
+        );
+        assert!(
+            !retry.log_line.contains("redemption not landed")
+                && !retry.log_line.contains("joining:"),
+            "post-standing retry must not look like a pending invite: {}",
+            retry.log_line
+        );
+    }
+
+    #[test]
+    fn parked_manifest_fetch_retry_keeps_join_announce() {
+        let retry =
+            joiner_manifest_fetch_retry("9f7bae44", false, "server error: bouncer rejected");
+
+        assert!(retry.announce, "a parked joiner must keep re-announcing");
+        assert!(
+            retry.log_line.contains("[node 9f7bae44] joining:")
+                && retry.log_line.contains("redemption not landed")
+                && retry.log_line.contains("bouncer rejected"),
+            "parked retry should keep the invite wording and source detail: {}",
+            retry.log_line
+        );
     }
 
     async fn served_directory_frame(
