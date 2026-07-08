@@ -228,7 +228,7 @@ const REPLY_KIND_CODE: &str = "code";
 /// reply as the fallback for prose. job runs never carry reply blocks — there
 /// is no channel to deliver them to.
 fn agent_response_from_text(text: &str, job_run: bool) -> AgentResponse {
-    let parsed = serde_json::from_str::<AgentResponse>(text).unwrap_or_else(|_| AgentResponse {
+    let parsed = parse_strict_response(text).unwrap_or_else(|| AgentResponse {
         reply_blocks: if job_run {
             Vec::new()
         } else {
@@ -237,6 +237,49 @@ fn agent_response_from_text(text: &str, job_run: bool) -> AgentResponse {
         actions: Vec::new(),
     });
     normalize_response(parsed, text, job_run)
+}
+
+/// decode the strict-output contract's [`AgentResponse`] from a provider's
+/// final message. the contract asks for a bare JSON object, but LLMs routinely
+/// wrap it in a ```` ```json ```` markdown fence (agentic multi-turn CLIs
+/// especially) or pad it with a line of prose — so parse tolerantly: bare
+/// first, then de-fenced, then the outermost `{…}` span. without this a
+/// perfectly well-formed reply reaches chat as a raw ```` ```json ```` code
+/// block instead of the prose the model actually wrote.
+fn parse_strict_response(text: &str) -> Option<AgentResponse> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    [
+        Some(trimmed),
+        strip_code_fence(trimmed),
+        outermost_json_object(trimmed),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|candidate| serde_json::from_str::<AgentResponse>(candidate.trim()).ok())
+}
+
+/// strip a single surrounding markdown code fence, returning the inner body.
+/// tolerant of an info string (```` ```json ````) and of a missing close.
+fn strip_code_fence(text: &str) -> Option<&str> {
+    // the opening fence's info string runs to the first newline (```json\n…).
+    let body = text.strip_prefix("```")?.split_once('\n').map(|(_, b)| b)?;
+    let body = body.trim();
+    Some(body.strip_suffix("```").unwrap_or(body).trim())
+}
+
+/// the span from the first `{` to the last `}` — JSON the model buried in
+/// prose. required fields keep a non-object span from parsing; an object with
+/// no known fields decodes empty and degrades to the raw-text paragraph, so
+/// over-matching is harmless.
+fn outermost_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    // lazily — a `}` before the first `{` gives start > end, and slicing that
+    // range panics; `then` must not evaluate the slice unless the range holds.
+    (start < end).then(|| &text[start..=end])
 }
 
 fn paragraph_block(text: String) -> ReplyBlock {
@@ -3679,6 +3722,81 @@ mod tests {
             ],
             "known kinds map to chat blocks; unknown kinds and blank texts drop"
         );
+    }
+
+    #[test]
+    fn a_fenced_json_reply_is_parsed_into_prose_not_dumped_as_a_code_block() {
+        // the observed failure: an agentic CLI wraps its AgentResponse in a
+        // ```json fence despite the contract, the bare parse fails, and the
+        // whole fenced string lands in chat as a raw code block. the tolerant
+        // parser must recover the real prose.
+        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+        let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"QUACKTEST! Hello there.\"}],\"actions\":[]}\n```";
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .from_dispatch()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(raw.as_bytes().to_vec())),
+        )
+        .unwrap();
+        let posts = ctx.chat_msgs();
+        let ChatMsg::PostMessage { blocks, .. } = &posts[0] else {
+            panic!("expected a post");
+        };
+        assert_eq!(
+            *blocks,
+            vec![Block::paragraph("QUACKTEST! Hello there.")],
+            "a fenced AgentResponse is decoded to its prose, never posted as raw JSON"
+        );
+    }
+
+    #[test]
+    fn parse_strict_response_tolerates_the_shapes_llms_actually_emit() {
+        let bare = r#"{"reply_blocks":[{"kind":"paragraph","text":"hi"}],"actions":[]}"#;
+        assert_eq!(parse_strict_response(bare).unwrap().reply_blocks[0].text, "hi");
+
+        // a fence with an info string (```json), the reproduced case.
+        let fenced = format!("```json\n{bare}\n```");
+        assert_eq!(
+            parse_strict_response(&fenced).unwrap().reply_blocks[0].text,
+            "hi"
+        );
+
+        // a bare fence (```), no info string.
+        let bare_fence = format!("```\n{bare}\n```");
+        assert_eq!(
+            parse_strict_response(&bare_fence).unwrap().reply_blocks[0].text,
+            "hi"
+        );
+
+        // JSON with a trailing line of prose the model tacked on.
+        let trailing = format!("{fenced}\nHope that helps!");
+        assert_eq!(
+            parse_strict_response(&trailing).unwrap().reply_blocks[0].text,
+            "hi"
+        );
+
+        // genuine prose (no JSON object) does NOT parse — it must fall back to
+        // the raw-text paragraph, not be swallowed.
+        assert!(parse_strict_response("just a plain hello, no json here").is_none());
+        assert!(parse_strict_response("   ").is_none());
+
+        // a `}` before the first `{` must not panic the outermost-object span.
+        assert!(parse_strict_response("close } then open { please").is_none());
+    }
+
+    #[test]
+    fn a_fenced_job_response_still_yields_actions_only() {
+        // job runs drop reply_blocks; the fenced-parse path must still recover
+        // the actions inside the fence.
+        let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"noise\"}],\"actions\":[{\"create_task\":{\"task_id\":\"t1\",\"title\":\"did it\"}}]}\n```";
+        let parsed = agent_response_from_text(raw, true);
+        assert!(parsed.reply_blocks.is_empty(), "job runs post no chat reply");
+        assert_eq!(parsed.actions.len(), 1, "the fenced action is recovered");
     }
 
     #[test]
