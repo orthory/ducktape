@@ -3714,7 +3714,7 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes());
     println!(
         "{}",
-        config::encode_invite(&descriptor, &token, wireguard.as_ref(), expires, &key)?
+        config::encode_invite(&descriptor, &token, wireguard.as_ref(), &[], expires, &key)?
     );
     Ok(())
 }
