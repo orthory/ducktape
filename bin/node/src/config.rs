@@ -31,8 +31,9 @@ pub const SCHEME_ED25519: &str = "ed25519";
 
 /// the invite blob prefix. UNVERSIONED on purpose (bootstrapping posture): the
 /// network re-mints invites on a format change, and a stale paste fails loudly
-/// at decode — the old `ducktape-invite-v*:` prefixes no longer decode at all.
-const INVITE_PREFIX: &str = "ducktape:";
+/// at decode — the old `ducktape:` / `ducktape-invite-v*:` prefixes no longer
+/// decode at all.
+const INVITE_PREFIX: &str = "🦆";
 
 // ============================================================================
 // hex — dependency-free codecs for keys, roots, and the invite blob.
@@ -1207,7 +1208,8 @@ pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String
         .ok_or_else(|| {
             format!(
                 "not a ducktape invite (expected {INVITE_PREFIX}...); an older \
-                 ducktape-invite-v*: blob no longer decodes — ask for a fresh invite"
+                 ducktape:/ducktape-invite-v*: blob no longer decodes — ask for a \
+                 fresh invite"
             )
         })?;
     let bytes = INVITE_B64
