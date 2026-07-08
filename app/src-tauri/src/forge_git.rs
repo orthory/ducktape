@@ -26,6 +26,8 @@ const MAIN_REF: &str = "refs/heads/main";
 pub struct CommitInfo {
     id: String,
     summary: String,
+    message: String,
+    parent_ids: Vec<String>,
     author: String,
     time: i64,
 }
@@ -35,6 +37,15 @@ pub struct CommitInfo {
 pub struct TreeEntry {
     name: String,
     kind: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilePage {
+    text: String,
+    offset: usize,
+    next_offset: Option<usize>,
+    total_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -164,16 +175,16 @@ pub fn forge_list_branches(app: tauri::AppHandle, repo: String) -> Result<Vec<Br
 }
 
 /// Read a commit log, newest first. `reference` picks the starting point — a
-/// branch short name or 40-hex oid, `None` for main. `limit` is optional:
-/// `None` walks the WHOLE history (the Forge view browses the full repo), `Some(n)`
-/// caps to the newest `n`. There is no built-in ceiling — a local git browser
-/// over a real repo (e.g. 740 commits) walks it all fine.
+/// branch short name or 40-hex oid, `None` for main. `after` is an exclusive
+/// commit cursor from the same walk. `limit` is optional: `None` walks the
+/// whole reachable history, `Some(n)` caps to the newest `n`.
 #[tauri::command]
 pub fn forge_log(
     app: tauri::AppHandle,
     repo: String,
     limit: Option<usize>,
     reference: Option<String>,
+    after: Option<String>,
 ) -> Result<Vec<CommitInfo>, String> {
     let Some(repo) = open_named_repo(&app, &repo)? else {
         return Ok(Vec::new());
@@ -187,9 +198,25 @@ pub fn forge_log(
     walk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL)
         .map_err(err)?;
 
+    let after_oid = after
+        .as_deref()
+        .map(str::trim)
+        .filter(|cursor| !cursor.is_empty())
+        .map(|cursor| {
+            Oid::from_str(cursor).map_err(|e| format!("invalid commit cursor {cursor:?}: {e}"))
+        })
+        .transpose()?;
+    let mut cursor_seen = after_oid.is_none();
     let mut commits = Vec::new();
     for oid in walk {
-        let commit = repo.find_commit(oid.map_err(err)?).map_err(err)?;
+        let oid = oid.map_err(err)?;
+        if !cursor_seen {
+            if after_oid.as_ref().is_some_and(|cursor| *cursor == oid) {
+                cursor_seen = true;
+            }
+            continue;
+        }
+        let commit = repo.find_commit(oid).map_err(err)?;
         commits.push(commit_info(&commit));
         if let Some(limit) = limit
             && commits.len() >= limit
@@ -272,6 +299,38 @@ pub fn forge_read_file(
         .map_err(|_| format!("{path} is not utf-8 text"))?
         .to_string();
     Ok(Some(text))
+}
+
+#[tauri::command]
+pub fn forge_read_file_page(
+    app: tauri::AppHandle,
+    repo: String,
+    path: String,
+    reference: Option<String>,
+    offset: usize,
+    limit: usize,
+) -> Result<Option<FilePage>, String> {
+    let path = clean_repo_path(&path, false)?;
+    let Some(repo) = open_named_repo(&app, &repo)? else {
+        return Ok(None);
+    };
+    let Some(commit) = commit_at(&repo, reference.as_deref())? else {
+        return Ok(None);
+    };
+
+    let tree = commit.tree().map_err(err)?;
+    let entry = match tree.get_path(Path::new(&path)) {
+        Ok(entry) => entry,
+        Err(e) if e.code() == ErrorCode::NotFound => return Ok(None),
+        Err(e) => return Err(err(e)),
+    };
+    if entry.kind() != Some(ObjectType::Blob) {
+        return Ok(None);
+    }
+    let blob = repo.find_blob(entry.id()).map_err(err)?;
+    utf8_text_page(blob.content(), offset, limit)
+        .map(Some)
+        .map_err(|e| format!("{path}: {e}"))
 }
 
 #[tauri::command]
@@ -772,6 +831,8 @@ fn commit_info(commit: &Commit<'_>) -> CommitInfo {
     CommitInfo {
         id: commit.id().to_string(),
         summary: commit.summary().unwrap_or("(no summary)").to_string(),
+        message: commit.message().unwrap_or("").to_string(),
+        parent_ids: commit.parent_ids().map(|oid| oid.to_string()).collect(),
         author: commit.author().name().unwrap_or("ducktape").to_string(),
         time: commit.time().seconds(),
     }
@@ -859,6 +920,41 @@ fn clean_repo_path(raw: &str, allow_empty: bool) -> Result<String, String> {
     Ok(path.to_string())
 }
 
+fn utf8_text_page(content: &[u8], offset: usize, limit: usize) -> Result<FilePage, String> {
+    if limit == 0 {
+        return Err("file page limit must be greater than 0".into());
+    }
+    let text = std::str::from_utf8(content).map_err(|_| "file is not utf-8 text".to_string())?;
+    let total_bytes = text.len();
+    if offset > total_bytes {
+        return Err(format!(
+            "file page offset {offset} exceeds file size {total_bytes}"
+        ));
+    }
+    if !text.is_char_boundary(offset) {
+        return Err(format!("file page offset {offset} is not a utf-8 boundary"));
+    }
+
+    let mut end = offset.saturating_add(limit).min(total_bytes);
+    while end > offset && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == offset && offset < total_bytes {
+        end = text[offset..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| offset + index)
+            .unwrap_or(total_bytes);
+    }
+
+    Ok(FilePage {
+        text: text[offset..end].to_string(),
+        offset,
+        next_offset: (end < total_bytes).then_some(end),
+        total_bytes,
+    })
+}
+
 fn delta_path(delta: &git2::DiffDelta<'_>) -> String {
     let file = match delta.status() {
         Delta::Deleted => delta.old_file(),
@@ -908,12 +1004,16 @@ fn err(e: impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_repo_name;
+    use super::{clean_repo_name, utf8_text_page};
 
     #[test]
     fn accepts_real_forge_repo_slugs() {
         for name in ["ducktape", "default", "my-repo", "a.b_c-1", "x"] {
-            assert_eq!(clean_repo_name(name).unwrap(), name, "{name} should be valid");
+            assert_eq!(
+                clean_repo_name(name).unwrap(),
+                name,
+                "{name} should be valid"
+            );
         }
     }
 
@@ -936,5 +1036,26 @@ mod tests {
                 "{name:?} must be rejected as a repo name"
             );
         }
+    }
+
+    #[test]
+    fn text_page_reports_next_offset() {
+        let page = utf8_text_page("hello world".as_bytes(), 0, 5).unwrap();
+        assert_eq!(page.text, "hello");
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.next_offset, Some(5));
+        assert_eq!(page.total_bytes, 11);
+    }
+
+    #[test]
+    fn text_page_ends_on_utf8_boundary() {
+        let text = "a🙂b";
+        let first = utf8_text_page(text.as_bytes(), 0, 2).unwrap();
+        assert_eq!(first.text, "a");
+        assert_eq!(first.next_offset, Some(1));
+
+        let second = utf8_text_page(text.as_bytes(), first.next_offset.unwrap(), 4).unwrap();
+        assert_eq!(second.text, "🙂");
+        assert_eq!(second.next_offset, Some(5));
     }
 }

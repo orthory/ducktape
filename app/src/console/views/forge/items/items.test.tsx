@@ -21,6 +21,7 @@ const forgeGit = vi.hoisted(() => ({
   forgeReadFile: vi.fn(),
   forgeCompare: vi.fn(),
   forgeBuildMerge: vi.fn(),
+  forgeDiff: vi.fn(),
 }));
 
 vi.mock("../../../../domain/forge-git-client", () => forgeGit);
@@ -126,7 +127,7 @@ describe("IssuesTab", () => {
 });
 
 describe("PullsTab", () => {
-  it("opens a PR from the form with a source branch and main as target", async () => {
+  it("opens a PR from the form with a selectable target branch", async () => {
     const openForgePr = vi.fn(() => Promise.resolve());
     renderInConsole(
       <PullsTab repo="ducktape" />,
@@ -135,6 +136,7 @@ describe("PullsTab", () => {
         forgeItems: [],
         forgeBranches: [
           { name: "main", head: HEAD },
+          { name: "release", head: "c".repeat(40) },
           { name: "feature", head: FEATURE_HEAD },
         ],
       },
@@ -143,6 +145,7 @@ describe("PullsTab", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "New pull request" }));
     fireEvent.change(screen.getByLabelText("Merge"), { target: { value: "feature" } });
+    fireEvent.change(screen.getByLabelText("Target"), { target: { value: "release" } });
     fireEvent.change(screen.getByPlaceholderText("Title"), {
       target: { value: "Add the feature" },
     });
@@ -154,8 +157,93 @@ describe("PullsTab", () => {
         title: "Add the feature",
         body: "",
         sourceBranch: "feature",
-        targetBranch: "main",
+        targetBranch: "release",
       });
+    });
+  });
+
+  it("opens PR commit details with the full message and first-parent diff", async () => {
+    const getForgeItem = vi.fn(() =>
+      Promise.resolve({
+        number: 7,
+        kind: "pr",
+        title: "Add review tools",
+        state: "open",
+        author: operator,
+        created_at: 1_800_000_000,
+        updated_at: 1_800_000_000,
+        body: "Reviewable changes.",
+        channel_id: "forge:ducktape:7",
+        source_branch: "feature",
+        target_branch: "main",
+        merge_oid: null,
+        reviews: [],
+      }),
+    );
+    forgeGit.forgeCompare.mockResolvedValue({
+      mergeBase: HEAD,
+      files: [],
+      totalAdditions: 0,
+      totalDeletions: 0,
+      commits: [
+        {
+          id: FEATURE_HEAD,
+          summary: "Add review tools",
+          message: "Add review tools\n\nShows commit metadata and file diffs.",
+          parentIds: [HEAD],
+          author: "operator",
+          time: 1_800_000_100,
+        },
+      ],
+    });
+    forgeGit.forgeDiff.mockResolvedValue([
+      {
+        path: "src/review.ts",
+        status: "modified",
+        hunks: [
+          {
+            header: "@@ -1,1 +1,2 @@",
+            lines: [
+              { origin: " ", content: "export const oldValue = true;" },
+              { origin: "+", content: "export const reviewable = true;" },
+            ],
+          },
+        ],
+      },
+    ]);
+    renderInConsole(
+      <PullsTab repo="ducktape" />,
+      {
+        forgeRepo: "ducktape",
+        forgeItems: [
+          {
+            number: 7,
+            kind: "pr",
+            title: "Add review tools",
+            state: "open",
+            author: operator,
+            created_at: 1_800_000_000,
+            updated_at: 1_800_000_000,
+          },
+        ],
+        forgeBranches: [
+          { name: "main", head: HEAD },
+          { name: "feature", head: FEATURE_HEAD },
+        ],
+      },
+      { getForgeItem },
+    );
+
+    fireEvent.click(screen.getByText("Add review tools"));
+    fireEvent.click(await screen.findByRole("button", { name: "Commits" }));
+    fireEvent.click(await screen.findByRole("button", { name: /Add review tools/ }));
+
+    expect(await screen.findByText("Shows commit metadata and file diffs.")).toBeInTheDocument();
+    expect(await screen.findByText("src/review.ts")).toBeInTheDocument();
+    expect(screen.getByText("+export const reviewable = true;")).toBeInTheDocument();
+    expect(forgeGit.forgeDiff).toHaveBeenCalledWith("ducktape", {
+      from: HEAD,
+      to: FEATURE_HEAD,
     });
   });
 

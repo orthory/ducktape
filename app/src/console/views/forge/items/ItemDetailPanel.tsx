@@ -14,6 +14,7 @@ import { MarkdownPreview } from "../MarkdownPreview";
 import {
   ActionButton,
   CenterNote,
+  CommitDetails,
   CommitRow,
   ErrorNote,
   errMsg,
@@ -285,6 +286,7 @@ function BackLink({ label, onBack }: { label: string; onBack: () => void }) {
 function PrCommits({ repo, detail }: { repo: string; detail: ForgeItemDetail }) {
   const desktop = isForgeGitAvailable();
   const [commits, setCommits] = useState<CommitInfo[] | null>(null);
+  const [selectedCommitId, setSelectedCommitId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const targetBranch = detail.target_branch || "main";
   const sourceBranch = detail.source_branch ?? "";
@@ -292,6 +294,7 @@ function PrCommits({ repo, detail }: { repo: string; detail: ForgeItemDetail }) 
   useEffect(() => {
     if (!desktop || !sourceBranch) return;
     let alive = true;
+    setSelectedCommitId(null);
     forgeCompare(repo, targetBranch, sourceBranch)
       .then((result) => {
         if (alive) setCommits(result.commits);
@@ -312,13 +315,21 @@ function PrCommits({ repo, detail }: { repo: string; detail: ForgeItemDetail }) 
   if (commits.length === 0) {
     return <CenterNote title="No commits" detail={`${sourceBranch} has no commits ahead of ${targetBranch}.`} />;
   }
+  const selectedCommit = commits.find((commit) => commit.id === selectedCommitId) ?? null;
   return (
     <div style={{ marginTop: 8 }}>
       <div style={{ ...panelLabel, margin: "12px 0 2px" }}>
         COMMITS - {commits.length}
       </div>
       {commits.map((commit) => (
-        <CommitRow key={commit.id} commit={commit} />
+        <div key={commit.id}>
+          <CommitRow
+            commit={commit}
+            selected={commit.id === selectedCommitId}
+            onOpen={() => setSelectedCommitId((current) => (current === commit.id ? null : commit.id))}
+          />
+          {selectedCommit?.id === commit.id && <CommitDetails repo={repo} commit={selectedCommit} />}
+        </div>
       ))}
     </div>
   );

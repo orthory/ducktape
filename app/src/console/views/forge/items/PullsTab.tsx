@@ -1,8 +1,7 @@
 // The repo's Pull requests tab: the same filtered list shape as Issues, plus
-// the "New pull request" form — source branch from state.forgeBranches (main
-// excluded), target fixed to main for v1.
+// the "New pull request" form — source/target branches from the local refs.
 
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { useDucktape } from "../../../store/use-ducktape";
 import { color, font, radius } from "../../../theme/tokens";
@@ -12,6 +11,11 @@ import { ItemRow, StateFilterTabs } from "./shared";
 
 const TARGET_BRANCH = "main";
 
+function preferredTarget(branches: { name: string }[], sourceBranch: string): string {
+  const candidates = branches.filter((branch) => branch.name !== sourceBranch);
+  return candidates.find((branch) => branch.name === TARGET_BRANCH)?.name ?? candidates[0]?.name ?? "";
+}
+
 export function PullsTab({ repo }: { repo: string }) {
   const { state, actions } = useDucktape();
   const [filter, setFilter] = useState<"open" | "closed">("open");
@@ -20,6 +24,7 @@ export function PullsTab({ repo }: { repo: string }) {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [sourceBranch, setSourceBranch] = useState("");
+  const [targetBranch, setTargetBranch] = useState("");
   const [busy, setBusy] = useState(false);
 
   const pulls = state.forgeItems.filter((item) => item.kind === "pr");
@@ -28,7 +33,24 @@ export function PullsTab({ repo }: { repo: string }) {
   const visible = pulls
     .filter((item) => (filter === "open" ? item.state === "open" : item.state !== "open"))
     .sort((a, b) => b.number - a.number);
-  const sourceBranches = state.forgeBranches.filter((branch) => branch.name !== TARGET_BRANCH);
+  const targetBranches = useMemo(
+    () => state.forgeBranches.filter((branch) => branch.name !== sourceBranch),
+    [state.forgeBranches, sourceBranch],
+  );
+  const sourceBranches = useMemo(
+    () => state.forgeBranches.filter((branch) => branch.name !== targetBranch),
+    [state.forgeBranches, targetBranch],
+  );
+
+  useEffect(() => {
+    if (targetBranch && targetBranches.some((branch) => branch.name === targetBranch)) return;
+    setTargetBranch(preferredTarget(state.forgeBranches, sourceBranch));
+  }, [sourceBranch, state.forgeBranches, targetBranch, targetBranches]);
+
+  useEffect(() => {
+    if (!sourceBranch || sourceBranches.some((branch) => branch.name === sourceBranch)) return;
+    setSourceBranch("");
+  }, [sourceBranch, sourceBranches]);
 
   if (openNumber !== null) {
     return (
@@ -39,7 +61,7 @@ export function PullsTab({ repo }: { repo: string }) {
   }
 
   const submit = () => {
-    if (busy || !title.trim() || !sourceBranch) return;
+    if (busy || !title.trim() || !sourceBranch || !targetBranch) return;
     setBusy(true);
     // Promise.resolve guards a test-harness action stub that returns void.
     Promise.resolve(
@@ -48,13 +70,14 @@ export function PullsTab({ repo }: { repo: string }) {
         title: title.trim(),
         body,
         sourceBranch,
-        targetBranch: TARGET_BRANCH,
+        targetBranch,
       }),
     )
       .then(() => {
         setTitle("");
         setBody("");
         setSourceBranch("");
+        setTargetBranch(preferredTarget(state.forgeBranches, ""));
         setShowForm(false);
       })
       .finally(() => setBusy(false));
@@ -83,11 +106,11 @@ export function PullsTab({ repo }: { repo: string }) {
           <div style={{ font: `600 13px ${font.sans}`, color: color.ink }}>New pull request</div>
           {sourceBranches.length === 0 ? (
             <div style={{ marginTop: 8, font: `400 12px ${font.sans}`, color: color.muted }}>
-              No source branches — push a branch besides {TARGET_BRANCH} to open a pull request.
+              No source branches — push a branch besides {targetBranch || TARGET_BRANCH} to open a pull request.
             </div>
           ) : (
             <>
-              <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 9 }}>
+              <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 9, flexWrap: "wrap" }}>
                 <label
                   htmlFor="forge-pr-source"
                   style={{ font: `600 11px ${font.sans}`, color: color.muted3, flexShrink: 0 }}
@@ -111,18 +134,25 @@ export function PullsTab({ repo }: { repo: string }) {
                   ))}
                 </select>
                 <span style={{ font: `600 11px ${font.sans}`, color: color.muted3 }}>into</span>
-                <span
-                  style={{
-                    font: `500 12px ${font.mono}`,
-                    color: color.ink,
-                    border: `1px solid ${color.border}`,
-                    borderRadius: radius.sm,
-                    background: color.paper,
-                    padding: "6px 10px",
-                  }}
+                <label
+                  htmlFor="forge-pr-target"
+                  style={{ font: `600 11px ${font.sans}`, color: color.muted3, flexShrink: 0 }}
                 >
-                  {TARGET_BRANCH}
-                </span>
+                  Target
+                </label>
+                <select
+                  id="forge-pr-target"
+                  name="forge-pr-target"
+                  value={targetBranch}
+                  onChange={(e) => setTargetBranch(e.target.value)}
+                  style={{ ...inputStyle, width: "auto", minWidth: 160, cursor: "pointer", font: `500 12px ${font.mono}` }}
+                >
+                  {targetBranches.map((branch) => (
+                    <option key={branch.name} value={branch.name}>
+                      {branch.name}
+                    </option>
+                  ))}
+                </select>
               </div>
               <input
                 value={title}
@@ -142,7 +172,7 @@ export function PullsTab({ repo }: { repo: string }) {
                 <ActionButton
                   label={busy ? "Opening..." : "Open pull request"}
                   onClick={submit}
-                  disabled={busy || !title.trim() || !sourceBranch}
+                  disabled={busy || !title.trim() || !sourceBranch || !targetBranch}
                   strong
                 />
               </div>

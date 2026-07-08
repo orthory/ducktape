@@ -20,6 +20,10 @@ export interface RepoInfo {
 export interface CommitInfo {
   id: string;
   summary: string;
+  /** Full git commit message: summary plus optional description/body. */
+  message?: string;
+  /** Parent commit ids, in git's parent order. Empty on a root commit. */
+  parentIds?: string[];
   author: string;
   /** Unix seconds from the git commit time. */
   time: number;
@@ -28,6 +32,13 @@ export interface CommitInfo {
 export interface TreeEntry {
   name: string;
   kind: "dir" | "file";
+}
+
+export interface FilePage {
+  text: string;
+  offset: number;
+  nextOffset: number | null;
+  totalBytes: number;
 }
 
 export interface DiffLine {
@@ -126,11 +137,13 @@ export const forgeLog = (
   repo: string,
   limit?: number,
   reference?: string,
+  after?: string | null,
 ): Promise<CommitInfo[]> =>
   desktopInvoke<CommitInfo[]>("forge_log", {
     repo,
     limit: limit ?? null,
     reference: reference ?? null,
+    after: after ?? null,
   });
 
 export const forgeTree = (repo: string, path = "", reference?: string): Promise<TreeEntry[]> =>
@@ -142,6 +155,23 @@ export const forgeReadFile = (
   reference?: string,
 ): Promise<string | null> =>
   desktopInvoke<string | null>("forge_read_file", { repo, path, reference: reference ?? null });
+
+export const forgeReadFilePage = (
+  repo: string,
+  path: string,
+  params: {
+    reference?: string;
+    offset: number;
+    limit: number;
+  },
+): Promise<FilePage | null> =>
+  desktopInvoke<FilePage | null>("forge_read_file_page", {
+    repo,
+    path,
+    reference: params.reference ?? null,
+    offset: params.offset,
+    limit: params.limit,
+  });
 
 /**
  * GitHub-style compare (three-dot): files changed from merge_base(base, head)

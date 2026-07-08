@@ -55,6 +55,7 @@ fn main() {
             forge_git::forge_log,
             forge_git::forge_tree,
             forge_git::forge_read_file,
+            forge_git::forge_read_file_page,
             forge_git::forge_diff,
             forge_git::forge_compare,
             forge_git::forge_build_merge,
