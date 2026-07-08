@@ -80,6 +80,7 @@ export const buildHuddleWindowState = (
       selfNodeHex,
       authorNames,
       selfMuted: voice.muted,
+      selfSpeaking: voice.speaking,
       sessionStartMs: voice.sessionStartMs,
       now,
     }),

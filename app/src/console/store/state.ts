@@ -55,6 +55,10 @@ export interface VoiceSlice {
    *  staleness baseline for a never-beaconed member. Shared so the dock and the
    *  popped window agree on who is sweepable. */
   sessionStartMs: number | null;
+  /** Whether OUR mic is currently above the speaking threshold (drives the self
+   *  speaking ring + the "you're muted while talking" banner). Detected off the
+   *  capture frames, so it's true even while muted. */
+  speaking: boolean;
 }
 
 /** One search round-trip across the modules that ship materialized views —
@@ -451,6 +455,7 @@ export const createInitialState = (): ConsoleState => {
       cameraOn: false,
       peers: {},
       sessionStartMs: null,
+      speaking: false,
     },
     videoCapability: { canEncode: false, canDecode: false },
     members: [],

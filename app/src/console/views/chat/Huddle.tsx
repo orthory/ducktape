@@ -217,14 +217,15 @@ const tileNameText: CSSProperties = {
  *  it renders whatever `setCamera` acquired. Muted (it's our own audio) and
  *  autoplaying (bindPreview only sets srcObject, it never calls play). */
 function SelfTile() {
-  const { actions } = useDucktape();
+  const { state, actions } = useDucktape();
   // Pin the ref callback so the 1 s staleness tick doesn't rebind every render.
   const bindPreview = useCallback(
     (el: HTMLVideoElement | null) => actions.getCallSession()?.bindPreview(el),
     [actions],
   );
+  const speaking = state.voice.speaking;
   return (
-    <div style={tileFrame}>
+    <div style={speaking ? { ...tileFrame, border: `2px solid ${color.green}` } : tileFrame}>
       <video ref={bindPreview} muted autoPlay playsInline style={tileMedia} />
       <span style={tileName}>
         <span style={tileNameText}>You</span>
@@ -366,6 +367,7 @@ function HuddleDockCard() {
     selfNodeHex: selfHex,
     authorNames: state.authorNames,
     selfMuted: voice.muted,
+    selfSpeaking: voice.speaking,
     sessionStartMs: voice.sessionStartMs,
     now: nowTick,
   });

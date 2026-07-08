@@ -21,6 +21,7 @@ const voice = (over: Partial<VoiceSlice> = {}): VoiceSlice => ({
   cameraOn: false,
   peers: {},
   sessionStartMs: NOW - 1_000,
+  speaking: false,
   ...over,
 });
 
@@ -60,8 +61,8 @@ describe("buildHuddleWindowState", () => {
     expect(state?.channelName).toBe("general");
     expect(state?.muted).toBe(true);
     expect(state?.participants).toEqual([
-      { key: keyHex(alice), name: "alice", muted: true, stale: false, isSelf: true, user: alice },
-      { key: keyHex(bob), name: "Bob!", muted: false, stale: false, isSelf: false, user: bob },
+      { key: keyHex(alice), name: "alice", muted: true, stale: false, isSelf: true, speaking: false, user: alice },
+      { key: keyHex(bob), name: "Bob!", muted: false, stale: false, isSelf: false, speaking: false, user: bob },
     ]);
   });
 

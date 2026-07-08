@@ -495,6 +495,10 @@ export function createActions({
       }));
       return;
     }
+    if (event.kind === "selfSpeaking") {
+      update((prev) => ({ voice: { ...prev.voice, speaking: event.speaking } }));
+      return;
+    }
     const status = event.status;
     const error = event.error;
     if (status === "closed" || status === "error") {
@@ -513,6 +517,7 @@ export function createActions({
             cameraOn: false,
             peers: {},
             sessionStartMs: null,
+            speaking: false,
           },
         });
       } else {
@@ -1256,6 +1261,7 @@ export function createActions({
           peers: {},
           // Fresh session → fresh staleness baseline (a retry replaces the session).
           sessionStartMs: Date.now(),
+          speaking: false,
         },
       }));
       voice.start(callSocketUrl(nodeUrl, channelId));
@@ -1276,6 +1282,7 @@ export function createActions({
           cameraOn: false,
           peers: {},
           sessionStartMs: null,
+          speaking: false,
         },
       });
       if (channelId) submitLeaveHuddle(channelId);

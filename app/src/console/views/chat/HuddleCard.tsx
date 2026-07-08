@@ -115,7 +115,8 @@ function Roster({
     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
       {shown.map((p) => (
         <div key={p.key} style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
-          <RowAvatar name={p.name} size={22} ring={ring} />
+          {/* A green ring while speaking (self only — peer speaking isn't known). */}
+          <RowAvatar name={p.name} size={22} ring={p.speaking ? color.green : ring} />
           <span
             title={p.name}
             style={{
@@ -211,6 +212,8 @@ export function HuddleCard({
   const live = status === "live";
   const failure = status === "error" ? (error ?? "connection") : null;
   const pop = onPopOut ?? onPopIn;
+  // Talking into a muted mic — the single most common "why can't they hear me".
+  const mutedWhileTalking = participants.some((p) => p.isSelf && p.muted && p.speaking);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -269,6 +272,25 @@ export function HuddleCard({
         <span style={{ font: `400 11px/1.4 ${font.sans}`, color: color.danger }}>
           {ERROR_COPY[failure]}
         </span>
+      )}
+
+      {!failure && mutedWhileTalking && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "5px 8px",
+            borderRadius: radius.sm,
+            background: color.dangerSoft,
+            border: `1px solid ${color.dangerBorder}`,
+            color: color.danger,
+            font: `600 11px ${font.sans}`,
+          }}
+        >
+          <MicGlyph size={13} muted />
+          You&rsquo;re muted
+        </div>
       )}
 
       {!failure && (

@@ -39,6 +39,9 @@ export interface HuddleParticipant {
   stale: boolean;
   /** This row is us (matched by node key). Never stale/removable. */
   isSelf: boolean;
+  /** Above the speaking threshold right now. Only the self row can be true —
+   *  peer speaking isn't derivable client-side (audio is server-mixed). */
+  speaking: boolean;
   /** The member's user key bytes — carried for SweepHuddle. */
   user: number[];
 }
@@ -51,6 +54,8 @@ export interface BuildParticipantsParams {
   authorNames: Record<string, string>;
   /** Our own mute state — self mute is authoritative locally, not beaconed to us. */
   selfMuted: boolean;
+  /** Our own speaking state (mic above threshold) — only the self row uses it. */
+  selfSpeaking: boolean;
   /** When our session started (staleness baseline for never-beaconed members).
    *  Null → treat as `now` so nothing is stale before a session is established. */
   sessionStartMs: number | null;
@@ -64,6 +69,7 @@ export const buildParticipants = ({
   selfNodeHex,
   authorNames,
   selfMuted,
+  selfSpeaking,
   sessionStartMs,
   now,
 }: BuildParticipantsParams): HuddleParticipant[] => {
@@ -79,6 +85,7 @@ export const buildParticipants = ({
       muted: isSelf ? selfMuted : !!beacon?.muted,
       stale: !isSelf && isBeaconStale(beacon, start, now),
       isSelf,
+      speaking: isSelf && selfSpeaking,
       user: m.user,
     };
   });

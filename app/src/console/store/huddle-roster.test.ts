@@ -41,6 +41,7 @@ describe("buildParticipants", () => {
     selfNodeHex: selfHex,
     authorNames: {} as Record<string, string>,
     selfMuted: false,
+    selfSpeaking: false,
     sessionStartMs: NOW - 1_000,
     now: NOW,
   };
@@ -99,5 +100,16 @@ describe("buildParticipants", () => {
       roster: [member("a", [1]), member("b", [2]), member("c", [3])],
     });
     expect(rows.map((r) => r.name)).toEqual(["a", "b", "c"]);
+  });
+
+  it("marks only the self row speaking (peer speaking is not derivable client-side)", () => {
+    const rows = buildParticipants({
+      ...base,
+      roster: [member("me", selfNode), member("bob", [1])],
+      selfSpeaking: true,
+    });
+    const byKey = Object.fromEntries(rows.map((r) => [r.key, r]));
+    expect(byKey[keyHex(bytes("me"))].speaking).toBe(true);
+    expect(byKey[keyHex(bytes("bob"))].speaking).toBe(false);
   });
 });
