@@ -6,11 +6,11 @@ description: Use when verifying a UI/design change in the real Ducktape desktop 
 # Tauri Debug (drive the live Ducktape app)
 
 The desktop shell ships a **dev-only** debug bridge: `tauri-plugin-agent`
-(vendored at `third_party/tauri-agent-plugin`), registered under
+(crates.io/npm release `0.0.1`), registered under
 `#[cfg(all(debug_assertions, desktop))]` in `app/src-tauri/src/main.rs`. It runs
 an inline loopback-TCP debugger and publishes an **app-scoped endpoint registry**
 so a driver can screenshot the window, snapshot the semantic tree, find/click by
-role+name, run JS in the webview, and read logs. Drive it with the vendored
+role+name, run JS in the webview, and read logs. Drive it with the package
 `tauri-agent` CLI via the thin shim `app/scripts/tauri-agent` (defaults
 `--app com.ducktape.app`), or with the native `tauri_*` MCP tools.
 
@@ -24,14 +24,13 @@ onboarding/workspace commands throw).
 
 | Layer | Where |
 |---|---|
-| Vendored plugin | `third_party/tauri-agent-plugin` (git submodule; run `git submodule update --init` then `bun install` inside it once — the CLI/MCP run straight off its TS) |
-| Rust dep | `app/src-tauri/Cargo.toml` — `tauri-plugin-agent = { path = "../../third_party/tauri-agent-plugin" }` |
+| Rust dep | `app/src-tauri/Cargo.toml` — `tauri-plugin-agent = "0.0.1"` |
 | Rust plugin | `app/src-tauri/src/main.rs` — `tauri_plugin_agent::init()` under `cfg(all(debug_assertions, desktop))` |
 | Inline server | `app/src-tauri/tauri.conf.json` — `plugins.agent.inlineServer` (`enabled`, `host`, `port:0`, `publishEndpoint`) |
 | Capability | `app/src-tauri/capabilities/default.json` — `agent:default` (windows main/tray/huddle) |
-| Guest JS | `app/src/main.tsx` — `new WebviewAgentInstrumentation({ windowLabel }).install()` under `import.meta.env.DEV`; resolved by a Vite alias to the submodule's `guest-js/index.ts` |
-| Driver | `app/scripts/tauri-agent` — thin shim over `third_party/tauri-agent-plugin/bin/tauri-agent.ts` |
-| MCP | `.mcp.json` — server `tauri-agent` (`bun .../bin/tauri-agent-mcp.ts`), native `tauri_*` tools |
+| Guest JS | `app/src/main.tsx` — `new WebviewAgentInstrumentation({ windowLabel }).install()` under `import.meta.env.DEV`; loaded from `@byeongsu-hong/tauri-plugin-agent@0.0.1` |
+| Driver | `app/scripts/tauri-agent` — thin shim over the package `tauri-agent` binary |
+| MCP | `.mcp.json` — server `tauri-agent` via `app/scripts/tauri-agent-mcp`, native `tauri_*` tools |
 
 ## Run it
 

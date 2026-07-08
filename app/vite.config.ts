@@ -1,7 +1,6 @@
 // defineConfig comes from vitest/config (not vite) so the `test` block below
 // is typed — vitest 4 dropped the `/// <reference types="vitest" />` module
 // augmentation. at runtime it is vite's own defineConfig, re-exported.
-import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
@@ -18,16 +17,6 @@ const strictPort = true;
 export default defineConfig({
   plugins: [tailwindcss(), react()],
   clearScreen: false,
-  resolve: {
-    alias: {
-      // Guest binding resolves to the vendored submodule source. Safe to leave
-      // unconditional: the only import is behind import.meta.env.DEV, so a
-      // release build dead-code-eliminates it before this alias is reached.
-      "@byeongsu-hong/tauri-plugin-agent": fileURLToPath(
-        new URL("../third_party/tauri-agent-plugin/guest-js/index.ts", import.meta.url),
-      ),
-    },
-  },
   server: {
     port: devPort,
     strictPort,
