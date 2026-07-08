@@ -1,8 +1,9 @@
 # Design Records
 
 non-page doc을 읽을지, 수정할지, prune할지 판단하기 위한 page다. 유지되는 reader
-doc은 `docs/pages`에 둔다. temporary planning note는 durable fact를 code, test,
-runbook, ADR, Vocs가 소유하게 된 뒤 repo에 남기지 않는다.
+doc은 `docs/pages`에 둔다. `docs/superpowers`는 아직 reader doc, ADR, runbook,
+test, code로 접히지 않은 reviewed active design record, approved spec, live
+execution plan을 위한 위치다.
 
 ## Read These First
 
@@ -17,10 +18,11 @@ runbook, ADR, Vocs가 소유하게 된 뒤 repo에 남기지 않는다.
 | WireGuard tunnel plan 변경 | `docs/wireguard-tunnel-upgrade.md`, `crates/system/wireguard-upgrade`. |
 | sentry/coordinator/private cutover 변경 | `docs/sentry-deployment.md`, `docs/deploy/*`, `ops/coordinator/*`. |
 | video huddle 변경 | `docs/adr/2026-07-06-video-call-module.mdx`, `bin/node/src/voice.rs`, `app/src/console/views/chat/Huddle.tsx`. |
+| working design/planning record audit | `docs/superpowers/README.md`, 그다음 관련 `docs/superpowers/specs/*` 또는 `docs/superpowers/plans/*` file. |
 
 ## Pruning Test
 
-temporary plan을 repo에 남기기 전에 네 가지를 확인한다.
+temporary plan이나 spec을 prune하기 전에 네 가지를 확인한다.
 
 1. operator가 아직 이 절차를 실행하는가?
 2. future implementer에게 unresolved decision이 필요한가?
@@ -31,10 +33,9 @@ temporary plan을 repo에 남기기 전에 네 가지를 확인한다.
 plan을 가리키면 이제 그 사실을 소유하는 ADR, test, runbook, code owner, Vocs page로
 retarget한다.
 
-## Current Pruned Set
+## Current Reviewed Prune Set
 
-이번 housekeeping pass는 pages/comments, agent visibility, agent setup
-simplification, chat polish, huddle pop-out, video calls, upgrade implementation
-plan을 maintained docs로 접는다. admission-boundary와 restart recovery의 historical
-note도 이제 Vocs summary와 test가 소유하므로 삭제한다. 삭제된 파일은 active
-contract가 아니라 task execution scaffold였다.
+현재 reviewed prune set은 의도적으로 좁다: 완료된 sentry phase-1 implementation
+plan, 명시적으로 historical인 coordinator-relay-era plan 세 개, 해결된
+fleet-isolation finding, non-binding librarian idea만 prune한다. 파일별 이유는
+`docs/superpowers/README.md`에 둔다.
