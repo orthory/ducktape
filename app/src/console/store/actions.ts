@@ -351,6 +351,13 @@ export interface ConsoleActions {
   /** Scrape + parse the node's `/metrics`. Null when no node is resolved or the
    *  scrape fails — best-effort, for the poll-driven Metrics view. */
   readMetrics(): Promise<NodeMetrics | null>;
+  /** The active workspace's `daemon.log` path + last 64 KB — polled by the
+   *  Node → Logs tab. Null when there is no managed workspace or the read
+   *  fails (node stopped mid-view); the viewer keeps its last good frame. */
+  readDaemonLog(): Promise<ws.LogTail | null>;
+  /** The active managed node's runtime facts (pid, uptime, binary, paths) for
+   *  the Logs tab's facts row. Null when unmanaged or the read fails. */
+  readRuntimeFacts(): Promise<ws.RuntimeFacts | null>;
   dismissError(): void;
 
   // ── Onboarding / workspaces (desktop only) ──
@@ -983,6 +990,22 @@ export function createActions({
       return live
         ? live.metrics().then(parseMetrics).catch(() => null)
         : Promise.resolve(null);
+    },
+
+    // The Logs tab surfaces the LOCAL daemon.log — a per-workspace file only the
+    // desktop shell that spawned the node can read. Both reads are best-effort:
+    // a stopped/forgotten node just yields null and the tab keeps its last frame
+    // (or shows its managed-only empty state). Keyed on the active workspace id.
+    readDaemonLog: () => {
+      const { managed, workspace } = getState();
+      if (!managed || !workspace) return Promise.resolve(null);
+      return ws.workspaceLogTail(workspace.id).catch(() => null);
+    },
+
+    readRuntimeFacts: () => {
+      const { managed, workspace } = getState();
+      if (!managed || !workspace) return Promise.resolve(null);
+      return ws.workspaceRuntimeFacts(workspace.id).catch(() => null);
     },
 
     // Keep the local author identity (still the web-origin string) AND submit

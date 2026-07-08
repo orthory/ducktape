@@ -1117,6 +1117,48 @@ pub fn workspace_log_tail(app: tauri::AppHandle, id: String) -> Result<LogTail, 
     })
 }
 
+/// the running node's operational identity for the Node → Logs tab: its pid +
+/// liveness, uptime, the resolved node binary, and the workspace's data + log
+/// paths. every process field is best-effort — a workspace whose node we did
+/// NOT spawn (adopted or already-listening) has no pidfile, so `pid`/`alive`/
+/// `uptime_secs` come back `None` and the row renders "—" rather than lying.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeFacts {
+    /// the detached node's pid, from the pidfile we recorded on spawn.
+    pub pid: Option<u32>,
+    /// `kill -0` on that pid; `None` when there is no pidfile to check.
+    pub alive: Option<bool>,
+    /// elapsed running time in seconds (`ps -o etime`); unix-only, best-effort.
+    pub uptime_secs: Option<u64>,
+    /// the `ducktape-node` binary path the daemon flow resolves to.
+    pub binary_path: Option<String>,
+    /// this workspace's on-disk directory (`~/.ducktape/workspaces/<id>`).
+    pub data_dir: String,
+    /// the `daemon.log` inside `data_dir` — the same file `workspace_log_tail`
+    /// reads, surfaced here so the row can show the path the viewer follows.
+    pub log_path: String,
+}
+
+#[tauri::command]
+pub fn workspace_runtime_facts(app: tauri::AppHandle, id: String) -> Result<RuntimeFacts, String> {
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
+    let dir = workspaces_dir(&app)?.join(&ws.id);
+    let pid = read_pid(&dir);
+    let log_path = dir.join("daemon.log");
+    Ok(RuntimeFacts {
+        pid,
+        alive: recorded_pid_alive(&dir),
+        uptime_secs: pid.and_then(node_uptime_secs),
+        binary_path: crate::daemon::resolve_node_bin()
+            .ok()
+            .map(|path| path.display().to_string()),
+        log_path: log_path.display().to_string(),
+        data_dir: dir.display().to_string(),
+    })
+}
+
 /// has the identity-creation mnemonic been confirmed once on this machine?
 /// `pub(crate)` so [`crate::user_identity::user_identity_state`] can fold
 /// this UX flag into its reported state without reaching into `Registry`'s
@@ -1243,6 +1285,59 @@ fn recorded_pid_alive(dir: &Path) -> Option<bool> {
         return None;
     }
     Some(pid_alive(pid))
+}
+
+/// the recorded pid as a number, or `None` when there is no (parseable)
+/// pidfile — an adopted or never-spawned node. mirrors [`recorded_pid_alive`]'s
+/// contract but yields the pid itself, for the runtime-facts row.
+fn read_pid(dir: &Path) -> Option<u32> {
+    fs::read_to_string(pidfile(dir)).ok()?.trim().parse().ok()
+}
+
+/// elapsed running time of `pid` in seconds, via `ps -o etime`. unix only —
+/// `ps` is this module's portable-enough process oracle (see [`cmdline_of`]).
+/// `None` when the process is gone or the field can't be parsed.
+#[cfg(unix)]
+fn node_uptime_secs(pid: u32) -> Option<u64> {
+    let out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "etime="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_etime(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+#[cfg(not(unix))]
+fn node_uptime_secs(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// parse a `ps -o etime` field ("[[dd-]hh:]mm:ss") into whole seconds. returns
+/// `None` for any shape it doesn't recognize (blank, out-of-range, too many
+/// colon groups) rather than guessing.
+fn parse_etime(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (days, hms) = match raw.split_once('-') {
+        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
+        None => (0u64, raw),
+    };
+    let mut fields = hms.split(':').rev();
+    let secs: u64 = fields.next()?.parse().ok()?;
+    let mins: u64 = fields.next()?.parse().ok()?;
+    let hours: u64 = match fields.next() {
+        Some(h) => h.parse().ok()?,
+        None => 0,
+    };
+    // a valid etime is at most dd-hh:mm:ss — a fourth colon group is malformed.
+    if fields.next().is_some() || secs >= 60 || mins >= 60 {
+        return None;
+    }
+    Some(((days * 24 + hours) * 60 + mins) * 60 + secs)
 }
 
 /// unix `kill -0 <pid>`: succeeds iff the process exists. shells out to match
@@ -1491,6 +1586,23 @@ mod tests {
         }];
         assert_eq!(unique_id("My Team", &taken), "my-team-2");
         assert_eq!(unique_id("***", &taken), "workspace");
+    }
+
+    #[test]
+    fn parse_etime_handles_every_field_width() {
+        assert_eq!(parse_etime("05"), None); // ss alone is not a valid etime
+        assert_eq!(parse_etime("01:05"), Some(65)); // mm:ss
+        assert_eq!(parse_etime("02:01:05"), Some(2 * 3600 + 65)); // hh:mm:ss
+        assert_eq!(parse_etime("3-02:01:05"), Some(3 * 86_400 + 2 * 3600 + 65)); // dd-hh:mm:ss
+        assert_eq!(parse_etime("  01:05  "), Some(65)); // ps pads the field
+    }
+
+    #[test]
+    fn parse_etime_rejects_malformed() {
+        assert_eq!(parse_etime(""), None);
+        assert_eq!(parse_etime("nope"), None);
+        assert_eq!(parse_etime("99:99"), None); // out-of-range mm/ss
+        assert_eq!(parse_etime("1:2:3:4"), None); // too many groups
     }
 
     #[test]
