@@ -875,6 +875,28 @@ pub struct InviteWireGuard {
     pub mesh_port: u16,
 }
 
+/// a member "front" a joiner races against the inviter during first contact:
+/// the member's REAL node identity, its WireGuard PUBLIC key + control-mesh
+/// port for the coordinated path, and an OPTIONAL direct underlay endpoint
+/// (present when the member is directly dialable, absent when it is reachable
+/// only by identity via the coordinator). Only PUBLIC keys ever travel — the
+/// WG private key never leaves the node. Fronts ride the SIGNED invite
+/// envelope but sit OUTSIDE `genesis_namespace` (advisory reach, zero
+/// consensus), exactly like the descriptor's `reach` hints.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Front {
+    /// the member's ed25519 identity, raw — the key the joiner authenticates
+    /// end-to-end regardless of which path reached it.
+    pub member_key: [u8; 32],
+    /// the member's X25519 WireGuard public key, raw.
+    pub wireguard_public_key: [u8; 32],
+    /// the member's control-mesh listen port, dialed at its overlay ULA.
+    pub mesh_port: u16,
+    /// the member's direct underlay endpoint (`host:port`) when it is directly
+    /// dialable; `None` means "reach me by identity via the coordinator".
+    pub endpoint: Option<String>,
+}
+
 /// a decoded, VERIFIED invite — the only constructor is [`decode_invite`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Invite {
@@ -883,6 +905,9 @@ pub struct Invite {
     /// `None` when the inviter runs no reachability plane (a TCP-reachable
     /// network) — the joiner then rides the descriptor's reach hints alone.
     pub wireguard: Option<InviteWireGuard>,
+    /// the member fronts the inviter offers as additional first-contact
+    /// candidates; empty for a pre-feature blob or an inviter that offers none.
+    pub fronts: Vec<Front>,
     pub expires_unix_secs: u64,
 }
 
@@ -892,6 +917,7 @@ pub fn encode_invite(
     descriptor: &NetworkDescriptor,
     token: &InviteToken,
     wireguard: Option<&InviteWireGuard>,
+    fronts: &[Front],
     expires_unix_secs: u64,
     signer: &ed25519::PrivateKey,
 ) -> Result<String, String> {
@@ -899,7 +925,7 @@ pub fn encode_invite(
     if signer.public_key() != token.issuer {
         return Err("invite envelope must be signed by the token's issuer".into());
     }
-    let mut out = pack_invite(descriptor, token, wireguard, expires_unix_secs)?;
+    let mut out = pack_invite(descriptor, token, wireguard, fronts, expires_unix_secs)?;
     let sig = signer.sign(INVITE_ENVELOPE_NAMESPACE, &out);
     out.extend_from_slice(sig.encode().as_ref());
     Ok(format!("{INVITE_PREFIX}{}", INVITE_B64.encode(out)))
@@ -968,6 +994,7 @@ fn pack_invite(
     d: &NetworkDescriptor,
     token: &InviteToken,
     wireguard: Option<&InviteWireGuard>,
+    fronts: &[Front],
     expires_unix_secs: u64,
 ) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
@@ -1025,6 +1052,29 @@ fn pack_invite(
 
     out.extend_from_slice(&expires_unix_secs.to_le_bytes());
     out.extend_from_slice(&pack_invite_token(token));
+
+    // the fronts block — APPENDED last, after every pre-feature field, so it
+    // stays inside the issuer-signed envelope yet OUTSIDE `genesis_namespace`
+    // (which hashes scheme + validators only). OMITTED entirely when empty:
+    // a modern zero-fronts blob is then byte-identical to a pre-feature one,
+    // and the decoder treats "no bytes after the token" as `fronts: vec![]`.
+    if !fronts.is_empty() {
+        out.push(
+            u8::try_from(fronts.len()).map_err(|_| format!("too many fronts ({})", fronts.len()))?,
+        );
+        for f in fronts {
+            out.extend_from_slice(&f.member_key);
+            out.extend_from_slice(&f.wireguard_public_key);
+            out.extend_from_slice(&f.mesh_port.to_le_bytes());
+            match &f.endpoint {
+                Some(e) => {
+                    out.push(1);
+                    put_str_u8(&mut out, e)?;
+                }
+                None => out.push(0),
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -1103,9 +1153,40 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         return Err("this invite has expired — ask for a fresh one".into());
     }
     let token = unpack_invite_token(r.take(INVITE_TOKEN_LEN)?)?;
-    if !r.done() {
-        return Err("invite payload has trailing bytes".into());
-    }
+
+    // the fronts block — appended after this feature landed. a PRE-FEATURE
+    // blob ends exactly at the token (`r.done()`), decoding to an empty fronts
+    // list; a modern blob carries a u8 count followed by that many fronts.
+    // fail-closed on any malformed remainder.
+    let fronts = if r.done() {
+        Vec::new()
+    } else {
+        let fcount = r.u8()? as usize;
+        let mut fronts = Vec::with_capacity(fcount);
+        for _ in 0..fcount {
+            let mut member_key = [0u8; 32];
+            member_key.copy_from_slice(r.take(32)?);
+            let mut wireguard_public_key = [0u8; 32];
+            wireguard_public_key.copy_from_slice(r.take(32)?);
+            let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
+            let endpoint = match r.u8()? {
+                0 => None,
+                1 => Some(r.take_str_u8()?),
+                other => return Err(format!("unknown front endpoint flag {other} in invite")),
+            };
+            fronts.push(Front {
+                member_key,
+                wireguard_public_key,
+                mesh_port,
+                endpoint,
+            });
+        }
+        if !r.done() {
+            return Err("invite payload has trailing bytes".into());
+        }
+        fronts
+    };
+
     Ok(Invite {
         descriptor: NetworkDescriptor {
             chain_id,
@@ -1119,6 +1200,7 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         },
         token,
         wireguard,
+        fronts,
         expires_unix_secs,
     })
 }
@@ -1961,7 +2043,7 @@ mod tests {
         wireguard: Option<&InviteWireGuard>,
     ) -> String {
         let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes());
-        encode_invite(d, &token, wireguard, u64::MAX, issuer).expect("encode")
+        encode_invite(d, &token, wireguard, &[], u64::MAX, issuer).expect("encode")
     }
 
     // ---- user-key bind/unbind certificates ---------------------------------
@@ -2175,7 +2257,7 @@ mod tests {
         let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
 
         // expiry is enforced at decode, deterministically via the injected clock.
-        let blob = encode_invite(&d, &token, None, 1_000, &issuer).expect("encode");
+        let blob = encode_invite(&d, &token, None, &[], 1_000, &issuer).expect("encode");
         assert!(decode_invite_at(&blob, 999).is_ok());
         let err = decode_invite_at(&blob, 1_000).expect_err("expired");
         assert!(err.contains("expired"), "{err}");
@@ -2195,7 +2277,7 @@ mod tests {
         // an envelope signed by someone other than the token's issuer is
         // refused at encode (and would fail decode's issuer verify anyway).
         let outsider = ed25519::PrivateKey::from_seed(8);
-        assert!(encode_invite(&d, &token, None, u64::MAX, &outsider).is_err());
+        assert!(encode_invite(&d, &token, None, &[], u64::MAX, &outsider).is_err());
 
         // the old versioned prefixes are gone: a stale paste fails loudly
         // with re-mint guidance.
@@ -2234,6 +2316,119 @@ mod tests {
         let invite =
             decode_invite(&encode_test_invite(&base, &issuer, None)).expect("roundtrip");
         assert_eq!(invite.descriptor.coordination.as_deref(), Some("private"));
+    }
+
+    /// helper: a descriptor whose only validator is `issuer` (the minimal
+    /// well-formed shape the invite tests need).
+    fn front_test_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
+        NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        }
+    }
+
+    #[test]
+    fn invite_blob_roundtrips_member_fronts() {
+        // (a) two fronts — one with a direct endpoint, one reachable only by
+        // identity (endpoint None) — survive the signed envelope byte-for-byte.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_test_descriptor(&issuer);
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+        let fronts = vec![
+            Front {
+                member_key: [11u8; 32],
+                wireguard_public_key: [12u8; 32],
+                mesh_port: 52210,
+                endpoint: Some("198.51.100.9:51820".into()),
+            },
+            Front {
+                member_key: [21u8; 32],
+                wireguard_public_key: [22u8; 32],
+                mesh_port: 52211,
+                endpoint: None,
+            },
+        ];
+        let blob =
+            encode_invite(&d, &token, None, &fronts, u64::MAX, &issuer).expect("encode");
+        let invite = decode_invite(&blob).expect("decode");
+        assert_eq!(invite.fronts, fronts, "fronts roundtrip through the envelope");
+    }
+
+    #[test]
+    fn a_pre_feature_blob_decodes_to_empty_fronts() {
+        // (b) the fronts block is OMITTED when empty, so a zero-fronts encode is
+        // byte-identical to a blob minted BEFORE this feature (which ended at
+        // the token). such a blob must decode to `fronts: vec![]`, never error
+        // on a "missing" block.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_test_descriptor(&issuer);
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+
+        let empty_blob =
+            encode_invite(&d, &token, None, &[], u64::MAX, &issuer).expect("encode");
+        let invite = decode_invite(&empty_blob).expect("decode pre-feature-shaped blob");
+        assert!(invite.fronts.is_empty(), "no fronts block => empty fronts");
+
+        // and the omission is real: adding a front lengthens the blob, proving
+        // the empty case appended nothing (i.e. matches the old wire).
+        let with_front = encode_invite(
+            &d,
+            &token,
+            None,
+            &[Front {
+                member_key: [1u8; 32],
+                wireguard_public_key: [2u8; 32],
+                mesh_port: 1,
+                endpoint: None,
+            }],
+            u64::MAX,
+            &issuer,
+        )
+        .expect("encode");
+        assert!(
+            with_front.len() > empty_blob.len(),
+            "a front appends bytes the empty blob lacks"
+        );
+    }
+
+    #[test]
+    fn fronts_are_excluded_from_the_genesis_fingerprint() {
+        // (c) two invites differing ONLY in fronts yield the SAME
+        // genesis_namespace: fronts ride the signed envelope but never feed the
+        // fingerprint (scheme + validators only), so they are ZERO-consensus.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_test_descriptor(&issuer);
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+
+        let no_fronts =
+            encode_invite(&d, &token, None, &[], u64::MAX, &issuer).expect("encode");
+        let with_fronts = encode_invite(
+            &d,
+            &token,
+            None,
+            &[Front {
+                member_key: [9u8; 32],
+                wireguard_public_key: [8u8; 32],
+                mesh_port: 4242,
+                endpoint: Some("203.0.113.4:51820".into()),
+            }],
+            u64::MAX,
+            &issuer,
+        )
+        .expect("encode");
+        assert_ne!(no_fronts, with_fronts, "fronts really change the blob bytes");
+
+        let a = decode_invite(&no_fronts).expect("decode");
+        let b = decode_invite(&with_fronts).expect("decode");
+        assert_eq!(
+            a.descriptor.genesis_namespace(),
+            b.descriptor.genesis_namespace(),
+            "fronts are outside the genesis fingerprint"
+        );
     }
 
     /// the FULL delivery chain at the crypto level: a genesis validator mints a
