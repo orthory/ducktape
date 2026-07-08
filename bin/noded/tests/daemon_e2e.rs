@@ -1233,8 +1233,31 @@ fn stage_script_provider(root: &Path, tag: &str, body: &str) -> Vec<(String, Str
     ]
 }
 
-/// channel + registered agent + mention watch: the client-side trigger stack
-/// for one agent run in `channel`.
+/// upload `prompt` through the node-local blob lane and return its digest
+/// bytes — the pin `register_agent` commits. the run envelope carries this
+/// pin and the host REFUSES to run an agent whose prompt blob is not in the
+/// store (never a silent fallback to the generic instructions), so arming an
+/// agent uploads its prompt first — exactly what the app's save-agent flow
+/// does.
+fn put_prompt_blob(daemon: &Daemon, prompt: &str) -> Vec<u8> {
+    let (code, body) = daemon.request_bytes("POST", "/v1/files/blob", prompt.as_bytes());
+    assert_eq!(
+        code,
+        200,
+        "prompt blob upload failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let reply: serde_json::Value = serde_json::from_slice(&body).expect("blob reply json");
+    let digest = reply["digest"].as_str().expect("digest hex");
+    assert_eq!(digest.len(), 64, "sha256 hex digest: {digest}");
+    (0..digest.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&digest[i..i + 2], 16).expect("hex digest"))
+        .collect()
+}
+
+/// channel + uploaded prompt blob + registered agent + mention watch: the
+/// client-side trigger stack for one agent run in `channel`.
 fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
     let (code, block) = daemon.submit(
         "chat",
@@ -1244,6 +1267,10 @@ fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
         Some("owner"),
     );
     assert_eq!(code, 200, "create channel failed: {block}");
+    let prompt_hash = put_prompt_blob(
+        daemon,
+        &format!("You are {agent_id}, a daemon e2e test agent."),
+    );
     let (code, block) = daemon.submit(
         "agent",
         serde_json::json!({
@@ -1251,7 +1278,7 @@ fn arm_agent(daemon: &Daemon, channel: &str, agent_id: &str, tag: &str) {
                 "agent_id": agent_id,
                 "display_name": agent_id,
                 "capability": tag,
-                "prompt_hash": vec![7u8; 32],
+                "prompt_hash": prompt_hash,
                 "allowed_actions": ["chat.post"]
             }
         }),
@@ -1412,9 +1439,11 @@ fn two_slow_runs_overlap() {
     assert_eq!(lines.len(), 4, "two complete executions: {lines:?}");
 }
 
-/// the failure path is unchanged: a provider that exits non-zero still
-/// produces the failure OracleResult, the saga burns its attempts, the
-/// failed delivery prunes the pending entry without posting a reply — and
+/// the failure path is loud, not silent: a provider that exits non-zero
+/// still produces the failure OracleResult, the saga burns its attempts,
+/// and the terminal failure prunes the pending entry — but the agent posts
+/// exactly one ⚠ failure reply into the channel (authored as the agent,
+/// carrying the provider's stderr excerpt) instead of dying silently. and
 /// the daemon answers throughout.
 #[test]
 fn a_failing_provider_still_fails_the_run_cleanly() {
@@ -1447,9 +1476,53 @@ fn a_failing_provider_still_fails_the_run_cleanly() {
     poll_until("the failed run to prune", Duration::from_secs(30), || {
         (pending_run_count(&daemon) == 0).then_some(())
     });
+
+    // the deliberate failure surface: exactly one ⚠ reply, authored as the
+    // agent, one-reply-per-run message id, provider stderr in the excerpt.
+    // (the anchor is a top-level post here, so the reply joins the channel
+    // with `thread: null` — the runs crate's unit tests cover the reply
+    // joining a threaded anchor's thread.)
+    let reply = daemon.query(
+        "chat",
+        serde_json::json!({ "messages_latest": { "channel_id": "general", "limit": 16 } }),
+    );
+    let agent_msgs: Vec<&serde_json::Value> = reply["messages"]
+        .as_array()
+        .expect("Messages reply")
+        .iter()
+        .filter(|m| m["head"]["author"].get("agent").is_some())
+        .collect();
+    assert_eq!(
+        agent_msgs.len(),
+        1,
+        "a failed run posts exactly one ⚠ failure reply: {reply}"
+    );
+    let head = &agent_msgs[0]["head"];
+    assert_eq!(
+        head["author"],
+        serde_json::json!({ "agent": { "module": "runs", "agent_id": "boomer" } }),
+        "the failure reply is authored as the agent"
+    );
+    let run_id = "chat\u{1f}general\u{1f}1\u{1f}boomer";
+    assert_eq!(
+        head["message_id"],
+        format!("agent/{run_id}"),
+        "one reply per run, failure included"
+    );
     assert!(
-        agent_replies(&daemon, "general").is_empty(),
-        "a failed run posts no reply"
+        head["thread"].is_null(),
+        "a top-level anchor's failure reply is not threaded: {head}"
+    );
+    let text = head["blocks"][0]["paragraph"][0]["text"]
+        .as_str()
+        .expect("reply text");
+    assert!(
+        text.starts_with("⚠ boomer failed: "),
+        "the ⚠ failure reply names the agent: {text}"
+    );
+    assert!(
+        text.contains("provider exploded"),
+        "the provider's stderr surfaces in the failure excerpt: {text}"
     );
     let executions = std::fs::read_to_string(&log)
         .map(|s| s.lines().count())
