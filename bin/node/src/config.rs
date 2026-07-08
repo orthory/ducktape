@@ -354,7 +354,16 @@ impl NetworkDescriptor {
         let mut typed_keys = std::collections::BTreeSet::new();
         for s in &self.reach {
             let hint = ReachHint::parse(s)?;
-            typed_keys.insert(hint.expected_key.as_ref().to_vec());
+            // only a typed DIRECT/FRONTED route supersedes a bootstrap-
+            // synthesised Direct for the same key (the member's dial address
+            // moved/upgraded). a Coordinated route is an ADDITIONAL rendezvous
+            // path, not a replacement — it must not erase a real direct dial
+            // hint, or a founder that advertises a public address AND enables a
+            // coordinator would ship coordinator-only reach and lose its direct
+            // fallback (terminal once a punch fails, since there is no relay).
+            if matches!(hint.reach, Reach::Direct(_) | Reach::Fronted(_)) {
+                typed_keys.insert(hint.expected_key.as_ref().to_vec());
+            }
             typed.push(hint);
         }
         bootstrap_by_key.retain(|k, _| !typed_keys.contains(k));
@@ -3326,6 +3335,66 @@ bootstrapper_addr = "127.0.0.1:52200"
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|(_, r)| matches!(r, ReachDial::Coordinated { .. })));
         assert!(entries.iter().any(|(_, r)| matches!(r, ReachDial::Direct(_))));
+    }
+
+    #[test]
+    fn a_coordinated_hint_does_not_suppress_a_founders_direct_bootstrap_route() {
+        // a founder that advertises a real dial address AND enables a
+        // coordinator must keep BOTH: the direct bootstrap route (punch-free
+        // first choice) and the coordinated rendezvous route. a Coordinated
+        // typed hint must not erase the bootstrap-synthesised Direct for the
+        // same key — otherwise every invite ships coordinator-only reach and a
+        // failed punch is terminal (no relay fallback).
+        let me = ed25519::PrivateKey::from_seed(41).public_key();
+        let coord = ed25519::PrivateKey::from_seed(42).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "fp#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_bootstrap(&me, "203.0.113.7:52200");
+        d.add_reach(&ReachHint {
+            expected_key: me.clone(),
+            reach: Reach::Coordinated(CoordRef {
+                coord_addr: "127.0.0.1:3478".into(),
+                coord_key: coord,
+            }),
+        });
+
+        let hints = d.reach_hints().expect("hints");
+        assert_eq!(
+            hints.len(),
+            2,
+            "the direct bootstrap route must survive alongside the coordinated hint"
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|h| matches!(&h.reach, Reach::Direct(a) if a == "203.0.113.7:52200")),
+            "the founder's advertised direct route was dropped"
+        );
+        assert!(hints.iter().any(|h| matches!(h.reach, Reach::Coordinated(_))));
+
+        // a typed DIRECT hint for the same key still supersedes the bootstrap
+        // Direct (the member's dial address moved) — no stale duplicate.
+        d.add_reach_route(&ReachHint {
+            expected_key: me.clone(),
+            reach: Reach::Direct("[fd87::2]:52200".into()),
+        });
+        let hints = d.reach_hints().expect("hints");
+        let directs: Vec<_> = hints
+            .iter()
+            .filter(|h| matches!(h.reach, Reach::Direct(_)))
+            .collect();
+        assert_eq!(
+            directs.len(),
+            1,
+            "a typed Direct supersedes the bootstrap Direct for the same key"
+        );
+        assert!(matches!(&directs[0].reach, Reach::Direct(a) if a == "[fd87::2]:52200"));
     }
 
     #[test]
