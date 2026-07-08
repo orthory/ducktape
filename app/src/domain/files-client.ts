@@ -66,6 +66,7 @@ export const MAX_CHANGES_PER_COMMIT = 4096;
 export const MAX_MESSAGE_BYTES = 4096;
 
 const TARGET = "files";
+const textEncoder = new TextEncoder();
 
 // ── base64 (browser-safe, chunked so a large file doesn't blow the arg cap) ─
 
@@ -244,9 +245,13 @@ const buildContent = async (
   transport: NodeTransport,
   bytes: Uint8Array<ArrayBuffer>,
   onProgress?: (staged: number, total: number) => void,
+  mode: "auto" | "chunks" = "auto",
 ): Promise<FileContent> => {
-  if (bytes.length <= MAX_INLINE_COMMIT_BYTES) {
+  if (mode === "auto" && bytes.length <= MAX_INLINE_COMMIT_BYTES) {
     return { inline: { b64: bytesToBase64(bytes) } };
+  }
+  if (bytes.length === 0) {
+    return { chunks: { size: 0, chunks: [] } };
   }
   const total = Math.ceil(bytes.length / CHUNK_SIZE);
   const chunks: string[] = [];
@@ -258,6 +263,55 @@ const buildContent = async (
     onProgress?.(i + 1, total);
   }
   return { chunks: { size: bytes.length, chunks } };
+};
+
+export type FileUploadEntry =
+  | {
+      kind: "file";
+      relativePath: string;
+      bytes: Uint8Array<ArrayBuffer>;
+      exec?: boolean;
+      meta?: Record<string, string>;
+    }
+  | {
+      kind: "dir";
+      relativePath: string;
+    };
+
+export interface UploadFilesProgress {
+  relativePath: string;
+  index: number;
+  totalEntries: number;
+  staged: number;
+  total: number;
+}
+
+const utf8Len = (value: string): number => textEncoder.encode(value).length;
+
+const cleanRelativePath = (path: string): string => {
+  const raw = path.replace(/\\/g, "/");
+  if (raw.trim() === "") throw new Error("files: upload path is empty");
+  if (raw.startsWith("/")) throw new Error(`files: upload path must be relative: ${path}`);
+  const parts = raw.split("/").filter((part) => part.length > 0);
+  if (parts.length === 0) throw new Error("files: upload path is empty");
+  for (const part of parts) {
+    if (part === "." || part === "..") {
+      throw new Error(`files: upload path escapes the target directory: ${path}`);
+    }
+    if (utf8Len(part) > MAX_NAME_BYTES) {
+      throw new Error(`files: upload path segment exceeds the byte cap: ${part}`);
+    }
+  }
+  const clean = parts.join("/");
+  if (utf8Len(clean) > MAX_PATH_BYTES) {
+    throw new Error(`files: upload path exceeds the byte cap: ${path}`);
+  }
+  return clean;
+};
+
+const cleanTargetDir = (dir: string): string => {
+  if (!dir.startsWith("/")) throw new Error(`files: target directory must be absolute: ${dir}`);
+  return dir === "/" ? "/" : dir.replace(/\/+$/, "");
 };
 
 /** Upload a file into the tree at `path`: stage its chunks (or inline it), then
@@ -291,6 +345,85 @@ export const uploadFile = async (
     baseSnapshot: base,
     message: params.message ?? `upload ${basename(params.path)}`,
     changes: [change],
+  });
+};
+
+/** Upload a folder or multi-file selection as one atomic commit. Relative paths
+ *  are preserved under `targetDir`; file bodies are staged as chunk references so
+ *  many small files cannot breach the module's per-commit inline-byte cap. */
+export const uploadFiles = async (
+  transport: NodeTransport,
+  params: {
+    targetDir: string;
+    entries: FileUploadEntry[];
+    message?: string;
+    /** Explicit base snapshot; omit to resolve the live head automatically. */
+    baseSnapshot?: string | null;
+    onProgress?: (progress: UploadFilesProgress) => void;
+  },
+): Promise<BlockEvent> => {
+  if (params.entries.length === 0) {
+    throw new Error("files: upload requires at least one entry");
+  }
+  if (params.entries.length > MAX_CHANGES_PER_COMMIT) {
+    throw new Error("files: upload exceeds the change cap");
+  }
+
+  const targetDir = cleanTargetDir(params.targetDir);
+  const prepared = params.entries.map((entry) => {
+    const relativePath = cleanRelativePath(entry.relativePath);
+    const path = joinPath(targetDir, relativePath);
+    if (utf8Len(path) > MAX_PATH_BYTES) {
+      throw new Error(`files: upload target path exceeds the byte cap: ${path}`);
+    }
+    return {
+      ...entry,
+      relativePath,
+      path,
+    };
+  });
+  const seen = new Set<string>();
+  for (const entry of prepared) {
+    if (seen.has(entry.path)) throw new Error(`files: duplicate upload path: ${entry.path}`);
+    seen.add(entry.path);
+  }
+
+  const base = await resolveBase(transport, params.baseSnapshot);
+  const changes: FileChange[] = [];
+  for (const [index, entry] of prepared.entries()) {
+    if (entry.kind === "dir") {
+      changes.push({ mkdir: { path: entry.path } });
+      continue;
+    }
+    const content = await buildContent(
+      transport,
+      entry.bytes,
+      (staged, total) =>
+        params.onProgress?.({
+          relativePath: entry.relativePath,
+          index,
+          totalEntries: prepared.length,
+          staged,
+          total,
+        }),
+      "chunks",
+    );
+    changes.push({
+      put: {
+        path: entry.path,
+        exec: entry.exec ?? false,
+        meta: entry.meta ?? {},
+        content,
+      },
+    });
+  }
+
+  return commit(transport, {
+    baseSnapshot: base,
+    message:
+      params.message ??
+      `upload ${prepared.length} item${prepared.length === 1 ? "" : "s"} to ${targetDir}`,
+    changes,
   });
 };
 

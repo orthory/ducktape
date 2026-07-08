@@ -125,13 +125,13 @@ describe("FilesView", () => {
     renderView(transport);
 
     const sharedColumn = await screen.findByRole("region", { name: /column \/shared/i });
-    expect(within(sharedColumn).getByText("docs")).toBeInTheDocument();
-    expect(within(sharedColumn).getByText("readme.md")).toBeInTheDocument();
+    expect(await within(sharedColumn).findByText("docs")).toBeInTheDocument();
+    expect(await within(sharedColumn).findByText("readme.md")).toBeInTheDocument();
 
     fireEvent.click(within(sharedColumn).getByRole("button", { name: /open folder docs/i }));
 
     const docsColumn = await screen.findByRole("region", { name: /column \/shared\/docs/i });
-    expect(within(docsColumn).getByText("plan.md")).toBeInTheDocument();
+    expect(await within(docsColumn).findByText("plan.md")).toBeInTheDocument();
     expect(within(sharedColumn).getByText("readme.md")).toBeInTheDocument();
     expect(transport.filesLs).toHaveBeenCalledWith(expect.objectContaining({ path: "/shared/docs" }));
   });
@@ -185,6 +185,91 @@ describe("FilesView", () => {
     await waitFor(() => expect(transport.filesCommit).toHaveBeenCalled());
     const body = (transport.filesCommit as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(body.changes[0].put.path).toBe("/shared/drop.txt");
+  });
+
+  it("uploads a chosen folder with relative paths under the current directory", async () => {
+    const transport = makeTransport({
+      filesStage: vi
+        .fn()
+        .mockResolvedValueOnce({ digest: "11".repeat(32) })
+        .mockResolvedValueOnce({ digest: "22".repeat(32) }),
+    });
+    const { container } = renderView(transport);
+    await screen.findByText("readme.md");
+
+    const readme = new File(["hello"], "readme.txt", { type: "text/plain" });
+    Object.defineProperty(readme, "webkitRelativePath", {
+      value: "Project/readme.txt",
+    });
+    Object.defineProperty(readme, "arrayBuffer", {
+      value: () => Promise.resolve(new TextEncoder().encode("hello").buffer),
+    });
+    const plan = new File(["plan"], "plan.md", { type: "text/markdown" });
+    Object.defineProperty(plan, "webkitRelativePath", {
+      value: "Project/docs/plan.md",
+    });
+    Object.defineProperty(plan, "arrayBuffer", {
+      value: () => Promise.resolve(new TextEncoder().encode("plan").buffer),
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^folder$/i }));
+    const input = container.querySelector('input[data-upload-kind="folder"]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [readme, plan] } });
+
+    await waitFor(() => expect(transport.filesCommit).toHaveBeenCalled());
+    const body = (transport.filesCommit as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(body.message).toBe("upload folder Project");
+    expect(body.changes.map((change: { put?: { path: string } }) => change.put?.path)).toEqual([
+      "/shared/Project/readme.txt",
+      "/shared/Project/docs/plan.md",
+    ]);
+  });
+
+  it("uploads a dropped folder entry with its directory prefix", async () => {
+    const transport = makeTransport({
+      filesStage: vi.fn().mockResolvedValue({ digest: "33".repeat(32) }),
+    });
+    renderView(transport);
+    const sharedColumn = await screen.findByRole("region", { name: /column \/shared/i });
+
+    const file = new File(["from folder"], "readme.txt", { type: "text/plain" });
+    Object.defineProperty(file, "arrayBuffer", {
+      value: () => Promise.resolve(new TextEncoder().encode("from folder").buffer),
+    });
+    const fileEntry = {
+      isFile: true,
+      isDirectory: false,
+      name: "readme.txt",
+      fullPath: "/Project/readme.txt",
+      file: (resolve: (file: File) => void) => resolve(file),
+    };
+    let reads = 0;
+    const folderEntry = {
+      isFile: false,
+      isDirectory: true,
+      name: "Project",
+      fullPath: "/Project",
+      createReader: () => ({
+        readEntries: (resolve: (entries: typeof fileEntry[]) => void) => {
+          reads += 1;
+          resolve(reads === 1 ? [fileEntry] : []);
+        },
+      }),
+    };
+
+    fireEvent.drop(sharedColumn, {
+      dataTransfer: {
+        files: [],
+        types: ["Files"],
+        dropEffect: "copy",
+        items: [{ webkitGetAsEntry: () => folderEntry }],
+      },
+    });
+
+    await waitFor(() => expect(transport.filesCommit).toHaveBeenCalled());
+    const body = (transport.filesCommit as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(body.message).toBe("upload folder Project");
+    expect(body.changes[0].put.path).toBe("/shared/Project/readme.txt");
   });
 
   it("shows the upload drop-zone overlay while a file is dragged over the browser", async () => {
