@@ -23,16 +23,18 @@ import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
 import { HealthBar, HealthLegend } from "./HealthBar";
+import { LogsTab } from "./LogsTab";
 import { commitHealth, healthSegments, nodeLiveness } from "./node-health";
 import { NodeFactsCard } from "./NodeFactsCard";
 import { PeersTab } from "./PeersTab";
 
-type TabId = "overview" | "peers" | "permissions";
+type TabId = "overview" | "peers" | "permissions" | "logs";
 
 const TABS: ReadonlyArray<readonly [TabId, string]> = [
   ["overview", "Overview"],
   ["peers", "Connections"],
   ["permissions", "Permissions"],
+  ["logs", "Logs"],
 ];
 
 const sectionLabelStyle = {
@@ -1170,6 +1172,8 @@ export function StatusView() {
           <PeersTab />
         ) : activeTab === "permissions" ? (
           <PermissionsTab />
+        ) : activeTab === "logs" ? (
+          <LogsTab />
         ) : (
           <OverviewTab />
         )}

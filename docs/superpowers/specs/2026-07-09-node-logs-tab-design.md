@@ -83,8 +83,16 @@ limitation, same 64 KB bound `workspace_phase` already uses).
     - Header: `daemon.log · following`, a **Copy** button (copies the visible
       lines to clipboard via the existing `navigator.clipboard` pattern).
 - **`views/status/log-lines.ts`** (new, pure) — line parsing/classification:
-  `parseLevel(line)`, `splitLines(tail)`, `filterLines(lines, {query, levels})`.
-  Kept pure + separately unit-tested (the app's convention, cf. `node-health.ts`).
+  `stripAnsi(line)`, `parseLevel(line)`, `splitLines(tail)`,
+  `filterLines(lines, {query, levels})`, `levelCounts(lines)`. Kept pure +
+  separately unit-tested (the app's convention, cf. `node-health.ts`).
+  - **ANSI stripping (found during live verification):** a real node's tracing
+    fmt layer writes ANSI SGR color codes to `daemon.log` (e.g.
+    `\x1b[31mERROR\x1b[0m`). Untreated these render as literal garbage AND the
+    trailing `m` of a color code fuses to the next word, breaking the `\b` level
+    boundary so every colorized line mis-classifies as "other". `splitLines`
+    strips SGR (anchored on the ESC byte, so real `[..m` message text survives)
+    before classifying and displaying.
 - **`StatusView.tsx`** — add `"logs"` to `TabId` and a `["logs","Logs"]` entry
   to `TABS`; render `<LogsTab />` when active.
 

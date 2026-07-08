@@ -62,6 +62,19 @@ export interface LogTail {
   tail: string;
 }
 
+/** The running node's operational identity for the Node → Logs tab. Every
+ *  process field is best-effort: a node we adopted (didn't spawn) has no
+ *  pidfile, so pid/alive/uptimeSecs come back null. Verbatim from workspaces.rs
+ *  RuntimeFacts (camelCase). */
+export interface RuntimeFacts {
+  pid: number | null;
+  alive: boolean | null;
+  uptimeSecs: number | null;
+  binaryPath: string | null;
+  dataDir: string;
+  logPath: string;
+}
+
 /** One pending join request a parked joiner delivered over the lobby channel.
  *  Snake_case: these rows pass through verbatim from the NODE's
  *  `join-requests` JSON (not the registry's camelCase structs). */
@@ -117,6 +130,11 @@ export const workspacePhase = (id: string): Promise<PhaseReport> =>
  *  node fails to answer, to surface the real reason and back "Open daemon.log". */
 export const workspaceLogTail = (id: string): Promise<LogTail> =>
   invoke<LogTail>("workspace_log_tail", { id });
+
+/** The running node's pid/uptime/binary/paths — polled by the Node → Logs tab's
+ *  runtime-facts row. Best-effort per field (see RuntimeFacts). */
+export const workspaceRuntimeFacts = (id: string): Promise<RuntimeFacts> =>
+  invoke<RuntimeFacts>("workspace_runtime_facts", { id });
 
 export const inviteBlob = (id: string): Promise<string> =>
   invoke<string>("workspace_invite_blob", { id });

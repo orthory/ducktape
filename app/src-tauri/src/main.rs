@@ -38,6 +38,7 @@ fn main() {
             workspaces::workspace_select,
             workspaces::workspace_phase,
             workspaces::workspace_log_tail,
+            workspaces::workspace_runtime_facts,
             workspaces::user_identity_confirm_mnemonic,
             user_identity::user_identity_status,
             user_identity::user_identity_state,
