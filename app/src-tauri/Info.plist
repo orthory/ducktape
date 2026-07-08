@@ -7,5 +7,11 @@
        app's Info.plist during the macOS build. -->
   <key>NSMicrophoneUsageDescription</key>
   <string>Ducktape uses your microphone for huddle voice chat.</string>
+  <!-- Required before getUserMedia({video}) can run under macOS TCC — WITHOUT
+       this key the OS terminates the app the moment the camera is touched.
+       Gated behind the runtime codec probe, so it only matters once a Mac user
+       actually turns their camera on in a huddle. -->
+  <key>NSCameraUsageDescription</key>
+  <string>Ducktape uses your camera for huddle video chat.</string>
 </dict>
 </plist>

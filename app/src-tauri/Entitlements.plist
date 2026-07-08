@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Hardened-runtime entitlements for a signed/notarized macOS build. Camera
+       and microphone are required for huddle video/voice; without them a
+       hardened-runtime app is denied device access even with the Info.plist
+       usage strings present. Referenced from tauri.conf.json
+       (bundle.macOS.entitlements). -->
+  <key>com.apple.security.device.camera</key>
+  <true/>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>
