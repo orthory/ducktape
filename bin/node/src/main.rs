@@ -133,11 +133,11 @@ const PEER_SET: u64 = 0;
 /// shows. the frame finalizes, rejects deterministically on every node (unknown
 /// module), advances the engine clock, and leaves no state.
 const NOP_TARGET: &str = "consensus.nop";
-/// heartbeat cadence: how often a node pushes a [`NOP_TARGET`] frame so an idle
-/// chain still finalizes blocks (its height keeps ticking) and any pending
-/// cutover still crosses. one block/sec while idle is the accepted cost of a
-/// visibly-live height.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+// block cadence is a single knob: `consensus::BLOCK_TIME` (2s). the idle
+// heartbeat beats one nop block per BLOCK_TIME so an idle chain still finalizes
+// (its height keeps ticking) and any pending cutover still crosses — paced to
+// the same interval the leader's idle-propose holds a view open, so the beat
+// never outpaces the intended block time.
 /// request timeout for the promoted-validator boot catch-up client. it is long
 /// enough to let discovery links warm, but bounded so boot cannot hang forever
 /// before the statesync server bridge is installed.
@@ -9144,7 +9144,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // gate skips, the timer stays elapsed, so the first tick after
                     // the queue drains injects the next nop immediately.
                     if !heartbeat_disabled
-                        && last_nop.elapsed() >= HEARTBEAT_INTERVAL
+                        && last_nop.elapsed() >= consensus::BLOCK_TIME
                         && node.orderer().pending_len() == 0
                     {
                         last_nop = std::time::Instant::now();
@@ -9227,7 +9227,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // throttled like the heartbeat, since a backlog wider
                     // than CRANK_BUDGET legitimately needs several. duplicate
                     // cranks from other nodes are deterministic no-ops.
-                    if last_crank.elapsed() >= HEARTBEAT_INTERVAL
+                    if last_crank.elapsed() >= consensus::BLOCK_TIME
                         && let Some(finalized_height) = node.finalized().map(|f| f.height)
                         && let Some(expiry) = saga_next_expiry(node.host()).await
                         && expiry <= finalized_height
@@ -9266,7 +9266,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // is non-empty, push one permissionless Nudge — a no-op
                     // whose block carries the injection. duplicate nudges
                     // from other nodes are free.
-                    if last_nudge.elapsed() >= HEARTBEAT_INTERVAL
+                    if last_nudge.elapsed() >= consensus::BLOCK_TIME
                         && dispatch_pending_deliveries(node.host()).await > 0
                     {
                         last_nudge = std::time::Instant::now();
