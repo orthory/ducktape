@@ -27,28 +27,42 @@ video degrades to audio + roster."* **This is obsolete.** Empirically verified o
   `requestVideoFrameCallback`, `getUserMedia`, and `getDisplayMedia` — **by default, no
   flag**. (Probed with `WebKit2.WebView` default settings.)
 - The WebKitGTK video codec path is **GStreamer-backed**: the WebCodecs API is present, but
-  actual VP8 encode/decode needs the `gstreamer1.0-plugins-good` (libvpx `vp8enc`/`vp8dec`)
-  plugin installed at runtime. On this dev box those plugins are **absent**, so API presence
-  alone does not imply working video.
+  actual encode/decode needs the GStreamer video codec elements to be registered and loadable
+  at runtime. **Empirically on this dev box** (Debian 13 container), `VideoEncoder` exists but
+  `VideoEncoder.isConfigSupported` returns **`supported:false` for vp8/vp9/h264/av1 alike** —
+  WebKit logs `No encoder found for codec vp8` — while **all decoders report `supported:true`**.
+  (The `libgstvpx.so` plugin + `libvpx.so.9` are on disk yet `gst-inspect` lists no `vp8enc`;
+  the encoder elements simply do not register in this build.) A normal Ubuntu desktop with a
+  correctly-provisioned `gstreamer1.0-plugins-good` does provide `vp8enc`; this box does not.
 - macOS WKWebView (Safari 16.4+) ships WebCodecs; the only shell-side blocker to macOS video
   is a missing `NSCameraUsageDescription`.
 
-**Consequence:** video is a first-class feature on **both** target OSes. Two design
-obligations follow:
+**Consequence:** video is architecturally a first-class feature on **both** target OSes, but
+**codec availability is a runtime property that varies per box** and is *not* implied by API
+presence. Three design obligations follow:
 
-1. Capability detection must probe *actual codec support*, not mere API presence
-   (`VideoEncoder.isConfigSupported`), so a WebKitGTK box without VP8 plugins degrades
-   honestly instead of showing a dead camera toggle.
-2. The VP8 GStreamer plugin is a documented Ubuntu runtime dependency.
+1. Capability detection must probe *actual codec support*, not API presence, via
+   `VideoEncoder.isConfigSupported` / `VideoDecoder.isConfigSupported` (proven to report
+   `false` correctly when the encoder is absent). API-presence gating (`typeof VideoEncoder`)
+   would wrongly show a dead camera toggle on this exact box.
+2. **Encode and decode capability must be gated separately** — they diverge in practice (this
+   box: decode available, encode not). The **camera toggle / self-preview** gates on *encoder*
+   support; **peer-tile `<canvas>` rendering** gates on *decoder* support.
+3. The GStreamer VP8 codec elements are a documented Ubuntu runtime dependency; when absent
+   the huddle stays audio + roster (honest degrade), which is now the tested default path here.
 
 ### Verification reality
 
-- **Ubuntu**: buildable + verifiable end-to-end in this environment (after installing the
-  VP8 GStreamer plugins on the box). This is the primary verification target.
-- **macOS**: the `Info.plist` + entitlements changes are correct-by-spec, but this
-  environment is headless Linux with **no Mac** — macOS camera/video must be verified by the
-  user on real hardware. Every macOS-specific change is inert behind the capability gate
-  until verified.
+- **Ubuntu (this env)**: fully verifiable in-app — the capability probe correctly **disabling**
+  the camera (honest degrade), audio huddle, roster/sweep/mute integration, correctness fixes,
+  self active-speaker, decode/render, and pop-out. **Camera *send* (real VP8 encode) is NOT
+  verifiable on this box** because no WebKit video encoder registers here (see §2); it requires
+  an encoder-capable Ubuntu desktop. The honest-degrade behavior *is* the tested path here.
+- **Camera-send video (both OSes)**: needs an encoder-capable box — a standard Ubuntu desktop
+  (`vp8enc` present) or the user's Mac. Do not claim camera-send video works from this env.
+- **macOS**: the `Info.plist` + entitlements changes are correct-by-spec, but this environment
+  is headless Linux with **no Mac** — macOS camera/video must be verified by the user on real
+  hardware. Every macOS-specific change is inert behind the capability gate until verified.
 
 ## 3. How the huddle works today (end-to-end)
 
@@ -140,23 +154,29 @@ touch consensus.
 Goal: video correctly enabled/detected on both OSes, and the verified backend ops reachable
 in **every** huddle (including audio-only). Ships a correct, integrated huddle on both OSes.
 
-### 6.1 Capability probe (real codec support, not API presence)
+### 6.1 Capability probe (real codec support, not API presence; encode/decode split)
 - Replace synchronous `supportsVideoCalls()` (`call-session.ts:90`, API-presence only) with
-  an **async capability probe** that runs once and caches:
-  `VideoEncoder.isConfigSupported({codec:'vp8', width:1280, height:720, bitrate:800_000, framerate:30})`
-  → `{supported}`; also confirm `VideoDecoder.isConfigSupported({codec:'vp8'})`.
-  Keep the existing API-presence checks (`VideoEncoder`/`VideoDecoder`/`rVFC`/`getUserMedia`)
-  as the fast pre-gate; only call `isConfigSupported` when those pass.
-- Expose it through the store as an async-resolved boolean the UI reads
-  (`actions.videoSupported()` today is sync — introduce a resolved `voice.videoCapable`
-  cached flag on the state, computed at app start and after daemon-ready).
-- **Degrade honestly**: when the API is present but codec unsupported (WebKitGTK without VP8
-  plugins), hide the camera toggle and show the existing "Video needs …" hint reworded to
-  "Camera needs the VP8 video codec (install gstreamer1.0-plugins-good)".
+  an **async capability probe** that runs once and caches **two** booleans:
+  - `canEncode` = API pre-gate (`VideoEncoder`/`VideoFrame`/`rVFC`/`getUserMedia` present)
+    **AND** `await VideoEncoder.isConfigSupported({codec:'vp8', width:1280, height:720,
+    bitrate:800_000, framerate:30})` → `.supported`.
+  - `canDecode` = `VideoDecoder` present **AND**
+    `await VideoDecoder.isConfigSupported({codec:'vp8', codedWidth:1280, codedHeight:720})`
+    → `.supported`.
+  These diverge in practice (empirically this box: `canEncode=false`, `canDecode=true`).
+- Expose both through the store as resolved cached flags on the voice slice
+  (`voice.canEncodeVideo`, `voice.canDecodeVideo`), computed at app start / after daemon-ready.
+  `actions.videoSupported()` (sync) is replaced by reads of these flags.
+- **Gate separately**: the **camera toggle + self-preview** on `canEncodeVideo`; the
+  **peer-tile `<canvas>` render branch** on `canDecodeVideo` (else initials avatar).
+- **Degrade honestly**: when `canEncodeVideo` is false, hide the camera toggle and show a
+  reworded hint — "Camera needs the VP8 video codec (install gstreamer1.0-plugins-good)" on
+  Linux, generic elsewhere.
 - Files: `app/src/domain/call-session.ts`, `app/src/console/store/{state.ts,actions.ts}`,
   `app/src/console/views/chat/Huddle.tsx`.
-- Tests: unit-test the probe's decision table (API-absent, API-present+codec-unsupported,
-  fully-supported) with a mocked `VideoEncoder.isConfigSupported`.
+- Tests: unit-test the probe's decision table (API-absent → both false; API-present +
+  isConfigSupported false → both false; encode-false/decode-true split; both-true) with a
+  mocked `VideoEncoder`/`VideoDecoder.isConfigSupported`.
 
 ### 6.2 macOS camera unblock
 - Add `NSCameraUsageDescription` to `app/src-tauri/Info.plist`.
@@ -180,7 +200,7 @@ in **every** huddle (including audio-only). Ships a correct, integrated huddle o
   gains a `sweep` command; staleness decision reused (`isBeaconStale`).
 
 ### 6.4 Correctness fixes
-- **Blank-tile guard**: gate the peer `<canvas>` render branch on `voice.videoCapable`
+- **Blank-tile guard**: gate the peer `<canvas>` render branch on `voice.canDecodeVideo`
   (`Huddle.tsx:294`) so a viewer that cannot decode shows the initials avatar, not a black
   canvas.
 - **"+N more"**: when `roster` exceeds `MAX_VIDEO_PARTICIPANTS`, show a "+N more" chip on the
@@ -255,10 +275,16 @@ in **every** huddle (including audio-only). Ships a correct, integrated huddle o
 
 ## 11. Risks & mitigations
 
-- **WebKitGTK video works in a standalone probe but not the real Tauri/wry webview** →
-  verify in the real app early in PR 1 (tauri-debug), before building UI on top.
-- **VP8 GStreamer plugin missing on a user's Ubuntu** → real capability probe degrades
-  honestly + documented dependency; camera hidden with a clear reason.
+- **WebKitGTK WebCodecs differs between the standalone probe and the real Tauri/wry webview**
+  → verify the probe's *decision* in the real app early in PR 1 (tauri-debug). Note: wry uses
+  the same webkit2gtk-4.1, so API presence is identical; the encoder-registration gap is a
+  system/GStreamer property, not a wry one.
+- **No working video encoder on this dev box** (empirically, all codecs `enc:false`) → real
+  encode is unverifiable here; the probe correctly hides the camera. Full camera-send
+  verification needs an encoder-capable Ubuntu or the user's Mac. The honest-degrade path is
+  what's tested here.
+- **VP8 encoder missing on a user's Ubuntu** → real capability probe degrades honestly +
+  documented dependency; camera hidden with a clear reason instead of a dead toggle.
 - **macOS unverifiable here** → keep macOS changes inert behind the gate; hand the user a
   verification checklist; do not claim macOS video works.
 - **Pop-out video ownership** (mirror vs move the media session) → resolve in the PR 2 plan
