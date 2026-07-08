@@ -512,6 +512,7 @@ export function createActions({
             popped: false,
             cameraOn: false,
             peers: {},
+            sessionStartMs: null,
           },
         });
       } else {
@@ -1253,6 +1254,8 @@ export function createActions({
           error: null,
           cameraOn: false,
           peers: {},
+          // Fresh session → fresh staleness baseline (a retry replaces the session).
+          sessionStartMs: Date.now(),
         },
       }));
       voice.start(callSocketUrl(nodeUrl, channelId));
@@ -1272,6 +1275,7 @@ export function createActions({
           popped: false,
           cameraOn: false,
           peers: {},
+          sessionStartMs: null,
         },
       });
       if (channelId) submitLeaveHuddle(channelId);

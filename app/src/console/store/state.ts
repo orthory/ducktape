@@ -51,6 +51,10 @@ export interface VoiceSlice {
   /** Per-peer ephemeral call state from 1 Hz beacons, keyed by NODE hex.
    *  Staleness (no beacon for >10 s) drives the sweep affordance. */
   peers: Record<string, { muted: boolean; cameraOn: boolean; atMs: number }>;
+  /** Epoch ms our current session started (set on join, null when idle) — the
+   *  staleness baseline for a never-beaconed member. Shared so the dock and the
+   *  popped window agree on who is sweepable. */
+  sessionStartMs: number | null;
 }
 
 /** One search round-trip across the modules that ship materialized views —
@@ -446,6 +450,7 @@ export const createInitialState = (): ConsoleState => {
       popped: false,
       cameraOn: false,
       peers: {},
+      sessionStartMs: null,
     },
     videoCapability: { canEncode: false, canDecode: false },
     members: [],

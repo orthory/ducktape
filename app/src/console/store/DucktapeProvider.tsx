@@ -506,10 +506,24 @@ export function DucktapeProvider({
   // 2e. Huddle pop-out bridge, sender half (desktop): while the huddle window
   //     is open, mirror the session's display state to it. A fingerprint
   //     dedupes the per-block channels churn. Protocol: store/huddle-window.ts.
+  //     Member staleness is time-based, so a 1 Hz tick (only while popped) lets a
+  //     member cross the stale threshold and re-push without a state change.
   const huddleStateFp = useRef("");
+  const [huddleStaleTick, setHuddleStaleTick] = useState(0);
+  useEffect(() => {
+    if (!state.voice.popped) return;
+    const id = setInterval(() => setHuddleStaleTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [state.voice.popped]);
   useEffect(() => {
     if (!state.voice.popped || !isTauri()) return;
-    const snapshot = buildHuddleWindowState(state.voice, state.channels, state.authorNames);
+    const snapshot = buildHuddleWindowState(
+      state.voice,
+      state.channels,
+      state.authorNames,
+      state.status?.publicKey ?? "",
+      Date.now(),
+    );
     if (!snapshot) return;
     const fp = JSON.stringify(snapshot);
     if (fp === huddleStateFp.current) return;
@@ -517,7 +531,7 @@ export function DucktapeProvider({
     void import("@tauri-apps/api/event")
       .then(({ emit }) => emit(HUDDLE_STATE_EVENT, snapshot))
       .catch(() => {});
-  }, [state.voice, state.channels, state.authorNames]);
+  }, [state.voice, state.channels, state.authorNames, state.status?.publicKey, huddleStaleTick]);
 
   // 2f. ...and the receiver half: apply the window's commands to the store,
   //     replay state on its ready handshake, and re-mount the in-app card when
@@ -544,6 +558,8 @@ export function DucktapeProvider({
                 current.voice,
                 current.channels,
                 current.authorNames,
+                current.status?.publicKey ?? "",
+                Date.now(),
               );
               if (snapshot) void emit(HUDDLE_STATE_EVENT, snapshot);
               return;
