@@ -12,10 +12,9 @@ height-gated upgrade로 구동해서는 안 된다.
 이 mechanism은 현재 node에 구현되어 있다. `crates/system/upgrade`는 genesis module
 set에 있고, governance는 `ScheduleUpgrade`/`CancelUpgrade` follow-up을 emit하며,
 validator는 readiness를 self-signal하고, `bin/node upgrade-status`는 live state를
-query한다. authoritative design은
-`docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md`에 있다.
-`upgrade` 모듈보다 앞선 binary로 구성된 network에서는 이 절차를 사용 가능한 것처럼
-제시하지 않는다.
+query한다. authoritative design은 이 page와 `skills/upgrade/SKILL.md`가
+소유한다. `upgrade` 모듈보다 앞선 binary로 구성된 network에서는 이 절차를 사용
+가능한 것처럼 제시하지 않는다.
 
 ## 반드시 지켜야 하는 Invariant
 

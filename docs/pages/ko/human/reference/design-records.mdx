@@ -1,6 +1,6 @@
 # Design Records
 
-대부분의 독자는 historical planning file보다 Vocs page에서 시작해야 한다. 아래
+대부분의 독자는 temporary planning file보다 Vocs page에서 시작해야 한다. 아래
 파일은 main tour에 넣기엔 길지만, decision, protocol boundary, operator procedure를
 아직 담고 있어서 유지한다.
 
@@ -8,16 +8,16 @@
 
 | Record | File | 유지 이유 |
 |---|---|---|
-| No-downtime node upgrades | `docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md` | height-gated upgrade policy의 safety argument. |
+| No-downtime node upgrades | [Node Upgrades](/ko/human/network/node-upgrades), [agent upgrade operations](/ko/agent/network/node-upgrades), `skills/upgrade/SKILL.md` | 유지되는 height-gated upgrade policy와 operator runbook. |
 | Quack packaged modules | `docs/adr/2026-07-07-quack-packaged-modules.mdx` | shareable module, agent, action, harness의 package boundary. |
 | Secure private messaging | `docs/adr/2026-07-06-private-team-messaging.mdx` | deterministic group crypto 전까지 deferred된 accepted direction. |
-| Video calls | `docs/adr/2026-07-06-video-call-module.mdx`, `docs/superpowers/specs/2026-07-06-video-call-build.md` | ADR과 shipped deviation: WebSocket bridge, huddle op, video lane, 남은 gap. |
+| Video calls | `docs/adr/2026-07-06-video-call-module.mdx`, `bin/node/src/voice.rs`, `app/src/console/views/chat/Huddle.tsx` | ADR과 shipped WebSocket bridge, huddle op, video lane, 남은 gap. |
 | Capability specs | `docs/capability-spec.md` | `capability-host`가 읽는 operator-facing executor spec format. |
 | Indexable views | `docs/indexable-spec.md` | search 또는 derived read를 노출하는 module의 materialized-view contract. |
 | Agent collaboration | `docs/agent-collaboration-design.md` | runs, dispatch, saga, no-fail intake의 as-built constraint. |
 | Validator onboarding | `docs/validator-onboarding.md`, `docs/invitation-protocol-deep-dive.md` | 현재 invite/join/admit flow와 이전 invite blob의 historical protocol note. |
 | WireGuard tunnel protocol | `docs/wireguard-tunnel-upgrade.md` | validator-owned tunnel plan의 implemented protocol boundary. |
-| Reachability and private cutover | `docs/superpowers/specs/2026-07-04-pluggable-network-entry-design.md`, `docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`, `docs/deploy/*` | sentry/coordinator entry와 남은 node wiring boundary. |
+| Reachability and private cutover | `docs/sentry-deployment.md`, `docs/deploy/*`, `ops/coordinator/*` | sentry/coordinator entry와 남은 node wiring boundary. |
 
 ## Historical Material
 

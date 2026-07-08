@@ -14,9 +14,8 @@ Mechanism is implemented in the current node: `crates/system/upgrade` is in the
 genesis module set, governance emits `ScheduleUpgrade`/`CancelUpgrade`
 follow-ups, validators self-signal readiness, and `bin/node upgrade-status`
 queries live state. The authoritative design is
-`docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md`. Do not
-present this procedure as available on a network whose binaries predate the
-`upgrade` module.
+this page plus `skills/upgrade/SKILL.md`. Do not present this procedure as
+available on a network whose binaries predate the `upgrade` module.
 
 ## Invariants You MUST Preserve
 

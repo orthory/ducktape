@@ -245,8 +245,7 @@ identity가 없던 network에 이를 추가하는 것은 다른 module-set 변�
 lockstep upgrade — 가 필요하다.
 
 이 module은 key를 저장할 뿐이고, user key 자체의 custody는 그 위에 얹힌
-desktop-app의 관심사다(`bin/node`의 `user-key` verb;
-`docs/superpowers/specs/2026-07-07-identity-onboarding-design.md` 참고).
+desktop-app의 관심사이며 `bin/node`의 `user-key` verb를 통해 다룬다.
 24-word mnemonic은 raw ed25519 seed를 그대로 encoding한 것이라 — entropy를
 보존하고 identity를 보존한다 — 새 identity를 derive하는 게 아니라 정확히 같은
 identity를 복구한다. password는 local encryption 용도일 뿐이다 — argon2id가
