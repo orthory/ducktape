@@ -1,7 +1,7 @@
 # `ops/coordinator/` — deploy artifacts for the untrusted coordinator
 
 Three ready-to-use artifacts for running `bin/coordinator` as
-`p2p.ducktape.industries`. The coordinator is the private-cutover reachability
+`p2p.ducktape.byeongsu.dev`. The coordinator is the private-cutover reachability
 helper: STUN reflexive + rendezvous over a single UDP socket — rendezvous
 only, it never carries peer traffic. It **holds no keys, serves no state, and
 is untrusted by design** — see `docs/deploy/coordinator.md` for the maintained

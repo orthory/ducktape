@@ -407,6 +407,33 @@ pub enum Coordination {
     Private,
 }
 
+/// Shared public rendezvous coordinator used when a network is created without
+/// an explicit direct-only override.
+pub const DEFAULT_PRIMARY_COORDINATOR: &str = "p2p.ducktape.byeongsu.dev:3478";
+
+/// The typed invite format still carries a coordinator key, but the deployed
+/// coordinator is intentionally keyless. Keep one stable valid key in the
+/// signed envelope until coordinator response signing exists.
+pub fn keyless_coordinator_placeholder_key() -> ed25519::PublicKey {
+    ed25519::PrivateKey::from_seed(0).public_key()
+}
+
+/// Resolve the primary coordinator option. `None` means "use the product
+/// default"; `"none"`/`"off"` keeps the old direct-only posture.
+pub fn primary_coordinator_or_default(raw: Option<&str>) -> Result<Option<String>, String> {
+    let coord = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_PRIMARY_COORDINATOR);
+    if matches!(coord, "none" | "off" | "direct") {
+        return Ok(None);
+    }
+    match ingress_of(coord)? {
+        Some(_) => Ok(Some(coord.to_string())),
+        None => Err(format!("primary coordinator {coord:?} is not dialable")),
+    }
+}
+
 impl NetworkDescriptor {
     pub fn coordination(&self) -> Coordination {
         match self.coordination.as_deref() {
@@ -414,6 +441,39 @@ impl NetworkDescriptor {
             _ => Coordination::Private,
         }
     }
+
+    /// Make `key` reachable through the configured public coordinator. This is
+    /// advisory reachability state, not part of the genesis fingerprint.
+    pub fn apply_primary_coordinator(
+        &mut self,
+        key: &ed25519::PublicKey,
+        coord_addr: &str,
+    ) -> Result<(), String> {
+        let coord_addr = primary_coordinator_or_default(Some(coord_addr))?
+            .ok_or("primary coordinator cannot be disabled here")?;
+        self.coordination = Some("public".into());
+        self.add_reach(&ReachHint {
+            expected_key: key.clone(),
+            reach: Reach::Coordinated(CoordRef {
+                coord_addr,
+                coord_key: keyless_coordinator_placeholder_key(),
+            }),
+        });
+        Ok(())
+    }
+
+    pub fn has_coordinated_reach(&self) -> Result<bool, String> {
+        Ok(self
+            .reach_hints()?
+            .iter()
+            .any(|h| matches!(h.reach, Reach::Coordinated(_))))
+    }
+}
+
+/// Joining through coordinated reach needs the local reachability plane even
+/// when the invite does not contain a direct inviter-hosted tunnel bootstrap.
+pub fn invite_requires_reachability_defaults(invite: &Invite) -> bool {
+    invite.wireguard.is_some() || invite.descriptor.has_coordinated_reach().unwrap_or(false)
 }
 
 /// a reach hint resolved to how the mesh actually reaches a member. `Direct`
@@ -1266,12 +1326,16 @@ pub struct Plumbing {
     /// merged from an existing file only (no flag); a WireGuard join seeds a
     /// default AFTER the merge when the invite carries a tunnel bootstrap.
     pub wireguard_listen: Option<String>,
+    /// merged from explicit flags or existing file; defaults from
+    /// `wireguard_listen` when absent.
+    pub invite_listen: Option<String>,
     /// merged like the rest — a hand-set value survives; the desktop app
     /// passes "socket" here (overlay-net ADR phase 4) while the parse
     /// default for a file without the key stays `tun`.
     pub wireguard_effect: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn merged_plumbing(
     dir: &Path,
     listen: Option<&str>,
@@ -1279,6 +1343,8 @@ pub fn merged_plumbing(
     http_listen: Option<&str>,
     rpc_listen: Option<&str>,
     wireguard_effect: Option<&str>,
+    wireguard_listen: Option<&str>,
+    invite_listen: Option<&str>,
 ) -> Result<Plumbing, String> {
     let path = dir.join("node.toml");
     let existing: Option<NodeToml> = if path.exists() {
@@ -1307,7 +1373,12 @@ pub fn merged_plumbing(
         storage_dir: e
             .and_then(|r| r.storage_dir.clone())
             .unwrap_or_else(|| "storage".into()),
-        wireguard_listen: e.and_then(|r| r.wireguard_listen.clone()),
+        wireguard_listen: wireguard_listen
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.wireguard_listen.clone())),
+        invite_listen: invite_listen
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.invite_listen.clone())),
         wireguard_effect: wireguard_effect
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.wireguard_effect.clone())),
@@ -1336,6 +1407,9 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     }
     if let Some(w) = &p.wireguard_listen {
         s += &format!("wireguard_listen = \"{w}\"\n");
+    }
+    if let Some(i) = &p.invite_listen {
+        s += &format!("invite_listen = \"{i}\"\n");
     }
     if let Some(w) = &p.wireguard_effect {
         s += &format!("wireguard_effect = \"{w}\"\n");
@@ -1938,6 +2012,64 @@ mod tests {
         assert_eq!(d.coordination(), Coordination::Public);
         d.coordination = Some("private".to_string());
         assert_eq!(d.coordination(), Coordination::Private);
+    }
+
+    #[test]
+    fn primary_coordinator_defaults_to_deployed_public_rendezvous() {
+        let coord = primary_coordinator_or_default(None).expect("default coordinator");
+        assert_eq!(coord.as_deref(), Some("p2p.ducktape.byeongsu.dev:3478"));
+
+        let disabled = primary_coordinator_or_default(Some("none")).expect("disabled");
+        assert_eq!(disabled, None);
+    }
+
+    #[test]
+    fn apply_primary_coordinator_records_public_coordinated_self_hint() {
+        let me = ed25519::PrivateKey::from_seed(7).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+
+        d.apply_primary_coordinator(&me, "p2p.ducktape.byeongsu.dev:3478")
+            .expect("coordinator hint");
+
+        assert_eq!(d.coordination(), Coordination::Public);
+        let hints = d.reach_hints().expect("hints");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].expected_key, me);
+        match &hints[0].reach {
+            Reach::Coordinated(coord) => {
+                assert_eq!(coord.coord_addr, "p2p.ducktape.byeongsu.dev:3478");
+                assert_eq!(coord.coord_key, keyless_coordinator_placeholder_key());
+            }
+            other => panic!("expected coordinated reach hint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coordinated_invite_needs_reachability_defaults_without_tunnel_bootstrap() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let mut d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.apply_primary_coordinator(&issuer.public_key(), "p2p.ducktape.byeongsu.dev:3478")
+            .expect("coordinator hint");
+        let invite = decode_invite(&encode_test_invite(&d, &issuer, None)).expect("decode");
+
+        assert!(
+            invite_requires_reachability_defaults(&invite),
+            "a coordinated invite must start the joiner's reachability plane even without a direct tunnel bootstrap"
+        );
     }
 
     #[test]
@@ -2858,8 +2990,17 @@ mod tests {
         .expect("write");
         // one flag overrides ONLY its field; the http port AND a hand-edited
         // storage_dir survive.
-        let p = merged_plumbing(&dir, Some("127.0.0.1:53000"), None, None, None, None)
-            .expect("merge");
+        let p = merged_plumbing(
+            &dir,
+            Some("127.0.0.1:53000"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
         assert_eq!(p.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(p.storage_dir, "/data/ducktape");
@@ -2877,20 +3018,24 @@ mod tests {
     fn plumbing_wireguard_effect_flag_wins_absence_preserves_and_typos_abort() {
         let dir = tmp("plumbing-wg-effect");
         // fresh dir + flag (the desktop app's init/join): written to disk.
-        let p = merged_plumbing(&dir, None, None, None, None, Some("socket")).expect("merge");
+        let p =
+            merged_plumbing(&dir, None, None, None, None, Some("socket"), None, None)
+                .expect("merge");
         assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
         write_node_toml(&dir, &p).expect("write");
 
         // no flag: the hand-settable value on disk survives a re-merge.
-        let p = merged_plumbing(&dir, None, None, None, None, None).expect("re-merge");
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None)
+            .expect("re-merge");
         assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
 
         // the flag wins over the file (merged_plumbing's standing precedence).
-        let p = merged_plumbing(&dir, None, None, None, None, Some("tun")).expect("override");
+        let p = merged_plumbing(&dir, None, None, None, None, Some("tun"), None, None)
+            .expect("override");
         assert_eq!(p.wireguard_effect.as_deref(), Some("tun"));
 
         // a typo aborts the verb before anything is written.
-        let err = merged_plumbing(&dir, None, None, None, None, Some("sokcet"))
+        let err = merged_plumbing(&dir, None, None, None, None, Some("sokcet"), None, None)
             .err()
             .expect("a bad effect value must abort the merge");
         assert!(err.contains("wireguard_effect"), "{err}");

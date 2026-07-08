@@ -28,19 +28,26 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::Manager as _;
 
+const DEFAULT_PRIMARY_COORDINATOR: &str = "p2p.ducktape.byeongsu.dev:3478";
+
 // ── The registry model ──────────────────────────────────
 
-/// the three ports a workspace's node binds. concrete (never `:0`) so the
-/// founder's descriptor carries a stable dial hint and the app knows where to
-/// reach the http surface across restarts.
+/// the ports a workspace's node binds. concrete (never `:0`) so the app knows
+/// where to reach the http surface and reachability plane across restarts.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Ports {
-    /// the encrypted p2p mesh listener (also the advertised dial hint).
+    /// the encrypted p2p mesh listener.
     pub listen: u16,
     /// the http/ws app surface the webview talks to.
     pub http: u16,
     /// the local json-lines rpc `invite-accept` drives.
     pub rpc: u16,
+    /// the UDP WireGuard/rendezvous underlay socket.
+    #[serde(default)]
+    pub wireguard: Option<u16>,
+    /// the UDP invite intro listener.
+    #[serde(default)]
+    pub invite: Option<u16>,
 }
 
 /// one workspace, as stored in the registry and handed to the ui.
@@ -230,7 +237,7 @@ fn free_port(used: &[u16]) -> Result<u16, String> {
     Err("could not find a free localhost port".into())
 }
 
-/// three distinct free ports, avoiding every port already recorded in the
+/// distinct free ports, avoiding every port already recorded in the
 /// registry — a stopped workspace's ports are still ITS ports; handing them to
 /// a new workspace would collide the moment both run.
 fn allocate_ports(reserved: &[u16]) -> Result<Ports, String> {
@@ -240,14 +247,33 @@ fn allocate_ports(reserved: &[u16]) -> Result<Ports, String> {
     let http = free_port(&used)?;
     used.push(http);
     let rpc = free_port(&used)?;
-    Ok(Ports { listen, http, rpc })
+    used.push(rpc);
+    let wireguard = free_port(&used)?;
+    used.push(wireguard);
+    let invite = free_port(&used)?;
+    Ok(Ports {
+        listen,
+        http,
+        rpc,
+        wireguard: Some(wireguard),
+        invite: Some(invite),
+    })
 }
 
 /// every port the registry has already committed to a workspace.
 fn reserved_ports(reg: &Registry) -> Vec<u16> {
     reg.workspaces
         .iter()
-        .flat_map(|w| [w.ports.listen, w.ports.http, w.ports.rpc])
+        .flat_map(|w| {
+            [
+                Some(w.ports.listen),
+                Some(w.ports.http),
+                Some(w.ports.rpc),
+                w.ports.wireguard,
+                w.ports.invite,
+            ]
+        })
+        .flatten()
         .collect()
 }
 
@@ -424,52 +450,6 @@ pub fn workspace_active(app: tauri::AppHandle) -> Result<Option<Workspace>, Stri
         .and_then(|id| reg.workspaces.iter().find(|w| &w.id == id).cloned()))
 }
 
-/// our public, internet-facing IP, asked of a plain-text echo service over a
-/// bare HTTP/1.0 GET (no dependency, no TLS). behind NAT the OS only knows its
-/// own private address, so the reachable one has to come from the outside.
-/// best-effort: a timeout or an unparseable reply just yields `None`.
-fn public_ip() -> Option<std::net::IpAddr> {
-    use std::io::{Read as _, Write as _};
-    use std::net::ToSocketAddrs as _;
-    let timeout = std::time::Duration::from_secs(4);
-    let addr = "api.ipify.org:80".to_socket_addrs().ok()?.next()?;
-    let mut sock = std::net::TcpStream::connect_timeout(&addr, timeout).ok()?;
-    sock.set_read_timeout(Some(timeout)).ok()?;
-    sock.write_all(b"GET / HTTP/1.0\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
-        .ok()?;
-    let mut resp = String::new();
-    sock.read_to_string(&mut resp).ok()?;
-    // the body follows the blank line; ipify returns just the bare IP.
-    resp.rsplit("\r\n\r\n").next()?.trim().parse().ok()
-}
-
-/// the full `host:port` a peer on another machine dials to reach this node —
-/// baked into the invite. we peer directly, so we expose a real reachable
-/// address. precedence:
-///   1. `DUCKTAPE_ADVERTISE_ADDR` — a full `host:port` used verbatim. this is
-///      how you advertise a DOMAIN on a specific external port, e.g.
-///      `node.ducktape.industries:443` (a stable name behind a proxy / forward),
-///      independent of the local mesh port.
-///   2. `DUCKTAPE_ADVERTISE_HOST` (a hostname or known public ip) on our own
-///      `listen_port`.
-///   3. our auto-discovered public ip on `listen_port`.
-///   4. `127.0.0.1:listen_port` — offline single-box fallback.
-fn advertised_addr(listen_port: u16) -> String {
-    if let Ok(addr) = std::env::var("DUCKTAPE_ADVERTISE_ADDR") {
-        let addr = addr.trim();
-        if !addr.is_empty() {
-            return addr.to_string();
-        }
-    }
-    let host = std::env::var("DUCKTAPE_ADVERTISE_HOST")
-        .ok()
-        .map(|h| h.trim().to_string())
-        .filter(|h| !h.is_empty())
-        .or_else(|| public_ip().map(|ip| ip.to_string()))
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    format!("{host}:{listen_port}")
-}
-
 /// found a NEW network: mint a fresh chain-id + this workspace's identity, seed
 /// the genesis validator set with it (a solo 1-validator network usable at
 /// once), and record it active. does not spawn — the ui calls
@@ -489,12 +469,22 @@ pub fn workspace_create(app: tauri::AppHandle, name: String) -> Result<Workspace
 
     // bind the mesh listener dual-stack ([::] accepts BOTH families on a
     // default dual-stack host — 0.0.0.0 could never accept the v6 overlay-ULA
-    // dials that ride WireGuard tunnels) so an invited peer can actually
-    // reach it; advertise the address they should dial (never loopback).
+    // dials that ride WireGuard tunnels).
     let listen = format!("[::]:{}", ports.listen);
-    let advertised = advertised_addr(ports.listen);
     let http = format!("127.0.0.1:{}", ports.http);
     let rpc = format!("127.0.0.1:{}", ports.rpc);
+    let wireguard = format!(
+        "0.0.0.0:{}",
+        ports
+            .wireguard
+            .ok_or("workspace allocator did not assign a wireguard port")?
+    );
+    let invite = format!(
+        "0.0.0.0:{}",
+        ports
+            .invite
+            .ok_or("workspace allocator did not assign an invite port")?
+    );
     let dir_s = dir.to_string_lossy().to_string();
     // desktop-spawned nodes run the TUN-less userspace WireGuard backend
     // (overlay-net ADR phase 4): no /dev/net/tun, no setcap, no host
@@ -509,12 +499,16 @@ pub fn workspace_create(app: tauri::AppHandle, name: String) -> Result<Workspace
             &dir_s,
             "--listen",
             &listen,
-            "--advertised",
-            &advertised,
             "--http",
             &http,
             "--rpc",
             &rpc,
+            "--primary-coordinator",
+            DEFAULT_PRIMARY_COORDINATOR,
+            "--wireguard-listen",
+            &wireguard,
+            "--invite-listen",
+            &invite,
             "--wireguard-effect",
             "socket",
         ],
@@ -582,6 +576,18 @@ pub fn workspace_join(
     let listen = format!("[::]:{}", ports.listen);
     let http = format!("127.0.0.1:{}", ports.http);
     let rpc = format!("127.0.0.1:{}", ports.rpc);
+    let wireguard = format!(
+        "0.0.0.0:{}",
+        ports
+            .wireguard
+            .ok_or("workspace allocator did not assign a wireguard port")?
+    );
+    let invite = format!(
+        "0.0.0.0:{}",
+        ports
+            .invite
+            .ok_or("workspace allocator did not assign an invite port")?
+    );
     let dir_s = dir.to_string_lossy().to_string();
     // join prints this identity's pubkey (for the inviter's admit) on stdout.
     // --wireguard-effect socket: the desktop default (overlay-net ADR phase
@@ -599,6 +605,10 @@ pub fn workspace_join(
             &http,
             "--rpc",
             &rpc,
+            "--wireguard-listen",
+            &wireguard,
+            "--invite-listen",
+            &invite,
             "--wireguard-effect",
             "socket",
         ],
@@ -1464,6 +1474,8 @@ mod tests {
                 listen: 1,
                 http: 2,
                 rpc: 3,
+                wireguard: None,
+                invite: None,
             },
         }];
         assert_eq!(unique_id("My Team", &taken), "my-team-2");
@@ -1626,12 +1638,50 @@ mod tests {
     fn allocated_ports_avoid_reserved() {
         let reserved = [40000u16, 40001, 40002];
         let p = allocate_ports(&reserved).unwrap();
-        for got in [p.listen, p.http, p.rpc] {
-            assert!(!reserved.contains(&got));
+        let got = [
+            p.listen,
+            p.http,
+            p.rpc,
+            p.wireguard.expect("wireguard port"),
+            p.invite.expect("invite port"),
+        ];
+        for port in got {
+            assert!(!reserved.contains(&port));
         }
-        assert_ne!(p.listen, p.http);
-        assert_ne!(p.http, p.rpc);
-        assert_ne!(p.listen, p.rpc);
+        for (idx, port) in got.iter().enumerate() {
+            assert!(
+                !got[..idx].contains(port),
+                "allocated duplicate port {port}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_ports_includes_reachability_ports() {
+        let reg = Registry {
+            version: 1,
+            active: None,
+            workspaces: vec![Workspace {
+                id: "team".into(),
+                name: "Team".into(),
+                chain_id: "chain".into(),
+                pubkey: "key".into(),
+                founder: true,
+                member: true,
+                ports: Ports {
+                    listen: 40000,
+                    http: 40001,
+                    rpc: 40002,
+                    wireguard: Some(40003),
+                    invite: Some(40004),
+                },
+            }],
+            mnemonic_confirmed: false,
+        };
+        let got = reserved_ports(&reg);
+        for port in [40000, 40001, 40002, 40003, 40004] {
+            assert!(got.contains(&port));
+        }
     }
 
     // ── stop_workspace_node: the forget teardown must be REAL ──
@@ -1686,6 +1736,8 @@ mod tests {
                 listen,
                 http,
                 rpc: 0,
+                wireguard: None,
+                invite: None,
             }
         }
 
@@ -1782,6 +1834,8 @@ mod tests {
                 listen: held,
                 http: free_port(&[held]).unwrap(),
                 rpc: 0,
+                wireguard: None,
+                invite: None,
             };
 
             let err = stop_workspace_node(&dir, &ports, Duration::from_millis(400))

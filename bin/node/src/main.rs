@@ -3508,7 +3508,9 @@ mod userkey_verb_tests {
 }
 
 /// `init --name <human name> [--dir .] [--listen a] [--advertised a] [--http a]
-/// [--rpc a] [--wireguard-effect socket|tun|fake]` — found a network: mint the
+/// [--rpc a] [--primary-coordinator host:port|none]
+/// [--wireguard-listen a] [--invite-listen a]
+/// [--wireguard-effect socket|tun|fake]` — found a network: mint the
 /// chain-id, write the descriptor + node config, seed the genesis validator
 /// set with this identity.
 fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -3533,14 +3535,36 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let plumbing = config::merged_plumbing(
+    let primary_coordinator =
+        config::primary_coordinator_or_default(flags.get("primary-coordinator").map(String::as_str))?;
+    let mut plumbing = config::merged_plumbing(
         &dir,
         flags.get("listen").map(String::as_str),
         flags.get("advertised").map(String::as_str),
         flags.get("http").map(String::as_str),
         flags.get("rpc").map(String::as_str),
         flags.get("wireguard-effect").map(String::as_str),
+        flags.get("wireguard-listen").map(String::as_str),
+        flags.get("invite-listen").map(String::as_str),
     )?;
+    if primary_coordinator.is_some() {
+        if plumbing.wireguard_listen.is_none() {
+            plumbing.wireguard_listen = Some("0.0.0.0:51820".into());
+        }
+        if !flags.contains_key("listen") {
+            let port: u16 = plumbing
+                .listen
+                .parse::<std::net::SocketAddr>()
+                .map(|a| a.port())
+                .unwrap_or(0);
+            if port == 0 || !plumbing.listen.starts_with('[') {
+                plumbing.listen = format!("[::]:{}", if port == 0 { 52200 } else { port });
+            }
+        }
+        if plumbing.advertised.is_none() {
+            plumbing.advertised = Some("overlay".into());
+        }
+    }
 
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me = key.public_key();
@@ -3555,6 +3579,9 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Some(addr) = config::dialable(plumbing.advertised.as_deref(), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
+    }
+    if let Some(coord) = &primary_coordinator {
+        descriptor.apply_primary_coordinator(&me, coord)?;
     }
     descriptor.save(&descriptor_path)?;
     config::write_node_toml(&dir, &plumbing)?;
@@ -3605,14 +3632,16 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
     let key = config::load_identity(&base.join(raw.key_file.as_deref().unwrap_or("identity.key")))?;
     let dial_hint = config::dialable(raw.advertised.as_deref(), &raw.listen)?;
+    let has_coordinated_reach = descriptor.has_coordinated_reach()?;
     match &dial_hint {
         Some(addr) => descriptor.add_bootstrap(&key.public_key(), addr),
         // an invite must carry SOME dialable member. a member that joined via
         // an invite holds its dial hints as `reach` (bootstrap is empty), so
         // check the union, not just bootstrap — else a reachable NAT'd member
-        // is wrongly refused. a WireGuard-planed inviter is exempt: its blob
-        // carries the tunnel bootstrap, which IS the dial path.
+        // is wrongly refused. reachability-plane inviters are exempt when
+        // they carry either a direct WireGuard bootstrap or coordinated reach.
         None if raw.wireguard_listen.is_none()
+            && !has_coordinated_reach
             && descriptor
                 .reach_hints()
                 .map(|h| h.is_empty())
@@ -3620,7 +3649,8 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         {
             return Err(
                 "no dialable address: give node.toml a concrete `listen` port or an \
-                        `advertised` addr so a joiner can reach the network"
+                        `advertised` addr, or configure a primary coordinator, so a joiner can \
+                        reach the network"
                     .into(),
             );
         }
@@ -3634,23 +3664,40 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // the joiner dials this member's overlay ULA once the tunnel routes.
     let wireguard = match config::resolved_wireguard_listen(raw.wireguard_listen.as_deref())? {
         Some(wg_listen) => {
-            let (wg_keypair, _) =
-                reachability::WireGuardKeypair::load_or_generate(&base.join("wireguard.key"))
+            let host =
+                match config::endpoint_host(raw.advertised.as_deref(), &raw.listen, wg_listen) {
+                    Ok(host) => Some(host),
+                    Err(_) if has_coordinated_reach => {
+                        // Coordinated reach gives the joiner a rendezvous
+                        // path; there is deliberately no inviter-hosted
+                        // underlay endpoint to bake into the blob.
+                        None
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+            match host {
+                Some(host) => {
+                    let (wg_keypair, _) = reachability::WireGuardKeypair::load_or_generate(
+                        &base.join("wireguard.key"),
+                    )
                     .map_err(|e| format!("wireguard key: {e}"))?;
-            let host = config::endpoint_host(raw.advertised.as_deref(), &raw.listen, wg_listen)?;
-            let intro_port = config::resolved_invite_listen(raw.invite_listen.as_deref(), wg_listen)?
-                .port();
-            let mesh_port: u16 = raw
-                .listen
-                .parse::<std::net::SocketAddr>()
-                .map(|a| a.port())
-                .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
-            Some(config::InviteWireGuard {
-                public_key: wg_keypair.public_key().0,
-                endpoint: format!("{host}:{}", wg_listen.port()),
-                intro: format!("{host}:{intro_port}"),
-                mesh_port,
-            })
+                    let intro_port =
+                        config::resolved_invite_listen(raw.invite_listen.as_deref(), wg_listen)?
+                            .port();
+                    let mesh_port: u16 = raw
+                        .listen
+                        .parse::<std::net::SocketAddr>()
+                        .map(|a| a.port())
+                        .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
+                    Some(config::InviteWireGuard {
+                        public_key: wg_keypair.public_key().0,
+                        endpoint: format!("{host}:{}", wg_listen.port()),
+                        intro: format!("{host}:{intro_port}"),
+                        mesh_port,
+                    })
+                }
+                None => None,
+            }
         }
         None => None,
     };
@@ -4431,7 +4478,8 @@ fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// `join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a]
-/// [--rpc a] [--wireguard-effect socket|tun|fake]` — materialize a workspace
+/// [--rpc a] [--wireguard-listen a] [--invite-listen a]
+/// [--wireguard-effect socket|tun|fake]` — materialize a workspace
 /// from an invite: descriptor + identity (kept across re-joins) + node
 /// config. prints this identity for the inviter's pre-genesis `admit`.
 fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -4457,19 +4505,20 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("http").map(String::as_str),
         flags.get("rpc").map(String::as_str),
         flags.get("wireguard-effect").map(String::as_str),
+        flags.get("wireguard-listen").map(String::as_str),
+        flags.get("invite-listen").map(String::as_str),
     )?;
-    if let Some(wg) = &invite.wireguard {
-        // a WireGuard invite makes the tunnel the dial path, so the joiner's
-        // defaults change shape: its own plane comes up (wireguard_listen),
-        // its mesh listens dual-stack on a CONCRETE port and advertises the
-        // overlay ULA (members reverse-dial it over the tunnels), and the
-        // descriptor gains the inviter's overlay mesh address as a Direct
-        // hint — dialable the moment the invite tunnel routes. explicit
-        // flags and an existing node.toml still win.
+    if config::invite_requires_reachability_defaults(&invite) {
+        // a WireGuard or Coordinated invite makes the reachability plane the
+        // dial path, so the joiner's defaults change shape: its own plane
+        // comes up (wireguard_listen), its mesh listens dual-stack on a
+        // CONCRETE port and advertises the overlay ULA (members reverse-dial
+        // it over the tunnels). explicit flags and an existing node.toml
+        // still win.
         if plumbing.wireguard_listen.is_none() {
             plumbing.wireguard_listen = Some("0.0.0.0:51820".into());
         }
-        if flags.get("listen").is_none() {
+        if !flags.contains_key("listen") {
             let port: u16 = plumbing
                 .listen
                 .parse::<std::net::SocketAddr>()
@@ -4482,17 +4531,19 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         if plumbing.advertised.is_none() {
             plumbing.advertised = Some("overlay".into());
         }
-        let issuer_identity =
-            wireguard_upgrade::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
-                .map_err(|e| format!("inviter identity: {e:?}"))?;
-        let inviter_ula = wireguard_upgrade::ula_v6_member_addr(
-            &descriptor.genesis_namespace(),
-            issuer_identity,
-        );
-        descriptor.add_reach(&config::ReachHint {
-            expected_key: invite.token.issuer.clone(),
-            reach: config::Reach::Direct(format!("[{inviter_ula}]:{}", wg.mesh_port)),
-        });
+        if let Some(wg) = &invite.wireguard {
+            let issuer_identity =
+                wireguard_upgrade::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
+                    .map_err(|e| format!("inviter identity: {e:?}"))?;
+            let inviter_ula = wireguard_upgrade::ula_v6_member_addr(
+                &descriptor.genesis_namespace(),
+                issuer_identity,
+            );
+            descriptor.add_reach(&config::ReachHint {
+                expected_key: invite.token.issuer.clone(),
+                reach: config::Reach::Direct(format!("[{inviter_ula}]:{}", wg.mesh_port)),
+            });
+        }
     }
     descriptor.save(&dir.join("network.toml"))?;
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
