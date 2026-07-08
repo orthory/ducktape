@@ -348,13 +348,14 @@ function HuddleDockCard() {
     voice.cameraOn ||
     (canDecode && roster.some((m) => voice.peers[keyHex(m.node)]?.cameraOn));
 
-  // Staleness is time-driven, so re-render once a second WHILE in a huddle to
-  // re-evaluate the roster's sweep affordances (and refresh the tile grid).
+  // Staleness is time-driven, so re-render once a second WHILE this in-app dock
+  // is showing (not popped — the popped window drives its own re-push tick).
   const [nowTick, setNowTick] = useState(() => Date.now());
   useEffect(() => {
+    if (voice.popped) return;
     const id = setInterval(() => setNowTick(Date.now()), 1000);
     return () => clearInterval(id);
-  }, []);
+  }, [voice.popped]);
 
   // Yield to the popped-out window (it mirrors the same HuddleCard). Every hook
   // above runs first, so this early return is rules-of-hooks safe.

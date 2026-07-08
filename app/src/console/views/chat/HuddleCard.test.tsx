@@ -12,13 +12,12 @@ import { HuddleCard } from "./HuddleCard";
 
 const participant = (over: Partial<HuddleParticipant> & { name: string }): HuddleParticipant => ({
   key: over.name,
-  name: over.name,
   muted: false,
   stale: false,
   isSelf: false,
   speaking: false,
   user: Array.from(new TextEncoder().encode(over.name)),
-  ...over,
+  ...over, // supplies name (required), and overrides key/user when given
 });
 
 const baseProps = {
@@ -76,6 +75,21 @@ describe("HuddleCard roster", () => {
     const many = Array.from({ length: 7 }, (_, i) => participant({ name: `u${i}` }));
     render(<HuddleCard {...baseProps} maxRows={4} participants={many} />);
     expect(screen.getByText("+3 more")).toBeTruthy();
+  });
+
+  it("keeps a stale member's 'remove' reachable even when it falls past maxRows", () => {
+    const onSweep = vi.fn();
+    const deadBytes = Array.from(new TextEncoder().encode("dead"));
+    // 6 members, cap 2, the stale one is last (index 5) — would be hidden by a
+    // naive slice, but its remove control must still render.
+    const roster = [
+      ...Array.from({ length: 5 }, (_, i) => participant({ name: `u${i}` })),
+      participant({ name: "dead", stale: true, user: deadBytes }),
+    ];
+    render(<HuddleCard {...baseProps} maxRows={2} onSweep={onSweep} participants={roster} />);
+    fireEvent.click(screen.getByText("remove"));
+    expect(onSweep).toHaveBeenCalledWith(deadBytes);
+    expect(screen.getByText("+3 more")).toBeTruthy(); // the 3 non-stale hidden rows
   });
 
   it("shows the 'You're muted' banner only when the self member is muted AND speaking", () => {

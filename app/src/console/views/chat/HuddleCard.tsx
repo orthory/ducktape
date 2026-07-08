@@ -109,7 +109,12 @@ function Roster({
   if (participants.length === 1 && participants[0].isSelf) {
     return <span style={{ font: `400 11px ${font.sans}`, color: color.muted2 }}>Just you</span>;
   }
-  const shown = participants.slice(0, maxRows);
+  // Show the first `maxRows` members, PLUS any stale (removable) members that
+  // fall in the overflow — otherwise a dead member past the cap could never be
+  // swept. "+N more" then counts only the remaining non-actionable rows.
+  const head = participants.slice(0, maxRows);
+  const hiddenStale = participants.slice(maxRows).filter((p) => p.stale);
+  const shown = [...head, ...hiddenStale];
   const extra = participants.length - shown.length;
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
