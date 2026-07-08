@@ -52,6 +52,13 @@ pub struct Candidate {
     /// the member's routable WireGuard underlay endpoint (`host:wg_port`), or
     /// `None` for a punchable member reached through the coordinator.
     pub endpoint: Option<String>,
+    /// the member's explicitly-advertised UDP intro listener (`host:port`) the
+    /// joiner announces its token-signed intro to on the DIRECT path. Carried
+    /// verbatim from the invite (the inviter advertises this as `wg.intro`,
+    /// which honors an operator-overridden `invite_listen`); `None` ⇒ derive
+    /// the intro port as `endpoint`'s `wg_port + 1` (the product-wide default,
+    /// and the only shape fronts advertise).
+    pub intro: Option<String>,
 }
 
 impl Candidate {
@@ -114,6 +121,12 @@ pub struct InviterContact {
     /// the inviter's underlay endpoint (`host:wg_port`), or `None` for a
     /// coordinated-only inviter.
     pub endpoint: Option<String>,
+    /// the inviter's explicitly-advertised UDP intro listener (`host:port`,
+    /// from the invite's `wg.intro`), honored verbatim on the DIRECT path so an
+    /// operator-overridden `invite_listen` (a host/port other than
+    /// `wg_port + 1`) is reached correctly. `None` ⇒ fall back to
+    /// `endpoint`'s `wg_port + 1`.
+    pub intro: Option<String>,
 }
 
 /// build the joiner's candidate set: the inviter (if it offered a bootstrap)
@@ -127,6 +140,8 @@ pub fn build_candidates(inviter: Option<InviterContact>, fronts: &[Front]) -> Ve
             wg: inv.wg,
             mesh_port: inv.mesh_port,
             endpoint: inv.endpoint,
+            // the inviter advertises its intro listener explicitly; honor it.
+            intro: inv.intro,
         });
     }
     for front in fronts {
@@ -136,6 +151,9 @@ pub fn build_candidates(inviter: Option<InviterContact>, fronts: &[Front]) -> Ve
                 wg: front.wireguard_public_key,
                 mesh_port: front.mesh_port,
                 endpoint: front.endpoint.clone(),
+                // fronts advertise no separate intro listener — the direct
+                // path derives `wg_port + 1`.
+                intro: None,
             }),
             Err(_) => continue,
         }
@@ -237,9 +255,33 @@ impl Drop for StopGuard {
     }
 }
 
+/// Where the DIRECT path announces this joiner's token-signed intro. Honor the
+/// candidate's explicitly-advertised `intro` endpoint VERBATIM when present —
+/// the inviter advertises this as `wg.intro`, which honors an operator-set
+/// `invite_listen` that need not be `wg_port + 1` (nor even the same host).
+/// Only when no intro is advertised (fronts never advertise one) does the
+/// underlay `wg_port + 1` default apply. Pure, so it is unit-testable without a
+/// live plane.
+fn resolve_intro_dest(candidate: &Candidate, endpoint_addr: SocketAddr) -> Result<SocketAddr, String> {
+    match &candidate.intro {
+        Some(advertised) => match advertised.to_socket_addrs() {
+            Ok(mut addrs) => addrs
+                .next()
+                .ok_or_else(|| format!("advertised intro endpoint {advertised:?} did not resolve")),
+            Err(e) => Err(format!("advertised intro endpoint {advertised:?} unusable ({e})")),
+        },
+        None => Ok(SocketAddr::new(
+            endpoint_addr.ip(),
+            endpoint_addr.port().saturating_add(1),
+        )),
+    }
+}
+
 /// DIRECT: install the join-window peer at its underlay endpoint, then run the
 /// blocking UDP intro announcer (its own OS thread, cancellable by the stop
-/// guard) targeting the member's intro listener at `wg_port + 1`.
+/// guard) targeting the member's intro listener — its explicitly-advertised
+/// `intro` endpoint when present (honoring an operator-overridden
+/// `invite_listen`), otherwise the underlay `wg_port + 1` default.
 async fn direct_attempt(
     reach: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
     intro: Vec<u8>,
@@ -282,9 +324,12 @@ async fn direct_attempt(
         Err(_) => return AttemptResult::Failed("install reply dropped".into()),
     }
 
-    // (b) the intro listener is the underlay port + 1 (the product-wide
-    // `invite_listen` default).
-    let intro_dest = SocketAddr::new(endpoint_addr.ip(), endpoint_addr.port().saturating_add(1));
+    // (b) resolve the intro listener: the candidate's advertised `intro`
+    // endpoint verbatim when present, else the underlay `wg_port + 1` default.
+    let intro_dest = match resolve_intro_dest(&candidate, endpoint_addr) {
+        Ok(dest) => dest,
+        Err(e) => return AttemptResult::Failed(e),
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let _guard = StopGuard(stop.clone());
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -404,6 +449,7 @@ mod tests {
             wg: [1u8; 32],
             mesh_port: 52200,
             endpoint: endpoint.map(str::to_string),
+            intro: None,
         }
     }
 
@@ -453,8 +499,8 @@ mod tests {
     async fn race_installs_the_first_to_ack_without_waiting_on_the_rest() {
         let winner = key(1);
         let candidates = vec![
-            Candidate { key: winner.clone(), wg: [1; 32], mesh_port: 1, endpoint: Some("win".into()) },
-            Candidate { key: key(2), wg: [2; 32], mesh_port: 2, endpoint: Some("slow".into()) },
+            Candidate { key: winner.clone(), wg: [1; 32], mesh_port: 1, endpoint: Some("win".into()), intro: None },
+            Candidate { key: key(2), wg: [2; 32], mesh_port: 2, endpoint: Some("slow".into()), intro: None },
         ];
         let outcome = race_first_contact(candidates, |c| async move {
             match c.endpoint.as_deref() {
@@ -476,8 +522,8 @@ mod tests {
     #[tokio::test]
     async fn race_returns_honest_terminal_when_all_fail() {
         let candidates = vec![
-            Candidate { key: key(1), wg: [1; 32], mesh_port: 1, endpoint: Some("a".into()) },
-            Candidate { key: key(2), wg: [2; 32], mesh_port: 2, endpoint: None },
+            Candidate { key: key(1), wg: [1; 32], mesh_port: 1, endpoint: Some("a".into()), intro: None },
+            Candidate { key: key(2), wg: [2; 32], mesh_port: 2, endpoint: None, intro: None },
         ];
         let outcome = race_first_contact(candidates, |_c| async move {
             AttemptResult::Failed("nope".into())
@@ -490,6 +536,52 @@ mod tests {
             }
             other => panic!("expected Terminal, got {other:?}"),
         }
+    }
+
+    fn direct_candidate(endpoint: &str, intro: Option<&str>) -> Candidate {
+        Candidate {
+            key: key(1),
+            wg: [1; 32],
+            mesh_port: 52200,
+            endpoint: Some(endpoint.into()),
+            intro: intro.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn intro_dest_defaults_to_underlay_port_plus_one_when_unadvertised() {
+        // no advertised intro (a front, or a default-configured inviter) ⇒ the
+        // product-wide `wg_port + 1` default, on the endpoint's own host.
+        let candidate = direct_candidate("198.51.100.7:51820", None);
+        let endpoint_addr = "198.51.100.7:51820".parse().unwrap();
+        let dest = resolve_intro_dest(&candidate, endpoint_addr).unwrap();
+        assert_eq!(dest, "198.51.100.7:51821".parse().unwrap());
+    }
+
+    #[test]
+    fn intro_dest_honors_the_advertised_intro_verbatim() {
+        // an operator-overridden `invite_listen` advertises an intro on a port
+        // that is NOT wg_port + 1 (and even a different host): the joiner must
+        // announce there verbatim, not re-derive wg_port + 1. This is the #260
+        // regression the fix closes.
+        let candidate = direct_candidate("198.51.100.7:51820", Some("203.0.113.9:7000"));
+        let endpoint_addr = "198.51.100.7:51820".parse().unwrap();
+        let dest = resolve_intro_dest(&candidate, endpoint_addr).unwrap();
+        assert_eq!(
+            dest,
+            "203.0.113.9:7000".parse().unwrap(),
+            "the advertised intro endpoint is used verbatim, never wg_port + 1"
+        );
+    }
+
+    #[test]
+    fn build_candidates_carries_the_inviters_advertised_intro() {
+        let mut inv = inviter(Some("198.51.100.1:51820"));
+        inv.intro = Some("198.51.100.1:7000".into());
+        let candidates = build_candidates(Some(inv), &[front(2, Some("198.51.100.2:51820"))]);
+        assert_eq!(candidates[0].intro.as_deref(), Some("198.51.100.1:7000"));
+        // fronts advertise no separate intro listener.
+        assert_eq!(candidates[1].intro, None);
     }
 
     #[tokio::test]

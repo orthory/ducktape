@@ -6026,6 +6026,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // the inviter's underlay endpoint; `None` => the
                             // inviter is coordinated-only (reached by identity).
                             endpoint: wg.endpoint.clone(),
+                            // the inviter's explicitly-advertised intro listener
+                            // (honors a custom `invite_listen`); the direct path
+                            // uses it verbatim instead of re-deriving wg_port+1.
+                            intro: wg.intro.clone(),
                         }),
                         _ => {
                             eprintln!(
