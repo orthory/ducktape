@@ -511,7 +511,7 @@ export function DucktapeProvider({
   const huddleStateFp = useRef("");
   const [huddleStaleTick, setHuddleStaleTick] = useState(0);
   useEffect(() => {
-    if (!state.voice.popped) return;
+    if (!state.voice.popped || !isTauri()) return;
     const id = setInterval(() => setHuddleStaleTick((n) => n + 1), 1000);
     return () => clearInterval(id);
   }, [state.voice.popped]);

@@ -442,7 +442,9 @@ export function createActions({
   // Resolve real VP8 encode/decode support ONCE (isConfigSupported is async, and
   // API presence lies on WebKitGTK). Until it lands, videoCapability stays
   // {false,false} so the camera toggle never appears as a dead control.
-  void probeVideoCapability().then((capability) => patch({ videoCapability: capability }));
+  void probeVideoCapability()
+    .then((capability) => patch({ videoCapability: capability }))
+    .catch(() => {}); // stay at {false,false} — no camera — on any probe failure
 
   /** Our own node key hex — the fan-out set excludes it. Empty on a daemon
    *  that can't do voice. */
