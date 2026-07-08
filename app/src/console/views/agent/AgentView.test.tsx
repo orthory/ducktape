@@ -392,7 +392,7 @@ describe("RunsOnPicker", () => {
         "codex",
         "codex_gpt-5.5_low",
         "codex_gpt-5.5_xhigh",
-        "codex_gpt-5.5-codex_high",
+        "codex_gpt-5.4-mini_high",
         "claude_opus_max",
       ],
     });
@@ -408,7 +408,7 @@ describe("RunsOnPicker", () => {
     const model = screen.getByLabelText("Model");
     expect(within(model).getByRole("option", { name: "Default" })).toBeInTheDocument();
     expect(within(model).getByRole("option", { name: "gpt-5.5" })).toBeInTheDocument();
-    expect(within(model).getByRole("option", { name: "gpt-5.5-codex" })).toBeInTheDocument();
+    expect(within(model).getByRole("option", { name: "gpt-5.4-mini" })).toBeInTheDocument();
 
     // Picking a model adopts its first announced effort; the composed tag
     // is shown verbatim under the picker.
@@ -420,7 +420,7 @@ describe("RunsOnPicker", () => {
     expect(screen.getByText("codex_gpt-5.5_xhigh")).toBeInTheDocument();
 
     // Switching model narrows efforts to what that model announced.
-    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.5-codex" } });
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.4-mini" } });
     expect(screen.getByLabelText("Effort")).toHaveValue("high");
 
     // A provider with no base tag composes its first variant.
