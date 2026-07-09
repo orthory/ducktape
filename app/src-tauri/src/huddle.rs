@@ -9,8 +9,12 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuild
 
 const LABEL: &str = "huddle";
 const CLOSED_EVENT: &str = "ducktape://huddle-closed";
-const WIDTH: f64 = 300.0;
-const HEIGHT: f64 = 168.0;
+// Sized for a real video surface (the window runs its own session now), not the
+// old audio pill — but still compact and floating.
+const WIDTH: f64 = 380.0;
+const HEIGHT: f64 = 300.0;
+const MIN_WIDTH: f64 = 300.0;
+const MIN_HEIGHT: f64 = 220.0;
 
 /// Create (or re-show) the huddle window.
 #[tauri::command]
@@ -27,7 +31,8 @@ pub fn huddle_pop_out<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     )
     .title("Huddle")
     .inner_size(WIDTH, HEIGHT)
-    .resizable(false)
+    .min_inner_size(MIN_WIDTH, MIN_HEIGHT)
+    .resizable(true)
     .maximizable(false)
     .minimizable(false)
     // A huddle is glanceable state you keep in view while working, so the popped
