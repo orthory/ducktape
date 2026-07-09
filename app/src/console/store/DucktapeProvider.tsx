@@ -17,6 +17,8 @@ import {
   isTauri,
   resolveNode,
 } from "../../domain/node-bootstrap";
+import * as notifyClient from "../../domain/notify-client";
+import type { NotifyConfigPayload } from "../../domain/notify-client";
 import type { PageMeta } from "../../domain/pages-client";
 import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
@@ -67,6 +69,40 @@ const BLOCKS_KEEP = 200;
 
 /** How often to re-poll a resolved-but-unanswering node until it comes back. */
 const RECONNECT_POLL_MS = 3_000;
+
+// One shared dynamic import of the Tauri event API for every effect below.
+// Several effects need it on the same mount tick, and concurrent dynamic
+// imports of one specifier both waste work and race vitest's module mocker
+// (the loser of the race resolves the REAL module past the test's mock).
+let tauriEventModule: Promise<typeof import("@tauri-apps/api/event")> | null = null;
+const tauriEventApi = () => (tauriEventModule ??= import("@tauri-apps/api/event"));
+
+/** The structured deep-link a desktop notification navigates with. A plain
+ *  string payload remains the tray popover's bare screen switch. Mirrored by
+ *  the Rust notifier — extend both sides together. */
+export interface NavigateTarget {
+  screen: string;
+  channelId?: string;
+  threadRoot?: number;
+  repo?: string;
+  number?: number;
+}
+
+/** Defensive parse of an untrusted navigate payload: anything without a
+ *  non-empty string `screen` is ignored, and each optional field is dropped
+ *  unless it carries the expected primitive type. */
+const parseNavigateTarget = (payload: unknown): NavigateTarget | null => {
+  if (typeof payload !== "object" || payload === null) return null;
+  const raw = payload as Record<string, unknown>;
+  if (typeof raw.screen !== "string" || raw.screen.length === 0) return null;
+  return {
+    screen: raw.screen,
+    channelId: typeof raw.channelId === "string" ? raw.channelId : undefined,
+    threadRoot: typeof raw.threadRoot === "number" ? raw.threadRoot : undefined,
+    repo: typeof raw.repo === "string" && raw.repo.length > 0 ? raw.repo : undefined,
+    number: typeof raw.number === "number" ? raw.number : undefined,
+  };
+};
 
 export function DucktapeProvider({
   transport,
@@ -552,7 +588,7 @@ export function DucktapeProvider({
     const fp = JSON.stringify(ctx);
     if (fp === huddleCtxFp.current) return;
     huddleCtxFp.current = fp;
-    void import("@tauri-apps/api/event")
+    void tauriEventApi()
       .then(({ emit }) => emit(HUDDLE_CONTEXT_EVENT, ctx))
       // A dropped push must not strand the window on a stale roster (it has no
       // other source) — clear the fingerprint so the next render re-emits.
@@ -575,7 +611,7 @@ export function DucktapeProvider({
       if (cancelled) un();
       else unlisteners.push(un);
     };
-    void import("@tauri-apps/api/event")
+    void tauriEventApi()
       .then(({ listen, emit }) =>
         Promise.all([
           listen(HUDDLE_CMD_EVENT, (event) => {
@@ -629,18 +665,57 @@ export function DucktapeProvider({
     });
   }, [state.nodeUrl]);
 
-  // 5. Menu-bar popover navigation (desktop/macOS): the tray popover is a
-  //    separate webview, so it asks the console to switch screens by having Rust
-  //    emit `ducktape://navigate` after showing this window. Inert on web.
+  // Deep-link thread hand-off parked by the navigate listener (see 5/5b), the
+  // window-focus half of the notify config, and the config push fingerprint.
+  const pendingThreadRef = useRef<{ channelId: string; root: number } | null>(null);
+  const [windowFocused, setWindowFocused] = useState(
+    () => typeof document === "undefined" || document.hasFocus(),
+  );
+  const notifyConfigFp = useRef("");
+
+  // 5. Navigation events from OUTSIDE this webview (desktop): the tray popover
+  //    asks the console to switch screens with a plain string (kept byte-for-
+  //    byte), and a clicked notification deep-links a structured NavigateTarget
+  //    — screen plus an optional channel/thread and forge repo/item. Inert on
+  //    web, and a malformed object payload is ignored.
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | undefined;
     let cancelled = false;
-    void import("@tauri-apps/api/event")
+    void tauriEventApi()
       .then(({ listen }) =>
-        listen<string>("ducktape://navigate", (event) => {
-          const screen = event.payload;
-          if (screen) dispatch({ type: "patch", patch: { screen } });
+        listen<string | NavigateTarget>("ducktape://navigate", (event) => {
+          const payload = event.payload;
+          if (typeof payload === "string") {
+            if (payload) dispatch({ type: "patch", patch: { screen: payload } });
+            return;
+          }
+          const target = parseNavigateTarget(payload);
+          if (!target) return;
+          const { channelId, threadRoot } = target;
+          // Park the thread hand-off BEFORE the channel switch dispatches:
+          // openThread reads the ACTIVE channel, and the switch only lands on
+          // the next render — effect 5b opens it once it has (an already-
+          // active channel opens immediately below instead).
+          if (channelId && threadRoot != null && stateRef.current.activeChannel !== channelId) {
+            pendingThreadRef.current = { channelId, root: threadRoot };
+          }
+          actions.setScreen(target.screen);
+          if (channelId) actions.selectChannel(channelId);
+          if (
+            threadRoot != null &&
+            (!channelId || stateRef.current.activeChannel === channelId)
+          ) {
+            actions.openThread(threadRoot);
+          }
+          // A forge target with no repo is unroutable — there is nothing to
+          // select — so `number` alone never sets a focus.
+          if (target.repo) {
+            dispatch({
+              type: "patch",
+              patch: { forgeFocus: { repo: target.repo, number: target.number ?? null } },
+            });
+          }
         }),
       )
       .then((un) => {
@@ -654,7 +729,92 @@ export function DucktapeProvider({
       cancelled = true;
       unlisten?.();
     };
+  }, [actions]);
+
+  // 5b. Deep-link thread hand-off: a selectChannel dispatched by the navigate
+  //     listener is not visible to openThread (which reads the ACTIVE channel)
+  //     until React re-renders, so the listener parks the target here and this
+  //     effect opens the thread once the channel switch has landed.
+  useEffect(() => {
+    const pending = pendingThreadRef.current;
+    if (!pending || state.activeChannel !== pending.channelId) return;
+    pendingThreadRef.current = null;
+    actions.openThread(pending.root);
+  }, [state.activeChannel, actions]);
+
+  // 5c. forgeFocus is a one-shot hand-off (the explorerFocus idiom), but the
+  //     forge view has no store action to clear it with — so the provider
+  //     retires it when the user leaves the forge screen, which is what keeps
+  //     a later remount of ForgeView from replaying the jump.
+  useEffect(() => {
+    if (state.screen !== "forge" && state.forgeFocus) {
+      dispatch({ type: "patch", patch: { forgeFocus: null } });
+    }
+  }, [state.screen, state.forgeFocus]);
+
+  // 6. Desktop notifier config push: the Rust notifier learns who "me" is (the
+  //    identity account behind our node key and EVERY node bound to it), what
+  //    is focused, and which categories are enabled — all from this webview.
+  //    Re-pushed whenever an input changes; the JSON fingerprint (the huddle-
+  //    context idiom) swallows the per-block identity churn of re-fetched but
+  //    unchanged projections. The window focus edge also marks everything seen
+  //    — the webview-side complement of the notifier's native focus backstop.
+  useEffect(() => {
+    if (!isTauri()) return;
+    const onFocus = () => {
+      setWindowFocused(true);
+      void notifyClient.markSeen();
+    };
+    const onBlur = () => setWindowFocused(false);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
+    };
   }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    // An empty publicKey (legacy daemon) reads as unknown, not as self "".
+    const selfNodeKeyHex = state.status?.publicKey?.toLowerCase() || null;
+    const selfUserKeyHex = selfNodeKeyHex
+      ? state.nodeUsers[selfNodeKeyHex]?.accountId ?? null
+      : null;
+    // Every node of our account — mentions of "me" on ANY of my devices
+    // notify here. Unbound (or unknown) identity falls back to just our node.
+    const accountNodes = selfUserKeyHex
+      ? Object.keys(state.nodeUsers)
+          .filter((nodeHex) => state.nodeUsers[nodeHex].accountId === selfUserKeyHex)
+          .map((nodeHex) => nodeHex.toLowerCase())
+      : [];
+    if (selfNodeKeyHex && !accountNodes.includes(selfNodeKeyHex)) {
+      accountNodes.push(selfNodeKeyHex);
+    }
+    accountNodes.sort(); // key-order independent fingerprint
+    const payload: NotifyConfigPayload = {
+      nodeUrl: state.nodeUrl ?? null,
+      selfUserKeyHex,
+      selfNodeKeysHex: accountNodes,
+      focusedChannel: state.screen === "chat" ? state.activeChannel : null,
+      mainWindowFocused: windowFocused,
+      authorNames: state.authorNames,
+      prefs: state.notifyPrefs,
+    };
+    const fp = JSON.stringify(payload);
+    if (fp === notifyConfigFp.current) return;
+    notifyConfigFp.current = fp;
+    void notifyClient.configure(payload);
+  }, [
+    state.status?.publicKey,
+    state.nodeUsers,
+    state.nodeUrl,
+    state.screen,
+    state.activeChannel,
+    state.authorNames,
+    state.notifyPrefs,
+    windowFocused,
+  ]);
 
   const value = useMemo<ConsoleContextValue>(
     () => ({ state, actions, transport: node }),

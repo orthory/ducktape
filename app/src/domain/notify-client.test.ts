@@ -158,3 +158,50 @@ describe("notify client", () => {
     expect(cb).not.toHaveBeenCalled();
   });
 });
+
+// configure() is re-invoked on every channel switch / focus / blur — a
+// persistently failing command must not spam the console, so warnFailure
+// dedupes per distinct (function, error) pair. Fresh module per test: the
+// dedupe set is module-level state.
+describe("warnFailure dedupe", () => {
+  const freshClient = async () => {
+    vi.resetModules();
+    return import("./notify-client");
+  };
+
+  it("warns once for the same repeated failure", async () => {
+    markTauri();
+    const client = await freshClient();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invokeMock.mockRejectedValue(new Error("persistent IPC failure"));
+
+    await expect(client.configure(emptyConfig())).resolves.toBeUndefined();
+    await expect(client.configure(emptyConfig())).resolves.toBeUndefined();
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("configure"),
+      expect.any(Error),
+    );
+  });
+
+  it("still warns when a different failure follows a deduped one", async () => {
+    markTauri();
+    const client = await freshClient();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    invokeMock.mockRejectedValue(new Error("failure alpha"));
+    await client.configure(emptyConfig());
+    await client.configure(emptyConfig());
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    invokeMock.mockRejectedValue(new Error("failure beta"));
+    await client.configure(emptyConfig());
+    expect(warn).toHaveBeenCalledTimes(2);
+
+    // a DIFFERENT function with an already-seen message is its own key
+    invokeMock.mockRejectedValue(new Error("failure beta"));
+    await client.markSeen();
+    expect(warn).toHaveBeenCalledTimes(3);
+  });
+});

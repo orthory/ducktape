@@ -275,6 +275,13 @@ export interface ConsoleState {
    *  once `blocks` has data and clears it). Null when nothing is pending. */
   explorerFocus: number | null;
 
+  /** The forge item the forge view should open on next render — a clicked
+   *  desktop notification's hand-off (the explorerFocus idiom: the provider's
+   *  navigate listener sets it, ForgeView consumes it, and the provider
+   *  retires it when the user leaves the forge screen). `number` null means
+   *  a repo-only focus. Null when nothing is pending. */
+  forgeFocus: { repo: string; number: number | null } | null;
+
   /** Per-operation finalization ledger (entity key → newest op touching that
    *  row): pending while a write is in flight, then finalized with the
    *  inclusion height + addressable op hash from the submit receipt. Client
@@ -650,6 +657,7 @@ export const createInitialState = (): ConsoleState => {
     lastBlock: null,
     blocks: [],
     explorerFocus: null,
+    forgeFocus: null,
     ops: {},
     error: null,
     bootError: null,

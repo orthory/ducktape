@@ -13,7 +13,16 @@ export interface NotifyConfigPayload {
 
 const noop = (): void => {};
 
+// configure() re-fires on every channel switch / focus / blur, so a
+// persistently failing command would otherwise warn on every keystroke of
+// normal use. Warn once per distinct (function, error) pair — a NEW failure
+// mode still surfaces, a repeated one stays quiet.
+const warnedFailures = new Set<string>();
+
 const warnFailure = (functionName: string, impact: string, error: unknown): void => {
+  const key = `${functionName}:${String(error)}`;
+  if (warnedFailures.has(key)) return;
+  warnedFailures.add(key);
   console.warn(`[notify-client] ${functionName} failed; ${impact}`, error);
 };
 

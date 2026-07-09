@@ -2,7 +2,7 @@
 // writes submit the exact wire msg, and block events trigger a re-query.
 
 import { act, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentRecord } from "../../domain/agent-client";
 import type { AccountView } from "../../domain/identity-client";
@@ -11,6 +11,43 @@ import type { BlockKind, PageBlock } from "../../domain/pages-client";
 import { DucktapeProvider } from "./DucktapeProvider";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
+
+// The desktop-only effects (notify config push, navigate deep-link) talk to
+// the Rust side through notify-client and the Tauri event plane — both mocked
+// so desktop-path tests can run in jsdom and observe/emit directly.
+const notifyMocks = vi.hoisted(() => ({
+  configure: vi.fn(() => Promise.resolve()),
+  markSeen: vi.fn(() => Promise.resolve()),
+  onUnread: vi.fn(() => Promise.resolve(() => {})),
+}));
+vi.mock("../../domain/notify-client", () => notifyMocks);
+
+const tauriEvent = vi.hoisted(() => {
+  const handlers = new Map<string, Set<(event: { payload: unknown }) => void>>();
+  return {
+    handlers,
+    /** Fire a Tauri event into every registered listener (the test's Rust). */
+    emitTo(name: string, payload: unknown) {
+      handlers.get(name)?.forEach((handler) => handler({ payload }));
+    },
+    listen: vi.fn((name: string, handler: (event: { payload: unknown }) => void) => {
+      if (!handlers.has(name)) handlers.set(name, new Set());
+      handlers.get(name)!.add(handler);
+      return Promise.resolve(() => handlers.get(name)?.delete(handler));
+    }),
+    emit: vi.fn(() => Promise.resolve()),
+  };
+});
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: tauriEvent.listen,
+  emit: tauriEvent.emit,
+}));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve()) }));
+// Materialize the mocked module up front: the provider fires several
+// CONCURRENT dynamic imports of the event module on mount, and vitest's lazy
+// mock factory races them — the loser would fall through to the real module.
+import "@tauri-apps/api/event";
+import "@tauri-apps/api/core";
 
 // Switching nodes dials a new one via node-bootstrap. Mock only connectRemote
 // so the switch lands on a benign, empty node (its status rejects → the "no
@@ -103,7 +140,8 @@ const wireChannel = (id: string, name: string, created_at: number) => ({
 const makeFakeNode = ({
   agents = [],
   users = [],
-}: { agents?: AgentRecord[]; users?: AccountView[] } = {}) => {
+  publicKey,
+}: { agents?: AgentRecord[]; users?: AccountView[]; publicKey?: string } = {}) => {
   const blockListeners = new Set<(block: BlockEvent) => void>();
   // channel-aware mini-node: CreateChannel grows the list, MessagesLatest
   // answers per channel — a stale-pane regression needs the distinction
@@ -179,6 +217,7 @@ const makeFakeNode = ({
       appHash: "aa".repeat(32),
       height: 1,
       modules: [{ id: "chat", root: "cc".repeat(32) }],
+      ...(publicKey ? { publicKey } : {}),
     }),
     metrics: vi.fn().mockResolvedValue(""),
     onBlock: vi.fn((listener: (block: BlockEvent) => void) => {
@@ -839,5 +878,279 @@ describe("pages snapshot refresh vs in-flight ops", () => {
       expect(capturedState!.activePageBlocks.map((b) => b.id)).toEqual(["p1", "a", "b"]);
       expect(capturedState!.activePageBlocks[1].text).toBe("hello world");
     });
+  });
+});
+
+// ── Desktop notifier: config push + deep-link navigation ─
+
+// The account this desktop "is": two nodes bound to one identity account.
+// status().publicKey (deliberately uppercase — the push must lowercase) names
+// node aa; the payload's selfNodeKeysHex must carry BOTH of the account's
+// nodes.
+const SELF_ACCOUNT: AccountView = {
+  account_id: JESS_USER_KEY,
+  display_name: "Jess K",
+  nonce: 0,
+  member_keys: [],
+  nodes: [[0xaa], [0xbb]],
+  updated_at: 1,
+};
+const SELF_ACCOUNT_HEX = JESS_USER_KEY.map((b) => b.toString(16).padStart(2, "0")).join("");
+
+const markTauri = () => {
+  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+};
+
+const lastConfig = () => {
+  const calls = notifyMocks.configure.mock.calls as unknown as Array<
+    [import("../../domain/notify-client").NotifyConfigPayload]
+  >;
+  return calls[calls.length - 1]?.[0];
+};
+
+describe("desktop notify config push", () => {
+  beforeEach(() => {
+    localStorage.clear(); // a persisted viewMode would move the boot screen
+    notifyMocks.configure.mockClear();
+    notifyMocks.markSeen.mockClear();
+  });
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    tauriEvent.handlers.clear();
+  });
+
+  it("stays silent on web — no Tauri, no push", async () => {
+    const { transport } = makeFakeNode({ users: [SELF_ACCOUNT], publicKey: "AA" });
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+    expect(notifyMocks.configure).not.toHaveBeenCalled();
+  });
+
+  it("pushes a payload whose self identity derives from nodeUsers[..].accountId", async () => {
+    markTauri();
+    const { transport } = makeFakeNode({ users: [SELF_ACCOUNT], publicKey: "AA" });
+    renderConsole(transport);
+
+    await waitFor(() => {
+      const config = lastConfig();
+      expect(config).toMatchObject({
+        selfUserKeyHex: SELF_ACCOUNT_HEX,
+        focusedChannel: "general",
+      });
+      // every node of the account, lowercase, self included
+      expect(config!.selfNodeKeysHex).toEqual(["aa", "bb"]);
+      expect(config!.prefs.enabled).toBe(true);
+      expect(config!.authorNames["aa"]).toBe("Jess K");
+    });
+  });
+
+  it("re-pushes on channel and screen switches with the new focusedChannel", async () => {
+    markTauri();
+    const { transport } = makeFakeNode({ users: [SELF_ACCOUNT], publicKey: "AA" });
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(lastConfig()).toMatchObject({ focusedChannel: "general" }),
+    );
+
+    await act(async () => {
+      capturedActions!.createChannel("Dev Room", "open");
+    });
+    await waitFor(() =>
+      expect(lastConfig()).toMatchObject({ focusedChannel: "dev-room" }),
+    );
+
+    // off the chat screen there is no focused channel to suppress
+    await act(async () => {
+      capturedActions!.setScreen("members");
+    });
+    await waitFor(() => expect(lastConfig()).toMatchObject({ focusedChannel: null }));
+  });
+
+  it("dedupes identical payloads across a refresh's identity churn", async () => {
+    markTauri();
+    const { transport, finalize } = makeFakeNode({ users: [SELF_ACCOUNT], publicKey: "AA" });
+    let identityRoot = "11".repeat(32);
+    vi.mocked(transport.status).mockImplementation(() =>
+      Promise.resolve({
+        version: "0.1.0",
+        appHash: "aa".repeat(32),
+        height: 1,
+        modules: [
+          { id: "chat", root: "cc".repeat(32) },
+          { id: "identity", root: identityRoot },
+        ],
+        publicKey: "AA",
+      }),
+    );
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(lastConfig()).toMatchObject({ focusedChannel: "general" }),
+    );
+
+    const calls = notifyMocks.configure.mock.calls.length;
+    // an identity-module block re-queries the people slices: fresh Record
+    // identities, identical values — the fingerprint must swallow the re-run.
+    identityRoot = "22".repeat(32);
+    const peopleQueries = vi
+      .mocked(transport.query)
+      .mock.calls.filter(([target]) => target === "identity").length;
+    await act(async () => {
+      finalize({ height: 5, appHash: "dd".repeat(32) });
+    });
+    await waitFor(() =>
+      expect(
+        vi.mocked(transport.query).mock.calls.filter(([target]) => target === "identity")
+          .length,
+      ).toBeGreaterThan(peopleQueries),
+    );
+    expect(notifyMocks.configure.mock.calls.length).toBe(calls);
+  });
+
+  it("tracks window focus and marks seen on the focus edge", async () => {
+    markTauri();
+    const { transport } = makeFakeNode({ users: [SELF_ACCOUNT], publicKey: "AA" });
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(lastConfig()).toMatchObject({ focusedChannel: "general" }),
+    );
+
+    await act(async () => {
+      window.dispatchEvent(new Event("blur"));
+    });
+    await waitFor(() => expect(lastConfig()).toMatchObject({ mainWindowFocused: false }));
+
+    notifyMocks.markSeen.mockClear();
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() => expect(lastConfig()).toMatchObject({ mainWindowFocused: true }));
+    expect(notifyMocks.markSeen).toHaveBeenCalled();
+  });
+});
+
+describe("ducktape://navigate deep-link", () => {
+  beforeEach(() => {
+    localStorage.clear(); // a persisted viewMode would move the boot screen
+    notifyMocks.configure.mockClear();
+  });
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    tauriEvent.handlers.clear();
+  });
+
+  it("keeps the plain-string screen switch byte-for-byte (tray popover)", async () => {
+    markTauri();
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+
+    await act(async () => {
+      tauriEvent.emitTo("ducktape://navigate", "members");
+    });
+    expect(capturedState!.screen).toBe("members");
+  });
+
+  it("navigates a structured chat target: screen, channel, thread", async () => {
+    markTauri();
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+    await act(async () => {
+      capturedActions!.setScreen("members");
+    });
+
+    await act(async () => {
+      tauriEvent.emitTo("ducktape://navigate", {
+        screen: "chat",
+        channelId: "dev",
+        threadRoot: 7,
+      });
+    });
+
+    await waitFor(() => {
+      expect(capturedState!.screen).toBe("chat");
+      expect(capturedState!.activeChannel).toBe("dev");
+      expect(screen.getByTestId("thread").textContent).toBe("open");
+    });
+    // the thread was fetched from the DEEP-LINKED channel, not the one that
+    // was active when the event arrived
+    expect(vi.mocked(transport.query)).toHaveBeenCalledWith(
+      "chat",
+      expect.objectContaining({
+        thread: expect.objectContaining({ channel_id: "dev", root_seq: 7 }),
+      }),
+    );
+  });
+
+  it("opens a thread in the already-active channel without a channel switch", async () => {
+    markTauri();
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+
+    await act(async () => {
+      tauriEvent.emitTo("ducktape://navigate", { screen: "chat", threadRoot: 1 });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("thread").textContent).toBe("open"),
+    );
+    expect(vi.mocked(transport.query)).toHaveBeenCalledWith(
+      "chat",
+      expect.objectContaining({
+        thread: expect.objectContaining({ channel_id: "general", root_seq: 1 }),
+      }),
+    );
+  });
+
+  it("sets forgeFocus for a forge target and clears it on leaving the screen", async () => {
+    markTauri();
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+
+    await act(async () => {
+      tauriEvent.emitTo("ducktape://navigate", { screen: "forge", repo: "default", number: 7 });
+    });
+    await waitFor(() => {
+      expect(capturedState!.screen).toBe("forge");
+      expect(capturedState!.forgeFocus).toEqual({ repo: "default", number: 7 });
+    });
+
+    // the hand-off is one-shot: leaving the forge screen retires it, so a
+    // later remount of the forge view can never replay the jump
+    await act(async () => {
+      tauriEvent.emitTo("ducktape://navigate", "members");
+    });
+    await waitFor(() => expect(capturedState!.forgeFocus).toBeNull());
+  });
+
+  it("ignores malformed structured payloads", async () => {
+    markTauri();
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+    const before = capturedState!.screen;
+
+    await act(async () => {
+      tauriEvent.emitTo("ducktape://navigate", {});
+      tauriEvent.emitTo("ducktape://navigate", { channelId: "dev" });
+      tauriEvent.emitTo("ducktape://navigate", null);
+      tauriEvent.emitTo("ducktape://navigate", 42);
+    });
+    expect(capturedState!.screen).toBe(before);
+    expect(capturedState!.forgeFocus).toBeNull();
   });
 });
