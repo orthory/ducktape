@@ -130,9 +130,20 @@ pub fn blocks_preview(blocks: &Value, max: usize) -> String {
     };
 
     for block in blocks {
-        append_text_block(&mut preview, variant(block, "paragraph"));
-        append_text_block(&mut preview, variant(block, "quote"));
-        append_code_block(&mut preview, variant(block, "code"));
+        let mut block_text = String::new();
+        append_text_block(&mut block_text, variant(block, "paragraph"));
+        append_text_block(&mut block_text, variant(block, "quote"));
+        append_code_block(&mut block_text, variant(block, "code"));
+
+        let block_text = block_text.trim();
+        if block_text.is_empty() {
+            continue;
+        }
+
+        if !preview.is_empty() {
+            preview.push(' ');
+        }
+        preview.push_str(block_text);
 
         if preview.chars().count() >= max {
             break;
@@ -259,6 +270,7 @@ mod tests {
 
     #[test]
     fn bytes_hex_decodes_byte_arrays() {
+        assert_eq!(bytes_hex(&json!([])), Some(String::new()));
         assert_eq!(bytes_hex(&json!([18, 52])), Some("1234".to_string()));
         assert_eq!(bytes_hex(&json!([256])), None);
         assert_eq!(bytes_hex(&json!("x")), None);
@@ -326,14 +338,23 @@ mod tests {
             {
                 "quote": [
                     {
-                        "text": " quoted",
+                        "text": "quoted",
                         "marks": []
                     }
                 ]
             },
             {
+                "paragraph": [
+                    {
+                        "text": "",
+                        "marks": []
+                    }
+                ]
+            },
+            "divider",
+            {
                 "code": {
-                    "text": " code"
+                    "text": "code"
                 }
             },
             "divider"
@@ -341,5 +362,6 @@ mod tests {
 
         assert_eq!(blocks_preview(&blocks, 4), "hi 🙂");
         assert_eq!(blocks_preview(&blocks, 14), "hi 🙂 there quo");
+        assert_eq!(blocks_preview(&blocks, 64), "hi 🙂 there quoted code");
     }
 }
