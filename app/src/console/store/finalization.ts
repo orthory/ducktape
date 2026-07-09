@@ -141,6 +141,23 @@ export const hasFreshPending = (ops: OpLedger, now: number): boolean =>
     (op) => op.phase === "pending" && now - op.startedAt < OP_STALE_MS,
   );
 
+/** The read-your-writes floor: the highest inclusion height among finalized
+ *  ops. A snapshot whose `status.height` sits below it predates a write this
+ *  console already holds a receipt for — applying it would un-render the
+ *  confirmed row until a later refresh (the "message disappears and
+ *  reappears" bug on nodes whose local fold trails the receipt's validator).
+ *  Unbounded on purpose: on one honest node heights are monotonic, so the
+ *  floor can never wedge hydration — and the ledger resets on node switches,
+ *  which is what makes that safe across connections. */
+export const receiptFloor = (ops: OpLedger): number =>
+  Object.values(ops).reduce(
+    (max, op) =>
+      op.phase === "finalized" && op.height !== undefined
+        ? Math.max(max, op.height)
+        : max,
+    0,
+  );
+
 /** Entity-key prefixes whose optimistic projections live in the pages slices
  *  (`pages`, `activePageBlocks`). */
 const PAGE_KEY_PREFIXES = ["page/", "page-block/"] as const;
