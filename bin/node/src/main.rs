@@ -2753,6 +2753,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &mut std::io::BufReader::new(std::io::stdin()),
             );
         }
+        Some("user-sign-possession") => {
+            return cmd_user_sign_possession(
+                &args[1..],
+                &mut std::io::BufReader::new(std::io::stdin()),
+            );
+        }
+        Some("user-sign-add-member") => {
+            return cmd_user_sign_add_member(
+                &args[1..],
+                &mut std::io::BufReader::new(std::io::stdin()),
+            );
+        }
+        Some("user-sign-remove-member") => {
+            return cmd_user_sign_remove_member(
+                &args[1..],
+                &mut std::io::BufReader::new(std::io::stdin()),
+            );
+        }
         Some("init") => return cmd_init(&args[1..]),
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
@@ -2781,7 +2799,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
-                     keygen|user-key|user-sign-bind|user-sign-unbind|init|invite|admit|\
+                     keygen|user-key|user-sign-bind|user-sign-unbind|\
+                     user-sign-possession|user-sign-add-member|user-sign-remove-member|\
+                     init|invite|admit|\
                      invite-accept|promote|resident-remove|\
                      join-requests|member-remove|member-leave|member-status|join|\
                      upgrade-status — or \
@@ -3258,11 +3278,12 @@ fn user_sign_bind(
         .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
 
     let user = load_user_signer(&key_path, stdin)?;
-    let user_sig = config::mint_bind_cert(&user, chain_id, node_pub.as_ref(), nonce);
-    let msg = IdentityMsg::BindNode {
-        user_key: user.public_key().as_ref().to_vec(),
-        user_sig,
-    };
+    let authorizer = config::ed25519_member_auth(
+        &user,
+        identity::IDENTITY_BIND_NS,
+        &identity::bind_preimage(chain_id, node_pub.as_ref(), nonce),
+    );
+    let msg = IdentityMsg::BindNode { authorizer };
     Ok(String::from_utf8(encode_msg(&msg)).expect("json is utf-8"))
 }
 
@@ -3308,10 +3329,14 @@ fn user_sign_unbind(
         .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
 
     let user = load_user_signer(&key_path, stdin)?;
-    let user_sig = config::mint_unbind_cert(&user, chain_id, node_pub.as_ref(), nonce);
+    let authorizer = config::ed25519_member_auth(
+        &user,
+        identity::IDENTITY_UNBIND_NS,
+        &identity::unbind_preimage(chain_id, node_pub.as_ref(), nonce),
+    );
     let msg = IdentityMsg::UnbindNode {
         node_key: node_pub.as_ref().to_vec(),
-        user_sig,
+        authorizer,
     };
     Ok(String::from_utf8(encode_msg(&msg)).expect("json is utf-8"))
 }
@@ -3327,6 +3352,198 @@ fn cmd_user_sign_unbind(
     stdin: &mut impl std::io::BufRead,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", user_sign_unbind(args, stdin)?);
+    Ok(())
+}
+
+/// parse a `--new-kind` flag value into a [`identity::KeyKind`]. the CLI's own
+/// key is always ed25519; `p256`/`webauthn_p256` name the kind of a DIFFERENT
+/// key being admitted (whose possession proof comes from that key's holder --
+/// a native signer, or the FIDO2 transport for a passkey).
+fn parse_kind(s: &str) -> Result<identity::KeyKind, Box<dyn std::error::Error>> {
+    match s {
+        "ed25519" => Ok(identity::KeyKind::Ed25519),
+        "p256" => Ok(identity::KeyKind::P256),
+        "webauthn_p256" | "webauthn-p256" | "passkey" => Ok(identity::KeyKind::WebauthnP256),
+        other => {
+            Err(format!("unknown key kind {other:?} (want ed25519|p256|webauthn_p256)").into())
+        }
+    }
+}
+
+/// `user-sign-possession` core — see [`cmd_user_sign_possession`].
+fn user_sign_possession(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-sign-possession needs --key <path>")?);
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-sign-possession needs --chain-id <id>")?;
+    let account_id = config::unhex(
+        flags
+            .get("account-id")
+            .ok_or("user-sign-possession needs --account-id <hex>")?,
+    )?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-sign-possession needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+
+    // this key proves it holds itself over the add-member preimage; its own
+    // pubkey is `new_key`, and the node's user key is ed25519.
+    let user = load_user_signer(&key_path, stdin)?;
+    let new_key = user.public_key().as_ref().to_vec();
+    let preimage = identity::add_member_preimage(
+        chain_id,
+        &account_id,
+        &new_key,
+        identity::KeyKind::Ed25519,
+        nonce,
+    );
+    let proof = config::ed25519_possession(&user, identity::IDENTITY_ADD_MEMBER_NS, &preimage);
+    Ok(serde_json::to_string(&proof).expect("json is utf-8"))
+}
+
+/// `user-sign-possession --key <path> --chain-id <id> --account-id <hex> --nonce <n>`
+/// — for a NEW ed25519 device joining an existing account: print the
+/// possession-proof `MemberProof` JSON this device signs over the add-member
+/// preimage (pair its `user-key status` pubkey with it). the existing member
+/// then feeds both to `user-sign-add-member`.
+fn cmd_user_sign_possession(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_sign_possession(args, stdin)?);
+    Ok(())
+}
+
+/// `user-sign-add-member` core — see [`cmd_user_sign_add_member`].
+fn user_sign_add_member(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use identity::{IdentityMsg, encode_msg};
+
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(flags.get("key").ok_or("user-sign-add-member needs --key <path>")?);
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-sign-add-member needs --chain-id <id>")?;
+    let account_id = config::unhex(
+        flags
+            .get("account-id")
+            .ok_or("user-sign-add-member needs --account-id <hex>")?,
+    )?;
+    let new_key = config::unhex(
+        flags
+            .get("new-key")
+            .ok_or("user-sign-add-member needs --new-key <hex>")?,
+    )?;
+    let new_kind = parse_kind(
+        flags
+            .get("new-kind")
+            .ok_or("user-sign-add-member needs --new-kind <ed25519|p256|webauthn_p256>")?,
+    )?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-sign-add-member needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+    let new_label = flags.get("label").cloned();
+    let possession: identity::MemberProof = serde_json::from_str(
+        flags
+            .get("possession")
+            .ok_or("user-sign-add-member needs --possession <MemberProof json>")?,
+    )
+    .map_err(|e| format!("--possession is not a MemberProof: {e}"))?;
+
+    // the local user key is an existing member; it consents to admitting the
+    // new key over the same preimage the new key proved possession of.
+    let user = load_user_signer(&key_path, stdin)?;
+    let preimage = identity::add_member_preimage(chain_id, &account_id, &new_key, new_kind, nonce);
+    let authorizer = config::ed25519_member_auth(&user, identity::IDENTITY_ADD_MEMBER_NS, &preimage);
+    let msg = IdentityMsg::AddMemberKey {
+        new_key,
+        new_kind,
+        new_label,
+        possession,
+        authorizer,
+    };
+    Ok(String::from_utf8(encode_msg(&msg)).expect("json is utf-8"))
+}
+
+/// `user-sign-add-member --key <path> --chain-id <id> --account-id <hex>
+/// --new-key <hex> --new-kind <ed25519|p256|webauthn_p256> --nonce <n>
+/// --possession <json> [--label <s>]` — the LOCAL user key (an existing
+/// member) consents to admitting `new-key`; `--possession` is that key's own
+/// proof (from `user-sign-possession`, or the FIDO2 transport for a passkey).
+/// prints the ready-to-submit `IdentityMsg::AddMemberKey` JSON.
+fn cmd_user_sign_add_member(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_sign_add_member(args, stdin)?);
+    Ok(())
+}
+
+/// `user-sign-remove-member` core — see [`cmd_user_sign_remove_member`].
+fn user_sign_remove_member(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use identity::{IdentityMsg, encode_msg};
+
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path =
+        PathBuf::from(flags.get("key").ok_or("user-sign-remove-member needs --key <path>")?);
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-sign-remove-member needs --chain-id <id>")?;
+    let account_id = config::unhex(
+        flags
+            .get("account-id")
+            .ok_or("user-sign-remove-member needs --account-id <hex>")?,
+    )?;
+    let target_key = config::unhex(
+        flags
+            .get("target-key")
+            .ok_or("user-sign-remove-member needs --target-key <hex>")?,
+    )?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-sign-remove-member needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+
+    let user = load_user_signer(&key_path, stdin)?;
+    let preimage = identity::remove_member_preimage(chain_id, &account_id, &target_key, nonce);
+    let authorizer =
+        config::ed25519_member_auth(&user, identity::IDENTITY_REMOVE_MEMBER_NS, &preimage);
+    let msg = IdentityMsg::RemoveMemberKey { target_key, authorizer };
+    Ok(String::from_utf8(encode_msg(&msg)).expect("json is utf-8"))
+}
+
+/// `user-sign-remove-member --key <path> --chain-id <id> --account-id <hex>
+/// --target-key <hex> --nonce <n>` — the LOCAL user key (a member) evicts
+/// `target-key` from the account. prints the ready-to-submit
+/// `IdentityMsg::RemoveMemberKey` JSON. any member may remove any member
+/// except the last one.
+fn cmd_user_sign_remove_member(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_sign_remove_member(args, stdin)?);
     Ok(())
 }
 
@@ -3625,8 +3842,9 @@ mod userkey_verb_tests {
         assert_eq!(legacy_json, v2_json);
 
         match identity::decode_msg(legacy_json.as_bytes()).unwrap() {
-            identity::IdentityMsg::BindNode { user_key, .. } => {
-                assert_eq!(user_key, pubkey_bytes(&seed));
+            identity::IdentityMsg::BindNode { authorizer } => {
+                assert_eq!(authorizer.key, pubkey_bytes(&seed));
+                assert_eq!(authorizer.kind, identity::KeyKind::Ed25519);
             }
             other => panic!("expected BindNode, got {other:?}"),
         }
