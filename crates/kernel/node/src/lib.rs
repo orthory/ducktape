@@ -61,6 +61,12 @@ pub enum Error {
     /// surfaces this and the caller fail-stops.
     #[error("recovery journal: {0}")]
     Journal(String),
+    /// this node's orderer is a follower — it holds no consensus proposal
+    /// rights, so nothing it submits can enter the agreed order. loud so a
+    /// miswired write path fails at the seam instead of silently vanishing;
+    /// a resident's writes relay to a validator instead.
+    #[error("this node holds no consensus proposal rights")]
+    NotAParticipant,
 }
 
 impl From<host::SubmitError> for Error {

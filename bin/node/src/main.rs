@@ -1479,7 +1479,6 @@ fn reopen_preflight_synced_host(host: &Host, expected: StateRoot) -> Result<(), 
 
 fn verify_manifest_floor(
     namespace: &[u8],
-    signer: &ed25519::PrivateKey,
     boundary: &statesync::Manifest,
 ) -> Result<Option<Vec<u8>>, String> {
     if boundary.height <= boundary.view_base {
@@ -1497,16 +1496,25 @@ fn verify_manifest_floor(
     }
     let participants =
         Set::try_from(keys).map_err(|_| "served participant set has duplicates".to_string())?;
-    let scheme = match CONSENSUS_SCHEME {
+    // a VERIFIER-only scheme: no signing key, no our-key-is-a-participant
+    // requirement — any node (a not-yet-seated joiner included) can check a
+    // served floor. and the check is now CRYPTOGRAPHIC (the quorum's
+    // signatures), not the former structural decode: a server cannot mint a
+    // floor its quorum never signed.
+    let finalization = match CONSENSUS_SCHEME {
         ConsensusScheme::V1Ed25519 => {
-            simplex_ed25519::Scheme::signer(namespace, participants, signer.clone())
-                .expect("our key is in the served participant set")
+            let scheme = simplex_ed25519::Scheme::verifier(namespace, participants);
+            consensus::verify_finalization(&mut rand::rngs::OsRng, &scheme, &cert)
         }
         ConsensusScheme::V2Bls => {
-            unimplemented!("V2Bls joiner wiring lands with valset bls key registration")
+            unimplemented!(
+                "V2Bls joiner wiring lands with valset bls key registration — the manifest \
+                 carries ed25519 transport identities only, and a bls verifier needs the \
+                 committed (ed25519 -> bls) participant map"
+            )
         }
-    };
-    let finalization = consensus::decode_finalization(&scheme, &cert).map_err(|e| {
+    }
+    .map_err(|e| {
         format!(
             "served finalization floor does not verify against the epoch's participant set: {e}"
         )
@@ -7407,7 +7415,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 ));
                                 let boundary = boundary.clone();
                                 let boundary_floor =
-                                    match verify_manifest_floor(&namespace, &signer, &boundary) {
+                                    match verify_manifest_floor(&namespace, &boundary) {
                                         Ok(floor) => floor,
                                         Err(e) => {
                                             eprintln!(
@@ -7978,7 +7986,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             );
                             std::process::exit(1);
                         }
-                        let floor = match verify_manifest_floor(&namespace, &signer, target) {
+                        let floor = match verify_manifest_floor(&namespace, target) {
                             Ok(floor) => floor,
                             Err(e) => {
                                 eprintln!(
@@ -8076,7 +8084,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             );
                             std::process::exit(1);
                         }
-                        let floor = match verify_manifest_floor(&namespace, &signer, &target) {
+                        let floor = match verify_manifest_floor(&namespace, &target) {
                             Ok(floor) => floor,
                             Err(e) => {
                                 eprintln!(
