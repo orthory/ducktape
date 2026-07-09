@@ -75,6 +75,7 @@ mod resident_dispatch;
 mod statesync_plane;
 mod userkey;
 mod voice;
+mod voice_plane;
 use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
 
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
@@ -7787,63 +7788,59 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // the ingress select arm and the drain-resolution/expiry code.
         let (mut relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
 
-        // the voice lane + hub: huddle audio between members. the hub runs on
-        // its OWN plain-tokio OS thread (the reachability/app-surface split
-        // exactly); these two pumps are its only mesh coupling — outbound
-        // datagrams fan out addressed to roster node keys, inbound receipts
-        // arrive stamped with the mesh-authenticated sender.
-        {
-            let (mut voice_p2p_tx, mut voice_p2p_rx) =
+        // the voice + video hub: huddle media between members. per the per-use
+        // data-plane ADR (docs/adr/2026-07-07-per-use-data-plane.mdx), media
+        // rides the OVERLAY — audio+control on Service::Voice's overlay socket
+        // (45902), camera on Service::Video's (45903) — NOT the mesh: two mesh
+        // channels to a peer funnel through one per-peer priority relay, so a
+        // multi-megabit video burst starved the 32 kbps voice stream behind it.
+        // CHANNEL_VOICE/CHANNEL_VIDEO stay REGISTERED + BLACKHOLED (an
+        // unregistered channel is a protocol violation that kills the peer's
+        // connection) so a peer still on the mesh-media build is absorbed, not
+        // disconnected; this node sends no media on them.
+        let media_peers = {
+            let (_voice_p2p_tx, mut voice_p2p_rx) =
                 network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
-            // video's own per-peer quota: 512 × 1372 B ≈ 5.6 Mbps — the
-            // 1200 kbps ladder top (~112 fragments/s) plus keyframe bursts.
-            // its own lane so a keyframe burst can't queue ahead of voice.
             let video_quota = Quota::per_second(NZU32!(512));
-            let (mut video_p2p_tx, mut video_p2p_rx) =
+            let (_video_p2p_tx, mut video_p2p_rx) =
                 network.register(CHANNEL_VIDEO, video_quota, MAX_BACKLOG);
-            let (mut voice_egress, mut video_egress, media_ingress) =
-                voice::spawn_hub(voice_requests);
-            context.child("voice_egress").spawn(move |_ctx| async move {
-                while let Some((to, frame)) = voice_egress.recv().await {
-                    let Ok(key) = ed25519::PublicKey::decode(&to[..]) else {
-                        continue;
-                    };
-                    // offline/rate-limited recipients drop the frame — voice
-                    // retries nothing, the receiver's jitter buffer fills gaps.
-                    let _ = voice_p2p_tx.send(Recipients::One(key), IoBuf::from(frame), false);
-                }
-            });
-            let voice_ingress = media_ingress.clone();
-            context.child("voice_ingress").spawn(move |_ctx| async move {
-                while let Ok((peer, bytes)) = voice_p2p_rx.recv().await {
-                    let mut raw = [0u8; 32];
-                    raw.copy_from_slice(peer.as_ref());
-                    // a full hub lane sheds the frame (late audio is dead
-                    // audio); the plane's per-flow accounting covers the rest.
-                    let _ = voice_ingress.try_send((raw, bytes.into()));
-                }
-            });
-            context.child("video_egress").spawn(move |_ctx| async move {
-                while let Some((to, frame)) = video_egress.recv().await {
-                    let Ok(key) = ed25519::PublicKey::decode(&to[..]) else {
-                        continue;
-                    };
-                    // offline/rate-limited recipients drop the fragment — video
-                    // retries nothing, the next keyframe renders the gap.
-                    let _ = video_p2p_tx.send(Recipients::One(key), IoBuf::from(frame), false);
-                }
-            });
-            let video_ingress = media_ingress.clone();
-            context.child("video_ingress").spawn(move |_ctx| async move {
-                while let Ok((peer, bytes)) = video_p2p_rx.recv().await {
-                    let mut raw = [0u8; 32];
-                    raw.copy_from_slice(peer.as_ref());
-                    // a full hub lane sheds the fragment; the reassembler asks
-                    // the sender for a keyframe when a frame dies incomplete.
-                    let _ = video_ingress.try_send((raw, bytes.into()));
-                }
-            });
-        }
+            context
+                .child("voice_blackhole")
+                .spawn(move |_ctx| async move { while voice_p2p_rx.recv().await.is_ok() {} });
+            context
+                .child("video_blackhole")
+                .spawn(move |_ctx| async move { while video_p2p_rx.recv().await.is_ok() {} });
+
+            // media needs the overlay: with no overlay (fake effect, or the
+            // reachability plane unconfigured) there is no media transport at
+            // all (the overlay-only cutover — no mesh fallback), so drop the
+            // session lane and huddle joins refuse fast instead of hanging.
+            let overlay_capable = wireguard_listen.is_some()
+                && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake);
+            if overlay_capable {
+                // tracked media set = transport members ∪ residents, refreshed
+                // on every valset cutover (below, beside the statesync book).
+                let peers = voice_plane::MediaPeers::new(
+                    String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+                );
+                peers.set_peers(initial_member_keys.iter().chain(initial_resident_keys.iter()));
+                let me: [u8; 32] = signer
+                    .public_key()
+                    .as_ref()
+                    .try_into()
+                    .expect("ed25519 keys are 32 bytes");
+                voice::spawn_hub(
+                    voice_requests,
+                    statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                    std::sync::Arc::clone(&peers),
+                    me,
+                );
+                Some(peers)
+            } else {
+                drop(voice_requests);
+                None
+            }
+        };
 
         // the reachability lane + the staged WireGuard plane. the channel is
         // registered unconditionally (an unregistered channel is a protocol
@@ -9390,6 +9387,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // who the mesh tracks — follow the re-track.
                             if let Some(book) = &sync_plane_book {
                                 book.set_peers(plan.valset().transport_members().iter());
+                            }
+                            // the media planes authenticate inbound by the same
+                            // tracked set — follow the re-track too, so a
+                            // just-added member's huddle media is admitted.
+                            if let Some(peers) = &media_peers {
+                                peers.set_peers(plan.valset().transport_members().iter());
                             }
                             // the reachability plane retunnels for the new
                             // member set the moment transport admits it —
