@@ -84,6 +84,7 @@ tempfile = "3"
 # daemon_e2e registers agents with a live prompt doc: prompt_hash pins sha256
 # of the doc's canonical rendering, computed test-side.
 sha2 = { workspace = true }
+ts-rs = { version = "12.0.1", features = ["serde-json-impl"] }
 # (duckfs-client and base64 are now direct deps above — daemon_e2e drives the
 # `HttpNode` transport through them as the full-stack proof of the client
 # transport, alongside the workspace RPC that uses them at runtime.)
