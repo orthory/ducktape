@@ -114,7 +114,7 @@ use saga::{LeasePolicy, SagaModule};
 use sdk::{ModuleId, Msg, StateRoot};
 use statesync::p2p::P2pSyncClient;
 use statesync::qmdb::RemoteQmdbResolver;
-use statesync::{SyncServer, fetch_frames, fetch_manifest, fetch_snapshot};
+use statesync::{SyncServer, fetch_frames, fetch_manifest, fetch_snapshot, fetch_tip_coords};
 use tasks::Tasks;
 use upgrade::Upgrade;
 use valset::Valset;
@@ -1801,6 +1801,13 @@ enum SyncStateRequest {
     IndexCut {
         reply: tokio::sync::oneshot::Sender<std::collections::BTreeMap<String, Vec<u8>>>,
     },
+    /// read the tip's consensus coordinates — the DETECTION lane: answered
+    /// straight from loop-owned state (no capture, no lease, no floor-cert
+    /// alignment gate), so a resident fleet's routine polling never rides
+    /// the Manifest path.
+    TipCoords {
+        reply: tokio::sync::oneshot::Sender<Result<statesync::TipCoords, String>>,
+    },
 }
 
 /// the [`SyncStateRequest::Boundary`] answer: the served boundary's identity
@@ -1930,6 +1937,15 @@ async fn drive_sync_request(
                 _ => statesync::SyncResponse::Error(
                     "index attach did not settle the request".into(),
                 ),
+            }
+        }
+        statesync::ServeStep::NeedCoords => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ask(SyncStateRequest::TipCoords { reply: tx }).await;
+            match rx.await {
+                Ok(Ok(coords)) => statesync::SyncResponse::TipCoords(coords),
+                Ok(Err(e)) => statesync::SyncResponse::Error(e),
+                Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
             }
         }
     }
@@ -8359,20 +8375,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     }
                 }
-                // a FOLDING replica's window closes per certificate; the
-                // manifest is only the fallback lane now (standing detection
-                // pre-ascension; promotion, cutover, and revocation detection
-                // after). pace it on an ABSOLUTE deadline — the window's own
-                // tick restarts per close and would never fire under steady
-                // cert traffic — so a fleet of replicas doesn't besiege the
-                // serve window per block, yet detection stays bounded by the
-                // fallback cadence.
+                // a FOLDING replica's window closes per certificate; this
+                // poll is only the fallback DETECTION lane now (standing
+                // detection pre-ascension; promotion, cutover, and revocation
+                // detection after). it reads tip COORDINATES — membership,
+                // epoch, height — which the server answers from loop-owned
+                // state with no capture, no lease, and no floor-cert gate;
+                // the transitions that consume an actual boundary (ascension,
+                // promotion) fetch a full manifest inside their branch. pace
+                // it on an ABSOLUTE deadline — the window's own tick restarts
+                // per close and would never fire under steady cert traffic —
+                // so a fleet of replicas doesn't besiege the serve window per
+                // block, yet detection stays bounded by the fallback cadence.
                 if serving.is_some() && std::time::Instant::now() < next_manifest_fetch {
                     continue;
                 }
                 next_manifest_fetch = std::time::Instant::now() + RESIDENT_FALLBACK_POLL;
-                let m = match fetch_manifest(&client).await {
-                    Ok(m) => m,
+                let tip = match fetch_tip_coords(&client).await {
+                    Ok(tip) => tip,
                     Err(e) => {
                         let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
                         println!("{}", retry.log_line);
@@ -8386,20 +8406,20 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // list is an unverified serving hint — the union with the
                 // descriptor mesh keeps the real members reachable, and
                 // promotion re-derives everything from verified state.
-                if m.epoch > last_tracked {
-                    if m.epoch >= EPOCH_CHANNEL_BANK {
+                if tip.epoch > last_tracked {
+                    if tip.epoch >= EPOCH_CHANNEL_BANK {
                         println!(
                             "[node {label}] warning: the network is at epoch {} — beyond this \
                              process's pre-registered channel bank ({EPOCH_CHANNEL_BANK}); \
                              expect reconnect churn while parked",
-                            m.epoch
+                            tip.epoch
                         );
                     }
                     oracle.track(
-                        m.epoch,
-                        joiner_epoch_mesh(&peers, &m.participants, &m.residents),
+                        tip.epoch,
+                        joiner_epoch_mesh(&peers, &tip.participants, &tip.residents),
                     );
-                    last_tracked = m.epoch;
+                    last_tracked = tip.epoch;
                 }
                 // drive the reachability plane's standby role off the
                 // manifest: membership and resident standing come from the
@@ -8409,22 +8429,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // Nothing is sent before standing: no member would admit the
                 // gossip yet.
                 if let Some(cmd) = &reach_cmd
-                    && m.residents.iter().any(|k| k == &me_bytes)
+                    && tip.residents.iter().any(|k| k == &me_bytes)
                 {
                     // NON-BLOCKING sends throughout: the plane is not this
                     // loop's dependency. a shed ViewTick is one beat of
                     // advert staleness (the next poll carries a fresher one);
                     // a refused Retarget retries naturally — the epoch latch
                     // below only advances when the send is taken.
-                    let clock = m.view_base.max(m.height);
+                    let clock = tip.view_base.max(tip.height);
                     let _ = cmd.try_send(reachability::ReachabilityCommand::ViewTick(clock));
-                    if last_plane_epoch != Some(m.epoch) {
-                        let members: Vec<ed25519::PublicKey> = m
+                    if last_plane_epoch != Some(tip.epoch) {
+                        let members: Vec<ed25519::PublicKey> = tip
                             .participants
                             .iter()
                             .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
                             .collect();
-                        let standbys: Vec<ed25519::PublicKey> = m
+                        let standbys: Vec<ed25519::PublicKey> = tip
                             .residents
                             .iter()
                             .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
@@ -8432,7 +8452,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         if cmd
                             .try_send(reachability::ReachabilityCommand::Retarget(
                                 reachability::MeshEpochEvent {
-                                    epoch: m.epoch,
+                                    epoch: tip.epoch,
                                     members,
                                     standbys,
                                     current_view: clock,
@@ -8440,14 +8460,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             ))
                             .is_ok()
                         {
-                            last_plane_epoch = Some(m.epoch);
+                            last_plane_epoch = Some(tip.epoch);
                         }
                     }
                 }
-                if !m.participants.iter().any(|k| k == &me_bytes) {
-                    // the manifest names the CURRENT members — better announce
+                if !tip.participants.iter().any(|k| k == &me_bytes) {
+                    // the tip names the CURRENT members — better announce
                     // targets than the genesis descriptor's list.
-                    let current: Vec<ed25519::PublicKey> = m
+                    let current: Vec<ed25519::PublicKey> = tip
                         .participants
                         .iter()
                         .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
@@ -8455,7 +8475,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     if !current.is_empty() {
                         announce_targets = current;
                     }
-                    if serving.is_some() && m.epoch > replica_epoch {
+                    if serving.is_some() && tip.epoch > replica_epoch {
                         // the network cut over to a new epoch: our follower's
                         // verifier and fetch lane are the old epoch's, so its
                         // certs stopped verifying here. DESCEND — drop the
@@ -8466,7 +8486,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         // collapse's concern (phase 3).
                         println!(
                             "[node {label}] replica: epoch cutover {} -> {} — re-ascending",
-                            replica_epoch, m.epoch
+                            replica_epoch, tip.epoch
                         );
                         serving = None;
                         replica_scheme = None;
@@ -8474,7 +8494,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         recovery_slot =
                             Some(reopen_recovery(&context, &mut recovery_reopens, &label).await);
                     }
-                    if m.residents.iter().any(|k| k == &me_bytes) {
+                    if tip.residents.iter().any(|k| k == &me_bytes) {
                         if !resident_standing {
                             resident_standing = true;
                             println!(
@@ -8493,6 +8513,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         // node's host through the serve window above, and
                         // `promote` finds a node already at head.
                         if serving.is_none() {
+                            // ascension consumes the BOUNDARY itself — module
+                            // entries to sync and the floor certificate to
+                            // verify — so this transition (and only this
+                            // transition) rides the full Manifest lane.
+                            let m = match fetch_manifest(&client).await {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    let retry = joiner_manifest_fetch_retry(
+                                        &label,
+                                        resident_standing,
+                                        &e,
+                                    );
+                                    println!("{}", retry.log_line);
+                                    continue;
+                                }
+                            };
                             if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
                                 eprintln!(
                                     "[node {label}] FATAL: cannot observe this network — {e}"
@@ -8757,13 +8793,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     }
                     println!(
                         "[node {label}] joining: awaiting redemption (epoch {} has {} validators)",
-                        m.epoch,
-                        m.participants.len()
+                        tip.epoch,
+                        tip.participants.len()
                     );
                     send_announce(&announce_targets, attempt);
                     continue;
                 }
-                // in the epoch set. a boundary PAST the epoch base needs its
+                // in the epoch set: PROMOTION consumes the boundary itself —
+                // module entries and the real floor certificate — so it rides
+                // the full Manifest lane from here.
+                let m = match fetch_manifest(&client).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
+                        println!("{}", retry.log_line);
+                        continue;
+                    }
+                };
+                // a boundary PAST the epoch base needs its
                 // finalization floor served alongside, or the respawned
                 // engine would re-deliver history the synced state already
                 // contains — retry until the source's floor catches up.
@@ -11751,6 +11798,33 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                         SyncStateRequest::IndexCut { reply } => {
                             let _ = reply.send(ship_index_blobs(&index, &label));
+                        }
+                        SyncStateRequest::TipCoords { reply } => {
+                            // the detection lane: everything here is already
+                            // loop-owned state — no capture, and deliberately
+                            // no floor-cert alignment gate. that gate protects
+                            // a JOINER from syncing a boundary whose history
+                            // it would skip; a detection reply carries a
+                            // presence bit, never certificate bytes, and every
+                            // action taken on it (ascension, promotion)
+                            // re-fetches a full manifest through the gated
+                            // Boundary path.
+                            let answer = match node.finalized() {
+                                None => Err("no finalized boundary to serve yet".to_string()),
+                                Some(f) => Ok(statesync::TipCoords {
+                                    height: f.height,
+                                    app_hash: f.app_hash,
+                                    epoch: orchestrator.epoch(),
+                                    view_base: orchestrator.epoch_base(),
+                                    participants: participant_bytes(&orchestrator),
+                                    residents: resident_bytes(&orchestrator),
+                                    has_floor: latest_floor
+                                        .as_ref()
+                                        .filter(|fc| fc.epoch == orchestrator.epoch())
+                                        .is_some_and(|fc| fc.height == f.height),
+                                }),
+                            };
+                            let _ = reply.send(answer);
                         }
                     }
                 }
