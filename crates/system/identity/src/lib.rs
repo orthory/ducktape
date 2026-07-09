@@ -56,7 +56,9 @@ pub use interface::*;
 // every scheme an account can collect. flattened at the crate root so the wire
 // types (`KeyKind`, `MemberProof`) and the account logic share one vocabulary.
 mod scheme;
-pub use scheme::{KeyKind, MemberProof, verify_authority, webauthn_rp_id_hash};
+pub use scheme::{
+    KeyKind, MemberProof, verify_authority, webauthn_challenge, webauthn_rp_id_hash,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 

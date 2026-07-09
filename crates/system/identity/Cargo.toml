@@ -15,6 +15,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 valset = { workspace = true }
 commonware-cryptography = { workspace = true }
+# union_unique: the exact namespaced signing preimage commonware's native
+# verify hashes -- exposed so the enrollment side hands a phone the precise
+# bytes to ECDSA-sign for a P256 member (the page never reframes them).
+commonware-utils = { workspace = true }
 # required for the PublicKey/Signature-from-bytes api (DecodeExt) -- same
 # reason valset depends on it.
 commonware-codec = { workspace = true }
