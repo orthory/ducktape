@@ -203,3 +203,16 @@ export const continuationKind = (kind: BlockKind): BlockKind =>
   kind === "bulleted" || kind === "numbered" || kind === "todo"
     ? kind
     : "paragraph";
+
+/** Kinds you escape by pressing Enter on an empty one, rather than nesting
+ *  another below. This used to be inferred from `continuationKind(k) === k`,
+ *  which is only true of the three list kinds — so an empty quote or callout
+ *  stayed put and grew a paragraph underneath it instead of becoming one. */
+export const emptyEnterExits = (kind: BlockKind): boolean =>
+  kind === "bulleted" ||
+  kind === "numbered" ||
+  kind === "todo" ||
+  kind === "quote" ||
+  kind === "code" ||
+  kind === "callout" ||
+  kind === "toggle";

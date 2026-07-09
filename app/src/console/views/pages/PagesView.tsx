@@ -4,27 +4,19 @@
 // shortcuts, layout. The editable row (and its keyboard grammar) lives in
 // BlockRow.tsx, the rail in PageRail.tsx.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
-import type { BlockKind } from "../../../domain/pages-client";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Icon } from "../../components/Icon";
 import { opKey } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
-import {
-  EDIT_BOUNDARY_MS,
-  buildRows,
-  continuationKind,
-  indentTarget,
-  moveDownTarget,
-  moveUpTarget,
-  outdentTarget,
-} from "./pages-model";
-import type { Row } from "./pages-model";
+import { EDIT_BOUNDARY_MS, buildRows } from "./pages-model";
+import { caretOffset } from "./block-keys";
+import type { FocusIntent } from "./block-keys";
+import { useRowHandlers } from "./use-row-handlers";
 import { BlockRow } from "./BlockRow";
-import type { RowHandlers } from "./BlockRow";
 import { CommentCard } from "./CommentCard";
 import type { CommentAnchor } from "./CommentCard";
 import { DocTabs } from "./DocTabs";
@@ -40,7 +32,9 @@ export function PagesView() {
   const { state, actions } = useDucktape();
   const [titleDraft, setTitleDraft] = useState("");
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
-  const [focusId, setFocusId] = useState<string | null>(null);
+  // which block to focus next, and WHERE in it. This used to be a bare block
+  // id, so every focus hop slammed the caret to the end of the text.
+  const [focus, setFocus] = useState<FocusIntent | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
   const [pendingPageDelete, setPendingPageDelete] = useState<string | null>(null);
   // the floating comment card's aim: ONE target (a block id or the page id),
@@ -62,6 +56,7 @@ export function PagesView() {
       ? blocks[0]
       : null;
   const rows = useMemo(() => buildRows(blocks, collapsed), [blocks, collapsed]);
+
 
   // live thread count keyed by target (block id or page id).
   const threadsByTarget = useMemo(() => {
@@ -98,16 +93,18 @@ export function PagesView() {
     if (root && root.text === "") titleRef.current?.focus();
   }, [root?.id]);
 
-  // once the snapshot carries a block we queued focus for, focus it.
+  // once the snapshot carries a block we queued focus for, focus it — at the
+  // offset the intent asked for, not unconditionally at the end.
   useEffect(() => {
-    if (!focusId) return;
-    const el = inputs.current.get(focusId);
+    if (!focus) return;
+    const el = inputs.current.get(focus.id);
     if (el) {
+      const at = caretOffset(focus.caret, el.value.length);
       el.focus();
-      el.setSelectionRange(el.value.length, el.value.length);
-      setFocusId(null);
+      el.setSelectionRange(at, at);
+      setFocus(null);
     }
-  }, [rows, focusId]);
+  }, [rows, focus]);
 
   // Docs-scoped keyboard shortcuts. This listener is registered only while the
   // Docs screen is mounted, so it never leaks into other modules:
@@ -152,57 +149,29 @@ export function PagesView() {
     return () => document.removeEventListener("keydown", onKey);
   }, [actions, state.openTabs, state.activePage]);
 
-  const insertAfterRow = (row: Row, kind: BlockKind) => {
-    if (!row.block.parent) return;
-    const blockId = crypto.randomUUID();
-    actions.insertPageBlock({
-      blockId,
-      parent: row.block.parent,
-      after: row.block.id,
-      kind,
-      text: "",
-    });
-    setFocusId(blockId);
-  };
-
-  const appendBlock = () => {
-    if (!root) return;
-    const blockId = crypto.randomUUID();
-    actions.insertPageBlock({
-      blockId,
-      parent: root.id,
-      after: root.children[root.children.length - 1] ?? null,
-      kind: "paragraph",
-      text: "",
-    });
-    setFocusId(blockId);
-  };
-
-  const move = (blockId: string, target: { parent: string; after: string | null } | null) => {
-    if (!target) return;
-    actions.movePageBlock({ blockId, ...target });
-    setFocusId(blockId);
-  };
-
-  const focusRow = (row: Row | undefined) => {
-    if (!row) {
-      titleRef.current?.focus();
-      return;
-    }
-    const el = inputs.current.get(row.block.id);
-    if (el) {
-      el.focus();
-      el.setSelectionRange(el.value.length, el.value.length);
-    }
-  };
 
   const confirmThenDelete = (id: string) => {
     setPendingPageDelete(id);
   };
 
-  const openBlockComments = (blockId: string, anchor: CommentAnchor) => {
+  const openBlockComments = useCallback((blockId: string, anchor: CommentAnchor) => {
     setCommentCard({ target: blockId, label: "this block", anchor });
-  };
+  }, []);
+
+  // row intents -> store ops + caret placement. `handlers` is referentially
+  // stable, which is what lets BlockRow's memo hold.
+  const { handlers, appendBlock, focusRow } = useRowHandlers({
+    actions,
+    rows,
+    blocks,
+    root,
+    activePage: state.activePage,
+    inputs,
+    titleRef,
+    setFocus,
+    setCollapsed,
+    openComments: openBlockComments,
+  });
 
   const commentOnPage = (anchor: CommentAnchor) => {
     if (!state.activePage) return;
@@ -222,58 +191,6 @@ export function PagesView() {
     actions.addComment({ threadId, target, text });
   };
 
-  const handlers: RowHandlers = {
-    commitText: (blockId, text) => actions.updatePageBlockText({ blockId, text }),
-    split: (row) => insertAfterRow(row, continuationKind(row.block.kind)),
-    removeEmpty: (row) => {
-      const index = rows.findIndex((r) => r.block.id === row.block.id);
-      actions.removePageBlock(row.block.id);
-      // walk back to the nearest row that has an editable input.
-      for (let i = index - 1; i >= 0; i -= 1) {
-        if (inputs.current.has(rows[i].block.id)) {
-          focusRow(rows[i]);
-          return;
-        }
-      }
-      focusRow(undefined);
-    },
-    indent: (row) => move(row.block.id, indentTarget(blocks, row.block.id)),
-    outdent: (row) => move(row.block.id, outdentTarget(blocks, row.block.id)),
-    moveUp: (row) => move(row.block.id, moveUpTarget(blocks, row.block.id)),
-    moveDown: (row) => move(row.block.id, moveDownTarget(blocks, row.block.id)),
-    setKind: (blockId, kind) => {
-      actions.setPageBlockKind({ blockId, kind });
-      setFocusId(blockId);
-    },
-    setChecked: (blockId, checked) =>
-      actions.setPageBlockChecked({ blockId, checked }),
-    remove: (blockId) => actions.removePageBlock(blockId),
-    toggleCollapse: (blockId) =>
-      setCollapsed((prev) => {
-        const next = new Set(prev);
-        if (next.has(blockId)) next.delete(blockId);
-        else next.add(blockId);
-        return next;
-      }),
-    focusRelative: (row, delta) => {
-      const index = rows.findIndex((r) => r.block.id === row.block.id);
-      for (let i = index + delta; i >= 0 && i < rows.length; i += delta) {
-        if (inputs.current.has(rows[i].block.id)) {
-          focusRow(rows[i]);
-          return;
-        }
-      }
-      if (delta === -1) focusRow(undefined);
-    },
-    registerInput: (blockId, el) => {
-      if (el) inputs.current.set(blockId, el);
-      else inputs.current.delete(blockId);
-    },
-    openComments: openBlockComments,
-    // the action creates the untitled child and opens its tab (cursor lands
-    // in the title via the fresh-page focus effect above).
-    createSubpage: () => actions.createChildPage(state.activePage),
-  };
 
   const commitTitle = () => {
     if (root && titleDraft !== root.text) {
@@ -463,11 +380,16 @@ export function PagesView() {
                       commitTitle();
                     }}
                     onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === "ArrowDown") {
-                        event.preventDefault();
-                        commitTitle();
-                        focusRow(rows.find((r) => inputs.current.has(r.block.id)));
-                      }
+                      if (event.key !== "Enter" && event.key !== "ArrowDown") return;
+                      event.preventDefault();
+                      commitTitle();
+                      // descend into the body. On a page with no blocks yet
+                      // there is nothing to descend into, so make one — this
+                      // used to call focusRow(undefined), whose contract is
+                      // "focus the title", and the key did nothing at all.
+                      const first = rows.find((r) => inputs.current.has(r.block.id));
+                      if (first) focusRow(first, "start");
+                      else appendBlock();
                     }}
                     placeholder="Untitled"
                     spellCheck={false}
@@ -495,6 +417,7 @@ export function PagesView() {
                       key={row.block.id}
                       row={row}
                       index={index}
+                      prevKind={index > 0 ? rows[index - 1].block.kind : null}
                       expanded={!collapsed.has(row.block.id)}
                       op={state.ops[opKey.pageBlock(row.block.id)]}
                       threadCount={threadsByTarget.get(row.block.id) ?? 0}
@@ -527,7 +450,7 @@ export function PagesView() {
                       gap: 8,
                       width: "100%",
                       boxSizing: "border-box",
-                      padding: "8px 0 8px 28px",
+                      padding: "8px 0",
                       color: color.muted2,
                       font: `400 13px ${font.sans}`,
                     }}

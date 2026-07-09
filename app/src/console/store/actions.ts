@@ -319,16 +319,22 @@ export interface ConsoleActions {
   /** Close a document tab; activates a neighbor if it was active. */
   closeTab(pageId: string): void;
   /** Insert a block into the active page. The VIEW mints the id (it drives
-   *  focus to the new block, so it must know the id before the round-trip). */
+   *  focus to the new block, so it must know the id before the round-trip).
+   *
+   *  Resolves true once the op commits, false if it failed (the failure is
+   *  already surfaced). The pages editor's split/merge use this to compensate:
+   *  a failed op is never rolled back, it is erased by the next authoritative
+   *  refresh, so a lost additive op would silently destroy text. */
   insertPageBlock(params: {
     blockId: string;
     parent: string;
     after: string | null;
     kind: PageBlockKind;
     text: string;
-  }): void;
-  /** Replace a block's text; on the page root this renames the page. */
-  updatePageBlockText(params: { blockId: string; text: string }): void;
+  }): Promise<boolean>;
+  /** Replace a block's text; on the page root this renames the page.
+   *  Resolves true once the op commits — see `insertPageBlock`. */
+  updatePageBlockText(params: { blockId: string; text: string }): Promise<boolean>;
   /** Convert a block to another kind (markdown shortcuts, slash menu). */
   setPageBlockKind(params: { blockId: string; kind: PageBlockKind }): void;
   /** Flip a Todo block's checked state. */
@@ -860,7 +866,15 @@ export function createActions({
         if (!isCurrentNode(live)) return false;
         update((prev) => ({ ops: failOp(prev.ops, key, String(err)) }));
         fail(err);
-        return refresh().then(() => true);
+        // resolve false rather than reject: a failed op is already surfaced to
+        // the user here, and rejecting would turn every caller that ignores the
+        // result into an unhandled rejection. `false` therefore means "this op
+        // did not land" — whether it failed or the node switched underneath it.
+        // Callers gate their follow-up work on it, so a failed write can no
+        // longer trigger a success-only side effect (the pages editor's
+        // compensating split/merge depends on this, and it stops
+        // `createChildPage` from opening a page that was never created).
+        return refresh().then(() => false);
       });
   };
 
@@ -2071,8 +2085,8 @@ export function createActions({
 
     insertPageBlock: ({ blockId, parent, after, kind, text }) => {
       const page = getState().activePage;
-      if (!page) return;
-      submitTracked(
+      if (!page) return Promise.resolve(false);
+      return submitTracked(
         opKey.pageBlock(blockId),
         (live) =>
           pagesClient.insertBlock(live, {
@@ -2089,13 +2103,12 @@ export function createActions({
       );
     },
 
-    updatePageBlockText: ({ blockId, text }) => {
+    updatePageBlockText: ({ blockId, text }) =>
       submitTracked(
         opKey.pageBlock(blockId),
         (live) => pagesClient.updateText(live, { blockId, text }),
         (prev) => optimistic.pageBlockPatched(prev, blockId, { text }),
-      );
-    },
+      ),
 
     setPageBlockKind: ({ blockId, kind }) => {
       submitTracked(
