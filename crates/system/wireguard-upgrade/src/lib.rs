@@ -478,7 +478,7 @@ impl MeshView {
     }
 }
 
-/// the documented v2 preimage (docs/wireguard-tunnel-upgrade.md "Mesh
+/// the documented v2 preimage (docs/records/protocols/wireguard-tunnel-upgrade.md "Mesh
 /// Version"): HASH(domain || namespace || epoch || valset_root ||
 /// admission_root || SORT_ASC(endpoint_record_hashes)). v2 differs from v1
 /// only in each record hash now covering `wireguard_public_key` (and the

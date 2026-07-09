@@ -5914,7 +5914,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // the real encrypted TCP mesh. `local` is the dev preset (allows private
         // ips). MUST be the real tokio runtime — discovery live-locks under the
         // deterministic clock.
-        // reachability plane (docs/sentry-deployment.md): a forward sentry on a
+        // reachability plane (docs/deploy/sentry-deployment.md): a forward sentry on a
         // private network relies on this `local` preset's allow_private_ips:true;
         // switching to a preset with allow_private_ips:false would reject the
         // forwarded connection from a private source IP — use a public-IP sentry
@@ -8722,7 +8722,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // the capability registry, so an announce can never claim more than
         // the host provides (`announce_capabilities = false` narrows the
         // announced set to nothing — never the reverse). routing and
-        // default models live in the specs (docs/capability-spec.md); a broken
+        // default models live in the specs (docs/records/specs/capability-spec.md); a broken
         // operator spec is a boot error, not a silently dropped executor.
         let providers = capability_host::discover_with_dirs(agent_dirs.clone())
             .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));

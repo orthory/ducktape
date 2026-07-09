@@ -27,7 +27,7 @@ const nodes: SemanticNode[] = [
   { id: 'valset', label: 'valset', sub: 'validator membership', category: 'system' },
   { id: 'saga', label: 'saga', sub: 'async continuations', category: 'system' },
   { id: 'dispatch', label: 'dispatch', sub: 'task plane', category: 'system' },
-  { id: 'sysmore', label: '+13 system modules', sub: 'identity · governance · net …', category: 'system' },
+  { id: 'sysmore', label: '+14 system modules', sub: 'identity · governance · net …', category: 'system' },
   // apps
   { id: 'apps', label: '12 product modules', sub: 'chat · pages · forge · agent …', category: 'app' },
   { id: 'files', label: 'files', sub: 'duckfs module adapter', category: 'app' },

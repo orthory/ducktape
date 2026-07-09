@@ -29,7 +29,7 @@
 # the sandbox rides the config override `-c sandbox_mode="workspace-write"`
 # instead, so nothing is dropped on the resume path.
 #
-# Format reference: docs/capability-spec.md
+# Format reference: docs/records/specs/capability-spec.md
 
 spec = 1
 

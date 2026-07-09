@@ -12,7 +12,7 @@
 //! who may cancel), pruned when the result delivers.
 //!
 //! the module implements the platform's ordering-contract promises where they
-//! touch agents (docs/agent-collaboration-design.md §2, §3, §5):
+//! touch agents (docs/records/architecture/agent-collaboration-design.md §2, §3, §5):
 //!
 //! - **P2 — atomic causal cascades.** a user post, the tagging plane's
 //!   engagement delivery, the pending entry, and the dispatch commit in ONE
