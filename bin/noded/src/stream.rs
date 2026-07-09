@@ -14,6 +14,15 @@ use crate::NodeHandle;
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 3_000;
 pub const STREAM_CATCHUP_BUDGET: usize = 256;
+/// per-connection subscription ceiling. the ws surface is unauthenticated
+/// (trusted-client convention), so per-connection state must stay bounded:
+/// the console needs ~15 module topics + logs + files:watch + a few
+/// run-output panes; far below this. beyond it, subscribes refuse per-topic.
+pub const MAX_TOPICS_PER_CONNECTION: usize = 64;
+/// rows a files:watch catch-up may SCAN (not just emit) per wakeup — a
+/// stage-heavy history is mostly non-commit rows, and an unbounded back-scan
+/// would stall the session task; past this the topic lags to live instead.
+pub const FILES_SCAN_BUDGET: usize = STREAM_CATCHUP_BUDGET * 4;
 pub const LOG_RING_CAPACITY: usize = 4_096;
 pub const RUN_OUTPUT_MAX_RUNS: usize = 32;
 pub const RUN_OUTPUT_MAX_LINES: usize = 2_048;
@@ -460,6 +469,29 @@ impl CatchUpResult {
     }
 }
 
+/// which wakeup source fired — each catch-up pass only visits the topic
+/// classes that source can have fed, so a log-line storm never re-scans
+/// module topics and a run-output append never touches the index. `All`
+/// covers subscribe replay, where any topic may owe frames.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    Block,
+    Logs,
+    RunOutput,
+    All,
+}
+
+impl TopicState {
+    fn wakes_on(&self, wake: Wake) -> bool {
+        match wake {
+            Wake::All => true,
+            Wake::Block => matches!(self, Self::Module { .. } | Self::FilesWatch { .. }),
+            Wake::Logs => matches!(self, Self::Logs { .. }),
+            Wake::RunOutput => matches!(self, Self::RunOutput { .. }),
+        }
+    }
+}
+
 pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
     let hub = handle.stream_hub();
     let mut block_rx = hub.subscribe_blocks();
@@ -480,7 +512,7 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                                 if !send_frames(&mut socket, frames).await {
                                     return;
                                 }
-                                if !catch_up_all(&handle, &mut socket, &mut topics).await {
+                                if !catch_up(&handle, &mut socket, &mut topics, Wake::All).await {
                                     return;
                                 }
                             }
@@ -507,7 +539,7 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
-                if !catch_up_all(&handle, &mut socket, &mut topics).await {
+                if !catch_up(&handle, &mut socket, &mut topics, Wake::Block).await {
                     return;
                 }
             }
@@ -520,7 +552,7 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                 if changed.is_err() {
                     return;
                 }
-                if !catch_up_all(&handle, &mut socket, &mut topics).await {
+                if !catch_up(&handle, &mut socket, &mut topics, Wake::Logs).await {
                     return;
                 }
             }
@@ -528,7 +560,7 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                 if changed.is_err() {
                     return;
                 }
-                if !catch_up_all(&handle, &mut socket, &mut topics).await {
+                if !catch_up(&handle, &mut socket, &mut topics, Wake::RunOutput).await {
                     return;
                 }
             }
@@ -565,6 +597,15 @@ fn subscribe_topics(
     let mut frames = Vec::new();
     let mut accepted = BTreeMap::new();
     for topic in requested {
+        // the cap counts a NEW topic only — re-subscribing (re-cursoring) an
+        // existing one is always allowed.
+        if !states.contains_key(&topic) && states.len() >= MAX_TOPICS_PER_CONNECTION {
+            frames.push(unavailable(
+                &topic,
+                format!("subscription cap ({MAX_TOPICS_PER_CONNECTION} topics) reached"),
+            ));
+            continue;
+        }
         match prepare_topic(&topic, resume.get(&topic), store.as_ref()) {
             Ok((state, lagged)) => {
                 accepted.insert(topic.clone(), Some(state.cursor()));
@@ -668,14 +709,19 @@ fn module_start_cursor(
     }
 }
 
-async fn catch_up_all(
+async fn catch_up(
     handle: &NodeHandle,
     socket: &mut WebSocket,
     topics: &mut BTreeMap<String, TopicState>,
+    wake: Wake,
 ) -> bool {
     let store = handle.stream_index();
     let hub = handle.stream_hub();
-    let topic_names = topics.keys().cloned().collect::<Vec<_>>();
+    let topic_names = topics
+        .iter()
+        .filter(|(_, state)| state.wakes_on(wake))
+        .map(|(topic, _)| topic.clone())
+        .collect::<Vec<_>>();
     for topic in topic_names {
         let Some(state) = topics.get_mut(&topic) else {
             continue;
@@ -786,6 +832,7 @@ fn catch_up_files(topic: &str, cursor: &mut String, store: &indexer::IndexStore)
 
     let mut frames = Vec::new();
     let mut emitted = 0usize;
+    let mut scanned = 0usize;
     loop {
         let page = match store.scan(
             "files",
@@ -800,6 +847,7 @@ fn catch_up_files(topic: &str, cursor: &mut String, store: &indexer::IndexStore)
             }
         };
         let entry_count = page.entries.len();
+        scanned += entry_count;
         for (key, value) in page.entries {
             let key = String::from_utf8_lossy(&key).into_owned();
             let row = match serde_json::from_slice::<StreamOpRow>(&value) {
@@ -847,6 +895,12 @@ fn catch_up_files(topic: &str, cursor: &mut String, store: &indexer::IndexStore)
         if page.has_more {
             if entry_count == 0 {
                 break;
+            }
+            // a stage-heavy history is mostly non-commit rows that never
+            // count against the emit budget — bound the raw scan too, or a
+            // far-behind resume stalls the session task in one wakeup.
+            if scanned >= FILES_SCAN_BUDGET {
+                return lag_to_live(topic, "files", cursor, store, frames);
             }
             continue;
         }
@@ -1244,6 +1298,67 @@ mod tests {
                 assert_eq!(interval_ms, HEARTBEAT_INTERVAL_MS);
             }
             other => panic!("expected heartbeat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subscription_cap_refuses_new_topics_but_allows_recursoring() {
+        let (handle, _rx, _hub) = crate::NodeHandle::channel();
+        let mut states = BTreeMap::new();
+        let requested: Vec<String> = (0..MAX_TOPICS_PER_CONNECTION + 1)
+            .map(|i| format!("run-output:r{i}"))
+            .collect();
+        let frames = subscribe_topics(&handle, &mut states, requested, &BTreeMap::new());
+        assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
+        let refused = frames
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f,
+                    ServerFrame::Error {
+                        code: StreamErrorCode::Unavailable,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(refused, 1, "exactly the over-cap topic refuses");
+        // re-subscribing an EXISTING topic at the cap re-cursors, never refuses.
+        let again = subscribe_topics(
+            &handle,
+            &mut states,
+            vec!["run-output:r0".into()],
+            &BTreeMap::new(),
+        );
+        assert!(
+            again
+                .iter()
+                .all(|f| !matches!(f, ServerFrame::Error { .. })),
+            "re-subscribe at the cap must stay allowed: {again:?}"
+        );
+        assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
+    }
+
+    #[test]
+    fn wake_classes_route_to_their_topics() {
+        let module = TopicState::Module {
+            module: "chat".into(),
+            cursor: String::new(),
+        };
+        let files = TopicState::FilesWatch {
+            cursor: String::new(),
+        };
+        let logs = TopicState::Logs { seq: 0 };
+        let run = TopicState::RunOutput {
+            id: "r1".into(),
+            seq: 0,
+        };
+        assert!(module.wakes_on(Wake::Block) && files.wakes_on(Wake::Block));
+        assert!(!logs.wakes_on(Wake::Block) && !run.wakes_on(Wake::Block));
+        assert!(logs.wakes_on(Wake::Logs) && !module.wakes_on(Wake::Logs));
+        assert!(run.wakes_on(Wake::RunOutput) && !files.wakes_on(Wake::RunOutput));
+        for state in [&module, &files, &logs, &run] {
+            assert!(state.wakes_on(Wake::All));
         }
     }
 
