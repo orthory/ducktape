@@ -11,6 +11,9 @@ import { BIP39_ENGLISH_WORDLIST } from "../../../domain/bip39-wordlist";
 import type { IdentityStateReport } from "../../../domain/user-identity-client";
 import { IdentityGate } from "./IdentityGate";
 
+const invokeMock = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+
 const identityStateMock = vi.hoisted(() => vi.fn());
 const createIdentityMock = vi.hoisted(() => vi.fn());
 const restoreIdentityMock = vi.hoisted(() => vi.fn());
@@ -39,6 +42,8 @@ const TEST_WORDS = TEST_MNEMONIC.split(" ");
 
 afterEach(() => {
   delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  localStorage.removeItem("ducktape.pendingDisplayName");
+  localStorage.removeItem("ducktape.accountLinkPending");
   vi.clearAllMocks();
 });
 
@@ -75,7 +80,7 @@ describe("identity gate — platform gating", () => {
 });
 
 describe("identity gate — state machine", () => {
-  it("absent renders the create/restore chooser", async () => {
+  it("absent renders the create/restore/link chooser under the first-run step rail", async () => {
     markTauri();
     identityStateMock.mockResolvedValue({
       state: "absent",
@@ -88,7 +93,12 @@ describe("identity gate — state machine", () => {
       </IdentityGate>,
     );
 
-    expect(await screen.findByText("Create your identity")).toBeInTheDocument();
+    expect(await screen.findByText("Create your account")).toBeInTheDocument();
+    expect(screen.getByText("Restore")).toBeInTheDocument();
+    expect(screen.getByText("Link device")).toBeInTheDocument();
+    // a true first run shows the 3-step rail (this is step 1 of 3).
+    expect(screen.getByText("Workspace")).toBeInTheDocument();
+    expect(screen.getByText("Connect")).toBeInTheDocument();
     expect(screen.queryByTestId("console")).toBeNull();
   });
 
@@ -106,10 +116,10 @@ describe("identity gate — state machine", () => {
       </IdentityGate>,
     );
 
-    expect(await screen.findByText("Secure your identity")).toBeInTheDocument();
+    expect(await screen.findByText("Secure your account")).toBeInTheDocument();
   });
 
-  it("locked (confirmed) renders the unlock form", async () => {
+  it("locked (confirmed) renders the unlock form without the first-run rail", async () => {
     markTauri();
     identityStateMock.mockResolvedValue({
       state: "locked",
@@ -123,7 +133,10 @@ describe("identity gate — state machine", () => {
       </IdentityGate>,
     );
 
-    expect(await screen.findByText("Unlock your identity")).toBeInTheDocument();
+    expect(await screen.findByText("Unlock your account")).toBeInTheDocument();
+    // the skip consequence is stated, and a returning user gets no stepper.
+    expect(screen.getByText(/stay unlinked to your account/)).toBeInTheDocument();
+    expect(screen.queryByText("Workspace")).toBeNull();
   });
 
   it("unlocked (confirmed) renders the console with no gate", async () => {
@@ -163,7 +176,7 @@ describe("identity gate — create flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Create your identity");
+    await screen.findByText("Create your account");
     fireEvent.change(screen.getByPlaceholderText("Password (min 8 characters)"), {
       target: { value: "correct horse battery" },
     });
@@ -171,7 +184,7 @@ describe("identity gate — create flow", () => {
       target: { value: "correct horse battery" },
     });
     await act(async () => {
-      fireEvent.click(screen.getByText("Create identity"));
+      fireEvent.click(screen.getByText("Create account"));
     });
 
     expect(createIdentityMock).toHaveBeenCalledWith("correct horse battery");
@@ -203,7 +216,7 @@ describe("identity gate — create flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Create your identity");
+    await screen.findByText("Create your account");
     fireEvent.change(screen.getByPlaceholderText("Password (min 8 characters)"), {
       target: { value: "correct horse battery" },
     });
@@ -211,7 +224,7 @@ describe("identity gate — create flow", () => {
       target: { value: "correct horse battery" },
     });
     await act(async () => {
-      fireEvent.click(screen.getByText("Create identity"));
+      fireEvent.click(screen.getByText("Create account"));
     });
     fireEvent.click(await screen.findByText("I've saved it — continue"));
     await screen.findByText("Confirm your recovery phrase");
@@ -247,7 +260,7 @@ describe("identity gate — create flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Create your identity");
+    await screen.findByText("Create your account");
     fireEvent.change(screen.getByPlaceholderText("Password (min 8 characters)"), {
       target: { value: "correct horse battery" },
     });
@@ -255,7 +268,7 @@ describe("identity gate — create flow", () => {
       target: { value: "correct horse battery" },
     });
     await act(async () => {
-      fireEvent.click(screen.getByText("Create identity"));
+      fireEvent.click(screen.getByText("Create account"));
     });
     fireEvent.click(await screen.findByText("I've saved it — continue"));
     await screen.findByText("Confirm your recovery phrase");
@@ -289,14 +302,14 @@ describe("identity gate — create flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Create your identity");
+    await screen.findByText("Create your account");
     fireEvent.change(screen.getByPlaceholderText("Password (min 8 characters)"), {
       target: { value: "longenoughpassword" },
     });
     fireEvent.change(screen.getByPlaceholderText("Confirm password"), {
       target: { value: "somethingelse" },
     });
-    fireEvent.click(screen.getByText("Create identity"));
+    fireEvent.click(screen.getByText("Create account"));
 
     expect(screen.getByText(/do not match/i)).toBeInTheDocument();
     expect(createIdentityMock).not.toHaveBeenCalled();
@@ -314,9 +327,9 @@ describe("identity gate — restore flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Create your identity");
+    await screen.findByText("Create your account");
     fireEvent.click(screen.getByText("Restore"));
-    await screen.findByText("Restore your identity");
+    await screen.findByText("Restore your account");
 
     fireEvent.change(
       screen.getByPlaceholderText("24-word recovery phrase, separated by spaces"),
@@ -328,7 +341,7 @@ describe("identity gate — restore flow", () => {
     fireEvent.change(screen.getByPlaceholderText("Confirm new password"), {
       target: { value: "correct horse battery" },
     });
-    fireEvent.click(screen.getByText("Restore identity"));
+    fireEvent.click(screen.getByText("Restore account"));
 
     expect(screen.getByText(/got 5/i)).toBeInTheDocument();
     expect(restoreIdentityMock).not.toHaveBeenCalled();
@@ -344,9 +357,9 @@ describe("identity gate — restore flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Create your identity");
+    await screen.findByText("Create your account");
     fireEvent.click(screen.getByText("Restore"));
-    await screen.findByText("Restore your identity");
+    await screen.findByText("Restore your account");
 
     const words = BIP39_ENGLISH_WORDLIST.slice(200, 224);
     words[10] = "zzznotarealword";
@@ -360,7 +373,7 @@ describe("identity gate — restore flow", () => {
     fireEvent.change(screen.getByPlaceholderText("Confirm new password"), {
       target: { value: "correct horse battery" },
     });
-    fireEvent.click(screen.getByText("Restore identity"));
+    fireEvent.click(screen.getByText("Restore account"));
 
     expect(screen.getByText('"zzznotarealword" is not a recovery-phrase word')).toBeInTheDocument();
     expect(restoreIdentityMock).not.toHaveBeenCalled();
@@ -377,9 +390,9 @@ describe("identity gate — restore flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Create your identity");
+    await screen.findByText("Create your account");
     fireEvent.click(screen.getByText("Restore"));
-    await screen.findByText("Restore your identity");
+    await screen.findByText("Restore your account");
 
     const words = BIP39_ENGLISH_WORDLIST.slice(300, 324);
     fireEvent.change(
@@ -393,7 +406,7 @@ describe("identity gate — restore flow", () => {
       target: { value: "correct horse battery" },
     });
     await act(async () => {
-      fireEvent.click(screen.getByText("Restore identity"));
+      fireEvent.click(screen.getByText("Restore account"));
     });
 
     expect(restoreIdentityMock).toHaveBeenCalledWith(words.join(" "), "correct horse battery");
@@ -413,9 +426,9 @@ describe("identity gate — restore flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Create your identity");
+    await screen.findByText("Create your account");
     fireEvent.click(screen.getByText("Restore"));
-    await screen.findByText("Restore your identity");
+    await screen.findByText("Restore your account");
 
     const words = BIP39_ENGLISH_WORDLIST.slice(400, 424);
     fireEvent.change(
@@ -429,7 +442,7 @@ describe("identity gate — restore flow", () => {
       target: { value: "correct horse battery" },
     });
     await act(async () => {
-      fireEvent.click(screen.getByText("Restore identity"));
+      fireEvent.click(screen.getByText("Restore account"));
     });
 
     expect(await screen.findByTestId("console")).toBeInTheDocument();
@@ -452,7 +465,7 @@ describe("identity gate — unlock flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Unlock your identity");
+    await screen.findByText("Unlock your account");
     fireEvent.change(screen.getByPlaceholderText("Password"), {
       target: { value: "nope" },
     });
@@ -477,7 +490,7 @@ describe("identity gate — unlock flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Unlock your identity");
+    await screen.findByText("Unlock your account");
     fireEvent.change(screen.getByPlaceholderText("Password"), {
       target: { value: "correct horse battery" },
     });
@@ -503,7 +516,7 @@ describe("identity gate — unlock flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Unlock your identity");
+    await screen.findByText("Unlock your account");
     fireEvent.click(screen.getByText("Skip for now"));
 
     expect(await screen.findByTestId("console")).toBeInTheDocument();
@@ -526,7 +539,7 @@ describe("identity gate — plaintext (legacy) flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Secure your identity");
+    await screen.findByText("Secure your account");
     fireEvent.click(screen.getByText("Not now"));
 
     expect(await screen.findByTestId("console")).toBeInTheDocument();
@@ -552,7 +565,7 @@ describe("identity gate — plaintext (legacy) flow", () => {
       </IdentityGate>,
     );
 
-    await screen.findByText("Secure your identity");
+    await screen.findByText("Secure your account");
     fireEvent.click(screen.getByText("Set a password"));
 
     await screen.findByText("Set a password", { selector: "span" });
@@ -563,7 +576,7 @@ describe("identity gate — plaintext (legacy) flow", () => {
       target: { value: "correct horse battery" },
     });
     await act(async () => {
-      fireEvent.click(screen.getByText("Secure identity"));
+      fireEvent.click(screen.getByText("Secure account"));
     });
 
     expect(encryptLegacyMock).toHaveBeenCalledWith("correct horse battery");
@@ -617,7 +630,7 @@ describe("identity gate — create-flow resume", () => {
     expect(confirmMnemonicMock).toHaveBeenCalledTimes(1);
     // mnemonic now confirmed but the encrypted key is still locked — the
     // normal unlock screen takes over rather than the console.
-    expect(await screen.findByText("Unlock your identity")).toBeInTheDocument();
+    expect(await screen.findByText("Unlock your account")).toBeInTheDocument();
   });
 
   it("skip for now proceeds straight to the console without confirming", async () => {
@@ -644,5 +657,183 @@ describe("identity gate — create-flow resume", () => {
     expect(await screen.findByTestId("console")).toBeInTheDocument();
     expect(confirmMnemonicMock).not.toHaveBeenCalled();
     expect(revealMnemonicMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("identity gate — pending display name", () => {
+  it("parks the chosen name for the first connect to apply on-chain", async () => {
+    markTauri();
+    identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "ab12", mnemonic: TEST_MNEMONIC });
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Create your account");
+    fireEvent.change(screen.getByLabelText("Display name"), {
+      target: { value: "  Eddy Hong  " },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Password (min 8 characters)"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Confirm password"), {
+      target: { value: "correct horse battery" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Create account"));
+    });
+
+    expect(localStorage.getItem("ducktape.pendingDisplayName")).toBe("Eddy Hong");
+  });
+
+  it("parks nothing when the name is left blank", async () => {
+    markTauri();
+    identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "ab12", mnemonic: TEST_MNEMONIC });
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Create your account");
+    fireEvent.change(screen.getByPlaceholderText("Password (min 8 characters)"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Confirm password"), {
+      target: { value: "correct horse battery" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Create account"));
+    });
+
+    expect(localStorage.getItem("ducktape.pendingDisplayName")).toBeNull();
+  });
+});
+
+describe("identity gate — link-device flow", () => {
+  // A challenge blob exactly as the other device's Account view mints it.
+  const CHALLENGE_JSON = {
+    chainId: "team#abcd",
+    accountId: "ab01".repeat(16),
+    nonce: 4,
+    name: "Eddy",
+  };
+  const CHALLENGE = `ducktape-link-challenge-v1:${btoa(JSON.stringify(CHALLENGE_JSON))}`;
+
+  it("creates the key, marks link-pending, signs possession, and shows the response code", async () => {
+    markTauri();
+    identityStateMock
+      // gate boot: no key yet
+      .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
+      // the wizard's own fetch after the key exists (and any later refresh)
+      .mockResolvedValue({ state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "cd34", mnemonic: TEST_MNEMONIC });
+    confirmMnemonicMock.mockResolvedValue(undefined);
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_sign_possession")
+        return Promise.resolve('{"signature":{"sig":[7,7]}}');
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Create your account");
+    fireEvent.click(screen.getByText("Link device"));
+    await screen.findByText("Link this device");
+
+    fireEvent.change(screen.getByPlaceholderText("Password (min 8 characters)"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Confirm password"), {
+      target: { value: "correct horse battery" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Create this device's key"));
+    });
+
+    // the phrase ceremony is skipped for a linked device (UX-only flag) and
+    // auto-bind is armed to wait for the other device's AddMemberKey.
+    expect(confirmMnemonicMock).toHaveBeenCalledTimes(1);
+    expect(localStorage.getItem("ducktape.accountLinkPending")).toBe("1");
+
+    await screen.findByText("Approve from your other device");
+    fireEvent.change(screen.getByLabelText("Link challenge code"), {
+      target: { value: `  ${CHALLENGE}\n` },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Device label (optional, e.g. work laptop)"), {
+      target: { value: "work laptop" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Generate link code"));
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith("user_sign_possession", {
+      chainId: "team#abcd",
+      accountId: "ab01".repeat(16),
+      nonce: 4,
+    });
+    const response = (await screen.findByLabelText("Link response code")) as HTMLTextAreaElement;
+    expect(response.value.startsWith("ducktape-link-response-v1:")).toBe(true);
+    const decoded = JSON.parse(atob(response.value.replace("ducktape-link-response-v1:", "")));
+    expect(decoded).toEqual({
+      pubkey: "cd34",
+      kind: "ed25519",
+      possession: '{"signature":{"sig":[7,7]}}',
+      label: "work laptop",
+    });
+
+    // Continue proceeds (the gate re-fetches; the key is now unlocked+confirmed).
+    await act(async () => {
+      fireEvent.click(screen.getByText("Continue"));
+    });
+    expect(await screen.findByTestId("console")).toBeInTheDocument();
+  });
+
+  it("rejects a malformed challenge inline without signing", async () => {
+    markTauri();
+    identityStateMock
+      .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "cd34", mnemonic: TEST_MNEMONIC });
+    confirmMnemonicMock.mockResolvedValue(undefined);
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Create your account");
+    fireEvent.click(screen.getByText("Link device"));
+    await screen.findByText("Link this device");
+    fireEvent.change(screen.getByPlaceholderText("Password (min 8 characters)"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Confirm password"), {
+      target: { value: "correct horse battery" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Create this device's key"));
+    });
+
+    await screen.findByText("Approve from your other device");
+    fireEvent.change(screen.getByLabelText("Link challenge code"), {
+      target: { value: "not a link code" },
+    });
+    fireEvent.click(screen.getByText("Generate link code"));
+
+    expect(
+      screen.getByText(/doesn't look like a link code/i),
+    ).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });

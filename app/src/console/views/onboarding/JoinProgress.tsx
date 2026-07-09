@@ -4,11 +4,15 @@
 // polls off the node log. Once the node's surface answers, the store swaps
 // this out for the console.
 
-import { useState, type CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 
 import { color, font, radius } from "../../theme/tokens";
 import { useDucktape } from "../../store/use-ducktape";
 import type { OnboardingPhase } from "../../../domain/workspace-client";
+import { identityState } from "../../../domain/user-identity-client";
+import type { IdentityState } from "../../../domain/user-identity-client";
+import { loadLinkPending } from "../../store/state";
+import { StepRail } from "./OnboardingChrome";
 
 // The ordered steps shown; the node's phase maps onto one of these. The
 // invite is the admission: the node delivers this identity to the members
@@ -149,6 +153,30 @@ function StepIcon({ state }: { state: "done" | "running" | "pending" | "failed" 
 export function JoinProgress() {
   const { state, actions } = useDucktape();
   const [copied, setCopied] = useState(false);
+  // One custody fetch drives the account-link hint: the silent auto-bind that
+  // runs on adoption is invisible otherwise, and a LOCKED account quietly
+  // produces a node linked to nobody. Web build resolves "absent" → no hint.
+  const [custody, setCustody] = useState<IdentityState | null>(null);
+  useEffect(() => {
+    let alive = true;
+    identityState().then(
+      (report) => {
+        if (alive) setCustody(report.state);
+      },
+      () => {},
+    );
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const linkHint =
+    custody === null || custody === "absent"
+      ? null
+      : custody === "locked"
+        ? "Your account is locked — unlock it in the Account view to link this node to you."
+        : loadLinkPending()
+          ? "Waiting for your other device to approve this device's link to your account."
+          : "This node will be linked to your account when it's admitted.";
   const phase = state.onboardingPhase?.phase ?? "starting";
   const current = stepOf(phase);
   const fatal = phase === "fatal";
@@ -170,15 +198,13 @@ export function JoinProgress() {
   return (
     <div style={rootStyle}>
       <div style={columnStyle}>
-        <div
-          style={{
-            font: `500 11px ${font.mono}`,
-            color: color.muted2,
-            letterSpacing: ".05em",
-          }}
-        >
-          STEP 2 / 3
-        </div>
+        {/* The first-run step rail — joining is the CONNECT stage. A second
+            workspace joined later isn't a first run; no rail there. */}
+        {state.workspaces.length <= 1 && (
+          <div style={{ display: "flex", justifyContent: "flex-start" }}>
+            <StepRail active={3} />
+          </div>
+        )}
         <div
           style={{
             font: `600 20px ${font.sans}`,
@@ -227,7 +253,7 @@ export function JoinProgress() {
               color: "#b7b7b7",
             }}
           >
-            YOUR NODE IDENTITY
+            THIS NODE'S KEY
           </div>
           <button
             onClick={copy}
@@ -269,6 +295,18 @@ export function JoinProgress() {
               {copied ? "copied" : "copy"}
             </span>
           </button>
+          {linkHint && (
+            <div
+              style={{
+                marginTop: 8,
+                font: `400 10.5px ${font.sans}`,
+                color: color.muted2,
+                lineHeight: 1.45,
+              }}
+            >
+              {linkHint}
+            </div>
+          )}
         </div>
 
         <div style={{ marginTop: 22, display: "flex", flexDirection: "column", gap: 14 }}>

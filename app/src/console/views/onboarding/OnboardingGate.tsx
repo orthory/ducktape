@@ -11,6 +11,7 @@ import { useDucktape } from "../../store/use-ducktape";
 import { LIVE_JOIN_SUPPORTED } from "../../../domain/workspace-client";
 import type { Workspace } from "../../../domain/workspace-client";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { OnboardingChrome } from "./OnboardingChrome";
 
 type Mode = "create" | "join" | "remote";
 
@@ -112,25 +113,20 @@ export function OnboardingGate() {
         : "Connect to a remote node";
   const subtitle =
     mode === "create"
-      ? "Found a new network — you become its first member, with a fresh identity."
+      ? "Found a new network — your account becomes its first member; this device runs its first node."
       : mode === "join"
         ? joinGated
           ? "Joining an existing network is temporarily unavailable."
-          : "Paste an invite from a member to join their network with a new identity."
+          : "Paste an invite from a member — this device joins their network with a fresh node key, owned by your account."
         : "Enter the http address of a node running on another device. It stays running there — this app just connects to it.";
 
+  // The step rail appears only on a true first run: the same gate doubles as
+  // the workspace SWITCHER for anyone who already has a workspace or a live
+  // connection, where a "step 2 of 3" would lie.
+  const firstRun = state.workspaces.length === 0 && !state.workspace && !state.nodeUrl;
+
   return (
-    <div
-      style={{
-        flex: 1,
-        minHeight: 0,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        background: color.paper,
-        padding: 24,
-      }}
-    >
+    <OnboardingChrome step={firstRun ? 2 : null}>
       <div
         style={{
           width: 440,
@@ -325,6 +321,7 @@ export function OnboardingGate() {
           </button>
         )}
       </div>
+
       {pendingDelete && (
         <ConfirmDialog
           title={
@@ -355,6 +352,6 @@ export function OnboardingGate() {
           )}
         </ConfirmDialog>
       )}
-    </div>
+    </OnboardingChrome>
   );
 }
