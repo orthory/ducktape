@@ -74,9 +74,11 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
         node.submit(&signer, 0, set("k0", "v0"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         node.submit(&signer, 1, set("k1", "v1"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 2);
         let checkpoint_height = node.finalized().expect("boundary").height;
 
@@ -107,6 +109,7 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
         node.submit(&signer, 2, set("k2", "v2"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         node.submit(
             &signer,
             3,
@@ -117,9 +120,11 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
         )
         .await
         .expect("submit");
+        node.flush_batch().await.expect("flush");
         node.submit(&signer, 4, set("k0", "v0-final"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 3);
         let tip = node.finalized().expect("boundary");
         let tip_hash = node.app_hash();
@@ -202,6 +207,7 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
         node.submit(&signer, 5, set("k3", "v3"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         node.drain_delivered().await.expect("drain");
         assert_eq!(get(node.host(), "k3").await.as_deref(), Some("v3"));
     });
@@ -229,11 +235,14 @@ fn a_crash_mid_apply_rolls_the_unsealed_block_forward() {
         node.submit(&signer, 0, set("a", "1"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         let sealed_height = node.finalized().expect("boundary").height;
 
-        // the torn write: pre_apply lands, the apply does not.
-        let frame = node::encode_frame(&signer, 1, &set("b", "2"));
+        // the torn write: pre_apply lands, the apply does not. the journaled
+        // block record is a BATCH super-frame (single member here), exactly what
+        // the live drain pins before it mutates state.
+        let frame = node::encode_batch(&[node::encode_frame(&signer, 1, &set("b", "2"))]);
         {
             use node::BlockSink as _;
             node.sink_mut()
@@ -318,9 +327,11 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
         node.submit(&signer, 0, set("k0", "v0"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         node.submit(&signer, 1, set("k1", "v1"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 2);
         let checkpoint_height = node.finalized().expect("boundary").height;
         assert_eq!(checkpoint_height, 1);
@@ -345,18 +356,21 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
             .await
             .expect("write manifest");
 
-        let frame2 = node::encode_frame(&signer, 2, &set("k2", "v2"));
-        let frame3 = node::encode_frame(
+        // each op is flushed as its OWN single-member batch, so the finalized
+        // block bytes read back are the BATCH super-frame wrapping that member.
+        let frame2 = node::encode_batch(&[node::encode_frame(&signer, 2, &set("k2", "v2"))]);
+        let frame3 = node::encode_batch(&[node::encode_frame(
             &signer,
             3,
             &Msg {
                 target: "no-such-module".into(),
                 payload: vec![1],
             },
-        );
+        )]);
         node.submit(&signer, 2, set("k2", "v2"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         node.submit(
             &signer,
             3,
@@ -367,6 +381,7 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
         )
         .await
         .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 2);
 
         let frames = node
@@ -375,12 +390,17 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
             .await
             .expect("range read");
         assert_eq!(frames.len(), 2);
+        // the round's two single-member batches deliver in the orderer's
+        // deterministic BYTE sort, which now ranks BATCH super-frames (not the
+        // raw member frames): batch(no-such-module) sorts before batch(k2) at the
+        // member-length varint (143 < 170), so the rejected op lands at height 2
+        // and the applied op at height 3 — the reverse of the raw-frame order.
         assert_eq!(frames[0].height, 2);
-        assert_eq!(frames[0].frame, frame2);
-        assert_eq!(frames[0].disposition, Disposition::Applied);
+        assert_eq!(frames[0].frame, frame3);
+        assert_eq!(frames[0].disposition, Disposition::Rejected);
         assert_eq!(frames[1].height, 3);
-        assert_eq!(frames[1].frame, frame3);
-        assert_eq!(frames[1].disposition, Disposition::Rejected);
+        assert_eq!(frames[1].frame, frame2);
+        assert_eq!(frames[1].disposition, Disposition::Applied);
 
         let err = node
             .sink_mut()

@@ -85,8 +85,8 @@ use commonware_storage::metadata;
 use commonware_utils::sequence::U64;
 use futures::{StreamExt as _, pin_mut};
 
-use host::{BlockContext, DispatchRecord, Host, SubmitError};
-use node::{BlockSeal, BlockSink, Disposition, decode_frame};
+use host::{BlockContext, DispatchRecord, Host, MemberOutcome, SubmitError};
+use node::{BlockSeal, BlockSink, Disposition, decode_batch, decode_frame};
 use sdk::{ModuleId, StateRoot, UpgradeCoords};
 
 /// runtime bounds every store here needs (same alias the storage crate uses:
@@ -1669,50 +1669,20 @@ async fn apply_block(
     protocol_version: u32,
     expect: Option<Disposition>,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
-    let mut dispatches = Vec::new();
-    let outcome = match decode_frame(frame) {
-        Ok((origin, msg)) => {
-            // `protocol_version` is the PURE `effective_version(height)` over the
-            // REPLAYED committed upgrade state — the identical value the live node
-            // stamped for this block (never the old hardcoded baseline, which would
-            // fork a dual-path module's v2 `root()` at/after an activation boundary
-            // H). the caller has already driven every dual-path module's non-hashed
-            // `active_version` to this same version so `root()` recomputes the
-            // boundary's format. inert (baseline) until the upgrade module is
-            // registered and armed.
-            let ctx = BlockContext {
-                protocol_version,
-                height,
-                consensus_time: height,
-                origin,
-            };
-            match host.submit_at(ctx, msg).await {
-                Ok(outcome) => {
-                    dispatches = outcome.dispatches;
-                    Disposition::Applied
-                }
-                Err(SubmitError::Rejected(_)) => Disposition::Rejected,
-                Err(SubmitError::Fatal(f)) => {
-                    return Err(Error::Torn(format!("boundary fault during replay: {f}")));
-                }
-            }
-        }
-        // a frame that never decoded was a deterministic no-op at runtime too.
-        Err(_) => Disposition::Rejected,
-    };
+    let (disposition, dispatches) = replay_batch(host, height, frame, protocol_version, None).await?;
     if let Some(expect) = expect
-        && outcome != expect
+        && disposition != expect
     {
         return Err(Error::Verify(format!(
-            "replayed block {height} landed as {outcome:?}, sealed as {expect:?}"
+            "replayed block {height} landed as {disposition:?}, sealed as {expect:?}"
         )));
     }
-    Ok((outcome, dispatches))
+    Ok((disposition, dispatches))
 }
 
 /// re-apply one journaled frame like [`apply_block`], but commit ONLY the
 /// modules in `commit_only` at the block boundary and abort the rest (see
-/// [`Host::submit_at_committing`]). used to heal a TORN block whose disk
+/// [`Host::submit_block_committing`]). used to heal a TORN block whose disk
 /// substrates are already durable at their sealed post-root: replay re-commits
 /// only the in-memory cohort that was rolled back to the checkpoint.
 async fn apply_block_committing(
@@ -1723,39 +1693,98 @@ async fn apply_block_committing(
     expect: Option<Disposition>,
     commit_only: &BTreeSet<ModuleId>,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
-    let mut dispatches = Vec::new();
-    let outcome = match decode_frame(frame) {
-        Ok((origin, msg)) => {
-            // stamp the block's effective version exactly like `apply_block`, so a
-            // dual-path module re-executes the sealed frame under the SAME version
-            // the live node did (fork-critical at an activation boundary).
-            let ctx = BlockContext {
-                protocol_version,
-                height,
-                consensus_time: height,
-                origin,
-            };
-            match host.submit_at_committing(ctx, msg, commit_only).await {
-                Ok(outcome) => {
-                    dispatches = outcome.dispatches;
-                    Disposition::Applied
-                }
-                Err(SubmitError::Rejected(_)) => Disposition::Rejected,
-                Err(SubmitError::Fatal(f)) => {
-                    return Err(Error::Torn(format!("boundary fault during torn replay: {f}")));
-                }
-            }
-        }
-        Err(_) => Disposition::Rejected,
-    };
+    let (disposition, dispatches) =
+        replay_batch(host, height, frame, protocol_version, Some(commit_only)).await?;
     if let Some(expect) = expect
-        && outcome != expect
+        && disposition != expect
     {
         return Err(Error::Verify(format!(
-            "torn-block replay {height} landed as {outcome:?}, sealed as {expect:?}"
+            "torn-block replay {height} landed as {disposition:?}, sealed as {expect:?}"
         )));
     }
-    Ok((outcome, dispatches))
+    Ok((disposition, dispatches))
+}
+
+/// replay one journaled BATCH frame, reproducing the live drain's per-block
+/// apply EXACTLY: decode the members, drop the members that fail to decode (the
+/// live drain excludes them as deterministic no-ops), and apply the rest as ONE
+/// block via the host's batch API. `commit_only` None = commit every touched
+/// module (forward replay); `Some` = the torn-block heal (commit the rolled-back
+/// in-memory cohort, abort the already-durable disk substrates).
+///
+/// returns the BLOCK-LEVEL disposition (`Applied` iff the batch MOVED app-hash —
+/// the identical rule the live node sealed under, so the caller's `expect` check
+/// is a true divergence detector) plus the aggregate dispatch trace (every
+/// applied member's dispatches in member order, then the once-per-block System
+/// injections) for the [`ReplaySink`] fold.
+///
+/// `protocol_version` is the PURE `effective_version(height)` over the REPLAYED
+/// committed upgrade state — the identical value the live node stamped, never the
+/// old baseline (which would fork a dual-path module's `root()` at/after an
+/// activation boundary). `ctx.origin` is unused on the batch path: each member
+/// carries its own origin, which the host stamps into that member's `Env`.
+async fn replay_batch(
+    host: &mut Host,
+    height: u64,
+    frame: &[u8],
+    protocol_version: u32,
+    commit_only: Option<&BTreeSet<ModuleId>>,
+) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
+    // a batch that never decoded was a whole-block deterministic no-op at runtime
+    // too — the live drain sealed it Rejected without touching state.
+    let Ok(members) = decode_batch(frame) else {
+        return Ok((Disposition::Rejected, Vec::new()));
+    };
+    let mut ops = Vec::new();
+    for member in &members {
+        if let Ok(pair) = decode_frame(member) {
+            ops.push(pair);
+        }
+    }
+    let ctx = BlockContext {
+        protocol_version,
+        height,
+        consensus_time: height,
+        origin: sdk::Origin::System,
+    };
+    let result = match commit_only {
+        None => host.submit_block(ctx, ops).await,
+        Some(set) => host.submit_block_committing(ctx, ops, set).await,
+    };
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        // a once-per-block System injection (`Advance` / `DeliverPending`)
+        // rejecting is a deterministic no-op — the live drain sealed the block
+        // Rejected. (a MEMBER rejection never errors the batch; submit_block folds
+        // it into its MemberOutcome.)
+        Err(SubmitError::Rejected(_)) => return Ok((Disposition::Rejected, Vec::new())),
+        Err(SubmitError::Fatal(f)) => {
+            return Err(Error::Torn(format!("boundary fault during replay: {f}")));
+        }
+    };
+    // block-level disposition, DRAIN-based to match the live seal (node's
+    // `drain_delivered`): Applied iff the block ran real work — any member applied
+    // or a once-per-block System injection dispatched. NEVER app-hash-based: a
+    // torn-heal (`commit_only = Some`) commits only the rolled-back cohort and
+    // ABORTS the already-durable mover, so the app-hash cannot move even though the
+    // block WAS applied — app-hash movement would spuriously read Rejected and trip
+    // the disk-cursor backstop.
+    let mut dispatches = Vec::new();
+    let mut any_applied = false;
+    for member in outcome.members {
+        if let MemberOutcome::Applied { dispatches: d } = member {
+            any_applied = true;
+            dispatches.extend(d);
+        }
+    }
+    let has_system = !outcome.system_dispatches.is_empty();
+    dispatches.extend(outcome.system_dispatches);
+    let disposition = if any_applied || has_system {
+        Disposition::Applied
+    } else {
+        Disposition::Rejected
+    };
+    Ok((disposition, dispatches))
 }
 
 #[cfg(test)]

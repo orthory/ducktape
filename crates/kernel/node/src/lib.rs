@@ -1476,7 +1476,6 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // effective_version(height) — never the raw stored current_version —
             // so dispatch and hashing agree on the version for block `height`.
             let protocol_version = self.host.effective_version(height).await;
-            let pre_hash = self.host.app_hash();
             // the observation barrier compares the watched root across the WHOLE
             // batch — only an applied member can move it (rejected members roll
             // back, discards never run).
@@ -1532,6 +1531,14 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // N DrainedFrames per batch, all sharing the ONE post-batch app-hash.
             let batch_hash = outcome.app_hash;
             self.effects.extend(outcome.effects);
+            // the block-level seal disposition is DRAIN-based, not app-hash-based:
+            // a block is Applied iff it ran real work — any member applied, or a
+            // once-per-block System injection dispatched. this is identical live,
+            // on forward replay, AND on a torn-heal's PARTIAL commit (which aborts
+            // the already-durable mover, so its app-hash cannot be trusted). exactly
+            // one seal per batch, below.
+            let has_system = !outcome.system_dispatches.is_empty();
+            let mut any_applied = false;
             // one record per applying member, in member (input/FIFO) order; the
             // host guarantees `members` is 1:1 with `ops` in input order. custody
             // ends for each resolved member.
@@ -1541,6 +1548,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 self.outstanding.remove(&mid);
                 let (disposition, dispatches, reason) = match member_outcome {
                     MemberOutcome::Applied { dispatches } => {
+                        any_applied = true;
                         (Disposition::Applied, dispatches, None)
                     }
                     // the host stringifies the reject error with its WRAPPED
@@ -1580,9 +1588,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     reason: Some("frame decode/signature check failed".to_string()),
                 });
             }
-            // the block-level seal disposition mirrors today's nop rule: Applied
-            // iff the batch MOVED state, else Rejected. exactly one seal per batch.
-            let block_disp = if batch_hash != pre_hash {
+            let block_disp = if any_applied || has_system {
                 Disposition::Applied
             } else {
                 Disposition::Rejected

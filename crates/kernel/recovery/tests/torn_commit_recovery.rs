@@ -327,6 +327,7 @@ fn a_torn_block_recovers_by_committing_only_the_in_memory_cohort() {
         node.submit(&signer, 0, set("fanout", "k", "v"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         let tip = node.finalized().expect("boundary");
         let tip_hash = node.app_hash();
@@ -470,6 +471,7 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
         node.submit(&signer, 0, set("fanout", "k0", "v0"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         let checkpoint_height = node.finalized().expect("boundary").height;
         assert_eq!(cell.borrow().counter, 1, "disk committed block 0");
@@ -500,9 +502,11 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
         node.submit(&signer, 1, set("fanout", "k1", "v1"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         node.submit(&signer, 2, set("fanout", "k2", "v2"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 2);
         let tip = node.finalized().expect("boundary");
         let tip_hash = node.app_hash();
@@ -597,12 +601,15 @@ fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
         node.submit(&signer, 0, set("diskish", "k0", "v0"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         node.submit(&signer, 1, set("diskish", "k1", "v1"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         node.submit(&signer, 2, set("diskish", "k2", "v2"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 3);
         let tip = node.finalized().expect("boundary");
         let tip_hash = node.app_hash();
@@ -671,6 +678,7 @@ fn a_disk_root_matching_no_record_still_fail_stops() {
         node.submit(&signer, 0, set("fanout", "k", "v"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(cell.borrow().counter, 1);
         node.sink_mut().sync().await.expect("sync");
@@ -820,6 +828,7 @@ fn a_multi_disk_torn_block_fail_stops() {
         node.submit(&signer, 0, set("fanout", "k", "v"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(cell_a.borrow().counter, 1, "diskA committed once");
         assert_eq!(cell_b.borrow().counter, 1, "diskB committed once");
@@ -1091,6 +1100,7 @@ fn a_boundary_torn_block_heals_under_the_pre_activation_version() {
         )
         .await
         .expect("submit below H");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         let checkpoint_height = node.finalized().expect("boundary").height;
         assert!(checkpoint_height < H, "checkpoint sits below H");
@@ -1138,6 +1148,7 @@ fn a_boundary_torn_block_heals_under_the_pre_activation_version() {
         node.submit(&signer, 1, set("dual", "k", "v"))
             .await
             .expect("submit at H");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         let tip = node.finalized().expect("boundary");
         assert_eq!(
