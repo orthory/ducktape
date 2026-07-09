@@ -21,16 +21,21 @@ use crate::hex;
 /// the envelope marker the host worker routes on. bumping it is a payload
 /// flag day for the worker, not for consensus state.
 ///
-/// HELD AT 2 on purpose: the portable `v3` shape (workspace mounts + base-tool
-/// manifest) is a consensus flag-day (M1) and MUST NOT be composed until the
-/// provisioning wrapper exists and a coordinated upgrade flips it (ADR
-/// `2026-07-09-deterministic-agent-runtime`, ROL/M2). The worker already
-/// *accepts* v3 (see `dispatch-oracle`) so that flip lands on ready nodes.
+/// the marker for a NON-portable run — composed byte-for-byte as the flat-era
+/// worker expects. the composer emits it when a run has no [`PortableInputs`]
+/// (dev tools / tests without a wired files module). the worker accepts both v2
+/// and v3 (see `dispatch-oracle`).
 pub const RUN_ENVELOPE_VERSION: u32 = 2;
 
-/// the result-wrapper version a portable (`v3`) provider returns. carried here
-/// so the `runs` delivery path can unwrap `response_text` from a runner result
-/// while the composer stays on v2 — a forward-compatible accept, no flip.
+/// the portable envelope shape (workspace source pin + base-tool manifest +
+/// skill refs). the composer emits it when the caller passes [`PortableInputs`]
+/// (i.e. the files module is wired). the additive v3 fields skip-serialize when
+/// a run is not portable, so the v2 wire above stays byte-identical.
+pub(crate) const RUN_ENVELOPE_VERSION_PORTABLE: u32 = 3;
+
+/// the result-wrapper version a portable (`v3`) provider returns. carried in
+/// the v3 envelope's `result_contract` so the worker refuses a runner-result
+/// version it cannot unwrap; the `runs` delivery path reads it back as `1`.
 pub(crate) const RUNNER_RESULT_VERSION: u32 = 1;
 
 /// generic instructions for an agent without a consensus-resident prompt —
@@ -63,19 +68,132 @@ struct RunEnvelope<'a> {
     instructions: &'a str,
     contract: &'a str,
     conversation: String,
+    // --- v3 (portable) additive fields ------------------------------------
+    // EVERY one is `Option` with `skip_serializing_if`, and all four are
+    // `None` on the v2 path, so a non-portable run emits ZERO extra keys and
+    // its bytes are byte-for-byte the v2 wire. they appear together only when
+    // the caller passes [`PortableInputs`] (the files module is wired).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<WorkspaceEnvelope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_tools: Option<Vec<BaseToolEnvelope>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skills: Option<Vec<SkillEnvelope>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_contract: Option<ResultContractEnvelope>,
+}
+
+/// the portable workspace block: the duckfs SOURCE coordinates only. carries
+/// NO `mount_path` (D7): the envelope states which committed subtree + snapshot
+/// to check out, and the phase-2 host wrapper picks the per-run writable cwd —
+/// never a consensus-supplied host path.
+#[derive(Serialize)]
+struct WorkspaceEnvelope {
+    source_prefix: String,
+    /// the W2 consensus pin of the duckfs head. ALWAYS emitted (null when the
+    /// files head is unresolved) so the envelope states its pin decision.
+    source_snapshot: Option<String>,
+}
+
+/// one base-tool manifest entry the worker exposes to a portable run.
+#[derive(Serialize)]
+struct BaseToolEnvelope {
+    name: &'static str,
+    version: &'static str,
+    exposure: &'static str,
+}
+
+/// the runner-result contract the worker must honor for a portable run.
+#[derive(Serialize)]
+struct ResultContractEnvelope {
+    ducktape_runner_result: u32,
+}
+
+/// a C4 skill ref: a duckfs read-only source subtree the host mounts for the
+/// run, mirroring the phase-4 [`agent::SkillRef`] (`name` + `source_prefix` +
+/// optional `source_snapshot`). a tracking skill's snapshot is resolved to the
+/// committed head at compose time (see `RunsModule::portable_inputs`).
+#[derive(Serialize, Debug)]
+pub(crate) struct SkillEnvelope {
+    pub name: String,
+    pub source_prefix: String,
+    pub source_snapshot: Option<String>,
+}
+
+/// everything the v3 flip needs beyond the shared v2 fields, resolved by the
+/// composer's callsite from COMMITTED state. `None` at the callsite => the v2
+/// composer path (byte-identical to today).
+#[derive(Debug)]
+pub(crate) struct PortableInputs {
+    pub source_snapshot: Option<String>,
+    pub skills: Vec<SkillEnvelope>,
+}
+
+/// the duckfs subtree a portable run's rw workspace is checked out from.
+fn workspace_source_prefix(agent: &AgentRecord) -> String {
+    format!("/shared/agent-workspaces/{}", agent.agent_id)
+}
+
+/// the base-tool manifest every portable run is granted (v1).
+fn base_tools() -> Vec<BaseToolEnvelope> {
+    vec![
+        BaseToolEnvelope {
+            name: "ducktape-files",
+            version: "1",
+            exposure: "cli",
+        },
+        BaseToolEnvelope {
+            name: "ducktape-index",
+            version: "1",
+            exposure: "cli",
+        },
+        BaseToolEnvelope {
+            name: "ducktape-chain",
+            version: "1",
+            exposure: "cli",
+        },
+    ]
 }
 
 /// serialize one envelope — deterministic: fixed field order (see
 /// [`RunEnvelope`]) and serde_json's canonical string escaping.
-fn envelope(agent: &AgentRecord, thread_key: Option<String>, conversation: String) -> String {
+///
+/// `portable` is the SINGLE version selector: `None` composes the v2 wire
+/// byte-for-byte (all four additive fields skip-serialize); `Some` composes the
+/// v3 portable wire.
+fn envelope(
+    agent: &AgentRecord,
+    thread_key: Option<String>,
+    conversation: String,
+    portable: Option<PortableInputs>,
+) -> String {
+    let (ducktape_run, workspace, base_tools, skills, result_contract) = match portable {
+        None => (RUN_ENVELOPE_VERSION, None, None, None, None),
+        Some(p) => (
+            RUN_ENVELOPE_VERSION_PORTABLE,
+            Some(WorkspaceEnvelope {
+                source_prefix: workspace_source_prefix(agent),
+                source_snapshot: p.source_snapshot,
+            }),
+            Some(base_tools()),
+            Some(p.skills),
+            Some(ResultContractEnvelope {
+                ducktape_runner_result: RUNNER_RESULT_VERSION,
+            }),
+        ),
+    };
     serde_json::to_string(&RunEnvelope {
-        ducktape_run: RUN_ENVELOPE_VERSION,
+        ducktape_run,
         agent_id: &agent.agent_id,
         prompt_hash: prompt_hash_hex(agent),
         thread_key,
         instructions: DEFAULT_PROMPT,
         contract: STRICT_OUTPUT_INSTRUCTION,
         conversation,
+        workspace,
+        base_tools,
+        skills,
+        result_contract,
     })
     .expect("envelope is serializable")
 }
@@ -97,24 +215,32 @@ pub(crate) fn render_payload(
     anchor_seq: u64,
     thread_root: Option<u64>,
     transcript: &[MessageView],
+    portable: Option<PortableInputs>,
 ) -> String {
     let thread_key = format!("{channel_id}#{}", thread_root.unwrap_or(anchor_seq));
     envelope(
         agent,
         Some(thread_key),
         render_conversation(module_id, &agent.agent_id, transcript),
+        portable,
     )
 }
 
 /// compose a job run's payload: same envelope, no thread key, and the
 /// conversation is the job's coordinates plus its FULL submitted spec.
-pub(crate) fn render_job_payload(agent: &AgentRecord, job_id: &str, spec: &str) -> String {
+pub(crate) fn render_job_payload(
+    agent: &AgentRecord,
+    job_id: &str,
+    spec: &str,
+    portable: Option<PortableInputs>,
+) -> String {
     envelope(
         agent,
         None,
         format!(
             "Job {job_id} — chat replies are not delivered for job runs; respond with actions only.\n\nJob spec:\n{spec}"
         ),
+        portable,
     )
 }
 
@@ -201,6 +327,9 @@ mod tests {
             status: AgentStatus::Active,
             created_at: 0,
             updated_at: 0,
+            recipe_hash: Vec::new(),
+            caps: agent::ResourceCaps::default(),
+            skills: Vec::new(),
         }
     }
 
@@ -234,7 +363,7 @@ mod tests {
     fn a_chat_envelope_carries_the_prompt_pin_and_anchor_thread_key() {
         let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
         let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
-        let payload = render_payload("runs", &agent, "general", 1, None, &transcript);
+        let payload = render_payload("runs", &agent, "general", 1, None, &transcript, None);
         let v = parse(&payload);
 
         assert_eq!(v["ducktape_run"], RUN_ENVELOPE_VERSION);
@@ -259,7 +388,7 @@ mod tests {
     #[test]
     fn an_agent_without_a_prompt_pin_composes_null() {
         let agent = agent_with_hash(Vec::new());
-        let payload = render_payload("runs", &agent, "general", 1, None, &[]);
+        let payload = render_payload("runs", &agent, "general", 1, None, &[], None);
         let v = parse(&payload);
         assert!(v["prompt_hash"].is_null());
         assert_eq!(
@@ -273,7 +402,7 @@ mod tests {
     fn a_threaded_anchor_keys_by_its_thread_root() {
         let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
         let transcript = vec![message(3, AuthorRef::User(vec![1; 32]), "in thread")];
-        let payload = render_payload("runs", &agent, "general", 3, Some(1), &transcript);
+        let payload = render_payload("runs", &agent, "general", 3, Some(1), &transcript, None);
         assert_eq!(
             parse(&payload)["thread_key"],
             "general#1",
@@ -284,7 +413,7 @@ mod tests {
     #[test]
     fn a_job_envelope_has_no_thread_key_and_preserves_the_job_framing() {
         let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
-        let payload = render_job_payload(&agent, "job-1", "summarize this work item");
+        let payload = render_job_payload(&agent, "job-1", "summarize this work item", None);
         let v = parse(&payload);
         assert!(v["thread_key"].is_null(), "job runs have no channel");
         assert_eq!(v["agent_id"], "bot");
@@ -309,15 +438,15 @@ mod tests {
                 "earlier reply",
             ),
         ];
-        let a = render_payload("runs", &agent, "general", 2, None, &transcript);
-        let b = render_payload("runs", &agent, "general", 2, None, &transcript);
+        let a = render_payload("runs", &agent, "general", 2, None, &transcript, None);
+        let b = render_payload("runs", &agent, "general", 2, None, &transcript, None);
         assert_eq!(
             a.as_bytes(),
             b.as_bytes(),
             "composition is byte-deterministic"
         );
-        let j1 = render_job_payload(&agent, "job-1", "spec");
-        let j2 = render_job_payload(&agent, "job-1", "spec");
+        let j1 = render_job_payload(&agent, "job-1", "spec", None);
+        let j2 = render_job_payload(&agent, "job-1", "spec", None);
         assert_eq!(j1.as_bytes(), j2.as_bytes());
     }
 
@@ -343,7 +472,7 @@ mod tests {
                 "someone else",
             ),
         ];
-        let payload = render_payload("runs", &agent, "general", 3, None, &transcript);
+        let payload = render_payload("runs", &agent, "general", 3, None, &transcript, None);
         let conversation = parse(&payload)["conversation"]
             .as_str()
             .unwrap()
@@ -351,5 +480,114 @@ mod tests {
         assert!(conversation.contains("[them] user:"));
         assert!(conversation.contains("[you] agent:runs/bot @2: my own reply"));
         assert!(conversation.contains("[them] agent:runs/other @3: someone else"));
+    }
+
+    // ---- the v3 (portable) flip ---------------------------------------------
+
+    fn portable(snapshot: Option<&str>, skills: Vec<SkillEnvelope>) -> PortableInputs {
+        PortableInputs {
+            source_snapshot: snapshot.map(str::to_string),
+            skills,
+        }
+    }
+
+    #[test]
+    fn none_composes_the_v2_wire_byte_identical() {
+        // with `portable == None`, the composer emits the EXACT v2 shape — no
+        // workspace/base_tools/skills/result_contract keys — so a non-portable
+        // run's dispatch-payload bytes are the plain v2 wire.
+        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
+        let payload = render_payload("runs", &agent, "general", 1, None, &transcript, None);
+
+        assert!(
+            payload.starts_with(r#"{"ducktape_run":2,"agent_id":"bot","prompt_hash":"#),
+            "the v2 prefix is byte-for-byte unchanged: {payload}"
+        );
+        let v = parse(&payload);
+        assert_eq!(v["ducktape_run"], 2);
+        assert!(v.get("workspace").is_none(), "no v3 workspace key at v2");
+        assert!(v.get("base_tools").is_none(), "no v3 base_tools key at v2");
+        assert!(v.get("skills").is_none(), "no v3 skills key at v2");
+        assert!(
+            v.get("result_contract").is_none(),
+            "no v3 result_contract key at v2"
+        );
+    }
+
+    #[test]
+    fn v3_portable_carries_source_coords_tools_and_skills_but_no_mount_path() {
+        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
+        let skills = vec![SkillEnvelope {
+            name: "release".into(),
+            source_prefix: "/shared/skills/release".into(),
+            source_snapshot: Some("bb".repeat(32)),
+        }];
+        let payload = render_payload(
+            "runs",
+            &agent,
+            "general",
+            1,
+            None,
+            &transcript,
+            Some(portable(Some(&"aa".repeat(32)), skills)),
+        );
+
+        // field order is stable — the v3 marker leads, exactly like v2.
+        assert!(
+            payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","prompt_hash":"#),
+            "the v3 marker leads with a stable field order: {payload}"
+        );
+        let v = parse(&payload);
+        assert_eq!(v["ducktape_run"], 3);
+        assert_eq!(v["workspace"]["source_prefix"], "/shared/agent-workspaces/bot");
+        assert_eq!(v["workspace"]["source_snapshot"], "aa".repeat(32));
+        // D7: the envelope carries SOURCE coords only — never a host mount path.
+        assert!(
+            v["workspace"].get("mount_path").is_none(),
+            "the v3 workspace must NOT carry a mount_path (D7): {}",
+            v["workspace"]
+        );
+        // the 3-tool base manifest, in order.
+        let tools = v["base_tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0]["name"], "ducktape-files");
+        assert_eq!(tools[1]["name"], "ducktape-index");
+        assert_eq!(tools[2]["name"], "ducktape-chain");
+        assert_eq!(tools[0]["version"], "1");
+        assert_eq!(tools[0]["exposure"], "cli");
+        assert_eq!(v["result_contract"]["ducktape_runner_result"], 1);
+        let skills = v["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0]["name"], "release");
+        assert_eq!(skills[0]["source_prefix"], "/shared/skills/release");
+        assert_eq!(skills[0]["source_snapshot"], "bb".repeat(32));
+    }
+
+    #[test]
+    fn v3_with_no_head_states_a_null_pin_not_an_absent_key() {
+        // an unresolved head is an EXPLICIT null pin decision, not a missing key.
+        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let payload = render_payload(
+            "runs",
+            &agent,
+            "general",
+            1,
+            None,
+            &[],
+            Some(portable(None, Vec::new())),
+        );
+        let v = parse(&payload);
+        assert_eq!(v["ducktape_run"], 3);
+        assert!(
+            v["workspace"]["source_snapshot"].is_null(),
+            "an unresolved head composes source_snapshot: null"
+        );
+        assert!(
+            v["workspace"].as_object().unwrap().contains_key("source_snapshot"),
+            "the pin decision is stated as null, not omitted"
+        );
+        assert_eq!(v["skills"].as_array().unwrap().len(), 0, "no skills is []");
     }
 }

@@ -40,8 +40,9 @@ pub use pool::{
     DEFAULT_MAX_CONCURRENT_RUNS, DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env,
 };
 pub use provision::{
-    BaseTool, PortablePlan, ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner,
-    WorkspaceReceipt, WorkspaceSpec, assemble_runner_result, bind_workspace,
+    BaseTool, PortablePlan, ProvisionedWorkspace, RoMount, RunEffect, SharedProvisioner, Sink, Status,
+    WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec, assemble_runner_result, bind_workspace,
+    effects_from_response_text,
 };
 
 /// everything a provider execution needs, extracted by the gate so the

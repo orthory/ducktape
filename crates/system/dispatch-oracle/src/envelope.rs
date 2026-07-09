@@ -26,7 +26,7 @@ use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::provision::{BaseTool, PortablePlan};
+use crate::provision::{BaseTool, PortablePlan, RoMount};
 
 /// the newest envelope version this worker assembles. v2 remains accepted for
 /// in-flight legacy runs; v3 is the portable duckfs-workspace runner contract.
@@ -65,19 +65,24 @@ struct WireEnvelope {
     conversation: String,
     workspace: Option<WireWorkspace>,
     base_tools: Option<Vec<WireBaseTool>>,
+    skills: Option<Vec<WireSkill>>,
     result_contract: Option<WireResultContract>,
 }
 
-/// the portable workspace block. every field is decoded so a malformed v3
-/// envelope fails to parse (acceptance IS validation); `source_prefix` and
-/// `mount_path` are validated non-empty, and the whole block is surfaced as a
-/// [`PortablePlan`] the pool acts on (or not) — the pinned `source_snapshot`
-/// is the source the provisioner checks out.
+/// the portable workspace block: the duckfs SOURCE coordinates only. every
+/// field is decoded so a malformed v3 envelope fails to parse (acceptance IS
+/// validation); `source_prefix` is validated non-empty, and the block is
+/// surfaced as a [`PortablePlan`] the pool acts on (or not) — the pinned
+/// `source_snapshot` is the source the provisioner checks out.
+///
+/// carries NO `mount_path` (D7): the phase-5 composer emits source coords only
+/// and the phase-2 wrapper chooses the per-run writable cwd. an OLD-shape v3
+/// that still carries a `mount_path` decodes fine (the extra field is ignored),
+/// so a mixed build never rejects an in-flight envelope.
 #[derive(Deserialize)]
 struct WireWorkspace {
     source_prefix: String,
     source_snapshot: Option<String>,
-    mount_path: String,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +90,17 @@ struct WireBaseTool {
     name: String,
     version: String,
     exposure: String,
+}
+
+/// a C4 skill ref: a read-only duckfs source subtree the wrapper mounts for the
+/// run. validated (non-empty `name` + `source_prefix`) and surfaced into the
+/// plan's [`crate::provision::RoMount`] set; `source_snapshot` is consumed by
+/// the provisioning wrapper at the flip.
+#[derive(Deserialize)]
+struct WireSkill {
+    name: String,
+    source_prefix: String,
+    source_snapshot: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +202,7 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
             &mut ctx,
             envelope.workspace,
             envelope.base_tools,
+            envelope.skills,
             envelope.result_contract,
         )?
     } else {
@@ -207,12 +224,12 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
 /// this worker validates the portable shape — proving mixed-network nodes on
 /// this binary understand v3 before any node composes it — and marks the run
 /// portable so no host-local native session is resumed for it. it deliberately
-/// does NOT translate the envelope's advisory `mount_path` into the child's
-/// working directory or inject workspace env: turning the plan into a real
-/// mount is the pool's job via the injected provisioner (and a
-/// consensus-supplied host path like the constant `/workspace` is exactly the
-/// unwritable cwd that turned live runs into `create_dir_all` failures). per
-/// the ADR (`2026-07-09-deterministic-agent-runtime`, ROL/M2 + W1) portable
+/// does NOT set the child's working directory or inject workspace env: the
+/// envelope carries SOURCE coordinates only (no `mount_path`, D7), and turning
+/// the plan into a real mount is the pool's job via the injected provisioner
+/// (a consensus-supplied host path like the constant `/workspace` is exactly
+/// the unwritable cwd that turned live runs into `create_dir_all` failures).
+/// per the ADR (`2026-07-09-deterministic-agent-runtime`, ROL/M2 + W1) portable
 /// ACTIVATION — a per-run writable mount and its bindings — happens in the pool
 /// only when a provisioner is wired AND a coordinated flip emits v3; until then
 /// the returned plan is inert data and the host's own scratch/persistent
@@ -221,14 +238,12 @@ fn accept_portable_envelope(
     ctx: &mut RunContext,
     workspace: Option<WireWorkspace>,
     base_tools: Option<Vec<WireBaseTool>>,
+    skills: Option<Vec<WireSkill>>,
     result_contract: Option<WireResultContract>,
 ) -> Result<Option<PortablePlan>, String> {
     let workspace = workspace.ok_or_else(|| "v3 run envelope is missing workspace".to_string())?;
     if workspace.source_prefix.is_empty() {
         return Err("v3 run envelope workspace.source_prefix must not be empty".into());
-    }
-    if workspace.mount_path.is_empty() {
-        return Err("v3 run envelope workspace.mount_path must not be empty".into());
     }
     let result_contract =
         result_contract.ok_or_else(|| "v3 run envelope is missing result_contract".to_string())?;
@@ -243,6 +258,15 @@ fn accept_portable_envelope(
     if base_tools.is_empty() {
         return Err("v3 run envelope base_tools must not be empty".into());
     }
+    // skills are optional, but each present entry must name a source (the
+    // wrapper checks it out as a ro mount).
+    let skills = skills.unwrap_or_default();
+    if skills
+        .iter()
+        .any(|s| s.name.is_empty() || s.source_prefix.is_empty())
+    {
+        return Err("v3 run envelope skill entries must carry a name and source_prefix".into());
+    }
 
     // mark portable (no host-local session resume) but set NO
     // workdir_override/env here (W1/M2) — the plan is data the pool decides
@@ -251,13 +275,22 @@ fn accept_portable_envelope(
     Ok(Some(PortablePlan {
         source_prefix: workspace.source_prefix,
         source_snapshot: workspace.source_snapshot,
-        mount_path: workspace.mount_path,
         base_tools: base_tools
             .into_iter()
             .map(|t| BaseTool {
                 name: t.name,
                 version: t.version,
                 exposure: t.exposure,
+            })
+            .collect(),
+        // each skill becomes a ro mount: its name is the mount subpath the
+        // wrapper materializes it under.
+        skills: skills
+            .into_iter()
+            .map(|s| RoMount {
+                source_prefix: s.source_prefix,
+                source_snapshot: s.source_snapshot,
+                mount_subpath: s.name,
             })
             .collect(),
     }))
@@ -311,13 +344,15 @@ mod tests {
             "conversation": "CONVERSATION",
             "workspace": {
                 "source_prefix": "/shared/agent-workspaces/bot",
-                "source_snapshot": "aa".repeat(32),
-                "mount_path": "/tmp/ducktape-workspace"
+                "source_snapshot": "aa".repeat(32)
             },
             "base_tools": [
                 {"name":"ducktape-files","version":"1","exposure":"cli"},
                 {"name":"ducktape-index","version":"1","exposure":"cli"},
                 {"name":"ducktape-chain","version":"1","exposure":"cli"}
+            ],
+            "skills": [
+                {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32)}
             ],
             "result_contract": {"ducktape_runner_result": 1}
         })
@@ -482,8 +517,31 @@ mod tests {
         let plan = workspace.expect("a v3 envelope surfaces its portable plan");
         assert_eq!(plan.source_prefix, "/shared/agent-workspaces/bot");
         assert_eq!(plan.source_snapshot.as_deref(), Some("aa".repeat(32).as_str()));
-        assert_eq!(plan.mount_path, "/tmp/ducktape-workspace");
         assert_eq!(plan.base_tools.len(), 3);
+        // the C4 skills are surfaced as ro mounts (name -> mount_subpath).
+        assert_eq!(plan.skills.len(), 1);
+        assert_eq!(plan.skills[0].mount_subpath, "release");
+        assert_eq!(plan.skills[0].source_prefix, "/shared/skills/release");
+        assert_eq!(
+            plan.skills[0].source_snapshot.as_deref(),
+            Some("bb".repeat(32).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_shape_v3_that_still_carries_mount_path_decodes_fine() {
+        // the composer no longer emits mount_path (D7), but a mixed build must
+        // never reject an in-flight envelope that still carries one — the extra
+        // field is tolerated (decoded and ignored).
+        let mut old_shape: serde_json::Value =
+            serde_json::from_str(&v3_envelope_json(None)).unwrap();
+        old_shape["workspace"]["mount_path"] = serde_json::json!("/tmp/ducktape-workspace");
+        let Prepared {
+            ctx, workspace, ..
+        } = prepare(&old_shape.to_string(), None).await.unwrap();
+        assert!(ctx.portable, "an old-shape v3 is still accepted + portable");
+        let plan = workspace.expect("an old-shape v3 still surfaces its plan");
+        assert_eq!(plan.source_prefix, "/shared/agent-workspaces/bot");
     }
 
     #[tokio::test]
@@ -511,6 +569,15 @@ mod tests {
         bad_result["result_contract"]["ducktape_runner_result"] = serde_json::json!(99);
         let err = prepare(&bad_result.to_string(), None).await.unwrap_err();
         assert!(err.contains("runner result version 99"), "got {err:?}");
+
+        // a present skill entry with no source is a mixed-network signal too.
+        let mut empty_skill = base.clone();
+        empty_skill["skills"][0]["source_prefix"] = serde_json::json!("");
+        let err = prepare(&empty_skill.to_string(), None).await.unwrap_err();
+        assert!(
+            err.contains("skill entries must carry a name and source_prefix"),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

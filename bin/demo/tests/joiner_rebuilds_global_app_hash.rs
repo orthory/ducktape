@@ -462,6 +462,9 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 capability: "mock-llm-1".into(),
                 prompt_hash: vec![7u8; 32],
                 allowed_actions: vec![ACTION_CHAT_POST.into()],
+                recipe_hash: None,
+                caps: None,
+                skills: None,
             }),
         )
         .await;
@@ -475,6 +478,9 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 capability: "mock-llm-1".into(),
                 prompt_hash: vec![8u8; 32],
                 allowed_actions: Vec::new(),
+                recipe_hash: None,
+                caps: None,
+                skills: None,
             }),
         )
         .await;

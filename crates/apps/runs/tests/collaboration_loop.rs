@@ -148,6 +148,9 @@ fn register_quackbot(actions: Vec<String>) -> Msg {
             capability: "mock-llm-1".into(),
             prompt_hash: vec![7u8; 32],
             allowed_actions: actions,
+            recipe_hash: None,
+            caps: None,
+            skills: None,
         }),
     }
 }
@@ -385,6 +388,9 @@ fn register_duck() -> Msg {
             capability: "mock-llm-1".into(),
             prompt_hash: vec![9u8; 32],
             allowed_actions: vec![ACTION_TASKS_CREATE.into()],
+            recipe_hash: None,
+            caps: None,
+            skills: None,
         }),
     }
 }
@@ -667,10 +673,17 @@ fn a_completed_job_run_finalizes_the_jobs_board_with_the_validated_response() {
         assert_eq!(job.status, JobStatus::Done);
         let result = job.result.expect("finalize result");
         assert!(result.ok);
+        // the finalize payload is a faceted DeliveryReceipt whose `response` is
+        // the normalized AgentResponse (a message-only result carries no facets).
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.payload).expect("delivery receipt json");
+        assert_eq!(payload["ducktape_delivery"], 1);
+        assert_eq!(payload["status"], "ok");
+        let expected: serde_json::Value =
+            serde_json::from_slice(&raw).expect("agent response json");
         assert_eq!(
-            result.payload,
-            String::from_utf8(raw).expect("json response is utf8"),
-            "the normalized response JSON is the finalize payload"
+            payload["response"], expected,
+            "the normalized response JSON is the finalize payload's response facet"
         );
         assert_eq!(task_ids(&host).await, vec!["job-task".to_string()]);
     });

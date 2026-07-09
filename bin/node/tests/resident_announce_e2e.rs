@@ -246,6 +246,9 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
             capability: provider.tag.clone(),
             prompt_hash: vec![7u8; 32],
             allowed_actions: vec![ACTION_CHAT_POST.into()],
+            recipe_hash: None,
+            caps: None,
+            skills: None,
         }),
     );
     cluster.submit(

@@ -413,6 +413,9 @@ fn main() {
                     capability: "mock-llm-1".into(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
+                    recipe_hash: None,
+                    caps: None,
+                    skills: None,
                 }),
             },
         )

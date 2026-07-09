@@ -118,10 +118,11 @@ pub use envelope::RUN_ENVELOPE_VERSION;
 use std::collections::{BTreeMap, BTreeSet};
 
 use agent::{
-    ACTION_CHAT_POST, AgentAction, AgentEvent, AgentQuery, AgentRecord, AgentReply, AgentResponse,
-    AgentStatus, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
+    ACTION_CHAT_POST, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent,
+    AgentQuery, AgentRecord, AgentReply, AgentResponse, AgentStatus, CapRequest,
+    MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
     decode_event as agent_decode_event, decode_reply as agent_decode_reply,
-    encode_query as agent_encode_query, encode_response,
+    encode_query as agent_encode_query,
 };
 use chat::{
     Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
@@ -133,6 +134,10 @@ use dispatch::{
     Routing, decode_reply as dispatch_decode_reply, decode_result_event,
     encode_msg as dispatch_encode_msg, encode_query as dispatch_encode_query,
 };
+use duckfs_core::{
+    FilesQuery, FilesReply, decode_reply as files_decode_reply,
+    encode_query as files_encode_query,
+};
 use jobs::{
     JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_event as jobs_decode_event,
     decode_reply as jobs_decode_reply, encode_msg as jobs_encode_msg,
@@ -140,7 +145,7 @@ use jobs::{
 };
 use saga::SagaOrigin;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tagging::{
     EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
@@ -225,46 +230,120 @@ const REPLY_KIND_HEADING: &str = "heading";
 const REPLY_KIND_CODE: &str = "code";
 const RUNNER_RESULT_VERSION: u32 = envelope::RUNNER_RESULT_VERSION;
 
+/// the R5 typed-data facet ceiling — data larger than this degrades to null.
+const MAX_DATA_BYTES: usize = 32 * 1024;
+/// the faceted job-finalize payload envelope version (the `ducktape_delivery`
+/// wrapper every run's finalize carries).
+const DELIVERY_RECEIPT_VERSION: u32 = 1;
+
 /// the wrapper a portable (`v3`) provider returns instead of the bare response
-/// text: the model prose plus a host-assembled workspace receipt. we unwrap
-/// `response_text` here so the rest of delivery is unchanged; the receipt bytes
-/// stay in dispatch history as the audit lane (ADR RES/R1, R6). LEGACY runs
-/// (today's live v2 composer) return raw text with no wrapper — those pass
-/// through untouched.
-#[derive(Deserialize)]
+/// text: the model prose plus the host-assembled facets — message
+/// (`response_text`) / data / effects / artifact (`workspace_receipt`) / sink /
+/// status. the five facet fields are ADDITIVE `#[serde(default)]`s (this struct
+/// is deliberately NOT `deny_unknown_fields`), so a minimal
+/// `{ducktape_runner_result, response_text, workspace_receipt}` wrapper still
+/// decodes and a bytes-with-no-marker result becomes a message-only result. the
+/// single delivery path ([`RunsModule::deliver_run_result`]) applies whatever
+/// facets are present; a plain (message-only) result carries none.
+#[derive(Deserialize, Debug)]
 struct RunnerResult {
     ducktape_runner_result: u32,
     response_text: String,
-    #[allow(
-        dead_code,
-        reason = "runs validates shape; dispatch history keeps receipt bytes"
-    )]
     workspace_receipt: WorkspaceReceipt,
+    /// R5 typed-data facet: an already-serialized JSON text or `None`.
+    #[serde(default)]
+    data: Option<String>,
+    /// R2 declarative effects, host-assembled (lifted from the model's actions).
+    #[serde(default)]
+    effects: Vec<WireEffect>,
+    /// O1/O2 output sink; default [`WireSink::Chain`].
+    #[serde(default)]
+    sink: WireSink,
+    /// the host's terminal observation; default [`WireStatus::Ok`].
+    #[serde(default)]
+    status: WireStatus,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default, Debug)]
 struct WorkspaceReceipt {
-    #[allow(dead_code, reason = "audit metadata retained in dispatch history")]
     source_prefix: String,
     #[allow(dead_code, reason = "audit metadata retained in dispatch history")]
     source_snapshot: Option<String>,
-    #[allow(dead_code, reason = "audit metadata retained in dispatch history")]
     output_snapshot: Option<String>,
-    #[allow(dead_code, reason = "audit metadata retained in dispatch history")]
     commit_height: Option<u64>,
-    #[allow(dead_code, reason = "audit metadata retained in dispatch history")]
     rebased: bool,
-    #[allow(dead_code, reason = "audit metadata retained in dispatch history")]
     no_changes: bool,
 }
 
-/// pull the deliverable response text out of a dispatch outcome. a portable
-/// runner returns a [`RunnerResult`] wrapper (marker `ducktape_runner_result`);
-/// a wrapper that claims the marker but cannot be honored (unknown version,
-/// malformed shape) fails the run loudly rather than being delivered as raw
-/// JSON. anything without the marker — every legacy raw-text result — passes
-/// through byte-for-byte via the lossy decode the delivery path always used.
-fn response_text_from_dispatch_bytes(bytes: &[u8]) -> Result<String, String> {
+/// one host-assembled declarative effect (R2). `kind` is a run-effect wire name
+/// (`tasks.create` / `tasks.update_status`); the remaining fields carry the
+/// action's payload. mapped to an [`AgentAction`] by [`effects_to_actions`],
+/// where an unknown `kind` fails the run deterministically (R4).
+#[derive(Deserialize, Debug)]
+struct WireEffect {
+    kind: String,
+    #[serde(default)]
+    task_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    status: String,
+}
+
+/// the O1/O2 output sink. internally tagged on `mode`; a MISSING sink field
+/// defaults to `Chain` via the `#[serde(default)]` on [`RunnerResult::sink`], and
+/// a present `{"mode":"pr",...}` decodes to `Pr`. `Merge` is DEFINED-BUT-INERT in
+/// v1 (validated on the wire, treated like `Chain` with a breadcrumb).
+#[derive(Deserialize, Default, Debug)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum WireSink {
+    #[default]
+    Chain,
+    Pr {
+        #[serde(default)]
+        repo: String,
+        source_branch: String,
+        #[serde(default)]
+        target_branch: String,
+        title: String,
+        #[serde(default)]
+        body: String,
+    },
+    Merge {
+        #[serde(default)]
+        repo: String,
+        number: u64,
+        #[allow(dead_code, reason = "merge sink wire is forward-compatible but inert in v1")]
+        prev_target_oid: String,
+        #[allow(dead_code, reason = "merge sink wire is forward-compatible but inert in v1")]
+        expected_source_oid: String,
+        #[allow(dead_code, reason = "merge sink wire is forward-compatible but inert in v1")]
+        merge_oid: String,
+        #[allow(dead_code, reason = "merge sink wire is forward-compatible but inert in v1")]
+        pack_digest: String,
+    },
+}
+
+/// the host's terminal observation of a run. `Failed` fails the run even with a
+/// present message facet; `Degraded` still delivers (surfaced in the receipt).
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum WireStatus {
+    #[default]
+    Ok,
+    Degraded,
+    Failed,
+}
+
+// ---- faceted delivery --------------------------------------------------------
+// the single delivery path decodes the runner result below and applies whatever
+// facets it carries; a plain (message-only) result carries none.
+
+/// decode the full faceted [`RunnerResult`]. marker + version strict (R4): a
+/// wrapper that claims the marker but is malformed or an unsupported version
+/// fails the run. bytes with NO marker — every legacy raw-text result — become a
+/// message-only result (response_text = the lossy-decoded bytes, no facets).
+fn decode_run_result_v1(bytes: &[u8]) -> Result<RunnerResult, String> {
     match serde_json::from_slice::<serde_json::Value>(bytes) {
         Ok(serde_json::Value::Object(map)) if map.contains_key("ducktape_runner_result") => {
             let result: RunnerResult = serde_json::from_value(serde_json::Value::Object(map))
@@ -275,10 +354,142 @@ fn response_text_from_dispatch_bytes(bytes: &[u8]) -> Result<String, String> {
                     result.ducktape_runner_result
                 ));
             }
-            Ok(result.response_text)
+            Ok(result)
         }
-        _ => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        _ => Ok(RunnerResult {
+            ducktape_runner_result: RUNNER_RESULT_VERSION,
+            response_text: String::from_utf8_lossy(bytes).into_owned(),
+            workspace_receipt: WorkspaceReceipt::default(),
+            data: None,
+            effects: Vec::new(),
+            sink: WireSink::Chain,
+            status: WireStatus::Ok,
+        }),
     }
+}
+
+/// map host-assembled declarative effects into the validated [`AgentAction`]
+/// vocabulary. v1 vocab == today's two task verbs (chat.post is the message
+/// facet, not an effect). an UNKNOWN kind fails the run deterministically (R4)
+/// — this is the concrete gate for any verb beyond the 3-verb set.
+fn effects_to_actions(effects: &[WireEffect]) -> Result<Vec<AgentAction>, String> {
+    if effects.len() > MAX_ACTIONS_PER_RUN {
+        return Err(format!(
+            "{} effects exceed the cap of {MAX_ACTIONS_PER_RUN}",
+            effects.len()
+        ));
+    }
+    effects
+        .iter()
+        .map(|e| match e.kind.as_str() {
+            ACTION_TASKS_CREATE => Ok(AgentAction::CreateTask {
+                task_id: e.task_id.clone(),
+                title: e.title.clone(),
+            }),
+            ACTION_TASKS_UPDATE_STATUS => Ok(AgentAction::UpdateTaskStatus {
+                task_id: e.task_id.clone(),
+                status: e.status.clone(),
+            }),
+            other => Err(format!("unknown effect kind: {other}")),
+        })
+        .collect()
+}
+
+/// the R5 data facet, valid only when it is within the size ceiling AND parses
+/// as JSON; anything else degrades to null (never fails the run).
+fn valid_data(data: &Option<String>) -> Option<&str> {
+    data.as_deref()
+        .filter(|s| s.len() <= MAX_DATA_BYTES && serde_json::from_str::<serde_json::Value>(s).is_ok())
+}
+
+/// the faceted job-finalize payload: the validated response plus the data
+/// facet, the derived output_ref (O1), and the status. deterministic — fixed
+/// serde field order, data embedded verbatim as already-validated JSON.
+#[derive(Serialize)]
+struct DeliveryReceipt<'a> {
+    ducktape_delivery: u32,
+    response: &'a AgentResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_ref: Option<OutputRef<'a>>,
+    status: &'static str,
+}
+
+/// the artifact facet distilled to a chainable reference (O1): a downstream run
+/// can set `workspace.source = prior.output_snapshot`.
+#[derive(Serialize)]
+struct OutputRef<'a> {
+    source_prefix: &'a str,
+    output_snapshot: &'a str,
+    commit_height: Option<u64>,
+    rebased: bool,
+    no_changes: bool,
+}
+
+fn encode_delivery_receipt(
+    response: &AgentResponse,
+    data: Option<&str>,
+    receipt: &WorkspaceReceipt,
+    status: WireStatus,
+) -> String {
+    let output_ref = receipt.output_snapshot.as_deref().map(|snap| OutputRef {
+        source_prefix: &receipt.source_prefix,
+        output_snapshot: snap,
+        commit_height: receipt.commit_height,
+        rebased: receipt.rebased,
+        no_changes: receipt.no_changes,
+    });
+    serde_json::to_string(&DeliveryReceipt {
+        ducktape_delivery: DELIVERY_RECEIPT_VERSION,
+        response,
+        data,
+        output_ref,
+        status: match status {
+            WireStatus::Ok => "ok",
+            WireStatus::Degraded => "degraded",
+            WireStatus::Failed => "failed",
+        },
+    })
+    .expect("delivery receipt serializes")
+}
+
+// ---- forge sink wire (local mirrors) -----------------------------------------
+// runs does NOT take a production dependency on the heavy `forge` crate (it
+// pulls vendored libgit2). instead it mirrors the exact JSON shape forge decodes
+// for the sink op it emits, and a dev-only conformance test pins the mirror
+// against `forge::decode_msg` so the wire can't silently drift.
+
+/// the exact `ForgeMsg::OpenPr` JSON the forge module decodes. only the PR sink
+/// is emitted in v1 (the merge sink is inert), so only `OpenPr` is mirrored.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ForgeSinkMsg<'a> {
+    OpenPr {
+        repo: &'a str,
+        title: &'a str,
+        body: &'a str,
+        source_branch: &'a str,
+        target_branch: &'a str,
+    },
+}
+
+fn forge_open_pr_bytes(repo: &str, title: &str, body: &str, src: &str, tgt: &str) -> Vec<u8> {
+    serde_json::to_vec(&ForgeSinkMsg::OpenPr {
+        repo,
+        title,
+        body,
+        source_branch: src,
+        target_branch: tgt,
+    })
+    .expect("forge sink msg serializes")
+}
+
+/// the `ForgeQuery::ListRefs` mirror the branch-born probe encodes.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ForgeSinkQuery<'a> {
+    ListRefs { repo: &'a str },
 }
 
 /// the model's raw answer as a NORMALIZED [`AgentResponse`]: the wire shape
@@ -496,6 +707,7 @@ impl PendingState {
 
 /// a chat run's read-only dispatch preparation: the pinned context plus the
 /// fully composed payload, gathered before anything is staged.
+#[derive(Debug)]
 struct PreparedDispatch {
     thread_root: Option<u64>,
     payload: Vec<u8>,
@@ -813,6 +1025,17 @@ pub struct RunsModule {
     agent: ModuleId,
     tasks: Option<ModuleId>,
     jobs: Option<ModuleId>,
+    /// the forge module id — the PR/merge sink target (O2). genesis config, NOT
+    /// committed state (it never enters `root()`), so it adds no consensus
+    /// surface. `None` on nodes not wired for the sink; the sink then degrades
+    /// to a breadcrumb.
+    forge: Option<ModuleId>,
+    /// the duckfs/files module id — queried for the committed head that a
+    /// portable (v3) envelope pins as `source_snapshot` (W2). genesis config,
+    /// NOT committed state (never in `root()`), so it adds no consensus surface.
+    /// its PRESENCE is what selects the portable v3 composer: `Some` composes v3
+    /// (pins the committed head), `None` composes the v2 wire.
+    files: Option<ModuleId>,
     /// committed state — what `root()` and the app-hash commit to.
     watches: BTreeMap<String, TurnPolicy>,
     /// in-flight correlation entries keyed by dispatch id — pruned on
@@ -874,11 +1097,50 @@ impl RunsModule {
             agent,
             tasks,
             jobs,
+            forge: None,
+            files: None,
             watches: BTreeMap::new(),
             pending: BTreeMap::new(),
             pending_watches: BTreeMap::new(),
             pending_overlay: BTreeMap::new(),
         }
+    }
+
+    /// wire the forge module as the PR/merge sink target (O2), after
+    /// construction — mirrors the injected `Option<ModuleId>` collaborators so
+    /// `new` and every existing call site stay untouched. the PR sink only fires
+    /// under a D3 forge-push cap; without this wired the sink degrades to a
+    /// breadcrumb.
+    pub fn with_sink_forge(mut self, forge: impl Into<ModuleId>) -> Self {
+        let forge = forge.into();
+        assert!(
+            forge != self.id
+                && forge != self.chat
+                && forge != self.saga
+                && forge != self.tagging
+                && forge != self.dispatch
+                && forge != self.agent
+                && Some(&forge) != self.tasks.as_ref()
+                && Some(&forge) != self.jobs.as_ref(),
+            "forge sink id must be distinct from every other collaborator"
+        );
+        self.forge = Some(forge);
+        self
+    }
+
+    /// wire the duckfs/files module so a portable (v3) envelope can pin the
+    /// committed head as `source_snapshot` (W2), after construction — mirrors
+    /// the injected `Option<ModuleId>` collaborators so `new` and every existing
+    /// call site stay untouched. wiring it is what makes the composer emit the
+    /// portable v3 wire; unwired, the composer emits the v2 wire.
+    pub fn with_files_module(mut self, files: impl Into<ModuleId>) -> Self {
+        let files = files.into();
+        assert!(
+            files != self.id,
+            "files module id must be distinct from the runs module id"
+        );
+        self.files = Some(files);
+        self
     }
 
     // ---- staged-over-committed reads ---------------------------------------
@@ -1080,6 +1342,63 @@ impl RunsModule {
 
     // ---- payload preparation (the dispatch plane's composition rule) -----
 
+    /// resolve the portable (v3) inputs, or `None` when the files module is
+    /// unwired.
+    ///
+    /// the files module's PRESENCE is the composer's v2-vs-v3 selector — it is
+    /// genesis-uniform infrastructure, not a version tag. unwired, no files query
+    /// is issued and the composer takes its byte-identical v2 path. wired, every
+    /// validator resolves the SAME committed head, so the composed v3 bytes are
+    /// consensus-uniform; a head query that FAILS becomes the run's error (a
+    /// loud skip at the callsite), never a silent unpinned source.
+    async fn portable_inputs(
+        &self,
+        ctx: &dyn Ctx,
+        agent: &AgentRecord,
+    ) -> Result<Option<envelope::PortableInputs>, String> {
+        let Some(files) = self.files.clone() else {
+            return Ok(None);
+        };
+        let source_snapshot = self.duckfs_head(ctx, &files).await?;
+        let skills = agent
+            .skills
+            .iter()
+            .map(|s| envelope::SkillEnvelope {
+                name: s.name.clone(),
+                source_prefix: s.source_prefix.clone(),
+                // a pinned skill passes its snapshot through; a tracking skill
+                // (no pin) resolves to the SAME committed head this run pins its
+                // workspace to (W2) — deterministic across validators.
+                source_snapshot: s.source_snapshot.clone().or_else(|| source_snapshot.clone()),
+            })
+            .collect();
+        Ok(Some(envelope::PortableInputs {
+            source_snapshot,
+            skills,
+        }))
+    }
+
+    /// the committed duckfs head — a dispatch-start committed read, so the
+    /// pinned id is consensus-uniform across validators (W2). errors become the
+    /// run's (a clean skip/error at the callsite), never a silent unpinned
+    /// compose. `RefsInfo.head` is `None` on a fresh network (a legitimate null
+    /// pin), which is distinct from the files module being unwired.
+    async fn duckfs_head(
+        &self,
+        ctx: &dyn Ctx,
+        files: &ModuleId,
+    ) -> Result<Option<String>, String> {
+        let reply = ctx
+            .query(files, &files_encode_query(&FilesQuery::Refs {}))
+            .await
+            .map_err(|e| format!("files refs query failed: {e}"))?;
+        match files_decode_reply(&reply) {
+            Ok(FilesReply::Refs(info)) => Ok(info.head),
+            Ok(_) => Err("unexpected files reply for a refs query".into()),
+            Err(e) => Err(format!("files refs reply failed to decode: {e}")),
+        }
+    }
+
     /// everything a chat run's dispatch needs, prepared read-only: the pinned
     /// context (P4) and the fully composed payload. any failure here is a
     /// clean skip for the no-fail engagement intake and a clean error for an
@@ -1092,6 +1411,7 @@ impl RunsModule {
         anchor_seq: u64,
     ) -> Result<PreparedDispatch, String> {
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
+        let portable = self.portable_inputs(ctx, agent).await?;
         let payload = envelope::render_payload(
             &self.id,
             agent,
@@ -1099,6 +1419,7 @@ impl RunsModule {
             anchor_seq,
             thread_root,
             &transcript,
+            portable,
         )
         .into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
@@ -1298,9 +1619,18 @@ impl RunsModule {
             }
         }
         // compose BEFORE claiming: a job whose payload cannot be composed
-        // (an oversized spec) is left unclaimed on the board, not claimed
-        // into a run that could never execute.
-        let payload = envelope::render_job_payload(&agent, &job_id, &spec).into_bytes();
+        // (an oversized spec, or an unpinnable portable source) is left
+        // unclaimed on the board, not claimed into a run that could never
+        // execute. the portable resolve is a loud skip like the rest of this
+        // no-fail arm.
+        let portable = match self.portable_inputs(&*ctx, &agent).await {
+            Ok(portable) => portable,
+            Err(reason) => {
+                self.note(ctx, format!("job run skipped for {run_id}: {reason}"));
+                return Ok(());
+            }
+        };
+        let payload = envelope::render_job_payload(&agent, &job_id, &spec, portable).into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
             self.note(
                 ctx,
@@ -1499,48 +1829,165 @@ impl RunsModule {
         self.pending_overlay.insert(dispatch_id, None);
 
         match outcome {
-            // a portable runner wraps its prose in a RunnerResult; unwrap it (or
-            // fail the run on a broken wrapper) before the response path. legacy
-            // raw-text results pass through unchanged.
-            Ok(bytes) => match response_text_from_dispatch_bytes(&bytes) {
-                Ok(text) => {
-                    let response = agent_response_from_text(&text, entry.job_id.is_some());
-                    match self.validate_response(&*ctx, &run_id, &entry, response).await {
-                        Ok(response) => {
-                            let payload = String::from_utf8(encode_response(&response))
-                                .expect("AgentResponse JSON is utf-8");
-                            self.emit_response(ctx, &run_id, &entry, response);
-                            self.emit_job_finalize_if_current_claimant(ctx, &entry, true, payload)
-                                .await;
-                        }
-                        // deterministically invalid response: the run fails —
-                        // breadcrumb, threaded failure reply, job finalize,
-                        // pruned entry — the delivery block commits.
-                        Err(reason) => {
-                            self.note(ctx, format!("run {run_id} failed: {reason}"));
-                            self.emit_failure_reply(ctx, &run_id, &entry, &reason).await;
-                            self.emit_job_finalize_if_current_claimant(ctx, &entry, false, reason)
-                                .await;
-                        }
-                    }
-                }
-                // a malformed / unsupported runner wrapper is a failed run, not
-                // a delivery-block abort and never raw JSON delivered as prose.
-                Err(reason) => {
-                    self.note(ctx, format!("run {run_id} failed: {reason}"));
-                    self.emit_failure_reply(ctx, &run_id, &entry, &reason).await;
-                    self.emit_job_finalize_if_current_claimant(ctx, &entry, false, reason)
-                        .await;
-                }
-            },
-            Err(reason) => {
-                self.note(ctx, format!("run {run_id} failed: {reason}"));
-                self.emit_failure_reply(ctx, &run_id, &entry, &reason).await;
-                self.emit_job_finalize_if_current_claimant(ctx, &entry, false, reason)
-                    .await;
-            }
+            // THE single delivery path: decode the runner result and apply
+            // whatever facets it carries. a plain (message-only) result carries
+            // none — it delivers exactly the model prose + its parsed actions.
+            Ok(bytes) => self.deliver_run_result(ctx, &run_id, &entry, &bytes).await,
+            Err(reason) => self.fail_run(ctx, &run_id, &entry, reason).await,
         }
         Ok(())
+    }
+
+    /// the failure triple (breadcrumb note + threaded failure reply + job
+    /// finalize false) — unchanged behavior, was inlined three times.
+    async fn fail_run(&mut self, ctx: &mut dyn Ctx, run_id: &str, entry: &PendingState, reason: String) {
+        self.note(ctx, format!("run {run_id} failed: {reason}"));
+        self.emit_failure_reply(ctx, run_id, entry, &reason).await;
+        self.emit_job_finalize_if_current_claimant(ctx, entry, false, reason)
+            .await;
+    }
+
+    /// THE single delivery path. message facet + host-assembled effects → one
+    /// [`AgentResponse`] (validate/emit reused); the sink is applied (cap-gated,
+    /// probe-guarded, degrades to a breadcrumb, never aborts); data (R5) +
+    /// artifact (O1) + status fold into the faceted finalize payload. a plain
+    /// (message-only) result — raw text or an `AgentResponse` with no runner
+    /// marker — decodes to a facet-free [`RunnerResult`] (Chain sink, Ok status,
+    /// empty effects), so it delivers exactly the model prose + its parsed
+    /// actions. idempotent by run_id — every effect applies once, here, from the
+    /// winning attempt (X2); nothing is emitted mid-run.
+    async fn deliver_run_result(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        bytes: &[u8],
+    ) {
+        let result = match decode_run_result_v1(bytes) {
+            Ok(r) => r,
+            Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
+        };
+        // the host observation overrides a present message facet (R4).
+        if result.status == WireStatus::Failed {
+            return self
+                .fail_run(ctx, run_id, entry, "run reported a failed status".into())
+                .await;
+        }
+        let mut response = agent_response_from_text(&result.response_text, entry.job_id.is_some());
+        // R1: host-assembled effects are authoritative. FALLBACK: only override
+        // the response-parsed actions when the effects facet is non-empty, so a
+        // model that emitted actions only in prose (an oracle that didn't lift
+        // them) still gets them applied — never a silent drop. a message-only
+        // result has empty effects, so it keeps its prose-parsed actions.
+        if !result.effects.is_empty() {
+            response.actions = match effects_to_actions(&result.effects) {
+                Ok(actions) => actions,
+                Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
+            };
+        }
+        let response = match self.validate_response(&*ctx, run_id, entry, response).await {
+            Ok(r) => r,
+            Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
+        };
+        // build the faceted finalize payload BEFORE moving `response` into
+        // emit_response; emission order is response → sink → finalize.
+        let payload =
+            encode_delivery_receipt(&response, valid_data(&result.data), &result.workspace_receipt, result.status);
+        self.emit_response(ctx, run_id, entry, response);
+        self.emit_sink(ctx, run_id, entry, &result.sink).await;
+        self.emit_job_finalize_if_current_claimant(ctx, entry, true, payload)
+            .await;
+    }
+
+    /// apply the O1/O2 sink. Chain is a breadcrumb/no-op in v1 (durable
+    /// output_ref chaining is future work — the receipt already carries the
+    /// output_ref for a downstream consumer). Pr emits a forge `OpenPr` gated on
+    /// the agent's D3 `ForgePush` cap (Phase 4's `permits`, NOT a KNOWN_ACTIONS
+    /// grant) and a committed-state branch-born probe (the no-fail rule: an
+    /// OpenPr for an unborn branch would abort the block). Merge is inert in v1.
+    /// any missing precondition degrades to a breadcrumb — the sink NEVER aborts
+    /// the delivery block.
+    async fn emit_sink(&self, ctx: &mut dyn Ctx, run_id: &str, entry: &PendingState, sink: &WireSink) {
+        match sink {
+            WireSink::Chain => {}
+            WireSink::Pr {
+                repo,
+                source_branch,
+                target_branch,
+                title,
+                body,
+            } => {
+                let Some(forge) = self.forge.clone() else {
+                    return self.note(ctx, format!("run {run_id} pr sink skipped: no forge module wired"));
+                };
+                let agent = match self.agent_record(&*ctx, &entry.agent_id).await {
+                    Ok(Some(a)) => a,
+                    _ => {
+                        return self
+                            .note(ctx, format!("run {run_id} pr sink skipped: agent not registered"));
+                    }
+                };
+                if !agent.permits(&CapRequest::ForgePush(repo.as_str())) {
+                    return self.note(
+                        ctx,
+                        format!("run {run_id} pr sink skipped: agent lacks forge_push for {repo}"),
+                    );
+                }
+                match self.forge_branch_born(&*ctx, &forge, repo, source_branch).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return self.note(
+                            ctx,
+                            format!("run {run_id} pr sink skipped: source branch not present"),
+                        );
+                    }
+                    Err(why) => {
+                        return self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
+                    }
+                }
+                ctx.emit_msg(Msg {
+                    target: forge,
+                    payload: forge_open_pr_bytes(repo, title, body, source_branch, target_branch),
+                });
+            }
+            WireSink::Merge { repo, number, .. } => {
+                // v1: the merge sink needs a host-computed merge pack (a phase-2
+                // wrapper responsibility). validate the wire, breadcrumb, and
+                // fall through like Chain — never emit a MergePr yet.
+                self.note(
+                    ctx,
+                    format!("run {run_id} merge sink for {repo}#{number} is inert in v1 (treated as chain)"),
+                );
+            }
+        }
+    }
+
+    /// deterministic committed-state probe: is `branch` a born ref of `repo`?
+    /// reads COMMITTED forge state via a query (never node-local pending), so it
+    /// is uniform across validators. decoded via `serde_json::Value` to avoid a
+    /// production dependency on the forge crate.
+    async fn forge_branch_born(
+        &self,
+        ctx: &dyn Ctx,
+        forge: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<bool, String> {
+        let reply = ctx
+            .query(
+                forge,
+                &serde_json::to_vec(&ForgeSinkQuery::ListRefs { repo }).expect("query serializes"),
+            )
+            .await
+            .map_err(|e| format!("forge refs lookup failed: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&reply).map_err(|e| format!("undecodable forge reply: {e}"))?;
+        let Some(refs) = value.get("refs").and_then(|r| r.as_array()) else {
+            return Err("unexpected forge reply for a refs listing".into());
+        };
+        Ok(refs
+            .iter()
+            .any(|r| r.get("name").and_then(|n| n.as_str()) == Some(branch)))
     }
 
     /// deterministic response validation — THE safety boundary (design §5).
@@ -2205,6 +2652,7 @@ mod tests {
         DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
         encode_reply as dispatch_encode_reply, encode_result_event,
     };
+    use duckfs_core::{decode_query as files_decode_query, encode_reply as files_encode_reply};
     use futures::executor::block_on;
     use jobs::{
         Claim as JobClaim, Job, encode_event as jobs_encode_event,
@@ -2237,6 +2685,12 @@ mod tests {
         taken_dispatches: BTreeSet<String>,
         /// job_id -> board record served by the jobs arm (finalize guard).
         jobs: BTreeMap<String, Job>,
+        /// repo -> born branch names, served by the "forge" ListRefs arm (the
+        /// sink's committed-state branch-born probe).
+        forge_refs: BTreeMap<String, Vec<String>>,
+        /// the committed duckfs head served by the "files" Refs arm — the v3
+        /// composer's `source_snapshot` pin. `None` = a fresh network (null pin).
+        files_head: Option<String>,
         msgs: Vec<Msg>,
         #[allow(dead_code)]
         effects: Vec<Effect>,
@@ -2257,6 +2711,8 @@ mod tests {
                 tasks: Vec::new(),
                 taken_dispatches: BTreeSet::new(),
                 jobs: BTreeMap::new(),
+                forge_refs: BTreeMap::new(),
+                files_head: None,
                 msgs: Vec::new(),
                 effects: Vec::new(),
                 events: Vec::new(),
@@ -2265,6 +2721,17 @@ mod tests {
         fn at(mut self, view: u64) -> Self {
             self.env.height = view;
             self.env.consensus_time = view;
+            self
+        }
+        /// register a born branch under `repo` (the sink's branch-born probe).
+        fn with_forge_ref(mut self, repo: &str, branch: &str) -> Self {
+            self.forge_refs.entry(repo.into()).or_default().push(branch.into());
+            self
+        }
+        /// set the committed duckfs head the "files" Refs arm serves (the v3
+        /// composer's `source_snapshot`).
+        fn with_files_head(mut self, head: &str) -> Self {
+            self.files_head = Some(head.into());
             self
         }
         fn with_origin(mut self, origin: Origin) -> Self {
@@ -2441,6 +2908,32 @@ mod tests {
                     }
                     _ => Err(Error::QueryUnsupported),
                 },
+                "files" => match files_decode_query(req).map_err(Error::Module)? {
+                    FilesQuery::Refs {} => Ok(files_encode_reply(&FilesReply::Refs(
+                        duckfs_core::RefsInfo {
+                            head: self.files_head.clone(),
+                            pins: BTreeMap::new(),
+                            window_len: 0,
+                        },
+                    ))),
+                    _ => Err(Error::QueryUnsupported),
+                },
+                "forge" => match forge::decode_query(req).map_err(Error::Module)? {
+                    forge::ForgeQuery::ListRefs { repo } => {
+                        let refs = self
+                            .forge_refs
+                            .get(&repo)
+                            .into_iter()
+                            .flatten()
+                            .map(|name| forge::RefHead {
+                                name: name.clone(),
+                                head: "00".repeat(20),
+                            })
+                            .collect();
+                        Ok(forge::encode_reply(&forge::ForgeReply::Refs(refs)))
+                    }
+                    _ => Err(Error::QueryUnsupported),
+                },
                 other => Err(Error::UnknownModule(other.into())),
             }
         }
@@ -2493,6 +2986,9 @@ mod tests {
             status: AgentStatus::Active,
             created_at: 0,
             updated_at: 0,
+            recipe_hash: Vec::new(),
+            caps: agent::ResourceCaps::default(),
+            skills: Vec::new(),
         }
     }
 
@@ -2662,7 +3158,7 @@ mod tests {
     }
 
     fn response(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
-        encode_response(&AgentResponse {
+        agent::encode_response(&AgentResponse {
             reply_blocks: reply
                 .iter()
                 .map(|t| ReplyBlock {
@@ -2675,13 +3171,100 @@ mod tests {
         })
     }
 
-    // ---- runner-result unwrap (forward-compatible v3 accept) --------------------
+    // ---- the composer's v2-vs-v3 selection (files presence) ---------------------
 
     #[test]
-    fn legacy_raw_text_results_pass_through_untouched() {
-        // today's live v2 composer produces raw text (or the AgentResponse JSON
-        // the model emits); neither carries the runner marker, so both decode
-        // byte-for-byte via the lossy path the delivery block always used.
+    fn a_run_composes_v2_without_files_and_v3_with_files_wired() {
+        let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        let agent = record("bot", &[ACTION_CHAT_POST]);
+        let head = "aa".repeat(32);
+
+        // no files module: the byte-identical v2 payload, no portable fields.
+        let m0 = module();
+        let ctx0 = CaptureCtx::new()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        let prepared = block_on(m0.prepare_dispatch(&ctx0, &agent, "general", 2)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
+        assert_eq!(v["ducktape_run"], 2, "no files module composes v2");
+        assert!(v.get("workspace").is_none(), "no v3 workspace without files");
+        assert!(v.get("skills").is_none());
+
+        // files wired: the v3 payload pins the committed head.
+        let m4 = module().with_files_module("files");
+        let ctx4 = CaptureCtx::new()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2))
+            .with_files_head(&head);
+        let prepared = block_on(m4.prepare_dispatch(&ctx4, &agent, "general", 2)).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
+        assert_eq!(v["ducktape_run"], 3, "a wired files module composes v3");
+        assert_eq!(v["workspace"]["source_prefix"], "/shared/agent-workspaces/bot");
+        assert_eq!(
+            v["workspace"]["source_snapshot"], head,
+            "source_snapshot pins the committed duckfs head (W2)"
+        );
+        assert!(
+            v["workspace"].get("mount_path").is_none(),
+            "the composed v3 workspace carries NO mount_path (D7)"
+        );
+    }
+
+    #[test]
+    fn portable_inputs_gate_pin_and_skill_resolution() {
+        let head = "aa".repeat(32);
+        let mut agent = record("bot", &[ACTION_CHAT_POST]);
+        agent.skills = vec![
+            agent::SkillRef {
+                name: "pinned".into(),
+                source_prefix: "/shared/skills/pinned".into(),
+                source_snapshot: Some("bb".repeat(32)),
+            },
+            agent::SkillRef {
+                name: "tracking".into(),
+                source_prefix: "/shared/skills/tracking".into(),
+                source_snapshot: None,
+            },
+        ];
+
+        // no files module: None (the composer takes its v2 path).
+        let unwired = module();
+        let ctx0 = CaptureCtx::new().with_files_head(&head);
+        assert!(
+            block_on(unwired.portable_inputs(&ctx0, &agent)).unwrap().is_none(),
+            "no portable inputs without a wired files module"
+        );
+
+        let m = module().with_files_module("files");
+
+        // files wired + a committed head: Some, head pinned, skills resolved.
+        let ctx4 = CaptureCtx::new().with_files_head(&head);
+        let inputs = block_on(m.portable_inputs(&ctx4, &agent)).unwrap().unwrap();
+        assert_eq!(inputs.source_snapshot.as_deref(), Some(head.as_str()));
+        // pinned skill passes its snapshot through; tracking resolves to the head.
+        assert_eq!(inputs.skills[0].source_snapshot.as_deref(), Some("bb".repeat(32).as_str()));
+        assert_eq!(
+            inputs.skills[1].source_snapshot.as_deref(),
+            Some(head.as_str()),
+            "a tracking skill pins the same committed head (W2)"
+        );
+
+        // files wired + an unresolved head: Some with a null pin (fresh network).
+        let ctx_empty = CaptureCtx::new();
+        let inputs = block_on(m.portable_inputs(&ctx_empty, &agent)).unwrap().unwrap();
+        assert!(
+            inputs.source_snapshot.is_none(),
+            "an unresolved head is a legitimate null pin, still Some"
+        );
+    }
+
+    // ---- runner-result decode (facet-free + faceted) ----------------------------
+
+    #[test]
+    fn legacy_raw_text_results_decode_as_message_only() {
+        // a raw-text result (or the AgentResponse JSON the model emits) carries
+        // no runner marker, so it decodes to a facet-free message-only result:
+        // response_text = the lossy-decoded bytes, no effects, Chain sink, Ok.
         for raw in [
             "just a prose answer",
             "",
@@ -2689,14 +3272,15 @@ mod tests {
             // a JSON object WITHOUT the marker is not a runner wrapper.
             r#"{"response_text":"nope"}"#,
         ] {
-            assert_eq!(
-                response_text_from_dispatch_bytes(raw.as_bytes()).unwrap(),
-                raw
-            );
+            let result = decode_run_result_v1(raw.as_bytes()).unwrap();
+            assert_eq!(result.response_text, raw);
+            assert!(result.effects.is_empty());
+            assert!(matches!(result.sink, WireSink::Chain));
+            assert_eq!(result.status, WireStatus::Ok);
         }
         // invalid utf-8 still degrades lossily rather than erroring.
         assert_eq!(
-            response_text_from_dispatch_bytes(&[0xff, 0xfe]).unwrap(),
+            decode_run_result_v1(&[0xff, 0xfe]).unwrap().response_text,
             "\u{fffd}\u{fffd}"
         );
     }
@@ -2717,7 +3301,7 @@ mod tests {
         })
         .to_string();
         assert_eq!(
-            response_text_from_dispatch_bytes(wrapper.as_bytes()).unwrap(),
+            decode_run_result_v1(wrapper.as_bytes()).unwrap().response_text,
             "the deliverable prose"
         );
     }
@@ -2734,14 +3318,435 @@ mod tests {
             }
         })
         .to_string();
-        let err = response_text_from_dispatch_bytes(bad_version.as_bytes()).unwrap_err();
+        let err = decode_run_result_v1(bad_version.as_bytes()).unwrap_err();
         assert!(err.contains("version 99"), "got {err:?}");
 
         // claims the marker but the shape is malformed → fail, never deliver
         // the raw JSON as if it were the model's prose.
         let malformed = r#"{"ducktape_runner_result":1,"response_text":42}"#;
-        let err = response_text_from_dispatch_bytes(malformed.as_bytes()).unwrap_err();
+        let err = decode_run_result_v1(malformed.as_bytes()).unwrap_err();
         assert!(err.contains("malformed"), "got {err:?}");
+    }
+
+    // ---- faceted delivery -------------------------------------------------------
+
+    /// build a faceted RunnerResult wrapper: the three core fields plus whatever
+    /// facet keys `facets` carries (data / effects / sink / status, and a
+    /// `workspace_receipt` override when present).
+    fn runner_wrapper(response_text: &str, facets: serde_json::Value) -> Vec<u8> {
+        let mut obj = serde_json::json!({
+            "ducktape_runner_result": 1,
+            "response_text": response_text,
+            "workspace_receipt": {
+                "source_prefix": "/shared/agent-workspaces/bot",
+                "source_snapshot": null,
+                "output_snapshot": null,
+                "commit_height": null,
+                "rebased": false,
+                "no_changes": true
+            }
+        });
+        if let serde_json::Value::Object(extra) = facets {
+            let base = obj.as_object_mut().expect("object");
+            for (k, v) in extra {
+                base.insert(k, v);
+            }
+        }
+        serde_json::to_vec(&obj).expect("wrapper serializes")
+    }
+
+    /// a module wired with the forge sink, one watch on "general", one engaged
+    /// run for agent "bot" at seq 2.
+    fn awaiting_run_with_forge(registry: &Registry) -> (RunsModule, String) {
+        let mut m = module().with_sink_forge("forge");
+        let mut ctx = CaptureCtx::new().with_origin(user(9)).with_registry(registry);
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&RunsMsg::WatchChannel {
+                channel_id: "general".into(),
+                policy: TurnPolicy::All,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        engage_post(&mut m, registry, 2, &[]);
+        commit(&mut m);
+        (m, run_id_for("general", 2, "bot"))
+    }
+
+    #[test]
+    fn a_plain_result_delivers_its_prose_and_parsed_actions() {
+        // a bare response_text (no runner marker, no facets) flows through the
+        // single delivery path: the message is delivered and the prose-parsed
+        // action is applied — exactly as today's message-only delivery did.
+        let response_text = String::from_utf8(response(
+            &["on it"],
+            vec![AgentAction::CreateTask {
+                task_id: "from_prose".into(),
+                title: "prose".into(),
+            }],
+        ))
+        .unwrap();
+        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(response_text.into_bytes())),
+        )
+        .unwrap();
+        assert_eq!(ctx.chat_msgs().len(), 1, "the run delivers its message");
+        assert_eq!(
+            ctx.task_msgs(),
+            vec![TaskMsg::CreateTask {
+                task_id: "from_prose".into(),
+                title: "prose".into(),
+            }],
+            "the prose-parsed action is applied"
+        );
+        assert!(
+            ctx.msgs.iter().all(|msg| msg.target != "forge"),
+            "a message-only result opens no sink"
+        );
+        commit(&mut m);
+        assert_eq!(get_pending(&m, &run_id), None);
+    }
+
+    #[test]
+    fn effects_facet_applies_cap_checked() {
+        // response_text is plain prose with NO action; the task write comes from
+        // the host-assembled effects facet (R1).
+        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+        let facets = serde_json::json!({
+            "effects": [{"kind":"tasks.create","task_id":"t1","title":"from effect"}]
+        });
+        let mut ctx = CaptureCtx::new()
+            .at(8)            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(runner_wrapper("done", facets))),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.task_msgs(),
+            vec![TaskMsg::CreateTask {
+                task_id: "t1".into(),
+                title: "from effect".into(),
+            }]
+        );
+        commit(&mut m);
+        assert_eq!(get_pending(&m, &run_id), None);
+    }
+
+    #[test]
+    fn unknown_effect_kind_fails_the_run() {
+        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+        let facets = serde_json::json!({
+            "effects": [{"kind":"forge.delete_universe","task_id":"t1"}]
+        });
+        let mut ctx = CaptureCtx::new()
+            .at(8)            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(runner_wrapper("done", facets))),
+        )
+        .unwrap();
+        assert!(ctx.task_msgs().is_empty(), "no task write escapes a failed run");
+        assert!(
+            ctx.events
+                .iter()
+                .any(|e| String::from_utf8_lossy(&e.payload).contains("unknown effect kind")),
+            "the failure names the unknown effect kind"
+        );
+        commit(&mut m);
+        assert_eq!(get_pending(&m, &run_id), None);
+    }
+
+    #[test]
+    fn empty_effects_falls_back_to_response_parsed_actions() {
+        // critic #4 fallback: with an EMPTY effects facet, a model that emitted
+        // the action only in prose still gets it applied — never a silent drop.
+        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+        let response_text = String::from_utf8(response(
+            &["on it"],
+            vec![AgentAction::CreateTask {
+                task_id: "t1".into(),
+                title: "from prose".into(),
+            }],
+        ))
+        .unwrap();
+        let mut ctx = CaptureCtx::new()
+            .at(8)            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(runner_wrapper(&response_text, serde_json::json!({})))),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.task_msgs(),
+            vec![TaskMsg::CreateTask {
+                task_id: "t1".into(),
+                title: "from prose".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn pr_sink_emits_open_pr_only_with_the_forge_push_cap() {
+        let sink = serde_json::json!({
+            "sink": {"mode":"pr","repo":"app","source_branch":"agent/x","target_branch":"main","title":"My PR","body":"details"}
+        });
+
+        // (1) GRANTED forge_push (D3 cap) + branch born → OpenPr emitted.
+        let mut granted = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        granted.get_mut("bot").unwrap().caps.forge_push = vec!["app".into()];
+        let (mut m, run_id) = awaiting_run_with_forge(&granted);
+        let mut ctx = CaptureCtx::new()
+            .at(8)            .with_dispatch_origin()
+            .with_registry(&granted)
+            .with_transcript("general", transcript(2))
+            .with_forge_ref("app", "agent/x");
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(runner_wrapper("done", sink.clone()))),
+        )
+        .unwrap();
+        let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
+        assert_eq!(forge_ops.len(), 1, "one OpenPr emitted");
+        assert_eq!(
+            forge::decode_msg(&forge_ops[0].payload).unwrap(),
+            forge::ForgeMsg::OpenPr {
+                repo: "app".into(),
+                title: "My PR".into(),
+                body: "details".into(),
+                source_branch: "agent/x".into(),
+                target_branch: "main".into(),
+            }
+        );
+
+        // (2) NO forge_push cap → degrade to a breadcrumb, no forge op, no abort.
+        let ungranted = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        let (mut m2, run_id2) = awaiting_run_with_forge(&ungranted);
+        let mut ctx2 = CaptureCtx::new()
+            .at(8)            .with_dispatch_origin()
+            .with_registry(&ungranted)
+            .with_transcript("general", transcript(2))
+            .with_forge_ref("app", "agent/x");
+        exec(
+            &mut m2,
+            &mut ctx2,
+            &result_event(&run_id2, Ok(runner_wrapper("done", sink))),
+        )
+        .unwrap();
+        assert!(
+            ctx2.msgs.iter().all(|m| m.target != "forge"),
+            "no cap → no forge op"
+        );
+        assert!(
+            ctx2.events
+                .iter()
+                .any(|e| String::from_utf8_lossy(&e.payload).contains("lacks forge_push")),
+            "the breadcrumb names the missing cap"
+        );
+        assert_eq!(ctx2.chat_msgs().len(), 1, "the run still delivers its message");
+    }
+
+    #[test]
+    fn pr_sink_with_an_unborn_branch_degrades_without_aborting() {
+        let mut granted = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        granted.get_mut("bot").unwrap().caps.forge_push = vec!["app".into()];
+        let (mut m, run_id) = awaiting_run_with_forge(&granted);
+        // no with_forge_ref → the source branch is NOT born in committed forge.
+        let mut ctx = CaptureCtx::new()
+            .at(8)            .with_dispatch_origin()
+            .with_registry(&granted)
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(
+                &run_id,
+                Ok(runner_wrapper(
+                    "done",
+                    serde_json::json!({"sink":{"mode":"pr","repo":"app","source_branch":"agent/x","title":"PR"}}),
+                )),
+            ),
+        )
+        .unwrap();
+        assert!(
+            ctx.msgs.iter().all(|m| m.target != "forge"),
+            "an unborn source branch must never emit an OpenPr (no-fail rule)"
+        );
+        assert!(
+            ctx.events
+                .iter()
+                .any(|e| String::from_utf8_lossy(&e.payload).contains("source branch not present"))
+        );
+    }
+
+    #[test]
+    fn malformed_facet_fails_the_run_without_aborting() {
+        // effects is not an array → decode_run_result_v1 fails → the run fails
+        // deterministically (R4), never a delivery-block abort.
+        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+        let bad = serde_json::json!({
+            "ducktape_runner_result": 1,
+            "response_text": "hi",
+            "workspace_receipt": {"source_prefix":"p","source_snapshot":null,"output_snapshot":null,"commit_height":null,"rebased":false,"no_changes":false},
+            "effects": "not-an-array"
+        });
+        let mut ctx = CaptureCtx::new()
+            .at(8)            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        // exec returns Ok — the block commits — but the run FAILED.
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(serde_json::to_vec(&bad).unwrap())),
+        )
+        .unwrap();
+        assert!(
+            ctx.events
+                .iter()
+                .any(|e| String::from_utf8_lossy(&e.payload).contains("malformed")),
+            "a malformed facet fails the run loudly"
+        );
+        assert_eq!(ctx.chat_msgs().len(), 1, "the failure surfaces as a threaded reply");
+        commit(&mut m);
+        assert_eq!(get_pending(&m, &run_id), None);
+    }
+
+    #[test]
+    fn status_failed_overrides_a_present_message() {
+        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+        let mut ctx = CaptureCtx::new()
+            .at(8)            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(
+                &run_id,
+                Ok(runner_wrapper("a perfectly good message", serde_json::json!({"status":"failed"}))),
+            ),
+        )
+        .unwrap();
+        assert!(
+            ctx.events
+                .iter()
+                .any(|e| String::from_utf8_lossy(&e.payload).contains("failed status")),
+            "a failed status fails the run despite the present message"
+        );
+    }
+
+    #[test]
+    fn job_finalize_is_a_delivery_receipt_with_data_and_output_ref() {
+        let registry = job_registry(); // agent "duck" with tasks.create
+        let mut m = module();
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
+        exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
+        commit(&mut m);
+        let run_id = job_run_id_for("job-1", "duck", 3);
+
+        let facets = serde_json::json!({
+            "workspace_receipt": {"source_prefix":"/ws/duck","source_snapshot":null,"output_snapshot":"deadbeef","commit_height":7,"rebased":false,"no_changes":false},
+            "data": "{\"summary\":\"ok\"}",
+            "effects": [{"kind":"tasks.create","task_id":"t1","title":"todo"}],
+            "status": "ok"
+        });
+        let mut ctx = CaptureCtx::new()
+            .at(10)            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_claimed_job("job-1", 3);
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(runner_wrapper("done", facets))),
+        )
+        .unwrap();
+
+        // the effects facet applied a task write.
+        assert_eq!(
+            ctx.task_msgs(),
+            vec![TaskMsg::CreateTask {
+                task_id: "t1".into(),
+                title: "todo".into(),
+            }]
+        );
+        // the finalize payload is a faceted DeliveryReceipt (not a bare response).
+        let finalize = ctx.job_msgs();
+        assert_eq!(finalize.len(), 1);
+        let JobsMsg::Finalize { ok, payload, .. } = &finalize[0] else {
+            panic!("expected a finalize");
+        };
+        assert!(*ok);
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(v["ducktape_delivery"], 1);
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["data"], "{\"summary\":\"ok\"}");
+        assert_eq!(v["output_ref"]["output_snapshot"], "deadbeef");
+        assert_eq!(v["output_ref"]["commit_height"], 7);
+        assert_eq!(v["output_ref"]["source_prefix"], "/ws/duck");
+    }
+
+    #[test]
+    fn wire_sink_defaults_to_chain_and_decodes_a_present_pr() {
+        // a MISSING sink field → Chain (internal-tag + serde default interplay).
+        let no_sink = runner_wrapper("hi", serde_json::json!({}));
+        assert!(matches!(
+            decode_run_result_v1(&no_sink).unwrap().sink,
+            WireSink::Chain
+        ));
+        // a present {"mode":"pr",...} → Pr.
+        let pr = runner_wrapper(
+            "hi",
+            serde_json::json!({"sink":{"mode":"pr","repo":"a","source_branch":"s","title":"t"}}),
+        );
+        assert!(matches!(
+            decode_run_result_v1(&pr).unwrap().sink,
+            WireSink::Pr { .. }
+        ));
+        // an unsupported wrapper version fails to decode (R4).
+        let badv = serde_json::json!({
+            "ducktape_runner_result": 99,
+            "response_text": "x",
+            "workspace_receipt": {"source_prefix":"p","source_snapshot":null,"output_snapshot":null,"commit_height":null,"rebased":false,"no_changes":false}
+        });
+        assert!(decode_run_result_v1(&serde_json::to_vec(&badv).unwrap()).is_err());
+    }
+
+    #[test]
+    fn forge_sink_mirror_matches_forge_decode_msg() {
+        // pin the local ForgeSinkMsg mirror against the real forge decoder so the
+        // wire cannot silently drift (the reason forge is a dev-dependency).
+        let bytes = forge_open_pr_bytes("app", "T", "B", "agent/x", "main");
+        assert_eq!(
+            forge::decode_msg(&bytes).unwrap(),
+            forge::ForgeMsg::OpenPr {
+                repo: "app".into(),
+                title: "T".into(),
+                body: "B".into(),
+                source_branch: "agent/x".into(),
+                target_branch: "main".into(),
+            }
+        );
     }
 
     // ---- the registry hook ------------------------------------------------------
@@ -4425,11 +5430,15 @@ mod tests {
         };
         assert_eq!(job_id, "job-1");
         assert!(*ok);
-        assert_eq!(
-            payload.as_bytes(),
-            bytes.as_slice(),
-            "the normalized response JSON is the finalize payload"
-        );
+        // a message-only job result finalizes as a faceted DeliveryReceipt whose
+        // `response` is the normalized AgentResponse (no data / output_ref facets).
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(v["ducktape_delivery"], 1);
+        assert_eq!(v["status"], "ok");
+        assert!(v.get("data").is_none(), "no data facet on a message-only result");
+        assert!(v.get("output_ref").is_none(), "no artifact facet");
+        let expected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["response"], expected, "response is the normalized AgentResponse");
         assert!(ctx.chat_msgs().is_empty(), "job runs never post to chat");
     }
 
