@@ -42,9 +42,11 @@ args = [
     "acceptEdits",
 ]
 prompt = "stdin"
-# Agentic runs (tool-use loops in a real workspace) are slower than one-shot
-# answers; operators override per tag by shadowing the spec, or globally via
-# DUCKTAPE_PROVIDER_TIMEOUT_SECS.
+# The IDLE budget (output refreshes it; hard-capped at 6x). NOTE: -p with
+# --output-format json prints ONE result object at the end, so this CLI is
+# silent for the whole run — 600s is its longest allowed thinking/tool
+# stretch, not a total-run cap. Operators override per tag by shadowing the
+# spec, or globally via DUCKTAPE_PROVIDER_TIMEOUT_SECS.
 timeout_secs = 600
 
 [output]

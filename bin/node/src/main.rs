@@ -784,16 +784,22 @@ async fn genesis_host(
         Box::new(AgentModule::new("agent", "saga", Some("runs".into()))),
         // the collaboration loop's actor: watches, engagement, composition,
         // dispatch, and response delivery — reads the registry by query.
-        Box::new(RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "tagging",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            Some("jobs".into()),
-        )),
+        Box::new(
+            RunsModule::new(
+                "runs",
+                "chat",
+                "saga",
+                "tagging",
+                "dispatch",
+                "agent",
+                Some("tasks".into()),
+                Some("jobs".into()),
+            )
+            // the duckfs/files module the portable (v3) composer pins its source
+            // head from (W2). its presence is what selects the v3 composer;
+            // unwired, the composer emits the v2 wire.
+            .with_files_module("files"),
+        ),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
         // events and emits chat/tasks follow-ups.
@@ -943,7 +949,8 @@ async fn restore_host(
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-    );
+    )
+    .with_files_module("files");
     let (bytes, root) = snapshot_of("runs")?;
     runs.install(bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
@@ -1260,7 +1267,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-    );
+    )
+    .with_files_module("files");
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 
@@ -1662,7 +1670,8 @@ async fn write_boundary_checkpoint<E>(
     floor: &Option<recovery::FloorCert>,
     label: &str,
     diag_tag: &str,
-) where
+) -> u64
+where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
 {
     let pos = recovery.oplog_pos().await;
@@ -1722,6 +1731,9 @@ async fn write_boundary_checkpoint<E>(
         eprintln!("[node {label}] FATAL: {diag_tag} journal prune: {e}");
         std::process::exit(1);
     }
+    // the checkpoint's oplog position — the caller's prune anchor when the
+    // NEXT (periodic) checkpoint supersedes this one.
+    pos
 }
 
 fn to_node_disposition(disposition: statesync::FrameDisposition) -> node::Disposition {
@@ -6467,6 +6479,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // from the module's own `<storage>/duckfs` dir).
         .with_duckfs_workspaces(storage.join("duckfs-workspaces"));
     let blobs = http_handle.blob_handle();
+    // the REAL portable-agent-run provisioner, built from a clone of the http
+    // handle BEFORE the serve/drop match consumes it. portable (v3) runs
+    // materialize a per-run duckfs checkout under a root VALIDATED to be
+    // outside <storage> (D7) and drive checkout/commit over this SAME
+    // NodeHandle actor lane the /v1/fs/workspaces RPC already rides here.
+    // LIVE for every agent run: this binary wires the files module
+    // unconditionally, so the runs composer emits v3 (the de-versioned
+    // activation — no flag day, pre-production re-genesis). a misconfigured
+    // root (inside <storage>) is a boot error, never a silent D7 hole.
+    let agent_provisioner: Option<dispatch_oracle::SharedProvisioner> =
+        Some(std::sync::Arc::new(noded::agent_provision::NodedProvisioner::new(
+            http_handle.clone(),
+            noded::agent_provision::agent_runs_root(&storage)
+                .unwrap_or_else(|e| panic!("agent runs root failed D7 validation: {e}")),
+        )));
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
     match http_listen.as_deref() {
@@ -6508,9 +6535,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
     let storage_for_sync = storage.clone();
-    // per-agent host state under the same storage root: persistent executor
-    // workspaces + session files (DUCKTAPE_AGENT_WORKSPACES / _SESSIONS
-    // override — see capability-host). host-local only, never consensus.
+    // per-agent host state, rooted OUTSIDE <storage> (D7 isolation floor): the
+    // persistent executor workspaces + session files must NOT be descendants of
+    // the key/consensus/blob tree, so a `..` from a run's cwd can't reach
+    // user.key/node keys/qmdb/blobstore. `DUCKTAPE_AGENT_WORKSPACES` / _SESSIONS
+    // override — see capability-host. host-local only, never consensus.
+    // non-portable (v2/persistent) agent workspaces stay under <storage>, exactly
+    // as today — relocating them would be a live (non-dormant) durability change.
+    // D7 relocation applies to the PORTABLE provisioner mount (agent_runs_root),
+    // which is out of <storage>; the pre-existing non-portable D7 gap is a
+    // separate, migration-aware hardening (tracked as a follow-up).
     let agent_dirs = capability_host::AgentDirs::under(&storage);
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
@@ -7296,6 +7330,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let mut replica_orchestrator: Option<
                 consensus::ValsetOrchestrator<ed25519::PublicKey>,
             > = None;
+            // the last checkpoint's (height, oplog position) — the prune
+            // anchor: the journal below it drops once the floor passes it.
+            let mut replica_prev_ckpt: (Option<u64>, u64) = (None, 0);
             // the app-hash of the last boundary the derived tier followed:
             // the index feed (heal + explorer row + ws event) fires only when
             // the verified app-hash MOVED. an unchanged hash is an idle
@@ -7387,6 +7424,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     &rec.participants,
                     &rec.residents,
                 ));
+                replica_prev_ckpt = (ckpt.height, ckpt.oplog_pos);
                 replica_epoch = rec.epoch;
                 replica_view_base = rec.view_base;
                 replica_watermark = Some(tip.saturating_sub(rec.view_base));
@@ -7538,6 +7576,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 resident_provider_set,
                 me_bytes.clone(),
                 blobs.clone(),
+                agent_provisioner.clone(),
             );
             let mut resident_dispatch =
                 resident_dispatch::ResidentDispatch::new(resident_pool, me_bytes.clone());
@@ -8253,13 +8292,33 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         match captured {
                             Ok(ckpt) => match node_r.sink_mut().write_manifest(&ckpt).await {
                                 Ok(()) => {
-                                    // MULE: capture-vs-live agreement probe.
-                                    eprintln!(
-                                        "[node {label}] MULE ckpt@{} capture_hash={} live_hash={}",
-                                        f.height,
-                                        hex(&ckpt.app_hash),
-                                        hex(&node_r.host().app_hash())
+                                    // prune the journal below the PREVIOUS
+                                    // checkpoint once the persisted floor
+                                    // passed it — the validator's exact
+                                    // prune discipline. without this a
+                                    // long-lived replica's journal grows
+                                    // without bound (pruned frames must
+                                    // never be needed to resolve a
+                                    // re-reported finalization; the floor
+                                    // gate guarantees it).
+                                    let floor_passed = matches!(
+                                        node_r.sink_mut().floor_cert(),
+                                        Ok(Some(fc))
+                                            if replica_prev_ckpt
+                                                .0
+                                                .is_none_or(|h| fc.height >= h)
                                     );
+                                    if floor_passed
+                                        && let Err(e) = node_r
+                                            .sink_mut()
+                                            .prune_oplog(replica_prev_ckpt.1)
+                                            .await
+                                    {
+                                        eprintln!(
+                                            "[node {label}] replica oplog prune failed: {e}"
+                                        );
+                                    }
+                                    replica_prev_ckpt = (ckpt.height, pos);
                                     blocks_since_checkpoint = 0;
                                 }
                                 Err(e) => eprintln!(
@@ -8480,7 +8539,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     let mut recovery = recovery_slot
                                         .take()
                                         .expect("the journal slot is filled whenever serving is None");
-                                    write_boundary_checkpoint(
+                                    let ckpt_pos = write_boundary_checkpoint(
                                         &mut recovery,
                                         &host,
                                         &m,
@@ -8489,6 +8548,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         "replica_checkpoint",
                                     )
                                     .await;
+                                    replica_prev_ckpt = (Some(m.height), ckpt_pos);
                                     // close the boundary -> live-tip gap
                                     // through the SAME journal a validator
                                     // restart would replay; every served
@@ -10191,6 +10251,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             providers,
             signer.public_key().as_ref().to_vec(),
             blobs.clone(),
+            agent_provisioner.clone(),
         );
         let workers: Vec<Box<dyn reactor::Worker>> = vec![oracle_worker];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains

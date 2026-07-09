@@ -13,30 +13,34 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 
-import * as agentClient from "../../domain/agent-client";
-import * as capabilityClient from "../../domain/capability-client";
-import * as chatClient from "../../domain/chat-client";
-import * as dispatchClient from "../../domain/dispatch-client";
-import * as filesClient from "../../domain/files-client";
-import type { FileEntry } from "../../domain/files-client";
-import * as forgeClient from "../../domain/forge-client";
-import * as governanceClient from "../../domain/governance-client";
-import type { ProposalView } from "../../domain/governance-client";
-import * as identityClient from "../../domain/identity-client";
-import * as pagesClient from "../../domain/pages-client";
-import type { PageBlock, PageMeta } from "../../domain/pages-client";
 import {
   isTauri,
   resolveNode,
 } from "../../domain/node-bootstrap";
-import * as profilesClient from "../../domain/profiles-client";
-import * as runsClient from "../../domain/runs-client";
-import * as valsetClient from "../../domain/valset-client";
+import type { PageMeta } from "../../domain/pages-client";
 import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
-import { hasFreshPending, pageSnapshotSuperseded } from "./finalization";
+import {
+  hasFreshPending,
+  pageSnapshotSuperseded,
+  receiptFloor,
+} from "./finalization";
+import {
+  changedModules,
+  fetchAgentsSlices,
+  fetchCapabilitySlices,
+  fetchChatSlices,
+  fetchFilesSlices,
+  fetchForgeSlices,
+  fetchGovernanceSlices,
+  fetchPagesSlices,
+  fetchPeopleSlices,
+  fetchRunsSlices,
+  fetchValsetSlices,
+  scopeFor,
+} from "./hydration";
 import {
   HUDDLE_CLOSED_EVENT,
   HUDDLE_CMD_EVENT,
@@ -92,6 +96,39 @@ export function DucktapeProvider({
     [],
   );
 
+  // Reconcile doc tabs against a live enumeration: a tab whose page no longer
+  // exists (deleted here or elsewhere) drops, and a now-dead active page falls
+  // back to the first surviving tab. CRITICAL: only called when the caller
+  // actually got an enumeration AND isn't holding the pages slices —
+  // `listPages` is best-effort, and evicting open tabs on a transient empty
+  // result would blank the editor mid-edit.
+  const reconcileDocTabs = useCallback((pages: PageMeta[]) => {
+    const prevTabs = stateRef.current.openTabs;
+    const prevActive = stateRef.current.activePage;
+    if (pages.length === 0) return { openTabs: prevTabs, activePage: prevActive };
+    const liveIds = new Set(pages.map((p) => p.id));
+    const openTabs = prevTabs.filter((id) => liveIds.has(id));
+    if (openTabs.length !== prevTabs.length) saveDocTabs(openTabs);
+    const activePage =
+      prevActive && liveIds.has(prevActive) ? prevActive : (openTabs[0] ?? null);
+    return { openTabs, activePage };
+  }, []);
+
+  // A pages snapshot that predates a page op must not be applied: it would
+  // clobber the op's preconfirmed projection — an optimistically inserted
+  // block unmounts (dropping the focused textarea with it) and just-committed
+  // text reverts until the op finalizes. The block stream's hasFreshPending
+  // gate covers stream refreshes; this covers the completion refresh of an
+  // EARLIER op that settles while a later one is still in flight, a snapshot
+  // raced by an op submitted mid-fetch, and a page we've navigated away from.
+  // Held slices converge on the last op's own refresh.
+  const shouldHoldPages = useCallback(
+    (fetchedPage: string | null, fetchStartedAt: number) =>
+      stateRef.current.activePage !== fetchedPage ||
+      pageSnapshotSuperseded(stateRef.current.ops, fetchStartedAt, Date.now()),
+    [],
+  );
+
   const refresh = useCallback(() => {
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
@@ -104,213 +141,180 @@ export function DucktapeProvider({
       .then(() =>
         Promise.all([
           live.status(),
-          chatClient.channels(live),
-          // valset only exists on the NETWORKED node (the local daemon has no
-          // validator set) — best-effort like governance below, so a local
-          // node reads as "no members" instead of never connecting.
-          valsetClient.validators(live).catch((): number[][] => []),
-          // the resident tier (staged admission) — same best-effort contract:
-          // a pre-resident node (protocol < 3) reads as "no residents".
-          valsetClient.residents(live).catch((): number[][] => []),
-          // governance is a first-class operator surface but best-effort in the
-          // snapshot: a node/build without it just reads as "no proposals"
-          // rather than failing the whole refresh.
-          governanceClient.proposals(live).catch((): ProposalView[] => []),
-          forgeClient.head(live),
-          // pages (the docs surface) is newer than some reachable nodes:
-          // best-effort, so a node without it reads as "no docs", never a
-          // failed refresh.
-          pagesClient.listPages(live).catch((): PageMeta[] => []),
-          fetchedPage
-            ? pagesClient
-                .getPage(live, fetchedPage)
-                .catch((): PageBlock[] | null => null)
-            : Promise.resolve<PageBlock[] | null>(null),
-          agentClient.agents(live),
-          // the executor registry — best-effort like governance/files above, so
-          // a node without the capability module reads as "no executors" (the
-          // "Runs on" picker degrades to a text field) rather than a failed
-          // refresh.
-          capabilityClient.capabilities(live).catch((): string[] => []),
-          // the same registry, kept per-node so a member row can show what it
-          // runs — best-effort like everything else in the snapshot.
-          capabilityClient
-            .capabilitiesByNode(live)
-            .catch((): Map<string, string[]> => new Map()),
-          runsClient.watches(live),
-          // newest-first for the timeline; the wire orders by dispatch id.
-          runsClient
-            .pendingRuns(live)
-            .then((list) => [...list].sort((a, b) => b.created_at - a.created_at)),
-          profilesClient.allProfiles(live, { from: 0, limit: 256 }),
-          // identity is newer than some reachable nodes (any pre-identity
-          // network, e.g. the web build's node) — best-effort like pages
-          // above, so the overlay just degrades to profiles' names instead
-          // of failing the whole refresh.
-          identityClient
-            .allAccounts(live, { from: 0, limit: 256 })
-            .catch((): identityClient.AccountView[] => []),
-          // files is best-effort so a node that does not register the module
-          // reads as "empty", never a failed refresh (same contract as
-          // governance above). Find under the tree root gives a flat file index
-          // for the command palette; the files browser pages the tree itself.
-          filesClient
-            .find(live, { prefix: "/" })
-            .then((page) => page.entries.filter((e) => e.kind === "file"))
-            .catch((): FileEntry[] => []),
+          fetchChatSlices(live, stateRef.current.activeChannel),
+          fetchValsetSlices(live),
+          fetchGovernanceSlices(live),
+          fetchForgeSlices(live),
+          fetchPagesSlices(live, fetchedPage),
+          fetchAgentsSlices(live),
+          fetchCapabilitySlices(live),
+          fetchRunsSlices(live),
+          fetchPeopleSlices(live),
+          fetchFilesSlices(live),
           // the explorer's ring pull — best-effort, so a node without
           // /v1/blocks reads as "no blocks yet".
           live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
         ]),
       )
-      .then(([
-        status,
-        channels,
-        validators,
-        residentKeys,
-        proposals,
-        forgeHead,
-        pages,
-        pageBlocks,
-        agents,
-        capabilities,
-        capabilitiesByNode,
-        watches,
-        pendingRuns,
-        profiles,
-        users,
-        files,
-        blocks,
-      ]) => {
-        // Profile.key is the origin bytes — the same bytes AuthorRef::User
-        // carries — so hex(key) is exactly authorName's AuthorNames key.
-        // identity's per-user display name OVERLAYS profiles for every node
-        // that user binds — bound-user identity wins over the node's own
-        // origin-set profile, since the node/user split makes the user the
-        // durable identity and the node just its hardware.
-        const authorNames: Record<string, string> = Object.fromEntries(
-          profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
-        );
-        // `userKey` in the store shape now holds the ACCOUNT id (the founding
-        // key) — the value that groups a person's keys/nodes. Every node the
-        // account owns points at it, carrying the shared display name.
-        const nodeUsers: Record<string, { userKey: string; name: string | null }> = {};
-        for (const u of users) {
-          const userKey = chatClient.keyHex(u.account_id);
-          for (const node of u.nodes) {
-            const nodeHex = chatClient.keyHex(node);
-            nodeUsers[nodeHex] = { userKey, name: u.display_name };
-            if (u.display_name) authorNames[nodeHex] = u.display_name;
-          }
-        }
-        // The account umbrella's collected keys, keyed by account id — Settings
-        // renders this to show every key that belongs to the account.
-        const accountKeys: Record<string, identityClient.MemberKeyView[]> = {};
-        for (const u of users) {
-          accountKeys[chatClient.keyHex(u.account_id)] = u.member_keys;
-        }
-        const members = validators.map(valsetClient.validatorHex);
-        const residents = residentKeys.map(valsetClient.validatorHex);
-        const current = stateRef.current.activeChannel;
-        // Default-channel selection skips module-reserved channels (forge's
-        // hidden `forge:<repo>:<n>` discussion threads) — the chat surface must
-        // never land on one by default. A deliberately-selected id survives
-        // as long as it exists, whatever its shape (future module deep-links).
-        const active =
-          current && channels.some((c) => c.id === current)
-            ? current
-            : (channels.find((c) => !chatClient.isModuleChannel(c.id))?.id ?? null);
-        // A pages snapshot that predates a page op must not be applied: it
-        // would clobber the op's preconfirmed projection — an optimistically
-        // inserted block unmounts (dropping the focused textarea with it) and
-        // just-committed text reverts until the op finalizes. The block
-        // stream's hasFreshPending gate covers stream refreshes; this covers
-        // the completion refresh of an EARLIER op that settles while a later
-        // one is still in flight, and a snapshot raced by an op submitted
-        // mid-fetch. A snapshot for a page we've since navigated away from is
-        // equally stale. Held slices converge on the last op's own refresh.
-        const holdPages =
-          stateRef.current.activePage !== fetchedPage ||
-          pageSnapshotSuperseded(stateRef.current.ops, fetchStartedAt, Date.now());
-        // reconcile doc tabs against the live enumeration: a tab whose page no
-        // longer exists (deleted here or elsewhere) drops, and a now-dead
-        // active page falls back to the first surviving tab. CRITICAL: only
-        // reconcile when we actually got an enumeration — `listPages` is
-        // best-effort (`.catch(() => [])`), and an empty result may be a
-        // transient failure (node busy, module absent). Evicting open tabs on
-        // that would blank the editor mid-edit, so an empty result is a no-op.
-        // A held (superseded) enumeration is equally untrustworthy for
-        // eviction, so it is a no-op too.
-        const prevTabs = stateRef.current.openTabs;
-        const prevActive = stateRef.current.activePage;
-        let openTabs = prevTabs;
-        let activePage = prevActive;
-        if (!holdPages && pages.length > 0) {
-          const liveIds = new Set(pages.map((p) => p.id));
-          openTabs = prevTabs.filter((id) => liveIds.has(id));
-          if (openTabs.length !== prevTabs.length) saveDocTabs(openTabs);
-          activePage =
-            prevActive && liveIds.has(prevActive) ? prevActive : (openTabs[0] ?? null);
-        }
-        return Promise.all([
-          active ? chatClient.latestMessages(live, active) : [],
-          // one dispatch read per in-flight run → its executor node. bounded by
-          // pendingRuns.length; each is best-effort so one miss never fails the
-          // refresh.
-          Promise.all(
-            pendingRuns.map((run) =>
-              dispatchClient
-                .dispatch(live, { dispatchId: run.dispatch_id })
-                .then(
-                  (view) =>
-                    [run.run_id, dispatchClient.assigneeHex(view)] as const,
-                )
-                .catch(() => [run.run_id, null] as const),
-            ),
-          ),
-        ]).then(([messages, assigneePairs]) => {
-          const runAssignee = new Map<string, string>();
-          for (const [runId, hex] of assigneePairs) if (hex) runAssignee.set(runId, hex);
+      .then(
+        ([
+          status,
+          chat,
+          valset,
+          governance,
+          forge,
+          pagesSlices,
+          agents,
+          capability,
+          runs,
+          people,
+          files,
+          blocks,
+        ]) => {
+          // read-your-writes floor (the follow-the-head handoff's bug B): a
+          // snapshot below a height this console holds a receipt for would
+          // un-render the confirmed write until a later refresh — skip; the
+          // next block's hydrate carries a taller status.
+          if (status.height < receiptFloor(stateRef.current.ops)) return;
+          const holdPages = shouldHoldPages(fetchedPage, fetchStartedAt);
+          const { openTabs, activePage } = holdPages
+            ? {
+                openTabs: stateRef.current.openTabs,
+                activePage: stateRef.current.activePage,
+              }
+            : reconcileDocTabs(pagesSlices.pages);
           return dispatch({
             type: "patch",
             patch: {
               ...applySnapshot({
                 connected: true,
                 status,
-                channels,
-                members,
-                residents,
-                proposals,
-                forgeHead,
-                activeChannel: active,
-                messages,
-                authorNames,
-                nodeUsers,
-                accountKeys,
-                pages: holdPages ? stateRef.current.pages : pages,
+                channels: chat.channels,
+                members: valset.members,
+                residents: valset.residents,
+                proposals: governance.proposals,
+                forgeHead: forge.forgeHead,
+                activeChannel: chat.activeChannel,
+                messages: chat.messages,
+                authorNames: people.authorNames,
+                nodeUsers: people.nodeUsers,
+                accountKeys: people.accountKeys,
+                pages: holdPages ? stateRef.current.pages : pagesSlices.pages,
                 activePageBlocks: holdPages
                   ? stateRef.current.activePageBlocks
-                  : (pageBlocks ?? []),
-                agents,
-                capabilities,
-                capabilitiesByNode,
-                watches,
-                pendingRuns,
-                runAssignee,
-                files,
+                  : (pagesSlices.pageBlocks ?? []),
+                agents: agents.agents,
+                capabilities: capability.capabilities,
+                capabilitiesByNode: capability.capabilitiesByNode,
+                watches: runs.watches,
+                pendingRuns: runs.pendingRuns,
+                runAssignee: runs.runAssignee,
+                files: files.files,
                 blocks,
               }),
               openTabs,
               activePage,
             },
           });
-        });
+        },
+      )
+      .catch((err) => {
+        dispatch({ type: "patch", patch: { connected: false } });
+        fail(err);
+      });
+  }, [fail, reconcileDocTabs, shouldHoldPages]);
+
+  // Scoped hydration for block events: ONE status read names the modules the
+  // block changed (their state roots ride status().modules[]), and only the
+  // slice groups that read those modules re-query — the wholesale refresh
+  // stays the boot / reconnect / never-hydrated path. The replica pipeline
+  // makes the diff exact: every node folds per block, so consecutive statuses
+  // differ by exactly what the block touched.
+  const refreshScoped = useCallback(() => {
+    const live = nodeRef.current;
+    if (!live) return Promise.resolve();
+    const fetchStartedAt = Date.now();
+    return Promise.resolve()
+      .then(() => live.status())
+      .then((status) => {
+        // read-your-writes floor, checked BEFORE fanning out: a lagging
+        // status buys nothing — the next block event retries.
+        if (status.height < receiptFloor(stateRef.current.ops)) return;
+        const prev = stateRef.current.status;
+        if (!prev) return refresh();
+        const scope = scopeFor(changedModules(prev, status));
+        const fetchedPage = stateRef.current.activePage;
+        return Promise.resolve()
+          .then(() =>
+            Promise.all([
+              scope.has("chat")
+                ? fetchChatSlices(live, stateRef.current.activeChannel)
+                : null,
+              scope.has("valset") ? fetchValsetSlices(live) : null,
+              scope.has("governance") ? fetchGovernanceSlices(live) : null,
+              scope.has("forge") ? fetchForgeSlices(live) : null,
+              scope.has("pages") ? fetchPagesSlices(live, fetchedPage) : null,
+              scope.has("agents") ? fetchAgentsSlices(live) : null,
+              scope.has("capability") ? fetchCapabilitySlices(live) : null,
+              scope.has("runs") ? fetchRunsSlices(live) : null,
+              scope.has("people") ? fetchPeopleSlices(live) : null,
+              scope.has("files") ? fetchFilesSlices(live) : null,
+              // the explorer ring follows every block regardless of scope.
+              live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
+            ]),
+          )
+          .then(
+            ([
+              chat,
+              valset,
+              governance,
+              forge,
+              pagesSlices,
+              agents,
+              capability,
+              runs,
+              people,
+              files,
+              blocks,
+            ]) => {
+              const holdPages =
+                !pagesSlices || shouldHoldPages(fetchedPage, fetchStartedAt);
+              const tabs =
+                !holdPages && pagesSlices
+                  ? reconcileDocTabs(pagesSlices.pages)
+                  : null;
+              return dispatch({
+                type: "patch",
+                patch: {
+                  connected: true,
+                  status,
+                  blocks,
+                  ...(chat ?? {}),
+                  ...(valset ?? {}),
+                  ...(governance ?? {}),
+                  ...(forge ?? {}),
+                  ...(agents ?? {}),
+                  ...(capability ?? {}),
+                  ...(runs ?? {}),
+                  ...(people ?? {}),
+                  ...(files ?? {}),
+                  ...(!holdPages && pagesSlices
+                    ? {
+                        pages: pagesSlices.pages,
+                        activePageBlocks: pagesSlices.pageBlocks ?? [],
+                      }
+                    : {}),
+                  ...(tabs ?? {}),
+                },
+              });
+            },
+          );
       })
       .catch((err) => {
         dispatch({ type: "patch", patch: { connected: false } });
         fail(err);
       });
-  }, [fail]);
+  }, [fail, refresh, reconcileDocTabs, shouldHoldPages]);
 
   const actions = useMemo(
     () =>
@@ -411,10 +415,10 @@ export function DucktapeProvider({
       // and the op's own completion refresh follows immediately anyway. Stale
       // pendings (a hung submit) stop gating so the stream can't be starved.
       if (hasFreshPending(stateRef.current.ops, Date.now())) return;
-      refresh();
+      refreshScoped();
     });
     return offBlock;
-  }, [node, refresh]);
+  }, [node, refresh, refreshScoped]);
 
   // 2b. Liveness heartbeat — the "no running node" detection AND recovery. The
   //     block stream can't do this alone: a node that silently goes away (crash,

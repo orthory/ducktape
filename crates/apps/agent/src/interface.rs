@@ -30,6 +30,14 @@ pub const DEFAULT_AGENT_TARGET: &str = "agent";
 /// bound on the follow-up fan-out a single delivery can cause.
 pub const MAX_ACTIONS_PER_RUN: usize = 8;
 
+/// hard cap on the SERIALIZED bytes of a response's actions — the byte peer of
+/// [`MAX_ACTIONS_PER_RUN`]'s count cap. action payloads (task ids, titles,
+/// statuses) are otherwise unbounded strings, and the delivering module embeds
+/// the validated response in a bounded job-finalize payload — so, like
+/// [`MAX_REPLY_BLOCKS_BYTES`], it must be able to prove the size BEFORE
+/// emitting.
+pub const MAX_ACTIONS_BYTES: usize = 8 * 1024;
+
 /// hard cap on a serialized [`AgentRecord`] — registry entries live in the
 /// root preimage and every snapshot, so registration is size-gated up front.
 pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
@@ -70,6 +78,93 @@ pub const KNOWN_ACTIONS: [&str; 3] = [
     ACTION_TASKS_UPDATE_STATUS,
 ];
 
+// ---- runtime identity ---------------------------------------------------------
+
+/// the D3 resource-capability grant an agent carries. every list is a
+/// canonical SORTED + DEDUPED set (the write path canonicalizes, the committed
+/// decoder rejects a non-ascending list) so two logically-equal grants hash
+/// identically. `secrets` are OPAQUE vault references (D6) — never a
+/// materialized value, never key material (D1). an empty `ResourceCaps` is the
+/// default and denies every request except a zero budget check.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceCaps {
+    /// forge repos this agent may READ.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forge_read: Vec<String>,
+    /// forge repos this agent may PUSH to (implies read).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forge_push: Vec<String>,
+    /// duckfs workspace-relative path prefixes this agent may READ (ro).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duckfs_read: Vec<String>,
+    /// duckfs workspace-relative path prefixes this agent may WRITE (rw).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duckfs_write: Vec<String>,
+    /// tool / mcp ids this agent may invoke.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// D6 vault references (scoped, opaque). refs only — the value is resolved
+    /// host-side and NEVER crosses consensus.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+    /// the D3 sub-agent spawn ceiling; 0 = none. consumption is the runtime's
+    /// concern; the record only states the ceiling.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub subagent_budget: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// whether a [`ResourceCaps`] is the empty default — used to keep the empty
+/// record's serialized JSON (and its `MAX_AGENT_RECORD_BYTES` size check)
+/// byte-lean, so a pre-v4-shaped record is unchanged on the wire.
+pub(crate) fn caps_is_default(c: &ResourceCaps) -> bool {
+    *c == ResourceCaps::default()
+}
+
+/// a C4 skill reference an agent's runs mount. this pins the REF, never the
+/// content: `source_prefix` is a duckfs read-only subtree and
+/// `source_snapshot` is its optional consensus pin — `Some` is a PINNED skill
+/// (immutable), `None` is a TRACKING skill (the phase-5 composer resolves the
+/// committed head at compose time). the list is ORDERED (later entries override
+/// earlier), so it is a `Vec`, not a set — order is significant to the hash.
+///
+/// deliberately a struct (not an enum): the phase-5 envelope composer reads
+/// `name` + `source_prefix` + `source_snapshot` straight through into a skill
+/// mount, so the same three fields live here.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SkillRef {
+    pub name: String,
+    pub source_prefix: String,
+    /// `Some` = pinned (immutable) snapshot id; `None` = tracking (resolved at
+    /// compose time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_snapshot: Option<String>,
+}
+
+/// a D3 capability request the runtime probes an [`AgentRecord`] with before
+/// applying an effect or opening a sink (the delivery path calls
+/// [`AgentRecord::permits`]). the record carries the grant; this is the ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapRequest<'a> {
+    /// read the named forge repo.
+    ForgeRead(&'a str),
+    /// push to the named forge repo.
+    ForgePush(&'a str),
+    /// write the named duckfs workspace-relative path.
+    DuckfsWrite(&'a str),
+    /// read the named duckfs workspace-relative path.
+    DuckfsRead(&'a str),
+    /// invoke the named tool / mcp.
+    Tool(&'a str),
+    /// resolve the named vault secret ref.
+    Secret(&'a str),
+    /// spawn a sub-agent (checked against the budget ceiling).
+    SpawnSubagent,
+}
+
 // ---- registry ----------------------------------------------------------------
 
 /// whether an agent may engage new runs. a paused agent never engages — but
@@ -105,6 +200,52 @@ pub struct AgentRecord {
     pub status: AgentStatus,
     pub created_at: u64,
     pub updated_at: u64,
+    /// W4 recipe content-address: empty (unset) or exactly [`PROMPT_HASH_LEN`]
+    /// bytes. the committed encoding always carries it (empty when unset).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recipe_hash: Vec<u8>,
+    /// D3 resource caps. the committed encoding always carries it (default-empty
+    /// when unset).
+    #[serde(default, skip_serializing_if = "caps_is_default")]
+    pub caps: ResourceCaps,
+    /// C4 ordered skill refs. the committed encoding always carries it (empty
+    /// when unset).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillRef>,
+}
+
+impl AgentRecord {
+    /// D2 two-level attribution: an agent's effect is charged to
+    /// `(owner, agent_id)`. keyless (D1): this returns coordinates, never a key
+    /// — no key material exists on the record to return.
+    pub fn attribution(&self) -> (&SagaOrigin, &str) {
+        (&self.owner, &self.agent_id)
+    }
+
+    /// the pure D3 cap gate. the runtime calls this before applying an effect
+    /// or opening a sink; a record with empty caps denies every request except a
+    /// positive budget check. forge/tool/
+    /// secret use exact membership; duckfs uses path-PREFIX containment (a
+    /// prefix grants itself and any child path, but never a sibling that merely
+    /// shares a textual prefix — `src` does not grant `srcx`). budget
+    /// CONSUMPTION is the runtime's concern; this only reads the ceiling.
+    pub fn permits(&self, req: &CapRequest) -> bool {
+        let c = &self.caps;
+        let has = |v: &[String], x: &str| v.iter().any(|s| s == x);
+        let under = |v: &[String], p: &str| {
+            v.iter()
+                .any(|pre| p == pre || p.starts_with(&format!("{pre}/")))
+        };
+        match req {
+            CapRequest::ForgeRead(r) => has(&c.forge_read, r) || has(&c.forge_push, r),
+            CapRequest::ForgePush(r) => has(&c.forge_push, r),
+            CapRequest::DuckfsWrite(p) => under(&c.duckfs_write, p),
+            CapRequest::DuckfsRead(p) => under(&c.duckfs_read, p) || under(&c.duckfs_write, p),
+            CapRequest::Tool(t) => has(&c.tools, t),
+            CapRequest::Secret(s) => has(&c.secrets, s),
+            CapRequest::SpawnSubagent => c.subagent_budget > 0,
+        }
+    }
 }
 
 // ---- the response wire spec ----------------------------------------------------
@@ -176,6 +317,14 @@ pub enum AgentMsg {
         capability: String,
         prompt_hash: Vec<u8>,
         allowed_actions: Vec<String>,
+        /// runtime-identity fields. `default` so a submitter's JSON that omits
+        /// them still decodes; the module accepts them unconditionally.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recipe_hash: Option<Vec<u8>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caps: Option<ResourceCaps>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skills: Option<Vec<SkillRef>>,
     },
     /// owner-gated partial update; `None` fields keep their current value. a
     /// capability change also notifies the hook target
@@ -186,6 +335,13 @@ pub enum AgentMsg {
         capability: Option<String>,
         prompt_hash: Option<Vec<u8>>,
         allowed_actions: Option<Vec<String>>,
+        /// runtime-identity fields; `None` keeps the current value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recipe_hash: Option<Vec<u8>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caps: Option<ResourceCaps>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skills: Option<Vec<SkillRef>>,
     },
     /// owner-gated: stop the agent from engaging new runs.
     PauseAgent { agent_id: String },
@@ -220,6 +376,12 @@ pub enum AgentQuery {
     Agent { agent_id: String },
 }
 
+// the runtime-identity tail grew `AgentRecord` past clippy's 200-byte
+// `large_enum_variant` threshold. this is a query REPLY, built rarely and moved
+// once through a channel, not a hot per-op allocation — boxing the variant
+// would ripple a wire/type change through every reader for no real benefit, so
+// the size asymmetry is accepted (mirrors the saga/reachability reply enums).
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentReply {

@@ -59,7 +59,7 @@ impl ScriptProvider {
                  # a test executor: drain the payload, log the invocation,\n\
                  # answer in the spec's output format.\n\
                  cat > /dev/null\n\
-                 echo ran >> {log}\n\
+                 echo \"ran $(date +%s.%N)\" >> {log}\n\
                  printf '%s\\n' '{stdout}'\n",
                 log = exec_log.display(),
             ),
@@ -237,6 +237,32 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
         matches!(chat::decode_reply(&raw).ok()?, ChatReply::Channel(Some(_))).then_some(())
     });
 
+    // arm the agent the way the app does: the prompt blob uploads FIRST —
+    // the run envelope carries its pin and the host REFUSES to run an agent
+    // whose registered prompt it cannot resolve (never a silent fallback to
+    // the generic instructions) — then RegisterAgent commits the digest.
+    // the blob lane takes the raw request body; the harness helper is
+    // json-bodied, so the blob is the JSON-encoded string — opaque bytes as
+    // far as this test cares (the provider script's answer is fixed).
+    //
+    // uploaded to BOTH nodes because blob bytes are NODE-LOCAL: the pin
+    // replicates through consensus, the bytes do not (yet — the tracked
+    // remote-executor replication gap), and the RESIDENT is the executor
+    // here. this mirrors what a resident operator's own app does today; a
+    // fetch-on-miss lane makes the second upload obsolete.
+    let prompt = serde_json::json!("You are quacker, a resident e2e test agent.");
+    let mut digests = Vec::new();
+    for port in [cluster.http_ports[0], cluster.http_ports[1]] {
+        let (blob_code, blob_reply) =
+            common::http_request(port, "POST", "/v1/files/blob", Some(&prompt));
+        assert_eq!(blob_code, 200, "prompt blob upload failed: {blob_reply}");
+        digests.push(common::unhex(
+            blob_reply["digest"].as_str().expect("blob reply carries a digest"),
+        ));
+    }
+    assert_eq!(digests[0], digests[1], "content addressing agrees across nodes");
+    let prompt_hash = digests.remove(0);
+    assert_eq!(prompt_hash.len(), 32, "sha256 digest bytes");
     cluster.submit(
         0,
         "agent",
@@ -244,8 +270,11 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
             agent_id: "quacker".into(),
             display_name: "quacker".into(),
             capability: provider.tag.clone(),
-            prompt_hash: vec![7u8; 32],
+            prompt_hash,
             allowed_actions: vec![ACTION_CHAT_POST.into()],
+            recipe_hash: None,
+            caps: None,
+            skills: None,
         }),
     );
     cluster.submit(

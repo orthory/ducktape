@@ -16,6 +16,10 @@ tagging = { workspace = true }
 dispatch = { workspace = true }
 tasks = { workspace = true }
 jobs = { workspace = true }
+# the duckfs wire types (FilesQuery::Refs / FilesReply::Refs / RefsInfo) the v3
+# composer queries for the committed head it pins as source_snapshot (W2).
+# duckfs-core is pure wire (no std::fs), matching runs' other wire-type deps.
+duckfs-core = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,3 +29,8 @@ async-trait = { workspace = true }
 futures = "0.3"
 host = { workspace = true }
 commonware-runtime = { workspace = true }
+# forge is a DEV dependency ONLY — the sink emits a local Serialize mirror of
+# ForgeMsg::OpenPr (production), and a conformance test pins that mirror against
+# forge::decode_msg. keeping forge dev-only keeps vendored libgit2/git2 out of
+# runs' production build + clippy graph.
+forge = { workspace = true }
