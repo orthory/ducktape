@@ -859,6 +859,109 @@ struct Capture {
     index_blobs: Option<BTreeMap<String, Vec<u8>>>,
 }
 
+/// a capture produced by the state owner, ready to install into a
+/// [`SyncServer`] — the request/reply payload that lets serving run on a
+/// different task than the host. opaque: only [`capture_boundary`] builds one
+/// and only [`SyncServer::install_capture`] consumes it.
+#[derive(Debug, Clone)]
+pub struct CaptureData {
+    app_hash: StateRoot,
+    coords: BoundaryCoords,
+    modules: BTreeMap<ModuleId, CapturedModule>,
+}
+
+/// capture the host's state at `finalized` — the STATE-OWNER half of serving:
+/// the one call that must run on the task that owns the [`Host`]. the returned
+/// [`CaptureData`] crosses to the serve task and installs via
+/// [`SyncServer::install_capture`].
+pub async fn capture_boundary(
+    host: &Host,
+    finalized: FinalizedBlock,
+    coords: &BoundaryCoords,
+) -> Result<(BoundaryId, CaptureData), String> {
+    let snapshot = host
+        .capture_finalized_snapshot(finalized)
+        .map_err(|e| format!("capture failed: {e}"))?;
+    let id = BoundaryId {
+        height: finalized.height,
+        app_hash: snapshot.app_hash,
+    };
+    let mut modules = BTreeMap::new();
+    for m in snapshot.modules {
+        let payload = match m.state_sync {
+            StateSyncHandle::Stateless => CapturedPayload::Stateless,
+            StateSyncHandle::SnapshotBytes(bytes) => CapturedPayload::Snapshot(bytes),
+            // an object-store resolver has no qmdb op-range target to pin: its
+            // refs image + content-addressed objects are served live over
+            // `serve_sync`, root-verified by the joiner against the boundary
+            // root already recorded in the entry. keep the qmdb arm below
+            // UNCHANGED.
+            StateSyncHandle::ResolverBacked { backend, .. } if backend == "duckfs-odb" => {
+                CapturedPayload::ObjectResolver
+            }
+            StateSyncHandle::ResolverBacked { .. } => {
+                let target = host
+                    .resolver_sync_target(&m.id)
+                    .await
+                    .map_err(|e| format!("module {} sync target: {e}", m.id))?;
+                if target.root != m.root {
+                    return Err(format!(
+                        "module {} resolver target root does not match boundary root",
+                        m.id
+                    ));
+                }
+                CapturedPayload::Resolver(ResolverTarget {
+                    root: commonware_cryptography::sha256::Digest(target.root.0),
+                    start: target.start,
+                    op_count: target.op_count,
+                })
+            }
+            StateSyncHandle::Unsupported { .. } => CapturedPayload::Unsupported,
+        };
+        modules.insert(
+            m.id,
+            CapturedModule {
+                root: m.root,
+                payload,
+            },
+        );
+    }
+    Ok((
+        id,
+        CaptureData {
+            app_hash: snapshot.app_hash,
+            coords: coords.clone(),
+            modules,
+        },
+    ))
+}
+
+/// what a [`SyncServer::serve`] step needs from its driver: either the answer
+/// itself, or one of the STATE TOUCHES only the host-owning task can make —
+/// the request/reply seam that keeps serving off the consensus loop.
+#[derive(Debug)]
+pub enum ServeStep {
+    /// the request resolved from served state alone.
+    Reply(SyncResponse),
+    /// Manifest: obtain the current finalized boundary from the state owner
+    /// ([`capture_boundary`] there unless this server already holds the id —
+    /// see [`SyncServer::has_boundary`]), install/refresh it, then finish with
+    /// [`SyncServer::manifest_for`].
+    NeedBoundary,
+    /// Module lane, checks passed: route `body` to the live host's
+    /// `serve_sync` and wrap the bytes in [`SyncResponse::Module`].
+    NeedModuleServe { module_id: ModuleId, body: Vec<u8> },
+    /// Frames lane: read the recovery journal on the state owner.
+    NeedFrames {
+        after_height: u64,
+        up_to_height: u64,
+    },
+    /// IndexModules on a leased-but-unattached boundary: cut the shipped-index
+    /// blobs (or decline with an empty attach), [`SyncServer::attach_index`],
+    /// then re-drive the request.
+    NeedIndexCut { boundary: BoundaryId },
+}
+
 /// the server side of the protocol: capture consistent boundary views on
 /// demand, cache a few, and answer manifest/chunk requests from them; route
 /// module-lane requests to the live host. hold one per node; drive it from the
@@ -880,6 +983,207 @@ impl SyncServer {
         self.touch_lease(id);
         self.release_leased_overflow();
         self.evict_unleased_overflow();
+    }
+
+    /// whether a capture for `id` is already installed — lets the serve
+    /// task's boundary request tell the state owner what it holds, so a
+    /// known boundary round-trips coordinates only, never payload bytes.
+    pub fn has_boundary(&self, id: BoundaryId) -> bool {
+        self.captures.contains_key(&id)
+    }
+
+    /// every installed capture's id — the `known` list a boundary request
+    /// carries (bounded by [`MAX_CAPTURES`]).
+    pub fn known_boundaries(&self) -> Vec<BoundaryId> {
+        self.captures.keys().copied().collect()
+    }
+
+    /// install a state-owner-produced capture (evicting past the cache cap),
+    /// or — when `id` is already held — refresh its consensus coordinates:
+    /// an epoch cutover at a stalled boundary (a 1->2 admission is the
+    /// canonical case) changes the coordinates without changing
+    /// (height, app_hash), and a capture taken just before the cutover would
+    /// otherwise serve its stale epoch/participants forever.
+    pub fn install_capture(&mut self, id: BoundaryId, data: CaptureData) {
+        match self.captures.get_mut(&id) {
+            Some(capture) => {
+                if capture.coords != data.coords {
+                    capture.coords = data.coords;
+                }
+            }
+            None => {
+                self.captures.insert(
+                    id,
+                    Capture {
+                        app_hash: data.app_hash,
+                        coords: data.coords,
+                        modules: data.modules,
+                        index_blobs: None,
+                    },
+                );
+                self.evict_unleased_overflow();
+            }
+        }
+    }
+
+    /// refresh a held capture's consensus coordinates without new payload —
+    /// the known-boundary half of [`SyncServer::install_capture`].
+    pub fn refresh_coords(&mut self, id: BoundaryId, coords: BoundaryCoords) {
+        if let Some(capture) = self.captures.get_mut(&id)
+            && capture.coords != coords
+        {
+            capture.coords = coords;
+        }
+    }
+
+    /// lease `id` and build its manifest — the serve-side finish of a
+    /// Manifest request, after the boundary round-trip installed/refreshed
+    /// the capture.
+    pub fn manifest_for(&mut self, id: BoundaryId) -> Result<SyncResponse, String> {
+        self.lease(id);
+        let capture = self
+            .captures
+            .get(&id)
+            .ok_or_else(|| format!("no capture at boundary {} (refetch manifest)", id.height))?;
+        let required_min_version = sdk::required_min_version(
+            capture.coords.current_version,
+            capture.coords.pending_upgrade.as_ref(),
+            id.height,
+        );
+        Ok(SyncResponse::Manifest(Manifest {
+            height: id.height,
+            app_hash: capture.app_hash,
+            epoch: capture.coords.epoch,
+            view_base: capture.coords.view_base,
+            participants: capture.coords.participants.clone(),
+            residents: capture.coords.residents.clone(),
+            floor_cert: capture.coords.floor_cert.clone(),
+            current_version: capture.coords.current_version,
+            pending_upgrade: capture.coords.pending_upgrade.clone(),
+            required_min_version,
+            entries: capture
+                .modules
+                .iter()
+                .map(|(id, m)| ManifestEntry {
+                    module_id: id.clone(),
+                    root: m.root,
+                    kind: m.payload.kind(),
+                    resolver_target: match &m.payload {
+                        CapturedPayload::Resolver(target) => Some(target.clone()),
+                        _ => None,
+                    },
+                })
+                .collect(),
+        }))
+    }
+
+    /// one PURE serve step: answer what served state can, and name the state
+    /// touch the driver must make otherwise (see [`ServeStep`]). this is the
+    /// whole protocol minus the host — a serve task drives it off the
+    /// consensus loop, round-tripping the named touches to the state owner.
+    pub fn serve(&mut self, req: SyncRequest) -> ServeStep {
+        let step = self.try_serve(req);
+        match step {
+            Ok(step) => step,
+            Err(msg) => ServeStep::Reply(SyncResponse::Error(msg)),
+        }
+    }
+
+    fn try_serve(&mut self, req: SyncRequest) -> Result<ServeStep, String> {
+        Ok(match req {
+            SyncRequest::Manifest => ServeStep::NeedBoundary,
+            SyncRequest::Frames {
+                after_height,
+                up_to_height,
+            } => ServeStep::NeedFrames {
+                after_height,
+                up_to_height,
+            },
+            SyncRequest::Chunk {
+                boundary,
+                module_id,
+                offset,
+            } => {
+                let capture = self.leased_capture(boundary)?;
+                let module = capture.modules.get(&module_id).ok_or_else(|| {
+                    format!("no module {module_id} in capture {}", boundary.height)
+                })?;
+                let CapturedPayload::Snapshot(bytes) = &module.payload else {
+                    return Err(format!("module {module_id} has no snapshot payload"));
+                };
+                let total = bytes.len() as u64;
+                if offset > total {
+                    return Err(format!(
+                        "offset {offset} past the {total}-byte snapshot of {module_id}"
+                    ));
+                }
+                let start = offset as usize;
+                let end = (start + CHUNK_LEN).min(bytes.len());
+                ServeStep::Reply(SyncResponse::Chunk {
+                    total,
+                    bytes: bytes[start..end].to_vec(),
+                })
+            }
+            SyncRequest::Module {
+                boundary,
+                module_id,
+                body,
+            } => {
+                let capture = self.leased_capture(boundary)?;
+                let module = capture.modules.get(&module_id).ok_or_else(|| {
+                    format!("no module {module_id} in capture {}", boundary.height)
+                })?;
+                // both resolver flavors serve their bytes live through the
+                // module's `serve_sync` (qmdb op ranges, or duckfs refs/objects).
+                if !matches!(
+                    module.payload,
+                    CapturedPayload::Resolver(_) | CapturedPayload::ObjectResolver
+                ) {
+                    return Err(format!("module {module_id} has no resolver payload"));
+                }
+                ServeStep::NeedModuleServe { module_id, body }
+            }
+            SyncRequest::IndexModules { boundary } => {
+                let capture = self.leased_capture(boundary)?;
+                let Some(blobs) = &capture.index_blobs else {
+                    // unattached: the driver cuts + attaches (or declines with
+                    // an empty attach) and re-drives.
+                    return Ok(ServeStep::NeedIndexCut { boundary });
+                };
+                ServeStep::Reply(SyncResponse::IndexModules {
+                    entries: blobs
+                        .iter()
+                        .map(|(db, blob)| (db.clone(), blob.len() as u64))
+                        .collect(),
+                })
+            }
+            SyncRequest::IndexChunk {
+                boundary,
+                db,
+                offset,
+            } => {
+                let capture = self.leased_capture(boundary)?;
+                let blob = capture
+                    .index_blobs
+                    .as_ref()
+                    .and_then(|blobs| blobs.get(&db))
+                    .ok_or_else(|| {
+                        format!("no shipped index db {db} in capture {}", boundary.height)
+                    })?;
+                let total = blob.len() as u64;
+                if offset > total {
+                    return Err(format!(
+                        "offset {offset} past the {total}-byte index archive of {db}"
+                    ));
+                }
+                let start = offset as usize;
+                let end = (start + CHUNK_LEN).min(blob.len());
+                ServeStep::Reply(SyncResponse::Chunk {
+                    total,
+                    bytes: blob[start..end].to_vec(),
+                })
+            }
+        })
     }
 
     pub fn release(&mut self, id: BoundaryId) {
@@ -1024,6 +1328,10 @@ impl SyncServer {
         encode_response(&resp)
     }
 
+    /// the composed one-owner path: drive [`SyncServer::serve`] and make every
+    /// state touch inline against `host`. callers that split ownership (the
+    /// node's off-loop serve task) drive `serve()` themselves and round-trip
+    /// the touches to the state owner instead.
     async fn try_handle(
         &mut self,
         host: &Host,
@@ -1031,138 +1339,28 @@ impl SyncServer {
         coords: &BoundaryCoords,
         req: SyncRequest,
     ) -> Result<SyncResponse, String> {
-        match req {
-            SyncRequest::Manifest => {
+        match self.serve(req) {
+            ServeStep::Reply(resp) => Ok(resp),
+            ServeStep::NeedBoundary => {
                 let finalized = finalized.ok_or("no finalized boundary to serve yet")?;
-                let id = self.ensure_capture(host, finalized, coords).await?;
-                self.lease(id);
-                let capture = self
-                    .captures
-                    .get(&id)
-                    .expect("ensure_capture inserted this boundary");
-                let required_min_version = sdk::required_min_version(
-                    capture.coords.current_version,
-                    capture.coords.pending_upgrade.as_ref(),
-                    id.height,
-                );
-                Ok(SyncResponse::Manifest(Manifest {
-                    height: id.height,
-                    app_hash: capture.app_hash,
-                    epoch: capture.coords.epoch,
-                    view_base: capture.coords.view_base,
-                    participants: capture.coords.participants.clone(),
-                    residents: capture.coords.residents.clone(),
-                    floor_cert: capture.coords.floor_cert.clone(),
-                    current_version: capture.coords.current_version,
-                    pending_upgrade: capture.coords.pending_upgrade.clone(),
-                    required_min_version,
-                    entries: capture
-                        .modules
-                        .iter()
-                        .map(|(id, m)| ManifestEntry {
-                            module_id: id.clone(),
-                            root: m.root,
-                            kind: m.payload.kind(),
-                            resolver_target: match &m.payload {
-                                CapturedPayload::Resolver(target) => Some(target.clone()),
-                                _ => None,
-                            },
-                        })
-                        .collect(),
-                }))
+                let (id, data) = capture_boundary(host, finalized, coords).await?;
+                self.install_capture(id, data);
+                self.manifest_for(id)
             }
-            SyncRequest::Chunk {
-                boundary,
-                module_id,
-                offset,
-            } => {
-                let capture = self.leased_capture(boundary)?;
-                let module = capture.modules.get(&module_id).ok_or_else(|| {
-                    format!("no module {module_id} in capture {}", boundary.height)
-                })?;
-                let CapturedPayload::Snapshot(bytes) = &module.payload else {
-                    return Err(format!("module {module_id} has no snapshot payload"));
-                };
-                let total = bytes.len() as u64;
-                if offset > total {
-                    return Err(format!(
-                        "offset {offset} past the {total}-byte snapshot of {module_id}"
-                    ));
-                }
-                let start = offset as usize;
-                let end = (start + CHUNK_LEN).min(bytes.len());
-                Ok(SyncResponse::Chunk {
-                    total,
-                    bytes: bytes[start..end].to_vec(),
-                })
-            }
-            SyncRequest::Module {
-                boundary,
-                module_id,
-                body,
-            } => {
-                let capture = self.leased_capture(boundary)?;
-                let module = capture.modules.get(&module_id).ok_or_else(|| {
-                    format!("no module {module_id} in capture {}", boundary.height)
-                })?;
-                // both resolver flavors serve their bytes live through the
-                // module's `serve_sync` (qmdb op ranges, or duckfs refs/objects).
-                if !matches!(
-                    module.payload,
-                    CapturedPayload::Resolver(_) | CapturedPayload::ObjectResolver
-                ) {
-                    return Err(format!("module {module_id} has no resolver payload"));
-                }
-                host.serve_sync(&module_id, &body)
-                    .await
-                    .map(SyncResponse::Module)
-                    .map_err(|e| format!("module {module_id} serve_sync: {e}"))
-            }
-            SyncRequest::Frames { .. } => {
+            ServeStep::NeedModuleServe { module_id, body } => host
+                .serve_sync(&module_id, &body)
+                .await
+                .map(SyncResponse::Module)
+                .map_err(|e| format!("module {module_id} serve_sync: {e}")),
+            ServeStep::NeedFrames { .. } => {
                 Err("frame range requests require the recovery journal".into())
             }
-            SyncRequest::IndexModules { boundary } => {
-                let capture = self.leased_capture(boundary)?;
-                let Some(blobs) = &capture.index_blobs else {
-                    // the caller intercepts this request to cut + attach
-                    // first; reaching here unattached means it chose not to
-                    // (no index store, or shipping refused) — an EMPTY list,
-                    // not an error, so the joiner cleanly falls back.
-                    return Ok(SyncResponse::IndexModules {
-                        entries: Vec::new(),
-                    });
-                };
+            ServeStep::NeedIndexCut { .. } => {
+                // this owner attaches nothing (no index store here) — an EMPTY
+                // list, not an error, so the joiner cleanly falls back to the
+                // from-state rebuild.
                 Ok(SyncResponse::IndexModules {
-                    entries: blobs
-                        .iter()
-                        .map(|(db, blob)| (db.clone(), blob.len() as u64))
-                        .collect(),
-                })
-            }
-            SyncRequest::IndexChunk {
-                boundary,
-                db,
-                offset,
-            } => {
-                let capture = self.leased_capture(boundary)?;
-                let blob = capture
-                    .index_blobs
-                    .as_ref()
-                    .and_then(|blobs| blobs.get(&db))
-                    .ok_or_else(|| {
-                        format!("no shipped index db {db} in capture {}", boundary.height)
-                    })?;
-                let total = blob.len() as u64;
-                if offset > total {
-                    return Err(format!(
-                        "offset {offset} past the {total}-byte index archive of {db}"
-                    ));
-                }
-                let start = offset as usize;
-                let end = (start + CHUNK_LEN).min(blob.len());
-                Ok(SyncResponse::Chunk {
-                    total,
-                    bytes: blob[start..end].to_vec(),
+                    entries: Vec::new(),
                 })
             }
         }
@@ -1184,88 +1382,6 @@ impl SyncServer {
                 hex_root(&boundary.app_hash)
             )
         })
-    }
-
-    /// capture the registry at `finalized` if not already cached; evict the
-    /// oldest capture past [`MAX_CAPTURES`].
-    async fn ensure_capture(
-        &mut self,
-        host: &Host,
-        finalized: FinalizedBlock,
-        coords: &BoundaryCoords,
-    ) -> Result<BoundaryId, String> {
-        let snapshot = host
-            .capture_finalized_snapshot(finalized)
-            .map_err(|e| format!("capture failed: {e}"))?;
-        let id = BoundaryId {
-            height: finalized.height,
-            app_hash: snapshot.app_hash,
-        };
-        if let Some(capture) = self.captures.get_mut(&id) {
-            // same boundary STATE, possibly new consensus ADDRESS: an epoch
-            // cutover at a stalled boundary (a 1->2 admission is the canonical
-            // case — epoch 1 cannot finalize until the joiner arrives) changes
-            // the coordinates without changing (height, app_hash). a capture
-            // taken just before the cutover would otherwise serve its stale
-            // epoch/participants forever, and the parked joiner it describes
-            // would never learn it was admitted. the payload bytes are
-            // identical either way; only the coordinates are refreshed.
-            if &capture.coords != coords {
-                capture.coords = coords.clone();
-            }
-            return Ok(id);
-        }
-
-        let mut modules = BTreeMap::new();
-        for m in snapshot.modules {
-            let payload = match m.state_sync {
-                StateSyncHandle::Stateless => CapturedPayload::Stateless,
-                StateSyncHandle::SnapshotBytes(bytes) => CapturedPayload::Snapshot(bytes),
-                // an object-store resolver has no qmdb op-range target to pin: its
-                // refs image + content-addressed objects are served live over
-                // `serve_sync`, root-verified by the joiner against the boundary
-                // root already recorded in the entry. keep the qmdb arm below
-                // UNCHANGED.
-                StateSyncHandle::ResolverBacked { backend, .. } if backend == "duckfs-odb" => {
-                    CapturedPayload::ObjectResolver
-                }
-                StateSyncHandle::ResolverBacked { .. } => {
-                    let target = host
-                        .resolver_sync_target(&m.id)
-                        .await
-                        .map_err(|e| format!("module {} sync target: {e}", m.id))?;
-                    if target.root != m.root {
-                        return Err(format!(
-                            "module {} resolver target root does not match boundary root",
-                            m.id
-                        ));
-                    }
-                    CapturedPayload::Resolver(ResolverTarget {
-                        root: commonware_cryptography::sha256::Digest(target.root.0),
-                        start: target.start,
-                        op_count: target.op_count,
-                    })
-                }
-                StateSyncHandle::Unsupported { .. } => CapturedPayload::Unsupported,
-            };
-            modules.insert(
-                m.id,
-                CapturedModule {
-                    root: m.root,
-                    payload,
-                },
-            );
-        }
-        self.captures.insert(
-            id,
-            Capture {
-                app_hash: snapshot.app_hash,
-                coords: coords.clone(),
-                modules,
-                index_blobs: None,
-            },
-        );
-        Ok(id)
     }
 
     fn touch_lease(&mut self, id: BoundaryId) {

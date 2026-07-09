@@ -31,8 +31,9 @@ pub const SCHEME_ED25519: &str = "ed25519";
 
 /// the invite blob prefix. UNVERSIONED on purpose (bootstrapping posture): the
 /// network re-mints invites on a format change, and a stale paste fails loudly
-/// at decode — the old `ducktape-invite-v*:` prefixes no longer decode at all.
-const INVITE_PREFIX: &str = "ducktape:";
+/// at decode — the old `ducktape:` / `ducktape-invite-v*:` prefixes no longer
+/// decode at all.
+const INVITE_PREFIX: &str = "🦆";
 
 // ============================================================================
 // hex — dependency-free codecs for keys, roots, and the invite blob.
@@ -362,7 +363,14 @@ impl NetworkDescriptor {
             // hint, or a founder that advertises a public address AND enables a
             // coordinator would ship coordinator-only reach and lose its direct
             // fallback (terminal once a punch fails, since there is no relay).
-            if matches!(hint.reach, Reach::Direct(_) | Reach::Fronted(_)) {
+            // an overlay-ULA Direct (this chain's tunnel /48) is likewise an
+            // ADDITIONAL route: it is only dialable once the reachability
+            // plane's tunnels apply, so letting it evict the underlay hint
+            // strands the member behind a plane that has not assembled yet
+            // (first join, promotion reboot, same-host tests).
+            if matches!(hint.reach, Reach::Direct(_) | Reach::Fronted(_))
+                && !self.overlay_route(&hint)?
+            {
                 typed_keys.insert(hint.expected_key.as_ref().to_vec());
             }
             typed.push(hint);
@@ -371,6 +379,25 @@ impl NetworkDescriptor {
         let mut out: Vec<_> = bootstrap_by_key.into_values().chain(typed).collect();
         out.sort_by_key(|h| h.to_canonical());
         Ok(out)
+    }
+
+    /// whether a hint's address lives inside this chain's overlay ULA /48 —
+    /// the tunnel-plane addresses [`wireguard_upgrade::ula_v6_member_addr`]
+    /// derives. such a route needs applied tunnels to be dialable, so it is
+    /// classified as an overlay route, never an underlay replacement.
+    fn overlay_route(&self, hint: &ReachHint) -> Result<bool, String> {
+        let addr = match &hint.reach {
+            Reach::Direct(a) | Reach::Fronted(a) => a,
+            Reach::Coordinated(_) => return Ok(false),
+        };
+        let Some(Ingress::Socket(sock)) = ingress_of(addr)? else {
+            return Ok(false); // hostnames and advisory noise are underlay-class.
+        };
+        let std::net::IpAddr::V6(v6) = sock.ip() else {
+            return Ok(false);
+        };
+        let prefix = wireguard_upgrade::ula_v6_prefix(&self.genesis_namespace()).octets();
+        Ok(v6.octets()[..6] == prefix[..6])
     }
 
     /// record a reach hint for a member, replacing any previous hint for the
@@ -406,6 +433,14 @@ impl NetworkDescriptor {
     /// dialable ingress (unspecified ip / port 0 / malformed host) is skipped.
     pub fn reach_entries(&self) -> Result<Vec<(ed25519::PublicKey, ReachDial)>, String> {
         let mut out = Vec::new();
+        // one DIRECT ingress per key, underlay preferred: discovery keeps one
+        // dial address per peer, and an overlay ULA only answers once the
+        // reachability plane's tunnels apply — so when a key carries both an
+        // underlay route and its overlay route, the mesh dialer gets the
+        // underlay and the plane owns the tunnel path. a key whose ONLY route
+        // is the overlay (a fully-NATed member) still dials it, as before.
+        let mut direct_at: std::collections::BTreeMap<Vec<u8>, (usize, bool)> =
+            std::collections::BTreeMap::new();
         for hint in self.reach_hints()? {
             let dial = match &hint.reach {
                 Reach::Direct(a) | Reach::Fronted(a) => match ingress_of(a)? {
@@ -417,6 +452,24 @@ impl NetworkDescriptor {
                     None => continue,
                 },
             };
+            if matches!(dial, ReachDial::Direct(_)) {
+                let key = hint.expected_key.as_ref().to_vec();
+                let overlay = self.overlay_route(&hint)?;
+                match direct_at.get(&key) {
+                    None => {
+                        direct_at.insert(key, (out.len(), overlay));
+                    }
+                    Some(&(at, held_overlay)) => {
+                        if held_overlay && !overlay {
+                            // the held slot is the overlay route — replace it
+                            // in place with the underlay one.
+                            out[at] = (hint.expected_key.clone(), dial);
+                            direct_at.insert(key, (at, false));
+                        }
+                        continue;
+                    }
+                }
+            }
             out.push((hint.expected_key.clone(), dial));
         }
         Ok(out)
@@ -1155,7 +1208,8 @@ pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String
         .ok_or_else(|| {
             format!(
                 "not a ducktape invite (expected {INVITE_PREFIX}...); an older \
-                 ducktape-invite-v*: blob no longer decodes — ask for a fresh invite"
+                 ducktape:/ducktape-invite-v*: blob no longer decodes — ask for a \
+                 fresh invite"
             )
         })?;
     let bytes = INVITE_B64
@@ -3846,6 +3900,61 @@ bootstrapper_addr = "127.0.0.1:52200"
             "a typed Direct supersedes the bootstrap Direct for the same key"
         );
         assert!(matches!(&directs[0].reach, Reach::Direct(a) if a == "[fd87::2]:52200"));
+    }
+
+    #[test]
+    fn an_overlay_ula_route_keeps_the_underlay_bootstrap_dial() {
+        // the join path records the inviter's tunnel address (the chain's
+        // overlay ULA) as a typed Direct route. that route is only dialable
+        // once the reachability plane's tunnels apply, so it must ride
+        // ALONGSIDE the underlay bootstrap hint — not evict it — and the mesh
+        // dialer must keep dialing the underlay while the plane assembles.
+        let me = ed25519::PrivateKey::from_seed(51).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "fp#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_bootstrap(&me, "203.0.113.7:52200");
+        // the EXACT derivation cmd_join uses for the inviter's tunnel route.
+        let identity = wireguard_upgrade::ValidatorIdentity::try_from(me.as_ref())
+            .expect("test key is a valid identity");
+        let ula = wireguard_upgrade::ula_v6_member_addr(&d.genesis_namespace(), identity);
+        d.add_reach_route(&ReachHint {
+            expected_key: me.clone(),
+            reach: Reach::Direct(format!("[{ula}]:52200")),
+        });
+
+        // the union keeps BOTH routes…
+        let hints = d.reach_hints().expect("hints");
+        let directs: Vec<_> = hints
+            .iter()
+            .filter(|h| matches!(h.reach, Reach::Direct(_)))
+            .collect();
+        assert_eq!(
+            directs.len(),
+            2,
+            "the overlay ULA route must not evict the underlay bootstrap hint"
+        );
+
+        // …and the dialer gets ONE Direct ingress for the key: the underlay.
+        let entries = d.reach_entries().expect("entries");
+        let dials: Vec<_> = entries
+            .iter()
+            .filter(|(k, r)| *k == me && matches!(r, ReachDial::Direct(_)))
+            .collect();
+        assert_eq!(dials.len(), 1, "one Direct ingress per key");
+        assert!(
+            matches!(
+                &dials[0].1,
+                ReachDial::Direct(Ingress::Socket(s)) if s.to_string() == "203.0.113.7:52200"
+            ),
+            "the mesh dialer must prefer the underlay route, got {:?}",
+            dials[0].1
+        );
     }
 
     #[test]

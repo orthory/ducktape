@@ -77,6 +77,101 @@ fn network_shape_joiner_parks_until_promote() {
     cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
 }
 
+/// the promotion REBOOT leg the markers above stop short of: after
+/// `promoted: validator at epoch` the node exec-reboots and must complete a
+/// post-reboot catch-up dialogue against the founder BEFORE it can serve or
+/// vote — and the founder must keep answering the statesync channel through
+/// that whole window, cutover included. every other promote leg in this
+/// suite latches the `promoted:` marker and stops, so a founder that goes
+/// silent right after the cutover (the field failure: ten
+/// `catch-up manifest unavailable ... timed out` retries, then FATAL, in a
+/// supervisor crash-loop) was invisible to CI. the exec keeps the same log
+/// fd, so markers span the reboot; a FATAL exit panics `wait_marker` with
+/// BOTH log tails — the founder's tail is the diagnosis.
+#[test]
+fn promoted_resident_boots_through_post_reboot_catchup() {
+    use directory::{DirMsg, DirQuery, DirReply};
+
+    let _serial = serial();
+    let mut cluster = NetworkShapeCluster::new();
+
+    let chain_id = cluster.init_founder("promote-reboot");
+    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+
+    // resident standing first — the field node parked as a resident (staged
+    // admission) before its promote, so the reboot starts from a warm,
+    // boundary-following node exactly as it did in the field.
+    let invite = cluster.invite();
+    let friend_key = cluster.join_friend_manual(&invite);
+    cluster.spawn(1);
+    cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
+    let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
+    assert!(ok, "invite-accept failed:\n{out}");
+    cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
+
+    let (ok, out) = cluster.run_promote(&friend_key);
+    assert!(ok, "promote failed:\n{out}");
+    cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
+
+    // THE property: the catch-up completes — the success line's " frames)"
+    // suffix is printed by no failure path ("unavailable" retries included).
+    cluster.wait_marker(1, " frames)", CONVERGE);
+
+    // and the network the reboot lands in is LIVE end to end: a write
+    // finalized through the founder becomes readable from the promoted
+    // friend's own surface…
+    cluster.submit(
+        0,
+        "directory",
+        &directory::encode_msg(&DirMsg::Set {
+            key: "post-promote-founder".into(),
+            value: "landed".into(),
+        }),
+    );
+    poll_until("the promoted friend to serve the founder's write", CONVERGE, || {
+        cluster
+            .query(
+                1,
+                "directory",
+                &directory::encode_query(&DirQuery::Get {
+                    key: "post-promote-founder".into(),
+                }),
+            )
+            .and_then(|raw| directory::decode_reply(&raw).ok())
+            .and_then(|r| match r {
+                DirReply::Value(Some(v)) if v == "landed" => Some(()),
+                _ => None,
+            })
+    });
+    // …and the promoted friend's own ordered lane finalizes into the widened
+    // quorum (a halted founder can never land this).
+    cluster.submit(
+        1,
+        "directory",
+        &directory::encode_msg(&DirMsg::Set {
+            key: "post-promote-friend".into(),
+            value: "landed".into(),
+        }),
+    );
+    poll_until("the founder to serve the friend's write", CONVERGE, || {
+        cluster
+            .query(
+                0,
+                "directory",
+                &directory::encode_query(&DirQuery::Get {
+                    key: "post-promote-friend".into(),
+                }),
+            )
+            .and_then(|raw| directory::decode_reply(&raw).ok())
+            .and_then(|r| match r {
+                DirReply::Value(Some(v)) if v == "landed" => Some(()),
+                _ => None,
+            })
+    });
+}
+
 // ---- duckfs joiner proof: full object possession over the REAL wire ---------
 //
 // the in-process `duckfs_resolver` test (statesync/tests) proves the resolver

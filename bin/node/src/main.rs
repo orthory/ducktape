@@ -152,6 +152,12 @@ const NUDGE_INTERVAL: Duration = Duration::from_secs(2);
 /// post-reboot catch-up should close the reboot gap, not chase a live chain
 /// forever. any tiny lag left after this cap is handled by the normal engine.
 const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
+/// how many times the promoted-validator boot retries an unavailable catch-up
+/// source before failing over to the supervisor. sized (with the escalating
+/// beat at the retry site) to ride out an overlay-only source whose tunnels
+/// are still assembling after the reboot — several minutes, not seconds: an
+/// exec-restart would only redo the plane restore from zero.
+const POST_REBOOT_CATCHUP_MAX_ATTEMPTS: usize = 60;
 /// max wire message size we accept on a channel (2 MiB). the tallest honest
 /// messages are (a) an op frame carrying a full 1 MiB duckfs chunk — capped at
 /// `node::MAX_FRAME_BYTES` by the submit-boundary guard, then gossiped raw on
@@ -1532,6 +1538,176 @@ fn recovery_frame_to_sync(
         roots: frame.roots,
         app_hash: frame.app_hash,
     })
+}
+
+// ---------------------------------------------------------------------------
+// the statesync serve seam: serving runs on its OWN task (captures, leases,
+// chunk slicing, mesh/plane replies), so a joiner's sync never rides a drain
+// beat of the consensus loop. only the four STATE TOUCHES below cross back to
+// the loop — the one task that owns the host, the recovery journal, and the
+// derived index — as bounded request/reply pairs, so a busy loop backpressures
+// the serve lane instead of the reverse.
+// ---------------------------------------------------------------------------
+
+/// one state touch the statesync serve task asks of the consensus loop.
+enum SyncStateRequest {
+    /// capture (or re-coordinate) the current finalized boundary — the
+    /// Manifest path. `known` names the boundaries the serve task already
+    /// holds, so a known id round-trips fresh coordinates only, never
+    /// payload bytes.
+    Boundary {
+        known: Vec<statesync::BoundaryId>,
+        reply: tokio::sync::oneshot::Sender<Result<SyncBoundary, String>>,
+    },
+    /// route module-defined bytes to the live module's `serve_sync` (the
+    /// resolver lanes: qmdb op ranges, duckfs refs/objects).
+    ModuleServe {
+        module_id: String,
+        body: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    /// read recovery-equivalent finalized frames in `(after, up_to]`.
+    Frames {
+        after_height: u64,
+        up_to_height: u64,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<recovery::JournalFrame>, recovery::Error>>,
+    },
+    /// checkpoint the derived index databases for the shipped-index lane.
+    IndexCut {
+        reply: tokio::sync::oneshot::Sender<std::collections::BTreeMap<String, Vec<u8>>>,
+    },
+}
+
+/// the [`SyncStateRequest::Boundary`] answer: the served boundary's identity
+/// and coordinates, with capture payload only when the serve task named the
+/// id unknown.
+struct SyncBoundary {
+    id: statesync::BoundaryId,
+    coords: statesync::BoundaryCoords,
+    data: Option<statesync::CaptureData>,
+}
+
+/// drive one decoded statesync request against the serve-task-owned
+/// [`SyncServer`], round-tripping the state touches to the consensus loop.
+/// a closed loop (shutdown) answers as a plain serve error — clients retry
+/// against the next source.
+async fn drive_sync_request(
+    server: &mut SyncServer,
+    state_tx: &futures::channel::mpsc::Sender<SyncStateRequest>,
+    req: statesync::SyncRequest,
+) -> statesync::SyncResponse {
+    const CLOSED: &str = "statesync state owner is shutting down";
+    // a failed send drops the request (and its reply sender) on the floor, so
+    // the paired `rx.await` below surfaces it as the CLOSED error — no
+    // separate delivered/undelivered bookkeeping.
+    let ask = |req: SyncStateRequest| {
+        let mut tx = state_tx.clone();
+        async move {
+            let _ = futures::SinkExt::send(&mut tx, req).await;
+        }
+    };
+    match server.serve(req) {
+        statesync::ServeStep::Reply(resp) => resp,
+        statesync::ServeStep::NeedBoundary => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ask(SyncStateRequest::Boundary {
+                known: server.known_boundaries(),
+                reply: tx,
+            })
+            .await;
+            match rx.await {
+                Ok(Ok(SyncBoundary { id, coords, data })) => {
+                    match data {
+                        Some(data) => server.install_capture(id, data),
+                        None => server.refresh_coords(id, coords),
+                    }
+                    server
+                        .manifest_for(id)
+                        .unwrap_or_else(statesync::SyncResponse::Error)
+                }
+                Ok(Err(e)) => statesync::SyncResponse::Error(e),
+                Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
+            }
+        }
+        statesync::ServeStep::NeedModuleServe { module_id, body } => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ask(SyncStateRequest::ModuleServe {
+                module_id,
+                body,
+                reply: tx,
+            })
+            .await;
+            match rx.await {
+                Ok(Ok(bytes)) => statesync::SyncResponse::Module(bytes),
+                Ok(Err(e)) => statesync::SyncResponse::Error(e),
+                Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
+            }
+        }
+        statesync::ServeStep::NeedFrames {
+            after_height,
+            up_to_height,
+        } => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ask(SyncStateRequest::Frames {
+                after_height,
+                up_to_height,
+                reply: tx,
+            })
+            .await;
+            match rx.await {
+                Ok(Ok(frames)) => {
+                    let mut out = Vec::new();
+                    let mut err = None;
+                    for frame in frames.into_iter().take(statesync::FRAME_BATCH_LEN) {
+                        match recovery_frame_to_sync(frame) {
+                            Ok(frame) => out.push(frame),
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    match err {
+                        Some(e) => statesync::SyncResponse::Error(e),
+                        None => statesync::SyncResponse::Frames { frames: out },
+                    }
+                }
+                Ok(Err(recovery::Error::RangePruned {
+                    after_height,
+                    retained_start,
+                })) => statesync::SyncResponse::RangePruned {
+                    requested_after: after_height,
+                    retained_from: retained_start,
+                },
+                Ok(Err(e)) => {
+                    statesync::SyncResponse::Error(format!("recovery frame range: {e}"))
+                }
+                Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
+            }
+        }
+        statesync::ServeStep::NeedIndexCut { boundary } => {
+            // the shipped-index lane cuts lazily: the FIRST index request for
+            // a boundary checkpoints the derived databases and attaches the
+            // archives to that capture, so joiners that never opt in cost
+            // nothing. the attach is unconditional, so the re-drive below
+            // resolves — it cannot need a second cut.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ask(SyncStateRequest::IndexCut { reply: tx }).await;
+            let blobs = match rx.await {
+                Ok(blobs) => blobs,
+                Err(_) => return statesync::SyncResponse::Error(CLOSED.into()),
+            };
+            if let Err(e) = server.attach_index(boundary, blobs) {
+                return statesync::SyncResponse::Error(e);
+            }
+            match server.serve(statesync::SyncRequest::IndexModules { boundary }) {
+                statesync::ServeStep::Reply(resp) => resp,
+                _ => statesync::SyncResponse::Error(
+                    "index attach did not settle the request".into(),
+                ),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6847,10 +7023,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 if let Some(cmd) = &reach_cmd
                     && m.residents.iter().any(|k| k == &me_bytes)
                 {
+                    // NON-BLOCKING sends throughout: the plane is not this
+                    // loop's dependency. a shed ViewTick is one beat of
+                    // advert staleness (the next poll carries a fresher one);
+                    // a refused Retarget retries naturally — the epoch latch
+                    // below only advances when the send is taken.
                     let clock = m.view_base.max(m.height);
-                    let _ = cmd
-                        .send(reachability::ReachabilityCommand::ViewTick(clock))
-                        .await;
+                    let _ = cmd.try_send(reachability::ReachabilityCommand::ViewTick(clock));
                     if last_plane_epoch != Some(m.epoch) {
                         let members: Vec<ed25519::PublicKey> = m
                             .participants
@@ -6862,8 +7041,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             .iter()
                             .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
                             .collect();
-                        let _ = cmd
-                            .send(reachability::ReachabilityCommand::Retarget(
+                        if cmd
+                            .try_send(reachability::ReachabilityCommand::Retarget(
                                 reachability::MeshEpochEvent {
                                     epoch: m.epoch,
                                     members,
@@ -6871,8 +7050,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     current_view: clock,
                                 },
                             ))
-                            .await;
-                        last_plane_epoch = Some(m.epoch);
+                            .is_ok()
+                        {
+                            last_plane_epoch = Some(m.epoch);
+                        }
                     }
                 }
                 if !m.participants.iter().any(|k| k == &me_bytes) {
@@ -7255,9 +7436,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // in-process boringtun device dies with the process either way,
             // but only an orderly Shutdown unlinks its UAPI socket path —
             // a stale one would fail the rebooted validator's restore-time
-            // create. Bounded: the reboot must not hang on a wedged plane.
+            // create. Bounded: the reboot must not hang on a wedged plane —
+            // try_send (a plane whose queue is full would never process the
+            // Shutdown anyway), then a 2s grace for the orderly unlink.
             if let Some(cmd) = &reach_cmd {
-                let _ = cmd.send(reachability::ReachabilityCommand::Shutdown).await;
+                let _ = cmd.try_send(reachability::ReachabilityCommand::Shutdown);
                 let deadline = std::time::Instant::now() + Duration::from_secs(2);
                 while !cmd.is_closed() && std::time::Instant::now() < deadline {
                     context.sleep(Duration::from_millis(20)).await;
@@ -7928,11 +8111,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         recovery_manifest_for_resume = Some(ckpt);
                         break;
                     }
-                    Err(PostRebootCatchupError::Retry(e)) if attempts < 10 => {
+                    Err(PostRebootCatchupError::Retry(e))
+                        if attempts < POST_REBOOT_CATCHUP_MAX_ATTEMPTS =>
+                    {
                         println!(
-                            "[node {label}] post-reboot catch-up unavailable ({e}); retrying"
+                            "[node {label}] post-reboot catch-up unavailable \
+                             (attempt {attempts}/{POST_REBOOT_CATCHUP_MAX_ATTEMPTS}): {e}; \
+                             retrying"
                         );
-                        context.sleep(Duration::from_millis(500)).await;
+                        // escalate toward a 5s beat: an overlay-only source
+                        // (a fully-NATed inviter) is reachable only once the
+                        // reachability plane's tunnels assemble, which can
+                        // take a while after a promotion reboot — a restart
+                        // would not arrive any sooner, it would just redo the
+                        // plane restore from zero.
+                        let beat = Duration::from_millis(500)
+                            .saturating_mul(attempts as u32)
+                            .min(Duration::from_secs(5));
+                        context.sleep(beat).await;
                     }
                     Err(PostRebootCatchupError::Retry(e)) => {
                         eprintln!(
@@ -8048,8 +8244,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // message. bounded + drop-on-full: clients time out and retry, so a
         // flood degrades to retries instead of unbounded memory. the queue
         // carries BOTH statesync carriers — mesh rpc frames and data-plane
-        // request streams — so one serve arm answers both.
-        let (bridge_tx, mut sync_ingress) =
+        // request streams — so one serve task answers both.
+        let (bridge_tx, sync_ingress) =
             futures::channel::mpsc::channel::<statesync_plane::SyncJob>(64);
         {
             let mut bridge_tx = bridge_tx.clone();
@@ -8090,6 +8286,67 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             book
         });
         drop(bridge_tx);
+        // the statesync SERVE task (the [`SyncStateRequest`] seam): owns the
+        // capture cache and both statesync carriers end-to-end — decode,
+        // leases, chunk slicing, and the mesh/plane replies — so serving a
+        // joiner never occupies the consensus loop. the loop answers only
+        // the bounded state touches crossing `sync_state_tx`; when the loop
+        // is busy the serve lane backpressures, never the reverse.
+        let (sync_state_tx, mut sync_state_rx) =
+            futures::channel::mpsc::channel::<SyncStateRequest>(8);
+        {
+            let state_tx = sync_state_tx;
+            let mut sync_tx = sync_tx;
+            let mut ingress = sync_ingress;
+            context
+                .child("statesync_serve")
+                .spawn(move |_ctx| async move {
+                    let mut server = SyncServer::new();
+                    while let Some(job) = ingress.next().await {
+                        // both carriers land here: mesh frames ride an rpc
+                        // envelope (multiplexed channel — the id correlates);
+                        // a plane stream IS its own correlation and reply path.
+                        let (reply_to, rpc_id, body) = match job {
+                            statesync_plane::SyncJob::Mesh(peer, bytes) => {
+                                let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                                    continue; // malformed rpc envelope: drop, never crash.
+                                };
+                                (
+                                    statesync_plane::SyncReplyTo::Mesh(peer),
+                                    rpc_id,
+                                    body.to_vec(),
+                                )
+                            }
+                            statesync_plane::SyncJob::Plane(stream, req) => {
+                                (statesync_plane::SyncReplyTo::Plane(stream), 0, req)
+                            }
+                        };
+                        let resp = match statesync::decode_request(&body) {
+                            Ok(req) => drive_sync_request(&mut server, &state_tx, req).await,
+                            Err(e) => statesync::SyncResponse::Error(format!(
+                                "bad request frame: {e}"
+                            )),
+                        };
+                        let resp = statesync::encode_response(&resp);
+                        match reply_to {
+                            statesync_plane::SyncReplyTo::Mesh(peer) => {
+                                let _ = sync_tx.send(
+                                    Recipients::One(peer),
+                                    IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
+                                    false,
+                                );
+                            }
+                            statesync_plane::SyncReplyTo::Plane(mut stream) => {
+                                // one request per stream: write the response
+                                // and drop — the close is the client's
+                                // completion.
+                                let _ =
+                                    statesync::dataplane::write_frame(&mut stream, &resp).await;
+                            }
+                        }
+                    }
+                });
+        }
         // the lobby lane rides the same bridge pattern: announces are consumed
         // by the pump between drains. drop-on-full is doubly safe here — a
         // parked joiner re-announces every few seconds anyway.
@@ -8394,7 +8651,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             (ed25519::PublicKey, std::time::Instant),
         > = std::collections::HashMap::new();
         let mut last_published: Option<u64> = None;
-        let mut sync_server = SyncServer::new();
         // verified-but-unapproved join requests, keyed by joiner key. NODE-
         // LOCAL and in-memory by design: this is a doorbell, not state — the
         // parked joiner re-announces every few seconds, so a restart loses
@@ -8410,6 +8666,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // the per-block-time flush cadence: packs the window's enqueued frames
         // (real ops and/or an idle nop) into one batch block. see the flush loop.
         let mut last_flush = std::time::Instant::now();
+        // a cutover Retarget the plane's command queue could not take yet
+        // (NON-BLOCKING sends: the plane is not consensus, so the loop never
+        // waits on it). retried every drain beat until it lands; a newer
+        // epoch's Retarget supersedes an undelivered older one.
+        let mut pending_retarget: Option<reachability::MeshEpochEvent> = None;
         // dev override (`make dev` sets DUCKTAPE_DISABLE_HEARTBEAT): keep an idle
         // dev chain quiet — no nop blocks — so every committed block is real
         // activity and the journal/logs carry no idle churn. NEVER set this on a
@@ -8937,12 +9198,27 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         if let Some(cmd) = &reach_cmd {
                             let absolute_view = orchestrator.app_height(engine_view);
                             if last_reach_view.is_none_or(|v| v < absolute_view) {
-                                let _ = cmd
-                                    .send(reachability::ReachabilityCommand::ViewTick(
-                                        absolute_view,
-                                    ))
-                                    .await;
+                                // NON-BLOCKING: the plane is not consensus. a
+                                // full command queue (a wedged or slow plane)
+                                // sheds this tick — the next drain beat carries
+                                // a fresher one — instead of stalling the loop
+                                // behind an actor that may never drain.
+                                let _ = cmd.try_send(
+                                    reachability::ReachabilityCommand::ViewTick(absolute_view),
+                                );
                                 last_reach_view = Some(absolute_view);
+                            }
+                            // flush a staged cutover Retarget (see
+                            // `pending_retarget`) — MUST eventually land, so
+                            // it retries every beat rather than being shed.
+                            if let Some(event) = pending_retarget.take()
+                                && let Err(tokio::sync::mpsc::error::TrySendError::Full(
+                                    reachability::ReachabilityCommand::Retarget(event),
+                                )) = cmd.try_send(reachability::ReachabilityCommand::Retarget(
+                                    event,
+                                ))
+                            {
+                                pending_retarget = Some(event);
                             }
                         }
                         let members_raw = read_valset_members(node.host()).await;
@@ -9040,17 +9316,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // here would be epoch-local, a different clock
                             // than the ViewTicks above and the boot
                             // Retarget's view_base.
-                            if let Some(cmd) = &reach_cmd {
-                                let _ = cmd
-                                    .send(reachability::ReachabilityCommand::Retarget(
-                                        reachability::MeshEpochEvent {
-                                            epoch: plan.epoch(),
-                                            members: members.iter().cloned().collect(),
-                                            standbys: plan_residents.clone(),
-                                            current_view: plan.cutover_app_height(),
-                                        },
-                                    ))
-                                    .await;
+                            if reach_cmd.is_some() {
+                                // STAGED, not sent inline: the flush below
+                                // (every drain beat) try_sends it, so a plane
+                                // whose queue is full delays retunneling by
+                                // beats — it can never stall the cutover or
+                                // the loop.
+                                pending_retarget = Some(reachability::MeshEpochEvent {
+                                    epoch: plan.epoch(),
+                                    members: members.iter().cloned().collect(),
+                                    standbys: plan_residents.clone(),
+                                    current_view: plan.cutover_app_height(),
+                                });
                             }
                             if !members.contains(&signer.public_key()) {
                                 println!(
@@ -9814,83 +10091,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     }
                 }
-                msg = sync_ingress.next() => {
-                    let Some(job) = msg else {
-                        // the ingress task ended (network shutdown) — nothing
-                        // left to serve; keep draining consensus regardless.
+                req = sync_state_rx.next() => {
+                    // the statesync serve task's state touches (the
+                    // [`SyncStateRequest`] seam): each is one bounded read
+                    // against loop-owned state — the heavy serving (decode,
+                    // captures, slicing, replies) lives on the serve task.
+                    let Some(req) = req else {
+                        // the serve task ended (network shutdown) — nothing
+                        // left to answer; keep draining consensus regardless.
                         continue;
                     };
-                    // both carriers land here: mesh frames ride an rpc
-                    // envelope (multiplexed channel — the id correlates);
-                    // a plane stream IS its own correlation and reply path.
-                    let (reply_to, rpc_id, body) = match job {
-                        statesync_plane::SyncJob::Mesh(peer, bytes) => {
-                            let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
-                                continue; // malformed rpc envelope: drop, never crash.
-                            };
-                            (statesync_plane::SyncReplyTo::Mesh(peer), rpc_id, body.to_vec())
-                        }
-                        statesync_plane::SyncJob::Plane(stream, req) => {
-                            (statesync_plane::SyncReplyTo::Plane(stream), 0, req)
-                        }
-                    };
-                    let resp = match statesync::decode_request(&body) {
-                        Ok(statesync::SyncRequest::Frames {
-                            after_height,
-                            up_to_height,
-                        }) => {
-                            let response = match node
-                                .sink_mut()
-                                .read_finalized_frames(after_height, up_to_height)
-                                .await
-                            {
-                                Ok(frames) => {
-                                    let mut out = Vec::new();
-                                    let mut err = None;
-                                    for frame in frames
-                                        .into_iter()
-                                        .take(statesync::FRAME_BATCH_LEN)
-                                    {
-                                        match recovery_frame_to_sync(frame) {
-                                            Ok(frame) => out.push(frame),
-                                            Err(e) => {
-                                                err = Some(e);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    match err {
-                                        Some(e) => statesync::SyncResponse::Error(e),
-                                        None => statesync::SyncResponse::Frames { frames: out },
-                                    }
-                                }
-                                Err(recovery::Error::RangePruned {
-                                    after_height,
-                                    retained_start,
-                                }) => statesync::SyncResponse::RangePruned {
-                                    requested_after: after_height,
-                                    retained_from: retained_start,
-                                },
-                                Err(e) => statesync::SyncResponse::Error(format!(
-                                    "recovery frame range: {e}"
-                                )),
-                            };
-                            statesync::encode_response(&response)
-                        }
-                        Ok(req) => {
-                            // the shipped-index lane cuts lazily: the FIRST
-                            // index request for a boundary checkpoints the
-                            // derived databases and attaches the archives to
-                            // that capture, so joiners that never opt in cost
-                            // nothing. an unleased boundary cannot hold an
-                            // attachment — handle() below answers it with the
-                            // proper refetch error either way.
-                            if let statesync::SyncRequest::IndexModules { boundary } = &req
-                                && !sync_server.index_attached(*boundary)
-                            {
-                                let _ = sync_server
-                                    .attach_index(*boundary, ship_index_blobs(&index, &label));
-                            }
+                    match req {
+                        SyncStateRequest::Boundary { known, reply } => {
                             // the boundary's consensus coordinates ride the manifest.
                             // the floor certificate is served only when it certifies
                             // exactly the current boundary — a cert behind the
@@ -9919,27 +10131,63 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             let finalized_for_sync = node.finalized().filter(|f| {
                                 f.height <= coords.view_base || coords.floor_cert.is_some()
                             });
-                            let response =
-                                sync_server.handle(node.host(), finalized_for_sync, &coords, req).await;
-                            statesync::encode_response(&response)
+                            let answer = match finalized_for_sync {
+                                // two refusals, named apart: no boundary at
+                                // all (pre-first-block), vs the per-block
+                                // window where the tip advanced but its
+                                // finalization certificate has not persisted
+                                // yet — a retry lands once they align.
+                                None => Err(match node.finalized() {
+                                    Some(f) => format!(
+                                        "boundary {} awaiting its finalization certificate — \
+                                         retry",
+                                        f.height
+                                    ),
+                                    None => "no finalized boundary to serve yet".to_string(),
+                                }),
+                                Some(finalized) => {
+                                    let id = statesync::BoundaryId {
+                                        height: finalized.height,
+                                        app_hash: finalized.app_hash,
+                                    };
+                                    if known.contains(&id) {
+                                        // the serve task holds this boundary's
+                                        // payload — coordinates only.
+                                        Ok(SyncBoundary { id, coords, data: None })
+                                    } else {
+                                        statesync::capture_boundary(
+                                            node.host(),
+                                            finalized,
+                                            &coords,
+                                        )
+                                        .await
+                                        .map(|(id, data)| SyncBoundary {
+                                            id,
+                                            coords,
+                                            data: Some(data),
+                                        })
+                                    }
+                                }
+                            };
+                            let _ = reply.send(answer);
                         }
-                        Err(e) => statesync::encode_response(&statesync::SyncResponse::Error(
-                            format!("bad request frame: {e}"),
-                        )),
-                    };
-                    match reply_to {
-                        statesync_plane::SyncReplyTo::Mesh(peer) => {
-                            let _ = sync_tx.send(
-                                Recipients::One(peer),
-                                IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
-                                false,
-                            );
+                        SyncStateRequest::ModuleServe { module_id, body, reply } => {
+                            let served = node
+                                .host()
+                                .serve_sync(&module_id, &body)
+                                .await
+                                .map_err(|e| format!("module {module_id} serve_sync: {e}"));
+                            let _ = reply.send(served);
                         }
-                        statesync_plane::SyncReplyTo::Plane(mut stream) => {
-                            // one request per stream: write the response and
-                            // drop — the close is the client's completion.
-                            let _ =
-                                statesync::dataplane::write_frame(&mut stream, &resp).await;
+                        SyncStateRequest::Frames { after_height, up_to_height, reply } => {
+                            let read = node
+                                .sink_mut()
+                                .read_finalized_frames(after_height, up_to_height)
+                                .await;
+                            let _ = reply.send(read);
+                        }
+                        SyncStateRequest::IndexCut { reply } => {
+                            let _ = reply.send(ship_index_blobs(&index, &label));
                         }
                     }
                 }
