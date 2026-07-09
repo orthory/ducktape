@@ -197,12 +197,13 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       await waitFor(() => expect(capturedState!.blocks.length).toBe(1));
       const record = capturedState!.blocks[0];
       expect(record.height).toBe(1);
-      expect(record.target).toBe("chat");
-      expect(record.opHash).toMatch(/^[0-9a-f]{64}$/);
+      const rootOp = record.ops[0]!;
+      expect(rootOp.target).toBe("chat");
+      expect(rootOp.opHash).toMatch(/^[0-9a-f]{64}$/);
 
       // and it is a REAL content address: the blob lane serves the committed
       // payload bytes back through the same transport the app uses.
-      const bytes = await transport.getBlob(record.opHash!);
+      const bytes = await transport.getBlob(rootOp.opHash);
       const payload = JSON.parse(new TextDecoder().decode(bytes)) as {
         create_channel: { channel_id: string };
       };
@@ -454,7 +455,8 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       await sim.step();
       await waitFor(() => expect(capturedState!.blocks.length).toBe(1));
       const record = capturedState!.blocks[0]!;
-      expect(record.opHash).toMatch(/^[0-9a-f]{64}$/);
+      const rootOp = record.ops[0]!;
+      expect(rootOp.opHash).toMatch(/^[0-9a-f]{64}$/);
 
       // the finalization-mark hand-off against the REAL view: focus lands,
       // the detail opens on the block…
@@ -463,7 +465,7 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       await waitFor(() => expect(screen.getByText("OP HASH")).toBeInTheDocument());
 
       // …the OP HASH digest line shows the record's full content address…
-      expect(screen.getByText(record.opHash!)).toBeInTheDocument();
+      expect(screen.getByText(rootOp.opHash)).toBeInTheDocument();
 
       // …and the focus was consumed, so re-entering won't replay the jump.
       await waitFor(() => expect(capturedState!.explorerFocus).toBeNull());

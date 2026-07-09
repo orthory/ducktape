@@ -1,15 +1,16 @@
-// The block explorer: recent NON-EMPTY finalized blocks (heartbeat nops never
-// reach the app), newest-first. One row per block — height, frame hash, commit
-// (post-block app-hash), proposer (the frame's verified signer, shown as its
-// profile display name when the `profiles` registry knows the key), op count —
-// and clicking a row opens the block: its coordinates in full plus the
-// transactions inside (the deterministic dispatch trace + the root op's
-// payload). Read-only; records re-pull from the node's ring on every block.
+// The block explorer: recent finalized blocks, newest-first. Post tx-
+// aggregation a block carries EVERY op drained from its ~2s window, so a row
+// shows the block's coordinates — height, frame hash, commit (post-block app-
+// hash), its primary op author, and how many ops it aggregated — and clicking
+// it opens the block: those coordinates in full plus one section per op (that
+// op's author, target, disposition, content address, dispatch trace, and
+// payload preview). An idle window rides as an empty-`ops` nop, shown as an
+// idle block with no op rows. Read-only; records re-pull on every block.
 
 import { useEffect, useState } from "react";
 
 import { displayNameForKey } from "../../../domain/names";
-import type { BlockRecord, DispatchInfo } from "../../../domain/transport";
+import type { BlockRecord, DispatchInfo, RootOp } from "../../../domain/transport";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 
@@ -49,7 +50,20 @@ function BlockRow({
   names: Record<string, string>;
   onOpen: () => void;
 }) {
-  const proposerName = displayNameForKey(block.proposer, names);
+  // A block can aggregate ops from several authors; the row summarizes them
+  // (the primary author, plus a `+n` when others chipped in) and opens the
+  // block for the per-op breakdown.
+  const proposers = [...new Set(block.ops.map((op) => op.proposer))];
+  const primary = proposers[0];
+  const primaryName = primary ? displayNameForKey(primary, names) : null;
+  const empty = block.ops.length === 0;
+  const rejected = block.ops.reduce(
+    (n, op) => n + (op.disposition === "rejected" ? 1 : 0),
+    0,
+  );
+  const proposerLabel = empty
+    ? "—"
+    : `${primaryName ?? shortHex(primary)}${proposers.length > 1 ? ` +${proposers.length - 1}` : ""}`;
   return (
     <button
       type="button"
@@ -78,25 +92,25 @@ function BlockRow({
         {shortHex(block.commitHash)}
       </span>
       <span
-        title={block.proposer}
+        title={proposers.join(" · ") || undefined}
         style={{
-          font: proposerName ? `500 11.5px ${font.sans}` : `400 11.5px ${font.mono}`,
+          font: !empty && primaryName ? `500 11.5px ${font.sans}` : `400 11.5px ${font.mono}`,
           color: color.muted3,
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
         }}
       >
-        {proposerName ?? shortHex(block.proposer)}
+        {proposerLabel}
       </span>
       <span
         style={{
           font: `600 11.5px ${font.mono}`,
-          color: block.disposition === "rejected" ? color.red : color.accent,
+          color: empty ? color.muted2 : rejected > 0 ? color.red : color.accent,
           textAlign: "right",
         }}
       >
-        {block.disposition === "rejected" ? "✕" : block.operations.length}
+        {empty ? "nop" : block.ops.length}
       </span>
     </button>
   );
@@ -147,6 +161,109 @@ function OperationRow({ op, index }: { op: DispatchInfo; index: number }) {
   );
 }
 
+/** One op inside the opened block: its author + target + disposition, its
+ *  digests, the dispatch trace, and a payload preview. Rendered once per entry
+ *  in `block.ops`. */
+function OpSection({
+  op,
+  index,
+  names,
+}: {
+  op: RootOp;
+  index: number;
+  names: Record<string, string>;
+}) {
+  const proposerName = displayNameForKey(op.proposer, names);
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 8,
+        padding: "11px 13px",
+        borderRadius: radius.md,
+        border: `1px solid ${color.border}`,
+        background: color.paper,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+        <span style={{ font: `600 10.5px ${font.mono}`, color: color.muted2 }}>
+          OP {index}
+        </span>
+        <span style={{ font: `600 12.5px ${font.sans}`, color: color.ink }}>{op.target}</span>
+        <span
+          style={{
+            font: `600 10.5px ${font.sans}`,
+            color: op.disposition === "rejected" ? color.red : color.green,
+          }}
+        >
+          {op.disposition}
+        </span>
+        <span
+          title={op.proposer}
+          style={{
+            font: proposerName ? `500 11px ${font.sans}` : `400 11px ${font.mono}`,
+            color: color.muted3,
+            marginLeft: "auto",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            maxWidth: "45%",
+          }}
+        >
+          {proposerName ?? shortHex(op.proposer)}
+        </span>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+        <DigestLine
+          label="PROPOSER"
+          value={proposerName ? `${proposerName} · ${op.proposer}` : op.proposer}
+        />
+        <DigestLine label="OP HASH" value={op.opHash} />
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <span style={{ font: `600 10.5px ${font.sans}`, color: color.muted }}>
+          TRANSACTIONS ({op.operations.length})
+        </span>
+        {op.operations.length === 0 ? (
+          <div style={{ font: `400 12px ${font.sans}`, color: color.muted2 }}>
+            {op.disposition === "rejected"
+              ? "The op finalized but was rejected — a deterministic no-op, so no dispatches ran."
+              : "No dispatches recorded."}
+          </div>
+        ) : (
+          op.operations.map((dispatch, i) => (
+            <OperationRow key={`${dispatch.module}-${i}`} op={dispatch} index={i} />
+          ))
+        )}
+      </div>
+
+      {op.payload && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <span style={{ font: `600 10.5px ${font.sans}`, color: color.muted }}>PAYLOAD</span>
+          <pre
+            style={{
+              font: `400 11px ${font.mono}`,
+              color: color.inkSofter,
+              background: color.sunken,
+              border: `1px solid ${color.border}`,
+              borderRadius: radius.md,
+              padding: "9px 11px",
+              margin: 0,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+            }}
+          >
+            {op.payload}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BlockDetail({
   block,
   names,
@@ -156,7 +273,11 @@ function BlockDetail({
   names: Record<string, string>;
   onBack: () => void;
 }) {
-  const proposerName = displayNameForKey(block.proposer, names);
+  const empty = block.ops.length === 0;
+  const rejected = block.ops.reduce(
+    (n, op) => n + (op.disposition === "rejected" ? 1 : 0),
+    0,
+  );
   return (
     <div style={{ padding: 17, display: "flex", flexDirection: "column", gap: 13, overflowY: "auto" }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
@@ -180,13 +301,13 @@ function BlockDetail({
         <span
           style={{
             font: `600 10.5px ${font.sans}`,
-            color: block.disposition === "rejected" ? color.red : color.green,
+            color: rejected > 0 ? color.red : color.green,
+            marginLeft: "auto",
           }}
         >
-          {block.disposition}
-        </span>
-        <span style={{ font: `400 11px ${font.mono}`, color: color.muted2, marginLeft: "auto" }}>
-          {block.target}
+          {empty
+            ? "idle"
+            : `${block.ops.length} op${block.ops.length === 1 ? "" : "s"}${rejected > 0 ? ` · ${rejected} rejected` : ""}`}
         </span>
       </div>
 
@@ -203,48 +324,20 @@ function BlockDetail({
       >
         <DigestLine label="HASH" value={block.hash} />
         <DigestLine label="COMMIT" value={block.commitHash} />
-        <DigestLine
-          label="PROPOSER"
-          value={proposerName ? `${proposerName} · ${block.proposer}` : block.proposer}
-        />
-        <DigestLine label="OP HASH" value={block.opHash ?? ""} />
       </div>
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        <span style={{ font: `600 10.5px ${font.sans}`, color: color.muted }}>
-          TRANSACTIONS ({block.operations.length})
-        </span>
-        {block.operations.length === 0 ? (
-          <div style={{ font: `400 12px ${font.sans}`, color: color.muted2 }}>
-            {block.disposition === "rejected"
-              ? "The op finalized but was rejected — a deterministic no-op, so no dispatches ran."
-              : "No dispatches recorded."}
-          </div>
-        ) : (
-          block.operations.map((op, index) => (
-            <OperationRow key={`${op.module}-${index}`} op={op} index={index} />
-          ))
-        )}
-      </div>
-
-      {block.payload && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <span style={{ font: `600 10.5px ${font.sans}`, color: color.muted }}>PAYLOAD</span>
-          <pre
-            style={{
-              font: `400 11px ${font.mono}`,
-              color: color.inkSofter,
-              background: color.sunken,
-              border: `1px solid ${color.border}`,
-              borderRadius: radius.md,
-              padding: "9px 11px",
-              margin: 0,
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-all",
-            }}
-          >
-            {block.payload}
-          </pre>
+      {empty ? (
+        <div style={{ font: `400 12px ${font.sans}`, color: color.muted2 }}>
+          Idle block — no ops committed in this window (a heartbeat nop).
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <span style={{ font: `600 10.5px ${font.sans}`, color: color.muted }}>
+            OPS ({block.ops.length})
+          </span>
+          {block.ops.map((op, index) => (
+            <OpSection key={`${op.opHash || op.target}-${index}`} op={op} index={index} names={names} />
+          ))}
         </div>
       )}
     </div>
