@@ -1032,7 +1032,13 @@ impl SyncServer {
                         index_blobs: None,
                     },
                 );
-                self.evict_unleased_overflow();
+                // spare the newborn: it is not leased until the manifest_for
+                // that every install exists to answer, so when every older
+                // capture holds a lease (leases never release, they only age
+                // out by overflow) the newborn would be the sole eviction
+                // candidate — evicting itself one step before its own
+                // manifest lookup ("no capture at boundary N").
+                self.evict_unleased_overflow_sparing(Some(id));
             }
         }
     }
@@ -1249,6 +1255,21 @@ impl SyncServer {
         );
     }
 
+    /// like [`SyncServer::insert_capture_for_test`] but through the REAL
+    /// install path, eviction included — for tests exercising install-time
+    /// cache behavior.
+    #[doc(hidden)]
+    pub fn install_capture_for_test(&mut self, id: BoundaryId) {
+        self.install_capture(
+            id,
+            CaptureData {
+                app_hash: id.app_hash,
+                coords: BoundaryCoords::default(),
+                modules: BTreeMap::new(),
+            },
+        );
+    }
+
     #[doc(hidden)]
     pub fn insert_resolver_capture_for_test(
         &mut self,
@@ -1413,12 +1434,20 @@ impl SyncServer {
     }
 
     fn evict_unleased_overflow(&mut self) {
+        self.evict_unleased_overflow_sparing(None);
+    }
+
+    /// evict past the cache cap, never touching a leased capture — nor
+    /// `spared`, the id an in-flight install is about to manifest. sparing an
+    /// unleased newborn can leave the cache one over cap for the single step
+    /// until its `manifest_for` lease lands and the next eviction rebalances.
+    fn evict_unleased_overflow_sparing(&mut self, spared: Option<BoundaryId>) {
         while self.captures.len() > MAX_CAPTURES {
             let Some(oldest) = self
                 .captures
                 .keys()
                 .copied()
-                .find(|id| !self.leased.contains_key(id))
+                .find(|id| !self.leased.contains_key(id) && Some(*id) != spared)
             else {
                 break;
             };
