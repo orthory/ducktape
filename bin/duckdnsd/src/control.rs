@@ -1,6 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use crate::{SharedState, SnapshotStatus};
 
 const CONTROL_TOKEN_FILE: &str = "control.token";
 const MAX_CONTROL_FRAME: u64 = 2 * 1024 * 1024;
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -60,6 +62,18 @@ impl ControlClient {
     }
 
     pub async fn request(&self, request: ControlRequest) -> Result<SnapshotStatus, String> {
+        tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, self.request_inner(request))
+            .await
+            .map_err(|_| {
+                format!(
+                    "DuckDNS control {} did not respond within {}s",
+                    self.address,
+                    CONTROL_REQUEST_TIMEOUT.as_secs()
+                )
+            })?
+    }
+
+    async fn request_inner(&self, request: ControlRequest) -> Result<SnapshotStatus, String> {
         let mut stream = TcpStream::connect(self.address)
             .await
             .map_err(|error| format!("connect DuckDNS control {}: {error}", self.address))?;

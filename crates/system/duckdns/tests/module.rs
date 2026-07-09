@@ -126,8 +126,7 @@ fn resolve(module: &DuckDns, ctx: &TestCtx, name: DuckDnsName) -> DuckDnsReply {
 }
 
 fn namespace(module: &DuckDns, ctx: &TestCtx) -> Vec<String> {
-    let bytes =
-        block_on(module.query_with(ctx, &encode_query(&DuckDnsQuery::Namespace))).unwrap();
+    let bytes = block_on(module.query_with(ctx, &encode_query(&DuckDnsQuery::Namespace))).unwrap();
     let DuckDnsReply::Namespace(names) = decode_reply(&bytes).unwrap() else {
         panic!("namespace query returned another reply shape");
     };

@@ -995,23 +995,27 @@ pub async fn workspace_forget(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     control: tauri::State<'_, NodeControl>,
+    registration: tauri::State<'_, crate::duckdns::Registration>,
     id: String,
     force: bool,
 ) -> Result<Option<Workspace>, String> {
     require_main_window(&window)?;
     let control = control.inner().clone();
+    let registration = registration.inner().clone();
     control
-        .run(move || workspace_forget_blocking(app, id, force))
+        .run(move || workspace_forget_blocking(app, registration, id, force))
         .await
 }
 
 fn workspace_forget_blocking(
     app: tauri::AppHandle,
+    registration: crate::duckdns::Registration,
     id: String,
     force: bool,
 ) -> Result<Option<Workspace>, String> {
     let mut reg = load_registry(&app)?;
     let ws = find(&reg, &id)?.clone();
+    let was_active = reg.active.as_deref() == Some(ws.id.as_str());
     let dir = workspaces_dir(&app)?.join(&ws.id);
 
     // guard (FAIL CLOSED): confirm — via the RUNNING node's own membership — that
@@ -1037,6 +1041,14 @@ fn workspace_forget_blocking(
     // node that cannot be stopped now honestly refuses the forget instead of
     // manufacturing a zombie.
     stop_workspace_node(&dir, &ws.ports, std::time::Duration::from_secs(6))?;
+    if was_active
+        && let Err(error) = crate::duckdns::deactivate(&registration)
+    {
+        // The refresher is stopped even when the helper cannot be reached; its
+        // short lease is the crash-safe cleanup. Forgetting local state must
+        // not be held hostage by an absent optional helper.
+        eprintln!("workspace_forget: could not clear DuckDNS registration: {error}");
+    }
 
     // delete the directory, then drop the registry entry and repoint active. a
     // failed rmdir (e.g. a still-open file on windows) must not block forgetting

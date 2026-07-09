@@ -10,6 +10,7 @@ use std::process::Command;
 use serde::Serialize;
 use tauri::Manager as _;
 
+use crate::daemon::require_main_window;
 use crate::duckdns::{Registration, client_token_path, deactivate_async};
 
 #[derive(Serialize)]
@@ -20,20 +21,30 @@ pub struct InstallResult {
 }
 
 #[tauri::command]
-pub async fn duckdns_install(app: tauri::AppHandle) -> Result<InstallResult, String> {
+pub async fn duckdns_install(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<InstallResult, String> {
+    require_main_window(&window)?;
     install_or_repair(&app, "install").await
 }
 
 #[tauri::command]
-pub async fn duckdns_repair(app: tauri::AppHandle) -> Result<InstallResult, String> {
+pub async fn duckdns_repair(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<InstallResult, String> {
+    require_main_window(&window)?;
     install_or_repair(&app, "repair").await
 }
 
 #[tauri::command]
 pub async fn duckdns_remove(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     registration: tauri::State<'_, Registration>,
 ) -> Result<InstallResult, String> {
+    require_main_window(&window)?;
     let clear_warning = deactivate_async(&registration).await.err();
     let before = helper_installation_status().ok();
     let helper = crate::daemon::resolve_duckdnsd_bin()?;

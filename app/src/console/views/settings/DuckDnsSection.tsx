@@ -40,7 +40,8 @@ export function DuckDnsSection() {
 
   const installation = status?.installation;
   const installed = status?.installed === true;
-  const healthy = installation?.healthy ?? status?.snapshot !== null;
+  const healthy =
+    (installation?.healthy ?? status?.snapshot !== null) && status?.error == null;
   const state = !desktop
     ? "Desktop only"
     : status === null
@@ -125,10 +126,10 @@ export function DuckDnsSection() {
             padding: "10px 15px 12px",
             font: `400 10.5px ${font.sans}`,
             lineHeight: 1.45,
-            color: detail ? color.red : color.muted2,
+            color: detail || status?.error ? color.red : color.muted2,
           }}
         >
-          {detail ??
+          {detail ?? status?.error ??
             ".quack is a private suffix, not an ICANN-reserved TLD; a future public delegation could collide with these local names."}
         </div>
       </GroupCard>

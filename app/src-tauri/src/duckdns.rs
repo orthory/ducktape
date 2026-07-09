@@ -17,6 +17,7 @@ use tauri::Manager as _;
 const LEASE_SECONDS: u64 = 30;
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+const NODE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Default)]
 pub struct Registration {
@@ -219,7 +220,11 @@ pub fn client_token_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 async fn query_namespace(node_http: &str) -> Result<Vec<String>, String> {
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(NODE_QUERY_TIMEOUT)
+        .build()
+        .map_err(|error| format!("build active node namespace client: {error}"))?;
+    let response = client
         .post(format!("{node_http}/v1/query"))
         .json(&serde_json::json!({ "target": "duckdns", "query": "namespace" }))
         .send()

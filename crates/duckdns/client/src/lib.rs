@@ -11,9 +11,6 @@ mod proxy;
 mod publication;
 
 pub use duckdns_core::*;
-pub use gateway::{
-    GatewayError, MAX_REQUEST_HEAD, PreparedHeaders, PreparedRequest, prepare_headers,
-    prepare_request,
-};
+pub use gateway::{GatewayError, PreparedHeaders, prepare_headers};
 pub use proxy::{ProxyError, proxy_to_publication};
 pub use publication::{DuckFsSite, Publication, PublicationTarget, Publications};

@@ -62,7 +62,25 @@ async fn serve_request(
         Ok(path) => path,
         Err(_) => return response(StatusCode::BAD_REQUEST, "invalid site path\n"),
     };
-    let snapshot = site.snapshot.clone();
+    // A "follow head" site follows it between requests, not between chunks of
+    // one response. Pin the committed head once so stat, index lookup, and all
+    // body pages see the same immutable tree and Content-Length/ETag stay true
+    // even if another DuckFS commit lands while the response is streaming.
+    let snapshot = match site.snapshot.clone() {
+        Some(snapshot) => Some(snapshot),
+        None => {
+            let refs_api = api.clone();
+            match tokio::task::spawn_blocking(move || refs_api.refs()).await {
+                Ok(Ok(refs)) => match refs.head {
+                    Some(head) => Some(head),
+                    None => return response(StatusCode::NOT_FOUND, "site has no files\n"),
+                },
+                Ok(Err(_)) | Err(_) => {
+                    return response(StatusCode::SERVICE_UNAVAILABLE, "DuckFS site unavailable\n");
+                }
+            }
+        }
+    };
     let lookup_api = api.clone();
     let lookup_path = requested_path.clone();
     let lookup_snapshot = snapshot.clone();
