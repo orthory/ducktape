@@ -67,7 +67,11 @@ export type CallEvent =
   // Our own mic went above/below the speaking threshold — drives the self
   // speaking ring and the "you're muted while talking" banner. Emitted only on a
   // change (mute keeps capturing, so this fires even while muted).
-  | { kind: "selfSpeaking"; speaking: boolean };
+  | { kind: "selfSpeaking"; speaking: boolean }
+  // Our own video-lane state SETTLED — the authoritative source for the slice's
+  // cameraOn/sharing (fires on toggle, on a failed acquire, on encoder death, and
+  // when the browser's own "Stop sharing" ends a screen share).
+  | { kind: "selfVideo"; cameraOn: boolean; sharing: boolean };
 
 export interface CallSession {
   /** Open the mic graph and dial the call ws. Idempotent — a second call while
@@ -267,6 +271,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "beacon", muted, cameraOn, sharing }));
     }
+    // Mirror the settled lane state to the store — authoritative for paths the
+    // store can't see (failed acquire, encoder death, native "Stop sharing").
+    onEvent({ kind: "selfVideo", cameraOn, sharing });
   };
 
   const setCamera = (on: boolean): void => {

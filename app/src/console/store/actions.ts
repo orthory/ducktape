@@ -519,6 +519,12 @@ export function createActions({
       }));
       return;
     }
+    if (event.kind === "selfVideo") {
+      // Authoritative lane state — corrects a failed acquire / encoder death /
+      // the browser's native "Stop sharing" that the optimistic action missed.
+      update((prev) => ({ voice: { ...prev.voice, cameraOn: event.cameraOn, sharing: event.sharing } }));
+      return;
+    }
     if (event.kind === "selfSpeaking") {
       update((prev) => ({ voice: { ...prev.voice, speaking: event.speaking } }));
       return;
