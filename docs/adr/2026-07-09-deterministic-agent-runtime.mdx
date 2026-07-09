@@ -122,12 +122,14 @@ invariant; **SHOULD** = a strong default, overridable as per-agent policy.
   **rw source** (the forge worktree / duckfs checkout at the work root, whose
   final diff becomes `output_ref`) plus **read-only** instruction/skill mounts at
   the CLI's expected paths. Only rw mounts contribute to `output_ref`; ro mounts
-  (skills, global `AGENTS.md`) never enter the output diff. Materialization is a
-  duckfs subtree checkout (`duckfs-client::checkout`, daemon-managed under
-  `<storage>/duckfs-workspaces`) today; FUSE is a documented phase-4 zero-copy
-  option for large read-only mounts. Because every ref is content-addressed, a
-  globally-shared skill is materialized/cached once per node and deduped across
-  all runs that reference it.
+  (skills, global `AGENTS.md`) never enter the output diff. Two materialization
+  mechanisms already exist: a duckfs subtree **checkout** (`duckfs-client::
+  checkout`, daemon-managed under `<storage>/duckfs-workspaces`) — copy-on-
+  materialize, cached per snapshot id — and a **FUSE mount** (`bin/fs` `fuse`
+  feature, `fuser` 0.17 via setuid `fusermount3`, both ro and rw filesystems) —
+  zero-copy and lazy, the natural fit for large read-only skill trees. Because
+  every ref is content-addressed, a globally-shared skill is materialized/cached
+  (or FUSE-mounted) once per node and deduped across all runs that reference it.
 
 ### Progress — two lanes (PRG)
 
