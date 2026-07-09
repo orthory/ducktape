@@ -66,6 +66,9 @@ impl TestCtx {
                 status: AgentStatus::Active,
                 created_at: 0,
                 updated_at: 0,
+                recipe_hash: Vec::new(),
+                caps: agent::ResourceCaps::default(),
+                skills: Vec::new(),
             },
         );
         self

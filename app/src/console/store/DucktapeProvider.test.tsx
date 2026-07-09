@@ -5,7 +5,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { AgentRecord } from "../../domain/agent-client";
-import type { UserView } from "../../domain/identity-client";
+import type { AccountView } from "../../domain/identity-client";
 import type { BlockEvent, NodeTransport, SubmitReceipt } from "../../domain/transport";
 import type { BlockKind, PageBlock } from "../../domain/pages-client";
 import { DucktapeProvider } from "./DucktapeProvider";
@@ -69,10 +69,11 @@ const GENERAL_MESSAGE = {
 
 const JESS_USER_KEY = Array.from({ length: 32 }, (_, index) => index);
 
-const JESS_USER: UserView = {
-  user_key: JESS_USER_KEY,
+const JESS_USER: AccountView = {
+  account_id: JESS_USER_KEY,
   display_name: "Jess K",
   nonce: 0,
+  member_keys: [],
   nodes: [[0xaa]],
   updated_at: 1,
 };
@@ -102,7 +103,7 @@ const wireChannel = (id: string, name: string, created_at: number) => ({
 const makeFakeNode = ({
   agents = [],
   users = [],
-}: { agents?: AgentRecord[]; users?: UserView[] } = {}) => {
+}: { agents?: AgentRecord[]; users?: AccountView[] } = {}) => {
   const blockListeners = new Set<(block: BlockEvent) => void>();
   // channel-aware mini-node: CreateChannel grows the list, MessagesLatest
   // answers per channel — a stale-pane regression needs the distinction
@@ -154,7 +155,7 @@ const makeFakeNode = ({
         return Promise.resolve({ profiles: [] });
       }
       if (target === "identity") {
-        return Promise.resolve({ users });
+        return Promise.resolve({ accounts: users });
       }
       if (target === "valset") {
         if (query === "residents") {
@@ -777,6 +778,13 @@ describe("pages snapshot refresh vs in-flight ops", () => {
     // a FRESH ring array per pull (the shared mock reuses one instance), so a
     // state.blocks identity change marks "a refresh snapshot fully applied".
     vi.mocked(transport.blocks).mockImplementation(() => Promise.resolve([]));
+    // an honest node's status height is never below a receipt it issued —
+    // the read-your-writes floor refuses lagging snapshots, so the mock must
+    // track the heights its own receipts hand out.
+    const baseStatus = vi.mocked(transport.status).getMockImplementation()!;
+    vi.mocked(transport.status).mockImplementation(() =>
+      baseStatus().then((s) => ({ ...s, height: committedHeight })),
+    );
 
     renderConsole(transport);
     await waitFor(() =>

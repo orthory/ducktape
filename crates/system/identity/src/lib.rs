@@ -1,47 +1,67 @@
-//! deterministic user->nodes binding registry.
+//! deterministic ACCOUNT registry: an umbrella over a person's keys and nodes.
 //!
-//! a USER (an ed25519 keypair held by the person, app-side) owns many NODES
-//! (each a mesh/valset identity). [`IdentityMsg::BindNode`] binds the
-//! SUBMITTING NODE (the verified origin) to a user, consented to by a
-//! USER-KEY SIGNATURE over a chain-and-nonce-scoped preimage --
-//! [`bind_preimage`]/[`unbind_preimage`] -- so a certificate can never replay
-//! across networks or after an unbind bumps the nonce.
+//! an ACCOUNT is keyed by its FOUNDING key (`account_id` = the first member
+//! key). it collects many MEMBER KEYS of different schemes (an ed25519 seed
+//! key, a WebAuthn passkey, a native P-256 key -- see [`scheme`]), shares one
+//! display name across them, and owns many NODES (each a workspace's
+//! mesh/valset identity). every state-changing op is authorized by a MEMBER
+//! KEY, captured as a [`MemberAuth`]: the account it speaks for is resolved
+//! from that key's membership, never a spoofable payload field. proofs are
+//! verified over chain-and-nonce-scoped preimages, so a certificate can never
+//! replay across networks or after the shared nonce advances.
 //!
-//! state model mirrors profiles/capability's host-lent staging seam:
-//! `execute` STAGES into a `pending` overlay (committed state untouched);
-//! `query` reads pending-over-committed (read-your-writes) via the
-//! `merged_*` helpers; `commit_block` folds pending into committed state AND
-//! rebuilds the derived `node_index`; `abort_block` drops pending; `root()`
-//! reflects COMMITTED `users` only (the index is derived, so it is excluded).
+//! - [`IdentityMsg::BindNode`] binds the SUBMITTING NODE (origin) to the
+//!   authorizer's account, CREATING that account if the authorizer is a
+//!   brand-new founding key (the desktop's auto-bind path).
+//! - [`IdentityMsg::UnbindNode`] evicts a node, authorized by ANY member --
+//!   the "surviving device evicts a lost one" recovery path.
+//! - [`IdentityMsg::AddMemberKey`] admits a new key: an existing member
+//!   consents AND the new key proves possession, both over one preimage.
+//! - [`IdentityMsg::RemoveMemberKey`] drops a key (any member may drop any,
+//!   except the last -- an account always keeps at least one live key).
+//! - [`IdentityMsg::SetAccountName`] renames, origin-gated to a bound node.
+//!
+//! state model mirrors profiles/capability's host-lent staging seam: `execute`
+//! STAGES into a `pending` overlay (committed state untouched); `query` reads
+//! pending-over-committed (read-your-writes) via the `merged_*` helpers;
+//! `commit_block` folds pending into committed state AND rebuilds the derived
+//! `node_index` + `member_index`; `abort_block` drops pending; `root()`
+//! reflects COMMITTED `accounts` only (both indexes are derived, so excluded).
 //!
 //! `BindNode` is additionally member-gated when constructed with a valset id:
 //! the submitting node must be a current validator OR resident (queried live
-//! via [`Ctx::query`]) -- without a valset (the single-node daemon has none)
-//! any external key may bind. `UnbindNode` carries NO member gate and NO
-//! origin restriction beyond "external": it is the recovery path a surviving
-//! device uses to evict a lost one, authorized purely by the user signature.
+//! via [`Ctx::query`]). the member-key and unbind ops carry NO valset gate
+//! beyond "external origin": their authority is the member signature.
 //!
 //! state-sync: a joiner rebuilds this module from a peer via
-//! [`Identity::snapshot`]/[`Identity::install`] (wired through
-//! [`Module::state_sync_handle`]). the snapshot is the exact preimage of
-//! `root()`, so `install` needs no trust in the serving peer -- it recomputes
-//! the root of whatever bytes arrived and adopts them only on a match,
-//! rebuilding `node_index` from the adopted map and clearing `pending`. a
-//! user with an EMPTY node set is a legal encoding (unlike capability, where
-//! an empty tag set means absent): an unbind can leave a record with no
-//! nodes but a surviving name/nonce.
+//! [`Identity::snapshot`]/[`Identity::install`]. the snapshot is the exact
+//! preimage of `root()`, so `install` needs no trust in the serving peer -- it
+//! recomputes the root of whatever bytes arrived and adopts them only on a
+//! match, rebuilding both indexes from the adopted map and clearing `pending`.
+//! an account with an EMPTY node set is a legal encoding (an unbind can leave a
+//! record with no nodes but surviving members/name/nonce); an account with an
+//! EMPTY member set is NOT (every live account keeps at least one key).
+//!
+//! MIGRATION NOTE: this is the v2 account format. the wire shape of the ops and
+//! the canonical state encoding both changed from the v1 single-user-key
+//! registry, so it is a coordinated consensus change -- a mixed old/new network
+//! would fork. dev networks re-establish binds automatically (auto-bind runs on
+//! every desktop connect); a versioned rollout uses the node upgrade path.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
 
+// the pluggable member-key verifier: "(kind, pubkey, proof) -> valid?" for
+// every scheme an account can collect. flattened at the crate root so the wire
+// types (`KeyKind`, `MemberProof`) and the account logic share one vocabulary.
+mod scheme;
+pub use scheme::{
+    KeyKind, MemberProof, verify_authority, webauthn_challenge, webauthn_rp_id_hash,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{
-    Verifier as _,
-    ed25519::{PublicKey, Signature},
-};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use valset::{
@@ -49,13 +69,26 @@ use valset::{
     encode_query as valset_encode_query,
 };
 
-/// one stored user: display name, replay-guard nonce, bound node set, and the
-/// last-write block timestamp. the user key is the map key, so it is not
-/// repeated here.
+/// per-member metadata; the public key is the map key, so it is not repeated.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UserRecord {
+struct MemberMeta {
+    kind: KeyKind,
+    label: Option<String>,
+    /// `SHA-256(rp_id)` a WebAuthn member's later assertions must carry in
+    /// authenticatorData -- pins the passkey to the RP it enrolled under.
+    /// `Some` iff `kind == WebauthnP256`, enforced by the canonical codec.
+    rp_id_hash: Option<[u8; 32]>,
+    added_at: u64,
+}
+
+/// one stored account: display name, shared replay nonce, the member-key set,
+/// the bound node set, and the last-write block timestamp. `account_id` is the
+/// map key, so it is not repeated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AccountRecord {
     display_name: Option<String>,
     nonce: u64,
+    member_keys: BTreeMap<Vec<u8>, MemberMeta>,
     nodes: BTreeSet<Vec<u8>>,
     updated_at: u64,
 }
@@ -67,17 +100,19 @@ pub struct Identity {
     /// daemon carries no valset).
     valset_id: Option<ModuleId>,
     /// this network's chain id -- folded into every signed preimage so a
-    /// certificate minted for one network can never bind/unbind on another.
+    /// certificate minted for one network can never act on another.
     chain_id: String,
     /// committed registry -- what `root()` commits to.
-    users: BTreeMap<Vec<u8>, UserRecord>,
-    /// committed, DERIVED index: node key -> owning user key. rebuilt from
-    /// `users` at every `commit_block`; excluded from `root()`.
+    accounts: BTreeMap<Vec<u8>, AccountRecord>,
+    /// committed, DERIVED index: node key -> owning account id. rebuilt from
+    /// `accounts` at every `commit_block`; excluded from `root()`.
     node_index: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// this block's staged per-user upserts (`Some`) / clears (`None`). read
-    /// ahead of `users` (read-your-writes), merged into committed state only
-    /// on `commit_block`.
-    pending: BTreeMap<Vec<u8>, Option<UserRecord>>,
+    /// committed, DERIVED index: member public key -> owning account id.
+    /// rebuilt alongside `node_index`; excluded from `root()`.
+    member_index: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// this block's staged per-account upserts (`Some`) / clears (`None`).
+    /// read ahead of `accounts` (read-your-writes), merged in on `commit_block`.
+    pending: BTreeMap<Vec<u8>, Option<AccountRecord>>,
 }
 
 impl Identity {
@@ -86,14 +121,15 @@ impl Identity {
             id: id.into(),
             valset_id,
             chain_id,
-            users: BTreeMap::new(),
+            accounts: BTreeMap::new(),
             node_index: BTreeMap::new(),
+            member_index: BTreeMap::new(),
             pending: BTreeMap::new(),
         }
     }
 
-    /// the AUTHENTICATED submitter key -- exactly profiles' gate: a non-empty
-    /// external origin, or a deterministic rejection.
+    /// the AUTHENTICATED submitter key -- a non-empty external origin, or a
+    /// deterministic rejection.
     fn origin_key(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
         match &ctx.env().origin {
             Origin::External(bytes) if bytes.is_empty() => Err(Error::Module(
@@ -106,9 +142,9 @@ impl Identity {
         }
     }
 
-    /// the CURRENT validator set UNION resident set, both queried live from
-    /// the valset module's staged-over-committed projection -- a bind is
-    /// admitted for either standing.
+    /// the CURRENT validator set UNION resident set, both queried live from the
+    /// valset module's staged-over-committed projection -- a bind is admitted
+    /// for either standing.
     async fn members(&self, ctx: &dyn Ctx, valset_id: &str) -> Result<BTreeSet<Vec<u8>>, Error> {
         let validators = match valset_decode_reply(
             &ctx.query(valset_id, &valset_encode_query(&ValsetQuery::Validators))
@@ -132,19 +168,48 @@ impl Identity {
             ValsetReply::Residents(o) => o,
             other => {
                 return Err(Error::Module(format!(
-                    "valset answered an Residents query with {other:?}"
+                    "valset answered a Residents query with {other:?}"
                 )));
             }
         };
         Ok(validators.into_iter().chain(residents).collect())
     }
 
+    /// verify that `auth` is a current member of `record` and that its proof
+    /// authorizes `preimage` under `namespace`. the one gate every member-signed
+    /// op funnels through, so scheme dispatch lives in exactly one place.
+    fn authorize(
+        record: &AccountRecord,
+        namespace: &[u8],
+        preimage: &[u8],
+        auth: &MemberAuth,
+    ) -> Result<(), Error> {
+        let meta = record.member_keys.get(&auth.key).ok_or_else(|| {
+            Error::Module("authorizer is not a member of this account".into())
+        })?;
+        if meta.kind != auth.kind {
+            return Err(Error::Module(
+                "authorizer kind does not match its registered kind".into(),
+            ));
+        }
+        if !verify_authority(
+            auth.kind,
+            &auth.key,
+            meta.rp_id_hash.as_ref(),
+            namespace,
+            preimage,
+            &auth.proof,
+        ) {
+            return Err(Error::Module("authorizer certificate does not verify".into()));
+        }
+        Ok(())
+    }
+
     // ---- merged (pending-over-committed) view -------------------------------
 
-    /// committed users with this block's staged changes applied -- the read
-    /// projection for `All` queries (a `None` overlay entry removes the key).
-    fn merged_users(&self) -> BTreeMap<Vec<u8>, UserRecord> {
-        let mut merged = self.users.clone();
+    /// committed accounts with this block's staged changes applied.
+    fn merged_accounts(&self) -> BTreeMap<Vec<u8>, AccountRecord> {
+        let mut merged = self.accounts.clone();
         for (key, change) in &self.pending {
             match change {
                 Some(record) => {
@@ -158,57 +223,75 @@ impl Identity {
         merged
     }
 
-    /// read one user through the staged overlay (read-your-writes): a
-    /// pending `None` reads as cleared even if a committed record exists.
-    fn merged_record(&self, user_key: &[u8]) -> Option<UserRecord> {
-        match self.pending.get(user_key) {
+    /// read one account through the staged overlay (read-your-writes).
+    fn merged_record(&self, account_id: &[u8]) -> Option<AccountRecord> {
+        match self.pending.get(account_id) {
             Some(change) => change.clone(),
-            None => self.users.get(user_key).cloned(),
+            None => self.accounts.get(account_id).cloned(),
         }
     }
 
-    /// the node -> user index derived from the merged view, so a staged bind
-    /// or unbind is visible to `UserOf`/the takeover guard before commit.
-    fn merged_index(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
-        let mut index = BTreeMap::new();
-        for (user_key, record) in self.merged_users() {
-            for node in &record.nodes {
-                index.insert(node.clone(), user_key.clone());
-            }
-        }
-        index
+    /// node -> account and member -> account indexes derived from the merged
+    /// view, so a staged bind/unbind/add/remove is visible before commit.
+    fn merged_node_index(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        Self::node_index_of(&self.merged_accounts())
+    }
+    fn merged_member_index(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        Self::member_index_of(&self.merged_accounts())
     }
 
-    fn user_view(key: &[u8], record: &UserRecord) -> UserView {
-        UserView {
-            user_key: key.to_vec(),
+    fn account_view(account_id: &[u8], record: &AccountRecord) -> AccountView {
+        AccountView {
+            account_id: account_id.to_vec(),
             display_name: record.display_name.clone(),
             nonce: record.nonce,
+            member_keys: record
+                .member_keys
+                .iter()
+                .map(|(pubkey, meta)| MemberKeyView {
+                    pubkey: pubkey.clone(),
+                    kind: meta.kind,
+                    label: meta.label.clone(),
+                    added_at: meta.added_at,
+                })
+                .collect(),
             nodes: record.nodes.iter().cloned().collect(),
             updated_at: record.updated_at,
         }
     }
 
-    // ---- canonical state bytes (root() preimage; Task 3 ships them as a
-    // snapshot) -----------------------------------------------------------
+    // ---- canonical state bytes (root() preimage / snapshot) -----------------
 
-    /// canonical bytes of `users`: `u64-le` user count, then per sorted user
-    /// `len+user_key`, a name-present flag (`u8` + `len+name` if set),
-    /// `u64-le` nonce, `u64-le` node count then per sorted node `len+node`,
-    /// and `u64-le updated_at`. the index is derived and excluded.
-    fn encode_state(users: &BTreeMap<Vec<u8>, UserRecord>) -> Vec<u8> {
+    /// canonical bytes of `accounts`: `u64-le` account count, then per sorted
+    /// account -- `len+account_id`, name (flag `u8` + `len+name` if set),
+    /// `u64-le` nonce, `u64-le` member count then per sorted member
+    /// (`len+pubkey`, kind tag `u8`, label flag + `len+label` if set,
+    /// rp-hash flag + 32 bytes if set, `u64-le added_at`), `u64-le` node count
+    /// then per sorted node `len+node`, and `u64-le updated_at`. both indexes
+    /// are derived and excluded.
+    fn encode_state(accounts: &BTreeMap<Vec<u8>, AccountRecord>) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(users.len() as u64).to_le_bytes());
-        for (user_key, record) in users {
-            push_bytes(&mut out, user_key);
-            match &record.display_name {
-                Some(name) => {
-                    out.push(1u8);
-                    push_bytes(&mut out, name.as_bytes());
-                }
-                None => out.push(0u8),
-            }
+        out.extend_from_slice(&(accounts.len() as u64).to_le_bytes());
+        for (account_id, record) in accounts {
+            push_bytes(&mut out, account_id);
+            push_opt_str(&mut out, record.display_name.as_deref());
             out.extend_from_slice(&record.nonce.to_le_bytes());
+
+            out.extend_from_slice(&(record.member_keys.len() as u64).to_le_bytes());
+            for (pubkey, meta) in &record.member_keys {
+                push_bytes(&mut out, pubkey);
+                out.push(meta.kind.tag());
+                push_opt_str(&mut out, meta.label.as_deref());
+                match &meta.rp_id_hash {
+                    Some(hash) => {
+                        out.push(1u8);
+                        out.extend_from_slice(hash);
+                    }
+                    None => out.push(0u8),
+                }
+                out.extend_from_slice(&meta.added_at.to_le_bytes());
+            }
+
             out.extend_from_slice(&(record.nodes.len() as u64).to_le_bytes());
             for node in &record.nodes {
                 push_bytes(&mut out, node);
@@ -218,52 +301,46 @@ impl Identity {
         out
     }
 
-    /// the state-based commitment for `users`: `ZERO` when empty (matching
-    /// capability's convention), else sha256 over exactly the bytes
-    /// `encode_state` emits.
-    fn root_of(users: &BTreeMap<Vec<u8>, UserRecord>) -> StateRoot {
-        if users.is_empty() {
+    /// the state-based commitment: `ZERO` when empty, else sha256 over exactly
+    /// the bytes `encode_state` emits.
+    fn root_of(accounts: &BTreeMap<Vec<u8>, AccountRecord>) -> StateRoot {
+        if accounts.is_empty() {
             return StateRoot::ZERO;
         }
-        StateRoot(Sha256::digest(Self::encode_state(users)).into())
+        StateRoot(Sha256::digest(Self::encode_state(accounts)).into())
     }
 
-    /// the node -> user index derived from `users` -- rebuilt wholesale after
-    /// `install` adopts a new registry (mirrors `commit_block`'s per-key
-    /// derivation, but over the entire adopted map at once).
-    fn index_of(users: &BTreeMap<Vec<u8>, UserRecord>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    fn node_index_of(accounts: &BTreeMap<Vec<u8>, AccountRecord>) -> BTreeMap<Vec<u8>, Vec<u8>> {
         let mut index = BTreeMap::new();
-        for (user_key, record) in users {
+        for (account_id, record) in accounts {
             for node in &record.nodes {
-                index.insert(node.clone(), user_key.clone());
+                index.insert(node.clone(), account_id.clone());
+            }
+        }
+        index
+    }
+
+    fn member_index_of(accounts: &BTreeMap<Vec<u8>, AccountRecord>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        let mut index = BTreeMap::new();
+        for (account_id, record) in accounts {
+            for member in record.member_keys.keys() {
+                index.insert(member.clone(), account_id.clone());
             }
         }
         index
     }
 
     // ---- state-sync (snapshot / install) -----------------------------------
-    // a joiner rebuilds this module from a peer via `snapshot`/`install`. the
-    // snapshot is the exact preimage of `root()`, so the joiner needs no
-    // trust in the serving peer: `install` recomputes the root of whatever
-    // bytes arrived and refuses to adopt them unless it matches the expected
-    // root consensus already agreed on.
 
     /// canonical bytes of the COMMITTED registry -- exactly what `root()`
-    /// hashes. pending is deliberately excluded: a snapshot ships what
-    /// consensus committed to, not this block's in-flight stage.
+    /// hashes. pending is deliberately excluded.
     pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode_state(&self.users)
+        Self::encode_state(&self.accounts)
     }
 
-    /// replace committed state with a decoded snapshot, iff the decoded
-    /// registry's recomputed root equals `expected`. decode and verification
-    /// land in a temporary map: `self` is mutated only after both pass, so on
-    /// any `Err` committed state, the derived index, and pending are
-    /// byte-identical to before the call. success rebuilds `node_index` from
-    /// the adopted map and clears `pending` -- staged changes belong to the
-    /// state being replaced, not the state being adopted. this is not an
-    /// execute path: no `Ctx` is consulted, so a member-gated module installs
-    /// exactly like an ungated one.
+    /// replace committed state with a decoded snapshot iff its recomputed root
+    /// equals `expected`. decode/verify land in a temporary map, so on any
+    /// `Err` committed state and both indexes are byte-identical to before.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let decoded = Self::decode_snapshot(bytes)?;
         let root = Self::root_of(&decoded);
@@ -272,156 +349,137 @@ impl Identity {
                 "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
             )));
         }
-        self.node_index = Self::index_of(&decoded);
-        self.users = decoded;
+        self.node_index = Self::node_index_of(&decoded);
+        self.member_index = Self::member_index_of(&decoded);
+        self.accounts = decoded;
         self.pending.clear();
         Ok(())
     }
 
-    /// strict decode of UNTRUSTED snapshot bytes (a byzantine peer serves
-    /// them). every count and length is checked against the remaining buffer
-    /// BEFORE any allocation, truncation and trailing bytes both reject, user
-    /// keys and (within a user) node keys must arrive strictly increasing,
-    /// the name-present flag must be exactly 0 or 1 with a non-empty name
-    /// when set, and a node claimed by two different users rejects (a state
-    /// the execute path can never commit). unlike capability, a user with an
-    /// EMPTY node set is a legal encoding -- an unbind can leave a record with
-    /// no nodes but a surviving name/nonce, so node count 0 must decode, not
-    /// reject.
-    fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, UserRecord>, Error> {
-        fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
-            let Some((head, rest)) = (*buf).split_first_chunk::<8>() else {
-                return Err(Error::Module("snapshot truncated".into()));
-            };
-            *buf = rest;
-            Ok(u64::from_le_bytes(*head))
-        }
+    /// strict decode of UNTRUSTED snapshot bytes (a byzantine peer serves them):
+    /// every count/length is checked against the remaining buffer before any
+    /// allocation; truncation and trailing bytes both reject; account ids,
+    /// member keys (within an account) and node keys (within an account) must
+    /// each arrive strictly increasing; the kind tag must be known; the rp-hash
+    /// flag must be present exactly for WebAuthn members; every account carries
+    /// at least one member; and no node or member key may appear in two
+    /// accounts (states the execute path can never commit).
+    fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, AccountRecord>, Error> {
+        let mut cur = Cursor::new(bytes);
+        let count = cur.u64()?;
+        // per-account minimum: id-len(8) + name flag(1) + nonce(8) + member
+        // count(8) + node count(8) + updated_at(8) = 41 bytes.
+        const MIN_ACCOUNT_BYTES: u64 = 41;
+        cur.bound(count, MIN_ACCOUNT_BYTES, "account")?;
 
-        let mut buf = bytes;
-        let count = take_u64(&mut buf)?;
-        // each user entry costs at least its 8-byte key-length prefix, a
-        // 1-byte name flag, an 8-byte nonce, an 8-byte node count, and an
-        // 8-byte updated_at -- 33 bytes minimum -- so a forged count the
-        // remaining bytes could not possibly hold is rejected up front.
-        const MIN_USER_BYTES: u64 = 33;
-        if count > (buf.len() as u64) / MIN_USER_BYTES {
-            return Err(Error::Module(format!(
-                "snapshot user count {count} exceeds the {} remaining bytes",
-                buf.len()
-            )));
-        }
-        let mut users = BTreeMap::new();
-        let mut prev_user: Option<&[u8]> = None;
+        let mut accounts = BTreeMap::new();
+        let mut prev_account: Option<Vec<u8>> = None;
         for _ in 0..count {
-            let key_len = take_u64(&mut buf)?;
-            if key_len > buf.len() as u64 {
-                return Err(Error::Module(format!(
-                    "snapshot user key length {key_len} exceeds the {} remaining bytes",
-                    buf.len()
-                )));
-            }
-            let (user_key, rest) = buf.split_at(key_len as usize);
-            buf = rest;
-            if prev_user.is_some_and(|p| p >= user_key) {
+            let account_id = cur.bytes()?.to_vec();
+            if prev_account.as_deref().is_some_and(|p| p >= account_id.as_slice()) {
                 return Err(Error::Module(
-                    "snapshot user keys must be strictly increasing".into(),
+                    "snapshot account ids must be strictly increasing".into(),
                 ));
             }
-            prev_user = Some(user_key);
+            prev_account = Some(account_id.clone());
 
-            let Some((&name_flag, rest)) = buf.split_first() else {
-                return Err(Error::Module("snapshot truncated".into()));
-            };
-            buf = rest;
-            let display_name = match name_flag {
-                0 => None,
-                1 => {
-                    let name_len = take_u64(&mut buf)?;
-                    if name_len > buf.len() as u64 {
-                        return Err(Error::Module(format!(
-                            "snapshot name length {name_len} exceeds the {} remaining bytes",
-                            buf.len()
-                        )));
-                    }
-                    let (name_bytes, rest) = buf.split_at(name_len as usize);
-                    buf = rest;
-                    if name_bytes.is_empty() {
-                        return Err(Error::Module(
-                            "snapshot name flag set but name is empty".into(),
-                        ));
-                    }
-                    if name_bytes.len() > MAX_NAME_LEN {
-                        return Err(Error::Module(format!(
-                            "snapshot name exceeds the {MAX_NAME_LEN}-byte limit"
-                        )));
-                    }
-                    let name = std::str::from_utf8(name_bytes).map_err(|e| {
-                        Error::Module(format!("snapshot name is not utf-8: {e}"))
-                    })?;
-                    Some(name.to_string())
-                }
-                other => {
-                    return Err(Error::Module(format!(
-                        "snapshot name flag must be 0 or 1, got {other}"
-                    )));
-                }
-            };
+            let display_name = cur.opt_str(MAX_NAME_LEN, "account name")?;
+            let nonce = cur.u64()?;
 
-            let nonce = take_u64(&mut buf)?;
+            let member_keys = Self::decode_members(&mut cur)?;
+            let nodes = Self::decode_nodes(&mut cur)?;
+            let updated_at = cur.u64()?;
 
-            let node_count = take_u64(&mut buf)?;
-            // each node costs at least its 8-byte length prefix.
-            if node_count > (buf.len() as u64) / 8 {
-                return Err(Error::Module(format!(
-                    "snapshot node count {node_count} exceeds the {} remaining bytes",
-                    buf.len()
-                )));
-            }
-            let mut nodes = BTreeSet::new();
-            let mut prev_node: Option<&[u8]> = None;
-            for _ in 0..node_count {
-                let node_len = take_u64(&mut buf)?;
-                if node_len > buf.len() as u64 {
-                    return Err(Error::Module(format!(
-                        "snapshot node length {node_len} exceeds the {} remaining bytes",
-                        buf.len()
-                    )));
-                }
-                let (node, rest) = buf.split_at(node_len as usize);
-                buf = rest;
-                if prev_node.is_some_and(|p| p >= node) {
-                    return Err(Error::Module(
-                        "snapshot node keys must be strictly increasing within a user".into(),
-                    ));
-                }
-                prev_node = Some(node);
-                nodes.insert(node.to_vec());
-            }
-
-            let updated_at = take_u64(&mut buf)?;
-
-            users.insert(
-                user_key.to_vec(),
-                UserRecord { display_name, nonce, nodes, updated_at },
+            accounts.insert(
+                account_id,
+                AccountRecord { display_name, nonce, member_keys, nodes, updated_at },
             );
         }
-        if !buf.is_empty() {
-            return Err(Error::Module(format!("snapshot carries {} trailing bytes", buf.len())));
-        }
+        cur.finish()?;
 
-        // a node bound to two different users is illegal: the execute path
-        // (bind's takeover guard) can never commit that state, so a snapshot
-        // claiming it must be a byzantine forgery.
+        // no node and no member key may be claimed by two accounts: the execute
+        // path enforces single-ownership, so a snapshot claiming otherwise is a
+        // forgery.
         let mut seen_nodes = BTreeSet::new();
-        for record in users.values() {
+        let mut seen_members = BTreeSet::new();
+        for record in accounts.values() {
             for node in &record.nodes {
                 if !seen_nodes.insert(node.clone()) {
                     return Err(Error::Module("node bound twice in snapshot".into()));
                 }
             }
+            for member in record.member_keys.keys() {
+                if !seen_members.insert(member.clone()) {
+                    return Err(Error::Module("member key claimed twice in snapshot".into()));
+                }
+            }
         }
 
-        Ok(users)
+        Ok(accounts)
+    }
+
+    fn decode_members(cur: &mut Cursor) -> Result<BTreeMap<Vec<u8>, MemberMeta>, Error> {
+        let count = cur.u64()?;
+        // per-member minimum: pubkey-len(8) + kind(1) + label flag(1) + rp
+        // flag(1) + added_at(8) = 19 bytes.
+        const MIN_MEMBER_BYTES: u64 = 19;
+        cur.bound(count, MIN_MEMBER_BYTES, "member")?;
+        if count == 0 {
+            return Err(Error::Module(
+                "snapshot account has no member keys (every live account keeps one)".into(),
+            ));
+        }
+        let mut members = BTreeMap::new();
+        let mut prev: Option<Vec<u8>> = None;
+        for _ in 0..count {
+            let pubkey = cur.bytes()?.to_vec();
+            if prev.as_deref().is_some_and(|p| p >= pubkey.as_slice()) {
+                return Err(Error::Module(
+                    "snapshot member keys must be strictly increasing within an account".into(),
+                ));
+            }
+            prev = Some(pubkey.clone());
+
+            let kind = KeyKind::from_tag(cur.byte()?)
+                .ok_or_else(|| Error::Module("snapshot member has an unknown key kind".into()))?;
+            let label = cur.opt_str(MAX_LABEL_LEN, "member label")?;
+            let rp_id_hash = match cur.byte()? {
+                0 => None,
+                1 => Some(cur.array::<32>()?),
+                other => {
+                    return Err(Error::Module(format!(
+                        "snapshot rp-hash flag must be 0 or 1, got {other}"
+                    )));
+                }
+            };
+            // the rp-hash pin is present exactly for WebAuthn members.
+            if rp_id_hash.is_some() != kind.expects_rp_id_hash() {
+                return Err(Error::Module(
+                    "snapshot rp-hash presence does not match the member kind".into(),
+                ));
+            }
+            let added_at = cur.u64()?;
+            members.insert(pubkey, MemberMeta { kind, label, rp_id_hash, added_at });
+        }
+        Ok(members)
+    }
+
+    fn decode_nodes(cur: &mut Cursor) -> Result<BTreeSet<Vec<u8>>, Error> {
+        let count = cur.u64()?;
+        cur.bound(count, 8, "node")?;
+        let mut nodes = BTreeSet::new();
+        let mut prev: Option<Vec<u8>> = None;
+        for _ in 0..count {
+            let node = cur.bytes()?.to_vec();
+            if prev.as_deref().is_some_and(|p| p >= node.as_slice()) {
+                return Err(Error::Module(
+                    "snapshot node keys must be strictly increasing within an account".into(),
+                ));
+            }
+            prev = Some(node.clone());
+            nodes.insert(node);
+        }
+        Ok(nodes)
     }
 }
 
@@ -430,941 +488,474 @@ fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+/// encode an optional string as a `0` flag, or `1` + length-prefixed bytes.
+fn push_opt_str(out: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(s) => {
+            out.push(1u8);
+            push_bytes(out, s.as_bytes());
+        }
+        None => out.push(0u8),
+    }
+}
+
+/// a forward-only reader over untrusted snapshot bytes: every accessor checks
+/// the remaining buffer before it reads, so a forged length can never
+/// over-read or drive an allocation the bytes could not back.
+struct Cursor<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
+    fn u64(&mut self) -> Result<u64, Error> {
+        let Some((head, rest)) = self.buf.split_first_chunk::<8>() else {
+            return Err(Error::Module("snapshot truncated".into()));
+        };
+        self.buf = rest;
+        Ok(u64::from_le_bytes(*head))
+    }
+
+    fn byte(&mut self) -> Result<u8, Error> {
+        let Some((&b, rest)) = self.buf.split_first() else {
+            return Err(Error::Module("snapshot truncated".into()));
+        };
+        self.buf = rest;
+        Ok(b)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+        let Some((head, rest)) = self.buf.split_first_chunk::<N>() else {
+            return Err(Error::Module("snapshot truncated".into()));
+        };
+        self.buf = rest;
+        Ok(*head)
+    }
+
+    /// a `u64`-length-prefixed byte slice, length-checked before the split.
+    fn bytes(&mut self) -> Result<&'a [u8], Error> {
+        let len = self.u64()?;
+        if len > self.buf.len() as u64 {
+            return Err(Error::Module(format!(
+                "snapshot length {len} exceeds the {} remaining bytes",
+                self.buf.len()
+            )));
+        }
+        let (head, rest) = self.buf.split_at(len as usize);
+        self.buf = rest;
+        Ok(head)
+    }
+
+    /// an optional utf-8 string: flag byte `0` (absent) or `1` + a non-empty,
+    /// `max`-bounded, valid-utf8 length-prefixed slice.
+    fn opt_str(&mut self, max: usize, what: &str) -> Result<Option<String>, Error> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => {
+                let raw = self.bytes()?;
+                if raw.is_empty() {
+                    return Err(Error::Module(format!("snapshot {what} flag set but empty")));
+                }
+                if raw.len() > max {
+                    return Err(Error::Module(format!(
+                        "snapshot {what} exceeds the {max}-byte limit"
+                    )));
+                }
+                let s = std::str::from_utf8(raw)
+                    .map_err(|e| Error::Module(format!("snapshot {what} is not utf-8: {e}")))?;
+                Ok(Some(s.to_string()))
+            }
+            other => Err(Error::Module(format!(
+                "snapshot {what} flag must be 0 or 1, got {other}"
+            ))),
+        }
+    }
+
+    /// reject a forged count that the remaining bytes could not possibly hold,
+    /// before looping -- `count * min_each` must fit.
+    fn bound(&self, count: u64, min_each: u64, what: &str) -> Result<(), Error> {
+        if count > (self.buf.len() as u64) / min_each {
+            return Err(Error::Module(format!(
+                "snapshot {what} count {count} exceeds the {} remaining bytes",
+                self.buf.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), Error> {
+        if self.buf.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Module(format!(
+                "snapshot carries {} trailing bytes",
+                self.buf.len()
+            )))
+        }
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl Module for Identity {
     fn id(&self) -> ModuleId {
         self.id.clone()
     }
 
-    /// state-based commitment over the COMMITTED registry only.
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.users)
+        Self::root_of(&self.accounts)
     }
 
-    /// advertise the snapshot lane: [`Identity::snapshot`] is the exact
-    /// preimage of `root()`, and [`Identity::install`] verifies before
-    /// adopting.
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
         Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
-            IdentityMsg::BindNode { user_key, user_sig } => {
-                let origin = Self::origin_key(ctx)?;
-
-                // 1. user_key must decode as a valid ed25519 point.
-                let pubkey = PublicKey::decode(user_key.as_slice())
-                    .map_err(|_| Error::Module("bind user_key is not a valid ed25519 key".into()))?;
-
-                // 2. member gate: validators UNION residents, only when configured.
-                if let Some(valset_id) = self.valset_id.clone() {
-                    let members = self.members(&*ctx, &valset_id).await?;
-                    if !members.contains(&origin) {
-                        return Err(Error::Module(
-                            "bind origin is not a network member or resident".into(),
-                        ));
-                    }
-                }
-
-                // 3. resolve the origin node's current binding via the merged view.
-                if let Some(bound_to) = self.merged_index().get(&origin) {
-                    if *bound_to == user_key {
-                        // idempotent re-bind: no-op, nonce NOT bumped. user_sig is
-                        // deliberately left unverified on this path — no state
-                        // changes, and origin is already consensus-authenticated.
-                        return Ok(());
-                    }
-                    return Err(Error::Module(
-                        "node is already bound to another user; unbind first".into(),
-                    ));
-                }
-
-                // 4. verify the user's consent certificate against the CURRENT nonce.
-                let mut record = self.merged_record(&user_key).unwrap_or_else(|| UserRecord {
-                    display_name: None,
-                    nonce: 0,
-                    nodes: BTreeSet::new(),
-                    updated_at: 0,
-                });
-                let sig = Signature::decode(user_sig.as_slice())
-                    .map_err(|_| Error::Module("bind certificate does not verify".into()))?;
-                let preimage = bind_preimage(&self.chain_id, &origin, record.nonce);
-                if !pubkey.verify(IDENTITY_BIND_NS, &preimage, &sig) {
-                    return Err(Error::Module("bind certificate does not verify".into()));
-                }
-
-                // 5. stage.
-                record.nodes.insert(origin);
-                record.nonce += 1;
-                record.updated_at = ctx.env().consensus_time;
-                self.pending.insert(user_key, Some(record));
-                Ok(())
+            IdentityMsg::BindNode { authorizer } => self.bind_node(ctx, authorizer).await,
+            IdentityMsg::UnbindNode { node_key, authorizer } => {
+                self.unbind_node(ctx, node_key, authorizer)
             }
-            IdentityMsg::UnbindNode { node_key, user_sig } => {
-                // external, non-empty; NO member gate, NO further origin
-                // restriction -- a surviving device can evict a lost one.
-                Self::origin_key(ctx)?;
-
-                let user_key = self
-                    .merged_index()
-                    .get(&node_key)
-                    .cloned()
-                    .ok_or_else(|| Error::Module("node is not bound".into()))?;
-                let mut record = self
-                    .merged_record(&user_key)
-                    .expect("node_index only ever points at an existing record");
-
-                let pubkey = PublicKey::decode(user_key.as_slice())
-                    .map_err(|_| Error::Module("unbind certificate does not verify".into()))?;
-                let sig = Signature::decode(user_sig.as_slice())
-                    .map_err(|_| Error::Module("unbind certificate does not verify".into()))?;
-                let preimage = unbind_preimage(&self.chain_id, &node_key, record.nonce);
-                if !pubkey.verify(IDENTITY_UNBIND_NS, &preimage, &sig) {
-                    return Err(Error::Module("unbind certificate does not verify".into()));
-                }
-
-                // the record persists even with an empty node set: name +
-                // nonce survive so a re-bind can still resolve them.
-                record.nodes.remove(&node_key);
-                record.nonce += 1;
-                record.updated_at = ctx.env().consensus_time;
-                self.pending.insert(user_key, Some(record));
-                Ok(())
+            IdentityMsg::AddMemberKey {
+                new_key,
+                new_kind,
+                new_label,
+                possession,
+                authorizer,
+            } => self.add_member_key(ctx, new_key, new_kind, new_label, possession, authorizer),
+            IdentityMsg::RemoveMemberKey { target_key, authorizer } => {
+                self.remove_member_key(ctx, target_key, authorizer)
             }
-            IdentityMsg::SetUserName { display_name } => {
-                let origin = Self::origin_key(ctx)?;
-                let user_key = self
-                    .merged_index()
-                    .get(&origin)
-                    .cloned()
-                    .ok_or_else(|| Error::Module("origin node is not bound to a user".into()))?;
-                let mut record = self
-                    .merged_record(&user_key)
-                    .expect("node_index only ever points at an existing record");
-
-                let trimmed = display_name.trim();
-                if trimmed.is_empty() {
-                    record.display_name = None;
-                } else if trimmed.len() > MAX_NAME_LEN {
-                    return Err(Error::Module(format!(
-                        "display name exceeds the {MAX_NAME_LEN}-byte limit"
-                    )));
-                } else {
-                    record.display_name = Some(trimmed.to_string());
-                }
-                // no user signature is consumed here: the nonce is NOT bumped.
-                record.updated_at = ctx.env().consensus_time;
-                self.pending.insert(user_key, Some(record));
-                Ok(())
-            }
+            IdentityMsg::SetAccountName { display_name } => self.set_account_name(ctx, display_name),
         }
     }
 
-    /// read projection -- the merged (pending-over-committed) view.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             IdentityQuery::All { from, limit } => {
-                let merged = self.merged_users();
+                let merged = self.merged_accounts();
                 let limit = limit.min(MAX_QUERY_LIMIT) as usize;
                 let from = usize::try_from(from).unwrap_or(usize::MAX);
-                let users = merged
+                let accounts = merged
                     .iter()
                     .skip(from)
                     .take(limit)
-                    .map(|(key, record)| Self::user_view(key, record))
+                    .map(|(id, record)| Self::account_view(id, record))
                     .collect();
-                Ok(encode_reply(&IdentityReply::Users(users)))
+                Ok(encode_reply(&IdentityReply::Accounts(accounts)))
             }
-            IdentityQuery::Get { user_key } => Ok(encode_reply(&IdentityReply::User(
-                self.merged_record(&user_key)
-                    .map(|record| Self::user_view(&user_key, &record)),
+            IdentityQuery::Get { account_id } => Ok(encode_reply(&IdentityReply::Account(
+                self.merged_record(&account_id)
+                    .map(|record| Self::account_view(&account_id, &record)),
             ))),
-            IdentityQuery::UserOf { node_key } => {
-                let user = self.merged_index().get(&node_key).cloned().and_then(|user_key| {
-                    self.merged_record(&user_key)
-                        .map(|record| Self::user_view(&user_key, &record))
+            IdentityQuery::OfNode { node_key } => {
+                let account = self.merged_node_index().get(&node_key).cloned().and_then(|id| {
+                    self.merged_record(&id).map(|record| Self::account_view(&id, &record))
                 });
-                Ok(encode_reply(&IdentityReply::User(user)))
+                Ok(encode_reply(&IdentityReply::Account(account)))
+            }
+            IdentityQuery::OfMember { member_key } => {
+                let account = self.merged_member_index().get(&member_key).cloned().and_then(|id| {
+                    self.merged_record(&id).map(|record| Self::account_view(&id, &record))
+                });
+                Ok(encode_reply(&IdentityReply::Account(account)))
             }
         }
     }
 
-    /// merge the block's staged upserts/clears into committed state and
-    /// rebuild the affected `node_index` entries.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        for (user_key, change) in std::mem::take(&mut self.pending) {
-            // drop every index entry currently pointing at this user; the
-            // new set (if any) is reinserted below.
-            self.node_index.retain(|_, owner| owner != &user_key);
+        for (account_id, change) in std::mem::take(&mut self.pending) {
+            // drop every index entry currently pointing at this account; the
+            // new sets (if any) are reinserted below.
+            self.node_index.retain(|_, owner| owner != &account_id);
+            self.member_index.retain(|_, owner| owner != &account_id);
             match change {
                 Some(record) => {
                     for node in &record.nodes {
-                        self.node_index.insert(node.clone(), user_key.clone());
+                        self.node_index.insert(node.clone(), account_id.clone());
                     }
-                    self.users.insert(user_key, record);
+                    for member in record.member_keys.keys() {
+                        self.member_index.insert(member.clone(), account_id.clone());
+                    }
+                    self.accounts.insert(account_id, record);
                 }
                 None => {
-                    self.users.remove(&user_key);
+                    self.accounts.remove(&account_id);
                 }
             }
         }
         Ok(())
     }
 
-    /// discard the block's staged changes -- committed state (and `root()`)
-    /// is unchanged.
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.pending.clear();
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use commonware_cryptography::{Signer as _, ed25519};
+impl Identity {
+    /// bind the origin node to the authorizer's account, creating that account
+    /// when the authorizer is a brand-new founding key.
+    async fn bind_node(&mut self, ctx: &mut dyn Ctx, authorizer: MemberAuth) -> Result<(), Error> {
+        let origin = Self::origin_key(ctx)?;
 
-    /// a minimal Ctx: origin-configurable, and (optionally) answers BOTH the
-    /// valset Validators and Residents queries so the member gate is
-    /// testable for either standing.
-    struct TestCtx {
-        env: sdk::Env,
-        members: Option<Vec<Vec<u8>>>,
-        residents: Option<Vec<Vec<u8>>>,
-    }
-    impl TestCtx {
-        fn external(key: &[u8]) -> Self {
-            Self::with_origin(sdk::Origin::External(key.to_vec()))
-        }
-        fn with_origin(origin: sdk::Origin) -> Self {
-            Self {
-                env: sdk::Env {
-                    protocol_version: 0,
-                    height: 0,
-                    consensus_time: 0,
-                    origin,
-                    me: "identity".into(),
-                },
-                members: None,
-                residents: None,
+        // member gate: validators UNION residents, only when configured.
+        if let Some(valset_id) = self.valset_id.clone() {
+            let members = self.members(&*ctx, &valset_id).await?;
+            if !members.contains(&origin) {
+                return Err(Error::Module(
+                    "bind origin is not a network member or resident".into(),
+                ));
             }
         }
-        fn gated(key: &[u8], validators: Vec<Vec<u8>>, residents: Vec<Vec<u8>>) -> Self {
-            let mut ctx = Self::external(key);
-            ctx.members = Some(validators);
-            ctx.residents = Some(residents);
-            ctx
+
+        // which account does this authorizer speak for -- an existing
+        // membership, or a brand-new account it founds?
+        let (account_id, mut record) = match self.merged_member_index().get(&authorizer.key).cloned()
+        {
+            Some(account_id) => {
+                let record = self
+                    .merged_record(&account_id)
+                    .expect("member_index only ever points at an existing record");
+                (account_id, record)
+            }
+            None => {
+                if !authorizer.kind.pubkey_wellformed(&authorizer.key) {
+                    return Err(Error::Module("founding key is malformed for its kind".into()));
+                }
+                if self.merged_record(&authorizer.key).is_some() {
+                    return Err(Error::Module(
+                        "account id already exists but its founding key is not a member".into(),
+                    ));
+                }
+                let rp_id_hash = if authorizer.kind.expects_rp_id_hash() {
+                    webauthn_rp_id_hash(&authorizer.proof)
+                } else {
+                    None
+                };
+                let mut member_keys = BTreeMap::new();
+                member_keys.insert(
+                    authorizer.key.clone(),
+                    MemberMeta {
+                        kind: authorizer.kind,
+                        label: None,
+                        rp_id_hash,
+                        added_at: ctx.env().consensus_time,
+                    },
+                );
+                let record = AccountRecord {
+                    display_name: None,
+                    nonce: 0,
+                    member_keys,
+                    nodes: BTreeSet::new(),
+                    updated_at: 0,
+                };
+                (authorizer.key.clone(), record)
+            }
+        };
+
+        // idempotent re-bind: node already bound to THIS account -> no-op, no
+        // nonce bump. the proof is deliberately left unverified here (no state
+        // change, and origin is already consensus-authenticated).
+        if let Some(bound_to) = self.merged_node_index().get(&origin) {
+            if *bound_to == account_id {
+                return Ok(());
+            }
+            return Err(Error::Module(
+                "node is already bound to another account; unbind first".into(),
+            ));
         }
-        fn with_members(key: &[u8], members: Vec<Vec<u8>>) -> Self {
-            Self::gated(key, members, Vec::new())
-        }
-        fn with_residents(key: &[u8], residents: Vec<Vec<u8>>) -> Self {
-            Self::gated(key, Vec::new(), residents)
-        }
+
+        // verify the member's consent at the account's CURRENT nonce.
+        let preimage = bind_preimage(&self.chain_id, &origin, record.nonce);
+        Self::authorize(&record, IDENTITY_BIND_NS, &preimage, &authorizer)?;
+
+        record.nodes.insert(origin);
+        record.nonce += 1;
+        record.updated_at = ctx.env().consensus_time;
+        self.pending.insert(account_id, Some(record));
+        Ok(())
     }
-    #[async_trait::async_trait(?Send)]
-    impl Ctx for TestCtx {
-        fn env(&self) -> &sdk::Env {
-            &self.env
+
+    /// evict `node_key`, authorized by any member of its account.
+    fn unbind_node(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        node_key: Vec<u8>,
+        authorizer: MemberAuth,
+    ) -> Result<(), Error> {
+        Self::origin_key(ctx)?;
+
+        let account_id = self
+            .merged_node_index()
+            .get(&node_key)
+            .cloned()
+            .ok_or_else(|| Error::Module("node is not bound".into()))?;
+        let mut record = self
+            .merged_record(&account_id)
+            .expect("node_index only ever points at an existing record");
+
+        let preimage = unbind_preimage(&self.chain_id, &node_key, record.nonce);
+        Self::authorize(&record, IDENTITY_UNBIND_NS, &preimage, &authorizer)?;
+
+        // the record persists even with an empty node set: members + name +
+        // nonce survive so a re-bind can still resolve them.
+        record.nodes.remove(&node_key);
+        record.nonce += 1;
+        record.updated_at = ctx.env().consensus_time;
+        self.pending.insert(account_id, Some(record));
+        Ok(())
+    }
+
+    /// admit `new_key` to the authorizer's account: an existing member consents
+    /// and the new key proves possession, both over the same add-preimage.
+    fn add_member_key(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        new_key: Vec<u8>,
+        new_kind: KeyKind,
+        new_label: Option<String>,
+        possession: MemberProof,
+        authorizer: MemberAuth,
+    ) -> Result<(), Error> {
+        Self::origin_key(ctx)?;
+
+        let account_id = self
+            .merged_member_index()
+            .get(&authorizer.key)
+            .cloned()
+            .ok_or_else(|| Error::Module("authorizer belongs to no account".into()))?;
+        let mut record = self
+            .merged_record(&account_id)
+            .expect("member_index only ever points at an existing record");
+
+        if !new_kind.pubkey_wellformed(&new_key) {
+            return Err(Error::Module("new member key is malformed for its kind".into()));
         }
-        fn module_root(&self, _t: &str) -> Option<StateRoot> {
+        if record.member_keys.contains_key(&new_key) {
+            return Err(Error::Module("key is already a member of this account".into()));
+        }
+        if self.merged_member_index().contains_key(&new_key) {
+            return Err(Error::Module("key already belongs to another account".into()));
+        }
+        let label = clean_label(new_label)?;
+
+        let preimage =
+            add_member_preimage(&self.chain_id, &account_id, &new_key, new_kind, record.nonce);
+        // existing member consents ...
+        Self::authorize(&record, IDENTITY_ADD_MEMBER_NS, &preimage, &authorizer)?;
+        // ... and the new key proves it holds itself (no rp pin yet -- the
+        // proof establishes it).
+        if !verify_authority(new_kind, &new_key, None, IDENTITY_ADD_MEMBER_NS, &preimage, &possession)
+        {
+            return Err(Error::Module("possession proof does not verify".into()));
+        }
+        let rp_id_hash = if new_kind.expects_rp_id_hash() {
+            Some(webauthn_rp_id_hash(&possession).ok_or_else(|| {
+                Error::Module("webauthn possession proof carries no rp id hash".into())
+            })?)
+        } else {
             None
-        }
-        async fn query(&self, t: &str, r: &[u8]) -> Result<Vec<u8>, Error> {
-            if t != "valset" {
-                return Err(Error::QueryUnsupported);
-            }
-            let q = valset::decode_query(r).map_err(Error::Module)?;
-            match (q, &self.members, &self.residents) {
-                (valset::ValsetQuery::Validators, Some(m), _) => {
-                    Ok(valset::encode_reply(&valset::ValsetReply::Validators(m.clone())))
-                }
-                (valset::ValsetQuery::Residents, _, Some(o)) => {
-                    Ok(valset::encode_reply(&valset::ValsetReply::Residents(o.clone())))
-                }
-                _ => Err(Error::QueryUnsupported),
-            }
-        }
-        fn emit_msg(&mut self, _m: Msg) {}
-        fn emit_event(&mut self, _e: sdk::Event) {}
-        fn request_effect(&mut self, _e: sdk::Effect) {}
-    }
-
-    const CHAIN: &str = "test-chain";
-
-    fn user() -> ed25519::PrivateKey {
-        ed25519::PrivateKey::from_seed(7)
-    }
-
-    fn bind_msg(user: &ed25519::PrivateKey, chain: &str, node: &[u8], nonce: u64) -> Msg {
-        let user_key = user.public_key().as_ref().to_vec();
-        let sig = user.sign(IDENTITY_BIND_NS, &bind_preimage(chain, node, nonce));
-        Msg {
-            target: "identity".into(),
-            payload: encode_msg(&IdentityMsg::BindNode {
-                user_key,
-                user_sig: sig.as_ref().to_vec(),
-            }),
-        }
-    }
-
-    fn unbind_msg(user: &ed25519::PrivateKey, chain: &str, node: &[u8], nonce: u64) -> Msg {
-        let sig = user.sign(IDENTITY_UNBIND_NS, &unbind_preimage(chain, node, nonce));
-        Msg {
-            target: "identity".into(),
-            payload: encode_msg(&IdentityMsg::UnbindNode {
-                node_key: node.to_vec(),
-                user_sig: sig.as_ref().to_vec(),
-            }),
-        }
-    }
-
-    fn setname_msg(display_name: &str) -> Msg {
-        Msg {
-            target: "identity".into(),
-            payload: encode_msg(&IdentityMsg::SetUserName {
-                display_name: display_name.to_string(),
-            }),
-        }
-    }
-
-    fn user_of(id: &Identity, node: &[u8]) -> Option<UserView> {
-        let reply = futures::executor::block_on(
-            id.query(&encode_query(&IdentityQuery::UserOf { node_key: node.to_vec() })),
-        )
-        .unwrap();
-        match decode_reply(&reply).unwrap() {
-            IdentityReply::User(u) => u,
-            other => panic!("expected User reply, got {other:?}"),
-        }
-    }
-
-    fn get_user(id: &Identity, user_key: &[u8]) -> Option<UserView> {
-        let reply = futures::executor::block_on(
-            id.query(&encode_query(&IdentityQuery::Get { user_key: user_key.to_vec() })),
-        )
-        .unwrap();
-        match decode_reply(&reply).unwrap() {
-            IdentityReply::User(u) => u,
-            other => panic!("expected User reply, got {other:?}"),
-        }
-    }
-
-    fn all_users(id: &Identity, from: u64, limit: u64) -> Vec<UserView> {
-        let reply = futures::executor::block_on(
-            id.query(&encode_query(&IdentityQuery::All { from, limit })),
-        )
-        .unwrap();
-        match decode_reply(&reply).unwrap() {
-            IdentityReply::Users(u) => u,
-            other => panic!("expected Users reply, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn bind_happy_path_binds_and_bumps_nonce() {
-        let mut id = Identity::new("identity", Some("valset".into()), CHAIN.into());
-        let u = user();
-        let node = vec![1u8; 32];
-        let mut ctx = TestCtx::with_members(&node, vec![node.clone()]);
-
-        futures::executor::block_on(id.execute(&mut ctx, &bind_msg(&u, CHAIN, &node, 0))).unwrap();
-        futures::executor::block_on(id.commit_block()).unwrap();
-
-        let view = user_of(&id, &node).expect("bound");
-        assert_eq!(view.nonce, 1);
-        assert_eq!(view.nodes, vec![node]);
-    }
-
-    #[test]
-    fn bind_rejects_wrong_signature() {
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let wrong = ed25519::PrivateKey::from_seed(8);
-        let node = vec![2u8; 32];
-        let mut ctx = TestCtx::external(&node);
-
-        // signed by a DIFFERENT key than the claimed user_key.
-        let sig = wrong.sign(IDENTITY_BIND_NS, &bind_preimage(CHAIN, &node, 0));
-        let msg = Msg {
-            target: "identity".into(),
-            payload: encode_msg(&IdentityMsg::BindNode {
-                user_key: u.public_key().as_ref().to_vec(),
-                user_sig: sig.as_ref().to_vec(),
-            }),
-        };
-        let err = futures::executor::block_on(id.execute(&mut ctx, &msg)).unwrap_err();
-        assert!(
-            matches!(err, Error::Module(ref m) if m == "bind certificate does not verify"),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn bind_rejects_wrong_chain() {
-        let mut id = Identity::new("identity", None, "chain-a".into());
-        let u = user();
-        let node = vec![3u8; 32];
-        let mut ctx = TestCtx::external(&node);
-
-        // cert signed over a DIFFERENT chain id than the module is configured with.
-        let err =
-            futures::executor::block_on(id.execute(&mut ctx, &bind_msg(&u, "chain-b", &node, 0)))
-                .unwrap_err();
-        assert!(
-            matches!(err, Error::Module(ref m) if m == "bind certificate does not verify"),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn bind_rejects_stale_nonce() {
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let node1 = vec![4u8; 32];
-        let node2 = vec![5u8; 32];
-
-        futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&node1), &bind_msg(&u, CHAIN, &node1, 0)),
-        )
-        .unwrap();
-        futures::executor::block_on(id.commit_block()).unwrap();
-        // the user's nonce is now 1.
-
-        // a cert correctly signed for node2 but at the STALE nonce (0) rejects.
-        let err = futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&node2), &bind_msg(&u, CHAIN, &node2, 0)),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::Module(ref m) if m == "bind certificate does not verify"),
-            "got {err:?}"
-        );
-
-        // the fresh cert at the CURRENT nonce (1) is accepted.
-        futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&node2), &bind_msg(&u, CHAIN, &node2, 1)),
-        )
-        .unwrap();
-        futures::executor::block_on(id.commit_block()).unwrap();
-
-        let view = get_user(&id, u.public_key().as_ref()).expect("bound");
-        assert_eq!(view.nonce, 2);
-        assert_eq!(view.nodes.len(), 2);
-    }
-
-    #[test]
-    fn bind_same_user_is_idempotent() {
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let node = vec![6u8; 32];
-        let mut ctx = TestCtx::external(&node);
-
-        futures::executor::block_on(id.execute(&mut ctx, &bind_msg(&u, CHAIN, &node, 0))).unwrap();
-        futures::executor::block_on(id.commit_block()).unwrap();
-
-        // second identical bind after commit -> Ok, nonce unchanged.
-        futures::executor::block_on(id.execute(&mut ctx, &bind_msg(&u, CHAIN, &node, 0))).unwrap();
-        futures::executor::block_on(id.commit_block()).unwrap();
-
-        let view = user_of(&id, &node).expect("bound");
-        assert_eq!(view.nonce, 1, "idempotent re-bind does not bump the nonce");
-        assert_eq!(view.nodes, vec![node]);
-    }
-
-    #[test]
-    fn bind_rejects_second_user_takeover() {
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        let a = user();
-        let b = ed25519::PrivateKey::from_seed(70);
-        let node = vec![7u8; 32];
-        let mut ctx = TestCtx::external(&node);
-
-        futures::executor::block_on(id.execute(&mut ctx, &bind_msg(&a, CHAIN, &node, 0))).unwrap();
-        futures::executor::block_on(id.commit_block()).unwrap();
-
-        let err =
-            futures::executor::block_on(id.execute(&mut ctx, &bind_msg(&b, CHAIN, &node, 0)))
-                .unwrap_err();
-        assert!(
-            matches!(err, Error::Module(ref m) if m == "node is already bound to another user; unbind first"),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn bind_rejects_non_member_when_gated() {
-        let mut id = Identity::new("identity", Some("valset".into()), CHAIN.into());
-        let u = user();
-        let node = vec![8u8; 32];
-        let other_member = vec![9u8; 32];
-        // `node` is neither a validator nor an resident.
-        let mut ctx = TestCtx::with_members(&node, vec![other_member]);
-
-        let err = futures::executor::block_on(id.execute(&mut ctx, &bind_msg(&u, CHAIN, &node, 0)))
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::Module(ref m) if m == "bind origin is not a network member or resident"),
-            "got {err:?}"
-        );
-
-        // an RESIDENT-only origin passes the gate too.
-        let mut ctx = TestCtx::with_residents(&node, vec![node.clone()]);
-        futures::executor::block_on(id.execute(&mut ctx, &bind_msg(&u, CHAIN, &node, 0))).unwrap();
-    }
-
-    #[test]
-    fn bind_ungated_without_valset() {
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let node = vec![10u8; 32];
-        // no members/residents configured at all: an ungated module must
-        // never call ctx.query, so this must succeed regardless.
-        let mut ctx = TestCtx::external(&node);
-        futures::executor::block_on(id.execute(&mut ctx, &bind_msg(&u, CHAIN, &node, 0))).unwrap();
-    }
-
-    #[test]
-    fn unbind_from_any_origin_with_valid_cert() {
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let node1 = vec![12u8; 32];
-        let node2 = vec![13u8; 32];
-
-        futures::executor::block_on(async {
-            id.execute(&mut TestCtx::external(&node1), &bind_msg(&u, CHAIN, &node1, 0))
-                .await
-                .unwrap();
-            id.commit_block().await.unwrap();
-            id.execute(&mut TestCtx::external(&node2), &bind_msg(&u, CHAIN, &node2, 1))
-                .await
-                .unwrap();
-            id.commit_block().await.unwrap();
-        });
-        // nonce is now 2; nodes == {node1, node2}.
-
-        // unbind node1, cert at the current nonce (2), submitted from a THIRD origin.
-        let third = vec![14u8; 32];
-        let unbind = unbind_msg(&u, CHAIN, &node1, 2);
-        futures::executor::block_on(id.execute(&mut TestCtx::external(&third), &unbind)).unwrap();
-        futures::executor::block_on(id.commit_block()).unwrap();
-
-        let view = get_user(&id, u.public_key().as_ref()).expect("still bound");
-        assert_eq!(view.nodes, vec![node2]);
-        assert_eq!(view.nonce, 3);
-        assert!(user_of(&id, &node1).is_none(), "node1 no longer bound");
-
-        // the OLD bind cert for node1 (nonce 0) is now stale (current nonce is 3).
-        let err = futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&node1), &bind_msg(&u, CHAIN, &node1, 0)),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::Module(ref m) if m == "bind certificate does not verify"),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn unbind_rejects_unbound_node() {
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let node = vec![15u8; 32];
-        let mut ctx = TestCtx::external(&[16u8; 32]);
-
-        let err =
-            futures::executor::block_on(id.execute(&mut ctx, &unbind_msg(&u, CHAIN, &node, 0)))
-                .unwrap_err();
-        assert!(
-            matches!(err, Error::Module(ref m) if m == "node is not bound"),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn unbind_bad_cert() {
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let node = vec![17u8; 32];
-        futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&node), &bind_msg(&u, CHAIN, &node, 0)),
-        )
-        .unwrap();
-        futures::executor::block_on(id.commit_block()).unwrap();
-
-        let wrong = ed25519::PrivateKey::from_seed(99);
-        let sig = wrong.sign(IDENTITY_UNBIND_NS, &unbind_preimage(CHAIN, &node, 1));
-        let msg = Msg {
-            target: "identity".into(),
-            payload: encode_msg(&IdentityMsg::UnbindNode {
-                node_key: node.clone(),
-                user_sig: sig.as_ref().to_vec(),
-            }),
-        };
-        let err = futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&[18u8; 32]), &msg),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::Module(ref m) if m == "unbind certificate does not verify"),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn set_user_name_origin_gated() {
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let node = vec![19u8; 32];
-        futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&node), &bind_msg(&u, CHAIN, &node, 0)),
-        )
-        .unwrap();
-        futures::executor::block_on(id.commit_block()).unwrap();
-
-        // an unbound origin is rejected.
-        let unbound = vec![20u8; 32];
-        let err = futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&unbound), &setname_msg("eddy")),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::Module(ref m) if m == "origin node is not bound to a user"),
-            "got {err:?}"
-        );
-
-        // the bound origin sets the name; the nonce does NOT bump.
-        futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&node), &setname_msg("eddy")),
-        )
-        .unwrap();
-        futures::executor::block_on(id.commit_block()).unwrap();
-        let view = get_user(&id, u.public_key().as_ref()).unwrap();
-        assert_eq!(view.display_name.as_deref(), Some("eddy"));
-        assert_eq!(view.nonce, 1, "setname does not bump the nonce");
-
-        // a 65-byte name is rejected.
-        let too_long = "x".repeat(65);
-        let err = futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&node), &setname_msg(&too_long)),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::Module(ref m) if m == "display name exceeds the 64-byte limit"),
-            "got {err:?}"
-        );
-
-        // an empty (whitespace) trim clears the name but the record survives.
-        futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&node), &setname_msg("   ")),
-        )
-        .unwrap();
-        futures::executor::block_on(id.commit_block()).unwrap();
-        let view = get_user(&id, u.public_key().as_ref()).unwrap();
-        assert_eq!(view.display_name, None);
-        assert_eq!(view.nonce, 1);
-        assert_eq!(view.nodes, vec![node]);
-    }
-
-    #[test]
-    fn queries_read_staged_overlay() {
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let node = vec![21u8; 32];
-
-        futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&node), &bind_msg(&u, CHAIN, &node, 0)),
-        )
-        .unwrap();
-
-        // read-your-writes before commit, across every query shape.
-        let view = user_of(&id, &node).expect("staged bind visible before commit");
-        assert_eq!(view.nonce, 1);
-        assert!(get_user(&id, u.public_key().as_ref()).is_some());
-        assert_eq!(all_users(&id, 0, MAX_QUERY_LIMIT).len(), 1);
-        assert_eq!(id.root(), StateRoot::ZERO, "root reflects committed only");
-
-        futures::executor::block_on(id.abort_block()).unwrap();
-        assert!(user_of(&id, &node).is_none(), "abort_block drops the staged bind");
-        assert!(all_users(&id, 0, MAX_QUERY_LIMIT).is_empty());
-    }
-
-    #[test]
-    fn root_changes_on_commit_only() {
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        assert_eq!(id.root(), StateRoot::ZERO, "an empty registry roots to ZERO");
-
-        let u = user();
-        let node = vec![22u8; 32];
-        futures::executor::block_on(
-            id.execute(&mut TestCtx::external(&node), &bind_msg(&u, CHAIN, &node, 0)),
-        )
-        .unwrap();
-        assert_eq!(
-            id.root(),
-            StateRoot::ZERO,
-            "root is stable across staged-but-uncommitted writes"
-        );
-
-        futures::executor::block_on(id.commit_block()).unwrap();
-        assert_ne!(id.root(), StateRoot::ZERO, "root changes after commit");
-    }
-
-    // ---- state-sync (snapshot / install) -----------------------------------
-
-    /// one hand-built user entry: key, name, nonce, node keys, updated_at.
-    type ManualUser<'a> = (Vec<u8>, Option<&'a str>, u64, Vec<Vec<u8>>, u64);
-
-    /// hand-rolled encoder mirroring `Identity::encode_state`'s layout,
-    /// reusing the crate's own `push_bytes` helper. used only to build
-    /// deliberately malformed byte streams the private encoder can never
-    /// produce itself (it always emits well-formed output from valid state).
-    fn manual_encode_users(entries: &[ManualUser]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-        for (key, name, nonce, nodes, updated_at) in entries {
-            push_bytes(&mut out, key);
-            match name {
-                Some(n) => {
-                    out.push(1u8);
-                    push_bytes(&mut out, n.as_bytes());
-                }
-                None => out.push(0u8),
-            }
-            out.extend_from_slice(&nonce.to_le_bytes());
-            out.extend_from_slice(&(nodes.len() as u64).to_le_bytes());
-            for node in nodes {
-                push_bytes(&mut out, node);
-            }
-            out.extend_from_slice(&updated_at.to_le_bytes());
-        }
-        out
-    }
-
-    #[test]
-    fn snapshot_is_root_preimage() {
-        // empty registry: the lone zero count, rooting to ZERO.
-        let empty = Identity::new("identity", None, CHAIN.into());
-        assert_eq!(empty.snapshot(), 0u64.to_le_bytes().to_vec());
-        assert_eq!(empty.root(), StateRoot::ZERO);
-
-        // non-empty registry: sha256(snapshot()) == root().
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let node = vec![30u8; 32];
-        futures::executor::block_on(async {
-            id.execute(&mut TestCtx::external(&node), &bind_msg(&u, CHAIN, &node, 0))
-                .await
-                .unwrap();
-            id.commit_block().await.unwrap();
-        });
-        let bytes = id.snapshot();
-        let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        assert_eq!(StateRoot(digest), id.root(), "sha256(snapshot()) == root()");
-    }
-
-    #[test]
-    fn install_roundtrip_rebuilds_index() {
-        let mut src = Identity::new("identity", None, CHAIN.into());
-        let a = user();
-        let b = ed25519::PrivateKey::from_seed(71);
-        let n1 = vec![31u8; 32];
-        let n2 = vec![32u8; 32];
-        let n3 = vec![33u8; 32];
-        futures::executor::block_on(async {
-            src.execute(&mut TestCtx::external(&n1), &bind_msg(&a, CHAIN, &n1, 0))
-                .await
-                .unwrap();
-            src.commit_block().await.unwrap();
-            src.execute(&mut TestCtx::external(&n2), &bind_msg(&a, CHAIN, &n2, 1))
-                .await
-                .unwrap();
-            src.commit_block().await.unwrap();
-            src.execute(&mut TestCtx::external(&n3), &bind_msg(&b, CHAIN, &n3, 0))
-                .await
-                .unwrap();
-            src.commit_block().await.unwrap();
-        });
-        let src_root = src.root();
-        assert_ne!(src_root, StateRoot::ZERO);
-        let bytes = src.snapshot();
-
-        let mut dst = Identity::new("identity", None, CHAIN.into());
-        dst.install(&bytes, src_root).unwrap();
-        assert_eq!(dst.root(), src_root, "installed root equals source root");
-        for node in [&n1, &n2, &n3] {
-            assert!(user_of(&dst, node).is_some(), "UserOf resolves {node:?} after install");
-        }
-    }
-
-    #[test]
-    fn install_rejects_root_mismatch() {
-        let mut src = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let node = vec![34u8; 32];
-        futures::executor::block_on(async {
-            src.execute(&mut TestCtx::external(&node), &bind_msg(&u, CHAIN, &node, 0))
-                .await
-                .unwrap();
-            src.commit_block().await.unwrap();
-        });
-        let src_root = src.root();
-        let bytes = src.snapshot();
-
-        let mut bad_root = src_root;
-        bad_root.0[0] ^= 0x01;
-
-        let mut dst = Identity::new("identity", None, CHAIN.into());
-        let before_root = dst.root();
-        let err = dst.install(&bytes, bad_root).unwrap_err();
-        assert!(matches!(err, Error::Module(_)), "got {err:?}");
-        assert_eq!(dst.root(), before_root, "a rejected install leaves state untouched");
-    }
-
-    #[test]
-    fn install_rejects_malformed() {
-        let good = vec![
-            (vec![1u8; 32], Some("a"), 0u64, vec![vec![10u8; 32]], 100u64),
-            (vec![2u8; 32], None, 3u64, vec![vec![20u8; 32], vec![21u8; 32]], 200u64),
-        ];
-        let bytes = manual_encode_users(&good);
-        let root = StateRoot(Sha256::digest(&bytes).into());
-
-        // sanity: the well-formed manual encoding actually installs.
-        let mut sane = Identity::new("identity", None, CHAIN.into());
-        sane.install(&bytes, root).unwrap();
-        assert_eq!(sane.root(), root);
-
-        let mut dst = Identity::new("identity", None, CHAIN.into());
-        let before_root = dst.root();
-        let assert_rejected = |dst: &mut Identity, bad: &[u8]| {
-            let err = dst.install(bad, root).unwrap_err();
-            assert!(matches!(err, Error::Module(_)), "got {err:?}");
-            assert_eq!(dst.root(), before_root, "state untouched after rejected install");
         };
 
-        // truncated: drop the final byte.
-        assert_rejected(&mut dst, &bytes[..bytes.len() - 1]);
-
-        // trailing garbage past a well-formed stream.
-        let mut trailing = bytes.clone();
-        trailing.push(0);
-        assert_rejected(&mut dst, &trailing);
-
-        // forged user count exceeding what the remaining buffer could hold.
-        let mut forged = bytes.clone();
-        forged[..8].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert_rejected(&mut dst, &forged);
-
-        // non-increasing user keys.
-        let non_increasing_users = manual_encode_users(&[
-            (vec![2u8; 32], None, 0, vec![], 0),
-            (vec![1u8; 32], None, 0, vec![], 0),
-        ]);
-        assert_rejected(&mut dst, &non_increasing_users);
-
-        // non-increasing node keys within a single user.
-        let non_increasing_nodes = manual_encode_users(&[(
-            vec![1u8; 32],
-            None,
-            0,
-            vec![vec![9u8; 32], vec![9u8; 32]],
-            0,
-        )]);
-        assert_rejected(&mut dst, &non_increasing_nodes);
-
-        // name flag 1 with an over-long name.
-        let long_name = "x".repeat(MAX_NAME_LEN + 1);
-        let over_long_name =
-            manual_encode_users(&[(vec![1u8; 32], Some(long_name.as_str()), 0, vec![], 0)]);
-        assert_rejected(&mut dst, &over_long_name);
-    }
-
-    #[test]
-    fn install_rejects_node_bound_twice_across_users() {
-        // a node claimed by two different users is a state the execute path
-        // can never commit -- decode must reject it outright.
-        let bytes = manual_encode_users(&[
-            (vec![1u8; 32], None, 0, vec![vec![9u8; 32]], 0),
-            (vec![2u8; 32], None, 0, vec![vec![9u8; 32]], 0),
-        ]);
-        let root = StateRoot(Sha256::digest(&bytes).into());
-
-        let mut dst = Identity::new("identity", None, CHAIN.into());
-        let err = dst.install(&bytes, root).unwrap_err();
-        assert!(
-            matches!(err, Error::Module(ref m) if m.contains("node bound twice in snapshot")),
-            "got {err:?}"
+        record.member_keys.insert(
+            new_key,
+            MemberMeta { kind: new_kind, label, rp_id_hash, added_at: ctx.env().consensus_time },
         );
+        record.nonce += 1;
+        record.updated_at = ctx.env().consensus_time;
+        self.pending.insert(account_id, Some(record));
+        Ok(())
     }
 
-    #[test]
-    fn unbind_last_node_keeps_record() {
-        let mut id = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let node = vec![36u8; 32];
+    /// drop `target_key` from the authorizer's account. any member may drop any
+    /// member (including itself), except the last remaining one.
+    fn remove_member_key(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        target_key: Vec<u8>,
+        authorizer: MemberAuth,
+    ) -> Result<(), Error> {
+        Self::origin_key(ctx)?;
 
-        futures::executor::block_on(async {
-            id.execute(&mut TestCtx::external(&node), &bind_msg(&u, CHAIN, &node, 0))
-                .await
-                .unwrap();
-            id.commit_block().await.unwrap();
-            id.execute(&mut TestCtx::external(&node), &setname_msg("eddy"))
-                .await
-                .unwrap();
-            id.commit_block().await.unwrap();
-            id.execute(
-                &mut TestCtx::external(&[37u8; 32]),
-                &unbind_msg(&u, CHAIN, &node, 1),
-            )
-            .await
-            .unwrap();
-            id.commit_block().await.unwrap();
-        });
+        let account_id = self
+            .merged_member_index()
+            .get(&authorizer.key)
+            .cloned()
+            .ok_or_else(|| Error::Module("authorizer belongs to no account".into()))?;
+        let mut record = self
+            .merged_record(&account_id)
+            .expect("member_index only ever points at an existing record");
 
-        let view =
-            get_user(&id, u.public_key().as_ref()).expect("record survives with zero nodes");
-        assert!(view.nodes.is_empty());
-        assert_eq!(view.display_name.as_deref(), Some("eddy"));
-        assert_eq!(view.nonce, 2);
+        if !record.member_keys.contains_key(&target_key) {
+            return Err(Error::Module("target key is not a member of this account".into()));
+        }
+        if record.member_keys.len() == 1 {
+            return Err(Error::Module(
+                "cannot remove the last member of an account".into(),
+            ));
+        }
 
-        // snapshot/install this zero-node state into a fresh Identity.
-        let root = id.root();
-        assert_ne!(root, StateRoot::ZERO, "a zero-node user record is not the empty registry");
-        let bytes = id.snapshot();
+        let preimage =
+            remove_member_preimage(&self.chain_id, &account_id, &target_key, record.nonce);
+        Self::authorize(&record, IDENTITY_REMOVE_MEMBER_NS, &preimage, &authorizer)?;
 
-        let mut fresh = Identity::new("identity", None, CHAIN.into());
-        fresh.install(&bytes, root).unwrap();
-        assert_eq!(fresh.root(), root);
-        let fresh_view =
-            get_user(&fresh, u.public_key().as_ref()).expect("zero-node record round-trips");
-        assert_eq!(fresh_view.nodes, Vec::<Vec<u8>>::new());
-        assert_eq!(fresh_view.display_name.as_deref(), Some("eddy"));
-        assert_eq!(fresh_view.nonce, 2);
+        record.member_keys.remove(&target_key);
+        record.nonce += 1;
+        record.updated_at = ctx.env().consensus_time;
+        self.pending.insert(account_id, Some(record));
+        Ok(())
     }
 
-    #[test]
-    fn install_gate_untouched_by_valset() {
-        // build committed state on an ungated source (no member cert needed),
-        // then install those bytes into a GATED registry (`valset_id =
-        // Some`): install takes no `Ctx` at all, so it must never consult the
-        // valset -- this is not an execute path.
-        let mut src = Identity::new("identity", None, CHAIN.into());
-        let u = user();
-        let node = vec![38u8; 32];
-        futures::executor::block_on(async {
-            src.execute(&mut TestCtx::external(&node), &bind_msg(&u, CHAIN, &node, 0))
-                .await
-                .unwrap();
-            src.commit_block().await.unwrap();
-        });
-        let root = src.root();
-        let bytes = src.snapshot();
+    /// set the display name of the account the origin node is bound to.
+    fn set_account_name(&mut self, ctx: &mut dyn Ctx, display_name: String) -> Result<(), Error> {
+        let origin = Self::origin_key(ctx)?;
+        let account_id = self
+            .merged_node_index()
+            .get(&origin)
+            .cloned()
+            .ok_or_else(|| Error::Module("origin node is not bound to an account".into()))?;
+        let mut record = self
+            .merged_record(&account_id)
+            .expect("node_index only ever points at an existing record");
 
-        let mut gated = Identity::new("identity", Some("valset".into()), CHAIN.into());
-        gated.install(&bytes, root).unwrap();
-        assert_eq!(gated.root(), root);
-        assert!(user_of(&gated, &node).is_some());
+        let trimmed = display_name.trim();
+        if trimmed.is_empty() {
+            record.display_name = None;
+        } else if trimmed.len() > MAX_NAME_LEN {
+            return Err(Error::Module(format!(
+                "display name exceeds the {MAX_NAME_LEN}-byte limit"
+            )));
+        } else {
+            record.display_name = Some(trimmed.to_string());
+        }
+        // no signature is consumed here: the nonce is NOT bumped.
+        record.updated_at = ctx.env().consensus_time;
+        self.pending.insert(account_id, Some(record));
+        Ok(())
     }
 }
+
+/// trim a member label: empty -> `None` (no label), over the limit -> reject.
+fn clean_label(label: Option<String>) -> Result<Option<String>, Error> {
+    match label {
+        None => Ok(None),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else if trimmed.len() > MAX_LABEL_LEN {
+                Err(Error::Module(format!(
+                    "member label exceeds the {MAX_LABEL_LEN}-byte limit"
+                )))
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

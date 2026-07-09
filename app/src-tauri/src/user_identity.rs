@@ -507,6 +507,124 @@ pub fn user_sign_unbind(
     Ok(last_line(&out))
 }
 
+/// sign this machine's ed25519 POSSESSION proof for joining `account_id` as a
+/// new member at `nonce` — the `MemberProof` JSON a new device produces to
+/// prove it holds its key. Pair it with this machine's pubkey (from
+/// [`user_identity_state`]); an existing member then feeds both to
+/// [`user_sign_add_member`]. `identity-locked` (exact string) on an encrypted,
+/// uncached key.
+#[tauri::command]
+pub fn user_sign_possession(
+    app: tauri::AppHandle,
+    chain_id: String,
+    account_id: String,
+    nonce: u64,
+) -> Result<String, String> {
+    let node_bin = crate::daemon::resolve_node_bin()?;
+    let stdin_lines = signing_stdin(&app, &node_bin)?;
+    let stdin_refs: Vec<&str> = stdin_lines.iter().map(String::as_str).collect();
+    let out = run_verb_with_stdin(
+        &node_bin,
+        &[
+            "user-sign-possession",
+            "--key",
+            &user_key_path(&app)?.to_string_lossy(),
+            "--chain-id",
+            &chain_id,
+            "--account-id",
+            &account_id,
+            "--nonce",
+            &nonce.to_string(),
+        ],
+        &stdin_refs,
+    )?;
+    Ok(last_line(&out))
+}
+
+/// sign an add-member AUTHORIZER certificate and assemble the ready-to-submit
+/// `IdentityMsg::AddMemberKey` JSON: the local user key (an existing member)
+/// consents to admitting `new_pub` (of `new_kind`, optional `label`) over the
+/// same add-member preimage `possession` was signed against. `possession` is
+/// the new key's own proof — from [`user_sign_possession`] on another device,
+/// or the native FIDO2 transport for a passkey. `identity-locked` on an
+/// encrypted, uncached key.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn user_sign_add_member(
+    app: tauri::AppHandle,
+    chain_id: String,
+    account_id: String,
+    new_pub: String,
+    new_kind: String,
+    nonce: u64,
+    possession: String,
+    label: Option<String>,
+) -> Result<String, String> {
+    let node_bin = crate::daemon::resolve_node_bin()?;
+    let stdin_lines = signing_stdin(&app, &node_bin)?;
+    let stdin_refs: Vec<&str> = stdin_lines.iter().map(String::as_str).collect();
+    let key = user_key_path(&app)?.to_string_lossy().into_owned();
+    let nonce = nonce.to_string();
+    let mut args: Vec<&str> = vec![
+        "user-sign-add-member",
+        "--key",
+        &key,
+        "--chain-id",
+        &chain_id,
+        "--account-id",
+        &account_id,
+        "--new-key",
+        &new_pub,
+        "--new-kind",
+        &new_kind,
+        "--nonce",
+        &nonce,
+        "--possession",
+        &possession,
+    ];
+    if let Some(label) = &label {
+        args.push("--label");
+        args.push(label);
+    }
+    let out = run_verb_with_stdin(&node_bin, &args, &stdin_refs)?;
+    Ok(last_line(&out))
+}
+
+/// sign a remove-member certificate and print the ready-to-submit
+/// `IdentityMsg::RemoveMemberKey` JSON: the local user key (a member) evicts
+/// `target_key` from `account_id` at `nonce`. Any member may remove any member
+/// except the last one. `identity-locked` on an encrypted, uncached key.
+#[tauri::command]
+pub fn user_sign_remove_member(
+    app: tauri::AppHandle,
+    chain_id: String,
+    account_id: String,
+    target_key: String,
+    nonce: u64,
+) -> Result<String, String> {
+    let node_bin = crate::daemon::resolve_node_bin()?;
+    let stdin_lines = signing_stdin(&app, &node_bin)?;
+    let stdin_refs: Vec<&str> = stdin_lines.iter().map(String::as_str).collect();
+    let out = run_verb_with_stdin(
+        &node_bin,
+        &[
+            "user-sign-remove-member",
+            "--key",
+            &user_key_path(&app)?.to_string_lossy(),
+            "--chain-id",
+            &chain_id,
+            "--account-id",
+            &account_id,
+            "--target-key",
+            &target_key,
+            "--nonce",
+            &nonce.to_string(),
+        ],
+        &stdin_refs,
+    )?;
+    Ok(last_line(&out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

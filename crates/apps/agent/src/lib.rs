@@ -72,6 +72,15 @@ struct AgentState {
     active: bool,
     created_at: u64,
     updated_at: u64,
+    /// runtime-identity tail. all three are empty/default when unset, and
+    /// [`encode_committed`] always appends them to the canonical encoding.
+    ///
+    /// W4 recipe content-address: empty (unset) or exactly [`PROMPT_HASH_LEN`].
+    recipe_hash: Vec<u8>,
+    /// D3 resource caps — each list canonical sorted+deduped.
+    caps: ResourceCaps,
+    /// C4 ordered skill refs (order is significant to the hash).
+    skills: Vec<SkillRef>,
 }
 
 // ---- canonical encoding -------------------------------------------------------
@@ -79,8 +88,8 @@ struct AgentState {
 // prefixes for byte strings, single-byte discriminants for enums, a 0/1 tag
 // byte for options, u64-le integers. this is the exact preimage
 // [`Module::root`] hashes, so a snapshot and the root that must authenticate
-// it cannot drift. no version byte — encoding changes are flag-day (design
-// principle: no backwards compatibility).
+// it cannot drift. every entry ALWAYS carries the recipe_hash/caps/skills tail
+// (empty/default when unset) — the runtime identity is part of the app-hash.
 
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
@@ -101,6 +110,47 @@ fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
     }
 }
 
+/// a canonical string SET: a u64-le count then each entry length-prefixed.
+/// callers pass an already sorted+deduped slice (the write path canonicalizes;
+/// the decoder rejects a non-ascending list). part of the runtime-identity tail.
+fn put_str_set(out: &mut Vec<u8>, items: &[String]) {
+    out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+    for s in items {
+        put_bytes(out, s.as_bytes());
+    }
+}
+
+/// the D3 caps segment: six canonical string sets in field order, then the
+/// budget as u64-le (the field is u32; the decoder range-checks). part of the
+/// runtime-identity tail.
+fn put_caps(out: &mut Vec<u8>, c: &ResourceCaps) {
+    put_str_set(out, &c.forge_read);
+    put_str_set(out, &c.forge_push);
+    put_str_set(out, &c.duckfs_read);
+    put_str_set(out, &c.duckfs_write);
+    put_str_set(out, &c.tools);
+    put_str_set(out, &c.secrets);
+    out.extend_from_slice(&(c.subagent_budget as u64).to_le_bytes());
+}
+
+/// the C4 skills segment: a u64-le count then each ref in ORDER (order is
+/// significant) — name, source_prefix, then a 0/1 option tag for the pinned
+/// snapshot. part of the runtime-identity tail.
+fn put_skills(out: &mut Vec<u8>, skills: &[SkillRef]) {
+    out.extend_from_slice(&(skills.len() as u64).to_le_bytes());
+    for s in skills {
+        put_bytes(out, s.name.as_bytes());
+        put_bytes(out, s.source_prefix.as_bytes());
+        match &s.source_snapshot {
+            Some(snap) => {
+                out.push(1);
+                put_bytes(out, snap.as_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+}
+
 fn encode_committed(agents: &BTreeMap<String, AgentState>) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(agents.len() as u64).to_le_bytes());
@@ -117,6 +167,10 @@ fn encode_committed(agents: &BTreeMap<String, AgentState>) -> Vec<u8> {
         out.push(if a.active { 0 } else { 1 });
         out.extend_from_slice(&a.created_at.to_le_bytes());
         out.extend_from_slice(&a.updated_at.to_le_bytes());
+        // the runtime-identity tail — ALWAYS appended (empty/default when unset).
+        put_bytes(&mut out, &a.recipe_hash);
+        put_caps(&mut out, &a.caps);
+        put_skills(&mut out, &a.skills);
     }
     out
 }
@@ -210,11 +264,77 @@ fn contains_reserved_separator(value: &str) -> bool {
     value.contains(RESERVED_ID_SEPARATOR)
 }
 
+/// decode a canonical string SET, enforcing strictly-ascending order so a
+/// non-canonical (unsorted / duplicated) snapshot is rejected — the same
+/// discipline `allowed_actions` uses. part of the runtime-identity tail.
+fn take_str_set(buf: &mut &[u8]) -> Result<Vec<String>, String> {
+    let n = take_count(buf, 8, "cap")?;
+    let mut v: Vec<String> = Vec::new();
+    for _ in 0..n {
+        let s = take_lp_string(buf)?;
+        if v.last().is_some_and(|last| last.as_str() >= s.as_str()) {
+            return Err("snapshot caps not strictly ascending".into());
+        }
+        v.push(s);
+    }
+    Ok(v)
+}
+
+/// decode the D3 caps segment; the budget is range-checked to `u32` so a
+/// byzantine value above `u32::MAX` is rejected, never truncated. part of the
+/// runtime-identity tail.
+fn take_caps(buf: &mut &[u8]) -> Result<ResourceCaps, String> {
+    let forge_read = take_str_set(buf)?;
+    let forge_push = take_str_set(buf)?;
+    let duckfs_read = take_str_set(buf)?;
+    let duckfs_write = take_str_set(buf)?;
+    let tools = take_str_set(buf)?;
+    let secrets = take_str_set(buf)?;
+    let subagent_budget = u32::try_from(take_u64(buf)?)
+        .map_err(|_| "snapshot subagent_budget exceeds u32".to_string())?;
+    Ok(ResourceCaps {
+        forge_read,
+        forge_push,
+        duckfs_read,
+        duckfs_write,
+        tools,
+        secrets,
+        subagent_budget,
+    })
+}
+
+/// decode the C4 skills segment IN ORDER (skills are an ordered list, not a
+/// set — no ascending check). an unknown option tag is rejected. part of the
+/// runtime-identity tail.
+fn take_skills(buf: &mut &[u8]) -> Result<Vec<SkillRef>, String> {
+    // per-entry minimum: a name prefix, a source_prefix prefix, and the option
+    // tag byte.
+    let n = take_count(buf, 8 + 8 + 1, "skill")?;
+    let mut v: Vec<SkillRef> = Vec::new();
+    for _ in 0..n {
+        let name = take_lp_string(buf)?;
+        let source_prefix = take_lp_string(buf)?;
+        let source_snapshot = match take(buf, 1)?[0] {
+            0 => None,
+            1 => Some(take_lp_string(buf)?),
+            d => return Err(format!("snapshot has unknown skill snapshot tag {d}")),
+        };
+        v.push(SkillRef {
+            name,
+            source_prefix,
+            source_snapshot,
+        });
+    }
+    Ok(v)
+}
+
 fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, String> {
     // per-entry minimum size: an agent costs its id prefix, one origin
     // discriminant, three length prefixes, a prompt-doc tag, an action
-    // count, a status byte, and two u64s.
-    const MIN_AGENT_BYTES: u64 = 8 + 1 + 8 + 8 + 8 + 8 + 1 + 8 + 8;
+    // count, a status byte, two u64s, and the ALWAYS-present runtime-identity
+    // tail (a recipe_hash length prefix, six cap-set counts, the budget u64,
+    // and the skills count).
+    const MIN_AGENT_BYTES: u64 = (8 + 1 + 8 + 8 + 8 + 8 + 1 + 8 + 8) + 8 + 6 * 8 + 8 + 8;
 
     let mut agents: BTreeMap<String, AgentState> = BTreeMap::new();
     let count = take_count(&mut buf, MIN_AGENT_BYTES, "agent")?;
@@ -245,6 +365,10 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
         };
         let created_at = take_u64(&mut buf)?;
         let updated_at = take_u64(&mut buf)?;
+        // the runtime-identity tail — ALWAYS present (empty/default when unset).
+        let recipe_hash = take_lp_bytes(&mut buf)?;
+        let caps = take_caps(&mut buf)?;
+        let skills = take_skills(&mut buf)?;
         insert_ascending(
             &mut agents,
             id,
@@ -257,6 +381,9 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
                 active,
                 created_at,
                 updated_at,
+                recipe_hash,
+                caps,
+                skills,
             },
         )?;
     }
@@ -349,6 +476,9 @@ impl AgentModule {
             },
             created_at: a.created_at,
             updated_at: a.updated_at,
+            recipe_hash: a.recipe_hash.clone(),
+            caps: a.caps.clone(),
+            skills: a.skills.clone(),
         }
     }
 
@@ -382,6 +512,62 @@ impl AgentModule {
             set.insert(action);
         }
         Ok(set)
+    }
+
+    /// a v4 recipe hash is empty (unset) or exactly [`PROMPT_HASH_LEN`] bytes —
+    /// the same discipline as `prompt_hash`, with empty permitted.
+    fn validate_recipe_hash(recipe_hash: &[u8]) -> Result<(), Error> {
+        if !recipe_hash.is_empty() && recipe_hash.len() != PROMPT_HASH_LEN {
+            return Err(Error::Module(format!(
+                "recipe_hash must be empty or {PROMPT_HASH_LEN} bytes, got {}",
+                recipe_hash.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// canonicalize the D3 caps: reject empty entries, then sort+dedup every
+    /// list so the committed encoding is canonical (the decoder enforces
+    /// strictly-ascending, so a non-canonicalized write would produce a
+    /// snapshot no joiner accepts). budget needs no normalization.
+    fn validate_caps(mut caps: ResourceCaps) -> Result<ResourceCaps, Error> {
+        for list in [
+            &mut caps.forge_read,
+            &mut caps.forge_push,
+            &mut caps.duckfs_read,
+            &mut caps.duckfs_write,
+            &mut caps.tools,
+            &mut caps.secrets,
+        ] {
+            if list.iter().any(|s| s.is_empty()) {
+                return Err(Error::Module("cap entries must be non-empty".into()));
+            }
+            list.sort();
+            list.dedup();
+        }
+        Ok(caps)
+    }
+
+    /// a v4 skill ref must carry a non-empty name and source_prefix; a pinned
+    /// snapshot, when present, must be non-empty. order is preserved verbatim
+    /// (skills are an ordered override list).
+    fn validate_skills(skills: &[SkillRef]) -> Result<(), Error> {
+        for skill in skills {
+            if skill.name.is_empty() {
+                return Err(Error::Module("skill name must not be empty".into()));
+            }
+            if skill.source_prefix.is_empty() {
+                return Err(Error::Module("skill source_prefix must not be empty".into()));
+            }
+            if let Some(snapshot) = &skill.source_snapshot
+                && snapshot.is_empty()
+            {
+                return Err(Error::Module(
+                    "skill source_snapshot must not be empty when set".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// registry entries live in the root preimage and every snapshot —
@@ -456,6 +642,9 @@ impl AgentModule {
                 capability,
                 prompt_hash,
                 allowed_actions,
+                recipe_hash,
+                caps,
+                skills,
             } => {
                 let owner = Self::admin_origin(&ctx.env().origin)?;
                 Self::validate_non_empty("agent_id", &agent_id)?;
@@ -468,6 +657,11 @@ impl AgentModule {
                 validate_tag(&capability).map_err(Error::Module)?;
                 Self::validate_prompt_hash(&prompt_hash)?;
                 let allowed_actions = Self::validate_actions(allowed_actions)?;
+                let recipe_hash = recipe_hash.unwrap_or_default();
+                Self::validate_recipe_hash(&recipe_hash)?;
+                let caps = Self::validate_caps(caps.unwrap_or_default())?;
+                let skills = skills.unwrap_or_default();
+                Self::validate_skills(&skills)?;
                 if self.agent(&agent_id).is_some() {
                     return Err(Error::Module(format!("agent already exists: {agent_id}")));
                 }
@@ -480,6 +674,9 @@ impl AgentModule {
                     active: true,
                     created_at: now,
                     updated_at: now,
+                    recipe_hash,
+                    caps,
+                    skills,
                 };
                 Self::validate_record_size(&agent_id, &state)?;
                 // the hook stages the agent's dispatch recipe in this same
@@ -501,6 +698,9 @@ impl AgentModule {
                 capability,
                 prompt_hash,
                 allowed_actions,
+                recipe_hash,
+                caps,
+                skills,
             } => {
                 let mut state = self.owned_agent(&*ctx, &agent_id)?.clone();
                 if let Some(display_name) = display_name {
@@ -528,6 +728,19 @@ impl AgentModule {
                 }
                 if let Some(allowed_actions) = allowed_actions {
                     state.allowed_actions = Self::validate_actions(allowed_actions)?;
+                }
+                // runtime-identity fields: each Some overwrites, None keeps
+                // the current value.
+                if let Some(recipe_hash) = recipe_hash {
+                    Self::validate_recipe_hash(&recipe_hash)?;
+                    state.recipe_hash = recipe_hash;
+                }
+                if let Some(caps) = caps {
+                    state.caps = Self::validate_caps(caps)?;
+                }
+                if let Some(skills) = skills {
+                    Self::validate_skills(&skills)?;
+                    state.skills = skills;
                 }
                 state.updated_at = now;
                 Self::validate_record_size(&agent_id, &state)?;
@@ -564,7 +777,7 @@ impl AgentModule {
 
     /// serialize the COMMITTED continuation state (never the staged overlay)
     /// into the canonical encoding `root()` commits to. deterministic across
-    /// nodes.
+    /// nodes — a plain body, no container magic.
     pub fn snapshot(&self) -> Vec<u8> {
         encode_committed(&self.agents)
     }
@@ -697,6 +910,12 @@ mod tests {
             self.env.origin = origin;
             self
         }
+        /// set the effective protocol version the module reads to select its
+        /// dual-path branch for op acceptance.
+        fn proto(mut self, version: u32) -> Self {
+            self.env.protocol_version = version;
+            self
+        }
         /// decoded hook events emitted this dispatch.
         fn hook_events(&self) -> Vec<AgentEvent> {
             self.msgs
@@ -745,7 +964,82 @@ mod tests {
             capability: "model-1".into(),
             prompt_hash: vec![7u8; PROMPT_HASH_LEN],
             allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
+            recipe_hash: None,
+            caps: None,
+            skills: None,
         }
+    }
+
+    /// a registration carrying the runtime-identity fields. `recipe_hash`
+    /// empty => omitted (None); caps/skills always present so the op exercises
+    /// the runtime-identity acceptance path.
+    fn register_runtime(
+        agent_id: &str,
+        caps: ResourceCaps,
+        skills: Vec<SkillRef>,
+        recipe_hash: Vec<u8>,
+    ) -> AgentMsg {
+        AgentMsg::RegisterAgent {
+            agent_id: agent_id.into(),
+            display_name: agent_id.to_uppercase(),
+            capability: "model-1".into(),
+            prompt_hash: vec![7u8; PROMPT_HASH_LEN],
+            allowed_actions: vec![],
+            recipe_hash: (!recipe_hash.is_empty()).then_some(recipe_hash),
+            caps: Some(caps),
+            skills: Some(skills),
+        }
+    }
+
+    /// an `AgentRecord` with the given caps and no skills — for the pure
+    /// [`AgentRecord::permits`] gate and the keyless-D1 serde assertion.
+    fn record_with_caps(caps: ResourceCaps) -> AgentRecord {
+        AgentRecord {
+            agent_id: "bot".into(),
+            owner: SagaOrigin::External(vec![9; 32]),
+            display_name: "BOT".into(),
+            capability: "model-1".into(),
+            prompt_hash: vec![7u8; PROMPT_HASH_LEN],
+            allowed_actions: vec![],
+            status: AgentStatus::Active,
+            created_at: 0,
+            updated_at: 0,
+            recipe_hash: vec![],
+            caps,
+            skills: vec![],
+        }
+    }
+
+    /// the fixed 2-agent registry the golden-hex + container-gating tests pin.
+    fn build_fixture_registry() -> AgentModule {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new().at(3).with_origin(user(9));
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&register("alpha", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])),
+        )
+        .unwrap();
+        exec(&mut m, &mut ctx, &admin(&register("beta", &[]))).unwrap();
+        commit(&mut m);
+        m
+    }
+
+    /// lowercase hex, for the golden-byte pin.
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
     }
 
     fn admin(m: &AgentMsg) -> Msg {
@@ -845,6 +1139,9 @@ mod tests {
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 31],
                     allowed_actions: Vec::new(),
+                    recipe_hash: None,
+                    caps: None,
+                    skills: None,
                 },
             ),
             // an action outside the known vocabulary.
@@ -856,6 +1153,9 @@ mod tests {
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: vec!["forge.push".into()],
+                    recipe_hash: None,
+                    caps: None,
+                    skills: None,
                 },
             ),
             // empty required fields.
@@ -867,6 +1167,9 @@ mod tests {
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: Vec::new(),
+                    recipe_hash: None,
+                    caps: None,
+                    skills: None,
                 },
             ),
             (
@@ -877,6 +1180,9 @@ mod tests {
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: Vec::new(),
+                    recipe_hash: None,
+                    caps: None,
+                    skills: None,
                 },
             ),
             (
@@ -887,6 +1193,9 @@ mod tests {
                     capability: String::new(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: Vec::new(),
+                    recipe_hash: None,
+                    caps: None,
+                    skills: None,
                 },
             ),
             // an oversized record is rejected before staging.
@@ -898,6 +1207,9 @@ mod tests {
                     capability: "m".into(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: Vec::new(),
+                    recipe_hash: None,
+                    caps: None,
+                    skills: None,
                 },
             ),
         ];
@@ -929,6 +1241,9 @@ mod tests {
                 capability: None,
                 prompt_hash: None,
                 allowed_actions: None,
+                recipe_hash: None,
+                caps: None,
+                skills: None,
             },
             AgentMsg::PauseAgent {
                 agent_id: "bot".into(),
@@ -954,6 +1269,9 @@ mod tests {
                 capability: Some("model-2".into()),
                 prompt_hash: None,
                 allowed_actions: Some(vec![ACTION_TASKS_CREATE.into()]),
+                recipe_hash: None,
+                caps: None,
+                skills: None,
             }),
         )
         .unwrap();
@@ -996,6 +1314,9 @@ mod tests {
                 capability: Some("model-2".into()),
                 prompt_hash: None,
                 allowed_actions: None,
+                recipe_hash: None,
+                caps: None,
+                skills: None,
             }),
         )
         .unwrap();
@@ -1105,6 +1426,9 @@ mod tests {
                     capability: Some("model-2".into()),
                     prompt_hash: None,
                     allowed_actions: None,
+                    recipe_hash: None,
+                    caps: None,
+                    skills: None,
                 },
             ),
             (
@@ -1169,5 +1493,248 @@ mod tests {
             StateSyncHandle::SnapshotBytes(bytes) => assert_eq!(bytes, m.snapshot()),
             other => panic!("unexpected handle: {other:?}"),
         }
+    }
+
+    // ---- runtime identity ------------------------------------------------------
+
+    /// the load-bearing determinism proof: a stable golden of the committed
+    /// encoding over the fixed 2-agent fixture. the record ALWAYS carries the
+    /// recipe_hash/caps/skills tail (empty/default here); if the encoding ever
+    /// drifts, this fails loudly.
+    #[test]
+    fn committed_bytes_match_the_golden() {
+        const GOLDEN_HEX: &str = "02000000000000000500000000000000616c70686100200000000000000009090909090909090909090909090909090909090909090909090909090909090500000000000000414c50484107000000000000006d6f64656c2d312000000000000000070707070707070707070707070707070707070707070707070707070707070702000000000000000900000000000000636861742e706f73740c000000000000007461736b732e6372656174650003000000000000000300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000062657461002000000000000000090909090909090909090909090909090909090909090909090909090909090904000000000000004245544107000000000000006d6f64656c2d312000000000000000070707070707070707070707070707070707070707070707070707070707070700000000000000000003000000000000000300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        let m = build_fixture_registry();
+        assert_eq!(
+            hex(&m.snapshot()),
+            GOLDEN_HEX,
+            "the committed bytes must never move"
+        );
+        assert_eq!(
+            m.root(),
+            StateRoot(Sha256::digest(unhex(GOLDEN_HEX)).into()),
+            "root is sha256 of exactly the golden bytes"
+        );
+    }
+
+    /// `root()` hashes exactly the snapshot bytes (there is no container magic),
+    /// and a snapshot round-trips into a fresh joiner under the agreed root.
+    #[test]
+    fn snapshot_install_round_trips_and_root_hashes_the_snapshot() {
+        let m = build_fixture_registry();
+        let (bytes, root) = (m.snapshot(), m.root());
+        assert_eq!(
+            root,
+            StateRoot(Sha256::digest(&bytes).into()),
+            "root() hashes exactly the snapshot bytes"
+        );
+        let mut joiner = module();
+        joiner.install(&bytes, root).unwrap();
+        assert_eq!(joiner.root(), root);
+        assert_eq!(joiner.snapshot(), bytes, "the joiner re-encodes identically");
+    }
+
+    /// register the runtime-identity fields, commit, snapshot -> install into a
+    /// fresh joiner: roots and every field round-trip.
+    #[test]
+    fn round_trips_recipe_caps_and_skills() {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new().at(3).with_origin(user(9));
+        let caps = ResourceCaps {
+            forge_read: vec!["repo-a".into()],
+            forge_push: vec!["repo-a".into()],
+            duckfs_read: vec!["src".into()],
+            duckfs_write: vec!["out".into()],
+            tools: vec!["bash".into()],
+            secrets: vec!["vault://k".into()],
+            subagent_budget: 2,
+        };
+        let skills = vec![
+            SkillRef {
+                name: "fmt".into(),
+                source_prefix: "/shared/skills/fmt".into(),
+                source_snapshot: Some("aa".repeat(32)),
+            },
+            SkillRef {
+                name: "lint".into(),
+                source_prefix: "/shared/skills/lint".into(),
+                source_snapshot: None,
+            },
+        ];
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&register_runtime(
+                "bot",
+                caps.clone(),
+                skills.clone(),
+                vec![9u8; PROMPT_HASH_LEN],
+            )),
+        )
+        .unwrap();
+        commit(&mut m);
+        let rec = get_agent(&m, "bot").unwrap();
+        assert_eq!(rec.caps, caps);
+        assert_eq!(rec.skills, skills);
+        assert_eq!(rec.recipe_hash, vec![9u8; PROMPT_HASH_LEN]);
+
+        let (bytes, root) = (m.snapshot(), m.root());
+        let mut joiner = module();
+        joiner.install(&bytes, root).unwrap();
+        assert_eq!(joiner.root(), root);
+        let jrec = get_agent(&joiner, "bot").unwrap();
+        assert_eq!(jrec.caps, caps);
+        assert_eq!(jrec.skills, skills);
+        assert_eq!(jrec.recipe_hash, vec![9u8; PROMPT_HASH_LEN]);
+    }
+
+    /// a Register carrying the runtime-identity fields is accepted at every
+    /// protocol version — there is no version gate on the op fields.
+    #[test]
+    fn execute_accepts_runtime_fields_unconditionally() {
+        for proto in [0u32, 3, 4, 7] {
+            let mut m = module();
+            let caps = ResourceCaps {
+                tools: vec!["bash".into()],
+                subagent_budget: 1,
+                ..Default::default()
+            };
+            let mut ctx = CaptureCtx::new().proto(proto).with_origin(user(9));
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&register_runtime(
+                    "bot",
+                    caps.clone(),
+                    vec![],
+                    vec![9u8; PROMPT_HASH_LEN],
+                )),
+            )
+            .unwrap();
+            commit(&mut m);
+            let rec = get_agent(&m, "bot").unwrap();
+            assert_eq!(rec.caps, caps, "runtime fields accepted at proto {proto}");
+            assert_eq!(rec.recipe_hash, vec![9u8; PROMPT_HASH_LEN]);
+        }
+    }
+
+    /// the pure D3 cap gate: forge read != push, duckfs prefix containment (the
+    /// `src`/`srcx` boundary), write-grants-read, tool/secret membership, and
+    /// the budget ceiling. an empty record denies everything.
+    #[test]
+    fn permits_enforces_forge_duckfs_tool_secret_budget() {
+        let rec = record_with_caps(ResourceCaps {
+            forge_read: vec!["r".into()],
+            duckfs_read: vec!["src".into()],
+            duckfs_write: vec!["out".into()],
+            tools: vec!["bash".into()],
+            secrets: vec!["s".into()],
+            subagent_budget: 1,
+            ..Default::default()
+        });
+        assert!(rec.permits(&CapRequest::ForgeRead("r")));
+        assert!(!rec.permits(&CapRequest::ForgePush("r")), "read is not push");
+        assert!(rec.permits(&CapRequest::DuckfsRead("src")));
+        assert!(rec.permits(&CapRequest::DuckfsRead("src/lib.rs")));
+        assert!(
+            !rec.permits(&CapRequest::DuckfsRead("srcx")),
+            "a sibling sharing a textual prefix is denied"
+        );
+        assert!(
+            rec.permits(&CapRequest::DuckfsRead("out/x")),
+            "a write grant also grants read"
+        );
+        assert!(rec.permits(&CapRequest::DuckfsWrite("out/x")));
+        assert!(
+            !rec.permits(&CapRequest::DuckfsWrite("src/x")),
+            "a read grant does not grant write"
+        );
+        assert!(rec.permits(&CapRequest::Tool("bash")));
+        assert!(!rec.permits(&CapRequest::Tool("rm")));
+        assert!(rec.permits(&CapRequest::Secret("s")));
+        assert!(!rec.permits(&CapRequest::Secret("t")));
+        assert!(rec.permits(&CapRequest::SpawnSubagent));
+
+        let empty = record_with_caps(ResourceCaps::default());
+        assert!(!empty.permits(&CapRequest::SpawnSubagent));
+        assert!(!empty.permits(&CapRequest::ForgeRead("r")));
+    }
+
+    /// `MAX_AGENT_RECORD_BYTES` counts the runtime-identity fields — an oversized
+    /// caps list is rejected before staging.
+    #[test]
+    fn record_size_gate_counts_runtime_fields() {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new().with_origin(user(9));
+        let huge = ResourceCaps {
+            tools: vec!["x".repeat(MAX_AGENT_RECORD_BYTES)],
+            ..Default::default()
+        };
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &admin(&register_runtime("bot", huge, vec![], vec![])),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(_)));
+        abort(&mut m);
+        assert!(get_agent(&m, "bot").is_none());
+    }
+
+    /// two instances replaying the same runtime-identity ops produce equal roots.
+    #[test]
+    fn replay_is_deterministic() {
+        let caps = ResourceCaps {
+            forge_push: vec!["a".into(), "b".into()],
+            subagent_budget: 3,
+            ..Default::default()
+        };
+        let skills = vec![SkillRef {
+            name: "s".into(),
+            source_prefix: "/p".into(),
+            source_snapshot: Some("cc".repeat(32)),
+        }];
+        let run = || {
+            let mut m = module();
+            let mut ctx = CaptureCtx::new().at(1).with_origin(user(9));
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&register_runtime(
+                    "alpha",
+                    caps.clone(),
+                    skills.clone(),
+                    vec![9u8; PROMPT_HASH_LEN],
+                )),
+            )
+            .unwrap();
+            commit(&mut m);
+            m
+        };
+        let (a, b) = (run(), run());
+        assert_eq!(a.root(), b.root());
+        let baseline = module();
+        assert_ne!(a.root(), baseline.root(), "state moved the root");
+    }
+
+    /// D1 keyless: a serialized record carries NO key material — only opaque
+    /// secret refs, nested under `caps`.
+    #[test]
+    fn keyless_d1_no_key_field() {
+        let rec = record_with_caps(ResourceCaps {
+            secrets: vec!["vault://k".into()],
+            ..Default::default()
+        });
+        let j = serde_json::to_value(&rec).unwrap();
+        assert!(j.get("key").is_none(), "no key material at the record root");
+        assert!(
+            j.get("secrets").is_none(),
+            "secrets live inside caps, not at the record root"
+        );
+        assert_eq!(
+            j["caps"]["secrets"][0],
+            serde_json::json!("vault://k"),
+            "secrets are opaque refs only"
+        );
     }
 }

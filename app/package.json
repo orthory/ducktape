@@ -16,6 +16,8 @@
     "@fontsource/geist-mono": "^5.2.8",
     "@fontsource/geist-sans": "^5.2.5",
     "@fontsource/ibm-plex-sans-kr": "^5.2.8",
+    "@noble/curves": "^2.2.0",
+    "@noble/hashes": "^2.2.0",
     "@shikijs/core": "^4.3.1",
     "@shikijs/engine-javascript": "^4.3.1",
     "@shikijs/langs": "^4.3.1",

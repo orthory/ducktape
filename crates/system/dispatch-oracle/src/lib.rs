@@ -34,9 +34,15 @@ use sdk::{Effect, Msg};
 
 mod envelope;
 mod pool;
-pub use envelope::{BlobResolver, RUN_ENVELOPE_VERSION};
+mod provision;
+pub use envelope::{BlobResolver, Prepared, RUN_ENVELOPE_VERSION, RUNNER_RESULT_VERSION};
 pub use pool::{
     DEFAULT_MAX_CONCURRENT_RUNS, DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env,
+};
+pub use provision::{
+    BaseTool, PortablePlan, ProvisionedWorkspace, RoMount, RunEffect, SharedProvisioner, Sink, Status,
+    WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec, assemble_runner_result, bind_workspace,
+    effects_from_response_text,
 };
 
 /// everything a provider execution needs, extracted by the gate so the
@@ -165,8 +171,11 @@ impl DispatchWorker {
             .map_err(|_| "dispatch payload is not utf-8; providers take text".to_string())?;
         let provider = self.providers.resolve(capability)?;
         // envelope payloads assemble (real prompt, run context); legacy flat
-        // strings pass through verbatim with a default context.
-        let (input, ctx) = envelope::prepare(&input, self.resolver.as_ref()).await?;
+        // strings pass through verbatim with a default context. the inline
+        // worker has no provisioner seam, so a v3 plan (if any) is ignored —
+        // it never materializes a portable mount; the real portable path is
+        // DispatchPool.
+        let Prepared { input, ctx, .. } = envelope::prepare(&input, self.resolver.as_ref()).await?;
         let text = provider.run(&input, &ctx).await?;
         Ok(text.into_bytes())
     }

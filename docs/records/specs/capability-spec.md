@@ -139,9 +139,15 @@ args = ["run", "--json", "--model", "large-v2"]
 # prompts can't deadlock the pipe) and then EOF. an argv placeholder would
 # leak prompts into `ps` output and hit ARG_MAX — deliberately unsupported.
 prompt = "stdin"
-# per-job wall-clock budget in seconds (1..=3600, default 300). the child is
-# KILLED at the deadline. $DUCKTAPE_PROVIDER_TIMEOUT_SECS overrides every
-# spec's timeout at once (ops knob for slow hosts).
+# the child's IDLE budget in seconds (1..=3600, default 300): any output on
+# either stream REFRESHES it, so a long agentic run that keeps streaming
+# (codex --json events, tool chatter) is never killed mid-work — only a child
+# SILENT this long dies. a quiet-by-design CLI (claude -p prints one result at
+# the end) gets exactly this many seconds of silence, so budget for its
+# longest silent stretch. a continuously-chatty child is still bounded at
+# 6x this value (the host hard cap; the saga's consensus deadline bounds the
+# run's outcome regardless). $DUCKTAPE_PROVIDER_TIMEOUT_SECS overrides every
+# spec's idle budget at once (ops knob for slow hosts).
 timeout_secs = 300
 
 [output]
@@ -197,7 +203,7 @@ being silently ignored.
 |---|---|---|---|
 | `args` | string array | no (default `[]`) | passed verbatim to exec; fully literal, no placeholders |
 | `prompt` | string | yes | must be `"stdin"` in v1 |
-| `timeout_secs` | integer | no (default `300`) | 1..=3600; child killed at deadline |
+| `timeout_secs` | integer | no (default `300`) | 1..=3600; IDLE budget — output refreshes it; killed after this much silence, or at 6x regardless |
 
 ### `[output]`
 
