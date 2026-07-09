@@ -1597,9 +1597,9 @@ where
 /// verifier needs the committed ed25519 -> bls participant map valset does
 /// not carry yet). FATAL on undecodable participants — the boundary already
 /// passed the floor verify, so garbage here is our own bug, not the wire's.
-fn replica_verifier(namespace: &[u8], boundary: &statesync::Manifest) -> simplex_ed25519::Scheme {
-    let mut keys = Vec::with_capacity(boundary.participants.len());
-    for k in &boundary.participants {
+fn replica_verifier(namespace: &[u8], participant_keys: &[Vec<u8>]) -> simplex_ed25519::Scheme {
+    let mut keys = Vec::with_capacity(participant_keys.len());
+    for k in participant_keys {
         let pk = ed25519::PublicKey::decode(k.as_slice())
             .expect("participants already decoded for the floor verify");
         keys.push(pk);
@@ -6841,6 +6841,108 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // gate keeps it. in-memory on purpose: after a restart the first
             // boundary re-fires and every write below is idempotent.
             let mut last_indexed_root: Option<StateRoot> = None;
+            // ---- REPLICA RESTART: recover by journal replay --------------
+            //
+            // a checkpoint that routed us here (it names this key a resident,
+            // not a participant) is a real recovery base: replay the journal
+            // exactly as a validator restart would — restore the checkpoint
+            // host, fold the retained suffix, verify the recomposed app-hash
+            // — and enter the park loop ALREADY serving at the recovered tip.
+            // no re-bootstrap: the fold driver closes any offline gap over
+            // the Frames lane the moment the first certificate's parent
+            // linkage names it.
+            if let Some(ckpt) = manifest.as_ref() {
+                if let Err(e) = ckpt.preflight(MAX_PROTOCOL_VERSION) {
+                    eprintln!(
+                        "[node {label}] FATAL: cannot recover — {e} (recovered boundary needs \
+                         protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
+                        ckpt.required_min_version()
+                    );
+                    std::process::exit(1);
+                }
+                let restored = restore_host(
+                    &context,
+                    &forge_repo,
+                    &duckfs_dir,
+                    ckpt,
+                    &namespace,
+                    blobs.clone(),
+                    &identity_chain_id,
+                )
+                .await;
+                let mut host = match restored {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("[node {label}] FATAL: replica checkpoint restore: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                // heal the derived index against the CHECKPOINT boundary
+                // before replay, so the suffix folds land contiguously.
+                if let Some(ckpt_height) = ckpt.height {
+                    heal_index(&index, &host, ckpt_height, &label).await;
+                }
+                let mut recovery = recovery_slot
+                    .take()
+                    .expect("the journal slot is filled before the first ascension");
+                let rec = match recovery.recover_with_sink(&mut host, ckpt, None).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "[node {label}] FATAL: {e}\n\
+                             [node {label}] replica state cannot be locally recovered. wipe \
+                             the app-state partitions and re-join — but ALWAYS keep the \
+                             consensus journal partitions: they are the anti-equivocation \
+                             record for this key."
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                // seed the shared store with every retained frame so a
+                // re-observed certificate resolves locally instead of
+                // wedging the gate awaiting a fetch nobody owes us.
+                for frame in &rec.frames {
+                    replica_store.pin(frame.clone());
+                }
+                let tip = rec.height.unwrap_or(rec.view_base);
+                let root = rec.app_hash;
+                let follower = consensus::FollowerOrderer::new(replica_store.clone());
+                let node_r = node::OrderedNode::resume(
+                    host,
+                    follower,
+                    recovery,
+                    rec.height.map(|height| host::FinalizedBlock {
+                        height,
+                        app_hash: root,
+                    }),
+                    rec.view_base,
+                );
+                replica_scheme = Some(replica_verifier(&namespace, &rec.participants));
+                replica_epoch = rec.epoch;
+                replica_view_base = rec.view_base;
+                replica_watermark = Some(tip.saturating_sub(rec.view_base));
+                resident_standing = rec
+                    .residents
+                    .iter()
+                    .any(|k| k.as_slice() == me_bytes.as_slice());
+                println!(
+                    "[node {label}] replica: restart replayed the journal to {} \
+                     (epoch {}, replayed {}, app_hash={})",
+                    tip,
+                    rec.epoch,
+                    rec.applied,
+                    hex(&root)
+                );
+                // the e2e / operator serve marker, truthful here too: the
+                // node serves a verified boundary — the recovered tip.
+                println!(
+                    "[node {label}] resident: pre-synced boundary {tip} app_hash={}",
+                    hex(&root)
+                );
+                heal_index(&index, node_r.host(), tip, &label).await;
+                last_indexed_root = Some(root);
+                serving = Some((tip, node_r));
+            }
             let not_serving = |standing: bool| -> String {
                 if standing {
                     "resident: no boundary pre-synced yet — retry shortly".into()
@@ -7827,7 +7929,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         }),
                                         m.view_base,
                                     );
-                                    replica_scheme = Some(replica_verifier(&namespace, &m));
+                                    replica_scheme =
+                                        Some(replica_verifier(&namespace, &m.participants));
                                     replica_epoch = m.epoch;
                                     replica_view_base = m.view_base;
                                     replica_watermark = Some(tip.saturating_sub(m.view_base));
