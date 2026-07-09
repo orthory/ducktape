@@ -1,5 +1,16 @@
 //! network state sync: how a joiner rebuilds every module from a RUNNING node.
 //!
+//! ## role (unified-node design, phases 2-4)
+//!
+//! state sync is the JOIN-TIME BOOTSTRAP, not the steady state. a standing
+//! node follows the head by FOLDING finalized frames (the replica pipeline:
+//! verified certificates through `consensus::FollowerOrderer` into the same
+//! `OrderedNode` a validator drains); these lanes serve exactly three
+//! moments — standing a fresh joiner up at a boundary, the `Frames` suffix
+//! that gives a bootstrap (or a fold-driver gap) journal continuity, and a
+//! promotion's boundary artifacts. `MAX_CAPTURES` is sized for that
+//! join-shaped load: concurrent joiners, not a resident fleet re-polling.
+//!
 //! ## protocol
 //!
 //! four request shapes ride one request/response transport (any transport —

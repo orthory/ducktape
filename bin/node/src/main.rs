@@ -1662,7 +1662,8 @@ async fn write_boundary_checkpoint<E>(
     floor: &Option<recovery::FloorCert>,
     label: &str,
     diag_tag: &str,
-) where
+) -> u64
+where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
 {
     let pos = recovery.oplog_pos().await;
@@ -1722,6 +1723,9 @@ async fn write_boundary_checkpoint<E>(
         eprintln!("[node {label}] FATAL: {diag_tag} journal prune: {e}");
         std::process::exit(1);
     }
+    // the checkpoint's oplog position — the caller's prune anchor when the
+    // NEXT (periodic) checkpoint supersedes this one.
+    pos
 }
 
 fn to_node_disposition(disposition: statesync::FrameDisposition) -> node::Disposition {
@@ -7090,6 +7094,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             let mut replica_orchestrator: Option<
                 consensus::ValsetOrchestrator<ed25519::PublicKey>,
             > = None;
+            // the last checkpoint's (height, oplog position) — the prune
+            // anchor: the journal below it drops once the floor passes it.
+            let mut replica_prev_ckpt: (Option<u64>, u64) = (None, 0);
             // the app-hash of the last boundary the derived tier followed:
             // the index feed (heal + explorer row + ws event) fires only when
             // the verified app-hash MOVED. an unchanged hash is an idle
@@ -7181,6 +7188,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     &rec.participants,
                     &rec.residents,
                 ));
+                replica_prev_ckpt = (ckpt.height, ckpt.oplog_pos);
                 replica_epoch = rec.epoch;
                 replica_view_base = rec.view_base;
                 replica_watermark = Some(tip.saturating_sub(rec.view_base));
@@ -8047,13 +8055,33 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         match captured {
                             Ok(ckpt) => match node_r.sink_mut().write_manifest(&ckpt).await {
                                 Ok(()) => {
-                                    // MULE: capture-vs-live agreement probe.
-                                    eprintln!(
-                                        "[node {label}] MULE ckpt@{} capture_hash={} live_hash={}",
-                                        f.height,
-                                        hex(&ckpt.app_hash),
-                                        hex(&node_r.host().app_hash())
+                                    // prune the journal below the PREVIOUS
+                                    // checkpoint once the persisted floor
+                                    // passed it — the validator's exact
+                                    // prune discipline. without this a
+                                    // long-lived replica's journal grows
+                                    // without bound (pruned frames must
+                                    // never be needed to resolve a
+                                    // re-reported finalization; the floor
+                                    // gate guarantees it).
+                                    let floor_passed = matches!(
+                                        node_r.sink_mut().floor_cert(),
+                                        Ok(Some(fc))
+                                            if replica_prev_ckpt
+                                                .0
+                                                .is_none_or(|h| fc.height >= h)
                                     );
+                                    if floor_passed
+                                        && let Err(e) = node_r
+                                            .sink_mut()
+                                            .prune_oplog(replica_prev_ckpt.1)
+                                            .await
+                                    {
+                                        eprintln!(
+                                            "[node {label}] replica oplog prune failed: {e}"
+                                        );
+                                    }
+                                    replica_prev_ckpt = (ckpt.height, pos);
                                     blocks_since_checkpoint = 0;
                                 }
                                 Err(e) => eprintln!(
@@ -8274,7 +8302,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     let mut recovery = recovery_slot
                                         .take()
                                         .expect("the journal slot is filled whenever serving is None");
-                                    write_boundary_checkpoint(
+                                    let ckpt_pos = write_boundary_checkpoint(
                                         &mut recovery,
                                         &host,
                                         &m,
@@ -8283,6 +8311,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         "replica_checkpoint",
                                     )
                                     .await;
+                                    replica_prev_ckpt = (Some(m.height), ckpt_pos);
                                     // close the boundary -> live-tip gap
                                     // through the SAME journal a validator
                                     // restart would replay; every served
