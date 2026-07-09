@@ -1551,6 +1551,10 @@ async fn reopen_recovery(
     }
 }
 
+/// a backfilled height's served seal, held for the post-fold cross-check:
+/// `(disposition, app_hash, per-module roots)` as the quorum sealed them.
+type ServedSeal = (node::Disposition, StateRoot, Vec<(sdk::ModuleId, StateRoot)>);
+
 /// fold the committed views in `(after_view, up_to_view]` that never reached
 /// this replica as certificates — lost gossip, or ancestors committed by
 /// descent without their own finalization (the parent-linkage gap the fold
@@ -1567,7 +1571,7 @@ async fn replica_backfill<C>(
     view_base: u64,
     views: (u64, u64),
     watermark: &mut Option<u64>,
-    seal_checks: &mut std::collections::HashMap<u64, (node::Disposition, StateRoot)>,
+    seal_checks: &mut std::collections::HashMap<u64, ServedSeal>,
     label: &str,
 ) -> Result<(), String>
 where
@@ -1584,7 +1588,10 @@ where
     );
     for f in frames {
         let view = f.height.saturating_sub(view_base);
-        seal_checks.insert(f.height, (to_node_disposition(f.disposition), f.app_hash));
+        seal_checks.insert(
+            f.height,
+            (to_node_disposition(f.disposition), f.app_hash, f.roots.clone()),
+        );
         if node_r.orderer_mut().admit_backfilled(view, f.frame.clone()) {
             *watermark = Some(view);
         }
@@ -1598,9 +1605,9 @@ where
 /// verifier needs the committed ed25519 -> bls participant map valset does
 /// not carry yet). FATAL on undecodable participants — the boundary already
 /// passed the floor verify, so garbage here is our own bug, not the wire's.
-fn replica_verifier(namespace: &[u8], boundary: &statesync::Manifest) -> simplex_ed25519::Scheme {
-    let mut keys = Vec::with_capacity(boundary.participants.len());
-    for k in &boundary.participants {
+fn replica_verifier(namespace: &[u8], participant_keys: &[Vec<u8>]) -> simplex_ed25519::Scheme {
+    let mut keys = Vec::with_capacity(participant_keys.len());
+    for k in participant_keys {
         let pk = ed25519::PublicKey::decode(k.as_slice())
             .expect("participants already decoded for the floor verify");
         keys.push(pk);
@@ -1613,6 +1620,32 @@ fn replica_verifier(namespace: &[u8], boundary: &statesync::Manifest) -> simplex
             unimplemented!("V2Bls replica wiring lands with valset bls key registration")
         }
     }
+}
+
+/// the replica's valset orchestrator at (epoch, base): the same
+/// deterministic observe → ceiling → cutover state machine the validator
+/// drain runs. the pending-cutover slot resumes empty — the manifest-epoch
+/// descend stays as the safety net for a cutover armed before this handle
+/// existed (a restart into a pending window).
+fn replica_orchestrator_at(
+    epoch: u64,
+    view_base: u64,
+    participants: &[Vec<u8>],
+    residents: &[Vec<u8>],
+) -> consensus::ValsetOrchestrator<ed25519::PublicKey> {
+    let decode = |keys: &[Vec<u8>]| -> Vec<ed25519::PublicKey> {
+        keys.iter()
+            .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+            .collect()
+    };
+    consensus::ValsetOrchestrator::resume(
+        CUTOVER_DELAY,
+        decode(participants),
+        decode(residents),
+        epoch,
+        view_base,
+        None,
+    )
 }
 
 /// capture and persist the checkpoint (+ floor cert) that makes a synced
@@ -6825,15 +6858,20 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // served seals awaiting the post-fold cross-check: a BACKFILLED
             // frame's trust is the served seal, verified against what OUR
             // fold produced (height -> served (disposition, app_hash)).
-            let mut pending_seal_checks: std::collections::HashMap<
-                u64,
-                (node::Disposition, StateRoot),
-            > = std::collections::HashMap::new();
+            let mut pending_seal_checks: std::collections::HashMap<u64, ServedSeal> =
+                std::collections::HashMap::new();
             let mut blocks_since_checkpoint: u64 = 0;
             let mut last_cert_height: Option<u64> = None;
             // the serving replica's manifest-fetch pacer (see the gate at the
             // fetch site). absolute, so per-cert window closes can't starve it.
             let mut next_manifest_fetch = std::time::Instant::now();
+            // the replica's valset orchestrator — Some exactly when serving.
+            // observe/ceiling/cutover mirror the validator drain; the SWAP
+            // exchanges the follower orderer where a validator respawns an
+            // engine.
+            let mut replica_orchestrator: Option<
+                consensus::ValsetOrchestrator<ed25519::PublicKey>,
+            > = None;
             // the app-hash of the last boundary the derived tier followed:
             // the index feed (heal + explorer row + ws event) fires only when
             // the verified app-hash MOVED. an unchanged hash is an idle
@@ -6842,6 +6880,120 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // gate keeps it. in-memory on purpose: after a restart the first
             // boundary re-fires and every write below is idempotent.
             let mut last_indexed_root: Option<StateRoot> = None;
+            // ---- REPLICA RESTART: recover by journal replay --------------
+            //
+            // a checkpoint that routed us here (it names this key a resident,
+            // not a participant) is a real recovery base: replay the journal
+            // exactly as a validator restart would — restore the checkpoint
+            // host, fold the retained suffix, verify the recomposed app-hash
+            // — and enter the park loop ALREADY serving at the recovered tip.
+            // no re-bootstrap: the fold driver closes any offline gap over
+            // the Frames lane the moment the first certificate's parent
+            // linkage names it.
+            if let Some(ckpt) = manifest.as_ref() {
+                if let Err(e) = ckpt.preflight(MAX_PROTOCOL_VERSION) {
+                    eprintln!(
+                        "[node {label}] FATAL: cannot recover — {e} (recovered boundary needs \
+                         protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
+                        ckpt.required_min_version()
+                    );
+                    std::process::exit(1);
+                }
+                let restored = restore_host(
+                    &context,
+                    &forge_repo,
+                    &duckfs_dir,
+                    ckpt,
+                    &namespace,
+                    blobs.clone(),
+                    &identity_chain_id,
+                )
+                .await;
+                let mut host = match restored {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("[node {label}] FATAL: replica checkpoint restore: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                // heal the derived index against the CHECKPOINT boundary
+                // before replay, so the suffix folds land contiguously.
+                if let Some(ckpt_height) = ckpt.height {
+                    heal_index(&index, &host, ckpt_height, &label).await;
+                }
+                let mut recovery = recovery_slot
+                    .take()
+                    .expect("the journal slot is filled before the first ascension");
+                let rec = match recovery.recover_with_sink(&mut host, ckpt, None).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "[node {label}] FATAL: {e}\n\
+                             [node {label}] replica state cannot be locally recovered. wipe \
+                             the app-state partitions and re-join — but ALWAYS keep the \
+                             consensus journal partitions: they are the anti-equivocation \
+                             record for this key."
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                // seed the shared store with every retained frame so a
+                // re-observed certificate resolves locally instead of
+                // wedging the gate awaiting a fetch nobody owes us.
+                for frame in &rec.frames {
+                    replica_store.pin(frame.clone());
+                }
+                let tip = rec.height.unwrap_or(rec.view_base);
+                let root = rec.app_hash;
+                let follower = consensus::FollowerOrderer::new(replica_store.clone());
+                let node_r = node::OrderedNode::resume(
+                    host,
+                    follower,
+                    recovery,
+                    rec.height.map(|height| host::FinalizedBlock {
+                        height,
+                        app_hash: root,
+                    }),
+                    rec.view_base,
+                );
+                replica_scheme = Some(replica_verifier(&namespace, &rec.participants));
+                replica_orchestrator = Some(replica_orchestrator_at(
+                    rec.epoch,
+                    rec.view_base,
+                    &rec.participants,
+                    &rec.residents,
+                ));
+                replica_epoch = rec.epoch;
+                replica_view_base = rec.view_base;
+                replica_watermark = Some(tip.saturating_sub(rec.view_base));
+                resident_standing = rec
+                    .residents
+                    .iter()
+                    .any(|k| k.as_slice() == me_bytes.as_slice());
+                println!(
+                    "[node {label}] replica: restart replayed the journal to {} \
+                     (epoch {}, replayed {}, already-on-disk {}{}, app_hash={})",
+                    tip,
+                    rec.epoch,
+                    rec.applied,
+                    rec.skipped,
+                    if rec.rolled_forward {
+                        ", rolled 1 forward"
+                    } else {
+                        ""
+                    },
+                    hex(&root)
+                );
+                // the e2e / operator serve marker, truthful here too: the
+                // node serves a verified boundary — the recovered tip.
+                println!(
+                    "[node {label}] resident: pre-synced boundary {tip} app_hash={}",
+                    hex(&root)
+                );
+                heal_index(&index, node_r.host(), tip, &label).await;
+                last_indexed_root = Some(root);
+                serving = Some((tip, node_r));
+            }
             let not_serving = |standing: bool| -> String {
                 if standing {
                     "resident: no boundary pre-synced yet — retry shortly".into()
@@ -7444,9 +7596,23 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         // a BACKFILLED height's trust is the served seal:
                         // what our fold produced must match it exactly, or
                         // this replica has diverged from the quorum's fold.
-                        if let Some((_, served_hash)) = pending_seal_checks.remove(&height)
+                        if let Some((_, served_hash, served_roots)) =
+                            pending_seal_checks.remove(&height)
                             && sealed_hash.is_some_and(|h| h != served_hash)
                         {
+                            // name the diverging module(s) — the one lead an
+                            // operator (or the next debugger) needs first.
+                            for (module, served_root) in &served_roots {
+                                let ours = node_r.host().module_root(module);
+                                if ours.as_ref() != Some(served_root) {
+                                    eprintln!(
+                                        "[node {label}] replica: diverged module={module} \
+                                         served={} ours={}",
+                                        hex(served_root),
+                                        ours.map(|r| hex(&r)).unwrap_or_else(|| "none".into())
+                                    );
+                                }
+                            }
                             eprintln!(
                                 "[node {label}] FATAL: backfilled height {height} folded to \
                                  {} but the quorum sealed {} — state diverged",
@@ -7488,6 +7654,127 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                         *served_height = height;
                         blocks_since_checkpoint += 1;
+                    }
+                    // ---- valset orchestration (the replica mirror) --------
+                    //
+                    // observe → ceiling → cutover, exactly the validator
+                    // drain's discipline. the CEILING is correctness, not
+                    // bookkeeping: a frame finalized before the cutover but
+                    // landing after it is DISCARDED by every validator, and
+                    // a replica without the ceiling would apply it — silent
+                    // divergence. the cutover SWAPS the follower orderer
+                    // (journaling Record::Cutover) where a validator
+                    // respawns an engine; the manifest-epoch descend remains
+                    // the safety net for anything this mirror missed.
+                    if !drained.is_empty()
+                        && let Some(orch) = replica_orchestrator.as_mut()
+                    {
+                        let folded_view = served_height.saturating_sub(replica_view_base);
+                        let members_raw = read_valset_members(node_r.host()).await;
+                        let observed: Vec<ed25519::PublicKey> = members_raw
+                            .iter()
+                            .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                            .collect();
+                        let residents_raw = read_valset_residents(node_r.host()).await;
+                        let observed_residents: Vec<ed25519::PublicKey> = residents_raw
+                            .iter()
+                            .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                            .collect();
+                        if let consensus::ObservationOutcome::Scheduled(cutover) = orch
+                            .observe_members(
+                                folded_view,
+                                observed.iter().cloned(),
+                                observed_residents.iter().cloned(),
+                            )
+                        {
+                            println!(
+                                "[node {label}] replica: membership change observed at view {} \
+                                 — cutover to epoch {} at view {}",
+                                cutover.observed_view(),
+                                cutover.next_epoch(),
+                                cutover.cutover_view()
+                            );
+                            node_r.set_view_ceiling(cutover.cutover_view());
+                        }
+                        let boundary_upgrade = read_upgrade_state(node_r.host()).await;
+                        if let Some(pending) = &boundary_upgrade.pending
+                            && let consensus::ObservationOutcome::Scheduled(cutover) =
+                                orch.observe_upgrade(folded_view, pending.activation_height)
+                        {
+                            println!(
+                                "[node {label}] replica: upgrade '{}' armed — cutover to epoch \
+                                 {} at view {} (activation height {})",
+                                pending.name,
+                                cutover.next_epoch(),
+                                cutover.cutover_view(),
+                                pending.activation_height
+                            );
+                            node_r.set_view_ceiling(cutover.cutover_view());
+                        }
+                        if let Some(plan) = orch.respawn_if_due(
+                            folded_view,
+                            observed,
+                            observed_residents,
+                            boundary_upgrade,
+                        ) {
+                            let members = plan.valset().consensus_members();
+                            let member_bytes: Vec<Vec<u8>> =
+                                members.iter().map(|k| k.as_ref().to_vec()).collect();
+                            let plan_residents: Vec<ed25519::PublicKey> = plan
+                                .valset()
+                                .transport_members()
+                                .difference(members)
+                                .cloned()
+                                .collect();
+                            let plan_resident_bytes: Vec<Vec<u8>> = plan_residents
+                                .iter()
+                                .map(|k| k.as_ref().to_vec())
+                                .collect();
+                            // transport first, exactly like the validator:
+                            // the new epoch's mesh must admit its members.
+                            oracle.track(
+                                plan.epoch(),
+                                joiner_epoch_mesh(&peers, &member_bytes, &plan_resident_bytes),
+                            );
+                            last_tracked = plan.epoch();
+                            // the follower swap: same OrderedNode, fresh
+                            // orderer, cutover journaled — the epoch-local
+                            // view clock restarts with the new base.
+                            let follower =
+                                consensus::FollowerOrderer::new(replica_store.clone());
+                            if let Err(e) = node_r
+                                .cutover(
+                                    follower,
+                                    plan.epoch(),
+                                    plan.cutover_app_height(),
+                                    &member_bytes,
+                                    &plan_resident_bytes,
+                                )
+                                .await
+                            {
+                                eprintln!(
+                                    "[node {label}] FATAL: replica cutover journal write: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                            node_r.host_mut().set_active_version(plan.boundary_version());
+                            replica_scheme =
+                                Some(replica_verifier(&namespace, &member_bytes));
+                            replica_epoch = plan.epoch();
+                            replica_view_base = plan.cutover_app_height();
+                            replica_watermark = None;
+                            pending_seal_checks.clear();
+                            // force a checkpoint on the next pass — the
+                            // validator writes one immediately post-cutover
+                            // for the same restart-boundary reason.
+                            blocks_since_checkpoint = checkpoint_blocks;
+                            println!(
+                                "[node {label}] replica: epoch cutover to {} at base {} — \
+                                 follower swapped in-loop",
+                                plan.epoch(),
+                                plan.cutover_app_height()
+                            );
+                        }
                     }
                     // persist the finalization floor once everything at or
                     // below it has drained — cert first, gate second, same
@@ -7541,7 +7828,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         );
                         match captured {
                             Ok(ckpt) => match node_r.sink_mut().write_manifest(&ckpt).await {
-                                Ok(()) => blocks_since_checkpoint = 0,
+                                Ok(()) => {
+                                    // MULE: capture-vs-live agreement probe.
+                                    eprintln!(
+                                        "[node {label}] MULE ckpt@{} capture_hash={} live_hash={}",
+                                        f.height,
+                                        hex(&ckpt.app_hash),
+                                        hex(&node_r.host().app_hash())
+                                    );
+                                    blocks_since_checkpoint = 0;
+                                }
                                 Err(e) => eprintln!(
                                     "[node {label}] replica checkpoint write failed \
                                      (will retry): {e}"
@@ -7691,6 +7987,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         );
                         serving = None;
                         replica_scheme = None;
+                        replica_orchestrator = None;
                         recovery_slot =
                             Some(reopen_recovery(&context, &mut recovery_reopens, &label).await);
                     }
@@ -7828,7 +8125,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         }),
                                         m.view_base,
                                     );
-                                    replica_scheme = Some(replica_verifier(&namespace, &m));
+                                    replica_scheme =
+                                        Some(replica_verifier(&namespace, &m.participants));
+                                    replica_orchestrator = Some(replica_orchestrator_at(
+                                        m.epoch,
+                                        m.view_base,
+                                        &m.participants,
+                                        &m.residents,
+                                    ));
                                     replica_epoch = m.epoch;
                                     replica_view_base = m.view_base;
                                     replica_watermark = Some(tip.saturating_sub(m.view_base));
