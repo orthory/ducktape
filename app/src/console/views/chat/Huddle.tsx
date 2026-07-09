@@ -20,6 +20,7 @@ import { accentVar, color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "./HoverButton";
 import { HuddleCard } from "./HuddleCard";
 import { CallTiles } from "../huddle/CallTiles";
+import { DevicesMenu } from "../huddle/DevicesMenu";
 import { HuddleControls } from "../huddle/HuddleControls";
 import { HuddleStage } from "../huddle/HuddleStage";
 
@@ -184,6 +185,7 @@ function HuddleDockCard() {
   // spotlight. Local state, so it resets on join (the card is keyed by channel)
   // and never conflicts with the popped window (which owns its own surface).
   const [expanded, setExpanded] = useState(false);
+  const [devicesOpen, setDevicesOpen] = useState(false);
 
   // Staleness is time-driven, so re-render once a second WHILE this compact dock
   // is the visible surface — not while popped (the popped window drives its own
@@ -238,6 +240,7 @@ function HuddleDockCard() {
         background: color.paper,
         border: `1px solid ${color.borderStrong}`,
         boxShadow: "0 1px 2px rgba(40,38,34,.05)",
+        position: "relative",
         display: "flex",
         flexDirection: "column",
         gap: 8,
@@ -297,11 +300,18 @@ function HuddleDockCard() {
         sharing={voice.sharing}
         canScreenShare={state.videoCapability.canScreenShare && !overCap}
         onToggleScreen={() => actions.setScreenShare(!voice.sharing)}
+        onOpenDevices={() => setDevicesOpen((v) => !v)}
         onToggleMute={() => actions.setHuddleMuted(!voice.muted)}
         onToggleCamera={() => actions.setCamera(!voice.cameraOn)}
         onLeave={() => actions.leaveHuddle()}
         onRetry={() => actions.joinHuddle(channelId)}
       />
+
+      {devicesOpen && (
+        <div style={{ position: "absolute", left: 10, right: 10, bottom: 46, zIndex: 5 }}>
+          <DevicesMenu onClose={() => setDevicesOpen(false)} />
+        </div>
+      )}
     </div>
   );
 }

@@ -19,6 +19,7 @@ import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "../chat/HoverButton";
 import { CallTiles } from "./CallTiles";
+import { DevicesMenu } from "./DevicesMenu";
 import { HuddleControls } from "./HuddleControls";
 
 // ── glyphs (view controls, kept local) ──────────────────
@@ -53,6 +54,7 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
   const { voice, videoCapability } = state;
   const [mode, setMode] = useState<"gallery" | "spotlight">("gallery");
   const [pinned, setPinned] = useState<string | null>(null);
+  const [devicesOpen, setDevicesOpen] = useState(false);
   const [nowTick, setNowTick] = useState(() => Date.now());
   useEffect(() => {
     const id = setInterval(() => setNowTick(Date.now()), 1000);
@@ -169,6 +171,12 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
         )}
       </div>
 
+      {devicesOpen && (
+        <div style={{ position: "absolute", bottom: 66, left: "50%", transform: "translateX(-50%)", width: 260, zIndex: 5 }}>
+          <DevicesMenu onClose={() => setDevicesOpen(false)} />
+        </div>
+      )}
+
       {/* control bar — media controls */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "12px 14px", borderTop: `1px solid ${color.borderSoft}` }}>
         <HuddleControls
@@ -181,6 +189,7 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
           sharing={voice.sharing}
           canScreenShare={videoCapability.canScreenShare && !overCap}
           onToggleScreen={() => actions.setScreenShare(!voice.sharing)}
+          onOpenDevices={() => setDevicesOpen((v) => !v)}
           onToggleMute={() => actions.setHuddleMuted(!voice.muted)}
           onToggleCamera={() => actions.setCamera(!voice.cameraOn)}
           onLeave={() => actions.leaveHuddle()}

@@ -24,6 +24,8 @@ import type {
 import type { BlockRecord, NodeStatus } from "../../domain/transport";
 import type { VoiceError } from "../../domain/voice-session";
 import type { VideoCapability } from "../../domain/video-capability";
+import { loadDevicePrefs } from "../../domain/media-devices";
+import type { DevicePrefs, HuddleDevices } from "../../domain/media-devices";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
@@ -163,6 +165,13 @@ export interface ConsoleState {
    *  voice slice — the huddle-reset paths must never wipe it. `canEncode` gates
    *  the camera control; `canDecode` gates peer-tile rendering. */
   videoCapability: VideoCapability;
+  /** The user's chosen huddle input/output devices (persisted; undefined =
+   *  system default). Stable across sessions, so it lives OUTSIDE the voice slice
+   *  — a leave/rejoin keeps the selection. */
+  devicePrefs: DevicePrefs;
+  /** The enumerated mic/camera/speaker options for the picker — refreshed on
+   *  demand (labels appear only after a media-permission grant). */
+  deviceOptions: HuddleDevices;
 
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
@@ -462,6 +471,8 @@ export const createInitialState = (): ConsoleState => {
       speaking: false,
     },
     videoCapability: { canEncode: false, canDecode: false, canScreenShare: false },
+    devicePrefs: loadDevicePrefs(),
+    deviceOptions: { mics: [], cameras: [], speakers: [] },
     members: [],
     residents: [],
     proposals: [],

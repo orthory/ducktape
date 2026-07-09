@@ -90,6 +90,10 @@ export interface CallSession {
    *  Enabling acquires getDisplayMedia; a denial/cancel leaves it off. Beacons
    *  `sharing` so peers letterbox + label the tile. */
   setScreenShare(on: boolean): void;
+  /** Select input/output devices (undefined = system default). Applied live: the
+   *  mic swaps into the running capture graph, a live camera re-acquires, and the
+   *  speaker routes via setSinkId where supported. Also read at the next acquire. */
+  setDevices(prefs: { micId?: string; cameraId?: string; speakerId?: string }): void;
   /** Bind (or unbind, with null) the canvas a peer's video decodes onto. */
   bindTile(peerHex: string, canvas: HTMLCanvasElement | null): void;
   /** Bind (or unbind, with null) the local camera preview <video>. */
@@ -126,6 +130,11 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   let muted = false;
   let started = false;
   let stopped = false;
+  // Chosen input/output devices (undefined = system default). Applied at acquire
+  // time (start / startVideo) and swapped live by setDevices.
+  let micId: string | undefined;
+  let cameraId: string | undefined;
+  let speakerId: string | undefined;
   // Self active-speaker detection off the capture frames (runs even while muted).
   let speaking = false;
   let speakingHoldUntil = 0;
@@ -202,7 +211,13 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     const media = screen
       ? await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } } })
       : await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30 },
+            // `ideal` (bare string) so an absent camera falls back, not throws.
+            ...(cameraId ? { deviceId: cameraId } : {}),
+          },
         });
     if (stopped || !wanted()) {
       media.getTracks().forEach((t) => t.stop());
@@ -388,6 +403,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   };
 
   const onPeerVideo = (peer: string, keyframe: boolean, tsMs: number, data: Uint8Array) => {
+    // No decode support on this runtime → ignore peer video rather than throw
+    // constructing a VideoDecoder on every frame (a decoder-less WKWebView).
+    if (typeof VideoDecoder === "undefined") return;
     const pipe = pipeFor(peer);
     if (pipe.awaitingKey && !keyframe) {
       requestPeerKeyframe(peer, pipe); // deltas are useless until a sync point
@@ -514,15 +532,68 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   };
 
   // ── lifecycle ───────────────────────────────────────────
+  const audioConstraints = (): MediaTrackConstraints => ({
+    echoCancellation: true,
+    noiseSuppression: true,
+    channelCount: 1,
+    // `ideal` (bare string), NOT { exact } — a persisted-but-now-absent device
+    // must fall back to the system default, not OverconstrainedError the join.
+    ...(micId ? { deviceId: micId } : {}),
+  });
+
+  /** Route playout to the chosen speaker — AudioContext.setSinkId is Chromium
+   *  only; WebKitGTK / macOS WKWebView lack it, so this is a no-op there and the
+   *  speaker picker hides itself (media-devices.canSelectSpeaker). */
+  const applySpeaker = (): void => {
+    const sink = ctx as (AudioContext & { setSinkId?: (id: string) => Promise<void> }) | null;
+    if (speakerId && typeof sink?.setSinkId === "function") void sink.setSinkId(speakerId).catch(() => {});
+  };
+
+  /** Re-acquire the mic on a new device, swapping it into the LIVE capture graph
+   *  without rebuilding the worklet (playout + encode untouched). */
+  const swapMic = async (): Promise<void> => {
+    if (!ctx || !capture) return; // not live yet — start() picks up micId at acquire
+    try {
+      const media = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints() });
+      if (stopped) {
+        media.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      const next = ctx.createMediaStreamSource(media);
+      source?.disconnect();
+      stream?.getTracks().forEach((t) => t.stop());
+      stream = media;
+      source = next;
+      source.connect(capture);
+    } catch {
+      // keep the current mic on a failed acquire.
+    }
+  };
+
+  const setDevices = (prefs: { micId?: string; cameraId?: string; speakerId?: string }): void => {
+    const micChanged = prefs.micId !== micId;
+    const cameraChanged = prefs.cameraId !== cameraId;
+    micId = prefs.micId;
+    cameraId = prefs.cameraId;
+    speakerId = prefs.speakerId;
+    applySpeaker();
+    if (micChanged) void swapMic();
+    // Re-acquire the live camera on the new device (a screen share is
+    // unaffected). A bad/exact deviceId can OverconstrainedError — turn the lane
+    // off cleanly rather than leak an unhandled rejection + a stuck camera flag.
+    if (cameraChanged && cameraOn) {
+      stopCameraGraph();
+      void startVideo(false).catch(() => stopVideoLane());
+    }
+  };
+
   const start = (wsUrl: string) => {
     if (started) return;
     started = true;
     setStatus("connecting");
     Promise.resolve()
       .then(() =>
-        navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
-        }),
+        navigator.mediaDevices.getUserMedia({ audio: audioConstraints() }),
       )
       .then(async (media) => {
         if (stopped) {
@@ -564,6 +635,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
         });
         play.connect(context.destination);
         playback = play;
+        applySpeaker(); // route to the chosen speaker if one is set + supported
 
         openSocket(wsUrl);
       })
@@ -639,5 +711,5 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     tileBindings.clear();
   };
 
-  return { start, setRecipients, setMuted, setCamera, setScreenShare, bindTile, bindPreview, stop };
+  return { start, setRecipients, setMuted, setCamera, setScreenShare, setDevices, bindTile, bindPreview, stop };
 };
