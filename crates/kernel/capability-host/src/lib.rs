@@ -35,9 +35,11 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio::io::AsyncBufReadExt as _;
 use tokio::io::AsyncWriteExt as _;
 
 mod session;
@@ -59,6 +61,26 @@ pub struct RunContext {
     pub agent_id: Option<String>,
     pub thread_key: Option<String>,
 }
+
+/// which child stream produced one live output line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// one line observed from a provider child as it arrives. `line` does not
+/// include the trailing newline, matching `BufReader::lines()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputLine {
+    pub stream: OutputStream,
+    pub line: String,
+}
+
+/// optional live-tail callback for provider output. The run context is passed
+/// beside each line so embedders can key their own per-run registry with the
+/// host-local identity available to capability-host.
+pub type OutputSink = Arc<dyn Fn(&RunContext, OutputLine) + Send + Sync>;
 
 /// a machine-local executor for one capability tag. implementations do real
 /// I/O (spawn processes); nothing consensus-side may ever hold one. the
@@ -205,6 +227,10 @@ pub struct CliProvider {
     /// host-wired roots for persistent workspaces and session files; both
     /// default absent (scratch + cold runs).
     dirs: AgentDirs,
+    /// optional live per-line output sink. `None` means no output lines are
+    /// forwarded; stdout/stderr are still accumulated for the existing parse
+    /// and error contracts.
+    output_sink: Option<OutputSink>,
 }
 
 impl CliProvider {
@@ -223,6 +249,7 @@ impl CliProvider {
             workdir,
             timeout,
             dirs: AgentDirs::default(),
+            output_sink: None,
         }
     }
 
@@ -238,6 +265,11 @@ impl CliProvider {
 
     pub fn with_agent_dirs(mut self, dirs: AgentDirs) -> Self {
         self.dirs = dirs;
+        self
+    }
+
+    pub fn with_output_sink(mut self, output_sink: OutputSink) -> Self {
+        self.output_sink = Some(output_sink);
         self
     }
 
@@ -304,6 +336,33 @@ struct Invocation {
     stdout: String,
 }
 
+struct CollectedOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+async fn collect_output_lines<R>(
+    reader: R,
+    stream: OutputStream,
+    sink: Option<OutputSink>,
+    ctx: &RunContext,
+) -> Result<String, std::io::Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    let mut output = String::new();
+    while let Some(line) = lines.next_line().await? {
+        output.push_str(&line);
+        output.push('\n');
+        if let Some(sink) = &sink {
+            sink(ctx, OutputLine { stream, line });
+        }
+    }
+    Ok(output)
+}
+
 impl CliProvider {
     /// one child process, start to parsed answer, with an explicit argv and
     /// working directory — the shared engine under the cold and resume paths.
@@ -312,6 +371,7 @@ impl CliProvider {
         prompt: &str,
         args: &[String],
         workdir: &Path,
+        ctx: &RunContext,
     ) -> Result<Invocation, String> {
         let mut child = self
             .command(args, workdir)
@@ -321,6 +381,14 @@ impl CliProvider {
             .stdin
             .take()
             .ok_or_else(|| "child stdin was not piped".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "child stdout was not piped".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "child stderr was not piped".to_string())?;
 
         // feed the prompt CONCURRENTLY with collecting output: a prompt larger
         // than the pipe buffer would deadlock a sequential write-then-wait if
@@ -334,8 +402,15 @@ impl CliProvider {
             drop(stdin); // EOF: the prompt is complete
             Ok::<(), std::io::Error>(())
         };
-        let (fed, out) = tokio::time::timeout(self.timeout, async {
-            tokio::join!(feed, child.wait_with_output())
+        let output_sink = self.output_sink.clone();
+        let stdout_sink = output_sink.clone();
+        let (fed, stdout, stderr, waited) = tokio::time::timeout(self.timeout, async {
+            tokio::join!(
+                feed,
+                collect_output_lines(stdout, OutputStream::Stdout, stdout_sink, ctx),
+                collect_output_lines(stderr, OutputStream::Stderr, output_sink, ctx),
+                child.wait()
+            )
         })
         .await
         .map_err(|_| {
@@ -345,7 +420,13 @@ impl CliProvider {
                 self.timeout
             )
         })?;
-        let out = out.map_err(|e| format!("waiting on {} failed: {e}", self.bin.display()))?;
+        let out = CollectedOutput {
+            status: waited.map_err(|e| format!("waiting on {} failed: {e}", self.bin.display()))?,
+            stdout: stdout
+                .map_err(|e| format!("reading stdout from {} failed: {e}", self.bin.display()))?,
+            stderr: stderr
+                .map_err(|e| format!("reading stderr from {} failed: {e}", self.bin.display()))?,
+        };
 
         if !out.status.success() {
             // a failed exit is the primary diagnostic — it subsumes any
@@ -354,7 +435,7 @@ impl CliProvider {
                 "{} exited with {}: {}",
                 self.bin.display(),
                 out.status,
-                excerpt(&String::from_utf8_lossy(&out.stderr))
+                excerpt(&out.stderr)
             ));
         }
         if let Err(e) = fed {
@@ -363,13 +444,15 @@ impl CliProvider {
                 self.bin.display()
             ));
         }
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let text = match self.spec.output {
-            OutputFormat::JsonlEvents => parse_jsonl_events(&stdout),
-            OutputFormat::JsonResult => parse_json_result(&stdout),
-            OutputFormat::Text => parse_text_output(&stdout),
+            OutputFormat::JsonlEvents => parse_jsonl_events(&out.stdout),
+            OutputFormat::JsonResult => parse_json_result(&out.stdout),
+            OutputFormat::Text => parse_text_output(&out.stdout),
         }?;
-        Ok(Invocation { text, stdout })
+        Ok(Invocation {
+            text,
+            stdout: out.stdout,
+        })
     }
 }
 
@@ -386,12 +469,15 @@ impl Provider for CliProvider {
 
         let Some((session, store)) = self.session_store(ctx)? else {
             // no session plumbing for this run: one cold invocation.
-            return Ok(self.invoke(prompt, &self.spec.args, &workdir).await?.text);
+            return Ok(self
+                .invoke(prompt, &self.spec.args, &workdir, ctx)
+                .await?
+                .text);
         };
 
         if let Some(session_id) = store.load() {
             let argv = session::resume_argv(&self.spec.args, &session.resume, &session_id);
-            match self.invoke(prompt, &argv, &workdir).await {
+            match self.invoke(prompt, &argv, &workdir, ctx).await {
                 Ok(run) => {
                     // re-capture on success: a CLI that rotates ids on
                     // resume stays resumable next time.
@@ -412,7 +498,7 @@ impl Provider for CliProvider {
                 }
             }
         }
-        let run = self.invoke(prompt, &self.spec.args, &workdir).await?;
+        let run = self.invoke(prompt, &self.spec.args, &workdir, ctx).await?;
         store.store_captured(&session.capture, &run.stdout);
         Ok(run.text)
     }
@@ -534,22 +620,45 @@ pub fn discover() -> Result<ProviderSet, String> {
     discover_with_dirs(AgentDirs::default())
 }
 
+/// [`discover`] with a live output sink installed on every discovered CLI
+/// provider.
+pub fn discover_with_output_sink(output_sink: OutputSink) -> Result<ProviderSet, String> {
+    discover_with_dirs_and_output_sink(AgentDirs::default(), output_sink)
+}
+
 /// [`discover`] with host-wired per-agent roots (see [`AgentDirs`]) — the
 /// binaries pass `AgentDirs::under(<data dir>)`. `DUCKTAPE_AGENT_WORKSPACES`
 /// and `DUCKTAPE_AGENT_SESSIONS` override the wired roots, following the
 /// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` precedent.
 pub fn discover_with_dirs(dirs: AgentDirs) -> Result<ProviderSet, String> {
+    discover_with_options(dirs, None)
+}
+
+/// [`discover_with_dirs`] with a live output sink installed on every
+/// discovered CLI provider.
+pub fn discover_with_dirs_and_output_sink(
+    dirs: AgentDirs,
+    output_sink: OutputSink,
+) -> Result<ProviderSet, String> {
+    discover_with_options(dirs, Some(output_sink))
+}
+
+fn discover_with_options(
+    dirs: AgentDirs,
+    output_sink: Option<OutputSink>,
+) -> Result<ProviderSet, String> {
     let specs = SpecSet::load(operator_spec_dir().as_deref())?;
     let timeout = std::env::var("DUCKTAPE_PROVIDER_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs);
-    Ok(discover_with(
+    Ok(discover_with_sink(
         specs,
         std::env::var_os("PATH"),
         &|k| std::env::var_os(k),
         timeout,
         dirs.resolved(&|k| std::env::var_os(k)),
+        output_sink,
     ))
 }
 
@@ -573,12 +682,24 @@ fn operator_spec_dir() -> Option<PathBuf> {
 /// and each PATH walk is a stat per directory — so tags sharing a probe
 /// identity are grouped, the binary is resolved ONCE, and the result fans
 /// out to every tag in the group.
+#[cfg(test)]
 fn discover_with(
     specs: SpecSet,
     path: Option<OsString>,
     env: &dyn Fn(&str) -> Option<OsString>,
     global_timeout: Option<Duration>,
     dirs: AgentDirs,
+) -> ProviderSet {
+    discover_with_sink(specs, path, env, global_timeout, dirs, None)
+}
+
+fn discover_with_sink(
+    specs: SpecSet,
+    path: Option<OsString>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    global_timeout: Option<Duration>,
+    dirs: AgentDirs,
+    output_sink: Option<OutputSink>,
 ) -> ProviderSet {
     let mut groups: BTreeMap<(&str, Option<&str>), Vec<&CapabilitySpec>> = BTreeMap::new();
     for spec in specs.iter() {
@@ -593,10 +714,13 @@ fn discover_with(
             continue;
         };
         for spec in group {
-            let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone())
-                .with_agent_dirs(dirs.clone());
+            let mut provider =
+                CliProvider::from_spec((*spec).clone(), bin.clone()).with_agent_dirs(dirs.clone());
             if let Some(t) = global_timeout {
                 provider = provider.with_timeout(t);
+            }
+            if let Some(output_sink) = &output_sink {
+                provider = provider.with_output_sink(output_sink.clone());
             }
             providers.push(Box::new(provider));
         }
@@ -1111,6 +1235,97 @@ cat > /dev/null"#,
             .with_timeout(Duration::from_secs(10));
         let big = "x".repeat(256 * 1024);
         assert_eq!(p.run(&big, &RunContext::default()).await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn output_sink_receives_lines_before_child_exit_and_stdout_still_parses() {
+        let dir = scratch("live-output");
+        let gate = dir.join("continue");
+        let bin = fake_cli(
+            &dir,
+            "tailer",
+            r#"cat > /dev/null
+printf 'first\n'
+while [ ! -f "$1" ]; do
+  sleep 0.05
+done
+printf 'diagnostic\n' >&2
+printf 'second\n'"#,
+        );
+        let spec = CapabilitySpec::parse(
+            &format!(
+                r#"
+spec = 1
+[capability]
+tag = "tailer"
+[detect]
+bin = "tailer"
+[invoke]
+args = ["{}"]
+prompt = "stdin"
+[output]
+format = "text"
+"#,
+                gate.display()
+            ),
+            "test",
+        )
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink: OutputSink = Arc::new(move |_ctx, line| {
+            tx.send(line).expect("test receiver is alive");
+        });
+        let p = sh_provider(spec, bin, "live-output-wd").with_output_sink(sink);
+
+        let run = tokio::spawn(async move {
+            let ctx = RunContext::default();
+            p.run("q", &ctx).await
+        });
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("first line should arrive before the child exits")
+            .expect("sink remains connected");
+        assert_eq!(
+            first,
+            OutputLine {
+                stream: OutputStream::Stdout,
+                line: "first".into()
+            }
+        );
+        assert!(
+            !run.is_finished(),
+            "the child must still be blocked after the first live line"
+        );
+
+        std::fs::write(&gate, b"go").expect("release the child");
+        let text = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("child should finish after the gate is released")
+            .expect("run task should not panic")
+            .expect("provider run succeeds");
+        assert_eq!(
+            text, "first\nsecond",
+            "stdout's final text contract is preserved"
+        );
+
+        let mut rest = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            rest.push(line);
+        }
+        assert!(
+            rest.contains(&OutputLine {
+                stream: OutputStream::Stderr,
+                line: "diagnostic".into()
+            }),
+            "stderr is tailed too: {rest:?}"
+        );
+        assert!(
+            rest.contains(&OutputLine {
+                stream: OutputStream::Stdout,
+                line: "second".into()
+            }),
+            "later stdout lines are tailed too: {rest:?}"
+        );
     }
 
     #[test]
