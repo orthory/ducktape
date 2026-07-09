@@ -1,10 +1,13 @@
-// The huddle session card BODY — status dot + channel, error row, participant
-// roster (name + per-member mute glyph + a stale-member "remove" control), and
-// mute/Leave controls. Purely presentational (props + callbacks, no store): the
-// in-app dock (Huddle.tsx) and the popped-out window
+// The huddle session card BODY — status dot + channel, error row, the
+// muted-while-talking banner, and the participant roster (name + per-member mute
+// glyph + a stale-member "remove" control). Purely presentational (props +
+// callbacks, no store): the in-app dock (Huddle.tsx) and the popped-out window
 // (views/huddle/HuddleWindow.tsx) both render it, so the two surfaces cannot
-// drift. Participants arrive fully resolved (name/muted/stale/self) — the window
-// side has no member records or profile registry of its own.
+// drift. Media controls (mute/camera/leave) live in the shared HuddleControls
+// bar and view controls (expand/pop) in each container's header — this file owns
+// only the status + roster body. Participants arrive fully resolved
+// (name/muted/stale/self); the window side has no member records or profile
+// registry of its own.
 
 import type { HuddleParticipant } from "../../store/huddle-roster";
 import type { VoiceError } from "../../../domain/voice-session";
@@ -20,26 +23,6 @@ function MicGlyph({ size = 15, muted = false }: { size?: number; muted?: boolean
       <path d="M5.5 11a6.5 6.5 0 0 0 13 0" />
       <path d="M12 17.5V21" />
       {muted && <path d="M4 4l16 16" strokeWidth={1.9} />}
-    </svg>
-  );
-}
-
-/** Arrow leaving a box (pop out) or entering it (pop in). */
-function PopGlyph({ size = 13, into = false }: { size?: number; into?: boolean }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-      <path d="M9 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-3" />
-      {into ? (
-        <>
-          <path d="M20 4l-7 7" />
-          <path d="M13.5 5.5V11H19" />
-        </>
-      ) : (
-        <>
-          <path d="M13 11l7-7" />
-          <path d="M14.5 4H20v5.5" />
-        </>
-      )}
     </svg>
   );
 }
@@ -179,7 +162,6 @@ export interface HuddleCardProps {
   status: HuddleStatus;
   /** Why `status` is "error" — picks the message row. Null otherwise. */
   error: VoiceError | null;
-  muted: boolean;
   /** The roster, fully resolved (name/muted/stale/self). Self included. */
   participants: HuddleParticipant[];
   /** Ring color behind the row avatars — the card's own surface color. */
@@ -187,36 +169,21 @@ export interface HuddleCardProps {
   /** Max roster rows before the "+N more" tail — the narrow dock fits fewer than
    *  the popped window. */
   maxRows?: number;
-  onSetMuted(muted: boolean): void;
-  onLeave(): void;
-  onRetry(): void;
   /** Remove a stale (signal-lost) member from the huddle (SweepHuddle). */
   onSweep?(user: number[]): void;
-  /** Dock only: open the separate huddle window. */
-  onPopOut?(): void;
-  /** Window only: close this window and return to the in-app card. */
-  onPopIn?(): void;
 }
 
 export function HuddleCard({
   channelName,
   status,
   error,
-  muted,
   participants,
   ring = color.paper,
   maxRows = 5,
-  onSetMuted,
-  onLeave,
-  onRetry,
   onSweep,
-  onPopOut,
-  onPopIn,
 }: HuddleCardProps) {
   const dot = STATUS_DOT[status] ?? STATUS_DOT.idle;
-  const live = status === "live";
   const failure = status === "error" ? (error ?? "connection") : null;
-  const pop = onPopOut ?? onPopIn;
   // Talking into a muted mic — the single most common "why can't they hear me".
   const mutedWhileTalking = participants.some((p) => p.isSelf && p.muted && p.speaking);
 
@@ -252,25 +219,6 @@ export function HuddleCard({
             {status === "connecting" ? "connecting…" : `${participants.length}`}
           </span>
         )}
-        {pop && (
-          <HoverButton
-            onClick={pop}
-            title={onPopOut ? "Open in window" : "Return to app"}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              width: 20,
-              height: 20,
-              borderRadius: radius.sm,
-              color: color.muted2,
-              flexShrink: 0,
-            }}
-            hoverStyle={{ background: color.hover, color: color.ink }}
-          >
-            <PopGlyph size={13} into={!!onPopIn} />
-          </HoverButton>
-        )}
       </div>
 
       {failure && (
@@ -301,68 +249,6 @@ export function HuddleCard({
       {!failure && (
         <Roster participants={participants} ring={ring} maxRows={maxRows} onSweep={onSweep} />
       )}
-
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <div style={{ flex: 1, minWidth: 0 }} />
-
-        {failure ? (
-          <HoverButton
-            onClick={onRetry}
-            title="Retry"
-            style={{
-              display: "flex",
-              alignItems: "center",
-              padding: "6px 11px",
-              borderRadius: radius.sm,
-              border: `1px solid ${color.borderSoft}`,
-              background: color.sunken,
-              color: color.inkSoft,
-              font: `600 11.5px ${font.sans}`,
-            }}
-            hoverStyle={{ background: color.hover, color: color.ink }}
-          >
-            Retry
-          </HoverButton>
-        ) : (
-          <HoverButton
-            onClick={() => onSetMuted(!muted)}
-            title={muted ? "Unmute" : "Mute"}
-            disabled={!live}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              width: 30,
-              height: 28,
-              borderRadius: radius.sm,
-              border: `1px solid ${muted ? color.dangerBorder : color.borderSoft}`,
-              background: muted ? color.dangerSoft : live ? color.dark : color.sunken,
-              color: muted ? color.danger : live ? color.onDark : color.muted2,
-              opacity: live ? 1 : 0.55,
-            }}
-            hoverStyle={{ filter: "brightness(1.05)" }}
-          >
-            <MicGlyph size={15} muted={muted} />
-          </HoverButton>
-        )}
-
-        <HoverButton
-          onClick={onLeave}
-          title="Leave huddle"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            padding: "6px 11px",
-            borderRadius: radius.sm,
-            background: color.danger,
-            color: "#fff",
-            font: `600 11.5px ${font.sans}`,
-          }}
-          hoverStyle={{ filter: "brightness(1.06)" }}
-        >
-          Leave
-        </HoverButton>
-      </div>
     </div>
   );
 }
