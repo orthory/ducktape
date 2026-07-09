@@ -941,21 +941,26 @@ export function createActions({
       patch({ onboardingPhase: null });
       setNode(transport);
       autoBindUserIdentity(transport, target)
-        .then(() => {
+        .then((outcome) => {
           // First-run hand-off: the name chosen while creating the account
           // parks in localStorage (names are chain-scoped) and lands here, on
-          // the first adopted node. profiles' SetName is origin-gated to our
-          // own submit, so it works bound or unbound; once the node is bound,
-          // later renames route through the identity module (setDisplayName).
-          // Same fire-and-forget contract as the bind: a failure keeps the
-          // parked name for the next connect and never surfaces as an error.
+          // the first adopted node. When the bind landed, the name belongs on
+          // the ACCOUNT (identity SetAccountName) so it travels with the
+          // person across devices; otherwise fall back to the per-node
+          // profiles name, same as setDisplayName's routing. Fire-and-forget
+          // like the bind itself: a failure keeps the parked name for the
+          // next connect and never surfaces as an error.
           const pending = loadPendingDisplayName();
           if (!pending) return;
           patch({ author: pending });
-          return profilesClient
-            .setName(transport, { displayName: pending, origin: pending })
-            .then(() => clearPendingDisplayName())
-            .catch(() => {});
+          const write =
+            outcome === "bound" || outcome === "already"
+              ? identityClient.setAccountName(transport, {
+                  displayName: pending,
+                  origin: pending,
+                })
+              : profilesClient.setName(transport, { displayName: pending, origin: pending });
+          return write.then(() => clearPendingDisplayName()).catch(() => {});
         })
         .catch(() => {});
     };

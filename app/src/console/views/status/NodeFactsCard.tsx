@@ -67,8 +67,15 @@ export function NodeFactsCard() {
     : "not available";
   const nodeKey = workspace?.pubkey ?? "";
   const owner = nodeKey ? state.nodeUsers[normalizeKey(nodeKey)] : undefined;
+  // Prefer the account's display name, then the profiles overlay (a name set
+  // before the bind landed) — never render the account id twice.
+  const ownerName = owner
+    ? (owner.name ?? state.authorNames[normalizeKey(nodeKey)] ?? null)
+    : null;
   const ownerLine = owner
-    ? `${owner.name ?? shortKey(owner.accountId)} · ${shortKey(owner.accountId)}`
+    ? ownerName
+      ? `${ownerName} · ${shortKey(owner.accountId)}`
+      : shortKey(owner.accountId)
     : "not linked to an account";
 
   return (
