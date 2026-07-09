@@ -1,0 +1,285 @@
+# ADR: Deterministically-Alive Agent Runtime on Consensus
+
+Date: 2026-07-09. Status: **Proposed**. This fixes the model and the locked
+requirements for giving agent runs a real, portable workspace — a provisioned
+environment, a faceted result, and an identity/authorization system — without
+breaking consensus determinism or run liveness. Merging this ADR ratifies the
+direction; the build lands in follow-up PRs (see Plan), starting from the
+`RunEnvelope v3` slice already open as PR #274.
+
+## Context
+
+An agent run today is a pure-ish text function dispatched through the generic
+async-task plane. `runs` composes a `RunEnvelope` (prompt hash + transcript
+window), `dispatch`/`saga`/`capability` lease exactly one node, `dispatch-oracle`
+assembles the prompt and runs a provider (`capability-host`), and the model's
+raw bytes re-enter consensus as one agreed op that `runs` validates and
+delivers. The determinism boundary is a single seam: everything left of it
+(compose, turn-claim, normalize, validate, deliver) is deterministic consensus
+work; only the LLM call, on one leased node, is non-deterministic — and it is
+sealed into one committed result. Liveness is owned by `saga`: lease + bounded
+attempts + a whole-run deadline (`RUN_DEADLINE_VIEWS = 1024`) + a permissionless
+crank that re-leases an expired attempt to a fresh rendezvous pick or converts
+the deadline into a committed failure.
+
+Two facts about the *current* runtime shape this decision:
+
+- **The executor is already a full agentic CLI.** The shipped capability specs
+  (`crates/kernel/capability-host/specs/{codex,claude}.toml`) run
+  `codex exec --sandbox workspace-write` / `claude -p --permission-mode
+  acceptEdits` with no turn cap — real tool-use loops that read and edit files.
+  `[workspace] mode = "persistent"` gives each agent a per-agent cwd under the
+  host's `agent-workspaces` root, so edits accumulate.
+- **That file work is trapped and invisible.** The persistent workspace is
+  **host-local and per-node**: not replicated, not on consensus, not auditable,
+  and gone when an attempt re-leases to a different node (sessions are
+  assignee-local; another node starts cold). The only consensus-visible output
+  is the `AgentResponse` — a chat reply plus the three-verb action vocabulary
+  (`chat.post`, `tasks.create`, `tasks.update_status`).
+
+So the agent already *does* real coding, but the platform captures none of it.
+The two hard problems that would make that work first-class are already solved
+elsewhere in the tree:
+
+- **Source replication** — `forge` is a native git remote: refs are consensus
+  state (CAS-guarded), objects ride the blob plane and materialize node-local,
+  and an http upload-pack lane serves `git clone`/`fetch` from the local node.
+- **File-state replication** — `duckfs` (`crates/duckfs/*`) is a content-addressed
+  filesystem with a client-side checkout/commit engine (`duckfs-client::NodeApi`)
+  whose object ids match every validator's.
+
+`RunEnvelope v3` (PR #274, open, **not merged**) is the first step toward using
+these: it pins a workspace snapshot + a base-tool manifest into the envelope and
+adds portable host-context fields. As written it also flips the live composer
+default to v3 pointing every run's cwd at a constant `/workspace`, which
+`create_dir_all` cannot create on a non-root node — turning working agents into
+deterministically-*failing* ones. That is a rollout-ordering defect, not a
+direction defect; it motivates the discipline in this ADR.
+
+## Decision
+
+Model the agent run as a **non-deterministic transaction settled through a
+deterministic contract**. `dispatch-oracle` is the oracle (one node, non-det,
+sealed output); `runs`/`dispatch`/`saga` is the contract runtime that judges the
+result and dispatches its effects. This is structurally the CosmWasm actor
+model — a run returns a result whose effects the runtime applies *after*
+execution (`Response.messages` ⇒ our `effects`, `reply`/SubMsg ⇒ sub-run await,
+`Response.data` ⇒ our typed `data`, attributes/events ⇒ ephemeral progress) —
+inverted only in the execution/trust axis: CosmWasm re-executes on every
+validator (trustless), the LLM contract is oracle-executed once (agreed, not
+re-derived). Generation is oracle-trusted; validation and dispatch stay
+deterministic and trustless, so the agent's caps are the containment boundary.
+
+Every requirement below serves that model. **MUST** = a safety/liveness
+invariant; **SHOULD** = a strong default, overridable as per-agent policy.
+
+### Invariants (INV)
+
+- **I1 (MUST) Determinism.** Every honest node replaying committed history
+  computes the identical agent state and the identical *applied* outcome.
+- **I2 (MUST) Liveness.** Every triggered run terminates in a committed outcome
+  (success or failure) in bounded time, independent of host death, provider
+  hang, or node churn.
+- **I3 (MUST) Containment.** A compromised or malicious executor node's *applied*
+  effects are a subset of the agent's caps. The oracle proposes; the
+  deterministic runtime disposes.
+- **I4 (MUST) Auditability.** What an (impure) run did is recorded verbatim in
+  dispatch history even when the run is not reproducible.
+
+### Execution model (EXE)
+
+- **X1 (MUST)** Exactly one node executes the LLM per attempt (lease); its raw
+  output is sealed as one agreed op; replay never re-invokes the LLM.
+- **X2 (MUST) No mid-run consensus mutation.** Consensus effects settle only at
+  the run boundary, from the winning attempt (actor model). Rationale: a
+  re-leased retry is a *different* non-deterministic execution, so an effect
+  committed mid-run may come from an attempt that is later discarded, producing
+  a history inconsistent with the final result. Only the boundary knows which
+  attempt won.
+- **X3 (MUST)** Bounded execution — a per-host provider timeout plus the
+  consensus deadline guarantee termination.
+- **X4 (SHOULD)** The run executes as a full agentic loop for autonomy: free
+  reads and workspace writes inside the loop; consensus effects batched outside.
+
+### Workspace and provisioning (WSP)
+
+- **W1 (MUST)** A per-run isolated workspace at a per-run *writable* path — never
+  a shared constant path such as `/workspace`.
+- **W2 (MUST)** The source is consensus-pinned (forge `{repo, commit}` or a
+  duckfs snapshot) and materialized node-local, with zero external network for
+  source acquisition.
+- **W3 (SHOULD)** A git **worktree** by default for forge repos (branch
+  `agent/<run_id>`, off the pinned commit, sharing the local ODB); a duckfs
+  checkout otherwise. Note: forge repos are sha256 object format — the
+  provisioning step must confirm the host `git` tolerates sha256 (libgit2 does).
+- **W4 (MUST)** The environment is provisioned from a consensus-pinned
+  `recipe_hash` (a devfile-like declaration). Provisioned deps/toolchain are
+  ephemeral (never committed), cached by `recipe_hash`.
+- **W5 (MUST)** Cleanup after the run (`git worktree remove`; GC unreferenced
+  snapshots).
+
+### Progress — two lanes (PRG)
+
+- **P1 (MUST)** Progress streams over the ephemeral **data-plane** lane
+  (huddle-style `Service` streaming): best-effort, not replicated, not replayed,
+  and **never** committed to consensus.
+- **P2 (SHOULD)** Retry-duplicated progress is tolerated, because it is not
+  persisted as truth. Persisted narration, when wanted, is committed at the
+  boundary from the winning attempt.
+
+### Result format — `RunResult v1` (RES)
+
+- **R1 (MUST) Host-assembled, not model-emitted.** The host builds the receipt
+  from *observed facts* (artifact = the actual commit; effects = captured tool
+  calls; ledger/status = host observation) plus *validated* model facets. The
+  model never has to emit the whole receipt as one blob.
+- **R2 (MUST)** Faceted: `message` (human prose) / `data` (typed, optional) /
+  `effects` (declarative, bounded, idempotent by `run_id`) / `artifact`
+  (`output_ref` + receipt) / `sink` / `status`. Any facet may be empty, so one
+  format covers Q&A bots, autonomous coders, and workflow steps.
+- **R3 (MUST)** `artifact` is a content-addressed **ref** (forge commit /
+  duckfs snapshot) plus a receipt, never inline bytes — the heavy tree stays in
+  the replicated stores and the consensus payload stays small.
+- **R4 (MUST) Liberal accept → strict validate → assemble → seal**, all
+  deterministic over the committed bytes. Malformed model output yields a
+  deterministic failed or degraded run, never a delivery-block abort. This
+  extends the existing `agent_response_from_text` tolerance in `runs`.
+- **R5 (SHOULD)** The `data` facet is produced via structured-output/tool-call
+  schema enforcement plus a bounded host-side retry, degrading to `null` — never
+  by parsing free-text JSON.
+- **R6 (MUST)** An audit lane (raw provider bytes + tool-call ledger +
+  model/variant/tokens/timing) is recorded in dispatch history, not applied.
+
+### Output disposition (OUT)
+
+- **O1 (MUST)** `output_ref` is the agent-native unit; a PR is one opt-in *sink*,
+  not the unit. A downstream run sets `workspace.source = prior.output_ref`.
+- **O2 (SHOULD)** Sinks over the same ref: **chain** (default, autonomous) / PR
+  (opt-in, human review) / merge (opt-in, trusted). Chain-by-default keeps
+  multi-agent workflows from stalling on a human gate.
+
+### Agent identity and authorization (IDN)
+
+- **D1 (MUST) Keyless principal.** An agent is a derived principal
+  (contract-address style) that holds no signing key — nothing for a compromised
+  node or a prompt-injection to steal. It acts only through the deterministic
+  runtime's dispatch, exactly as a CosmWasm contract acts through the VM.
+- **D2 (MUST) Two-level attribution.** The node signs the submit for liveness
+  and anti-equivocation; the `agent_id` under its `owner` is the semantic author
+  of every effect.
+- **D3 (MUST) Fine-grained resource caps** — which forge repos (read/push),
+  duckfs paths (read/write), tools/MCPs, secrets, and sub-agent spawns. This is
+  the OS/resource-level peer of `allowed_actions`, and it must be *complete* for
+  I3 to hold.
+- **D4 (MUST) Delegation chain.** A spawned sub-agent is its own principal; its
+  authority chains from the spawner, is bounded (subset of the spawner's
+  delegatable caps), non-escalating, and the chain is recorded.
+- **D5 (MUST)** Identity is the pinned bundle `prompt_hash + skills + recipe +
+  caps`. Mutations are owner-gated, auditable, and flag-day where
+  consensus-affecting.
+- **D6 (MUST)** Secrets are bound to agent identity and tenant-isolated
+  (`vaults`).
+
+### Capabilities layering (CAP)
+
+- **C1 (MUST) Classification test.** For any new capability, ask "must it replay
+  identically across nodes?" Yes ⇒ consensus-pinned data. No ⇒ a host
+  tool/side-effect, modeled as a `capability` tag, sealed into the one result.
+- **C2 (SHOULD)** Skills are consensus-pinned content-addressed text (the
+  `prompt_hash` pattern) — deterministic input, free given replication.
+- **C3 (SHOULD)** Tools/MCPs are host capabilities (announce + provision),
+  node-local, sealed, non-reproducible. A "plugin" is a `recipe` + skill-set
+  bundle, not a separate concept.
+
+### Orchestration / autonomy (ORC)
+
+- **N1 (SHOULD, now)** Level 2: a read-augmented autonomous loop; consensus
+  effects batched at the boundary.
+- **N2 (SHOULD, target)** Level 3: suspendable orchestration — an agent triggers
+  and awaits sub-runs across consensus rounds; the checkpoint is the pinned
+  state (workspace snapshot + transcript + ledger); `response` becomes a durable
+  continuation yield. Sub-runs respect D4.
+
+### Rollout discipline (ROL)
+
+- **M1 (MUST)** Envelope/composer version bumps change committed dispatch-payload
+  bytes and are therefore consensus flag-days → a coordinated (lockstep) upgrade.
+- **M2 (MUST)** Order: workers *accept* the new envelope → build the provisioning
+  wrapper → flip the composer and activate portable execution. Never flip the
+  live default ahead of the runtime.
+
+## Alternatives considered
+
+- **Mid-run consensus mutation (e.g., committing progress chat posts as they
+  happen).** Rejected by X2. Under retry the loop re-fires, and because each
+  attempt is a distinct non-deterministic execution, position-keyed dedup yields
+  a Frankenstein history (progress from a discarded attempt, result from the
+  winner). Progress belongs on the ephemeral data-plane lane (P1); durable
+  narration is committed at the boundary from the winning attempt.
+- **Model emits the whole `RunResult` as one JSON blob.** Rejected by R1. LLMs
+  emit unreliable structured output. Instead the host assembles the receipt from
+  observed facts; the only genuinely model-shaped facet, `data`, is enforced via
+  structured output with a bounded retry and graceful degrade.
+- **PR as the output unit.** Rejected by O1. A PR is human-review ceremony; it
+  stalls autonomous workflows. The unit is `output_ref`; PR/merge are opt-in
+  sinks.
+- **Agent holds a signing key.** Rejected by D1. The agent runs non-deterministic
+  code on an untrusted node; a key it held could be exfiltrated by a compromised
+  node or a prompt-injection. Keyless, runtime-mediated action removes the
+  target entirely.
+- **A bespoke, hermetic sandbox as the default.** Deferred. The default posture
+  is **YOLO** — the executor already runs cwd-confined agentic modes
+  (`workspace-write` / `acceptEdits`); full FS/net is acceptable for
+  trusted-tenant workspaces. The one non-negotiable is that the child must not
+  reach the node's identity key material (D1 makes the agent keyless; the
+  provisioning step withholds `~/.ducktape` keys). A `bwrap`-style hardening that
+  binds only the checkout is a documented future option, not a v1 requirement.
+- **A new consensus module for agent runs.** Rejected. The generic dispatch/
+  saga/capability plane already provides settlement, lease, retry, deadline, and
+  routing. This ADR adds no consensus module; the deltas are host-edge apps
+  (`runs`, `dispatch-oracle`, `capability-host`) plus reuse of `forge`/`duckfs`.
+
+## Consequences
+
+- **The consensus engine does not change.** `dispatch`, `saga`, and `capability`
+  are untouched; they carry richer payload/receipt bytes with no new logic. The
+  real code lands in three host-edge sites (`runs`, `dispatch-oracle`,
+  `capability-host`) plus two small additions (agent `recipe_hash`/caps; the
+  provisioning wrapper), reusing `forge` and `duckfs` wholesale.
+- **Impure runs are auditable but not reproducible.** A run that calls external
+  tools/MCPs cannot be replayed to the same result; I4 (recorded ledger) is how
+  "deterministic-in-audit" is preserved. Re-lease still yields a *valid* result
+  because the pinned inputs are reproduced, but not the *same* result.
+- **Composer/envelope bumps are flag-days (M1).** Mixed-binary validator sets
+  diverge on the composed payload; upgrades must be coordinated, like prior
+  FRAME_NS / engine-bank flag days.
+- **Portability enables both retry and orchestration.** Removing host-local
+  hidden state (session, local files) in favor of pinned snapshot + transcript
+  is what makes saga's re-lease produce a valid result on any node (I2) and is
+  the same checkpoint that L3 suspendable orchestration (N2) resumes from.
+- **Identity becomes the security spine.** Because generation is oracle-trusted,
+  I3/containment rests entirely on complete, fine-grained caps (D3) and keyless,
+  runtime-mediated action (D1). Incomplete caps are a containment hole.
+
+## Plan
+
+Phased, honoring M2 so agents stay alive through the transition:
+
+1. **Envelope acceptance (in flight).** Land PR #274's worker-side v3 *accept*,
+   `RunContext` fields, and `RunnerResult` unwrap — all forward-compatible — but
+   **hold** the composer flip and portable activation. Fix W1 by making the
+   host workdir a per-run writable path with a safe fallback.
+2. **Provisioning wrapper.** In `dispatch-oracle`/`capability-host`: materialize
+   the workspace (forge worktree / duckfs checkout) from the pinned source, run
+   the recipe setup (ephemeral), execute in the per-run workdir, capture the
+   `output_ref`, push/commit, and clean up (W1–W5, R3, R6).
+3. **`RunResult v1`.** Extend the receipt to the faceted, host-assembled shape
+   (R1–R6), add the `data` structured-output path, and route the sink (O1–O2).
+4. **Identity and caps.** Add `recipe_hash` and resource caps to the agent
+   record; enforce two-level attribution and cap-checked effect application;
+   wire secret scoping via `vaults` (D1–D6, I3).
+5. **Composer flip + activate portable** (M1/M2 coordinated upgrade), then
+   iterate toward L3 suspendable orchestration (N2).
+
+The committed design sketch (as-is/to-be, component map, lifecycle) backing this
+ADR is maintained as a visual artifact and can be regenerated on request.
