@@ -23,11 +23,18 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::{Duration, Instant, timeout};
 
 use crate::plane;
 
 type BodyError = Box<dyn StdError + Send + Sync>;
 type Body = UnsyncBoxBody<Bytes, BodyError>;
+
+/// One down overlay route must not pin a logical service ahead of its healthy
+/// providers. The outer budget also keeps a large stale pool from multiplying
+/// the per-provider deadline into an unbounded browser request.
+const PROVIDER_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+const PROVIDER_SELECTION_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn serve(
     listener: std::net::TcpListener,
@@ -173,9 +180,18 @@ async fn route_inner(
     }
 
     let mut selected = None;
+    let selection_deadline = Instant::now() + PROVIDER_SELECTION_TIMEOUT;
     for provider in ordered_providers(&resolved, &prepared.hostname) {
-        let Some(stream) =
-            open_provider(&provider, &resolved, plane, me, publications, files.clone()).await
+        let remaining = selection_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt = remaining.min(PROVIDER_OPEN_TIMEOUT);
+        let Ok(Some(stream)) = timeout(
+            attempt,
+            open_provider(&provider, &resolved, plane, me, publications, files.clone()),
+        )
+        .await
         else {
             continue;
         };

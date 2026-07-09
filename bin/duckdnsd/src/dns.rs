@@ -189,7 +189,12 @@ mod tests {
         let task = tokio::spawn(run_dns(
             udp,
             tcp,
-            DnsHandler::new(state.clone(), Some(Ipv4Addr::new(127, 77, 0, 1)), None).unwrap(),
+            DnsHandler::new(
+                state.clone(),
+                Some(Ipv4Addr::new(127, 77, 0, 1)),
+                Some(Ipv6Addr::LOCALHOST),
+            )
+            .unwrap(),
         ));
 
         let answer = query(
@@ -202,6 +207,25 @@ mod tests {
         assert!(answer.metadata.authoritative);
         assert_eq!(answer.answers.len(), 1);
         assert_eq!(answer.answers[0].ttl, DNS_TTL);
+
+        let ipv6 = query(
+            address,
+            "docs.team-a1b2c3d4.net.ducktape.quack.",
+            RecordType::AAAA,
+        )
+        .await;
+        assert_eq!(ipv6.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(ipv6.answers.len(), 1);
+        assert!(matches!(ipv6.answers[0].data, RData::AAAA(_)));
+
+        let any = query(
+            address,
+            "docs.team-a1b2c3d4.net.ducktape.quack.",
+            RecordType::ANY,
+        )
+        .await;
+        assert_eq!(any.answers.len(), 2);
+        assert!(any.answers.iter().all(|record| record.ttl == DNS_TTL));
 
         let tcp_answer = query_tcp(
             address,

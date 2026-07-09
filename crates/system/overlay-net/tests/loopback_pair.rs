@@ -818,4 +818,78 @@ async fn socket_factory_serves_the_data_plane_surface() {
     .await
     .expect("stream round trip within deadline");
     assert_eq!(&echo, b"stream-plane");
+
+    // A membership epoch retarget removes and recreates the userspace
+    // interface while every per-use DataPlane keeps its original bound
+    // sockets. The factory wrappers must rebind those same handles to the new
+    // stack; otherwise post-cutover datagrams disappear and TCP gets ECONNREFUSED.
+    let b_port = b.endpoint.port();
+    b.effect.remove_interface().expect("remove b interface");
+    b.effect.create_interface().expect("re-create b interface");
+    let peers_for_b = vec![peer_entry(&a, None)];
+    b.effect
+        .apply(&config(&b, b_port, peers_for_b))
+        .expect("re-apply b interface");
+    a.effect
+        .device()
+        .expect("a device")
+        .initiate_handshake(b.ula, true)
+        .await
+        .expect("re-handshake after b rebuild");
+
+    let rebuilt_datagram = async {
+        let mut buf = [0u8; 2048];
+        let receive = udp_b.recv_from(&mut buf);
+        let send = async {
+            // Arm the rebinding receive before the first unreliable datagram;
+            // production's DataPlane demux likewise has recv parked for life.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            udp_a
+                .send_to(
+                    b"rebuilt-plane",
+                    SocketAddr::new(IpAddr::V6(b.ula), ECHO_PORT),
+                )
+                .await
+                .expect("send to rebuilt b");
+        };
+        let (received, ()) = tokio::join!(receive, send);
+        let (len, from) = received.expect("recv on rebuilt b");
+        assert_eq!(&buf[..len], b"rebuilt-plane");
+        udp_b
+            .send_to(&buf[..len], from)
+            .await
+            .expect("rebuilt echo");
+        let (len, _) = udp_a.recv_from(&mut buf).await.expect("recv rebuilt echo");
+        assert_eq!(&buf[..len], b"rebuilt-plane");
+    };
+    tokio::time::timeout(Duration::from_secs(15), rebuilt_datagram)
+        .await
+        .expect("factory datagram socket rebinds after interface rebuild");
+
+    let rebuilt_dial = async {
+        let mut stream = factory_a
+            .dial_from(IpAddr::V6(a.ula), SocketAddr::new(IpAddr::V6(b.ula), 8555))
+            .await
+            .expect("dial rebuilt listener");
+        stream.write_all(b"after-rebuild").await.expect("write");
+        stream.flush().await.expect("flush");
+        let mut echo = [0u8; 13];
+        stream.read_exact(&mut echo).await.expect("read echo");
+        echo
+    };
+    let rebuilt_accept = async {
+        let (mut stream, remote) = listener.accept().await.expect("accept after rebuild");
+        assert_eq!(remote.ip(), IpAddr::V6(a.ula));
+        let mut request = [0u8; 13];
+        stream.read_exact(&mut request).await.expect("read");
+        stream.write_all(&request).await.expect("echo");
+        stream.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let (echo, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(rebuilt_dial, rebuilt_accept)
+    })
+    .await
+    .expect("factory stream listener rebinds after interface rebuild");
+    assert_eq!(&echo, b"after-rebuild");
 }

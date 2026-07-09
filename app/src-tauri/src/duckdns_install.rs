@@ -222,24 +222,33 @@ fn install_nss_trust(app: &tauri::AppHandle, installation: &serde_json::Value) -
         return vec!["DuckDNS installation did not report its public root certificate".into()];
     };
     let nickname = format!("Ducktape DuckDNS {id}");
-    nss_profiles(app)
+    nss_databases(app)
         .into_iter()
-        .filter_map(|profile| {
-            let database = format!("sql:{}", profile.display());
+        .filter_map(|database| {
+            if let Err(error) = initialize_nss_database(&database) {
+                return Some(error);
+            }
+            let argument = format!("sql:{}", database.display());
+            // Repair is intentionally idempotent. NSS refuses to add a
+            // certificate under an existing nickname, so discard only our
+            // installation-scoped entry before replacing it.
+            let _ = Command::new("certutil")
+                .args(["-D", "-d", &argument, "-n", &nickname])
+                .output();
             let output = Command::new("certutil")
-                .args(["-A", "-d", &database, "-n", &nickname, "-t", "C,,", "-i"])
+                .args(["-A", "-d", &argument, "-n", &nickname, "-t", "C,,", "-i"])
                 .arg(&certificate)
                 .output();
             match output {
                 Ok(output) if output.status.success() => None,
                 Ok(output) => Some(format!(
                     "NSS trust for {} failed: {}",
-                    profile.display(),
+                    database.display(),
                     String::from_utf8_lossy(&output.stderr).trim()
                 )),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Some("certutil is unavailable; Firefox NSS trust was not installed".into())
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(
+                    "certutil is unavailable; Chromium/Firefox NSS trust was not installed".into(),
+                ),
                 Err(error) => Some(format!("run certutil: {error}")),
             }
         })
@@ -263,18 +272,30 @@ fn remove_nss_trust(
         return Vec::new();
     };
     let nickname = format!("Ducktape DuckDNS {id}");
-    nss_profiles(app)
+    nss_databases(app)
         .into_iter()
-        .filter_map(|profile| {
-            let database = format!("sql:{}", profile.display());
+        .filter(|database| database.join("cert9.db").exists())
+        .filter_map(|database| {
+            let argument = format!("sql:{}", database.display());
             match Command::new("certutil")
-                .args(["-D", "-d", &database, "-n", &nickname])
+                .args(["-D", "-d", &argument, "-n", &nickname])
                 .output()
             {
                 Ok(output) if output.status.success() => None,
+                // A browser database may have been removed or repaired since
+                // installation. Missing Ducktape trust is already the desired
+                // uninstall state.
+                Ok(output)
+                    if String::from_utf8_lossy(&output.stderr)
+                        .contains("SEC_ERROR_BAD_DATABASE")
+                        || String::from_utf8_lossy(&output.stderr)
+                            .contains("SEC_ERROR_UNKNOWN_CERT") =>
+                {
+                    None
+                }
                 Ok(output) => Some(format!(
                     "remove NSS trust for {} failed: {}",
-                    profile.display(),
+                    database.display(),
                     String::from_utf8_lossy(&output.stderr).trim()
                 )),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -293,17 +314,96 @@ fn remove_nss_trust(
 }
 
 #[cfg(target_os = "linux")]
-fn nss_profiles(app: &tauri::AppHandle) -> Vec<PathBuf> {
+fn nss_databases(app: &tauri::AppHandle) -> Vec<PathBuf> {
     let Ok(home) = app.path().home_dir() else {
         return Vec::new();
     };
-    let root = home.join(".mozilla/firefox");
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Vec::new();
+    nss_databases_in(&home, std::env::var_os("XDG_DATA_HOME").as_deref())
+}
+
+#[cfg(target_os = "linux")]
+fn nss_databases_in(home: &Path, xdg_data_home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    // Chromium M146+ moved the shared NSS database under XDG data. Preserve
+    // Chromium's legacy selection rule when ~/.pki/nssdb already exists.
+    let legacy_chromium = home.join(".pki/nssdb");
+    let chromium = if legacy_chromium.exists() {
+        legacy_chromium
+    } else {
+        xdg_data_home
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"))
+            .join("pki/nssdb")
     };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && path.join("cert9.db").exists())
-        .collect()
+    let mut databases = vec![chromium];
+    let root = home.join(".mozilla/firefox");
+    if let Ok(entries) = std::fs::read_dir(root) {
+        databases.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir() && path.join("cert9.db").exists()),
+        );
+    }
+    databases.sort();
+    databases.dedup();
+    databases
+}
+
+#[cfg(target_os = "linux")]
+fn initialize_nss_database(database: &Path) -> Result<(), String> {
+    if database.join("cert9.db").exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(database)
+        .map_err(|error| format!("create NSS database {}: {error}", database.display()))?;
+    let argument = format!("sql:{}", database.display());
+    let output = Command::new("certutil")
+        .args(["-N", "--empty-password", "-d", &argument])
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "certutil is unavailable; Chromium/Firefox NSS trust was not installed".into()
+            } else {
+                format!("run certutil: {error}")
+            }
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "initialize NSS database {} failed: {}",
+            database.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_nss_tests {
+    use super::*;
+
+    #[test]
+    fn discovers_chromium_and_existing_firefox_databases() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let xdg = directory.path().join("xdg");
+        let firefox = home.join(".mozilla/firefox/member.default");
+        std::fs::create_dir_all(&firefox).unwrap();
+        std::fs::write(firefox.join("cert9.db"), []).unwrap();
+
+        assert_eq!(
+            nss_databases_in(&home, Some(xdg.as_os_str())),
+            vec![firefox, xdg.join("pki/nssdb")]
+        );
+    }
+
+    #[test]
+    fn preserves_chromiums_existing_legacy_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        let legacy = home.join(".pki/nssdb");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        assert_eq!(nss_databases_in(home, None), vec![legacy]);
+    }
 }
