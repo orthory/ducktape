@@ -21,7 +21,7 @@
 // overwrites the draft of the block being edited; committed truth reconciles
 // through the next boundary commit instead.
 
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 
 import type { BlockKind } from "../../../domain/pages-client";
@@ -32,7 +32,7 @@ import { accentVar, color, font, radius } from "../../theme/tokens";
 import { EDIT_BOUNDARY_MS, filterSlashKinds, shortcutFor } from "./pages-model";
 import { SlashMenu } from "./SlashMenu";
 import type { Row } from "./pages-model";
-import { FOCUS_NEXT_CARET, FOCUS_PREV_CARET, resolveKey } from "./block-keys";
+import { FOCUS_NEXT_CARET, FOCUS_PREV_CARET, caretOffset, resolveKey } from "./block-keys";
 import type { Caret } from "./block-keys";
 import { INDENT, MARKER_HANG, ROW_PAD_Y, headingTopSpace } from "./pages-style";
 
@@ -98,6 +98,8 @@ export interface RowHandlers {
   remove(blockId: string): void;
   toggleCollapse(blockId: string): void;
   focusRelative(row: Row, delta: -1 | 1, caret: Caret): void;
+  /** Reported by the row once it has placed a requested caret. */
+  focusApplied(blockId: string): void;
   registerInput(blockId: string, el: HTMLTextAreaElement | null): void;
   openComments(blockId: string, anchor: { x: number; y: number }): void;
   createSubpage(): void;
@@ -107,6 +109,7 @@ function BlockRowInner({
   row,
   index,
   prevKind,
+  caret,
   expanded,
   op,
   threadCount,
@@ -118,6 +121,8 @@ function BlockRowInner({
    *  needs it to tell "merge into the prose above" from "delete the divider
    *  above", which owns no textarea of its own. */
   prevKind: BlockKind | null;
+  /** Where this row's caret should land, or null if it is not the focus target. */
+  caret: Caret | null;
   /** Only meaningful for Toggle rows: whether children are shown. */
   expanded: boolean;
   /** The block's finalization record — only rendered while pending/failed. */
@@ -143,6 +148,23 @@ function BlockRowInner({
   useEffect(() => {
     if (!focusedRef.current) setDraft(block.text);
   }, [block.text]);
+
+  // Place a requested caret — but only once our draft has adopted the committed
+  // text. Writing a textarea's value moves its selection to the end, so a caret
+  // set while `draft` is still the old text (a merge: the block above is still
+  // showing its shorter half) would be stomped by the very next render. Waiting
+  // for draft === block.text makes it deterministic; a rAF here would race
+  // React's own re-render. jsdom's selection never showed this — a real browser
+  // engine did.
+  useLayoutEffect(() => {
+    if (caret == null) return;
+    const el = areaRef.current;
+    if (!el || draft !== block.text) return;
+    const at = caretOffset(caret, el.value.length);
+    el.focus();
+    el.setSelectionRange(at, at);
+    handlers.focusApplied(block.id);
+  }, [caret, draft, block.text, block.id, handlers]);
 
   // auto-grow: the textarea is exactly as tall as its content.
   useEffect(() => {
@@ -570,6 +592,7 @@ export const BlockRow = memo(BlockRowInner, (a, b) => {
     a.row.listIndex === b.row.listIndex &&
     a.index === b.index &&
     a.prevKind === b.prevKind &&
+    a.caret === b.caret &&
     a.expanded === b.expanded &&
     a.op === b.op &&
     a.threadCount === b.threadCount &&

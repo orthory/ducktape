@@ -13,7 +13,6 @@ import { opKey } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { EDIT_BOUNDARY_MS, buildRows } from "./pages-model";
-import { caretOffset } from "./block-keys";
 import type { FocusIntent } from "./block-keys";
 import { useRowHandlers } from "./use-row-handlers";
 import { BlockRow } from "./BlockRow";
@@ -93,18 +92,12 @@ export function PagesView() {
     if (root && root.text === "") titleRef.current?.focus();
   }, [root?.id]);
 
-  // once the snapshot carries a block we queued focus for, focus it — at the
-  // offset the intent asked for, not unconditionally at the end.
-  useEffect(() => {
-    if (!focus) return;
-    const el = inputs.current.get(focus.id);
-    if (el) {
-      const at = caretOffset(focus.caret, el.value.length);
-      el.focus();
-      el.setSelectionRange(at, at);
-      setFocus(null);
-    }
-  }, [rows, focus]);
+  // NOTE: the caret is NOT placed from here. A row's textarea value is owned by
+  // BlockRow's draft state, and writing a textarea's value stomps its selection
+  // to the end — so a caret placed by the parent before the row adopts the new
+  // text is silently lost (this is exactly what a merge does). The row applies
+  // its own caret once its draft matches the committed text; `focus` below is
+  // only ever "which row wants the caret, and where".
 
   // Docs-scoped keyboard shortcuts. This listener is registered only while the
   // Docs screen is mounted, so it never leaks into other modules:
@@ -418,6 +411,7 @@ export function PagesView() {
                       row={row}
                       index={index}
                       prevKind={index > 0 ? rows[index - 1].block.kind : null}
+                      caret={focus?.id === row.block.id ? focus.caret : null}
                       expanded={!collapsed.has(row.block.id)}
                       op={state.ops[opKey.pageBlock(row.block.id)]}
                       threadCount={threadsByTarget.get(row.block.id) ?? 0}
