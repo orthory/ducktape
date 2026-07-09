@@ -70,6 +70,12 @@ fn main() {
         .setup(|app| {
             tray::init(app.handle())?;
             menu::install(app)?;
+            // The in-app huddle dock captures from THIS window, so the main
+            // webview needs the same mic/camera grant as the pop-out
+            // (Linux only; no-ops elsewhere — see huddle::allow_user_media).
+            let main = tauri::Manager::get_webview_window(app, "main")
+                .ok_or("main window missing (tauri.conf.json windows)")?;
+            huddle::allow_user_media(&main)?;
             Ok(())
         });
 
