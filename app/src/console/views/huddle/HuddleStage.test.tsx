@@ -77,7 +77,7 @@ describe("HuddleStage", () => {
 
   it("drives mute and leave from the control bar", () => {
     const { spies } = renderStage();
-    fireEvent.click(screen.getByRole("button", { name: /^mute$/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^mic$/i }));
     expect(spies.setHuddleMuted).toHaveBeenCalledWith(true);
     fireEvent.click(screen.getByRole("button", { name: /leave/i }));
     expect(spies.leaveHuddle).toHaveBeenCalled();

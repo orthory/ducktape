@@ -1,13 +1,14 @@
-// The huddle session card BODY — status dot + channel, error row, the
-// muted-while-talking banner, and the participant roster (name + per-member mute
-// glyph + a stale-member "remove" control). Purely presentational (props +
-// callbacks, no store): the in-app dock (Huddle.tsx) and the popped-out window
-// (views/huddle/HuddleWindow.tsx) both render it, so the two surfaces cannot
-// drift. Media controls (mute/camera/leave) live in the shared HuddleControls
-// bar and view controls (expand/pop) in each container's header — this file owns
-// only the status + roster body. Participants arrive fully resolved
-// (name/muted/stale/self); the window side has no member records or profile
-// registry of its own.
+// The huddle session card BODY — status dot + channel, the notice rows
+// (error / muted-while-talking / transient media note), and the participant
+// roster (name + per-member mute glyph + a stale-member "remove" control).
+// Purely presentational (props + callbacks, no store). The in-app dock
+// (Huddle.tsx) renders the whole card; the stage and the popped-out window
+// (views/huddle/) compose the exported pieces (CardNotices, Roster) under
+// their own headers — one implementation, three surfaces, no drift. Media
+// controls (mute/camera/leave) live in the shared HuddleControls bar and view
+// controls (expand/pop) in each container's header. Participants arrive fully
+// resolved (name/muted/stale/self); the window side has no member records or
+// profile registry of its own.
 
 import type { HuddleParticipant } from "../../store/huddle-roster";
 import { isMacDesktop } from "../../../domain/node-bootstrap";
@@ -15,7 +16,7 @@ import type { VoiceError } from "../../../domain/voice-session";
 import { color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "./HoverButton";
 
-export type HuddleStatus = "idle" | "connecting" | "live" | "error";
+export type HuddleStatus = "idle" | "connecting" | "reconnecting" | "live" | "error";
 
 function MicGlyph({ size = 15, muted = false }: { size?: number; muted?: boolean }) {
   return (
@@ -30,6 +31,7 @@ function MicGlyph({ size = 15, muted = false }: { size?: number; muted?: boolean
 
 const STATUS_DOT: Record<HuddleStatus, { color: string; pulse: boolean }> = {
   connecting: { color: color.amber, pulse: true },
+  reconnecting: { color: color.amber, pulse: true },
   live: { color: color.green, pulse: false },
   error: { color: color.red, pulse: false },
   idle: { color: color.muted2, pulse: false },
@@ -45,12 +47,20 @@ const MIC_DENIED_COPY = isMacDesktop()
   ? "Mic access is blocked — allow it in System Settings, then retry."
   : "Mic access is blocked — check the system's microphone permissions, then retry.";
 
-const ERROR_COPY: Record<VoiceError, string> = {
+export const ERROR_COPY: Record<VoiceError, string> = {
   "mic-denied": MIC_DENIED_COPY,
   "mic-missing": "No usable microphone found.",
   "mic-failed": "Mic setup failed.",
   connection: "Voice connection failed.",
   refused: "Couldn't join this huddle.",
+  removed: "You're no longer in this huddle — another member or device removed you.",
+};
+
+/** Copy for a transient camera/screen acquire failure — the call is fine, the
+ *  lane just stayed off; say why instead of a button that silently snaps back. */
+const MEDIA_NOTE_COPY: Record<"camera-failed" | "screen-failed", string> = {
+  "camera-failed": "Camera didn't start — check camera permissions.",
+  "screen-failed": "Screen share didn't start — permission was denied or cancelled.",
 };
 
 const initialsOf = (name: string): string => name.slice(0, 2).toUpperCase();
@@ -79,11 +89,70 @@ function RowAvatar({ name, size, ring }: { name: string; size: number; ring: str
   );
 }
 
+/** The failure/notice rows shared by every huddle surface: the error copy, the
+ *  muted-while-talking banner, and the transient media note. The dock renders
+ *  them inside HuddleCard; the stage and the popped window (which own their own
+ *  headers) render them directly so the three surfaces say the same things. */
+export function CardNotices({
+  failure,
+  mutedWhileTalking,
+  mediaNote,
+}: {
+  failure: VoiceError | null;
+  mutedWhileTalking: boolean;
+  mediaNote?: "camera-failed" | "screen-failed" | null;
+}) {
+  return (
+    <>
+      {failure && (
+        <span style={{ font: `400 11px/1.4 ${font.sans}`, color: color.danger }}>
+          {ERROR_COPY[failure]}
+        </span>
+      )}
+
+      {!failure && mutedWhileTalking && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "5px 8px",
+            borderRadius: radius.sm,
+            background: color.dangerSoft,
+            border: `1px solid ${color.dangerBorder}`,
+            color: color.danger,
+            font: `600 11px ${font.sans}`,
+          }}
+        >
+          <MicGlyph size={13} muted />
+          You&rsquo;re muted
+        </div>
+      )}
+
+      {!failure && mediaNote && (
+        <div
+          style={{
+            padding: "5px 8px",
+            borderRadius: radius.sm,
+            background: color.sunken,
+            border: `1px solid ${color.borderSoft}`,
+            color: color.inkSoft,
+            font: `500 11px/1.4 ${font.sans}`,
+          }}
+        >
+          {MEDIA_NOTE_COPY[mediaNote]}
+        </div>
+      )}
+    </>
+  );
+}
+
 /** The roster: one row per member — avatar, name (+ "you"), a muted-mic glyph
  *  when known-muted, and a "remove" control on a stale (signal-lost) member.
  *  Capped at `maxRows`, with a "+N more" tail. This is what makes mute + sweep
- *  reachable in an audio-only huddle, where no video tiles render. */
-function Roster({
+ *  reachable in an audio-only huddle, where no video tiles render. Exported for
+ *  the popped window, which composes it under its own header. */
+export function Roster({
   participants,
   ring,
   maxRows,
@@ -170,6 +239,9 @@ export interface HuddleCardProps {
   status: HuddleStatus;
   /** Why `status` is "error" — picks the message row. Null otherwise. */
   error: VoiceError | null;
+  /** A transient camera/screen acquire failure to surface (auto-cleared by the
+   *  store). Never fatal — renders as a quiet note, not the error row. */
+  mediaNote?: "camera-failed" | "screen-failed" | null;
   /** The roster, fully resolved (name/muted/stale/self). Self included. */
   participants: HuddleParticipant[];
   /** Ring color behind the row avatars — the card's own surface color. */
@@ -185,6 +257,7 @@ export function HuddleCard({
   channelName,
   status,
   error,
+  mediaNote = null,
   participants,
   ring = color.paper,
   maxRows = 5,
@@ -224,35 +297,16 @@ export function HuddleCard({
         </span>
         {!failure && (
           <span style={{ font: `500 10.5px ${font.sans}`, color: color.muted2, flexShrink: 0 }}>
-            {status === "connecting" ? "connecting…" : `${participants.length}`}
+            {status === "connecting"
+              ? "connecting…"
+              : status === "reconnecting"
+                ? "reconnecting…"
+                : `${participants.length}`}
           </span>
         )}
       </div>
 
-      {failure && (
-        <span style={{ font: `400 11px/1.4 ${font.sans}`, color: color.danger }}>
-          {ERROR_COPY[failure]}
-        </span>
-      )}
-
-      {!failure && mutedWhileTalking && (
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-            padding: "5px 8px",
-            borderRadius: radius.sm,
-            background: color.dangerSoft,
-            border: `1px solid ${color.dangerBorder}`,
-            color: color.danger,
-            font: `600 11px ${font.sans}`,
-          }}
-        >
-          <MicGlyph size={13} muted />
-          You&rsquo;re muted
-        </div>
-      )}
+      <CardNotices failure={failure} mutedWhileTalking={mutedWhileTalking} mediaNote={mediaNote} />
 
       {!failure && (
         <Roster participants={participants} ring={ring} maxRows={maxRows} onSweep={onSweep} />
