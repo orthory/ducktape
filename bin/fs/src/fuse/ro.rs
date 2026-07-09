@@ -16,7 +16,7 @@ use std::sync::Mutex;
 
 use duckfs_client::api::{ApiError, NodeApi};
 use duckfs_client::http::HttpNode;
-use files::{EntryInfo, EntryKindWire, MAX_PAGE};
+use duckfs_core::{EntryInfo, EntryKindWire, MAX_PAGE};
 use fuser::{
     Errno, FileType, Filesystem, Generation, INodeNo, ReplyAttr, ReplyData, ReplyDirectory,
     ReplyEntry, ReplyStatfs, Request,

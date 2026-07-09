@@ -18,11 +18,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use files::objects::object_id;
-use files::{
-    CHUNK_SIZE, Change, Content, Files, FilesMsg, FilesQuery, Kind, MAX_SYNC_IDS, encode_msg,
+use duckfs_core::objects::object_id;
+use duckfs_core::{
+    CHUNK_SIZE, Change, Content, FilesMsg, FilesQuery, Kind, MAX_SYNC_IDS, encode_msg,
     encode_putblob, encode_query, to_hex,
 };
+use files::Files;
 use sdk::{Ctx, Effect, Env, Error, Event, Module as _, Msg, Origin, StateRoot};
 use statesync::{ModuleLane, ObjectFetch, SyncError, sync_object_possession};
 
@@ -216,10 +217,10 @@ struct TargetOdb<'a>(&'a mut Files);
 
 impl ObjectFetch for TargetOdb<'_> {
     fn refs_request(&self) -> Vec<u8> {
-        files::encode_get_refs()
+        duckfs_core::encode_get_refs()
     }
     fn install_refs(&mut self, reply: &[u8], root: StateRoot, height: u64) -> Result<(), String> {
-        let bytes = files::decode_refs_reply(reply)?;
+        let bytes = duckfs_core::decode_refs_reply(reply)?;
         self.0
             .install(&bytes, root, height)
             .map_err(|e| e.to_string())
@@ -229,10 +230,10 @@ impl ObjectFetch for TargetOdb<'_> {
         if ids.is_empty() {
             return Ok(None);
         }
-        Ok(Some(files::encode_get_objects(&ids)))
+        Ok(Some(duckfs_core::encode_get_objects(&ids)))
     }
     fn ingest(&mut self, reply: &[u8]) -> Result<usize, String> {
-        let batch = files::decode_objects_reply(reply)?;
+        let batch = duckfs_core::decode_objects_reply(reply)?;
         let landed = batch.len();
         self.0.ingest_objects(&batch).map_err(|e| e.to_string())?;
         Ok(landed)
@@ -329,15 +330,15 @@ fn duckfs_odb_resolver_reaches_full_possession_with_identical_reads() {
 
 #[test]
 fn node_batch_cap_fits_the_serve_sync_id_ceiling() {
-    // `sync_all_modules` passes `files::MAX_SYNC_IDS` as the driver batch. a
+    // `sync_all_modules` passes `duckfs_core::MAX_SYNC_IDS` as the driver batch. a
     // MAX_SYNC_IDS-sized GetObjects request must serve WITHOUT the "too many ids"
     // rejection — pinning that the node's batch and the module's serve cap agree.
-    let req = files::encode_get_objects(&vec![[0u8; 32]; MAX_SYNC_IDS]);
+    let req = duckfs_core::encode_get_objects(&vec![[0u8; 32]; MAX_SYNC_IDS]);
     let src_dir = tempfile::tempdir().unwrap();
     let source = open_files(&src_dir);
     let resp = block_on(source.serve_sync(&req)).expect("serve at the id ceiling");
     assert!(
-        files::decode_objects_reply(&resp)
+        duckfs_core::decode_objects_reply(&resp)
             .expect("decode")
             .is_empty(),
         "all ids absent on a fresh source"

@@ -43,7 +43,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
-use files::CHUNK_SIZE;
+use duckfs_core::CHUNK_SIZE;
 use futures::SinkExt as _;
 use futures::channel::{mpsc, oneshot};
 use sdk::StateRoot;
@@ -1296,7 +1296,7 @@ async fn put_blob(
 /// a malformed digest (anything but 64 lowercase hex chars) is a 400; a
 /// well-formed digest this node holds no bytes for is a 404.
 async fn get_blob(State(handle): State<NodeHandle>, Path(digest): Path<String>) -> Response {
-    let Some(raw) = files::from_hex_32(&digest) else {
+    let Some(raw) = duckfs_core::from_hex_32(&digest) else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "digest must be 64 characters of lowercase hex",
@@ -2073,7 +2073,7 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
                         Ok(CallClientControl::Recipients { peers }) => {
                             let keys: Vec<[u8; 32]> = peers
                                 .iter()
-                                .filter_map(|hex| files::from_hex_32(hex))
+                                .filter_map(|hex| duckfs_core::from_hex_32(hex))
                                 .collect();
                             let _ = recipients.send(keys);
                         }
@@ -2082,7 +2082,7 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
                                 .try_send(CallControlIn::Beacon { muted, camera_on });
                         }
                         Ok(CallClientControl::KeyframeRequest { peer }) => {
-                            if let Some(key) = files::from_hex_32(&peer) {
+                            if let Some(key) = duckfs_core::from_hex_32(&peer) {
                                 let _ = control_in
                                     .try_send(CallControlIn::KeyframeRequest { peer: key });
                             }

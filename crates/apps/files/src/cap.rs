@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
-use crate::wire::*;
+use duckfs_core::*;
 use sdk::{Ctx, Error, Msg};
 
 /// a typed duckfs handle bound to one dispatch's `sdk::Ctx`. reads borrow the ctx

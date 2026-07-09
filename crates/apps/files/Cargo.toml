@@ -3,20 +3,18 @@ name = "files"
 edition.workspace = true
 version.workspace = true
 
-# duckfs: a consensus-replicated, copy-on-write, content-addressed filesystem
-# module. ONE crate with the pure core always compiled (the future wasm unit);
-# the `native` feature (default) adds the disk stores and the sdk module glue.
-# purity gate: `cargo check -p files --no-default-features` must stay green.
+# Ducktape module adapter for duckfs. The reusable deterministic state machine
+# lives in duckfs-core; disk persistence lives in duckfs-disk. `files` keeps the
+# consensus module id and SDK capability glue, plus a compatibility re-export.
 [features]
 default = ["native"]
-native = ["dep:sdk", "dep:async-trait"]
+native = ["dep:duckfs-disk", "dep:sdk", "dep:async-trait", "dep:base64", "dep:serde_json"]
 
 [dependencies]
-sha2 = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-base64 = { workspace = true }
-unicode-normalization = { workspace = true }
+duckfs-core = { workspace = true }
+duckfs-disk = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 sdk = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 
@@ -28,3 +26,4 @@ futures = "0.3"
 tempfile = { workspace = true }
 base64 = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }

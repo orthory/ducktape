@@ -39,6 +39,7 @@ kv = { workspace = true }
 # object-possession loop over an in-process ModuleLane (dev-only; statesync
 # never depends on an app crate at build time).
 files = { workspace = true }
+duckfs-core = { workspace = true }
 base64 = { workspace = true }
 futures = "0.3"
 async-trait = { workspace = true }

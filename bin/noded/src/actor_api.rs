@@ -15,7 +15,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use duckfs_client::api::{ApiError, CommitReceipt, NodeApi};
-use files::{
+use duckfs_core::{
     Change, DiffEntry, DigestHex, EntryInfo, FilesMsg, FilesQuery, FilesReply, RefsInfo,
     SnapshotInfo, decode_reply, encode_msg, encode_putblob, encode_query,
 };
@@ -200,8 +200,8 @@ impl NodeApi for ActorNodeApi {
 
     fn stage_chunk(&self, bytes: &[u8]) -> Result<DigestHex, ApiError> {
         self.submit(encode_putblob(bytes))?;
-        Ok(files::to_hex(&files::objects::object_id(
-            files::Kind::Chunk,
+        Ok(duckfs_core::to_hex(&duckfs_core::objects::object_id(
+            duckfs_core::Kind::Chunk,
             bytes,
         )))
     }

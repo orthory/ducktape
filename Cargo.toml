@@ -38,7 +38,9 @@ members = [
     "crates/system/dispatch",
     "crates/system/dispatch-oracle",
     "crates/system/tagging",
-    "crates/system/duckfs-client",
+    "crates/duckfs/core",
+    "crates/duckfs/disk",
+    "crates/duckfs/client",
     # apps — product feature modules
     "crates/apps/forge",
     "crates/apps/pages",
@@ -167,7 +169,9 @@ profiles = { path = "crates/apps/profiles" }
 automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }
-duckfs-client = { path = "crates/system/duckfs-client" }
+duckfs-core = { path = "crates/duckfs/core" }
+duckfs-disk = { path = "crates/duckfs/disk" }
+duckfs-client = { path = "crates/duckfs/client" }
 jobs = { path = "crates/apps/jobs" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }

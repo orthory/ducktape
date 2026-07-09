@@ -95,6 +95,7 @@ use capability::CapabilityRegistry;
 use chat::Chat;
 use directory::Directory;
 use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use duckfs_disk::SyncScratch;
 use files::Files;
 use forge::Forge;
 use governance::Governance;
@@ -156,12 +157,12 @@ const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
 /// `node::MAX_FRAME_BYTES` by the submit-boundary guard, then gossiped raw on
 /// the payload channel and served (plus a small rpc envelope) on the fetch and
 /// statesync lanes — and (b) a `GetObjects` sync reply page, capped at
-/// `files::MAX_SYNC_REPLY_BYTES` (base64 wraps each 1 MiB object ~4/3x). the
+/// `duckfs_core::MAX_SYNC_REPLY_BYTES` (base64 wraps each 1 MiB object ~4/3x). the
 /// asserts below pin both caps under this one, envelope headroom included:
 /// commonware's sender ASSERTS on this cap, so "over" is a panic, not an error.
 const MAX_MESSAGE_SIZE: u32 = 1 << 21;
 const _: () = assert!(MAX_MESSAGE_SIZE as usize >= node::MAX_FRAME_BYTES + 1024);
-const _: () = assert!(MAX_MESSAGE_SIZE as usize >= files::MAX_SYNC_REPLY_BYTES + 1024);
+const _: () = assert!(MAX_MESSAGE_SIZE as usize >= duckfs_core::MAX_SYNC_REPLY_BYTES + 1024);
 /// inbound backlog before a channel applies receive backpressure.
 const MAX_BACKLOG: usize = 128;
 /// pump drain cadence: how often the pump applies finalized frames (and runs
@@ -975,7 +976,7 @@ async fn restore_host(
 ///
 /// SCRATCH NAMESPACE (#219): like the qmdb modules — whose `sync_from` lands
 /// under an ATTEMPT-scoped runtime child (`{name}_scratch_a{n}`) — the module
-/// this adapter wraps is opened over `files::SyncScratch`'s attempt-scoped
+/// this adapter wraps is opened over `duckfs_disk::SyncScratch`'s attempt-scoped
 /// scratch dir, NEVER the canonical `duckfs_dir`. the canonical dir is written
 /// only by the verified promotion after `sync_all_modules`' composite app-hash
 /// gate, so a failed join leaves it byte-untouched.
@@ -983,11 +984,11 @@ struct FilesOdb<'a>(&'a mut Files);
 
 impl statesync::ObjectFetch for FilesOdb<'_> {
     fn refs_request(&self) -> Vec<u8> {
-        files::encode_get_refs()
+        duckfs_core::encode_get_refs()
     }
 
     fn install_refs(&mut self, reply: &[u8], root: StateRoot, height: u64) -> Result<(), String> {
-        let bytes = files::decode_refs_reply(reply)?;
+        let bytes = duckfs_core::decode_refs_reply(reply)?;
         // persist the refs envelope at the SYNCED boundary height so a restart
         // right after the join resumes replay from the boundary, not genesis.
         self.0
@@ -1000,11 +1001,11 @@ impl statesync::ObjectFetch for FilesOdb<'_> {
         if ids.is_empty() {
             return Ok(None);
         }
-        Ok(Some(files::encode_get_objects(&ids)))
+        Ok(Some(duckfs_core::encode_get_objects(&ids)))
     }
 
     fn ingest(&mut self, reply: &[u8]) -> Result<usize, String> {
-        let batch = files::decode_objects_reply(reply)?;
+        let batch = duckfs_core::decode_objects_reply(reply)?;
         let landed = batch.len();
         self.0.ingest_objects(&batch).map_err(|e| e.to_string())?;
         Ok(landed)
@@ -1204,7 +1205,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     // (`duckfs_scratch_a{attempt}`, mirroring the qmdb scratch namespaces);
     // the canonical `duckfs_dir` is written only by the verified promotion
     // after the composite app-hash gate below (#219).
-    let files_scratch = files::SyncScratch::prepare(duckfs_dir, attempt)
+    let files_scratch = SyncScratch::prepare(duckfs_dir, attempt)
         .map_err(|e| format!("duckfs scratch: {e}"))?;
     let mut files = Files::open("files", files_scratch.dir().to_path_buf())
         .map_err(|e| format!("duckfs open: {e}"))?;
@@ -1216,7 +1217,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         files_root,
         manifest.height,
         &mut FilesOdb(&mut files),
-        files::MAX_SYNC_IDS,
+        duckfs_core::MAX_SYNC_IDS,
     )
     .await
     .map_err(|e| format!("files sync: {e}"))?;
@@ -5952,7 +5953,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // boot sweep (#219): no sync attempt is in flight yet, so any leftover
         // `duckfs_scratch_a*` dir (a crashed attempt, or a promoted scratch
         // whose final removal was interrupted) is safe to remove. best-effort.
-        files::SyncScratch::sweep_stale(&duckfs_dir);
+        SyncScratch::sweep_stale(&duckfs_dir);
 
         // ---- the JOINER: park on the mesh, sync a boundary that includes
         // this key, fabricate the equivalent recovery checkpoint, reboot ----

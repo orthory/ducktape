@@ -5,16 +5,15 @@
 
 use std::path::PathBuf;
 
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
-
-use crate::disk::{DiskRefs, DiskStore};
-use crate::fs::{Fs, StagedObjects};
-use crate::state::Refs;
-use crate::store::{ObjectStore as _, RefsStore as _};
-use crate::wire::{
-    FilesMsg, GC_PERIOD_BLOCKS, PUTBLOB_FRAME_TAG, decode_msg, decode_query, decode_sync_req,
-    encode_reply, encode_sync_resp, to_hex,
+use duckfs_core::fs::{Fs, StagedObjects};
+use duckfs_core::state::Refs;
+use duckfs_core::store::{ObjectStore as _, RefsStore as _};
+use duckfs_core::{
+    FilesMsg, GC_PERIOD_BLOCKS, ObjectId, PUTBLOB_FRAME_TAG, decode_msg, decode_query,
+    decode_sync_req, encode_reply, encode_sync_resp, to_hex,
 };
+use duckfs_disk::{DiskRefs, DiskStore};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 
 /// gc is due at `height` iff `height` has crossed into a new
 /// [`GC_PERIOD_BLOCKS`]-wide window since the last swept height (`watermark`).
@@ -125,7 +124,7 @@ impl Files {
 
     /// the ids of up to `limit` objects reachable from the committed refs but not
     /// yet in the odb — the fetch driver's worklist. see [`Fs::missing_objects`].
-    pub fn missing_objects(&self, limit: usize) -> Result<Vec<crate::ObjectId>, Error> {
+    pub fn missing_objects(&self, limit: usize) -> Result<Vec<ObjectId>, Error> {
         self.fs.missing_objects(limit).map_err(Error::Module)
     }
 
@@ -135,10 +134,7 @@ impl Files {
     /// over the batch rather than paid per object (the [`Fs::ingest_object`] seam
     /// is pure; the batch fsync is the glue's job, mirroring `commit_block` step
     /// 3). every object is re-hashed and (for files) shape-checked before it lands.
-    pub fn ingest_objects(
-        &mut self,
-        batch: &[(crate::ObjectId, u8, Vec<u8>)],
-    ) -> Result<(), Error> {
+    pub fn ingest_objects(&mut self, batch: &[(ObjectId, u8, Vec<u8>)]) -> Result<(), Error> {
         for (id, kind, body) in batch {
             self.fs
                 .ingest_object(id, *kind, body)
@@ -244,7 +240,7 @@ impl Files {
 
     /// `#[doc(hidden)]` test seam: does the committed odb hold `id`?
     #[doc(hidden)]
-    pub fn odb_has_for_test(&self, id: &crate::ObjectId) -> bool {
+    pub fn odb_has_for_test(&self, id: &ObjectId) -> bool {
         self.fs.odb_has_for_test(id)
     }
 
@@ -256,7 +252,7 @@ impl Files {
 
     /// `#[doc(hidden)]` test seam: the gc mark set over committed refs.
     #[doc(hidden)]
-    pub fn gc_mark_for_test(&self) -> std::collections::BTreeSet<crate::ObjectId> {
+    pub fn gc_mark_for_test(&self) -> std::collections::BTreeSet<ObjectId> {
         self.fs.gc_mark_for_test()
     }
 }
