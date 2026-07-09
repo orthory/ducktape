@@ -11,6 +11,7 @@ import type { FormEvent } from "react";
 import { isModuleChannel } from "../../../domain/chat-client";
 import type { PostPolicy } from "../../../domain/chat-client";
 import { Icon } from "../../components/Icon";
+import { selfAuthorBytes } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { selfAuthorKeyOf } from "./chat-helpers";
@@ -303,7 +304,7 @@ function EmptyChannelState() {
 export function ChatView() {
   const { state, actions } = useDucktape();
   const channel = state.channels.find((c) => c.id === state.activeChannel);
-  const selfKey = selfAuthorKeyOf(state.author);
+  const selfKey = selfAuthorKeyOf(selfAuthorBytes(state.status, state.author));
   const workspaceId = state.workspace?.id ?? null;
   const rootMessageCount = state.messages.filter((message) => message.head.thread === null).length;
 
