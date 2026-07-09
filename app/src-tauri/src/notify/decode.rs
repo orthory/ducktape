@@ -18,8 +18,11 @@ pub struct Origin {
 #[derive(Debug, Clone)]
 pub struct OpRow {
     // These block coordinates are retained for future toast timestamps and debugging.
+    #[allow(dead_code)]
     pub height: u64,
+    #[allow(dead_code)]
     pub seq: u32,
+    #[allow(dead_code)]
     pub time: u64,
     pub origin: Origin,
     /// the embedded op payload; None when the row carried `payloadHex` or nothing.
