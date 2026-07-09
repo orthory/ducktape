@@ -16,6 +16,19 @@ const initialsOf = (name: string): string => name.slice(0, 2).toUpperCase();
 
 const media: CSSProperties = { width: "100%", height: "100%", objectFit: "cover", display: "block" };
 
+/** A muted-mic glyph for a tile's name pill — the video-surface equivalent of the
+ *  roster's per-member mute indicator (the stage has no roster fallback). */
+function MicGlyph({ size = 11 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.9} strokeLinecap="round" strokeLinejoin="round">
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M5.5 11a6.5 6.5 0 0 0 13 0" />
+      <path d="M12 17.5V21" />
+      <path d="M4 4l16 16" />
+    </svg>
+  );
+}
+
 export interface CallTilesProps {
   layout: "strip" | "gallery" | "spotlight";
   participants: HuddleParticipant[];
@@ -125,6 +138,11 @@ export function StageTile({
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {member.isSelf ? "You" : member.name}
         </span>
+        {member.muted && (
+          <span title="Muted" style={{ display: "flex" }}>
+            <MicGlyph size={big ? 12 : 11} />
+          </span>
+        )}
       </span>
       {member.stale && (
         <span style={{ position: "absolute", top: 6, right: 6, padding: "2px 7px", borderRadius: 999, background: color.danger, color: "#fff", font: `600 9.5px ${font.sans}` }}>

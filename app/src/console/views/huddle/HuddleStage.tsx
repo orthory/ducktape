@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { CSSProperties } from "react";
 
+import { MAX_VIDEO_PARTICIPANTS } from "../../../domain/call-session";
 import { keyHex } from "../../../domain/chat-client";
 import { buildParticipants } from "../../store/huddle-roster";
 import { isTauri } from "../../../domain/node-bootstrap";
@@ -84,6 +85,7 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
   );
 
   const live = voice.status === "live";
+  const overCap = (channel?.huddle?.length ?? 0) > MAX_VIDEO_PARTICIPANTS;
 
   const barBtn = (activeOn: boolean): CSSProperties => ({
     display: "flex",
@@ -170,11 +172,11 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "12px 14px", borderTop: `1px solid ${color.borderSoft}` }}>
         <HuddleControls
           size="comfortable"
-          home="stage"
           status={voice.status}
           muted={voice.muted}
           cameraOn={voice.cameraOn}
           canEncode={videoCapability.canEncode}
+          cameraDisabledReason={overCap ? "Video is capped at 8 participants" : undefined}
           onToggleMute={() => actions.setHuddleMuted(!voice.muted)}
           onToggleCamera={() => actions.setCamera(!voice.cameraOn)}
           onLeave={() => actions.leaveHuddle()}

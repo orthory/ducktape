@@ -11,8 +11,6 @@ import type { HuddleStatus } from "../chat/HuddleCard";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "../chat/HoverButton";
 
-export type ControlHome = "dock" | "stage" | "window";
-
 export interface HuddleControlsProps {
   size: "compact" | "comfortable";
   status: HuddleStatus;
@@ -33,8 +31,6 @@ export interface HuddleControlsProps {
   onToggleCamera?: () => void;
   onLeave: () => void;
   onRetry: () => void;
-  /** Reserved for later PRs; the bar itself renders no view controls. */
-  home: ControlHome;
 }
 
 function MicGlyph({ size = 15, muted = false }: { size?: number; muted?: boolean }) {

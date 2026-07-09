@@ -13,7 +13,6 @@ const base: HuddleControlsProps = {
   onToggleCamera: vi.fn(),
   onLeave: vi.fn(),
   onRetry: vi.fn(),
-  home: "dock",
 };
 
 const order = () =>
@@ -67,5 +66,20 @@ describe("HuddleControls", () => {
     render(<HuddleControls {...base} status="connecting" />);
     expect(screen.getByRole("button", { name: /mute/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /camera/i })).toBeDisabled();
+  });
+
+  it("disables the camera with the given reason as its tooltip even while live", () => {
+    // comfortable size gives the camera button visible "Camera" text so it's
+    // locatable by role-name even when its title carries the cap reason.
+    render(
+      <HuddleControls
+        {...base}
+        size="comfortable"
+        cameraDisabledReason="Video is capped at 8 participants"
+      />,
+    );
+    const cam = screen.getByRole("button", { name: /camera/i });
+    expect(cam).toBeDisabled();
+    expect(cam).toHaveAttribute("title", "Video is capped at 8 participants");
   });
 });

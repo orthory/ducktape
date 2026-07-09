@@ -40,6 +40,15 @@ describe("CallTiles", () => {
     expect(container.querySelector("canvas")).toBeNull();
   });
 
+  it("marks a muted participant's tile with a mute glyph (video surfaces have no roster)", () => {
+    const { queryByTitle, rerender } = render(
+      <CallTiles layout="gallery" participants={[p({ key: "ab", muted: true })]} {...common} />,
+    );
+    expect(queryByTitle("Muted")).not.toBeNull();
+    rerender(<CallTiles layout="gallery" participants={[p({ key: "ab", muted: false })]} {...common} />);
+    expect(queryByTitle("Muted")).toBeNull();
+  });
+
   it("caps a strip and surfaces the overflow tail", () => {
     const many = Array.from({ length: 10 }, (_, i) => p({ key: `u${i}` }));
     const { getByText } = render(

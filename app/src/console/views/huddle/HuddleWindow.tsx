@@ -91,7 +91,6 @@ export function HuddleWindow() {
           </div>
           <HuddleControls
             size="compact"
-            home="window"
             status={card.status}
             muted={card.muted}
             cameraOn={false}

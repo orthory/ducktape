@@ -175,19 +175,21 @@ function HuddleDockCard() {
     voice.cameraOn ||
     (canDecode && roster.some((m) => voice.peers[keyHex(m.node)]?.cameraOn));
 
-  // Staleness is time-driven, so re-render once a second WHILE this in-app dock
-  // is showing (not popped — the popped window drives its own re-push tick).
-  const [nowTick, setNowTick] = useState(() => Date.now());
-  useEffect(() => {
-    if (voice.popped) return;
-    const id = setInterval(() => setNowTick(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [voice.popped]);
-
   // The in-app "stage" — expand the compact dock into a full-window gallery /
   // spotlight. Local state, so it resets on join (the card is keyed by channel)
   // and never conflicts with the popped window (which owns its own surface).
   const [expanded, setExpanded] = useState(false);
+
+  // Staleness is time-driven, so re-render once a second WHILE this compact dock
+  // is the visible surface — not while popped (the popped window drives its own
+  // re-push tick) and not while expanded (the stage owns its own tick; a second
+  // timer here would just re-render the stage subtree needlessly).
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    if (voice.popped || expanded) return;
+    const id = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [voice.popped, expanded]);
 
   // Stable ref binders so the 1 Hz tick never detaches the tile canvases.
   const bindPreview = useCallback(
@@ -273,13 +275,14 @@ function HuddleDockCard() {
           selfCameraOn={voice.cameraOn}
           bindPreview={bindPreview}
           bindTile={bindTile}
-          maxTiles={MAX_VIDEO_PARTICIPANTS}
+          // +1 so the self tile rides on top of the peer cap, matching the old
+          // dock (self shown separately, peers capped at MAX_VIDEO_PARTICIPANTS).
+          maxTiles={MAX_VIDEO_PARTICIPANTS + 1}
         />
       )}
 
       <HuddleControls
         size="compact"
-        home="dock"
         status={voice.status}
         muted={voice.muted}
         cameraOn={voice.cameraOn}
