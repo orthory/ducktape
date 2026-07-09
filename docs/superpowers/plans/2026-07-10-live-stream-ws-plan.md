@@ -269,19 +269,113 @@ registry wiring joins them afterwards).
 - Gate: `cargo clippy -p capability-host --tests --no-deps`,
   `cargo test -p capability-host`.
 
-## Work order C — wiring run-output (after A+B merge in-branch)
+## Work order C — wiring run-output (after A+B land in-branch)
 
-`bin/node/src/oracle_pool.rs` (and any other provider-construction site —
-grep `capability_host::` in bin/): install a sink that appends to the hub's
-`RunOutputRegistry` keyed by the id the oracle path carries for the run —
-find the dispatch/run id available at provider spawn and CONFIRM it equals
-the id the app's `pendingRuns` rows expose (runs-client). If they differ,
-key by the id the app can see.
+Verified id chain: the oracle exec seam carries `ExecJob.saga_id`
+(`dispatch-oracle/src/lib.rs:46`), and the dispatch module derives
+`saga_id = "dispatch\x1f{receiver}\x1f{dispatch_id}"`
+(`crates/system/dispatch/src/lib.rs:59-67`). The app's `PendingRun` rows
+(`app/src/domain/runs-client.ts:38`) expose exactly that `dispatch_id`
+(hex sha256 of `run_id`). Therefore:
 
-## Work order D — app side
+- **Registry key = the segment after the LAST `\x1f` in `job.saga_id`**
+  (the dispatch_id). The app subscribes `run-output:<PendingRun.dispatch_id>`.
+- Thread a per-run sink from the pool's exec site — `DispatchPool` /
+  `spawn_exec` in `crates/system/dispatch-oracle/src/pool.rs` knows the
+  `ExecJob` and calls the capability-host provider — down to work order B's
+  line sink, capturing the extracted dispatch_id.
+- Wire EVERY provider-pool construction site: `bin/node/src/oracle_pool.rs`
+  `build()` (two callers: validator :9461 and resident :6960) AND
+  `bin/noded`'s `oracle_pool::oracle_workers` (bin/noded/src/main.rs:260) —
+  each appends into its hub's `RunOutputRegistry`. simnode's echo worker can
+  stay silent (no live providers).
+- Gate: `cargo clippy -p noded -p node-bin -p dispatch-oracle --tests
+  --no-deps`; `cargo test -p dispatch-oracle -p noded`.
 
-As specced (transport subscribe/onStream, store/refresh.ts stage 1,
-LogsTab/FilesView/RunOutputPane consumers, transport-stub swap, vitest
-suites). Detailed in the spec + the plan file at
-`~/.claude/plans/support-grpc-for-components-dazzling-quiche.md`; will be cut
-into Codex-sized orders once `stream.gen.ts` exists on the branch.
+## Work order D — app side (after A lands; `stream.gen.ts` exists)
+
+Topic names are the NODE's grammar — `module:<id>`, `logs`, `files:watch`,
+`run-output:<dispatch_id>` — never invent an `ops:` prefix.
+
+### D1. Transport (`app/src/domain/transport.ts`)
+
+- Delete `onBlock` (interface :300, impl :619-626) and the hand-written
+  `WsBlockFrame`/`WsFrame` types (:305-311). New API on `NodeTransport`:
+  ```ts
+  subscribe(topics: string[], handlers: TopicHandlers, resume?: Record<string, string>): () => void;
+  onStream(listener: (s: StreamSignal) => void): () => void;
+  // TopicHandlers { onEvent?(f: EventFrame): void; onTail?(f: TailFrame): void; onLagged?(topic: string, cursor: string): void }
+  // StreamSignal = {kind:"heartbeat", frame} | {kind:"up"} | {kind:"down", reason: string}
+  ```
+- Internals (same single shared reconnecting socket, backoff loop :471-479
+  kept verbatim): refcounted `topicSubs: Map<string, Set<TopicHandlers>>`
+  (first handler → incremental `{op:"subscribe"}` wire frame; last removal →
+  `{op:"unsubscribe"}`); `cursors: Map<string, string>` updated from every
+  event/tail frame; `ws.onopen` sends ONE union subscribe with known cursors
+  (reconnect-with-resume for free) and emits `up`; `lagged` frame → adopt its
+  cursor into the map + fan `onLagged`; `error` frames for a topic → drop
+  that topic's wire state silently (slice stays fetch-based) but log once.
+- Heartbeat watchdog: any inbound frame re-arms a dead-man timer of
+  `2.5 × heartbeat.intervalMs` (exported constant fallback 7500ms before the
+  first heartbeat); expiry closes the socket → normal backoff + `down`.
+  Heartbeats with `height: 0` are liveness-only (never patch the tip).
+- New thin `app/src/domain/stream.ts`: topic constructors
+  (`moduleTopic(id)`, `runOutputTopic(dispatchId)`, `LOGS_TOPIC`,
+  `FILES_WATCH_TOPIC`), frame type guards. Import discipline: only
+  `stream.ts` and `transport.ts` import `stream.gen.ts`.
+
+### D2. Store stage 1 (`app/src/console/store/`)
+
+- Extract `DucktapeProvider.refresh()` (:95-303) into per-slice fetchers in
+  NEW `store/refresh.ts` (verbatim move — behavior-neutral). Module→fetcher
+  map: chat→fetchChat; valset→fetchRoster; governance; forge→fetchForgeHead;
+  pages; agent→fetchAgents; capability→fetchCapabilities; runs+dispatch→
+  fetchRuns; profiles+identity→fetchNames; files→fetchFilesIndex; `blocks`
+  refetches coalesced on ANY event; `status` only on edges + upgrade events.
+- Effect 2 (:386-407) → one `subscribe(status.modules.map(m => moduleTopic(m.id)), …)`;
+  `onEvent` adds the module to a dirty set + bumps `lastBlock` from
+  `op.height`; ~100ms trailing debounce flushes dirty slices through the map
+  (keep the `hasFreshPending` gate). `onLagged` → immediate refetch of that
+  slice. Tolerate per-topic refusals.
+- Effect 2b (:419-469) → heartbeat connection slice: heartbeat patches tip
+  (`height > 0` only); `down` sets the disconnect banner; `up` edge runs the
+  one-shot recovery — `status()` → impostor check moved VERBATIM from
+  :428-446 (publicKey vs workspace.pubkey) → full refresh. Delete
+  `RECONNECT_POLL_MS`. Onboarding/park-phase skip conditions carry over.
+- The 25 post-op `refresh()` call sites in actions stay as-is (stage 1).
+
+### D3. Feature consumers
+
+- `logs` → `LogsTab` (+ new `use-log-stream.ts`): stream-backed log body
+  ring (~2000 lines, drop-marker on lagged); remote nodes gain live logs;
+  the Tauri `workspace_log_tail` read stays as managed-node backfill;
+  `RuntimeFactsRow` stays managed-only. Reuse `log-lines.ts` helpers.
+- `files:watch` → `FilesView`: while on the live head (snapshot === null),
+  any tail frame bumps the existing `reloadToken` (debounced); lagged = same.
+- `run-output:<dispatch_id>` → runs timeline: expandable `RunOutputPane`
+  per pending-run row; subscribe on expand (component-local state,
+  `Discussion.tsx` self-loading pattern), unsubscribe on collapse; render
+  stdout/stderr lines live; lagged → gap marker; empty state
+  "waiting for output…" (subscribing before the executor spawns is legal).
+
+### D4. Tests
+
+- Rewrite `transport.test.ts` stream tests (extend `FakeWebSocket` with
+  `send`/`sent[]`/`onopen`): union-subscribe frame on open; per-topic
+  routing; refcount edges (one wire sub for two handlers; unsubscribe on
+  last); reconnect-with-resume carries cursors; lagged adopts cursor + fires
+  handler; watchdog closes after silence (fake timers) and emits `down`;
+  malformed frames are no-ops.
+- NEW `app/src/test/transport-stub.ts` (`makeTransportStub(overrides)`) —
+  inside the tsconfig-build exclude — and migrate the ~11 test files with
+  hand-rolled `NodeTransport` literals onto it (agent/capability/chat/
+  dispatch/files/forge/identity/profiles/runs client tests, auto-bind,
+  FilesView).
+- `DucktapeProvider.test.tsx`: fake transport gains `emitOps(module, rows)`
+  / `emitHeartbeat(height)` / `emitDown(reason)`; port "block → re-query" to
+  "chat event refetches the chat slice and NOT others"; watchdog silent-death
+  test replaces the 3s-poll test; add an up-edge impostor recheck test.
+- `simnode.scenario.test.tsx` + `live-daemon.e2e.test.ts`: assert real
+  `event` frames for posted ops + heartbeats (simnode inherits the router).
+- Gates: `make install` (tsconfig build gate), `bun run test`/`make test`
+  (includes the stream-types drift check).
