@@ -12,6 +12,22 @@
 
 // ── Types ───────────────────────────────────────────────
 
+import type { ClientMsg, ServerFrame } from "./stream.gen";
+import type {
+  EventFrame,
+  HeartbeatFrame,
+  TailFrame,
+} from "./stream";
+import {
+  isErrorFrame,
+  isEventFrame,
+  isHeartbeatFrame,
+  isLaggedFrame,
+  isServerFrame,
+  isSubscribedFrame,
+  isTailFrame,
+} from "./stream";
+
 export interface BlockEvent {
   height: number;
   appHash: string;
@@ -296,19 +312,26 @@ export interface NodeTransport {
    * all buffered).
    */
   blocks(limit?: number): Promise<BlockRecord[]>;
-  /** Subscribe to finalized blocks. Returns the unsubscribe. */
-  onBlock(listener: (block: BlockEvent) => void): () => void;
+  /** Subscribe to one or more node stream topics. Returns the unsubscribe. */
+  subscribe(
+    topics: string[],
+    handlers: TopicHandlers,
+    resume?: Record<string, string>,
+  ): () => void;
+  /** Subscribe to stream connection/liveness signals. Returns the unsubscribe. */
+  onStream(listener: (signal: StreamSignal) => void): () => void;
 }
 
-// ── The transport ───────────────────────────────────────
-
-interface WsBlockFrame {
-  type: "block";
-  height: number;
-  appHash: string;
+export interface TopicHandlers {
+  onEvent?(frame: EventFrame): void;
+  onTail?(frame: TailFrame): void;
+  onLagged?(topic: string, cursor: string): void;
 }
 
-type WsFrame = WsBlockFrame;
+export type StreamSignal =
+  | { kind: "heartbeat"; frame: HeartbeatFrame }
+  | { kind: "up" }
+  | { kind: "down"; reason: string };
 
 // ── Error classification + bounded fetch ────────────────
 
@@ -376,6 +399,7 @@ const errorDetail = async (res: Response): Promise<string> => {
 
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_CAP_MS = 30_000;
+export const STREAM_WATCHDOG_FALLBACK_MS = 7_500;
 
 const postJson = async <T>(url: string, body: unknown): Promise<T> => {
   const res = await fetchDeadline(url, {
@@ -437,12 +461,124 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
   const base = baseUrl.replace(/\/$/, "");
   const wsUrl = `${wsBase(baseUrl)}/v1/ws`;
 
-  // One shared socket for every block subscriber; reconnects while any
-  // remain, closes once all unsubscribe.
-  const blockListeners = new Set<(block: BlockEvent) => void>();
-  const hasSubscribers = (): boolean => blockListeners.size > 0;
+  // One shared socket for every topic and liveness subscriber; reconnects
+  // while any remain, closes once all unsubscribe.
+  const topicSubs = new Map<string, Set<TopicHandlers>>();
+  const streamListeners = new Set<(signal: StreamSignal) => void>();
+  const cursors = new Map<string, string>();
+  const refusedTopics = new Set<string>();
+  const loggedTopicErrors = new Set<string>();
+  const hasSubscribers = (): boolean =>
+    topicSubs.size > 0 || streamListeners.size > 0;
+  const activeTopics = (): string[] =>
+    [...topicSubs.keys()].filter((topic) => !refusedTopics.has(topic));
   let socket: WebSocket | null = null;
   let retries = 0;
+  let watchdog: ReturnType<typeof setTimeout> | null = null;
+  let watchdogMs = STREAM_WATCHDOG_FALLBACK_MS;
+  let closeReason = "stream socket closed";
+
+  const emitStream = (signal: StreamSignal): void => {
+    streamListeners.forEach((notify) => notify(signal));
+  };
+
+  const clearWatchdog = (): void => {
+    if (watchdog !== null) clearTimeout(watchdog);
+    watchdog = null;
+  };
+
+  const closeWithReason = (reason: string): void => {
+    closeReason = reason;
+    socket?.close();
+  };
+
+  const armWatchdog = (timeoutMs = watchdogMs): void => {
+    clearWatchdog();
+    watchdogMs = timeoutMs;
+    watchdog = setTimeout(
+      () => closeWithReason("stream heartbeat timed out"),
+      timeoutMs,
+    );
+  };
+
+  const socketIsOpen = (): boolean => {
+    const state = socket?.readyState as number | undefined;
+    return state === WebSocket.OPEN || state === 1;
+  };
+
+  const sendFrame = (frame: ClientMsg): void => {
+    if (!socketIsOpen()) return;
+    socket?.send(JSON.stringify(frame));
+  };
+
+  const subscribeFrame = (topics: string[]): ClientMsg => {
+    const resume: Record<string, string> = {};
+    for (const topic of topics) {
+      const cursor = cursors.get(topic);
+      if (cursor) resume[topic] = cursor;
+    }
+    return { op: "subscribe", topics, resume };
+  };
+
+  const sendSubscribe = (topics: string[]): void => {
+    const wanted = topics.filter((topic) => topicSubs.has(topic) && !refusedTopics.has(topic));
+    if (wanted.length === 0) return;
+    sendFrame(subscribeFrame(wanted));
+  };
+
+  const sendUnsubscribe = (topics: string[]): void => {
+    const wanted = topics.filter((topic) => !refusedTopics.has(topic));
+    if (wanted.length === 0) return;
+    sendFrame({ op: "unsubscribe", topics: wanted });
+  };
+
+  const dispatchFrame = (frame: ServerFrame): void => {
+    if (isSubscribedFrame(frame)) {
+      for (const [topic, cursor] of Object.entries(frame.topics)) {
+        if (typeof cursor === "string") cursors.set(topic, cursor);
+      }
+      return;
+    }
+    if (isEventFrame(frame)) {
+      cursors.set(frame.topic, frame.cursor);
+      topicSubs.get(frame.topic)?.forEach((handlers) => handlers.onEvent?.(frame));
+      return;
+    }
+    if (isTailFrame(frame)) {
+      cursors.set(frame.topic, frame.cursor);
+      topicSubs.get(frame.topic)?.forEach((handlers) => handlers.onTail?.(frame));
+      return;
+    }
+    if (isLaggedFrame(frame)) {
+      cursors.set(frame.topic, frame.cursor);
+      topicSubs
+        .get(frame.topic)
+        ?.forEach((handlers) => handlers.onLagged?.(frame.topic, frame.cursor));
+      return;
+    }
+    if (isHeartbeatFrame(frame)) {
+      const timeout = Math.max(
+        STREAM_WATCHDOG_FALLBACK_MS,
+        Math.ceil(frame.intervalMs * 2.5),
+      );
+      armWatchdog(timeout);
+      emitStream({ kind: "heartbeat", frame });
+      return;
+    }
+    if (isErrorFrame(frame)) {
+      if (frame.topic) {
+        refusedTopics.add(frame.topic);
+        cursors.delete(frame.topic);
+        const key = `${frame.topic}:${frame.code}`;
+        if (!loggedTopicErrors.has(key)) {
+          loggedTopicErrors.add(key);
+          console.warn(
+            `stream topic ${frame.topic} refused (${frame.code}): ${frame.detail}`,
+          );
+        }
+      }
+    }
+  };
 
   const connect = (): void => {
     if (socket || !hasSubscribers()) return;
@@ -450,39 +586,43 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
     socket = ws;
     ws.onopen = () => {
       retries = 0; // a clean connection resets the backoff
+      closeReason = "stream socket closed";
+      watchdogMs = STREAM_WATCHDOG_FALLBACK_MS;
+      // a fresh connection may face a different node build/module set —
+      // retry refused topics once per connection instead of pinning them.
+      refusedTopics.clear();
+      emitStream({ kind: "up" });
+      armWatchdog(STREAM_WATCHDOG_FALLBACK_MS);
+      sendSubscribe(activeTopics());
     };
     ws.onmessage = (event) => {
-      let frame: WsFrame;
+      armWatchdog();
+      let frame: unknown;
       try {
-        frame = JSON.parse(String(event.data)) as WsFrame;
+        frame = JSON.parse(String(event.data));
       } catch {
         return; // a malformed / non-json frame is a no-op, not an uncaught throw
       }
-      switch (frame.type) {
-        case "block": {
-          const block = { height: frame.height, appHash: frame.appHash };
-          blockListeners.forEach((notify) => notify(block));
-          break;
-        }
-        default:
-          break; // unknown frame kinds are fine — the stream may grow
-      }
+      if (isServerFrame(frame)) dispatchFrame(frame);
     };
     ws.onclose = () => {
+      clearWatchdog();
       socket = null;
       if (!hasSubscribers()) return;
+      emitStream({ kind: "down", reason: closeReason });
       // exponential backoff (capped) + jitter, instead of the blind 2s retry
       // loop that spammed the console every 2s forever against a dead node.
       const backoff = Math.min(RECONNECT_CAP_MS, RECONNECT_BASE_MS * 2 ** retries);
       retries += 1;
       setTimeout(connect, backoff * (0.5 + Math.random() * 0.5));
     };
-    ws.onerror = () => ws.close();
+    ws.onerror = () => closeWithReason("stream socket error");
   };
 
   /** Drop the socket once nothing is subscribed. */
   const closeIfIdle = (): void => {
     if (!hasSubscribers()) {
+      clearWatchdog();
       socket?.close();
       socket = null;
     }
@@ -616,11 +756,43 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
       const body = (await res.json().catch(() => ({}))) as { blocks?: BlockRecord[] };
       return body.blocks ?? [];
     },
-    onBlock: (listener) => {
-      blockListeners.add(listener);
+    subscribe: (topics, handlers, resume) => {
+      const wanted = [...new Set(topics)];
+      const firstTopics: string[] = [];
+      for (const topic of wanted) {
+        if (resume?.[topic]) cursors.set(topic, resume[topic]);
+        let subs = topicSubs.get(topic);
+        if (!subs) {
+          subs = new Set();
+          topicSubs.set(topic, subs);
+          firstTopics.push(topic);
+        }
+        subs.add(handlers);
+      }
+      connect();
+      sendSubscribe(firstTopics);
+      return () => {
+        const lastTopics: string[] = [];
+        for (const topic of wanted) {
+          const subs = topicSubs.get(topic);
+          if (!subs) continue;
+          subs.delete(handlers);
+          if (subs.size === 0) {
+            topicSubs.delete(topic);
+            cursors.delete(topic);
+            refusedTopics.delete(topic);
+            lastTopics.push(topic);
+          }
+        }
+        sendUnsubscribe(lastTopics);
+        closeIfIdle();
+      };
+    },
+    onStream: (listener) => {
+      streamListeners.add(listener);
       connect();
       return () => {
-        blockListeners.delete(listener);
+        streamListeners.delete(listener);
         closeIfIdle();
       };
     },

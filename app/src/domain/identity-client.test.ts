@@ -13,25 +13,10 @@ import {
   userOf,
 } from "./identity-client";
 import type { UserView } from "./identity-client";
-import type { NodeTransport } from "./transport";
+import { makeTransportStub } from "../test/transport-stub";
 
-const stubTransport = (reply?: unknown): NodeTransport => ({
-  submit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
-  query: vi.fn().mockResolvedValue(reply),
-  view: vi.fn(),
-  putBlob: vi.fn(),
-  getBlob: vi.fn(),
-  status: vi.fn(),
-  metrics: vi.fn(),
-  blocks: vi.fn(),
-  filesStage: vi.fn(),
-  filesCommit: vi.fn(),
-  filesStat: vi.fn(),
-  filesLs: vi.fn(),
-  filesRead: vi.fn(),
-  filesHistory: vi.fn(),
-  onBlock: vi.fn(),
-});
+const stubTransport = (reply?: unknown) =>
+  makeTransportStub({ query: vi.fn().mockResolvedValue(reply) });
 
 const wireUser = (patch: Partial<UserView> = {}): UserView => ({
   user_key: [1, 2, 3],

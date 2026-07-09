@@ -2,13 +2,21 @@
 // Every listed run is awaiting its dispatch delivery — the node prunes
 // entries the moment a result lands.
 
+import { useEffect, useState } from "react";
+
 import type { AgentRecord } from "../../../domain/agent-client";
 import type { Channel } from "../../../domain/chat-client";
 import { displayNameForKey, shortKey } from "../../../domain/names";
 import type { PendingRun } from "../../../domain/runs-client";
+import {
+  isRunOutputTailItem,
+  runOutputTopic,
+  type RunStream,
+} from "../../../domain/stream";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { opKey } from "../../store/finalization";
 import type { OpLedger, OpRecord } from "../../store/finalization";
+import { useDucktape } from "../../store/use-ducktape";
 import { color, font, shadow } from "../../theme/tokens";
 import {
   agentLabel,
@@ -24,6 +32,107 @@ import {
   statusTone,
   StatusPill,
 } from "./parts";
+
+type OutputLine =
+  | { id: number; kind: "line"; stream: RunStream; text: string }
+  | { id: number; kind: "gap"; text: string };
+
+const MAX_OUTPUT_LINES = 1_000;
+
+function RunOutputPane({ run }: { run: PendingRun }) {
+  const { transport } = useDucktape();
+  const [lines, setLines] = useState<OutputLine[]>([]);
+
+  useEffect(() => {
+    setLines([]);
+    if (!transport) return;
+    let nextId = 0;
+    const topic = runOutputTopic(run.dispatch_id);
+    return transport.subscribe([topic], {
+      onTail: (frame) => {
+        if (frame.topic !== topic || !isRunOutputTailItem(frame.item)) return;
+        const line: OutputLine = {
+          id: nextId++,
+          kind: "line",
+          stream: frame.item.stream,
+          text: frame.item.line,
+        };
+        setLines((prev) => [...prev, line].slice(-MAX_OUTPUT_LINES));
+      },
+      onLagged: (laggedTopic, cursor) => {
+        if (laggedTopic !== topic) return;
+        const line: OutputLine = {
+          id: nextId++,
+          kind: "gap",
+          text: `output gap: dropped older lines before cursor ${cursor}`,
+        };
+        setLines((prev) => [...prev, line].slice(-MAX_OUTPUT_LINES));
+      },
+    });
+  }, [transport, run.dispatch_id]);
+
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        border: `1px solid ${color.borderSoft}`,
+        borderRadius: 6,
+        background: "#fbfaf7",
+        padding: "8px 10px",
+        maxHeight: 220,
+        overflow: "auto",
+      }}
+    >
+      {lines.length === 0 ? (
+        <div style={{ font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
+          waiting for output…
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          {lines.map((line) =>
+            line.kind === "gap" ? (
+              <div
+                key={line.id}
+                style={{
+                  font: `600 10px ${font.mono}`,
+                  color: color.amber,
+                  padding: "2px 0",
+                }}
+              >
+                {line.text}
+              </div>
+            ) : (
+              <div
+                key={line.id}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "44px 1fr",
+                  gap: 8,
+                  font: `500 11px ${font.mono}`,
+                  color: line.stream === "stderr" ? color.red : color.inkSoft,
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                }}
+              >
+                <span
+                  style={{
+                    color: color.muted2,
+                    font: `700 9px ${font.mono}`,
+                    textAlign: "right",
+                    userSelect: "none",
+                  }}
+                >
+                  {line.stream}
+                </span>
+                <span>{line.text || " "}</span>
+              </div>
+            ),
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 /** The daemon-lifecycle switch for job-board pickup — its own row on the
  *  Activity tab, where background work lives. */
@@ -104,6 +213,7 @@ function RunRow({
   /** This run was requested by the local user. */
   mine?: boolean;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const agentName = agentLabel(agents, run.agent_id);
   const label = run.job_id
     ? `job ${run.job_id}`
@@ -175,6 +285,19 @@ function RunRow({
             {run.thread_root !== null && <Chip text={`thread ${run.thread_root}`} />}
             {assigneeName ? <Chip text={`on ${assigneeName}`} tone={statusTone.agent} /> : null}
             {mine ? <Chip text="you" tone={statusTone.neutral} /> : null}
+            <button
+              type="button"
+              aria-expanded={expanded}
+              onClick={() => setExpanded((v) => !v)}
+              style={{
+                ...secondaryButton,
+                minHeight: 22,
+                padding: "2px 8px",
+                font: `600 10px ${font.sans}`,
+              }}
+            >
+              Output
+            </button>
           </div>
           <div
             title={`run ${run.run_id} · ${runDetail(run)}`}
@@ -189,6 +312,7 @@ function RunRow({
           >
             started {run.created_at}
           </div>
+          {expanded && <RunOutputPane run={run} />}
         </div>
       </GroupCard>
     </div>
