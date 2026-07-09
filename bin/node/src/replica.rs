@@ -120,6 +120,7 @@ mod tests {
     use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
     use commonware_consensus::simplex::types::{Finalization, Proposal, Subject};
     use commonware_consensus::types::{Epoch, Round, View};
+    use commonware_cryptography::certificate::Scheme as _;
     use commonware_cryptography::{Signer as _, ed25519};
     use commonware_parallel::Sequential;
     use commonware_utils::{Faults as _, N3f1, ordered::Set};
