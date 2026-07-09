@@ -157,7 +157,7 @@ export interface ConsoleState {
   /** hex(node key bytes) → its owning user, from the `identity` module — the
    *  node/user split's resolver: `name` is that user's chosen display name
    *  (null if unset), already folded into `authorNames` when present. */
-  nodeUsers: Record<string, { userKey: string; name: string | null }>;
+  nodeUsers: Record<string, { accountId: string; name: string | null }>;
   /** hex(account id) → the account's collected member keys (of any scheme),
    *  from the `identity` module. `nodeUsers`/`authorNames` carry the shared
    *  display name; this is the key list the account settings surface renders. */
@@ -591,7 +591,7 @@ export interface ConsoleSnapshot {
   activeChannel: string | null;
   messages: MessageView[];
   authorNames: Record<string, string>;
-  nodeUsers: Record<string, { userKey: string; name: string | null }>;
+  nodeUsers: Record<string, { accountId: string; name: string | null }>;
   accountKeys: Record<string, MemberKeyView[]>;
   pages: PageMeta[];
   activePageBlocks: PageBlock[];

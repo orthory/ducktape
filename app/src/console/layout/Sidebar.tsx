@@ -9,6 +9,7 @@ import { modulesInSection } from "../modules/registry";
 import type { NavSection } from "../modules/module-def";
 import { useDucktape } from "../store/use-ducktape";
 import { color, font, radius } from "../theme/tokens";
+import { initialsOf } from "../views/account/ProfileCard";
 
 const navBg = (active: boolean) => (active ? "#e9e9e9" : "transparent");
 const navFg = (active: boolean) => (active ? "#3a3934" : "#959595");
@@ -160,6 +161,30 @@ export function Sidebar() {
       })}
 
       <div style={{ flex: 1 }} />
+
+      {/* The person's console — pinned above the gear: Account is a peer of
+          Settings, not a rail module (it isn't workspace content). */}
+      <button
+        onClick={() => actions.setScreen("account")}
+        title="Account"
+        aria-label="Account"
+        style={{
+          all: "unset",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: 34,
+          height: 34,
+          borderRadius: "50%",
+          marginBottom: 2,
+          background: state.screen === "account" ? color.dark : "#cdcdcd",
+          color: state.screen === "account" ? color.onDark : color.muted3,
+          font: `600 12px ${font.sans}`,
+        }}
+      >
+        {initialsOf(state.author)}
+      </button>
 
       <button
         onClick={() => actions.setScreen("settings")}

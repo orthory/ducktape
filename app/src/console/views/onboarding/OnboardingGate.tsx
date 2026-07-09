@@ -1,7 +1,7 @@
 // The front door (desktop): shown when there is no active workspace, or when
 // the user asks to add/switch one. Two paths — found a new network, or join one
 // from an invite blob — plus a list of existing workspaces to jump back into.
-// On submit the store mints identity + workspace and connects; a joiner then
+// On submit the store mints the node key + workspace and connects; a joiner
 // falls through to JoinProgress while its node parks.
 
 import { useState } from "react";
@@ -339,14 +339,14 @@ export function OnboardingGate() {
           {pendingDelete.force ? (
             <>
               Its node could not confirm it has left its validator set. Forcing deletes
-              the workspace without that confirmation: its directory, identity key,
+              the workspace without that confirmation: its directory, node key,
               and registry entry are removed for good. Only do this for a solo or
               defunct network.
             </>
           ) : (
             <>
               This stops its node and deletes the workspace locally: directory,
-              identity key, and registry entry. It is refused while its node is still
+              node key, and registry entry. It is refused while its node is still
               a current validator of a network with other members.
             </>
           )}

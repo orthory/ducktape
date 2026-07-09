@@ -191,15 +191,15 @@ export function DucktapeProvider({
         const authorNames: Record<string, string> = Object.fromEntries(
           profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
         );
-        // `userKey` in the store shape now holds the ACCOUNT id (the founding
+        // `accountId` in the store shape now holds the ACCOUNT id (the founding
         // key) — the value that groups a person's keys/nodes. Every node the
         // account owns points at it, carrying the shared display name.
-        const nodeUsers: Record<string, { userKey: string; name: string | null }> = {};
+        const nodeUsers: Record<string, { accountId: string; name: string | null }> = {};
         for (const u of users) {
-          const userKey = chatClient.keyHex(u.account_id);
+          const accountId = chatClient.keyHex(u.account_id);
           for (const node of u.nodes) {
             const nodeHex = chatClient.keyHex(node);
-            nodeUsers[nodeHex] = { userKey, name: u.display_name };
+            nodeUsers[nodeHex] = { accountId, name: u.display_name };
             if (u.display_name) authorNames[nodeHex] = u.display_name;
           }
         }
