@@ -459,6 +459,35 @@ mod tests {
     }
 
     #[test]
+    fn noble_v2_signature_verifies_under_the_chain_ecdsa() {
+        // A FIXED @noble/curves v2 vector — p256.sign(payload, sk, {prehash:true,
+        // lowS:true, format:"compact"}), the phone page's exact call. Prove its
+        // raw 64-byte R‖S over the payload verifies under the p256 crate's
+        // ECDSA-P256-SHA256 (which `p256_raw_ecdsa_over_the_signing_payload_verifies`
+        // already showed lands as KeyKind::P256). Closes the JS↔Rust loop, so
+        // the pure-JS phone signer is proven end-to-end, not just asserted.
+        use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+        let pk = unhex("02e598dd2b188a4fed92560c4df0da33ef018b00fb3f698f6b786481ff041581b2");
+        let sig = unhex(
+            "e69e6ba950cd41bed5e43d907ef9ed0d32fbf9ca6d9b0f2201f32abb7dff5fc7\
+             07e6edf2fb8906070a6e8d89bbc0992d773b7c0fee689edf2fcb8dde198ceee4",
+        );
+        let payload = unhex("deadbeef010203");
+        let vk = VerifyingKey::from_sec1_bytes(&pk).expect("valid compressed p256 pubkey");
+        let sig = Signature::from_slice(&sig).expect("valid 64-byte sig");
+        assert!(
+            vk.verify(&payload, &sig).is_ok(),
+            "a @noble/curves v2 signature must verify under the chain's ECDSA-P256-SHA256"
+        );
+    }
+
+    #[test]
     fn wellformed_rejects_wrong_lengths() {
         assert!(KeyKind::Ed25519.pubkey_wellformed(&[0u8; 32]));
         assert!(!KeyKind::Ed25519.pubkey_wellformed(&[0u8; 33]));

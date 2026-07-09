@@ -12,6 +12,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
+mod enroll;
 mod forge_git;
 mod huddle;
 mod menu;
@@ -53,6 +54,9 @@ fn main() {
             user_identity::user_sign_possession,
             user_identity::user_sign_add_member,
             user_identity::user_sign_remove_member,
+            enroll::enroll_start,
+            enroll::enroll_poll,
+            enroll::enroll_cancel,
             forge_git::forge_list_repos,
             forge_git::forge_list_branches,
             forge_git::forge_head,
