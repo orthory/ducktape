@@ -2,11 +2,16 @@
 // palette over a connected workspace. With no workspace chosen (the onboarding
 // gate) or mid-join (the waiting room) there is nothing to search, so the bar
 // must not render.
+//
+// The bar's left slot names the window: the active workspace's name when one
+// is connected, the "ducktape" brand wherever none exists (web build, remote
+// node, the gate).
 
 import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DucktapeProvider } from "../store/DucktapeProvider";
+import type { Workspace } from "../../domain/workspace-client";
 import { WindowFrame } from "./WindowFrame";
 
 const invokeMock = vi.hoisted(() => vi.fn());
@@ -66,5 +71,87 @@ describe("window frame search affordance", () => {
     );
 
     await waitFor(() => expect(screen.getByLabelText("Search")).toBeTruthy());
+  });
+});
+
+describe("title bar workspace name", () => {
+  const team: Workspace = {
+    id: "team",
+    name: "Team",
+    chainId: "team#abcd",
+    pubkey: "ab12",
+    founder: true,
+    member: true,
+    ports: { listen: 1, http: 9001, rpc: 3 },
+  };
+
+  const jsonResponse = (body: unknown): Response =>
+    new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+
+  it("shows the active workspace's name once its node is connected", async () => {
+    markTauri();
+    invokeMock.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "workspace_list":
+          return Promise.resolve([team]);
+        case "workspace_active":
+          return Promise.resolve(team);
+        case "workspace_select":
+          return Promise.resolve({ id: "team", httpUrl: "http://127.0.0.1:9001" });
+        default:
+          return Promise.resolve(null);
+      }
+    });
+    // the node answers with the workspace's own identity so the connect sticks.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) =>
+        Promise.resolve(
+          jsonResponse(
+            String(url).endsWith("/v1/status")
+              ? {
+                  version: "0.1.0",
+                  appHash: "aa".repeat(32),
+                  height: 0,
+                  modules: [],
+                  publicKey: "ab12",
+                }
+              : { channels: [] },
+          ),
+        ),
+      ),
+    );
+
+    render(
+      <DucktapeProvider>
+        <WindowFrame>
+          <div />
+        </WindowFrame>
+      </DucktapeProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText("Team")).toBeTruthy());
+    expect(screen.queryByText("ducktape")).toBeNull();
+  });
+
+  it("keeps the brand where no workspace exists (web build)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResponse({ channels: [] }))),
+    );
+
+    render(
+      <DucktapeProvider>
+        <WindowFrame>
+          <div />
+        </WindowFrame>
+      </DucktapeProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByLabelText("Search")).toBeTruthy());
+    expect(screen.getByText("ducktape")).toBeTruthy();
   });
 });
