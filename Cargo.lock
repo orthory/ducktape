@@ -4171,6 +4171,7 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
+ "sha2",
  "statesync",
  "tagging",
  "tasks",

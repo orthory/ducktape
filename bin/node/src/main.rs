@@ -71,6 +71,7 @@ mod first_contact_join;
 mod lobby;
 mod oracle_pool;
 mod relay;
+mod relay_runtime;
 mod replica;
 mod resident_announce;
 mod resident_dispatch;
@@ -1071,6 +1072,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     duckfs_dir: &std::path::Path,
     // see `genesis_host` — the same binding must reach every rebuild path.
     invite_binding: &[u8],
+    blobs: blobstore::BlobHandle,
     attempt: usize,
     chain_id: &str,
 ) -> Result<Host, String> {
@@ -1293,7 +1295,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("automations install: {e}"))?;
 
     let (bytes, root) = snapshot_of("forge").await?;
-    let mut forge = Forge::init("forge", forge_repo.to_path_buf())
+    let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .map_err(|e| format!("forge init: {e}"))?
         .with_chat("chat");
     // set the dual-path branch selector to the SERVED boundary version BEFORE
@@ -6843,6 +6845,7 @@ fn run_node(
                 &forge_repo,
                 &duckfs_dir,
                 &namespace,
+                blobs.clone(),
                 0,
                 &identity_chain_id,
             )
@@ -7515,69 +7518,13 @@ fn run_node(
                     "joining: redemption not landed yet — no state to serve".into()
                 }
             };
-            // relay a caller's op: sign with THIS node's identity (the frame
-            // origin — chat authorship, status.publicKey), bump+persist the seq
-            // BEFORE building the frame (a crash between persist and send costs
-            // one seq number, never a reuse), ship to one current validator
-            // round-robin. Err is immediate — nothing is held on it, and
-            // `relay_round` advances only on an actual send attempt.
-            #[allow(clippy::too_many_arguments)]
-            fn relay_submit_frame<S: P2pSender<PublicKey = ed25519::PublicKey>>(
-                signer: &ed25519::PrivateKey,
-                relay_seq_file: &std::path::Path,
-                relay_seq: &mut u64,
-                relay_round: &mut usize,
-                targets: &[ed25519::PublicKey],
-                relay_tx: &mut S,
-                target: String,
-                payload: Vec<u8>,
-            ) -> Result<node::FrameId, String> {
-                if targets.is_empty() {
-                    return Err("no validator known yet — the manifest poll has not landed".into());
-                }
-                *relay_seq += 1;
-                if let Err(e) = std::fs::write(relay_seq_file, relay_seq.to_string()) {
-                    // persist FAILED before any send: surface it and hold nothing
-                    // (a wedged disk must not silently reuse a seq into the mesh).
-                    return Err(format!("cannot persist the submit seq: {e}"));
-                }
-                let frame = node::encode_frame(signer, *relay_seq, &Msg { target, payload });
-                let id = node::frame_id(&frame);
-                let target_v = targets[*relay_round % targets.len()].clone();
-                *relay_round += 1;
-                let sent = relay_tx.send(
-                    Recipients::One(target_v),
-                    IoBuf::from(relay::encode_msg(&relay::RelayMsg::Submit { frame })),
-                    false,
-                );
-                if sent.is_empty() {
-                    return Err("validator unreachable — retry shortly".into());
-                }
-                Ok(id)
-            }
-            // the caller's held reply for a relayed submit, keyed by the frame's
-            // content address. either surface may hold: the rpc bridge sender or
-            // the app-surface oneshot. swept on the serve-window tick with the
-            // validator's own SUBMIT_HOLD budget (the rpc bridge times out at
-            // that same 10s — a sweep race there reads as a stuck node, same as
-            // on a validator).
-            enum RelayHold {
-                Rpc(std::sync::mpsc::Sender<RpcReply>),
-                Http(futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>),
-            }
-            let mut pending_relayed: std::collections::HashMap<
-                node::FrameId,
-                (RelayHold, std::time::Instant),
-            > = std::collections::HashMap::new();
-            let mut relay_round = 0usize;
-            // this origin's next frame seq, persisted so restarts keep climbing
-            // (a lost file restarts at 0 — kernel-safe: distinct digests both
-            // apply; per-origin nonces are the documented roadmap item).
-            let relay_seq_file = storage_for_sync.join("relay-submit-seq");
-            let mut relay_seq: u64 = std::fs::read_to_string(&relay_seq_file)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0);
+            // The relay runtime owns caller holds, Forge pack fanout, and the
+            // persisted resident sequence. This loop only supplies current
+            // validator targets and consumes unclaimed pump replies.
+            let mut resident_relay = relay_runtime::ResidentRelay::new(
+                storage_for_sync.join("relay-submit-seq"),
+                blobs.clone(),
+            );
             // bridge the relay lane ONCE, before the park loop: the serve
             // window's select is torn down every 2s tick, and dropping the p2p
             // receiver's actor-backed `recv()` mid-flight could eat a delivered
@@ -7683,31 +7630,18 @@ fn run_node(
                                             RpcReply::err(not_serving(resident_standing))
                                         } else {
                                             match unhex(&payload_hex) {
-                                                Ok(payload) => match relay_submit_frame(
+                                                Ok(payload) => match resident_relay.submit(
                                                     &signer,
-                                                    &relay_seq_file,
-                                                    &mut relay_seq,
-                                                    &mut relay_round,
                                                     &announce_targets,
                                                     &mut relay_tx,
                                                     target,
                                                     payload,
+                                                    relay_runtime::ResidentHold::Rpc(reply.clone()),
                                                 ) {
-                                                    Ok(id) => {
-                                                        pending_relayed.insert(
-                                                            id,
-                                                            (
-                                                                RelayHold::Rpc(reply.clone()),
-                                                                std::time::Instant::now()
-                                                                    + SUBMIT_HOLD,
-                                                            ),
-                                                        );
-                                                        // held — answered by the relay
-                                                        // Reply or the sweep; skip the
-                                                        // shared tail send below.
+                                                    Ok(_) => {
                                                         continue;
                                                     }
-                                                    Err(e) => RpcReply::err(e),
+                                                    Err((_hold, e)) => RpcReply::err(e),
                                                 },
                                                 Err(e) => {
                                                     RpcReply::err(format!("bad payload_hex: {e}"))
@@ -7786,33 +7720,16 @@ fn run_node(
                                             let _ =
                                                 reply.send(Err(not_serving(resident_standing)));
                                         } else {
-                                            match relay_submit_frame(
+                                            match resident_relay.submit(
                                                 &signer,
-                                                &relay_seq_file,
-                                                &mut relay_seq,
-                                                &mut relay_round,
                                                 &announce_targets,
                                                 &mut relay_tx,
                                                 target,
                                                 payload,
+                                                relay_runtime::ResidentHold::Http(reply),
                                             ) {
-                                                // move the oneshot into the hold on
-                                                // success, use it for the error on
-                                                // failure — mutually exclusive, so one
-                                                // reply is guaranteed on every path.
-                                                Ok(id) => {
-                                                    pending_relayed.insert(
-                                                        id,
-                                                        (
-                                                            RelayHold::Http(reply),
-                                                            std::time::Instant::now()
-                                                                + SUBMIT_HOLD,
-                                                        ),
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    let _ = reply.send(Err(e));
-                                                }
+                                                Ok(_) => {}
+                                                Err((hold, e)) => hold.fail(e),
                                             }
                                         }
                                     }
@@ -7867,79 +7784,43 @@ fn run_node(
                             // to the held caller by frame id and release the reply.
                             // an unknown id (already swept, or a stray) drops.
                             answer = relay_ingress.next() => {
-                                let Some((_peer, bytes)) = answer else { continue };
-                                let Ok(relay::RelayMsg::Reply { frame_id, outcome }) =
-                                    relay::decode_msg(&bytes)
+                                let Some((peer, bytes)) = answer else { continue };
+                                let Ok(msg) = relay::decode_msg(&bytes) else { continue };
+                                let Some((frame_id, outcome)) =
+                                    resident_relay.on_message(peer, msg, &mut relay_tx)
                                 else {
-                                    continue; // junk or a stray Submit at a resident — drop.
-                                };
-                                let Some((hold, _)) = pending_relayed.remove(&frame_id) else {
-                                    // not a held caller reply: maybe one of the
-                                    // resident-tier pumps' own frames.
-                                    let applied =
-                                        matches!(outcome, relay::RelayOutcome::Applied { .. });
-                                    if let Some(ok) =
-                                        resident_announcer.on_reply(&frame_id, applied)
-                                    {
-                                        if ok {
-                                            println!(
-                                                "[node {label}] resident: announced \
-                                                 capabilities {:?}",
-                                                resident_announcer.capabilities()
-                                            );
-                                        } else {
-                                            eprintln!(
-                                                "[node {label}] resident: capability announce \
-                                                 did not apply ({outcome:?}) — will retry"
-                                            );
-                                        }
-                                    } else if let Some((saga_id, attempt)) =
-                                        resident_dispatch.on_reply(&frame_id, applied)
-                                    {
-                                        if applied {
-                                            println!(
-                                                "[node {label}] resident: dispatch result for \
-                                                 saga {saga_id} attempt {attempt} applied"
-                                            );
-                                        } else {
-                                            eprintln!(
-                                                "[node {label}] resident: dispatch result for \
-                                                 saga {saga_id} attempt {attempt} did not apply \
-                                                 ({outcome:?}) — will retry while leased"
-                                            );
-                                        }
-                                    }
                                     continue;
                                 };
-                                match (hold, outcome) {
-                                    (RelayHold::Rpc(tx), relay::RelayOutcome::Applied { .. }) => {
-                                        let _ = tx.send(RpcReply::ok());
+                                // Unclaimed final replies belong to the
+                                // resident-owned capability/dispatch pumps.
+                                let applied =
+                                    matches!(outcome, relay::RelayOutcome::Applied { .. });
+                                if let Some(ok) = resident_announcer.on_reply(&frame_id, applied) {
+                                    if ok {
+                                        println!(
+                                            "[node {label}] resident: announced capabilities {:?}",
+                                            resident_announcer.capabilities()
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[node {label}] resident: capability announce did not \
+                                             apply ({outcome:?}) - will retry"
+                                        );
                                     }
-                                    (RelayHold::Rpc(tx), relay::RelayOutcome::Rejected { detail })
-                                    | (
-                                        RelayHold::Rpc(tx),
-                                        relay::RelayOutcome::Refused { detail },
-                                    ) => {
-                                        let _ = tx.send(RpcReply::err(detail));
-                                    }
-                                    (
-                                        RelayHold::Http(tx),
-                                        relay::RelayOutcome::Applied { height, app_hash },
-                                    ) => {
-                                        let _ = tx.send(Ok(noded::BlockSummary {
-                                            height,
-                                            app_hash,
-                                        }));
-                                    }
-                                    (
-                                        RelayHold::Http(tx),
-                                        relay::RelayOutcome::Rejected { detail },
-                                    )
-                                    | (
-                                        RelayHold::Http(tx),
-                                        relay::RelayOutcome::Refused { detail },
-                                    ) => {
-                                        let _ = tx.send(Err(detail));
+                                } else if let Some((saga_id, attempt)) =
+                                    resident_dispatch.on_reply(&frame_id, applied)
+                                {
+                                    if applied {
+                                        println!(
+                                            "[node {label}] resident: dispatch result for saga \
+                                             {saga_id} attempt {attempt} applied"
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[node {label}] resident: dispatch result for saga \
+                                             {saga_id} attempt {attempt} did not apply \
+                                             ({outcome:?}) - will retry while leased"
+                                        );
                                     }
                                 }
                             }
@@ -8383,32 +8264,7 @@ fn run_node(
                         }
                     }
                 }
-                // expire relay holds the mesh never answered. the op may still
-                // land — the app re-queries on block events, same contract as a
-                // validator hold. budget is SUBMIT_HOLD (the rpc bridge caps at
-                // that same 10s, so a sweep race reads as a stuck node either way).
-                if !pending_relayed.is_empty() {
-                    let now = std::time::Instant::now();
-                    let expired: Vec<node::FrameId> = pending_relayed
-                        .iter()
-                        .filter(|(_, (_, deadline))| *deadline <= now)
-                        .map(|(k, _)| *k)
-                        .collect();
-                    for k in expired {
-                        if let Some((hold, _)) = pending_relayed.remove(&k) {
-                            let detail =
-                                "timed out awaiting the relay answer — re-query on the next block";
-                            match hold {
-                                RelayHold::Rpc(tx) => {
-                                    let _ = tx.send(RpcReply::err(detail));
-                                }
-                                RelayHold::Http(tx) => {
-                                    let _ = tx.send(Err(detail.into()));
-                                }
-                            }
-                        }
-                    }
-                }
+                resident_relay.expire(std::time::Instant::now());
                 // a FOLDING replica's window closes per certificate; this
                 // poll is only the fallback DETECTION lane now (standing
                 // detection pre-ascension; promotion, cutover, and revocation
@@ -8581,6 +8437,7 @@ fn run_node(
                                 &forge_repo,
                                 &duckfs_dir,
                                 &namespace,
+                                blobs.clone(),
                                 attempt,
                                 &identity_chain_id,
                             )
@@ -8754,11 +8611,8 @@ fn run_node(
                                 && let Some(msg) =
                                     resident_announcer.maybe_announce(host, now).await
                             {
-                                match relay_submit_frame(
+                                match resident_relay.submit_unheld(
                                     &signer,
-                                    &relay_seq_file,
-                                    &mut relay_seq,
-                                    &mut relay_round,
                                     &announce_targets,
                                     &mut relay_tx,
                                     msg.target,
@@ -8792,11 +8646,8 @@ fn run_node(
                                 resident_dispatch.completed(msg);
                             }
                             for (key, msg) in resident_dispatch.tick(host, now).await {
-                                match relay_submit_frame(
+                                match resident_relay.submit_unheld(
                                     &signer,
-                                    &relay_seq_file,
-                                    &mut relay_seq,
-                                    &mut relay_round,
                                     &announce_targets,
                                     &mut relay_tx,
                                     msg.target,
@@ -8932,6 +8783,7 @@ fn run_node(
                     &forge_repo,
                     &duckfs_dir,
                     &namespace,
+                    blobs.clone(),
                     attempt,
                     &identity_chain_id,
                 )
@@ -9639,6 +9491,7 @@ fn run_node(
                             &forge_repo,
                             &duckfs_dir,
                             &namespace,
+                            blobs.clone(),
                             10_000 + attempts,
                             &identity_chain_id,
                         )
@@ -10269,6 +10122,7 @@ fn run_node(
             node::FrameId,
             (ed25519::PublicKey, std::time::Instant),
         > = std::collections::HashMap::new();
+        let mut validator_relay = relay_runtime::ValidatorRelay::new(blobs.clone());
         let mut last_published: Option<u64> = None;
         // verified-but-unapproved join requests, keyed by joiner key. NODE-
         // LOCAL and in-memory by design: this is a doorbell, not state — the
@@ -10680,6 +10534,7 @@ fn run_node(
                             node::Disposition::Discarded => continue,
                         });
                     }
+                    validator_relay.expire(std::time::Instant::now(), &mut relay_tx);
                     // expire holds the mesh never finalized in time. the op may
                     // still land later — clients re-query on block events.
                     if !pending_submits.is_empty() {
@@ -11625,45 +11480,64 @@ fn run_node(
                 }
                 relayed = relay_ingress.next() => {
                     let Some((peer, bytes)) = relayed else { continue };
-                    let mut send_reply = |frame_id: node::FrameId, outcome: relay::RelayOutcome| {
-                        let msg = relay::RelayMsg::Reply { frame_id, outcome };
-                        let _ = relay_tx.send(
-                            Recipients::One(peer.clone()),
-                            IoBuf::from(relay::encode_msg(&msg)),
-                            false,
-                        );
+                    let Ok(msg) = relay::decode_msg(&bytes) else { continue };
+                    let needs_standing = matches!(
+                        msg,
+                        relay::RelayMsg::BlobOffer { .. } | relay::RelayMsg::Submit { .. }
+                    );
+                    let (members_now, residents_now) = if needs_standing {
+                        (
+                            read_valset_members(node.host()).await,
+                            read_valset_residents(node.host()).await,
+                        )
+                    } else {
+                        (Vec::new(), Vec::new())
                     };
-                    let msg = match relay::decode_msg(&bytes) {
-                        Ok(m) => m,
-                        Err(_) => continue, // junk on the doorbell — drop, lobby idiom.
+                    let Some(action) = validator_relay.on_message(
+                        peer,
+                        msg,
+                        &members_now,
+                        &residents_now,
+                        &mut relay_tx,
+                    ) else {
+                        continue;
                     };
-                    let relay::RelayMsg::Submit { frame } = msg else {
-                        continue; // a Reply at a validator is a protocol confusion — drop.
-                    };
-                    // the door check needs committed state: the resident projection at
-                    // this node's latest boundary. the frame signature and the ORIGIN's
-                    // standing ride inside — the sending peer is not consulted (residents
-                    // speak from the shared, invite-derivable lobby transport identity).
-                    let residents_now = read_valset_residents(node.host()).await;
-                    let frame_id = match relay::verify_relay_submit(&frame, &residents_now) {
-                        Ok(id) => id,
-                        Err(detail) => {
-                            send_reply(node::frame_id(&frame), relay::RelayOutcome::Refused { detail });
-                            continue;
-                        }
-                    };
-                    match node.submit_frame(frame).await {
-                        Ok(id) => {
-                            debug_assert_eq!(id, frame_id);
-                            pending_relays.insert(
-                                id,
-                                (peer.clone(), std::time::Instant::now() + SUBMIT_HOLD),
-                            );
-                        }
-                        Err(e) => send_reply(
+                    match action {
+                        relay_runtime::ValidatorAction::SubmitResident {
                             frame_id,
-                            relay::RelayOutcome::Refused { detail: format!("submit failed: {e}") },
-                        ),
+                            frame,
+                            peer,
+                        } => match node.submit_frame(frame).await {
+                            Ok(id) => {
+                                debug_assert_eq!(id, frame_id);
+                                pending_relays.insert(
+                                    id,
+                                    (peer, std::time::Instant::now() + SUBMIT_HOLD),
+                                );
+                            }
+                            Err(e) => relay_runtime::send_reply(
+                                &mut relay_tx,
+                                &peer,
+                                frame_id,
+                                relay::RelayOutcome::Refused {
+                                    detail: format!("submit failed: {e}"),
+                                },
+                            ),
+                        },
+                        relay_runtime::ValidatorAction::SubmitLocal {
+                            frame_id,
+                            frame,
+                            reply,
+                            deadline,
+                        } => match node.submit_frame(frame).await {
+                            Ok(id) => {
+                                debug_assert_eq!(id, frame_id);
+                                pending_submits.insert(id, (reply, deadline));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(format!("submit failed: {e}")));
+                            }
+                        },
                     }
                 }
                 cmd = http_ingress.next() => {
@@ -11679,18 +11553,46 @@ fn run_node(
                         noded::NodeCommand::Submit { target, payload, origin: _, reply } => {
                             let seq = next_seq;
                             next_seq += 1;
-                            match node.submit(&signer, seq, Msg { target, payload }).await {
-                                // HOLD the reply: it lands when this frame
-                                // drains at a finalized boundary, so the app's
-                                // follow-up query reads the applied state.
-                                Ok(frame) => {
-                                    pending_submits.insert(
-                                        frame,
-                                        (reply, std::time::Instant::now() + SUBMIT_HOLD),
-                                    );
+                            let frame = node::encode_frame(&signer, seq, &Msg { target, payload });
+                            let peers: Vec<ed25519::PublicKey> =
+                                if relay::required_blob_digest(&frame).is_some() {
+                                    read_valset_members(node.host())
+                                        .await
+                                        .iter()
+                                        .filter_map(|raw| {
+                                            ed25519::PublicKey::decode(raw.as_slice()).ok()
+                                        })
+                                        .filter(|key| key != &signer.public_key())
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+                            match validator_relay.prepare_local(
+                                frame,
+                                reply,
+                                peers,
+                                &mut relay_tx,
+                            ) {
+                                Ok(Some(relay_runtime::ValidatorAction::SubmitLocal {
+                                    frame_id,
+                                    frame,
+                                    reply,
+                                    deadline,
+                                })) => match node.submit_frame(frame).await {
+                                    Ok(id) => {
+                                        debug_assert_eq!(id, frame_id);
+                                        pending_submits.insert(id, (reply, deadline));
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(Err(format!("submit failed: {e}")));
+                                    }
+                                },
+                                Ok(Some(relay_runtime::ValidatorAction::SubmitResident { .. })) => {
+                                    unreachable!("local preparation returns a local action")
                                 }
-                                Err(e) => {
-                                    let _ = reply.send(Err(format!("submit failed: {e}")));
+                                Ok(None) => {}
+                                Err((reply, detail)) => {
+                                    let _ = reply.send(Err(detail));
                                 }
                             }
                         }

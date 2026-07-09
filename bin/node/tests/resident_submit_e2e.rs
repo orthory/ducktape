@@ -10,13 +10,15 @@
 
 mod common;
 
+use std::path::Path;
+use std::process::{Command, Output};
 use std::time::Duration;
 
 use chat::{
     AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg,
     encode_query,
 };
-use common::{NetworkShapeCluster, poll_until, serial};
+use common::{Cluster, NetworkShapeCluster, poll_until, serial};
 
 /// generous like the sibling live-admission legs: standing → follow-arm sync →
 /// first pre-synced boundary is several blocks of slack.
@@ -28,7 +30,10 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("resident-submit");
-    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
@@ -139,7 +144,66 @@ fn resident_posts_to_chat_with_its_own_authorship() {
         "authorship is the resident's key, not the injecting validator's"
     );
 
-    // (4) NO AUTHORITY ESCALATION: a member-gated governance op from the
+    // (4) A stock Git push to the resident carries an out-of-consensus pack
+    //     beside the signed Forge frame. The validator must have that pack
+    //     before consensus accepts the ref update, otherwise its ref is born
+    //     without the objects and checkpoint capture cannot walk the closure.
+    let source = tempfile::tempdir().expect("git source dir");
+    git_ok(source.path(), &["init"]);
+    std::fs::create_dir(source.path().join("src")).expect("create source directory");
+    std::fs::write(
+        source.path().join("src/lib.rs"),
+        "pub fn actual_source() -> &'static str { \"visible\" }\n",
+    )
+    .expect("write source file");
+    git_ok(source.path(), &["add", "src/lib.rs"]);
+    git_ok(source.path(), &["commit", "-m", "add source"]);
+    let pushed_head = git_stdout(source.path(), &["rev-parse", "HEAD"]);
+    let resident_url = format!(
+        "http://127.0.0.1:{}/forge/resident-source",
+        cluster.http_ports[1]
+    );
+    git_ok(source.path(), &["remote", "add", "resident", &resident_url]);
+    git_ok(source.path(), &["push", "resident", "main"]);
+
+    for (idx, role) in [(0, "validator"), (1, "resident")] {
+        let head = poll_until(
+            &format!("the Forge head to finalize on the {role}"),
+            CONVERGE,
+            || {
+                let raw = cluster.query(
+                    idx,
+                    "forge",
+                    &forge::encode_query(&forge::ForgeQuery::HeadOf {
+                        repo: "resident-source".into(),
+                    }),
+                )?;
+                match forge::decode_reply(&raw).ok()? {
+                    forge::ForgeReply::Head(Some(head)) if head == pushed_head => Some(head),
+                    _ => None,
+                }
+            },
+        );
+        assert_eq!(head, pushed_head, "{role} must commit the pushed head");
+
+        let checkout = tempfile::tempdir().expect("git checkout parent");
+        let destination = checkout.path().join(role);
+        let url = format!(
+            "http://127.0.0.1:{}/forge/resident-source",
+            cluster.http_ports[idx]
+        );
+        git_ok(
+            checkout.path(),
+            &["clone", "--quiet", &url, destination.to_str().unwrap()],
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("src/lib.rs")).unwrap(),
+            "pub fn actual_source() -> &'static str { \"visible\" }\n",
+            "{role} must serve the actual Git objects, not only the ref"
+        );
+    }
+
+    // (5) NO AUTHORITY ESCALATION: a member-gated governance op from the
     //     resident finalizes Rejected (deterministic no-op), and the relay
     //     reply says so — the relay grants no membership authority.
     let gov = cluster.rpc(
@@ -172,6 +236,70 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     cluster.kill(0);
 }
 
+#[test]
+fn validator_push_fans_pack_to_every_validator_before_consensus() {
+    let _serial = serial();
+    let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
+    cluster.spawn(0);
+    cluster.spawn(1);
+    cluster.wait_marker(0, "genesis app_hash=", Duration::from_secs(60));
+    cluster.wait_marker(1, "genesis app_hash=", Duration::from_secs(60));
+    cluster.wait_marker(0, "converged app_hash=", CONVERGE);
+    cluster.wait_marker(1, "converged app_hash=", CONVERGE);
+
+    let source = tempfile::tempdir().expect("git source dir");
+    git_ok(source.path(), &["init"]);
+    std::fs::write(
+        source.path().join("validator.rs"),
+        "pub const SOURCE: bool = true;\n",
+    )
+    .expect("write source file");
+    git_ok(source.path(), &["add", "validator.rs"]);
+    git_ok(source.path(), &["commit", "-m", "add validator source"]);
+    let pushed_head = git_stdout(source.path(), &["rev-parse", "HEAD"]);
+    let receiving_validator = format!("{}/forge/validator-source", cluster.http_base(0));
+    git_ok(
+        source.path(),
+        &["remote", "add", "validator", &receiving_validator],
+    );
+    git_ok(source.path(), &["push", "validator", "main"]);
+
+    poll_until(
+        "the peer validator to finalize the pushed Forge head",
+        CONVERGE,
+        || {
+            let raw = cluster.query(
+                1,
+                "forge",
+                &forge::encode_query(&forge::ForgeQuery::HeadOf {
+                    repo: "validator-source".into(),
+                }),
+            )?;
+            matches!(
+                forge::decode_reply(&raw).ok()?,
+                forge::ForgeReply::Head(Some(head)) if head == pushed_head
+            )
+            .then_some(())
+        },
+    );
+
+    let checkout = tempfile::tempdir().expect("git checkout parent");
+    let destination = checkout.path().join("peer-validator");
+    let peer_url = format!("{}/forge/validator-source", cluster.http_base(1));
+    git_ok(
+        checkout.path(),
+        &["clone", "--quiet", &peer_url, destination.to_str().unwrap()],
+    );
+    assert_eq!(
+        std::fs::read_to_string(destination.join("validator.rs")).unwrap(),
+        "pub const SOURCE: bool = true;\n",
+        "a non-receiving validator must possess and serve the pushed objects"
+    );
+
+    cluster.kill(1);
+    cluster.kill(0);
+}
+
 /// an Open-channel post to `general` with a caller-chosen message id.
 fn post(id: &str, text: &str) -> ChatMsg {
     ChatMsg::PostMessage {
@@ -196,4 +324,53 @@ fn governance_probe() -> Vec<u8> {
         },
         voting_period: 1_000,
     })
+}
+
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "-c",
+            "init.defaultBranch=main",
+            "-c",
+            "user.name=Ducktape Test",
+            "-c",
+            "user.email=test@ducktape.local",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args);
+    command
+}
+
+fn git_output(dir: &Path, args: &[&str]) -> Output {
+    git_command(dir, args).output().expect("spawn git")
+}
+
+fn git_ok(dir: &Path, args: &[&str]) {
+    let output = git_output(dir, args);
+    assert!(
+        output.status.success(),
+        "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    let output = git_output(dir, args);
+    assert!(
+        output.status.success(),
+        "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8(output.stdout)
+        .expect("git stdout is utf-8")
+        .trim()
+        .to_string()
 }
