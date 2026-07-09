@@ -45,6 +45,8 @@ tasks = { workspace = true }
 vaults = { workspace = true }
 profiles = { workspace = true }
 identity = { workspace = true }
+duckdns = { workspace = true }
+duckdns-client = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
@@ -78,6 +80,7 @@ data-plane = { workspace = true }
 overlay-net = { workspace = true }
 futures = "0.3"
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 # compact, url-safe text encoding for the invite blob (replaces hex-of-toml).
 base64 = "0.22"
 # the http/ws app surface, shared with the embedded daemon: NodeCommand lane,

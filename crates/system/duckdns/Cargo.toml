@@ -1,0 +1,17 @@
+[package]
+name = "duckdns"
+edition.workspace = true
+version.workspace = true
+
+# Ducktape module adapter for duckdns-core. The pure state machine and wire
+# surface live in duckdns-core; this crate maps SDK origins and live sibling
+# module queries into it.
+[dependencies]
+duckdns-core = { workspace = true }
+sdk = { workspace = true }
+identity = { workspace = true }
+valset = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"

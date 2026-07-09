@@ -2261,6 +2261,7 @@ mod tests {
             "saga",
             "profiles",
             "identity",
+            "duckdns",
             "kv",
             "valset",
             "governance",

@@ -63,6 +63,7 @@ use axum::{Json, Router};
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
+use duckdns::DuckDns;
 use tagging::TaggingModule;
 use files::Files;
 use forge::Forge;
@@ -89,7 +90,7 @@ use tasks::Tasks;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 15] = [
+const MODULE_IDS: [&str; 16] = [
     "chat",
     "saga",
     "dispatch",
@@ -105,6 +106,7 @@ const MODULE_IDS: [&str; 15] = [
     "files",
     "profiles",
     "identity",
+    "duckdns",
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 const PEER_ORIGIN: &[u8] = b"peer";
@@ -399,6 +401,8 @@ fn run_sim(
         // the deterministic user->nodes binding registry — no valset, no chain
         // (the simulator has neither), matching noded's daemon wiring.
         let identity = Identity::new("identity", None, String::new());
+        let duckdns = DuckDns::new("duckdns", "identity", None, "local#00000000")
+            .expect("fixed local DuckDNS chain id");
         let host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),
@@ -415,6 +419,7 @@ fn run_sim(
             Box::new(files),
             Box::new(profiles),
             Box::new(identity),
+            Box::new(duckdns),
         ])
         .expect("genesis");
 

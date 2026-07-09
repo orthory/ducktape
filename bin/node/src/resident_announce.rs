@@ -22,6 +22,7 @@ use host::Host;
 use sdk::Msg;
 
 use crate::CapabilityAnnouncer;
+use crate::duckdns_announce::DuckDnsAnnouncer;
 
 /// how long a relayed announce may await its consensus fate before the pump
 /// un-latches and re-decides from committed state. comfortably above the
@@ -101,6 +102,63 @@ impl ResidentAnnouncer {
         {
             self.in_flight = None;
             self.announcer.announced = None;
+        }
+    }
+}
+
+/// Resident delivery wrapper for the DuckDNS declarative announcer. It shares
+/// the same relay fate/deadline discipline as capability announcements.
+pub(crate) struct ResidentDuckDnsAnnouncer {
+    announcer: DuckDnsAnnouncer,
+    in_flight: Option<(node::FrameId, Instant)>,
+}
+
+impl ResidentDuckDnsAnnouncer {
+    pub(crate) fn new(me: Vec<u8>, announcements: Vec<duckdns::ServiceAnnouncement>) -> Self {
+        Self {
+            announcer: DuckDnsAnnouncer::new(me, announcements),
+            in_flight: None,
+        }
+    }
+
+    pub(crate) fn announcements(&self) -> &[duckdns::ServiceAnnouncement] {
+        self.announcer.announcements()
+    }
+
+    pub(crate) async fn maybe_announce(&mut self, host: &Host, now: Instant) -> Option<Msg> {
+        self.rearm_if_stale(now);
+        if self.in_flight.is_some() {
+            return None;
+        }
+        self.announcer.maybe_announce(host).await
+    }
+
+    pub(crate) fn sent(&mut self, frame: node::FrameId, now: Instant) {
+        self.in_flight = Some((frame, now + ANNOUNCE_RETRY));
+    }
+
+    pub(crate) fn send_failed(&mut self) {
+        self.in_flight = None;
+        self.announcer.send_failed();
+    }
+
+    pub(crate) fn on_reply(&mut self, frame: &node::FrameId, applied: bool) -> Option<bool> {
+        match &self.in_flight {
+            Some((id, _)) if id == frame => {}
+            _ => return None,
+        }
+        self.in_flight = None;
+        if !applied {
+            self.announcer.send_failed();
+        }
+        Some(applied)
+    }
+
+    fn rearm_if_stale(&mut self, now: Instant) {
+        if let Some((_, deadline)) = &self.in_flight
+            && now >= *deadline
+        {
+            self.send_failed();
         }
     }
 }

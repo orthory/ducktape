@@ -2042,6 +2042,7 @@ dependencies = [
  "commonware-storage",
  "directory",
  "dispatch",
+ "duckdns",
  "files",
  "forge",
  "futures",
@@ -2280,6 +2281,36 @@ name = "dtor-proc-macro"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
+
+[[package]]
+name = "duckdns"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "duckdns-core",
+ "futures",
+ "identity",
+ "sdk",
+ "valset",
+]
+
+[[package]]
+name = "duckdns-client"
+version = "0.1.0"
+dependencies = [
+ "duckdns-core",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "duckdns-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "duckfs-client"
@@ -4366,6 +4397,8 @@ dependencies = [
  "directory",
  "dispatch",
  "dispatch-oracle",
+ "duckdns",
+ "duckdns-client",
  "duckfs-client",
  "duckfs-core",
  "duckfs-disk",
@@ -4400,6 +4433,7 @@ dependencies = [
  "tagging",
  "tasks",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
  "tracing-subscriber 0.3.23",
@@ -4426,6 +4460,7 @@ dependencies = [
  "commonware-runtime",
  "dispatch",
  "dispatch-oracle",
+ "duckdns",
  "duckfs-client",
  "duckfs-core",
  "files",
@@ -6402,6 +6437,7 @@ dependencies = [
  "chat",
  "commonware-runtime",
  "dispatch",
+ "duckdns",
  "files",
  "forge",
  "futures",
