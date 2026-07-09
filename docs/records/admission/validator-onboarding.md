@@ -6,7 +6,7 @@
 > quorum seat (`promote`) remains a deliberate member act. Invites are also
 > tunnel-first — the blob carries the inviter's WireGuard bootstrap, and the
 > join rides the VPN before any p2p. The current recipe lives in
-> [deploy/private-cutover-integration-gap.md](deploy/private-cutover-integration-gap.md);
+> [../../deploy/private-cutover-integration-gap.md](../../deploy/private-cutover-integration-gap.md);
 > the approval mechanics below (`invite-accept`, join-request queues) survive
 > only as the manual fallback for token-less joins.
 

@@ -19,6 +19,6 @@ serde_json = { workspace = true }
 # filesystem-safe (see src/session.rs).
 sha2 = { workspace = true }
 # the capability spec format: executors are described by TOML files (embedded
-# defaults + operator dir), not Rust — see src/spec.rs and docs/capability-spec.md.
+# defaults + operator dir), not Rust — see src/spec.rs and docs/records/specs/capability-spec.md.
 toml = "0.8"
 tokio = { workspace = true, features = ["process", "io-util"] }

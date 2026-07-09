@@ -451,7 +451,7 @@ fn responder_derives_its_own_install_plan_from_validate_upgrade_as() {
 
 // ── the doc-mandated fixed vector ───────────────────────────────────────────
 
-/// docs/wireguard-tunnel-upgrade.md: "Implementations must ship fixed test
+/// docs/records/protocols/wireguard-tunnel-upgrade.md: "Implementations must ship fixed test
 /// vectors for this preimage so that independent nodes produce the same mesh
 /// version from the same admitted set." this pins the v2 preimage (v1 + the
 /// record's `wireguard_public_key`) — an accidental encoding change fails

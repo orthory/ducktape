@@ -57,7 +57,7 @@
 //! re-fires on the next boot — the rebuild is idempotent by re-trigger.
 //!
 //! the full "indexable" contract a per-module mapper must satisfy (fold
-//! rules, view rules, when NOT to index) is `docs/indexable-spec.md`.
+//! rules, view rules, when NOT to index) is `docs/records/specs/indexable-spec.md`.
 
 pub mod search;
 

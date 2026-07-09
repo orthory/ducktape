@@ -1,6 +1,14 @@
+---
+showAskAi: false
+---
+
 # Repository Map
 
+import { WorkspaceMap } from '../../../../components/diagram/WorkspaceMap.client'
+
 수정 전 authoritative surface를 찾기 위한 map이다.
+
+<WorkspaceMap />
 
 ## Kernel
 
@@ -18,7 +26,7 @@
 - `crates/system/valset`: validator membership state.
 - `crates/system/saga`: deterministic continuation state.
 - `crates/system/governance`: valset 위의 validator-set governance.
-- `crates/system/duckfs-client`: OS-side duckfs checkout/commit engine — chunk
+- `crates/duckfs/client`: OS-side duckfs checkout/commit engine — chunk
   hashing, versioned `.duckfs` index, worktree scan/status, change planning, 그리고
   sync `NodeApi` transport(HTTP). consensus path에는 절대 오르지 않는다.
 - wire surface: 각 module의 typed payload와 query shape는 crate root(`src/interface.rs`)에 있다.
@@ -34,7 +42,6 @@
 - `crates/apps/inbox`: per-member notification queue.
 - `crates/apps/automations`: chat hook seam 위의 operator rule.
 - `crates/apps/files`: node-local chunk byte 위의 consensus manifest.
-- `crates/apps/memory`: filesystem 모양의 shared agent workspace.
 - `crates/apps/jobs`: consensus-native work board.
 
 ## Binaries
@@ -42,7 +49,7 @@
 - `bin/node`: p2p validator/mesh node (noded app surface도 함께 제공).
 - `bin/noded`: http/ws app surface 뒤의 single embedded-host daemon.
 - `bin/fs`: `ducktape-fs`, duckfs working-copy CLI — read verb과
-  `crates/system/duckfs-client` 위의 checkout/status/commit/pin loop. `mount`
+  `crates/duckfs/client` 위의 checkout/status/commit/pin loop. `mount`
   verb(FUSE, `src/fuse/`)는 `fuse` cargo feature 뒤에 gate된다 — pinned snapshot
   에서 `NodeApi`로 read-only, `--rw`는 backing checkout 위 — 그래서 default build은
   libfuse/`fuser`를 끌어오지 않는다.

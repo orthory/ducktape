@@ -1,7 +1,21 @@
+---
+showAskAi: false
+---
+
 # State Sync Contract
+
+import { StateSyncFlow } from '../../../../components/diagram/StateSyncFlow.client'
+
+<StateSyncFlow />
 
 State sync must rebuild module state from authenticated commitments rather than
 trusting peer bytes.
+
+Related: [State Sync](/en/human/architecture/state-sync) gives the reader
+overview, [Implementation Status](/en/human/reference/implementation-status)
+lists current proof commands, [Validator Onboarding](/en/human/reference/design-records)
+points to admission records, and [Repository Map](/en/agent/reference/repository-map)
+locates sync surfaces.
 
 ## Trust Anchor
 

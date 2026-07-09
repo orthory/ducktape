@@ -1,3 +1,7 @@
+---
+showAskAi: false
+---
+
 # Design Records
 
 대부분의 독자는 temporary planning file보다 Vocs page에서 시작해야 한다. 아래
@@ -13,12 +17,13 @@
 | Quack packaged modules | `docs/adr/2026-07-07-quack-packaged-modules.mdx` | shareable module, agent, action, harness의 package boundary. |
 | Secure private messaging | `docs/adr/2026-07-06-private-team-messaging.mdx` | deterministic group crypto 전까지 deferred된 accepted direction. |
 | Video calls | `docs/adr/2026-07-06-video-call-module.mdx`, `bin/node/src/voice.rs`, `app/src/console/views/chat/Huddle.tsx` | ADR과 shipped WebSocket bridge, huddle op, video lane, 남은 gap. |
-| Capability specs | `docs/capability-spec.md` | `capability-host`가 읽는 operator-facing executor spec format. |
-| Indexable views | `docs/indexable-spec.md` | search 또는 derived read를 노출하는 module의 materialized-view contract. |
-| Agent collaboration | `docs/agent-collaboration-design.md` | runs, dispatch, saga, no-fail intake의 as-built constraint. |
-| Validator onboarding | `docs/validator-onboarding.md`, `docs/invitation-protocol-deep-dive.md` | 현재 invite/join/admit flow와 이전 invite blob의 historical protocol note. |
-| WireGuard tunnel protocol | `docs/wireguard-tunnel-upgrade.md` | validator-owned tunnel plan의 implemented protocol boundary. |
-| Reachability and private cutover | `docs/sentry-deployment.md`, `docs/deploy/*`, `ops/coordinator/*` | sentry/coordinator entry와 남은 node wiring boundary. |
+| Capability specs | `docs/records/specs/capability-spec.md` | `capability-host`가 읽는 operator-facing executor spec format. |
+| Indexable views | `docs/records/specs/indexable-spec.md` | search 또는 derived read를 노출하는 module의 materialized-view contract. |
+| Agent collaboration | `docs/records/architecture/agent-collaboration-design.md` | runs, dispatch, saga, no-fail intake의 as-built constraint. |
+| Validator onboarding | `docs/records/admission/validator-onboarding.md`, `docs/records/admission/invitation-protocol-deep-dive.md` | 현재 invite/join/admit flow와 이전 invite blob의 historical protocol note. |
+| WireGuard tunnel protocol | `docs/records/protocols/wireguard-tunnel-upgrade.md` | validator-owned tunnel plan의 implemented protocol boundary. |
+| Reachability and private cutover | `docs/deploy/sentry-deployment.md`, `docs/deploy/*`, `ops/coordinator/*` | sentry/coordinator entry와 남은 node wiring boundary. |
+| Use-case research | `docs/records/research/use-case-research.md` | dated market/product research이며 roadmap commitment가 아니다. |
 | Working design/planning records | `docs/superpowers/README.md`, `docs/superpowers/specs/*`, `docs/superpowers/plans/*` | Vocs나 ADR로 아직 접히지 않은 reviewed active spec과 live plan. |
 
 ## Historical Material

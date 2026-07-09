@@ -25,7 +25,7 @@ end-to-end encrypted **without** the coordinator:
 - The **control mesh** is commonware `authenticated::discovery`: a dialer dials
   an address and expects a specific `ed25519` public key; the handshake
   authenticates that key regardless of what network path delivered the bytes
-  (same property that makes the Phase-1 [sentry](../sentry-deployment.md) safe).
+  (same property that makes the Phase-1 [sentry](sentry-deployment.md) safe).
 - The **data tunnel** is validator↔validator **WireGuard**, keyed and encrypted
   between the two validators' own keys.
 
@@ -213,7 +213,7 @@ coordinator. The one caveat is the relay case above: if a **malicious**
 coordinator made itself a peer's underlay endpoint, that tunnel rides *it*, so
 that tunnel does depend on it (and it can drop it) — which is exactly why you
 run coordinators you trust and prefer direct signed endpoints. This is still a
-sharp contrast with an in-path [sentry](../sentry-deployment.md), which is
+sharp contrast with an in-path [sentry](sentry-deployment.md), which is
 *always* in the data path and a single point of failure for the validator it
 fronts: an honest out-of-path coordinator is where the "established connections
 survive; only new ones depend on it" framing holds.

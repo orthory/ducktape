@@ -1,8 +1,24 @@
+---
+showAskAi: false
+---
+
 # Module Model
+
+import { ArchitectureStack } from '../../../../components/diagram/ArchitectureStack.client'
+import { ModuleLifecycle } from '../../../../components/diagram/ModuleLifecycle.client'
 
 A module is an isolated state machine behind a small native Rust contract. The
 pattern borrows the isolation shape of CosmWasm, but the current implementation
 is native Rust rather than Wasm.
+
+<ArchitectureStack />
+
+Related: [Platform Invariants](/en/human/architecture/platform-invariants)
+names the promises, [Consensus and Node](/en/human/architecture/consensus-and-node)
+explains ordered delivery, [State Sync](/en/human/architecture/state-sync)
+covers rebuild surfaces, [Determinism Contract](/en/agent/architecture/determinism-contract)
+is the edit checklist, and [Repository Map](/en/human/reference/repository-map)
+locates crates.
 
 ## Contract
 
@@ -25,6 +41,8 @@ committed state transitions. Ducktape does not currently have runtime
 install/enable/disable rows for modules: every registered genesis module is
 active, and changing the module set is a new genesis or coordinated upgrade
 concern.
+
+<ModuleLifecycle />
 
 The operational lifecycle is:
 

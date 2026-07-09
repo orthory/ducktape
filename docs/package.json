@@ -10,14 +10,16 @@
     "docs:check": "bun scripts/check-docs-structure.mjs && vocs build"
   },
   "dependencies": {
+    "@xyflow/react": "^12.11.2",
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "react-server-dom-webpack": "19.2.7",
     "vite": "8.1.3",
-    "waku": "1.0.0-beta.6",
-    "vocs": "2.3.0"
+    "vocs": "2.3.0",
+    "waku": "1.0.0-beta.6"
   },
   "devDependencies": {
+    "@dagrejs/dagre": "^3.0.0",
     "typescript": "^5.9.3"
   }
 }

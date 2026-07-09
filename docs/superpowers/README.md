@@ -15,7 +15,7 @@ The following files were reviewed and intentionally left pruned:
 
 - `plans/2026-07-04-pluggable-network-entry-phase1-plan.md` — completed sentry
   implementation plan; the maintained operator record is
-  `docs/sentry-deployment.md`.
+  `docs/deploy/sentry-deployment.md`.
 - `plans/2026-07-05-slice2-coordinator-relay.md` — explicitly marked historical;
   the DERP-style coordinator relay was removed.
 - `plans/2026-07-05-slice3-hardening-simnat.md` — explicitly marked historical

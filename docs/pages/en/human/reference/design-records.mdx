@@ -1,3 +1,7 @@
+---
+showAskAi: false
+---
+
 # Design Records
 
 Most readers should start with the Vocs pages, not temporary planning files.
@@ -5,6 +9,12 @@ The files below are the maintained records that still carry decisions,
 protocol boundaries, or operator procedures that are too detailed for the main
 tour. Reviewed active records that have not been folded into these pages yet
 live under `docs/superpowers`.
+
+Related: [Repository Map](/en/human/reference/repository-map) locates source
+surfaces, [Gotchas](/en/human/reference/gotchas) lists recurring traps,
+[agent Design Records](/en/agent/reference/design-records) is the edit-oriented
+twin, [Coordination](/en/human/network/coordination) covers rendezvous records,
+and [Open Work](/en/agent/roadmap/open-work) tracks live gaps.
 
 ## Maintained Records
 
@@ -14,12 +24,13 @@ live under `docs/superpowers`.
 | Quack packaged modules | `docs/adr/2026-07-07-quack-packaged-modules.mdx` | Accepted package boundary for shareable modules, agents, actions, and harnesses. |
 | Secure private messaging | `docs/adr/2026-07-06-private-team-messaging.mdx` | Accepted direction, deliberately deferred until group crypto can be deterministic. |
 | Video calls | `docs/adr/2026-07-06-video-call-module.mdx`, `bin/node/src/voice.rs`, `app/src/console/views/chat/Huddle.tsx` | ADR plus the shipped WebSocket bridge, huddle ops, video lane, and current gaps. |
-| Capability specs | `docs/capability-spec.md` | Operator-facing executor spec format consumed by `capability-host`. |
-| Indexable views | `docs/indexable-spec.md` | Materialized-view contract for modules that expose search or derived reads. |
-| Agent collaboration | `docs/agent-collaboration-design.md` | As-built constraints for runs, dispatch, saga, and no-fail intake. |
-| Validator onboarding | `docs/validator-onboarding.md` and `docs/invitation-protocol-deep-dive.md` | Current invite/join/admit flow plus historical protocol notes for the older invite blob. |
-| WireGuard tunnel protocol | `docs/wireguard-tunnel-upgrade.md` | Implemented protocol boundary for validator-owned tunnel plans. |
-| Reachability and private cutover | `docs/sentry-deployment.md`, `docs/deploy/*`, `ops/coordinator/*` | Maintained operator docs for sentry/coordinator entry and the remaining node wiring boundary. |
+| Capability specs | `docs/records/specs/capability-spec.md` | Operator-facing executor spec format consumed by `capability-host`. |
+| Indexable views | `docs/records/specs/indexable-spec.md` | Materialized-view contract for modules that expose search or derived reads. |
+| Agent collaboration | `docs/records/architecture/agent-collaboration-design.md` | As-built constraints for runs, dispatch, saga, and no-fail intake. |
+| Validator onboarding | `docs/records/admission/validator-onboarding.md` and `docs/records/admission/invitation-protocol-deep-dive.md` | Current invite/join/admit flow plus historical protocol notes for the older invite blob. |
+| WireGuard tunnel protocol | `docs/records/protocols/wireguard-tunnel-upgrade.md` | Implemented protocol boundary for validator-owned tunnel plans. |
+| Reachability and private cutover | `docs/deploy/sentry-deployment.md`, `docs/deploy/*`, `ops/coordinator/*` | Maintained operator docs for sentry/coordinator entry and the remaining node wiring boundary. |
+| Use-case research | `docs/records/research/use-case-research.md` | Dated market/product research synthesis, not a roadmap commitment. |
 | Working design/planning records | `docs/superpowers/README.md`, `docs/superpowers/specs/*`, `docs/superpowers/plans/*` | Reviewed active specs and live plans that are not yet folded into Vocs or ADRs. |
 
 ## Historical Material

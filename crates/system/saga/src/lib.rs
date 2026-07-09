@@ -5,7 +5,7 @@
 //! `directory`'s shape — an in-memory `BTreeMap` with a `pending` overlay
 //! staged during a block and merged at the boundary, and a state-based
 //! `root()` — and implements three of the platform's ordering-contract
-//! promises (docs/agent-collaboration-design.md §2, §4):
+//! promises (docs/records/architecture/agent-collaboration-design.md §2, §4):
 //!
 //! - **P5 — result singularity.** exactly one `OracleResult` transitions a
 //!   given attempt: the `(saga_id, attempt)` pair is the idempotency key, so

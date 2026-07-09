@@ -835,7 +835,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `bin/node/tests/resident_submit_e2e.rs`
-- Modify: `docs/validator-onboarding.md` — one paragraph: resident standing now includes writes (relayed, authorship = the resident's key); reads were already local.
+- Modify: `docs/records/admission/validator-onboarding.md` — one paragraph: resident standing now includes writes (relayed, authorship = the resident's key); reads were already local.
 
 **Interfaces:**
 - Consumes: everything above; `NetworkShapeCluster` (`bin/node/tests/common/mod.rs`); `chat::interface` (dependency of the `ducktape-node` bin — reuse via `chat::…` path used by main.rs; if the test needs it in dev-dependencies, add `chat = { path = "../../crates/apps/chat" }` to `bin/node/Cargo.toml` `[dev-dependencies]`).
@@ -1003,12 +1003,12 @@ Expected before Tasks 3–4 land: the parked refusal passes, the resident submit
 Run: `cargo test -p ducktape-node --test live_admission_e2e --test join_request_e2e -- --nocapture`
 Expected: pass (serial-gated; run on an otherwise idle machine — parallel cluster e2es flake, dedicated runs are authoritative).
 
-- [ ] **Step 4: Docs touch** — `docs/validator-onboarding.md`: in the resident-standing section, state: residents now WRITE through their own surface (the node signs with its identity key and relays to a validator; authorship is the resident's key; member-gated modules still reject non-member origins deterministically).
+- [ ] **Step 4: Docs touch** — `docs/records/admission/validator-onboarding.md`: in the resident-standing section, state: residents now WRITE through their own surface (the node signs with its identity key and relays to a validator; authorship is the resident's key; member-gated modules still reject non-member origins deterministically).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add bin/node/tests/resident_submit_e2e.rs bin/node/Cargo.toml docs/validator-onboarding.md
+git add bin/node/tests/resident_submit_e2e.rs bin/node/Cargo.toml docs/records/admission/validator-onboarding.md
 git -c commit.gpgsign=false commit -m "test(node): resident submit relay e2e — chat authorship + no escalation
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"

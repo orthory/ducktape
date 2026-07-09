@@ -1,3 +1,7 @@
+---
+showAskAi: false
+---
+
 # Node Upgrades
 
 Shipping a consensus-breaking change — any change to a module `root()`, an
@@ -16,6 +20,11 @@ follow-ups, validators self-signal readiness, and `bin/node upgrade-status`
 queries live state. The authoritative design is
 this page plus `skills/upgrade/SKILL.md`. Do not present this procedure as
 available on a network whose binaries predate the `upgrade` module.
+
+Related: [human node upgrades](/en/human/network/node-upgrades) explains the
+policy for operators, [State Sync Contract](/en/agent/architecture/state-sync-contract)
+and [State Sync](/en/human/architecture/state-sync) cover replay/join safety,
+and [Open Work](/en/agent/roadmap/open-work) tracks the remaining edges.
 
 ## Invariants You MUST Preserve
 
@@ -209,5 +218,5 @@ Docs-only edits to this page verify with:
 ```sh
 cd docs
 bun run docs:check
-git diff --check origin/main...HEAD
+git diff --check origin/dev...HEAD
 ```

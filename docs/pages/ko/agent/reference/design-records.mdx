@@ -1,3 +1,7 @@
+---
+showAskAi: false
+---
+
 # Design Records
 
 non-page doc을 읽을지, 수정할지, prune할지 판단하기 위한 page다. 유지되는 reader
@@ -11,13 +15,14 @@ execution plan을 위한 위치다.
 |---|---|
 | node upgrade를 실행하거나 수정 | [Node Upgrades](/ko/agent/network/node-upgrades), [human upgrade overview](/ko/human/network/node-upgrades), `skills/upgrade/SKILL.md`. |
 | package/module sharing 변경 | `docs/adr/2026-07-07-quack-packaged-modules.mdx`. |
-| dispatch, saga, agent run, no-fail intake 변경 | `docs/agent-collaboration-design.md`. |
-| capability provider spec 변경 | `docs/capability-spec.md`, `crates/kernel/capability-host/src/spec.rs`. |
-| QMDB search/index projection 변경 | `docs/indexable-spec.md`, `crates/kernel/indexer/src/lib.rs`. |
-| invite/join/admit 또는 admission state sync 변경 | `docs/validator-onboarding.md`, [State Sync Contract](/ko/agent/architecture/state-sync-contract), `bin/node/tests/invite_e2e.rs`. |
-| WireGuard tunnel plan 변경 | `docs/wireguard-tunnel-upgrade.md`, `crates/system/wireguard-upgrade`. |
-| sentry/coordinator/private cutover 변경 | `docs/sentry-deployment.md`, `docs/deploy/*`, `ops/coordinator/*`. |
+| dispatch, saga, agent run, no-fail intake 변경 | `docs/records/architecture/agent-collaboration-design.md`. |
+| capability provider spec 변경 | `docs/records/specs/capability-spec.md`, `crates/kernel/capability-host/src/spec.rs`. |
+| QMDB search/index projection 변경 | `docs/records/specs/indexable-spec.md`, `crates/kernel/indexer/src/lib.rs`. |
+| invite/join/admit 또는 admission state sync 변경 | `docs/records/admission/validator-onboarding.md`, `docs/records/admission/invitation-protocol-deep-dive.md`, [State Sync Contract](/ko/agent/architecture/state-sync-contract), `bin/node/tests/invite_e2e.rs`. |
+| WireGuard tunnel plan 변경 | `docs/records/protocols/wireguard-tunnel-upgrade.md`, `crates/system/wireguard-upgrade`. |
+| sentry/coordinator/private cutover 변경 | `docs/deploy/sentry-deployment.md`, `docs/deploy/*`, `ops/coordinator/*`. |
 | video huddle 변경 | `docs/adr/2026-07-06-video-call-module.mdx`, `bin/node/src/voice.rs`, `app/src/console/views/chat/Huddle.tsx`. |
+| dated use-case research 확인 | `docs/records/research/use-case-research.md`, roadmap commitment가 아닌 dated market/product research. |
 | working design/planning record audit | `docs/superpowers/README.md`, 그다음 관련 `docs/superpowers/specs/*` 또는 `docs/superpowers/plans/*` file. |
 
 ## Pruning Test

@@ -25,6 +25,8 @@ content is intentionally reader-specific.
   build, and index it.
 - Put accepted decision records under `docs/adr` when the decision boundary
   should outlive an implementation branch.
+- Put maintained non-page records that are not ADRs or operator runbooks under
+  `docs/records`; keep them listed from the `reference/design-records` pages.
 - Keep operator runbooks as standalone Markdown only when an operator still
   executes them directly.
 - Keep `docs/superpowers` small and reviewed: active design records, approved

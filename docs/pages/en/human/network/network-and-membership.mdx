@@ -1,7 +1,22 @@
+---
+showAskAi: false
+---
+
 # Network and Membership
+
+import { NetworkTopology } from '../../../../components/diagram/NetworkTopology.client'
+
+<NetworkTopology />
 
 The repository currently has three separate network and membership concerns:
 message propagation, ordered consensus delivery, and validator membership state.
+
+Related: [Coordination](/en/human/network/coordination) covers rendezvous and
+reachability, [Consensus and Node](/en/human/architecture/consensus-and-node)
+explains ordered delivery, [Node Upgrades](/en/human/network/node-upgrades)
+covers height-gated activation, [Implementation Status](/en/human/reference/implementation-status)
+tracks built surfaces, and [agent Validator Operations](/en/agent/network/validator-operations)
+is the edit-oriented twin.
 
 ## Propagation Seam
 
@@ -29,11 +44,12 @@ transport happened to deliver.
 messages and queries through valset's crate-root wire types, and the demo applies a join
 message carrying an ed25519 public key.
 
-The remaining membership work is live orchestration around consensus epochs: the
-repo has tests for respawn behavior and a tested deterministic cutover state
-machine (`ValsetOrchestrator`) that watches finalized valset state and decides
-the cutover point, but the live loop that acts on it — stopping old orderers,
-starting the new epoch, aligning transport readiness — is still future work.
+Live orchestration around consensus epochs is implemented. `bin/node` feeds
+finalized validator and resident membership into `ValsetOrchestrator`, schedules
+the cutover, retargets mesh, state-sync, and reachability, then respawns the
+ordered node over the new epoch's validator set. Remaining gaps are narrower:
+demoted validators currently halt instead of degrading to resident/sync service,
+and pre-recovery storage directories fail loudly rather than migrating.
 
 ## Identity Above Membership
 
