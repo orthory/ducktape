@@ -29,6 +29,8 @@ import {
 } from "../../domain/call-session";
 import type { CallSession, CallEvent } from "../../domain/call-session";
 import { probeVideoCapability } from "../../domain/video-capability";
+import { enumerateHuddleDevices, saveDevicePrefs } from "../../domain/media-devices";
+import type { DevicePrefs } from "../../domain/media-devices";
 import { huddleRecipients } from "../../domain/voice-session";
 import { keyBytes, keyHex } from "../../domain/chat-client";
 import * as valsetClient from "../../domain/valset-client";
@@ -140,6 +142,12 @@ export interface ConsoleActions {
    *  `videoCapability.canScreenShare` (VP8 encode + getDisplayMedia) + the video
    *  cap. Enabling swaps the camera off; beacons `sharing` to peers. */
   setScreenShare(on: boolean): void;
+  /** Re-enumerate the mic/camera/speaker options into `deviceOptions` (labels
+   *  appear only after a media grant). Called when the devices menu opens. */
+  refreshDevices(): void;
+  /** Choose input/output devices: persist, apply to the live session, and store
+   *  on `devicePrefs`. A leave/rejoin keeps the selection. */
+  setDevicePrefs(prefs: DevicePrefs): void;
   /** Whether this runtime can do video calls — WebKitGTK can't (no WebCodecs),
    *  its Chromium companion window can. Drives the camera control's enablement. */
   videoSupported(): boolean;
@@ -1285,6 +1293,7 @@ export function createActions({
       // deliberate act.
       voice = createCallSession(onCallEvent);
       voice.setMuted(true);
+      voice.setDevices(getState().devicePrefs); // start() reads these at acquire
       // a retry from the popped window must keep it popped — spread, don't reset;
       // camera/peer state resets since this is a fresh session.
       update((prev) => ({
@@ -1354,6 +1363,18 @@ export function createActions({
       voice.setScreenShare(on);
       // Camera XOR screen: enabling the share swaps the camera off.
       update((prev) => ({ voice: { ...prev.voice, sharing: on, ...(on ? { cameraOn: false } : {}) } }));
+    },
+
+    refreshDevices: () => {
+      void enumerateHuddleDevices()
+        .then((deviceOptions) => patch({ deviceOptions }))
+        .catch(() => {});
+    },
+
+    setDevicePrefs: (prefs) => {
+      saveDevicePrefs(prefs);
+      voice?.setDevices(prefs);
+      patch({ devicePrefs: prefs });
     },
 
     videoSupported: () => getState().videoCapability.canEncode,
