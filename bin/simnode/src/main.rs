@@ -389,8 +389,7 @@ fn run_sim(
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-        )
-        .with_files("files");
+        );
         let pages = Pages::init(context.child("pages"), "pages").await;
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
             .expect("forge init")

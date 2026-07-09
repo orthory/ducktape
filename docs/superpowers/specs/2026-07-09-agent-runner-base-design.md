@@ -1,19 +1,31 @@
 # Agent runner base v1
 
 **Date:** 2026-07-09
-**Status:** approved for implementation
+**Status:** approved for implementation — landing in the phased order of ADR
+`2026-07-09-deterministic-agent-runtime` (accept → wrapper → flip).
+
+> **Rollout status.** This document describes the TARGET `RunEnvelope v3` /
+> `RunnerResult v1` contract. The base slice that has landed is the
+> **acceptance** half only: the host worker (`dispatch-oracle`) parses and
+> validates v3 and marks such runs portable, and `runs` unwraps a
+> `RunnerResult`. The composer stays on **v2** and the host does NOT activate a
+> workspace mount yet — composing v3 is a consensus flag-day (ADR M1) and
+> pointing a run's cwd at the constant `/workspace` is unwritable on a non-root
+> node, so the flip waits for the provisioning wrapper and a coordinated
+> upgrade (ADR ROL/M2, W1). Sections below marked _(deferred: flip)_ describe
+> the post-wrapper state.
 
 ## Summary
 
 Agent runs use Ducktape's existing dispatch, capability, and duckfs systems as a
 portable execution layer. This design does not add a new consensus module.
-Instead, `runs` commits a `RunEnvelope v3` dispatch payload that includes the
-agent prompt hash, transcript, base tool manifest, and duckfs workspace
-coordinates. The host runner executes against that workspace and returns a
-`RunnerResult v1` receipt whose `response_text` is validated by `runs` as the
-existing `AgentResponse`.
+Instead, `runs` composes a `RunEnvelope` dispatch payload that includes the
+agent prompt hash, transcript, and — once the flip lands — a base tool manifest
+and duckfs workspace coordinates. The host runner executes against that
+workspace and returns a `RunnerResult v1` receipt whose `response_text` is
+validated by `runs` as the existing `AgentResponse`.
 
-Native provider sessions remain valid for legacy v2 payloads, but v3 is
+Native provider sessions remain valid for legacy v2 payloads; a v3 run is
 portable by construction: the resumable state is the duckfs snapshot and the
 conversation transcript, not an executor-local session id.
 
@@ -28,10 +40,10 @@ conversation transcript, not an executor-local session id.
 | `dispatch` | Consensus task plane that stores full payload/result bytes and delivers outcomes. |
 | `saga` | Worker-request, retry, and oracle-result plumbing already used by dispatch. |
 | `capability` | Consensus registry of which nodes can serve which runner tags. |
-| `capability-host` | Host-local executor surface; v3 runs override cwd/env/PATH and disable native sessions. |
-| `dispatch-oracle` | Host worker that parses v2/v3 envelopes and submits provider output as saga results. |
+| `capability-host` | Host-local executor surface; disables native sessions for portable runs and resolves the cwd to a per-run writable path (overriding cwd/env/PATH from a materialized mount is _deferred: flip_). |
+| `dispatch-oracle` | Host worker that parses v2/v3 envelopes, marks v3 runs portable, and submits provider output as saga results. |
 | `agent` | Registry for agent id, capability tag, prompt hash, and allowed actions. |
-| `runs` | Composes v3 payloads and validates `RunnerResult v1.response_text`. |
+| `runs` | Composes the payload (v2 today) and validates `RunnerResult v1.response_text`. |
 
 | Tool class | v1 role |
 | --- | --- |
@@ -39,11 +51,12 @@ conversation transcript, not an executor-local session id.
 | Write path | Only edits inside the checked-out duckfs workspace; the runner commits the final workspace result. |
 | Not base v1 | Vaults, governance, upgrade, valset, identity mutation, automations mutation, inbox mutation, huddle/media, overlay networking, and forge push/review writes. |
 
-## `RunEnvelope v3`
+## `RunEnvelope v3` _(worker-accepted; composer-emitted only after the flip)_
 
-`runs` serializes fields in a fixed struct order. Existing v2 fields remain:
+`runs` serializes fields in a fixed struct order. The v2 fields the composer
+emits today are:
 
-- `ducktape_run: 3`
+- `ducktape_run: 2` (bumped to `3` at the coordinated flip)
 - `agent_id`
 - `prompt_hash`
 - `thread_key`
@@ -51,12 +64,15 @@ conversation transcript, not an executor-local session id.
 - `contract`
 - `conversation`
 
-v3 adds:
+v3 adds (understood by the worker now; emitted at the flip):
 
-- `workspace`: `source_prefix`, `source_snapshot`, and `mount_path`
-  (`/workspace` by default). When `runs` is wired to the `files` module, it pins
-  the current duckfs head as `source_snapshot`; harnesses without `files` commit
-  `null` explicitly.
+- `workspace`: `source_prefix`, `source_snapshot`, and `mount_path`. The mount
+  path is a host materialization detail, not a consensus-fixed constant — the
+  provisioning wrapper chooses a per-run writable path relocated out of the
+  node's sensitive data tree (ADR W1/D7); a constant `/workspace` is exactly the
+  unwritable cwd this ordering avoids. `source_snapshot` pins the current duckfs
+  head when `runs` is wired to the `files` module (wiring lands with the flip);
+  harnesses without `files` commit `null` explicitly.
 - `base_tools`: deterministic manifest of enabled host bindings:
   `ducktape-files@1`, `ducktape-index@1`, and `ducktape-chain@1`, all exposed as
   CLI-style tools.
@@ -82,12 +98,18 @@ accepted for v2 and in-flight runs.
 `capability-host::RunContext` carries portable fields in addition to
 `agent_id` and `thread_key`:
 
-- `workdir_override`: the mounted duckfs workspace path.
-- `env`: run-scoped environment for tool bindings and workspace metadata.
-- `path_entries`: run-scoped `PATH` prefixes.
+- `workdir_override`: the mounted duckfs workspace path _(deferred: flip — set
+  by the provisioning wrapper, not from a consensus mount path)_.
+- `env`: run-scoped environment for tool bindings and workspace metadata
+  _(deferred: flip)_.
+- `path_entries`: run-scoped `PATH` prefixes _(deferred: flip)_.
 - `portable`: disables host-local native session resume/capture.
 
-`dispatch-oracle` sets these fields only for v3. v2 behavior is unchanged.
+For a v3 envelope today, `dispatch-oracle` validates the portable block and sets
+only `portable`; it does not force `workdir_override`/`env`/`PATH` from the
+envelope. The host resolves the cwd through its own scratch/persistent policy,
+always to a per-run writable path with a scratch fallback (`ensure_writable_workdir`),
+so an unwritable preferred path never fails the run. v2 behavior is unchanged.
 
 ## Tool binding contract
 
@@ -104,7 +126,15 @@ workspace and committing the workspace as the runner result.
 
 ## Open follow-up
 
-The committed envelope and host context are in place. The remaining runner
-piece is the host-side wrapper that creates a managed duckfs workspace before
-provider execution, commits it after execution, and emits the populated
-`workspace_receipt`.
+The worker-side acceptance (v3 parse/validate + portable flag), the host
+`RunContext` fields, the `RunnerResult` unwrap, and the W1 writable-workdir
+fallback are in place. The remaining pieces, in the ADR's order:
+
+1. **Wrapper.** The host-side provisioning wrapper that relocates the agent
+   workspace root out of the sensitive data tree (D7), creates a managed duckfs
+   checkout before provider execution, executes in that per-run writable mount,
+   commits it after execution, and emits the populated `workspace_receipt`.
+2. **Flip.** A coordinated (flag-day) upgrade that bumps the composer to emit
+   `RunEnvelope v3` and activates portable execution (the wrapper sets
+   `workdir_override`/`env`/`PATH`). Never flip the composer ahead of the
+   wrapper (ADR M1/M2).

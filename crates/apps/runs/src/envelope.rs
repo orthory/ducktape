@@ -20,13 +20,18 @@ use crate::hex;
 
 /// the envelope marker the host worker routes on. bumping it is a payload
 /// flag day for the worker, not for consensus state.
-pub const RUN_ENVELOPE_VERSION: u32 = 3;
+///
+/// HELD AT 2 on purpose: the portable `v3` shape (workspace mounts + base-tool
+/// manifest) is a consensus flag-day (M1) and MUST NOT be composed until the
+/// provisioning wrapper exists and a coordinated upgrade flips it (ADR
+/// `2026-07-09-deterministic-agent-runtime`, ROL/M2). The worker already
+/// *accepts* v3 (see `dispatch-oracle`) so that flip lands on ready nodes.
+pub const RUN_ENVELOPE_VERSION: u32 = 2;
 
-/// the result wrapper v3 providers return. the dispatch plane stores the full
-/// bytes; runs unwraps `response_text` deterministically during delivery.
+/// the result-wrapper version a portable (`v3`) provider returns. carried here
+/// so the `runs` delivery path can unwrap `response_text` from a runner result
+/// while the composer stays on v2 — a forward-compatible accept, no flip.
 pub(crate) const RUNNER_RESULT_VERSION: u32 = 1;
-
-const WORKSPACE_MOUNT_PATH: &str = "/workspace";
 
 /// generic instructions for an agent without a consensus-resident prompt —
 /// the host uses `instructions` only when `prompt_hash` is null.
@@ -58,38 +63,11 @@ struct RunEnvelope<'a> {
     instructions: &'a str,
     contract: &'a str,
     conversation: String,
-    workspace: WorkspaceEnvelope,
-    base_tools: Vec<BaseToolEnvelope>,
-    result_contract: ResultContractEnvelope,
-}
-
-#[derive(Serialize)]
-struct WorkspaceEnvelope {
-    source_prefix: String,
-    source_snapshot: Option<String>,
-    mount_path: &'static str,
-}
-
-#[derive(Serialize)]
-struct BaseToolEnvelope {
-    name: &'static str,
-    version: &'static str,
-    exposure: &'static str,
-}
-
-#[derive(Serialize)]
-struct ResultContractEnvelope {
-    ducktape_runner_result: u32,
 }
 
 /// serialize one envelope — deterministic: fixed field order (see
 /// [`RunEnvelope`]) and serde_json's canonical string escaping.
-fn envelope(
-    agent: &AgentRecord,
-    thread_key: Option<String>,
-    conversation: String,
-    source_snapshot: Option<String>,
-) -> String {
+fn envelope(agent: &AgentRecord, thread_key: Option<String>, conversation: String) -> String {
     serde_json::to_string(&RunEnvelope {
         ducktape_run: RUN_ENVELOPE_VERSION,
         agent_id: &agent.agent_id,
@@ -98,15 +76,6 @@ fn envelope(
         instructions: DEFAULT_PROMPT,
         contract: STRICT_OUTPUT_INSTRUCTION,
         conversation,
-        workspace: WorkspaceEnvelope {
-            source_prefix: workspace_source_prefix(agent),
-            source_snapshot,
-            mount_path: WORKSPACE_MOUNT_PATH,
-        },
-        base_tools: base_tools(),
-        result_contract: ResultContractEnvelope {
-            ducktape_runner_result: RUNNER_RESULT_VERSION,
-        },
     })
     .expect("envelope is serializable")
 }
@@ -119,33 +88,8 @@ fn prompt_hash_hex(agent: &AgentRecord) -> Option<String> {
     (agent.prompt_hash.len() == PROMPT_HASH_LEN).then(|| hex(&agent.prompt_hash))
 }
 
-fn workspace_source_prefix(agent: &AgentRecord) -> String {
-    format!("/shared/agent-workspaces/{}", agent.agent_id)
-}
-
-fn base_tools() -> Vec<BaseToolEnvelope> {
-    vec![
-        BaseToolEnvelope {
-            name: "ducktape-files",
-            version: "1",
-            exposure: "cli",
-        },
-        BaseToolEnvelope {
-            name: "ducktape-index",
-            version: "1",
-            exposure: "cli",
-        },
-        BaseToolEnvelope {
-            name: "ducktape-chain",
-            version: "1",
-            exposure: "cli",
-        },
-    ]
-}
-
 /// compose a chat run's payload: the envelope around the rendered transcript
 /// window ending at the anchor.
-#[cfg(test)]
 pub(crate) fn render_payload(
     module_id: &str,
     agent: &AgentRecord,
@@ -154,55 +98,23 @@ pub(crate) fn render_payload(
     thread_root: Option<u64>,
     transcript: &[MessageView],
 ) -> String {
-    render_payload_with_workspace_snapshot(
-        module_id,
-        agent,
-        channel_id,
-        anchor_seq,
-        thread_root,
-        transcript,
-        None,
-    )
-}
-
-pub(crate) fn render_payload_with_workspace_snapshot(
-    module_id: &str,
-    agent: &AgentRecord,
-    channel_id: &str,
-    anchor_seq: u64,
-    thread_root: Option<u64>,
-    transcript: &[MessageView],
-    source_snapshot: Option<String>,
-) -> String {
     let thread_key = format!("{channel_id}#{}", thread_root.unwrap_or(anchor_seq));
     envelope(
         agent,
         Some(thread_key),
         render_conversation(module_id, &agent.agent_id, transcript),
-        source_snapshot,
     )
 }
 
 /// compose a job run's payload: same envelope, no thread key, and the
 /// conversation is the job's coordinates plus its FULL submitted spec.
-#[cfg(test)]
 pub(crate) fn render_job_payload(agent: &AgentRecord, job_id: &str, spec: &str) -> String {
-    render_job_payload_with_workspace_snapshot(agent, job_id, spec, None)
-}
-
-pub(crate) fn render_job_payload_with_workspace_snapshot(
-    agent: &AgentRecord,
-    job_id: &str,
-    spec: &str,
-    source_snapshot: Option<String>,
-) -> String {
     envelope(
         agent,
         None,
         format!(
             "Job {job_id} — chat replies are not delivered for job runs; respond with actions only.\n\nJob spec:\n{spec}"
         ),
-        source_snapshot,
     )
 }
 
@@ -341,39 +253,7 @@ mod tests {
 
         // field order is part of the committed bytes — assert the layout, not
         // just the values.
-        assert!(payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","prompt_hash":"#));
-    }
-
-    #[test]
-    fn a_v3_envelope_commits_workspace_tools_and_result_contract() {
-        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
-        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
-        let payload = render_payload("runs", &agent, "general", 1, None, &transcript);
-        let v = parse(&payload);
-
-        assert_eq!(v["ducktape_run"], 3);
-        assert_eq!(
-            v["workspace"]["source_prefix"],
-            "/shared/agent-workspaces/bot"
-        );
-        assert!(
-            v["workspace"]["source_snapshot"].is_null(),
-            "a run without files-module wiring still commits an explicit null snapshot"
-        );
-        assert_eq!(v["workspace"]["mount_path"], "/workspace");
-        assert_eq!(
-            v["base_tools"],
-            serde_json::json!([
-                {"name":"ducktape-files","version":"1","exposure":"cli"},
-                {"name":"ducktape-index","version":"1","exposure":"cli"},
-                {"name":"ducktape-chain","version":"1","exposure":"cli"}
-            ])
-        );
-        assert_eq!(v["result_contract"]["ducktape_runner_result"], 1);
-        assert!(
-            payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","prompt_hash":"#),
-            "version stays first in the committed byte layout"
-        );
+        assert!(payload.starts_with(r#"{"ducktape_run":2,"agent_id":"bot","prompt_hash":"#));
     }
 
     #[test]

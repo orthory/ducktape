@@ -773,19 +773,16 @@ async fn genesis_host(
         Box::new(AgentModule::new("agent", "saga", Some("runs".into()))),
         // the collaboration loop's actor: watches, engagement, composition,
         // dispatch, and response delivery — reads the registry by query.
-        Box::new(
-            RunsModule::new(
-                "runs",
-                "chat",
-                "saga",
-                "tagging",
-                "dispatch",
-                "agent",
-                Some("tasks".into()),
-                Some("jobs".into()),
-            )
-            .with_files("files"),
-        ),
+        Box::new(RunsModule::new(
+            "runs",
+            "chat",
+            "saga",
+            "tagging",
+            "dispatch",
+            "agent",
+            Some("tasks".into()),
+            Some("jobs".into()),
+        )),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
         // events and emits chat/tasks follow-ups.
@@ -935,8 +932,7 @@ async fn restore_host(
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-    )
-    .with_files("files");
+    );
     let (bytes, root) = snapshot_of("runs")?;
     runs.install(bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
@@ -1253,8 +1249,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-    )
-    .with_files("files");
+    );
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 

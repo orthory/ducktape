@@ -5592,7 +5592,6 @@ dependencies = [
  "chat",
  "commonware-runtime",
  "dispatch",
- "files",
  "futures",
  "host",
  "jobs",

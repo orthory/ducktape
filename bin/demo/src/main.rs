@@ -105,8 +105,7 @@ fn main() {
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-        )
-        .with_files("files");
+        );
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
         let mut host = Host::genesis(vec![
             Box::new(kv),

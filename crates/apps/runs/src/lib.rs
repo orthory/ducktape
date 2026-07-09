@@ -133,9 +133,6 @@ use dispatch::{
     Routing, decode_reply as dispatch_decode_reply, decode_result_event,
     encode_msg as dispatch_encode_msg, encode_query as dispatch_encode_query,
 };
-use files::{
-    FilesQuery, FilesReply, decode_reply as files_decode_reply, encode_query as files_encode_query,
-};
 use jobs::{
     JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_event as jobs_decode_event,
     decode_reply as jobs_decode_reply, encode_msg as jobs_encode_msg,
@@ -228,6 +225,12 @@ const REPLY_KIND_HEADING: &str = "heading";
 const REPLY_KIND_CODE: &str = "code";
 const RUNNER_RESULT_VERSION: u32 = envelope::RUNNER_RESULT_VERSION;
 
+/// the wrapper a portable (`v3`) provider returns instead of the bare response
+/// text: the model prose plus a host-assembled workspace receipt. we unwrap
+/// `response_text` here so the rest of delivery is unchanged; the receipt bytes
+/// stay in dispatch history as the audit lane (ADR RES/R1, R6). LEGACY runs
+/// (today's live v2 composer) return raw text with no wrapper — those pass
+/// through untouched.
 #[derive(Deserialize)]
 struct RunnerResult {
     ducktape_runner_result: u32,
@@ -255,6 +258,12 @@ struct WorkspaceReceipt {
     no_changes: bool,
 }
 
+/// pull the deliverable response text out of a dispatch outcome. a portable
+/// runner returns a [`RunnerResult`] wrapper (marker `ducktape_runner_result`);
+/// a wrapper that claims the marker but cannot be honored (unknown version,
+/// malformed shape) fails the run loudly rather than being delivered as raw
+/// JSON. anything without the marker — every legacy raw-text result — passes
+/// through byte-for-byte via the lossy decode the delivery path always used.
 fn response_text_from_dispatch_bytes(bytes: &[u8]) -> Result<String, String> {
     match serde_json::from_slice::<serde_json::Value>(bytes) {
         Ok(serde_json::Value::Object(map)) if map.contains_key("ducktape_runner_result") => {
@@ -385,8 +394,7 @@ fn normalize_response(mut response: AgentResponse, raw_text: &str, job_run: bool
             .reply_blocks
             .push(paragraph_block(non_empty_text(raw_text)));
     }
-    let bytes =
-        serde_json::to_vec(&to_chat_blocks(&response.reply_blocks)).expect("blocks serialize");
+    let bytes = serde_json::to_vec(&to_chat_blocks(&response.reply_blocks)).expect("blocks serialize");
     if bytes.len() > MAX_REPLY_BLOCKS_BYTES {
         response.reply_blocks = vec![paragraph_block(truncate_utf8(
             &non_empty_text(raw_text),
@@ -724,7 +732,10 @@ fn validate_decoded_pending(dispatch_id: &str, p: &PendingState) -> Result<(), S
     Ok(())
 }
 
-type Committed = (BTreeMap<String, TurnPolicy>, BTreeMap<String, PendingState>);
+type Committed = (
+    BTreeMap<String, TurnPolicy>,
+    BTreeMap<String, PendingState>,
+);
 
 fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     // per-entry minimum sizes: a watch costs its id prefix and a policy
@@ -800,9 +811,6 @@ pub struct RunsModule {
     /// the agent registry — the record book this module reads by query, and
     /// the registry hook's trusted origin.
     agent: ModuleId,
-    /// optional duckfs module wiring: when present, run envelopes pin the
-    /// committed head snapshot as the portable workspace source.
-    files: Option<ModuleId>,
     tasks: Option<ModuleId>,
     jobs: Option<ModuleId>,
     /// committed state — what `root()` and the app-hash commit to.
@@ -864,7 +872,6 @@ impl RunsModule {
             tagging,
             dispatch,
             agent,
-            files: None,
             tasks,
             jobs,
             watches: BTreeMap::new(),
@@ -872,34 +879,6 @@ impl RunsModule {
             pending_watches: BTreeMap::new(),
             pending_overlay: BTreeMap::new(),
         }
-    }
-
-    /// wire the duckfs module used to pin workspace input snapshots into v3
-    /// envelopes. kept as a builder so older tests/genesis snapshots that do
-    /// not install `files` keep their null-snapshot payload behavior.
-    pub fn with_files(mut self, files: impl Into<ModuleId>) -> Self {
-        let files = files.into();
-        let mut ids = BTreeSet::from([
-            self.id.clone(),
-            self.chat.clone(),
-            self.saga.clone(),
-            self.tagging.clone(),
-            self.dispatch.clone(),
-            self.agent.clone(),
-            files.clone(),
-        ]);
-        let mut expected = 7;
-        for module in [&self.tasks, &self.jobs].into_iter().flatten() {
-            ids.insert(module.clone());
-            expected += 1;
-        }
-        assert_eq!(
-            ids.len(),
-            expected,
-            "runs collaborator module ids must be pairwise distinct"
-        );
-        self.files = Some(files);
-        self
     }
 
     // ---- staged-over-committed reads ---------------------------------------
@@ -1099,20 +1078,6 @@ impl RunsModule {
         Ok((thread_root, window))
     }
 
-    async fn duckfs_head_snapshot(&self, ctx: &dyn Ctx) -> Result<Option<String>, String> {
-        let Some(files) = &self.files else {
-            return Ok(None);
-        };
-        let reply = ctx
-            .query(files, &files_encode_query(&FilesQuery::Refs {}))
-            .await
-            .map_err(|e| format!("duckfs refs query failed: {e}"))?;
-        match files_decode_reply(&reply) {
-            Ok(FilesReply::Refs(info)) => Ok(info.head),
-            _ => Err("unexpected duckfs reply for a refs query".into()),
-        }
-    }
-
     // ---- payload preparation (the dispatch plane's composition rule) -----
 
     /// everything a chat run's dispatch needs, prepared read-only: the pinned
@@ -1127,15 +1092,13 @@ impl RunsModule {
         anchor_seq: u64,
     ) -> Result<PreparedDispatch, String> {
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
-        let source_snapshot = self.duckfs_head_snapshot(ctx).await?;
-        let payload = envelope::render_payload_with_workspace_snapshot(
+        let payload = envelope::render_payload(
             &self.id,
             agent,
             channel_id,
             anchor_seq,
             thread_root,
             &transcript,
-            source_snapshot,
         )
         .into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
@@ -1337,20 +1300,7 @@ impl RunsModule {
         // compose BEFORE claiming: a job whose payload cannot be composed
         // (an oversized spec) is left unclaimed on the board, not claimed
         // into a run that could never execute.
-        let source_snapshot = match self.duckfs_head_snapshot(&*ctx).await {
-            Ok(source_snapshot) => source_snapshot,
-            Err(reason) => {
-                self.note(ctx, format!("job run skipped for {run_id}: {reason}"));
-                return Ok(());
-            }
-        };
-        let payload = envelope::render_job_payload_with_workspace_snapshot(
-            &agent,
-            &job_id,
-            &spec,
-            source_snapshot,
-        )
-        .into_bytes();
+        let payload = envelope::render_job_payload(&agent, &job_id, &spec).into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
             self.note(
                 ctx,
@@ -1471,10 +1421,7 @@ impl RunsModule {
         let engaged = match self.engaged_agents(&*ctx, &policy, &tags, seq).await {
             Ok(engaged) => engaged,
             Err(reason) => {
-                self.note(
-                    ctx,
-                    format!("engagement skipped for {channel_id}: {reason}"),
-                );
+                self.note(ctx, format!("engagement skipped for {channel_id}: {reason}"));
                 return Ok(());
             }
         };
@@ -1499,7 +1446,10 @@ impl RunsModule {
                     continue;
                 }
             };
-            match self.prepare_dispatch(&*ctx, &agent, &channel_id, seq).await {
+            match self
+                .prepare_dispatch(&*ctx, &agent, &channel_id, seq)
+                .await
+            {
                 Ok(prepared) => self.stage_dispatch_run(
                     ctx,
                     &run_id,
@@ -1549,44 +1499,40 @@ impl RunsModule {
         self.pending_overlay.insert(dispatch_id, None);
 
         match outcome {
-            Ok(bytes) => {
-                match response_text_from_dispatch_bytes(&bytes) {
-                    Ok(text) => {
-                        let response = agent_response_from_text(&text, entry.job_id.is_some());
-                        match self
-                            .validate_response(&*ctx, &run_id, &entry, response)
-                            .await
-                        {
-                            Ok(response) => {
-                                let payload = String::from_utf8(encode_response(&response))
-                                    .expect("AgentResponse JSON is utf-8");
-                                self.emit_response(ctx, &run_id, &entry, response);
-                                self.emit_job_finalize_if_current_claimant(
-                                    ctx, &entry, true, payload,
-                                )
+            // a portable runner wraps its prose in a RunnerResult; unwrap it (or
+            // fail the run on a broken wrapper) before the response path. legacy
+            // raw-text results pass through unchanged.
+            Ok(bytes) => match response_text_from_dispatch_bytes(&bytes) {
+                Ok(text) => {
+                    let response = agent_response_from_text(&text, entry.job_id.is_some());
+                    match self.validate_response(&*ctx, &run_id, &entry, response).await {
+                        Ok(response) => {
+                            let payload = String::from_utf8(encode_response(&response))
+                                .expect("AgentResponse JSON is utf-8");
+                            self.emit_response(ctx, &run_id, &entry, response);
+                            self.emit_job_finalize_if_current_claimant(ctx, &entry, true, payload)
                                 .await;
-                            }
-                            // deterministically invalid response: the run fails —
-                            // breadcrumb, threaded failure reply, job finalize,
-                            // pruned entry — the delivery block commits.
-                            Err(reason) => {
-                                self.note(ctx, format!("run {run_id} failed: {reason}"));
-                                self.emit_failure_reply(ctx, &run_id, &entry, &reason).await;
-                                self.emit_job_finalize_if_current_claimant(
-                                    ctx, &entry, false, reason,
-                                )
+                        }
+                        // deterministically invalid response: the run fails —
+                        // breadcrumb, threaded failure reply, job finalize,
+                        // pruned entry — the delivery block commits.
+                        Err(reason) => {
+                            self.note(ctx, format!("run {run_id} failed: {reason}"));
+                            self.emit_failure_reply(ctx, &run_id, &entry, &reason).await;
+                            self.emit_job_finalize_if_current_claimant(ctx, &entry, false, reason)
                                 .await;
-                            }
                         }
                     }
-                    Err(reason) => {
-                        self.note(ctx, format!("run {run_id} failed: {reason}"));
-                        self.emit_failure_reply(ctx, &run_id, &entry, &reason).await;
-                        self.emit_job_finalize_if_current_claimant(ctx, &entry, false, reason)
-                            .await;
-                    }
                 }
-            }
+                // a malformed / unsupported runner wrapper is a failed run, not
+                // a delivery-block abort and never raw JSON delivered as prose.
+                Err(reason) => {
+                    self.note(ctx, format!("run {run_id} failed: {reason}"));
+                    self.emit_failure_reply(ctx, &run_id, &entry, &reason).await;
+                    self.emit_job_finalize_if_current_claimant(ctx, &entry, false, reason)
+                        .await;
+                }
+            },
             Err(reason) => {
                 self.note(ctx, format!("run {run_id} failed: {reason}"));
                 self.emit_failure_reply(ctx, &run_id, &entry, &reason).await;
@@ -2051,7 +1997,13 @@ impl RunsModule {
                     .await
                     .map_err(Error::Module)?;
                 self.stage_dispatch_run(
-                    ctx, &run_id, agent_id, channel_id, anchor_seq, requester, prepared,
+                    ctx,
+                    &run_id,
+                    agent_id,
+                    channel_id,
+                    anchor_seq,
+                    requester,
+                    prepared,
                 );
                 Ok(())
             }
@@ -2244,7 +2196,6 @@ impl Module for RunsModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{decode_reply as runs_decode_reply, encode_msg, encode_query};
     use agent::{
         ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, PROMPT_HASH_LEN,
         encode_event as agent_encode_event, encode_reply as agent_encode_reply,
@@ -2259,9 +2210,12 @@ mod tests {
         Claim as JobClaim, Job, encode_event as jobs_encode_event,
         encode_reply as jobs_encode_reply,
     };
+    use crate::{decode_reply as runs_decode_reply, encode_msg, encode_query};
     use sdk::{Effect, Env};
     use tagging::{Author, encode_event as tagging_encode_event};
-    use tasks::{Task, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply};
+    use tasks::{
+        Task, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply,
+    };
 
     /// a canned registry: agent id -> record, served by the ctx's "agent"
     /// query arm exactly like the live registry module would answer.
@@ -2471,19 +2425,18 @@ mod tests {
                 },
                 "dispatch" => match dispatch::decode_query(req).map_err(Error::Module)? {
                     DispatchQuery::Dispatch { dispatch_id, .. } => {
-                        let view =
-                            self.taken_dispatches
-                                .contains(&dispatch_id)
-                                .then(|| DispatchView {
-                                    dispatch_id,
-                                    recipe_id: "agent/x".into(),
-                                    receiver: "runs".into(),
-                                    status: DispatchStatus::Delivered,
-                                    outcome: Some(Ok(Vec::new())),
-                                    assignee: None,
-                                    created_at: 0,
-                                    updated_at: 0,
-                                });
+                        let view = self.taken_dispatches.contains(&dispatch_id).then(|| {
+                            DispatchView {
+                                dispatch_id,
+                                recipe_id: "agent/x".into(),
+                                receiver: "runs".into(),
+                                status: DispatchStatus::Delivered,
+                                outcome: Some(Ok(Vec::new())),
+                                assignee: None,
+                                created_at: 0,
+                                updated_at: 0,
+                            }
+                        });
                         Ok(dispatch_encode_reply(&DispatchReply::Dispatch(view)))
                     }
                     _ => Err(Error::QueryUnsupported),
@@ -2720,6 +2673,75 @@ mod tests {
                 .collect(),
             actions,
         })
+    }
+
+    // ---- runner-result unwrap (forward-compatible v3 accept) --------------------
+
+    #[test]
+    fn legacy_raw_text_results_pass_through_untouched() {
+        // today's live v2 composer produces raw text (or the AgentResponse JSON
+        // the model emits); neither carries the runner marker, so both decode
+        // byte-for-byte via the lossy path the delivery block always used.
+        for raw in [
+            "just a prose answer",
+            "",
+            r#"{"reply_blocks":[{"id":"x","kind":"paragraph","text":"hi"}],"actions":[]}"#,
+            // a JSON object WITHOUT the marker is not a runner wrapper.
+            r#"{"response_text":"nope"}"#,
+        ] {
+            assert_eq!(
+                response_text_from_dispatch_bytes(raw.as_bytes()).unwrap(),
+                raw
+            );
+        }
+        // invalid utf-8 still degrades lossily rather than erroring.
+        assert_eq!(
+            response_text_from_dispatch_bytes(&[0xff, 0xfe]).unwrap(),
+            "\u{fffd}\u{fffd}"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_runner_result_yields_its_response_text() {
+        let wrapper = serde_json::json!({
+            "ducktape_runner_result": 1,
+            "response_text": "the deliverable prose",
+            "workspace_receipt": {
+                "source_prefix": "/shared/agent-workspaces/bot",
+                "source_snapshot": null,
+                "output_snapshot": null,
+                "commit_height": null,
+                "rebased": false,
+                "no_changes": true
+            }
+        })
+        .to_string();
+        assert_eq!(
+            response_text_from_dispatch_bytes(wrapper.as_bytes()).unwrap(),
+            "the deliverable prose"
+        );
+    }
+
+    #[test]
+    fn a_broken_runner_wrapper_is_a_loud_error_not_raw_delivery() {
+        // claims the marker but the version is unknown → fail the run.
+        let bad_version = serde_json::json!({
+            "ducktape_runner_result": 99,
+            "response_text": "x",
+            "workspace_receipt": {
+                "source_prefix": "p", "source_snapshot": null, "output_snapshot": null,
+                "commit_height": null, "rebased": false, "no_changes": false
+            }
+        })
+        .to_string();
+        let err = response_text_from_dispatch_bytes(bad_version.as_bytes()).unwrap_err();
+        assert!(err.contains("version 99"), "got {err:?}");
+
+        // claims the marker but the shape is malformed → fail, never deliver
+        // the raw JSON as if it were the model's prose.
+        let malformed = r#"{"ducktape_runner_result":1,"response_text":42}"#;
+        let err = response_text_from_dispatch_bytes(malformed.as_bytes()).unwrap_err();
+        assert!(err.contains("malformed"), "got {err:?}");
     }
 
     // ---- the registry hook ------------------------------------------------------
@@ -3056,9 +3078,7 @@ mod tests {
         let mut m = watched(TurnPolicy::All, &registry);
 
         // the registration hook fires as it would in the record's block.
-        let mut hook_ctx = CaptureCtx::new()
-            .with_agent_origin()
-            .with_registry(&registry);
+        let mut hook_ctx = CaptureCtx::new().with_agent_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut hook_ctx,
@@ -3081,9 +3101,7 @@ mod tests {
         // the owner rotates the prompt; the registry hook only ever carries
         // capability retunes — process one to show it is orthogonal.
         registry.get_mut("bot").unwrap().prompt_hash = vec![9u8; PROMPT_HASH_LEN];
-        let mut hook_ctx = CaptureCtx::new()
-            .with_agent_origin()
-            .with_registry(&registry);
+        let mut hook_ctx = CaptureCtx::new().with_agent_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut hook_ctx,
@@ -3201,10 +3219,7 @@ mod tests {
         let before = m.root();
 
         // an engagement whose source is not chat: dropped with a breadcrumb.
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .with_tagging_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(2).with_tagging_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -3273,15 +3288,9 @@ mod tests {
 
         // a failing context pin (the ctx serves NO transcript at all — the
         // chat query errors) must not poison the posting block: Ok, no run.
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .with_tagging_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(2).with_tagging_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
-        assert!(
-            ctx.dispatch_msgs().is_empty(),
-            "no dispatch on a failed pin"
-        );
+        assert!(ctx.dispatch_msgs().is_empty(), "no dispatch on a failed pin");
         assert!(!ctx.events.is_empty(), "the skip leaves a breadcrumb event");
         commit(&mut m);
         assert_eq!(m.root(), before, "nothing was staged");
@@ -3387,9 +3396,7 @@ mod tests {
         let mut m = watched(TurnPolicy::All, &registry);
         let root = m.root();
 
-        let mut ctx = CaptureCtx::new()
-            .with_origin(user(9))
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_origin(user(9)).with_registry(&registry);
         let err = exec(
             &mut m,
             &mut ctx,
@@ -3419,9 +3426,7 @@ mod tests {
         assert!(matches!(err, Error::Module(message) if message.contains("unit separator")));
         abort(&mut m);
 
-        let mut ctx = CaptureCtx::new()
-            .with_jobs_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_jobs_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -3431,9 +3436,7 @@ mod tests {
         assert!(ctx.msgs.is_empty(), "no claim emitted for a bad job id");
 
         // a spec that does not hash to spec_hash is dropped the same way.
-        let mut ctx = CaptureCtx::new()
-            .with_jobs_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_jobs_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -3618,87 +3621,6 @@ mod tests {
                     status: TaskStatus::InProgress,
                 },
             ]
-        );
-    }
-
-    #[test]
-    fn a_runner_result_v1_unwraps_response_text_before_validation() {
-        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
-        let response_text = String::from_utf8(response(&["from workspace"], vec![])).unwrap();
-        let raw = serde_json::json!({
-            "ducktape_runner_result": 1,
-            "response_text": response_text,
-            "workspace_receipt": {
-                "source_prefix": "/shared/agent-workspaces/bot",
-                "source_snapshot": "aa".repeat(32),
-                "output_snapshot": "bb".repeat(32),
-                "commit_height": 8,
-                "rebased": false,
-                "no_changes": false
-            }
-        })
-        .to_string()
-        .into_bytes();
-        let mut ctx = CaptureCtx::new()
-            .at(8)
-            .with_dispatch_origin()
-            .with_registry(&registry)
-            .with_transcript("general", transcript(2));
-
-        exec(&mut m, &mut ctx, &result_event(&run_id, Ok(raw))).unwrap();
-        commit(&mut m);
-
-        assert_eq!(get_pending(&m, &run_id), None, "the entry pruned");
-        let posts = ctx.chat_msgs();
-        let ChatMsg::PostMessage { blocks, .. } = &posts[0] else {
-            panic!("expected a post");
-        };
-        assert_eq!(
-            *blocks,
-            vec![Block::paragraph("from workspace")],
-            "runs validates the unwrapped AgentResponse, not the receipt wrapper JSON"
-        );
-    }
-
-    #[test]
-    fn an_invalid_runner_result_fails_the_run_without_aborting_delivery() {
-        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
-        let raw = serde_json::json!({
-            "ducktape_runner_result": 2,
-            "response_text": "{}",
-            "workspace_receipt": {
-                "source_prefix": "/shared/agent-workspaces/bot",
-                "source_snapshot": null,
-                "output_snapshot": null,
-                "commit_height": null,
-                "rebased": false,
-                "no_changes": true
-            }
-        })
-        .to_string()
-        .into_bytes();
-        let mut ctx = CaptureCtx::new()
-            .at(8)
-            .with_dispatch_origin()
-            .with_registry(&registry)
-            .with_transcript("general", transcript(2));
-
-        exec(&mut m, &mut ctx, &result_event(&run_id, Ok(raw))).unwrap();
-        commit(&mut m);
-
-        assert_eq!(get_pending(&m, &run_id), None, "the failed run pruned");
-        let posts = ctx.chat_msgs();
-        assert_eq!(posts.len(), 1);
-        let ChatMsg::PostMessage { blocks, .. } = &posts[0] else {
-            panic!("expected a failure post");
-        };
-        let Block::Paragraph(spans) = &blocks[0] else {
-            panic!("expected a paragraph");
-        };
-        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-        assert!(
-            text.contains("runner result version 2 is not supported"),
-            "failure is surfaced as a run result, got {text:?}"
         );
     }
 
@@ -3972,10 +3894,7 @@ mod tests {
     #[test]
     fn parse_strict_response_tolerates_the_shapes_llms_actually_emit() {
         let bare = r#"{"reply_blocks":[{"kind":"paragraph","text":"hi"}],"actions":[]}"#;
-        assert_eq!(
-            parse_strict_response(bare).unwrap().reply_blocks[0].text,
-            "hi"
-        );
+        assert_eq!(parse_strict_response(bare).unwrap().reply_blocks[0].text, "hi");
 
         // a fence with an info string (```json), the reproduced case.
         let fenced = format!("```json\n{bare}\n```");
@@ -4013,10 +3932,7 @@ mod tests {
         // the actions inside the fence.
         let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"noise\"}],\"actions\":[{\"create_task\":{\"task_id\":\"t1\",\"title\":\"did it\"}}]}\n```";
         let parsed = agent_response_from_text(raw, true);
-        assert!(
-            parsed.reply_blocks.is_empty(),
-            "job runs post no chat reply"
-        );
+        assert!(parsed.reply_blocks.is_empty(), "job runs post no chat reply");
         assert_eq!(parsed.actions.len(), 1, "the fenced action is recovered");
     }
 
@@ -4094,7 +4010,14 @@ mod tests {
     fn task_actions_without_a_configured_tasks_module_fail_the_run() {
         let registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])]);
         let mut m = RunsModule::new(
-            "runs", "chat", "saga", "tagging", "dispatch", "agent", None, None,
+            "runs",
+            "chat",
+            "saga",
+            "tagging",
+            "dispatch",
+            "agent",
+            None,
+            None,
         );
         let mut ctx = CaptureCtx::new()
             .with_origin(user(9))
@@ -4341,10 +4264,7 @@ mod tests {
     fn a_job_submit_claims_and_dispatches_with_the_spec_payload() {
         let registry = job_registry();
         let mut m = module();
-        let mut ctx = CaptureCtx::new()
-            .at(3)
-            .with_jobs_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -4417,10 +4337,7 @@ mod tests {
         let registry = job_registry();
         let mut m = module();
         let spec = "x".repeat(MAX_PAYLOAD_BYTES);
-        let mut ctx = CaptureCtx::new()
-            .at(3)
-            .with_jobs_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", &spec)).unwrap();
         assert!(ctx.msgs.is_empty(), "no claim and no dispatch may land");
         let breadcrumbs: Vec<String> = ctx
@@ -4445,27 +4362,18 @@ mod tests {
         let root = m.root();
 
         // an unregistered agent kind: no claim, no dispatch, no entry.
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .with_jobs_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(2).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("j", "agent/ghost", "s")).unwrap();
         assert!(ctx.msgs.is_empty());
 
         // a non-agent kind is somebody else's job.
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .with_jobs_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(2).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("j", "render/video", "s")).unwrap();
         assert!(ctx.msgs.is_empty());
 
         // a paused agent never claims.
         pause(&mut registry, "duck");
-        let mut ctx = CaptureCtx::new()
-            .at(2)
-            .with_jobs_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(2).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("j", "agent/duck", "s")).unwrap();
         assert!(ctx.msgs.is_empty());
         commit(&mut m);
@@ -4477,10 +4385,7 @@ mod tests {
     fn a_job_result_finalizes_the_board_and_emits_actions() {
         let registry = job_registry();
         let mut m = module();
-        let mut ctx = CaptureCtx::new()
-            .at(3)
-            .with_jobs_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
         commit(&mut m);
         let run_id = job_run_id_for("job-1", "duck", 3);
@@ -4532,10 +4437,7 @@ mod tests {
     fn a_failed_job_result_finalizes_with_error_detail() {
         let registry = job_registry();
         let mut m = module();
-        let mut ctx = CaptureCtx::new()
-            .at(3)
-            .with_jobs_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
         commit(&mut m);
         let run_id = job_run_id_for("job-1", "duck", 3);
@@ -4575,10 +4477,7 @@ mod tests {
         // finalizes the job as failed.
         let registry = job_registry();
         let mut m = module();
-        let mut ctx = CaptureCtx::new()
-            .at(3)
-            .with_jobs_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
         commit(&mut m);
         let run_id = job_run_id_for("job-1", "duck", 3);
@@ -4613,10 +4512,7 @@ mod tests {
         // stale run's delivery must not finalize the new episode.
         let registry = job_registry();
         let mut m = module();
-        let mut ctx = CaptureCtx::new()
-            .at(3)
-            .with_jobs_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
         exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
         commit(&mut m);
         let run_id = job_run_id_for("job-1", "duck", 3);
@@ -4647,11 +4543,7 @@ mod tests {
             ctx.job_msgs().is_empty(),
             "a stale claim episode is never finalized"
         );
-        assert_eq!(
-            get_pending(&m, &run_id),
-            None,
-            "the stale entry still prunes"
-        );
+        assert_eq!(get_pending(&m, &run_id), None, "the stale entry still prunes");
     }
 
     // ---- explicit runs + cancellation ------------------------------------------------
@@ -4743,15 +4635,11 @@ mod tests {
         });
 
         // a foreign origin (neither requester user(1) nor owner user(9)).
-        let mut ctx = CaptureCtx::new()
-            .with_origin(user(2))
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_origin(user(2)).with_registry(&registry);
         assert!(exec(&mut m, &mut ctx, &cancel).is_err());
         abort(&mut m);
         // an unknown run is an error too.
-        let mut ctx = CaptureCtx::new()
-            .with_origin(user(1))
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_origin(user(1)).with_registry(&registry);
         assert!(
             exec(
                 &mut m,
@@ -4767,10 +4655,7 @@ mod tests {
         // the REQUESTER cancels: the dispatch plane is told; the entry STAYS
         // pending — the plane's Err("cancelled") delivery is the one result
         // path that prunes it.
-        let mut ctx = CaptureCtx::new()
-            .at(7)
-            .with_origin(user(1))
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().at(7).with_origin(user(1)).with_registry(&registry);
         exec(&mut m, &mut ctx, &cancel).unwrap();
         assert_eq!(
             ctx.dispatch_msgs(),
@@ -4784,9 +4669,7 @@ mod tests {
         // the plane's Err("cancelled") delivery prunes the entry. it rides
         // the ONE result path, so it surfaces like any failed run — a
         // threaded ⚠ reply, never silence.
-        let mut ctx = CaptureCtx::new()
-            .with_dispatch_origin()
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_dispatch_origin().with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -4820,9 +4703,7 @@ mod tests {
         engage_post(&mut m, &registry, 2, &["bot"]);
         commit(&mut m);
         let engaged_run = run_id_for("general", 2, "bot");
-        let mut ctx = CaptureCtx::new()
-            .with_origin(user(9))
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_origin(user(9)).with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,
@@ -4917,9 +4798,7 @@ mod tests {
         let registry = registry(&[("a", &[]), ("b", &[])]);
         let mut m = watched(TurnPolicy::All, &registry);
         // watch a second channel and create runs in both.
-        let mut ctx = CaptureCtx::new()
-            .with_origin(user(9))
-            .with_registry(&registry);
+        let mut ctx = CaptureCtx::new().with_origin(user(9)).with_registry(&registry);
         exec(
             &mut m,
             &mut ctx,

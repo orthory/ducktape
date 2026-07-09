@@ -19,7 +19,6 @@
 //! prompt for the generic instructions — is exactly the quiet corruption
 //! this format exists to kill.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use capability_host::RunContext;
@@ -63,16 +62,32 @@ struct WireEnvelope {
     result_contract: Option<WireResultContract>,
 }
 
+/// the portable workspace block. every field is decoded so a malformed v3
+/// envelope fails to parse (acceptance IS validation), but the accept slice
+/// only reads `source_prefix`/`mount_path` for their non-empty checks — the
+/// snapshot is consumed by the provisioning wrapper at the flip.
 #[derive(Deserialize)]
 struct WireWorkspace {
     source_prefix: String,
+    #[allow(
+        dead_code,
+        reason = "pinned source consumed by the provisioning wrapper at the flip"
+    )]
     source_snapshot: Option<String>,
     mount_path: String,
 }
 
 #[derive(Deserialize)]
 struct WireBaseTool {
+    #[allow(
+        dead_code,
+        reason = "manifest entry validated by presence; bindings wired at the flip"
+    )]
     name: String,
+    #[allow(
+        dead_code,
+        reason = "manifest entry validated by presence; bindings wired at the flip"
+    )]
     version: String,
     #[allow(
         dead_code,
@@ -161,7 +176,7 @@ pub async fn prepare(
         ..RunContext::default()
     };
     if version == RUN_ENVELOPE_VERSION {
-        apply_portable_context(
+        accept_portable_envelope(
             &mut ctx,
             envelope.workspace,
             envelope.base_tools,
@@ -177,7 +192,21 @@ pub async fn prepare(
     ))
 }
 
-fn apply_portable_context(
+/// ACCEPT a v3 (portable) envelope without ACTIVATING portable execution.
+///
+/// this worker validates the portable shape — proving mixed-network nodes on
+/// this binary understand v3 before any node composes it — and marks the run
+/// portable so no host-local native session is resumed for it. it deliberately
+/// does NOT translate the envelope's advisory `mount_path` into the child's
+/// working directory or inject workspace env: the mount is not materialized
+/// until the provisioning wrapper exists, and a consensus-supplied host path
+/// (constant `/workspace`) is exactly the unwritable cwd that turned live runs
+/// into `create_dir_all` failures. per the ADR
+/// (`2026-07-09-deterministic-agent-runtime`, ROL/M2 + W1) portable ACTIVATION
+/// — a per-run writable mount and its bindings — lands with that wrapper and a
+/// coordinated flip; until then the host's own scratch/persistent workspace
+/// policy owns the cwd (see `capability-host::workdir_for`).
+fn accept_portable_envelope(
     ctx: &mut RunContext,
     workspace: Option<WireWorkspace>,
     base_tools: Option<Vec<WireBaseTool>>,
@@ -198,31 +227,14 @@ fn apply_portable_context(
             result_contract.ducktape_runner_result
         ));
     }
-    let base_tools =
-        base_tools.ok_or_else(|| "v3 run envelope is missing base_tools".to_string())?;
+    if base_tools
+        .ok_or_else(|| "v3 run envelope is missing base_tools".to_string())?
+        .is_empty()
+    {
+        return Err("v3 run envelope base_tools must not be empty".into());
+    }
 
     ctx.portable = true;
-    ctx.workdir_override = Some(PathBuf::from(&workspace.mount_path));
-    ctx.env.insert(
-        "DUCKTAPE_RUN_WORKSPACE".into(),
-        workspace.mount_path.clone(),
-    );
-    ctx.env.insert(
-        "DUCKTAPE_RUN_WORKSPACE_PREFIX".into(),
-        workspace.source_prefix,
-    );
-    if let Some(snapshot) = workspace.source_snapshot {
-        ctx.env
-            .insert("DUCKTAPE_RUN_WORKSPACE_SNAPSHOT".into(), snapshot);
-    }
-    ctx.env.insert(
-        "DUCKTAPE_RUN_BASE_TOOLS".into(),
-        base_tools
-            .into_iter()
-            .map(|tool| format!("{}@{}", tool.name, tool.version))
-            .collect::<Vec<_>>()
-            .join(","),
-    );
     Ok(())
 }
 
@@ -408,7 +420,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v3_envelopes_prepare_a_portable_workspace_context() {
+    async fn v3_envelopes_are_accepted_and_marked_portable_without_activating_a_mount() {
+        // the worker ACCEPTS v3 (proving readiness for a future coordinated
+        // flip) and marks the run portable, but it does NOT activate a
+        // workspace mount: no consensus-supplied cwd override, no workspace
+        // env. the host's own scratch/persistent policy owns the cwd until the
+        // provisioning wrapper lands (ADR ROL/M2 + W1).
         let (input, ctx) = prepare(&v3_envelope_json(None), None).await.unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
@@ -417,20 +434,42 @@ mod tests {
             ctx.portable,
             "v3 runs are portable and cannot resume host-local sessions"
         );
-        assert_eq!(
-            ctx.workdir_override.as_deref(),
-            Some(std::path::Path::new("/tmp/ducktape-workspace"))
+        assert!(
+            ctx.workdir_override.is_none(),
+            "portable activation is HELD: no consensus-supplied cwd is forced"
         );
-        assert_eq!(
-            ctx.env.get("DUCKTAPE_RUN_WORKSPACE").map(String::as_str),
-            Some("/tmp/ducktape-workspace")
+        assert!(
+            ctx.env.is_empty(),
+            "no workspace env is injected until the mount is materialized"
         );
-        assert_eq!(
-            ctx.env
-                .get("DUCKTAPE_RUN_WORKSPACE_SNAPSHOT")
-                .map(String::as_str),
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        );
+        assert!(ctx.path_entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_v3_envelope_that_omits_or_breaks_the_portable_shape_fails_loudly() {
+        // accept still means VALIDATE: a v3 marker with a missing/empty/wrong
+        // portable block is a mixed-network signal, never silently downgraded.
+        let base: serde_json::Value = serde_json::from_str(&v3_envelope_json(None)).unwrap();
+
+        let mut missing = base.clone();
+        missing["workspace"] = serde_json::Value::Null;
+        let err = prepare(&missing.to_string(), None).await.unwrap_err();
+        assert!(err.contains("missing workspace"), "got {err:?}");
+
+        let mut empty_prefix = base.clone();
+        empty_prefix["workspace"]["source_prefix"] = serde_json::json!("");
+        let err = prepare(&empty_prefix.to_string(), None).await.unwrap_err();
+        assert!(err.contains("source_prefix must not be empty"), "got {err:?}");
+
+        let mut empty_tools = base.clone();
+        empty_tools["base_tools"] = serde_json::json!([]);
+        let err = prepare(&empty_tools.to_string(), None).await.unwrap_err();
+        assert!(err.contains("base_tools must not be empty"), "got {err:?}");
+
+        let mut bad_result = base.clone();
+        bad_result["result_contract"]["ducktape_runner_result"] = serde_json::json!(99);
+        let err = prepare(&bad_result.to_string(), None).await.unwrap_err();
+        assert!(err.contains("runner result version 99"), "got {err:?}");
     }
 
     #[tokio::test]

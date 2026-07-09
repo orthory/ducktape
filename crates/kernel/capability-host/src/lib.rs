@@ -309,6 +309,36 @@ impl CliProvider {
         Ok(self.workdir.clone())
     }
 
+    /// resolve the run's cwd to a per-run WRITABLE directory, creating it.
+    ///
+    /// the preferred choice ([`Self::workdir_for`]) may be unwritable on THIS
+    /// node — an activated portable mount that nothing materialized, or a
+    /// persistent root on a read-only volume. rather than fail the whole run on
+    /// `create_dir_all` (the constant `/workspace` a portable envelope names is
+    /// unwritable on a non-root node, which turned working agents into
+    /// deterministically-failing ones), fall back to the host-owned scratch
+    /// dir — always a per-run writable path (ADR W1). scratch itself has no
+    /// fallback: if the host cannot create its own scratch dir, the run has
+    /// nowhere to execute.
+    fn ensure_writable_workdir(&self, ctx: &RunContext) -> Result<PathBuf, String> {
+        let preferred = self.workdir_for(ctx)?;
+        match std::fs::create_dir_all(&preferred) {
+            Ok(()) => Ok(preferred),
+            Err(_) if preferred != self.workdir => {
+                std::fs::create_dir_all(&self.workdir).map_err(|e| {
+                    format!(
+                        "provider workdir {} is unusable and the scratch fallback \
+                         {} could not be created: {e}",
+                        preferred.display(),
+                        self.workdir.display()
+                    )
+                })?;
+                Ok(self.workdir.clone())
+            }
+            Err(e) => Err(format!("provider workdir {}: {e}", preferred.display())),
+        }
+    }
+
     /// the session slot for this run — `Some` only when the spec opts into
     /// `[session]`, the run carries both continuity coordinates, and the
     /// host wired a sessions root. anything less runs cold, by design.
@@ -420,9 +450,7 @@ impl Provider for CliProvider {
     }
 
     async fn run(&self, prompt: &str, ctx: &RunContext) -> Result<String, String> {
-        let workdir = self.workdir_for(ctx)?;
-        std::fs::create_dir_all(&workdir)
-            .map_err(|e| format!("provider workdir {}: {e}", workdir.display()))?;
+        let workdir = self.ensure_writable_workdir(ctx)?;
 
         let Some((session, store)) = self.session_store(ctx)? else {
             // no session plumbing for this run: one cold invocation.
@@ -1322,6 +1350,38 @@ printf '%s\n' "$PATH"
             lines[2].starts_with(path_entry.to_str().unwrap()),
             "PATH starts with the run-local tool binding path: {:?}",
             lines[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_workdir_override_falls_back_to_scratch_not_a_failed_run() {
+        // W1: a portable envelope names a mount that nothing materialized (the
+        // constant `/workspace`, unwritable on a non-root node). the host must
+        // run the child in its own scratch dir instead of failing the whole run
+        // on `create_dir_all`. an override whose parent is a FILE is
+        // `create_dir_all`-impossible regardless of privilege — `/workspace`'s
+        // EPERM in miniature, reproducible as an unprivileged test.
+        let dir = scratch("w1-fallback");
+        let bin = fake_cli(&dir, "wd", "cat > /dev/null\npwd");
+        let blocker = scratch("w1-fallback-blocker").join("a-file");
+        std::fs::write(&blocker, b"x").unwrap();
+        let uncreatable = blocker.join("child");
+        assert!(
+            std::fs::create_dir_all(&uncreatable).is_err(),
+            "the override must be genuinely uncreatable for this test to mean anything"
+        );
+
+        let p = sh_provider(mock_spec("wd", "wd", "text"), bin, "w1-fallback-scratch");
+        let ctx = RunContext {
+            workdir_override: Some(uncreatable),
+            portable: true,
+            ..RunContext::default()
+        };
+        let cwd = p.run("q", &ctx).await.unwrap();
+        assert_eq!(
+            PathBuf::from(cwd),
+            scratch("w1-fallback-scratch").canonicalize().unwrap(),
+            "the run succeeds in the scratch fallback, never EPERMs on the mount"
         );
     }
 
