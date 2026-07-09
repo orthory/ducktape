@@ -85,19 +85,44 @@ pub(crate) fn collect_missing(
     refs: &Refs,
     store: &dyn ObjectStore,
 ) -> Result<BTreeSet<ObjectId>, String> {
+    collect(refs, store, false)
+}
+
+/// the integrity-verified twin of [`collect_missing`]: the SAME reachability walk
+/// from the SAME committed roots, but each reached CHUNK is checked with
+/// [`ObjectStore::verify`] (a re-hash on a disk store) rather than a mere presence
+/// probe — so a present-but-corrupt chunk is reported unpossessed (and, on a disk
+/// store, deleted so it re-fetches as absent). interior objects already re-hash
+/// via `fetch`, so only the leaf check differs. this is the possession-boundary
+/// gate (finding #2): a false "fully possessed" over silent bit-rot would let a
+/// node go READY holding an unreadable file. it re-hashes every reached chunk, so
+/// it runs ONCE at a boundary — never on the per-round fetch loop, which stays on
+/// the cheap presence walk above.
+pub(crate) fn collect_missing_verified(
+    refs: &Refs,
+    store: &dyn ObjectStore,
+) -> Result<BTreeSet<ObjectId>, String> {
+    collect(refs, store, true)
+}
+
+fn collect(
+    refs: &Refs,
+    store: &dyn ObjectStore,
+    verify_chunks: bool,
+) -> Result<BTreeSet<ObjectId>, String> {
     let mut visited = BTreeSet::new();
     let mut missing = BTreeSet::new();
     if let Some(head) = &refs.head {
-        collect_snapshot(head, store, &mut visited, &mut missing)?;
+        collect_snapshot(head, store, &mut visited, &mut missing, verify_chunks)?;
     }
     for snapshot in &refs.window {
-        collect_snapshot(snapshot, store, &mut visited, &mut missing)?;
+        collect_snapshot(snapshot, store, &mut visited, &mut missing, verify_chunks)?;
     }
     for pin in refs.pins.values() {
-        collect_snapshot(&pin.snapshot, store, &mut visited, &mut missing)?;
+        collect_snapshot(&pin.snapshot, store, &mut visited, &mut missing, verify_chunks)?;
     }
     for digest in refs.staging.keys() {
-        collect_chunk(digest, store, &mut visited, &mut missing);
+        collect_chunk(digest, store, &mut visited, &mut missing, verify_chunks)?;
     }
     Ok(missing)
 }
@@ -110,6 +135,7 @@ fn collect_snapshot(
     store: &dyn ObjectStore,
     visited: &mut BTreeSet<ObjectId>,
     missing: &mut BTreeSet<ObjectId>,
+    verify_chunks: bool,
 ) -> Result<(), String> {
     if !visited.insert(*id) {
         return Ok(());
@@ -120,7 +146,7 @@ fn collect_snapshot(
     }
     let body = fetch(store, id, Kind::Snapshot)?;
     let snapshot = SnapshotObj::decode(&body)?;
-    collect_tree(&snapshot.root, store, visited, missing)
+    collect_tree(&snapshot.root, store, visited, missing, verify_chunks)
 }
 
 /// walk a tree for [`collect_missing`]: absent -> record and stop; present ->
@@ -130,6 +156,7 @@ fn collect_tree(
     store: &dyn ObjectStore,
     visited: &mut BTreeSet<ObjectId>,
     missing: &mut BTreeSet<ObjectId>,
+    verify_chunks: bool,
 ) -> Result<(), String> {
     if !visited.insert(*id) {
         return Ok(());
@@ -142,9 +169,9 @@ fn collect_tree(
     let tree = TreeObj::decode(&body)?;
     for entry in tree.entries.values() {
         match entry.kind {
-            EntryKind::Dir => collect_tree(&entry.id, store, visited, missing)?,
+            EntryKind::Dir => collect_tree(&entry.id, store, visited, missing, verify_chunks)?,
             EntryKind::File | EntryKind::Symlink => {
-                collect_file(&entry.id, store, visited, missing)?
+                collect_file(&entry.id, store, visited, missing, verify_chunks)?
             }
         }
     }
@@ -158,6 +185,7 @@ fn collect_file(
     store: &dyn ObjectStore,
     visited: &mut BTreeSet<ObjectId>,
     missing: &mut BTreeSet<ObjectId>,
+    verify_chunks: bool,
 ) -> Result<(), String> {
     if !visited.insert(*id) {
         return Ok(());
@@ -169,26 +197,37 @@ fn collect_file(
     let body = fetch(store, id, Kind::File)?;
     let file = FileObj::decode(&body)?;
     for chunk in &file.chunks {
-        collect_chunk(chunk, store, visited, missing);
+        collect_chunk(chunk, store, visited, missing, verify_chunks)?;
     }
     Ok(())
 }
 
-/// record a chunk leaf for [`collect_missing`] if it is absent. a chunk has no
-/// children, so a present chunk is nothing more to do — and its BYTES are not
-/// verified here (that is the read side's job), so this never errors.
+/// record a chunk leaf if it is not held. a chunk has no children, so a held one
+/// is nothing more to do. `verify_chunks` picks the possession rule: the cheap
+/// presence probe ([`ObjectStore::has`]) for the fetch loop, or the integrity
+/// check ([`ObjectStore::verify`]) for the possession boundary — the latter
+/// re-hashes and (on a disk store) removes a corrupt chunk, so it reads as absent
+/// here and re-fetches (finding #2). only the verified path can error (a genuine
+/// read fault); the presence path never does.
 fn collect_chunk(
     id: &ObjectId,
     store: &dyn ObjectStore,
     visited: &mut BTreeSet<ObjectId>,
     missing: &mut BTreeSet<ObjectId>,
-) {
+    verify_chunks: bool,
+) -> Result<(), String> {
     if !visited.insert(*id) {
-        return;
+        return Ok(());
     }
-    if !store.has(id) {
+    let held = if verify_chunks {
+        store.verify(id)?
+    } else {
+        store.has(id)
+    };
+    if !held {
         missing.insert(*id);
     }
+    Ok(())
 }
 
 /// mark a snapshot root and walk its committed root tree (never its parent).

@@ -89,6 +89,60 @@ fn corrupt_object_is_an_error_not_bad_bytes() {
 }
 
 #[test]
+fn put_replaces_a_length_corrupt_existing_object() {
+    // finding #2: put must not treat mere path existence as success — a corrupt
+    // existing object (here a torn/truncated external write) must be REPLACED, or
+    // a "possessed" object stays permanently unreadable and put can never repair
+    // it. (a length change is the cheap-to-detect corruption put itself catches;
+    // a same-length bit-flip is caught by `verify` on the possession path.)
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("objects");
+    let mut odb = DiskStore::open(dir.clone()).unwrap();
+    let id = odb.put(Kind::Chunk, b"bytes").unwrap();
+
+    let hex = to_hex(&id);
+    let path = dir.join(&hex[..2]).join(&hex[2..]);
+    std::fs::write(&path, b"xx").unwrap(); // truncate behind the store's back
+    assert!(odb.get(&id).is_err(), "the truncated object reads as corrupt");
+
+    // re-put the correct bytes: put REPLACES the corrupt file rather than no-op.
+    let id2 = odb.put(Kind::Chunk, b"bytes").unwrap();
+    assert_eq!(id, id2);
+    assert_eq!(
+        odb.get(&id).unwrap(),
+        Some((Kind::Chunk, b"bytes".to_vec())),
+        "put replaced the corrupt object with the correct bytes"
+    );
+}
+
+#[test]
+fn verify_removes_a_bitflipped_object_so_it_self_heals() {
+    // finding #2: possession must be integrity-verified — a present-but-corrupt
+    // chunk must NOT count as possessed. `verify` re-hashes and, on a same-length
+    // bit-flip, DELETES the corrupt file so it reads as absent and the self-heal
+    // fetch loop re-fetches a good copy (which `put` then lands).
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path().join("objects");
+    let mut odb = DiskStore::open(dir.clone()).unwrap();
+    let id = odb.put(Kind::Chunk, b"bytes").unwrap();
+    assert!(odb.verify(&id).unwrap(), "an intact object verifies");
+
+    let hex = to_hex(&id);
+    let path = dir.join(&hex[..2]).join(&hex[2..]);
+    let mut raw = std::fs::read(&path).unwrap();
+    raw[3] ^= 0xff; // same-length bit-flip
+    std::fs::write(&path, raw).unwrap();
+
+    assert!(!odb.verify(&id).unwrap(), "a corrupt object fails verify");
+    assert!(
+        !odb.has(&id),
+        "verify removed the corrupt file so it re-fetches as absent"
+    );
+    // an absent object verifies false, never an error.
+    assert!(!odb.verify(&object_id(Kind::Chunk, b"never")).unwrap());
+}
+
+#[test]
 fn open_sweeps_tmp_debris_and_list_enumerates() {
     let d = tempfile::tempdir().unwrap();
     let dir = d.path().join("objects");

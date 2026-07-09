@@ -876,3 +876,44 @@ fn a_non_chunk_object_cannot_pose_as_a_chunk() {
     );
     abort_block(&mut f);
 }
+
+/// finding #2: a present-but-corrupt chunk must NOT count as possessed. after an
+/// on-disk bit-flip, `possession_complete()` reports incomplete (never a false
+/// "done"), and the verified pass removes the corrupt object so the self-heal
+/// fetch loop re-fetches a good copy.
+#[test]
+fn possession_is_incomplete_over_a_corrupt_chunk() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    commit(
+        &mut f,
+        ext(b"u"),
+        1,
+        None,
+        vec![put_inline("/shared/a", b"chunk-body")],
+    )
+    .expect("seed");
+    commit_block(&mut f);
+    assert!(
+        f.possession_complete().expect("possession"),
+        "an intact object set is fully possessed"
+    );
+
+    // bit-flip the committed chunk on disk, behind the module's back.
+    let chunk = files::objects::object_id(files::Kind::Chunk, b"chunk-body");
+    let hex = to_hex(&chunk);
+    let path = d.path().join("objects").join(&hex[..2]).join(&hex[2..]);
+    let mut raw = std::fs::read(&path).unwrap();
+    let last = raw.len() - 1;
+    raw[last] ^= 0xff; // same-length corruption: length checks alone miss it
+    std::fs::write(&path, raw).unwrap();
+
+    assert!(
+        !f.possession_complete().expect("possession"),
+        "a corrupt chunk is not possessed — possession must not report complete"
+    );
+    assert!(
+        !path.exists(),
+        "the verified pass removed the corrupt chunk so it re-fetches as absent"
+    );
+}

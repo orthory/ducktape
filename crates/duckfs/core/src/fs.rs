@@ -722,6 +722,17 @@ impl<S: ObjectStore> Fs<S> {
         Ok(missing.into_iter().take(limit).collect())
     }
 
+    /// whether every object the committed refs reach is present AND INTACT — the
+    /// verified possession gate (finding #2). where [`Fs::missing_objects`] drives
+    /// the per-round fetch loop with a cheap presence walk, this re-hashes every
+    /// reached chunk, so a present-but-corrupt chunk is caught (and, on a disk
+    /// store, deleted so it re-fetches) instead of passing as "possessed" and
+    /// letting a node go READY over an unreadable file. call it ONCE at a
+    /// possession boundary, never per fetch round.
+    pub fn possession_complete(&self) -> Result<bool, String> {
+        Ok(crate::gc::collect_missing_verified(&self.refs, &self.store)?.is_empty())
+    }
+
     /// verify-then-store one fetched object. the id must re-derive from the bytes
     /// (`object_id(kind, body) == *id`) or the object is rejected — the
     /// dishonest-server rule: a peer cannot smuggle bytes under an id they do not
