@@ -129,7 +129,14 @@ impl From<Error> for node::Error {
 // length-prefixed, bounds-checked, no partial reads).
 // ============================================================================
 
-const MAX_LEN: usize = 1 << 21; // 2 MiB: > the p2p frame cap + framing.
+/// Journal records never legitimately exceed one framed operation plus its
+/// replay metadata.
+const MAX_RECORD_FIELD_LEN: usize = 1 << 21; // 2 MiB: > the p2p frame cap + framing.
+
+/// A checkpoint embeds self-contained module snapshots. Forge snapshots carry
+/// a Git object closure and can legitimately exceed the operation/frame cap;
+/// keep their per-field decoder bound aligned with the smart-HTTP pack ceiling.
+const MAX_CHECKPOINT_FIELD_LEN: usize = 512 * 1024 * 1024;
 
 fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -151,11 +158,24 @@ fn put_root(out: &mut Vec<u8>, r: &StateRoot) {
 struct Cursor<'a> {
     buf: &'a [u8],
     at: usize,
+    max_field_len: usize,
 }
 
 impl<'a> Cursor<'a> {
     fn new(buf: &'a [u8]) -> Self {
-        Self { buf, at: 0 }
+        Self {
+            buf,
+            at: 0,
+            max_field_len: MAX_RECORD_FIELD_LEN,
+        }
+    }
+
+    fn checkpoint(buf: &'a [u8]) -> Self {
+        Self {
+            buf,
+            at: 0,
+            max_field_len: MAX_CHECKPOINT_FIELD_LEN,
+        }
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
@@ -188,9 +208,10 @@ impl<'a> Cursor<'a> {
 
     fn bytes(&mut self) -> Result<Vec<u8>, Error> {
         let len = self.u64()? as usize;
-        if len > MAX_LEN {
+        if len > self.max_field_len {
             return Err(Error::Corrupt(format!(
-                "length {len} exceeds the record cap"
+                "length {len} exceeds the field cap {}",
+                self.max_field_len
             )));
         }
         Ok(self.take(len)?.to_vec())
@@ -500,7 +521,7 @@ impl Manifest {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        let mut c = Cursor::new(bytes);
+        let mut c = Cursor::checkpoint(bytes);
         let height = match c.take(1)?[0] {
             0 => None,
             1 => Some(c.u64()?),
@@ -758,7 +779,7 @@ where
                 items_per_section: NonZeroU64::new(64).expect("nonzero"),
                 write_buffer: NonZeroUsize::new(1024).expect("nonzero"),
                 compression: None,
-                codec_config: (RangeCfg::from(0..=MAX_LEN), ()),
+                codec_config: (RangeCfg::from(0..=MAX_RECORD_FIELD_LEN), ()),
                 page_cache,
             },
         )
@@ -777,7 +798,7 @@ where
             context.child("cert"),
             metadata::Config {
                 partition: PARTITION_CERT.into(),
-                codec_config: (RangeCfg::from(0..=MAX_LEN), ()),
+                codec_config: (RangeCfg::from(0..=MAX_RECORD_FIELD_LEN), ()),
             },
         )
         .await
@@ -1873,6 +1894,21 @@ mod tests {
         assert!(Record::decode(&bad).is_err());
     }
 
+    #[test]
+    fn record_keeps_the_operation_field_cap() {
+        let encoded = Record::Block {
+            height: 7,
+            frame: vec![0; MAX_RECORD_FIELD_LEN + 1],
+        }
+        .encode();
+        assert!(
+            Record::decode(&encoded)
+                .unwrap_err()
+                .to_string()
+                .contains("field cap")
+        );
+    }
+
     fn sample_manifest() -> Manifest {
         Manifest {
             height: Some(42),
@@ -1916,6 +1952,17 @@ mod tests {
             ..sample_manifest()
         };
         assert_eq!(Manifest::decode(&m.encode()).expect("roundtrip"), m);
+    }
+
+    #[test]
+    fn manifest_roundtrips_a_module_snapshot_above_the_operation_cap() {
+        let snapshot = vec![0xA5; MAX_RECORD_FIELD_LEN + 1];
+        let mut manifest = sample_manifest();
+        manifest.snapshots = vec![("forge".into(), snapshot.clone())];
+
+        let decoded = Manifest::decode(&manifest.encode()).expect("large checkpoint decodes");
+        assert_eq!(decoded.snapshot("forge"), Some(snapshot.as_slice()));
+        assert_eq!(decoded, manifest);
     }
 
     #[test]
