@@ -423,7 +423,7 @@ impl ConsensusHandle {
 /// flush/heartbeat loop AND this automaton's idle-wait both pace off this one
 /// value, so no producer can outpace it (the 1-tx-1-block + faster-than-intended
 /// beat regime is gone). raising it slows the visibly-live height tick 1:1.
-pub const BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+pub const BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 /// how long a leader holds an otherwise-idle view open, polling for an op or the
 /// node's heartbeat nop before declining — keeping a solo validator (no quorum
 /// to wait on) from spinning nullifications, and the height they stamp, at CPU
@@ -1656,6 +1656,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_block_time_is_one_second() {
+        assert_eq!(BLOCK_TIME, std::time::Duration::from_secs(1));
+    }
 
     #[test]
     fn content_store_round_trips_by_digest() {

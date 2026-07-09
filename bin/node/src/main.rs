@@ -134,7 +134,7 @@ const PEER_SET: u64 = 0;
 /// shows. the frame finalizes, rejects deterministically on every node (unknown
 /// module), advances the engine clock, and leaves no state.
 const NOP_TARGET: &str = "consensus.nop";
-// block cadence is a single knob: `consensus::BLOCK_TIME` (2s). the idle
+// block cadence is a single knob: `consensus::BLOCK_TIME` (1s). the idle
 // heartbeat beats one nop block per BLOCK_TIME so an idle chain still finalizes
 // (its height keeps ticking) and any pending cutover still crosses — paced to
 // the same interval the leader's idle-propose holds a view open, so the beat
