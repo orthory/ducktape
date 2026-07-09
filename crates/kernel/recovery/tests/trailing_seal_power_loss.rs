@@ -413,6 +413,7 @@ fn a_lost_trailing_seal_with_a_height_cursor_recovers() {
         node.submit(&signer, 0, set("disk", "k0", "v0"))
             .await
             .expect("submit block 0");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
 
         // block 1: pure-disk — and the POWER CUT eats its seal. the WAL Block
@@ -422,6 +423,7 @@ fn a_lost_trailing_seal_with_a_height_cursor_recovers() {
         node.submit(&signer, 1, set("disk", "k1", "v1"))
             .await
             .expect("submit block 1");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         let tip = node.finalized().expect("boundary");
         let tip_hash = node.app_hash();
@@ -520,12 +522,14 @@ fn a_lost_trailing_seal_heals_the_fanned_out_cohort_too() {
         node.submit(&signer, 0, set("fanout", "k0", "v0"))
             .await
             .expect("submit block 0");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         // block 1: fanout -> disk, seal LOST to the power cut.
         node.sink_mut().drop_seals_from = Some(1);
         node.submit(&signer, 1, set("fanout", "k1", "v1"))
             .await
             .expect("submit block 1");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         let tip_hash = node.app_hash();
         assert_eq!(cell.borrow().counter, 2);
@@ -601,11 +605,13 @@ fn a_lost_trailing_seal_without_a_cursor_still_fail_stops() {
         node.submit(&signer, 0, set("disk", "k0", "v0"))
             .await
             .expect("submit block 0");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         node.sink_mut().drop_seals_from = Some(1);
         node.submit(&signer, 1, set("disk", "k1", "v1"))
             .await
             .expect("submit block 1");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(cell.borrow().counter, 2);
         drop(node);
@@ -664,11 +670,13 @@ fn a_cursor_claiming_the_wrong_trailing_height_still_fail_stops() {
         node.submit(&signer, 0, set("disk", "k0", "v0"))
             .await
             .expect("submit block 0");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         node.sink_mut().drop_seals_from = Some(1);
         node.submit(&signer, 1, set("disk", "k1", "v1"))
             .await
             .expect("submit block 1");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         drop(node);
 
@@ -731,9 +739,11 @@ fn a_cursor_with_no_trailing_wal_record_still_fail_stops() {
         node.submit(&signer, 0, set("disk", "k0", "v0"))
             .await
             .expect("submit block 0");
+        node.flush_batch().await.expect("flush");
         node.submit(&signer, 1, set("disk", "k1", "v1"))
             .await
             .expect("submit block 1");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 2);
         node.sink_mut().inner.sync().await.expect("graceful sync");
         drop(node);
@@ -799,6 +809,7 @@ fn two_trailing_claimants_still_fail_stop() {
         node.submit(&signer, 0, set("fanout", "k", "v"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(cell_a.borrow().counter, 1);
         assert_eq!(cell_b.borrow().counter, 1);

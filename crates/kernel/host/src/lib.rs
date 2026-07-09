@@ -130,6 +130,41 @@ pub struct BlockOutcome {
     pub dispatches: Vec<DispatchRecord>,
 }
 
+/// the result of applying a BATCH of ops as ONE block ([`Host::submit_block`]).
+///
+/// per-op isolation with a SINGLE commit boundary: each input op is drained on
+/// top of the prior accepted ops' staged writes (read-your-writes across
+/// members); an op that rejects DETERMINISTICALLY is isolated — its stage rolled
+/// back and the accepted ops replayed — so the committed state is exactly the
+/// accepted subset applied in input order. every applied member shares the ONE
+/// post-batch [`app_hash`](BatchOutcome::app_hash).
+#[derive(Debug)]
+pub struct BatchOutcome {
+    /// the one post-batch app-hash, shared by every applied member.
+    pub app_hash: StateRoot,
+    /// one outcome per input op, in input order.
+    pub members: Vec<MemberOutcome>,
+    /// aggregate observability events, in drain order: every applied member's
+    /// trace in input order, then the once-per-block injections.
+    pub events: Vec<Event>,
+    /// aggregate effect intents, in the same order.
+    pub effects: Vec<Effect>,
+    /// the dispatch trace from the once-per-block System injections
+    /// (`pending_advance` / `pending_deliveries`), drained once after the members.
+    pub system_dispatches: Vec<DispatchRecord>,
+}
+
+/// the outcome of one member op in a [`BatchOutcome`].
+#[derive(Debug)]
+pub enum MemberOutcome {
+    /// the op applied; carries its OWN dispatch trace (root op + follow-ups).
+    Applied { dispatches: Vec<DispatchRecord> },
+    /// the op rejected deterministically; its staged writes were rolled back and
+    /// the accepted members replayed, so it left no trace on committed state. the
+    /// reason is the drain [`Error`] rendered to a string.
+    Rejected { reason: String },
+}
+
 /// a finalized consensus boundary the host is allowed to serve from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FinalizedBlock {
@@ -703,43 +738,217 @@ impl Host {
         }
     }
 
-    /// RECOVERY-ONLY selective-commit replay of one block. identical to
-    /// [`Host::submit_at`] — same [`drain`](Self::drain), same deterministic
-    /// execution — except at the boundary it partitions the touched set: a
-    /// module in `commit_only` is committed (its staged writes published),
-    /// every other touched module is ABORTED (its stage discarded).
+    /// apply a BATCH of ops as ONE block: per-op isolation, a SINGLE commit
+    /// boundary, and ONE post-batch app-hash shared by every applied member.
     ///
-    /// this exists to heal a TORN block at boot: a block that committed a
-    /// per-block-durable disk substrate (already at its sealed post-root on
-    /// disk) but whose in-memory cohort was rolled back to the checkpoint
-    /// (still at its pre-root). replay re-runs the sealed frame and commits
-    /// ONLY the in-memory cohort — the modules still at pre — while ABORTING
-    /// the disk substrates, because re-committing an already-durable qmdb store
-    /// would MOVE its op-log root and fork this node. the caller (`recovery`)
-    /// computes `commit_only` by per-module root compare and verifies every
-    /// touched module lands on its sealed root afterward.
+    /// each op is drained in input order on top of the prior accepted ops' staged
+    /// writes (read-your-writes across members). an op that rejects
+    /// DETERMINISTICALLY is ISOLATED — its stage is rolled back and every already-
+    /// accepted op is replayed — so the committed state equals exactly the accepted
+    /// subset applied in order (applying `[A, B]` where `B` rejects lands the same
+    /// state as applying `[A]` alone). the once-per-block System injections
+    /// (`Advance` / `DeliverPending`), computed against PRE-batch committed state,
+    /// drain once after the members; then the whole touched set commits together.
     ///
-    /// NOT for the live consensus path: on a live block every touched module
-    /// commits together (that is [`Host::submit_at`]); this reconstructs an
-    /// outcome consensus already sealed and never manufactures new live state.
-    pub async fn submit_at_committing(
+    /// the two failure modes match [`Host::submit_at`]: a boundary hook failing is
+    /// a node-local [`SubmitError::Fatal`] (fail-stop); a member rejecting is
+    /// folded into that member's [`MemberOutcome::Rejected`], never a whole-batch
+    /// error. an empty `ops` is a valid empty block — no members, injections drain
+    /// once and the touched set commits (a no-op when nothing was pending).
+    pub async fn submit_block(
         &mut self,
         ctx: BlockContext,
-        msg: Msg,
-        commit_only: &BTreeSet<ModuleId>,
-    ) -> Result<BlockOutcome, SubmitError> {
-        let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
+        ops: Vec<(Origin, Msg)>,
+    ) -> Result<BatchOutcome, SubmitError> {
+        self.apply_block(ctx, ops, None).await
+    }
 
-        match self.drain(ctx, msg, &mut touched).await {
-            Ok((events, effects, dispatches)) => {
-                // partition the touched set at the boundary: commit the modules
-                // the caller marked (the in-memory cohort still at pre), abort
-                // the rest (disk substrates already durable at post — a
-                // re-commit would move their op-log root and fork). both hooks
-                // run in deterministic registry order; either failing is FATAL.
-                for id in &touched {
+    /// RECOVERY-ONLY selective-commit variant of [`Host::submit_block`]: identical
+    /// per-op isolation and single-app-hash composition, but at the boundary it
+    /// partitions the touched set — commit the modules in `commit_only`, abort the
+    /// rest. this heals a TORN block at boot: a block that committed a
+    /// per-block-durable disk substrate (already at its sealed post-root on disk)
+    /// but whose in-memory cohort was rolled back to the checkpoint; replay re-runs
+    /// the frame and commits ONLY the at-pre cohort, aborting the durable substrate
+    /// (re-committing it would move its op-log root and fork). NOT the live path.
+    pub async fn submit_block_committing(
+        &mut self,
+        ctx: BlockContext,
+        ops: Vec<(Origin, Msg)>,
+        commit_only: &BTreeSet<ModuleId>,
+    ) -> Result<BatchOutcome, SubmitError> {
+        self.apply_block(ctx, ops, Some(commit_only)).await
+    }
+
+    /// the shared batch engine behind [`Host::submit_block`] /
+    /// [`Host::submit_block_committing`]. `commit_only == None` commits every
+    /// touched module (the live path); `Some(set)` partitions the boundary
+    /// (recovery). see [`Host::submit_block`] for the algorithm and invariants.
+    async fn apply_block(
+        &mut self,
+        ctx: BlockContext,
+        ops: Vec<(Origin, Msg)>,
+        commit_only: Option<&BTreeSet<ModuleId>>,
+    ) -> Result<BatchOutcome, SubmitError> {
+        // block-constant across every dispatch this block — the agreed values.
+        let height = ctx.height;
+        let consensus_time = ctx.consensus_time;
+        let protocol_version = ctx.protocol_version;
+
+        // 1. the once-per-block System injections, computed ONCE against PRE-batch
+        // committed state — the "results staged by this very block are invisible
+        // here" invariant, evaluated BEFORE any member stages. same order as the
+        // single-op drain: `Advance` then `DeliverPending`. drained once, after
+        // every member, below (step 4).
+        let mut injections: VecDeque<(Origin, Msg)> = VecDeque::new();
+        if let Some(advance) = self.pending_advance(height).await {
+            injections.push_back((Origin::System, advance));
+        }
+        if let Some(deliver) = self.pending_deliveries().await {
+            injections.push_back((Origin::System, deliver));
+        }
+
+        // 2. per-op isolation. `touched` and the modules' own staging accumulate
+        // ACROSS members (never committed mid-batch); a member that rejects rolls
+        // the whole stage back and replays the accepted members, so its rejection
+        // leaves no trace on committed state.
+        let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
+        // accepted members and their authoritative traces, parallel arrays in
+        // input order; `acc_pos[k]` is the input index of accepted member `k`.
+        let mut accepted: Vec<(Origin, Msg)> = Vec::new();
+        let mut acc_traces: Vec<(Vec<Event>, Vec<Effect>, Vec<DispatchRecord>)> = Vec::new();
+        let mut acc_pos: Vec<usize> = Vec::new();
+        let mut results: Vec<Option<MemberOutcome>> = (0..ops.len()).map(|_| None).collect();
+
+        for (i, (origin, msg)) in ops.into_iter().enumerate() {
+            let mut ev: Vec<Event> = Vec::new();
+            let mut ef: Vec<Effect> = Vec::new();
+            let mut di: Vec<DispatchRecord> = Vec::new();
+            let queue: VecDeque<(Origin, Msg)> = VecDeque::from([(origin.clone(), msg.clone())]);
+            match self
+                .drain_queue(
+                    height,
+                    consensus_time,
+                    protocol_version,
+                    queue,
+                    &mut touched,
+                    &mut ev,
+                    &mut ef,
+                    &mut di,
+                )
+                .await
+            {
+                Ok(()) => {
+                    accepted.push((origin, msg));
+                    acc_traces.push((ev, ef, di));
+                    acc_pos.push(i);
+                    // authoritative trace is written after the loop (step 3);
+                    // this placeholder is overwritten there.
+                    results[i] = Some(MemberOutcome::Applied {
+                        dispatches: Vec::new(),
+                    });
+                }
+                Err(reason) => {
+                    // ISOLATE: this member's partial stage is entangled with the
+                    // accepted members' stage (one shared per-module stage), so
+                    // roll the WHOLE stage back, then replay only the accepted
+                    // members to rebuild their writes without this one.
+                    self.abort_all(&mut touched).await?;
+                    for (k, (o, m)) in accepted.iter().enumerate() {
+                        let mut rev: Vec<Event> = Vec::new();
+                        let mut ref_: Vec<Effect> = Vec::new();
+                        let mut rdi: Vec<DispatchRecord> = Vec::new();
+                        let rq: VecDeque<(Origin, Msg)> = VecDeque::from([(o.clone(), m.clone())]);
+                        // an accepted member drained Ok in this same context
+                        // before; a reject on replay is NON-DETERMINISM → fatal.
+                        self.drain_queue(
+                            height,
+                            consensus_time,
+                            protocol_version,
+                            rq,
+                            &mut touched,
+                            &mut rev,
+                            &mut ref_,
+                            &mut rdi,
+                        )
+                        .await
+                        .map_err(|re| {
+                            SubmitError::Fatal(FatalError {
+                                module: m.target.clone(),
+                                phase: BoundaryPhase::Abort,
+                                source: Error::Module(format!(
+                                    "non-deterministic reject replaying accepted batch \
+                                     member during per-op isolation: {re}"
+                                )),
+                            })
+                        })?;
+                        acc_traces[k] = (rev, ref_, rdi);
+                    }
+                    results[i] = Some(MemberOutcome::Rejected {
+                        reason: reason.to_string(),
+                    });
+                }
+            }
+        }
+
+        // 3. write each accepted member's authoritative trace and accumulate the
+        // aggregate events/effects in input order (accepted / acc_traces / acc_pos
+        // are all in input order).
+        let mut events: Vec<Event> = Vec::new();
+        let mut effects: Vec<Effect> = Vec::new();
+        for ((ev, ef, di), pos) in acc_traces.into_iter().zip(acc_pos.iter()) {
+            events.extend(ev);
+            effects.extend(ef);
+            results[*pos] = Some(MemberOutcome::Applied { dispatches: di });
+        }
+
+        // 4. drain the once-per-block injections ONCE, on top of the accepted
+        // members' staged writes. an injection drain error is handled exactly like
+        // submit_at's drain failure: abort the whole touched set — fatal on an
+        // abort fault, else the deterministic rejection.
+        let mut system_dispatches: Vec<DispatchRecord> = Vec::new();
+        let mut sys_events: Vec<Event> = Vec::new();
+        let mut sys_effects: Vec<Effect> = Vec::new();
+        if let Err(reason) = self
+            .drain_queue(
+                height,
+                consensus_time,
+                protocol_version,
+                injections,
+                &mut touched,
+                &mut sys_events,
+                &mut sys_effects,
+                &mut system_dispatches,
+            )
+            .await
+        {
+            self.abort_all(&mut touched).await?;
+            return Err(SubmitError::Rejected(reason));
+        }
+        events.extend(sys_events);
+        effects.extend(sys_effects);
+
+        // 5. COMMIT once — the single boundary for the whole batch. the live path
+        // commits every touched module; recovery partitions on `commit_only`
+        // (commit those in the set, abort the rest). either hook failing is FATAL.
+        match commit_only {
+            None => {
+                for id in touched.iter() {
                     if let Some(m) = self.registry.get_mut(id) {
-                        if commit_only.contains(id) {
+                        m.commit_block().await.map_err(|source| {
+                            SubmitError::Fatal(FatalError {
+                                module: id.clone(),
+                                phase: BoundaryPhase::Commit,
+                                source,
+                            })
+                        })?;
+                    }
+                }
+            }
+            Some(set) => {
+                for id in touched.iter() {
+                    if let Some(m) = self.registry.get_mut(id) {
+                        if set.contains(id) {
                             m.commit_block().await.map_err(|source| {
                                 SubmitError::Fatal(FatalError {
                                     module: id.clone(),
@@ -758,34 +967,40 @@ impl Host {
                         }
                     }
                 }
-                Ok(BlockOutcome {
-                    app_hash: self.app_hash(),
-                    events,
-                    effects,
-                    dispatches,
-                })
             }
-            Err(e) => {
-                // drain failure: identical to submit_at — abort every touched
-                // module, report the first abort fault as fatal else the
-                // deterministic rejection.
-                let mut fatal: Option<FatalError> = None;
-                for id in &touched {
-                    if let Some(m) = self.registry.get_mut(id)
-                        && let Err(source) = m.abort_block().await
-                    {
-                        fatal.get_or_insert(FatalError {
-                            module: id.clone(),
-                            phase: BoundaryPhase::Abort,
-                            source,
-                        });
-                    }
-                }
-                match fatal {
-                    Some(f) => Err(SubmitError::Fatal(f)),
-                    None => Err(SubmitError::Rejected(e)),
-                }
+        }
+
+        // 6. ONE app-hash over the committed registry, shared by every member.
+        Ok(BatchOutcome {
+            app_hash: self.app_hash(),
+            members: results.into_iter().map(Option::unwrap).collect(),
+            events,
+            effects,
+            system_dispatches,
+        })
+    }
+
+    /// abort every module in `touched` (deterministic registry order), then clear
+    /// the set. best-effort: keep aborting after a fault (each un-aborted stage is
+    /// one more leak) but return the FIRST fault as a fatal boundary error. shared
+    /// by [`Host::apply_block`]'s isolation and injection-failure paths.
+    async fn abort_all(&mut self, touched: &mut BTreeSet<ModuleId>) -> Result<(), SubmitError> {
+        let mut fatal: Option<FatalError> = None;
+        for id in touched.iter() {
+            if let Some(m) = self.registry.get_mut(id)
+                && let Err(source) = m.abort_block().await
+            {
+                fatal.get_or_insert(FatalError {
+                    module: id.clone(),
+                    phase: BoundaryPhase::Abort,
+                    source,
+                });
             }
+        }
+        touched.clear();
+        match fatal {
+            Some(f) => Err(SubmitError::Fatal(f)),
+            None => Ok(()),
         }
     }
 
@@ -834,9 +1049,49 @@ impl Host {
         if let Some(deliver) = self.pending_deliveries().await {
             queue.push_back((Origin::System, deliver));
         }
+
+        // run the whole queue (root op + the once-per-block injections) as ONE
+        // drain into fresh trace vecs. the extracted queue-runner is what
+        // submit_block reuses — once per member, then once for the injections.
         let mut events: Vec<Event> = Vec::new();
         let mut effects: Vec<Effect> = Vec::new();
         let mut dispatches: Vec<DispatchRecord> = Vec::new();
+        self.drain_queue(
+            height,
+            consensus_time,
+            protocol_version,
+            queue,
+            touched,
+            &mut events,
+            &mut effects,
+            &mut dispatches,
+        )
+        .await?;
+        Ok((events, effects, dispatches))
+    }
+
+    /// the extracted dispatch-loop queue-runner: pop `(origin, msg)` FIFO, run
+    /// each target's `execute` (remove-execute-reinsert), record the deterministic
+    /// [`DispatchRecord`], and push emitted follow-ups back as `Origin::Module`
+    /// ops until the queue empties or [`MAX_DISPATCHES`] is hit. modules only
+    /// STAGE; the caller owns the commit/abort boundary. staged writes and
+    /// `touched` accumulate across calls, so `submit_block` can drain members one
+    /// at a time on top of one another. `events` / `effects` / `dispatches` are
+    /// appended to (never cleared), so a caller can thread one set of sinks across
+    /// several calls or hand in fresh ones per call. the dispatch budget is
+    /// per-call: each queue-run gets a fresh [`MAX_DISPATCHES`].
+    #[allow(clippy::too_many_arguments)]
+    async fn drain_queue(
+        &mut self,
+        height: u64,
+        consensus_time: u64,
+        protocol_version: u32,
+        mut queue: VecDeque<(Origin, Msg)>,
+        touched: &mut BTreeSet<ModuleId>,
+        events: &mut Vec<Event>,
+        effects: &mut Vec<Effect>,
+        dispatches: &mut Vec<DispatchRecord>,
+    ) -> Result<(), Error> {
         let mut n: u32 = 0;
 
         while let Some((origin, msg)) = queue.pop_front() {
@@ -917,7 +1172,7 @@ impl Host {
             effects.extend(out_effects);
         }
 
-        Ok((events, effects, dispatches))
+        Ok(())
     }
 }
 

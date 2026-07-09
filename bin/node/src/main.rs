@@ -134,11 +134,11 @@ const PEER_SET: u64 = 0;
 /// shows. the frame finalizes, rejects deterministically on every node (unknown
 /// module), advances the engine clock, and leaves no state.
 const NOP_TARGET: &str = "consensus.nop";
-/// heartbeat cadence: how often a node pushes a [`NOP_TARGET`] frame so an idle
-/// chain still finalizes blocks (its height keeps ticking) and any pending
-/// cutover still crosses. one block/sec while idle is the accepted cost of a
-/// visibly-live height.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+// block cadence is a single knob: `consensus::BLOCK_TIME` (2s). the idle
+// heartbeat beats one nop block per BLOCK_TIME so an idle chain still finalizes
+// (its height keeps ticking) and any pending cutover still crosses — paced to
+// the same interval the leader's idle-propose holds a view open, so the beat
+// never outpaces the intended block time.
 /// request timeout for the promoted-validator boot catch-up client. it is long
 /// enough to let discovery links warm, but bounded so boot cannot hang forever
 /// before the statesync server bridge is installed.
@@ -8407,8 +8407,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // the last absolute view ticked to the reachability plane — one
         // ViewTick per actual advance, not one per 100ms drain pass.
         let mut last_reach_view: Option<u64> = None;
-        // throttle for the pending-cutover nop pusher below.
-        let mut last_nop = std::time::Instant::now();
+        // the per-block-time flush cadence: packs the window's enqueued frames
+        // (real ops and/or an idle nop) into one batch block. see the flush loop.
+        let mut last_flush = std::time::Instant::now();
         // dev override (`make dev` sets DUCKTAPE_DISABLE_HEARTBEAT): keep an idle
         // dev chain quiet — no nop blocks — so every committed block is real
         // activity and the journal/logs carry no idle churn. NEVER set this on a
@@ -8587,23 +8588,46 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // peers, so applying even one more finalized op could
                     // silently fork it. exit loudly; an operator (or supervisor)
                     // restarts the node, which then re-joins via state sync.
-                    applied += match node.drain_delivered().await {
+                    let drained_count = match node.drain_delivered().await {
                         Ok(n) => n,
                         Err(e) => {
                             eprintln!("[node {label}] FATAL: {e} — halting");
                             std::process::exit(1);
                         }
                     };
+                    applied += drained_count;
+                    // durabilize the tip seal when the chain goes idle. a seal is a
+                    // plain journal append made durable only by the NEXT block's
+                    // pre-apply sync; on an idle chain the tip block's seal can sit
+                    // un-synced for a whole block-time, and a crash there loses it,
+                    // turning the tip into a TRAILING block. that is fine for most
+                    // ops, but a trailing SELF-READING op — a files CAS commit whose
+                    // re-execution reads the claimant's already-durable post-state —
+                    // cannot be selective-replayed and would brick a SOLO node (no
+                    // peer to re-sync from). syncing on the idle transition closes
+                    // the window; a busy chain amortizes durability against the next
+                    // pre-apply and needs no extra sync here.
+                    if drained_count > 0
+                        && node.pending_batch_len() == 0
+                        && node.orderer().pending_len() == 0
+                        && let Err(e) = node.sink_mut().sync().await
+                    {
+                        eprintln!("[node {label}] tip-seal sync failed: {e}");
+                    }
                     // resolve held app-surface submits against what this
                     // drain finished with; every disposition is deterministic,
                     // so the reply faithfully reports the op's consensus fate.
                     let drained = node.take_drained();
-                    // sealed = journaled: applied and rejected frames both got
-                    // recovery seals; discarded frames were never journaled.
+                    // sealed = journaled: one seal per BLOCK (height), whatever a
+                    // batch's member count. count DISTINCT sealed heights so the
+                    // checkpoint cadence stays per-block; applied and rejected
+                    // members both seal, discarded frames never sealed a height.
                     blocks_since_checkpoint += drained
                         .iter()
                         .filter(|d| d.disposition != node::Disposition::Discarded)
-                        .count() as u64;
+                        .map(|d| d.height)
+                        .collect::<std::collections::BTreeSet<u64>>()
+                        .len() as u64;
                     // fold every SEALED frame into the derived per-module
                     // index: an applied frame contributes its dispatch trace,
                     // a rejected one folds EMPTY (it still consumed its
@@ -8617,38 +8641,53 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // canonical state committed above, so an index failure
                     // degrades read models only — the store poisons itself
                     // and stays loud until rebuilt.
-                    for d in &drained {
-                        if d.disposition == node::Disposition::Discarded {
-                            continue;
-                        }
-                        let dispatches: &[host::DispatchRecord] = match (&d.disposition, &d.op) {
-                            (node::Disposition::Applied, Some(op)) => &op.dispatches,
-                            _ => &[],
-                        };
-                        // metrics: fold the block into the validator's
-                        // `ducktape_*` Prometheus series (GET /metrics). an
-                        // APPLIED block records fully — count, this node's
-                        // apply latency, per-module dispatch counters; a
-                        // REJECTED frame (a deterministic no-op — the idle
-                        // heartbeat nop lands here) only follows the height
-                        // gauge, so it never pollutes the block series.
-                        match (&d.disposition, &d.op) {
-                            (node::Disposition::Applied, Some(op)) => {
-                                metrics.record_block(d.height, op.latency_us, dispatches);
+                    // fold each BLOCK once: a batch delivers N DrainedFrames at
+                    // ONE height (its members, contiguous in agreed order). the
+                    // per-module index and the `ducktape_*` metrics series are
+                    // per-BLOCK — folding per frame would over-count blocks as ops
+                    // AND lose every member after the first to the index's
+                    // idempotent same-height skip. group the run of same-height
+                    // frames, concatenate their dispatch traces under one running
+                    // seq (so `op_key(height, seq)` stays unique across members),
+                    // and fold once. canonical state committed above, so an index
+                    // failure degrades read models only — it stays loud.
+                    let mut gi = 0;
+                    while gi < drained.len() {
+                        let height = drained[gi].height;
+                        let mut block_dispatches: Vec<host::DispatchRecord> = Vec::new();
+                        let mut block_latency = 0u64;
+                        let mut any_applied = false;
+                        // the block-list row: the FIRST non-nop member represents
+                        // the block (full per-op block rendering is a read-model
+                        // follow-up). the idle nop and pre-first rejects carry none.
+                        let mut record = None;
+                        while gi < drained.len() && drained[gi].height == height {
+                            let d = &drained[gi];
+                            gi += 1;
+                            // a DISCARD never sealed this height (it is carried, not
+                            // applied) — it contributes nothing to the fold.
+                            if d.disposition == node::Disposition::Discarded {
+                                continue;
                             }
-                            _ => metrics.record_height(d.height),
-                        }
-                        let record = match &d.op {
-                            Some(op) if op.target != NOP_TARGET => {
+                            if let (node::Disposition::Applied, Some(op)) =
+                                (&d.disposition, &d.op)
+                            {
+                                any_applied = true;
+                                block_latency = block_latency.saturating_add(op.latency_us);
+                                block_dispatches.extend(op.dispatches.iter().cloned());
+                            }
+                            if record.is_none()
+                                && let Some(op) = &d.op
+                                && op.target != NOP_TARGET
+                            {
                                 let disposition = match d.disposition {
                                     node::Disposition::Applied => noded::BlockDisposition::Applied,
                                     node::Disposition::Rejected => noded::BlockDisposition::Rejected,
-                                    // unreachable — filtered at the loop top —
-                                    // but stay total on this observability
-                                    // lane rather than panic.
+                                    // unreachable: Discarded is filtered at the top
+                                    // of the inner loop; kept for match exhaustiveness.
                                     node::Disposition::Discarded => continue,
                                 };
-                                Some(explorer_block_row(
+                                record = Some(explorer_block_row(
                                     &blobs,
                                     d.height,
                                     &d.id,
@@ -8656,26 +8695,30 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     &op.origin,
                                     &op.target,
                                     &op.payload,
-                                    // == op.dispatches: a rejected frame's
-                                    // trace is empty on both bindings.
-                                    dispatches,
+                                    &op.dispatches,
                                     disposition,
-                                ))
+                                ));
                             }
-                            _ => None,
-                        };
+                        }
+                        // one block per height: an APPLIED block records fully
+                        // (count, this node's summed apply latency, per-module
+                        // dispatch counters); an all-rejected block (the idle nop
+                        // lands here) only follows the height gauge.
+                        if any_applied {
+                            metrics.record_block(height, block_latency, &block_dispatches);
+                        } else {
+                            metrics.record_height(height);
+                        }
+                        // this lane's agreed clock IS the height: the drain stamps
+                        // BlockContext { consensus_time: height } for every block.
                         let ops = indexer::BlockOps {
                             record,
-                            // this lane's agreed clock IS the height: the
-                            // drain stamps BlockContext { consensus_time:
-                            // height } for every frame.
-                            ..noded::index_block_ops(d.height, d.height, dispatches)
+                            ..noded::index_block_ops(height, height, &block_dispatches)
                         };
                         if let Err(err) = index.apply_block(&ops) {
                             eprintln!(
-                                "[node {label}] module index apply failed at height {}: {err} \
-                                 — wipe <storage>/index to rebuild",
-                                d.height
+                                "[node {label}] module index apply failed at height {height}: {err} \
+                                 — wipe <storage>/index to rebuild"
                             );
                         }
                     }
@@ -9124,42 +9167,47 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     }
 
-                    // heartbeat: finalized views only advance with ops, so an
-                    // idle network freezes — its height never ticks, and a
-                    // pending cutover (which crosses only when finalized views
-                    // REACH it) would park at the armed boundary forever. push a
-                    // deterministically-rejected nop (unknown module target:
-                    // rejects identically on every node, leaves no state) once
-                    // per block-time so the chain — and the height the console
-                    // shows — keeps moving whether or not anyone is active.
+                    // BLOCK CADENCE + heartbeat, unified. `submit`/`submit_frame`
+                    // now ENQUEUE into the node's `pending_batch`; this is the one
+                    // place per block-time that FLUSHES the window — packing every
+                    // frame that arrived in it (real ops and/or an idle nop) into
+                    // ONE batch super-frame and proposing it as a single block.
+                    // that is the aggregation: at most one block per BLOCK_TIME,
+                    // carrying all the window's txs, never 1-tx-1-block.
                     //
-                    // GATE on an EMPTY pending FIFO: the queue is strictly serial
-                    // (one frame finalized per block), so a nop pushed while real
-                    // frames are pending only builds a backlog that starves real
-                    // ops after any finalization stall (a flapping quorum peer piles
-                    // nops at 1/s; recovery then drains them ahead of real work —
-                    // minutes of head-of-line latency). a nop only ticks an IDLE
-                    // chain, and an idle chain has an empty queue, so beat only when
-                    // the FIFO is empty — at most one nop outstanding, and only when
-                    // it is alone. the reset stays inside the taken branch: when the
-                    // gate skips, the timer stays elapsed, so the first tick after
-                    // the queue drains injects the next nop immediately.
-                    if !heartbeat_disabled
-                        && last_nop.elapsed() >= HEARTBEAT_INTERVAL
-                        && node.orderer().pending_len() == 0
-                    {
-                        last_nop = std::time::Instant::now();
-                        let seq = next_seq;
-                        next_seq += 1;
-                        if let Err(e) = node
-                            .submit(
-                                &signer,
-                                seq,
-                                Msg { target: NOP_TARGET.into(), payload: Vec::new() },
-                            )
-                            .await
-                        {
-                            eprintln!("[node {label}] heartbeat nop submit failed: {e}");
+                    // the idle nop still exists: finalized views only advance with
+                    // a proposed frame, so an idle network would freeze (its height
+                    // never ticks and a pending cutover, which crosses only when
+                    // finalized views REACH it, would park forever). so on an EMPTY
+                    // window inject one deterministically-rejected nop (unknown
+                    // module target: rejects identically everywhere, leaves no
+                    // state) and flush that. a window with real ops needs no nop —
+                    // the ops ARE the block.
+                    //
+                    // GATE the idle nop on an empty orderer FIFO too: a nop pushed
+                    // while a batch still awaits finalization only piles behind a
+                    // finalization stall (a flapping quorum peer would stack idle
+                    // blocks). real ops are never gated — they must not wait.
+                    if !heartbeat_disabled && last_flush.elapsed() >= consensus::BLOCK_TIME {
+                        last_flush = std::time::Instant::now();
+                        if node.pending_batch_len() == 0 && node.orderer().pending_len() == 0 {
+                            let seq = next_seq;
+                            next_seq += 1;
+                            if let Err(e) = node
+                                .submit(
+                                    &signer,
+                                    seq,
+                                    Msg { target: NOP_TARGET.into(), payload: Vec::new() },
+                                )
+                                .await
+                            {
+                                eprintln!("[node {label}] heartbeat nop submit failed: {e}");
+                            }
+                        }
+                        // flush the window: no-op when `pending_batch` is empty
+                        // (idle with a batch already in flight — wait for it).
+                        if let Err(e) = node.flush_batch().await {
+                            eprintln!("[node {label}] batch flush failed: {e}");
                         }
                     }
 
@@ -9228,7 +9276,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // throttled like the heartbeat, since a backlog wider
                     // than CRANK_BUDGET legitimately needs several. duplicate
                     // cranks from other nodes are deterministic no-ops.
-                    if last_crank.elapsed() >= HEARTBEAT_INTERVAL
+                    if last_crank.elapsed() >= consensus::BLOCK_TIME
                         && let Some(finalized_height) = node.finalized().map(|f| f.height)
                         && let Some(expiry) = saga_next_expiry(node.host()).await
                         && expiry <= finalized_height
@@ -9267,7 +9315,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // is non-empty, push one permissionless Nudge — a no-op
                     // whose block carries the injection. duplicate nudges
                     // from other nodes are free.
-                    if last_nudge.elapsed() >= HEARTBEAT_INTERVAL
+                    if last_nudge.elapsed() >= consensus::BLOCK_TIME
                         && dispatch_pending_deliveries(node.host()).await > 0
                     {
                         last_nudge = std::time::Instant::now();

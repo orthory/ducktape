@@ -417,14 +417,24 @@ impl ConsensusHandle {
 /// is a no-op `true` — in this single-app sim every payload asked about is one we
 /// stored. generic over the public key `P` so `Context<Digest, P>` lines up with
 /// whatever scheme the engine runs.
+/// the single block-time knob: the target interval between finalized blocks.
+/// an idle chain ticks exactly one nop block per `BLOCK_TIME`; a busy window's
+/// ops all aggregate into the single block that closes the window. the node's
+/// flush/heartbeat loop AND this automaton's idle-wait both pace off this one
+/// value, so no producer can outpace it (the 1-tx-1-block + faster-than-intended
+/// beat regime is gone). raising it slows the visibly-live height tick 1:1.
+pub const BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(2);
 /// how long a leader holds an otherwise-idle view open, polling for an op or the
-/// node's heartbeat nop before declining. keeping a solo validator (no quorum to
-/// wait on) from spinning nullifications — and the height they stamp — at CPU
-/// speed. MUST exceed the node's heartbeat interval (`HEARTBEAT_INTERVAL`, 1s) so
-/// the beat always lands inside the window and the view advances by a single
-/// finalized block per beat (a clean ~1s block time), never a nullify + a
-/// finalize per beat.
-const IDLE_BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+/// node's heartbeat nop before declining — keeping a solo validator (no quorum
+/// to wait on) from spinning nullifications, and the height they stamp, at CPU
+/// speed. equal to [`BLOCK_TIME`]: the node's flush loop is the real pacer, so
+/// this is only the safety ceiling for a node whose flush loop is disabled. it
+/// MUST be >= the beat interval so the beat lands inside the window and the view
+/// advances by a single finalized block per beat, never a nullify + a finalize.
+const IDLE_BLOCK_TIME: std::time::Duration = BLOCK_TIME;
+/// how often [`ConsensusAutomaton::propose`] polls the pending FIFO while it
+/// holds an idle view open. matches the node's `DRAIN_TICK`.
+const POLL_STEP: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub struct ConsensusAutomaton<P, C> {
     pending: Arc<Mutex<VecDeque<Digest>>>,
@@ -515,7 +525,7 @@ where
         // nop is proposed within a tick. still empty at the deadline → drop `tx`
         // (the engine reads that as "can't propose" and nullifies), now paced to
         // ~1 block per block-time.
-        let step = std::time::Duration::from_millis(100);
+        let step = POLL_STEP;
         let mut waited = std::time::Duration::ZERO;
         loop {
             if let Some(digest) = self

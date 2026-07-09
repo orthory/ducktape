@@ -90,6 +90,13 @@ async fn feed_and_drain<O: Orderer>(
         node.submit(origin, *seq, msg.clone())
             .await
             .expect("submit");
+        // flush each op into its OWN single-member batch super-frame. cross-node
+        // agreement then rides the orderer's sort over the identical SET of
+        // super-frames (RoundOrderer) or their arrival order (ArrivalOrderer) —
+        // exactly as the pre-batch per-op frames did. packing multiple ops into
+        // one batch would fix their order to this node's LOCAL submit order (no
+        // cross-node agreement) and fork the order-dependent qmdb root.
+        node.flush_batch().await.expect("flush");
     }
     let mut total = 0;
     loop {
@@ -127,18 +134,22 @@ fn n_validators_converge_under_agreed_order_including_qmdb_root() {
         let genesis_kv = nodes[0].host().module_root("kv").unwrap();
 
         // each validator receives the SAME op-set in a DIFFERENT arrival order,
-        // and SUBMITS every op (no local apply — the semantic shift).
+        // and SUBMITS + FLUSHES every op (no local apply — the semantic shift).
+        // each op becomes its own single-member batch super-frame, so the agreed
+        // order is the orderer's sort over the identical SET (as before batching).
         for (i, node) in nodes.iter_mut().enumerate() {
             let arrival = rotated(&ops, i);
             for (origin, seq, msg) in &arrival {
                 node.submit(origin, *seq, msg.clone())
                     .await
                     .expect("submit");
+                node.flush_batch().await.expect("flush");
             }
         }
 
-        // SEMANTIC SHIFT: after submit, before any drain, EVERY node is still at
-        // genesis. the originator is NOT ahead — nothing was applied optimistically.
+        // SEMANTIC SHIFT: after submit+flush, before any drain, EVERY node is
+        // still at genesis. flush pins+proposes but does NOT apply — nothing is
+        // applied optimistically; the originator is NOT ahead.
         for n in &nodes {
             assert_eq!(
                 n.app_hash(),

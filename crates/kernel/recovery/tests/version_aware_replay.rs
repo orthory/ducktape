@@ -213,7 +213,9 @@ fn replay_recomputes_the_identical_app_hash_across_an_armed_boundary() {
 
         // two ops BELOW H: baseline version, dual root uses v0.
         node.submit(&signer, 0, op()).await.expect("submit");
+        node.flush_batch().await.expect("flush");
         node.submit(&signer, 1, op()).await.expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 2);
         let checkpoint_height = node.finalized().expect("boundary").height;
         assert!(checkpoint_height < H, "checkpoint must sit below H");
@@ -262,7 +264,9 @@ fn replay_recomputes_the_identical_app_hash_across_an_armed_boundary() {
         // two ops AT/ABOVE H: version-1, dual root uses v1. the host injects a
         // boundary `Advance` at each (>= H) — the mock accepts it.
         node.submit(&signer, 2, op()).await.expect("submit");
+        node.flush_batch().await.expect("flush");
         node.submit(&signer, 3, op()).await.expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 2);
         let tip = node.finalized().expect("boundary");
         assert!(tip.height >= H, "tip must sit at/above H");
@@ -368,7 +372,9 @@ fn roll_forward_of_an_unsealed_block_across_h_is_version_aware() {
         .expect("genesis");
         let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
         node.submit(&signer, 0, op()).await.expect("submit");
+        node.flush_batch().await.expect("flush");
         node.submit(&signer, 1, op()).await.expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 2);
         let checkpoint_height = node.finalized().expect("boundary").height;
         assert!(checkpoint_height < H, "checkpoint below H");
@@ -392,7 +398,8 @@ fn roll_forward_of_an_unsealed_block_across_h_is_version_aware() {
         node.sink_mut().write_manifest(&manifest).await.expect("write manifest");
 
         // the torn write: the H block's WAL record lands, its apply/seal does not.
-        let frame = node::encode_frame(&signer, 2, &op());
+        // the record is a BATCH super-frame (single member), as the live drain pins.
+        let frame = node::encode_batch(&[node::encode_frame(&signer, 2, &op())]);
         {
             use node::BlockSink as _;
             node.sink_mut().pre_apply(H, &frame).await.expect("wal record");
