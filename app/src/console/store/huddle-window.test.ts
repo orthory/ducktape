@@ -22,6 +22,7 @@ const voice = (over: Partial<VoiceSlice> = {}): VoiceSlice => ({
   error: null,
   popped: true,
   cameraOn: false,
+  sharing: false,
   peers: {},
   sessionStartMs: NOW - 1_000,
   speaking: false,

@@ -435,7 +435,7 @@ async fn run_session<T: DataPlaneTransport>(
     let mut frame_no: u32 = 0;
     let mut peer_lanes: HashMap<[u8; 32], PeerLane> = HashMap::new();
     // what the webview last told us — repeated at 1 Hz as our beacon.
-    let (mut muted, mut camera_on) = (true, false);
+    let (mut muted, mut camera_on, mut sharing) = (true, false, false);
     // rate hints RECEIVED from each peer about OUR sending; effective = min.
     let mut inbound_hints: HashMap<[u8; 32], u32> = HashMap::new();
     let mut effective_kbps: u32 = chat::video::RATE_LADDER_KBPS[0];
@@ -534,9 +534,9 @@ async fn run_session<T: DataPlaneTransport>(
                             let _ = control_out.try_send(noded::CallControlOut::KeyframeRequest);
                         }
                     }
-                    chat::video::CallControl::Beacon { muted, camera_on } => {
+                    chat::video::CallControl::Beacon { muted, camera_on, sharing } => {
                         let _ = control_out.try_send(noded::CallControlOut::PeerBeacon {
-                            peer: peer.0, muted, camera_on,
+                            peer: peer.0, muted, camera_on, sharing,
                         });
                     }
                     chat::video::CallControl::RateHint { max_kbps } => {
@@ -561,11 +561,11 @@ async fn run_session<T: DataPlaneTransport>(
             state = control_in.recv() => {
                 let Some(state) = state else { break };
                 match state {
-                    noded::CallControlIn::Beacon { muted: m, camera_on: c } => {
-                        (muted, camera_on) = (m, c);
+                    noded::CallControlIn::Beacon { muted: m, camera_on: c, sharing: s } => {
+                        (muted, camera_on, sharing) = (m, c, s);
                         // push immediately so toggles feel live; the 1 Hz
                         // tick keeps late joiners current.
-                        send_beacon(&ctl, &recipients, muted, camera_on).await;
+                        send_beacon(&ctl, &recipients, muted, camera_on, sharing).await;
                     }
                     noded::CallControlIn::KeyframeRequest { peer } => {
                         if let Some(lane) = peer_lanes.get_mut(&peer) {
@@ -575,7 +575,7 @@ async fn run_session<T: DataPlaneTransport>(
                 }
             }
             _ = ctl_tick.tick() => {
-                send_beacon(&ctl, &recipients, muted, camera_on).await;
+                send_beacon(&ctl, &recipients, muted, camera_on, sharing).await;
                 // hints from peers no longer in the roster must not pin our rate.
                 let live: HashSet<[u8; 32]> = recipients.borrow().iter().copied().collect();
                 inbound_hints.retain(|peer, _| live.contains(peer));
@@ -623,8 +623,14 @@ async fn send_beacon<T: DataPlaneTransport>(
     recipients: &watch::Receiver<Vec<[u8; 32]>>,
     muted: bool,
     camera_on: bool,
+    sharing: bool,
 ) {
-    let frame = chat::video::CallControl::Beacon { muted, camera_on }.encode();
+    let frame = chat::video::CallControl::Beacon {
+        muted,
+        camera_on,
+        sharing,
+    }
+    .encode();
     let peers: Vec<PeerId> = recipients.borrow().iter().map(|raw| PeerId(*raw)).collect();
     for peer in peers {
         let _ = ctl.send_to(peer, &frame).await;
@@ -992,12 +998,14 @@ mod tests {
             .send(noded::CallControlIn::Beacon {
                 muted: false,
                 camera_on: true,
+                sharing: true,
             })
             .await
             .expect("session a alive");
 
         // B's control_out yields A's beacon as peer state (the 1 Hz tick also
-        // repeats it, so a generous timeout is safe).
+        // repeats it, so a generous timeout is safe). `sharing` must survive the
+        // cross-node encode/decode + hub relay.
         let state = loop {
             let msg = tokio::time::timeout(Duration::from_secs(10), session_b.control_out.recv())
                 .await
@@ -1007,12 +1015,13 @@ mod tests {
                 peer,
                 muted,
                 camera_on,
+                sharing,
             } = msg
             {
-                break (peer, muted, camera_on);
+                break (peer, muted, camera_on, sharing);
             }
         };
-        assert_eq!(state, (key_a, false, true));
+        assert_eq!(state, (key_a, false, true, true));
 
         drop((req_a_tx, req_b_tx));
     }

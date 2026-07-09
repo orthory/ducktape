@@ -48,9 +48,12 @@ export interface VoiceSlice {
   popped: boolean;
   /** Local camera state (ephemeral, beaconed to peers — never consensus). */
   cameraOn: boolean;
+  /** Whether OUR video lane is a screen share rather than the camera (camera XOR
+   *  screen — ephemeral, beaconed, never consensus). */
+  sharing: boolean;
   /** Per-peer ephemeral call state from 1 Hz beacons, keyed by NODE hex.
    *  Staleness (no beacon for >10 s) drives the sweep affordance. */
-  peers: Record<string, { muted: boolean; cameraOn: boolean; atMs: number }>;
+  peers: Record<string, { muted: boolean; cameraOn: boolean; sharing: boolean; atMs: number }>;
   /** Epoch ms our current session started (set on join, null when idle) — the
    *  staleness baseline for a never-beaconed member. Shared so the dock and the
    *  popped window agree on who is sweepable. */
@@ -453,11 +456,12 @@ export const createInitialState = (): ConsoleState => {
       error: null,
       popped: false,
       cameraOn: false,
+      sharing: false,
       peers: {},
       sessionStartMs: null,
       speaking: false,
     },
-    videoCapability: { canEncode: false, canDecode: false },
+    videoCapability: { canEncode: false, canDecode: false, canScreenShare: false },
     members: [],
     residents: [],
     proposals: [],

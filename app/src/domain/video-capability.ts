@@ -28,6 +28,8 @@ export interface VideoCapability {
   canEncode: boolean;
   /** Can this runtime VP8-decode a peer's video (gates peer-tile <canvas> rendering). */
   canDecode: boolean;
+  /** Can this runtime screen-share — VP8 encode AND getDisplayMedia present. */
+  canScreenShare: boolean;
 }
 
 type ConfigProbe = { isConfigSupported?: (config: unknown) => Promise<{ supported?: boolean }> };
@@ -62,5 +64,8 @@ export const probeVideoCapability = async (): Promise<VideoCapability> => {
     typeof VideoDecoder !== "undefined"
       ? await isSupported(VideoDecoder as unknown as ConfigProbe, PROBE_DECODER_CONFIG)
       : false;
-  return { canEncode, canDecode };
+  // Screen share reuses the VP8 encode path, so it needs canEncode plus the
+  // getDisplayMedia API (WebKitGTK may lack a working portal → hide the button).
+  const canScreenShare = canEncode && typeof navigator.mediaDevices?.getDisplayMedia === "function";
+  return { canEncode, canDecode, canScreenShare };
 };

@@ -173,7 +173,12 @@ function HuddleDockCard() {
   // camera-on and we can actually decode it (else that peer shows a roster row).
   const showTiles =
     voice.cameraOn ||
-    (canDecode && roster.some((m) => voice.peers[keyHex(m.node)]?.cameraOn));
+    voice.sharing ||
+    (canDecode &&
+      roster.some((m) => {
+        const b = voice.peers[keyHex(m.node)];
+        return b?.cameraOn || b?.sharing;
+      }));
 
   // The in-app "stage" — expand the compact dock into a full-window gallery /
   // spotlight. Local state, so it resets on join (the card is keyed by channel)
@@ -273,6 +278,7 @@ function HuddleDockCard() {
           canEncode={canEncode}
           canDecode={canDecode}
           selfCameraOn={voice.cameraOn}
+          selfSharing={voice.sharing}
           bindPreview={bindPreview}
           bindTile={bindTile}
           // +1 so the self tile rides on top of the peer cap, matching the old
@@ -288,6 +294,9 @@ function HuddleDockCard() {
         cameraOn={voice.cameraOn}
         canEncode={canEncode}
         cameraDisabledReason={overCap ? "Video is capped at 8 participants" : undefined}
+        sharing={voice.sharing}
+        canScreenShare={state.videoCapability.canScreenShare && !overCap}
+        onToggleScreen={() => actions.setScreenShare(!voice.sharing)}
         onToggleMute={() => actions.setHuddleMuted(!voice.muted)}
         onToggleCamera={() => actions.setCamera(!voice.cameraOn)}
         onLeave={() => actions.leaveHuddle()}

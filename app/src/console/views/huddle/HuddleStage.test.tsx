@@ -35,7 +35,7 @@ const renderStage = (voicePatch: Partial<ConsoleState["voice"]> = {}) => {
     status: { publicKey: selfHex } as ConsoleState["status"],
     channels: [channel()],
     authorNames: {},
-    videoCapability: { canEncode: false, canDecode: true },
+    videoCapability: { canEncode: false, canDecode: true, canScreenShare: false },
     voice: {
       ...base.voice,
       channelId: "ch",

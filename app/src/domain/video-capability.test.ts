@@ -24,7 +24,7 @@ const stubEncodeApis = (present: boolean) => {
   vi.stubGlobal("VideoFrame", present ? function () {} : undefined);
   if (present) {
     (HTMLVideoElement.prototype as { requestVideoFrameCallback?: unknown }).requestVideoFrameCallback = () => 0;
-    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia: vi.fn() } });
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia: vi.fn(), getDisplayMedia: vi.fn() } });
   } else {
     delete (HTMLVideoElement.prototype as { requestVideoFrameCallback?: unknown }).requestVideoFrameCallback;
     vi.stubGlobal("navigator", {});
@@ -44,38 +44,47 @@ describe("probeVideoCapability", () => {
     vi.stubGlobal("VideoEncoder", undefined);
     vi.stubGlobal("VideoDecoder", undefined);
     stubEncodeApis(false);
-    expect(await probeVideoCapability()).toEqual({ canEncode: false, canDecode: false });
+    expect(await probeVideoCapability()).toEqual({ canEncode: false, canDecode: false, canScreenShare: false });
   });
 
   it("reports both false when isConfigSupported says unsupported (API present)", async () => {
     stubCodec("VideoEncoder", { supported: false });
     stubCodec("VideoDecoder", { supported: false });
-    expect(await probeVideoCapability()).toEqual({ canEncode: false, canDecode: false });
+    expect(await probeVideoCapability()).toEqual({ canEncode: false, canDecode: false, canScreenShare: false });
   });
 
   it("reflects the encode/decode split: decode yes, encode no", async () => {
     // The real WebKitGTK-2.52 dev-box case: no encoder registers, decoder does.
     stubCodec("VideoEncoder", { supported: false });
     stubCodec("VideoDecoder", { supported: true });
-    expect(await probeVideoCapability()).toEqual({ canEncode: false, canDecode: true });
+    expect(await probeVideoCapability()).toEqual({ canEncode: false, canDecode: true, canScreenShare: false });
   });
 
   it("reports both true when the platform supports vp8 encode and decode", async () => {
     stubCodec("VideoEncoder", { supported: true });
     stubCodec("VideoDecoder", { supported: true });
-    expect(await probeVideoCapability()).toEqual({ canEncode: true, canDecode: true });
+    expect(await probeVideoCapability()).toEqual({ canEncode: true, canDecode: true, canScreenShare: true });
+  });
+
+  it("gates screen share on getDisplayMedia even when encode is available", async () => {
+    stubCodec("VideoEncoder", { supported: true });
+    stubCodec("VideoDecoder", { supported: true });
+    // encode-capable, but no getDisplayMedia (e.g. WebKitGTK without a portal).
+    (HTMLVideoElement.prototype as { requestVideoFrameCallback?: unknown }).requestVideoFrameCallback = () => 0;
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia: vi.fn() } });
+    expect(await probeVideoCapability()).toEqual({ canEncode: true, canDecode: true, canScreenShare: false });
   });
 
   it("gates encode on getUserMedia even when isConfigSupported is true", async () => {
     stubCodec("VideoEncoder", { supported: true });
     stubCodec("VideoDecoder", { supported: true });
     vi.stubGlobal("navigator", {}); // no mediaDevices → cannot capture → cannot encode
-    expect(await probeVideoCapability()).toEqual({ canEncode: false, canDecode: true });
+    expect(await probeVideoCapability()).toEqual({ canEncode: false, canDecode: true, canScreenShare: false });
   });
 
   it("treats an isConfigSupported that throws as unsupported", async () => {
     stubCodec("VideoEncoder", { throws: true });
     stubCodec("VideoDecoder", { throws: true });
-    expect(await probeVideoCapability()).toEqual({ canEncode: false, canDecode: false });
+    expect(await probeVideoCapability()).toEqual({ canEncode: false, canDecode: false, canScreenShare: false });
   });
 });
