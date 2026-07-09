@@ -784,16 +784,22 @@ async fn genesis_host(
         Box::new(AgentModule::new("agent", "saga", Some("runs".into()))),
         // the collaboration loop's actor: watches, engagement, composition,
         // dispatch, and response delivery — reads the registry by query.
-        Box::new(RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "tagging",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            Some("jobs".into()),
-        )),
+        Box::new(
+            RunsModule::new(
+                "runs",
+                "chat",
+                "saga",
+                "tagging",
+                "dispatch",
+                "agent",
+                Some("tasks".into()),
+                Some("jobs".into()),
+            )
+            // the duckfs/files module the portable (v3) composer pins its source
+            // head from (W2). its presence is what selects the v3 composer;
+            // unwired, the composer emits the v2 wire.
+            .with_files_module("files"),
+        ),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
         // events and emits chat/tasks follow-ups.
@@ -943,7 +949,8 @@ async fn restore_host(
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-    );
+    )
+    .with_files_module("files");
     let (bytes, root) = snapshot_of("runs")?;
     runs.install(bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
@@ -1260,7 +1267,8 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         "agent",
         Some("tasks".into()),
         Some("jobs".into()),
-    );
+    )
+    .with_files_module("files");
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 
@@ -6265,6 +6273,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // from the module's own `<storage>/duckfs` dir).
         .with_duckfs_workspaces(storage.join("duckfs-workspaces"));
     let blobs = http_handle.blob_handle();
+    // the REAL portable-agent-run provisioner, built from a clone of the http
+    // handle BEFORE the serve/drop match consumes it. portable (v3) runs
+    // materialize a per-run duckfs checkout under a root VALIDATED to be
+    // outside <storage> (D7) and drive checkout/commit over this SAME
+    // NodeHandle actor lane the /v1/fs/workspaces RPC already rides here.
+    // LIVE for every agent run: this binary wires the files module
+    // unconditionally, so the runs composer emits v3 (the de-versioned
+    // activation — no flag day, pre-production re-genesis). a misconfigured
+    // root (inside <storage>) is a boot error, never a silent D7 hole.
+    let agent_provisioner: Option<dispatch_oracle::SharedProvisioner> =
+        Some(std::sync::Arc::new(noded::agent_provision::NodedProvisioner::new(
+            http_handle.clone(),
+            noded::agent_provision::agent_runs_root(&storage)
+                .unwrap_or_else(|e| panic!("agent runs root failed D7 validation: {e}")),
+        )));
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
     match http_listen.as_deref() {
@@ -6306,9 +6329,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
     let storage_for_sync = storage.clone();
-    // per-agent host state under the same storage root: persistent executor
-    // workspaces + session files (DUCKTAPE_AGENT_WORKSPACES / _SESSIONS
-    // override — see capability-host). host-local only, never consensus.
+    // per-agent host state, rooted OUTSIDE <storage> (D7 isolation floor): the
+    // persistent executor workspaces + session files must NOT be descendants of
+    // the key/consensus/blob tree, so a `..` from a run's cwd can't reach
+    // user.key/node keys/qmdb/blobstore. `DUCKTAPE_AGENT_WORKSPACES` / _SESSIONS
+    // override — see capability-host. host-local only, never consensus.
+    // non-portable (v2/persistent) agent workspaces stay under <storage>, exactly
+    // as today — relocating them would be a live (non-dormant) durability change.
+    // D7 relocation applies to the PORTABLE provisioner mount (agent_runs_root),
+    // which is out of <storage>; the pre-existing non-portable D7 gap is a
+    // separate, migration-aware hardening (tracked as a follow-up).
     let agent_dirs = capability_host::AgentDirs::under(&storage);
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
@@ -7340,6 +7370,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 resident_provider_set,
                 me_bytes.clone(),
                 blobs.clone(),
+                agent_provisioner.clone(),
             );
             let mut resident_dispatch =
                 resident_dispatch::ResidentDispatch::new(resident_pool, me_bytes.clone());
@@ -10014,6 +10045,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             providers,
             signer.public_key().as_ref().to_vec(),
             blobs.clone(),
+            agent_provisioner.clone(),
         );
         let workers: Vec<Box<dyn reactor::Worker>> = vec![oracle_worker];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
-use dispatch_oracle::{BlobResolver, DeliverFn, DispatchPool, SpawnFn};
+use dispatch_oracle::{BlobResolver, DeliverFn, DispatchPool, SharedProvisioner, SpawnFn};
 use futures::SinkExt as _;
 use futures::channel::mpsc;
 use noded::NodeCommand;
@@ -26,12 +26,15 @@ use crate::ORACLE_ORIGIN;
 /// `blobs` is the daemon's node-local content-addressed store (the app's
 /// putBlob lane) — run-envelope prompt pins resolve through its read path.
 /// `agent_dirs` roots persistent agent workspaces + session files under the
-/// daemon's storage dir (host-local, never consensus).
+/// daemon's storage dir (host-local, never consensus). `storage` keys the
+/// portable run-workspace root's per-node salt and its D7 boot validation.
 pub(crate) fn oracle_workers<C>(
     context: &C,
     cmds: mpsc::Sender<NodeCommand>,
+    node_handle: noded::NodeHandle,
     blobs: noded::blobs::BlobHandle,
     agent_dirs: capability_host::AgentDirs,
+    storage: &std::path::Path,
 ) -> Vec<Box<dyn reactor::Worker>>
 where
     C: Spawner + Supervisor + 'static,
@@ -92,6 +95,20 @@ where
         Box::pin(async move { blobs.get_chunk(&digest) })
     });
 
+    // the REAL workspace provisioner: portable (v3) runs materialize a per-run
+    // duckfs checkout under a root VALIDATED to be outside <storage> (D7),
+    // drive it over the daemon's OWN actor lane (no self-dial), commit the
+    // output_ref, and clean up. LIVE for every agent run: the daemon wires the
+    // files module unconditionally, so the runs composer emits v3 (the
+    // de-versioned activation — no flag day, pre-production re-genesis). a
+    // misconfigured root (inside <storage>) is a boot error, never a silent
+    // D7 hole.
+    let provisioner: SharedProvisioner = Arc::new(noded::agent_provision::NodedProvisioner::new(
+        node_handle,
+        noded::agent_provision::agent_runs_root(storage)
+            .unwrap_or_else(|e| panic!("agent runs root failed D7 validation: {e}")),
+    ));
+
     vec![Box::new(
         DispatchPool::new(
             Arc::new(providers),
@@ -102,7 +119,8 @@ where
             spawn,
             deliver,
         )
-        .with_resolver(resolver),
+        .with_resolver(resolver)
+        .with_provisioner(provisioner),
     )]
 }
 

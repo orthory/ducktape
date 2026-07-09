@@ -5608,6 +5608,8 @@ dependencies = [
  "chat",
  "commonware-runtime",
  "dispatch",
+ "duckfs-core",
+ "forge",
  "futures",
  "host",
  "jobs",

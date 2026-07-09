@@ -30,6 +30,10 @@ pub use files_http::*;
 // by the workspace handlers — nothing outside the crate touches either.
 mod actor_api;
 mod workspaces;
+// the REAL portable-agent-run provisioner (NodedProvisioner + agent_runs_root,
+// the D7 root). public so BOTH node binaries can build one and wire it into
+// their DispatchPool via `with_provisioner`.
+pub mod agent_provision;
 
 use std::path::PathBuf;
 use std::sync::Arc;
