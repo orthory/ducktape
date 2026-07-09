@@ -8587,13 +8587,32 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     // peers, so applying even one more finalized op could
                     // silently fork it. exit loudly; an operator (or supervisor)
                     // restarts the node, which then re-joins via state sync.
-                    applied += match node.drain_delivered().await {
+                    let drained_count = match node.drain_delivered().await {
                         Ok(n) => n,
                         Err(e) => {
                             eprintln!("[node {label}] FATAL: {e} — halting");
                             std::process::exit(1);
                         }
                     };
+                    applied += drained_count;
+                    // durabilize the tip seal when the chain goes idle. a seal is a
+                    // plain journal append made durable only by the NEXT block's
+                    // pre-apply sync; on an idle chain the tip block's seal can sit
+                    // un-synced for a whole block-time, and a crash there loses it,
+                    // turning the tip into a TRAILING block. that is fine for most
+                    // ops, but a trailing SELF-READING op — a files CAS commit whose
+                    // re-execution reads the claimant's already-durable post-state —
+                    // cannot be selective-replayed and would brick a SOLO node (no
+                    // peer to re-sync from). syncing on the idle transition closes
+                    // the window; a busy chain amortizes durability against the next
+                    // pre-apply and needs no extra sync here.
+                    if drained_count > 0
+                        && node.pending_batch_len() == 0
+                        && node.orderer().pending_len() == 0
+                        && let Err(e) = node.sink_mut().sync().await
+                    {
+                        eprintln!("[node {label}] tip-seal sync failed: {e}");
+                    }
                     // resolve held app-surface submits against what this
                     // drain finished with; every disposition is deterministic,
                     // so the reply faithfully reports the op's consensus fate.
