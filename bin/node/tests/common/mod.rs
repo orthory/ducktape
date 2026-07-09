@@ -142,6 +142,14 @@ impl NetworkShapeCluster {
                 "init",
                 "--name",
                 name,
+                // hermetic: no ambient coordinator. the default would dial the
+                // LIVE public coordinator from inside the test AND flip both
+                // nodes into the overlay shape (wireguard on a shared port +
+                // ULA-advertised mesh) — same-host nodes then fight over one
+                // interface and the underlay never assembles. the coordinated
+                // shape has its own e2e (coordinated_invite_cli).
+                "--primary-coordinator",
+                "none",
                 "--dir",
                 self.founder_dir.to_str().expect("utf-8 founder dir"),
                 "--listen",
