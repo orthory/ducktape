@@ -13,13 +13,17 @@ export interface NotifyConfigPayload {
 
 const noop = (): void => {};
 
+const warnFailure = (functionName: string, impact: string, error: unknown): void => {
+  console.warn(`[notify-client] ${functionName} failed; ${impact}`, error);
+};
+
 export const configure = async (config: NotifyConfigPayload): Promise<void> => {
   if (!isTauri()) return;
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("notify_configure", { config });
-  } catch {
-    // Non-tauri/test environments and Phase B's missing Rust command both no-op.
+  } catch (error) {
+    warnFailure("configure", "notification configuration was not applied", error);
   }
 };
 
@@ -28,8 +32,8 @@ export const markSeen = async (): Promise<void> => {
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("notify_mark_seen");
-  } catch {
-    // Non-tauri/test environments and Phase B's missing Rust command both no-op.
+  } catch (error) {
+    warnFailure("markSeen", "notification read state was not updated", error);
   }
 };
 
@@ -42,7 +46,12 @@ export const onUnread = async (
     return await listen<{ unread: number }>("ducktape://notify-unread", (event) => {
       cb(event.payload.unread);
     });
-  } catch {
+  } catch (error) {
+    warnFailure(
+      "onUnread",
+      "unread stream is inactive; returning a no-op unlisten",
+      error,
+    );
     return noop;
   }
 };
