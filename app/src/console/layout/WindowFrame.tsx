@@ -142,6 +142,8 @@ function TitleBar() {
             font: `600 11.5px ${font.sans}`,
             color: color.inkSoft,
             whiteSpace: "nowrap",
+            // let the name span ellipsize instead of pushing the badge out
+            minWidth: 0,
           }}
         >
           <span
@@ -155,11 +157,23 @@ function TitleBar() {
               justifyContent: "center",
               font: `600 8px ${font.mono}`,
               color: color.onDark,
+              flexShrink: 0,
             }}
           >
             D
           </span>
-          ducktape
+          {/* The active workspace names the window; the brand is the correct
+              fallback wherever none exists (web build, remote node, the
+              pre-onboarding gate). */}
+          <span
+            style={{
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {state.workspace?.name ?? "ducktape"}
+          </span>
           <span
             style={{
               font: `600 8px ${font.mono}`,
@@ -168,6 +182,7 @@ function TitleBar() {
               borderRadius: 4,
               padding: "2px 5px",
               letterSpacing: ".05em",
+              flexShrink: 0,
             }}
           >
             {state.managed ? "LOCAL" : "REMOTE"}
