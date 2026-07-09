@@ -525,7 +525,11 @@ export function DucktapeProvider({
     huddleCtxFp.current = fp;
     void import("@tauri-apps/api/event")
       .then(({ emit }) => emit(HUDDLE_CONTEXT_EVENT, ctx))
-      .catch(() => {});
+      // A dropped push must not strand the window on a stale roster (it has no
+      // other source) — clear the fingerprint so the next render re-emits.
+      .catch(() => {
+        huddleCtxFp.current = "";
+      });
   }, [state.voice, state.channels, state.authorNames, state.nodeUrl, state.status?.publicKey, state.videoCapability]);
 
   // 2f. ...and the receiver half: apply the window's commands (leave / sweep) to

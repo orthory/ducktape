@@ -75,21 +75,42 @@ describe("useHuddleWindowSession", () => {
     expect(bob?.muted).toBe(true);
   });
 
-  it("proxies the camera toggle to the session and local state", () => {
+  it("proxies mute and camera toggles to the session and local state", () => {
     const stub = makeStub();
     const { result } = renderHook(() => useHuddleWindowSession(ctx(), vi.fn(), stub.factory));
     act(() => result.current?.setCamera(true));
     expect(stub.calls.camera).toContain(true);
     expect(result.current?.cameraOn).toBe(true);
+    act(() => result.current?.setMuted(false));
+    expect(stub.calls.muted).toContain(false);
+    expect(result.current?.muted).toBe(false);
   });
 
-  it("ends the session (fallback signal) on a hard error", () => {
+  it("signals the fallback (onMediaEnded) on both a hard error and a replaced session", () => {
+    const onError = vi.fn();
+    const s1 = makeStub();
+    renderHook(() => useHuddleWindowSession(ctx(), onError, s1.factory));
+    act(() => s1.fire({ kind: "status", status: "error", error: "connection" }));
+    expect(onError).toHaveBeenCalledWith("error");
+
+    const onClosed = vi.fn();
+    const s2 = makeStub();
+    renderHook(() => useHuddleWindowSession(ctx(), onClosed, s2.factory));
+    act(() => s2.fire({ kind: "status", status: "closed" }));
+    expect(onClosed).toHaveBeenCalledWith("closed");
+  });
+
+  it("re-pushes the fan-out set when the roster changes", () => {
     const stub = makeStub();
-    const onEnded = vi.fn();
-    const { result } = renderHook(() => useHuddleWindowSession(ctx(), onEnded, stub.factory));
-    act(() => stub.fire({ kind: "status", status: "error", error: "connection" }));
-    expect(onEnded).toHaveBeenCalledWith("error");
-    expect(result.current?.status).toBe("error");
+    const { rerender } = renderHook(({ c }: { c: HuddleContext }) => useHuddleWindowSession(c, vi.fn(), stub.factory), {
+      initialProps: { c: ctx() },
+    });
+    const grown: HuddleContext = {
+      ...ctx(),
+      roster: [...ctx().roster, { user: bytes("cara"), node: [2], joined_at: 2 }],
+    };
+    rerender({ c: grown });
+    expect(stub.calls.recipients[stub.calls.recipients.length - 1]).toEqual([keyHex([1]), keyHex([2])]);
   });
 
   it("stops the session on unmount", () => {

@@ -126,10 +126,16 @@ export function HuddleWindow() {
               cameraOn={view.cameraOn}
               canEncode={view.canEncode}
               cameraDisabledReason={overCap ? "Video is capped at 8 participants" : undefined}
-              onToggleMute={() => view.setMuted(!view.muted)}
+              onToggleMute={() => {
+                const next = !view.muted;
+                view.setMuted(next);
+                send({ op: "mute", muted: next }); // let main re-take with the same mute
+              }}
               onToggleCamera={() => view.setCamera(!view.cameraOn)}
               onLeave={() => send({ op: "leave" })}
-              onRetry={() => view.retry()}
+              // No in-window retry — a dead session closes the float and the dock
+              // re-takes (see useHuddleWindowSession); the error state never shows.
+              onRetry={() => {}}
             />
           </div>
         </>

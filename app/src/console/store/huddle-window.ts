@@ -65,7 +65,10 @@ export interface HuddleContext {
 export type HuddleWindowCmd =
   | { op: "ready" }
   | { op: "leave" }
-  | { op: "sweep"; user: number[] };
+  | { op: "sweep"; user: number[] }
+  // The window owns mute locally, but it reports each change so main can re-take
+  // with the SAME mute on pop-in (call continuity — no silent re-mute).
+  | { op: "mute"; muted: boolean };
 
 /** Build the context to push to the window. Null when not in a huddle (the
  *  caller closes the window instead) or the node url is unresolved. */
@@ -101,6 +104,7 @@ export const applyHuddleWindowCmd = (
   actions: {
     leaveHuddle(): void;
     sweepHuddle(channelId: string, user: number[]): void;
+    noteHuddleMuted(muted: boolean): void;
   },
   currentChannelId: string | null,
 ): void => {
@@ -110,6 +114,9 @@ export const applyHuddleWindowCmd = (
       return;
     case "sweep":
       if (currentChannelId) actions.sweepHuddle(currentChannelId, cmd.user);
+      return;
+    case "mute":
+      actions.noteHuddleMuted(cmd.muted);
       return;
     case "ready":
       // handled by the wiring (replays the current context); nothing to do here.

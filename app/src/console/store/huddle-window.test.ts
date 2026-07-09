@@ -85,12 +85,19 @@ describe("applyHuddleWindowCmd", () => {
   const actions = () => ({
     leaveHuddle: vi.fn<() => void>(),
     sweepHuddle: vi.fn<(channelId: string, user: number[]) => void>(),
+    noteHuddleMuted: vi.fn<(muted: boolean) => void>(),
   });
 
   it("maps leave onto the store action", () => {
     const a = actions();
     applyHuddleWindowCmd({ op: "leave" }, a, "ch-1");
     expect(a.leaveHuddle).toHaveBeenCalledOnce();
+  });
+
+  it("records the window's mute so a re-take keeps it", () => {
+    const a = actions();
+    applyHuddleWindowCmd({ op: "mute", muted: false }, a, "ch-1");
+    expect(a.noteHuddleMuted).toHaveBeenCalledWith(false);
   });
 
   it("maps sweep onto sweepHuddle for the current channel, and only when one exists", () => {

@@ -160,6 +160,10 @@ export interface ConsoleActions {
    *  consensus member of (after the popped window released it). Idempotent — a
    *  no-op when a main session already exists or we are not in a huddle. */
   retakeHuddleMedia(): void;
+  /** Record the popped window's current mute (it owns mute locally) so a re-take
+   *  reconnects with the same mute — no consensus, no session touch (main has
+   *  none while popped). */
+  noteHuddleMuted(muted: boolean): void;
 
   commitForge(params: { path: string; content: string; message: string }): void;
 
@@ -572,9 +576,10 @@ export function createActions({
   // Re-establish the main-window media session for a huddle we are still a
   // consensus member of, after the popped window released it. Idempotent — a
   // no-op (just clears `popped`) when a session already exists or we are not in
-  // a huddle. A fresh session (never restart a stopped one); re-join MUTED,
-  // camera off — the safe default, exactly like a first join. Consensus
-  // membership is intact, so this is a media reconnect, not a re-join.
+  // a huddle. A fresh session (never restart a stopped one). This is a media
+  // reconnect, NOT a re-join, so it PRESERVES the current mute (the window
+  // reported its mute via `noteHuddleMuted`) for call continuity; camera resets
+  // off (the stream can't transfer between webviews). Consensus is intact.
   const retakeHuddleMedia = (): void => {
     const state = getState();
     const channelId = state.voice.channelId;
@@ -583,13 +588,14 @@ export function createActions({
       update((prev) => ({ voice: { ...prev.voice, popped: false } }));
       return;
     }
+    const seedMuted = state.voice.muted;
     voice = createCallSession(onCallEvent);
-    voice.setMuted(true);
+    voice.setMuted(seedMuted);
     update((prev) => ({
       voice: {
         ...prev.voice,
         popped: false,
-        muted: true,
+        muted: seedMuted,
         status: "connecting",
         error: null,
         cameraOn: false,
@@ -1399,6 +1405,8 @@ export function createActions({
     },
 
     retakeHuddleMedia,
+
+    noteHuddleMuted: (muted) => update((prev) => ({ voice: { ...prev.voice, muted } })),
 
     commitForge: (params) => {
       if (!params.path.trim() || params.content.length === 0) return;
