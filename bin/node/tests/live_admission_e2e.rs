@@ -810,13 +810,15 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "back"))
     }));
 
-    // (7) promote: the warm resident becomes a validator through the normal
-    //     promotion path; valset Join clears its resident standing.
+    // (7) promote: the warm resident becomes a validator through the replica
+    //     promotion collapse — it checkpoints its OWN folded state and
+    //     reboots (no re-sync: at a quorum-widening cutover the founder
+    //     halts awaiting this very node, so there is nothing to sync FROM);
+    //     valset Join clears its resident standing.
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected promote output:\n{out}");
     cluster.wait_marker(1, "admitted at epoch", CONVERGE);
-    cluster.wait_marker(1, "synced app_hash=", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
     let residents = cluster
         .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
