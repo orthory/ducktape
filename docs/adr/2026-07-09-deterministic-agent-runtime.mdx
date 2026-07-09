@@ -117,6 +117,17 @@ invariant; **SHOULD** = a strong default, overridable as per-agent policy.
   ephemeral (never committed), cached by `recipe_hash`.
 - **W5 (MUST)** Cleanup after the run (`git worktree remove`; GC unreferenced
   snapshots).
+- **W6 (SHOULD) Workspace = a composition of pinned mounts.** The workspace is
+  assembled from a declared set of `(pinned_ref, mount_path, mode)` mounts: one
+  **rw source** (the forge worktree / duckfs checkout at the work root, whose
+  final diff becomes `output_ref`) plus **read-only** instruction/skill mounts at
+  the CLI's expected paths. Only rw mounts contribute to `output_ref`; ro mounts
+  (skills, global `AGENTS.md`) never enter the output diff. Materialization is a
+  duckfs subtree checkout (`duckfs-client::checkout`, daemon-managed under
+  `<storage>/duckfs-workspaces`) today; FUSE is a documented phase-4 zero-copy
+  option for large read-only mounts. Because every ref is content-addressed, a
+  globally-shared skill is materialized/cached once per node and deduped across
+  all runs that reference it.
 
 ### Progress — two lanes (PRG)
 
@@ -189,7 +200,15 @@ invariant; **SHOULD** = a strong default, overridable as per-agent policy.
   I3 (containment) hold: "sandbox mechanism deferred" (e.g. `bwrap`) is never
   "containment deferred" — the boundary is a MUST for v1; each host only chooses
   the tech that enforces it (process-user separation, mount/namespace, or a
-  bind-only sandbox).
+  bind-only sandbox). Concrete evidence this is not automatic: today the
+  persistent workspace is `<storage>/agent-workspaces/<agent_id>`
+  (`capability-host::AgentDirs::under`), a *descendant* of the same `<storage>`
+  tree that holds the user key, node keys, the qmdb consensus DB, the blobstore
+  (prompt pins), and `forge-git` — so a single `..` traversal reaches all of it,
+  and a CLI's own `--sandbox workspace-write` confines writes but not reads. The
+  floor therefore requires the workspace root to live *outside* the sensitive
+  tree (a relocated `DUCKTAPE_AGENT_WORKSPACES`) or a namespace/user boundary
+  that hides it — not merely a per-run subdir under the node's data dir.
 
 ### Capabilities layering (CAP)
 
@@ -201,6 +220,19 @@ invariant; **SHOULD** = a strong default, overridable as per-agent policy.
 - **C3 (SHOULD)** Tools/MCPs are host capabilities (announce + provision),
   node-local, sealed, non-reproducible. A "plugin" is a `recipe` + skill-set
   bundle, not a separate concept.
+- **C4 (SHOULD) Skill/instruction distribution — globally shared by default.**
+  Skills and `AGENTS.md`-style instructions are authored and versioned as a
+  **forge repo** (a shared skills library: refs on consensus, PR-reviewed,
+  node-local clone) and mounted **read-only at run time as a pinned duckfs
+  snapshot subtree** (W6). An agent's identity carries `skills` as *refs, not
+  copies* — so importing at agent creation is referencing a library subtree (or
+  cloning a template agent's set), and content-addressing dedups a globally
+  shared skill to one replicated copy. Each ref is **pinned** (a specific id,
+  fully reproducible) or **tracking** (a mutable pointer — a forge branch or a
+  named duckfs pin — that `runs` resolves to a concrete snapshot at compose time,
+  exactly like the source snapshot, so it stays deterministic per run while
+  auto-updating across runs). Effective instructions layer deterministically:
+  global → team → repo (read for free from the source mount) → persona (prompt).
 
 ### Orchestration / autonomy (ORC)
 
@@ -286,17 +318,21 @@ Phased, honoring M2 so agents stay alive through the transition:
    `RunContext` fields, and `RunnerResult` unwrap — all forward-compatible — but
    **hold** the composer flip and portable activation. Fix W1 by making the
    host workdir a per-run writable path with a safe fallback.
-2. **Provisioning wrapper.** In `dispatch-oracle`/`capability-host`: materialize
-   the workspace (forge worktree / duckfs checkout) from the pinned source, run
-   the recipe setup (ephemeral), execute in the per-run workdir, capture the
-   `output_ref`, push/commit, and clean up (W1–W5, R3, R6).
+2. **Provisioning wrapper + mount composition.** In `dispatch-oracle`/
+   `capability-host`: relocate the agent workspace root *outside* the sensitive
+   `<storage>` tree (D7), then compose the workspace from pinned mounts — the rw
+   source (forge worktree / duckfs checkout) plus ro skill/instruction subtrees
+   (duckfs `checkout`) — run the recipe setup (ephemeral), execute in the per-run
+   workdir, capture the `output_ref` from the rw mount only, push/commit, and
+   clean up (W1–W6, R3, R6).
 3. **`RunResult v1`.** Extend the receipt to the faceted, host-assembled shape
    (R1–R6), add the `data` structured-output path, and route the sink (O1–O2).
-4. **Identity and caps.** Add `recipe_hash` and resource caps to the agent
-   record; enforce two-level attribution and cap-checked effect application;
+4. **Identity, caps, and skills.** Add `recipe_hash`, resource caps, and `skills`
+   refs to the agent record (import = reference/clone; pinned or compose-time
+   resolved); enforce two-level attribution and cap-checked effect application;
    enforce the minimum isolation floor in the provisioning wrapper (withhold node
    keys/data-dir/operator-config from the child); wire secret scoping via
-   `vaults` (D1–D7, I3).
+   `vaults` (D1–D7, C4, I3).
 5. **Composer flip + activate portable** (M1/M2 coordinated upgrade), then
    iterate toward L3 suspendable orchestration (N2).
 
