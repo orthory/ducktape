@@ -1,10 +1,18 @@
+---
+showAskAi: false
+---
+
 # Ducktape
+
+import { ModuleMap } from '../../../components/diagram/ModuleMap.client'
 
 Ducktape is a consensus-based workplace super-app: a single BFT-replicated state
 machine that hosts isolated product modules such as pages, forge, chat, and
 agent workflows. Each module owns its authenticated state substrate and exposes
 only a 32-byte root to the host. The host composes those module roots into the
 global app-hash that consensus commits.
+
+<ModuleMap />
 
 The core rule is simple: modules do not link to each other's implementation
 crates. They depend on `sdk` and on types-only interface crates for the modules

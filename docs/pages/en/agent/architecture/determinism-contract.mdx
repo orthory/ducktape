@@ -1,7 +1,21 @@
+---
+showAskAi: false
+---
+
 # Determinism Contract
+
+import { ModuleLifecycle } from '../../../../components/diagram/ModuleLifecycle.client'
+
+<ModuleLifecycle />
 
 Ducktape is safe only when every validator derives the same module roots from the
 same agreed operation order. Agent edits must preserve that contract.
+
+Related: [Module Model](/en/human/architecture/module-model) explains the shared
+module lifecycle, [Platform Invariants](/en/human/architecture/platform-invariants)
+names the system promises, [Async Engine](/en/human/architecture/async-engine)
+covers non-deterministic work, and [Verification Matrix](/en/agent/reference/verification-matrix)
+lists proof commands.
 
 ## Inside Execution
 

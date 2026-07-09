@@ -25,7 +25,7 @@ end-to-end encrypted **without** the coordinator:
 - The **control mesh** is commonware `authenticated::discovery`: a dialer dials
   an address and expects a specific `ed25519` public key; the handshake
   authenticates that key regardless of what network path delivered the bytes
-  (same property that makes the Phase-1 [sentry](../sentry-deployment.md) safe).
+  (same property that makes the Phase-1 [sentry](sentry-deployment.md) safe).
 - The **data tunnel** is validator↔validator **WireGuard**, keyed and encrypted
   between the two validators' own keys.
 
@@ -184,7 +184,7 @@ Run **multiple** coordinators. A v3 invite carries a `Vec` of reach hints and
 coordinator outage is not fatal to entry. And an already-**punched** direct path
 survives a coordinator restart entirely — only *new* rendezvous depends on a
 live coordinator; no data path ever traverses one. This is the key contrast
-with an in-path [sentry](../sentry-deployment.md), which sits in the data path
+with an in-path [sentry](sentry-deployment.md), which sits in the data path
 and is a single point of failure for the validator it fronts: an out-of-path
 coordinator is where the "established connections survive; only new ones depend
 on it" framing actually holds.

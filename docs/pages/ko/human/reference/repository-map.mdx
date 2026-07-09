@@ -1,6 +1,14 @@
+---
+showAskAi: false
+---
+
 # Repository Map
 
+import { WorkspaceMap } from '../../../../components/diagram/WorkspaceMap.client'
+
 workspace는 platform layer별로 구성되어 있다.
+
+<WorkspaceMap />
 
 ## Kernel
 
@@ -33,7 +41,6 @@ workspace는 platform layer별로 구성되어 있다.
 - `crates/apps/inbox`: follow-up으로 배달되는 per-member notification queue.
 - `crates/apps/automations`: chat hook seam 위의 operator rule.
 - `crates/apps/files`: node-local chunk byte 위의 consensus file manifest.
-- `crates/apps/memory`: filesystem 모양의 shared agent workspace.
 - `crates/apps/jobs`: consensus-native work board.
 - app wire surface: crate-root type이 합법적인 cross-module payload surface다.
 

@@ -1,9 +1,17 @@
+---
+showAskAi: false
+---
+
 # Ducktape
+
+import { ModuleMap } from '../../../components/diagram/ModuleMap.client'
 
 Ducktape는 합의 기반 업무용 슈퍼앱이다. 하나의 BFT 복제 상태 머신이 pages,
 forge, chat, agent workflow 같은 격리된 제품 모듈을 호스팅한다.
 각 모듈은 자기 인증 상태 저장소를 소유하고, 호스트에는 32바이트 root만
 노출한다. 호스트는 그 module root들을 전역 app-hash로 합성한다.
+
+<ModuleMap />
 
 핵심 규칙은 단순하다. 모듈은 서로의 구현 crate에 링크하지 않는다. 모듈은
 `sdk`와 필요한 타입 전용 interface crate에만 의존한다. 모듈 간 read는

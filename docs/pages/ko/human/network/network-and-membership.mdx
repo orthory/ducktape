@@ -1,4 +1,12 @@
+---
+showAskAi: false
+---
+
 # Network and Membership
+
+import { NetworkTopology } from '../../../../components/diagram/NetworkTopology.client'
+
+<NetworkTopology />
 
 repo에는 현재 세 가지 network 및 membership concern이 분리되어 있다. message
 propagation, ordered consensus delivery, validator membership state다.
@@ -29,11 +37,11 @@ apply해야 한다.
 valset의 crate-root wire type을 통해 typed message와 query를 노출하며, demo는 ed25519 public
 key가 담긴 join message를 apply한다.
 
-남은 membership work는 consensus epoch 주변 live orchestration이다. repo에는
-respawn behavior test와, finalized valset state를 watch하고 cutover point를
-결정하는 test된 deterministic cutover state machine(`ValsetOrchestrator`)이
-있다. 다만 그 결정에 따라 old orderer를 stop하고 new epoch를 start하고 transport
-readiness를 정렬하는 live loop는 아직 미래 작업이다.
+consensus epoch 주변 live orchestration도 구현되어 있다. repo에는 respawn behavior
+test와, finalized valset state를 watch하고 cutover point를 결정하는 test된
+deterministic cutover state machine(`ValsetOrchestrator`)이 있다. live loop는 그
+결정에 따라 old orderer를 stop하고 new epoch를 start하며 transport readiness를
+정렬한다.
 
 ## Membership 위의 Identity
 

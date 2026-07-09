@@ -1,7 +1,16 @@
+---
+showAskAi: false
+---
+
 # Module Model
+
+import { ArchitectureStack } from '../../../../components/diagram/ArchitectureStack.client'
+import { ModuleLifecycle } from '../../../../components/diagram/ModuleLifecycle.client'
 
 module은 작은 native Rust contract 뒤에 있는 격리 상태 머신이다. isolation
 shape는 CosmWasm과 비슷하지만, 현재 구현은 Wasm이 아니라 native Rust다.
+
+<ArchitectureStack />
 
 ## Contract
 
@@ -23,6 +32,8 @@ module lifecycle은 genesis registration에서 committed state transition까지 
 host-owned 경로다. Ducktape에는 아직 runtime install/enable/disable row가 없다.
 genesis에 등록된 module은 모두 active이고, module set 변경은 새 genesis 또는
 coordinated upgrade의 영역이다.
+
+<ModuleLifecycle />
 
 운영 lifecycle은 다음 순서다.
 

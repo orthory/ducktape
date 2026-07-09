@@ -1,4 +1,12 @@
+---
+showAskAi: false
+---
+
 # Coordination
+
+import { InvitationFlow } from '../../../../components/diagram/InvitationFlow.client'
+
+<InvitationFlow />
 
 Two validators that both sit behind NAT cannot dial each other directly — neither
 exposes an inbound port. A **coordinator** is the small helper that lets them
@@ -11,6 +19,13 @@ ever traverses it.
 
 This page explains the one operational choice a network makes about its
 coordinator — **public or private coordination** — and how to run one either way.
+
+Related: [Network and Membership](/en/human/network/network-and-membership)
+places coordination beside valset state, [Quick Start](/en/human/start/quick-start)
+shows the onboarding path, [Node Upgrades](/en/human/network/node-upgrades)
+covers live binary changes, [Design Records](/en/human/reference/design-records)
+points to maintained protocol records, and [agent Validator Operations](/en/agent/network/validator-operations)
+is the edit checklist.
 
 ## The coordinator is untrusted by design
 

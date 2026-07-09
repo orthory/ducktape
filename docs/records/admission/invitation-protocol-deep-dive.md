@@ -5,7 +5,7 @@
 > `ducktape:` format carrying a WireGuard bootstrap and a single-use token
 > that redeems AUTOMATICALLY (governance `Redeem` — minting is the
 > admission; no `invite-accept` step). See
-> [deploy/private-cutover-integration-gap.md](deploy/private-cutover-integration-gap.md)
+> [../../deploy/private-cutover-integration-gap.md](../../deploy/private-cutover-integration-gap.md)
 > for the current join recipe.
 
 > 노드 초대(invitation) 프로토콜의 구조 분석. `bin/node`(CLI + joiner 런타임), `crates/system`(on-chain admission),
