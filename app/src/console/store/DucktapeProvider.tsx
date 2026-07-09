@@ -148,8 +148,8 @@ export function DucktapeProvider({
           // above, so the overlay just degrades to profiles' names instead
           // of failing the whole refresh.
           identityClient
-            .allUsers(live, { from: 0, limit: 256 })
-            .catch((): identityClient.UserView[] => []),
+            .allAccounts(live, { from: 0, limit: 256 })
+            .catch((): identityClient.AccountView[] => []),
           // files is best-effort so a node that does not register the module
           // reads as "empty", never a failed refresh (same contract as
           // governance above). Find under the tree root gives a flat file index
@@ -191,14 +191,23 @@ export function DucktapeProvider({
         const authorNames: Record<string, string> = Object.fromEntries(
           profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
         );
+        // `userKey` in the store shape now holds the ACCOUNT id (the founding
+        // key) — the value that groups a person's keys/nodes. Every node the
+        // account owns points at it, carrying the shared display name.
         const nodeUsers: Record<string, { userKey: string; name: string | null }> = {};
         for (const u of users) {
-          const userKey = chatClient.keyHex(u.user_key);
+          const userKey = chatClient.keyHex(u.account_id);
           for (const node of u.nodes) {
             const nodeHex = chatClient.keyHex(node);
             nodeUsers[nodeHex] = { userKey, name: u.display_name };
             if (u.display_name) authorNames[nodeHex] = u.display_name;
           }
+        }
+        // The account umbrella's collected keys, keyed by account id — Settings
+        // renders this to show every key that belongs to the account.
+        const accountKeys: Record<string, identityClient.MemberKeyView[]> = {};
+        for (const u of users) {
+          accountKeys[chatClient.keyHex(u.account_id)] = u.member_keys;
         }
         const members = validators.map(valsetClient.validatorHex);
         const residents = residentKeys.map(valsetClient.validatorHex);
@@ -277,6 +286,7 @@ export function DucktapeProvider({
                 messages,
                 authorNames,
                 nodeUsers,
+                accountKeys,
                 pages: holdPages ? stateRef.current.pages : pages,
                 activePageBlocks: holdPages
                   ? stateRef.current.activePageBlocks

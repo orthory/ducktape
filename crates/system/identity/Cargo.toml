@@ -3,10 +3,12 @@ name = "identity"
 edition.workspace = true
 version.workspace = true
 
-# the user->nodes binding registry as replicated state: one USER (an ed25519
-# keypair held by the person, app-side) owns many NODES (each a mesh/valset
-# identity). depends only on sdk + valset wire types (to member-gate binds) +
-# commonware-cryptography (to verify user certificates deterministically).
+# the account registry as replicated state: an ACCOUNT (an umbrella keyed by
+# its founding key) collects many MEMBER KEYS of different schemes and owns
+# many NODES (each a mesh/valset identity). depends on sdk + valset wire types
+# (to member-gate binds) + commonware-cryptography (to verify ed25519/p256
+# member certificates deterministically) + p256/base64 (for the bespoke
+# WebAuthn passkey envelope, which commonware's namespaced signer can't cover).
 [dependencies]
 sdk = { workspace = true }
 serde = { workspace = true }
@@ -18,6 +20,15 @@ commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
+# the WebAuthn (passkey) member-key kind verifies a raw ECDSA-P256 assertion
+# envelope (authData ‖ SHA256(clientDataJSON)), NOT commonware's namespaced
+# signer -- so it uses the RustCrypto p256/ecdsa primitives directly. both are
+# already compiled into the tree transitively via commonware-cryptography; this
+# only promotes them to direct deps. deterministic (pure-Rust verify on every
+# arch), so consensus-safe.
+p256 = "0.13"
+# base64url-decoding the WebAuthn challenge out of clientDataJSON.
+base64 = "0.22"
 
 [dev-dependencies]
 futures = "0.3"
