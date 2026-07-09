@@ -5,8 +5,11 @@ Structural deviations from the accepted direction: the webview↔node leg is the
 typed websocket + WebCodecs, not the §4 str0m WebRTC gateway (the inter-node
 wire below shipped as written); admission is the huddle build's locally-live-
 flows posture, not §3's consensus-roster policy (still the hardening seam);
-and media rides the authenticated TCP mesh arm rather than waiting on the
-slice-0 overlay socket, which remains a drop-in behind the same trait.
+and media initially rode the authenticated TCP mesh arm rather than waiting on
+the slice-0 overlay socket. **Update 2026-07-09:** media has since moved to the
+overlay-socket arm — one per-use plane per service — because the shared mesh
+relay queue starved voice behind video under load; see the 2026-07-09 update in
+`docs/adr/2026-07-07-per-use-data-plane.mdx`.
 
 Original status: Accepted as direction, build not scheduled —
 recorded so the architecture is not re-litigated when calls become current.
