@@ -1063,12 +1063,6 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// always a subset of `outstanding` (an un-flushed member is still in
     /// custody), so a cutover rebuilds it from `outstanding` and re-flushes.
     pending_batch: Vec<(FrameId, Vec<u8>)>,
-    /// per-MEMBER exactly-once APPLY guard: a member [`FrameId`] lands here the
-    /// instant its op APPLIES (never for a rejected, decode-failed, or
-    /// discarded member), so a re-reported finalized batch never double-applies
-    /// a member. process-lifetime like `seen` and deterministic across nodes —
-    /// a pure function of the finalized batch sequence.
-    applied_frames: std::collections::HashSet<FrameId>,
 }
 
 impl<O: Orderer> OrderedNode<O> {
@@ -1096,7 +1090,6 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
-            applied_frames: std::collections::HashSet::new(),
         }
     }
 
@@ -1127,7 +1120,6 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             deferred: std::collections::VecDeque::new(),
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
-            applied_frames: std::collections::HashSet::new(),
         }
     }
 
@@ -1451,22 +1443,22 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     continue;
                 }
             };
-            // decode each member into the ops the block applies. an already-
-            // APPLIED member (re-reported after a restart, or a byzantine
-            // replay) is SKIPPED — the per-member exactly-once guard,
-            // deterministic across nodes. a member that fails to decode is a
-            // deterministic no-op: EXCLUDED from the ops and recorded Rejected
-            // after the block settles (it shares the block app-hash). the rest
-            // carry their identity parallel to `ops`, in member (= applied,
-            // = enqueue/FIFO) order, for building the drained records.
+            // decode each member into the ops the block applies. no per-member
+            // dedup here on purpose: in honest operation a signed frame lives in
+            // exactly ONE proposer's mempool (relays fan to one validator,
+            // custody ends on apply, the cutover carry never double-applies), so
+            // a finalized batch never repeats a member; a byzantine duplicate is
+            // caught deterministically by the module's own (origin, seq) dedup —
+            // identically live and on recovery replay. a member that fails to
+            // decode is a deterministic no-op: EXCLUDED from the ops and recorded
+            // Rejected after the block settles (it shares the block app-hash).
+            // the rest carry their identity parallel to `ops`, in member (=
+            // applied, = enqueue/FIFO) order, for building the drained records.
             let mut ops: Vec<(Origin, Msg)> = Vec::new();
             let mut op_meta: Vec<(FrameId, Origin, sdk::ModuleId, Vec<u8>)> = Vec::new();
             let mut decode_fail: Vec<FrameId> = Vec::new();
             for member in &members {
                 let mid = frame_id(member);
-                if self.applied_frames.contains(&mid) {
-                    continue;
-                }
                 match decode_frame(member) {
                     Ok((origin, msg)) => {
                         op_meta.push((
@@ -1542,15 +1534,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             self.effects.extend(outcome.effects);
             // one record per applying member, in member (input/FIFO) order; the
             // host guarantees `members` is 1:1 with `ops` in input order. custody
-            // ends for each resolved member; only APPLIED members enter the
-            // exactly-once guard.
+            // ends for each resolved member.
             for ((mid, op_origin, op_target, op_payload), member_outcome) in
                 op_meta.into_iter().zip(outcome.members)
             {
                 self.outstanding.remove(&mid);
                 let (disposition, dispatches, reason) = match member_outcome {
                     MemberOutcome::Applied { dispatches } => {
-                        self.applied_frames.insert(mid);
                         (Disposition::Applied, dispatches, None)
                     }
                     // the host stringifies the reject error with its WRAPPED
