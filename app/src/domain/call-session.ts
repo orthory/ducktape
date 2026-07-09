@@ -161,8 +161,6 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   let framesSinceKey = 0;
   let bitrateKbps = START_BITRATE_KBPS; // rateHint moves it
 
-  const videoActive = () => cameraOn || sharing;
-
   const configureEncoder = () => {
     encoder?.configure({
       codec: "vp8",
@@ -196,12 +194,17 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   };
 
   const startVideo = async (screen: boolean) => {
+    // Guard on the mode WE were asked to start, not "any video" — a swap that
+    // flipped the lane to the other mode while our getUserMedia/getDisplayMedia
+    // was in flight must make this stale acquire bail (else it overwrites the
+    // live stream/encoder, leaking a track and mislabeling the beacon).
+    const wanted = () => (screen ? sharing : cameraOn);
     const media = screen
       ? await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } } })
       : await navigator.mediaDevices.getUserMedia({
           video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
         });
-    if (stopped || !videoActive()) {
+    if (stopped || !wanted()) {
       media.getTracks().forEach((t) => t.stop());
       return;
     }
@@ -223,7 +226,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     video.playsInline = true;
     video.srcObject = media;
     await video.play();
-    if (stopped || !videoActive()) {
+    if (stopped || !wanted()) {
       stopCameraGraph();
       return;
     }
@@ -235,11 +238,11 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
       media.getVideoTracks()[0]?.addEventListener("ended", () => setScreenShare(false));
     }
     const pump = () => {
-      if (!videoActive() || !camVideo || !encoder || encoder.state === "closed") return;
+      if (!wanted() || !camVideo || !encoder || encoder.state === "closed") return;
       // rVFC is the portable frame source (Chromium + WebKit) — no
       // MediaStreamTrackProcessor dependency.
       camVideo.requestVideoFrameCallback((_now, meta) => {
-        if (videoActive() && encoder && encoder.state === "configured" && encoder.encodeQueueSize < 2) {
+        if (wanted() && encoder && encoder.state === "configured" && encoder.encodeQueueSize < 2) {
           const frame = new VideoFrame(camVideo!, {
             timestamp: Math.round(meta.mediaTime * 1_000_000),
           });
