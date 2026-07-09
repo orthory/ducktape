@@ -6367,9 +6367,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // - PAYLOAD lanes drain store-only into the shared content store
             //   (content-addressing is the verification), so a finalization's
             //   bytes are usually already local when its certificate lands.
-            // - vote/resolver/fetch lanes stay black-holed; the fold driver's
-            //   resolver runs on the CURRENT epoch's fetch lane only, wired at
-            //   replica ascension.
+            // - vote/resolver/fetch lanes stay black-holed. the follower runs
+            //   WITHOUT a payload resolver: a gossip-missed payload surfaces
+            //   as Unresolvable and backfills over the Frames lane (the
+            //   backstop that must exist anyway). a banked-but-unread lane is
+            //   NOT an option — validators' resolvers send fetch requests to
+            //   every tracked peer, and an unread backlog jams the very
+            //   connection the sync client rides.
             oracle.track(PEER_SET, mesh_participants.clone());
             let replica_store = ContentStore::new();
             let (head_wake_tx, mut head_wake) = futures::channel::mpsc::channel::<()>(1);
@@ -6379,18 +6383,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // blocks the peer connection.
             let (cert_bridge_tx, mut cert_bridge) =
                 futures::channel::mpsc::channel::<Vec<u8>>(256);
-            // fetch lanes bank like the validator's channel bank: slot i =
-            // epoch i's pair, consumed by the fold driver's resolver at
-            // ascension (and by each cutover's fresh follower after it).
-            let mut replica_fetch_lanes: Vec<Option<_>> = (0..EPOCH_CHANNEL_BANK)
-                .map(|epoch| {
-                    let (_, _, _, _, fetch) = engine_channels(epoch);
-                    Some(network.register(fetch, quota, MAX_BACKLOG))
-                })
-                .collect();
             for epoch in 0..EPOCH_CHANNEL_BANK {
-                let (vote, cert, res, payload, _fetch) = engine_channels(epoch);
-                for ch in [vote, res] {
+                let (vote, cert, res, payload, fetch) = engine_channels(epoch);
+                for ch in [vote, res, fetch] {
                     let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
                     let label: &'static str =
                         Box::leak(format!("blackhole_{ch}").into_boxed_str());
@@ -7327,16 +7322,30 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     }
                                     Ok(consensus::Observed::Stale(_)) => continue,
                                     Ok(consensus::Observed::Unresolvable(view)) => {
-                                        // the spawned follower always carries a
-                                        // resolver, so this cannot occur; stay
-                                        // loud rather than silently dropping a
-                                        // committed block.
-                                        eprintln!(
-                                            "[node {label}] replica: view {view} unresolvable \
-                                             despite the resolver — treating as a missed \
-                                             certificate"
-                                        );
-                                        continue;
+                                        // payload gossip missed this block's
+                                        // bytes and the follower runs without
+                                        // a resolver: fetch the frame itself
+                                        // over the Frames lane (seal
+                                        // cross-checked post-fold), which
+                                        // also admits it.
+                                        if let Err(e) = replica_backfill(
+                                            &client,
+                                            node_r,
+                                            replica_view_base,
+                                            (replica_watermark.unwrap_or(0), view),
+                                            &mut replica_watermark,
+                                            &mut pending_seal_checks,
+                                            &label,
+                                        )
+                                        .await
+                                        {
+                                            println!(
+                                                "[node {label}] replica: unresolvable view \
+                                                 {view} backfill failed: {e} — retrying on \
+                                                 the next certificate"
+                                            );
+                                        }
+                                        break;
                                     }
                                     Err(e) => {
                                         // quorum verification failed: a lying
@@ -7772,38 +7781,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                         replica_store.put(bytes.clone());
                                     }
                                     let root = host.app_hash();
-                                    // the epoch's fetch lane arms the
-                                    // resolver; consumed only now that every
-                                    // fallible step is behind us.
-                                    let Some(fetch_lane) = replica_fetch_lanes
-                                        .get_mut(m.epoch as usize)
-                                        .and_then(|slot| slot.take())
-                                    else {
-                                        eprintln!(
-                                            "[node {label}] FATAL: network is at epoch {} — \
-                                             beyond this process's pre-registered channel bank \
-                                             ({EPOCH_CHANNEL_BANK}); restart to re-arm the bank \
-                                             at the current epoch",
-                                            m.epoch
-                                        );
-                                        std::process::exit(1);
-                                    };
                                     // the fold pipeline: the follower orderer
                                     // in the engine's seat of the SAME
                                     // OrderedNode a validator drains, this
-                                    // journal as its sink. the oracle is
-                                    // provider AND blocker for the resolver,
-                                    // exactly as the validator wires it.
-                                    let follower = consensus::FollowerOrderer::spawn_resolver(
-                                        context.child(Box::leak(
-                                            format!("replica_e{}", m.epoch).into_boxed_str(),
-                                        )),
-                                        oracle.clone(),
-                                        oracle.clone(),
-                                        signer.public_key(),
-                                        replica_store.clone(),
-                                        fetch_lane,
-                                    );
+                                    // journal as its sink. resolver-less by
+                                    // design (see the lane wiring above): a
+                                    // store miss surfaces as Unresolvable and
+                                    // the driver backfills over the Frames
+                                    // lane.
+                                    let follower =
+                                        consensus::FollowerOrderer::new(replica_store.clone());
                                     let node_r = node::OrderedNode::resume(
                                         host,
                                         follower,
@@ -7820,6 +7807,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     replica_watermark = Some(tip.saturating_sub(m.view_base));
                                     blocks_since_checkpoint = 0;
                                     pending_seal_checks.clear();
+                                    // the stable serve marker: "this node now
+                                    // serves a verified boundary" — the line
+                                    // the e2e suite (and operators) key on,
+                                    // truthful under both the old re-install
+                                    // model and the fold pipeline.
+                                    println!(
+                                        "[node {label}] resident: pre-synced boundary {} \
+                                         app_hash={}",
+                                        tip,
+                                        hex(&root)
+                                    );
                                     println!(
                                         "[node {label}] replica: following the head from {} \
                                          (epoch {}, app_hash={})",
