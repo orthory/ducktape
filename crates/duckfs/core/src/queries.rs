@@ -71,12 +71,18 @@ pub(crate) fn query<S: ObjectStore>(fs: &Fs<S>, q: FilesQuery) -> Result<FilesRe
     }
 }
 
-/// the client staging probe: for each requested chunk id, is it present — staged
-/// in the committed refs OR durable in the odb? this is exactly the commit-time
-/// availability rule (`fs.rs`, step 6) minus the in-block pending sources, which
-/// a client cannot observe. the answer is advisory: odb contents can differ per
-/// node between gc sweeps, and staging can expire, so the commit re-validates —
-/// a stale `true` costs one clean rejection, a stale `false` one redundant stage.
+/// the client staging probe: for each requested chunk id, is it staged in the
+/// committed refs? this mirrors the CONSENSUS-UNIFORM half of the commit-time
+/// availability rule (`fs.rs`, step 6): a chunk is referenceable iff it is
+/// staged or produced in-block, and a client cannot observe the in-block source,
+/// so it probes staging alone and re-stages anything reported absent. the local
+/// odb is DELIBERATELY not consulted — its orphan set is per-node (gc timing,
+/// join/rejoin history), so a `true` sourced from raw odb presence would tell
+/// the client to skip staging a chunk that other nodes lack, and the commit
+/// referencing it would then be accepted on some validators and rejected on
+/// others — a split app-hash (finding #1). the answer is advisory: staging can
+/// expire, so the commit re-validates — a stale `true` costs one clean
+/// rejection, a stale `false` one redundant (but consensus-safe) stage.
 ///
 /// strictness mirrors the sync lane: beyond [`MAX_SYNC_IDS`] the whole request
 /// rejects, and any non-hex id rejects the WHOLE batch (a malformed batch is a
@@ -86,11 +92,10 @@ fn has_chunks<S: ObjectStore>(fs: &Fs<S>, ids: &[String]) -> Result<FilesReply, 
         return Err("files: too many ids".into());
     }
     let refs = fs.refs_view();
-    let store = fs.store_ref();
     let mut present = Vec::with_capacity(ids.len());
     for hex in ids {
         let id = from_hex_32(hex).ok_or_else(|| "files: id is not hex".to_string())?;
-        present.push(refs.staging.contains_key(&id) || store.has(&id));
+        present.push(refs.staging.contains_key(&id));
     }
     Ok(FilesReply::HasChunks { present })
 }

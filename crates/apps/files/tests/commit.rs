@@ -833,26 +833,21 @@ fn chunk_length_must_match_the_size_rule_at_commit() {
     assert_eq!(stat(&f, "/shared/ok", None).expect("present").size, 5);
 }
 
-/// a digest that names a durable NON-chunk object cannot pose as a chunk, even
-/// when its body length happens to match the size rule — the kind is checked,
-/// not just the byte count.
+/// a digest that names a NON-chunk object cannot pose as a chunk, even when its
+/// body length happens to match the size rule — the kind is checked, not just the
+/// byte count. availability is consensus-uniform now (finding #1), so the object
+/// must be produced IN-BLOCK for the kind guard to apply; a merely-durable odb
+/// object is rejected earlier as simply unavailable (see the core
+/// `consensus_uniformity` tests and the "reject a Content::Chunks that names an
+/// odb-only orphan" contract).
 #[test]
 fn a_non_chunk_object_cannot_pose_as_a_chunk() {
     let d = tempfile::tempdir().unwrap();
     let mut f = open_files(&d);
-    // block 1: an inline commit makes a FileObj durable in the odb.
-    commit(
-        &mut f,
-        ext(b"u"),
-        1,
-        None,
-        vec![put_inline("/shared/a", b"x")],
-    )
-    .expect("seed");
-    commit_block(&mut f);
 
-    // reconstruct that FileObj byte-for-byte and reference ITS id as a chunk
-    // digest, with the size chosen so the LENGTH rule alone would pass.
+    // the FileObj an inline `/shared/a` = b"x" produces, reconstructed
+    // byte-for-byte so we can reference ITS id as a chunk digest, with the size
+    // chosen so the LENGTH rule alone would pass.
     let fileobj = files::objects::FileObj {
         size: 1,
         chunks: vec![files::objects::object_id(files::Kind::Chunk, b"x")],
@@ -860,12 +855,19 @@ fn a_non_chunk_object_cannot_pose_as_a_chunk() {
     };
     let body = fileobj.encode();
     let hex = to_hex(&files::objects::object_id(files::Kind::File, &body));
+
+    // ONE block: change 1 stages that FileObj in-block; change 2 references its
+    // digest as a chunk. the in-block object index carries the kind, so the
+    // reference is rejected as "not a chunk" — the kind is checked, not the count.
     let err = commit(
         &mut f,
         ext(b"u"),
-        2,
+        1,
         None,
-        vec![put_chunks("/shared/fake", body.len() as u64, &[&hex])],
+        vec![
+            put_inline("/shared/a", b"x"),
+            put_chunks("/shared/fake", body.len() as u64, &[&hex]),
+        ],
     )
     .expect_err("a File object under a chunk reference rejects");
     assert!(

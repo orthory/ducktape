@@ -706,7 +706,7 @@ fn has_chunks_err(f: &files::Files, ids: &[String]) -> String {
 }
 
 #[test]
-fn has_chunks_reports_staged_committed_and_absent() {
+fn has_chunks_reports_only_staging_not_the_odb() {
     let d = tempfile::tempdir().unwrap();
     let mut f = open_files(&d);
 
@@ -718,7 +718,11 @@ fn has_chunks_reports_staged_committed_and_absent() {
     let staged = chunk_hex(staged_bytes);
 
     // a committed chunk: an inline commit chunks + stores the file's bytes in the
-    // odb (present via `store.has`, not via staging).
+    // odb. it is durable on disk but NO LONGER in refs.staging (a commit consumes
+    // its stage). has_chunks reports it ABSENT so the client RE-STAGES it: odb
+    // presence is per-node (orphan sets diverge across the set), so probing it
+    // would tell one client to skip a stage another node needs — the finding #1
+    // split app-hash. re-staging is consensus-safe (the bytes ride the block).
     let committed_bytes = b"committed-inline-body";
     commit(
         &mut f,
@@ -740,8 +744,9 @@ fn has_chunks_reports_staged_committed_and_absent() {
     let present = has_chunks(&f, &[staged.clone(), committed.clone(), absent.clone()]);
     assert_eq!(
         present,
-        vec![true, true, false],
-        "order matches the request: staged, committed, absent"
+        vec![true, false, false],
+        "staging is the only source: staged => present; committed-but-unstaged \
+         and never-seen => absent (both must be re-staged before a commit)"
     );
 }
 
