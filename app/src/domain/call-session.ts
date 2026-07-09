@@ -215,7 +215,8 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
             width: { ideal: 1280 },
             height: { ideal: 720 },
             frameRate: { ideal: 30 },
-            ...(cameraId ? { deviceId: { exact: cameraId } } : {}),
+            // `ideal` (bare string) so an absent camera falls back, not throws.
+            ...(cameraId ? { deviceId: cameraId } : {}),
           },
         });
     if (stopped || !wanted()) {
@@ -402,6 +403,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   };
 
   const onPeerVideo = (peer: string, keyframe: boolean, tsMs: number, data: Uint8Array) => {
+    // No decode support on this runtime → ignore peer video rather than throw
+    // constructing a VideoDecoder on every frame (a decoder-less WKWebView).
+    if (typeof VideoDecoder === "undefined") return;
     const pipe = pipeFor(peer);
     if (pipe.awaitingKey && !keyframe) {
       requestPeerKeyframe(peer, pipe); // deltas are useless until a sync point
@@ -532,7 +536,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     echoCancellation: true,
     noiseSuppression: true,
     channelCount: 1,
-    ...(micId ? { deviceId: { exact: micId } } : {}),
+    // `ideal` (bare string), NOT { exact } — a persisted-but-now-absent device
+    // must fall back to the system default, not OverconstrainedError the join.
+    ...(micId ? { deviceId: micId } : {}),
   });
 
   /** Route playout to the chosen speaker — AudioContext.setSinkId is Chromium
@@ -572,10 +578,12 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     speakerId = prefs.speakerId;
     applySpeaker();
     if (micChanged) void swapMic();
-    // Re-acquire the live camera on the new device (a screen share is unaffected).
+    // Re-acquire the live camera on the new device (a screen share is
+    // unaffected). A bad/exact deviceId can OverconstrainedError — turn the lane
+    // off cleanly rather than leak an unhandled rejection + a stuck camera flag.
     if (cameraChanged && cameraOn) {
       stopCameraGraph();
-      void startVideo(false);
+      void startVideo(false).catch(() => stopVideoLane());
     }
   };
 
