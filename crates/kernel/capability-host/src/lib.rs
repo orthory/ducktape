@@ -275,88 +275,40 @@ impl CliProvider {
             // dropping the wait future (timeout) must kill the child — a hung
             // CLI never outlives its job.
             .kill_on_drop(true);
-        if ctx.portable {
-            // D7 isolation floor (deterministic-agent-runtime): a PORTABLE run
-            // starts from an EMPTY environment so the child cannot inherit the
-            // node's ambient secrets — HOME (=> ~/.ducktape/user.key), every
-            // DUCKTAPE_* var, and the node data dir are all stripped. only a
-            // minimal, non-sensitive base is re-injected, plus this run's
-            // explicit ctx.env. this branch is DORMANT until the composer flips
-            // to v3 (nothing sets ctx.portable in production yet).
-            self.apply_portable_env(&mut cmd, workdir, ctx)?;
-        } else {
-            // NON-portable (v2 / live) runs keep TODAY's behavior byte-for-byte:
-            // an ADDITIVE overlay on the inherited environment. a blanket
-            // env_clear here would strip HOME and break the live codex/claude
-            // CLIs' BYO-auth — a non-dormant regression — so it is scoped to
-            // portable runs only, above.
-            cmd.envs(ctx.env.iter());
-            if !ctx.path_entries.is_empty() {
-                let mut path = ctx.path_entries.clone();
-                if let Some(existing) = std::env::var_os("PATH") {
-                    path.extend(std::env::split_paths(&existing));
-                }
-                let joined = std::env::join_paths(path).map_err(|e| {
-                    format!(
-                        "run-local PATH for {} contains an invalid path entry: {e}",
-                        self.spec.tag
-                    )
-                })?;
-                cmd.env("PATH", joined);
+        // env handling is the SAME for portable and non-portable runs: an
+        // ADDITIVE overlay on the inherited environment, plus this run's scoped
+        // ctx.env / PATH bindings. providers run the claude/codex CLI HEADLESS
+        // and are BYO-auth — the CLI reads its OWN credentials from the ambient
+        // env (e.g. ANTHROPIC_API_KEY) or a dotfile under HOME (~/.claude,
+        // ~/.codex), per this module's doc — so the child MUST inherit that
+        // environment or it cannot authenticate to the model.
+        //
+        // D7 isolation floor — the env half: hiding the node's ambient secrets
+        // (HOME => ~/.ducktape/user.key, DUCKTAPE_*, the data dir) from the
+        // child WITHOUT also hiding the operator's CLI credentials (which live
+        // under the same HOME) cannot be done with `env_clear` alone — it needs
+        // the ADR's deferred enforcement MECHANISM (a mount namespace, a
+        // bind-only sandbox, or a separate unix user that holds the CLI creds
+        // but not the node data dir). Until that lands, a portable child
+        // inherits the env exactly like a non-portable one (no worse than
+        // today). The ACTIVE D7 measure is the WORKSPACE RELOCATION: a portable
+        // run's cwd is the provisioner's per-run mount OUTSIDE <storage>, so a
+        // `..` from the cwd no longer reaches the key tree.
+        cmd.envs(ctx.env.iter());
+        if !ctx.path_entries.is_empty() {
+            let mut path = ctx.path_entries.clone();
+            if let Some(existing) = std::env::var_os("PATH") {
+                path.extend(std::env::split_paths(&existing));
             }
+            let joined = std::env::join_paths(path).map_err(|e| {
+                format!(
+                    "run-local PATH for {} contains an invalid path entry: {e}",
+                    self.spec.tag
+                )
+            })?;
+            cmd.env("PATH", joined);
         }
         Ok(cmd)
-    }
-
-    /// build the PORTABLE child's environment from scratch (D7 isolation floor):
-    /// `env_clear`, then a minimal safe base + this run's explicit `ctx.env`. the
-    /// node's ambient environment — HOME, every `DUCKTAPE_*`, the data dir — is
-    /// NEVER re-injected here, so a portable child cannot reach the node's keys
-    /// or state through an inherited variable.
-    ///
-    /// TODO (v4 activation-correctness, refine before the flip): the exact
-    /// operator-CLI auth surface under isolation is not settled. today HOME is
-    /// pointed at this run's own workspace (a writable per-run scratch, never a
-    /// data dir) so a CLI that writes dotfiles has somewhere safe to go, and
-    /// tool/secret bindings arrive ONLY through `ctx.env` (populated from the
-    /// agent's `ResourceCaps`). BYO-auth for portable runs must be wired through
-    /// `ctx.env` from the caps/vault before v3 composition activates. portable
-    /// runs are dormant until then, so this is an activation item, not a live
-    /// regression.
-    fn apply_portable_env(
-        &self,
-        cmd: &mut tokio::process::Command,
-        workdir: &Path,
-        ctx: &RunContext,
-    ) -> Result<(), String> {
-        cmd.env_clear();
-        // a sanitized PATH base (this run's tool bin dirs first, then a fixed
-        // safe default) — NOT the node's inherited PATH, which could point at
-        // node-private tooling.
-        let mut path: Vec<PathBuf> = ctx.path_entries.clone();
-        for entry in ["/usr/local/bin", "/usr/bin", "/bin"] {
-            path.push(PathBuf::from(entry));
-        }
-        let joined = std::env::join_paths(&path).map_err(|e| {
-            format!(
-                "run-local PATH for {} contains an invalid path entry: {e}",
-                self.spec.tag
-            )
-        })?;
-        cmd.env("PATH", joined);
-        // locale only, if the node has one — harmless and often required for
-        // correct text handling. NOTHING else from the ambient environment.
-        for key in ["LANG", "LC_ALL"] {
-            if let Some(val) = std::env::var_os(key) {
-                cmd.env(key, val);
-            }
-        }
-        // HOME points at this run's own workspace (writable, per-run, outside
-        // any data dir) — never the node's real HOME (=> ~/.ducktape keys).
-        cmd.env("HOME", workdir);
-        // finally this run's explicit, scoped bindings (tool/workspace vars).
-        cmd.envs(ctx.env.iter());
-        Ok(())
     }
 
     /// where this run's child executes: the per-agent persistent workspace
@@ -1700,105 +1652,62 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
 
     // ---- D7 isolation floor (portable env) --------------------------------------
 
-    /// structural proof: a PORTABLE run's command env is built from scratch —
-    /// only a sanitized PATH, HOME=workspace, and this run's explicit ctx.env,
-    /// with NO ambient `DUCKTAPE_*` and NO data-dir HOME. a NON-portable run's
-    /// env is the unchanged additive overlay (exactly ctx.env), byte-for-byte
-    /// today's behavior.
+    /// portable and non-portable runs use the SAME additive env overlay: no
+    /// `env_clear`, no HOME override. get_envs (the explicitly-set overlay) is
+    /// exactly ctx.env for both — so a headless CLI's BYO-auth (ambient
+    /// ANTHROPIC_API_KEY, ~/.claude, &c) survives into a portable child.
     #[test]
-    fn portable_command_env_is_isolated_nonportable_is_additive() {
+    fn portable_and_nonportable_use_the_same_additive_env_overlay() {
         let spec = mock_spec("iso", "iso-cli", "text");
         let p = CliProvider::from_spec(spec, PathBuf::from("/bin/true"));
         let workdir = scratch("iso-portable-wd");
 
-        // PORTABLE.
         let mut env = BTreeMap::new();
         env.insert("AGENT_TOKEN".to_string(), "abc".to_string());
-        let portable = RunContext {
-            portable: true,
-            workdir_override: Some(workdir.clone()),
-            env,
-            ..Default::default()
-        };
-        let cmd = p.command(&[], &workdir, &portable).expect("portable command");
-        let envs: BTreeMap<String, Option<String>> = cmd
-            .as_std()
-            .get_envs()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
+        let expected: BTreeMap<String, Option<String>> = env
+            .iter()
+            .map(|(k, v)| (k.clone(), Some(v.clone())))
             .collect();
-        assert!(
-            envs.keys().all(|k| !k.starts_with("DUCKTAPE_")),
-            "a portable child sees no DUCKTAPE_* var: {envs:?}"
-        );
-        assert_eq!(
-            envs.get("HOME"),
-            Some(&Some(workdir.display().to_string())),
-            "HOME is this run's workspace"
-        );
-        assert!(
-            !envs["HOME"].as_ref().unwrap().contains(".ducktape"),
-            "HOME never points into the node data dir"
-        );
-        assert_eq!(
-            envs.get("AGENT_TOKEN"),
-            Some(&Some("abc".to_string())),
-            "the run's explicit binding survives"
-        );
-        assert!(envs.contains_key("PATH"), "a sanitized PATH is set");
 
-        // NON-PORTABLE: additive-only. get_envs is EXACTLY ctx.env (no
-        // env_clear, no allowlist, no PATH when path_entries is empty), so a
-        // DUCKTAPE_* binding passed in ctx.env is preserved unchanged.
-        let mut env2 = BTreeMap::new();
-        env2.insert("DUCKTAPE_NODE_DATA".to_string(), "/data".to_string());
-        env2.insert("FOO".to_string(), "bar".to_string());
-        let live = RunContext {
-            portable: false,
-            env: env2.clone(),
-            ..Default::default()
-        };
-        let cmd = p.command(&[], &workdir, &live).expect("live command");
-        let envs2: BTreeMap<String, Option<String>> = cmd
-            .as_std()
-            .get_envs()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
-        let expected: BTreeMap<String, Option<String>> =
-            env2.into_iter().map(|(k, v)| (k, Some(v))).collect();
-        assert_eq!(
-            envs2, expected,
-            "a non-portable command env is an unchanged additive overlay"
-        );
+        for portable in [true, false] {
+            let ctx = RunContext {
+                portable,
+                workdir_override: Some(workdir.clone()),
+                env: env.clone(),
+                ..Default::default()
+            };
+            let cmd = p.command(&[], &workdir, &ctx).expect("command");
+            let envs: BTreeMap<String, Option<String>> = cmd
+                .as_std()
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                envs, expected,
+                "portable={portable}: env is the additive overlay (no env_clear, no HOME override)"
+            );
+        }
     }
 
-    /// behavioral proof that `env_clear` actually strips the inherited
-    /// environment (which `get_envs` cannot show): a portable child's `$HOME`
-    /// is its own workspace, while a non-portable child inherits the ambient
-    /// `$HOME`. if the fundamental inherited `HOME` is replaced for a portable
-    /// run, every ambient var (incl. `DUCKTAPE_*` and the data dir) is stripped
-    /// by the same `env_clear`.
+    /// a portable run INHERITS the ambient `$HOME` — same as a non-portable run
+    /// — so the headless claude/codex CLI finds its BYO credentials. (The env
+    /// half of the D7 isolation floor needs the ADR's deferred sandbox
+    /// mechanism; the ACTIVE D7 measure is the workspace relocation, i.e. the
+    /// cwd being the per-run mount outside <storage>, not an env rewrite.)
     #[tokio::test]
-    async fn portable_run_replaces_inherited_home_nonportable_inherits_it() {
+    async fn portable_runs_inherit_the_ambient_home_for_byo_auth() {
         let dir = scratch("portable-home");
         let bin = fake_cli(&dir, "home", "cat > /dev/null\nprintf '%s' \"$HOME\"");
         let p = mock_provider("home", "text", bin, "portable-home-wd");
 
         let real_home = std::env::var("HOME").expect("the test env has HOME set");
         let inherited = p.run("x", &RunContext::default()).await.unwrap();
-        assert_eq!(
-            inherited, real_home,
-            "a non-portable run inherits the ambient HOME (today's behavior)"
-        );
+        assert_eq!(inherited, real_home, "a non-portable run inherits HOME");
 
         let mount = scratch("portable-home-mount");
         let ctx = RunContext {
@@ -1806,15 +1715,10 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
             workdir_override: Some(mount.clone()),
             ..Default::default()
         };
-        let isolated = p.run("x", &ctx).await.unwrap();
+        let portable_home = p.run("x", &ctx).await.unwrap();
         assert_eq!(
-            PathBuf::from(&isolated),
-            mount,
-            "a portable run's HOME is its own workspace"
-        );
-        assert_ne!(
-            isolated, real_home,
-            "the inherited HOME (=> ~/.ducktape keys) is stripped"
+            portable_home, real_home,
+            "a portable run ALSO inherits the ambient HOME so BYO-auth works"
         );
     }
 }

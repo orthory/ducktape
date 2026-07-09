@@ -418,7 +418,7 @@ struct DeliveryReceipt<'a> {
 
 /// the artifact facet distilled to a chainable reference (O1): a downstream run
 /// can set `workspace.source = prior.output_snapshot`.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct OutputRef<'a> {
     source_prefix: &'a str,
     output_snapshot: &'a str,
@@ -440,18 +440,34 @@ fn encode_delivery_receipt(
         rebased: receipt.rebased,
         no_changes: receipt.no_changes,
     });
-    serde_json::to_string(&DeliveryReceipt {
-        ducktape_delivery: DELIVERY_RECEIPT_VERSION,
-        response,
-        data,
-        output_ref,
-        status: match status {
-            WireStatus::Ok => "ok",
-            WireStatus::Degraded => "degraded",
-            WireStatus::Failed => "failed",
-        },
-    })
-    .expect("delivery receipt serializes")
+    let status = match status {
+        WireStatus::Ok => "ok",
+        WireStatus::Degraded => "degraded",
+        WireStatus::Failed => "failed",
+    };
+    let encode = |data: Option<&str>| {
+        serde_json::to_string(&DeliveryReceipt {
+            ducktape_delivery: DELIVERY_RECEIPT_VERSION,
+            response,
+            data,
+            output_ref: output_ref.clone(),
+            status,
+        })
+        .expect("delivery receipt serializes")
+    };
+    // the finalize payload MUST stay valid JSON within the jobs cap: the naive
+    // byte-truncation the jobs board applies would corrupt it. the response is
+    // already capped (MAX_REPLY_BLOCKS_BYTES) and output_ref/status are tiny, so
+    // only the optional `data` facet is unbounded — embed it only if the whole
+    // receipt still fits, else DROP it here (the full data facet stays in the
+    // dispatch-history audit lane, R6, so nothing durable is lost). guarantees a
+    // valid, bounded finalize payload with the O1 output_ref always intact.
+    let full = encode(data);
+    if data.is_some() && full.len() > JOB_FINALIZE_PAYLOAD_BYTES {
+        encode(None)
+    } else {
+        full
+    }
 }
 
 // ---- forge sink wire (local mirrors) -----------------------------------------

@@ -42,19 +42,32 @@ pub fn agent_runs_root() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("ducktape-agent-runs"))
 }
 
-/// a slug is a bounded `[a-z0-9]` string — a saga_id is NEVER trusted as a raw
-/// path component (no `.`, no `/`, so a per-run dir can never escape the root).
+/// a bounded, collision-free `[a-z0-9]` dir name derived from the FULL run_id
+/// (`"{saga_id}:{attempt}"`). the SHA-256 tail keys the dir on the ENTIRE
+/// run_id — INCLUDING the attempt — so distinct attempts of one saga never
+/// share a checkout dir. this matters because a re-lease spawns a NEW attempt
+/// WITHOUT cancelling the still-running prior one (agent runs are minutes-long,
+/// lease windows shorter), so two attempts can execute concurrently; distinct
+/// dirs keep them from interleaving writes / racing commits / cleaning up each
+/// other's tree. a readable alnum prefix aids debugging but is NEVER the
+/// discriminator, and the id is never trusted as a raw path component (no `.`,
+/// no `/`, so a per-run dir can never escape the root).
 fn run_slug(run_id: &str) -> String {
-    let mut s: String = run_id
+    // reuse duckfs's content-address hash (no new dep): a domain-separated
+    // sha-256 over the FULL run_id → a stable 24-hex tail keyed on the entire
+    // id, attempt included.
+    let digest = duckfs_core::objects::object_id(
+        duckfs_core::objects::Kind::Chunk,
+        run_id.as_bytes(),
+    );
+    let hash: String = duckfs_core::to_hex(&digest).chars().take(24).collect();
+    let prefix: String = run_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
-        .take(48)
+        .take(24)
         .collect();
-    if s.is_empty() {
-        s.push('r');
-    }
-    s
+    format!("{prefix}{hash}")
 }
 
 /// the real provisioner: mints per-run checkouts under `root`, driving the
@@ -206,16 +219,23 @@ mod tests {
     }
 
     #[test]
-    fn run_slug_is_a_bounded_lowercase_alnum_path_component() {
-        assert_eq!(run_slug("s1:0"), "s10");
-        assert_eq!(run_slug("../../etc/passwd"), "etcpasswd");
-        assert_eq!(run_slug(""), "r");
-        assert_eq!(run_slug("A/B.C-D"), "abcd");
-        let long = run_slug(&"z".repeat(200));
-        assert_eq!(long.len(), 48, "slug is length-bounded");
-        assert!(
-            run_slug("saga:99").chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
-            "no path-traversal metacharacters survive"
-        );
+    fn run_slug_is_bounded_alnum_and_collision_free_per_attempt() {
+        // pure [a-z0-9], bounded, never empty, no traversal metacharacter survives.
+        for id in ["s1:0", "../../etc/passwd", "", "A/B.C-D", &"z".repeat(200)] {
+            let s = run_slug(id);
+            assert!(!s.is_empty() && s.len() <= 48, "slug {s:?} bounded+non-empty");
+            assert!(
+                s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "slug {s:?} is [a-z0-9] — no path-traversal metacharacter"
+            );
+        }
+        // THE bug this guards: distinct attempts of one saga (id differs only in
+        // the ":{attempt}" tail) must map to DISTINCT dirs so overlapping
+        // attempts never corrupt one checkout.
+        let a0 = run_slug("dispatch\u{1f}r\u{1f}deadbeefdeadbeef:0");
+        let a1 = run_slug("dispatch\u{1f}r\u{1f}deadbeefdeadbeef:1");
+        assert_ne!(a0, a1, "attempt 0 and 1 get distinct dirs");
+        // deterministic per run_id (idempotent provision + cleanup).
+        assert_eq!(run_slug("saga:2"), run_slug("saga:2"));
     }
 }
