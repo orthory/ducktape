@@ -1656,7 +1656,7 @@ where
     }
 }
 
-/// re-apply one journaled frame through the host at its original block
+/// re-apply one journaled BATCH frame through the host at its original block
 /// coordinate. when `expect` is given, the outcome must reproduce the sealed
 /// disposition (the drain is deterministic — anything else is divergence).
 /// alongside the disposition, hands back the block's dispatch trace (empty
@@ -1680,7 +1680,7 @@ async fn apply_block(
     Ok((disposition, dispatches))
 }
 
-/// re-apply one journaled frame like [`apply_block`], but commit ONLY the
+/// re-apply one journaled BATCH frame like [`apply_block`], but commit ONLY the
 /// modules in `commit_only` at the block boundary and abort the rest (see
 /// [`Host::submit_block_committing`]). used to heal a TORN block whose disk
 /// substrates are already durable at their sealed post-root: replay re-commits

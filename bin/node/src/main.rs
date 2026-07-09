@@ -8682,6 +8682,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 let disposition = match d.disposition {
                                     node::Disposition::Applied => noded::BlockDisposition::Applied,
                                     node::Disposition::Rejected => noded::BlockDisposition::Rejected,
+                                    // unreachable: Discarded is filtered at the top
+                                    // of the inner loop; kept for match exhaustiveness.
                                     node::Disposition::Discarded => continue,
                                 };
                                 record = Some(explorer_block_row(
