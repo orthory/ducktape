@@ -7022,10 +7022,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 if let Some(cmd) = &reach_cmd
                     && m.residents.iter().any(|k| k == &me_bytes)
                 {
+                    // NON-BLOCKING sends throughout: the plane is not this
+                    // loop's dependency. a shed ViewTick is one beat of
+                    // advert staleness (the next poll carries a fresher one);
+                    // a refused Retarget retries naturally — the epoch latch
+                    // below only advances when the send is taken.
                     let clock = m.view_base.max(m.height);
-                    let _ = cmd
-                        .send(reachability::ReachabilityCommand::ViewTick(clock))
-                        .await;
+                    let _ = cmd.try_send(reachability::ReachabilityCommand::ViewTick(clock));
                     if last_plane_epoch != Some(m.epoch) {
                         let members: Vec<ed25519::PublicKey> = m
                             .participants
@@ -7037,8 +7040,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             .iter()
                             .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
                             .collect();
-                        let _ = cmd
-                            .send(reachability::ReachabilityCommand::Retarget(
+                        if cmd
+                            .try_send(reachability::ReachabilityCommand::Retarget(
                                 reachability::MeshEpochEvent {
                                     epoch: m.epoch,
                                     members,
@@ -7046,8 +7049,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     current_view: clock,
                                 },
                             ))
-                            .await;
-                        last_plane_epoch = Some(m.epoch);
+                            .is_ok()
+                        {
+                            last_plane_epoch = Some(m.epoch);
+                        }
                     }
                 }
                 if !m.participants.iter().any(|k| k == &me_bytes) {
@@ -7430,9 +7435,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // in-process boringtun device dies with the process either way,
             // but only an orderly Shutdown unlinks its UAPI socket path —
             // a stale one would fail the rebooted validator's restore-time
-            // create. Bounded: the reboot must not hang on a wedged plane.
+            // create. Bounded: the reboot must not hang on a wedged plane —
+            // try_send (a plane whose queue is full would never process the
+            // Shutdown anyway), then a 2s grace for the orderly unlink.
             if let Some(cmd) = &reach_cmd {
-                let _ = cmd.send(reachability::ReachabilityCommand::Shutdown).await;
+                let _ = cmd.try_send(reachability::ReachabilityCommand::Shutdown);
                 let deadline = std::time::Instant::now() + Duration::from_secs(2);
                 while !cmd.is_closed() && std::time::Instant::now() < deadline {
                     context.sleep(Duration::from_millis(20)).await;
@@ -8655,6 +8662,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // the last absolute view ticked to the reachability plane — one
         // ViewTick per actual advance, not one per 100ms drain pass.
         let mut last_reach_view: Option<u64> = None;
+        // a cutover Retarget the plane's command queue could not take yet
+        // (NON-BLOCKING sends: the plane is not consensus, so the loop never
+        // waits on it). retried every drain beat until it lands; a newer
+        // epoch's Retarget supersedes an undelivered older one.
+        let mut pending_retarget: Option<reachability::MeshEpochEvent> = None;
         // throttle for the pending-cutover nop pusher below.
         let mut last_nop = std::time::Instant::now();
         // dev override (`make dev` sets DUCKTAPE_DISABLE_HEARTBEAT): keep an idle
@@ -9142,12 +9154,27 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         if let Some(cmd) = &reach_cmd {
                             let absolute_view = orchestrator.app_height(engine_view);
                             if last_reach_view.is_none_or(|v| v < absolute_view) {
-                                let _ = cmd
-                                    .send(reachability::ReachabilityCommand::ViewTick(
-                                        absolute_view,
-                                    ))
-                                    .await;
+                                // NON-BLOCKING: the plane is not consensus. a
+                                // full command queue (a wedged or slow plane)
+                                // sheds this tick — the next drain beat carries
+                                // a fresher one — instead of stalling the loop
+                                // behind an actor that may never drain.
+                                let _ = cmd.try_send(
+                                    reachability::ReachabilityCommand::ViewTick(absolute_view),
+                                );
                                 last_reach_view = Some(absolute_view);
+                            }
+                            // flush a staged cutover Retarget (see
+                            // `pending_retarget`) — MUST eventually land, so
+                            // it retries every beat rather than being shed.
+                            if let Some(event) = pending_retarget.take()
+                                && let Err(tokio::sync::mpsc::error::TrySendError::Full(
+                                    reachability::ReachabilityCommand::Retarget(event),
+                                )) = cmd.try_send(reachability::ReachabilityCommand::Retarget(
+                                    event,
+                                ))
+                            {
+                                pending_retarget = Some(event);
                             }
                         }
                         let members_raw = read_valset_members(node.host()).await;
@@ -9245,17 +9272,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // here would be epoch-local, a different clock
                             // than the ViewTicks above and the boot
                             // Retarget's view_base.
-                            if let Some(cmd) = &reach_cmd {
-                                let _ = cmd
-                                    .send(reachability::ReachabilityCommand::Retarget(
-                                        reachability::MeshEpochEvent {
-                                            epoch: plan.epoch(),
-                                            members: members.iter().cloned().collect(),
-                                            standbys: plan_residents.clone(),
-                                            current_view: plan.cutover_app_height(),
-                                        },
-                                    ))
-                                    .await;
+                            if reach_cmd.is_some() {
+                                // STAGED, not sent inline: the flush below
+                                // (every drain beat) try_sends it, so a plane
+                                // whose queue is full delays retunneling by
+                                // beats — it can never stall the cutover or
+                                // the loop.
+                                pending_retarget = Some(reachability::MeshEpochEvent {
+                                    epoch: plan.epoch(),
+                                    members: members.iter().cloned().collect(),
+                                    standbys: plan_residents.clone(),
+                                    current_view: plan.cutover_app_height(),
+                                });
                             }
                             if !members.contains(&signer.public_key()) {
                                 println!(
@@ -10055,7 +10083,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 f.height <= coords.view_base || coords.floor_cert.is_some()
                             });
                             let answer = match finalized_for_sync {
-                                None => Err("no finalized boundary to serve yet".to_string()),
+                                // two refusals, named apart: no boundary at
+                                // all (pre-first-block), vs the per-block
+                                // window where the tip advanced but its
+                                // finalization certificate has not persisted
+                                // yet — a retry lands once they align.
+                                None => Err(match node.finalized() {
+                                    Some(f) => format!(
+                                        "boundary {} awaiting its finalization certificate — \
+                                         retry",
+                                        f.height
+                                    ),
+                                    None => "no finalized boundary to serve yet".to_string(),
+                                }),
                                 Some(finalized) => {
                                     let id = statesync::BoundaryId {
                                         height: finalized.height,
