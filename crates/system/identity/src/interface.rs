@@ -201,6 +201,29 @@ fn push_len(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+/// the exact bytes a NATIVE key (`Ed25519`/`P256`) signs to prove possession
+/// when joining an account: commonware's namespaced signing preimage
+/// `union_unique(IDENTITY_ADD_MEMBER_NS, add_member_preimage(...))`, which is
+/// what `commonware_cryptography`'s `verify` reconstructs internally.
+///
+/// exposed for the ENROLLMENT side: the node hands a joining device these exact
+/// bytes to ECDSA/EdDSA-sign, so the phone page never reconstructs the preimage
+/// or the namespace framing -- one source of truth with the on-chain verifier.
+/// (a WebAuthn passkey does NOT use this; its challenge is the hashed form --
+/// see [`crate::webauthn_challenge`].)
+pub fn add_member_signing_payload(
+    chain_id: &str,
+    account_id: &[u8],
+    new_key: &[u8],
+    new_kind: KeyKind,
+    nonce: u64,
+) -> Vec<u8> {
+    commonware_utils::union_unique(
+        IDENTITY_ADD_MEMBER_NS,
+        &add_member_preimage(chain_id, account_id, new_key, new_kind, nonce),
+    )
+}
+
 pub fn encode_msg(m: &IdentityMsg) -> Vec<u8> {
     serde_json::to_vec(m).expect("serializable")
 }

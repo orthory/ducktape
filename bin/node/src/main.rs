@@ -2970,6 +2970,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("user-webauthn-challenge") => {
             return cmd_user_webauthn_challenge(&args[1..]);
         }
+        Some("user-p256-payload") => {
+            return cmd_user_p256_payload(&args[1..]);
+        }
         Some("init") => return cmd_init(&args[1..]),
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
@@ -3000,7 +3003,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "unexpected arg {other:?} (want a subcommand — \
                      keygen|user-key|user-sign-bind|user-sign-unbind|\
                      user-sign-possession|user-sign-add-member|user-sign-remove-member|\
-                     user-webauthn-challenge|\
+                     user-webauthn-challenge|user-p256-payload|\
                      init|invite|admit|\
                      invite-accept|promote|resident-remove|\
                      join-requests|member-remove|member-leave|member-status|join|\
@@ -3802,6 +3805,54 @@ fn cmd_user_webauthn_challenge(args: &[String]) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+/// `user-p256-payload` core — see [`cmd_user_p256_payload`].
+fn user_p256_payload(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-p256-payload needs --chain-id <id>")?;
+    let account_id = config::unhex(
+        flags
+            .get("account-id")
+            .ok_or("user-p256-payload needs --account-id <hex>")?,
+    )?;
+    let new_key = config::unhex(
+        flags
+            .get("new-key")
+            .ok_or("user-p256-payload needs --new-key <hex>")?,
+    )?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-p256-payload needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+
+    // the exact bytes a P256 joiner must ECDSA-sign — union_unique(ADD_MEMBER_NS,
+    // add_member_preimage(...)), what the on-chain verifier reconstructs. Hex so
+    // the phone hex-decodes and signs them raw; no preimage math on the page.
+    let payload = identity::add_member_signing_payload(
+        chain_id,
+        &account_id,
+        &new_key,
+        identity::KeyKind::P256,
+        nonce,
+    );
+    Ok(payload.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// `user-p256-payload --chain-id <id> --account-id <hex> --new-key <hex>
+/// --nonce <n>` — print the hex bytes a software P256 key (a phone's pure-JS
+/// signer, in the in-app LAN enrollment) must ECDSA-P256-SHA256-sign to join
+/// `account-id` as `new-key` at `nonce`. Its raw R‖S signature feeds
+/// `user-sign-add-member --new-kind p256 --possession`. Pure computation.
+fn cmd_user_p256_payload(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_p256_payload(args)?);
+    Ok(())
+}
+
 #[cfg(test)]
 mod webauthn_challenge_tests {
     use super::*;
@@ -3858,6 +3909,43 @@ mod webauthn_challenge_tests {
         assert_ne!(base, challenge("c", "cc", "bb", "0"), "account must move it");
         assert_ne!(base, challenge("c", "aa", "cc", "0"), "new key must move it");
         assert_ne!(base, challenge("c", "aa", "bb", "1"), "nonce must move it");
+    }
+
+    #[test]
+    fn p256_payload_matches_identity_signing_payload() {
+        let account_id = [0xabu8; 33];
+        let new_key = [0xcdu8; 33];
+        let account_hex: String = account_id.iter().map(|b| format!("{b:02x}")).collect();
+        let new_hex: String = new_key.iter().map(|b| format!("{b:02x}")).collect();
+
+        let args: Vec<String> = [
+            "--chain-id",
+            "team#abcd",
+            "--account-id",
+            &account_hex,
+            "--new-key",
+            &new_hex,
+            "--nonce",
+            "5",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got = user_p256_payload(&args).unwrap();
+
+        // the verb's hex must be exactly identity's signing payload — the bytes
+        // the on-chain P256 verifier reconstructs.
+        let expected: String = identity::add_member_signing_payload(
+            "team#abcd",
+            &account_id,
+            &new_key,
+            identity::KeyKind::P256,
+            5,
+        )
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+        assert_eq!(got, expected);
     }
 }
 

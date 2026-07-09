@@ -410,6 +410,55 @@ mod tests {
     }
 
     #[test]
+    fn p256_raw_ecdsa_over_the_signing_payload_verifies() {
+        // The in-app LAN enrollment mints a real P256 member from a phone using
+        // a pure-JS signer (@noble/curves): it signs `add_member_signing_payload`
+        // with RAW ECDSA-P256-SHA256 (low-S), NOT commonware's Signer. Prove
+        // that still verifies as KeyKind::P256 — i.e. the node's payload bytes +
+        // a raw ECDSA sig round-trip through the on-chain verifier.
+        use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
+
+        let sk = SigningKey::from_slice(&[0x33u8; 32]).expect("valid scalar");
+        // compressed SEC1 — the form commonware's secp256r1 PublicKey decodes.
+        let new_key = sk.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+        let account_id = [0xaau8; 33];
+
+        let payload =
+            crate::add_member_signing_payload("chain-a", &account_id, &new_key, KeyKind::P256, 7);
+        let sig: Signature = sk.sign(&payload);
+        let proof = MemberProof::Signature { sig: sig.to_bytes().to_vec() };
+
+        let preimage =
+            crate::add_member_preimage("chain-a", &account_id, &new_key, KeyKind::P256, 7);
+        assert!(verify_authority(
+            KeyKind::P256,
+            &new_key,
+            None,
+            crate::IDENTITY_ADD_MEMBER_NS,
+            &preimage,
+            &proof,
+        ));
+
+        // a signature over a different payload (nonce 8) must not verify at 7.
+        let stale: Signature = sk.sign(&crate::add_member_signing_payload(
+            "chain-a",
+            &account_id,
+            &new_key,
+            KeyKind::P256,
+            8,
+        ));
+        let stale_proof = MemberProof::Signature { sig: stale.to_bytes().to_vec() };
+        assert!(!verify_authority(
+            KeyKind::P256,
+            &new_key,
+            None,
+            crate::IDENTITY_ADD_MEMBER_NS,
+            &preimage,
+            &stale_proof,
+        ));
+    }
+
+    #[test]
     fn wellformed_rejects_wrong_lengths() {
         assert!(KeyKind::Ed25519.pubkey_wellformed(&[0u8; 32]));
         assert!(!KeyKind::Ed25519.pubkey_wellformed(&[0u8; 33]));
