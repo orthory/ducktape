@@ -1090,7 +1090,7 @@ export function createActions({
         opKey.profile(),
         (live) =>
           bound
-            ? identityClient.setUserName(live, { displayName: name, origin })
+            ? identityClient.setAccountName(live, { displayName: name, origin })
             : profilesClient.setName(live, { displayName: name, origin }),
         () => ({ author: name }),
       );
