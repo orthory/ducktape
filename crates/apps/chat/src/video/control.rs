@@ -36,8 +36,15 @@ pub enum CallControl {
     /// the receiver lost a frame and needs a decoder sync point. Senders
     /// rate-limit honoring this to one keyframe per second.
     KeyframeRequest,
-    /// 1 Hz presence + ephemeral state (drives tiles, NOT consensus).
-    Beacon { muted: bool, camera_on: bool },
+    /// 1 Hz presence + ephemeral state (drives tiles, NOT consensus). `sharing`
+    /// marks the video lane as a screen share (vs the camera) so peers render it
+    /// letterboxed + labelled — appended as an optional 5th byte, so a pre-share
+    /// node's 4-byte frame still decodes (sharing = false).
+    Beacon {
+        muted: bool,
+        camera_on: bool,
+        sharing: bool,
+    },
     /// receiver loss report: send to me at no more than `max_kbps`.
     RateHint { max_kbps: u32 },
 }
@@ -56,9 +63,17 @@ impl CallControl {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             CallControl::KeyframeRequest => vec![CTL_VERSION, TAG_KEYFRAME_REQUEST],
-            CallControl::Beacon { muted, camera_on } => {
-                vec![CTL_VERSION, TAG_BEACON, *muted as u8, *camera_on as u8]
-            }
+            CallControl::Beacon {
+                muted,
+                camera_on,
+                sharing,
+            } => vec![
+                CTL_VERSION,
+                TAG_BEACON,
+                *muted as u8,
+                *camera_on as u8,
+                *sharing as u8,
+            ],
             CallControl::RateHint { max_kbps } => {
                 let mut frame = vec![CTL_VERSION, TAG_RATE_HINT];
                 frame.extend_from_slice(&max_kbps.to_be_bytes());
@@ -79,6 +94,8 @@ impl CallControl {
             TAG_BEACON if frame.len() >= 4 => Ok(CallControl::Beacon {
                 muted: frame[2] != 0,
                 camera_on: frame[3] != 0,
+                // Optional 5th byte — absent on a pre-share sender → not sharing.
+                sharing: frame.get(4).is_some_and(|b| *b != 0),
             }),
             TAG_RATE_HINT if frame.len() >= 6 => Ok(CallControl::RateHint {
                 max_kbps: u32::from_be_bytes(frame[2..6].try_into().expect("4 bytes")),
@@ -104,11 +121,33 @@ mod tests {
 
     #[test]
     fn beacon_round_trips() {
-        for (muted, camera_on) in [(false, false), (true, false), (false, true), (true, true)] {
-            let control = CallControl::Beacon { muted, camera_on };
-            let frame = control.encode();
-            assert_eq!(CallControl::decode(&frame).unwrap(), control);
+        for muted in [false, true] {
+            for camera_on in [false, true] {
+                for sharing in [false, true] {
+                    let control = CallControl::Beacon {
+                        muted,
+                        camera_on,
+                        sharing,
+                    };
+                    let frame = control.encode();
+                    assert_eq!(CallControl::decode(&frame).unwrap(), control);
+                }
+            }
         }
+    }
+
+    #[test]
+    fn beacon_decodes_legacy_four_byte_frame_as_not_sharing() {
+        // A pre-share sender emits only 4 bytes; it must still decode, sharing=false.
+        let legacy = vec![CTL_VERSION, TAG_BEACON, 1, 1];
+        assert_eq!(
+            CallControl::decode(&legacy).unwrap(),
+            CallControl::Beacon {
+                muted: true,
+                camera_on: true,
+                sharing: false,
+            },
+        );
     }
 
     #[test]

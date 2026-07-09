@@ -410,8 +410,13 @@ pub struct PeerVideo {
 /// call-control the WEBVIEW asks the hub to act on (webview → hub).
 pub enum CallControlIn {
     /// our local presence/state, pushed immediately AND repeated at 1 Hz as
-    /// this session's beacon to every recipient.
-    Beacon { muted: bool, camera_on: bool },
+    /// this session's beacon to every recipient. `sharing` = the video lane is a
+    /// screen share rather than the camera.
+    Beacon {
+        muted: bool,
+        camera_on: bool,
+        sharing: bool,
+    },
     /// our decoder lost `peer`'s stream — ask `peer` for a fresh keyframe.
     KeyframeRequest { peer: [u8; 32] },
 }
@@ -421,11 +426,13 @@ pub enum CallControlOut {
     /// a peer's receiver asked us to send it a fresh keyframe — the webview
     /// tells its encoder to emit one (rate-limited to ≤1 Hz by the hub).
     KeyframeRequest,
-    /// a peer's 1 Hz presence beacon — drives the tile's mute/camera badges.
+    /// a peer's 1 Hz presence beacon — drives the tile's mute/camera badges +
+    /// the screen-share treatment.
     PeerBeacon {
         peer: [u8; 32],
         muted: bool,
         camera_on: bool,
+        sharing: bool,
     },
     /// the effective outbound bitrate cap (min of every peer's hint) — the
     /// webview retargets its encoder. emitted only when the value changes.
@@ -481,7 +488,13 @@ pub enum CallClientControl {
     /// the client tracks the consensus huddle roster).
     Recipients { peers: Vec<String> },
     /// this client's ephemeral state; the hub beacons it to peers at 1 Hz.
-    Beacon { muted: bool, camera_on: bool },
+    /// `sharing` defaults false so a pre-share client (no field) still parses.
+    Beacon {
+        muted: bool,
+        camera_on: bool,
+        #[serde(default)]
+        sharing: bool,
+    },
     /// the decoder lost sync with `peer` — ask it for a keyframe.
     KeyframeRequest { peer: String },
 }
@@ -501,6 +514,7 @@ pub enum CallServerControl {
         peer: String,
         muted: bool,
         camera_on: bool,
+        sharing: bool,
     },
     /// send at no more than this (min across peers' loss reports).
     RateHint { max_kbps: u32 },
@@ -2077,9 +2091,16 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
                                 .collect();
                             let _ = recipients.send(keys);
                         }
-                        Ok(CallClientControl::Beacon { muted, camera_on }) => {
-                            let _ = control_in
-                                .try_send(CallControlIn::Beacon { muted, camera_on });
+                        Ok(CallClientControl::Beacon {
+                            muted,
+                            camera_on,
+                            sharing,
+                        }) => {
+                            let _ = control_in.try_send(CallControlIn::Beacon {
+                                muted,
+                                camera_on,
+                                sharing,
+                            });
                         }
                         Ok(CallClientControl::KeyframeRequest { peer }) => {
                             if let Some(key) = duckfs_core::from_hex_32(&peer) {
@@ -2125,11 +2146,12 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
                 Some(out) => {
                     let message = match out {
                         CallControlOut::KeyframeRequest => CallServerControl::KeyframeRequest,
-                        CallControlOut::PeerBeacon { peer, muted, camera_on } => {
+                        CallControlOut::PeerBeacon { peer, muted, camera_on, sharing } => {
                             CallServerControl::PeerBeacon {
                                 peer: hex_bytes(&peer),
                                 muted,
                                 camera_on,
+                                sharing,
                             }
                         }
                         CallControlOut::RateHint { max_kbps } => {
