@@ -17,6 +17,10 @@ export const INDENT = 26;
  *  did relative to their own text. */
 export const MARKER_HANG = 28;
 
+/** Vertical padding on every row. The hanging marker offsets from the row's
+ *  padding box, so it must add this back to sit on the same line as the text. */
+export const ROW_PAD_Y = 2.5;
+
 /** Breathing room above a heading. Rows are otherwise uniformly spaced, which
  *  made an H1 sit as tight against the paragraph above it as another
  *  paragraph would. */
