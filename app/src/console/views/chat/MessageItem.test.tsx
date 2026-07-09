@@ -6,7 +6,7 @@ import { selfAuthorKeyOf } from "./chat-helpers";
 import { MessageItem } from "./MessageItem";
 
 const SELF = "operator";
-const selfKey = selfAuthorKeyOf(SELF);
+const selfKey = selfAuthorKeyOf(Array.from(new TextEncoder().encode(SELF)));
 const ownAuthor: AuthorRef = { user: Array.from(new TextEncoder().encode(SELF)) };
 const otherAuthor: AuthorRef = { user: Array.from(new TextEncoder().encode("someone-else")) };
 

@@ -573,6 +573,32 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
 
 // ── Pure helpers ────────────────────────────────────────
 
+/** The identity committed rows actually carry for OUR writes. The submit
+ *  lane SIGNS frames on networked nodes: committed authorship is the NODE's
+ *  pubkey and the client's origin string is deliberately ignored — so self
+ *  is `status.publicKey` whenever the node reports one. The embedded daemon
+ *  (empty publicKey) stores the origin string verbatim, so the author
+ *  string remains its self there. This is the follow-the-head handoff's
+ *  bug A: every self-comparison (optimistic rows, canModify,
+ *  reaction-"mine", huddle roster) must use THESE bytes, never the literal
+ *  author string. */
+export const selfAuthorBytes = (
+  status: NodeStatus | null,
+  author: string,
+): number[] => {
+  const pk = (status?.publicKey ?? "").toLowerCase();
+  if (pk.length >= 64 && pk.length % 2 === 0) {
+    const bytes: number[] = [];
+    for (let i = 0; i < pk.length; i += 2) {
+      const byte = parseInt(pk.slice(i, i + 2), 16);
+      if (Number.isNaN(byte)) return Array.from(new TextEncoder().encode(author));
+      bytes.push(byte);
+    }
+    return bytes;
+  }
+  return Array.from(new TextEncoder().encode(author));
+};
+
 /** A channel id from a display name: lowercase, dash-separated, wire-safe. */
 export const channelIdOf = (name: string): string =>
   name
