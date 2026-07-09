@@ -54,10 +54,11 @@ import {
   removeTab,
   saveAccent,
   saveDocTabs,
+  saveNotifyPrefs,
   saveRemoteUrl,
   saveViewMode,
 } from "./state";
-import type { ConsoleState, ViewMode } from "./state";
+import type { ConsoleState, NotifyPrefs, ViewMode } from "./state";
 
 /** How often a parked joiner's phase is polled while it promotes. */
 const JOIN_POLL_MS = 1500;
@@ -96,6 +97,8 @@ export interface ConsoleActions {
    *  to the other rail, so the body always matches the rail. */
   setViewMode(mode: ViewMode): void;
   setAccent(accent: string): void;
+  setNotifyPrefs(prefs: NotifyPrefs): void;
+  toggleChannelMute(channelId: string): void;
   setAuthor(author: string): void;
   /** Set our own display name in the `profiles` module (origin-gated SetName)
    *  and keep it as the local author identity, so it propagates to everyone. */
@@ -488,6 +491,11 @@ export function createActions({
   /** Our own node key hex — the fan-out set excludes it. Empty on a daemon
    *  that can't do voice. */
   const selfNodeHex = (): string => getState().status?.publicKey ?? "";
+
+  const setNotifyPrefs = (prefs: NotifyPrefs): void => {
+    saveNotifyPrefs(prefs);
+    patch({ notifyPrefs: prefs });
+  };
 
   // The last fan-out set pushed into the live session — refresh() lands a new
   // channels array every block, so pushes are deduped by value here rather
@@ -1046,6 +1054,16 @@ export function createActions({
     setAccent: (accent) => {
       saveAccent(accent);
       patch({ accent });
+    },
+    setNotifyPrefs,
+    toggleChannelMute: (channelId) => {
+      const prefs = getState().notifyPrefs;
+      setNotifyPrefs({
+        ...prefs,
+        mutedChannels: prefs.mutedChannels.includes(channelId)
+          ? prefs.mutedChannels.filter((id) => id !== channelId)
+          : [...prefs.mutedChannels, channelId],
+      });
     },
     setAuthor: (author) => patch({ author }),
 

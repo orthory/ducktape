@@ -123,6 +123,7 @@ export interface ConsoleState {
    *  Kept in sync with `screen`: navigating to a surface adopts its section. */
   viewMode: ViewMode;
   accent: string;
+  notifyPrefs: NotifyPrefs;
   author: string;
   /** The node answered the last status query. */
   connected: boolean;
@@ -311,6 +312,28 @@ export interface ConsoleState {
 
 export const DEFAULT_ACCENT = "#a05a3c";
 
+export interface NotifyPrefs {
+  enabled: boolean;
+  mentions: boolean;
+  replies: boolean;
+  huddles: boolean;
+  runs: boolean;
+  forge: boolean;
+  governance: boolean;
+  mutedChannels: string[];
+}
+
+export const DEFAULT_NOTIFY_PREFS: NotifyPrefs = {
+  enabled: true,
+  mentions: true,
+  replies: true,
+  huddles: true,
+  runs: true,
+  forge: true,
+  governance: true,
+  mutedChannels: [],
+};
+
 // ── Accent persistence ──────────────────────────────────
 //
 // The chosen accent survives restarts. Values are validated as #rrggbb on
@@ -329,6 +352,62 @@ export const loadAccent = (): string => {
 export const saveAccent = (accent: string): void => {
   try {
     localStorage.setItem(ACCENT_KEY, accent);
+  } catch {
+    // persistence is best-effort; a failed write just doesn't survive restart.
+  }
+};
+
+// ── Notification prefs persistence ─────────────────────
+//
+// Desktop notification preferences survive restarts. Each field is validated
+// independently so a partial or corrupt blob falls back only where needed.
+const NOTIFY_PREFS_KEY = "ducktape.notifyPrefs";
+
+const defaultNotifyPrefs = (): NotifyPrefs => ({
+  ...DEFAULT_NOTIFY_PREFS,
+  mutedChannels: [...DEFAULT_NOTIFY_PREFS.mutedChannels],
+});
+
+const loadNotifyPrefsFrom = (value: unknown): NotifyPrefs => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return defaultNotifyPrefs();
+  }
+  const prefs = value as Record<string, unknown>;
+  return {
+    enabled:
+      typeof prefs.enabled === "boolean" ? prefs.enabled : DEFAULT_NOTIFY_PREFS.enabled,
+    mentions:
+      typeof prefs.mentions === "boolean" ? prefs.mentions : DEFAULT_NOTIFY_PREFS.mentions,
+    replies:
+      typeof prefs.replies === "boolean" ? prefs.replies : DEFAULT_NOTIFY_PREFS.replies,
+    huddles:
+      typeof prefs.huddles === "boolean" ? prefs.huddles : DEFAULT_NOTIFY_PREFS.huddles,
+    runs: typeof prefs.runs === "boolean" ? prefs.runs : DEFAULT_NOTIFY_PREFS.runs,
+    forge: typeof prefs.forge === "boolean" ? prefs.forge : DEFAULT_NOTIFY_PREFS.forge,
+    governance:
+      typeof prefs.governance === "boolean"
+        ? prefs.governance
+        : DEFAULT_NOTIFY_PREFS.governance,
+    mutedChannels:
+      Array.isArray(prefs.mutedChannels) &&
+      prefs.mutedChannels.every((channel): channel is string => typeof channel === "string")
+        ? [...prefs.mutedChannels]
+        : [...DEFAULT_NOTIFY_PREFS.mutedChannels],
+  };
+};
+
+export const loadNotifyPrefs = (): NotifyPrefs => {
+  try {
+    const raw = localStorage.getItem(NOTIFY_PREFS_KEY);
+    return loadNotifyPrefsFrom(raw ? JSON.parse(raw) : null);
+  } catch {
+    return defaultNotifyPrefs();
+  }
+};
+
+export const saveNotifyPrefs = (prefs: NotifyPrefs): void => {
+  try {
+    localStorage.setItem(NOTIFY_PREFS_KEY, JSON.stringify(prefs));
   } catch {
     // persistence is best-effort; a failed write just doesn't survive restart.
   }
@@ -443,6 +522,7 @@ export const createInitialState = (): ConsoleState => {
     screen: viewMode === "operator" ? DEFAULT_OPERATOR_SCREEN : DEFAULT_USER_SCREEN,
     viewMode,
     accent: loadAccent(),
+    notifyPrefs: loadNotifyPrefs(),
     author: "operator",
     connected: false,
     nodeUrl: null,
@@ -572,4 +652,3 @@ export const channelIdOf = (name: string): string =>
     .trim()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
-
