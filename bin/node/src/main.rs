@@ -6833,6 +6833,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // the serving replica's manifest-fetch pacer (see the gate at the
             // fetch site). absolute, so per-cert window closes can't starve it.
             let mut next_manifest_fetch = std::time::Instant::now();
+            // the folded tip at promotion descend: the promotion boundary
+            // must reach it before the checkpoint lands (see the descend).
+            let mut replica_promotion_floor: u64 = 0;
             // the app-hash of the last boundary the derived tier followed:
             // the index feed (heal + explorer row + ws event) fires only when
             // the verified app-hash MOVED. an unchanged hash is an idle
@@ -8003,7 +8006,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // a promoted resident stops serving: drop the replica node
                 // (host, follower, journal handles) before the promotion
                 // sync reopens the same partitions, then reopen the journal
-                // for the promotion checkpoint below.
+                // for the promotion checkpoint below. remember how far the
+                // replica FOLDED — the promotion boundary must not sit below
+                // it (journal pruning is section-granular, so a sealed frame
+                // above a lower checkpoint survives and recovery would roll
+                // it forward past the boot base, booting this node ahead of
+                // its catch-up source).
+                if let Some((folded_tip, _)) = &serving {
+                    replica_promotion_floor = replica_promotion_floor.max(*folded_tip);
+                }
                 serving = None;
                 replica_scheme = None;
                 if recovery_slot.is_none() {
@@ -8050,6 +8061,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         if let Err(e) = reopen_preflight_synced_host(&host, m.app_hash) {
                             eprintln!("[node {label}] FATAL: promotion preflight failed: {e}");
                             std::process::exit(1);
+                        }
+                        if latest.height < replica_promotion_floor {
+                            println!(
+                                "[node {label}] promotion boundary {} trails this replica's \
+                                 folded tip {} — waiting for the source to pass it",
+                                latest.height, replica_promotion_floor
+                            );
+                            continue;
                         }
                         match choose_promotion_boundary(host_hash, &latest, &me_bytes) {
                             PromotionBoundary::Promote { boundary, source } => {
