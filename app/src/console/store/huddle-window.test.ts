@@ -13,7 +13,7 @@ import { applyHuddleWindowCmd, buildHuddleContext } from "./huddle-window";
 
 const bytes = (text: string): number[] => Array.from(new TextEncoder().encode(text));
 const NOW = 1_000_000;
-const CAP: VideoCapability = { canEncode: true, canDecode: true };
+const CAP: VideoCapability = { canEncode: true, canDecode: true, canScreenShare: true };
 
 const voice = (over: Partial<VoiceSlice> = {}): VoiceSlice => ({
   channelId: "ch-1",

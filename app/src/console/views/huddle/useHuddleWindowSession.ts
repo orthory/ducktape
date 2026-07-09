@@ -71,11 +71,20 @@ export function useHuddleWindowSession(
     if (!channelId || !nodeUrl) return;
     const onEvent = (e: CallEvent): void => {
       if (e.kind === "peerBeacon") {
-        setPeers((p) => ({ ...p, [e.peer]: { muted: e.muted, cameraOn: e.cameraOn, atMs: e.atMs } }));
+        setPeers((p) => ({
+          ...p,
+          [e.peer]: { muted: e.muted, cameraOn: e.cameraOn, sharing: e.sharing, atMs: e.atMs },
+        }));
         return;
       }
       if (e.kind === "selfSpeaking") {
         setSpeaking(e.speaking);
+        return;
+      }
+      if (e.kind === "selfVideo") {
+        // Authoritative camera state (e.g. a failed acquire) — the window can't
+        // screen-share yet, so `sharing` is ignored here.
+        setCameraOnState(e.cameraOn);
         return;
       }
       // Any terminal end (hard error or replaced) ends this float — the window

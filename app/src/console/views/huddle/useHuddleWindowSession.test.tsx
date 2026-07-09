@@ -29,6 +29,8 @@ const makeStub = () => {
     setRecipients: (r) => calls.recipients.push(r),
     setMuted: (m) => calls.muted.push(m),
     setCamera: (on) => calls.camera.push(on),
+    setScreenShare: () => {},
+    setDevices: () => {},
     bindTile: () => {},
     bindPreview: () => {},
     stop: () => {
@@ -70,7 +72,7 @@ describe("useHuddleWindowSession", () => {
   it("surfaces a peer beacon in the projected roster", () => {
     const stub = makeStub();
     const { result } = renderHook(() => useHuddleWindowSession(ctx(), vi.fn(), stub.factory));
-    act(() => stub.fire({ kind: "peerBeacon", peer: keyHex([1]), muted: true, cameraOn: false, atMs: 2 }));
+    act(() => stub.fire({ kind: "peerBeacon", peer: keyHex([1]), muted: true, cameraOn: false, sharing: false, atMs: 2 }));
     const bob = result.current?.participants.find((p) => !p.isSelf);
     expect(bob?.muted).toBe(true);
   });
