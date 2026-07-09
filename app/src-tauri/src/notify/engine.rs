@@ -19,12 +19,12 @@ use super::{
 pub enum Frame {
     Event {
         topic: String,
-        cursor: Value,
+        cursor: String,
         op: Value,
     },
     Lagged {
         topic: String,
-        cursor: Value,
+        cursor: String,
     },
     Heartbeat,
 }
@@ -45,7 +45,7 @@ pub struct Engine<S: Sink> {
     unread: u32,
     /// IN-MEMORY ONLY, never persisted. These cursors resume a live stream only
     /// during a transient reconnect in the current app session.
-    cursors: BTreeMap<String, Value>,
+    cursors: BTreeMap<String, String>,
 }
 
 impl<S: Sink> Engine<S> {
@@ -115,7 +115,7 @@ impl<S: Sink> Engine<S> {
     /// Returns cursors for a transient in-session reconnect.
     ///
     /// They must not be used to resume history after an app restart.
-    pub fn cursors(&self) -> &BTreeMap<String, Value> {
+    pub fn cursors(&self) -> &BTreeMap<String, String> {
         &self.cursors
     }
 
@@ -278,7 +278,7 @@ mod tests {
         })
     }
 
-    fn event(topic: &str, cursor: Value, op: Value) -> Frame {
+    fn event(topic: &str, cursor: String, op: Value) -> Frame {
         Frame::Event {
             topic: topic.to_string(),
             cursor,
@@ -324,7 +324,7 @@ mod tests {
     fn event_presents_mention_increments_unread_advances_cursor_and_persists() {
         let path = TestStatePath::new();
         let mut engine = engine(&path);
-        let cursor = json!({ "height": 42, "seq": 1 });
+        let cursor = "op/000000000000002a/0001".to_string();
 
         engine.handle(
             event("module:chat", cursor.clone(), mention_op("general")),
@@ -346,7 +346,7 @@ mod tests {
     fn disabled_notifications_drop_event_but_still_advance_cursor() {
         let path = TestStatePath::new();
         let mut engine = engine(&path);
-        let cursor = json!("cursor-1");
+        let cursor = "op/0000000000000001/0000".to_string();
         let mut config = config();
         config.prefs.enabled = false;
 
@@ -371,12 +371,12 @@ mod tests {
         category_config.prefs.mentions = false;
 
         category_engine.handle(
-            event("module:chat", json!(1), mention_op("general")),
+            event("module:chat", "op/0000000000000001/0000".to_string(), mention_op("general")),
             &category_config,
             &no_root,
         );
         category_engine.handle(
-            event("module:chat", json!(2), huddle_op("general")),
+            event("module:chat", "op/0000000000000002/0000".to_string(), huddle_op("general")),
             &category_config,
             &no_root,
         );
@@ -392,12 +392,12 @@ mod tests {
         muted_config.prefs.muted_channels = vec!["general".to_string()];
 
         muted_engine.handle(
-            event("module:chat", json!(1), mention_op("general")),
+            event("module:chat", "op/0000000000000001/0000".to_string(), mention_op("general")),
             &muted_config,
             &no_root,
         );
         muted_engine.handle(
-            event("module:chat", json!(2), huddle_op("general")),
+            event("module:chat", "op/0000000000000002/0000".to_string(), huddle_op("general")),
             &muted_config,
             &no_root,
         );
@@ -459,18 +459,18 @@ mod tests {
         config.focused_channel = Some("general".to_string());
 
         engine.handle(
-            event("module:chat", json!(1), mention_op("general")),
+            event("module:chat", "op/0000000000000001/0000".to_string(), mention_op("general")),
             &config,
             &no_root,
         );
         engine.handle(
-            event("module:chat", json!(2), mention_op("other")),
+            event("module:chat", "op/0000000000000002/0000".to_string(), mention_op("other")),
             &config,
             &no_root,
         );
         config.main_window_focused = false;
         engine.handle(
-            event("module:chat", json!(3), mention_op("general")),
+            event("module:chat", "op/0000000000000003/0000".to_string(), mention_op("general")),
             &config,
             &no_root,
         );
@@ -487,7 +487,7 @@ mod tests {
     fn lagged_adopts_cursor_without_backfill_then_event_presents() {
         let path = TestStatePath::new();
         let mut engine = engine(&path);
-        let lagged_cursor = json!({ "height": 80 });
+        let lagged_cursor = "op/0000000000000050/ffff".to_string();
 
         engine.handle(
             Frame::Lagged {
@@ -504,7 +504,7 @@ mod tests {
         assert!(badges(&engine).is_empty());
         assert!(!path.path().exists());
 
-        let event_cursor = json!({ "height": 81 });
+        let event_cursor = "op/0000000000000051/0000".to_string();
         engine.handle(
             event("module:chat", event_cursor.clone(), mention_op("general")),
             &config(),
@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(badges(&engine), vec![0]);
 
         engine.handle(
-            event("module:chat", json!(1), mention_op("general")),
+            event("module:chat", "op/0000000000000001/0000".to_string(), mention_op("general")),
             &config(),
             &no_root,
         );
@@ -571,7 +571,7 @@ mod tests {
         assert!(presented(&engine).is_empty());
         assert!(engine.cursors().is_empty());
 
-        let cursor = json!({ "height": 99 });
+        let cursor = "op/0000000000000063/0000".to_string();
         engine.handle(
             event("module:chat", cursor.clone(), mention_op("general")),
             &config(),

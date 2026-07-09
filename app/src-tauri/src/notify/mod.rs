@@ -18,6 +18,18 @@ pub mod present;
 pub mod stream;
 pub mod state;
 
+/// Webview-pushed runtime config, shared with the stream task.
+pub struct Shared {
+    pub config: std::sync::Mutex<NotifyConfig>,
+    /// Notified on any config replacement (the loop re-reads; a node_url change reconnects).
+    pub changed: tokio::sync::Notify,
+}
+
+/// Commands crossing from tauri command handlers into the stream task.
+pub enum Cmd {
+    MarkSeen,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct NotifyPrefs {
