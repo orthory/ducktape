@@ -16,6 +16,8 @@ tauri-build = { version = "2", features = [] }
 # tray-icon: the macOS menu-bar icon + popover (src/tray.rs, gated to macOS).
 # image-png: decode the bundled tray.png for the icon.
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
+# native OS toasts for the production notification sink (src/notify/present.rs).
+tauri-plugin-notification = "2"
 # in-app LAN key-enrollment server (pure Rust, no system libs): an ephemeral,
 # session-token-gated HTTP relay a phone hits over the Wi-Fi LAN to enroll a key.
 tiny_http = "0.12"
@@ -23,6 +25,12 @@ getrandom = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
+# notify/stream.rs: the async ws client of the node's typed /v1/ws stream.
+# tokio-tungstenite deliberately builds without TLS features — the stream dials
+# the local workspace node over plain localhost http.
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros"] }
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 zeroize = { workspace = true }
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 

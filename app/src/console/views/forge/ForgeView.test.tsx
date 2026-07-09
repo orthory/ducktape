@@ -55,11 +55,14 @@ const COMMITS = [
   },
 ];
 
-function renderForge(stateOverrides: Partial<ConsoleState> = {}) {
+function renderForge(
+  stateOverrides: Partial<ConsoleState> = {},
+  extraActions: Partial<Record<keyof ConsoleActions, ReturnType<typeof vi.fn>>> = {},
+) {
   const commitForge = vi.fn();
   const noop = vi.fn();
   const actions = new Proxy(
-    { commitForge },
+    { commitForge, ...extraActions },
     {
       get: (target, key: string) =>
         key in target ? target[key as keyof typeof target] : noop,
@@ -271,6 +274,32 @@ describe("ForgeView", () => {
       from: "b".repeat(40),
       to: HEAD,
     });
+  });
+
+  it("consumes a forgeFocus hand-off: selects the repo and opens the item", async () => {
+    const getForgeItem = vi.fn().mockResolvedValue(null);
+    renderForge({ forgeFocus: { repo: "ducktape", number: 7 } }, { getForgeItem });
+
+    // the deep-linked repo got selected (its tab bar renders) and the detail
+    // panel consumed item #7 — a missing item degrades to the honest note.
+    expect(await screen.findByText("Item not found")).toBeInTheDocument();
+    expect(screen.getByText("#7 names nothing in ducktape.")).toBeInTheDocument();
+    expect(getForgeItem).toHaveBeenCalledWith("ducktape", 7);
+
+    // backing out of the focused item lands on the repo's Issues tab
+    fireEvent.click(screen.getByRole("button", { name: /← Issues/ }));
+    expect(await screen.findByText("New issue")).toBeInTheDocument();
+  });
+
+  it("ignores a forgeFocus naming an unknown repo and stays on the overview", async () => {
+    const getForgeItem = vi.fn();
+    renderForge({ forgeFocus: { repo: "ghost", number: 1 } }, { getForgeItem });
+
+    await waitFor(() => {
+      expect(screen.getByText("ducktape/ducktape")).toBeInTheDocument();
+    });
+    expect(screen.getByText("REPOSITORIES")).toBeInTheDocument();
+    expect(getForgeItem).not.toHaveBeenCalled();
   });
 
   it("adds Issues and Pull requests tabs that render the tracker lists", async () => {

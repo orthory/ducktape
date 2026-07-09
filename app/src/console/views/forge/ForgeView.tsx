@@ -26,6 +26,7 @@ import { BranchSelector } from "./BranchSelector";
 import { CodeView } from "./CodeView";
 import { fileIcon } from "./file-icons";
 import { IssuesTab } from "./items/IssuesTab";
+import { ItemDetailPanel } from "./items/ItemDetailPanel";
 import { PullsTab } from "./items/PullsTab";
 import { MarkdownPreview } from "./MarkdownPreview";
 import {
@@ -134,6 +135,11 @@ export function ForgeView() {
   const [branches, setBranches] = useState<BranchInfo[]>([]);
   const [branch, setBranch] = useState<string | null>(null);
   const [branchMenuOpen, setBranchMenuOpen] = useState(false);
+
+  // The deep-linked item to show instead of the tab bodies (a notification's
+  // forgeFocus hand-off), and the last focus object already consumed.
+  const [focusItem, setFocusItem] = useState<number | null>(null);
+  const consumedFocusRef = useRef<object | null>(null);
 
   const fileRequestRef = useRef(0);
   const dirTokenRef = useRef(0);
@@ -301,6 +307,35 @@ export function ForgeView() {
     };
   }, [desktop, state.forgeHead]);
 
+  // Consume a deep-link hand-off (state.forgeFocus, set by the provider when
+  // a forge notification is clicked): select the repo, land on its tracker
+  // tab, and open the item. One-shot by OBJECT identity — the consumed ref
+  // keeps the per-block repos churn from replaying it, while the provider
+  // retires the state itself when the user leaves the forge screen. Tolerant:
+  // an unknown repo just stays on what exists.
+  useEffect(() => {
+    const focus = state.forgeFocus;
+    if (!focus || consumedFocusRef.current === focus) return;
+    if (!desktop) {
+      consumedFocusRef.current = focus; // web has no repo browser to drive
+      return;
+    }
+    if (repos === null) return; // enumeration still loading — not consumed yet
+    consumedFocusRef.current = focus;
+    const match = repos.find((r) => r.name === focus.repo || r.id === focus.repo);
+    if (!match) return;
+    setSelectedRepoId(match.id);
+    // The tracker slices may not be this repo's yet — a known PR lands on
+    // Pulls, everything else defaults to Issues (only the back label differs;
+    // the detail panel resolves the item's real kind itself).
+    const kind =
+      state.forgeRepo === match.name
+        ? state.forgeItems.find((item) => item.number === focus.number)?.kind
+        : undefined;
+    setTab(kind === "pr" ? "pulls" : "issues");
+    setFocusItem(focus.number);
+  }, [state.forgeFocus, repos, desktop, state.forgeRepo, state.forgeItems]);
+
   // A repo switch always lands back on the default branch.
   useEffect(() => {
     setBranch(null);
@@ -421,11 +456,18 @@ export function ForgeView() {
     setSelectedRepoId(repoId);
     setTab("code");
     setRepoMenuOpen(false);
+    setFocusItem(null);
   };
 
   const goRepos = () => {
     setSelectedRepoId(null);
     setRepoMenuOpen(false);
+    setFocusItem(null);
+  };
+
+  const selectTab = (next: ForgeTab) => {
+    setTab(next);
+    setFocusItem(null); // a tab click always leaves the focused-item panel
   };
 
   const selectBranch = (name: string) => {
@@ -464,10 +506,12 @@ export function ForgeView() {
             branchMenuOpen={branchMenuOpen}
             openIssues={openIssues}
             openPulls={openPulls}
+            focusItem={focusItem}
+            onCloseFocus={() => setFocusItem(null)}
             onOpenRepo={openRepo}
             onGoRepos={goRepos}
             onToggleRepoMenu={() => setRepoMenuOpen((value) => !value)}
-            onTab={setTab}
+            onTab={selectTab}
             onToggleDir={toggleDir}
             onSelectFile={loadFile}
             onLoadMoreFile={loadMoreFile}
@@ -631,6 +675,8 @@ function RepoListing({
   branchMenuOpen,
   openIssues,
   openPulls,
+  focusItem,
+  onCloseFocus,
   onOpenRepo,
   onGoRepos,
   onToggleRepoMenu,
@@ -666,6 +712,9 @@ function RepoListing({
   branchMenuOpen: boolean;
   openIssues: number;
   openPulls: number;
+  /** A deep-linked item to render in place of the tab bodies (null = none). */
+  focusItem: number | null;
+  onCloseFocus: () => void;
   onOpenRepo: (repoId: string) => void;
   onGoRepos: () => void;
   onToggleRepoMenu: () => void;
@@ -750,43 +799,66 @@ function RepoListing({
         </div>
       </div>
 
-      {tab === "code" && (
-        repo.browsable ? (
-          <CodeBrowser
-            rows={rows}
-            rootLoading={rootLoading}
-            treeError={treeError}
-            selected={selected}
-            latest={latest}
-            fileLoading={fileLoading}
-            fileError={fileError}
-            fileText={fileText}
-            filePage={filePage}
-            fileWasPaged={fileWasPaged}
-            fileLoadingMore={fileLoadingMore}
-            repoName={repo.name}
-            onToggleDir={onToggleDir}
-            onSelectFile={onSelectFile}
-            onLoadMoreFile={onLoadMoreFile}
+      {focusItem !== null ? (
+        // A deep-linked item (notification click) takes the body over until
+        // dismissed — the same shell the tabs' own detail views use.
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            overflowY: "auto",
+            borderTop: `1px solid ${color.borderSoft}`,
+            padding: "16px 24px",
+          }}
+        >
+          <ItemDetailPanel
+            repo={repo.name}
+            number={focusItem}
+            backLabel={tab === "pulls" ? "Pull requests" : "Issues"}
+            onBack={onCloseFocus}
           />
-        ) : (
-          <RepoUnavailable />
-        )
+        </div>
+      ) : (
+        <>
+          {tab === "code" && (
+            repo.browsable ? (
+              <CodeBrowser
+                rows={rows}
+                rootLoading={rootLoading}
+                treeError={treeError}
+                selected={selected}
+                latest={latest}
+                fileLoading={fileLoading}
+                fileError={fileError}
+                fileText={fileText}
+                filePage={filePage}
+                fileWasPaged={fileWasPaged}
+                fileLoadingMore={fileLoadingMore}
+                repoName={repo.name}
+                onToggleDir={onToggleDir}
+                onSelectFile={onSelectFile}
+                onLoadMoreFile={onLoadMoreFile}
+              />
+            ) : (
+              <RepoUnavailable />
+            )
+          )}
+          {tab === "commits" && (
+            <CommitHistory
+              repo={repo.name}
+              commits={commits}
+              loading={rootLoading}
+              browsable={repo.browsable}
+              hasMore={commitHasMore}
+              loadingMore={commitLoadingMore}
+              error={commitError}
+              onLoadMore={onLoadMoreCommits}
+            />
+          )}
+          {tab === "issues" && <IssuesTab repo={repo.name} />}
+          {tab === "pulls" && <PullsTab repo={repo.name} />}
+        </>
       )}
-      {tab === "commits" && (
-        <CommitHistory
-          repo={repo.name}
-          commits={commits}
-          loading={rootLoading}
-          browsable={repo.browsable}
-          hasMore={commitHasMore}
-          loadingMore={commitLoadingMore}
-          error={commitError}
-          onLoadMore={onLoadMoreCommits}
-        />
-      )}
-      {tab === "issues" && <IssuesTab repo={repo.name} />}
-      {tab === "pulls" && <PullsTab repo={repo.name} />}
     </>
   );
 }

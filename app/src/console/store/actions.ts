@@ -37,7 +37,11 @@ import * as valsetClient from "../../domain/valset-client";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
-import { hasAgentMention, mentionResolverOf } from "../views/chat/mention";
+import {
+  hasAgentMention,
+  mentionableUsers,
+  mentionResolverOf,
+} from "../views/chat/mention";
 import {
   defaultScreenForSection,
   sectionForScreen,
@@ -66,11 +70,12 @@ import {
   removeTab,
   saveAccent,
   saveDocTabs,
+  saveNotifyPrefs,
   saveRemoteUrl,
   saveViewMode,
   selfAuthorBytes,
 } from "./state";
-import type { ConsoleState, ViewMode } from "./state";
+import type { ConsoleState, NotifyPrefs, ViewMode } from "./state";
 
 /** How often a parked joiner's phase is polled while it promotes. */
 const JOIN_POLL_MS = 1500;
@@ -109,6 +114,8 @@ export interface ConsoleActions {
    *  to the other rail, so the body always matches the rail. */
   setViewMode(mode: ViewMode): void;
   setAccent(accent: string): void;
+  setNotifyPrefs(prefs: NotifyPrefs): void;
+  toggleChannelMute(channelId: string): void;
   setAuthor(author: string): void;
   /** Set our own display name in the `profiles` module (origin-gated SetName)
    *  and keep it as the local author identity, so it propagates to everyone. */
@@ -536,6 +543,11 @@ export function createActions({
    *  that can't do voice. */
   const selfNodeHex = (): string => getState().status?.publicKey ?? "";
 
+  const setNotifyPrefs = (prefs: NotifyPrefs): void => {
+    saveNotifyPrefs(prefs);
+    patch({ notifyPrefs: prefs });
+  };
+
   // The last fan-out set pushed into the live session — refresh() lands a new
   // channels array every block, so pushes are deduped by value here rather
   // than by effect identity upstream.
@@ -744,6 +756,14 @@ export function createActions({
           origin: getState().author,
         }),
       (prev) => optimistic.watchSet(prev, { channelId, policy: "mention" }),
+    );
+  };
+
+  const mentionResolver = () => {
+    const state = getState();
+    return mentionResolverOf(
+      state.agents,
+      mentionableUsers(state.nodeUsers, state.agents),
     );
   };
 
@@ -1116,6 +1136,16 @@ export function createActions({
       saveAccent(accent);
       patch({ accent });
     },
+    setNotifyPrefs,
+    toggleChannelMute: (channelId) => {
+      const prefs = getState().notifyPrefs;
+      setNotifyPrefs({
+        ...prefs,
+        mutedChannels: prefs.mutedChannels.includes(channelId)
+          ? prefs.mutedChannels.filter((id) => id !== channelId)
+          : [...prefs.mutedChannels, channelId],
+      });
+    },
     setAuthor: (author) => patch({ author }),
 
     // ── Account writes (see account-ops.ts) ──
@@ -1221,7 +1251,7 @@ export function createActions({
       const channelId = getState().activeChannel;
       if (!channelId || !body.trim()) return;
       const messageId = crypto.randomUUID();
-      const blocks = parseMessageInput(body, mentionResolverOf(getState().agents));
+      const blocks = parseMessageInput(body, mentionResolver());
       const author = getState().author;
       void ensureMentionWatch(channelId, blocks).then(() =>
         submitTracked(
@@ -1263,7 +1293,7 @@ export function createActions({
       const root = getState().activeThread?.root;
       if (!channelId || !root || !body.trim()) return;
       const messageId = crypto.randomUUID();
-      const blocks = parseMessageInput(body, mentionResolverOf(getState().agents));
+      const blocks = parseMessageInput(body, mentionResolver());
       const author = getState().author;
       void ensureMentionWatch(channelId, blocks)
         .then(() =>
@@ -1315,7 +1345,7 @@ export function createActions({
       // seeded the editor with "@agent_id", so re-parsing must resolve it
       // back or the edit silently strips the mention. No auto-watch here —
       // engagement is a post-time concern.
-      const blocks = parseMessageInput(body, mentionResolverOf(getState().agents));
+      const blocks = parseMessageInput(body, mentionResolver());
       submitTracked(
         opKey.messageSeq(channelId, seq),
         (live) =>
