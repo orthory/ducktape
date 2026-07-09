@@ -1,3 +1,9 @@
+//! Stateful notification processing for live stream frames.
+//!
+//! The engine persists the unread count, but its per-topic cursors are strictly
+//! in-memory. App startup always subscribes live from the tip; carrying cursors
+//! across starts could replay historical events as a burst of notifications.
+
 use std::{collections::BTreeMap, path::PathBuf};
 
 use serde_json::Value;
@@ -23,6 +29,10 @@ pub enum Frame {
     Heartbeat,
 }
 
+/// Delivery seam for desktop notifications and unread badges.
+///
+/// Keeping OS integration behind this trait lets the entire engine be tested
+/// with a capture sink and no desktop notification service.
 pub trait Sink: Send {
     fn present(&self, n: &Notification);
     fn badge(&self, unread: u32);
@@ -33,6 +43,8 @@ pub struct Engine<S: Sink> {
     match_state: MatchState,
     state_path: PathBuf,
     unread: u32,
+    /// IN-MEMORY ONLY, never persisted. These cursors resume a live stream only
+    /// during a transient reconnect in the current app session.
     cursors: BTreeMap<String, Value>,
 }
 
@@ -100,10 +112,15 @@ impl<S: Sink> Engine<S> {
         self.persist_unread();
     }
 
+    /// Returns cursors for a transient in-session reconnect.
+    ///
+    /// They must not be used to resume history after an app restart.
     pub fn cursors(&self) -> &BTreeMap<String, Value> {
         &self.cursors
     }
 
+    /// Discards cursors after the node URL changes, since they belong to the old
+    /// node's streams and are no longer valid.
     pub fn reset_cursors(&mut self) {
         self.cursors.clear();
     }

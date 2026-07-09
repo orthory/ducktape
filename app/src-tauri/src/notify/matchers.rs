@@ -1,6 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use super::decode::{self, OpRow, OriginKind};
+use super::{
+    decode::{self, OpRow, OriginKind},
+    huddle,
+};
+
+pub use super::huddle::MatchState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
@@ -33,22 +38,21 @@ pub struct Notification {
     pub title: String,
     pub body: String,
     pub target: NavigateTarget,
+    /// Channel used for focus suppression and mute filtering. Runs, forge, and
+    /// governance notifications have no channel and use `None`.
     pub channel_id: Option<String>,
 }
 
 pub struct MatcherCtx<'a> {
+    /// My user key in hex, used to recognize direct mentions.
     pub self_user_key_hex: Option<&'a str>,
+    /// Every node key bound to my user, in hex, used to recognize my own events.
     pub self_node_keys_hex: &'a [String],
+    /// Known display names keyed by lowercase author key hex.
     pub author_names: &'a BTreeMap<String, String>,
+    /// Looks up the author of a thread root. Tests inject a closure here; the
+    /// stream module will wire the real lookup.
     pub root_author: &'a dyn Fn(&str, u64) -> Option<String>,
-}
-
-#[derive(Debug, Default)]
-pub struct HuddleTracker(BTreeMap<String, BTreeSet<String>>);
-
-#[derive(Debug, Default)]
-pub struct MatchState {
-    pub huddles: HuddleTracker,
 }
 
 pub fn match_topic(
@@ -73,14 +77,12 @@ fn match_chat(op: &OpRow, ctx: &MatcherCtx<'_>, state: &mut MatchState) -> Optio
         return match_message(message, op, ctx);
     }
     if let Some(join) = decode::variant(payload, "join_huddle") {
-        return match_huddle_join(join, op, ctx, &mut state.huddles);
+        return huddle::match_huddle_join(join, op, ctx, &mut state.huddles);
     }
     if let Some(leave) = decode::variant(payload, "leave_huddle") {
-        track_huddle_leave(leave, op, &mut state.huddles);
-        return None;
-    }
-    if let Some(sweep) = decode::variant(payload, "sweep_huddle") {
-        track_huddle_sweep(sweep, &mut state.huddles);
+        huddle::track_huddle_leave(leave, op, &mut state.huddles);
+    } else if let Some(sweep) = decode::variant(payload, "sweep_huddle") {
+        huddle::track_huddle_sweep(sweep, &mut state.huddles);
     }
 
     None
@@ -136,59 +138,6 @@ fn match_message(
         channel,
         Some(root),
     ))
-}
-
-fn match_huddle_join(
-    join: &serde_json::Value,
-    op: &OpRow,
-    ctx: &MatcherCtx<'_>,
-    tracker: &mut HuddleTracker,
-) -> Option<Notification> {
-    if op.origin.kind != OriginKind::External {
-        return None;
-    }
-    let joiner = op.origin.id.as_deref()?;
-    let channel = join.get("channel_id")?.as_str()?;
-    let node = decode::bytes_hex(join.get("node")?)?;
-    let roster = tracker.0.entry(channel.to_string()).or_default();
-    let was_empty = roster.is_empty();
-    roster.insert(joiner.to_ascii_lowercase());
-
-    if !was_empty || is_me(ctx, joiner) || is_me(ctx, &node) {
-        return None;
-    }
-
-    Some(chat_notification(
-        Category::Huddle,
-        format!("Huddle started in #{channel}"),
-        format!("{} started a huddle", display_name(ctx, joiner)),
-        channel,
-        None,
-    ))
-}
-
-fn track_huddle_leave(leave: &serde_json::Value, op: &OpRow, tracker: &mut HuddleTracker) {
-    let Some(channel) = leave.get("channel_id").and_then(serde_json::Value::as_str) else {
-        return;
-    };
-    let Some(leaver) = op.origin.id.as_deref() else {
-        return;
-    };
-    if let Some(roster) = tracker.0.get_mut(channel) {
-        roster.remove(&leaver.to_ascii_lowercase());
-    }
-}
-
-fn track_huddle_sweep(sweep: &serde_json::Value, tracker: &mut HuddleTracker) {
-    let Some(channel) = sweep.get("channel_id").and_then(serde_json::Value::as_str) else {
-        return;
-    };
-    let Some(user) = sweep.get("user").and_then(decode::bytes_hex) else {
-        return;
-    };
-    if let Some(roster) = tracker.0.get_mut(channel) {
-        roster.remove(&user);
-    }
 }
 
 fn match_run(op: &OpRow) -> Option<Notification> {
@@ -271,13 +220,13 @@ fn match_governance(op: &OpRow) -> Option<Notification> {
     })
 }
 
-fn is_me(ctx: &MatcherCtx<'_>, hex: &str) -> bool {
+pub(super) fn is_me(ctx: &MatcherCtx<'_>, hex: &str) -> bool {
     ctx.self_node_keys_hex
         .iter()
         .any(|key| key.eq_ignore_ascii_case(hex))
 }
 
-fn display_name(ctx: &MatcherCtx<'_>, hex: &str) -> String {
+pub(super) fn display_name(ctx: &MatcherCtx<'_>, hex: &str) -> String {
     ctx.author_names
         .get(&hex.to_ascii_lowercase())
         .cloned()
@@ -302,7 +251,7 @@ fn target(screen: &str) -> NavigateTarget {
     }
 }
 
-fn chat_notification(
+pub(super) fn chat_notification(
     category: Category,
     title: String,
     body: String,
@@ -325,7 +274,7 @@ fn chat_notification(
 mod tests {
     use std::{collections::HashMap, sync::LazyLock};
 
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     use super::*;
     use crate::notify::decode::Origin;
@@ -496,6 +445,20 @@ mod tests {
             assert!(chat(&join(origin, node, channel), &ctx, &mut state).is_none());
             assert!(chat(&join("dddd", [221, 221], channel), &ctx, &mut state).is_none());
         }
+    }
+
+    #[test]
+    fn malformed_huddle_node_still_marks_the_roster_non_empty() {
+        let ctx = ctx(&no_root);
+        let mut state = MatchState::default();
+        let malformed = op(
+            OriginKind::External,
+            "cccc",
+            json!({ "join_huddle": { "channel_id": "team", "node": "not-bytes" } }),
+        );
+
+        assert!(chat(&malformed, &ctx, &mut state).is_none());
+        assert!(chat(&join("dddd", [221, 221], "team"), &ctx, &mut state).is_none());
     }
 
     #[test]
