@@ -25,7 +25,24 @@ struct GenesisPin {
 /// `--allow-anonymous`    => fully-open (legacy);
 /// otherwise              => public with proof-of-possession (deployed default).
 pub fn select_policy(args: &[String]) -> std::io::Result<nat_traversal::AuthPolicy> {
-    if args.iter().any(|a| a == "--allow-anonymous") {
+    let allow_anonymous = args.iter().any(|a| a == "--allow-anonymous");
+    let has_genesis_set = args.iter().any(|a| a == "--genesis-set");
+    // `--allow-anonymous` and `--genesis-set` are mutually exclusive (the USAGE
+    // string declares them so with `|`). Passing BOTH is contradictory, so it is
+    // a HARD error and NOT a silent pick of the weaker policy. Failing closed
+    // here is what keeps a stray or env-templated `--allow-anonymous` from
+    // quietly disabling a genesis pin — the same "malformed/conflicting args
+    // hard-fail, never downgrade to a weaker policy" contract the value-less
+    // `--genesis-set` check below already upholds. (Previously `--allow-anonymous`
+    // short-circuited first and silently won, downgrading a Private coordinator
+    // to fully-open on a config mistake.)
+    if allow_anonymous && has_genesis_set {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--allow-anonymous and --genesis-set are mutually exclusive",
+        ));
+    }
+    if allow_anonymous {
         return Ok(nat_traversal::AuthPolicy::Open { require_pop: false });
     }
     // `--genesis-set` presence is detected SEPARATELY from its value: a present
