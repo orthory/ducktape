@@ -6262,22 +6262,40 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 std::process::exit(1);
             }
             // the parked mesh identity: genesis set at the base index (no
-            // consensus coordinates yet), engine lanes black-holed like the
-            // sync-only resident — an unregistered channel is a protocol
-            // violation that kills the very connection the sync client needs.
-            // EXCEPT the cert lanes: certificate traffic (notarizations,
-            // finalizations) is the push signal that the head advanced, so
-            // their drains nudge the park loop below instead of dropping on
-            // the floor — the resident re-syncs the moment a boundary seals
-            // rather than on the fallback poll. the nudge is a HINT only
-            // (coalesced, undecoded, unauthenticated): state is adopted
-            // exclusively through the verified manifest path, and a spurious
-            // nudge costs one height-gated no-op fetch.
+            // consensus coordinates yet). engine lanes are NOT black-holed
+            // like the sync-only resident — the replica pipeline (phase 2)
+            // consumes them:
+            // - CERT lanes bridge their raw bytes to the fold driver, which
+            //   decodes finalizations and verifies them against the epoch's
+            //   quorum (the phase-1 gate). pre-standing, the same bytes fire
+            //   the park loop's wake (a byte's arrival is the old nudge).
+            // - PAYLOAD lanes drain store-only into the shared content store
+            //   (content-addressing is the verification), so a finalization's
+            //   bytes are usually already local when its certificate lands.
+            // - vote/resolver/fetch lanes stay black-holed; the fold driver's
+            //   resolver runs on the CURRENT epoch's fetch lane only, wired at
+            //   replica ascension.
             oracle.track(PEER_SET, mesh_participants.clone());
+            let replica_store = ContentStore::new();
             let (head_wake_tx, mut head_wake) = futures::channel::mpsc::channel::<()>(1);
+            // raw cert-lane bytes for the fold driver: bounded, drop-on-full —
+            // a shed certificate is re-anchored by the next one's parent
+            // linkage (the planner backfills the gap), so the drain never
+            // blocks the peer connection.
+            let (cert_bridge_tx, mut cert_bridge) =
+                futures::channel::mpsc::channel::<Vec<u8>>(256);
+            // fetch lanes bank like the validator's channel bank: slot i =
+            // epoch i's pair, consumed by the fold driver's resolver at
+            // ascension (and by each cutover's fresh follower after it).
+            let mut replica_fetch_lanes: Vec<Option<_>> = (0..EPOCH_CHANNEL_BANK)
+                .map(|epoch| {
+                    let (_, _, _, _, fetch) = engine_channels(epoch);
+                    Some(network.register(fetch, quota, MAX_BACKLOG))
+                })
+                .collect();
             for epoch in 0..EPOCH_CHANNEL_BANK {
-                let (vote, cert, res, payload, fetch) = engine_channels(epoch);
-                for ch in [vote, res, payload, fetch] {
+                let (vote, cert, res, payload, _fetch) = engine_channels(epoch);
+                for ch in [vote, res] {
                     let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
                     let label: &'static str =
                         Box::leak(format!("blackhole_{ch}").into_boxed_str());
@@ -6285,15 +6303,33 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         while rx.recv().await.is_ok() {}
                     });
                 }
+                {
+                    let (_tx, mut payload_rx) = network.register(payload, quota, MAX_BACKLOG);
+                    let store = replica_store.clone();
+                    let label: &'static str =
+                        Box::leak(format!("payload_store_{payload}").into_boxed_str());
+                    context.child(label).spawn(move |_ctx| async move {
+                        while let Ok((_peer, msg)) = payload_rx.recv().await {
+                            let bytes: Vec<u8> = msg.into();
+                            // store-ONLY, never delivered: delivery is the
+                            // fold driver's verified-finalization arm.
+                            store.put(bytes);
+                        }
+                    });
+                }
                 let (_tx, mut cert_rx) = network.register(cert, quota, MAX_BACKLOG);
                 let label: &'static str =
-                    Box::leak(format!("headwake_{cert}").into_boxed_str());
+                    Box::leak(format!("certbridge_{cert}").into_boxed_str());
                 let mut wake = head_wake_tx.clone();
+                let mut bridge = cert_bridge_tx.clone();
                 context.child(label).spawn(move |_ctx| async move {
-                    while cert_rx.recv().await.is_ok() {
+                    while let Ok((_peer, msg)) = cert_rx.recv().await {
+                        let bytes: Vec<u8> = msg.into();
                         // full == a wake is already pending: coalesce, never
                         // block the drain (an unread lane kills the peer).
                         let _ = wake.try_send(());
+                        // drop-on-full: parent linkage re-covers shed certs.
+                        let _ = bridge.try_send(bytes);
                     }
                 });
             }

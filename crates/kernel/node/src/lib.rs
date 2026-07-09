@@ -1683,6 +1683,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         &self.orderer
     }
 
+    /// mutably borrow the orderer. the replica fold driver feeds its
+    /// follower orderer through this — observe/admit are orderer-side
+    /// operations that must not require dismantling the node.
+    pub fn orderer_mut(&mut self) -> &mut O {
+        &mut self.orderer
+    }
+
     /// borrow the wrapped host (queries, module_root inspection, ...).
     pub fn host(&self) -> &Host {
         &self.host
