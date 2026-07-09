@@ -180,12 +180,13 @@ mod tests {
 
     use super::*;
     use crate::notify::{
-        matchers::{Category, Notification},
+        matchers::{Category, NavigateTarget, Notification},
         state::{self, NotifyState},
-        NotifyConfig,
+        NotifyConfig, NotifyPrefs,
     };
 
     static PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+    type DisablePreference = fn(&mut NotifyPrefs);
 
     #[derive(Default)]
     struct CaptureSink {
@@ -303,6 +304,22 @@ mod tests {
         engine.sink.badges.lock().unwrap().clone()
     }
 
+    fn notification(category: Category) -> Notification {
+        Notification {
+            category,
+            title: String::new(),
+            body: String::new(),
+            target: NavigateTarget {
+                screen: String::new(),
+                channel_id: None,
+                thread_root: None,
+                repo: None,
+                number: None,
+            },
+            channel_id: None,
+        }
+    }
+
     #[test]
     fn event_presents_mention_increments_unread_advances_cursor_and_persists() {
         let path = TestStatePath::new();
@@ -389,6 +406,48 @@ mod tests {
         assert_eq!(muted_engine.unread, 0);
         assert!(badges(&muted_engine).is_empty());
         assert!(!muted_path.path().exists());
+    }
+
+    #[test]
+    fn every_category_uses_its_matching_preference_toggle() {
+        let cases: [(Category, DisablePreference); 6] = [
+            (Category::Mention, |prefs| prefs.mentions = false),
+            (Category::Reply, |prefs| prefs.replies = false),
+            (Category::Huddle, |prefs| prefs.huddles = false),
+            (Category::Run, |prefs| prefs.runs = false),
+            (Category::Forge, |prefs| prefs.forge = false),
+            (Category::Governance, |prefs| prefs.governance = false),
+        ];
+
+        for (disabled_category, disable) in cases {
+            let mut config = config();
+            config.prefs = NotifyPrefs {
+                enabled: true,
+                mentions: true,
+                replies: true,
+                huddles: true,
+                runs: true,
+                forge: true,
+                governance: true,
+                muted_channels: Vec::new(),
+            };
+            disable(&mut config.prefs);
+
+            assert!(
+                !should_present(&notification(disabled_category), &config),
+                "{disabled_category:?} should use its matching preference toggle"
+            );
+
+            let enabled_category = if disabled_category == Category::Mention {
+                Category::Reply
+            } else {
+                Category::Mention
+            };
+            assert!(
+                should_present(&notification(enabled_category), &config),
+                "disabling {disabled_category:?} should leave {enabled_category:?} enabled"
+            );
+        }
     }
 
     #[test]

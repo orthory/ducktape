@@ -49,6 +49,7 @@ afterEach(() => {
   delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
   vi.restoreAllMocks();
   vi.resetAllMocks();
+  vi.resetModules();
 });
 
 describe("notify client", () => {

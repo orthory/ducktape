@@ -17,6 +17,7 @@ pub struct Origin {
 
 #[derive(Debug, Clone)]
 pub struct OpRow {
+    // These block coordinates are retained for future toast timestamps and debugging.
     pub height: u64,
     pub seq: u32,
     pub time: u64,
