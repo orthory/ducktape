@@ -322,7 +322,8 @@ describe("onboarding gate — remote node", () => {
       target: { value: "http://10.0.0.5:8844" },
     });
     await act(async () => {
-      fireEvent.click(screen.getByText("Connect"));
+      // role-scoped: the first-run step rail also carries a "Connect" label.
+      fireEvent.click(screen.getByRole("button", { name: "Connect" }));
     });
 
     await waitFor(() => {

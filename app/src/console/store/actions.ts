@@ -43,6 +43,14 @@ import {
   sectionForScreen,
 } from "../modules/registry";
 import type { Action } from "./reducer";
+import {
+  addMemberFromResponse,
+  mintLinkChallenge,
+  removeMemberKey,
+  unbindNode,
+} from "./account-ops";
+import type { AccountOpsDeps } from "./account-ops";
+import type { LinkChallenge } from "../views/account/link-device";
 import { autoBindUserIdentity } from "./auto-bind";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
@@ -50,7 +58,9 @@ import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
 import {
   addTab,
   channelIdOf,
+  clearPendingDisplayName,
   clearRemoteUrl,
+  loadPendingDisplayName,
   removeTab,
   saveAccent,
   saveDocTabs,
@@ -101,6 +111,19 @@ export interface ConsoleActions {
   /** Set our own display name in the `profiles` module (origin-gated SetName)
    *  and keep it as the local author identity, so it propagates to everyone. */
   setDisplayName(name: string): void;
+
+  // ── Account (the person: member keys, bound nodes) ──
+  /** Mint a fresh device-link challenge for this node's account — the Account
+   *  view encodes it for display and holds it to approve the response against
+   *  (the possession proof is pinned to the challenge's nonce). */
+  accountLinkChallenge(): Promise<LinkChallenge>;
+  /** Approve a pasted link response against `challenge` — submits
+   *  AddMemberKey. Rejects with an actionable error on nonce drift. */
+  accountAddMember(challenge: LinkChallenge, responseBlob: string): Promise<void>;
+  /** Drop a member key from this account (the module refuses the last one). */
+  accountRemoveMember(targetKeyHex: string): Promise<void>;
+  /** Evict a (lost) node from this account — its first UI consumer. */
+  accountUnbindNode(targetNodeHex: string): Promise<void>;
   selectChannel(channelId: string): void;
   createChannel(name: string, postPolicy: PostPolicy): void;
   sendMessage(body: string): void;
@@ -463,6 +486,16 @@ export function createActions({
   const patch = (p: Partial<ConsoleState>) => dispatch({ type: "patch", patch: p });
   const update = (fn: (state: ConsoleState) => Partial<ConsoleState>) =>
     dispatch({ type: "update", fn });
+
+  /** The live transport + active workspace the account writes sign against.
+   *  Throws when disconnected — callers wrap it in a promise chain, so the
+   *  rejection lands in the Account view's inline error slot. */
+  const accountDeps = (): AccountOpsDeps => {
+    const live = getNode();
+    const { workspace } = getState();
+    if (!live || !workspace) throw new Error("not connected to a workspace node");
+    return { transport: live, chainId: workspace.chainId, nodePub: workspace.pubkey };
+  };
 
   // Monotonic token gating the async search fan-out: each runSearch/clearSearch
   // bumps it, and a resolving fan-out only writes results if its token is still
@@ -908,7 +941,29 @@ export function createActions({
     const adopt = (transport: NodeTransport): void => {
       patch({ onboardingPhase: null });
       setNode(transport);
-      autoBindUserIdentity(transport, target).catch(() => {});
+      autoBindUserIdentity(transport, target)
+        .then((outcome) => {
+          // First-run hand-off: the name chosen while creating the account
+          // parks in localStorage (names are chain-scoped) and lands here, on
+          // the first adopted node. When the bind landed, the name belongs on
+          // the ACCOUNT (identity SetAccountName) so it travels with the
+          // person across devices; otherwise fall back to the per-node
+          // profiles name, same as setDisplayName's routing. Fire-and-forget
+          // like the bind itself: a failure keeps the parked name for the
+          // next connect and never surfaces as an error.
+          const pending = loadPendingDisplayName();
+          if (!pending) return;
+          patch({ author: pending });
+          const write =
+            outcome === "bound" || outcome === "already"
+              ? identityClient.setAccountName(transport, {
+                  displayName: pending,
+                  origin: pending,
+                })
+              : profilesClient.setName(transport, { displayName: pending, origin: pending });
+          return write.then(() => clearPendingDisplayName()).catch(() => {});
+        })
+        .catch(() => {});
     };
     return Promise.resolve()
       .then(() => ws.selectWorkspace(target.id))
@@ -1050,6 +1105,26 @@ export function createActions({
     },
     setAuthor: (author) => patch({ author }),
 
+    // ── Account writes (see account-ops.ts) ──
+    // Each resolves the live transport + active workspace up front; callers
+    // (the Account view) surface the rejection inline. The refresh() after a
+    // landed submit re-reads the identity projections promptly instead of
+    // waiting for the next block tick.
+    accountLinkChallenge: () =>
+      Promise.resolve().then(() => mintLinkChallenge(accountDeps())),
+    accountAddMember: (challenge, responseBlob) =>
+      Promise.resolve()
+        .then(() => addMemberFromResponse(accountDeps(), challenge, responseBlob))
+        .then(() => refresh()),
+    accountRemoveMember: (targetKeyHex) =>
+      Promise.resolve()
+        .then(() => removeMemberKey(accountDeps(), targetKeyHex))
+        .then(() => refresh()),
+    accountUnbindNode: (targetNodeHex) =>
+      Promise.resolve()
+        .then(() => unbindNode(accountDeps(), targetNodeHex))
+        .then(() => refresh()),
+
     readMetrics: () => {
       const live = getNode();
       return live
@@ -1077,7 +1152,7 @@ export function createActions({
     // a name write so the chosen name propagates: it's origin-gated, so
     // passing our origin only ever writes OUR OWN name. Once this node is
     // bound to a user (state.nodeUsers has it), the durable identity is the
-    // USER, not the node — so the write goes through identity's SetUserName
+    // USER, not the node — so the write goes through identity's SetAccountName
     // instead of profiles' SetName, the same way MembersView's inline
     // self-rename (canRename row, also wired to this action) picks up the
     // bound-vs-unbound distinction for free. An unbound node keeps the
