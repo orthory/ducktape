@@ -2967,6 +2967,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &mut std::io::BufReader::new(std::io::stdin()),
             );
         }
+        Some("user-webauthn-challenge") => {
+            return cmd_user_webauthn_challenge(&args[1..]);
+        }
         Some("init") => return cmd_init(&args[1..]),
         Some("invite") => return cmd_invite(&args[1..]),
         Some("admit") => return cmd_admit(&args[1..]),
@@ -2997,6 +3000,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "unexpected arg {other:?} (want a subcommand — \
                      keygen|user-key|user-sign-bind|user-sign-unbind|\
                      user-sign-possession|user-sign-add-member|user-sign-remove-member|\
+                     user-webauthn-challenge|\
                      init|invite|admit|\
                      invite-accept|promote|resident-remove|\
                      join-requests|member-remove|member-leave|member-status|join|\
@@ -3741,6 +3745,120 @@ fn cmd_user_sign_remove_member(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", user_sign_remove_member(args, stdin)?);
     Ok(())
+}
+
+/// `user-webauthn-challenge` core — see [`cmd_user_webauthn_challenge`].
+fn user_webauthn_challenge(args: &[String]) -> Result<String, Box<dyn std::error::Error>> {
+    use base64::Engine as _;
+
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let chain_id = flags
+        .get("chain-id")
+        .ok_or("user-webauthn-challenge needs --chain-id <id>")?;
+    let account_id = config::unhex(
+        flags
+            .get("account-id")
+            .ok_or("user-webauthn-challenge needs --account-id <hex>")?,
+    )?;
+    let new_key = config::unhex(
+        flags
+            .get("new-key")
+            .ok_or("user-webauthn-challenge needs --new-key <hex>")?,
+    )?;
+    let nonce: u64 = flags
+        .get("nonce")
+        .ok_or("user-webauthn-challenge needs --nonce <n>")?
+        .parse()
+        .map_err(|e| format!("--nonce is not a valid u64: {e}"))?;
+
+    // the exact bytes the on-chain verifier will demand the passkey signed:
+    // SHA256(ADD_MEMBER_NS ‖ add_member_preimage(...)). one source of truth
+    // with `identity::verify_authority` — no drift between enroll and verify.
+    let preimage = identity::add_member_preimage(
+        chain_id,
+        &account_id,
+        &new_key,
+        identity::KeyKind::WebauthnP256,
+        nonce,
+    );
+    let challenge =
+        identity::webauthn_challenge(identity::IDENTITY_ADD_MEMBER_NS, &preimage);
+    // base64url (no pad) — WebAuthn's native challenge encoding, so the phone
+    // page passes it straight into `navigator.credentials.get({ challenge })`.
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge))
+}
+
+/// `user-webauthn-challenge --chain-id <id> --account-id <hex> --new-key <hex>
+/// --nonce <n>` — print the base64url WebAuthn challenge a passkey must sign to
+/// join `account-id` as `new-key` at `nonce`. Pure computation (no key, no
+/// signing): the phone's `get()` signs this, and the resulting assertion feeds
+/// `user-sign-add-member --possession`. Keeping the preimage math in the node
+/// (not the web page) is why "core in node" — the page never reconstructs it.
+fn cmd_user_webauthn_challenge(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_webauthn_challenge(args)?);
+    Ok(())
+}
+
+#[cfg(test)]
+mod webauthn_challenge_tests {
+    use super::*;
+
+    fn challenge(chain: &str, account_hex: &str, new_hex: &str, nonce: &str) -> String {
+        let args: Vec<String> = [
+            "--chain-id",
+            chain,
+            "--account-id",
+            account_hex,
+            "--new-key",
+            new_hex,
+            "--nonce",
+            nonce,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        user_webauthn_challenge(&args).unwrap()
+    }
+
+    #[test]
+    fn challenge_matches_the_on_chain_verifier_math() {
+        use base64::Engine as _;
+        let account_id = [0xabu8; 33];
+        let new_key = [0xcdu8; 33];
+        let account_hex: String = account_id.iter().map(|b| format!("{b:02x}")).collect();
+        let new_hex: String = new_key.iter().map(|b| format!("{b:02x}")).collect();
+
+        let got = challenge("team#abcd", &account_hex, &new_hex, "5");
+
+        // recompute via identity's PUBLIC surface — the exact functions the
+        // verifier uses. if the verb and the verifier ever diverge, an enrolled
+        // passkey would sign a challenge the chain then rejects.
+        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            identity::webauthn_challenge(
+                identity::IDENTITY_ADD_MEMBER_NS,
+                &identity::add_member_preimage(
+                    "team#abcd",
+                    &account_id,
+                    &new_key,
+                    identity::KeyKind::WebauthnP256,
+                    5,
+                ),
+            ),
+        );
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn challenge_binds_chain_account_key_and_nonce() {
+        let base = challenge("c", "aa", "bb", "0");
+        assert_ne!(base, challenge("d", "aa", "bb", "0"), "chain must move it");
+        assert_ne!(base, challenge("c", "cc", "bb", "0"), "account must move it");
+        assert_ne!(base, challenge("c", "aa", "cc", "0"), "new key must move it");
+        assert_ne!(base, challenge("c", "aa", "bb", "1"), "nonce must move it");
+    }
 }
 
 #[cfg(test)]

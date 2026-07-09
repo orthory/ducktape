@@ -163,7 +163,12 @@ const FLAG_USER_PRESENT: u8 = 0x01;
 /// the SAME domain separation commonware's `verify` gives the native kinds,
 /// so an assertion minted to "add member X" can never be replayed as
 /// "unbind node Y".
-fn webauthn_challenge(namespace: &[u8], preimage: &[u8]) -> [u8; 32] {
+///
+/// PUBLIC so the ENROLLMENT side (the node verb that tells the phone what to
+/// sign) computes the challenge from the exact same bytes the verifier checks
+/// against — one source of truth, no drift between "what was signed" and "what
+/// is accepted".
+pub fn webauthn_challenge(namespace: &[u8], preimage: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(namespace);
     h.update(preimage);
