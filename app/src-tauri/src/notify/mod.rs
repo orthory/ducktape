@@ -10,10 +10,12 @@
 #![allow(dead_code)]
 
 pub mod decode;
+pub mod http;
 pub mod engine;
 pub mod huddle;
 pub mod matchers;
 pub mod present;
+pub mod stream;
 pub mod state;
 
 #[derive(Debug, Clone, serde::Deserialize)]
