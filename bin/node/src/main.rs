@@ -1677,6 +1677,17 @@ async fn write_boundary_checkpoint<E>(
         eprintln!("[node {label}] FATAL: {diag_tag} floor-cert write: {e}");
         std::process::exit(1);
     }
+    // this checkpoint IS the journal's new genesis: everything below its
+    // oplog position must never roll into a boot at this base — a prior
+    // life's replica-folded frames sit at earlier POSITIONS even when their
+    // heights exceed the boundary, and recovery would roll a trailing one
+    // forward past the checkpoint (observed: a promoted ex-replica booting
+    // AHEAD of its source's serving window). the engine floor at `boundary`
+    // suppresses replay at or below it, so no pruned frame is needed again.
+    if let Err(e) = recovery.prune_oplog(pos).await {
+        eprintln!("[node {label}] FATAL: {diag_tag} journal prune: {e}");
+        std::process::exit(1);
+    }
 }
 
 fn to_node_disposition(disposition: statesync::FrameDisposition) -> node::Disposition {
@@ -6974,6 +6985,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // in flight below queues jobs here — bounded by the rpc
                 // bridge's buffer and the listener's reply timeout — so every
                 // answer reflects a whole boundary, never a torn one.)
+                let mut fetch_due = false;
                 {
                     let fallback = if resident_standing && serving.is_some() {
                         RESIDENT_FALLBACK_POLL
@@ -7362,7 +7374,10 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // (None — every drain gone — only happens at mesh
                             // shutdown; fall through to the tick's exit.)
                             wake = head_wake.next() => if wake.is_some() { break },
-                            _ = tick => break,
+                            _ = tick => {
+                                fetch_due = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -7564,6 +7579,15 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             }
                         }
                     }
+                }
+                // a FOLDING replica's window closes per certificate; the
+                // manifest is only the fallback lane now (standing detection
+                // pre-ascension; promotion and cutover detection after). so
+                // fetch it on the fallback tick's cadence, not per block — a
+                // fleet of replicas re-fetching per block would besiege the
+                // serve window that exists for joiners.
+                if serving.is_some() && !fetch_due {
+                    continue;
                 }
                 let m = match fetch_manifest(&client).await {
                     Ok(m) => m,

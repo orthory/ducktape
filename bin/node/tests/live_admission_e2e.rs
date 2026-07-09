@@ -690,19 +690,23 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
                 })
             })
     }));
-    //     …and /v1/index/* answers from boundary-healed read models: every
-    //     watermark sits at a followed boundary, visibly boundary-stamped
-    //     (the backfill floor), with the store healthy. polled: a heal drops
-    //     the watermark FIRST (crash-safety by re-trigger), so a read racing
-    //     an in-flight heal legitimately sees 0 for a moment.
-    poll("the resident index to report boundary-stamped watermarks", Box::new(|| {
+    //     …and /v1/index/* answers from healthy read models. under the
+    //     replica pipeline the resident FOLDS blocks, so watermarks advance
+    //     per block PAST the ascension heal's backfill floor (the old
+    //     boundary-healed model pinned them equal — that trailing-watermark
+    //     era is exactly what the fold retired). polled: a heal drops the
+    //     watermark FIRST (crash-safety by re-trigger), so a read racing an
+    //     in-flight heal legitimately sees 0 for a moment.
+    poll("the resident index to report folding watermarks", Box::new(|| {
         let (status, index_status) =
             common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
         let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
         status == 200
             && index_status["poisoned"] == serde_json::json!(false)
             && watermark > 0
-            && index_status["backfilled"]["directory"].as_u64() == Some(watermark)
+            && index_status["backfilled"]["directory"]
+                .as_u64()
+                .is_some_and(|floor| floor <= watermark)
     }));
 
     // (3) quorum untouched: kill the resident; the founder keeps finalizing.
