@@ -1152,7 +1152,7 @@ export function createActions({
     // a name write so the chosen name propagates: it's origin-gated, so
     // passing our origin only ever writes OUR OWN name. Once this node is
     // bound to a user (state.nodeUsers has it), the durable identity is the
-    // USER, not the node — so the write goes through identity's SetUserName
+    // USER, not the node — so the write goes through identity's SetAccountName
     // instead of profiles' SetName, the same way MembersView's inline
     // self-rename (canRename row, also wired to this action) picks up the
     // bound-vs-unbound distinction for free. An unbound node keeps the

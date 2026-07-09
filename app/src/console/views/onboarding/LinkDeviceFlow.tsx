@@ -16,6 +16,7 @@ import {
   errMessage,
   errorTextStyle,
   inputStyle,
+  linkButtonStyle,
   primaryButtonStyle,
   secondaryButtonStyle,
 } from "./IdentityGateForms";
@@ -142,6 +143,13 @@ export function LinkDeviceFlow({
       {error && <span style={errorTextStyle}>{error}</span>}
       <button onClick={generate} disabled={busy} style={primaryButtonStyle(busy)}>
         {busy ? "Signing…" : "Generate link code"}
+      </button>
+      {/* Linking and proceeding are independent (spec §1): a user without the
+          other device at hand must never be trapped here. The link-pending
+          flag stays set, auto-bind keeps deferring, and this same wizard
+          re-opens from Account → Link this device. */}
+      <button onClick={onDone} style={linkButtonStyle}>
+        I'll finish this later
       </button>
     </div>
   );

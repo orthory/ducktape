@@ -798,6 +798,47 @@ describe("identity gate — link-device flow", () => {
     expect(await screen.findByTestId("console")).toBeInTheDocument();
   });
 
+  it("proceeds past the wizard WITHOUT a challenge — linking must never trap onboarding", async () => {
+    // Spec §1: linking and joining are independent. A user who started on the
+    // new device before fetching the code from their other device continues
+    // to the workspace step; the link-pending flag survives so auto-bind
+    // keeps deferring and the Account view re-offers the wizard.
+    markTauri();
+    identityStateMock
+      .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
+      .mockResolvedValue({ state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true });
+    createIdentityMock.mockResolvedValue({ pubkey: "cd34", mnemonic: TEST_MNEMONIC });
+    confirmMnemonicMock.mockResolvedValue(undefined);
+
+    render(
+      <IdentityGate>
+        <Child />
+      </IdentityGate>,
+    );
+
+    await screen.findByText("Create your account");
+    fireEvent.click(screen.getByText("Link device"));
+    await screen.findByText("Link this device");
+    fireEvent.change(screen.getByPlaceholderText("Password (min 8 characters)"), {
+      target: { value: "correct horse battery" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Confirm password"), {
+      target: { value: "correct horse battery" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Create this device's key"));
+    });
+
+    await screen.findByText("Approve from your other device");
+    await act(async () => {
+      fireEvent.click(screen.getByText("I'll finish this later"));
+    });
+
+    expect(await screen.findByTestId("console")).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(localStorage.getItem("ducktape.accountLinkPending")).toBe("1");
+  });
+
   it("rejects a malformed challenge inline without signing", async () => {
     markTauri();
     identityStateMock
