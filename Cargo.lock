@@ -4156,6 +4156,7 @@ dependencies = [
  "indexer",
  "jobs",
  "kv",
+ "libc",
  "nat-traversal",
  "node",
  "noded",

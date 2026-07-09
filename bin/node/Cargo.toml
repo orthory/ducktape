@@ -115,6 +115,8 @@ chacha20poly1305 = { workspace = true }
 zeroize = { workspace = true }
 # stderr tracing for the p2p/consensus internals (RUST_LOG=commonware_p2p=debug).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Raise the node's inherited open-file soft limit before opening module stores.
+libc = "0.2"
 
 # the process-level e2e suite (tests/) spawns REAL `ducktape-node` binaries and
 # drives them through the rpc with TYPED interface-crate payloads — payload
