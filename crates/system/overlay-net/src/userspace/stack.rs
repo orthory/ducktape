@@ -133,8 +133,12 @@ impl StackState {
         SmolInstant::from_micros(self.epoch.elapsed().as_micros() as i64)
     }
 
-    fn allocate_ephemeral(&mut self) -> u16 {
-        loop {
+    fn allocate_ephemeral(&mut self) -> io::Result<u16> {
+        // Scan the ephemeral range [EPHEMERAL_START, u16::MAX] at most once. If
+        // every port is in use, FAIL rather than spin forever holding the stack
+        // lock — an exhausted (e.g. socket-leaked) ephemeral space must surface
+        // as an error, not freeze the poll loop and every virtual socket op.
+        for _ in 0..(u16::MAX - EPHEMERAL_START + 1) {
             let port = self.next_ephemeral;
             self.next_ephemeral = if port == u16::MAX {
                 EPHEMERAL_START
@@ -142,9 +146,13 @@ impl StackState {
                 port + 1
             };
             if !self.port_in_use(port) {
-                return port;
+                return Ok(port);
             }
         }
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no ephemeral port available",
+        ))
     }
 
     /// is any live socket already using this local port? keeps ephemeral
@@ -314,7 +322,7 @@ impl VirtualStack {
         let local_ip = self.local_ip();
         let mut state = self.shared.lock();
         let port = if port == 0 {
-            state.allocate_ephemeral()
+            state.allocate_ephemeral()?
         } else {
             port
         };
@@ -348,7 +356,7 @@ impl VirtualStack {
         let local_ip = self.local_ip();
         let mut state = self.shared.lock();
         let port = if port == 0 {
-            state.allocate_ephemeral()
+            state.allocate_ephemeral()?
         } else {
             port
         };
@@ -369,7 +377,7 @@ impl VirtualStack {
         let local_ip = self.local_ip();
         let handle = {
             let mut state = self.shared.lock();
-            let local_port = state.allocate_ephemeral();
+            let local_port = state.allocate_ephemeral()?;
             let mut socket = new_tcp_socket();
             let remote: IpEndpoint = addr_to_endpoint(remote)?;
             let local = IpListenEndpoint {
@@ -385,6 +393,28 @@ impl VirtualStack {
             state.sockets.add(socket)
         };
         self.shared.poll_wake.notify_one();
+
+        // Remove the half-open socket if this future is CANCELLED (e.g. the dial
+        // was wrapped in a timeout or lost a select!) or errors before the stream
+        // is handed off. The prior `.inspect_err` only covered the error path, so
+        // a cancelled connect leaked the smoltcp socket and its buffers — enough
+        // leaks eventually exhaust the ephemeral range. The guard is disarmed on
+        // success, where `VirtualTcpStream`'s own Drop takes over teardown.
+        struct ConnectGuard {
+            shared: Arc<StackShared>,
+            handle: Option<SocketHandle>,
+        }
+        impl Drop for ConnectGuard {
+            fn drop(&mut self) {
+                if let Some(handle) = self.handle.take() {
+                    self.shared.lock().sockets.remove(handle);
+                }
+            }
+        }
+        let mut guard = ConnectGuard {
+            shared: self.shared.clone(),
+            handle: Some(handle),
+        };
 
         // park until the handshake resolves; smoltcp fires the wakers on
         // every state transition, including the RST/timeout path to Closed.
@@ -405,11 +435,9 @@ impl VirtualStack {
                 }
             }
         })
-        .await
-        .inspect_err(|_| {
-            let mut state = self.shared.lock();
-            state.sockets.remove(handle);
-        })?;
+        .await?;
+        // Success: hand the socket to the stream and disarm the guard.
+        let handle = guard.handle.take().expect("guard armed until success");
         Ok(VirtualTcpStream::new(self.shared.clone(), handle))
     }
 }
