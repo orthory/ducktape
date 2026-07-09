@@ -4,7 +4,7 @@ import { GraphFlow, type SemanticEdge, type SemanticNode } from './GraphFlow.cli
 
 /**
  * From submitted op to committed block, as a horizontal pipeline: signed op
- * frames batch on a ~2s cadence into a super-frame, Simplex agrees the batch,
+ * frames batch on a ~1s cadence into a super-frame, Simplex agrees the batch,
  * the node applies it as one block, the app-hash is sealed, and effects leave
  * the hot path and re-enter later as ordinary ordered ops. Curated from the
  * consensus / node / saga ground truth.
@@ -12,7 +12,7 @@ import { GraphFlow, type SemanticEdge, type SemanticNode } from './GraphFlow.cli
 
 const nodes: SemanticNode[] = [
   { id: 'frames', label: 'Signed op frames', sub: 'member-authored', category: 'network' },
-  { id: 'batch', label: 'Batch super-frame', sub: '~2s cadence', category: 'network' },
+  { id: 'batch', label: 'Batch super-frame', sub: '~1s cadence', category: 'network' },
   { id: 'simplex', label: 'Simplex agree', sub: 'BFT view + finalize', category: 'kernel' },
   { id: 'drain', label: 'Node drain', sub: 'apply as one block', category: 'kernel' },
   { id: 'apphash', label: 'App-hash + seal', sub: 'modules execute · roots', category: 'store' },
@@ -39,7 +39,7 @@ export function ConsensusFlow({ height = 340 }: { height?: number }) {
   return (
     <GraphFlow
       title="Consensus & block commit"
-      description="Signed op frames batch on a ~2s cadence into a super-frame that Simplex agrees; the node applies the finalized batch as one block with an agreed height and time, seals the app-hash, and lets effects rejoin later as ordinary ordered ops."
+      description="Signed op frames batch on a ~1s cadence into a super-frame that Simplex agrees; the node applies the finalized batch as one block with an agreed height and time, seals the app-hash, and lets effects rejoin later as ordinary ordered ops."
       nodes={nodes}
       edges={edges}
       legend={legend}
