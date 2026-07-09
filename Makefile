@@ -53,10 +53,13 @@ web: app/node_modules
 ## desktop build — stages the sidecar itself via beforeBuildCommand. on macOS
 ## a bundle (.app + .dmg under target/release/bundle); on Linux the plain
 ## binary at target/release/ducktape-desktop (--no-bundle: install-app wants
-## only the binary, and no deb/rpm/appimage packagers are needed).
+## only the binary, and no deb/rpm/appimage packagers are needed). the dmg
+## post-fix hides .VolumeIcon.icns, which macOS 26 Finder would otherwise
+## show overlapping the app icon — see ops/fix-dmg.sh.
 ifeq ($(UNAME_S),Darwin)
 app: app/node_modules
 	cd app && $(BUN) run tauri build
+	bash ops/fix-dmg.sh
 else
 app: app/node_modules
 	cd app && $(BUN) run tauri build --no-bundle

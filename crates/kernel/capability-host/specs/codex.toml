@@ -58,8 +58,10 @@ args = [
     "-",
 ]
 prompt = "stdin"
-# Agentic runs (tool-use loops in a real workspace) are slower than one-shot
-# answers; operators override per tag by shadowing the spec, or globally via
+# The IDLE budget (output refreshes it; hard-capped at 6x). `exec --json`
+# streams an event per action, so a long agentic run refreshes continuously
+# and only a genuinely STALLED run dies at this window. Operators override
+# per tag by shadowing the spec, or globally via
 # DUCKTAPE_PROVIDER_TIMEOUT_SECS.
 timeout_secs = 600
 

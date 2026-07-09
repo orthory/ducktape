@@ -39,8 +39,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::AsyncBufReadExt as _;
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+/// the hard ceiling on one child's lifetime, as a multiple of its idle
+/// timeout: `spec.timeout_secs` bounds SILENCE (any output refreshes it —
+/// long agentic runs that keep streaming are never killed mid-work), and
+/// `idle × this` bounds even a continuously-chatty child, guarding the
+/// host's own resources. the RUN's committed outcome is bounded by the
+/// saga's consensus deadline regardless (ADR X3) — this factor only decides
+/// how long this host keeps paying for one child.
+const HARD_TIMEOUT_FACTOR: u32 = 6;
 
 mod session;
 mod spec;
@@ -60,7 +68,26 @@ pub use workspace::WorkspaceMode;
 pub struct RunContext {
     pub agent_id: Option<String>,
     pub thread_key: Option<String>,
+    /// the live-output registry key (the dispatch_id half of the saga id) —
+    /// set by the oracle pool before provider.run so the output sink can key
+    /// a per-run ring the app subscribes as run-output:<dispatch_id>.
     pub run_key: Option<String>,
+    /// an already-materialized workspace this specific run must execute in.
+    /// set only by the provisioning wrapper (`dispatch-oracle::bind_workspace`)
+    /// after a successful per-run duckfs checkout — never a consensus-supplied
+    /// path (D7). when set, the provider's cwd is the evidence-backed
+    /// workspace; an unusable mount fails the run (W1), never falls back to
+    /// the shared scratch dir.
+    pub workdir_override: Option<PathBuf>,
+    /// run-scoped environment variables for host-provided tool bindings.
+    /// these are additive to the process environment and apply only to the
+    /// spawned provider child.
+    pub env: BTreeMap<String, String>,
+    /// path entries prepended to `PATH` for run-scoped tool bindings.
+    pub path_entries: Vec<PathBuf>,
+    /// true for portable v3 runs: native CLI sessions are host-local
+    /// optimizations and must not be resumed or captured for portable state.
+    pub portable: bool,
 }
 
 /// which child stream produced one live output line.
@@ -224,6 +251,9 @@ pub struct CliProvider {
     /// per-agent dir under `dirs.workspaces_root` when the run carries an
     /// agent id.
     workdir: PathBuf,
+    /// the IDLE window, not a wall clock: any child output refreshes it, so
+    /// a streaming agentic run outlives it freely; only silence this long
+    /// kills the child. `idle × HARD_TIMEOUT_FACTOR` is the absolute cap.
     timeout: Duration,
     /// host-wired roots for persistent workspaces and session files; both
     /// default absent (scratch + cold runs).
@@ -274,7 +304,12 @@ impl CliProvider {
         self
     }
 
-    fn command(&self, args: &[String], workdir: &Path) -> tokio::process::Command {
+    fn command(
+        &self,
+        args: &[String],
+        workdir: &Path,
+        ctx: &RunContext,
+    ) -> Result<tokio::process::Command, String> {
         let mut cmd = tokio::process::Command::new(&self.bin);
         // argv straight from the spec, fully literal (the resume path's
         // {session_id} slot is substituted host-side BEFORE this point, with
@@ -289,7 +324,40 @@ impl CliProvider {
             // dropping the wait future (timeout) must kill the child — a hung
             // CLI never outlives its job.
             .kill_on_drop(true);
-        cmd
+        // env handling is the SAME for portable and non-portable runs: an
+        // ADDITIVE overlay on the inherited environment, plus this run's scoped
+        // ctx.env / PATH bindings. providers run the claude/codex CLI HEADLESS
+        // and are BYO-auth — the CLI reads its OWN credentials from the ambient
+        // env (e.g. ANTHROPIC_API_KEY) or a dotfile under HOME (~/.claude,
+        // ~/.codex), per this module's doc — so the child MUST inherit that
+        // environment or it cannot authenticate to the model.
+        //
+        // D7 isolation floor — the env half: hiding the node's ambient secrets
+        // (HOME => ~/.ducktape/user.key, DUCKTAPE_*, the data dir) from the
+        // child WITHOUT also hiding the operator's CLI credentials (which live
+        // under the same HOME) cannot be done with `env_clear` alone — it needs
+        // the ADR's deferred enforcement MECHANISM (a mount namespace, a
+        // bind-only sandbox, or a separate unix user that holds the CLI creds
+        // but not the node data dir). Until that lands, a portable child
+        // inherits the env exactly like a non-portable one (no worse than
+        // today). The ACTIVE D7 measure is the WORKSPACE RELOCATION: a portable
+        // run's cwd is the provisioner's per-run mount OUTSIDE <storage>, so a
+        // `..` from the cwd no longer reaches the key tree.
+        cmd.envs(ctx.env.iter());
+        if !ctx.path_entries.is_empty() {
+            let mut path = ctx.path_entries.clone();
+            if let Some(existing) = std::env::var_os("PATH") {
+                path.extend(std::env::split_paths(&existing));
+            }
+            let joined = std::env::join_paths(path).map_err(|e| {
+                format!(
+                    "run-local PATH for {} contains an invalid path entry: {e}",
+                    self.spec.tag
+                )
+            })?;
+            cmd.env("PATH", joined);
+        }
+        Ok(cmd)
     }
 
     /// where this run's child executes: the per-agent persistent workspace
@@ -297,6 +365,9 @@ impl CliProvider {
     /// root — the scratch default otherwise. the agent id is defensively
     /// checked as a path component even though registry caps bound it.
     fn workdir_for(&self, ctx: &RunContext) -> Result<PathBuf, String> {
+        if let Some(workdir) = &ctx.workdir_override {
+            return Ok(workdir.clone());
+        }
         if self.spec.workspace == WorkspaceMode::Persistent
             && let (Some(root), Some(agent_id)) = (&self.dirs.workspaces_root, &ctx.agent_id)
         {
@@ -306,6 +377,43 @@ impl CliProvider {
         Ok(self.workdir.clone())
     }
 
+    /// resolve the run's cwd to a per-run WRITABLE directory, creating it.
+    ///
+    /// a `workdir_override` is a workspace the provisioner ALREADY materialized
+    /// (the only setter is `dispatch-oracle`'s `bind_workspace`, after a
+    /// successful checkout — the envelope itself carries no host path, D7). if
+    /// creating it fails, the run must FAIL so the saga can retry elsewhere:
+    /// falling back would silently execute the run in `self.workdir` — a single
+    /// dir shared by every run of this capability tag on the node, so
+    /// concurrent runs would collide and the workspace commit would read the
+    /// untouched real mount and report a clean tree (W1 violation, masked).
+    ///
+    /// the persistent per-agent choice keeps its scratch fallback: it may sit
+    /// on a read-only volume, and those runs never promised a workspace.
+    fn ensure_writable_workdir(&self, ctx: &RunContext) -> Result<PathBuf, String> {
+        let preferred = self.workdir_for(ctx)?;
+        match std::fs::create_dir_all(&preferred) {
+            Ok(()) => Ok(preferred),
+            Err(e) if ctx.workdir_override.is_some() => Err(format!(
+                "provisioned workspace mount {} is unusable: {e}; refusing the \
+                 shared scratch fallback for a portable run (W1)",
+                preferred.display()
+            )),
+            Err(_) if preferred != self.workdir => {
+                std::fs::create_dir_all(&self.workdir).map_err(|e| {
+                    format!(
+                        "provider workdir {} is unusable and the scratch fallback \
+                         {} could not be created: {e}",
+                        preferred.display(),
+                        self.workdir.display()
+                    )
+                })?;
+                Ok(self.workdir.clone())
+            }
+            Err(e) => Err(format!("provider workdir {}: {e}", preferred.display())),
+        }
+    }
+
     /// the session slot for this run — `Some` only when the spec opts into
     /// `[session]`, the run carries both continuity coordinates, and the
     /// host wired a sessions root. anything less runs cold, by design.
@@ -313,6 +421,9 @@ impl CliProvider {
         &'a self,
         ctx: &'a RunContext,
     ) -> Result<Option<(&'a SessionSpec, session::SessionStore<'a>)>, String> {
+        if ctx.portable {
+            return Ok(None);
+        }
         let Some(session) = &self.spec.session else {
             return Ok(None);
         };
@@ -337,31 +448,56 @@ struct Invocation {
     stdout: String,
 }
 
-struct CollectedOutput {
-    status: std::process::ExitStatus,
-    stdout: String,
-    stderr: String,
+/// append one raw chunk to `pending` and forward every newline-completed
+/// line to the sink (strips `\n`/`\r\n`, lossy on invalid utf-8 — matching
+/// the final-output accumulation). a no-op without a sink.
+fn forward_lines(
+    pending: &mut Vec<u8>,
+    chunk: &[u8],
+    stream: OutputStream,
+    sink: &Option<OutputSink>,
+    ctx: &RunContext,
+) {
+    let Some(sink) = sink else { return };
+    pending.extend_from_slice(chunk);
+    while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+        let mut line: Vec<u8> = pending.drain(..=pos).collect();
+        line.pop(); // the newline
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        sink(
+            ctx,
+            OutputLine {
+                stream,
+                line: String::from_utf8_lossy(&line).into_owned(),
+            },
+        );
+    }
 }
 
-async fn collect_output_lines<R>(
-    reader: R,
+/// the stream closed: a trailing newline-less line still reaches the sink.
+fn flush_pending_line(
+    pending: &mut Vec<u8>,
     stream: OutputStream,
-    sink: Option<OutputSink>,
+    sink: &Option<OutputSink>,
     ctx: &RunContext,
-) -> Result<String, std::io::Error>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut lines = tokio::io::BufReader::new(reader).lines();
-    let mut output = String::new();
-    while let Some(line) = lines.next_line().await? {
-        output.push_str(&line);
-        output.push('\n');
-        if let Some(sink) = &sink {
-            sink(ctx, OutputLine { stream, line });
-        }
+) {
+    let Some(sink) = sink else {
+        pending.clear();
+        return;
+    };
+    if pending.is_empty() {
+        return;
     }
-    Ok(output)
+    let line = std::mem::take(pending);
+    sink(
+        ctx,
+        OutputLine {
+            stream,
+            line: String::from_utf8_lossy(&line).into_owned(),
+        },
+    );
 }
 
 impl CliProvider {
@@ -375,18 +511,18 @@ impl CliProvider {
         ctx: &RunContext,
     ) -> Result<Invocation, String> {
         let mut child = self
-            .command(args, workdir)
+            .command(args, workdir, ctx)?
             .spawn()
             .map_err(|e| format!("spawn {} failed: {e}", self.bin.display()))?;
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| "child stdin was not piped".to_string())?;
-        let stdout = child
+        let mut stdout_pipe = child
             .stdout
             .take()
             .ok_or_else(|| "child stdout was not piped".to_string())?;
-        let stderr = child
+        let mut stderr_pipe = child
             .stderr
             .take()
             .ok_or_else(|| "child stderr was not piped".to_string())?;
@@ -403,40 +539,115 @@ impl CliProvider {
             drop(stdin); // EOF: the prompt is complete
             Ok::<(), std::io::Error>(())
         };
+        // the live tail rides the SAME chunk reads the refreshable timeout
+        // watches: complete lines forward to the sink as they arrive, a
+        // trailing partial line flushes when its stream closes.
         let output_sink = self.output_sink.clone();
-        let stdout_sink = output_sink.clone();
-        let (fed, stdout, stderr, waited) = tokio::time::timeout(self.timeout, async {
-            tokio::join!(
-                feed,
-                collect_output_lines(stdout, OutputStream::Stdout, stdout_sink, ctx),
-                collect_output_lines(stderr, OutputStream::Stderr, output_sink, ctx),
-                child.wait()
-            )
-        })
-        .await
-        .map_err(|_| {
-            format!(
-                "{} timed out after {:?} (child killed)",
-                self.bin.display(),
-                self.timeout
-            )
-        })?;
-        let out = CollectedOutput {
-            status: waited.map_err(|e| format!("waiting on {} failed: {e}", self.bin.display()))?,
-            stdout: stdout
-                .map_err(|e| format!("reading stdout from {} failed: {e}", self.bin.display()))?,
-            stderr: stderr
-                .map_err(|e| format!("reading stderr from {} failed: {e}", self.bin.display()))?,
-        };
+        let mut out_pending: Vec<u8> = Vec::new();
+        let mut err_pending: Vec<u8> = Vec::new();
 
-        if !out.status.success() {
+        // REFRESHABLE timeout: `self.timeout` is an IDLE window, not a wall
+        // clock — any child output (either stream) refreshes it, so a
+        // long-running agentic loop that keeps streaming events (codex --json)
+        // or emitting tool output is never killed mid-work; only a SILENT
+        // child dies at the window. a CLI that is quiet by design (claude -p
+        // prints one result object at the end) keeps exactly the old
+        // semantics: its silence budget is the spec's timeout. the hard
+        // ceiling ([`HARD_TIMEOUT_FACTOR`] × idle) guards this host's
+        // resources against a chatty-forever child; the RUN's outcome is
+        // bounded by the saga's consensus deadline regardless (ADR X3).
+        let idle = self.timeout;
+        let hard = tokio::time::Instant::now() + idle.saturating_mul(HARD_TIMEOUT_FACTOR);
+        let mut feed = std::pin::pin!(feed);
+        let mut fed: Option<Result<(), std::io::Error>> = None;
+        let mut out_bytes: Vec<u8> = Vec::new();
+        let mut err_bytes: Vec<u8> = Vec::new();
+        let (mut out_open, mut err_open) = (true, true);
+        let mut obuf = [0u8; 8192];
+        let mut ebuf = [0u8; 8192];
+        let mut last_activity = tokio::time::Instant::now();
+        while out_open || err_open {
+            let deadline = (last_activity + idle).min(hard);
+            tokio::select! {
+                r = &mut feed, if fed.is_none() => fed = Some(r),
+                r = stdout_pipe.read(&mut obuf), if out_open => match r {
+                    Ok(0) => {
+                        out_open = false;
+                        flush_pending_line(&mut out_pending, OutputStream::Stdout, &output_sink, ctx);
+                    }
+                    Ok(n) => {
+                        out_bytes.extend_from_slice(&obuf[..n]);
+                        forward_lines(&mut out_pending, &obuf[..n], OutputStream::Stdout, &output_sink, ctx);
+                        last_activity = tokio::time::Instant::now();
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "reading {} stdout failed: {e}",
+                            self.bin.display()
+                        ));
+                    }
+                },
+                r = stderr_pipe.read(&mut ebuf), if err_open => match r {
+                    Ok(0) => {
+                        err_open = false;
+                        flush_pending_line(&mut err_pending, OutputStream::Stderr, &output_sink, ctx);
+                    }
+                    Ok(n) => {
+                        err_bytes.extend_from_slice(&ebuf[..n]);
+                        forward_lines(&mut err_pending, &ebuf[..n], OutputStream::Stderr, &output_sink, ctx);
+                        last_activity = tokio::time::Instant::now();
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "reading {} stderr failed: {e}",
+                            self.bin.display()
+                        ));
+                    }
+                },
+                // returning drops `child` (kill_on_drop): a stalled or
+                // runaway CLI never outlives its job.
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(if deadline == hard {
+                        format!(
+                            "{} timed out: still running at the hard cap of {:?} \
+                             ({HARD_TIMEOUT_FACTOR}x the idle window; child killed)",
+                            self.bin.display(),
+                            idle.saturating_mul(HARD_TIMEOUT_FACTOR)
+                        )
+                    } else {
+                        format!(
+                            "{} timed out after {:?} with no output (child killed); \
+                             an actively-streaming run refreshes this window",
+                            self.bin.display(),
+                            idle
+                        )
+                    });
+                }
+            }
+        }
+        // both streams closed: the child is done (or moments from it) — a
+        // bounded wait, never indefinite.
+        let status = tokio::time::timeout(idle, child.wait())
+            .await
+            .map_err(|_| {
+                format!(
+                    "{} closed its output but did not exit within {idle:?}",
+                    self.bin.display()
+                )
+            })?
+            .map_err(|e| format!("waiting on {} failed: {e}", self.bin.display()))?;
+        // an unfinished feed at this point means the child exited without
+        // draining stdin — the exit status below is the primary diagnostic.
+        let fed = fed.unwrap_or(Ok(()));
+
+        if !status.success() {
             // a failed exit is the primary diagnostic — it subsumes any
             // stdin write error (an early-exiting child EPIPEs the feed).
             return Err(format!(
                 "{} exited with {}: {}",
                 self.bin.display(),
-                out.status,
-                excerpt(&out.stderr)
+                status,
+                excerpt(&String::from_utf8_lossy(&err_bytes))
             ));
         }
         if let Err(e) = fed {
@@ -445,15 +656,13 @@ impl CliProvider {
                 self.bin.display()
             ));
         }
+        let stdout = String::from_utf8_lossy(&out_bytes).into_owned();
         let text = match self.spec.output {
-            OutputFormat::JsonlEvents => parse_jsonl_events(&out.stdout),
-            OutputFormat::JsonResult => parse_json_result(&out.stdout),
-            OutputFormat::Text => parse_text_output(&out.stdout),
+            OutputFormat::JsonlEvents => parse_jsonl_events(&stdout),
+            OutputFormat::JsonResult => parse_json_result(&stdout),
+            OutputFormat::Text => parse_text_output(&stdout),
         }?;
-        Ok(Invocation {
-            text,
-            stdout: out.stdout,
-        })
+        Ok(Invocation { text, stdout })
     }
 }
 
@@ -464,9 +673,7 @@ impl Provider for CliProvider {
     }
 
     async fn run(&self, prompt: &str, ctx: &RunContext) -> Result<String, String> {
-        let workdir = self.workdir_for(ctx)?;
-        std::fs::create_dir_all(&workdir)
-            .map_err(|e| format!("provider workdir {}: {e}", workdir.display()))?;
+        let workdir = self.ensure_writable_workdir(ctx)?;
 
         let Some((session, store)) = self.session_store(ctx)? else {
             // no session plumbing for this run: one cold invocation.
@@ -611,7 +818,8 @@ fn excerpt(s: &str) -> String {
 ///
 /// per spec: the `detect.env` override wins (broken override = loud warning +
 /// absent capability), else the first executable `detect.bin` on `PATH`.
-/// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` overrides every spec's timeout at once.
+/// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` overrides every spec's IDLE timeout at
+/// once (refreshed by child output; see [`HARD_TIMEOUT_FACTOR`]).
 /// what discovery finds is exactly what the node announces.
 ///
 /// this arity wires NO agent roots: persistent workspaces and sessions stay
@@ -767,7 +975,6 @@ fn is_executable(p: &Path) -> bool {
             .map(|m| m.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1076,7 +1283,10 @@ format = "text"
         assert!(err.contains("alpha"), "names the loaded specs: {err}");
 
         // an empty set fails cleanly, not a panic.
-        let err = ProviderSet::empty().resolve("anything").err().expect("empty set");
+        let err = ProviderSet::empty()
+            .resolve("anything")
+            .err()
+            .expect("empty set");
         assert!(err.contains("no capability spec is loaded"), "got: {err}");
     }
 
@@ -1145,7 +1355,10 @@ printf '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"b
         let dir = scratch("text-run");
         let bin = fake_cli(&dir, "plain", "cat > /dev/null\necho '  the answer  '");
         let p = mock_provider("plain", "text", bin, "text-run-wd");
-        assert_eq!(p.run("q", &RunContext::default()).await.unwrap(), "the answer");
+        assert_eq!(
+            p.run("q", &RunContext::default()).await.unwrap(),
+            "the answer"
+        );
 
         // "ran fine, said nothing" is a broken executor, not an answer.
         let silent = fake_cli(&dir, "silent", "cat > /dev/null");
@@ -1184,13 +1397,21 @@ echo "arg=$1""#,
         // run via sh_provider: the script becomes $0 and the spec's
         // untouched args follow, so "{model}" still arrives as $1.
         let p = sh_provider(spec, bin, "arg-verbatim-wd");
-        assert_eq!(p.run("q", &RunContext::default()).await.unwrap(), "arg={model}", "argv is literal");
+        assert_eq!(
+            p.run("q", &RunContext::default()).await.unwrap(),
+            "arg={model}",
+            "argv is literal"
+        );
     }
 
     #[tokio::test]
     async fn a_failing_cli_surfaces_status_and_stderr() {
         let dir = scratch("cli-fail");
-        let bin = fake_cli(&dir, "flaky", "cat > /dev/null\necho 'auth missing' >&2\nexit 3");
+        let bin = fake_cli(
+            &dir,
+            "flaky",
+            "cat > /dev/null\necho 'auth missing' >&2\nexit 3",
+        );
         let p = mock_provider("flaky", "text", bin, "cli-fail-wd");
         let err = p.run("x", &RunContext::default()).await.unwrap_err();
         assert!(err.contains("auth missing"), "stderr in error: {err}");
@@ -1213,12 +1434,61 @@ printf '{"type":"turn.completed"}\n'"#,
 
     #[tokio::test]
     async fn a_hung_cli_is_killed_at_the_timeout() {
+        // a SILENT child dies at the idle window — the pre-refresh contract,
+        // unchanged for CLIs that emit nothing while stuck.
         let dir = scratch("hang");
         let bin = fake_cli(&dir, "sleeper", "sleep 30");
         let p = mock_provider("sleeper", "text", bin, "hang-wd")
             .with_timeout(Duration::from_millis(200));
         let err = p.run("x", &RunContext::default()).await.unwrap_err();
         assert!(err.contains("timed out"), "got: {err}");
+        assert!(err.contains("no output"), "names the idle window: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_streaming_cli_refreshes_the_timeout_and_outlives_the_window() {
+        // THE refreshable-timeout property: total runtime (≈1s) is far past
+        // the idle window (200ms), but the child emits a heartbeat every
+        // 100ms — activity refreshes the window, so a long agentic run that
+        // keeps streaming is never killed mid-work.
+        let dir = scratch("heartbeat");
+        let bin = fake_cli(
+            &dir,
+            "beats",
+            "cat > /dev/null\n\
+             for i in 1 2 3 4 5 6 7 8 9 10; do echo tick-$i >&2; sleep 0.1; done\n\
+             printf '%s\\n' 'survived the window'",
+        );
+        let p = mock_provider("beats", "text", bin, "heartbeat-wd")
+            .with_timeout(Duration::from_millis(200));
+        assert_eq!(
+            p.run("x", &RunContext::default()).await.unwrap(),
+            "survived the window",
+            "a streaming run outlives many idle windows"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chatty_forever_cli_is_killed_at_the_hard_cap() {
+        // the ceiling behind the refresh: a child that streams forever is
+        // still bounded — idle × HARD_TIMEOUT_FACTOR ends it.
+        let dir = scratch("chatty");
+        let bin = fake_cli(
+            &dir,
+            "chatterbox",
+            "cat > /dev/null\nwhile true; do echo tick >&2; sleep 0.05; done",
+        );
+        let p = mock_provider("chatterbox", "text", bin, "chatty-wd")
+            .with_timeout(Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        let err = p.run("x", &RunContext::default()).await.unwrap_err();
+        assert!(err.contains("hard cap"), "names the ceiling: {err}");
+        assert!(
+            start.elapsed() >= Duration::from_millis(500)
+                && start.elapsed() < Duration::from_secs(5),
+            "killed at ~idle × {HARD_TIMEOUT_FACTOR}, not the idle window: {:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -1360,7 +1630,11 @@ format = "text"
             Some(Duration::from_secs(7)),
             AgentDirs::default(),
         );
-        assert_eq!(set.capabilities(), vec!["slowpoke"], "override plumbed without error");
+        assert_eq!(
+            set.capabilities(),
+            vec!["slowpoke"],
+            "override plumbed without error"
+        );
     }
 
     // ---- workspaces and sessions ----------------------------------------------
@@ -1369,7 +1643,7 @@ format = "text"
         RunContext {
             agent_id: Some(agent.into()),
             thread_key: Some(thread.into()),
-            run_key: None,
+            ..RunContext::default()
         }
     }
 
@@ -1404,11 +1678,12 @@ mode = "persistent"
         // the fake prints its own cwd — the observable workdir selection.
         let bin = fake_cli(&dir, "wd", "cat > /dev/null\npwd");
         let root = scratch("workspace-cwd-root");
-        let p = sh_provider(persistent_spec("wd"), bin, "workspace-cwd-scratch")
-            .with_agent_dirs(AgentDirs {
+        let p = sh_provider(persistent_spec("wd"), bin, "workspace-cwd-scratch").with_agent_dirs(
+            AgentDirs {
                 workspaces_root: Some(root.clone()),
                 sessions_root: None,
-            });
+            },
+        );
 
         // an agent-carrying run lands in <root>/<agent_id>, created on demand.
         let cwd = p.run("q", &agent_ctx("bot", "t#1")).await.unwrap();
@@ -1423,12 +1698,98 @@ mode = "persistent"
         // a second agent gets its own dir; a context-less (legacy) run stays
         // in the scratch dir even though the spec says persistent.
         let other = p.run("q", &agent_ctx("other", "t#1")).await.unwrap();
-        assert_eq!(PathBuf::from(other), root.join("other").canonicalize().unwrap());
+        assert_eq!(
+            PathBuf::from(other),
+            root.join("other").canonicalize().unwrap()
+        );
         let legacy = p.run("q", &RunContext::default()).await.unwrap();
         assert_eq!(
             PathBuf::from(legacy),
             scratch("workspace-cwd-scratch").canonicalize().unwrap(),
             "no agent id = the scratch fence, unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn workdir_override_env_and_path_entries_apply_to_one_run() {
+        let dir = scratch("portable-context");
+        let bin = fake_cli(
+            &dir,
+            "ctx",
+            r#"cat > /dev/null
+printf '%s\n' "$(pwd)"
+printf '%s\n' "$DUCKTAPE_RUN_WORKSPACE"
+printf '%s\n' "$PATH"
+"#,
+        );
+        let override_dir = scratch("portable-context-workdir");
+        let path_entry = scratch("portable-context-tools");
+        let p = sh_provider(
+            mock_spec("ctx", "ctx", "text"),
+            bin,
+            "portable-context-scratch",
+        );
+        let ctx = RunContext {
+            agent_id: Some("bot".into()),
+            thread_key: Some("general#7".into()),
+            run_key: None,
+            workdir_override: Some(override_dir.clone()),
+            env: BTreeMap::from([(
+                "DUCKTAPE_RUN_WORKSPACE".to_string(),
+                override_dir.display().to_string(),
+            )]),
+            path_entries: vec![path_entry.clone()],
+            portable: true,
+        };
+
+        let output = p.run("q", &ctx).await.unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(
+            PathBuf::from(lines[0]),
+            override_dir.canonicalize().unwrap()
+        );
+        assert_eq!(lines[1], override_dir.display().to_string());
+        assert!(
+            lines[2].starts_with(path_entry.to_str().unwrap()),
+            "PATH starts with the run-local tool binding path: {:?}",
+            lines[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unusable_workdir_override_fails_the_run_never_shares_scratch() {
+        // W1: a workdir_override is a mount the provisioner already
+        // materialized; if it is unusable the run must FAIL (the saga retries)
+        // rather than silently fall back to the capability's SHARED scratch dir
+        // — where concurrent runs of different agents would collide and the
+        // workspace commit would report a clean tree while the agent's work
+        // vanished. an override whose parent is a FILE is
+        // `create_dir_all`-impossible regardless of privilege, reproducible as
+        // an unprivileged test.
+        let dir = scratch("w1-hard-fail");
+        let bin = fake_cli(&dir, "wd", "cat > /dev/null\npwd");
+        let blocker = scratch("w1-hard-fail-blocker").join("a-file");
+        std::fs::write(&blocker, b"x").unwrap();
+        let uncreatable = blocker.join("child");
+        assert!(
+            std::fs::create_dir_all(&uncreatable).is_err(),
+            "the override must be genuinely uncreatable for this test to mean anything"
+        );
+
+        let p = sh_provider(mock_spec("wd", "wd", "text"), bin, "w1-hard-fail-scratch");
+        let ctx = RunContext {
+            workdir_override: Some(uncreatable.clone()),
+            portable: true,
+            ..RunContext::default()
+        };
+        let err = p.run("q", &ctx).await.unwrap_err();
+        assert!(
+            err.contains("provisioned workspace mount") && err.contains("refusing"),
+            "the run fails loudly on an unusable mount: {err}"
+        );
+        assert!(
+            !scratch("w1-hard-fail-scratch").join("anything").exists(),
+            "nothing executed in the shared scratch dir"
         );
     }
 
@@ -1508,12 +1869,11 @@ else
 fi"#,
         );
         let sessions = scratch("session-flow-store");
-        let p = sh_provider(session_spec("sess"), bin, "session-flow-wd").with_agent_dirs(
-            AgentDirs {
+        let p =
+            sh_provider(session_spec("sess"), bin, "session-flow-wd").with_agent_dirs(AgentDirs {
                 workspaces_root: None,
                 sessions_root: Some(sessions.clone()),
-            },
-        );
+            });
 
         // cold first run: answers cold, captures and stores the id.
         let ctx = agent_ctx("bot", "general#7");
@@ -1524,11 +1884,56 @@ fi"#,
         assert_eq!(p.run("q", &ctx).await.unwrap(), "resumed:sid-1");
 
         // a different thread key starts cold — its own slot.
-        assert_eq!(p.run("q", &agent_ctx("bot", "general#8")).await.unwrap(), "cold");
+        assert_eq!(
+            p.run("q", &agent_ctx("bot", "general#8")).await.unwrap(),
+            "cold"
+        );
 
         // a context-less legacy run has no session identity: cold, no store
         // beyond the two thread slots.
         assert_eq!(p.run("q", &RunContext::default()).await.unwrap(), "cold");
+    }
+
+    #[tokio::test]
+    async fn portable_runs_do_not_resume_or_capture_native_sessions() {
+        let dir = scratch("portable-session-flow");
+        let bin = fake_cli(
+            &dir,
+            "sess",
+            r#"cat > /dev/null
+if [ "$1" = "--resume" ]; then
+  printf '{"type":"item.completed","item":{"type":"agent_message","text":"resumed:%s"}}\n' "$2"
+else
+  printf '{"type":"thread.started","thread_id":"sid-1"}\n'
+  printf '{"type":"item.completed","item":{"type":"agent_message","text":"cold"}}\n'
+fi"#,
+        );
+        let sessions = scratch("portable-session-store");
+        let p = sh_provider(session_spec("sess"), bin, "portable-session-wd").with_agent_dirs(
+            AgentDirs {
+                workspaces_root: None,
+                sessions_root: Some(sessions.clone()),
+            },
+        );
+
+        let normal = agent_ctx("bot", "general#7");
+        assert_eq!(p.run("q", &normal).await.unwrap(), "cold");
+        assert_eq!(sole_session_id(&sessions, "bot").as_deref(), Some("sid-1"));
+
+        let portable = RunContext {
+            portable: true,
+            ..normal.clone()
+        };
+        assert_eq!(
+            p.run("q", &portable).await.unwrap(),
+            "cold",
+            "portable v3 runs start from duckfs state, not host-local CLI sessions"
+        );
+        assert_eq!(
+            sole_session_id(&sessions, "bot").as_deref(),
+            Some("sid-1"),
+            "portable runs do not recapture/overwrite the host-local session slot"
+        );
     }
 
     #[tokio::test]
@@ -1550,26 +1955,36 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"cold-ans
         );
         let sessions = scratch("session-stale-store");
         let wd = scratch("session-stale-wd");
-        let p = sh_provider(session_spec("sess"), bin, "session-stale-wd").with_agent_dirs(
-            AgentDirs {
+        let p =
+            sh_provider(session_spec("sess"), bin, "session-stale-wd").with_agent_dirs(AgentDirs {
                 workspaces_root: None,
                 sessions_root: Some(sessions.clone()),
-            },
-        );
+            });
 
         // seed a stale id directly — the state a dead executor session leaves.
         let ctx = agent_ctx("bot", "general#7");
         std::fs::create_dir_all(sessions.join("bot")).unwrap();
-        session::SessionStore::new(&sessions, "bot", "general#7")
-            .store_captured(&SessionCapture::JsonlEvents, "{\"session_id\":\"sid-stale\"}");
-        assert_eq!(sole_session_id(&sessions, "bot").as_deref(), Some("sid-stale"));
+        session::SessionStore::new(&sessions, "bot", "general#7").store_captured(
+            &SessionCapture::JsonlEvents,
+            "{\"session_id\":\"sid-stale\"}",
+        );
+        assert_eq!(
+            sole_session_id(&sessions, "bot").as_deref(),
+            Some("sid-stale")
+        );
 
         // the run still answers (cold retry), and the slot re-primes with
         // the fresh id the retry captured.
         assert_eq!(p.run("q", &ctx).await.unwrap(), "cold-answer");
         let attempts = std::fs::read_to_string(wd.join("resume-attempts")).unwrap();
-        assert_eq!(attempts, "sid-stale\n", "exactly ONE resume attempt, with the stale id");
-        assert_eq!(sole_session_id(&sessions, "bot").as_deref(), Some("sid-fresh"));
+        assert_eq!(
+            attempts, "sid-stale\n",
+            "exactly ONE resume attempt, with the stale id"
+        );
+        assert_eq!(
+            sole_session_id(&sessions, "bot").as_deref(),
+            Some("sid-fresh")
+        );
     }
 
     #[tokio::test]
@@ -1609,9 +2024,8 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
         );
 
         // injected env, no process-state mutation (the discover_with rule).
-        let env = |k: &str| {
-            (k == "DUCKTAPE_AGENT_WORKSPACES").then(|| OsString::from("/elsewhere/ws"))
-        };
+        let env =
+            |k: &str| (k == "DUCKTAPE_AGENT_WORKSPACES").then(|| OsString::from("/elsewhere/ws"));
         let resolved = wired.resolved(&env);
         assert_eq!(
             resolved.workspaces_root.as_deref(),
@@ -1622,6 +2036,78 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
             resolved.sessions_root.as_deref(),
             Some(Path::new("/data/agent-sessions")),
             "an unset override leaves the wired root"
+        );
+    }
+
+    // ---- D7 isolation floor (portable env) --------------------------------------
+
+    /// portable and non-portable runs use the SAME additive env overlay: no
+    /// `env_clear`, no HOME override. get_envs (the explicitly-set overlay) is
+    /// exactly ctx.env for both — so a headless CLI's BYO-auth (ambient
+    /// ANTHROPIC_API_KEY, ~/.claude, &c) survives into a portable child.
+    #[test]
+    fn portable_and_nonportable_use_the_same_additive_env_overlay() {
+        let spec = mock_spec("iso", "iso-cli", "text");
+        let p = CliProvider::from_spec(spec, PathBuf::from("/bin/true"));
+        let workdir = scratch("iso-portable-wd");
+
+        let mut env = BTreeMap::new();
+        env.insert("AGENT_TOKEN".to_string(), "abc".to_string());
+        let expected: BTreeMap<String, Option<String>> = env
+            .iter()
+            .map(|(k, v)| (k.clone(), Some(v.clone())))
+            .collect();
+
+        for portable in [true, false] {
+            let ctx = RunContext {
+                portable,
+                workdir_override: Some(workdir.clone()),
+                env: env.clone(),
+                ..Default::default()
+            };
+            let cmd = p.command(&[], &workdir, &ctx).expect("command");
+            let envs: BTreeMap<String, Option<String>> = cmd
+                .as_std()
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                envs, expected,
+                "portable={portable}: env is the additive overlay (no env_clear, no HOME override)"
+            );
+        }
+    }
+
+    /// a portable run INHERITS the ambient `$HOME` — same as a non-portable run
+    /// — so the headless claude/codex CLI finds its BYO credentials. (The env
+    /// half of the D7 isolation floor needs the ADR's deferred sandbox
+    /// mechanism; the ACTIVE D7 measure is the workspace relocation, i.e. the
+    /// cwd being the per-run mount outside <storage>, not an env rewrite.)
+    #[tokio::test]
+    async fn portable_runs_inherit_the_ambient_home_for_byo_auth() {
+        let dir = scratch("portable-home");
+        let bin = fake_cli(&dir, "home", "cat > /dev/null\nprintf '%s' \"$HOME\"");
+        let p = mock_provider("home", "text", bin, "portable-home-wd");
+
+        let real_home = std::env::var("HOME").expect("the test env has HOME set");
+        let inherited = p.run("x", &RunContext::default()).await.unwrap();
+        assert_eq!(inherited, real_home, "a non-portable run inherits HOME");
+
+        let mount = scratch("portable-home-mount");
+        let ctx = RunContext {
+            portable: true,
+            workdir_override: Some(mount.clone()),
+            ..Default::default()
+        };
+        let portable_home = p.run("x", &ctx).await.unwrap();
+        assert_eq!(
+            portable_home, real_home,
+            "a portable run ALSO inherits the ambient HOME so BYO-auth works"
         );
     }
 }

@@ -128,6 +128,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the oracle pool's re-entry lane: completed provider runs inject their
     // results as Submit commands, exactly as the http layer does.
     let oracle_cmds = handle.command_sender();
+    // a full handle clone for the portable-agent-run provisioner: it drives
+    // duckfs checkout/commit over this SAME actor lane (the /v1/fs/workspaces
+    // transport). cheap — NodeHandle is a command-lane sender + a few Arcs.
+    let actor_handle = handle.clone();
     std::thread::Builder::new()
         .name("node-actor".into())
         .spawn(move || {
@@ -137,6 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 actor_index,
                 blobs,
                 oracle_cmds,
+                actor_handle,
                 cmd_rx,
                 stream_hub,
             )
@@ -174,21 +179,34 @@ fn init_tracing(log_ring: noded::LogRing) {
 
 /// own the host for the process lifetime: genesis the module set, then apply
 /// commands in arrival order — every submit is its own block.
+// the actor thread's entry point threads every daemon-owned root/lane in by
+// value (storage, forge, index, blobs, the oracle re-entry lane, the actor
+// handle the provisioner drives, the command receiver, the event fan-out);
+// bundling them into a struct would only rename the same list.
+#[allow(clippy::too_many_arguments)]
 fn run_node(
     storage: PathBuf,
     forge_repo: PathBuf,
     index: Arc<IndexStore>,
     blobs: noded::blobs::BlobHandle,
     oracle_cmds: mpsc::Sender<NodeCommand>,
+    node_handle: noded::NodeHandle,
     mut cmds: mpsc::Receiver<NodeCommand>,
     stream_hub: StreamHub,
 ) {
     // forge_repo is derived by the caller (shared with the http upload-pack lane).
     let duckfs_dir = storage.join("duckfs");
-    // per-agent host state under the same storage root: persistent executor
-    // workspaces + session files (DUCKTAPE_AGENT_WORKSPACES / _SESSIONS
-    // override — see capability-host). host-local only, never consensus.
+    // per-agent host state, rooted OUTSIDE <storage> (D7 isolation floor): the
+    // persistent executor workspaces + session files must NOT be descendants of
+    // the key/consensus/blob tree, so a `..` from a run's cwd can't reach
+    // user.key/node keys/qmdb/blobstore. `DUCKTAPE_AGENT_WORKSPACES` / _SESSIONS
+    // override — see capability-host. host-local only, never consensus.
+    // non-portable (v2/persistent) agent workspaces stay under <storage>, exactly
+    // as today — relocating them would be a live (non-dormant) durability change.
+    // D7 relocation applies to the PORTABLE provisioner mount (agent_runs_root).
     let agent_dirs = capability_host::AgentDirs::under(&storage);
+    // keys the portable run-root's per-node salt + D7 validation (oracle_workers).
+    let storage_for_runs = storage.clone();
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
@@ -220,7 +238,11 @@ fn run_node(
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-        );
+        )
+        // the duckfs/files module the portable (v3) composer pins its source
+        // head from (W2). its presence is what selects the v3 composer; unwired,
+        // the composer emits the v2 wire.
+        .with_files_module("files");
         let pages = Pages::init(context.child("pages"), "pages").await;
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the
@@ -275,9 +297,10 @@ fn run_node(
         let workers = oracle_pool::oracle_workers(
             &context,
             oracle_cmds,
+            node_handle,
             blobs.clone(),
             agent_dirs,
-            stream_hub.run_output(),
+            &storage_for_runs,
         );
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would

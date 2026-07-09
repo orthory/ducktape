@@ -19,7 +19,7 @@ describe("postedMessage", () => {
       channelId: "general",
       messageId: "m-1",
       blocks: [{ paragraph: [{ text: "hi", marks: [] }] }],
-      author: "jess",
+      authorBytes: Array.from(new TextEncoder().encode("jess")),
       at: 123,
       thread: null,
     });
@@ -39,7 +39,7 @@ describe("postedMessage", () => {
         channelId: "general",
         messageId: "m-1",
         blocks: [],
-        author: "jess",
+        authorBytes: Array.from(new TextEncoder().encode("jess")),
         at: 0,
         thread: null,
       }),
@@ -49,7 +49,7 @@ describe("postedMessage", () => {
   it("threads a reply into the open panel and bumps the root's counts", () => {
     const root = optimistic.postedMessage(
       base({ activeChannel: "general" }),
-      { channelId: "general", messageId: "r", blocks: [], author: "a", at: 0, thread: null },
+      { channelId: "general", messageId: "r", blocks: [], authorBytes: Array.from(new TextEncoder().encode("a")), at: 0, thread: null },
     ).messages![0];
     const prev = base({
       activeChannel: "general",
@@ -60,7 +60,7 @@ describe("postedMessage", () => {
       channelId: "general",
       messageId: "m-2",
       blocks: [],
-      author: "jess",
+      authorBytes: Array.from(new TextEncoder().encode("jess")),
       at: 5,
       thread: root.seq,
     });
@@ -160,7 +160,7 @@ describe("huddle projections", () => {
     const out = optimistic.huddleJoined(prev, {
       channelId: "general",
       node: selfNode,
-      author: "jess",
+      authorBytes: Array.from(new TextEncoder().encode("jess")),
       at: 42,
     });
     expect(out.channels![0].huddle).toEqual([
@@ -171,7 +171,7 @@ describe("huddle projections", () => {
     const again = optimistic.huddleJoined(base({ channels: out.channels! }), {
       channelId: "general",
       node: selfNode,
-      author: "jess",
+      authorBytes: Array.from(new TextEncoder().encode("jess")),
       at: 99,
     });
     expect(again).toEqual({});
@@ -214,7 +214,7 @@ describe("reaction projections", () => {
     const self = Array.from(new TextEncoder().encode("jess"));
     const seeded = optimistic.postedMessage(
       base({ activeChannel: "general" }),
-      { channelId: "general", messageId: "m", blocks: [], author: "a", at: 0, thread: null },
+      { channelId: "general", messageId: "m", blocks: [], authorBytes: Array.from(new TextEncoder().encode("a")), at: 0, thread: null },
     ).messages![0];
     const prev = base({ activeChannel: "general", messages: [seeded] });
 

@@ -22,11 +22,12 @@ export const isAgentAuthor = (author: AuthorRef): boolean =>
   typeof author === "object" && "agent" in author;
 
 /** The local author's key, in the same shape `authorKey` produces for a
- *  `User` author — the origin string crosses the wire as `Origin::External`
- *  bytes, which the chat module stores verbatim as `AuthorRef::User`, so this
- *  is just `authorKey` applied to our own submitted identity. */
-export const selfAuthorKeyOf = (origin: string): string =>
-  `user:${Array.from(new TextEncoder().encode(origin)).join(",")}`;
+ *  `User` author. Callers pass `selfAuthorBytes(status, author)` — the node
+ *  pubkey on a networked node (the submit lane SIGNS frames; committed
+ *  authorship is the node's key and the origin string is ignored), the
+ *  origin bytes on the embedded daemon (which stores them verbatim). */
+export const selfAuthorKeyOf = (selfBytes: number[]): string =>
+  `user:${selfBytes.join(",")}`;
 
 export const hasReacted = (message: MessageView, emoji: string, selfKey: string): boolean =>
   message.reactions.some(

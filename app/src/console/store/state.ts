@@ -13,6 +13,7 @@ import type {
   MessageView,
 } from "../../domain/chat-client";
 import type { FileEntry } from "../../domain/files-client";
+import type { MemberKeyView } from "../../domain/identity-client";
 import type { ForgeItemSummary, ForgeRefHead } from "../../domain/forge-client";
 import type { ProposalView } from "../../domain/governance-client";
 import type {
@@ -157,6 +158,10 @@ export interface ConsoleState {
    *  node/user split's resolver: `name` is that user's chosen display name
    *  (null if unset), already folded into `authorNames` when present. */
   nodeUsers: Record<string, { userKey: string; name: string | null }>;
+  /** hex(account id) → the account's collected member keys (of any scheme),
+   *  from the `identity` module. `nodeUsers`/`authorNames` carry the shared
+   *  display name; this is the key list the account settings surface renders. */
+  accountKeys: Record<string, MemberKeyView[]>;
   /** This client's live voice-huddle session — ephemeral, never in the
    *  committed snapshot (see VoiceSlice). */
   voice: VoiceSlice;
@@ -458,6 +463,7 @@ export const createInitialState = (): ConsoleState => {
     channelTags: [],
     authorNames: {},
     nodeUsers: {},
+    accountKeys: {},
     voice: {
       channelId: null,
       muted: false,
@@ -525,6 +531,7 @@ export interface ConsoleSnapshot {
   messages: MessageView[];
   authorNames: Record<string, string>;
   nodeUsers: Record<string, { userKey: string; name: string | null }>;
+  accountKeys: Record<string, MemberKeyView[]>;
   pages: PageMeta[];
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
@@ -551,6 +558,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   messages: snapshot.messages,
   authorNames: snapshot.authorNames,
   nodeUsers: snapshot.nodeUsers,
+  accountKeys: snapshot.accountKeys,
   pages: snapshot.pages,
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,
@@ -564,6 +572,32 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
 });
 
 // ── Pure helpers ────────────────────────────────────────
+
+/** The identity committed rows actually carry for OUR writes. The submit
+ *  lane SIGNS frames on networked nodes: committed authorship is the NODE's
+ *  pubkey and the client's origin string is deliberately ignored — so self
+ *  is `status.publicKey` whenever the node reports one. The embedded daemon
+ *  (empty publicKey) stores the origin string verbatim, so the author
+ *  string remains its self there. This is the follow-the-head handoff's
+ *  bug A: every self-comparison (optimistic rows, canModify,
+ *  reaction-"mine", huddle roster) must use THESE bytes, never the literal
+ *  author string. */
+export const selfAuthorBytes = (
+  status: NodeStatus | null,
+  author: string,
+): number[] => {
+  const pk = (status?.publicKey ?? "").toLowerCase();
+  if (pk.length >= 64 && pk.length % 2 === 0) {
+    const bytes: number[] = [];
+    for (let i = 0; i < pk.length; i += 2) {
+      const byte = parseInt(pk.slice(i, i + 2), 16);
+      if (Number.isNaN(byte)) return Array.from(new TextEncoder().encode(author));
+      bytes.push(byte);
+    }
+    return bytes;
+  }
+  return Array.from(new TextEncoder().encode(author));
+};
 
 /** A channel id from a display name: lowercase, dash-separated, wire-safe. */
 export const channelIdOf = (name: string): string =>

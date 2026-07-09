@@ -56,6 +56,7 @@ import {
   saveDocTabs,
   saveRemoteUrl,
   saveViewMode,
+  selfAuthorBytes,
 } from "./state";
 import type { ConsoleState, ViewMode } from "./state";
 
@@ -1090,7 +1091,7 @@ export function createActions({
         opKey.profile(),
         (live) =>
           bound
-            ? identityClient.setUserName(live, { displayName: name, origin })
+            ? identityClient.setAccountName(live, { displayName: name, origin })
             : profilesClient.setName(live, { displayName: name, origin }),
         () => ({ author: name }),
       );
@@ -1136,7 +1137,7 @@ export function createActions({
               channelId,
               messageId,
               blocks,
-              author,
+              authorBytes: selfAuthorBytes(prev.status, prev.author),
               at: Date.now(),
               thread: null,
             }),
@@ -1185,7 +1186,7 @@ export function createActions({
                 channelId,
                 messageId,
                 blocks,
-                author,
+                authorBytes: selfAuthorBytes(prev.status, prev.author),
                 at: Date.now(),
                 thread: root.seq,
               }),
@@ -1313,7 +1314,7 @@ export function createActions({
           optimistic.huddleJoined(prev, {
             channelId,
             node,
-            author: prev.author,
+            authorBytes: selfAuthorBytes(prev.status, prev.author),
             at: Math.floor(Date.now() / 1000),
           }),
       ).then(() => {

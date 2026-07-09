@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
-use dispatch_oracle::{BlobResolver, DeliverFn, DispatchPool, SpawnFn};
+use dispatch_oracle::{BlobResolver, DeliverFn, DispatchPool, SharedProvisioner, SpawnFn};
 use futures::SinkExt as _;
 use sdk::Msg;
 
@@ -35,6 +35,7 @@ pub(crate) fn build<C>(
     providers: capability_host::ProviderSet,
     node_key: Vec<u8>,
     blobs: blobstore::BlobHandle,
+    provisioner: Option<SharedProvisioner>,
 ) -> (
     Box<dyn reactor::Worker>,
     futures::channel::mpsc::Receiver<Msg>,
@@ -72,7 +73,17 @@ where
         Box::pin(async move { blobs.get_chunk(&digest) })
     });
 
-    let pool =
+    let mut pool =
         DispatchPool::new(Arc::new(providers), node_key, spawn, deliver).with_resolver(resolver);
+    // portable (v3) runs materialize a per-run duckfs workspace through this,
+    // over the SAME NodeHandle actor lane the /v1/fs/workspaces RPC uses. LIVE:
+    // the composer emits v3 for every run (files module wired unconditionally),
+    // so this seam is on the hot path. `None` keeps the accept-only degrade
+    // (raw-text delivery, no workspace) — main.rs currently always passes
+    // `Some`, so the branch is defensive plumbing for embedders, not a live
+    // production mode.
+    if let Some(provisioner) = provisioner {
+        pool = pool.with_provisioner(provisioner);
+    }
     (Box::new(pool), rx)
 }

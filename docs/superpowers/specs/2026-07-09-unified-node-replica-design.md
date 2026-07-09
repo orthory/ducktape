@@ -1,8 +1,18 @@
 # Unified Node — Replica Pipeline — Design
 
-Status: proposed — Phase 0 of the unified-node epic ("a node is a node").
-Implementation is phased; each phase is its own PR and its own gate. Where
-this document and shipped code disagree, the code is authoritative.
+Status: SHIPPED through phase 4 (2026-07-10; PRs #291, #293, #296 + the
+phase-4 closeout). Residents fold finalized frames, restart by journal
+replay, cross epochs by in-loop follower swap, and promote from their own
+state; state sync is join-time bootstrap only. Two deltas against the plan
+below, both forced by reality and recorded in the PRs: the promotion
+collapse (phase 3 here) landed IN phase 2 — a quorum-widening cutover halts
+the source awaiting the promoted node, so wait-for-the-source promotion
+deadlocks — and the phase-3 replay gate unearthed a pre-existing recovery
+hazard (the legacy trailing roll-forward sealed observed mixed roots),
+fixed in `crates/kernel/recovery`. Residuals: V2/BLS verifier construction
+awaits valset key registration; cutover behavior under adversarial timing
+beyond the e2e suite is future hardening. Where this document and shipped
+code disagree, the code is authoritative.
 
 ## The model in one paragraph
 

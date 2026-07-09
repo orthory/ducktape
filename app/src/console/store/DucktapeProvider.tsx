@@ -17,11 +17,31 @@ import {
   isTauri,
   resolveNode,
 } from "../../domain/node-bootstrap";
+import type { PageMeta } from "../../domain/pages-client";
 import { moduleTopic } from "../../domain/stream";
-import type { NodeTransport } from "../../domain/transport";
+import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
 import { ConsoleContext, type ConsoleContextValue } from "./context";
+import {
+  hasFreshPending,
+  pageSnapshotSuperseded,
+  receiptFloor,
+} from "./finalization";
+import {
+  changedModules,
+  fetchAgentsSlices,
+  fetchCapabilitySlices,
+  fetchChatSlices,
+  fetchFilesSlices,
+  fetchForgeSlices,
+  fetchGovernanceSlices,
+  fetchPagesSlices,
+  fetchPeopleSlices,
+  fetchRunsSlices,
+  fetchValsetSlices,
+  scopeFor,
+} from "./hydration";
 import {
   HUDDLE_CLOSED_EVENT,
   HUDDLE_CMD_EVENT,
@@ -30,15 +50,19 @@ import {
   buildHuddleContext,
 } from "./huddle-window";
 import type { HuddleWindowCmd } from "./huddle-window";
-import { refreshAll, refreshModules, type RefreshEnv } from "./refresh";
 import { reducer } from "./reducer";
 import {
+  applySnapshot,
   createInitialState,
   loadRemoteUrl,
+  saveDocTabs,
 } from "./state";
 
 export type { ConsoleActions } from "./actions";
 export type { ConsoleContextValue } from "./context";
+
+/** How many recent non-empty blocks the explorer pulls per refresh. */
+const BLOCKS_KEEP = 200;
 
 export function DucktapeProvider({
   transport,
@@ -70,16 +94,225 @@ export function DucktapeProvider({
     [],
   );
 
+  // Reconcile doc tabs against a live enumeration: a tab whose page no longer
+  // exists (deleted here or elsewhere) drops, and a now-dead active page falls
+  // back to the first surviving tab. CRITICAL: only called when the caller
+  // actually got an enumeration AND isn't holding the pages slices —
+  // `listPages` is best-effort, and evicting open tabs on a transient empty
+  // result would blank the editor mid-edit.
+  const reconcileDocTabs = useCallback((pages: PageMeta[]) => {
+    const prevTabs = stateRef.current.openTabs;
+    const prevActive = stateRef.current.activePage;
+    if (pages.length === 0) return { openTabs: prevTabs, activePage: prevActive };
+    const liveIds = new Set(pages.map((p) => p.id));
+    const openTabs = prevTabs.filter((id) => liveIds.has(id));
+    if (openTabs.length !== prevTabs.length) saveDocTabs(openTabs);
+    const activePage =
+      prevActive && liveIds.has(prevActive) ? prevActive : (openTabs[0] ?? null);
+    return { openTabs, activePage };
+  }, []);
+
+  // A pages snapshot that predates a page op must not be applied: it would
+  // clobber the op's preconfirmed projection — an optimistically inserted
+  // block unmounts (dropping the focused textarea with it) and just-committed
+  // text reverts until the op finalizes. The block stream's hasFreshPending
+  // gate covers stream refreshes; this covers the completion refresh of an
+  // EARLIER op that settles while a later one is still in flight, a snapshot
+  // raced by an op submitted mid-fetch, and a page we've navigated away from.
+  // Held slices converge on the last op's own refresh.
+  const shouldHoldPages = useCallback(
+    (fetchedPage: string | null, fetchStartedAt: number) =>
+      stateRef.current.activePage !== fetchedPage ||
+      pageSnapshotSuperseded(stateRef.current.ops, fetchStartedAt, Date.now()),
+    [],
+  );
+
   const refresh = useCallback(() => {
     const live = nodeRef.current;
     if (!live) return Promise.resolve();
-    return refreshAll({
-      live,
-      getState: () => stateRef.current,
-      dispatch,
-      fail,
-    });
-  }, [fail]);
+    // the pages (docs) slice refreshes by enumeration + the open page's tree.
+    const fetchedPage = stateRef.current.activePage;
+    // ops submitted at or after this instant cannot be in the snapshot the
+    // queries below return — pageSnapshotSuperseded keys off it at apply time.
+    const fetchStartedAt = Date.now();
+    return Promise.resolve()
+      .then(() =>
+        Promise.all([
+          live.status(),
+          fetchChatSlices(live, stateRef.current.activeChannel),
+          fetchValsetSlices(live),
+          fetchGovernanceSlices(live),
+          fetchForgeSlices(live),
+          fetchPagesSlices(live, fetchedPage),
+          fetchAgentsSlices(live),
+          fetchCapabilitySlices(live),
+          fetchRunsSlices(live),
+          fetchPeopleSlices(live),
+          fetchFilesSlices(live),
+          // the explorer's ring pull — best-effort, so a node without
+          // /v1/blocks reads as "no blocks yet".
+          live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
+        ]),
+      )
+      .then(
+        ([
+          status,
+          chat,
+          valset,
+          governance,
+          forge,
+          pagesSlices,
+          agents,
+          capability,
+          runs,
+          people,
+          files,
+          blocks,
+        ]) => {
+          // read-your-writes floor (the follow-the-head handoff's bug B): a
+          // snapshot below a height this console holds a receipt for would
+          // un-render the confirmed write until a later refresh — skip; the
+          // next block's hydrate carries a taller status.
+          if (status.height < receiptFloor(stateRef.current.ops)) return;
+          const holdPages = shouldHoldPages(fetchedPage, fetchStartedAt);
+          const { openTabs, activePage } = holdPages
+            ? {
+                openTabs: stateRef.current.openTabs,
+                activePage: stateRef.current.activePage,
+              }
+            : reconcileDocTabs(pagesSlices.pages);
+          return dispatch({
+            type: "patch",
+            patch: {
+              ...applySnapshot({
+                connected: true,
+                status,
+                channels: chat.channels,
+                members: valset.members,
+                residents: valset.residents,
+                proposals: governance.proposals,
+                forgeHead: forge.forgeHead,
+                activeChannel: chat.activeChannel,
+                messages: chat.messages,
+                authorNames: people.authorNames,
+                nodeUsers: people.nodeUsers,
+                accountKeys: people.accountKeys,
+                pages: holdPages ? stateRef.current.pages : pagesSlices.pages,
+                activePageBlocks: holdPages
+                  ? stateRef.current.activePageBlocks
+                  : (pagesSlices.pageBlocks ?? []),
+                agents: agents.agents,
+                capabilities: capability.capabilities,
+                capabilitiesByNode: capability.capabilitiesByNode,
+                watches: runs.watches,
+                pendingRuns: runs.pendingRuns,
+                runAssignee: runs.runAssignee,
+                files: files.files,
+                blocks,
+              }),
+              openTabs,
+              activePage,
+            },
+          });
+        },
+      )
+      .catch((err) => {
+        dispatch({ type: "patch", patch: { connected: false } });
+        fail(err);
+      });
+  }, [fail, reconcileDocTabs, shouldHoldPages]);
+
+  // Scoped hydration for block events: ONE status read names the modules the
+  // block changed (their state roots ride status().modules[]), and only the
+  // slice groups that read those modules re-query — the wholesale refresh
+  // stays the boot / reconnect / never-hydrated path. The replica pipeline
+  // makes the diff exact: every node folds per block, so consecutive statuses
+  // differ by exactly what the block touched.
+  const refreshScoped = useCallback(() => {
+    const live = nodeRef.current;
+    if (!live) return Promise.resolve();
+    const fetchStartedAt = Date.now();
+    return Promise.resolve()
+      .then(() => live.status())
+      .then((status) => {
+        // read-your-writes floor, checked BEFORE fanning out: a lagging
+        // status buys nothing — the next block event retries.
+        if (status.height < receiptFloor(stateRef.current.ops)) return;
+        const prev = stateRef.current.status;
+        if (!prev) return refresh();
+        const scope = scopeFor(changedModules(prev, status));
+        const fetchedPage = stateRef.current.activePage;
+        return Promise.resolve()
+          .then(() =>
+            Promise.all([
+              scope.has("chat")
+                ? fetchChatSlices(live, stateRef.current.activeChannel)
+                : null,
+              scope.has("valset") ? fetchValsetSlices(live) : null,
+              scope.has("governance") ? fetchGovernanceSlices(live) : null,
+              scope.has("forge") ? fetchForgeSlices(live) : null,
+              scope.has("pages") ? fetchPagesSlices(live, fetchedPage) : null,
+              scope.has("agents") ? fetchAgentsSlices(live) : null,
+              scope.has("capability") ? fetchCapabilitySlices(live) : null,
+              scope.has("runs") ? fetchRunsSlices(live) : null,
+              scope.has("people") ? fetchPeopleSlices(live) : null,
+              scope.has("files") ? fetchFilesSlices(live) : null,
+              // the explorer ring follows every block regardless of scope.
+              live.blocks(BLOCKS_KEEP).catch((): BlockRecord[] => []),
+            ]),
+          )
+          .then(
+            ([
+              chat,
+              valset,
+              governance,
+              forge,
+              pagesSlices,
+              agents,
+              capability,
+              runs,
+              people,
+              files,
+              blocks,
+            ]) => {
+              const holdPages =
+                !pagesSlices || shouldHoldPages(fetchedPage, fetchStartedAt);
+              const tabs =
+                !holdPages && pagesSlices
+                  ? reconcileDocTabs(pagesSlices.pages)
+                  : null;
+              return dispatch({
+                type: "patch",
+                patch: {
+                  connected: true,
+                  status,
+                  blocks,
+                  ...(chat ?? {}),
+                  ...(valset ?? {}),
+                  ...(governance ?? {}),
+                  ...(forge ?? {}),
+                  ...(agents ?? {}),
+                  ...(capability ?? {}),
+                  ...(runs ?? {}),
+                  ...(people ?? {}),
+                  ...(files ?? {}),
+                  ...(!holdPages && pagesSlices
+                    ? {
+                        pages: pagesSlices.pages,
+                        activePageBlocks: pagesSlices.pageBlocks ?? [],
+                      }
+                    : {}),
+                  ...(tabs ?? {}),
+                },
+              });
+            },
+          );
+      })
+      .catch((err) => {
+        dispatch({ type: "patch", patch: { connected: false } });
+        fail(err);
+      });
+  }, [fail, refresh, reconcileDocTabs, shouldHoldPages]);
 
   const actions = useMemo(
     () =>
@@ -174,81 +407,67 @@ export function DucktapeProvider({
     refresh();
   }, [node, refresh]);
 
-  // 2a. Follow module stream topics. The chain tip update is ungated; slice
-  //     fetches are trailing-debounced and still honor the fresh-pending gate.
+  // 2a. Follow the module stream topics: every finalized op streams as an
+  //     event, the chain tip patches UNGATED, and a trailing debounce
+  //     coalesces a block burst into ONE scoped hydrate — refreshScoped's
+  //     root diff fetches exactly the slice groups the blocks touched, so
+  //     the events are the trigger and the roots are the scope. The
+  //     fresh-pending gate carries over from the block-frame era; a lagged
+  //     topic hydrates immediately (the root diff covers whatever the gap
+  //     contained).
   useEffect(() => {
     if (!node || !streamModuleKey) return;
     const modules = streamModuleKey.split("\0").filter(Boolean);
-    const dirty = new Set<string>();
     let timer: ReturnType<typeof setTimeout> | null = null;
-    const env = (): RefreshEnv => ({
-      live: node,
-      getState: () => stateRef.current,
-      dispatch,
-      fail,
-    });
     const clearFlush = () => {
       if (timer !== null) clearTimeout(timer);
       timer = null;
     };
     const flush = () => {
       timer = null;
-      const modulesToRefresh = [...dirty];
-      dirty.clear();
-      void refreshModules(env(), modulesToRefresh, {
-        includeBlocks: true,
-        respectFreshPending: true,
-      });
+      void refreshScoped();
     };
     const schedule = () => {
+      // An op of OURS in flight: its own completion refresh follows, and a
+      // scoped re-query now would clobber the preconfirmed projection. Stale
+      // pendings (a hung submit) stop gating so the stream can't be starved.
+      if (hasFreshPending(stateRef.current.ops, Date.now())) return;
       clearFlush();
       timer = setTimeout(flush, 100);
     };
 
-    const off = node.subscribe(
-      modules.map(moduleTopic),
-      {
-        onEvent: (frame) => {
-          const module = frame.topic.startsWith("module:")
-            ? frame.topic.slice("module:".length)
-            : null;
-          if (!module) return;
-          dirty.add(module);
-          // The live chain tip, UNGATED — recorded before the pending gate
-          // below, so the console always knows the chain moved even while an op
-          // of ours is in flight. An event at height N also proves the node's
-          // tip is ≥ N, so status.height advances here too instead of waiting
-          // up to a heartbeat interval (appHash refreshes on the next beat).
-          dispatch({
-            type: "update",
-            fn: (prev) => {
-              const patch: { lastBlock?: number; status?: typeof prev.status } = {};
-              if (frame.op.height > (prev.lastBlock ?? -1)) {
-                patch.lastBlock = frame.op.height;
-              }
-              if (prev.status && frame.op.height > prev.status.height) {
-                patch.status = { ...prev.status, height: frame.op.height };
-              }
-              return patch;
-            },
-          });
-          schedule();
-        },
-        onLagged: (topic) => {
-          const module = topic.startsWith("module:")
-            ? topic.slice("module:".length)
-            : null;
-          if (!module) return;
-          dirty.delete(module);
-          void refreshModules(env(), [module], { includeBlocks: true });
-        },
+    const off = node.subscribe(modules.map(moduleTopic), {
+      onEvent: (frame) => {
+        // The live chain tip, UNGATED — recorded before the pending gate so
+        // the console always knows the chain moved even while an op of ours
+        // is in flight. An event at height N also proves the node's tip is
+        // ≥ N, so status.height advances here too instead of waiting up to a
+        // heartbeat interval (appHash refreshes on the next beat).
+        dispatch({
+          type: "update",
+          fn: (prev) => {
+            const patch: { lastBlock?: number; status?: typeof prev.status } = {};
+            if (frame.op.height > (prev.lastBlock ?? -1)) {
+              patch.lastBlock = frame.op.height;
+            }
+            if (prev.status && frame.op.height > prev.status.height) {
+              patch.status = { ...prev.status, height: frame.op.height };
+            }
+            return patch;
+          },
+        });
+        schedule();
       },
-    );
+      onLagged: () => {
+        clearFlush();
+        void refreshScoped();
+      },
+    });
     return () => {
       clearFlush();
       off();
     };
-  }, [node, streamModuleKey, fail]);
+  }, [node, streamModuleKey, refreshScoped]);
 
   // 2b. Liveness heartbeat — connection banner, tip patching, and one-shot
   //     recovery on the up edge. The transport's watchdog turns silent stream

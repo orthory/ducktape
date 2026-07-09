@@ -1,98 +1,227 @@
 //! the identity module's public wire surface -- types only.
 //!
-//! a USER is an ed25519 keypair held by the person (in the app), a NODE is a
-//! workspace's mesh/valset identity. this module binds nodes to users so any
-//! verified submit origin (a node key) resolves to the human who owns it.
+//! an ACCOUNT is the umbrella a person owns: it is keyed by its FOUNDING key
+//! (`account_id` = the first member key), collects many MEMBER KEYS of
+//! different schemes (an ed25519 seed key, a WebAuthn passkey, ...), shares one
+//! display name across all of them, and owns many NODES (each a workspace's
+//! mesh/valset identity). binding a node resolves to the ACCOUNT, so any
+//! verified submit origin (a node key) maps to the human who owns it.
+//!
 //! writes go via [`IdentityMsg`]; reads via [`IdentityQuery`] ->
-//! [`IdentityReply`]. bind/unbind carry USER-KEY SIGNATURES over
-//! chain-and-nonce-scoped preimages so a certificate can never replay across
-//! networks or after an unbind.
+//! [`IdentityReply`]. every state-changing op is authorized by a MEMBER KEY --
+//! captured as a [`MemberAuth`] (which key, which scheme, and the proof over
+//! the op's chain-and-nonce-scoped preimage) -- so a certificate can never
+//! replay across networks or after the account nonce advances. adding/removing
+//! a member key needs TWO consents: an existing member authorizes, and (for an
+//! add) the new key proves possession, both over the same preimage.
 
 use serde::{Deserialize, Serialize};
 
-/// signing domain for bind certificates -- namespace-separated from every
+pub use crate::scheme::{KeyKind, MemberProof};
+
+/// signing domain for node-bind certificates -- namespace-separated from every
 /// other signed artifact (frames, invites, coord caps, endpoint records).
 pub const IDENTITY_BIND_NS: &[u8] = b"ducktape-identity-bind-v1";
-/// signing domain for unbind certificates.
+/// signing domain for node-unbind certificates.
 pub const IDENTITY_UNBIND_NS: &[u8] = b"ducktape-identity-unbind-v1";
+/// signing domain for add-member-key certificates.
+pub const IDENTITY_ADD_MEMBER_NS: &[u8] = b"ducktape-identity-add-member-v1";
+/// signing domain for remove-member-key certificates.
+pub const IDENTITY_REMOVE_MEMBER_NS: &[u8] = b"ducktape-identity-remove-member-v1";
 
-/// max user display-name length, in bytes (profiles' exact limit).
+/// max account display-name length, in bytes.
 pub const MAX_NAME_LEN: usize = 64;
+/// max member-key label length, in bytes (e.g. "Kim's phone").
+pub const MAX_LABEL_LEN: usize = 64;
 /// query pagination ceiling -- [`IdentityQuery::All`] clamps `limit` to this.
 pub const MAX_QUERY_LIMIT: u64 = 256;
 
-/// one user record as queries expose it.
+/// one member key as queries expose it: its public key, scheme, optional
+/// human label, and the block timestamp it was admitted at.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct UserView {
-    pub user_key: Vec<u8>,
+pub struct MemberKeyView {
+    pub pubkey: Vec<u8>,
+    pub kind: KeyKind,
+    pub label: Option<String>,
+    pub added_at: u64,
+}
+
+/// one account record as queries expose it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AccountView {
+    /// the account's stable id -- the founding member key's bytes. it need not
+    /// still be a current member (the founder can be removed while others
+    /// remain); it is an identifier, not a live authority.
+    pub account_id: Vec<u8>,
     pub display_name: Option<String>,
-    /// replay guard: every accepted user-signed op must sign the CURRENT
-    /// nonce, and acceptance bumps it.
+    /// replay guard: every accepted member-signed op signs the CURRENT nonce,
+    /// and acceptance bumps it. shared by the whole account.
     pub nonce: u64,
+    /// the collected keys, ascending by public key. always non-empty for a
+    /// live account.
+    pub member_keys: Vec<MemberKeyView>,
     pub nodes: Vec<Vec<u8>>,
     pub updated_at: u64,
+}
+
+/// an authorization by one member key: which key, its scheme, and its proof
+/// over the operation's preimage. the account it speaks for is resolved from
+/// this key's membership -- never carried as a spoofable payload field.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MemberAuth {
+    pub key: Vec<u8>,
+    pub kind: KeyKind,
+    pub proof: MemberProof,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityMsg {
     /// bind the SUBMITTING NODE (the verified origin -- never a payload field)
-    /// to `user_key`. `user_sig` is the user key's signature over
-    /// [`bind_preimage`] with the user's current nonce (0 when the user record
-    /// does not exist yet). both consents ride one op: the node consents by
-    /// being the origin, the user by the signature.
-    BindNode { user_key: Vec<u8>, user_sig: Vec<u8> },
-    /// remove `node_key` from its user's set. user-signed over
-    /// [`unbind_preimage`]; accepted from ANY external origin so a surviving
-    /// device can evict a lost one. bumps the nonce, killing stale bind certs.
-    UnbindNode { node_key: Vec<u8>, user_sig: Vec<u8> },
-    /// set the display name of the user the SUBMITTING NODE is bound to.
+    /// to the account that `authorizer` is a member of, consented to by that
+    /// member's signature over [`bind_preimage`] at the account's current
+    /// nonce. if `authorizer.key` belongs to no account yet, this CREATES a
+    /// new account founded by that key (account_id = the key, nonce 0) -- the
+    /// path the desktop's auto-bind takes on first connect.
+    BindNode { authorizer: MemberAuth },
+    /// remove `node_key` from its account. authorized by ANY member of that
+    /// account over [`unbind_preimage`], so a surviving device can evict a
+    /// lost one. bumps the nonce, killing stale certs.
+    UnbindNode {
+        node_key: Vec<u8>,
+        authorizer: MemberAuth,
+    },
+    /// add `new_key` (of `new_kind`, optional `new_label`) to the account
+    /// `authorizer` belongs to. TWO consents over [`add_member_preimage`]: the
+    /// existing member `authorizer` admits it, and `possession` proves the new
+    /// key holds itself. bumps the nonce.
+    AddMemberKey {
+        new_key: Vec<u8>,
+        new_kind: KeyKind,
+        new_label: Option<String>,
+        possession: MemberProof,
+        authorizer: MemberAuth,
+    },
+    /// remove `target_key` from the account `authorizer` belongs to, over
+    /// [`remove_member_preimage`]. any member may remove any member (including
+    /// itself) -- the "surviving device evicts a lost one" recovery path at
+    /// key granularity -- EXCEPT the last remaining member (an account keeps
+    /// at least one live key). bumps the nonce.
+    RemoveMemberKey {
+        target_key: Vec<u8>,
+        authorizer: MemberAuth,
+    },
+    /// set the display name of the account the SUBMITTING NODE is bound to.
     /// origin-gated (a bound node is user-trusted hardware); empty trim
-    /// clears, over [`MAX_NAME_LEN`] bytes rejects.
-    SetUserName { display_name: String },
+    /// clears, over [`MAX_NAME_LEN`] bytes rejects. no signature, no nonce bump.
+    SetAccountName { display_name: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityQuery {
-    /// every user, ascending by user key, offset+limit paginated.
+    /// every account, ascending by account id, offset+limit paginated.
     All { from: u64, limit: u64 },
-    /// one user by user key.
-    Get { user_key: Vec<u8> },
-    /// the user owning `node_key`, if bound -- the resolver other modules and
-    /// the app read through.
-    UserOf { node_key: Vec<u8> },
+    /// one account by its id (its founding key).
+    Get { account_id: Vec<u8> },
+    /// the account owning `node_key`, if bound -- the resolver other modules
+    /// and the app read through.
+    OfNode { node_key: Vec<u8> },
+    /// the account a `member_key` belongs to, if any -- how a device finds its
+    /// own account from whatever member key it holds locally.
+    OfMember { member_key: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityReply {
-    Users(Vec<UserView>),
-    User(Option<UserView>),
+    Accounts(Vec<AccountView>),
+    Account(Option<AccountView>),
 }
 
-/// the signed preimage of a bind certificate: length-prefixed chain id +
-/// node key + nonce, so no field boundary ambiguity exists and a cert minted
-/// for one network can never bind a node on another.
+// ---- signing preimages --------------------------------------------------
+//
+// each is length-prefixed so no field boundary is ambiguous, and each folds
+// in the chain id so a certificate minted for one network can never act on
+// another. the account nonce (folded in) makes each single-use.
+
+/// the signed preimage of a node-bind certificate: chain id + node key + nonce.
 pub fn bind_preimage(chain_id: &str, node_key: &[u8], nonce: u64) -> Vec<u8> {
-    preimage(chain_id, node_key, nonce)
-}
-
-/// the signed preimage of an unbind certificate (same shape, different
-/// namespace at signing time).
-pub fn unbind_preimage(chain_id: &str, node_key: &[u8], nonce: u64) -> Vec<u8> {
-    preimage(chain_id, node_key, nonce)
-}
-
-fn preimage(chain_id: &str, node_key: &[u8], nonce: u64) -> Vec<u8> {
-    let chain = chain_id.as_bytes();
-    let mut out = Vec::with_capacity(16 + chain.len() + node_key.len() + 8);
-    out.extend_from_slice(&(chain.len() as u64).to_le_bytes());
-    out.extend_from_slice(chain);
-    out.extend_from_slice(&(node_key.len() as u64).to_le_bytes());
-    out.extend_from_slice(node_key);
+    let mut out = Vec::new();
+    push_len(&mut out, chain_id.as_bytes());
+    push_len(&mut out, node_key);
     out.extend_from_slice(&nonce.to_le_bytes());
     out
+}
+
+/// the signed preimage of a node-unbind certificate (same shape as bind, but
+/// signed under [`IDENTITY_UNBIND_NS`]).
+pub fn unbind_preimage(chain_id: &str, node_key: &[u8], nonce: u64) -> Vec<u8> {
+    bind_preimage(chain_id, node_key, nonce)
+}
+
+/// the signed preimage of an add-member-key certificate, over (in order) the
+/// chain id, account id, new key, its one-byte kind tag, and the nonce. the
+/// kind tag binds the consent to the exact scheme being admitted, so it can't
+/// be swapped after the fact.
+pub fn add_member_preimage(
+    chain_id: &str,
+    account_id: &[u8],
+    new_key: &[u8],
+    new_kind: KeyKind,
+    nonce: u64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_len(&mut out, chain_id.as_bytes());
+    push_len(&mut out, account_id);
+    push_len(&mut out, new_key);
+    out.push(new_kind.tag());
+    out.extend_from_slice(&nonce.to_le_bytes());
+    out
+}
+
+/// the signed preimage of a remove-member-key certificate: chain id + account
+/// id + target key + nonce.
+pub fn remove_member_preimage(
+    chain_id: &str,
+    account_id: &[u8],
+    target_key: &[u8],
+    nonce: u64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_len(&mut out, chain_id.as_bytes());
+    push_len(&mut out, account_id);
+    push_len(&mut out, target_key);
+    out.extend_from_slice(&nonce.to_le_bytes());
+    out
+}
+
+fn push_len(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// the exact bytes a NATIVE key (`Ed25519`/`P256`) signs to prove possession
+/// when joining an account: commonware's namespaced signing preimage
+/// `union_unique(IDENTITY_ADD_MEMBER_NS, add_member_preimage(...))`, which is
+/// what `commonware_cryptography`'s `verify` reconstructs internally.
+///
+/// exposed for the ENROLLMENT side: the node hands a joining device these exact
+/// bytes to ECDSA/EdDSA-sign, so the phone page never reconstructs the preimage
+/// or the namespace framing -- one source of truth with the on-chain verifier.
+/// (a WebAuthn passkey does NOT use this; its challenge is the hashed form --
+/// see [`crate::webauthn_challenge`].)
+pub fn add_member_signing_payload(
+    chain_id: &str,
+    account_id: &[u8],
+    new_key: &[u8],
+    new_kind: KeyKind,
+    nonce: u64,
+) -> Vec<u8> {
+    commonware_utils::union_unique(
+        IDENTITY_ADD_MEMBER_NS,
+        &add_member_preimage(chain_id, account_id, new_key, new_kind, nonce),
+    )
 }
 
 pub fn encode_msg(m: &IdentityMsg) -> Vec<u8> {
@@ -119,28 +248,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preimage_is_length_prefixed_and_deterministic() {
-        let a = bind_preimage("net-a", &[1u8; 32], 0);
-        let b = bind_preimage("net-a", &[1u8; 32], 0);
+    fn preimages_are_length_prefixed_and_deterministic() {
+        let a = add_member_preimage("net-a", &[1u8; 32], &[2u8; 33], KeyKind::WebauthnP256, 0);
+        let b = add_member_preimage("net-a", &[1u8; 32], &[2u8; 33], KeyKind::WebauthnP256, 0);
         assert_eq!(a, b);
-        // chain id and node key cannot bleed into each other
-        assert_ne!(bind_preimage("ab", &[1, 2, 3], 0), bind_preimage("a", &[98, 1, 2, 3], 0));
-        // nonce moves the preimage
-        assert_ne!(bind_preimage("n", &[1u8; 32], 0), bind_preimage("n", &[1u8; 32], 1));
+        // account id and new key cannot bleed into each other.
+        assert_ne!(
+            add_member_preimage("n", &[1, 2, 3], &[4], KeyKind::Ed25519, 0),
+            add_member_preimage("n", &[1], &[2, 3, 4], KeyKind::Ed25519, 0),
+        );
+        // the kind tag moves the preimage: same key admitted as a different
+        // scheme is a different consent.
+        assert_ne!(
+            add_member_preimage("n", &[1u8; 32], &[2u8; 33], KeyKind::P256, 0),
+            add_member_preimage("n", &[1u8; 32], &[2u8; 33], KeyKind::WebauthnP256, 0),
+        );
+        // nonce moves the preimage.
+        assert_ne!(
+            remove_member_preimage("n", &[1u8; 32], &[2u8; 32], 0),
+            remove_member_preimage("n", &[1u8; 32], &[2u8; 32], 1),
+        );
     }
 
     #[test]
     fn msg_codec_roundtrips() {
+        let auth = MemberAuth {
+            key: vec![7; 32],
+            kind: KeyKind::Ed25519,
+            proof: MemberProof::Signature { sig: vec![9; 64] },
+        };
         for m in [
-            IdentityMsg::BindNode { user_key: vec![7; 32], user_sig: vec![9; 64] },
-            IdentityMsg::UnbindNode { node_key: vec![1; 32], user_sig: vec![2; 64] },
-            IdentityMsg::SetUserName { display_name: "eddy".into() },
+            IdentityMsg::BindNode {
+                authorizer: auth.clone(),
+            },
+            IdentityMsg::UnbindNode {
+                node_key: vec![1; 32],
+                authorizer: auth.clone(),
+            },
+            IdentityMsg::AddMemberKey {
+                new_key: vec![2; 33],
+                new_kind: KeyKind::WebauthnP256,
+                new_label: Some("phone".into()),
+                possession: MemberProof::Webauthn {
+                    authenticator_data: vec![0; 37],
+                    client_data_json: b"{}".to_vec(),
+                    signature: vec![3; 64],
+                },
+                authorizer: auth.clone(),
+            },
+            IdentityMsg::RemoveMemberKey {
+                target_key: vec![4; 32],
+                authorizer: auth.clone(),
+            },
+            IdentityMsg::SetAccountName {
+                display_name: "eddy".into(),
+            },
         ] {
             assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);
         }
-        let q = IdentityQuery::UserOf { node_key: vec![3; 32] };
+        let q = IdentityQuery::OfMember {
+            member_key: vec![3; 32],
+        };
         assert_eq!(decode_query(&encode_query(&q)).unwrap(), q);
-        let r = IdentityReply::User(None);
+        let r = IdentityReply::Account(None);
         assert_eq!(decode_reply(&encode_reply(&r)).unwrap(), r);
     }
 }

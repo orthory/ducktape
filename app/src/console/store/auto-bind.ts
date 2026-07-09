@@ -10,7 +10,11 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-import { getUser, submitRawMsg, userOf } from "../../domain/identity-client";
+import {
+  accountOfMember,
+  accountOfNode,
+  submitRawMsg,
+} from "../../domain/identity-client";
 import { isTauri } from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
 import { identityState } from "../../domain/user-identity-client";
@@ -42,14 +46,20 @@ export const autoBindUserIdentity = (
         return "locked" as const;
       }
 
-      return userOf(transport, workspace.pubkey).then((bound) => {
+      return accountOfNode(transport, workspace.pubkey).then((bound) => {
         if (bound) return "already" as const;
         // Belt-and-suspenders: "unlocked"/"plaintext" always carry a pubkey
         // in the clear (v2 files included), so this should never trip in
         // practice. No pubkey means nothing to sign a bind with, either way.
         if (!userKey) return "failed" as const;
-        return getUser(transport, userKey)
-          .then((user) => user?.nonce ?? 0)
+        // The nonce is the ACCOUNT's, resolved via the key's membership —
+        // not `getAccount(userKey)`, which only matches when this key is the
+        // FOUNDER. Once this machine's key was added to an existing account as
+        // a non-founding member, its account is keyed by a different id, so the
+        // bind must sign over that account's current nonce. A brand-new key
+        // (no account yet) resolves null → nonce 0, and the bind founds it.
+        return accountOfMember(transport, userKey)
+          .then((account) => account?.nonce ?? 0)
           .then((nonce) =>
             invoke<string>("user_sign_bind", {
               chainId: workspace.chainId,

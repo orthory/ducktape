@@ -54,7 +54,7 @@ const rowProps = {
   message,
   names: {},
   groupStart: true,
-  selfKey: selfAuthorKeyOf("operator"),
+  selfKey: selfAuthorKeyOf(Array.from(new TextEncoder().encode("operator"))),
   hovered: true,
   menuOpen: false,
   replyHint: null,

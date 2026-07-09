@@ -89,6 +89,15 @@ const makeFakeNode = () => {
     general: [GENERAL_MESSAGE],
   };
   let forgeHead: string | null = null;
+  const nodeStatus = {
+    version: "0.1.0",
+    appHash: "aa".repeat(32),
+    height: 1,
+    modules: [
+      { id: "chat", root: "cc".repeat(32) },
+      { id: "agent", root: "ee".repeat(32) },
+    ],
+  };
   const transport: NodeTransport = makeTransportStub({
     submit: vi.fn((target: string, payload: unknown) => {
       const create = (payload as { create_channel?: { channel_id: string; name: string } })
@@ -151,12 +160,18 @@ const makeFakeNode = () => {
     filesLs: vi.fn(),
     filesRead: vi.fn(),
     filesHistory: vi.fn(),
-    status: vi.fn().mockResolvedValue({
-      version: "0.1.0",
-      appHash: "aa".repeat(32),
-      height: 1,
-      modules: [{ id: "chat", root: "cc".repeat(32) }],
-    }),
+    // dynamic: emitOps advances the height and rolls the emitted module's
+    // root, so refreshScoped's root diff sees exactly what "the block"
+    // touched. deep-copied per call — the provider stores the previous
+    // status and diffs against the next one; aliasing would blank the diff.
+    status: vi.fn(() =>
+      Promise.resolve({
+        version: nodeStatus.version,
+        appHash: nodeStatus.appHash,
+        height: nodeStatus.height,
+        modules: nodeStatus.modules.map((m) => ({ ...m })),
+      }),
+    ),
     metrics: vi.fn().mockResolvedValue(""),
     blocks: vi.fn().mockResolvedValue([]),
     subscribe: vi.fn((topics: string[], handlers: TopicHandlers) => {
@@ -201,6 +216,14 @@ const makeFakeNode = () => {
       };
       topicHandlers.get(topic)?.forEach((handlers) => handlers.onEvent?.(frame));
     });
+    // "the block" this batch represents: advance the tip and roll the folded
+    // module's root so the next scoped hydrate diffs exactly this module.
+    const tip = Math.max(...rows.map((row) => row.height));
+    if (tip > nodeStatus.height) nodeStatus.height = tip;
+    const folded = nodeStatus.modules.find((m) => m.id === module);
+    if (folded) {
+      folded.root = tip.toString(16).padStart(2, "0").repeat(32).slice(0, 64);
+    }
   };
   const emitHeartbeat = (height: number, appHash = "dd".repeat(32)) => {
     const frame: HeartbeatFrame = {
@@ -314,29 +337,36 @@ describe("DucktapeProvider", () => {
     expect(msg.post_message.message_id).toBeTruthy();
   });
 
-  it("a chat event refetches the chat slice and not status", async () => {
+  it("a chat event triggers a scoped hydrate: chat refetches, agents don't", async () => {
     const { transport, emitOps } = makeFakeNode();
     renderConsole(transport);
     await waitFor(() =>
       expect(screen.getByTestId("channel").textContent).toBe("general"),
     );
 
-    const statusCalls = vi.mocked(transport.status).mock.calls.length;
     const chatCalls = vi
       .mocked(transport.query)
       .mock.calls.filter((call) => call[0] === "chat").length;
+    const agentCalls = vi
+      .mocked(transport.query)
+      .mock.calls.filter((call) => call[0] === "agent").length;
     await act(async () => {
       emitOps("chat", [{ height: 5 }]);
       await new Promise((resolve) => setTimeout(resolve, 150));
     });
 
+    // the event drives refreshScoped: one status read roots the diff, the
+    // chat slice group re-queries, and untouched groups (agents) stay quiet.
     await waitFor(() =>
       expect(
         vi.mocked(transport.query).mock.calls.filter((call) => call[0] === "chat")
           .length,
       ).toBeGreaterThan(chatCalls),
     );
-    expect(vi.mocked(transport.status).mock.calls.length).toBe(statusCalls);
+    expect(
+      vi.mocked(transport.query).mock.calls.filter((call) => call[0] === "agent")
+        .length,
+    ).toBe(agentCalls);
     expect(capturedState!.lastBlock).toBe(5);
   });
 
@@ -665,6 +695,13 @@ describe("pages snapshot refresh vs in-flight ops", () => {
     // a FRESH ring array per pull (the shared mock reuses one instance), so a
     // state.blocks identity change marks "a refresh snapshot fully applied".
     vi.mocked(transport.blocks).mockImplementation(() => Promise.resolve([]));
+    // an honest node's status height is never below a receipt it issued —
+    // the read-your-writes floor refuses lagging snapshots, so the mock must
+    // track the heights its own receipts hand out.
+    const baseStatus = vi.mocked(transport.status).getMockImplementation()!;
+    vi.mocked(transport.status).mockImplementation(() =>
+      baseStatus().then((s) => ({ ...s, height: committedHeight })),
+    );
 
     renderConsole(transport);
     await waitFor(() =>

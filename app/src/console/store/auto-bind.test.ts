@@ -2,7 +2,8 @@
 // key to bind the workspace's node — see auto-bind.ts for the step-by-step.
 // Every failure mode (no tauri shell, no user key yet, a nonce race on
 // submit) must resolve a status, never throw — the caller fires this without
-// awaiting.
+// awaiting. The nonce comes from the ACCOUNT the local key belongs to
+// (of_member), not a lookup by account id.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -10,7 +11,7 @@ const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import { autoBindUserIdentity } from "./auto-bind";
-import type { UserView } from "../../domain/identity-client";
+import type { AccountView } from "../../domain/identity-client";
 import type { NodeTransport } from "../../domain/transport";
 import { makeTransportStub } from "../../test/transport-stub";
 
@@ -23,17 +24,22 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-const wireUser = (patch: Partial<UserView> = {}): UserView => ({
-  user_key: [1, 2, 3],
+const wireAccount = (patch: Partial<AccountView> = {}): AccountView => ({
+  account_id: [1, 2, 3],
   display_name: null,
   nonce: 0,
+  member_keys: [{ pubkey: [1, 2, 3], kind: "ed25519", label: null, added_at: 1 }],
   nodes: [[9, 9, 9]],
   updated_at: 1,
   ...patch,
 });
 
 const boundMsg = (sig: number[]) =>
-  JSON.stringify({ bind_node: { user_key: [1, 2, 3], user_sig: sig } });
+  JSON.stringify({
+    bind_node: {
+      authorizer: { key: [1, 2, 3], kind: "ed25519", proof: { signature: { sig } } },
+    },
+  });
 
 const stubTransport = (
   queryImpl: (target: string, query: unknown) => unknown,
@@ -49,7 +55,7 @@ const workspace = { chainId: "team#abcd", pubkey: "ab12" };
 
 describe("autoBindUserIdentity", () => {
   it("skips on the web build (no tauri shell) without touching the node", async () => {
-    const transport = stubTransport(() => ({ user: null }));
+    const transport = stubTransport(() => ({ account: null }));
 
     await expect(autoBindUserIdentity(transport, workspace)).resolves.toBe(
       "skipped",
@@ -65,14 +71,14 @@ describe("autoBindUserIdentity", () => {
         return Promise.resolve({ state: "plaintext", mnemonicConfirmed: true });
       throw new Error(`unexpected invoke ${cmd}`);
     });
-    const transport = stubTransport(() => ({ user: wireUser() }));
+    const transport = stubTransport(() => ({ account: wireAccount() }));
 
     await expect(autoBindUserIdentity(transport, workspace)).resolves.toBe(
       "already",
     );
     expect(transport.query).toHaveBeenCalledTimes(1);
     expect(transport.query).toHaveBeenCalledWith("identity", {
-      user_of: { node_key: [171, 18] }, // hexToBytes("ab12")
+      of_node: { node_key: [171, 18] }, // hexToBytes("ab12")
     });
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(invokeMock).toHaveBeenCalledWith("user_identity_state");
@@ -102,7 +108,7 @@ describe("autoBindUserIdentity", () => {
     expect(transport.submit).not.toHaveBeenCalled();
   });
 
-  it("walks a fresh bind with nonce 0 when no user is bound anywhere yet", async () => {
+  it("walks a fresh bind with nonce 0 when no account is bound anywhere yet", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_state")
@@ -116,8 +122,8 @@ describe("autoBindUserIdentity", () => {
     });
     const transport = stubTransport((_target, q) => {
       const query = q as Record<string, unknown>;
-      if ("user_of" in query) return { user: null };
-      if ("get" in query) return { user: null };
+      if ("of_node" in query) return { account: null };
+      if ("of_member" in query) return { account: null };
       throw new Error(`unexpected query ${JSON.stringify(q)}`);
     });
 
@@ -129,7 +135,7 @@ describe("autoBindUserIdentity", () => {
     // straight off identityState()'s own reply.
     expect(invokeMock).not.toHaveBeenCalledWith("user_identity_status");
     expect(transport.query).toHaveBeenCalledWith("identity", {
-      get: { user_key: [205, 52] }, // hexToBytes("cd34")
+      of_member: { member_key: [205, 52] }, // hexToBytes("cd34")
     });
     expect(invokeMock).toHaveBeenCalledWith("user_sign_bind", {
       chainId: "team#abcd",
@@ -137,11 +143,13 @@ describe("autoBindUserIdentity", () => {
       nonce: 0,
     });
     expect(transport.submit).toHaveBeenCalledWith("identity", {
-      bind_node: { user_key: [1, 2, 3], user_sig: [9, 9, 9] },
+      bind_node: {
+        authorizer: { key: [1, 2, 3], kind: "ed25519", proof: { signature: { sig: [9, 9, 9] } } },
+      },
     });
   });
 
-  it("signs with the existing user's nonce (3), not 0", async () => {
+  it("signs with the existing account's nonce (3), not 0", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_state")
@@ -155,8 +163,8 @@ describe("autoBindUserIdentity", () => {
     });
     const transport = stubTransport((_target, q) => {
       const query = q as Record<string, unknown>;
-      if ("user_of" in query) return { user: null };
-      if ("get" in query) return { user: wireUser({ nonce: 3 }) };
+      if ("of_node" in query) return { account: null };
+      if ("of_member" in query) return { account: wireAccount({ nonce: 3 }) };
       throw new Error(`unexpected query ${JSON.stringify(q)}`);
     });
 
@@ -183,7 +191,7 @@ describe("autoBindUserIdentity", () => {
       if (cmd === "user_sign_bind") return Promise.resolve(boundMsg([9, 9, 9]));
       throw new Error(`unexpected invoke ${cmd}`);
     });
-    const transport = stubTransport(() => ({ user: null }));
+    const transport = stubTransport(() => ({ account: null }));
     (transport.submit as ReturnType<typeof vi.fn>).mockRejectedValue(
       new Error("nonce conflict — another device already bound this node"),
     );
@@ -206,7 +214,7 @@ describe("autoBindUserIdentity", () => {
     });
     const transport = stubTransport((_target, q) => {
       const query = q as Record<string, unknown>;
-      if ("user_of" in query) return { user: null };
+      if ("of_node" in query) return { account: null };
       throw new Error(`unexpected query ${JSON.stringify(q)}`);
     });
 
@@ -220,7 +228,7 @@ describe("autoBindUserIdentity", () => {
   it("resolves 'failed' when identityState() rejects (e.g. the shell can't read the user key)", async () => {
     markTauri();
     invokeMock.mockRejectedValue(new Error("no machine user key"));
-    const transport = stubTransport(() => ({ user: null }));
+    const transport = stubTransport(() => ({ account: null }));
 
     await expect(autoBindUserIdentity(transport, workspace)).resolves.toBe(
       "failed",
