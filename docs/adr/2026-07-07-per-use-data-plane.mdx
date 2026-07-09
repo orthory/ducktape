@@ -75,7 +75,9 @@ re-merging planes.
 
 ## Consequences
 
-- Voice's existing arm is already conformant; no migration.
+- Voice now rides two per-use overlay planes, one per service — see the
+  2026-07-09 update below. (At the time of this ADR it rode a
+  mesh-encapsulation arm; that update retires the mesh arm for media.)
 - Statesync's `bin/node` wiring instantiates the second per-use plane and is
   the pattern-setter for future consumers.
 - Per-service observability falls out naturally: each plane's counters are
@@ -85,3 +87,40 @@ re-merging planes.
 - The one regression risk versus a shared instance — uncoordinated bulk
   senders saturating the uplink — is acknowledged and parked until a second
   bulk consumer exists (see the pacing-coordinator shape above).
+
+## Update (2026-07-09): real-time media moved to the overlay arm
+
+When this ADR was accepted, voice rode a datagram `ChannelTransport` that
+encapsulated media in the authenticated TCP mesh (an interim arm the video-call
+ADR called out as pending the real overlay socket). That arm quietly violated
+this ADR's own isolation guarantee: the mesh routes every channel to a peer
+through ONE per-peer priority relay (`commonware-p2p`'s `Relay` — a shared
+high/low send queue), and voice, call-control, and camera video were all sent
+at equal (low) priority, so they shared one queue. Under load a multi-megabit
+video burst saturated that queue and the 32 kbps voice stream was dropped
+behind it: audio cut out for the length of the congestion while video (which
+self-heals via keyframes and adapts its bitrate) sailed through. The plane's "a
+misbehaving consumer can only exhaust its own plane's queues and ports" promise
+did not hold, because the shared mesh relay sits BELOW the plane.
+
+**Decision:** real-time media (`Service::Voice`, `Service::Video`) rides the
+`OverlaySockets` arm — one per-use plane per service, each on its own overlay
+datagram port (45902 / 45903), exactly as statesync does. Voice and video no
+longer share a socket or a send queue, so neither can starve the other. The
+mesh-encapsulation arm is retired for media; `CHANNEL_VOICE` / `CHANNEL_VIDEO`
+stay registered and black-holed for wire-compatibility with peers on the old
+build, but this node emits no media on them.
+
+**Overlay-only, no fallback:** unlike statesync (which keeps the mesh as a
+request/response fallback), media has NO mesh fallback — with no overlay there
+is simply no media transport. The voice hub is spawned only where the overlay
+is reachable (`wireguard_effect != fake` and the reachability plane
+configured); elsewhere huddle joins refuse fast rather than silently degrade
+onto the mesh. This keeps the crossfire path out of the tree entirely, which is
+the durable guarantee: a future change cannot accidentally route media back
+onto the mesh, because that path no longer exists.
+
+Wiring: `bin/node/src/voice_plane.rs` (the media `AddressBook` + per-service
+plane bring-up) and `bin/node/src/voice.rs` (the hub over the two planes). The
+isolation invariant is guarded by the test
+`voice::tests::per_service_isolation_keeps_a_video_flood_from_starving_audio`.

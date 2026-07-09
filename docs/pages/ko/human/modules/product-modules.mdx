@@ -1,4 +1,12 @@
+---
+showAskAi: false
+---
+
 # Product Modules
+
+import { ModuleMap } from '../../../../components/diagram/ModuleMap.client'
+
+<ModuleMap />
 
 product module은 platform이 호스팅하는 업무용 surface다. 같은 module contract를
 공유하지만, 각 module은 자기 작업에 맞는 storage substrate와 interface를 고른다.
@@ -143,7 +151,7 @@ duckfs는 snapshot으로 한다. agent workspace는 `/home`과 `/shared` 아래�
 `/ab`에는 절대 match하지 않는다)가 어느 module에든 trigger한 commit과
 atomic하게 배달되는 change notification을 준다.
 
-client 절반은 OS-side checkout/commit engine(`crates/system/duckfs-client`)과
+client 절반은 OS-side checkout/commit engine(`crates/duckfs/client`)과
 `ducktape-fs` CLI다. checkout은 duckfs subtree를 실제 working directory로
 materialize하고 그 옆에 `.duckfs/index.json`을 둔다 — git의 index discipline:
 working copy가 내려온 base snapshot, 대화하는 node, 그리고 per-path

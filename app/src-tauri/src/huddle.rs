@@ -1,11 +1,15 @@
 //! The pop-out huddle window — a small companion window rendering the frontend
 //! at `?view=huddle`. It is a pure event mirror of the main window's voice
 //! session (protocol in app/src/console/store/huddle-window.ts); this module
-//! only owns the window lifecycle. Whatever way the window dies — native close
-//! button, the pop-in control, or `huddle_pop_in` — the Destroyed hook tells
-//! the main window so its in-app card comes back.
+//! owns the window lifecycle plus the native media-permission wiring every
+//! huddle-capable webview needs (`allow_user_media`). Whatever way the window
+//! dies — native close button, the pop-in control, or `huddle_pop_in` — the
+//! Destroyed hook tells the main window so its in-app card comes back.
 
-use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{
+    AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    WindowEvent,
+};
 
 const LABEL: &str = "huddle";
 const CLOSED_EVENT: &str = "ducktape://huddle-closed";
@@ -15,6 +19,38 @@ const WIDTH: f64 = 380.0;
 const HEIGHT: f64 = 300.0;
 const MIN_WIDTH: f64 = 300.0;
 const MIN_HEIGHT: f64 = 220.0;
+
+/// Grant the webview's mic/camera permission requests (Linux; no-op elsewhere).
+///
+/// WebKitGTK has no OS permission prompt: `getUserMedia` raises a
+/// `permission-request` signal for the EMBEDDER to decide, and an unhandled
+/// request is denied — so without this hook every huddle fails `NotAllowedError`
+/// ("mic-denied") no matter what the user does. User-media requests only ever
+/// originate from our own bundled console, where joining a huddle / enabling the
+/// camera is itself the consent, so they are allowed; every other request kind
+/// (geolocation, notifications, …) is left to WebKit's default deny. macOS and
+/// Windows are untouched: WKWebView and WebView2 already run a real OS prompt.
+pub fn allow_user_media<R: Runtime>(window: &WebviewWindow<R>) -> tauri::Result<()> {
+    #[cfg(target_os = "linux")]
+    return window.with_webview(|webview| {
+        use webkit2gtk::glib::Cast;
+        use webkit2gtk::{PermissionRequestExt, UserMediaPermissionRequest, WebViewExt};
+        webview.inner().connect_permission_request(|_, request| {
+            match request.downcast_ref::<UserMediaPermissionRequest>() {
+                Some(media) => {
+                    media.allow();
+                    true
+                }
+                None => false,
+            }
+        });
+    });
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window;
+        Ok(())
+    }
+}
 
 /// Create (or re-show) the huddle window.
 #[tauri::command]
@@ -42,6 +78,7 @@ pub fn huddle_pop_out<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     .skip_taskbar(true)
     .build()
     .map_err(|e| e.to_string())?;
+    allow_user_media(&win).map_err(|e| e.to_string())?;
 
     let handle = app.clone();
     win.on_window_event(move |event| {

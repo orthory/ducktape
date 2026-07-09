@@ -10,6 +10,7 @@
 // registry of its own.
 
 import type { HuddleParticipant } from "../../store/huddle-roster";
+import { isMacDesktop } from "../../../domain/node-bootstrap";
 import type { VoiceError } from "../../../domain/voice-session";
 import { color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "./HoverButton";
@@ -35,10 +36,17 @@ const STATUS_DOT: Record<HuddleStatus, { color: string; pulse: boolean }> = {
 };
 
 // What the card says per failure. macOS records a mic denial permanently (it
-// never re-prompts), so `mic-denied` must route through System Settings — for
-// dev runs the OS attributes the prompt to the launching terminal, not the app.
+// never re-prompts), so `mic-denied` must route through System Settings there —
+// for dev runs the OS attributes the prompt to the launching terminal, not the
+// app. No such Settings pane exists elsewhere (Linux is granted in-app by the
+// shell's WebKitGTK hook, Windows by the WebView2 prompt), so non-mac copy
+// points at the platform's own mic permissions without naming a macOS pane.
+const MIC_DENIED_COPY = isMacDesktop()
+  ? "Mic access is blocked — allow it in System Settings, then retry."
+  : "Mic access is blocked — check the system's microphone permissions, then retry.";
+
 const ERROR_COPY: Record<VoiceError, string> = {
-  "mic-denied": "Mic access is blocked — allow it in System Settings, then retry.",
+  "mic-denied": MIC_DENIED_COPY,
   "mic-missing": "No usable microphone found.",
   "mic-failed": "Mic setup failed.",
   connection: "Voice connection failed.",

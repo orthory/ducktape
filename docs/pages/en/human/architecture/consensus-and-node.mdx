@@ -1,8 +1,22 @@
+---
+showAskAi: false
+---
+
 # Consensus and Node
+
+import { ConsensusFlow } from '../../../../components/diagram/ConsensusFlow.client'
+
+<ConsensusFlow />
 
 Consensus supplies the single agreed order that makes order-dependent module
 roots safe. The node layer stamps finalized ops with agreed view-derived
 environment data and hands them to the host.
+
+Related: [Network and Membership](/en/human/network/network-and-membership)
+covers valset cutovers, [Node Upgrades](/en/human/network/node-upgrades) covers
+height-gated activation, [State Sync](/en/human/architecture/state-sync) covers
+joining across finalized state, and [agent Validator Operations](/en/agent/network/validator-operations)
+is the edit-oriented twin.
 
 ## Ordered Delivery
 

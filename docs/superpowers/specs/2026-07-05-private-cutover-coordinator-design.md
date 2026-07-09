@@ -20,7 +20,7 @@ Companions:
 - `docs/superpowers/specs/2026-07-04-pluggable-network-entry-design.md` — the
   reachability-plane design of record. This document is the detailed P2+P3
   slice of it.
-- `docs/wireguard-tunnel-upgrade.md` — the validator-owned WireGuard
+- `docs/records/protocols/wireguard-tunnel-upgrade.md` — the validator-owned WireGuard
   **data-plane** protocol. This document does **not** edit it; in particular
   its validator-only `relay_candidates` mechanism is untouched (and is the
   only relay concept left in the system).
@@ -235,7 +235,7 @@ All three of the following must hold before the epic merges to `dev`:
    success; hole-punch failure → terminal `NotReachable` (no fallback); v3
    invite signature verify and reject; v2 parse-compatibility; endpoint-churn
    re-advertisement. Mirrors the "Minimum Tests Before Mergeable" pattern in
-   `wireguard-tunnel-upgrade.md`.
+   `docs/records/protocols/wireguard-tunnel-upgrade.md`.
 2. **Cross-machine zero-exposure demo.** Two validators on separate machines
    behind real (punchable) NAT, neither exposing an inbound port, with a
    coordinator on a third box: they hole-punch a WireGuard tunnel; real

@@ -1,7 +1,18 @@
+---
+showAskAi: false
+---
+
 # Open Work
 
 This page tracks implementation gaps that agents should not accidentally present
 as finished.
+
+Related: [human What Is Left](/en/human/roadmap/what-is-left) is the reader
+version, [Product Modules](/en/human/modules/product-modules) explains built
+module behavior, [Coordination](/en/human/network/coordination) covers
+rendezvous, [Node Upgrades](/en/agent/network/node-upgrades) covers live
+upgrade work, and [Implementation Status](/en/human/reference/implementation-status)
+is the built/tested checklist.
 
 ## WireGuard Tunnel Runtime
 
@@ -57,12 +68,12 @@ and durable agent workflows that feel native rather than a debug surface.
 duckfs Phases 1–2 are shipped: the rebuilt `files` module (staging, atomic
 per-path-CAS commits, snapshots, pins, watches, snapshot-addressed reads),
 resolver-backed state sync to full possession, restart durability, and the
-noded HTTP surface. Do not list those as missing. Nothing mounts it yet: the
-checkout/commit engine (`duckfs-client`, the `.duckfs/` index), the CLI, the
-FUSE mount, and the app FilesView rebuilt on duckfs verbs are Phases 3–5 and
-remain open. The `memory` module was deleted — absorbed by duckfs (generations
-became snapshots, `duck://memory/...` became `duck://files/...`). The
-automations memory-watch trigger was removed with it; filesystem-change
+noded HTTP surface are present. The client side is also built: `crates/duckfs/client`
+owns the checkout/status/commit engine, `ducktape-fs` ships read verbs plus
+checkout/status/commit/pin, and `mount` exists behind the `fuse` cargo feature.
+Do not list the engine, CLI, or mount as missing. Remaining work is the app
+FilesView/UX rebuilt on duckfs verbs. The old memory/workspace surface was
+absorbed by duckfs snapshots and `duck://files/...` evidence. Filesystem-change
 automations would return as a new duckfs-watch trigger, a fresh feature, not a
 migration.
 

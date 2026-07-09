@@ -8,7 +8,7 @@ Status: implementation plan of record for **Slice 1** of the
 Design of record:
 `docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`,
 Component 2 ("Typed reach hint + v3 signed invite"). Byte-layout analysis of the
-current v2 format: `docs/invitation-protocol-deep-dive.md` §1–2 (the `config.rs`
+current v2 format: `docs/records/admission/invitation-protocol-deep-dive.md` §1–2 (the `config.rs`
 wire format + the genesis fingerprint).
 
 ## Scope
@@ -1192,7 +1192,7 @@ full gate one last time.
 - Add a short "v3 invite" note to
   `docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`'s
   Component 2 marking Slice 1 landed, OR add a one-paragraph subsection to
-  `docs/invitation-protocol-deep-dive.md` §1 documenting the v3 layout (keep the
+  `docs/records/admission/invitation-protocol-deep-dive.md` §1 documenting the v3 layout (keep the
   analysis doc current). Prefer the deep-dive note since it is the byte-layout
   reference.
 - Out of scope, listed as follow-ups (do **not** do here): the desktop

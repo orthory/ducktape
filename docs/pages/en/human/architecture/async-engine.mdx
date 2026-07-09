@@ -1,7 +1,21 @@
+---
+showAskAi: false
+---
+
 # Async Engine
+
+import { AsyncEngine } from '../../../../components/diagram/AsyncEngine.client'
+
+<AsyncEngine />
 
 Ducktape splits asynchronous work into deterministic continuation state and a
 host-owned non-deterministic worker loop.
+
+Related: [Product Modules](/en/human/modules/product-modules) covers Agents and
+Runs, [Determinism Contract](/en/agent/architecture/determinism-contract)
+explains execution limits, [Implementation Status](/en/human/reference/implementation-status)
+marks what is built, and [Open Work](/en/agent/roadmap/open-work) tracks
+remaining product depth.
 
 ## Saga
 

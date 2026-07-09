@@ -46,7 +46,7 @@ where
     let providers = capability_host::discover_with_dirs(agent_dirs)
         // BYO: run whatever executor CLIs the capability specs describe and
         // this host has installed — no credential handling here (see
-        // docs/capability-spec.md). a broken operator spec is a boot error.
+        // docs/records/specs/capability-spec.md). a broken operator spec is a boot error.
         .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
 
     // one supervised node for the pool; each run spawns as its own child.

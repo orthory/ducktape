@@ -48,6 +48,15 @@ if (existsSync(join(root, 'docs'))) {
   failures.push('nested docs/docs directory must not exist')
 }
 
+// Keep the docs root as the Vocs project entry only. Maintained non-page records
+// belong under docs/records, accepted decisions under docs/adr, and operator
+// runbooks under docs/deploy — never loose at the root.
+for (const entry of readdirSync(root)) {
+  if (entry.endsWith('.md') && entry !== 'README.md') {
+    failures.push(`root-level ${entry} must live under docs/records, docs/adr, or docs/deploy`)
+  }
+}
+
 if (existsSync(join(root, 'pnpm-lock.yaml'))) {
   failures.push('docs must use bun.lock, not pnpm-lock.yaml')
 }
@@ -109,7 +118,7 @@ for (const page of pages) {
   if (/\bpnpm\b/.test(text)) {
     failures.push(`${rel} must use bun commands`)
   }
-  if (!/^#\s+/m.test(text)) {
+  if (!/(^#\s+)|(<h1[\s/>])|(<Hero[\s>])/m.test(text)) {
     failures.push(`${rel} has no h1`)
   }
 }

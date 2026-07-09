@@ -1,6 +1,15 @@
+---
+showAskAi: false
+---
+
 # Implementation Status
 
 This status page is grounded in checked-in code, tests, and binaries.
+
+Related: [Product Modules](/en/human/modules/product-modules) expands module
+behavior, [Repository Map](/en/human/reference/repository-map) locates source
+crates, [State Sync](/en/human/architecture/state-sync) explains rebuild proofs,
+and [What Is Left](/en/human/roadmap/what-is-left) keeps the open-work boundary.
 
 ## Platform Spine
 
@@ -40,8 +49,8 @@ This status page is grounded in checked-in code, tests, and binaries.
 - Forge derives a 32-byte state root from git state and verifies object closure
   before install.
 - Snapshot-style modules use canonical bytes where that fits the module: valset,
-  saga, tasks, directory, governance, vaults, inbox, automations, files, memory,
-  jobs.
+  saga, tasks, directory, governance, vaults, inbox, automations, files/duckfs,
+  jobs, upgrade, profiles, identity, agent, and runs.
 - System governance gates the validator set (member-only proposals, deterministic
   tally, follow-up membership ops); valset rejects external membership writes.
 - Vaults replicate opaque secret ciphertext with owner-gated write integrity.
@@ -49,11 +58,11 @@ This status page is grounded in checked-in code, tests, and binaries.
   run records; automations evaluates user-authored chat posts against operator
   rules with probe-before-emit follow-up actions.
 - The module wave rounds out the workplace surface: inbox delivers notifications
-  as follow-up ops atomic with their cause (P2), files commits content-addressed
-  manifests while chunk bytes stay node-local behind digest-and-length
-  verification, memory is a generation-pinned shared agent workspace with prefix
-  watches and citable `duck://` reads, and jobs is a first-claim-wins work board
-  with view leases and permissionless reclaim.
+  as follow-up ops atomic with their cause (P2), files is duckfs — a
+  consensus-replicated filesystem with content-addressed objects, refs, snapshots,
+  pins, and workspace paths — and jobs is a first-claim-wins work board with view
+  leases and permissionless reclaim. duckfs absorbed the old shared workspace
+  surface: agent workspaces are ordinary files with `duck://files/...` evidence.
 
 ## Verification Surface
 
@@ -87,6 +96,8 @@ This status page is grounded in checked-in code, tests, and binaries.
 - A demoted validator degrading to a sync-server rather than halting.
 - Per-origin replay nonces in state (cross-epoch frame replay currently gated by
   the per-engine finalization dedup).
-- Origin-bound message authorship, the agent reactor-worker seam, and the
-  agent/tasks pipeline.
+- Origin-bound message authorship and richer agent product behavior. The live
+  node already registers `agent`, `runs`, `dispatch`, `saga`, `capability`,
+  `jobs`, and `tasks`; the remaining gap is packaged UX and durable workflows,
+  not the basic execution seam.
 - Unifying the two parallel mesh type systems and wiring the WireGuard overlay.

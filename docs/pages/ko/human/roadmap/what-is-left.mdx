@@ -1,3 +1,7 @@
+---
+showAskAi: false
+---
+
 # What Is Left
 
 core architecture와 live control plane은 자리 잡았다. network state sync, epoch
@@ -24,8 +28,8 @@ product depth다.
   full possession까지 가는 resolver-backed state sync, noded HTTP surface를
   갖췄다. `memory` module은 제거되었다 — duckfs가 흡수했다(generation은
   snapshot이 되고, `duck://memory/...` URI는 `duck://files/...`가 되었다).
-  client stack — checkout/commit engine, CLI, FUSE mount, app FilesView
-  rebuild — 은 Phase 3–5이고 아직 open이다.
+  client stack — checkout/commit engine, CLI, FUSE mount — 도 구현되어 있다.
+  남은 일은 duckfs 위의 app FilesView product integration이다.
 
 ## Durability And Promotion
 

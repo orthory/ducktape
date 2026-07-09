@@ -1,4 +1,12 @@
+---
+showAskAi: false
+---
+
 # Determinism Contract
+
+import { ModuleLifecycle } from '../../../../components/diagram/ModuleLifecycle.client'
+
+<ModuleLifecycle />
 
 Ducktape는 모든 validator가 같은 agreed operation order에서 같은 module root를
 도출할 때만 안전하다. agent edit는 이 contract를 보존해야 한다.

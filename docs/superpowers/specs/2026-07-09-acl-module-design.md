@@ -147,4 +147,4 @@ rather than silent.
   and untouched.
 - No capability *verification* — activation is a trust decision by
   governance, not an attestation protocol; providers still BYO credentials
-  (docs/capability-spec.md) and announce only what the host installed.
+  (docs/records/specs/capability-spec.md) and announce only what the host installed.

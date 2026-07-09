@@ -13,7 +13,7 @@ data-plane `relay_candidates` mechanism. See
 rationale. The relay text below is retained as the original design record,
 annotated where it no longer holds.
 
-Companion to `docs/wireguard-tunnel-upgrade.md`. That document specifies the
+Companion to `docs/records/protocols/wireguard-tunnel-upgrade.md`. That document specifies the
 validator-owned WireGuard **data-plane** tunnel-upgrade protocol. This document
 specifies the orthogonal **reachability plane**: how a node reaches the mesh at
 all, and how to stop forcing validators to expose a public inbound port. The two
@@ -74,7 +74,7 @@ non-validator, untrusted infrastructure.
 
 ## Layering
 
-The reconciliation with `wireguard-tunnel-upgrade.md` is strict layer
+The reconciliation with `docs/records/protocols/wireguard-tunnel-upgrade.md` is strict layer
 separation. Its hard non-goal — "no external relay that is not also in the
 validator set" — governs the **WireGuard data-plane relay**: a mesh participant
 that forwards authenticated WireGuard traffic and could otherwise be treated as a
@@ -85,7 +85,7 @@ serving peer. That rule is retained unchanged.
 │ Authority: validator set + admission        (UNCHANGED)    │
 ├───────────────────────────────────────────────────────────┤
 │ WireGuard data-plane relay = validator-only (UNCHANGED,    │
-│   docs/wireguard-tunnel-upgrade.md)          existing doc) │
+│   docs/records/protocols/wireguard-tunnel-upgrade.md)      existing doc) │
 ├───────────────────────────────────────────────────────────┤
 │ mesh crypto: key-auth + E2E encryption      (the invariant)│
 ├───────────────────────────────────────────────────────────┤
@@ -186,7 +186,7 @@ for a **filtering** sentry, not a transparent splicer. Mitigations (later work):
 expose and relax the per-IP/subnet handshake quotas on fronted validators (the
 node currently hardcodes the `local` preset), and/or a PROXY-protocol-aware sentry
 plus commonware PROXY-header parsing to preserve the real source IP (neither
-exists today). See `docs/sentry-deployment.md`.
+exists today). See `docs/deploy/sentry-deployment.md`.
 
 Expected code delta (to be confirmed by the Phase 1 investigation):
 
@@ -243,7 +243,7 @@ Cutover sequence, after admission over the entry plane:
    coordinator's reflexive-address service plus simultaneous-open.
 3. On failure, emit signed `DirectDialFailureEvidence` and fall back to the
    **WireGuard data-plane relay** — validator-only, per
-   `wireguard-tunnel-upgrade.md`. *(The original design listed a second,
+   `docs/records/protocols/wireguard-tunnel-upgrade.md`. *(The original design listed a second,
    coordinator-relay flavor here; it was built and then removed 2026-07-06 —
    at the reachability plane, a failed punch is now terminal and surfaced.)*
 
@@ -320,5 +320,5 @@ Each phase is independently useful and gets its own spec→plan→impl cycle.
   candidates, `DirectDialFailureEvidence`, `TunnelInstallPlan` (inert leaf).
 - `crates/system/valset-mesh-interface/src/lib.rs` — mesh roles (bootnode/relay
   capabilities, `requires_external_relay`).
-- `docs/wireguard-tunnel-upgrade.md` — the data-plane tunnel-upgrade protocol
+- `docs/records/protocols/wireguard-tunnel-upgrade.md` — the data-plane tunnel-upgrade protocol
   this design complements.

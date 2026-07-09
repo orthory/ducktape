@@ -1,8 +1,23 @@
+---
+showAskAi: false
+---
+
 # Platform Invariants
+
+import { ArchitectureStack } from '../../../../components/diagram/ArchitectureStack.client'
+
+<ArchitectureStack />
 
 Ducktape is built around five invariants. They are not style preferences; they
 are the rules that let independent validators derive the same app-hash from the
 same agreed operation order.
+
+Related: [Module Model](/en/human/architecture/module-model) expands the module
+contract, [Consensus and Node](/en/human/architecture/consensus-and-node)
+explains ordered delivery, [Async Engine](/en/human/architecture/async-engine)
+covers worker seams, [State Sync](/en/human/architecture/state-sync) covers
+rebuilds, and [Determinism Contract](/en/agent/architecture/determinism-contract)
+is the agent checklist.
 
 ## Isolation
 

@@ -12,7 +12,7 @@
 //!
 //! WHICH executors exist, how to detect them, the argv to run them, and how
 //! to parse their output is all described by TOML capability specs (see
-//! [`spec`] and `docs/capability-spec.md`), not by Rust. the built-in
+//! [`spec`] and `docs/records/specs/capability-spec.md`), not by Rust. the built-in
 //! executor support ships as embedded spec files parsed by the same code
 //! path as operator-provided specs under `$DUCKTAPE_CAPABILITY_DIR` (default
 //! `~/.ducktape/capabilities`). adding an executor — or retuning a built-in's

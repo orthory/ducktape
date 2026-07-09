@@ -2176,6 +2176,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-agent",
  "toml 0.8.23",
+ "webkit2gtk",
 ]
 
 [[package]]
@@ -4113,11 +4114,13 @@ dependencies = [
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-p2p",
+ "commonware-parallel",
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
  "consensus",
  "data-plane",
+ "defguard_wireguard_rs",
  "directory",
  "dispatch",
  "dispatch-oracle",

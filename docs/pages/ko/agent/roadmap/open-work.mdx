@@ -1,3 +1,7 @@
+---
+showAskAi: false
+---
+
 # Open Work
 
 이 page는 agent가 실수로 완료된 것처럼 말하면 안 되는 implementation gap을 기록한다.
@@ -48,14 +52,14 @@ truthful tag set을 announce하며, 자기 key에 assign된 lease만 dispatch wo
 UX와 package-level behavior다: packaged agent와 harness, 더 넓은 action vocabulary,
 task obligation, debug surface가 아닌 native하게 느껴지는 durable agent workflow.
 
-## duckfs Client Stack
+## duckfs Product Edges
 
-duckfs Phase 1–2는 shipped다: 다시 만든 `files` module(staging, atomic
+duckfs Phase 1–5의 core stack은 구현되어 있다: 다시 만든 `files` module(staging, atomic
 per-path-CAS commit, snapshot, pin, watch, snapshot-addressed read),
 full possession까지 가는 resolver-backed state sync, restart durability, noded
-HTTP surface. 이것들을 missing으로 기록하면 안 된다. 아직 아무것도 mount하지
-않는다: checkout/commit engine(`duckfs-client`, `.duckfs/` index), CLI, FUSE
-mount, duckfs verb 위로 다시 만드는 app FilesView는 Phase 3–5이고 아직 open이다.
+HTTP surface, checkout/commit engine(`crates/duckfs/client`, `.duckfs/` index),
+CLI, FUSE mount. 이것들을 missing으로 기록하면 안 된다. 남은 duckfs work는
+duckfs verb 위로 다시 만드는 app FilesView product integration이다.
 `memory` module은 삭제되었다 — duckfs가 흡수했다(generation은 snapshot이 되고,
 `duck://memory/...`는 `duck://files/...`가 되었다). automations memory-watch
 trigger도 함께 제거되었다. filesystem-change automation은 migration이 아니라

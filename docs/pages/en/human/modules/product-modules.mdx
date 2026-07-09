@@ -1,8 +1,22 @@
+---
+showAskAi: false
+---
+
 # Product Modules
+
+import { ModuleMap } from '../../../../components/diagram/ModuleMap.client'
+
+<ModuleMap />
 
 Product modules are the workplace surface hosted by the platform. They share the
 same module contract, but each module chooses the storage substrate and interface
 that fits its job.
+
+Related: [Module Model](/en/human/architecture/module-model) explains the shared
+contract, [State Sync](/en/human/architecture/state-sync) covers rebuild
+surfaces, [Implementation Status](/en/human/reference/implementation-status)
+marks what is tested, and [Open Work](/en/agent/roadmap/open-work) tracks
+agent-facing gaps.
 
 ## Built or Started
 
@@ -150,7 +164,7 @@ prefix watches with segment-aware matching (`/a` matches `/a/b`, never `/ab`)
 give any module change notifications delivered atomically with the triggering
 commit.
 
-The client half is the OS-side checkout/commit engine (`crates/system/duckfs-client`)
+The client half is the OS-side checkout/commit engine (`crates/duckfs/client`)
 and the `ducktape-fs` CLI. A checkout materializes a duckfs subtree into a real
 working directory beside a `.duckfs/index.json` — git's index discipline: the
 base snapshot the copy descends from, the node it talks to, and a per-path

@@ -61,6 +61,12 @@ pub enum Error {
     /// surfaces this and the caller fail-stops.
     #[error("recovery journal: {0}")]
     Journal(String),
+    /// this node's orderer is a follower — it holds no consensus proposal
+    /// rights, so nothing it submits can enter the agreed order. loud so a
+    /// miswired write path fails at the seam instead of silently vanishing;
+    /// a resident's writes relay to a validator instead.
+    #[error("this node holds no consensus proposal rights")]
+    NotAParticipant,
 }
 
 impl From<host::SubmitError> for Error {
@@ -1675,6 +1681,21 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// reads these to decide when a floor certificate is safe to persist).
     pub fn orderer(&self) -> &O {
         &self.orderer
+    }
+
+    /// mutably borrow the orderer. the replica fold driver feeds its
+    /// follower orderer through this — observe/admit are orderer-side
+    /// operations that must not require dismantling the node.
+    pub fn orderer_mut(&mut self) -> &mut O {
+        &mut self.orderer
+    }
+
+    /// borrow the sink mutably AND the host immutably in one call — the
+    /// replica's self-checkpoint at promotion captures the live host through
+    /// the very journal the node owns as its sink, and two separate
+    /// accessors cannot borrow both at once.
+    pub fn sink_and_host(&mut self) -> (&mut S, &Host) {
+        (&mut self.sink, &self.host)
     }
 
     /// borrow the wrapped host (queries, module_root inspection, ...).

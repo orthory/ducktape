@@ -1,7 +1,7 @@
 # Capability spec: Claude Code CLI.
 #
 # Embedded built-in default — see codex.toml for the annotated reference and
-# docs/capability-spec.md for the full format. The BASE tag ("claude") passes
+# docs/records/specs/capability-spec.md for the full format. The BASE tag ("claude") passes
 # no --model flag: which model runs is the operator's CLI configuration (host
 # policy). The [[variants]] below are the curated model/effort matrix — each
 # expands at load time into a finer tag `claude_<model>_<effort>` carrying

@@ -1,3 +1,7 @@
+---
+showAskAi: false
+---
+
 # Verification Matrix
 
 touched surface를 증명하는 가장 좁은 command set을 사용한다.
@@ -12,7 +16,7 @@ bun run docs:check
 추가로 실행한다.
 
 ```sh
-git diff --check origin/main...HEAD
+git diff --check origin/dev...HEAD
 ```
 
 `docs/docs`가 없고 authored docs에 draft marker가 없는지 확인한다.
@@ -21,7 +25,6 @@ git diff --check origin/main...HEAD
 
 ```sh
 cargo test --workspace
-cargo fmt --all -- --check
 ```
 
 특정 module을 바꿀 때 focused test를 실행할 수 있다. 다만 사용자가 narrow run을
