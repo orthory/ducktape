@@ -38,7 +38,16 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+/// the hard ceiling on one child's lifetime, as a multiple of its idle
+/// timeout: `spec.timeout_secs` bounds SILENCE (any output refreshes it —
+/// long agentic runs that keep streaming are never killed mid-work), and
+/// `idle × this` bounds even a continuously-chatty child, guarding the
+/// host's own resources. the RUN's committed outcome is bounded by the
+/// saga's consensus deadline regardless (ADR X3) — this factor only decides
+/// how long this host keeps paying for one child.
+const HARD_TIMEOUT_FACTOR: u32 = 6;
 
 mod session;
 mod spec;
@@ -217,6 +226,9 @@ pub struct CliProvider {
     /// per-agent dir under `dirs.workspaces_root` when the run carries an
     /// agent id.
     workdir: PathBuf,
+    /// the IDLE window, not a wall clock: any child output refreshes it, so
+    /// a streaming agentic run outlives it freely; only silence this long
+    /// kills the child. `idle × HARD_TIMEOUT_FACTOR` is the absolute cap.
     timeout: Duration,
     /// host-wired roots for persistent workspaces and session files; both
     /// default absent (scratch + cold runs).
@@ -432,27 +444,109 @@ impl CliProvider {
             drop(stdin); // EOF: the prompt is complete
             Ok::<(), std::io::Error>(())
         };
-        let (fed, out) = tokio::time::timeout(self.timeout, async {
-            tokio::join!(feed, child.wait_with_output())
-        })
-        .await
-        .map_err(|_| {
-            format!(
-                "{} timed out after {:?} (child killed)",
-                self.bin.display(),
-                self.timeout
-            )
-        })?;
-        let out = out.map_err(|e| format!("waiting on {} failed: {e}", self.bin.display()))?;
 
-        if !out.status.success() {
+        // REFRESHABLE timeout: `self.timeout` is an IDLE window, not a wall
+        // clock — any child output (either stream) refreshes it, so a
+        // long-running agentic loop that keeps streaming events (codex --json)
+        // or emitting tool output is never killed mid-work; only a SILENT
+        // child dies at the window. a CLI that is quiet by design (claude -p
+        // prints one result object at the end) keeps exactly the old
+        // semantics: its silence budget is the spec's timeout. the hard
+        // ceiling ([`HARD_TIMEOUT_FACTOR`] × idle) guards this host's
+        // resources against a chatty-forever child; the RUN's outcome is
+        // bounded by the saga's consensus deadline regardless (ADR X3).
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| "child stdout was not piped".to_string())?;
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| "child stderr was not piped".to_string())?;
+        let idle = self.timeout;
+        let hard = tokio::time::Instant::now() + idle.saturating_mul(HARD_TIMEOUT_FACTOR);
+        let mut feed = std::pin::pin!(feed);
+        let mut fed: Option<Result<(), std::io::Error>> = None;
+        let mut out_bytes: Vec<u8> = Vec::new();
+        let mut err_bytes: Vec<u8> = Vec::new();
+        let (mut out_open, mut err_open) = (true, true);
+        let mut obuf = [0u8; 8192];
+        let mut ebuf = [0u8; 8192];
+        let mut last_activity = tokio::time::Instant::now();
+        while out_open || err_open {
+            let deadline = (last_activity + idle).min(hard);
+            tokio::select! {
+                r = &mut feed, if fed.is_none() => fed = Some(r),
+                r = stdout_pipe.read(&mut obuf), if out_open => match r {
+                    Ok(0) => out_open = false,
+                    Ok(n) => {
+                        out_bytes.extend_from_slice(&obuf[..n]);
+                        last_activity = tokio::time::Instant::now();
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "reading {} stdout failed: {e}",
+                            self.bin.display()
+                        ));
+                    }
+                },
+                r = stderr_pipe.read(&mut ebuf), if err_open => match r {
+                    Ok(0) => err_open = false,
+                    Ok(n) => {
+                        err_bytes.extend_from_slice(&ebuf[..n]);
+                        last_activity = tokio::time::Instant::now();
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "reading {} stderr failed: {e}",
+                            self.bin.display()
+                        ));
+                    }
+                },
+                // returning drops `child` (kill_on_drop): a stalled or
+                // runaway CLI never outlives its job.
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(if deadline == hard {
+                        format!(
+                            "{} timed out: still running at the hard cap of {:?} \
+                             ({HARD_TIMEOUT_FACTOR}x the idle window; child killed)",
+                            self.bin.display(),
+                            idle.saturating_mul(HARD_TIMEOUT_FACTOR)
+                        )
+                    } else {
+                        format!(
+                            "{} timed out after {:?} with no output (child killed); \
+                             an actively-streaming run refreshes this window",
+                            self.bin.display(),
+                            idle
+                        )
+                    });
+                }
+            }
+        }
+        // both streams closed: the child is done (or moments from it) — a
+        // bounded wait, never indefinite.
+        let status = tokio::time::timeout(idle, child.wait())
+            .await
+            .map_err(|_| {
+                format!(
+                    "{} closed its output but did not exit within {idle:?}",
+                    self.bin.display()
+                )
+            })?
+            .map_err(|e| format!("waiting on {} failed: {e}", self.bin.display()))?;
+        // an unfinished feed at this point means the child exited without
+        // draining stdin — the exit status below is the primary diagnostic.
+        let fed = fed.unwrap_or(Ok(()));
+
+        if !status.success() {
             // a failed exit is the primary diagnostic — it subsumes any
             // stdin write error (an early-exiting child EPIPEs the feed).
             return Err(format!(
                 "{} exited with {}: {}",
                 self.bin.display(),
-                out.status,
-                excerpt(&String::from_utf8_lossy(&out.stderr))
+                status,
+                excerpt(&String::from_utf8_lossy(&err_bytes))
             ));
         }
         if let Err(e) = fed {
@@ -461,7 +555,7 @@ impl CliProvider {
                 self.bin.display()
             ));
         }
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stdout = String::from_utf8_lossy(&out_bytes).into_owned();
         let text = match self.spec.output {
             OutputFormat::JsonlEvents => parse_jsonl_events(&stdout),
             OutputFormat::JsonResult => parse_json_result(&stdout),
@@ -623,7 +717,8 @@ fn excerpt(s: &str) -> String {
 ///
 /// per spec: the `detect.env` override wins (broken override = loud warning +
 /// absent capability), else the first executable `detect.bin` on `PATH`.
-/// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` overrides every spec's timeout at once.
+/// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` overrides every spec's IDLE timeout at
+/// once (refreshed by child output; see [`HARD_TIMEOUT_FACTOR`]).
 /// what discovery finds is exactly what the node announces.
 ///
 /// this arity wires NO agent roots: persistent workspaces and sessions stay
@@ -1200,12 +1295,61 @@ printf '{"type":"turn.completed"}\n'"#,
 
     #[tokio::test]
     async fn a_hung_cli_is_killed_at_the_timeout() {
+        // a SILENT child dies at the idle window — the pre-refresh contract,
+        // unchanged for CLIs that emit nothing while stuck.
         let dir = scratch("hang");
         let bin = fake_cli(&dir, "sleeper", "sleep 30");
         let p = mock_provider("sleeper", "text", bin, "hang-wd")
             .with_timeout(Duration::from_millis(200));
         let err = p.run("x", &RunContext::default()).await.unwrap_err();
         assert!(err.contains("timed out"), "got: {err}");
+        assert!(err.contains("no output"), "names the idle window: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_streaming_cli_refreshes_the_timeout_and_outlives_the_window() {
+        // THE refreshable-timeout property: total runtime (≈1s) is far past
+        // the idle window (200ms), but the child emits a heartbeat every
+        // 100ms — activity refreshes the window, so a long agentic run that
+        // keeps streaming is never killed mid-work.
+        let dir = scratch("heartbeat");
+        let bin = fake_cli(
+            &dir,
+            "beats",
+            "cat > /dev/null\n\
+             for i in 1 2 3 4 5 6 7 8 9 10; do echo tick-$i >&2; sleep 0.1; done\n\
+             printf '%s\\n' 'survived the window'",
+        );
+        let p = mock_provider("beats", "text", bin, "heartbeat-wd")
+            .with_timeout(Duration::from_millis(200));
+        assert_eq!(
+            p.run("x", &RunContext::default()).await.unwrap(),
+            "survived the window",
+            "a streaming run outlives many idle windows"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chatty_forever_cli_is_killed_at_the_hard_cap() {
+        // the ceiling behind the refresh: a child that streams forever is
+        // still bounded — idle × HARD_TIMEOUT_FACTOR ends it.
+        let dir = scratch("chatty");
+        let bin = fake_cli(
+            &dir,
+            "chatterbox",
+            "cat > /dev/null\nwhile true; do echo tick >&2; sleep 0.05; done",
+        );
+        let p = mock_provider("chatterbox", "text", bin, "chatty-wd")
+            .with_timeout(Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        let err = p.run("x", &RunContext::default()).await.unwrap_err();
+        assert!(err.contains("hard cap"), "names the ceiling: {err}");
+        assert!(
+            start.elapsed() >= Duration::from_millis(500)
+                && start.elapsed() < Duration::from_secs(5),
+            "killed at ~idle × {HARD_TIMEOUT_FACTOR}, not the idle window: {:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
