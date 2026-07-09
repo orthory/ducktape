@@ -1683,6 +1683,21 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         &self.orderer
     }
 
+    /// mutably borrow the orderer. the replica fold driver feeds its
+    /// follower orderer through this — observe/admit are orderer-side
+    /// operations that must not require dismantling the node.
+    pub fn orderer_mut(&mut self) -> &mut O {
+        &mut self.orderer
+    }
+
+    /// borrow the sink mutably AND the host immutably in one call — the
+    /// replica's self-checkpoint at promotion captures the live host through
+    /// the very journal the node owns as its sink, and two separate
+    /// accessors cannot borrow both at once.
+    pub fn sink_and_host(&mut self) -> (&mut S, &Host) {
+        (&mut self.sink, &self.host)
+    }
+
     /// borrow the wrapped host (queries, module_root inspection, ...).
     pub fn host(&self) -> &Host {
         &self.host

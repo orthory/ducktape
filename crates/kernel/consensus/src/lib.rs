@@ -1786,6 +1786,93 @@ impl FollowerOrderer {
         }
     }
 
+    /// the production follower WITHOUT its own payload drain: the content
+    /// store is fed EXTERNALLY (a caller that drains many epochs' payload
+    /// lanes into one shared store), and only the resolver fetch engine runs
+    /// here — the same producer/consumer/gate wiring
+    /// [`SimplexOrderer::spawn_with_resolver`] gives a validator.
+    /// [`FollowerOrderer::spawn`] composes this with the standard drain.
+    pub fn spawn_resolver<E, B, D, FS, FR>(
+        context: E,
+        blocker: B,
+        provider: D,
+        me: commonware_cryptography::ed25519::PublicKey,
+        store: ContentStore,
+        fetch: (FS, FR),
+    ) -> Self
+    where
+        E: commonware_runtime::Spawner
+            + commonware_runtime::Clock
+            + commonware_runtime::Storage
+            + commonware_runtime::Metrics
+            + commonware_runtime::BufferPooler
+            + rand_core::CryptoRngCore
+            + Send
+            + Sync
+            + 'static,
+        B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        D: commonware_p2p::Provider<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        FS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        FR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+    {
+        use commonware_utils::NZUsize;
+        use std::time::Duration;
+
+        let inbox = FinalizedInbox::new();
+        let fetch_cfg = ResolverConfig {
+            peer_provider: provider,
+            blocker,
+            consumer: PayloadConsumer {
+                store: store.clone(),
+                inbox: inbox.clone(),
+            },
+            producer: PayloadProducer {
+                store: store.clone(),
+            },
+            mailbox_size: NZUsize!(1024),
+            me: Some(me),
+            initial: Duration::from_millis(100),
+            timeout: Duration::from_millis(400),
+            fetch_retry_timeout: Duration::from_millis(100),
+            priority_requests: false,
+            priority_responses: false,
+        };
+        let (fetch_engine, mailbox) =
+            ResolverEngine::new(context.child("payload_fetch"), fetch_cfg);
+        let fetch_handle = fetch_engine.start(fetch);
+
+        Self {
+            store,
+            inbox,
+            last_admitted: None,
+            latest_final: LatestFinalization::default(),
+            mailbox: Some(mailbox),
+            deferred_fetches: VecDeque::new(),
+            resolver_fetch: Some(fetch_handle),
+            payload_drain: None,
+        }
+    }
+
+    /// admit one BACKFILLED finalized frame — bytes fetched over the
+    /// statesync Frames lane rather than proven by an observed certificate.
+    /// THE CALLER OWNS THIS LANE'S TRUST: after the fold it must cross-check
+    /// the folded seal (disposition / app-hash) against the served one, the
+    /// same per-frame verification the post-reboot catch-up performs — this
+    /// method only stores the bytes content-addressed and logs the gate
+    /// slot. the latest-finalization floor slot is deliberately NOT advanced
+    /// (it only ever holds real certificates). refused (`false`) at or below
+    /// the admission watermark.
+    pub fn admit_backfilled(&mut self, view: u64, bytes: Vec<u8>) -> bool {
+        if self.last_admitted.is_some_and(|last| view <= last) {
+            return false;
+        }
+        let digest = self.store.put(bytes);
+        // a guaranteed store hit (just put): the slot logs ready, no fetch.
+        let _ = self.inbox.record(view, digest, &self.store, false);
+        self.last_admitted = Some(view);
+        true
+    }
+
     /// the production follower: drain payload gossip store-only AND run the
     /// resolver fetch engine, so a finalization observed before (or without)
     /// its gossip resolves by fetching peers — the identical
@@ -1818,47 +1905,14 @@ impl FollowerOrderer {
         FS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
         FR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
     {
-        use commonware_utils::NZUsize;
-        use std::time::Duration;
-
         let drain_handle = spawn_payload_drain(
             context.child("payload_drain"),
             payload_receiver,
             store.clone(),
         );
-        let inbox = FinalizedInbox::new();
-        let fetch_cfg = ResolverConfig {
-            peer_provider: provider,
-            blocker,
-            consumer: PayloadConsumer {
-                store: store.clone(),
-                inbox: inbox.clone(),
-            },
-            producer: PayloadProducer {
-                store: store.clone(),
-            },
-            mailbox_size: NZUsize!(1024),
-            me: Some(me),
-            initial: Duration::from_millis(100),
-            timeout: Duration::from_millis(400),
-            fetch_retry_timeout: Duration::from_millis(100),
-            priority_requests: false,
-            priority_responses: false,
-        };
-        let (fetch_engine, mailbox) =
-            ResolverEngine::new(context.child("payload_fetch"), fetch_cfg);
-        let fetch_handle = fetch_engine.start(fetch);
-
-        Self {
-            store,
-            inbox,
-            last_admitted: None,
-            latest_final: LatestFinalization::default(),
-            mailbox: Some(mailbox),
-            deferred_fetches: VecDeque::new(),
-            resolver_fetch: Some(fetch_handle),
-            payload_drain: Some(drain_handle),
-        }
+        let mut follower = Self::spawn_resolver(context, blocker, provider, me, store, fetch);
+        follower.payload_drain = Some(drain_handle);
+        follower
     }
 
     /// issue (or re-issue) a payload fetch; an unaccepted submission parks
