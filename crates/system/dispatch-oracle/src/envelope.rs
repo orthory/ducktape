@@ -127,6 +127,7 @@ pub async fn prepare(
     let ctx = RunContext {
         agent_id: Some(envelope.agent_id),
         thread_key: envelope.thread_key,
+        run_key: None,
     };
     Ok((
         format!("{prompt}\n\n{}\n\n{}", envelope.contract, envelope.conversation),

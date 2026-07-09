@@ -20,6 +20,19 @@ use noded::NodeCommand;
 
 use crate::ORACLE_ORIGIN;
 
+fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
+    Arc::new(move |ctx, line| {
+        let Some(run_key) = ctx.run_key.as_deref() else {
+            return;
+        };
+        let stream = match line.stream {
+            capability_host::OutputStream::Stdout => noded::RunStream::Stdout,
+            capability_host::OutputStream::Stderr => noded::RunStream::Stderr,
+        };
+        registry.append(run_key, stream, line.line);
+    })
+}
+
 /// the daemon's worker set: the dispatch pool (or, in debug builds under
 /// `DUCKTAPE_NODED_ECHO_ORACLE`, the inline echo stand-in).
 ///
@@ -32,6 +45,7 @@ pub(crate) fn oracle_workers<C>(
     cmds: mpsc::Sender<NodeCommand>,
     blobs: noded::blobs::BlobHandle,
     agent_dirs: capability_host::AgentDirs,
+    run_output: noded::RunOutputRegistry,
 ) -> Vec<Box<dyn reactor::Worker>>
 where
     C: Spawner + Supervisor + 'static,
@@ -42,11 +56,14 @@ where
             return vec![Box::new(EchoWorker)];
         }
     }
-    let providers = capability_host::discover_with_dirs(agent_dirs)
-        // BYO: run whatever executor CLIs the capability specs describe and
-        // this host has installed — no credential handling here (see
-        // docs/records/specs/capability-spec.md). a broken operator spec is a boot error.
-        .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
+    let providers = capability_host::discover_with_dirs_and_output_sink(
+        agent_dirs,
+        run_output_sink(run_output),
+    )
+    // BYO: run whatever executor CLIs the capability specs describe and
+    // this host has installed — no credential handling here (see
+    // docs/records/specs/capability-spec.md). a broken operator spec is a boot error.
+    .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
 
     // one supervised node for the pool; each run spawns as its own child.
     let exec_ctx = context.child("oracle_pool");

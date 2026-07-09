@@ -60,6 +60,7 @@ pub use workspace::WorkspaceMode;
 pub struct RunContext {
     pub agent_id: Option<String>,
     pub thread_key: Option<String>,
+    pub run_key: Option<String>,
 }
 
 /// which child stream produced one live output line.
@@ -1368,6 +1369,7 @@ format = "text"
         RunContext {
             agent_id: Some(agent.into()),
             thread_key: Some(thread.into()),
+            run_key: None,
         }
     }
 

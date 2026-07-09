@@ -80,6 +80,19 @@ mod voice;
 mod voice_plane;
 use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
 
+fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
+    std::sync::Arc::new(move |ctx, line| {
+        let Some(run_key) = ctx.run_key.as_deref() else {
+            return;
+        };
+        let stream = match line.stream {
+            capability_host::OutputStream::Stdout => noded::RunStream::Stdout,
+            capability_host::OutputStream::Stderr => noded::RunStream::Stderr,
+        };
+        registry.append(run_key, stream, line.line);
+    })
+}
+
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
 const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
@@ -4121,7 +4134,7 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         None
                     }
                     Err(err) => return Err(err.into()),
-            };
+                };
             match host {
                 Some(host) => {
                     let intro_port =
@@ -6973,8 +6986,11 @@ fn run_node(
             // drained by the park loop's pump pass, so a minutes-long run
             // never stalls the serve window, boundary follow, or promotion
             // detection.
-            let resident_provider_set = capability_host::discover_with_dirs(agent_dirs.clone())
-                .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
+            let resident_provider_set = capability_host::discover_with_dirs_and_output_sink(
+                agent_dirs.clone(),
+                run_output_sink(stream_hub.run_output()),
+            )
+            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
             let resident_capabilities = resident_provider_set.capabilities();
             let mut resident_announcer = resident_announce::ResidentAnnouncer::new(
                 me_bytes.clone(),
@@ -9461,8 +9477,11 @@ fn run_node(
         // announced set to nothing — never the reverse). routing and
         // default models live in the specs (docs/records/specs/capability-spec.md); a broken
         // operator spec is a boot error, not a silently dropped executor.
-        let providers = capability_host::discover_with_dirs(agent_dirs.clone())
-            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
+        let providers = capability_host::discover_with_dirs_and_output_sink(
+            agent_dirs.clone(),
+            run_output_sink(stream_hub.run_output()),
+        )
+        .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
         let my_capabilities = providers.capabilities();
         // OFF-LOOP execution: the pool gates effects inline (lease check —
         // WorkerRequests leased to another node's key are skipped, not

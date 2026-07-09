@@ -53,6 +53,13 @@ pub fn max_concurrent_runs_from_env() -> usize {
         .unwrap_or(DEFAULT_MAX_CONCURRENT_RUNS)
 }
 
+fn run_key_for(saga_id: &str) -> String {
+    saga_id
+        .rsplit_once('\x1f')
+        .map_or(saga_id, |(_, dispatch_id)| dispatch_id)
+        .to_string()
+}
+
 /// one attempt's in-flight identity — the same `(saga_id, attempt)`
 /// idempotency key the saga itself dedups results on.
 type AttemptKey = (String, u32);
@@ -153,11 +160,14 @@ impl DispatchPool {
                 // are the run's result: a saga Err, never a silent fallback.
                 Ok(provider) => match crate::envelope::prepare(&job.input, resolver.as_ref()).await
                 {
-                    Ok((input, ctx)) => provider
-                        .run(&input, &ctx)
-                        .await
-                        .map(String::into_bytes)
-                        .map_err(clean_error),
+                    Ok((input, mut ctx)) => {
+                        ctx.run_key = Some(run_key_for(&job.saga_id));
+                        provider
+                            .run(&input, &ctx)
+                            .await
+                            .map(String::into_bytes)
+                            .map_err(clean_error)
+                    }
                     Err(e) => Err(clean_error(e)),
                 },
                 Err(e) => Err(clean_error(e)),
@@ -349,6 +359,16 @@ format = "text"
         effect_with_payload(saga_id, attempt, assignee, b"the entire input")
     }
 
+    #[test]
+    fn run_key_for_dispatch_saga_uses_last_segment() {
+        assert_eq!(run_key_for("dispatch\x1fruns\x1fd1"), "d1");
+    }
+
+    #[test]
+    fn run_key_for_legacy_saga_uses_whole_id() {
+        assert_eq!(run_key_for("s1"), "s1");
+    }
+
     async fn next_result(
         rx: &mut futures::channel::mpsc::UnboundedReceiver<Msg>,
     ) -> (String, u32, Result<Vec<u8>, String>) {
@@ -520,6 +540,21 @@ format = "text"
         assert!(!input.contains("ducktape_run"), "the provider never sees envelope JSON");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
+    }
+
+    #[tokio::test]
+    async fn provider_context_carries_dispatch_id_run_key() {
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
+        let (pool, mut rx) = pool_with(providers, 4);
+
+        let saga_id = "dispatch\x1fruns\x1fd1";
+        let eff = effect_for(saga_id, 0, Some(b"me"));
+        pool.run(&eff).await.unwrap();
+        let (result_saga_id, _, outcome) = next_result(&mut rx).await;
+        assert_eq!(result_saga_id, saga_id);
+        assert_eq!(outcome.unwrap(), b"answer to: the entire input".to_vec());
+        let (_, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
+        assert_eq!(ctx.run_key.as_deref(), Some("d1"));
     }
 
     #[tokio::test]

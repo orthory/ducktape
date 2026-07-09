@@ -272,8 +272,13 @@ fn run_node(
         // Submit command on `oracle_cmds`, so this serial command loop
         // never awaits a provider and Query/Status stay responsive while
         // runs are in flight.
-        let workers =
-            oracle_pool::oracle_workers(&context, oracle_cmds, blobs.clone(), agent_dirs);
+        let workers = oracle_pool::oracle_workers(
+            &context,
+            oracle_cmds,
+            blobs.clone(),
+            agent_dirs,
+            stream_hub.run_output(),
+        );
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would
         // re-use indexed heights — every new block silently skipped.
@@ -401,10 +406,10 @@ async fn submit_and_drain(
         Ok(out) => out,
         Err(SubmitError::Fatal(err)) => {
             eprintln!("[noded] FATAL: {err} — halting");
-            std::process::exit(1);
-        }
-        Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
-    };
+                std::process::exit(1);
+            }
+            Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
+        };
 
     let mut queue = VecDeque::new();
     offer_effects(workers, effects, &mut queue).await;
