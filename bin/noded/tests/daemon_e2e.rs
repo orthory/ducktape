@@ -629,17 +629,20 @@ fn state_persists_across_restart() {
     assert_eq!(blocks[0]["height"], 1);
     let post = &blocks[1];
     assert_eq!(post["height"], 2);
-    assert_eq!(post["target"], "chat");
-    assert_eq!(post["disposition"], "applied");
-    // this lane frames and signs nothing: the hash is honestly empty, and
-    // the proposer is the SUBMITTER's origin bytes as hex ("eddy").
+    // a block now carries its member ops under `ops[]`; this lane is one op
+    // per block.
+    let op = &post["ops"][0];
+    assert_eq!(op["target"], "chat");
+    assert_eq!(op["disposition"], "applied");
+    // this lane frames and signs nothing: the block hash is honestly empty, and
+    // the op's proposer is the SUBMITTER's origin bytes as hex ("eddy").
     assert_eq!(post["hash"], "");
-    assert_eq!(post["proposer"], "65646479");
+    assert_eq!(op["proposer"], "65646479");
     assert!(
-        post["operations"]
+        op["operations"]
             .as_array()
             .is_some_and(|ops| !ops.is_empty()),
-        "the dispatch trace rides the row: {post}"
+        "the dispatch trace rides the op: {post}"
     );
 }
 
