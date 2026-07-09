@@ -4119,6 +4119,7 @@ dependencies = [
  "commonware-utils",
  "consensus",
  "data-plane",
+ "defguard_wireguard_rs",
  "directory",
  "dispatch",
  "dispatch-oracle",

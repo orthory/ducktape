@@ -1239,3 +1239,181 @@ mod tests {
         );
     }
 }
+
+/// Headless end-to-end proof that huddle audio crosses the REAL userspace
+/// WireGuard overlay — no TUN, no root, no mics, no GUI (the
+/// `crates/system/overlay-net/tests/loopback_pair` harness shape). Two voice
+/// hubs run on their OWN runtimes (`spawn_hub`) and bind the per-service
+/// overlay sockets over two loopback-peered virtual stacks; audio fed into one
+/// comes out the other, Opus-decoded. Unlike the in-memory tests above, this
+/// exercises the exact production runtime topology — hub runtime + stack
+/// runtime + cross-runtime socket driving + a real WireGuard tunnel — which is
+/// the one thing unit-level transports cannot cover.
+#[cfg(test)]
+mod overlay_e2e {
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+
+    use commonware_cryptography::{Signer as _, ed25519};
+    use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
+    use overlay_net::userspace::{UserspaceWireGuardEffect, VirtualSocketFactory};
+    use wireguard_effect::WireGuardEffect;
+
+    use super::*;
+
+    /// a fixture chain namespace — both hubs derive every member's overlay
+    /// `/128` from it, exactly as production derives it from the chain id.
+    const NS: &str = "e2e-huddle-overlay";
+
+    /// one overlay node: the WireGuard effect (the only handle we drive), its
+    /// ed25519 identity (which fixes its overlay `/128`), and the loopback
+    /// underlay endpoint of its bound WG socket.
+    struct OverlayNode {
+        effect: UserspaceWireGuardEffect,
+        wg_secret: Key,
+        node_key: ed25519::PublicKey,
+        raw_key: [u8; 32],
+        ula: Ipv6Addr,
+        endpoint: SocketAddr,
+    }
+
+    /// any 32 bytes are a valid X25519 secret (the curve clamps); each node
+    /// needs a distinct one.
+    fn wg_secret(seed: u8) -> Key {
+        let mut bytes = [seed; 32];
+        bytes[0] = seed.wrapping_add(1);
+        Key::new(bytes)
+    }
+
+    fn config(node: &OverlayNode, port: u16, peers: Vec<Peer>) -> InterfaceConfiguration {
+        InterfaceConfiguration {
+            name: "dt-huddle".into(),
+            prvkey: node.wg_secret.to_string(),
+            addresses: vec![IpAddrMask::new(IpAddr::V6(node.ula), 128)],
+            port,
+            peers,
+            mtu: None,
+            fwmark: None,
+        }
+    }
+
+    fn peer_entry(of: &OverlayNode, endpoint: Option<SocketAddr>) -> Peer {
+        let mut peer = Peer::new(of.wg_secret.public_key());
+        peer.endpoint = endpoint;
+        peer.set_allowed_ips(vec![IpAddrMask::new(IpAddr::V6(of.ula), 128)]);
+        peer
+    }
+
+    /// stand a node up: its overlay `/128` is `ula_v6_member_addr(NS, key)` —
+    /// the SAME function the media `AddressBook` resolves peers by, so the two
+    /// ends agree with no coordination. first apply is empty-peer/port-0 so the
+    /// OS allocates the underlay port before the peered re-apply.
+    fn stand_up(node_seed: u64, wg_seed: u8) -> OverlayNode {
+        let node_key = ed25519::PrivateKey::from_seed(node_seed).public_key();
+        let raw_key: [u8; 32] = node_key.as_ref().try_into().expect("ed25519 is 32 bytes");
+        let ula = wireguard_upgrade::ula_v6_member_addr(
+            NS,
+            wireguard_upgrade::ValidatorIdentity(raw_key),
+        );
+        let mut node = OverlayNode {
+            effect: UserspaceWireGuardEffect::new(tokio::runtime::Handle::current()),
+            wg_secret: wg_secret(wg_seed),
+            node_key,
+            raw_key,
+            ula,
+            endpoint: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        };
+        node.effect.create_interface().expect("create interface");
+        node.effect
+            .apply(&config(&node, 0, Vec::new()))
+            .expect("first apply binds the underlay");
+        let bound = node.effect.local_underlay_addr().expect("underlay bound");
+        node.endpoint.set_port(bound.port());
+        node
+    }
+
+    /// peer `a`↔`b`: `a` knows `b`'s endpoint, `b` learns `a`'s from the first
+    /// authenticated inbound datagram (the zero-config joiner shape).
+    fn peer_up(a: &mut OverlayNode, b: &mut OverlayNode) {
+        let (a_port, b_port) = (a.endpoint.port(), b.endpoint.port());
+        a.effect
+            .apply(&config(a, a_port, vec![peer_entry(b, Some(b.endpoint))]))
+            .expect("peered re-apply on a");
+        b.effect
+            .apply(&config(b, b_port, vec![peer_entry(a, None)]))
+            .expect("peered re-apply on b");
+    }
+
+    /// the media peer set both hubs track: both members, so each resolves the
+    /// other's `/128` (forward) and authenticates its source (reverse).
+    fn media_peers(nodes: &[&OverlayNode]) -> Arc<MediaPeers> {
+        let peers = MediaPeers::new(NS.to_string());
+        peers.set_peers(nodes.iter().map(|n| &n.node_key));
+        peers
+    }
+
+    /// spawn a hub over a node's overlay stack (its OWN runtime binds the media
+    /// sockets; the stack keeps polling on this test's runtime).
+    fn spawn_over(
+        node: &OverlayNode,
+        peers: Arc<MediaPeers>,
+    ) -> mpsc::Sender<noded::CallSessionRequest> {
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let factory: Arc<dyn SocketFactory> =
+            Arc::new(VirtualSocketFactory::new(node.effect.stack_slot()));
+        spawn_hub(req_rx, factory, peers, node.raw_key);
+        req_tx
+    }
+
+    async fn open(lane: &mpsc::Sender<noded::CallSessionRequest>) -> noded::CallSession {
+        let (reply, opened) = tokio::sync::oneshot::channel();
+        lane.send(noded::CallSessionRequest {
+            channel_id: "general".into(),
+            reply,
+        })
+        .await
+        .expect("hub alive");
+        opened.await.expect("hub replies").expect("session opens")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn audio_crosses_a_real_overlay_between_two_hubs() {
+        let mut a = stand_up(1, 0x11);
+        let mut b = stand_up(2, 0x22);
+        peer_up(&mut a, &mut b);
+
+        let req_a = spawn_over(&a, media_peers(&[&a, &b]));
+        let req_b = spawn_over(&b, media_peers(&[&a, &b]));
+
+        let session_a = open(&req_a).await;
+        let mut session_b = open(&req_b).await;
+        session_a
+            .recipients
+            .send(vec![b.raw_key])
+            .expect("session a alive");
+        session_b
+            .recipients
+            .send(vec![a.raw_key])
+            .expect("session b alive");
+
+        // loud constant audio from A must surface as energy in B's mixed
+        // playout, having crossed: A's hub runtime → its overlay socket → the
+        // WireGuard tunnel → B's overlay socket → B's jitter buffer → Opus
+        // decode → mix. A generous deadline covers the handshake + the bind
+        // retry loop.
+        let loud = vec![8000i16; FRAME_SAMPLES];
+        let heard = async {
+            loop {
+                let _ = session_a.pcm_in.send(loud.clone()).await;
+                let Some(mixed) = session_b.mixed_out.recv().await else {
+                    panic!("session b ended early");
+                };
+                if mixed.iter().any(|s| s.abs() > 1000) {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), heard)
+            .await
+            .expect("audio must cross the real overlay between the two hubs");
+    }
+}
