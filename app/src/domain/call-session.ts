@@ -60,6 +60,13 @@ const START_BITRATE_KBPS = 800;
  *  would fail the encoder's configure and silently kill the camera. */
 const MIN_BITRATE_KBPS = 300;
 const MAX_BITRATE_KBPS = 1200;
+/** How long an OPEN socket may sit with no inbound frame before the session is
+ *  declared failed. The hub emits a mixed frame every 20 ms once it serves the
+ *  session, so a silent open socket means the hub can't (media planes not up,
+ *  request queued forever) — without this bound the dock shows "connecting…"
+ *  indefinitely. Timed from socket open, NOT from start(): getUserMedia's
+ *  permission prompt can legitimately hold `start` open for minutes. */
+const CONNECT_TIMEOUT_MS = 12_000;
 
 export type CallEvent =
   | { kind: "status"; status: VoiceStatus; error?: VoiceError }
@@ -71,7 +78,11 @@ export type CallEvent =
   // Our own video-lane state SETTLED — the authoritative source for the slice's
   // cameraOn/sharing (fires on toggle, on a failed acquire, on encoder death, and
   // when the browser's own "Stop sharing" ends a screen share).
-  | { kind: "selfVideo"; cameraOn: boolean; sharing: boolean };
+  | { kind: "selfVideo"; cameraOn: boolean; sharing: boolean }
+  // A camera/screen acquire FAILED after the user asked for it — the lane stays
+  // off (selfVideo already said so); this carries the WHY so the surface can say
+  // something instead of a button that silently snaps back.
+  | { kind: "mediaNote"; note: "camera-failed" | "screen-failed" };
 
 export interface CallSession {
   /** Open the mic graph and dial the call ws. Idempotent — a second call while
@@ -147,6 +158,15 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   // suppress the browser's follow-up close, so the caller keeps a visible error
   // state instead of having it wiped by 'closed'.
   let failed = false;
+  // armed when the socket opens; a session still 'connecting' when it fires is
+  // stuck against a hub that will never serve it (see CONNECT_TIMEOUT_MS).
+  let connectTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearConnectTimer = () => {
+    if (connectTimer !== null) {
+      clearTimeout(connectTimer);
+      connectTimer = null;
+    }
+  };
   const setStatus = (next: VoiceStatus, error?: VoiceError) => {
     status = next;
     onEvent({ kind: "status", status: next, error });
@@ -154,6 +174,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   // the first inbound frame that proves the hub is live promotes us out of
   // 'connecting'; anything after error/closed is left alone.
   const markLive = () => {
+    clearConnectTimer();
     if (status === "connecting") setStatus("live");
   };
 
@@ -166,6 +187,11 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   let previewEl: HTMLVideoElement | null = null;
   let cameraOn = false;
   let sharing = false; // the lane is a screen share rather than the camera
+  // A screen share that displaced a live camera puts it back when it ends (the
+  // user's "Stop sharing", a cancelled picker, our own toggle) — sharing a
+  // screen mid-video-call must not end your video. Cleared by any explicit
+  // camera toggle: the user's own act supersedes the remembered state.
+  let resumeCameraAfterShare = false;
   let forceKeyframe = true; // first frame, and on server keyframeRequest
   let framesSinceKey = 0;
   let bitrateKbps = START_BITRATE_KBPS; // rateHint moves it
@@ -295,6 +321,8 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   };
 
   const setCamera = (on: boolean): void => {
+    // The user's explicit camera choice supersedes any share-displaced state.
+    resumeCameraAfterShare = false;
     if (on === cameraOn) return; // idempotent
     if (on) {
       if (sharing) {
@@ -308,10 +336,12 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
           if (cameraOn) sendBeacon();
         })
         .catch(() => {
-          // acquire/encode setup failed: stay off, surface nothing fatal.
+          // acquire/encode setup failed: the lane stays off, the session lives —
+          // but say so, or the button just snaps back with no explanation.
           cameraOn = false;
           stopCameraGraph();
           sendBeacon();
+          onEvent({ kind: "mediaNote", note: "camera-failed" });
         });
     } else {
       cameraOn = false;
@@ -320,11 +350,19 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     }
   };
 
+  /** End-of-share hook: put a camera the share displaced back on. */
+  const maybeResumeCamera = (): void => {
+    if (!resumeCameraAfterShare || stopped) return;
+    resumeCameraAfterShare = false;
+    setCamera(true);
+  };
+
   const setScreenShare = (on: boolean): void => {
     if (on === sharing) return; // idempotent
     if (on) {
       if (cameraOn) {
-        // swap the lane from camera → screen.
+        // swap the lane from camera → screen, and remember to swap back.
+        resumeCameraAfterShare = true;
         cameraOn = false;
         stopCameraGraph();
       }
@@ -334,15 +372,20 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
           if (sharing) sendBeacon();
         })
         .catch(() => {
-          // getDisplayMedia denied / cancelled: stay off, nothing fatal.
+          // getDisplayMedia denied / cancelled: the share stays off — restore a
+          // camera it displaced (cancelling a share must not end your video),
+          // and say what happened.
           sharing = false;
           stopCameraGraph();
           sendBeacon();
+          onEvent({ kind: "mediaNote", note: "screen-failed" });
+          maybeResumeCamera();
         });
     } else {
       sharing = false;
       stopCameraGraph();
       sendBeacon();
+      maybeResumeCamera();
     }
   };
 
@@ -493,6 +536,19 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     socket = ws;
+    // A hub that upgrades the socket but never serves the session (media planes
+    // down, request parked) would otherwise hold 'connecting' forever.
+    connectTimer = setTimeout(() => {
+      connectTimer = null;
+      if (stopped || status !== "connecting") return;
+      failed = true;
+      setStatus("error", "connection");
+      try {
+        ws.close();
+      } catch {
+        // already closing — the error status above is what matters.
+      }
+    }, CONNECT_TIMEOUT_MS);
     ws.onopen = () => {
       if (stopped) return;
       // NB: no 'live' here — that waits on the first inbound frame so a refusal
@@ -521,10 +577,12 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
       }
     };
     ws.onclose = () => {
+      clearConnectTimer();
       if (stopped || failed) return;
       setStatus("closed");
     };
     ws.onerror = () => {
+      clearConnectTimer();
       if (stopped) return;
       failed = true;
       setStatus("error", "connection");
@@ -673,6 +731,8 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     stopped = true;
     cameraOn = false;
     sharing = false;
+    resumeCameraAfterShare = false;
+    clearConnectTimer();
     if (socket) {
       // drop handlers first so our own close doesn't fire onEvent('closed').
       socket.onopen = null;
