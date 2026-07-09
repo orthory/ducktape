@@ -4,7 +4,7 @@
 // panel's reply box never touches the main channel's in-progress draft,
 // since they're just two separate component instances).
 
-import { useContext, useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
 
 import { Icon } from "../../components/Icon";
@@ -12,10 +12,20 @@ import type { IconName } from "../../components/Icon";
 import { ConsoleContext } from "../../store/context";
 import { HoverButton } from "./HoverButton";
 import { MentionMenu } from "./MentionMenu";
-import { insertMention, mentionCandidates, mentionTokenAt } from "./mention";
+import {
+  insertMention,
+  mentionableUsers,
+  mentionCandidatesAll,
+  mentionTokenAt,
+  type MentionCandidate,
+} from "./mention";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 
 const DEFAULT_MAX_HEIGHT = 168;
+const EMPTY_NODE_USERS: Record<string, { userKey: string; name: string | null }> = {};
+
+const mentionCandidateHandle = (candidate: MentionCandidate): string =>
+  candidate.kind === "user" ? candidate.handle : candidate.agent.agent_id;
 
 function FmtButton({
   label,
@@ -76,11 +86,13 @@ export function Composer({
   const pendingSelection = useRef<[number, number] | null>(null);
 
   // ── @mention typeahead ──
-  // The composer is shared (main lane + thread panel), so the agent roster
-  // comes from context here rather than threading a prop through both callers.
+  // The composer is shared (main lane + thread panel), so mention candidates
+  // come from context here rather than threading props through both callers.
   // Context may be absent in bare component tests — then no menu, no crash.
   const store = useContext(ConsoleContext);
   const agents = store?.state.agents ?? [];
+  const nodeUsers = store?.state.nodeUsers ?? EMPTY_NODE_USERS;
+  const users = useMemo(() => mentionableUsers(nodeUsers, agents), [nodeUsers, agents]);
   const [caret, setCaret] = useState(0);
   const [mentionIndex, setMentionIndex] = useState(0);
   // The token.start the user Escaped out of — that token stays dismissed
@@ -88,10 +100,15 @@ export function Composer({
   const [mentionDismissedAt, setMentionDismissedAt] = useState<number | null>(null);
 
   const mentionToken = mentionTokenAt(value, caret);
-  const menuCandidates =
-    mentionToken !== null && mentionToken.start !== mentionDismissedAt
-      ? mentionCandidates(agents, mentionToken.query)
-      : [];
+  const mentionStart = mentionToken?.start ?? null;
+  const mentionQuery = mentionToken?.query ?? "";
+  const menuCandidates = useMemo(
+    () =>
+      mentionStart !== null && mentionStart !== mentionDismissedAt
+        ? mentionCandidatesAll(agents, users, mentionQuery)
+        : [],
+    [agents, mentionDismissedAt, mentionQuery, mentionStart, users],
+  );
   const menuOpen = menuCandidates.length > 0;
 
   const handleChange = (next: string, nextCaret: number) => {
@@ -102,10 +119,10 @@ export function Composer({
     onChange(next);
   };
 
-  const pickMention = (agentId: string) => {
+  const pickMention = (handle: string) => {
     if (!mentionToken) return;
     const el = ref.current;
-    const next = insertMention(value, mentionToken, el?.selectionStart ?? caret, agentId);
+    const next = insertMention(value, mentionToken, el?.selectionStart ?? caret, handle);
     pendingSelection.current = [next.caret, next.caret];
     setCaret(next.caret);
     setMentionIndex(0);
@@ -206,7 +223,9 @@ export function Composer({
       }
       if (event.key === "Enter" || event.key === "Tab") {
         event.preventDefault();
-        pickMention(menuCandidates[Math.min(mentionIndex, menuCandidates.length - 1)]!.agent_id);
+        pickMention(
+          mentionCandidateHandle(menuCandidates[Math.min(mentionIndex, menuCandidates.length - 1)]!),
+        );
         return;
       }
       if (event.key === "Escape") {

@@ -9,8 +9,10 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentRecord } from "../../../domain/agent-client";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
-import { createInitialState } from "../../store/state";
+import { createInitialState, type ConsoleState } from "../../store/state";
 import { Composer } from "./Composer";
+import { MentionMenu } from "./MentionMenu";
+import type { MentionCandidate } from "./mention";
 
 const agent = (
   agentId: string,
@@ -34,6 +36,45 @@ const ROSTER = [
   agent("idler", "Idler", "paused"),
 ];
 
+const MIXED_CANDIDATES: MentionCandidate[] = [
+  { kind: "agent", agent: agent("quackbot", "Quackbot") },
+  {
+    kind: "user",
+    userKeyHex: "abcdef1234567890",
+    handle: "jess",
+    label: "Jess Example",
+  },
+];
+
+describe("MentionMenu mixed candidates", () => {
+  it("renders agents and users, including the user's label and handle", () => {
+    render(<MentionMenu candidates={MIXED_CANDIDATES} activeIndex={0} onPick={vi.fn()} />);
+
+    expect(screen.getByRole("listbox", { name: "Mention a person or agent" })).toBeTruthy();
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+      "Quackbot@quackbot",
+      "Jess Example@jess",
+    ]);
+  });
+
+  it("mousedown on a user row picks the user's handle", () => {
+    const onPick = vi.fn();
+    render(<MentionMenu candidates={MIXED_CANDIDATES} activeIndex={0} onPick={onPick} />);
+
+    fireEvent.mouseDown(screen.getAllByRole("option")[1]!);
+
+    expect(onPick).toHaveBeenCalledWith("jess");
+  });
+
+  it("marks the active row by mixed-list index", () => {
+    render(<MentionMenu candidates={MIXED_CANDIDATES} activeIndex={1} onPick={vi.fn()} />);
+
+    const options = screen.getAllByRole("option");
+    expect(options[0]!.getAttribute("aria-selected")).toBe("false");
+    expect(options[1]!.getAttribute("aria-selected")).toBe("true");
+  });
+});
+
 function Harness({ onSend }: { onSend: (value: string) => void }) {
   const [value, setValue] = useState("");
   return (
@@ -46,11 +87,11 @@ function Harness({ onSend }: { onSend: (value: string) => void }) {
   );
 }
 
-const setup = (onSend = vi.fn()) => {
+const setup = (onSend = vi.fn(), statePatch: Partial<ConsoleState> = {}) => {
   render(
     <ConsoleContext.Provider
       value={{
-        state: { ...createInitialState(), agents: ROSTER },
+        state: { ...createInitialState(), agents: ROSTER, ...statePatch },
         actions: {} as ConsoleActions,
       }}
     >
@@ -161,6 +202,24 @@ describe("Composer @mention typeahead", () => {
     type(textarea, "@scr");
     fireEvent.mouseDown(screen.getByRole("option"));
     expect((textarea as HTMLTextAreaElement).value).toBe("@scribe ");
+  });
+
+  it("lists node users and inserts the picked user's handle", () => {
+    const { textarea } = setup(vi.fn(), {
+      nodeUsers: {
+        "01": { userKey: "ABCDEF1234567890", name: "Jess Example" },
+      },
+    });
+
+    type(textarea, "@je");
+
+    expect(screen.getByRole("listbox", { name: "Mention a person or agent" })).toBeTruthy();
+    expect(screen.getByText("Jess Example")).toBeTruthy();
+    expect(screen.getByText("@jess-example")).toBeTruthy();
+
+    fireEvent.mouseDown(screen.getByRole("option"));
+
+    expect((textarea as HTMLTextAreaElement).value).toBe("@jess-example ");
   });
 
   it("IME composition Enter neither picks nor sends", () => {

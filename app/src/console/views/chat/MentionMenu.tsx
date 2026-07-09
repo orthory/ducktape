@@ -1,25 +1,25 @@
 // The composer's @mention typeahead popover — the Pages SlashMenu idiom
-// (role="listbox" / role="option", activeIndex highlight, mousedown-to-pick)
-// pointed at Active agents. Opens UPWARD (bottom: 100%): the composer sits at
-// the bottom of the pane, so a downward menu would render off-screen.
+// (role="listbox" / role="option", activeIndex highlight, mousedown-to-pick).
+// Opens UPWARD (bottom: 100%): the composer sits at the bottom of the pane,
+// so a downward menu would render off-screen.
 
-import type { AgentRecord } from "../../../domain/agent-client";
 import { color, font, radius, shadow } from "../../theme/tokens";
+import type { MentionCandidate } from "./mention";
 
 export function MentionMenu({
   candidates,
   activeIndex,
   onPick,
 }: {
-  candidates: AgentRecord[];
+  candidates: MentionCandidate[];
   activeIndex: number;
-  onPick: (agentId: string) => void;
+  onPick: (handle: string) => void;
 }) {
   if (candidates.length === 0) return null;
   return (
     <div
       role="listbox"
-      aria-label="Mention an agent"
+      aria-label="Mention a person or agent"
       style={{
         position: "absolute",
         zIndex: 20,
@@ -36,54 +36,62 @@ export function MentionMenu({
         padding: 4,
       }}
     >
-      {candidates.map((agent, i) => (
-        <button
-          key={agent.agent_id}
-          type="button"
-          role="option"
-          aria-selected={i === activeIndex}
-          onMouseDown={(event) => {
-            // mousedown, not click: the textarea must not blur first.
-            event.preventDefault();
-            onPick(agent.agent_id);
-          }}
-          style={{
-            all: "unset",
-            cursor: "pointer",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            width: "100%",
-            boxSizing: "border-box",
-            padding: "6px 9px",
-            borderRadius: radius.sm,
-            background: i === activeIndex ? color.hover : "transparent",
-          }}
-        >
-          <span
+      {candidates.map((candidate, i) => {
+        const key = candidate.kind === "user" ? candidate.userKeyHex : candidate.agent.agent_id;
+        const label =
+          candidate.kind === "user"
+            ? candidate.label
+            : candidate.agent.display_name || candidate.agent.agent_id;
+        const handle = candidate.kind === "user" ? candidate.handle : candidate.agent.agent_id;
+        return (
+          <button
+            key={key}
+            type="button"
+            role="option"
+            aria-selected={i === activeIndex}
+            onMouseDown={(event) => {
+              // mousedown, not click: the textarea must not blur first.
+              event.preventDefault();
+              onPick(handle);
+            }}
             style={{
-              font: `600 12px ${font.sans}`,
-              color: color.ink,
-              minWidth: 0,
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
+              all: "unset",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              width: "100%",
+              boxSizing: "border-box",
+              padding: "6px 9px",
+              borderRadius: radius.sm,
+              background: i === activeIndex ? color.hover : "transparent",
             }}
           >
-            {agent.display_name || agent.agent_id}
-          </span>
-          <span
-            style={{
-              marginLeft: "auto",
-              font: `400 10.5px ${font.mono}`,
-              color: color.muted2,
-              flexShrink: 0,
-            }}
-          >
-            @{agent.agent_id}
-          </span>
-        </button>
-      ))}
+            <span
+              style={{
+                font: `600 12px ${font.sans}`,
+                color: color.ink,
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {label}
+            </span>
+            <span
+              style={{
+                marginLeft: "auto",
+                font: `400 10.5px ${font.mono}`,
+                color: color.muted2,
+                flexShrink: 0,
+              }}
+            >
+              @{handle}
+            </span>
+          </button>
+        );
+      })}
     </div>
   );
 }
