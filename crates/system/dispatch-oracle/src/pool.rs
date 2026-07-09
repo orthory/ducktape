@@ -26,6 +26,7 @@ use reactor::{WorkOutcome, Worker};
 use sdk::{Effect, Msg};
 use tokio::sync::Semaphore;
 
+use crate::provision::{SharedProvisioner, WorkspaceSpec, assemble_runner_result, bind_workspace};
 use crate::{ExecJob, Gated, clean_error, gate, oracle_result};
 
 /// how many provider runs may execute concurrently unless
@@ -78,6 +79,13 @@ pub struct DispatchPool {
     /// binary like spawn/deliver, so the pool stays storage-agnostic. `None`
     /// fails prompt-pinned envelopes loudly (see [`crate::envelope::prepare`]).
     resolver: Option<crate::BlobResolver>,
+    /// materializes/commits/cleans a per-run duckfs workspace for portable
+    /// (v3) runs — injected by the node binary, where duckfs-client + the
+    /// actor lane are reachable. `None` (the default) keeps today's
+    /// accept-only behavior: a v3 plan is surfaced but never activated, so the
+    /// run is byte-identical to a legacy one. dormant regardless pre-flip
+    /// (the composer emits no v3 envelope).
+    provisioner: Option<SharedProvisioner>,
 }
 
 impl DispatchPool {
@@ -113,6 +121,7 @@ impl DispatchPool {
             semaphore: Arc::new(Semaphore::new(limit.max(1))),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             resolver: None,
+            provisioner: None,
         }
     }
 
@@ -121,6 +130,16 @@ impl DispatchPool {
     /// keep compiling; without it, prompt-pinned envelopes fail loudly.
     pub fn with_resolver(mut self, resolver: crate::BlobResolver) -> Self {
         self.resolver = Some(resolver);
+        self
+    }
+
+    /// wire the host-side workspace provisioner portable (v3) runs materialize
+    /// through — mirrors [`Self::with_resolver`]. without it (or on any run
+    /// that carries no v3 plan) the pool behaves EXACTLY as today: the
+    /// provider's raw text is delivered verbatim. the portable path is dormant
+    /// until a coordinated flip emits v3 envelopes.
+    pub fn with_provisioner(mut self, provisioner: SharedProvisioner) -> Self {
+        self.provisioner = Some(provisioner);
         self
     }
 
@@ -138,6 +157,7 @@ impl DispatchPool {
         let semaphore = self.semaphore.clone();
         let inflight = self.inflight.clone();
         let resolver = self.resolver.clone();
+        let provisioner = self.provisioner.clone();
         (self.spawn)(Box::pin(async move {
             // over-cap runs queue HERE, on their own task.
             let _permit = semaphore
@@ -153,10 +173,8 @@ impl DispatchPool {
                 // are the run's result: a saga Err, never a silent fallback.
                 Ok(provider) => match crate::envelope::prepare(&job.input, resolver.as_ref()).await
                 {
-                    Ok((input, ctx)) => provider
-                        .run(&input, &ctx)
+                    Ok(prepared) => execute(&job, prepared, provider, provisioner.as_ref())
                         .await
-                        .map(String::into_bytes)
                         .map_err(clean_error),
                     Err(e) => Err(clean_error(e)),
                 },
@@ -170,6 +188,62 @@ impl DispatchPool {
             inflight.lock().expect("inflight lock").remove(&key);
         }));
     }
+}
+
+/// provision → bind → run → commit → assemble → cleanup, at the dispatch
+/// boundary on the spawned task.
+///
+/// DORMANT unless BOTH a v3 plan AND a wired provisioner are present: without
+/// either, this is byte-for-byte today's `provider.run(&input, &ctx).await`
+/// with the raw text as the delivered bytes. on the portable path the winning
+/// attempt's bytes are the host-assembled `RunnerResult` (prose + receipt).
+/// commit runs ONLY on a successful run (a failed/timed-out run yields a saga
+/// `Err` with the dir cleaned up and no `output_ref`); cleanup always runs
+/// (W5). a commit-mechanism failure degrades to a `no_changes` receipt (R4) —
+/// the run's answer is never lost to a receipt-plumbing error.
+async fn execute(
+    job: &ExecJob,
+    prepared: crate::envelope::Prepared,
+    provider: &dyn capability_host::Provider,
+    provisioner: Option<&SharedProvisioner>,
+) -> Result<Vec<u8>, String> {
+    let crate::envelope::Prepared {
+        input,
+        mut ctx,
+        workspace,
+    } = prepared;
+    let Some((plan, prov)) = workspace.zip(provisioner) else {
+        // accept-only / legacy: unchanged behavior, raw text bytes.
+        return provider.run(&input, &ctx).await.map(String::into_bytes);
+    };
+    let spec = WorkspaceSpec {
+        run_id: format!("{}:{}", job.saga_id, job.attempt),
+        agent_id: ctx.agent_id.clone(),
+        source_prefix: plan.source_prefix,
+        source_snapshot: plan.source_snapshot,
+        mount_path: plan.mount_path,
+        base_tools: plan.base_tools,
+        ro_mounts: Vec::new(), // W6 skills = phase 4
+    };
+    let ws = prov.provision(&spec).await?; // (a)+(b) materialize OUTSIDE storage
+    bind_workspace(ws.as_ref(), &mut ctx); // set workdir_override/env/path_entries
+    let outcome = match provider.run(&input, &ctx).await {
+        Ok(text) => {
+            // (d) capture output_ref; a commit-mechanism failure is a receipt
+            // note, not a lost run (R4).
+            let receipt = ws
+                .commit(&format!("agent run {}", spec.run_id))
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("[oracle] commit failed for {}: {e}", spec.run_id);
+                    crate::provision::WorkspaceReceipt::no_changes(&spec)
+                });
+            Ok(assemble_runner_result(&text, &receipt))
+        }
+        Err(e) => Err(e), // failed run: no commit, no output_ref
+    };
+    ws.cleanup().await; // (e) W5 always
+    outcome
 }
 
 #[async_trait::async_trait(?Send)]
@@ -204,9 +278,12 @@ impl Worker for DispatchPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use crate::provision::{ProvisionedWorkspace, WorkspaceReceipt};
     use dispatch::{WORK_SPEC_KIND, WorkSpec, encode_work_spec};
     use futures::StreamExt as _;
     use saga::{SagaMsg, WorkerRequest, encode_worker_request};
@@ -573,6 +650,297 @@ format = "text"
             0,
             "the provider is never invoked on a failed resolution"
         );
+    }
+
+    // ---- the portable (v3) provisioning bracket -----------------------------
+
+    /// a v3 (portable) run envelope payload — the shape the composer emits only
+    /// AFTER the coordinated flip. carried here to exercise the pool's bracket
+    /// without a live duckfs (the mock stands in for the checkout engine).
+    fn v3_envelope_payload() -> Vec<u8> {
+        serde_json::json!({
+            "ducktape_run": 3,
+            "agent_id": "bot",
+            "prompt_hash": null,
+            "thread_key": "general#7",
+            "instructions": "GENERIC",
+            "contract": "CONTRACT",
+            "conversation": "CONVERSATION",
+            "workspace": {
+                "source_prefix": "/shared/agent-workspaces/bot",
+                "source_snapshot": "aa".repeat(32),
+                "mount_path": "/tmp/ducktape-workspace"
+            },
+            "base_tools": [
+                {"name":"ducktape-files","version":"1","exposure":"cli"}
+            ],
+            "result_contract": {"ducktape_runner_result": 1}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// the winning-attempt bytes a portable run assembles: the mock stand-in
+    /// for a real duckfs checkout. records that provision/commit/cleanup fired,
+    /// binds a deterministic mount + env the provider observes, and (on commit)
+    /// mints a fake output_ref.
+    struct MockProvisioner {
+        provisioned: Arc<AtomicBool>,
+        committed: Arc<AtomicBool>,
+        cleaned: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provision::WorkspaceProvisioner for MockProvisioner {
+        async fn provision(
+            &self,
+            spec: &WorkspaceSpec,
+        ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
+            self.provisioned.store(true, Ordering::SeqCst);
+            let dir = std::env::temp_dir()
+                .join(format!("mock-ws-{}", spec.run_id.replace(':', "_")));
+            let mut env = BTreeMap::new();
+            env.insert("DUCKTAPE_RUN_WORKSPACE".into(), dir.display().to_string());
+            Ok(Box::new(MockWs {
+                dir,
+                src: spec.source_prefix.clone(),
+                snap: spec.source_snapshot.clone(),
+                env,
+                committed: self.committed.clone(),
+                cleaned: self.cleaned.clone(),
+            }))
+        }
+    }
+
+    struct MockWs {
+        dir: PathBuf,
+        src: String,
+        snap: Option<String>,
+        env: BTreeMap<String, String>,
+        committed: Arc<AtomicBool>,
+        cleaned: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProvisionedWorkspace for MockWs {
+        fn workdir(&self) -> PathBuf {
+            self.dir.clone()
+        }
+        fn env(&self) -> BTreeMap<String, String> {
+            self.env.clone()
+        }
+        fn path_entries(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+        async fn commit(&self, _message: &str) -> Result<WorkspaceReceipt, String> {
+            self.committed.store(true, Ordering::SeqCst);
+            Ok(WorkspaceReceipt {
+                source_prefix: self.src.clone(),
+                source_snapshot: self.snap.clone(),
+                output_snapshot: Some("cc".repeat(32)),
+                commit_height: Some(9),
+                rebased: false,
+                no_changes: false,
+            })
+        }
+        async fn cleanup(&self) {
+            self.cleaned.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn flags() -> (Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
+        (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn pool_with_provisioner(
+        providers: Arc<ProviderSet>,
+        provisioner: SharedProvisioner,
+    ) -> (DispatchPool, futures::channel::mpsc::UnboundedReceiver<Msg>) {
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Msg>();
+        let spawn: SpawnFn = Box::new(|fut| {
+            tokio::spawn(fut);
+        });
+        let deliver: DeliverFn = Arc::new(move |msg| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.unbounded_send(msg);
+            })
+        });
+        (
+            DispatchPool::with_limit(providers, b"me".to_vec(), spawn, deliver, 4)
+                .with_provisioner(provisioner),
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_v3_run_with_a_provisioner_wired_provisions_binds_commits_and_wraps_the_result() {
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
+        let (provisioned, committed, cleaned) = flags();
+        let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
+            provisioned: provisioned.clone(),
+            committed: committed.clone(),
+            cleaned: cleaned.clone(),
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        pool.run(&eff).await.unwrap();
+        let (saga_id, attempt, outcome) = next_result(&mut rx).await;
+        assert_eq!((saga_id.as_str(), attempt), ("s1", 0));
+
+        // the delivered bytes are a host-assembled RunnerResult, NOT raw text.
+        let bytes = outcome.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["ducktape_runner_result"], 1);
+        assert_eq!(v["response_text"], "answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION");
+        assert_eq!(v["workspace_receipt"]["output_snapshot"], "cc".repeat(32));
+        assert_eq!(v["workspace_receipt"]["commit_height"], 9);
+        assert_eq!(v["workspace_receipt"]["source_prefix"], "/shared/agent-workspaces/bot");
+        assert_eq!(v["workspace_receipt"]["no_changes"], false);
+
+        // the full lifecycle fired, and the provider ran INSIDE the mount.
+        assert!(provisioned.load(Ordering::SeqCst), "provision was called");
+        assert!(committed.load(Ordering::SeqCst), "commit ran on success");
+        assert!(cleaned.load(Ordering::SeqCst), "cleanup always runs (W5)");
+        let (_, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
+        let expected = std::env::temp_dir().join("mock-ws-s1_0");
+        assert_eq!(
+            ctx.workdir_override.as_deref(),
+            Some(expected.as_path()),
+            "the provider observed the bound mount as its cwd"
+        );
+        assert_eq!(
+            ctx.env.get("DUCKTAPE_RUN_WORKSPACE").map(String::as_str),
+            Some(expected.display().to_string().as_str()),
+            "the run-scoped workspace env was applied"
+        );
+        assert!(ctx.portable, "a v3 run is portable");
+    }
+
+    #[tokio::test]
+    async fn a_failed_v3_run_cleans_up_without_committing_and_delivers_the_error() {
+        let (providers, _probes) = slow_providers(Duration::from_millis(5), true);
+        let (provisioned, committed, cleaned) = flags();
+        let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
+            provisioned: provisioned.clone(),
+            committed: committed.clone(),
+            cleaned: cleaned.clone(),
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        pool.run(&eff).await.unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+
+        let err = outcome.unwrap_err();
+        assert!(err.contains("provider exploded"), "the run's error surfaces: {err}");
+        assert!(provisioned.load(Ordering::SeqCst), "the mount was materialized");
+        assert!(
+            !committed.load(Ordering::SeqCst),
+            "a failed run commits NOTHING — no output_ref for a discarded attempt"
+        );
+        assert!(cleaned.load(Ordering::SeqCst), "cleanup still runs on failure (W5)");
+    }
+
+    #[tokio::test]
+    async fn a_v3_run_without_a_provisioner_is_dormant_raw_text_no_wrapper() {
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
+        let (pool, mut rx) = pool_with(providers, 4); // NO provisioner
+
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        pool.run(&eff).await.unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+
+        // no wrapper: the raw provider text is delivered verbatim.
+        assert_eq!(
+            outcome.unwrap(),
+            b"answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION".to_vec(),
+            "an unwired provisioner keeps the accept-only behavior (dormant)"
+        );
+        let (_, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
+        assert!(
+            ctx.workdir_override.is_none(),
+            "no provisioner => no mount is bound, exactly the accept slice"
+        );
+        assert!(ctx.portable, "the run is still marked portable at accept");
+    }
+
+    #[tokio::test]
+    async fn a_v2_run_is_byte_identical_with_or_without_a_provisioner() {
+        // the pre-flip regression guard: every LIVE (v2) run must produce the
+        // exact same outcome bytes whether or not a provisioner is wired.
+        let expected = b"answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION".to_vec();
+
+        // without a provisioner.
+        let (providers, _p) = slow_providers(Duration::from_millis(5), false);
+        let (pool, mut rx) = pool_with(providers, 4);
+        pool.run(&effect_with_payload("s1", 0, Some(b"me"), &envelope_payload(None)))
+            .await
+            .unwrap();
+        assert_eq!(next_result(&mut rx).await.2.unwrap(), expected);
+
+        // with a provisioner wired: a v2 run carries no plan, so the bracket
+        // takes the unchanged branch and the provisioner is never touched.
+        let (providers, _p) = slow_providers(Duration::from_millis(5), false);
+        let (provisioned, committed, cleaned) = flags();
+        let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
+            provisioned: provisioned.clone(),
+            committed: committed.clone(),
+            cleaned: cleaned.clone(),
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+        pool.run(&effect_with_payload("s1", 0, Some(b"me"), &envelope_payload(None)))
+            .await
+            .unwrap();
+        assert_eq!(next_result(&mut rx).await.2.unwrap(), expected);
+        assert!(!provisioned.load(Ordering::SeqCst), "a v2 run never provisions");
+        assert!(!committed.load(Ordering::SeqCst));
+        assert!(!cleaned.load(Ordering::SeqCst));
+    }
+
+    /// pin the assembled wire shape against `runs::RunnerResult` field-for-field
+    /// (a mirror of the consumer's Deserialize). a rename in EITHER crate must
+    /// fail THIS test, never production — the receipt round-trips through
+    /// `runs::response_text_from_dispatch_bytes`.
+    #[test]
+    fn assembled_runner_result_matches_the_runs_deserialize_contract() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct RunsRunnerResult {
+            ducktape_runner_result: u32,
+            response_text: String,
+            workspace_receipt: RunsWorkspaceReceipt,
+        }
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct RunsWorkspaceReceipt {
+            source_prefix: String,
+            source_snapshot: Option<String>,
+            output_snapshot: Option<String>,
+            commit_height: Option<u64>,
+            rebased: bool,
+            no_changes: bool,
+        }
+
+        let receipt = WorkspaceReceipt {
+            source_prefix: "/shared/agent-workspaces/bot".into(),
+            source_snapshot: Some("aa".repeat(32)),
+            output_snapshot: Some("cc".repeat(32)),
+            commit_height: Some(9),
+            rebased: true,
+            no_changes: false,
+        };
+        let bytes = assemble_runner_result("the answer", &receipt);
+        let parsed: RunsRunnerResult = serde_json::from_slice(&bytes)
+            .expect("assembled bytes deserialize into the runs contract");
+        assert_eq!(parsed.ducktape_runner_result, 1);
+        assert_eq!(parsed.response_text, "the answer");
+        assert_eq!(parsed.workspace_receipt.output_snapshot, Some("cc".repeat(32)));
     }
 
     /// the pool's gate is the shared one: announcements claim (Accept) or

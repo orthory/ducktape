@@ -275,6 +275,14 @@ impl CliProvider {
             // dropping the wait future (timeout) must kill the child — a hung
             // CLI never outlives its job.
             .kill_on_drop(true);
+        // D7 TODO (deterministic-agent-runtime, isolation floor): for a
+        // portable run this is still ADDITIVE-only — no `cmd.env_clear()` —
+        // so the child inherits the node's full environment (HOME =>
+        // ~/.ducktape/user.key, DUCKTAPE_*, &c). the env_clear + ResourceCaps
+        // allowlist lands in Phase 4 (identity/caps); Phase 2 only relocated
+        // the workspace ROOT outside <storage> to kill the `..`-traversal
+        // hole. Phase 4 MUST land before the composer flips to v3 or
+        // containment is incomplete.
         cmd.envs(ctx.env.iter());
         if !ctx.path_entries.is_empty() {
             let mut path = ctx.path_entries.clone();

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
-use dispatch_oracle::{BlobResolver, DeliverFn, DispatchPool, SpawnFn};
+use dispatch_oracle::{BlobResolver, DeliverFn, DispatchPool, SharedProvisioner, SpawnFn};
 use futures::SinkExt as _;
 use futures::channel::mpsc;
 use noded::NodeCommand;
@@ -30,6 +30,7 @@ use crate::ORACLE_ORIGIN;
 pub(crate) fn oracle_workers<C>(
     context: &C,
     cmds: mpsc::Sender<NodeCommand>,
+    node_handle: noded::NodeHandle,
     blobs: noded::blobs::BlobHandle,
     agent_dirs: capability_host::AgentDirs,
 ) -> Vec<Box<dyn reactor::Worker>>
@@ -92,6 +93,16 @@ where
         Box::pin(async move { blobs.get_chunk(&digest) })
     });
 
+    // the REAL workspace provisioner: portable (v3) runs materialize a per-run
+    // duckfs checkout under a root OUTSIDE <storage> (D7), drive it over the
+    // daemon's OWN actor lane (no self-dial), commit the output_ref, and clean
+    // up. DORMANT until the composer flips to v3 — every live (v2) run takes
+    // the pool's unchanged plain-run branch and never touches this.
+    let provisioner: SharedProvisioner = Arc::new(noded::agent_provision::NodedProvisioner::new(
+        node_handle,
+        noded::agent_provision::agent_runs_root(),
+    ));
+
     vec![Box::new(
         DispatchPool::new(
             Arc::new(providers),
@@ -102,7 +113,8 @@ where
             spawn,
             deliver,
         )
-        .with_resolver(resolver),
+        .with_resolver(resolver)
+        .with_provisioner(provisioner),
     )]
 }
 

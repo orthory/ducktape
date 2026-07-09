@@ -26,11 +26,17 @@ use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::provision::{BaseTool, PortablePlan};
+
 /// the newest envelope version this worker assembles. v2 remains accepted for
 /// in-flight legacy runs; v3 is the portable duckfs-workspace runner contract.
 pub const RUN_ENVELOPE_VERSION: u64 = 3;
 const LEGACY_RUN_ENVELOPE_VERSION: u64 = 2;
-const RUNNER_RESULT_VERSION: u64 = 1;
+/// the runner-result wrapper version — the SINGLE owner across this crate. the
+/// provisioning wrapper's [`crate::provision::assemble_runner_result`] stamps
+/// it, the v3 accept slice validates the envelope requests it, and `runs`
+/// reads it back as `u32 == 1`. never redeclare a second const.
+pub const RUNNER_RESULT_VERSION: u64 = 1;
 
 /// resolve one 32-byte content address to its blob bytes, `None` when this
 /// node does not hold it. injected by the embedding binary (the node-local
@@ -63,36 +69,21 @@ struct WireEnvelope {
 }
 
 /// the portable workspace block. every field is decoded so a malformed v3
-/// envelope fails to parse (acceptance IS validation), but the accept slice
-/// only reads `source_prefix`/`mount_path` for their non-empty checks — the
-/// snapshot is consumed by the provisioning wrapper at the flip.
+/// envelope fails to parse (acceptance IS validation); `source_prefix` and
+/// `mount_path` are validated non-empty, and the whole block is surfaced as a
+/// [`PortablePlan`] the pool acts on (or not) — the pinned `source_snapshot`
+/// is the source the provisioner checks out.
 #[derive(Deserialize)]
 struct WireWorkspace {
     source_prefix: String,
-    #[allow(
-        dead_code,
-        reason = "pinned source consumed by the provisioning wrapper at the flip"
-    )]
     source_snapshot: Option<String>,
     mount_path: String,
 }
 
 #[derive(Deserialize)]
 struct WireBaseTool {
-    #[allow(
-        dead_code,
-        reason = "manifest entry validated by presence; bindings wired at the flip"
-    )]
     name: String,
-    #[allow(
-        dead_code,
-        reason = "manifest entry validated by presence; bindings wired at the flip"
-    )]
     version: String,
-    #[allow(
-        dead_code,
-        reason = "exposure is validated by manifest presence, not interpreted"
-    )]
     exposure: String,
 }
 
@@ -101,24 +92,39 @@ struct WireResultContract {
     ducktape_runner_result: u64,
 }
 
+/// the assembled provider input plus the per-run context, and — for a v3
+/// (portable) envelope — the pinned workspace plan. the pool acts on
+/// `workspace` iff a provisioner is wired; otherwise the run stays accept-only
+/// (dormant), so surfacing the plan here never activates a mount.
+#[derive(Debug)]
+pub struct Prepared {
+    pub input: String,
+    pub ctx: RunContext,
+    /// `Some` only for a v3 envelope; `None` for v2/legacy.
+    pub workspace: Option<PortablePlan>,
+}
+
 /// turn one dispatch payload into the provider's input and per-run context.
 ///
 /// - no `ducktape_run` marker → legacy passthrough: the input IS the payload,
-///   byte-identical, with a default context.
+///   byte-identical, with a default context and no workspace plan.
 /// - marker present → full envelope handling; every failure is a loud `Err`
 ///   that becomes the saga result (NEVER a silent fallback to the generic
 ///   instructions — the agent's registered prompt is the whole point).
-pub async fn prepare(
-    input: &str,
-    resolver: Option<&BlobResolver>,
-) -> Result<(String, RunContext), String> {
+pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Prepared, String> {
     // marker detection is deliberately strict about what counts as a claim:
     // the payload must be a whole JSON object carrying the key. a flat
     // prompt that merely STARTS with '{' (or embeds the marker in prose)
     // fails the parse and passes through untouched.
     let claimed = match serde_json::from_str::<Value>(input) {
         Ok(Value::Object(map)) if map.contains_key("ducktape_run") => Value::Object(map),
-        _ => return Ok((input.to_string(), RunContext::default())),
+        _ => {
+            return Ok(Prepared {
+                input: input.to_string(),
+                ctx: RunContext::default(),
+                workspace: None,
+            });
+        }
     };
 
     let version = claimed
@@ -175,43 +181,48 @@ pub async fn prepare(
         thread_key: envelope.thread_key,
         ..RunContext::default()
     };
-    if version == RUN_ENVELOPE_VERSION {
+    let workspace = if version == RUN_ENVELOPE_VERSION {
         accept_portable_envelope(
             &mut ctx,
             envelope.workspace,
             envelope.base_tools,
             envelope.result_contract,
-        )?;
-    }
-    Ok((
-        format!(
+        )?
+    } else {
+        None
+    };
+    Ok(Prepared {
+        input: format!(
             "{prompt}\n\n{}\n\n{}",
             envelope.contract, envelope.conversation
         ),
         ctx,
-    ))
+        workspace,
+    })
 }
 
-/// ACCEPT a v3 (portable) envelope without ACTIVATING portable execution.
+/// ACCEPT a v3 (portable) envelope and surface its pinned plan, without
+/// ACTIVATING portable execution HERE.
 ///
 /// this worker validates the portable shape — proving mixed-network nodes on
 /// this binary understand v3 before any node composes it — and marks the run
 /// portable so no host-local native session is resumed for it. it deliberately
 /// does NOT translate the envelope's advisory `mount_path` into the child's
-/// working directory or inject workspace env: the mount is not materialized
-/// until the provisioning wrapper exists, and a consensus-supplied host path
-/// (constant `/workspace`) is exactly the unwritable cwd that turned live runs
-/// into `create_dir_all` failures. per the ADR
-/// (`2026-07-09-deterministic-agent-runtime`, ROL/M2 + W1) portable ACTIVATION
-/// — a per-run writable mount and its bindings — lands with that wrapper and a
-/// coordinated flip; until then the host's own scratch/persistent workspace
-/// policy owns the cwd (see `capability-host::workdir_for`).
+/// working directory or inject workspace env: turning the plan into a real
+/// mount is the pool's job via the injected provisioner (and a
+/// consensus-supplied host path like the constant `/workspace` is exactly the
+/// unwritable cwd that turned live runs into `create_dir_all` failures). per
+/// the ADR (`2026-07-09-deterministic-agent-runtime`, ROL/M2 + W1) portable
+/// ACTIVATION — a per-run writable mount and its bindings — happens in the pool
+/// only when a provisioner is wired AND a coordinated flip emits v3; until then
+/// the returned plan is inert data and the host's own scratch/persistent
+/// workspace policy owns the cwd (see `capability-host::workdir_for`).
 fn accept_portable_envelope(
     ctx: &mut RunContext,
     workspace: Option<WireWorkspace>,
     base_tools: Option<Vec<WireBaseTool>>,
     result_contract: Option<WireResultContract>,
-) -> Result<(), String> {
+) -> Result<Option<PortablePlan>, String> {
     let workspace = workspace.ok_or_else(|| "v3 run envelope is missing workspace".to_string())?;
     if workspace.source_prefix.is_empty() {
         return Err("v3 run envelope workspace.source_prefix must not be empty".into());
@@ -227,15 +238,29 @@ fn accept_portable_envelope(
             result_contract.ducktape_runner_result
         ));
     }
-    if base_tools
-        .ok_or_else(|| "v3 run envelope is missing base_tools".to_string())?
-        .is_empty()
-    {
+    let base_tools =
+        base_tools.ok_or_else(|| "v3 run envelope is missing base_tools".to_string())?;
+    if base_tools.is_empty() {
         return Err("v3 run envelope base_tools must not be empty".into());
     }
 
+    // mark portable (no host-local session resume) but set NO
+    // workdir_override/env here (W1/M2) — the plan is data the pool decides
+    // whether to act on.
     ctx.portable = true;
-    Ok(())
+    Ok(Some(PortablePlan {
+        source_prefix: workspace.source_prefix,
+        source_snapshot: workspace.source_snapshot,
+        mount_path: workspace.mount_path,
+        base_tools: base_tools
+            .into_iter()
+            .map(|t| BaseTool {
+                name: t.name,
+                version: t.version,
+                exposure: t.exposure,
+            })
+            .collect(),
+    }))
 }
 
 /// 64 lowercase-or-uppercase hex chars → 32 bytes. strict charset first:
@@ -314,15 +339,20 @@ mod tests {
             // the marker as PROSE inside a flat prompt, not a JSON key.
             "the ducktape_run marker is discussed here",
         ] {
-            let (input, ctx) = prepare(legacy, None).await.unwrap();
+            let Prepared {
+                input,
+                ctx,
+                workspace,
+            } = prepare(legacy, None).await.unwrap();
             assert_eq!(input.as_bytes(), legacy.as_bytes(), "verbatim: {legacy:?}");
             assert_eq!(ctx, RunContext::default());
+            assert!(workspace.is_none(), "legacy payloads carry no plan");
         }
     }
 
     #[tokio::test]
     async fn a_null_hash_envelope_assembles_instructions_contract_conversation() {
-        let (input, ctx) = prepare(&envelope_json(None), None).await.unwrap();
+        let Prepared { input, ctx, .. } = prepare(&envelope_json(None), None).await.unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
@@ -333,7 +363,7 @@ mod tests {
         let hash = [7u8; 32];
         let hex = "07".repeat(32);
         let resolver = resolver_with(hash, b"You are Bot, the release captain.".to_vec());
-        let (input, _) = prepare(&envelope_json(Some(&hex)), Some(&resolver))
+        let Prepared { input, .. } = prepare(&envelope_json(Some(&hex)), Some(&resolver))
             .await
             .unwrap();
         assert_eq!(
@@ -406,7 +436,7 @@ mod tests {
         // worker must not kill in-flight runs over it.
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
         v["a_future_field"] = serde_json::json!("x");
-        let (input, _) = prepare(&v.to_string(), None).await.unwrap();
+        let Prepared { input, .. } = prepare(&v.to_string(), None).await.unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
     }
 
@@ -414,7 +444,7 @@ mod tests {
     async fn job_envelopes_carry_no_thread_key() {
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json(None)).unwrap();
         v["thread_key"] = serde_json::Value::Null;
-        let (_, ctx) = prepare(&v.to_string(), None).await.unwrap();
+        let Prepared { ctx, .. } = prepare(&v.to_string(), None).await.unwrap();
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert_eq!(ctx.thread_key, None);
     }
@@ -426,7 +456,11 @@ mod tests {
         // workspace mount: no consensus-supplied cwd override, no workspace
         // env. the host's own scratch/persistent policy owns the cwd until the
         // provisioning wrapper lands (ADR ROL/M2 + W1).
-        let (input, ctx) = prepare(&v3_envelope_json(None), None).await.unwrap();
+        let Prepared {
+            input,
+            ctx,
+            workspace,
+        } = prepare(&v3_envelope_json(None), None).await.unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
@@ -443,6 +477,13 @@ mod tests {
             "no workspace env is injected until the mount is materialized"
         );
         assert!(ctx.path_entries.is_empty());
+        // the pinned plan IS surfaced (so the pool CAN act on it when a
+        // provisioner is wired) — surfacing it is not activating it.
+        let plan = workspace.expect("a v3 envelope surfaces its portable plan");
+        assert_eq!(plan.source_prefix, "/shared/agent-workspaces/bot");
+        assert_eq!(plan.source_snapshot.as_deref(), Some("aa".repeat(32).as_str()));
+        assert_eq!(plan.mount_path, "/tmp/ducktape-workspace");
+        assert_eq!(plan.base_tools.len(), 3);
     }
 
     #[tokio::test]
@@ -474,10 +515,13 @@ mod tests {
 
     #[tokio::test]
     async fn v2_envelopes_remain_non_portable_for_legacy_in_flight_runs() {
-        let (_, ctx) = prepare(&envelope_json(None), None).await.unwrap();
+        let Prepared {
+            ctx, workspace, ..
+        } = prepare(&envelope_json(None), None).await.unwrap();
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert!(!ctx.portable);
         assert!(ctx.workdir_override.is_none());
         assert!(ctx.env.is_empty());
+        assert!(workspace.is_none(), "v2 runs carry no portable plan");
     }
 }
