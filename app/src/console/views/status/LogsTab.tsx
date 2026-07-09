@@ -1,8 +1,5 @@
-// Node → Logs tab: a live view of the LOCAL daemon.log the desktop shell wrote
-// when it spawned this workspace's node, plus the running process's runtime
-// facts. Managed-only: a remote/unmanaged node has no local log or pid to read.
-// The log is POLLED (the existing workspace_log_tail 64 KB tail), not streamed —
-// an operator glance, not a full history browser.
+// Node → Logs tab: a live stream of the node logs. Managed desktop nodes also
+// use the existing daemon.log tail as backfill and show local runtime facts.
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
@@ -16,6 +13,7 @@ import {
   splitLines,
   type LogLevel,
 } from "./log-lines";
+import { useLogStream } from "./use-log-stream";
 
 /** How often the tail is re-read. Fast enough to feel live, slow enough that a
  *  64 KB read every tick is negligible. Mirrors the Overview's metrics poller. */
@@ -285,7 +283,7 @@ function Toolbar({
             }}
           />
           <span style={{ font: `600 11px ${font.mono}`, color: color.inkSoft }}>
-            daemon.log
+            node logs
           </span>
           <span style={{ font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
             {following ? "following" : "paused"}
@@ -359,26 +357,6 @@ function Toolbar({
           />
         ))}
       </div>
-    </div>
-  );
-}
-
-function ManagedOnlyEmpty() {
-  return (
-    <div
-      style={{
-        border: `1px solid ${color.borderSoft}`,
-        background: color.sunken,
-        borderRadius: radius.lg,
-        padding: "22px 20px",
-        font: `400 12.5px ${font.sans}`,
-        color: color.muted2,
-        lineHeight: 1.5,
-        maxWidth: 560,
-      }}
-    >
-      Logs are only available for the local daemon this app manages. This view is
-      connected to a remote node, which writes its logs on its own machine.
     </div>
   );
 }
@@ -460,17 +438,18 @@ function LogBody({
 }
 
 export function LogsTab(): ReactNode {
-  const { state } = useDucktape();
+  const { state, transport } = useDucktape();
   const managed = state.managed;
   const version = state.status?.version ?? null;
   const { tail, facts } = usePolledDaemon(managed, state.workspace?.id ?? null);
+  const streamed = useLogStream(transport, managed ? tail : null);
 
   const [query, setQuery] = useState("");
   const [enabled, setEnabled] = useState<Set<LogLevel>>(() => new Set(LOG_LEVELS));
   const [following, setFollowing] = useState(true);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  const lines = useMemo(() => splitLines(tail ?? ""), [tail]);
+  const lines = useMemo(() => splitLines(streamed.text), [streamed.text]);
   const counts = useMemo(() => levelCounts(lines), [lines]);
   const filtered = useMemo(
     () => filterLines(lines, { query, levels: enabled }),
@@ -483,8 +462,6 @@ export function LogsTab(): ReactNode {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [filtered, following]);
-
-  if (!managed) return <ManagedOnlyEmpty />;
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -521,7 +498,7 @@ export function LogsTab(): ReactNode {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16, minHeight: 0, flex: 1 }}>
-      <RuntimeFactsRow facts={facts} version={version} />
+      {managed && <RuntimeFactsRow facts={facts} version={version} />}
       <Toolbar
         following={following}
         matchInfo={matchInfo}
@@ -534,7 +511,7 @@ export function LogsTab(): ReactNode {
         onJump={jumpToLatest}
       />
       <LogBody
-        ready={tail !== null}
+        ready={streamed.ready}
         lines={filtered}
         scrollRef={scrollRef}
         onScroll={onScroll}

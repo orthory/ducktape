@@ -236,7 +236,7 @@ impl Daemon {
     }
 
     /// read one server->client text frame (unfragmented, unmasked — what the
-    /// daemon sends for block events).
+    /// daemon sends for stream frames).
     fn ws_read_text(reader: &mut BufReader<TcpStream>) -> String {
         let mut head = [0u8; 2];
         reader.read_exact(&mut head).expect("ws frame head");
@@ -254,6 +254,42 @@ impl Daemon {
         let mut payload = vec![0u8; len as usize];
         reader.read_exact(&mut payload).expect("ws frame payload");
         String::from_utf8(payload).expect("ws text frame is utf-8")
+    }
+
+    /// send one client->server text frame. RFC6455 requires client frames to
+    /// be masked; the static key is fine for a deterministic test client.
+    fn ws_send_text(reader: &mut BufReader<TcpStream>, text: &str) {
+        let payload = text.as_bytes();
+        let mut frame = Vec::new();
+        frame.push(0x81);
+        if payload.len() < 126 {
+            frame.push(0x80 | payload.len() as u8);
+        } else if payload.len() <= u16::MAX as usize {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        frame.extend_from_slice(&mask);
+        for (i, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[i % mask.len()]);
+        }
+        reader.get_mut().write_all(&frame).expect("ws frame write");
+    }
+
+    fn ws_read_json(reader: &mut BufReader<TcpStream>) -> serde_json::Value {
+        serde_json::from_str(&Self::ws_read_text(reader)).expect("ws frame json")
+    }
+
+    fn ws_read_type(reader: &mut BufReader<TcpStream>, want: &str) -> serde_json::Value {
+        loop {
+            let frame = Self::ws_read_json(reader);
+            if frame["type"] == want {
+                return frame;
+            }
+        }
     }
 
     /// a websocket-upgrade GET that expects an http REFUSAL, not a 101: sends
@@ -391,8 +427,19 @@ fn full_surface_blocks_authorship_and_ws() {
     );
     let genesis_hash = status["appHash"].as_str().expect("appHash").to_string();
 
-    // subscribe BEFORE submitting: every committed block must fan out.
+    // connect before submitting: the stream heartbeats without a subscription,
+    // then module events catch up from the subscribed cursor.
     let mut ws = daemon.ws_connect();
+    let heartbeat = Daemon::ws_read_type(&mut ws, "heartbeat");
+    assert_eq!(heartbeat["height"], 0);
+    assert_eq!(heartbeat["intervalMs"], 3_000);
+
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["module:chat"]}"#);
+    let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+    assert_eq!(
+        subscribed["topics"]["module:chat"],
+        "op/0000000000000000/ffff"
+    );
 
     // one msg = one block; the summary echoes the new height + app-hash.
     let (code, block) = daemon.submit(
@@ -414,18 +461,45 @@ fn full_surface_blocks_authorship_and_ws() {
     assert_eq!(code, 200, "post failed: {block}");
     assert_eq!(block["height"], 2);
 
-    // the ws stream carries one tagged Block frame per committed block, in
-    // order. classify by `type` — unknown kinds are a wire regression here.
-    let mut block_heights: Vec<u64> = Vec::new();
-    while block_heights.len() < 2 {
-        let frame: serde_json::Value =
-            serde_json::from_str(&Daemon::ws_read_text(&mut ws)).expect("ws frame json");
-        match frame["type"].as_str() {
-            Some("block") => block_heights.push(frame["height"].as_u64().expect("block height")),
-            other => panic!("unexpected ws frame type: {other:?}"),
-        }
-    }
-    assert_eq!(block_heights, [1, 2], "both blocks fan out in order");
+    // the ws stream carries index-backed op rows, not payload-free block
+    // ticks. each event cursor is the same `after` token the HTTP op log uses.
+    let event1 = Daemon::ws_read_type(&mut ws, "event");
+    let event2 = Daemon::ws_read_type(&mut ws, "event");
+    assert_eq!(event1["topic"], "module:chat");
+    assert_eq!(event2["topic"], "module:chat");
+    assert_eq!(event1["cursor"], "op/0000000000000001/0000");
+    assert_eq!(event2["cursor"], "op/0000000000000002/0000");
+
+    let (code, ops) = daemon.request("GET", "/v1/index/chat/ops?limit=10", None);
+    assert_eq!(code, 200, "ops failed: {ops}");
+    let rows = ops["ops"].as_array().expect("ops array");
+    assert_eq!(rows.len(), 2, "create and post rows: {ops}");
+    assert_eq!(event1["op"], rows[0]);
+    assert_eq!(event2["op"], rows[1]);
+
+    let cursor1 = event1["cursor"].as_str().expect("event cursor");
+    let (code, paged) = daemon.request(
+        "GET",
+        &format!("/v1/index/chat/ops?after={cursor1}&limit=10"),
+        None,
+    );
+    assert_eq!(code, 200, "paged ops failed: {paged}");
+    let paged_rows = paged["ops"].as_array().expect("paged ops array");
+    assert_eq!(paged_rows.as_slice(), &rows[1..], "cursor pages to row 2");
+
+    drop(ws);
+    let mut ws = daemon.ws_connect();
+    let _heartbeat = Daemon::ws_read_type(&mut ws, "heartbeat");
+    Daemon::ws_send_text(
+        &mut ws,
+        &format!(
+            r#"{{"op":"subscribe","topics":["module:chat"],"resume":{{"module:chat":"{cursor1}"}}}}"#
+        ),
+    );
+    let _subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+    let replay = Daemon::ws_read_type(&mut ws, "event");
+    assert_eq!(replay["cursor"], event2["cursor"]);
+    assert_eq!(replay["op"], rows[1]);
 
     // committed state reads back; authorship derived from the submit origin.
     let reply = daemon.query(

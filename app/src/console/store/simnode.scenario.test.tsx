@@ -2,7 +2,7 @@
 // (real http + ws) against a spawned deterministic sim node (bin/simnode).
 // The unit suites fake the transport; live-daemon.e2e drives the domain layer
 // only. This suite is the missing middle — the provider's refresh loop,
-// optimistic ledger, and block-stream gating against actual wire traffic,
+// optimistic ledger, and module event-stream gating against actual wire traffic,
 // with block production under test control so every race is a script, not a
 // timing accident.
 //
@@ -137,7 +137,7 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
   );
 
   it(
-    "a fresh pending gates block-stream refreshes; a stale one stops gating (the accepted race)",
+    "a fresh pending gates module-event refreshes; a stale one stops gating (the accepted race)",
     { timeout: 30_000 },
     async () => {
       const { sim } = await boot();
@@ -146,8 +146,8 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       act(() => capturedActions!.createChannel("Mine", "open"));
       await waitFor(async () => expect((await sim.state()).held).toBe(1));
 
-      // a concurrent writer's block lands. the ws chain tip is ungated, so
-      // its advance proves the ws delivered — then the gate must have held:
+      // a concurrent writer's chat event lands. the ws chain tip is ungated, so
+      // its advance proves the stream delivered — then the gate must have held:
       // no refresh, so the rival's committed channel stays invisible.
       await sim.peerBlock("chat", peerChannel("rival-1", "Rival 1"));
       await waitFor(() => expect(capturedState!.lastBlock).toBe(1));
@@ -225,7 +225,7 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       const { sim } = await boot();
 
       // a rival authors the channel and a message — peer blocks commit
-      // immediately, and with nothing pending the block-stream refresh is
+      // immediately, and with nothing pending the module-event refresh is
       // ungated, so committed truth reaches the app on its own.
       await sim.peerBlock("chat", peerChannel("general", "General"), "rival");
       await sim.peerBlock(
@@ -354,7 +354,7 @@ describe.skipIf(!bin)("provider scenarios against the sim node", () => {
       expect(report.committed?.kind).toBe("oracle");
       expect(report.committed?.height).toBe(5);
 
-      // the follow-up's height reaches the app over the ws stream ONLY —
+      // the follow-up's height reaches the app over the module event stream ONLY —
       // no submit receipt ever carries it, and no op record claims it.
       await waitFor(() => expect(capturedState!.lastBlock).toBe(5));
       await waitFor(() => expect(capturedState!.status?.height).toBe(5));

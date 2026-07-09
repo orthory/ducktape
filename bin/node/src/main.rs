@@ -62,6 +62,7 @@ use commonware_utils::{NZU32, ordered::Set};
 use dispatch::DispatchModule;
 use tagging::TaggingModule;
 use futures::{FutureExt as _, StreamExt as _};
+use tracing_subscriber::prelude::*;
 
 use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
 
@@ -70,6 +71,7 @@ mod first_contact_join;
 mod lobby;
 mod oracle_pool;
 mod relay;
+mod relay_runtime;
 mod replica;
 mod resident_announce;
 mod resident_dispatch;
@@ -78,6 +80,19 @@ mod userkey;
 mod voice;
 mod voice_plane;
 use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
+
+fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
+    std::sync::Arc::new(move |ctx, line| {
+        let Some(run_key) = ctx.run_key.as_deref() else {
+            return;
+        };
+        let stream = match line.stream {
+            capability_host::OutputStream::Stdout => noded::RunStream::Stdout,
+            capability_host::OutputStream::Stderr => noded::RunStream::Stderr,
+        };
+        registry.append(run_key, stream, line.line);
+    })
+}
 
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
@@ -114,7 +129,7 @@ use saga::{LeasePolicy, SagaModule};
 use sdk::{ModuleId, Msg, StateRoot};
 use statesync::p2p::P2pSyncClient;
 use statesync::qmdb::RemoteQmdbResolver;
-use statesync::{SyncServer, fetch_frames, fetch_manifest, fetch_snapshot};
+use statesync::{SyncServer, fetch_frames, fetch_manifest, fetch_snapshot, fetch_tip_coords};
 use tasks::Tasks;
 use upgrade::Upgrade;
 use valset::Valset;
@@ -1057,6 +1072,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     duckfs_dir: &std::path::Path,
     // see `genesis_host` — the same binding must reach every rebuild path.
     invite_binding: &[u8],
+    blobs: blobstore::BlobHandle,
     attempt: usize,
     chain_id: &str,
 ) -> Result<Host, String> {
@@ -1279,7 +1295,7 @@ async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("automations install: {e}"))?;
 
     let (bytes, root) = snapshot_of("forge").await?;
-    let mut forge = Forge::init("forge", forge_repo.to_path_buf())
+    let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .map_err(|e| format!("forge init: {e}"))?
         .with_chat("chat");
     // set the dual-path branch selector to the SERVED boundary version BEFORE
@@ -1801,6 +1817,13 @@ enum SyncStateRequest {
     IndexCut {
         reply: tokio::sync::oneshot::Sender<std::collections::BTreeMap<String, Vec<u8>>>,
     },
+    /// read the tip's consensus coordinates — the DETECTION lane: answered
+    /// straight from loop-owned state (no capture, no lease, no floor-cert
+    /// alignment gate), so a resident fleet's routine polling never rides
+    /// the Manifest path.
+    TipCoords {
+        reply: tokio::sync::oneshot::Sender<Result<statesync::TipCoords, String>>,
+    },
 }
 
 /// the [`SyncStateRequest::Boundary`] answer: the served boundary's identity
@@ -1930,6 +1953,15 @@ async fn drive_sync_request(
                 _ => statesync::SyncResponse::Error(
                     "index attach did not settle the request".into(),
                 ),
+            }
+        }
+        statesync::ServeStep::NeedCoords => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            ask(SyncStateRequest::TipCoords { reply: tx }).await;
+            match rx.await {
+                Ok(Ok(coords)) => statesync::SyncResponse::TipCoords(coords),
+                Ok(Err(e)) => statesync::SyncResponse::Error(e),
+                Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
             }
         }
     }
@@ -3039,13 +3071,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // opt-in internals visibility: RUST_LOG=commonware_p2p=debug etc.
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+    let log_ring = noded::LogRing::default();
+    init_tracing(log_ring.clone());
 
-    run_node(config::resolve(&cfg_path)?, sync_only)
+    run_node(config::resolve(&cfg_path)?, sync_only, log_ring)
+}
+
+fn init_tracing(log_ring: noded::LogRing) {
+    // opt-in internals visibility: RUST_LOG=commonware_p2p=debug etc.
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+    // the stream's `logs` topic: info floor by default so hot-path debug/trace
+    // events never pay per-event formatting into the ring; RUST_LOG overrides.
+    let ring_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(log_ring)
+        .with_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        );
+    let _ = tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(ring_layer)
+        .try_init();
 }
 
 // ============================================================================
@@ -4572,7 +4621,7 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         None
                     }
                     Err(err) => return Err(err.into()),
-            };
+                };
             match host {
                 Some(host) => {
                     let intro_port =
@@ -6222,7 +6271,11 @@ async fn reachability_plane(
 /// and you cannot start a runtime from inside one. so `main` is sync and hands
 /// off to `Runner::start`, which drives everything (including the engine's spawned
 /// tasks) on the runtime it owns.
-fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_node(
+    resolved: Resolved,
+    sync_only: bool,
+    log_ring: noded::LogRing,
+) -> Result<(), Box<dyn std::error::Error>> {
     let Resolved {
         signer,
         label,
@@ -6449,7 +6502,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // its OWN plain-tokio OS thread (noded's exact split — the host never
     // leaves the commonware runner thread; http handlers only send
     // NodeCommands over the lane), so the pump below is its single consumer.
-    let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
+    let (http_handle, http_cmds, stream_hub) = noded::NodeHandle::channel_with_log_ring(log_ring);
     // the derived per-module index (noded's exact store, <storage>/index),
     // plus the blocks database the explorer reads: the pump folds sealed
     // blocks into it, boot heals it from verified state at sync/recovery
@@ -6459,6 +6512,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // is fatal-with-remedy rather than a silent no-index run: the tier is
     // rebuildable, so the fix is always "delete <storage>/index".
     let index = noded::open_index_store(&storage, &MODULE_IDS)?;
+    stream_hub.prime(index.resume_height()?, String::new());
     // the voice hub's session lane: /v1/call/ws handlers ask for huddle
     // audio sessions here. created up front because the app-surface thread
     // starts before the mesh exists; only the validator path below spawns the
@@ -6791,6 +6845,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 &forge_repo,
                 &duckfs_dir,
                 &namespace,
+                blobs.clone(),
                 0,
                 &identity_chain_id,
             )
@@ -7463,69 +7518,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     "joining: redemption not landed yet — no state to serve".into()
                 }
             };
-            // relay a caller's op: sign with THIS node's identity (the frame
-            // origin — chat authorship, status.publicKey), bump+persist the seq
-            // BEFORE building the frame (a crash between persist and send costs
-            // one seq number, never a reuse), ship to one current validator
-            // round-robin. Err is immediate — nothing is held on it, and
-            // `relay_round` advances only on an actual send attempt.
-            #[allow(clippy::too_many_arguments)]
-            fn relay_submit_frame<S: P2pSender<PublicKey = ed25519::PublicKey>>(
-                signer: &ed25519::PrivateKey,
-                relay_seq_file: &std::path::Path,
-                relay_seq: &mut u64,
-                relay_round: &mut usize,
-                targets: &[ed25519::PublicKey],
-                relay_tx: &mut S,
-                target: String,
-                payload: Vec<u8>,
-            ) -> Result<node::FrameId, String> {
-                if targets.is_empty() {
-                    return Err("no validator known yet — the manifest poll has not landed".into());
-                }
-                *relay_seq += 1;
-                if let Err(e) = std::fs::write(relay_seq_file, relay_seq.to_string()) {
-                    // persist FAILED before any send: surface it and hold nothing
-                    // (a wedged disk must not silently reuse a seq into the mesh).
-                    return Err(format!("cannot persist the submit seq: {e}"));
-                }
-                let frame = node::encode_frame(signer, *relay_seq, &Msg { target, payload });
-                let id = node::frame_id(&frame);
-                let target_v = targets[*relay_round % targets.len()].clone();
-                *relay_round += 1;
-                let sent = relay_tx.send(
-                    Recipients::One(target_v),
-                    IoBuf::from(relay::encode_msg(&relay::RelayMsg::Submit { frame })),
-                    false,
-                );
-                if sent.is_empty() {
-                    return Err("validator unreachable — retry shortly".into());
-                }
-                Ok(id)
-            }
-            // the caller's held reply for a relayed submit, keyed by the frame's
-            // content address. either surface may hold: the rpc bridge sender or
-            // the app-surface oneshot. swept on the serve-window tick with the
-            // validator's own SUBMIT_HOLD budget (the rpc bridge times out at
-            // that same 10s — a sweep race there reads as a stuck node, same as
-            // on a validator).
-            enum RelayHold {
-                Rpc(std::sync::mpsc::Sender<RpcReply>),
-                Http(futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>),
-            }
-            let mut pending_relayed: std::collections::HashMap<
-                node::FrameId,
-                (RelayHold, std::time::Instant),
-            > = std::collections::HashMap::new();
-            let mut relay_round = 0usize;
-            // this origin's next frame seq, persisted so restarts keep climbing
-            // (a lost file restarts at 0 — kernel-safe: distinct digests both
-            // apply; per-origin nonces are the documented roadmap item).
-            let relay_seq_file = storage_for_sync.join("relay-submit-seq");
-            let mut relay_seq: u64 = std::fs::read_to_string(&relay_seq_file)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0);
+            // The relay runtime owns caller holds, Forge pack fanout, and the
+            // persisted resident sequence. This loop only supplies current
+            // validator targets and consumes unclaimed pump replies.
+            let mut resident_relay = relay_runtime::ResidentRelay::new(
+                storage_for_sync.join("relay-submit-seq"),
+                blobs.clone(),
+            );
             // bridge the relay lane ONCE, before the park loop: the serve
             // window's select is torn down every 2s tick, and dropping the p2p
             // receiver's actor-backed `recv()` mid-flight could eat a delivered
@@ -7564,8 +7563,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // drained by the park loop's pump pass, so a minutes-long run
             // never stalls the serve window, boundary follow, or promotion
             // detection.
-            let resident_provider_set = capability_host::discover_with_dirs(agent_dirs.clone())
-                .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
+            let resident_provider_set = capability_host::discover_with_dirs_and_output_sink(
+                agent_dirs.clone(),
+                run_output_sink(stream_hub.run_output()),
+            )
+            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
             let resident_capabilities = resident_provider_set.capabilities();
             let mut resident_announcer = resident_announce::ResidentAnnouncer::new(
                 me_bytes.clone(),
@@ -7628,31 +7630,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                             RpcReply::err(not_serving(resident_standing))
                                         } else {
                                             match unhex(&payload_hex) {
-                                                Ok(payload) => match relay_submit_frame(
+                                                Ok(payload) => match resident_relay.submit(
                                                     &signer,
-                                                    &relay_seq_file,
-                                                    &mut relay_seq,
-                                                    &mut relay_round,
                                                     &announce_targets,
                                                     &mut relay_tx,
                                                     target,
                                                     payload,
+                                                    relay_runtime::ResidentHold::Rpc(reply.clone()),
                                                 ) {
-                                                    Ok(id) => {
-                                                        pending_relayed.insert(
-                                                            id,
-                                                            (
-                                                                RelayHold::Rpc(reply.clone()),
-                                                                std::time::Instant::now()
-                                                                    + SUBMIT_HOLD,
-                                                            ),
-                                                        );
-                                                        // held — answered by the relay
-                                                        // Reply or the sweep; skip the
-                                                        // shared tail send below.
+                                                    Ok(_) => {
                                                         continue;
                                                     }
-                                                    Err(e) => RpcReply::err(e),
+                                                    Err((_hold, e)) => RpcReply::err(e),
                                                 },
                                                 Err(e) => {
                                                     RpcReply::err(format!("bad payload_hex: {e}"))
@@ -7731,33 +7720,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                             let _ =
                                                 reply.send(Err(not_serving(resident_standing)));
                                         } else {
-                                            match relay_submit_frame(
+                                            match resident_relay.submit(
                                                 &signer,
-                                                &relay_seq_file,
-                                                &mut relay_seq,
-                                                &mut relay_round,
                                                 &announce_targets,
                                                 &mut relay_tx,
                                                 target,
                                                 payload,
+                                                relay_runtime::ResidentHold::Http(reply),
                                             ) {
-                                                // move the oneshot into the hold on
-                                                // success, use it for the error on
-                                                // failure — mutually exclusive, so one
-                                                // reply is guaranteed on every path.
-                                                Ok(id) => {
-                                                    pending_relayed.insert(
-                                                        id,
-                                                        (
-                                                            RelayHold::Http(reply),
-                                                            std::time::Instant::now()
-                                                                + SUBMIT_HOLD,
-                                                        ),
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    let _ = reply.send(Err(e));
-                                                }
+                                                Ok(_) => {}
+                                                Err((hold, e)) => hold.fail(e),
                                             }
                                         }
                                     }
@@ -7812,79 +7784,43 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // to the held caller by frame id and release the reply.
                             // an unknown id (already swept, or a stray) drops.
                             answer = relay_ingress.next() => {
-                                let Some((_peer, bytes)) = answer else { continue };
-                                let Ok(relay::RelayMsg::Reply { frame_id, outcome }) =
-                                    relay::decode_msg(&bytes)
+                                let Some((peer, bytes)) = answer else { continue };
+                                let Ok(msg) = relay::decode_msg(&bytes) else { continue };
+                                let Some((frame_id, outcome)) =
+                                    resident_relay.on_message(peer, msg, &mut relay_tx)
                                 else {
-                                    continue; // junk or a stray Submit at a resident — drop.
-                                };
-                                let Some((hold, _)) = pending_relayed.remove(&frame_id) else {
-                                    // not a held caller reply: maybe one of the
-                                    // resident-tier pumps' own frames.
-                                    let applied =
-                                        matches!(outcome, relay::RelayOutcome::Applied { .. });
-                                    if let Some(ok) =
-                                        resident_announcer.on_reply(&frame_id, applied)
-                                    {
-                                        if ok {
-                                            println!(
-                                                "[node {label}] resident: announced \
-                                                 capabilities {:?}",
-                                                resident_announcer.capabilities()
-                                            );
-                                        } else {
-                                            eprintln!(
-                                                "[node {label}] resident: capability announce \
-                                                 did not apply ({outcome:?}) — will retry"
-                                            );
-                                        }
-                                    } else if let Some((saga_id, attempt)) =
-                                        resident_dispatch.on_reply(&frame_id, applied)
-                                    {
-                                        if applied {
-                                            println!(
-                                                "[node {label}] resident: dispatch result for \
-                                                 saga {saga_id} attempt {attempt} applied"
-                                            );
-                                        } else {
-                                            eprintln!(
-                                                "[node {label}] resident: dispatch result for \
-                                                 saga {saga_id} attempt {attempt} did not apply \
-                                                 ({outcome:?}) — will retry while leased"
-                                            );
-                                        }
-                                    }
                                     continue;
                                 };
-                                match (hold, outcome) {
-                                    (RelayHold::Rpc(tx), relay::RelayOutcome::Applied { .. }) => {
-                                        let _ = tx.send(RpcReply::ok());
+                                // Unclaimed final replies belong to the
+                                // resident-owned capability/dispatch pumps.
+                                let applied =
+                                    matches!(outcome, relay::RelayOutcome::Applied { .. });
+                                if let Some(ok) = resident_announcer.on_reply(&frame_id, applied) {
+                                    if ok {
+                                        println!(
+                                            "[node {label}] resident: announced capabilities {:?}",
+                                            resident_announcer.capabilities()
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[node {label}] resident: capability announce did not \
+                                             apply ({outcome:?}) - will retry"
+                                        );
                                     }
-                                    (RelayHold::Rpc(tx), relay::RelayOutcome::Rejected { detail })
-                                    | (
-                                        RelayHold::Rpc(tx),
-                                        relay::RelayOutcome::Refused { detail },
-                                    ) => {
-                                        let _ = tx.send(RpcReply::err(detail));
-                                    }
-                                    (
-                                        RelayHold::Http(tx),
-                                        relay::RelayOutcome::Applied { height, app_hash },
-                                    ) => {
-                                        let _ = tx.send(Ok(noded::BlockSummary {
-                                            height,
-                                            app_hash,
-                                        }));
-                                    }
-                                    (
-                                        RelayHold::Http(tx),
-                                        relay::RelayOutcome::Rejected { detail },
-                                    )
-                                    | (
-                                        RelayHold::Http(tx),
-                                        relay::RelayOutcome::Refused { detail },
-                                    ) => {
-                                        let _ = tx.send(Err(detail));
+                                } else if let Some((saga_id, attempt)) =
+                                    resident_dispatch.on_reply(&frame_id, applied)
+                                {
+                                    if applied {
+                                        println!(
+                                            "[node {label}] resident: dispatch result for saga \
+                                             {saga_id} attempt {attempt} applied"
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[node {label}] resident: dispatch result for saga \
+                                             {saga_id} attempt {attempt} did not apply \
+                                             ({outcome:?}) - will retry while leased"
+                                        );
                                     }
                                 }
                             }
@@ -8107,12 +8043,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             );
                         }
                         if let Some(root) = sealed_hash {
-                            let _ = http_events.send(noded::WsFrame::Block(
-                                noded::BlockSummary {
-                                    height,
-                                    app_hash: hex(&root),
-                                },
-                            ));
+                            stream_hub.publish_block(height, hex(&root));
                             last_indexed_root = Some(root);
                         }
                         *served_height = height;
@@ -8333,46 +8264,25 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                     }
                 }
-                // expire relay holds the mesh never answered. the op may still
-                // land — the app re-queries on block events, same contract as a
-                // validator hold. budget is SUBMIT_HOLD (the rpc bridge caps at
-                // that same 10s, so a sweep race reads as a stuck node either way).
-                if !pending_relayed.is_empty() {
-                    let now = std::time::Instant::now();
-                    let expired: Vec<node::FrameId> = pending_relayed
-                        .iter()
-                        .filter(|(_, (_, deadline))| *deadline <= now)
-                        .map(|(k, _)| *k)
-                        .collect();
-                    for k in expired {
-                        if let Some((hold, _)) = pending_relayed.remove(&k) {
-                            let detail =
-                                "timed out awaiting the relay answer — re-query on the next block";
-                            match hold {
-                                RelayHold::Rpc(tx) => {
-                                    let _ = tx.send(RpcReply::err(detail));
-                                }
-                                RelayHold::Http(tx) => {
-                                    let _ = tx.send(Err(detail.into()));
-                                }
-                            }
-                        }
-                    }
-                }
-                // a FOLDING replica's window closes per certificate; the
-                // manifest is only the fallback lane now (standing detection
-                // pre-ascension; promotion, cutover, and revocation detection
-                // after). pace it on an ABSOLUTE deadline — the window's own
-                // tick restarts per close and would never fire under steady
-                // cert traffic — so a fleet of replicas doesn't besiege the
-                // serve window per block, yet detection stays bounded by the
-                // fallback cadence.
+                resident_relay.expire(std::time::Instant::now());
+                // a FOLDING replica's window closes per certificate; this
+                // poll is only the fallback DETECTION lane now (standing
+                // detection pre-ascension; promotion, cutover, and revocation
+                // detection after). it reads tip COORDINATES — membership,
+                // epoch, height — which the server answers from loop-owned
+                // state with no capture, no lease, and no floor-cert gate;
+                // the transitions that consume an actual boundary (ascension,
+                // promotion) fetch a full manifest inside their branch. pace
+                // it on an ABSOLUTE deadline — the window's own tick restarts
+                // per close and would never fire under steady cert traffic —
+                // so a fleet of replicas doesn't besiege the serve window per
+                // block, yet detection stays bounded by the fallback cadence.
                 if serving.is_some() && std::time::Instant::now() < next_manifest_fetch {
                     continue;
                 }
                 next_manifest_fetch = std::time::Instant::now() + RESIDENT_FALLBACK_POLL;
-                let m = match fetch_manifest(&client).await {
-                    Ok(m) => m,
+                let tip = match fetch_tip_coords(&client).await {
+                    Ok(tip) => tip,
                     Err(e) => {
                         let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
                         println!("{}", retry.log_line);
@@ -8386,20 +8296,20 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // list is an unverified serving hint — the union with the
                 // descriptor mesh keeps the real members reachable, and
                 // promotion re-derives everything from verified state.
-                if m.epoch > last_tracked {
-                    if m.epoch >= EPOCH_CHANNEL_BANK {
+                if tip.epoch > last_tracked {
+                    if tip.epoch >= EPOCH_CHANNEL_BANK {
                         println!(
                             "[node {label}] warning: the network is at epoch {} — beyond this \
                              process's pre-registered channel bank ({EPOCH_CHANNEL_BANK}); \
                              expect reconnect churn while parked",
-                            m.epoch
+                            tip.epoch
                         );
                     }
                     oracle.track(
-                        m.epoch,
-                        joiner_epoch_mesh(&peers, &m.participants, &m.residents),
+                        tip.epoch,
+                        joiner_epoch_mesh(&peers, &tip.participants, &tip.residents),
                     );
-                    last_tracked = m.epoch;
+                    last_tracked = tip.epoch;
                 }
                 // drive the reachability plane's standby role off the
                 // manifest: membership and resident standing come from the
@@ -8409,22 +8319,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // Nothing is sent before standing: no member would admit the
                 // gossip yet.
                 if let Some(cmd) = &reach_cmd
-                    && m.residents.iter().any(|k| k == &me_bytes)
+                    && tip.residents.iter().any(|k| k == &me_bytes)
                 {
                     // NON-BLOCKING sends throughout: the plane is not this
                     // loop's dependency. a shed ViewTick is one beat of
                     // advert staleness (the next poll carries a fresher one);
                     // a refused Retarget retries naturally — the epoch latch
                     // below only advances when the send is taken.
-                    let clock = m.view_base.max(m.height);
+                    let clock = tip.view_base.max(tip.height);
                     let _ = cmd.try_send(reachability::ReachabilityCommand::ViewTick(clock));
-                    if last_plane_epoch != Some(m.epoch) {
-                        let members: Vec<ed25519::PublicKey> = m
+                    if last_plane_epoch != Some(tip.epoch) {
+                        let members: Vec<ed25519::PublicKey> = tip
                             .participants
                             .iter()
                             .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
                             .collect();
-                        let standbys: Vec<ed25519::PublicKey> = m
+                        let standbys: Vec<ed25519::PublicKey> = tip
                             .residents
                             .iter()
                             .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
@@ -8432,7 +8342,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         if cmd
                             .try_send(reachability::ReachabilityCommand::Retarget(
                                 reachability::MeshEpochEvent {
-                                    epoch: m.epoch,
+                                    epoch: tip.epoch,
                                     members,
                                     standbys,
                                     current_view: clock,
@@ -8440,14 +8350,14 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             ))
                             .is_ok()
                         {
-                            last_plane_epoch = Some(m.epoch);
+                            last_plane_epoch = Some(tip.epoch);
                         }
                     }
                 }
-                if !m.participants.iter().any(|k| k == &me_bytes) {
-                    // the manifest names the CURRENT members — better announce
+                if !tip.participants.iter().any(|k| k == &me_bytes) {
+                    // the tip names the CURRENT members — better announce
                     // targets than the genesis descriptor's list.
-                    let current: Vec<ed25519::PublicKey> = m
+                    let current: Vec<ed25519::PublicKey> = tip
                         .participants
                         .iter()
                         .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
@@ -8455,7 +8365,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     if !current.is_empty() {
                         announce_targets = current;
                     }
-                    if serving.is_some() && m.epoch > replica_epoch {
+                    if serving.is_some() && tip.epoch > replica_epoch {
                         // the network cut over to a new epoch: our follower's
                         // verifier and fetch lane are the old epoch's, so its
                         // certs stopped verifying here. DESCEND — drop the
@@ -8466,7 +8376,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         // collapse's concern (phase 3).
                         println!(
                             "[node {label}] replica: epoch cutover {} -> {} — re-ascending",
-                            replica_epoch, m.epoch
+                            replica_epoch, tip.epoch
                         );
                         serving = None;
                         replica_scheme = None;
@@ -8474,7 +8384,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         recovery_slot =
                             Some(reopen_recovery(&context, &mut recovery_reopens, &label).await);
                     }
-                    if m.residents.iter().any(|k| k == &me_bytes) {
+                    if tip.residents.iter().any(|k| k == &me_bytes) {
                         if !resident_standing {
                             resident_standing = true;
                             println!(
@@ -8493,6 +8403,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         // node's host through the serve window above, and
                         // `promote` finds a node already at head.
                         if serving.is_none() {
+                            // ascension consumes the BOUNDARY itself — module
+                            // entries to sync and the floor certificate to
+                            // verify — so this transition (and only this
+                            // transition) rides the full Manifest lane.
+                            let m = match fetch_manifest(&client).await {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    let retry = joiner_manifest_fetch_retry(
+                                        &label,
+                                        resident_standing,
+                                        &e,
+                                    );
+                                    println!("{}", retry.log_line);
+                                    continue;
+                                }
+                            };
                             if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
                                 eprintln!(
                                     "[node {label}] FATAL: cannot observe this network — {e}"
@@ -8511,6 +8437,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 &forge_repo,
                                 &duckfs_dir,
                                 &namespace,
+                                blobs.clone(),
                                 attempt,
                                 &identity_chain_id,
                             )
@@ -8654,12 +8581,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                                  ascension tip {tip} refused: {err}"
                                             );
                                         }
-                                        let _ = http_events.send(noded::WsFrame::Block(
-                                            noded::BlockSummary {
-                                                height: tip,
-                                                app_hash: hex(&root),
-                                            },
-                                        ));
+                                        stream_hub.publish_block(tip, hex(&root));
                                         last_indexed_root = Some(root);
                                     }
                                     serving = Some((tip, node_r));
@@ -8689,11 +8611,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 && let Some(msg) =
                                     resident_announcer.maybe_announce(host, now).await
                             {
-                                match relay_submit_frame(
+                                match resident_relay.submit_unheld(
                                     &signer,
-                                    &relay_seq_file,
-                                    &mut relay_seq,
-                                    &mut relay_round,
                                     &announce_targets,
                                     &mut relay_tx,
                                     msg.target,
@@ -8727,11 +8646,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 resident_dispatch.completed(msg);
                             }
                             for (key, msg) in resident_dispatch.tick(host, now).await {
-                                match relay_submit_frame(
+                                match resident_relay.submit_unheld(
                                     &signer,
-                                    &relay_seq_file,
-                                    &mut relay_seq,
-                                    &mut relay_round,
                                     &announce_targets,
                                     &mut relay_tx,
                                     msg.target,
@@ -8757,13 +8673,24 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     }
                     println!(
                         "[node {label}] joining: awaiting redemption (epoch {} has {} validators)",
-                        m.epoch,
-                        m.participants.len()
+                        tip.epoch,
+                        tip.participants.len()
                     );
                     send_announce(&announce_targets, attempt);
                     continue;
                 }
-                // in the epoch set. a boundary PAST the epoch base needs its
+                // in the epoch set: PROMOTION consumes the boundary itself —
+                // module entries and the real floor certificate — so it rides
+                // the full Manifest lane from here.
+                let m = match fetch_manifest(&client).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
+                        println!("{}", retry.log_line);
+                        continue;
+                    }
+                };
+                // a boundary PAST the epoch base needs its
                 // finalization floor served alongside, or the respawned
                 // engine would re-deliver history the synced state already
                 // contains — retry until the source's floor catches up.
@@ -8856,6 +8783,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     &forge_repo,
                     &duckfs_dir,
                     &namespace,
+                    blobs.clone(),
                     attempt,
                     &identity_chain_id,
                 )
@@ -9563,6 +9491,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             &forge_repo,
                             &duckfs_dir,
                             &namespace,
+                            blobs.clone(),
                             10_000 + attempts,
                             &identity_chain_id,
                         )
@@ -10193,6 +10122,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             node::FrameId,
             (ed25519::PublicKey, std::time::Instant),
         > = std::collections::HashMap::new();
+        let mut validator_relay = relay_runtime::ValidatorRelay::new(blobs.clone());
         let mut last_published: Option<u64> = None;
         // verified-but-unapproved join requests, keyed by joiner key. NODE-
         // LOCAL and in-memory by design: this is a doorbell, not state — the
@@ -10236,8 +10166,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
         // announced set to nothing — never the reverse). routing and
         // default models live in the specs (docs/records/specs/capability-spec.md); a broken
         // operator spec is a boot error, not a silently dropped executor.
-        let providers = capability_host::discover_with_dirs(agent_dirs.clone())
-            .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
+        let providers = capability_host::discover_with_dirs_and_output_sink(
+            agent_dirs.clone(),
+            run_output_sink(stream_hub.run_output()),
+        )
+        .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
         let my_capabilities = providers.capabilities();
         // OFF-LOOP execution: the pool gates effects inline (lease check —
         // WorkerRequests leased to another node's key are skipped, not
@@ -10601,6 +10534,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             node::Disposition::Discarded => continue,
                         });
                     }
+                    validator_relay.expire(std::time::Instant::now(), &mut relay_tx);
                     // expire holds the mesh never finalized in time. the op may
                     // still land later — clients re-query on block events.
                     if !pending_submits.is_empty() {
@@ -10653,10 +10587,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     if let Some(f) = node.finalized()
                         && last_published != Some(f.height)
                     {
-                        let _ = http_events.send(noded::WsFrame::Block(noded::BlockSummary {
-                            height: f.height,
-                            app_hash: hex(&f.app_hash),
-                        }));
+                        stream_hub.publish_block(f.height, hex(&f.app_hash));
                         last_published = Some(f.height);
                     }
 
@@ -11549,45 +11480,64 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
                 relayed = relay_ingress.next() => {
                     let Some((peer, bytes)) = relayed else { continue };
-                    let mut send_reply = |frame_id: node::FrameId, outcome: relay::RelayOutcome| {
-                        let msg = relay::RelayMsg::Reply { frame_id, outcome };
-                        let _ = relay_tx.send(
-                            Recipients::One(peer.clone()),
-                            IoBuf::from(relay::encode_msg(&msg)),
-                            false,
-                        );
+                    let Ok(msg) = relay::decode_msg(&bytes) else { continue };
+                    let needs_standing = matches!(
+                        msg,
+                        relay::RelayMsg::BlobOffer { .. } | relay::RelayMsg::Submit { .. }
+                    );
+                    let (members_now, residents_now) = if needs_standing {
+                        (
+                            read_valset_members(node.host()).await,
+                            read_valset_residents(node.host()).await,
+                        )
+                    } else {
+                        (Vec::new(), Vec::new())
                     };
-                    let msg = match relay::decode_msg(&bytes) {
-                        Ok(m) => m,
-                        Err(_) => continue, // junk on the doorbell — drop, lobby idiom.
+                    let Some(action) = validator_relay.on_message(
+                        peer,
+                        msg,
+                        &members_now,
+                        &residents_now,
+                        &mut relay_tx,
+                    ) else {
+                        continue;
                     };
-                    let relay::RelayMsg::Submit { frame } = msg else {
-                        continue; // a Reply at a validator is a protocol confusion — drop.
-                    };
-                    // the door check needs committed state: the resident projection at
-                    // this node's latest boundary. the frame signature and the ORIGIN's
-                    // standing ride inside — the sending peer is not consulted (residents
-                    // speak from the shared, invite-derivable lobby transport identity).
-                    let residents_now = read_valset_residents(node.host()).await;
-                    let frame_id = match relay::verify_relay_submit(&frame, &residents_now) {
-                        Ok(id) => id,
-                        Err(detail) => {
-                            send_reply(node::frame_id(&frame), relay::RelayOutcome::Refused { detail });
-                            continue;
-                        }
-                    };
-                    match node.submit_frame(frame).await {
-                        Ok(id) => {
-                            debug_assert_eq!(id, frame_id);
-                            pending_relays.insert(
-                                id,
-                                (peer.clone(), std::time::Instant::now() + SUBMIT_HOLD),
-                            );
-                        }
-                        Err(e) => send_reply(
+                    match action {
+                        relay_runtime::ValidatorAction::SubmitResident {
                             frame_id,
-                            relay::RelayOutcome::Refused { detail: format!("submit failed: {e}") },
-                        ),
+                            frame,
+                            peer,
+                        } => match node.submit_frame(frame).await {
+                            Ok(id) => {
+                                debug_assert_eq!(id, frame_id);
+                                pending_relays.insert(
+                                    id,
+                                    (peer, std::time::Instant::now() + SUBMIT_HOLD),
+                                );
+                            }
+                            Err(e) => relay_runtime::send_reply(
+                                &mut relay_tx,
+                                &peer,
+                                frame_id,
+                                relay::RelayOutcome::Refused {
+                                    detail: format!("submit failed: {e}"),
+                                },
+                            ),
+                        },
+                        relay_runtime::ValidatorAction::SubmitLocal {
+                            frame_id,
+                            frame,
+                            reply,
+                            deadline,
+                        } => match node.submit_frame(frame).await {
+                            Ok(id) => {
+                                debug_assert_eq!(id, frame_id);
+                                pending_submits.insert(id, (reply, deadline));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(format!("submit failed: {e}")));
+                            }
+                        },
                     }
                 }
                 cmd = http_ingress.next() => {
@@ -11603,18 +11553,46 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         noded::NodeCommand::Submit { target, payload, origin: _, reply } => {
                             let seq = next_seq;
                             next_seq += 1;
-                            match node.submit(&signer, seq, Msg { target, payload }).await {
-                                // HOLD the reply: it lands when this frame
-                                // drains at a finalized boundary, so the app's
-                                // follow-up query reads the applied state.
-                                Ok(frame) => {
-                                    pending_submits.insert(
-                                        frame,
-                                        (reply, std::time::Instant::now() + SUBMIT_HOLD),
-                                    );
+                            let frame = node::encode_frame(&signer, seq, &Msg { target, payload });
+                            let peers: Vec<ed25519::PublicKey> =
+                                if relay::required_blob_digest(&frame).is_some() {
+                                    read_valset_members(node.host())
+                                        .await
+                                        .iter()
+                                        .filter_map(|raw| {
+                                            ed25519::PublicKey::decode(raw.as_slice()).ok()
+                                        })
+                                        .filter(|key| key != &signer.public_key())
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+                            match validator_relay.prepare_local(
+                                frame,
+                                reply,
+                                peers,
+                                &mut relay_tx,
+                            ) {
+                                Ok(Some(relay_runtime::ValidatorAction::SubmitLocal {
+                                    frame_id,
+                                    frame,
+                                    reply,
+                                    deadline,
+                                })) => match node.submit_frame(frame).await {
+                                    Ok(id) => {
+                                        debug_assert_eq!(id, frame_id);
+                                        pending_submits.insert(id, (reply, deadline));
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(Err(format!("submit failed: {e}")));
+                                    }
+                                },
+                                Ok(Some(relay_runtime::ValidatorAction::SubmitResident { .. })) => {
+                                    unreachable!("local preparation returns a local action")
                                 }
-                                Err(e) => {
-                                    let _ = reply.send(Err(format!("submit failed: {e}")));
+                                Ok(None) => {}
+                                Err((reply, detail)) => {
+                                    let _ = reply.send(Err(detail));
                                 }
                             }
                         }
@@ -11751,6 +11729,33 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         }
                         SyncStateRequest::IndexCut { reply } => {
                             let _ = reply.send(ship_index_blobs(&index, &label));
+                        }
+                        SyncStateRequest::TipCoords { reply } => {
+                            // the detection lane: everything here is already
+                            // loop-owned state — no capture, and deliberately
+                            // no floor-cert alignment gate. that gate protects
+                            // a JOINER from syncing a boundary whose history
+                            // it would skip; a detection reply carries a
+                            // presence bit, never certificate bytes, and every
+                            // action taken on it (ascension, promotion)
+                            // re-fetches a full manifest through the gated
+                            // Boundary path.
+                            let answer = match node.finalized() {
+                                None => Err("no finalized boundary to serve yet".to_string()),
+                                Some(f) => Ok(statesync::TipCoords {
+                                    height: f.height,
+                                    app_hash: f.app_hash,
+                                    epoch: orchestrator.epoch(),
+                                    view_base: orchestrator.epoch_base(),
+                                    participants: participant_bytes(&orchestrator),
+                                    residents: resident_bytes(&orchestrator),
+                                    has_floor: latest_floor
+                                        .as_ref()
+                                        .filter(|fc| fc.epoch == orchestrator.epoch())
+                                        .is_some_and(|fc| fc.height == f.height),
+                                }),
+                            };
+                            let _ = reply.send(answer);
                         }
                     }
                 }

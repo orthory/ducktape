@@ -351,6 +351,31 @@ pub enum SyncRequest {
         db: String,
         offset: u64,
     },
+    /// read the tip's consensus coordinates (membership, epoch, height) —
+    /// the DETECTION lane; see [`TipCoords`].
+    TipCoords,
+}
+
+/// the tip's consensus coordinates without a captured boundary — the
+/// DETECTION lane. a parked or folding resident polls this to track
+/// membership, standing, and epoch cutovers; answering costs the server no
+/// capture, no lease, and no floor-cert alignment, so a fleet's routine
+/// polling never contends with (or churns) the join-shaped capture cache
+/// the Manifest lane is sized for. same trust model as the manifest's
+/// coordinates: unauthenticated serving hints — action taken on them
+/// (ascension, promotion) re-fetches a full [`Manifest`] and verifies its
+/// floor certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TipCoords {
+    pub height: u64,
+    pub app_hash: StateRoot,
+    pub epoch: u64,
+    pub view_base: u64,
+    pub participants: Vec<Vec<u8>>,
+    pub residents: Vec<Vec<u8>>,
+    /// whether the server holds the finalization certificate for exactly
+    /// `height` — a liveness hint, never the certificate itself.
+    pub has_floor: bool,
 }
 
 /// a state-sync response.
@@ -374,6 +399,8 @@ pub enum SyncResponse {
     /// poisoned, or nothing attached) — the joiner just falls back to the
     /// from-state rebuild. chunks come back as [`SyncResponse::Chunk`].
     IndexModules { entries: Vec<(String, u64)> },
+    /// the tip's consensus coordinates — the [`SyncRequest::TipCoords`] answer.
+    TipCoords(TipCoords),
     Error(String),
 }
 
@@ -386,6 +413,7 @@ impl SyncResponse {
             Self::Frames { .. } => "Frames",
             Self::RangePruned { .. } => "RangePruned",
             Self::IndexModules { .. } => "IndexModules",
+            Self::TipCoords(_) => "TipCoords",
             Self::Error(_) => "Error",
         }
     }
@@ -443,6 +471,7 @@ pub fn encode_request(req: &SyncRequest) -> Vec<u8> {
             wire::put_str(&mut out, db);
             out.extend_from_slice(&offset.to_le_bytes());
         }
+        SyncRequest::TipCoords => out.push(6u8),
     }
     out
 }
@@ -486,6 +515,7 @@ pub fn decode_request(bytes: &[u8]) -> Result<SyncRequest, WireError> {
             db: wire::take_str(&mut buf)?,
             offset: wire::take_u64(&mut buf)?,
         },
+        6 => SyncRequest::TipCoords,
         other => return Err(WireError::BadTag("SyncRequest", other)),
     };
     wire::expect_empty(buf)?;
@@ -600,6 +630,22 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 wire::put_str(&mut out, db);
                 out.extend_from_slice(&len.to_le_bytes());
             }
+        }
+        SyncResponse::TipCoords(c) => {
+            out.push(7u8);
+            out.extend_from_slice(&c.height.to_le_bytes());
+            out.extend_from_slice(c.app_hash.as_bytes());
+            out.extend_from_slice(&c.epoch.to_le_bytes());
+            out.extend_from_slice(&c.view_base.to_le_bytes());
+            out.extend_from_slice(&(c.participants.len() as u64).to_le_bytes());
+            for p in &c.participants {
+                wire::put_bytes(&mut out, p);
+            }
+            out.extend_from_slice(&(c.residents.len() as u64).to_le_bytes());
+            for r in &c.residents {
+                wire::put_bytes(&mut out, r);
+            }
+            out.push(u8::from(c.has_floor));
         }
     }
     out
@@ -771,6 +817,50 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 entries.push((wire::take_str(&mut buf)?, wire::take_u64(&mut buf)?));
             }
             SyncResponse::IndexModules { entries }
+        }
+        7 => {
+            let height = wire::take_u64(&mut buf)?;
+            let app_hash = StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?);
+            let epoch = wire::take_u64(&mut buf)?;
+            let view_base = wire::take_u64(&mut buf)?;
+            let p = wire::take_u64(&mut buf)?;
+            // each key costs at least its 8-byte length prefix, so a forged
+            // count can never drive allocation past the buffer.
+            if p > (buf.len() / 8) as u64 {
+                return Err(WireError::Codec(format!(
+                    "participant count {p} exceeds the {} remaining bytes",
+                    buf.len()
+                )));
+            }
+            let mut participants = Vec::with_capacity(p as usize);
+            for _ in 0..p {
+                participants.push(wire::take_bytes(&mut buf)?.to_vec());
+            }
+            let r = wire::take_u64(&mut buf)?;
+            if r > (buf.len() / 8) as u64 {
+                return Err(WireError::Codec(format!(
+                    "resident count {r} exceeds the {} remaining bytes",
+                    buf.len()
+                )));
+            }
+            let mut residents = Vec::with_capacity(r as usize);
+            for _ in 0..r {
+                residents.push(wire::take_bytes(&mut buf)?.to_vec());
+            }
+            let has_floor = match wire::take_u8(&mut buf)? {
+                0 => false,
+                1 => true,
+                t => return Err(WireError::BadTag("has_floor", t)),
+            };
+            SyncResponse::TipCoords(TipCoords {
+                height,
+                app_hash,
+                epoch,
+                view_base,
+                participants,
+                residents,
+                has_floor,
+            })
         }
         other => return Err(WireError::BadTag("SyncResponse", other)),
     };
@@ -971,6 +1061,9 @@ pub enum ServeStep {
     /// blobs (or decline with an empty attach), [`SyncServer::attach_index`],
     /// then re-drive the request.
     NeedIndexCut { boundary: BoundaryId },
+    /// TipCoords: read the tip's consensus coordinates from the state owner —
+    /// no capture, no lease, no floor-cert alignment gate.
+    NeedCoords,
 }
 
 /// the server side of the protocol: capture consistent boundary views on
@@ -1032,7 +1125,13 @@ impl SyncServer {
                         index_blobs: None,
                     },
                 );
-                self.evict_unleased_overflow();
+                // spare the newborn: it is not leased until the manifest_for
+                // that every install exists to answer, so when every older
+                // capture holds a lease (leases never release, they only age
+                // out by overflow) the newborn would be the sole eviction
+                // candidate — evicting itself one step before its own
+                // manifest lookup ("no capture at boundary N").
+                self.evict_unleased_overflow_sparing(Some(id));
             }
         }
     }
@@ -1103,6 +1202,7 @@ impl SyncServer {
     fn try_serve(&mut self, req: SyncRequest) -> Result<ServeStep, String> {
         Ok(match req {
             SyncRequest::Manifest => ServeStep::NeedBoundary,
+            SyncRequest::TipCoords => ServeStep::NeedCoords,
             SyncRequest::Frames {
                 after_height,
                 up_to_height,
@@ -1249,6 +1349,21 @@ impl SyncServer {
         );
     }
 
+    /// like [`SyncServer::insert_capture_for_test`] but through the REAL
+    /// install path, eviction included — for tests exercising install-time
+    /// cache behavior.
+    #[doc(hidden)]
+    pub fn install_capture_for_test(&mut self, id: BoundaryId) {
+        self.install_capture(
+            id,
+            CaptureData {
+                app_hash: id.app_hash,
+                coords: BoundaryCoords::default(),
+                modules: BTreeMap::new(),
+            },
+        );
+    }
+
     #[doc(hidden)]
     pub fn insert_resolver_capture_for_test(
         &mut self,
@@ -1374,6 +1489,18 @@ impl SyncServer {
                     entries: Vec::new(),
                 })
             }
+            ServeStep::NeedCoords => {
+                let finalized = finalized.ok_or("no finalized boundary to serve yet")?;
+                Ok(SyncResponse::TipCoords(TipCoords {
+                    height: finalized.height,
+                    app_hash: finalized.app_hash,
+                    epoch: coords.epoch,
+                    view_base: coords.view_base,
+                    participants: coords.participants.clone(),
+                    residents: coords.residents.clone(),
+                    has_floor: coords.floor_cert.is_some(),
+                }))
+            }
         }
     }
 
@@ -1413,12 +1540,20 @@ impl SyncServer {
     }
 
     fn evict_unleased_overflow(&mut self) {
+        self.evict_unleased_overflow_sparing(None);
+    }
+
+    /// evict past the cache cap, never touching a leased capture — nor
+    /// `spared`, the id an in-flight install is about to manifest. sparing an
+    /// unleased newborn can leave the cache one over cap for the single step
+    /// until its `manifest_for` lease lands and the next eviction rebalances.
+    fn evict_unleased_overflow_sparing(&mut self, spared: Option<BoundaryId>) {
         while self.captures.len() > MAX_CAPTURES {
             let Some(oldest) = self
                 .captures
                 .keys()
                 .copied()
-                .find(|id| !self.leased.contains_key(id))
+                .find(|id| !self.leased.contains_key(id) && Some(*id) != spared)
             else {
                 break;
             };
@@ -1447,6 +1582,18 @@ pub trait SyncClient: Clone + Send + Sync + 'static {
 pub async fn fetch_manifest<C: SyncClient>(client: &C) -> Result<Manifest, SyncError> {
     match client.request(SyncRequest::Manifest).await? {
         SyncResponse::Manifest(m) => Ok(m),
+        SyncResponse::Error(e) => Err(SyncError::Server(e)),
+        other => Err(SyncError::UnexpectedResponse(other.kind_name())),
+    }
+}
+
+/// fetch the serving peer's tip coordinates — the detection lane: membership,
+/// epoch, and height without capturing a boundary. action taken on the answer
+/// (ascension, promotion) re-fetches a full [`Manifest`] and verifies its
+/// floor certificate.
+pub async fn fetch_tip_coords<C: SyncClient>(client: &C) -> Result<TipCoords, SyncError> {
+    match client.request(SyncRequest::TipCoords).await? {
+        SyncResponse::TipCoords(c) => Ok(c),
         SyncResponse::Error(e) => Err(SyncError::Server(e)),
         other => Err(SyncError::UnexpectedResponse(other.kind_name())),
     }

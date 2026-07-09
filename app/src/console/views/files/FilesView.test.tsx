@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { FileEntry, FilePage } from "../../../domain/files-client";
 import type { NodeTransport } from "../../../domain/transport";
+import { makeTransportStub } from "../../../test/transport-stub";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
@@ -38,34 +39,28 @@ const lsByPath: Record<string, FilePage> = {
 };
 
 const makeTransport = (overrides: Partial<NodeTransport> = {}): NodeTransport => ({
-  submit: vi.fn(),
-  query: vi.fn().mockResolvedValue({ refs: { head: HEAD_ID, pins: {}, window_len: 1 } }),
-  view: vi.fn(),
-  putBlob: vi.fn(),
-  getBlob: vi.fn(),
-  filesStage: vi.fn().mockResolvedValue({ digest: "ab".repeat(32) }),
-  filesCommit: vi.fn().mockResolvedValue({ height: 2, appHash: "aa".repeat(32) }),
-  filesStat: vi.fn().mockResolvedValue(null),
-  filesLs: vi.fn(({ path }: { path: string }) =>
-    Promise.resolve(lsByPath[path] ?? { entries: [], next: null }),
-  ),
-  filesRead: vi.fn().mockResolvedValue({ b64: btoa("readme body"), eof: true }),
-  filesHistory: vi.fn().mockResolvedValue([
-    {
-      id: SNAP_ID,
-      parent: null,
-      root_tree: "aa".repeat(32),
-      author: "me",
-      height: 1,
-      consensus_time: 1_700_000_000,
-      message: "initial commit",
-    },
-  ]),
-  status: vi.fn(),
-  metrics: vi.fn(),
-  blocks: vi.fn(),
-  onBlock: vi.fn(),
-  ...overrides,
+  ...makeTransportStub({
+    query: vi.fn().mockResolvedValue({ refs: { head: HEAD_ID, pins: {}, window_len: 1 } }),
+    filesStage: vi.fn().mockResolvedValue({ digest: "ab".repeat(32) }),
+    filesCommit: vi.fn().mockResolvedValue({ height: 2, appHash: "aa".repeat(32) }),
+    filesStat: vi.fn().mockResolvedValue(null),
+    filesLs: vi.fn(({ path }: { path: string }) =>
+      Promise.resolve(lsByPath[path] ?? { entries: [], next: null }),
+    ),
+    filesRead: vi.fn().mockResolvedValue({ b64: btoa("readme body"), eof: true }),
+    filesHistory: vi.fn().mockResolvedValue([
+      {
+        id: SNAP_ID,
+        parent: null,
+        root_tree: "aa".repeat(32),
+        author: "me",
+        height: 1,
+        consensus_time: 1_700_000_000,
+        message: "initial commit",
+      },
+    ]),
+    ...overrides,
+  }),
 });
 
 const backedStatus = {

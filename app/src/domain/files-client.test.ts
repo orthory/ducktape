@@ -9,28 +9,17 @@ import { describe, expect, it, vi } from "vitest";
 import * as files from "./files-client";
 import { NodeError } from "./transport";
 import type { FileReadRange, FileSnapshot, NodeTransport } from "./transport";
+import { makeTransportStub } from "../test/transport-stub";
 
 const b64 = (...bytes: number[]): string => btoa(String.fromCharCode(...bytes));
 
 // House stub pattern, extended to the duckfs plane. `query` defaults to an empty
 // filesystem (head null) so an upload's base-snapshot resolves without a stub.
 const fakeTransport = (overrides: Partial<NodeTransport> = {}): NodeTransport => ({
-  submit: vi.fn(),
-  query: vi.fn().mockResolvedValue({ refs: { head: null, pins: {}, window_len: 0 } }),
-  view: vi.fn(),
-  putBlob: vi.fn(),
-  getBlob: vi.fn(),
-  filesStage: vi.fn(),
-  filesCommit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
-  filesStat: vi.fn(),
-  filesLs: vi.fn(),
-  filesRead: vi.fn(),
-  filesHistory: vi.fn(),
-  status: vi.fn(),
-  metrics: vi.fn(),
-  blocks: vi.fn(),
-  onBlock: vi.fn(),
-  ...overrides,
+  ...makeTransportStub({
+    query: vi.fn().mockResolvedValue({ refs: { head: null, pins: {}, window_len: 0 } }),
+    ...overrides,
+  }),
 });
 
 describe("uploadFile", () => {

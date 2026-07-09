@@ -13,6 +13,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 import { autoBindUserIdentity } from "./auto-bind";
 import type { AccountView } from "../../domain/identity-client";
 import type { NodeTransport } from "../../domain/transport";
+import { makeTransportStub } from "../../test/transport-stub";
 
 const markTauri = () => {
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
@@ -44,23 +45,11 @@ const boundMsg = (sig: number[]) =>
 const stubTransport = (
   queryImpl: (target: string, query: unknown) => unknown,
 ): NodeTransport => ({
-  submit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
-  // wrap the sync stub so the mock's type matches NodeTransport.query's
-  // Promise<unknown> return (await already coerces the plain value at runtime).
-  query: vi.fn((target: string, query: unknown) => Promise.resolve(queryImpl(target, query))),
-  view: vi.fn(),
-  putBlob: vi.fn(),
-  getBlob: vi.fn(),
-  status: vi.fn(),
-  metrics: vi.fn(),
-  blocks: vi.fn(),
-  filesStage: vi.fn(),
-  filesCommit: vi.fn(),
-  filesStat: vi.fn(),
-  filesLs: vi.fn(),
-  filesRead: vi.fn(),
-  filesHistory: vi.fn(),
-  onBlock: vi.fn(),
+  ...makeTransportStub({
+    // wrap the sync stub so the mock's type matches NodeTransport.query's
+    // Promise<unknown> return (await already coerces the plain value at runtime).
+    query: vi.fn((target: string, query: unknown) => Promise.resolve(queryImpl(target, query))),
+  }),
 });
 
 const workspace = { chainId: "team#abcd", pubkey: "ab12" };
