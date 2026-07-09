@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import type { AgentRecord } from "../../../domain/agent-client";
-import type { ChatBlock } from "../../../domain/chat-client";
+import { keyBytes, type ChatBlock } from "../../../domain/chat-client";
+import { parseMessageInput } from "./chat-input";
 import {
   hasAgentMention,
   insertMention,
   mentionCandidates,
+  mentionCandidatesAll,
+  mentionableUsers,
   mentionResolverOf,
   mentionTokenAt,
 } from "./mention";
@@ -85,6 +88,58 @@ describe("mentionCandidates", () => {
   });
 });
 
+describe("mentionableUsers", () => {
+  const jessKey = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const fallbackKey = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+  it("dedupes node users, slugifies names, falls back to short hex, and avoids agent handle collisions", () => {
+    const users = mentionableUsers(
+      {
+        node1: { userKey: jessKey, name: "Jess K" },
+        node2: { userKey: jessKey, name: "Jess K" },
+        node3: { userKey: fallbackKey, name: null },
+      },
+      [],
+    );
+
+    expect(users).toEqual([
+      { kind: "user", userKeyHex: jessKey, handle: "jess-k", label: "Jess K" },
+      { kind: "user", userKeyHex: fallbackKey, handle: fallbackKey.slice(0, 8), label: fallbackKey.slice(0, 8) },
+    ]);
+
+    expect(
+      mentionableUsers({ node1: { userKey: jessKey, name: "Jess K" } }, [agent("jess-k", "Jess Agent")]),
+    ).toEqual([{ kind: "user", userKeyHex: jessKey, handle: "jess-k-2", label: "Jess K" }]);
+  });
+});
+
+describe("mentionCandidatesAll", () => {
+  const users = [
+    { kind: "user" as const, userKeyHex: "11", handle: "jess-k", label: "Jess K" },
+    { kind: "user" as const, userKeyHex: "22", handle: "casey", label: "Casey Jensen" },
+  ];
+
+  it("ranks prefix matches first, with agents before users for rank ties", () => {
+    const hits = mentionCandidatesAll(
+      [agent("writer", "Pocket Jensen"), agent("je-bot", "Agent")],
+      users,
+      "je",
+    );
+
+    expect(
+      hits.map((hit) => (hit.kind === "agent" ? `agent:${hit.agent.agent_id}` : `user:${hit.handle}`)),
+    ).toEqual(["agent:je-bot", "user:jess-k", "agent:writer", "user:casey"]);
+  });
+
+  it("returns agents then users on an empty query", () => {
+    const hits = mentionCandidatesAll([agent("alpha", "Alpha"), agent("omega", "Omega")], users, "");
+
+    expect(
+      hits.map((hit) => (hit.kind === "agent" ? `agent:${hit.agent.agent_id}` : `user:${hit.handle}`)),
+    ).toEqual(["agent:alpha", "agent:omega", "user:jess-k", "user:casey"]);
+  });
+});
+
 describe("insertMention", () => {
   it("replaces the typed fragment with @agent_id plus a trailing space", () => {
     const next = insertMention("hey @qu can you", { start: 4, query: "qu" }, 7, "quackbot");
@@ -111,6 +166,20 @@ describe("mentionResolverOf", () => {
     });
     expect(resolver.has("paused-bot")).toBe(false);
   });
+
+  it("maps user handles to user AuthorRefs while keeping active agent resolution", () => {
+    const jessKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const resolver = mentionResolverOf(
+      [agent("quackbot", "Quackbot"), agent("paused-bot", "Paused Bot", "paused")],
+      [{ kind: "user", userKeyHex: jessKey, handle: "jess-k", label: "Jess K" }],
+    );
+
+    expect(resolver.get("jess-k")).toEqual({ user: keyBytes(jessKey) });
+    expect(resolver.get("quackbot")).toEqual({
+      agent: { module: "runs", agent_id: "quackbot" },
+    });
+    expect(resolver.has("paused-bot")).toBe(false);
+  });
 });
 
 describe("hasAgentMention", () => {
@@ -132,5 +201,36 @@ describe("hasAgentMention", () => {
       "divider",
     ];
     expect(hasAgentMention(blocks)).toBe(false);
+  });
+
+  it("returns false for blocks containing only a user mention", () => {
+    const blocks: ChatBlock[] = [
+      {
+        paragraph: [
+          {
+            text: "@jess-k",
+            marks: [{ mention: { user: keyBytes("0123456789abcdef") } }],
+          },
+        ],
+      },
+    ];
+
+    expect(hasAgentMention(blocks)).toBe(false);
+  });
+});
+
+describe("user mention parsing", () => {
+  it("round-trips a user handle through parseMessageInput with the mention resolver", () => {
+    const jessKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const users = [{ kind: "user" as const, userKeyHex: jessKey, handle: "jess-k", label: "Jess K" }];
+
+    expect(parseMessageInput("hi @jess-k", mentionResolverOf([], users))).toEqual([
+      {
+        paragraph: [
+          { text: "hi ", marks: [] },
+          { text: "@jess-k", marks: [{ mention: { user: keyBytes(jessKey) } }] },
+        ],
+      },
+    ]);
   });
 });
