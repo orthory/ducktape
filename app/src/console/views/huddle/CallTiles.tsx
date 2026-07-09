@@ -39,6 +39,8 @@ export interface CallTilesProps {
   canEncode: boolean;
   canDecode: boolean;
   selfCameraOn: boolean;
+  /** Our own video lane is a screen share (letterboxed + labelled). */
+  selfSharing?: boolean;
   bindPreview: (el: HTMLVideoElement | null) => void;
   bindTile: (nodeHex: string, el: HTMLCanvasElement | null) => void;
   /** strip cap; overflow surfaces a "+N more not shown" tail. */
@@ -55,6 +57,7 @@ export function StageTile({
   canEncode,
   canDecode,
   selfCameraOn,
+  selfSharing,
   big,
   bindPreview,
   bindTile,
@@ -66,13 +69,18 @@ export function StageTile({
   canEncode: boolean;
   canDecode: boolean;
   selfCameraOn: boolean;
+  selfSharing: boolean;
   big: boolean;
   bindPreview: (el: HTMLVideoElement | null) => void;
   bindTile: (nodeHex: string, el: HTMLCanvasElement | null) => void;
   onPin?: () => void;
 }) {
-  const selfVideo = member.isSelf && selfCameraOn && canEncode;
-  const peerVideo = !member.isSelf && canDecode && !!beacon?.cameraOn;
+  // One VP8 lane carries the camera OR a screen share; a screen tile is
+  // letterboxed (contain) + labelled so it isn't cropped like a camera tile.
+  const isScreen = member.isSelf ? selfSharing : !!beacon?.sharing;
+  const selfVideo = member.isSelf && (selfCameraOn || selfSharing) && canEncode;
+  const peerVideo = !member.isSelf && canDecode && !!(beacon?.cameraOn || beacon?.sharing);
+  const mediaStyle: CSSProperties = isScreen ? { ...media, objectFit: "contain" } : media;
   // Pin the ref callbacks so a container's 1 Hz staleness re-render doesn't
   // detach + reattach (briefly dropping) the <video>/<canvas) every tick.
   const videoRef = useCallback((el: HTMLVideoElement | null) => bindPreview(el), [bindPreview]);
@@ -96,9 +104,9 @@ export function StageTile({
   return (
     <div style={frame} onDoubleClick={onPin} title={onPin ? "Double-click to spotlight" : undefined}>
       {selfVideo ? (
-        <video ref={videoRef} muted autoPlay playsInline style={media} />
+        <video ref={videoRef} muted autoPlay playsInline style={mediaStyle} />
       ) : peerVideo && nodeHex ? (
-        <canvas ref={canvasRef} style={media} />
+        <canvas ref={canvasRef} style={mediaStyle} />
       ) : (
         <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
           <span
@@ -138,6 +146,11 @@ export function StageTile({
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {member.isSelf ? "You" : member.name}
         </span>
+        {isScreen && (
+          <span title="Sharing screen" style={{ opacity: 0.85, fontSize: big ? 10 : 9, letterSpacing: 0.2 }}>
+            screen
+          </span>
+        )}
         {member.muted && (
           <span title="Muted" style={{ display: "flex" }}>
             <MicGlyph size={big ? 12 : 11} />
@@ -166,6 +179,7 @@ export function CallTiles(props: CallTilesProps) {
         canEncode={props.canEncode}
         canDecode={props.canDecode}
         selfCameraOn={props.selfCameraOn}
+        selfSharing={props.selfSharing ?? false}
         big={big}
         bindPreview={props.bindPreview}
         bindTile={props.bindTile}

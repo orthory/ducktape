@@ -22,10 +22,10 @@ const selfHex = keyHex(selfNode);
 
 describe("isBeaconStale", () => {
   it("a fresh beacon is not stale", () => {
-    expect(isBeaconStale({ muted: false, cameraOn: true, atMs: NOW - 1_000 }, 0, NOW)).toBe(false);
+    expect(isBeaconStale({ muted: false, cameraOn: true, sharing: false, atMs: NOW - 1_000 }, 0, NOW)).toBe(false);
   });
   it("a beacon silent past the window is stale", () => {
-    expect(isBeaconStale({ muted: false, cameraOn: false, atMs: NOW - (STALE_BEACON_MS + 1) }, 0, NOW)).toBe(true);
+    expect(isBeaconStale({ muted: false, cameraOn: false, sharing: false, atMs: NOW - (STALE_BEACON_MS + 1) }, 0, NOW)).toBe(true);
   });
   it("does NOT flag a never-beaconed member right after we join", () => {
     expect(isBeaconStale(undefined, NOW - 2_000, NOW)).toBe(false);
@@ -37,7 +37,7 @@ describe("isBeaconStale", () => {
 
 describe("buildParticipants", () => {
   const base = {
-    peers: {} as Record<string, { muted: boolean; cameraOn: boolean; atMs: number }>,
+    peers: {} as Record<string, { muted: boolean; cameraOn: boolean; sharing: boolean; atMs: number }>,
     selfNodeHex: selfHex,
     authorNames: {} as Record<string, string>,
     selfMuted: false,
@@ -65,7 +65,7 @@ describe("buildParticipants", () => {
     const rows = buildParticipants({
       ...base,
       roster: [bob, carol],
-      peers: { [keyHex([1])]: { muted: true, cameraOn: false, atMs: NOW } }, // bob known-muted; carol no beacon
+      peers: { [keyHex([1])]: { muted: true, cameraOn: false, sharing: false, atMs: NOW } }, // bob known-muted; carol no beacon
     });
     const byKey = Object.fromEntries(rows.map((r) => [r.key, r]));
     expect(byKey[keyHex(bytes("bob"))].muted).toBe(true);
@@ -77,7 +77,7 @@ describe("buildParticipants", () => {
     const rows = buildParticipants({
       ...base,
       roster: [bob],
-      peers: { [keyHex([1])]: { muted: false, cameraOn: false, atMs: NOW - (STALE_BEACON_MS + 1) } },
+      peers: { [keyHex([1])]: { muted: false, cameraOn: false, sharing: false, atMs: NOW - (STALE_BEACON_MS + 1) } },
     });
     expect(rows[0].stale).toBe(true);
     expect(rows[0].isSelf).toBe(false);

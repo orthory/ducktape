@@ -136,6 +136,10 @@ export interface ConsoleActions {
    *  peers. Guarded: no-op with no session, on a runtime that can't do video,
    *  or when the roster already EXCEEDS the video cap (audio-only past it). */
   setCamera(on: boolean): void;
+  /** Toggle screen share on the single video lane (camera XOR screen). Gated on
+   *  `videoCapability.canScreenShare` (VP8 encode + getDisplayMedia) + the video
+   *  cap. Enabling swaps the camera off; beacons `sharing` to peers. */
+  setScreenShare(on: boolean): void;
   /** Whether this runtime can do video calls — WebKitGTK can't (no WebCodecs),
    *  its Chromium companion window can. Drives the camera control's enablement. */
   videoSupported(): boolean;
@@ -509,7 +513,7 @@ export function createActions({
           ...prev.voice,
           peers: {
             ...prev.voice.peers,
-            [event.peer]: { muted: event.muted, cameraOn: event.cameraOn, atMs: event.atMs },
+            [event.peer]: { muted: event.muted, cameraOn: event.cameraOn, sharing: event.sharing, atMs: event.atMs },
           },
         },
       }));
@@ -535,6 +539,7 @@ export function createActions({
             error: null,
             popped: false,
             cameraOn: false,
+            sharing: false,
             peers: {},
             sessionStartMs: null,
             speaking: false,
@@ -547,6 +552,7 @@ export function createActions({
             status: "error",
             error: error ?? "connection",
             cameraOn: false,
+            sharing: false,
             peers: {},
           },
         }));
@@ -1263,7 +1269,7 @@ export function createActions({
           stopVoice();
           // the session is gone — camera/beacon state must not outlive it.
           update((prev) => ({
-            voice: { ...prev.voice, status: "error", error: "refused", cameraOn: false, peers: {} },
+            voice: { ...prev.voice, status: "error", error: "refused", cameraOn: false, sharing: false, peers: {} },
           }));
         }
       });
@@ -1283,6 +1289,7 @@ export function createActions({
           status: "connecting",
           error: null,
           cameraOn: false,
+            sharing: false,
           peers: {},
           // Fresh session → fresh staleness baseline (a retry replaces the session).
           sessionStartMs: Date.now(),
@@ -1305,6 +1312,7 @@ export function createActions({
           error: null,
           popped: false,
           cameraOn: false,
+            sharing: false,
           peers: {},
           sessionStartMs: null,
           speaking: false,
@@ -1328,7 +1336,18 @@ export function createActions({
       // grid can't render more tiles, so those huddles stay audio-only.
       if (on && (channel?.huddle?.length ?? 0) > MAX_VIDEO_PARTICIPANTS) return;
       voice.setCamera(on);
-      update((prev) => ({ voice: { ...prev.voice, cameraOn: on } }));
+      // Camera XOR screen: enabling the camera swaps any screen share off.
+      update((prev) => ({ voice: { ...prev.voice, cameraOn: on, ...(on ? { sharing: false } : {}) } }));
+    },
+
+    setScreenShare: (on) => {
+      if (!voice) return;
+      if (on && !getState().videoCapability.canScreenShare) return; // capability-gated UI should prevent this
+      const channel = getState().channels.find((c) => c.id === getState().voice.channelId);
+      if (on && (channel?.huddle?.length ?? 0) > MAX_VIDEO_PARTICIPANTS) return; // same tile cap as the camera
+      voice.setScreenShare(on);
+      // Camera XOR screen: enabling the share swaps the camera off.
+      update((prev) => ({ voice: { ...prev.voice, sharing: on, ...(on ? { cameraOn: false } : {}) } }));
     },
 
     videoSupported: () => getState().videoCapability.canEncode,

@@ -15,7 +15,7 @@ const p = (over: Partial<HuddleParticipant> & { key: string }): HuddleParticipan
 
 const common = {
   memberNodes: { self: "nself", ab: "nab" } as Record<string, string>,
-  peers: { nab: { muted: false, cameraOn: true, atMs: 0 } },
+  peers: { nab: { muted: false, cameraOn: true, sharing: false, atMs: 0 } },
   canEncode: true,
   canDecode: true,
   selfCameraOn: true,
@@ -47,6 +47,29 @@ describe("CallTiles", () => {
     expect(queryByTitle("Muted")).not.toBeNull();
     rerender(<CallTiles layout="gallery" participants={[p({ key: "ab", muted: false })]} {...common} />);
     expect(queryByTitle("Muted")).toBeNull();
+  });
+
+  it("labels a screen-sharing peer's tile and still paints its video", () => {
+    const sharingPeers = { nab: { muted: false, cameraOn: false, sharing: true, atMs: 0 } };
+    const { container, getByTitle } = render(
+      <CallTiles layout="gallery" participants={[p({ key: "ab" })]} {...common} peers={sharingPeers} />,
+    );
+    // sharing counts as an active video lane → canvas painted (decode-capable).
+    expect(container.querySelector("canvas")).not.toBeNull();
+    expect(getByTitle("Sharing screen")).toBeTruthy();
+  });
+
+  it("labels our own screen share on the self tile", () => {
+    const { getByTitle } = render(
+      <CallTiles
+        layout="gallery"
+        participants={[p({ key: "self", isSelf: true })]}
+        {...common}
+        selfCameraOn={false}
+        selfSharing
+      />,
+    );
+    expect(getByTitle("Sharing screen")).toBeTruthy();
   });
 
   it("caps a strip and surfaces the overflow tail", () => {

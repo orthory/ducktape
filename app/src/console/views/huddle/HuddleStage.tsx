@@ -157,6 +157,7 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
             canEncode={videoCapability.canEncode}
             canDecode={videoCapability.canDecode}
             selfCameraOn={voice.cameraOn}
+            selfSharing={voice.sharing}
             bindPreview={bindPreview}
             bindTile={bindTile}
             pinned={pinned}
@@ -177,6 +178,9 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
           cameraOn={voice.cameraOn}
           canEncode={videoCapability.canEncode}
           cameraDisabledReason={overCap ? "Video is capped at 8 participants" : undefined}
+          sharing={voice.sharing}
+          canScreenShare={videoCapability.canScreenShare && !overCap}
+          onToggleScreen={() => actions.setScreenShare(!voice.sharing)}
           onToggleMute={() => actions.setHuddleMuted(!voice.muted)}
           onToggleCamera={() => actions.setCamera(!voice.cameraOn)}
           onLeave={() => actions.leaveHuddle()}

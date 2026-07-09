@@ -63,7 +63,7 @@ const MAX_BITRATE_KBPS = 1200;
 
 export type CallEvent =
   | { kind: "status"; status: VoiceStatus; error?: VoiceError }
-  | { kind: "peerBeacon"; peer: string; muted: boolean; cameraOn: boolean; atMs: number }
+  | { kind: "peerBeacon"; peer: string; muted: boolean; cameraOn: boolean; sharing: boolean; atMs: number }
   // Our own mic went above/below the speaking threshold — drives the self
   // speaking ring and the "you're muted while talking" banner. Emitted only on a
   // change (mute keeps capturing, so this fires even while muted).
@@ -79,8 +79,13 @@ export interface CallSession {
   /** Stop forwarding captured frames (true) without dropping the track; beacons. */
   setMuted(muted: boolean): void;
   /** Enable/disable the camera. Enabling acquires + encodes asynchronously; a
-   *  failed acquire leaves the camera off. Beacons on every settled change. */
+   *  failed acquire leaves the camera off. Beacons on every settled change.
+   *  Turning the camera on while screen-sharing swaps the lane. */
   setCamera(on: boolean): void;
+  /** Enable/disable screen share on the SAME video lane (camera XOR screen).
+   *  Enabling acquires getDisplayMedia; a denial/cancel leaves it off. Beacons
+   *  `sharing` so peers letterbox + label the tile. */
+  setScreenShare(on: boolean): void;
   /** Bind (or unbind, with null) the canvas a peer's video decodes onto. */
   bindTile(peerHex: string, canvas: HTMLCanvasElement | null): void;
   /** Bind (or unbind, with null) the local camera preview <video>. */
@@ -99,6 +104,7 @@ interface ServerControl {
   peer?: string;
   muted?: boolean;
   cameraOn?: boolean;
+  sharing?: boolean;
   maxKbps?: number;
 }
 
@@ -138,15 +144,20 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     if (status === "connecting") setStatus("live");
   };
 
-  // ── camera / encode ─────────────────────────────────────
+  // ── video lane (camera XOR screen) / encode ──────────────
+  // One VP8 lane, sourced from EITHER the camera or a screen share — the two are
+  // mutually exclusive (a mode-swap), beaconed as `cameraOn` / `sharing`.
   let camStream: MediaStream | null = null;
   let camVideo: HTMLVideoElement | null = null; // hidden frame source
   let encoder: VideoEncoder | null = null;
   let previewEl: HTMLVideoElement | null = null;
   let cameraOn = false;
+  let sharing = false; // the lane is a screen share rather than the camera
   let forceKeyframe = true; // first frame, and on server keyframeRequest
   let framesSinceKey = 0;
   let bitrateKbps = START_BITRATE_KBPS; // rateHint moves it
+
+  const videoActive = () => cameraOn || sharing;
 
   const configureEncoder = () => {
     encoder?.configure({
@@ -180,11 +191,13 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     forceKeyframe = true; // the next enable opens with a keyframe
   };
 
-  const startCamera = async () => {
-    const media = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-    });
-    if (stopped || !cameraOn) {
+  const startVideo = async (screen: boolean) => {
+    const media = screen
+      ? await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } } })
+      : await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+        });
+    if (stopped || !videoActive()) {
       media.getTracks().forEach((t) => t.stop());
       return;
     }
@@ -198,7 +211,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
           encodeCapturedVideo(chunk.type === "key", Math.round(chunk.timestamp / 1000), data),
         );
       },
-      error: () => setCamera(false), // encoder death = camera off, session lives
+      error: () => stopVideoLane(), // encoder death = lane off, session lives
     });
     configureEncoder();
     const video = document.createElement("video");
@@ -206,18 +219,23 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     video.playsInline = true;
     video.srcObject = media;
     await video.play();
-    if (stopped || !cameraOn) {
+    if (stopped || !videoActive()) {
       stopCameraGraph();
       return;
     }
     camVideo = video;
     if (previewEl) previewEl.srcObject = media;
+    // A screen share can be ended from the browser's OWN "Stop sharing" UI —
+    // mirror that back into our lane state so the beacon + button stay honest.
+    if (screen) {
+      media.getVideoTracks()[0]?.addEventListener("ended", () => setScreenShare(false));
+    }
     const pump = () => {
-      if (!cameraOn || !camVideo || !encoder || encoder.state === "closed") return;
+      if (!videoActive() || !camVideo || !encoder || encoder.state === "closed") return;
       // rVFC is the portable frame source (Chromium + WebKit) — no
       // MediaStreamTrackProcessor dependency.
       camVideo.requestVideoFrameCallback((_now, meta) => {
-        if (cameraOn && encoder && encoder.state === "configured" && encoder.encodeQueueSize < 2) {
+        if (videoActive() && encoder && encoder.state === "configured" && encoder.encodeQueueSize < 2) {
           const frame = new VideoFrame(camVideo!, {
             timestamp: Math.round(meta.mediaTime * 1_000_000),
           });
@@ -237,17 +255,30 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     pump();
   };
 
+  /** Force the whole video lane off (encoder death, or a swap failure). */
+  const stopVideoLane = (): void => {
+    cameraOn = false;
+    sharing = false;
+    stopCameraGraph();
+    sendBeacon();
+  };
+
   const sendBeacon = () => {
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "beacon", muted, cameraOn }));
+      socket.send(JSON.stringify({ type: "beacon", muted, cameraOn, sharing }));
     }
   };
 
   const setCamera = (on: boolean): void => {
     if (on === cameraOn) return; // idempotent
     if (on) {
+      if (sharing) {
+        // swap the lane from screen → camera.
+        sharing = false;
+        stopCameraGraph();
+      }
       cameraOn = true;
-      startCamera()
+      startVideo(false)
         .then(() => {
           if (cameraOn) sendBeacon();
         })
@@ -255,9 +286,36 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
           // acquire/encode setup failed: stay off, surface nothing fatal.
           cameraOn = false;
           stopCameraGraph();
+          sendBeacon();
         });
     } else {
       cameraOn = false;
+      stopCameraGraph();
+      sendBeacon();
+    }
+  };
+
+  const setScreenShare = (on: boolean): void => {
+    if (on === sharing) return; // idempotent
+    if (on) {
+      if (cameraOn) {
+        // swap the lane from camera → screen.
+        cameraOn = false;
+        stopCameraGraph();
+      }
+      sharing = true;
+      startVideo(true)
+        .then(() => {
+          if (sharing) sendBeacon();
+        })
+        .catch(() => {
+          // getDisplayMedia denied / cancelled: stay off, nothing fatal.
+          sharing = false;
+          stopCameraGraph();
+          sendBeacon();
+        });
+    } else {
+      sharing = false;
       stopCameraGraph();
       sendBeacon();
     }
@@ -370,6 +428,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
             peer: msg.peer.toLowerCase(),
             muted: !!msg.muted,
             cameraOn: !!msg.cameraOn,
+            sharing: !!msg.sharing,
             atMs: Date.now(),
           });
         }
@@ -531,6 +590,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     if (stopped) return;
     stopped = true;
     cameraOn = false;
+    sharing = false;
     if (socket) {
       // drop handlers first so our own close doesn't fire onEvent('closed').
       socket.onopen = null;
@@ -569,5 +629,5 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     tileBindings.clear();
   };
 
-  return { start, setRecipients, setMuted, setCamera, bindTile, bindPreview, stop };
+  return { start, setRecipients, setMuted, setCamera, setScreenShare, bindTile, bindPreview, stop };
 };

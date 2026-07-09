@@ -9,7 +9,7 @@ import { authorName, keyHex } from "../../domain/chat-client";
 import type { HuddleMember } from "../../domain/chat-client";
 
 /** A peer's ephemeral call state from the hub's 1 Hz beacons (see VoiceSlice). */
-export type PeerBeacon = { muted: boolean; cameraOn: boolean; atMs: number };
+export type PeerBeacon = { muted: boolean; cameraOn: boolean; sharing: boolean; atMs: number };
 
 /** After this much beacon silence a huddle member is offered for sweeping. */
 export const STALE_BEACON_MS = 10_000;
