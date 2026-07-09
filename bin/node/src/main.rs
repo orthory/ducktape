@@ -6830,6 +6830,9 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             > = std::collections::HashMap::new();
             let mut blocks_since_checkpoint: u64 = 0;
             let mut last_cert_height: Option<u64> = None;
+            // the serving replica's manifest-fetch pacer (see the gate at the
+            // fetch site). absolute, so per-cert window closes can't starve it.
+            let mut next_manifest_fetch = std::time::Instant::now();
             // the app-hash of the last boundary the derived tier followed:
             // the index feed (heal + explorer row + ws event) fires only when
             // the verified app-hash MOVED. an unchanged hash is an idle
@@ -6985,7 +6988,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 // in flight below queues jobs here — bounded by the rpc
                 // bridge's buffer and the listener's reply timeout — so every
                 // answer reflects a whole boundary, never a torn one.)
-                let mut fetch_due = false;
                 {
                     let fallback = if resident_standing && serving.is_some() {
                         RESIDENT_FALLBACK_POLL
@@ -7374,10 +7376,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             // (None — every drain gone — only happens at mesh
                             // shutdown; fall through to the tick's exit.)
                             wake = head_wake.next() => if wake.is_some() { break },
-                            _ = tick => {
-                                fetch_due = true;
-                                break;
-                            }
+                            _ = tick => break,
                         }
                     }
                 }
@@ -7582,13 +7581,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 }
                 // a FOLDING replica's window closes per certificate; the
                 // manifest is only the fallback lane now (standing detection
-                // pre-ascension; promotion and cutover detection after). so
-                // fetch it on the fallback tick's cadence, not per block — a
-                // fleet of replicas re-fetching per block would besiege the
-                // serve window that exists for joiners.
-                if serving.is_some() && !fetch_due {
+                // pre-ascension; promotion, cutover, and revocation detection
+                // after). pace it on an ABSOLUTE deadline — the window's own
+                // tick restarts per close and would never fire under steady
+                // cert traffic — so a fleet of replicas doesn't besiege the
+                // serve window per block, yet detection stays bounded by the
+                // fallback cadence.
+                if serving.is_some() && std::time::Instant::now() < next_manifest_fetch {
                     continue;
                 }
+                next_manifest_fetch = std::time::Instant::now() + RESIDENT_FALLBACK_POLL;
                 let m = match fetch_manifest(&client).await {
                     Ok(m) => m,
                     Err(e) => {
