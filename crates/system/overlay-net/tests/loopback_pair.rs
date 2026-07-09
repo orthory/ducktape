@@ -369,6 +369,77 @@ async fn peer_replace_switches_traffic_atomically() {
     );
 }
 
+/// ONE node carrying TWO tunnels AT ONCE over its single underlay socket —
+/// the multiplexing the device's peer table exists for: a `Tunn` per peer,
+/// inbound datagrams routed by the device-assigned index (`receiver_idx >> 8`)
+/// or the handshake's static key, outbound packets cryptokey-routed by
+/// destination `/128`.
+///
+/// every other proof here is PAIRWISE — one peer per device — and the replace
+/// case swaps `b` for `c` rather than holding both. a demux that ignored the
+/// peer index entirely would pass all of them, because a one-entry table has
+/// nothing to confuse. so both legs must be live SIMULTANEOUSLY, with distinct
+/// payloads: cross-wiring delivers `b`'s bytes to `c`, and a table that clobbers
+/// on the second peer drops a leg outright.
+///
+/// `a` holds both endpoints and initiates; `b` and `c` peer it passively
+/// (endpoint learned from the first authenticated datagram) — the shape a NAT'd
+/// node that can only dial out actually forms against two reachable peers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_node_carries_two_concurrent_tunnels() {
+    let mut a = stand_up(0xc1, 0xa);
+    let mut b = stand_up(0xd2, 0xb);
+    let mut c = stand_up(0xe3, 0xc);
+
+    // ONE interface on `a`, TWO peer relationships.
+    let a_port = a.endpoint.port();
+    let peers_for_a = vec![
+        peer_entry(&b, Some(b.endpoint)),
+        peer_entry(&c, Some(c.endpoint)),
+    ];
+    a.effect
+        .apply(&config(&a, a_port, peers_for_a))
+        .expect("a re-applies with TWO peers on one interface");
+    let b_port = b.endpoint.port();
+    c.effect
+        .apply(&config(&c, c.endpoint.port(), vec![peer_entry(&a, None)]))
+        .expect("c peers a passively");
+    b.effect
+        .apply(&config(&b, b_port, vec![peer_entry(&a, None)]))
+        .expect("b peers a passively");
+
+    // both legs at once. `udp_round_trip` asserts the payload survives AND that
+    // the source address on each hop is the far peer's overlay `/128`, so a
+    // datagram decapsulated under the wrong `Tunn` fails the assertion rather
+    // than passing silently.
+    let (ab, ac) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(10), udp_round_trip(&a, &b, b"a and b")),
+        tokio::time::timeout(Duration::from_secs(10), udp_round_trip(&a, &c, b"a and c")),
+    );
+    ab.expect("echo a↔b while a↔c runs");
+    ac.expect("echo a↔c while a↔b runs");
+
+    // both sessions live in the SAME device, reached over the SAME socket:
+    // two `Tunn`s, one `UnderlaySocket`.
+    let device_a = a.effect.device().expect("a device");
+    assert!(
+        device_a.time_since_last_handshake(b.ula).is_some(),
+        "a↔b session established"
+    );
+    assert!(
+        device_a.time_since_last_handshake(c.ula).is_some(),
+        "a↔c session established"
+    );
+    assert_eq!(
+        a.effect
+            .local_underlay_addr()
+            .expect("a underlay bound")
+            .port(),
+        a_port,
+        "both tunnels multiplexed over a's single, unchanged underlay socket"
+    );
+}
+
 // ── ADR phase 3: the shared underlay + the mesh listener's virtual leg ──
 
 /// the node wiring's shared underlay socket: WireGuard traffic and the NAT
