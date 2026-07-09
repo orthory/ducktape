@@ -6020,14 +6020,18 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     let blobs = http_handle.blob_handle();
     // the REAL portable-agent-run provisioner, built from a clone of the http
     // handle BEFORE the serve/drop match consumes it. portable (v3) runs
-    // materialize a per-run duckfs checkout under a root OUTSIDE <storage> (D7)
-    // and drive checkout/commit over this SAME NodeHandle actor lane the
-    // /v1/fs/workspaces RPC already rides here. DORMANT until the composer flips
-    // to v3 — every live (v2) run takes the pool's unchanged plain-run branch.
+    // materialize a per-run duckfs checkout under a root VALIDATED to be
+    // outside <storage> (D7) and drive checkout/commit over this SAME
+    // NodeHandle actor lane the /v1/fs/workspaces RPC already rides here.
+    // LIVE for every agent run: this binary wires the files module
+    // unconditionally, so the runs composer emits v3 (the de-versioned
+    // activation — no flag day, pre-production re-genesis). a misconfigured
+    // root (inside <storage>) is a boot error, never a silent D7 hole.
     let agent_provisioner: Option<dispatch_oracle::SharedProvisioner> =
         Some(std::sync::Arc::new(noded::agent_provision::NodedProvisioner::new(
             http_handle.clone(),
-            noded::agent_provision::agent_runs_root(),
+            noded::agent_provision::agent_runs_root(&storage)
+                .unwrap_or_else(|e| panic!("agent runs root failed D7 validation: {e}")),
         )));
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)

@@ -76,9 +76,12 @@ where
     let mut pool =
         DispatchPool::new(Arc::new(providers), node_key, spawn, deliver).with_resolver(resolver);
     // portable (v3) runs materialize a per-run duckfs workspace through this,
-    // over the SAME NodeHandle actor lane the /v1/fs/workspaces RPC uses. `None`
-    // (a surface-off validator with no command lane) keeps today's accept-only
-    // behavior. dormant regardless pre-flip — the composer emits no v3 envelope.
+    // over the SAME NodeHandle actor lane the /v1/fs/workspaces RPC uses. LIVE:
+    // the composer emits v3 for every run (files module wired unconditionally),
+    // so this seam is on the hot path. `None` keeps the accept-only degrade
+    // (raw-text delivery, no workspace) — main.rs currently always passes
+    // `Some`, so the branch is defensive plumbing for embedders, not a live
+    // production mode.
     if let Some(provisioner) = provisioner {
         pool = pool.with_provisioner(provisioner);
     }

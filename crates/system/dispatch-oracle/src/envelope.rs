@@ -221,19 +221,18 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
 /// ACCEPT a v3 (portable) envelope and surface its pinned plan, without
 /// ACTIVATING portable execution HERE.
 ///
-/// this worker validates the portable shape — proving mixed-network nodes on
-/// this binary understand v3 before any node composes it — and marks the run
-/// portable so no host-local native session is resumed for it. it deliberately
-/// does NOT set the child's working directory or inject workspace env: the
-/// envelope carries SOURCE coordinates only (no `mount_path`, D7), and turning
-/// the plan into a real mount is the pool's job via the injected provisioner
-/// (a consensus-supplied host path like the constant `/workspace` is exactly
-/// the unwritable cwd that turned live runs into `create_dir_all` failures).
-/// per the ADR (`2026-07-09-deterministic-agent-runtime`, ROL/M2 + W1) portable
-/// ACTIVATION — a per-run writable mount and its bindings — happens in the pool
-/// only when a provisioner is wired AND a coordinated flip emits v3; until then
-/// the returned plan is inert data and the host's own scratch/persistent
-/// workspace policy owns the cwd (see `capability-host::workdir_for`).
+/// this worker validates the portable shape and marks the run portable so no
+/// host-local native session is resumed for it. it deliberately does NOT set
+/// the child's working directory or inject workspace env: the envelope carries
+/// SOURCE coordinates only (no `mount_path`, D7), and turning the plan into a
+/// real mount is the pool's job via the injected provisioner (a
+/// consensus-supplied host path like the constant `/workspace` is exactly the
+/// unwritable cwd that turned live runs into `create_dir_all` failures, W1).
+/// portable ACTIVATION — a per-run writable mount and its bindings — happens
+/// in the pool iff a provisioner is wired (the production binaries always wire
+/// one); an embedder without one leaves the returned plan inert and the host's
+/// own scratch/persistent workspace policy owns the cwd (see
+/// `capability-host::workdir_for`).
 fn accept_portable_envelope(
     ctx: &mut RunContext,
     workspace: Option<WireWorkspace>,

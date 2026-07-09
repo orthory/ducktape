@@ -59,9 +59,11 @@ pub struct RunContext {
     pub agent_id: Option<String>,
     pub thread_key: Option<String>,
     /// an already-materialized workspace this specific run must execute in.
-    /// v3 portable runs set this to the duckfs checkout mount (normally
-    /// `/workspace`) so the provider's cwd is the evidence-backed workspace,
-    /// independent of the host's per-agent scratch/persistent policy.
+    /// set only by the provisioning wrapper (`dispatch-oracle::bind_workspace`)
+    /// after a successful per-run duckfs checkout — never a consensus-supplied
+    /// path (D7). when set, the provider's cwd is the evidence-backed
+    /// workspace; an unusable mount fails the run (W1), never falls back to
+    /// the shared scratch dir.
     pub workdir_override: Option<PathBuf>,
     /// run-scoped environment variables for host-provided tool bindings.
     /// these are additive to the process environment and apply only to the
@@ -330,19 +332,26 @@ impl CliProvider {
 
     /// resolve the run's cwd to a per-run WRITABLE directory, creating it.
     ///
-    /// the preferred choice ([`Self::workdir_for`]) may be unwritable on THIS
-    /// node — an activated portable mount that nothing materialized, or a
-    /// persistent root on a read-only volume. rather than fail the whole run on
-    /// `create_dir_all` (the constant `/workspace` a portable envelope names is
-    /// unwritable on a non-root node, which turned working agents into
-    /// deterministically-failing ones), fall back to the host-owned scratch
-    /// dir — always a per-run writable path (ADR W1). scratch itself has no
-    /// fallback: if the host cannot create its own scratch dir, the run has
-    /// nowhere to execute.
+    /// a `workdir_override` is a workspace the provisioner ALREADY materialized
+    /// (the only setter is `dispatch-oracle`'s `bind_workspace`, after a
+    /// successful checkout — the envelope itself carries no host path, D7). if
+    /// creating it fails, the run must FAIL so the saga can retry elsewhere:
+    /// falling back would silently execute the run in `self.workdir` — a single
+    /// dir shared by every run of this capability tag on the node, so
+    /// concurrent runs would collide and the workspace commit would read the
+    /// untouched real mount and report a clean tree (W1 violation, masked).
+    ///
+    /// the persistent per-agent choice keeps its scratch fallback: it may sit
+    /// on a read-only volume, and those runs never promised a workspace.
     fn ensure_writable_workdir(&self, ctx: &RunContext) -> Result<PathBuf, String> {
         let preferred = self.workdir_for(ctx)?;
         match std::fs::create_dir_all(&preferred) {
             Ok(()) => Ok(preferred),
+            Err(e) if ctx.workdir_override.is_some() => Err(format!(
+                "provisioned workspace mount {} is unusable: {e}; refusing the \
+                 shared scratch fallback for a portable run (W1)",
+                preferred.display()
+            )),
             Err(_) if preferred != self.workdir => {
                 std::fs::create_dir_all(&self.workdir).map_err(|e| {
                     format!(
@@ -1373,16 +1382,18 @@ printf '%s\n' "$PATH"
     }
 
     #[tokio::test]
-    async fn an_unwritable_workdir_override_falls_back_to_scratch_not_a_failed_run() {
-        // W1: a portable envelope names a mount that nothing materialized (the
-        // constant `/workspace`, unwritable on a non-root node). the host must
-        // run the child in its own scratch dir instead of failing the whole run
-        // on `create_dir_all`. an override whose parent is a FILE is
-        // `create_dir_all`-impossible regardless of privilege — `/workspace`'s
-        // EPERM in miniature, reproducible as an unprivileged test.
-        let dir = scratch("w1-fallback");
+    async fn an_unusable_workdir_override_fails_the_run_never_shares_scratch() {
+        // W1: a workdir_override is a mount the provisioner already
+        // materialized; if it is unusable the run must FAIL (the saga retries)
+        // rather than silently fall back to the capability's SHARED scratch dir
+        // — where concurrent runs of different agents would collide and the
+        // workspace commit would report a clean tree while the agent's work
+        // vanished. an override whose parent is a FILE is
+        // `create_dir_all`-impossible regardless of privilege, reproducible as
+        // an unprivileged test.
+        let dir = scratch("w1-hard-fail");
         let bin = fake_cli(&dir, "wd", "cat > /dev/null\npwd");
-        let blocker = scratch("w1-fallback-blocker").join("a-file");
+        let blocker = scratch("w1-hard-fail-blocker").join("a-file");
         std::fs::write(&blocker, b"x").unwrap();
         let uncreatable = blocker.join("child");
         assert!(
@@ -1390,17 +1401,20 @@ printf '%s\n' "$PATH"
             "the override must be genuinely uncreatable for this test to mean anything"
         );
 
-        let p = sh_provider(mock_spec("wd", "wd", "text"), bin, "w1-fallback-scratch");
+        let p = sh_provider(mock_spec("wd", "wd", "text"), bin, "w1-hard-fail-scratch");
         let ctx = RunContext {
-            workdir_override: Some(uncreatable),
+            workdir_override: Some(uncreatable.clone()),
             portable: true,
             ..RunContext::default()
         };
-        let cwd = p.run("q", &ctx).await.unwrap();
-        assert_eq!(
-            PathBuf::from(cwd),
-            scratch("w1-fallback-scratch").canonicalize().unwrap(),
-            "the run succeeds in the scratch fallback, never EPERMs on the mount"
+        let err = p.run("q", &ctx).await.unwrap_err();
+        assert!(
+            err.contains("provisioned workspace mount") && err.contains("refusing"),
+            "the run fails loudly on an unusable mount: {err}"
+        );
+        assert!(
+            !scratch("w1-hard-fail-scratch").join("anything").exists(),
+            "nothing executed in the shared scratch dir"
         );
     }
 

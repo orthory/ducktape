@@ -30,6 +30,14 @@ pub const DEFAULT_AGENT_TARGET: &str = "agent";
 /// bound on the follow-up fan-out a single delivery can cause.
 pub const MAX_ACTIONS_PER_RUN: usize = 8;
 
+/// hard cap on the SERIALIZED bytes of a response's actions — the byte peer of
+/// [`MAX_ACTIONS_PER_RUN`]'s count cap. action payloads (task ids, titles,
+/// statuses) are otherwise unbounded strings, and the delivering module embeds
+/// the validated response in a bounded job-finalize payload — so, like
+/// [`MAX_REPLY_BLOCKS_BYTES`], it must be able to prove the size BEFORE
+/// emitting.
+pub const MAX_ACTIONS_BYTES: usize = 8 * 1024;
+
 /// hard cap on a serialized [`AgentRecord`] — registry entries live in the
 /// root preimage and every snapshot, so registration is size-gated up front.
 pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;

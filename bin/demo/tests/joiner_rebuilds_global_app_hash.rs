@@ -16,7 +16,7 @@
 
 use agent::AgentModule;
 use agent::{
-    ACTION_CHAT_POST, AgentMsg, AgentQuery, AgentReply, AgentStatus,
+    ACTION_CHAT_POST, AgentMsg, AgentQuery, AgentReply, AgentStatus, ResourceCaps, SkillRef,
     decode_reply as agent_decode_reply, encode_msg as agent_encode_msg,
     encode_query as agent_encode_query,
 };
@@ -451,6 +451,28 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
         // the agent crate's own snapshot suite; this leg pins the joiner
         // path. admin ops are owner-gated, so they carry an external origin.
         let owner = sdk::Origin::External(b"agent-owner".to_vec());
+        let quackbot_recipe_hash = vec![7u8; 32];
+        let quackbot_caps = ResourceCaps {
+            forge_read: vec!["app".into()],
+            forge_push: vec!["app".into()],
+            duckfs_read: vec!["/shared/docs".into()],
+            duckfs_write: vec!["/shared/agent-workspaces/bot".into()],
+            tools: vec!["ducktape-files".into()],
+            secrets: vec!["vault:ci".into()],
+            subagent_budget: 2,
+        };
+        let quackbot_skills = vec![
+            SkillRef {
+                name: "release".into(),
+                source_prefix: "/shared/skills/release".into(),
+                source_snapshot: Some("bb".repeat(32)),
+            },
+            SkillRef {
+                name: "tracking".into(),
+                source_prefix: "/shared/skills/tracking".into(),
+                source_snapshot: None,
+            },
+        ];
         let mut src_agent = AgentModule::new("agent", "saga", Some("runs".into()));
         commit_op_as(
             &mut src_agent,
@@ -462,9 +484,9 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 capability: "mock-llm-1".into(),
                 prompt_hash: vec![7u8; 32],
                 allowed_actions: vec![ACTION_CHAT_POST.into()],
-                recipe_hash: None,
-                caps: None,
-                skills: None,
+                recipe_hash: Some(quackbot_recipe_hash.clone()),
+                caps: Some(quackbot_caps.clone()),
+                skills: Some(quackbot_skills.clone()),
             }),
         )
         .await;
@@ -821,6 +843,13 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 ("sleepy", AgentStatus::Paused),
             ]
         );
+        let quackbot = agents
+            .iter()
+            .find(|a| a.agent_id == "quackbot")
+            .expect("quackbot survives state sync");
+        assert_eq!(quackbot.recipe_hash, quackbot_recipe_hash);
+        assert_eq!(quackbot.caps, quackbot_caps);
+        assert_eq!(quackbot.skills, quackbot_skills);
         let reply = join_runs
             .query(&runs_encode_query(&RunsQuery::Watches))
             .await

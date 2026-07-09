@@ -11,18 +11,21 @@
 //! worker), and drives them through [`ActorNodeApi`] so there is no self-dial.
 //!
 //! D7 (isolation floor): the per-run dir is minted under [`agent_runs_root`],
-//! a root OUTSIDE `<storage>` and OUTSIDE `~/.ducktape` — so a `..` from a
+//! a root VALIDATED at boot to be OUTSIDE `<storage>` — so a `..` from a
 //! checkout can NOT reach `user.key`, the node keys, qmdb, the blobstore, or
 //! forge's git substrate. the managed `/v1/fs/workspaces` root stays under
 //! `<storage>`; this is a distinct, relocated root for live agent runs.
 //!
-//! DORMANT in phase 2: the runs composer is held at v2, so no v3 envelope is
-//! composed and the pool never reaches this provisioner on a live run. it is
-//! wired now so the coordinated flip (Phase 5) activates it without another
-//! deploy.
+//! LIVE, not dormant: this branch de-versioned the ADR's phased rollout
+//! (pre-production — no committed history, no mixed-binary set). both binaries
+//! wire the files module unconditionally, so the runs composer emits v3 for
+//! every agent run and the pool takes the full provision → bind → run →
+//! commit → cleanup bracket through this provisioner. the v2/scratch path
+//! survives only for embedders that never wire a files module (dev tools,
+//! tests).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use dispatch_oracle::{ProvisionedWorkspace, WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec};
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
@@ -31,15 +34,59 @@ use duckfs_client::commit::{CommitError, commit};
 use crate::NodeHandle;
 use crate::actor_api::ActorNodeApi;
 
-/// the D7 relocation lever: the root per-run agent workspaces are minted under.
-/// MUST be outside `<storage>` and outside `~/.ducktape` (see the module doc).
-/// `DUCKTAPE_AGENT_WORKSPACES` overrides it (operators point it at an isolated
-/// volume); the default is the system temp tree, the same safe scratch tree
-/// `CliProvider`'s fallback workdir already uses.
-pub fn agent_runs_root() -> PathBuf {
-    std::env::var_os("DUCKTAPE_AGENT_WORKSPACES")
+/// the D7 relocation lever: the root per-run agent workspaces are minted
+/// under. MUST be outside `<storage>` — VALIDATED here at boot, never trusted.
+/// `DUCKTAPE_AGENT_RUNS_ROOT` overrides the base (operators point it at an
+/// isolated volume); deliberately NOT `DUCKTAPE_AGENT_WORKSPACES`, which
+/// already means the legacy persistent per-agent root in `capability-host` —
+/// one knob must not govern two unrelated trees. the default is the system
+/// temp tree, the same safe scratch tree `CliProvider`'s fallback workdir
+/// already uses.
+///
+/// the returned root is salted with a hash of THIS node's storage path, so
+/// co-located nodes (fleet tiles, multi-node test boxes) never share a
+/// run-dir tree — one node's W5 cleanup must never be able to delete a
+/// sibling process's in-flight checkout.
+pub fn agent_runs_root(storage: &Path) -> Result<PathBuf, String> {
+    let base = std::env::var_os("DUCKTAPE_AGENT_RUNS_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("ducktape-agent-runs"))
+        .unwrap_or_else(|| std::env::temp_dir().join("ducktape-agent-runs"));
+    runs_root_under(base, storage)
+}
+
+/// the testable core of [`agent_runs_root`]: salt `base` per-storage, create
+/// it, and REFUSE a root inside `<storage>` (D7 is a MUST, not a convention).
+fn runs_root_under(base: PathBuf, storage: &Path) -> Result<PathBuf, String> {
+    let digest = duckfs_core::objects::object_id(
+        duckfs_core::objects::Kind::Chunk,
+        storage.to_string_lossy().as_bytes(),
+    );
+    let salt: String = duckfs_core::to_hex(&digest).chars().take(16).collect();
+    let root = base.join(salt);
+    std::fs::create_dir_all(&root).map_err(|e| {
+        format!(
+            "agent runs root {} could not be created: {e}",
+            root.display()
+        )
+    })?;
+    // D7 (MUST): the run tree may never live under <storage> — a `..` from a
+    // checkout would reach user.key/node keys/qmdb/blobstore. canonicalize
+    // both sides so symlinks/relative paths cannot dodge the check.
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("agent runs root {}: {e}", root.display()))?;
+    let canon_storage = storage
+        .canonicalize()
+        .unwrap_or_else(|_| storage.to_path_buf());
+    if canon_root.starts_with(&canon_storage) {
+        return Err(format!(
+            "agent runs root {} is inside the node storage tree {} — D7 forbids \
+             this; set DUCKTAPE_AGENT_RUNS_ROOT to a directory outside it",
+            canon_root.display(),
+            canon_storage.display()
+        ));
+    }
+    Ok(root)
 }
 
 /// a bounded, collision-free `[a-z0-9]` dir name derived from the FULL run_id
@@ -109,12 +156,30 @@ impl WorkspaceProvisioner for NodedProvisioner {
                 snapshot.as_deref(),
                 &CheckoutOptions::default(),
             )
+            .inspect_err(|_| {
+                // a checkout can fail PARTWAY (transport mid-read, verify
+                // mismatch) after materializing some of the tree — the run
+                // never gets a workspace handle to clean up, so the error
+                // path must remove its own debris (W5 applies here too).
+                let _ = std::fs::remove_dir_all(&checkout_dir);
+            })
         })
         .await
         .map_err(|_| "workspace checkout task panicked".to_string())?
         .map_err(|e| e.to_string())?;
-        // phase 2 wires the rw source only; spec.ro_mounts is empty (W6 skill
-        // trees = phase 4).
+        // this provisioner wires the rw source only: W6 skill/instruction ro
+        // mounts are NOT materialized yet. an agent with skills still runs —
+        // minus its skill trees — and the gap is LOUD, never silent: the
+        // envelope pinned those refs on consensus, so dropping them without a
+        // trace would break the composer's contract invisibly.
+        if !spec.ro_mounts.is_empty() {
+            eprintln!(
+                "[oracle] run {} requests {} skill mount(s) this provisioner \
+                 does not materialize yet — running without them",
+                spec.run_id,
+                spec.ro_mounts.len()
+            );
+        }
         let mut env = BTreeMap::new();
         env.insert("DUCKTAPE_RUN_WORKSPACE".into(), dir.display().to_string());
         Ok(Box::new(NodedWorkspace {
@@ -207,14 +272,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_runs_root_honors_the_env_override() {
-        // no env mutation (parallel tests share the process): assert the
-        // default shape only.
-        let root = agent_runs_root();
+    fn runs_root_is_salted_per_storage_and_refuses_a_root_inside_storage() {
+        // no env mutation (parallel tests share the process): exercise the
+        // testable core directly.
+        let scratch = std::env::temp_dir().join("ducktape-runs-root-test");
+        let storage_a = scratch.join("storage-a");
+        let storage_b = scratch.join("storage-b");
+        std::fs::create_dir_all(&storage_a).unwrap();
+        std::fs::create_dir_all(&storage_b).unwrap();
+        let base = scratch.join("runs-base");
+
+        // co-located nodes (distinct storage) get DISJOINT roots — one node's
+        // W5 cleanup can never touch a sibling's in-flight checkout.
+        let a = runs_root_under(base.clone(), &storage_a).unwrap();
+        let b = runs_root_under(base.clone(), &storage_b).unwrap();
+        assert_ne!(a, b, "the storage-path salt separates co-located nodes");
+        assert!(a.starts_with(&base) && b.starts_with(&base));
+        // deterministic per storage: a restart reuses the same root.
+        assert_eq!(a, runs_root_under(base.clone(), &storage_a).unwrap());
+
+        // D7 is ENFORCED, not advisory: a base inside <storage> is refused.
+        let err = runs_root_under(storage_a.join("agent-runs"), &storage_a).unwrap_err();
         assert!(
-            root.ends_with("ducktape-agent-runs")
-                || std::env::var_os("DUCKTAPE_AGENT_WORKSPACES").is_some(),
-            "default root lives under the temp tree, outside <storage>"
+            err.contains("D7 forbids") && err.contains("DUCKTAPE_AGENT_RUNS_ROOT"),
+            "the refusal names the invariant and the remedy: {err}"
         );
     }
 

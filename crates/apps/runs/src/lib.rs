@@ -120,7 +120,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent,
     AgentQuery, AgentRecord, AgentReply, AgentResponse, AgentStatus, CapRequest,
-    MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
+    MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR,
+    ReplyBlock,
     decode_event as agent_decode_event, decode_reply as agent_decode_reply,
     encode_query as agent_encode_query,
 };
@@ -273,6 +274,12 @@ struct WorkspaceReceipt {
     commit_height: Option<u64>,
     rebased: bool,
     no_changes: bool,
+    /// `Some` iff the executor's workspace commit failed — the writes were not
+    /// captured (paired with a `degraded` status by the wrapper). additive:
+    /// absent on healthy receipts.
+    #[serde(default)]
+    #[allow(dead_code, reason = "audit metadata retained in dispatch history")]
+    commit_error: Option<String>,
 }
 
 /// one host-assembled declarative effect (R2). `kind` is a run-effect wire name
@@ -457,17 +464,31 @@ fn encode_delivery_receipt(
     };
     // the finalize payload MUST stay valid JSON within the jobs cap: the naive
     // byte-truncation the jobs board applies would corrupt it. the response is
-    // already capped (MAX_REPLY_BLOCKS_BYTES) and output_ref/status are tiny, so
-    // only the optional `data` facet is unbounded — embed it only if the whole
-    // receipt still fits, else DROP it here (the full data facet stays in the
-    // dispatch-history audit lane, R6, so nothing durable is lost). guarantees a
-    // valid, bounded finalize payload with the O1 output_ref always intact.
+    // capped by validation (MAX_REPLY_BLOCKS_BYTES + MAX_ACTIONS_BYTES) and
+    // output_ref/status are tiny, so a no-data receipt always fits; the
+    // optional `data` facet is embedded only if the whole receipt still fits,
+    // else DROPPED here (the full data facet stays in the dispatch-history
+    // audit lane, R6, so nothing durable is lost). the ladder re-checks its own
+    // fallback — never hand the jobs board something it would byte-truncate.
     let full = encode(data);
-    if data.is_some() && full.len() > JOB_FINALIZE_PAYLOAD_BYTES {
-        encode(None)
-    } else {
-        full
+    if full.len() <= JOB_FINALIZE_PAYLOAD_BYTES {
+        return full;
     }
+    let without_data = encode(None);
+    if without_data.len() <= JOB_FINALIZE_PAYLOAD_BYTES {
+        return without_data;
+    }
+    // unreachable while the validation caps hold (32Ki blocks + 8Ki actions
+    // << 64Ki cap); a deterministic stub keeps the payload valid JSON with the
+    // O1 output_ref intact even if a cap regresses.
+    serde_json::to_string(&DeliveryReceipt {
+        ducktape_delivery: DELIVERY_RECEIPT_VERSION,
+        response: &AgentResponse::default(),
+        data: None,
+        output_ref,
+        status: "degraded",
+    })
+    .expect("delivery receipt serializes")
 }
 
 // ---- forge sink wire (local mirrors) -----------------------------------------
@@ -1933,6 +1954,15 @@ impl RunsModule {
                 title,
                 body,
             } => {
+                // malformed pr sinks degrade to a breadcrumb.
+                if repo.is_empty() || source_branch.is_empty() || target_branch.is_empty() {
+                    return self.note(
+                        ctx,
+                        format!(
+                            "run {run_id} pr sink skipped: incomplete pr sink (repo/source_branch/target_branch required)"
+                        ),
+                    );
+                }
                 let Some(forge) = self.forge.clone() else {
                     return self.note(ctx, format!("run {run_id} pr sink skipped: no forge module wired"));
                 };
@@ -2030,6 +2060,17 @@ impl RunsModule {
             return Err(format!(
                 "{} actions exceed the cap of {MAX_ACTIONS_PER_RUN}",
                 response.actions.len()
+            ));
+        }
+        // the byte peer of the count cap: action payloads are unbounded strings,
+        // and the finalize payload embeds the validated response — prove the size
+        // BEFORE emitting, exactly like the reply-blocks cap below.
+        let actions_bytes = serde_json::to_vec(&response.actions)
+            .expect("actions are serializable")
+            .len();
+        if actions_bytes > MAX_ACTIONS_BYTES {
+            return Err(format!(
+                "actions are {actions_bytes} bytes; the cap is {MAX_ACTIONS_BYTES}"
             ));
         }
 
@@ -3583,6 +3624,48 @@ mod tests {
     }
 
     #[test]
+    fn pr_sink_with_empty_required_fields_degrades_without_emitting_forge_op() {
+        let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        let (mut m, run_id) = awaiting_run_with_forge(&registry);
+        let mut ctx = CaptureCtx::new()
+            .at(8)            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(
+                &run_id,
+                Ok(runner_wrapper(
+                    "done",
+                    serde_json::json!({
+                        "sink": {
+                            "mode": "pr",
+                            "repo": "",
+                            "source_branch": "agent/x",
+                            "target_branch": "",
+                            "title": "t",
+                            "body": ""
+                        }
+                    }),
+                )),
+            ),
+        )
+        .unwrap();
+        assert!(
+            ctx.msgs.iter().all(|m| m.target != "forge"),
+            "incomplete pr sink must not emit an OpenPr"
+        );
+        assert!(
+            ctx.events
+                .iter()
+                .any(|e| String::from_utf8_lossy(&e.payload).contains("incomplete pr sink")),
+            "the breadcrumb names the incomplete pr sink"
+        );
+        assert_eq!(ctx.chat_msgs().len(), 1, "the run still delivers its message");
+    }
+
+    #[test]
     fn pr_sink_with_an_unborn_branch_degrades_without_aborting() {
         let mut granted = registry(&[("bot", &[ACTION_CHAT_POST])]);
         granted.get_mut("bot").unwrap().caps.forge_push = vec!["app".into()];
@@ -3599,7 +3682,7 @@ mod tests {
                 &run_id,
                 Ok(runner_wrapper(
                     "done",
-                    serde_json::json!({"sink":{"mode":"pr","repo":"app","source_branch":"agent/x","title":"PR"}}),
+                    serde_json::json!({"sink":{"mode":"pr","repo":"app","source_branch":"agent/x","target_branch":"main","title":"PR"}}),
                 )),
             ),
         )
@@ -4848,6 +4931,41 @@ mod tests {
             let posts = ctx.chat_msgs();
             assert_eq!(posts.len(), 1, "exactly one normalized reply posts");
         }
+    }
+
+    #[test]
+    fn oversized_actions_fail_the_run_deterministically() {
+        // the byte peer of the count cap: one action carrying a huge payload
+        // (a pasted-file title) must be a deterministic run failure — never an
+        // oversized finalize payload the jobs board would byte-truncate into
+        // invalid JSON.
+        let (mut m, registry, run_id) = awaiting_run(&[ACTION_TASKS_CREATE]);
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        let huge = response(
+            &[],
+            vec![AgentAction::CreateTask {
+                task_id: "t1".into(),
+                title: "x".repeat(MAX_ACTIONS_BYTES),
+            }],
+        );
+        exec(&mut m, &mut ctx, &result_event(&run_id, Ok(huge))).unwrap();
+        commit(&mut m);
+        assert_eq!(get_pending(&m, &run_id), None, "the failed run's entry pruned");
+        let breadcrumbs: Vec<String> = ctx
+            .events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect();
+        assert!(
+            breadcrumbs
+                .iter()
+                .any(|b| b.contains(&format!("the cap is {MAX_ACTIONS_BYTES}"))),
+            "the failure names the byte cap: {breadcrumbs:?}"
+        );
     }
 
     #[test]

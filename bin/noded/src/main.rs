@@ -189,6 +189,8 @@ fn run_node(
     // as today — relocating them would be a live (non-dormant) durability change.
     // D7 relocation applies to the PORTABLE provisioner mount (agent_runs_root).
     let agent_dirs = capability_host::AgentDirs::under(&storage);
+    // keys the portable run-root's per-node salt + D7 validation (oracle_workers).
+    let storage_for_runs = storage.clone();
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
@@ -282,6 +284,7 @@ fn run_node(
             node_handle,
             blobs.clone(),
             agent_dirs,
+            &storage_for_runs,
         );
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would

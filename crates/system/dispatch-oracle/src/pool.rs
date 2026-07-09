@@ -81,10 +81,10 @@ pub struct DispatchPool {
     resolver: Option<crate::BlobResolver>,
     /// materializes/commits/cleans a per-run duckfs workspace for portable
     /// (v3) runs — injected by the node binary, where duckfs-client + the
-    /// actor lane are reachable. `None` (the default) keeps today's
-    /// accept-only behavior: a v3 plan is surfaced but never activated, so the
-    /// run is byte-identical to a legacy one. dormant regardless pre-flip
-    /// (the composer emits no v3 envelope).
+    /// actor lane are reachable. `None` (the default) keeps the accept-only
+    /// degrade: a v3 plan is surfaced but never activated, so the run executes
+    /// like a legacy one (raw-text delivery, no workspace). both node binaries
+    /// wire a real provisioner, so this is LIVE on every production agent run.
     provisioner: Option<SharedProvisioner>,
 }
 
@@ -135,9 +135,9 @@ impl DispatchPool {
 
     /// wire the host-side workspace provisioner portable (v3) runs materialize
     /// through — mirrors [`Self::with_resolver`]. without it (or on any run
-    /// that carries no v3 plan) the pool behaves EXACTLY as today: the
-    /// provider's raw text is delivered verbatim. the portable path is dormant
-    /// until a coordinated flip emits v3 envelopes.
+    /// that carries no v3 plan) the pool takes the legacy branch: the
+    /// provider's raw text is delivered verbatim, no workspace exists. the
+    /// production binaries always wire one; v3 envelopes are live.
     pub fn with_provisioner(mut self, provisioner: SharedProvisioner) -> Self {
         self.provisioner = Some(provisioner);
         self
@@ -231,19 +231,26 @@ async fn execute(
     bind_workspace(ws.as_ref(), &mut ctx); // set workdir_override/env/path_entries
     let outcome = match provider.run(&input, &ctx).await {
         Ok(text) => {
-            // (d) capture output_ref; a commit-mechanism failure is a receipt
-            // note, not a lost run (R4).
-            let receipt = ws
-                .commit(&format!("agent run {}", spec.run_id))
-                .await
-                .unwrap_or_else(|e| {
+            // (d) capture output_ref. a commit-MECHANISM failure (conflict,
+            // transport, rejection) must never masquerade as a clean tree: the
+            // receipt records the error and the status degrades, while the
+            // run's answer still delivers (R4 — never lost to receipt
+            // plumbing). only `CommitError::Nothing` is a true `no_changes`,
+            // and the workspace impl already maps that to Ok.
+            let (receipt, status) = match ws.commit(&format!("agent run {}", spec.run_id)).await {
+                Ok(receipt) => (receipt, crate::provision::Status::Ok),
+                Err(e) => {
                     eprintln!("[oracle] commit failed for {}: {e}", spec.run_id);
-                    crate::provision::WorkspaceReceipt::no_changes(&spec)
-                });
-            // LIFT the model's task actions into the effects facet (critic #4):
-            // at v4 runs applies the host-assembled effects; an empty result
-            // lets runs fall back to the response-parsed actions. the other
-            // facets (data/sink/status) are host-observed later — Chain/Ok here.
+                    (
+                        crate::provision::WorkspaceReceipt::commit_failed(&spec, e),
+                        crate::provision::Status::Degraded,
+                    )
+                }
+            };
+            // LIFT the model's task actions into the effects facet: runs
+            // applies the host-assembled effects; an empty result lets runs
+            // fall back to the response-parsed actions. the other facets
+            // (data/sink) are host-observed later — Chain here.
             let effects = crate::provision::effects_from_response_text(&text);
             Ok(assemble_runner_result(
                 &text,
@@ -251,7 +258,7 @@ async fn execute(
                 None,
                 effects,
                 crate::provision::Sink::Chain,
-                crate::provision::Status::Ok,
+                status,
             ))
         }
         Err(e) => Err(e), // failed run: no commit, no output_ref
@@ -668,9 +675,10 @@ format = "text"
 
     // ---- the portable (v3) provisioning bracket -----------------------------
 
-    /// a v3 (portable) run envelope payload — the shape the composer emits only
-    /// AFTER the coordinated flip. carried here to exercise the pool's bracket
-    /// without a live duckfs (the mock stands in for the checkout engine).
+    /// a v3 (portable) run envelope payload — the shape the composer emits for
+    /// every run when a files module is wired (the production default). carried
+    /// here to exercise the pool's bracket without a live duckfs (the mock
+    /// stands in for the checkout engine).
     fn v3_envelope_payload() -> Vec<u8> {
         serde_json::json!({
             "ducktape_run": 3,
@@ -699,11 +707,12 @@ format = "text"
     /// the winning-attempt bytes a portable run assembles: the mock stand-in
     /// for a real duckfs checkout. records that provision/commit/cleanup fired,
     /// binds a deterministic mount + env the provider observes, and (on commit)
-    /// mints a fake output_ref.
+    /// mints a fake output_ref — or fails the commit when `fail_commit` is set.
     struct MockProvisioner {
         provisioned: Arc<AtomicBool>,
         committed: Arc<AtomicBool>,
         cleaned: Arc<AtomicBool>,
+        fail_commit: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -724,6 +733,7 @@ format = "text"
                 env,
                 committed: self.committed.clone(),
                 cleaned: self.cleaned.clone(),
+                fail_commit: self.fail_commit.clone(),
             }))
         }
     }
@@ -735,6 +745,9 @@ format = "text"
         env: BTreeMap<String, String>,
         committed: Arc<AtomicBool>,
         cleaned: Arc<AtomicBool>,
+        /// `Some` makes commit() fail with this error — the commit-mechanism
+        /// failure seam.
+        fail_commit: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -750,6 +763,9 @@ format = "text"
         }
         async fn commit(&self, _message: &str) -> Result<WorkspaceReceipt, String> {
             self.committed.store(true, Ordering::SeqCst);
+            if let Some(err) = &self.fail_commit {
+                return Err(err.clone());
+            }
             Ok(WorkspaceReceipt {
                 source_prefix: self.src.clone(),
                 source_snapshot: self.snap.clone(),
@@ -757,6 +773,7 @@ format = "text"
                 commit_height: Some(9),
                 rebased: false,
                 no_changes: false,
+                commit_error: None,
             })
         }
         async fn cleanup(&self) {
@@ -801,6 +818,7 @@ format = "text"
             provisioned: provisioned.clone(),
             committed: committed.clone(),
             cleaned: cleaned.clone(),
+            fail_commit: None,
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
 
@@ -877,6 +895,7 @@ format = "text"
                 commit_height: None,
                 rebased: false,
                 no_changes: true,
+                commit_error: None,
             })
         }
         async fn cleanup(&self) {}
@@ -913,6 +932,7 @@ format = "text"
             provisioned: provisioned.clone(),
             committed: committed.clone(),
             cleaned: cleaned.clone(),
+            fail_commit: None,
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
 
@@ -928,6 +948,46 @@ format = "text"
             "a failed run commits NOTHING — no output_ref for a discarded attempt"
         );
         assert!(cleaned.load(Ordering::SeqCst), "cleanup still runs on failure (W5)");
+    }
+
+    #[tokio::test]
+    async fn a_commit_mechanism_failure_degrades_the_receipt_never_fakes_a_clean_tree() {
+        // THE silent-data-loss guard: a conflict/transport/rejection during the
+        // workspace commit must surface as `commit_error` + a degraded status —
+        // never as `no_changes: true` with an Ok status, which would report the
+        // agent's lost writes as a clean working copy.
+        let (providers, _probes) = slow_providers(Duration::from_millis(5), false);
+        let (provisioned, committed, cleaned) = flags();
+        let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
+            provisioned: provisioned.clone(),
+            committed: committed.clone(),
+            cleaned: cleaned.clone(),
+            fail_commit: Some("commit conflict: head moved".into()),
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        pool.run(&eff).await.unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+
+        // the run's answer still delivers (R4) — wrapped, with the failure on
+        // the receipt and the status degraded.
+        let bytes = outcome.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["ducktape_runner_result"], 1);
+        assert_eq!(v["response_text"], "answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION");
+        assert_eq!(v["status"], "degraded", "a failed capture degrades the run");
+        assert_eq!(
+            v["workspace_receipt"]["commit_error"],
+            "commit conflict: head moved",
+            "the receipt records the real failure for the audit lane (I4)"
+        );
+        assert_eq!(
+            v["workspace_receipt"]["no_changes"], false,
+            "a failed capture must NEVER masquerade as a clean tree"
+        );
+        assert!(v["workspace_receipt"]["output_snapshot"].is_null());
+        assert!(cleaned.load(Ordering::SeqCst), "cleanup still runs (W5)");
     }
 
     #[tokio::test]
@@ -955,7 +1015,7 @@ format = "text"
 
     #[tokio::test]
     async fn a_v2_run_is_byte_identical_with_or_without_a_provisioner() {
-        // the pre-flip regression guard: every LIVE (v2) run must produce the
+        // the legacy regression guard: every non-portable (v2) run must produce the
         // exact same outcome bytes whether or not a provisioner is wired.
         let expected = b"answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION".to_vec();
 
@@ -975,6 +1035,7 @@ format = "text"
             provisioned: provisioned.clone(),
             committed: committed.clone(),
             cleaned: cleaned.clone(),
+            fail_commit: None,
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
         pool.run(&effect_with_payload("s1", 0, Some(b"me"), &envelope_payload(None)))
@@ -1019,6 +1080,8 @@ format = "text"
             commit_height: Option<u64>,
             rebased: bool,
             no_changes: bool,
+            #[serde(default)]
+            commit_error: Option<String>,
         }
         #[derive(serde::Deserialize)]
         #[allow(dead_code)]
@@ -1060,6 +1123,7 @@ format = "text"
             commit_height: Some(9),
             rebased: true,
             no_changes: false,
+            commit_error: None,
         };
 
         use crate::provision::{RunEffect, Sink, Status};

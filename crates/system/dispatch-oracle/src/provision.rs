@@ -9,9 +9,11 @@
 //! live in the node binary's provisioner impl. the pool brackets a portable
 //! run with provision → bind → run → commit → assemble → cleanup ONLY when
 //! both a v3 plan AND a wired provisioner exist; otherwise the run is
-//! byte-identical to today (see [`crate::pool`]). the whole path is dormant
-//! pre-flip: the runs composer is still held at v2, so no v3 envelope is ever
-//! emitted and [`crate::envelope::prepare`] returns `workspace: None`.
+//! byte-identical to the legacy path (see [`crate::pool`]). this path is LIVE
+//! in both node binaries: they wire the files module unconditionally, so the
+//! runs composer emits v3 for every agent run (the de-versioned activation —
+//! no flag day, pre-production re-genesis). only embedders without a files
+//! module (dev tools, tests) still compose v2.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -83,6 +85,13 @@ pub struct WorkspaceReceipt {
     pub commit_height: Option<u64>,
     pub rebased: bool,
     pub no_changes: bool,
+    /// `Some` iff the commit MECHANISM failed (conflict, transport, rejection)
+    /// — the agent's writes were NOT captured and this is not a clean tree.
+    /// distinct from `no_changes` (the agent genuinely wrote nothing) so a
+    /// failed capture can never masquerade as one; skip-serialized so the
+    /// healthy wire shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_error: Option<String>,
 }
 
 impl WorkspaceReceipt {
@@ -95,6 +104,7 @@ impl WorkspaceReceipt {
             commit_height: Some(height),
             rebased,
             no_changes: false,
+            commit_error: None,
         }
     }
 
@@ -108,6 +118,23 @@ impl WorkspaceReceipt {
             commit_height: None,
             rebased: false,
             no_changes: true,
+            commit_error: None,
+        }
+    }
+
+    /// the commit MECHANISM failed — the agent's writes were not captured. the
+    /// truth is "capture failed", never "clean tree": `no_changes` stays false
+    /// and the error rides the receipt into the audit lane (I4), while the
+    /// run's answer still delivers (R4) under a `Degraded` status.
+    pub fn commit_failed(spec: &WorkspaceSpec, error: String) -> Self {
+        Self {
+            source_prefix: spec.source_prefix.clone(),
+            source_snapshot: spec.source_snapshot.clone(),
+            output_snapshot: None,
+            commit_height: None,
+            rebased: false,
+            no_changes: false,
+            commit_error: Some(error),
         }
     }
 }
