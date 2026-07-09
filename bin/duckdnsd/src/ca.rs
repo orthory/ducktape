@@ -12,10 +12,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use time::{Duration, OffsetDateTime};
 
-pub const ROOT_CERT_FILE: &str = "root-ca.pem";
-pub const ROOT_KEY_FILE: &str = "root-ca-key.der";
+use crate::{ROOT_CERT_FILE, ROOT_KEY_FILE};
+
 const ROOT_DER_FILE: &str = "root-ca.der";
-const INSTALLATION_ID_FILE: &str = "installation.id";
+pub(crate) const INSTALLATION_ID_FILE: &str = "installation.id";
 
 #[derive(Clone)]
 pub struct CaStore {
@@ -57,7 +57,7 @@ impl CaStore {
                     .into(),
             );
         }
-        let materials = Materials::generate()?;
+        let materials = Materials::generate(None)?;
         materials.write_new(&paths)?;
         Self::load(&paths)
     }
@@ -66,7 +66,17 @@ impl CaStore {
         std::fs::create_dir_all(state_dir)
             .map_err(|error| format!("create DuckDNS state dir: {error}"))?;
         let paths = Paths::new(state_dir);
-        let materials = Materials::generate()?;
+        let installation_id = if paths.installation_id.exists() {
+            let id = std::fs::read_to_string(&paths.installation_id)
+                .map_err(|error| format!("read DuckDNS installation id: {error}"))?
+                .trim()
+                .to_owned();
+            validate_installation_id(&id)?;
+            Some(id)
+        } else {
+            None
+        };
+        let materials = Materials::generate(installation_id)?;
         materials.replace(&paths)?;
         Self::load(&paths)
     }
@@ -88,6 +98,7 @@ impl CaStore {
         params.not_before = now - Duration::minutes(5);
         params.not_after = now + Duration::hours(24);
         params.distinguished_name = distinguished_name(&format!("DuckDNS {hostname}"), None);
+        params.use_authority_key_identifier_extension = true;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let key = KeyPair::generate().map_err(|error| format!("DuckDNS leaf key: {error}"))?;
@@ -102,6 +113,20 @@ impl CaStore {
     }
 
     fn load(paths: &Paths) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&paths.key)
+                .map_err(|error| format!("stat DuckDNS CA key: {error}"))?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "duckdnsd: CA key permissions are {mode:o}; repair requires 600"
+                ));
+            }
+        }
         let key_bytes =
             std::fs::read(&paths.key).map_err(|error| format!("read DuckDNS CA key: {error}"))?;
         let key = KeyPair::try_from(key_bytes.as_slice())
@@ -152,8 +177,8 @@ struct Materials {
 }
 
 impl Materials {
-    fn generate() -> Result<Self, String> {
-        let installation_id = random_hex(16);
+    fn generate(installation_id: Option<String>) -> Result<Self, String> {
+        let installation_id = installation_id.unwrap_or_else(|| random_hex(16));
         let params = root_params(&installation_id);
         let key =
             KeyPair::generate().map_err(|error| format!("generate DuckDNS CA key: {error}"))?;
@@ -202,6 +227,7 @@ impl Materials {
             (&temporary.cert_pem, &paths.cert_pem),
             (&temporary.installation_id, &paths.installation_id),
         ] {
+            #[cfg(not(unix))]
             if to.exists() {
                 std::fs::remove_file(to)
                     .map_err(|error| format!("replace {}: {error}", to.display()))?;
@@ -298,7 +324,7 @@ mod tests {
 
         let rotated = CaStore::rotate(directory.path()).unwrap();
         assert_ne!(first.root_der(), rotated.root_der());
-        assert_ne!(first.installation_id(), rotated.installation_id());
+        assert_eq!(first.installation_id(), rotated.installation_id());
 
         #[cfg(unix)]
         {

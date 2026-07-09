@@ -17,6 +17,10 @@ usage:
   duckdnsd register --workspace ID --ingress ADDR --name HOST... [--lease SECONDS] [connection flags]
   duckdnsd clear --workspace ID [connection flags]
   duckdnsd status [connection flags]
+  duckdnsd install --client-token PATH
+  duckdnsd repair --client-token PATH
+  duckdnsd install-status
+  duckdnsd uninstall
   duckdnsd root-ca [--state-dir PATH]
   duckdnsd rotate-ca [--state-dir PATH]
 
@@ -52,6 +56,10 @@ async fn run(mut arguments: Vec<String>) -> Result<(), String> {
         "register" => register(Options::parse(arguments)?).await,
         "clear" => clear(Options::parse(arguments)?).await,
         "status" => status(Options::parse(arguments)?).await,
+        "install" => install(Options::parse(arguments)?, false),
+        "repair" => install(Options::parse(arguments)?, true),
+        "install-status" => install_status(Options::parse(arguments)?),
+        "uninstall" => uninstall(Options::parse(arguments)?),
         "root-ca" => root_ca(Options::parse(arguments)?),
         "rotate-ca" => rotate_ca(Options::parse(arguments)?),
         other => Err(format!("unknown command {other:?}\n\n{USAGE}")),
@@ -60,6 +68,7 @@ async fn run(mut arguments: Vec<String>) -> Result<(), String> {
 
 async fn serve(options: Options) -> Result<(), String> {
     options.reject_names()?;
+    options.reject_unknown(&["state-dir", "dns-listen", "https-listen", "control-listen"])?;
     let state_dir = options.state_dir();
     let dns: SocketAddr = options
         .value("dns-listen")
@@ -129,6 +138,13 @@ async fn serve(options: Options) -> Result<(), String> {
 }
 
 async fn register(options: Options) -> Result<(), String> {
+    options.reject_unknown(&[
+        "workspace",
+        "ingress",
+        "lease",
+        "state-dir",
+        "control-listen",
+    ])?;
     let workspace = options.required("workspace")?.to_owned();
     let ingress = options
         .required("ingress")?
@@ -160,6 +176,7 @@ async fn register(options: Options) -> Result<(), String> {
 
 async fn clear(options: Options) -> Result<(), String> {
     options.reject_names()?;
+    options.reject_unknown(&["workspace", "state-dir", "control-listen"])?;
     let workspace = options.required("workspace")?.to_owned();
     let status = options
         .control_client()?
@@ -176,6 +193,7 @@ async fn clear(options: Options) -> Result<(), String> {
 
 async fn status(options: Options) -> Result<(), String> {
     options.reject_names()?;
+    options.reject_unknown(&["state-dir", "control-listen"])?;
     let status = options
         .control_client()?
         .request(ControlRequest::Status)
@@ -189,6 +207,7 @@ async fn status(options: Options) -> Result<(), String> {
 
 fn root_ca(options: Options) -> Result<(), String> {
     options.reject_names()?;
+    options.reject_unknown(&["state-dir"])?;
     let state_dir = options.state_dir();
     CaStore::load_or_create(&state_dir)?;
     let pem = std::fs::read_to_string(state_dir.join(duckdnsd::ROOT_CERT_FILE))
@@ -199,8 +218,42 @@ fn root_ca(options: Options) -> Result<(), String> {
 
 fn rotate_ca(options: Options) -> Result<(), String> {
     options.reject_names()?;
+    options.reject_unknown(&["state-dir"])?;
     let ca = CaStore::rotate(&options.state_dir())?;
     println!("rotated DuckDNS CA installation={}", ca.installation_id());
+    Ok(())
+}
+
+fn install(options: Options, repair: bool) -> Result<(), String> {
+    options.reject_names()?;
+    options.reject_unknown(&["client-token"])?;
+    let token = PathBuf::from(options.required("client-token")?);
+    let status = duckdnsd::install(&token, repair)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&status).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+fn install_status(options: Options) -> Result<(), String> {
+    options.reject_names()?;
+    options.reject_unknown(&[])?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&duckdnsd::installation_status())
+            .map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+fn uninstall(options: Options) -> Result<(), String> {
+    options.reject_names()?;
+    options.reject_unknown(&[])?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&duckdnsd::uninstall()?).map_err(|error| error.to_string())?
+    );
     Ok(())
 }
 
@@ -264,5 +317,16 @@ impl Options {
         } else {
             Err("--name is valid only for register".into())
         }
+    }
+
+    fn reject_unknown(&self, allowed: &[&str]) -> Result<(), String> {
+        if let Some(name) = self
+            .values
+            .keys()
+            .find(|name| !allowed.contains(&name.as_str()))
+        {
+            return Err(format!("unknown option --{name}"));
+        }
+        Ok(())
     }
 }

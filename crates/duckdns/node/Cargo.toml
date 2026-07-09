@@ -22,7 +22,7 @@ commonware-cryptography = { workspace = true }
 futures = "0.3"
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "rt", "time", "sync"] }
-hyper = { version = "1", features = ["http1", "server"] }
+hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"

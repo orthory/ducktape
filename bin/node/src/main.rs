@@ -719,6 +719,15 @@ struct NetworkBindings<'a> {
     duckdns_chain_id: &'a str,
 }
 
+/// Node-local substrates needed while reconstructing a host from state sync.
+/// Consensus-visible names stay in [`NetworkBindings`]; paths and blob handles
+/// stay here so callers cannot accidentally blur the two kinds of input.
+struct SyncSubstrates<'a> {
+    forge_repo: &'a std::path::Path,
+    duckfs_dir: &'a std::path::Path,
+    blobs: blobstore::BlobHandle,
+}
+
 /// the PRODUCTION module set — genesis state, identical on every node (a
 /// different set composes a different app-hash and the network forks at
 /// genesis). system infrastructure (kv, valset seeded with the genesis
@@ -1104,12 +1113,15 @@ async fn sync_all_modules<C: statesync::SyncClient>(
     context: &commonware_runtime::tokio::Context,
     client: &C,
     manifest: &statesync::Manifest,
-    forge_repo: &std::path::Path,
-    duckfs_dir: &std::path::Path,
     bindings: NetworkBindings<'_>,
-    blobs: blobstore::BlobHandle,
+    substrates: SyncSubstrates<'_>,
     attempt: usize,
 ) -> Result<Host, String> {
+    let SyncSubstrates {
+        forge_repo,
+        duckfs_dir,
+        blobs,
+    } = substrates;
     let entry_root = |module: &str| -> Result<StateRoot, String> {
         Ok(manifest
             .entry(module)
@@ -6972,14 +6984,16 @@ fn run_node(
                 &context,
                 &client,
                 &manifest,
-                &forge_repo,
-                &duckfs_dir,
                 NetworkBindings {
                     invite: &namespace,
                     identity_chain_id: &identity_chain_id,
                     duckdns_chain_id: &duckdns_chain_id,
                 },
-                blobs.clone(),
+                SyncSubstrates {
+                    forge_repo: &forge_repo,
+                    duckfs_dir: &duckfs_dir,
+                    blobs: blobs.clone(),
+                },
                 0,
             )
             .await
@@ -8472,17 +8486,17 @@ fn run_node(
                 }
                 // A resident is a real DuckDNS requester/provider. Bring its
                 // web plane up once standing appears, and refresh admission on
-                // every later manifest so revocation cuts inbound streams.
-                let duckdns_transport_keys: Vec<ed25519::PublicKey> = m
+                // every later tip snapshot so revocation cuts inbound streams.
+                let duckdns_transport_keys: Vec<ed25519::PublicKey> = tip
                     .participants
                     .iter()
-                    .chain(m.residents.iter())
+                    .chain(tip.residents.iter())
                     .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
                     .collect();
                 if let Some(book) = &resident_duckdns_plane_book {
                     book.set_peers(duckdns_transport_keys.iter());
                 } else if wireguard_listen.is_some()
-                    && m.residents.iter().any(|key| key == &me_bytes)
+                    && tip.residents.iter().any(|key| key == &me_bytes)
                 {
                     let book = duckdns_node::plane::WebPeers::new(
                         String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
@@ -8622,14 +8636,16 @@ fn run_node(
                                 &context,
                                 &client,
                                 &m,
-                                &forge_repo,
-                                &duckfs_dir,
                                 NetworkBindings {
                                     invite: &namespace,
                                     identity_chain_id: &identity_chain_id,
                                     duckdns_chain_id: &duckdns_chain_id,
                                 },
-                                blobs.clone(),
+                                SyncSubstrates {
+                                    forge_repo: &forge_repo,
+                                    duckfs_dir: &duckfs_dir,
+                                    blobs: blobs.clone(),
+                                },
                                 attempt,
                             )
                             .await
@@ -8832,11 +8848,8 @@ fn run_node(
                                 .maybe_announce(host, now)
                                 .await
                             {
-                                match relay_submit_frame(
+                                match resident_relay.submit_unheld(
                                     &signer,
-                                    &relay_seq_file,
-                                    &mut relay_seq,
-                                    &mut relay_round,
                                     &announce_targets,
                                     &mut relay_tx,
                                     msg.target,
@@ -9004,14 +9017,16 @@ fn run_node(
                     &context,
                     &client,
                     &m,
-                    &forge_repo,
-                    &duckfs_dir,
                     NetworkBindings {
                         invite: &namespace,
                         identity_chain_id: &identity_chain_id,
                         duckdns_chain_id: &duckdns_chain_id,
                     },
-                    blobs.clone(),
+                    SyncSubstrates {
+                        forge_repo: &forge_repo,
+                        duckfs_dir: &duckfs_dir,
+                        blobs: blobs.clone(),
+                    },
                     attempt,
                 )
                 .await
@@ -9721,14 +9736,16 @@ fn run_node(
                             &context,
                             &client,
                             &target,
-                            &forge_repo,
-                            &duckfs_dir,
                             NetworkBindings {
                                 invite: &namespace,
                                 identity_chain_id: &identity_chain_id,
                                 duckdns_chain_id: &duckdns_chain_id,
                             },
-                            blobs.clone(),
+                            SyncSubstrates {
+                                forge_repo: &forge_repo,
+                                duckfs_dir: &duckfs_dir,
+                                blobs: blobs.clone(),
+                            },
                             10_000 + attempts,
                         )
                         .await

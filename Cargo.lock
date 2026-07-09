@@ -2379,6 +2379,7 @@ version = "0.1.0"
 dependencies = [
  "duckdns-core",
  "duckfs-core",
+ "http",
  "thiserror 2.0.18",
  "tokio",
 ]

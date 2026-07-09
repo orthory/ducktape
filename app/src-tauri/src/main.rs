@@ -14,6 +14,7 @@
 
 mod daemon;
 mod duckdns;
+mod duckdns_install;
 mod enroll;
 mod forge_git;
 mod huddle;
@@ -30,6 +31,9 @@ fn main() {
         .manage(duckdns::Registration::default())
         .invoke_handler(tauri::generate_handler![
             duckdns::duckdns_status,
+            duckdns_install::duckdns_install,
+            duckdns_install::duckdns_repair,
+            duckdns_install::duckdns_remove,
             workspaces::workspace_list,
             workspaces::workspace_active,
             workspaces::workspace_create,

@@ -1139,6 +1139,7 @@ fn finish_selection(
         workspace.id.clone(),
         http_url.clone(),
         ingress,
+        crate::duckdns::client_token_path(app)?,
     );
     Ok(Selection {
         id: workspace.id,

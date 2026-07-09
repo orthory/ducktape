@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
@@ -14,6 +14,7 @@ use crate::{CaStore, SharedState};
 
 const LEAF_CACHE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_CACHED_LEAVES: usize = 4096;
+const MAX_ERROR_REQUEST_HEAD: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct LeafResolver {
@@ -131,7 +132,7 @@ async fn handle_https(
         }
     };
     let Some(ingress) = state.ingress() else {
-        return write_error(
+        return write_http_error(
             &mut tls,
             503,
             "Service Unavailable",
@@ -143,7 +144,7 @@ async fn handle_https(
         match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(ingress)).await {
             Ok(Ok(stream)) => stream,
             _ => {
-                return write_error(
+                return write_http_error(
                     &mut tls,
                     502,
                     "Bad Gateway",
@@ -154,6 +155,35 @@ async fn handle_https(
         };
     tokio::io::copy_bidirectional(&mut tls, &mut upstream).await?;
     Ok(())
+}
+
+async fn write_http_error<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: u16,
+    reason: &str,
+    message: &str,
+) -> io::Result<()> {
+    // If the peer already sent a request, closing with unread TLS application
+    // bytes can turn the intended response into a TCP reset. Consume one
+    // bounded head before the explicit helper-level 502/503 and close_notify.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut bytes = Vec::with_capacity(1024);
+        while bytes.len() < MAX_ERROR_REQUEST_HEAD {
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            let mut chunk = [0u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        Ok::<(), io::Error>(())
+    })
+    .await;
+    write_error(stream, status, reason, message).await?;
+    stream.shutdown().await
 }
 
 async fn write_error<S: tokio::io::AsyncWrite + Unpin>(
@@ -190,5 +220,12 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &same));
         assert!(!Arc::ptr_eq(&first, &other));
         assert!(resolver.certificate_for("public.example").is_err());
+        assert!(
+            first.cert[0]
+                .as_ref()
+                .windows(5)
+                .any(|window| window == [0x06, 0x03, 0x55, 0x1d, 0x23]),
+            "strict TLS clients require a leaf Authority Key Identifier"
+        );
     }
 }

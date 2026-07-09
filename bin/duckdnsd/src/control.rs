@@ -56,9 +56,7 @@ impl ControlClient {
     }
 
     pub fn from_token_file(address: SocketAddr, path: &Path) -> Result<Self, String> {
-        let token = std::fs::read_to_string(path)
-            .map_err(|error| format!("read DuckDNS control token {}: {error}", path.display()))?;
-        Self::new(address, token.trim().to_owned())
+        Self::new(address, read_token(path)?)
     }
 
     pub async fn request(&self, request: ControlRequest) -> Result<SnapshotStatus, String> {
@@ -100,6 +98,7 @@ pub fn load_or_create_token(state_dir: &Path) -> io::Result<String> {
     let path = control_token_path(state_dir);
     match std::fs::read_to_string(&path) {
         Ok(token) => {
+            ensure_private_mode(&path).map_err(io::Error::other)?;
             let token = token.trim().to_owned();
             validate_token(&token).map_err(io::Error::other)?;
             Ok(token)
@@ -113,6 +112,69 @@ pub fn load_or_create_token(state_dir: &Path) -> io::Result<String> {
         }
         Err(error) => Err(error),
     }
+}
+
+/// Install the app-owned control credential into the privileged helper state.
+/// The source stays in the user's app-data directory; only this private copy is
+/// read by the system service.
+pub fn install_token(state_dir: &Path, token: &str) -> io::Result<()> {
+    validate_token(token).map_err(io::Error::other)?;
+    std::fs::create_dir_all(state_dir)?;
+    let path = control_token_path(state_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(existing) if token_matches(existing.trim(), token) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            return Ok(());
+        }
+        Ok(_) => {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).truncate(true);
+            let mut file = options.open(&path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            use std::io::Write as _;
+            file.write_all(format!("{token}\n").as_bytes())?;
+            return file.sync_all();
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    write_private_new(&path, format!("{token}\n").as_bytes())
+}
+
+pub fn read_token(path: &Path) -> Result<String, String> {
+    ensure_private_mode(path)?;
+    let token = std::fs::read_to_string(path)
+        .map_err(|error| format!("read DuckDNS control token {}: {error}", path.display()))?;
+    let token = token.trim().to_owned();
+    validate_token(&token)?;
+    Ok(token)
+}
+
+fn ensure_private_mode(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(path)
+            .map_err(|error| format!("stat DuckDNS control token {}: {error}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "DuckDNS control token {} has unsafe mode {mode:o}; want 600",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub async fn run_control(
@@ -265,5 +327,32 @@ mod tests {
         let client = ControlClient::new(address, "cd".repeat(32)).unwrap();
         assert!(client.request(ControlRequest::Status).await.is_err());
         assert_eq!(state.status(), SnapshotStatus::Inactive);
+    }
+
+    #[test]
+    fn installed_control_token_is_private_and_replaceable() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = "ab".repeat(32);
+        let second = "cd".repeat(32);
+        install_token(directory.path(), &first).unwrap();
+        assert_eq!(
+            read_token(&control_token_path(directory.path())).unwrap(),
+            first
+        );
+        install_token(directory.path(), &second).unwrap();
+        assert_eq!(
+            read_token(&control_token_path(directory.path())).unwrap(),
+            second
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(control_token_path(directory.path()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

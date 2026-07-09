@@ -4,6 +4,9 @@
 
 use std::net::IpAddr;
 
+use http::header::{HOST, HeaderName, HeaderValue, ORIGIN};
+use http::{HeaderMap, Method};
+
 pub const MAX_REQUEST_HEAD: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -25,6 +28,98 @@ pub struct PreparedRequest {
     /// Rewritten request bytes, including any body bytes read with the head.
     pub bytes: Vec<u8>,
     pub websocket: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedHeaders {
+    pub hostname: String,
+    pub websocket: bool,
+}
+
+/// Structured twin of [`prepare_request`] for the node's keep-alive HTTP
+/// gateway. Applying the policy per parsed request prevents a safe first
+/// request from laundering later unsafe requests over the same TLS connection.
+pub fn prepare_headers(
+    method: &Method,
+    headers: &mut HeaderMap,
+    client_ip: IpAddr,
+    allow_cross_site: bool,
+) -> Result<PreparedHeaders, GatewayError> {
+    let hosts: Vec<_> = headers.get_all(HOST).iter().collect();
+    if hosts.len() != 1 {
+        return Err(GatewayError::Malformed("want exactly one Host"));
+    }
+    let hostname = canonical_host(
+        hosts[0]
+            .to_str()
+            .map_err(|_| GatewayError::Malformed("Host is not ASCII"))?,
+    )?;
+    let cross_site = header_values(headers, "sec-fetch-site")
+        .any(|value| value.eq_ignore_ascii_case("cross-site"));
+    let safe = matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    );
+    if !allow_cross_site && !safe && cross_site {
+        return Err(GatewayError::CrossSite);
+    }
+
+    let websocket =
+        header_values(headers, "upgrade").any(|value| header_has_token(value, "websocket"));
+    if websocket {
+        let origins: Vec<_> = headers
+            .get_all(ORIGIN)
+            .iter()
+            .map(|value| value.to_str())
+            .collect::<Result<_, _>>()
+            .map_err(|_| GatewayError::WebSocketOrigin)?;
+        if origins.len() != 1 || !origin_matches(origins[0], &hostname) {
+            return Err(GatewayError::WebSocketOrigin);
+        }
+    }
+
+    let untrusted: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| matches_forwarded(name.as_str()))
+        .cloned()
+        .collect();
+    for name in untrusted {
+        headers.remove(name);
+    }
+    insert_header(headers, "x-forwarded-proto", "https")?;
+    insert_header(headers, "x-forwarded-host", &hostname)?;
+    insert_header(headers, "x-forwarded-for", &client_ip.to_string())?;
+    let forwarded_for = match client_ip {
+        IpAddr::V4(address) => address.to_string(),
+        IpAddr::V6(address) => format!("\"[{address}]\""),
+    };
+    insert_header(
+        headers,
+        "forwarded",
+        &format!("for={forwarded_for};proto=https;host=\"{hostname}\""),
+    )?;
+    Ok(PreparedHeaders {
+        hostname,
+        websocket,
+    })
+}
+
+fn header_values<'a>(headers: &'a HeaderMap, name: &'static str) -> impl Iterator<Item = &'a str> {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+}
+
+fn insert_header(
+    headers: &mut HeaderMap,
+    name: &'static str,
+    value: &str,
+) -> Result<(), GatewayError> {
+    let value = HeaderValue::from_str(value)
+        .map_err(|_| GatewayError::Malformed("forwarding metadata is invalid"))?;
+    headers.insert(HeaderName::from_static(name), value);
+    Ok(())
 }
 
 /// Validate one complete request-head buffer (`\r\n\r\n` must be present),
@@ -261,5 +356,44 @@ mod tests {
         ] {
             assert!(prepare_request(bytes, "127.0.0.1".parse().unwrap(), false).is_err());
         }
+    }
+
+    #[test]
+    fn structured_keep_alive_policy_rechecks_and_rebuilds_forwarding_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HOST,
+            HeaderValue::from_static("blog.orthory.ducktape.quack"),
+        );
+        headers.insert(
+            HeaderName::from_static("sec-fetch-site"),
+            HeaderValue::from_static("cross-site"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("attacker"),
+        );
+        assert_eq!(
+            prepare_headers(
+                &Method::POST,
+                &mut headers.clone(),
+                "127.0.0.2".parse().unwrap(),
+                false,
+            ),
+            Err(GatewayError::CrossSite)
+        );
+
+        headers.insert(
+            HeaderName::from_static("sec-fetch-site"),
+            HeaderValue::from_static("same-origin"),
+        );
+        let prepared =
+            prepare_headers(&Method::POST, &mut headers, "::1".parse().unwrap(), false).unwrap();
+        assert_eq!(prepared.hostname, "blog.orthory.ducktape.quack");
+        assert_eq!(headers["x-forwarded-for"], "::1");
+        assert_eq!(
+            headers["forwarded"],
+            "for=\"[::1]\";proto=https;host=\"blog.orthory.ducktape.quack\""
+        );
     }
 }

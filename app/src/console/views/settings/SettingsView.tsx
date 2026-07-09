@@ -7,6 +7,7 @@
 import { color, font } from "../../theme/tokens";
 import { useDucktape } from "../../store/use-ducktape";
 import { DangerZone } from "./DangerZone";
+import { DuckDnsSection } from "./DuckDnsSection";
 import {
   ControlRow,
   GroupCard,
@@ -66,6 +67,8 @@ export function SettingsView() {
         <AccountLinkSection />
 
         <PreferencesSection />
+
+        <DuckDnsSection />
 
         <WorkspaceSection />
 
