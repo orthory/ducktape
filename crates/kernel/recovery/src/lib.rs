@@ -1564,7 +1564,7 @@ where
                         .map(|(id, _)| id)
                         .filter(|id| !moved.contains(id))
                         .collect();
-                    let (disposition, dispatches) = apply_block_committing(
+                    let (_relanded, dispatches) = apply_block_committing(
                         host,
                         height,
                         &frame,
@@ -1573,23 +1573,18 @@ where
                         &commit_only,
                     )
                     .await?;
-                    // consistency backstops: a mover whose durable commit
-                    // this frame cannot explain is damage, not a roll-forward.
-                    if disposition != Disposition::Applied {
-                        return Err(Error::Torn(format!(
-                            "trailing block {height} re-landed as {disposition:?}, but \
-                             module(s) {moved:?} durably committed it — the observed state \
-                             cannot come from this frame. wipe app state and re-sync (keep \
-                             the consensus journal)"
-                        )));
-                    }
-                    // a mover the frame explains is either DISPATCHED by the
-                    // re-execution or directly TARGETED by a member. a
-                    // targeted-but-undispatched mover is the expected shape
-                    // of re-executing on post-state: the member re-lands as
-                    // a deterministic duplicate-reject against the mover's
-                    // own already-committed effect — evidence FOR the frame
-                    // explaining the state, never against it.
+                    // the re-execution's own disposition is NOT a backstop:
+                    // members whose effects the movers already hold re-land
+                    // as deterministic duplicate-rejects (a solo block whose
+                    // only member did so re-lands whole-block Rejected) —
+                    // evidence FOR the frame explaining the state. the moved
+                    // roots are the durable proof the block APPLIED live, so
+                    // that is what the seal records.
+                    let disposition = Disposition::Applied;
+                    // the one genuine damage detector: a mover the frame
+                    // explains is either DISPATCHED by the re-execution or
+                    // directly TARGETED by a member; anything else durably
+                    // moved without a frame that could have moved it.
                     let targets = frame_targets(&frame);
                     for id in &moved {
                         if !dispatches.iter().any(|d| d.module == *id)
