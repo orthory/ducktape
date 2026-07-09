@@ -18,6 +18,13 @@ Fact corrections found while confirming wire shapes (none change the architectur
 5. **Desktop notification click-to-navigate is best-effort.** `tauri-plugin-notification` v2 has no reliable per-notification click callback on desktop/macOS. The structured `ducktape://navigate` deep-link machinery is still built (the tray popover and any future plugin support use it); clicking a toast activates the app but may not navigate. Badge + tray remain the guaranteed path. Not a redesign — noting so reviewers don't fail the e2e on it.
 6. **File inventory addition:** `engine.rs` (frame→notification policy: prefs gating, focus suppression, cursor adoption, unread) is added to the design's `notify/` file list. It is what makes the Phase A/B split real: the engine consumes an *internal* `Frame` enum and is fully testable with injected frames now; Phase B's `stream.rs` only maps wire frames → `Frame`. Also added: `http.rs` (a ~60-line localhost-only HTTP POST helper for the reply-root query — no new HTTP crate, preserving dep hygiene).
 
+## 2b. Pre-flight decisions (controller + user, before execution)
+
+Two plan-internal issues were found in the pre-flight scan and resolved by the user. These OVERRIDE the task text where they conflict:
+
+1. **Cursors are in-memory only; `state.json` persists `unread` alone.** Since app-start subscribes live-from-tip (Task 9) and Task 12 asserts a restart must not re-notify, persisted cursors were never read — dead state. `Engine` keeps `cursors` in memory for the in-session reconnect resume; `NotifyState` = `{ unread }`. Tasks 3 and 9 below reflect this.
+2. **No `assert_sink` compile-bound test (Task 4).** `impl Sink for AppSink` is itself the compile-time check, and `cargo check -p ducktape-desktop` is already in Task 4's acceptance. A test with no runtime assertion would be flagged as a defect on every review pass.
+
 ## 3. Global Constraints (binding for every task)
 
 - **Shell dep hygiene:** `app/src-tauri` (crate `ducktape-desktop`) stays free of host/module crate deps — the comment at the top of `app/src-tauri/Cargo.toml` is the contract. NO `chat`, `forge`, `noded`, `indexer`, `governance`, `dispatch`, `runs` crate deps. All op decoding is ad-hoc `serde_json::Value`.
@@ -252,11 +259,12 @@ pub struct NotifyConfig {
 
 **Interfaces:**
 ```rust
-// state.rs — persisted at <app_data_dir>/notify/state.json, pure fns over a path
+// state.rs — persisted at <app_data_dir>/notify/state.json, pure fns over a path.
+// ONLY `unread` is persisted (pre-flight decision 1): cursors are in-memory on the
+// Engine, because app start always subscribes live-from-tip and never resumes from disk.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct NotifyState {
-    /// opaque per-topic resume cursors (the stream owns their meaning).
-    pub cursors: std::collections::BTreeMap<String, serde_json::Value>,
     pub unread: u32,
 }
 pub fn load(path: &std::path::Path) -> NotifyState;          // missing/corrupt -> Default
@@ -277,34 +285,41 @@ pub trait Sink: Send {
     fn badge(&self, unread: u32);
 }
 
-pub struct Engine<S: Sink> { /* sink, match_state, NotifyState, state_path, ... */ }
+pub struct Engine<S: Sink> {
+    /* sink, match_state, state_path, unread,
+       cursors: BTreeMap<String, serde_json::Value>  // IN-MEMORY ONLY, never persisted */
+}
 
 impl<S: Sink> Engine<S> {
-    pub fn new(sink: S, state_path: std::path::PathBuf) -> Self; // loads persisted state, pushes initial badge
+    pub fn new(sink: S, state_path: std::path::PathBuf) -> Self; // loads persisted unread, pushes initial badge
     /// One frame in. `config` is read per-frame (Phase B swaps it under a lock).
     /// `root_author` as in MatcherCtx.
     pub fn handle(&mut self, frame: Frame, config: &NotifyConfig,
                   root_author: &dyn Fn(&str, u64) -> Option<String>);
     /// notify_mark_seen: zero unread, clear badge, persist.
     pub fn mark_seen(&mut self);
-    /// resume cursors for a transient reconnect (Phase B).
+    /// In-memory resume cursors for a TRANSIENT in-session reconnect (Phase B).
+    /// Never persisted — app start is always live-from-tip.
     pub fn cursors(&self) -> &std::collections::BTreeMap<String, serde_json::Value>;
+    /// Drop all cursors (Phase B: node_url changed -> old cursors are invalid).
+    pub fn reset_cursors(&mut self);
 }
 ```
 **`handle` semantics (exact):**
-- `Event`: always record `cursors[topic] = cursor` + `save` (best-effort). Then decode via `decode::decode_op_row(&op)`; on Some, run `matchers::match_topic`. A produced notification is DROPPED (no present, no unread) when any of: `!prefs.enabled`; its category toggle is off (`Mention/Reply→mentions/replies`, `Huddle→huddles`, `Run→runs`, `Forge→forge`, `Governance→governance`); `channel_id` is Some and in `prefs.muted_channels`; or (focus suppression) `config.main_window_focused && notification.channel_id.is_some() && notification.channel_id == config.focused_channel`. Otherwise `sink.present(&n)`, `unread += 1`, `sink.badge(unread)`, persist.
-- `Lagged`: adopt `cursors[topic] = cursor`, persist, notify NOTHING (no backfill).
+- `Event`: always record `cursors[topic] = cursor` **in memory** (no disk write). Then decode via `decode::decode_op_row(&op)`; on Some, run `matchers::match_topic`. A produced notification is DROPPED (no present, no unread) when any of: `!prefs.enabled`; its category toggle is off (`Mention/Reply→mentions/replies`, `Huddle→huddles`, `Run→runs`, `Forge→forge`, `Governance→governance`); `channel_id` is Some and in `prefs.muted_channels`; or (focus suppression) `config.main_window_focused && notification.channel_id.is_some() && notification.channel_id == config.focused_channel`. Otherwise `sink.present(&n)`, `unread += 1`, `sink.badge(unread)`, and `save` (disk writes happen only when `unread` changes).
+- `Lagged`: adopt `cursors[topic] = cursor` in memory, notify NOTHING (no backfill), no disk write.
 - `Heartbeat`: no-op (liveness watchdog is stream.rs's, Phase B).
-- Live-from-tip is a **connection** policy (Phase B ignores persisted cursors on app start); the engine itself never replays anything it wasn't handed — add a test documenting that a fresh engine with pre-persisted cursors emits nothing until a frame arrives.
+- Live-from-tip is a **connection** policy (Phase B never resumes from disk on app start — cursors are not persisted at all); the engine itself never replays anything it wasn't handed — add a test documenting that a fresh engine emits nothing until a frame arrives.
 
 **Tests first** (`#[cfg(test)]`, a `CaptureSink(std::sync::Mutex<Vec<Notification>>)` + captured badge values; state paths under `std::env::temp_dir()` with a unique suffix, removed after):
-1. Event frame carrying the Task 2 mention op (self keys in config) → 1 presented, unread 1, badge [1], cursor recorded, state.json written and `load` round-trips it.
-2. Same op with `prefs.enabled=false` → nothing presented, unread stays 0, cursor STILL advances.
+1. Event frame carrying the Task 2 mention op (self keys in config) → 1 presented, unread 1, badge [1], `engine.cursors()["module:chat"]` == the frame's cursor, and `state.json` holds `{"unread":1}` which `load` round-trips.
+2. Same op with `prefs.enabled=false` → nothing presented, unread stays 0, but the in-memory cursor STILL advances.
 3. `mentions:false` drops Mention but a huddle op still presents; `muted_channels:["general"]` drops both for that channel.
 4. Focus suppression: `main_window_focused=true, focused_channel=Some("general")` → mention in "general" dropped (unread unchanged), mention in "other" presented; `main_window_focused=false` → "general" mention presented.
-5. Lagged adopts the cursor, presents nothing; a following Event presents normally.
-6. `mark_seen` zeroes unread, badge [.., 0], persists; `Engine::new` on that path restores unread 0 and pushes badge 0.
+5. Lagged adopts the cursor (in memory), presents nothing; a following Event presents normally.
+6. `mark_seen` zeroes unread, badge [.., 0], persists; `Engine::new` on that path restores unread 0 and pushes badge 0. A path with `{"unread":5}` restores 5 and pushes badge 5.
 7. Corrupt state.json → `load` returns Default (no panic).
+8. A fresh `Engine` presents nothing and leaves `cursors()` empty until a frame arrives (documents live-from-tip: no disk cursors exist to replay).
 
 **Acceptance:** `cargo test -p ducktape-desktop notify::` green (all three modules); clippy gate clean; no tauri types in engine/state (only `std` + serde). Files each under ~600 lines.
 **Depends on:** 2
@@ -338,7 +353,7 @@ impl<R: Runtime> super::engine::Sink for AppSink<R> {
 - `badge`: on the `"main"` webview window call `set_badge_count(if unread == 0 { None } else { Some(unread as i64) })`, ignoring errors (Linux WebKitGTK may not support it). `#[cfg(target_os = "macos")]`: additionally set the tray title via `app.tray_by_id("ducktape")` → `set_title(Some(unread.to_string()))` when unread > 0, `set_title(None::<&str>)` at 0. Emit `"ducktape://notify-unread"` with `{"unread": n}` via `tauri::Emitter` so the webview can render its own indicator.
 - `Sink` is `Send`: `AppHandle` is Send+Sync — fine.
 
-**Tests:** presentation is OS-bound, so TDD here is compile-level + gate-level: (a) `cargo clippy -p ducktape-desktop --tests --no-deps` clean on all platforms' cfg paths you can check locally (Linux); (b) a `#[cfg(test)]` test asserting `AppSink` implements `Sink` via a generic bound fn (`fn assert_sink<S: Sink>() {}`); (c) capability JSON is valid — `cargo check -p ducktape-desktop` passes (tauri build validates capabilities against the now-present plugin).
+**Tests:** presentation is OS-bound, so verification here is compile-level + gate-level: (a) `cargo clippy -p ducktape-desktop --tests --no-deps` clean; (b) capability JSON is valid — `cargo check -p ducktape-desktop` passes (the tauri build validates capabilities against the now-present plugin). Per pre-flight decision 2, do **NOT** add an `assert_sink::<AppSink>()` compile-bound test — the `impl Sink for AppSink` block is itself the compile-time check, and a test with no runtime assertion is a defect. Presentation behaviour stays covered by the Engine's `CaptureSink` tests (Task 3) and the live drive (Task 12).
 **Acceptance:** `cargo check -p ducktape-desktop` + clippy gate green; `capabilities/default.json` contains `"notification:default"`; main.rs registers the plugin unconditionally; description comment in Cargo.toml follows the file's commented-dep style. No other permission changes.
 **Depends on:** 3
 
@@ -547,7 +562,8 @@ Loop semantics (from the design, reconcile with the landed contract):
 - **App-start subscribe: NO `resume` cursor** (live-from-tip — the coordination guarantee). **Transient in-session reconnect: resume from `engine.cursors()`** for topics that have one. **`lagged`: adopt** (engine already does).
 - Map wire `event`/`lagged` frames to `Frame::{Event,Lagged}`; heartbeat frames feed a watchdog: no frame for ~2.5× the advertised `intervalMs` (fallback 3000ms × 2.5) → drop the socket and reconnect (with resume). Reconnect backoff: 1s doubling to 30s cap, reset on a successful frame.
 - On each `Frame`, snapshot the config under the lock, call `engine.handle(frame, &config, &|ch, root| http::root_author(&url, ch, root))`. `root_author` is a rare blocking localhost call inside the async task — acceptable; do NOT hold the config lock across it (snapshot first).
-- `node_url` change or shutdown Notify → drop the connection; a NEW url means app-level reconnect: treat it like app start (no resume — different node, cursors invalid; also clear engine cursors for safety via a small `Engine::reset_cursors()` you may add).
+- `node_url` change or shutdown Notify → drop the connection; a NEW url means app-level reconnect: treat it like app start (no resume — different node, cursors invalid; call `Engine::reset_cursors()`, defined in Task 3).
+- Cursors are never read from disk (pre-flight decision 1): the ONLY resume source is the in-memory `engine.cursors()` from the current session.
 
 **Tests first:**
 1. `http.rs`: an in-file test spins a `std::net::TcpListener` stub returning a canned HTTP/1.1 200 with Content-Length + the `{"messages":[{...MessageView json with head.author {"user":[18,52]}...}]}` body → `root_author` returns `Some("1234")`; author `{"agent":{...}}` → None; connection refused → None (fast).
