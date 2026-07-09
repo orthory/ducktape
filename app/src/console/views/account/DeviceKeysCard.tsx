@@ -4,15 +4,17 @@
 // the NEW-device side of the ceremony (LinkDeviceFlow) so a device that
 // skipped linking during onboarding can still join an account from here.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import QRCode from "qrcode";
 
 import { keyHex } from "../../../domain/chat-client";
 import type { KeyKind, MemberKeyView } from "../../../domain/identity-client";
 import { shortKey } from "../../../domain/names";
 import type { IdentityStateReport } from "../../../domain/user-identity-client";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import type { EnrollHandle } from "../../store/actions";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font } from "../../theme/tokens";
+import { color, font, radius } from "../../theme/tokens";
 import {
   errMessage,
   errorTextStyle,
@@ -142,6 +144,133 @@ function LinkInviterPanel({ onDone }: { onDone: () => void }) {
   );
 }
 
+// ── Add a key (phone QR / LAN enrollment) ────────────────
+
+type AddKeyStatus =
+  | { kind: "form" }
+  | { kind: "starting" }
+  | { kind: "waiting"; qr: string }
+  | { kind: "added" }
+  | { kind: "error"; message: string };
+
+/** The QR/LAN add-key ceremony: name the key, stand the enrollment server up
+ *  (via the action), render its url as a QR for the phone to scan, and wait for
+ *  the phone's proof to land the key. The action owns start→poll→sign→submit;
+ *  this panel only drives the label, renders the QR/status, and cancels the
+ *  ceremony — tearing the LAN server down — when it unmounts. */
+function AddKeyPanel({ onDone }: { onDone: () => void }) {
+  const { actions } = useDucktape();
+  const [label, setLabel] = useState("Phone");
+  const [status, setStatus] = useState<AddKeyStatus>({ kind: "form" });
+  const handleRef = useRef<EnrollHandle | null>(null);
+  const aliveRef = useRef(true);
+
+  // Cancel the ceremony (and tear the LAN server down) on unmount — via the
+  // Cancel toggle, a completed add, or leaving the screen.
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      handleRef.current?.cancel();
+      handleRef.current = null;
+    };
+  }, []);
+
+  const start = () => {
+    const named = label.trim() || "Phone";
+    setStatus({ kind: "starting" });
+    Promise.resolve()
+      .then(() => actions.accountEnrollKey(named))
+      .then((handle) => {
+        // Unmounted mid-start: don't leave an orphaned server bound.
+        if (!aliveRef.current) return handle.cancel();
+        handleRef.current = handle;
+        return QRCode.toDataURL(handle.url, { margin: 1, width: 224 }).then((qr) => {
+          if (!aliveRef.current) return;
+          setStatus({ kind: "waiting", qr });
+          void handle.completion.then((outcome): void => {
+            if (!aliveRef.current) return;
+            switch (outcome.kind) {
+              case "added":
+                setStatus({ kind: "added" });
+                onDone();
+                return;
+              case "cancelled":
+                return; // this panel initiated the cancel
+              case "error":
+                setStatus({ kind: "error", message: outcome.message });
+                return;
+              default: {
+                const exhaustive: never = outcome;
+                return exhaustive;
+              }
+            }
+          });
+        });
+      })
+      .catch((err) => {
+        if (aliveRef.current) setStatus({ kind: "error", message: errMessage(err) });
+      });
+  };
+
+  switch (status.kind) {
+    case "form":
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <span style={{ ...hintStyle, marginBottom: 0 }}>
+            Add a key your phone generates — scan the QR with its camera on the
+            same Wi-Fi, then approve on the phone. Nothing leaves your network.
+          </span>
+          <input
+            aria-label="Key label"
+            value={label}
+            onChange={(event) => setLabel(event.target.value)}
+            placeholder="Name this key (e.g. Phone)"
+            style={inputStyle}
+          />
+          <button onClick={start} style={primaryButtonStyle(false)}>
+            Show QR code
+          </button>
+        </div>
+      );
+    case "starting":
+      return <span style={hintStyle}>Starting…</span>;
+    case "waiting":
+      return (
+        <div
+          style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "center" }}
+        >
+          <img
+            src={status.qr}
+            alt="Enrollment QR code"
+            width={224}
+            height={224}
+            style={{ borderRadius: radius.sm, background: "#fff" }}
+          />
+          <span style={{ ...hintStyle, marginBottom: 0, textAlign: "center" }}>
+            Scan with your phone, then approve there. Waiting for it to add
+            “{label.trim() || "Phone"}”…
+          </span>
+        </div>
+      );
+    case "added":
+      return <span style={hintStyle}>Key added.</span>;
+    case "error":
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <span style={errorTextStyle}>{status.message}</span>
+          <button onClick={() => setStatus({ kind: "form" })} style={secondaryButtonStyle}>
+            Try again
+          </button>
+        </div>
+      );
+    default: {
+      const exhaustive: never = status;
+      return exhaustive;
+    }
+  }
+}
+
 export function DeviceKeysCard({
   accountId,
   identity,
@@ -150,7 +279,7 @@ export function DeviceKeysCard({
   identity: IdentityStateReport | null;
 }) {
   const { state, actions } = useDucktape();
-  const [panel, setPanel] = useState<"none" | "invite" | "linkSelf">("none");
+  const [panel, setPanel] = useState<"none" | "invite" | "linkSelf" | "addKey">("none");
   const [pendingRemove, setPendingRemove] = useState<MemberKeyView | null>(null);
   const [removeError, setRemoveError] = useState<string | null>(null);
 
@@ -229,6 +358,25 @@ export function DeviceKeysCard({
             label="Member keys"
             value={<span style={monoValue}>loading…</span>}
           />
+        )}
+        <ControlRow
+          title="Add a key"
+          desc="Scan a QR with your phone to add a key it generates — sign in from that device."
+          last={false}
+          control={
+            <HoverButton
+              onClick={() => setPanel(panel === "addKey" ? "none" : "addKey")}
+              hoverBg={color.titlebar}
+              style={outlineButton}
+            >
+              {panel === "addKey" ? "Cancel" : "Add"}
+            </HoverButton>
+          }
+        />
+        {panel === "addKey" && (
+          <CustodyPanel last={false}>
+            <AddKeyPanel onDone={() => setPanel("none")} />
+          </CustodyPanel>
         )}
         <ControlRow
           title="Link a device"

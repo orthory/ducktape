@@ -11,6 +11,12 @@ import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
+// The Add-a-key panel renders the enrollment url as a QR; stub the encoder so
+// the test needs no canvas and asserts on the wiring, not the pixels.
+vi.mock("qrcode", () => ({
+  default: { toDataURL: vi.fn().mockResolvedValue("data:image/png;base64,QQ==") },
+}));
+
 import { BIP39_ENGLISH_WORDLIST } from "../../../domain/bip39-wordlist";
 import { shortKey } from "../../../domain/names";
 import type { ConsoleActions } from "../../store/actions";
@@ -219,6 +225,33 @@ describe("AccountView — devices & keys", () => {
     await waitFor(() =>
       expect(spies.accountAddMember).toHaveBeenCalledWith(challenge, reply),
     );
+  });
+
+  it("opens the QR add-key flow and starts enrollment with the chosen label", async () => {
+    markTauri();
+    mockIdentity("unlocked");
+    const cancel = vi.fn();
+    const { spies } = renderAccount(linkedState(), {
+      accountEnrollKey: () =>
+        Promise.resolve({
+          url: "http://10.0.0.5:5051/enroll#tok",
+          completion: new Promise<never>(() => {}), // stays "waiting" for the assertion
+          cancel,
+        }),
+    });
+
+    // Open the Add-a-key panel via its "Add" button (distinct from the link "Start").
+    fireEvent.click(await screen.findByRole("button", { name: /^add$/i }));
+
+    const labelInput = (await screen.findByLabelText("Key label")) as HTMLInputElement;
+    expect(labelInput.value).toBe("Phone");
+    fireEvent.change(labelInput, { target: { value: "My pixel" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /show qr code/i }));
+
+    await waitFor(() => expect(spies.accountEnrollKey).toHaveBeenCalledWith("My pixel"));
+    // The url is rendered as a scannable QR once enrollment starts.
+    expect(await screen.findByRole("img", { name: /enrollment qr code/i })).toBeTruthy();
   });
 
   it("offers the new-device link wizard when this node is unlinked", async () => {

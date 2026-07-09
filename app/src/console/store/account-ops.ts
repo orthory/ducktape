@@ -16,7 +16,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import { keyHex } from "../../domain/chat-client";
-import { accountOfNode, submitRawMsg } from "../../domain/identity-client";
+import { enrollStart } from "../../domain/enroll-client";
+import { accountOfNode, hexToBytes, submitRawMsg } from "../../domain/identity-client";
 import type { AccountView } from "../../domain/identity-client";
 import type { NodeTransport } from "../../domain/transport";
 import { decodeLinkResponse } from "../views/account/link-device";
@@ -121,3 +122,62 @@ export const unbindNode = (
       .then((msg) => submitRawMsg(deps.transport, msg))
       .then(() => undefined, rethrowActionable),
   );
+
+// ── QR/LAN enrollment (add a phone-held P-256 key) ───────
+//
+// A second AddMemberKey path beside the device-link ceremony: the phone scans a
+// QR, generates a P-256 key, and signs the node's `user-p256-payload` — which is
+// NONCE-SCOPED (enroll.rs mints it with the account's nonce). So enrollment pins
+// the nonce read when the QR goes up, and the eventual add must sign against
+// THAT nonce; an account op landing during the scan invalidates the possession
+// proof, so this refuses on drift rather than submit a doomed msg — the exact
+// discipline addMemberFromResponse enforces for the paste-code flow.
+
+/** Begin enrollment: read the account fresh (its id + current nonce) and stand
+ *  up the ephemeral LAN server, returning its QR url plus the id+nonce the add
+ *  will be signed against. The controller renders the url as a QR and, once the
+ *  phone posts, calls `addEnrolledKey` with the same id+nonce. */
+export const beginEnrollment = (
+  deps: AccountOpsDeps,
+): Promise<{ url: string; accountId: string; nonce: number }> =>
+  ownAccount(deps).then((account) => {
+    const accountId = keyHex(account.account_id);
+    return enrollStart(deps.chainId, accountId, account.nonce).then(({ url }) => ({
+      url,
+      accountId,
+      nonce: account.nonce,
+    }));
+  });
+
+/** Complete enrollment: the phone's `[newKeyHex, sigHex]` proof → an AddMemberKey
+ *  (kind p256, possession = the raw R‖S signature bytes) signed by the shell at
+ *  the pinned nonce, then submitted. Refuses on nonce drift (see section note). */
+export const addEnrolledKey = (
+  deps: AccountOpsDeps,
+  proof: {
+    accountId: string;
+    nonce: number;
+    newKeyHex: string;
+    sigHex: string;
+    label: string;
+  },
+): Promise<void> =>
+  ownAccount(deps).then((account) => {
+    if (account.nonce !== proof.nonce) {
+      throw new Error(
+        "your account changed while this key was being added — start the add again",
+      );
+    }
+    const possession = JSON.stringify({ signature: { sig: hexToBytes(proof.sigHex) } });
+    return invoke<string>("user_sign_add_member", {
+      chainId: deps.chainId,
+      accountId: proof.accountId,
+      newPub: proof.newKeyHex,
+      newKind: "p256",
+      nonce: proof.nonce,
+      possession,
+      label: proof.label,
+    })
+      .then((msg) => submitRawMsg(deps.transport, msg))
+      .then(() => undefined, rethrowActionable);
+  });

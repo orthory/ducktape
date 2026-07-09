@@ -3,6 +3,7 @@ import type { Dispatch } from "react";
 import * as agentClient from "../../domain/agent-client";
 import * as chatClient from "../../domain/chat-client";
 import type { ChatBlock, PostPolicy } from "../../domain/chat-client";
+import { enrollCancel, enrollPoll } from "../../domain/enroll-client";
 import * as forgeClient from "../../domain/forge-client";
 import type {
   ForgeItemDetail,
@@ -44,7 +45,9 @@ import {
 } from "../modules/registry";
 import type { Action } from "./reducer";
 import {
+  addEnrolledKey,
   addMemberFromResponse,
+  beginEnrollment,
   mintLinkChallenge,
   removeMemberKey,
   unbindNode,
@@ -73,6 +76,9 @@ import type { ConsoleState, ViewMode } from "./state";
 /** How often a parked joiner's phase is polled while it promotes. */
 const JOIN_POLL_MS = 1500;
 
+/** How often the desktop polls the enrollment server for the phone's proof. */
+const ENROLL_POLL_MS = 1000;
+
 const wait = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -92,6 +98,22 @@ const mergeWorkspace = (list: Workspace[], next: Workspace): Workspace[] =>
   list.some((w) => w.id === next.id)
     ? list.map((w) => (w.id === next.id ? next : w))
     : [...list, next];
+
+/** The terminal result of a QR enrollment ceremony — a result envelope the
+ *  Account view switches on, so it never has to catch the completion. */
+export type EnrollOutcome =
+  | { kind: "added" }
+  | { kind: "cancelled" }
+  | { kind: "error"; message: string };
+
+/** A live enrollment handle: the QR url to render, a `completion` that settles
+ *  once the phone's key is added (or the ceremony is cancelled / errors), and a
+ *  `cancel` that stops polling and tears the ephemeral LAN server down. */
+export interface EnrollHandle {
+  url: string;
+  completion: Promise<EnrollOutcome>;
+  cancel: () => void;
+}
 
 export interface ConsoleActions {
   setScreen(screen: string): void;
@@ -124,6 +146,13 @@ export interface ConsoleActions {
   accountRemoveMember(targetKeyHex: string): Promise<void>;
   /** Evict a (lost) node from this account — its first UI consumer. */
   accountUnbindNode(targetNodeHex: string): Promise<void>;
+  /** Begin QR/LAN enrollment of a new phone-held P-256 key: stand up the
+   *  ephemeral server and return its QR url + a completion that settles when the
+   *  phone's key is signed in and submitted. The orchestration (start → poll →
+   *  sign → submit → cancel) lives in the action; the Account view only renders
+   *  the QR and reacts to the outcome. Rejects up front if enrollment can't
+   *  start (disconnected, unbound node). */
+  accountEnrollKey(label: string): Promise<EnrollHandle>;
   selectChannel(channelId: string): void;
   createChannel(name: string, postPolicy: PostPolicy): void;
   sendMessage(body: string): void;
@@ -1124,6 +1153,62 @@ export function createActions({
       Promise.resolve()
         .then(() => unbindNode(accountDeps(), targetNodeHex))
         .then(() => refresh()),
+
+    // QR enrollment is a polling ceremony, not a one-shot write: begin (bind the
+    // server, pin the nonce) hands back the QR url, then a recursive poll waits
+    // for the phone's proof and completes the AddMemberKey at the pinned nonce.
+    // The imperative shell below is deliberate — a cancellable poll loop needs a
+    // little mutable coordination: `settle` fires the completion exactly once
+    // (added / cancelled / error) and `timer` holds the pending re-poll so a
+    // cancel can clear it. Every terminal path tears the LAN server down.
+    accountEnrollKey: (label) =>
+      Promise.resolve()
+        .then(() => beginEnrollment(accountDeps()))
+        .then(({ url, accountId, nonce }) => {
+          let settle: ((outcome: EnrollOutcome) => void) | null = null;
+          let timer: ReturnType<typeof setTimeout> | null = null;
+          const completion = new Promise<EnrollOutcome>((resolve) => {
+            settle = resolve;
+          });
+          const finish = (outcome: EnrollOutcome): void => {
+            if (!settle) return; // already settled — drop a late result
+            const done = settle;
+            settle = null;
+            if (timer) clearTimeout(timer);
+            timer = null;
+            void enrollCancel().catch(() => {}); // best-effort server teardown
+            done(outcome);
+          };
+          const poll = (): void => {
+            if (!settle) return; // cancelled/settled between ticks
+            void enrollPoll()
+              .then((result) => {
+                if (!settle) return;
+                if (!result) {
+                  timer = setTimeout(poll, ENROLL_POLL_MS);
+                  return;
+                }
+                const [newKeyHex, sigHex] = result;
+                return addEnrolledKey(accountDeps(), {
+                  accountId,
+                  nonce,
+                  newKeyHex,
+                  sigHex,
+                  label,
+                })
+                  .then(() => refresh())
+                  .then(() => finish({ kind: "added" }));
+              })
+              .catch((err) =>
+                finish({
+                  kind: "error",
+                  message: err instanceof Error ? err.message : String(err),
+                }),
+              );
+          };
+          poll();
+          return { url, completion, cancel: () => finish({ kind: "cancelled" }) };
+        }),
 
     readMetrics: () => {
       const live = getNode();

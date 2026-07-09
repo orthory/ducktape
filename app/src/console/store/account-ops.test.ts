@@ -8,7 +8,9 @@ const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import {
+  addEnrolledKey,
   addMemberFromResponse,
+  beginEnrollment,
   mintLinkChallenge,
   removeMemberKey,
   unbindNode,
@@ -164,5 +166,73 @@ describe("unbindNode", () => {
   it("refuses when this node is unbound", async () => {
     await expect(unbindNode(deps(null), "0b0b")).rejects.toThrow(/isn't linked/);
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("beginEnrollment", () => {
+  it("binds the LAN server at the account's live id and nonce", async () => {
+    const d = deps(wireAccount());
+    invokeMock.mockResolvedValue({ url: "http://10.0.0.5:5051/enroll#tok" });
+
+    await expect(beginEnrollment(d)).resolves.toEqual({
+      url: "http://10.0.0.5:5051/enroll#tok",
+      accountId: "010203",
+      nonce: 5,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("enroll_start", {
+      chainId: "team#abcd",
+      accountId: "010203",
+      nonce: 5,
+    });
+  });
+
+  it("refuses when this node is unbound", async () => {
+    await expect(beginEnrollment(deps(null))).rejects.toThrow(/isn't linked/);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("addEnrolledKey", () => {
+  const proof = {
+    accountId: "010203",
+    nonce: 5,
+    newKeyHex: "cd34",
+    sigHex: "aabb",
+    label: "Phone",
+  };
+
+  it("signs a p256 add at the pinned nonce with the sig as raw possession bytes", async () => {
+    const d = deps(wireAccount());
+    invokeMock.mockResolvedValue('{"add_member_key":{"ok":1}}');
+
+    await expect(addEnrolledKey(d, proof)).resolves.toBeUndefined();
+
+    expect(invokeMock).toHaveBeenCalledWith("user_sign_add_member", {
+      chainId: "team#abcd",
+      accountId: "010203",
+      newPub: "cd34",
+      newKind: "p256",
+      nonce: 5,
+      possession: '{"signature":{"sig":[170,187]}}',
+      label: "Phone",
+    });
+    expect(d.transport.submit).toHaveBeenCalledWith("identity", {
+      add_member_key: { ok: 1 },
+    });
+  });
+
+  it("refuses on nonce drift instead of submitting an unverifiable proof", async () => {
+    const d = deps(wireAccount({ nonce: 6 })); // an op landed during the phone scan
+
+    await expect(addEnrolledKey(d, proof)).rejects.toThrow(/changed while this key/);
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(d.transport.submit).not.toHaveBeenCalled();
+  });
+
+  it("maps the shell's identity-locked sentinel to an actionable error", async () => {
+    const d = deps(wireAccount());
+    invokeMock.mockRejectedValue(new Error("identity-locked"));
+
+    await expect(addEnrolledKey(d, proof)).rejects.toThrow(/locked on this device/);
   });
 });
