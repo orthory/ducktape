@@ -2184,6 +2184,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
  "git2",
+ "libc",
  "serde",
  "serde_json",
  "tauri",
@@ -2192,6 +2193,7 @@ dependencies = [
  "tiny_http",
  "toml 0.8.23",
  "webkit2gtk",
+ "zeroize",
 ]
 
 [[package]]
