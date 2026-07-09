@@ -69,8 +69,9 @@ reachability = { workspace = true }
 nat-traversal = { workspace = true }
 wireguard-upgrade = { workspace = true }
 wireguard-effect = { workspace = true }
-# the voice hub's transport seam: huddle audio rides data-plane datagrams over
-# the dedicated CHANNEL_VOICE mesh lane (src/voice.rs owns the mesh arm).
+# the voice hub's transport seam: huddle media rides data-plane datagrams over
+# the per-service overlay sockets (src/voice_plane.rs binds them); the mesh arm
+# it replaced is retired — see docs/adr/2026-07-07-per-use-data-plane.mdx.
 data-plane = { workspace = true }
 # the overlay routing seam (ADR 2026-07-07-userspace-overlay-net): the mesh's
 # runtime context is wrapped so dial/bind route overlay ULAs by address.
@@ -125,6 +126,9 @@ tempfile = "3"
 # prove huddle media crosses the REAL overlay headless — this supplies the WG
 # interface config types; the boringtun crypto rides overlay-net (a dep above).
 defguard_wireguard_rs = { workspace = true }
+# replica::tests assembles real finalization certificates (sign -> assemble)
+# to exercise the cert-lane decode + fold planner.
+commonware-parallel = { workspace = true }
 # the phase-3 proof: duckfs_client_e2e drives the checkout/commit engine (as a
 # library, over each node's real http surface) across a two-validator cluster.
 duckfs-client = { workspace = true }

@@ -690,19 +690,23 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
                 })
             })
     }));
-    //     …and /v1/index/* answers from boundary-healed read models: every
-    //     watermark sits at a followed boundary, visibly boundary-stamped
-    //     (the backfill floor), with the store healthy. polled: a heal drops
-    //     the watermark FIRST (crash-safety by re-trigger), so a read racing
-    //     an in-flight heal legitimately sees 0 for a moment.
-    poll("the resident index to report boundary-stamped watermarks", Box::new(|| {
+    //     …and /v1/index/* answers from healthy read models. under the
+    //     replica pipeline the resident FOLDS blocks, so watermarks advance
+    //     per block PAST the ascension heal's backfill floor (the old
+    //     boundary-healed model pinned them equal — that trailing-watermark
+    //     era is exactly what the fold retired). polled: a heal drops the
+    //     watermark FIRST (crash-safety by re-trigger), so a read racing an
+    //     in-flight heal legitimately sees 0 for a moment.
+    poll("the resident index to report folding watermarks", Box::new(|| {
         let (status, index_status) =
             common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
         let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
         status == 200
             && index_status["poisoned"] == serde_json::json!(false)
             && watermark > 0
-            && index_status["backfilled"]["directory"].as_u64() == Some(watermark)
+            && index_status["backfilled"]["directory"]
+                .as_u64()
+                .is_some_and(|floor| floor <= watermark)
     }));
 
     // (3) quorum untouched: kill the resident; the founder keeps finalizing.
@@ -806,13 +810,15 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "back"))
     }));
 
-    // (7) promote: the warm resident becomes a validator through the normal
-    //     promotion path; valset Join clears its resident standing.
+    // (7) promote: the warm resident becomes a validator through the replica
+    //     promotion collapse — it checkpoints its OWN folded state and
+    //     reboots (no re-sync: at a quorum-widening cutover the founder
+    //     halts awaiting this very node, so there is nothing to sync FROM);
+    //     valset Join clears its resident standing.
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected promote output:\n{out}");
     cluster.wait_marker(1, "admitted at epoch", CONVERGE);
-    cluster.wait_marker(1, "synced app_hash=", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
     let residents = cluster
         .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
