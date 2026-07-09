@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import type { PageBlock } from "../../../domain/pages-client";
+import type { BlockKind, PageBlock } from "../../../domain/pages-client";
 import {
   buildRows,
   continuationKind,
+  emptyEnterExits,
   filterSlashKinds,
   indentTarget,
   moveDownTarget,
@@ -117,5 +118,41 @@ describe("slash menu + list continuation", () => {
     expect(continuationKind("todo")).toBe("todo");
     expect(continuationKind("heading1")).toBe("paragraph");
     expect(continuationKind("quote")).toBe("paragraph");
+  });
+});
+
+describe("emptyEnterExits", () => {
+  it("escapes every kind you can get stuck inside", () => {
+    const escapable: BlockKind[] = [
+      "bulleted",
+      "numbered",
+      "todo",
+      "quote",
+      "code",
+      "callout",
+      "toggle",
+    ];
+    for (const kind of escapable) expect(emptyEnterExits(kind)).toBe(true);
+  });
+
+  it("leaves prose and structural kinds alone", () => {
+    const stays: BlockKind[] = [
+      "paragraph",
+      "heading1",
+      "heading2",
+      "heading3",
+      "divider",
+      "page",
+    ];
+    for (const kind of stays) expect(emptyEnterExits(kind)).toBe(false);
+  });
+
+  // the old code inferred this from continuationKind, which only ever agreed
+  // for the three list kinds — that is exactly the bug.
+  it("covers kinds continuationKind never could", () => {
+    for (const kind of ["quote", "code", "callout", "toggle"] as BlockKind[]) {
+      expect(continuationKind(kind)).not.toBe(kind);
+      expect(emptyEnterExits(kind)).toBe(true);
+    }
   });
 });

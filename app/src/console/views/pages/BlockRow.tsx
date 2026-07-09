@@ -1,12 +1,19 @@
 // One editable block row of the Docs editor. Editing is KEYBOARD-FIRST:
 //
-//   Enter          split: a fresh sibling below (lists continue their kind)
-//   Backspace      on an empty block: remove it, focus the previous one
+//   Enter          split at the caret: this block keeps the left half, a fresh
+//                  sibling below takes the right (lists continue their kind)
+//   Mod+Enter      check a to-do / collapse a toggle — never splits
+//   Backspace      at offset 0: merge into the block above (or delete a divider
+//                  above); on an empty block: remove it
 //   Tab / S-Tab    indent under the previous sibling / outdent to grandparent
 //   Alt+Up/Down    move among siblings
-//   Up/Down        at the draft's edges: hop between blocks
+//   Up/Left        at the start: hop to the previous block, caret at its END
+//   Down/Right     at the end: hop to the next block, caret at its START
 //   "# " "- " …    markdown prefixes convert a paragraph's kind
 //   "/"            slash menu over every block kind
+//
+// What a keystroke MEANS lives in block-keys.ts as a pure resolveKey(); this
+// file only carries the intent out.
 //
 // Text commits on debounced edit boundaries (a typing pause), on blur, and
 // before any structural op — one consensus op per boundary, mirroring the
@@ -14,23 +21,20 @@
 // overwrites the draft of the block being edited; committed truth reconciles
 // through the next boundary commit instead.
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
 
 import type { BlockKind } from "../../../domain/pages-client";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { Icon } from "../../components/Icon";
 import type { OpRecord } from "../../store/finalization";
-import { accentVar, color, font, radius, shadow } from "../../theme/tokens";
-import {
-  EDIT_BOUNDARY_MS,
-  continuationKind,
-  filterSlashKinds,
-  shortcutFor,
-} from "./pages-model";
+import { accentVar, color, font, radius } from "../../theme/tokens";
+import { EDIT_BOUNDARY_MS, filterSlashKinds, shortcutFor } from "./pages-model";
+import { SlashMenu } from "./SlashMenu";
 import type { Row } from "./pages-model";
-
-const INDENT = 26;
+import { FOCUS_NEXT_CARET, FOCUS_PREV_CARET, resolveKey } from "./block-keys";
+import type { Caret } from "./block-keys";
+import { INDENT, MARKER_HANG, headingTopSpace } from "./pages-style";
 
 /** Per-kind typography for the block textarea. */
 function kindFont(kind: BlockKind): string {
@@ -75,86 +79,15 @@ function focusPlaceholder(kind: BlockKind): string {
   }
 }
 
-// ── Slash menu ───────────────────────────────────────────
-
-function SlashMenu({
-  query,
-  activeIndex,
-  onPick,
-}: {
-  query: string;
-  activeIndex: number;
-  onPick: (kind: BlockKind) => void;
-}) {
-  const options = filterSlashKinds(query);
-  if (options.length === 0) return null;
-  return (
-    <div
-      role="listbox"
-      aria-label="Block kind menu"
-      style={{
-        position: "absolute",
-        zIndex: 20,
-        top: "100%",
-        left: 0,
-        marginTop: 4,
-        width: 240,
-        maxHeight: 280,
-        overflowY: "auto",
-        border: `1px solid ${color.border}`,
-        borderRadius: radius.md,
-        background: color.paper,
-        boxShadow: shadow.card,
-        padding: 4,
-      }}
-    >
-      {options.map((option, i) => (
-        <button
-          key={option.kind}
-          type="button"
-          role="option"
-          aria-selected={i === activeIndex}
-          onMouseDown={(event) => {
-            // mousedown, not click: the textarea must not blur-commit first.
-            event.preventDefault();
-            onPick(option.kind);
-          }}
-          style={{
-            all: "unset",
-            cursor: "pointer",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            width: "100%",
-            boxSizing: "border-box",
-            padding: "6px 9px",
-            borderRadius: radius.sm,
-            background: i === activeIndex ? color.hover : "transparent",
-          }}
-        >
-          <span style={{ font: `600 12px ${font.sans}`, color: color.ink }}>
-            {option.label}
-          </span>
-          <span
-            style={{
-              marginLeft: "auto",
-              font: `400 10.5px ${font.mono}`,
-              color: color.muted2,
-            }}
-          >
-            {option.hint}
-          </span>
-        </button>
-      ))}
-    </div>
-  );
-}
-
 // ── One editable block row ───────────────────────────────
 
 export interface RowHandlers {
   commitText(blockId: string, text: string): void;
-  split(row: Row, draftLeft: string): void;
+  /** This block keeps `left`; a fresh sibling below takes `right`. */
+  split(row: Row, left: string, right: string): void;
+  /** Join `text` onto the block above and drop this one. */
+  mergePrev(row: Row, text: string): void;
+  removeDividerAbove(row: Row): void;
   removeEmpty(row: Row): void;
   indent(row: Row): void;
   outdent(row: Row): void;
@@ -164,15 +97,16 @@ export interface RowHandlers {
   setChecked(blockId: string, checked: boolean): void;
   remove(blockId: string): void;
   toggleCollapse(blockId: string): void;
-  focusRelative(row: Row, delta: -1 | 1): void;
+  focusRelative(row: Row, delta: -1 | 1, caret: Caret): void;
   registerInput(blockId: string, el: HTMLTextAreaElement | null): void;
   openComments(blockId: string, anchor: { x: number; y: number }): void;
   createSubpage(): void;
 }
 
-export function BlockRow({
+function BlockRowInner({
   row,
   index,
+  prevKind,
   expanded,
   op,
   threadCount,
@@ -180,6 +114,10 @@ export function BlockRow({
 }: {
   row: Row;
   index: number;
+  /** The kind of the row above, or null at the top. Backspace at offset 0
+   *  needs it to tell "merge into the prose above" from "delete the divider
+   *  above", which owns no textarea of its own. */
+  prevKind: BlockKind | null;
   /** Only meaningful for Toggle rows: whether children are shown. */
   expanded: boolean;
   /** The block's finalization record — only rendered while pending/failed. */
@@ -300,58 +238,74 @@ export function BlockRow({
       }
     }
 
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      // an empty list item exits the list instead of continuing it.
-      if (draft.trim() === "" && continuationKind(block.kind) === block.kind
-          && block.kind !== "paragraph") {
+    // everything below is grammar, and grammar is pure: resolveKey decides what
+    // the keystroke MEANS, this switch carries it out.
+    const intent = resolveKey({
+      key: event.key,
+      shiftKey: event.shiftKey,
+      metaKey: event.metaKey,
+      ctrlKey: event.ctrlKey,
+      altKey: event.altKey,
+      value: draft,
+      caretStart: el.selectionStart ?? 0,
+      caretEnd: el.selectionEnd ?? 0,
+      kind: block.kind,
+      slashOpen: slashOpen && slashOptions.length > 0,
+      prevKind,
+    });
+    if (intent.type === "none") return;
+    event.preventDefault();
+
+    switch (intent.type) {
+      case "split":
+        // adopt the left half locally first: the block's own edit-boundary
+        // timer must not fire afterwards and commit the whole pre-split draft
+        // back over the truncation.
+        setDraft(intent.left);
+        handlers.split(row, intent.left, intent.right);
+        return;
+      case "merge-prev":
+        handlers.mergePrev(row, draft);
+        return;
+      case "remove-divider-above":
+        handlers.removeDividerAbove(row);
+        return;
+      case "remove-empty":
+        handlers.removeEmpty(row);
+        return;
+      case "exit-to-paragraph":
         handlers.setKind(block.id, "paragraph");
         return;
-      }
-      maybeCommit();
-      handlers.split(row, draft);
-      return;
-    }
-    if (event.key === "Backspace" && draft === "") {
-      event.preventDefault();
-      handlers.removeEmpty(row);
-      return;
-    }
-    if (event.key === "Tab") {
-      event.preventDefault();
-      maybeCommit();
-      if (event.shiftKey) handlers.outdent(row);
-      else handlers.indent(row);
-      return;
-    }
-    if (event.altKey && event.key === "ArrowUp") {
-      event.preventDefault();
-      maybeCommit();
-      handlers.moveUp(row);
-      return;
-    }
-    if (event.altKey && event.key === "ArrowDown") {
-      event.preventDefault();
-      maybeCommit();
-      handlers.moveDown(row);
-      return;
-    }
-    if (
-      event.key === "ArrowUp" &&
-      el.selectionStart === 0 &&
-      el.selectionEnd === 0
-    ) {
-      event.preventDefault();
-      handlers.focusRelative(row, -1);
-      return;
-    }
-    if (
-      event.key === "ArrowDown" &&
-      el.selectionStart === el.value.length &&
-      el.selectionEnd === el.value.length
-    ) {
-      event.preventDefault();
-      handlers.focusRelative(row, 1);
+      case "toggle-check":
+        handlers.setChecked(block.id, !block.checked);
+        return;
+      case "toggle-collapse":
+        handlers.toggleCollapse(block.id);
+        return;
+      case "indent":
+        maybeCommit();
+        handlers.indent(row);
+        return;
+      case "outdent":
+        maybeCommit();
+        handlers.outdent(row);
+        return;
+      case "move-up":
+        maybeCommit();
+        handlers.moveUp(row);
+        return;
+      case "move-down":
+        maybeCommit();
+        handlers.moveDown(row);
+        return;
+      case "focus-prev":
+        maybeCommit();
+        handlers.focusRelative(row, -1, FOCUS_PREV_CARET);
+        return;
+      case "focus-next":
+        maybeCommit();
+        handlers.focusRelative(row, 1, FOCUS_NEXT_CARET);
+        return;
     }
   };
 
@@ -491,26 +445,36 @@ export function BlockRow({
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
+        position: "relative",
         display: "flex",
         alignItems: "flex-start",
         gap: 8,
         padding: "2.5px 0",
         marginLeft: depth * INDENT,
+        marginTop: headingTopSpace(block.kind),
       }}
     >
-      <div
-        style={{
-          flexShrink: 0,
-          width: 20,
-          minHeight: 24,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          paddingTop: block.kind === "heading1" ? 6 : block.kind === "heading2" ? 3 : 0,
-        }}
-      >
-        {marker}
-      </div>
+      {/* the marker hangs in the left margin instead of sitting in flow, so the
+          text column below starts at offset 0 and lines up with the page title.
+          Prose kinds render no marker at all and used to pay for the gutter
+          anyway — that was the whole reason the body sat 28px right of the
+          title. */}
+      {marker ? (
+        <div
+          style={{
+            position: "absolute",
+            left: -MARKER_HANG,
+            top: 0,
+            width: 20,
+            height: 24,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          {marker}
+        </div>
+      ) : null}
       <div style={{ flex: 1, minWidth: 0 }}>{content}</div>
       <div
         style={{
@@ -574,3 +538,37 @@ export function BlockRow({
     </div>
   );
 }
+
+// Rows are re-rendered by every store patch — a typing pause, an op's finalize
+// receipt, the refresh that follows it. Without this memo each of those
+// reconciles all N rows, which is what makes a long list feel slow: building
+// one is a burst of back-to-back Enters with no cheap keystrokes in between to
+// space the patches out.
+//
+// The comparator cannot be a reference check on `row`: buildRows allocates a
+// fresh { block, depth } wrapper every recompute, so the memo would never hit.
+// Nor can it be a reference check on `row.block`: an authoritative refresh
+// deserializes the whole snapshot, so every block is a new object even when
+// nothing about it changed. It compares the fields this component actually
+// reads.
+//
+// `handlers` must stay referentially stable (PagesView builds it once against a
+// live ref) or this memo is defeated by that prop alone.
+export const BlockRow = memo(BlockRowInner, (a, b) => {
+  const x = a.row.block;
+  const y = b.row.block;
+  return (
+    x.id === y.id &&
+    x.kind === y.kind &&
+    x.text === y.text &&
+    x.checked === y.checked &&
+    a.row.depth === b.row.depth &&
+    a.row.listIndex === b.row.listIndex &&
+    a.index === b.index &&
+    a.prevKind === b.prevKind &&
+    a.expanded === b.expanded &&
+    a.op === b.op &&
+    a.threadCount === b.threadCount &&
+    a.handlers === b.handlers
+  );
+});

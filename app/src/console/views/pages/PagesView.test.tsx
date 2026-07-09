@@ -13,7 +13,12 @@ const makeActions = () => {
     {},
     {
       get: (_target, key: string) => {
-        spies[key] ??= vi.fn() as (...args: unknown[]) => void;
+        // the block-write actions resolve true once the op commits (false on a
+        // surfaced failure); the editor's split/merge await that to compensate.
+        // Void actions resolving a promise nobody reads is harmless.
+        spies[key] ??= vi.fn(() => Promise.resolve(true)) as unknown as (
+          ...args: unknown[]
+        ) => void;
         return spies[key];
       },
     },
@@ -55,7 +60,17 @@ const renderPagesView = (patch: Partial<ConsoleState> = {}) => {
     </ConsoleContext.Provider>
   );
   const { rerender } = render(view(patch));
-  return { spies, rerender: (p: Partial<ConsoleState>) => rerender(view(p)) };
+  // the Proxy mints a spy on first access, so `spies.x` is undefined until the
+  // view calls `actions.x`. Asserting "never called" needs the spy to exist:
+  // touch it through `actions` first.
+  const materialize = (...names: (keyof ConsoleActions)[]) => {
+    for (const name of names) void actions[name];
+  };
+  return {
+    spies,
+    materialize,
+    rerender: (p: Partial<ConsoleState>) => rerender(view(p)),
+  };
 };
 
 describe("PagesView", () => {
@@ -498,5 +513,197 @@ describe("endless canvas", () => {
   it("drops the bordered page card — the scroll surface itself is paper", () => {
     renderPagesView();
     expect(screen.getByTestId("doc-scroll")).toHaveStyle({ background: "#ffffff" });
+  });
+});
+
+// The block used to be an atomic text cell: Enter appended an empty sibling and
+// left your text behind, Backspace never joined two blocks, and Cmd+Enter on a
+// to-do made a block instead of checking it. jsdom does not place a caret for
+// us, so every test here sets the selection before dispatching the key.
+describe("text moves across block boundaries", () => {
+  const caretAt = (area: HTMLTextAreaElement, at: number) => {
+    fireEvent.focus(area);
+    area.setSelectionRange(at, at);
+  };
+
+  it("splits at the caret: this block keeps the left half, the sibling takes the right", () => {
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    caretAt(area, 5); // "First| draft"
+    fireEvent.keyDown(area, { key: "Enter" });
+
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ parent: "p1", after: "a", kind: "paragraph", text: " draft" }),
+    );
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({ blockId: "a", text: "First" });
+  });
+
+  it("continues a list on Enter, carrying the right half into the new item", () => {
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 4); // "Ship| it"
+    fireEvent.keyDown(area, { key: "Enter" });
+
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "todo", text: " it" }),
+    );
+  });
+
+  it("merges into the previous block on Backspace at offset 0, caret at the seam", () => {
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    expect(spies.updatePageBlockText).toHaveBeenCalledWith({
+      blockId: "a",
+      text: "First draftShip it",
+    });
+    expect(spies.removePageBlock).toHaveBeenCalledWith("b");
+  });
+
+  it("leaves Backspace alone in the middle of a block", () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("removePageBlock", "updatePageBlockText");
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 3);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    expect(spies.removePageBlock).not.toHaveBeenCalled();
+    expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+  });
+
+  it("checks a to-do with Cmd+Enter, and makes no block", () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("insertPageBlock");
+    const area = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    caretAt(area, 2);
+    fireEvent.keyDown(area, { key: "Enter", metaKey: true });
+
+    expect(spies.setPageBlockChecked).toHaveBeenCalledWith({ blockId: "b", checked: true });
+    expect(spies.insertPageBlock).not.toHaveBeenCalled();
+  });
+});
+
+describe("the caret lands on the adjacent line", () => {
+  it("ArrowDown from the end of a block lands at the START of the next", () => {
+    renderPagesView();
+    const first = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    const second = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    fireEvent.focus(first);
+    first.setSelectionRange(first.value.length, first.value.length);
+    fireEvent.keyDown(first, { key: "ArrowDown" });
+
+    expect(document.activeElement).toBe(second);
+    expect(second.selectionStart).toBe(0);
+  });
+
+  it("ArrowUp from the start of a block lands at the END of the previous", () => {
+    renderPagesView();
+    const first = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    const second = screen.getByLabelText("Edit todo block 2") as HTMLTextAreaElement;
+    fireEvent.focus(second);
+    second.setSelectionRange(0, 0);
+    fireEvent.keyDown(second, { key: "ArrowUp" });
+
+    expect(document.activeElement).toBe(first);
+    expect(first.selectionStart).toBe(first.value.length);
+  });
+
+  it("ArrowUp from the first block reaches the title", () => {
+    renderPagesView();
+    const first = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    fireEvent.focus(first);
+    first.setSelectionRange(0, 0);
+    fireEvent.keyDown(first, { key: "ArrowUp" });
+
+    expect(document.activeElement).toBe(screen.getByLabelText("Page title"));
+  });
+});
+
+describe("the title descends into the body", () => {
+  it("focuses the first block at its start, inserting nothing", () => {
+    const { spies, materialize } = renderPagesView();
+    materialize("insertPageBlock");
+    const title = screen.getByLabelText("Page title");
+    fireEvent.keyDown(title, { key: "Enter" });
+
+    const first = screen.getByLabelText("Edit paragraph block 1") as HTMLTextAreaElement;
+    expect(document.activeElement).toBe(first);
+    expect(first.selectionStart).toBe(0);
+    expect(spies.insertPageBlock).not.toHaveBeenCalled();
+  });
+
+  // the reported papercut: on a page with no body there was nothing to focus,
+  // and focusRow(undefined) means "focus the title", so Enter did nothing.
+  it("creates the first block when the page has no body yet", () => {
+    const empty: PageBlock[] = [
+      blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: [] }),
+    ];
+    const { spies } = renderPagesView({ activePageBlocks: empty });
+    fireEvent.keyDown(screen.getByLabelText("Page title"), { key: "Enter" });
+
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(
+      expect.objectContaining({ parent: "p1", kind: "paragraph", text: "" }),
+    );
+  });
+});
+
+describe("a divider is reachable from the keyboard", () => {
+  it("Backspace at the start of the block below removes the divider above", () => {
+    const withDivider: PageBlock[] = [
+      blockOf({ id: "p1", parent: null, kind: "page", text: "Launch plan", children: ["d", "a"] }),
+      blockOf({ id: "d", kind: "divider" }),
+      blockOf({ id: "a", text: "First draft" }),
+    ];
+    const { spies, materialize } = renderPagesView({ activePageBlocks: withDivider });
+    materialize("updatePageBlockText");
+    const area = screen.getByLabelText("Edit paragraph block 2") as HTMLTextAreaElement;
+    fireEvent.focus(area);
+    area.setSelectionRange(0, 0);
+    fireEvent.keyDown(area, { key: "Backspace" });
+
+    expect(spies.removePageBlock).toHaveBeenCalledWith("d");
+    // the text is not merged into a divider, and this block survives.
+    expect(spies.updatePageBlockText).not.toHaveBeenCalled();
+  });
+});
+
+describe("the document has one left edge", () => {
+  it("hangs a list marker in the margin instead of indenting the text column", () => {
+    renderPagesView();
+    const checkbox = screen.getByRole("button", { name: "Check to-do block 2" });
+    const gutter = checkbox.parentElement as HTMLElement;
+
+    // out of flow, so the text column beside it starts at offset 0.
+    expect(gutter.style.position).toBe("absolute");
+    expect(gutter.style.left).toBe("-28px");
+  });
+
+  it("gives prose no marker box to pay for", () => {
+    renderPagesView();
+    const rowOf = (label: string) =>
+      screen.getByLabelText(label).closest('[style*="margin-left"]') as HTMLElement;
+
+    // a paragraph renders no marker element at all. It used to render an empty
+    // 20px box + an 8px gap, which is what pushed every line of body text 28px
+    // right of the title. A to-do still renders its checkbox — hanging, now.
+    const prose = rowOf("Edit paragraph block 1");
+    const todo = rowOf("Edit todo block 2");
+    expect(prose.children.length).toBe(todo.children.length - 1);
+    expect(prose.querySelector('[style*="-28px"]')).toBeNull();
+    expect(todo.querySelector('[style*="-28px"]')).not.toBeNull();
+  });
+
+  it("keeps the title flush with the text column", () => {
+    renderPagesView();
+    const title = screen.getByLabelText("Page title") as HTMLInputElement;
+    expect(title.style.padding).toBe("0px");
+  });
+
+  it("stops padding the add-block button around a gutter that no longer exists", () => {
+    renderPagesView();
+    const add = screen.getByRole("button", { name: /add a block|start writing/i });
+    expect(add.style.padding).toBe("8px 0px");
   });
 });

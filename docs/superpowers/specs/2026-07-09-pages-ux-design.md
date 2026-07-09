@@ -206,10 +206,15 @@ The invariant: **no keystroke may lose text.** The worst case degrades to a
 the user already sees the op failure via the existing `fail(err)` surface
 (PR #200).
 
-This requires `insertPageBlock` and `updatePageBlockText` to return
-`Promise<void>` rather than `void` (`actions.ts:256-264`). `submitTracked`
-already returns the promise; the interface merely discards it. Callers that
-ignore the return value are unaffected.
+This requires `insertPageBlock` and `updatePageBlockText` to return a promise
+rather than `void` (`actions.ts:256-264`). It resolves **`boolean`**, not
+`void`: `submitTracked`'s `.catch` already handles and *swallows* the failure
+(`failOp` + `fail(err)` + `refresh()`, `actions.ts:655-659`), so its promise
+resolves either way and a caller's `.catch()` would never fire. Making it
+reject instead would turn every existing caller — all of which ignore the
+result — into an unhandled rejection. So it resolves `true` on commit and
+`false` on a surfaced failure, and only an explicit `false` triggers
+compensation.
 
 ### 5. `emptyEnterExits` (pages-model.ts)
 
@@ -352,6 +357,33 @@ serialize even though the investigation parallelized.
 
 `insertAfterRow` is inlined into `split` and removed only after confirming no
 other creator needs it.
+
+### Keeping both host files under the cap
+
+The pass adds behavior to two files that were already at ~600 lines, so it also
+takes two responsibilities out of them:
+
+- `use-row-handlers.ts` — row intents → store ops + caret placement, the
+  stable-`handlers` hook. Out of `PagesView.tsx`.
+- `SlashMenu.tsx` — the "/" palette. Out of `BlockRow.tsx`.
+
+Net effect: `PagesView.tsx` 616 → 539, `BlockRow.tsx` 576 → 574. The monsters
+shrink rather than grow.
+
+### The memo comparator cannot use reference equality
+
+`applySnapshot` (`state.ts:542`) passes freshly deserialized objects straight
+through, so after any authoritative `refresh()` every `PageBlock` is a new
+object even when nothing about it changed. A comparator keyed on `row.block`
+identity would therefore go inert for exactly the patches that follow each
+Enter. It compares the fields `BlockRow` actually reads — `id`, `kind`, `text`,
+`checked`, plus `row.depth` and `row.listIndex`.
+
+`pages-render-cost.test.tsx` measures this directly: it mocks `headingTopSpace`
+(called once per row render) as a render counter, and asserts that the cost of a
+patch is **independent of N** by running the same mutation on a 20-row and an
+80-row page. Verified to fail without the memo, and to fail again if `handlers`
+is made unstable — both conditions are guarded, not assumed.
 
 ## Risks
 

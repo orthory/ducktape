@@ -252,16 +252,22 @@ export interface ConsoleActions {
   /** Close a document tab; activates a neighbor if it was active. */
   closeTab(pageId: string): void;
   /** Insert a block into the active page. The VIEW mints the id (it drives
-   *  focus to the new block, so it must know the id before the round-trip). */
+   *  focus to the new block, so it must know the id before the round-trip).
+   *
+   *  Resolves true once the op commits, false if it failed (the failure is
+   *  already surfaced). The pages editor's split/merge use this to compensate:
+   *  a failed op is never rolled back, it is erased by the next authoritative
+   *  refresh, so a lost additive op would silently destroy text. */
   insertPageBlock(params: {
     blockId: string;
     parent: string;
     after: string | null;
     kind: PageBlockKind;
     text: string;
-  }): void;
-  /** Replace a block's text; on the page root this renames the page. */
-  updatePageBlockText(params: { blockId: string; text: string }): void;
+  }): Promise<boolean>;
+  /** Replace a block's text; on the page root this renames the page.
+   *  Resolves true once the op commits — see `insertPageBlock`. */
+  updatePageBlockText(params: { blockId: string; text: string }): Promise<boolean>;
   /** Convert a block to another kind (markdown shortcuts, slash menu). */
   setPageBlockKind(params: { blockId: string; kind: PageBlockKind }): void;
   /** Flip a Todo block's checked state. */
@@ -640,7 +646,7 @@ export function createActions({
     preconfirm?: (prev: ConsoleState) => Partial<ConsoleState>,
   ) => {
     const live = getNode();
-    if (!live) return Promise.resolve();
+    if (!live) return Promise.resolve(false);
     const startedAt = Date.now();
     update((prev) => ({
       ...(preconfirm ? preconfirm(prev) : {}),
@@ -650,12 +656,16 @@ export function createActions({
       .then(() => submit(live))
       .then((result) => {
         update((prev) => ({ ops: finalizeOp(prev.ops, key, receiptOf(result)) }));
-        return refresh();
+        return refresh().then(() => true);
       })
       .catch((err) => {
         update((prev) => ({ ops: failOp(prev.ops, key, String(err)) }));
         fail(err);
-        return refresh();
+        // resolve false rather than reject: a failed op is already surfaced to
+        // the user here, and every caller but the compensating writes in the
+        // pages editor ignores the result. Rejecting would turn each of them
+        // into an unhandled rejection.
+        return refresh().then(() => false);
       });
   };
 
@@ -1645,8 +1655,8 @@ export function createActions({
 
     insertPageBlock: ({ blockId, parent, after, kind, text }) => {
       const page = getState().activePage;
-      if (!page) return;
-      submitTracked(
+      if (!page) return Promise.resolve(false);
+      return submitTracked(
         opKey.pageBlock(blockId),
         (live) =>
           pagesClient.insertBlock(live, {
@@ -1663,13 +1673,12 @@ export function createActions({
       );
     },
 
-    updatePageBlockText: ({ blockId, text }) => {
+    updatePageBlockText: ({ blockId, text }) =>
       submitTracked(
         opKey.pageBlock(blockId),
         (live) => pagesClient.updateText(live, { blockId, text }),
         (prev) => optimistic.pageBlockPatched(prev, blockId, { text }),
-      );
-    },
+      ),
 
     setPageBlockKind: ({ blockId, kind }) => {
       submitTracked(
