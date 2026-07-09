@@ -179,6 +179,17 @@ invariant; **SHOULD** = a strong default, overridable as per-agent policy.
   consensus-affecting.
 - **D6 (MUST)** Secrets are bound to agent identity and tenant-isolated
   (`vaults`).
+- **D7 (MUST) Minimum isolation floor — the containment boundary is v1, only
+  its enforcement mechanism is deferred.** Independent of the sandbox mechanism
+  (YOLO or hardened), the run's child process MUST NOT be able to read the
+  node's identity/consensus/WireGuard key material, the node data directory,
+  operator/capability configuration, or any unscoped secret. Every secret, tool
+  credential, and network grant reaches the child *only* through the agent's
+  declared caps and vault grants (D3/D6). This is the concrete floor that makes
+  I3 (containment) hold: "sandbox mechanism deferred" (e.g. `bwrap`) is never
+  "containment deferred" — the boundary is a MUST for v1; each host only chooses
+  the tech that enforces it (process-user separation, mount/namespace, or a
+  bind-only sandbox).
 
 ### Capabilities layering (CAP)
 
@@ -227,13 +238,17 @@ invariant; **SHOULD** = a strong default, overridable as per-agent policy.
   code on an untrusted node; a key it held could be exfiltrated by a compromised
   node or a prompt-injection. Keyless, runtime-mediated action removes the
   target entirely.
-- **A bespoke, hermetic sandbox as the default.** Deferred. The default posture
-  is **YOLO** — the executor already runs cwd-confined agentic modes
-  (`workspace-write` / `acceptEdits`); full FS/net is acceptable for
-  trusted-tenant workspaces. The one non-negotiable is that the child must not
-  reach the node's identity key material (D1 makes the agent keyless; the
-  provisioning step withholds `~/.ducktape` keys). A `bwrap`-style hardening that
-  binds only the checkout is a documented future option, not a v1 requirement.
+- **A bespoke, hermetic sandbox as the default.** The *mechanism* is deferred,
+  **not the containment boundary.** The default posture is **YOLO** for the
+  agent's own workspace surface — the executor already runs cwd-confined agentic
+  modes (`workspace-write` / `acceptEdits`); open FS/net *within the run's
+  sandbox* is acceptable for trusted-tenant workspaces. But the minimum
+  isolation floor (D7) is a v1 MUST: the child never sees node identity/keys, the
+  node data dir, operator/capability config, or unscoped secrets, and all
+  secret/tool/network access is injected only through declared caps and vault
+  grants. What is deferred is only the enforcement *tech* — a `bwrap`-style
+  bind-only sandbox is one option; process-user separation or a mount namespace
+  are others — so "sandbox deferred" must not be read as "containment deferred."
 - **A new consensus module for agent runs.** Rejected. The generic dispatch/
   saga/capability plane already provides settlement, lease, retry, deadline, and
   routing. This ADR adds no consensus module; the deltas are host-edge apps
@@ -258,8 +273,10 @@ invariant; **SHOULD** = a strong default, overridable as per-agent policy.
   is what makes saga's re-lease produce a valid result on any node (I2) and is
   the same checkpoint that L3 suspendable orchestration (N2) resumes from.
 - **Identity becomes the security spine.** Because generation is oracle-trusted,
-  I3/containment rests entirely on complete, fine-grained caps (D3) and keyless,
-  runtime-mediated action (D1). Incomplete caps are a containment hole.
+  I3/containment rests entirely on complete, fine-grained caps (D3), keyless
+  runtime-mediated action (D1), and the minimum isolation floor (D7). Incomplete
+  caps — or a child that can read node keys/data/config/unscoped secrets — is a
+  containment hole regardless of how permissive the *workspace* sandbox is.
 
 ## Plan
 
@@ -277,7 +294,9 @@ Phased, honoring M2 so agents stay alive through the transition:
    (R1–R6), add the `data` structured-output path, and route the sink (O1–O2).
 4. **Identity and caps.** Add `recipe_hash` and resource caps to the agent
    record; enforce two-level attribution and cap-checked effect application;
-   wire secret scoping via `vaults` (D1–D6, I3).
+   enforce the minimum isolation floor in the provisioning wrapper (withhold node
+   keys/data-dir/operator-config from the child); wire secret scoping via
+   `vaults` (D1–D7, I3).
 5. **Composer flip + activate portable** (M1/M2 coordinated upgrade), then
    iterate toward L3 suspendable orchestration (N2).
 
