@@ -3370,6 +3370,7 @@ dependencies = [
  "base64 0.22.1",
  "commonware-codec",
  "commonware-cryptography",
+ "commonware-utils",
  "futures",
  "p256",
  "sdk",

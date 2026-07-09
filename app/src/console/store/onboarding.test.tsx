@@ -232,6 +232,65 @@ describe("onboarding gate — live join UI", () => {
       vi.useRealTimers();
     }
   });
+
+  // A real invite blob is one long 🦆+base64url line; terminal and chat copies
+  // hard-wrap it, so a paste carries embedded newlines/spaces (and sometimes
+  // zero-width characters). The field must swallow those on input so the node
+  // never sees a blob that fails base64url decode.
+  it("strips line breaks and blanks from a pasted invite blob", async () => {
+    vi.useFakeTimers();
+    try {
+      markTauri();
+      const guest = workspace({ id: "g", name: "Guest", founder: false, member: false });
+      invokeMock.mockImplementation((cmd: string) => {
+        switch (cmd) {
+          case "workspace_list":
+            return Promise.resolve([]);
+          case "workspace_active":
+            return Promise.resolve(null);
+          case "workspace_join":
+            return Promise.resolve(guest);
+          case "workspace_select":
+            return Promise.resolve({ id: "g", httpUrl: "http://127.0.0.1:9002" });
+          case "workspace_phase":
+            return Promise.resolve({ phase: "parked", detail: "awaiting admission" });
+          default:
+            return Promise.resolve(null);
+        }
+      });
+      vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("refused"))));
+
+      render(
+        <DucktapeProvider>
+          <OnboardingGate />
+        </DucktapeProvider>,
+      );
+      await act(async () => {}); // flush boot
+
+      fireEvent.click(screen.getByText("Join"));
+      fireEvent.change(screen.getByPlaceholderText("Workspace name"), {
+        target: { value: "Guest" },
+      });
+      const field = screen.getByPlaceholderText<HTMLTextAreaElement>(/Paste invite blob/i);
+      fireEvent.change(field, {
+        target: { value: "  🦆abc\ndef\r\n gh\u200Bij\u2060 \t" },
+      });
+
+      // the field itself holds the cleaned single-line blob
+      expect(field.value).toBe("🦆abcdefghij");
+
+      await act(async () => {
+        fireEvent.click(screen.getByText("Join workspace"));
+      });
+
+      expect(invokeMock).toHaveBeenCalledWith("workspace_join", {
+        name: "Guest",
+        blob: "🦆abcdefghij",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // Connecting to a node on another device over plain http/https. No workspace,

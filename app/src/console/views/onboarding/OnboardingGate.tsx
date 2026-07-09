@@ -15,6 +15,14 @@ import { OnboardingChrome } from "./OnboardingChrome";
 
 type Mode = "create" | "join" | "remote";
 
+// An invite blob is 🦆 + base64url — whitespace is never part of it. Terminal
+// and chat copies hard-wrap the long blob, so a paste arrives with embedded
+// newlines/spaces (and chat apps sometimes inject zero-width characters, which
+// \s does not cover); strip them all so the field always holds the canonical
+// single-line blob.
+const sanitizeInviteBlob = (raw: string): string =>
+  raw.replace(/[\s\u200B-\u200D\u2060]+/g, "");
+
 const inputStyle: React.CSSProperties = {
   width: "100%",
   boxSizing: "border-box",
@@ -205,7 +213,7 @@ export function OnboardingGate() {
                     <textarea
                       value={blob}
                       placeholder="Paste invite blob (🦆…)"
-                      onChange={(event) => setBlob(event.target.value)}
+                      onChange={(event) => setBlob(sanitizeInviteBlob(event.target.value))}
                       rows={3}
                       style={{ ...inputStyle, resize: "vertical", font: `500 11px ${font.mono}` }}
                     />

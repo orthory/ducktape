@@ -2,7 +2,7 @@
 **/*.rs.bk
 .DS_Store
 .claude/worktrees/
-node_modules/
+node_modules
 docs/dist/
 docs/pages.gen.ts
 app/dist/

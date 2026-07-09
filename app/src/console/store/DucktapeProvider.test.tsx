@@ -584,6 +584,13 @@ describe("pages snapshot refresh vs in-flight ops", () => {
     // a FRESH ring array per pull (the shared mock reuses one instance), so a
     // state.blocks identity change marks "a refresh snapshot fully applied".
     vi.mocked(transport.blocks).mockImplementation(() => Promise.resolve([]));
+    // an honest node's status height is never below a receipt it issued —
+    // the read-your-writes floor refuses lagging snapshots, so the mock must
+    // track the heights its own receipts hand out.
+    const baseStatus = vi.mocked(transport.status).getMockImplementation()!;
+    vi.mocked(transport.status).mockImplementation(() =>
+      baseStatus().then((s) => ({ ...s, height: committedHeight })),
+    );
 
     renderConsole(transport);
     await waitFor(() =>
