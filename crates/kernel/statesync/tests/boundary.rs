@@ -47,6 +47,41 @@ fn leased_capture_survives_eviction() {
 }
 
 #[test]
+fn fresh_install_serves_its_manifest_under_full_lease_pressure() {
+    // the self-eviction regression: with every cache slot's capture leased
+    // (leases only age out by overflow, never by client release), a newly
+    // installed boundary was the sole unleased entry — install-time eviction
+    // removed it before its own manifest_for could lease it, and every
+    // manifest fetch at a fresh boundary failed with "no capture at boundary
+    // N (refetch manifest)".
+    let mut srv = SyncServer::new();
+    for h in 1..=(MAX_CAPTURES as u64) {
+        let b = BoundaryId {
+            height: h,
+            app_hash: StateRoot([(h % 251) as u8; 32]),
+        };
+        srv.install_capture_for_test(b);
+        srv.lease(b);
+    }
+
+    let tip = BoundaryId {
+        height: 1000,
+        app_hash: StateRoot([42u8; 32]),
+    };
+    srv.install_capture_for_test(tip);
+    let manifest = srv.manifest_for(tip);
+    assert!(
+        matches!(manifest, Ok(SyncResponse::Manifest(_))),
+        "a fresh install must serve its own manifest even when every older \
+         capture holds a lease: {manifest:?}",
+    );
+    assert!(
+        srv.known_boundaries().len() <= MAX_CAPTURES,
+        "manifest_for's lease must rebalance the cache back under its cap",
+    );
+}
+
+#[test]
 fn leased_boundaries_are_bounded_and_oldest_is_released() {
     let mut srv = SyncServer::new();
     let mut leased = Vec::new();
