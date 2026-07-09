@@ -203,6 +203,12 @@ export function DucktapeProvider({
             if (u.display_name) authorNames[nodeHex] = u.display_name;
           }
         }
+        // The account umbrella's collected keys, keyed by account id — Settings
+        // renders this to show every key that belongs to the account.
+        const accountKeys: Record<string, identityClient.MemberKeyView[]> = {};
+        for (const u of users) {
+          accountKeys[chatClient.keyHex(u.account_id)] = u.member_keys;
+        }
         const members = validators.map(valsetClient.validatorHex);
         const residents = residentKeys.map(valsetClient.validatorHex);
         const current = stateRef.current.activeChannel;
@@ -280,6 +286,7 @@ export function DucktapeProvider({
                 messages,
                 authorNames,
                 nodeUsers,
+                accountKeys,
                 pages: holdPages ? stateRef.current.pages : pages,
                 activePageBlocks: holdPages
                   ? stateRef.current.activePageBlocks

@@ -11,6 +11,8 @@
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 
+import { keyHex } from "../../../domain/chat-client";
+import type { KeyKind } from "../../../domain/identity-client";
 import { normalizeKey, shortKey } from "../../../domain/names";
 import type { IdentityStateReport } from "../../../domain/user-identity-client";
 import {
@@ -36,6 +38,14 @@ import {
 } from "./parts";
 
 type UserKeyStatus = { pubkey: string } | { error: string };
+
+/** Human label for a member key's scheme — how the account's collected keys
+ *  read in Settings. */
+const KIND_LABEL: Record<KeyKind, string> = {
+  ed25519: "Seed key",
+  p256: "Security key",
+  webauthn_p256: "Passkey",
+};
 
 /** Which inline custody form/grid (if any) is currently expanded below its
  *  trigger row. Mutually exclusive — only one of unlock/set-password/reveal
@@ -229,9 +239,33 @@ export function DevicesSection() {
   // "absent" (no user.key yet) renders exactly like non-desktop: no custody
   // rows at all — the identity gate is what's supposed to create one first.
   const showCustody = identity !== null && identity.state !== "absent";
+  // The account this device's node is bound to, and its collected member keys
+  // (of any scheme) — the account umbrella made visible. Empty until the node
+  // is bound and the account view has loaded.
+  const accountId = bound?.userKey;
+  const members = accountId ? (state.accountKeys[accountId] ?? []) : [];
 
   return (
     <>
+      {members.length > 0 ? (
+        <>
+          <SectionLabel>ACCOUNT</SectionLabel>
+          <GroupCard>
+            {members.map((member, i) => (
+              <InfoRow
+                key={keyHex(member.pubkey)}
+                label={member.label ?? KIND_LABEL[member.kind]}
+                last={i === members.length - 1}
+                value={
+                  <span style={monoValue}>
+                    {KIND_LABEL[member.kind]} · {shortKey(keyHex(member.pubkey))}
+                  </span>
+                }
+              />
+            ))}
+          </GroupCard>
+        </>
+      ) : null}
       <SectionLabel>DEVICES</SectionLabel>
       <GroupCard>
         <InfoRow
