@@ -1,9 +1,10 @@
-// The popped-out huddle window's OWN media session (PR-B). Unlike the pre-PR-B
-// mirror, the window runs a real CallSession — mic, camera, peer decode — dialed
-// straight at the local node, seeded by the context the main window pushes
-// (nodeUrl + channelId + raw roster + capability). Main keeps consensus; this
-// controller keeps everything media/ephemeral (peers, mute, camera, speaking,
-// status) and projects the roster with its OWN beacons.
+// The popped-out huddle window's OWN media session. Unlike the old mirror, the
+// window runs a real CallSession — mic, camera, screen share, peer decode —
+// dialed straight at the local node, seeded by the context the main window
+// pushes (nodeUrl + channelId + raw roster + capability) and by the same
+// persisted device prefs main uses (shared localStorage). Main keeps consensus;
+// this controller keeps everything media/ephemeral (peers, mute, camera/share,
+// speaking, status) and projects the roster with its OWN beacons.
 //
 // StrictMode note: a CallSession cannot restart after stop(), and StrictMode
 // double-invokes effects — so the session is created INSIDE the effect and
@@ -15,6 +16,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createCallSession } from "../../../domain/call-session";
 import type { CallEvent, CallSession } from "../../../domain/call-session";
 import { keyHex } from "../../../domain/chat-client";
+import { loadDevicePrefs } from "../../../domain/media-devices";
 import { callSocketUrl } from "../../../domain/transport";
 import { huddleRecipients } from "../../../domain/voice-session";
 import { buildParticipants } from "../../store/huddle-roster";
@@ -27,13 +29,18 @@ export interface WindowSessionView {
   status: HuddleStatus;
   muted: boolean;
   cameraOn: boolean;
+  sharing: boolean;
   canEncode: boolean;
   canDecode: boolean;
+  canScreenShare: boolean;
+  /** Transient camera/screen acquire failure — surfaced for a few seconds. */
+  mediaNote: "camera-failed" | "screen-failed" | null;
   participants: HuddleParticipant[];
   peers: Record<string, PeerBeacon>;
   memberNodes: Record<string, string>;
   setMuted(m: boolean): void;
   setCamera(on: boolean): void;
+  setScreenShare(on: boolean): void;
   bindPreview(el: HTMLVideoElement | null): void;
   bindTile(nodeHex: string, el: HTMLCanvasElement | null): void;
 }
@@ -49,13 +56,16 @@ export function useHuddleWindowSession(
 ): WindowSessionView | null {
   const [muted, setMutedState] = useState(true);
   const [cameraOn, setCameraOnState] = useState(false);
+  const [sharing, setSharingState] = useState(false);
   const [status, setStatus] = useState<HuddleStatus>("connecting");
   const [peers, setPeers] = useState<Record<string, PeerBeacon>>({});
   const [speaking, setSpeaking] = useState(false);
+  const [mediaNote, setMediaNote] = useState<"camera-failed" | "screen-failed" | null>(null);
   const [sessionStartMs, setSessionStartMs] = useState<number | null>(null);
   const [nowTick, setNowTick] = useState(() => Date.now());
 
   const sessionRef = useRef<CallSession | null>(null);
+  const mediaNoteTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const endedRef = useRef(onMediaEnded);
   endedRef.current = onMediaEnded;
 
@@ -82,9 +92,20 @@ export function useHuddleWindowSession(
         return;
       }
       if (e.kind === "selfVideo") {
-        // Authoritative camera state (e.g. a failed acquire) — the window can't
-        // screen-share yet, so `sharing` is ignored here.
+        // Authoritative lane state (a failed acquire, encoder death, the
+        // browser's own "Stop sharing") — mirrors both camera and share.
         setCameraOnState(e.cameraOn);
+        setSharingState(e.sharing);
+        return;
+      }
+      if (e.kind === "mediaNote") {
+        // Same transient surfacing as the dock: say why the toggle snapped back.
+        if (mediaNoteTimer.current !== null) clearTimeout(mediaNoteTimer.current);
+        setMediaNote(e.note);
+        mediaNoteTimer.current = setTimeout(() => {
+          mediaNoteTimer.current = null;
+          setMediaNote(null);
+        }, 5_000);
         return;
       }
       // Any terminal end (hard error or replaced) ends this float — the window
@@ -101,10 +122,16 @@ export function useHuddleWindowSession(
     setStatus("connecting");
     setPeers({});
     setCameraOnState(false);
+    setSharingState(false);
     setSpeaking(false);
+    setMediaNote(null);
     setMutedState(seedMuted);
     setSessionStartMs(Date.now());
     session.setMuted(seedMuted);
+    // The window session honors the same persisted device choices as main —
+    // same origin, same localStorage — so a pop-out never silently reverts to
+    // the system-default mic/camera.
+    session.setDevices(loadDevicePrefs());
     session.start(callSocketUrl(nodeUrl, channelId));
     return () => {
       session.stop();
@@ -134,7 +161,15 @@ export function useHuddleWindowSession(
   }, []);
   const setCamera = useCallback((on: boolean) => {
     sessionRef.current?.setCamera(on);
+    // Camera XOR screen: the session swaps the lane; mirror it optimistically
+    // (the settled selfVideo event corrects a failed acquire).
     setCameraOnState(on);
+    if (on) setSharingState(false);
+  }, []);
+  const setScreenShare = useCallback((on: boolean) => {
+    sessionRef.current?.setScreenShare(on);
+    setSharingState(on);
+    if (on) setCameraOnState(false);
   }, []);
   const bindPreview = useCallback((el: HTMLVideoElement | null) => sessionRef.current?.bindPreview(el), []);
   const bindTile = useCallback(
@@ -161,13 +196,17 @@ export function useHuddleWindowSession(
     status,
     muted,
     cameraOn,
+    sharing,
     canEncode: ctx.canEncode,
     canDecode: ctx.canDecode,
+    canScreenShare: ctx.canScreenShare,
+    mediaNote,
     participants,
     peers,
     memberNodes,
     setMuted,
     setCamera,
+    setScreenShare,
     bindPreview,
     bindTile,
   };

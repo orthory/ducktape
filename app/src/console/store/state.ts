@@ -43,9 +43,14 @@ export type ViewMode = "user" | "operator";
 export interface VoiceSlice {
   channelId: string | null;
   muted: boolean;
-  status: "idle" | "connecting" | "live" | "error";
+  /** "reconnecting" = the live session dropped unexpectedly and ONE automatic
+   *  media re-establish is in flight — consensus membership is kept. */
+  status: "idle" | "connecting" | "reconnecting" | "live" | "error";
   /** Why `status` is "error" — picks the dock's message. Null otherwise. */
   error: VoiceError | null;
+  /** A transient media failure note (camera/screen acquire failed) — shown for a
+   *  few seconds by the card surfaces, then auto-cleared. Never fatal. */
+  mediaNote: "camera-failed" | "screen-failed" | null;
   /** The huddle lives in its own desktop window right now — the in-app card
    *  yields to it (desktop only; see store/huddle-window.ts). */
   popped: boolean;
@@ -622,6 +627,7 @@ export const createInitialState = (): ConsoleState => {
       muted: false,
       status: "idle",
       error: null,
+      mediaNote: null,
       popped: false,
       cameraOn: false,
       sharing: false,

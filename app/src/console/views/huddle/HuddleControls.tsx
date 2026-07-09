@@ -68,6 +68,16 @@ function DevicesGlyph({ size = 15 }: { size?: number }) {
     </svg>
   );
 }
+/** Handset put down — leave the call. */
+function LeaveGlyph({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3.5 14.5c4.9-4.4 12.1-4.4 17 0" />
+      <path d="M6.2 12.2l-.4 3.2-3-.6" />
+      <path d="M17.8 12.2l.4 3.2 3-.6" />
+    </svg>
+  );
+}
 
 export function HuddleControls({
   size,
@@ -89,8 +99,8 @@ export function HuddleControls({
   const failed = status === "error";
   const comfortable = size === "comfortable";
   const h = comfortable ? 36 : 28;
-  const pad = comfortable ? "0 12px" : "0 10px";
-  const gap = comfortable ? 10 : 8;
+  const pad = comfortable ? "0 12px" : "0 6px";
+  const gap = comfortable ? 10 : 6;
 
   const btn = (extra: CSSProperties): CSSProperties => ({
     display: "flex",
@@ -105,6 +115,9 @@ export function HuddleControls({
     background: color.sunken,
     color: color.inkSoft,
     font: `600 ${comfortable ? 12 : 11.5}px ${font.sans}`,
+    // Never let the flex row squeeze a button below its content — a cramped
+    // bar must overflow into the container's layout, not clip its own labels.
+    flexShrink: 0,
     ...extra,
   });
 
@@ -138,7 +151,7 @@ export function HuddleControls({
             hoverStyle={{ filter: "brightness(1.05)" }}
           >
             <MicGlyph size={comfortable ? 16 : 15} muted={muted} />
-            {comfortable && <span>{muted ? "Muted" : "Mute"}</span>}
+            {comfortable && <span>Mic</span>}
           </HoverButton>
 
           {canEncode && onToggleCamera && (
@@ -150,7 +163,7 @@ export function HuddleControls({
               hoverStyle={{ filter: "brightness(1.05)" }}
             >
               <CameraGlyph size={comfortable ? 16 : 15} off={!cameraOn} />
-              {comfortable && <span>{cameraOn ? "Camera on" : "Camera"}</span>}
+              {comfortable && <span>Camera</span>}
             </HoverButton>
           )}
 
@@ -163,7 +176,7 @@ export function HuddleControls({
               hoverStyle={{ filter: "brightness(1.05)" }}
             >
               <ScreenGlyph size={comfortable ? 16 : 15} on={sharing} />
-              {comfortable && <span>{sharing ? "Sharing" : "Screen"}</span>}
+              {comfortable && <span>Screen</span>}
             </HoverButton>
           )}
 
@@ -181,7 +194,8 @@ export function HuddleControls({
       )}
 
       <HoverButton onClick={onLeave} title="Leave huddle" style={leaveBtn} hoverStyle={{ filter: "brightness(1.06)" }}>
-        Leave
+        <LeaveGlyph size={comfortable ? 16 : 15} />
+        {comfortable && <span>Leave</span>}
       </HoverButton>
     </div>
   );

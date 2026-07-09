@@ -18,6 +18,7 @@ import { isTauri } from "../../../domain/node-bootstrap";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "../chat/HoverButton";
+import { CardNotices } from "../chat/HuddleCard";
 import { CallTiles } from "./CallTiles";
 import { DevicesMenu } from "./DevicesMenu";
 import { HuddleControls } from "./HuddleControls";
@@ -125,7 +126,12 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
         <span style={{ font: `500 11px ${font.sans}`, color: color.muted2 }}>{participants.length} in call</span>
         <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
           <HoverButton
-            onClick={() => setMode(mode === "gallery" ? "spotlight" : "gallery")}
+            onClick={() => {
+              // Leaving spotlight also clears the pin, so the next spotlight
+              // follows the active speaker again instead of a stale choice.
+              if (mode === "spotlight") setPinned(null);
+              setMode(mode === "gallery" ? "spotlight" : "gallery");
+            }}
             title={mode === "gallery" ? "Spotlight view" : "Gallery view"}
             style={barBtn(false)}
             hoverStyle={{ background: color.hover }}
@@ -133,7 +139,7 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
             {mode === "gallery" ? <SpotlightGlyph /> : <GridGlyph />}
             {mode === "gallery" ? "Spotlight" : "Gallery"}
           </HoverButton>
-          {isTauri() && (
+          {isTauri() && live && (
             <HoverButton onClick={() => actions.popOutHuddle()} title="Pop out to a window" style={barBtn(false)} hoverStyle={{ background: color.hover }}>
               Pop out
             </HoverButton>
@@ -143,6 +149,21 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
           </HoverButton>
         </div>
       </div>
+
+      {/* the shared notice rows (error / muted-while-talking / media note),
+          centered over their own strip so the stage says the same things the
+          dock card does. */}
+      {(voice.status === "error" || (voice.muted && voice.speaking) || voice.mediaNote) && (
+        <div style={{ display: "flex", justifyContent: "center", padding: "8px 14px 0" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 260, maxWidth: 420 }}>
+            <CardNotices
+              failure={voice.status === "error" ? (voice.error ?? "connection") : null}
+              mutedWhileTalking={voice.muted && voice.speaking}
+              mediaNote={voice.mediaNote}
+            />
+          </div>
+        </div>
+      )}
 
       {/* tiles */}
       <div style={{ flex: 1, minHeight: 0, padding: 14, overflow: "auto" }}>
@@ -164,7 +185,9 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
             bindTile={bindTile}
             pinned={pinned}
             onPin={(key) => {
-              setPinned(key);
+              // Double-clicking the pinned tile again unpins (back to
+              // speaker-follow); any other tile moves the pin.
+              setPinned((prev) => (prev === key ? null : key));
               setMode("spotlight");
             }}
           />
@@ -177,26 +200,29 @@ export function HuddleStage({ onCollapse }: { onCollapse: () => void }) {
         </div>
       )}
 
-      {/* control bar — media controls */}
+      {/* control bar — media controls. The bar spans a fixed comfortable width
+          so Leave's own margin can actually isolate it at the far right. */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "12px 14px", borderTop: `1px solid ${color.borderSoft}` }}>
-        <HuddleControls
-          size="comfortable"
-          status={voice.status}
-          muted={voice.muted}
-          cameraOn={voice.cameraOn}
-          canEncode={videoCapability.canEncode}
-          cameraDisabledReason={overCap ? "Video is capped at 8 participants" : undefined}
-          sharing={voice.sharing}
-          canScreenShare={videoCapability.canScreenShare && !overCap}
-          onToggleScreen={() => actions.setScreenShare(!voice.sharing)}
-          onOpenDevices={() => setDevicesOpen((v) => !v)}
-          onToggleMute={() => actions.setHuddleMuted(!voice.muted)}
-          onToggleCamera={() => actions.setCamera(!voice.cameraOn)}
-          onLeave={() => actions.leaveHuddle()}
-          onRetry={() => {
-            if (voice.channelId) actions.joinHuddle(voice.channelId);
-          }}
-        />
+        <div style={{ flex: 1, maxWidth: 460 }}>
+          <HuddleControls
+            size="comfortable"
+            status={voice.status}
+            muted={voice.muted}
+            cameraOn={voice.cameraOn}
+            canEncode={videoCapability.canEncode}
+            cameraDisabledReason={overCap ? "Video is capped at 8 participants" : undefined}
+            sharing={voice.sharing}
+            canScreenShare={videoCapability.canScreenShare && !overCap}
+            onToggleScreen={() => actions.setScreenShare(!voice.sharing)}
+            onOpenDevices={() => setDevicesOpen((v) => !v)}
+            onToggleMute={() => actions.setHuddleMuted(!voice.muted)}
+            onToggleCamera={() => actions.setCamera(!voice.cameraOn)}
+            onLeave={() => actions.leaveHuddle()}
+            onRetry={() => {
+              if (voice.channelId) actions.joinHuddle(voice.channelId);
+            }}
+          />
+        </div>
       </div>
     </div>
   );

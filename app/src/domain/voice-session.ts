@@ -17,9 +17,17 @@ export const FRAME_SAMPLES = 960;
 export type VoiceStatus = "connecting" | "live" | "error" | "closed";
 
 /** Why a session failed — which message the dock shows. `mic-*` come from the
- *  capture graph (getUserMedia/worklet), `connection` from the call ws, and
- *  `refused` from a consensus join rejection (assigned by the caller). */
-export type VoiceError = "mic-denied" | "mic-missing" | "mic-failed" | "connection" | "refused";
+ *  capture graph (getUserMedia/worklet), `connection` from the call ws,
+ *  `refused` from a consensus join rejection, and `removed` when the finalized
+ *  roster dropped us while the session was live — a sweep by another member, or
+ *  another device of this identity leaving (both assigned by the caller). */
+export type VoiceError =
+  | "mic-denied"
+  | "mic-missing"
+  | "mic-failed"
+  | "connection"
+  | "refused"
+  | "removed";
 
 // ── Pure helpers (tested) ───────────────────────────────
 
