@@ -1,0 +1,130 @@
+# ADR: Desktop Node-Control Boundary
+
+Date: 2026-07-10. Status: **Accepted**. The Tauri shell must never execute or
+wait on `ducktape-node` from an IPC command handler or a Tauri async-runtime
+worker. Node control is serialized through one bounded, dedicated actor.
+
+## Context
+
+The desktop is intentionally a pure UI shell over a separate node process. It
+does, however, need to create and join workspaces, drive membership ceremonies,
+perform user-key custody operations, and start the selected workspace node.
+Those operations were implemented as synchronous `std::process::Command`
+calls inside Tauri command handlers.
+
+A synchronous Tauri command is scheduled through Tauri's async runtime. A
+single slow child therefore occupies a runtime worker; repeated invokes can
+occupy the pool, race registry/key load-modify-save sequences, and make the app
+appear stopped. Merely changing the Rust function to `async fn` does not make a
+blocking process wait asynchronous.
+
+The boundary also has architectural constraints:
+
+- Workspace configuration, governance ceremonies, key formats, and signature
+  preimages have one source of truth in `ducktape-node`. The shell must not
+  import host/module/crypto internals or reimplement those rules.
+- Passwords and recovery phrases cross the node boundary through stdin, never
+  argv or environment variables.
+- The selected workspace node is intentionally detached and outlives a hidden
+  console window. A real app quit stops it through the recorded pid.
+- The existing loopback RPC is a low-level, unauthenticated node protocol. It
+  is not yet a safe desktop administration API, and its CLI callers currently
+  own multi-step governance orchestration.
+
+## Decision
+
+All blocking node control goes through `daemon::NodeControl`, a bounded actor
+on one named OS thread:
+
+```text
+main webview -> async Tauri adapter --+
+                                     +-> bounded NodeControl actor -> fixed node sidecar
+phone enrollment server ------------+                           \-> detached workspace node
+```
+
+The command adapters authorize the originating window, move owned inputs into
+a backend closure, enqueue it without waiting for queue capacity, and
+asynchronously await a one-shot result. The actor has these invariants:
+
+- One operation runs at a time. Registry mutations and user-key custody cannot
+  race each other.
+- The queue holds at most 32 jobs. A full or unavailable queue fails fast
+  instead of retaining an unbounded backlog of closures and secrets.
+- A job waiting 30 seconds expires before execution, and a job whose command
+  future was cancelled is skipped. Stale UI intents cannot execute minutes
+  later merely because earlier node calls timed out.
+- A job panic becomes a content-free error and does not kill the actor.
+- The LAN enrollment server uses the same actor, so it cannot create a second
+  node execution lane.
+
+Only `daemon.rs` can resolve or execute the node binary. Command modules can
+request a fixed backend operation, but cannot obtain an executable path (the
+diagnostics surface receives only a display string). Resolution canonicalizes
+the configured sibling/override; on Unix it rejects missing, empty,
+non-regular, non-executable, untrusted-owner, world-writable, or
+untrusted-group-writable targets and replaceable/untrusted ancestor
+directories. A current-user-owned primary-group development tree remains
+usable. Resolution never searches `PATH` or falls back to a legacy binary. No
+shell parses arguments.
+
+Short-lived verbs have a 30-second deadline and are killed and reaped on
+expiry. Stdout and stderr are drained concurrently to avoid pipe deadlock,
+retained up to 1 MiB each, and rejected when truncated. Argument count/bytes
+and secret stdin bytes are bounded; NUL and line-delimiter injection is
+rejected. Secret buffers and the in-process password cache use `zeroize` before
+release. Workspace/identity/signing commands and enrollment controls accept
+invokes only from the `main` webview, so the tray and huddle webviews cannot
+use this authority or read workspace diagnostics.
+
+The obsolete `daemon_spawn` IPC command and the legacy binary/config fallback
+are removed. The selected workspace still starts as a detached child, but that
+spawn and its readiness wait run inside the same actor rather than a Tauri
+worker.
+
+## Alternatives considered
+
+- **Mark the existing handlers async.** Rejected: `Command::spawn`, polling,
+  sleeps, filesystem work, and pipe joins remain blocking inside an async
+  function.
+- **Use one `spawn_blocking` task per invoke.** Rejected: without a hard
+  admission bound, repeated invokes can still consume the blocking pool and
+  retain unbounded secret-bearing requests. It also does not serialize
+  registry/key mutation.
+- **Import node crates into the desktop and call them in-process.** Rejected:
+  this collapses the pure-shell boundary, duplicates custody responsibility,
+  and couples the desktop to host/module internals. A panic or expensive crypto
+  operation would again share the app process.
+- **Call the current raw loopback RPC directly.** Rejected for now: it is
+  unauthenticated and exposes low-level steps, while the CLI owns the complete
+  governance ceremonies. Reimplementing those ceremonies in Tauri would add a
+  second, security-sensitive source of truth.
+
+## Future transport
+
+The more elegant end state is a versioned, high-level local administration API
+owned by the node: intent-shaped requests such as `CreateWorkspace`,
+`AdmitMember`, and `SignAddMember`, with request ids, deadlines, cancellation,
+bounded admission, and stable typed errors. It should use an authenticated
+local transport: Unix-domain sockets with peer/permission checks and Windows
+named pipes, or a loopback endpoint gated by a per-process 256-bit capability
+token. Secret fields must remain out of argv and logs.
+
+`NodeControl` is the migration seam. Its command-facing API and admission
+policy remain; individual operations can switch from the short-lived CLI to
+that administration transport without changing the webview IPC surface or
+moving crypto into Tauri.
+
+## Consequences
+
+Short-lived CLI processes still exist because they preserve the current source
+of truth, but no Tauri handler/runtime worker executes or waits for them. One
+wedged verb can delay other node-control work for at most its deadline; it
+cannot stop window/event processing or grow work without bound. Serialization
+reduces concurrency intentionally in exchange for deterministic registry/key
+mutation and a small, auditable execution surface.
+
+The boundary is guarded by unit tests for dedicated-thread execution,
+serialization, panic recovery, queue backpressure, process deadlines, binary
+permissions, bounded output, secret-input delimiters, and enrollment input
+shapes. Native-window QA remains the release gate for proving the UI continues
+to pump while node control is busy.

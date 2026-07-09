@@ -2,12 +2,13 @@
 //!
 //! the node no longer lives in this process. the shell's jobs beyond the
 //! webview are the `~/.ducktape` WORKSPACE REGISTRY (see [`workspaces`]) — found
-//! or join networks, allocate ports, drive the node's onboarding verbs, and
-//! spawn the selected workspace's node DETACHED (its own process group, stdio
-//! to `daemon.log`) so closing the console window only hides to the menu-bar
-//! app instead of killing the network. a real app quit (tray Quit / Cmd-Q /
-//! OS exit) stops the active managed node through the workspace pidfile before
-//! the shell exits.
+//! or join networks and allocate ports. A bounded, dedicated node-control actor
+//! drives onboarding/custody verbs and spawns the selected workspace's node
+//! DETACHED (its own process group, stdio to `daemon.log`), so Tauri runtime
+//! workers never execute or wait on the node binary. Closing the console window
+//! only hides to the menu-bar app instead of killing the network. A real app
+//! quit (tray Quit / Cmd-Q / OS exit) stops the active managed node through the
+//! workspace pidfile before the shell exits.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -21,9 +22,10 @@ mod user_identity;
 mod workspaces;
 
 fn main() {
+    let node_control = daemon::NodeControl::new().expect("start desktop node-control actor");
     let mut builder = tauri::Builder::default()
+        .manage(node_control)
         .invoke_handler(tauri::generate_handler![
-            daemon::daemon_spawn,
             workspaces::workspace_list,
             workspaces::workspace_active,
             workspaces::workspace_create,

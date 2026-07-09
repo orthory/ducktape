@@ -16,16 +16,15 @@
 //! key the user must still approve. The token, the bind-only-during-enrollment
 //! lifetime, and the strict input validation are defense-in-depth on top.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read as _};
 use std::net::{IpAddr, UdpSocket};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-use crate::workspaces::{last_line, run_verb};
+use crate::daemon::{NodeControl, last_line, require_main_window, run_verb};
 
 // ── session state ────────────────────────────────────────
 
@@ -43,7 +42,7 @@ struct EnrollState {
     chain_id: String,
     account_id: String,
     nonce: u64,
-    node_bin: PathBuf,
+    control: NodeControl,
     server: Arc<Server>,
     result: Option<Possession>,
 }
@@ -83,15 +82,19 @@ struct PossessionReq {
 /// are sent) and read back which local interface the OS would route through.
 fn lan_ipv4() -> Result<IpAddr, String> {
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("udp bind: {e}"))?;
-    sock.connect("8.8.8.8:80").map_err(|e| format!("udp connect: {e}"))?;
-    Ok(sock.local_addr().map_err(|e| format!("local addr: {e}"))?.ip())
+    sock.connect("8.8.8.8:80")
+        .map_err(|e| format!("udp connect: {e}"))?;
+    Ok(sock
+        .local_addr()
+        .map_err(|e| format!("local addr: {e}"))?
+        .ip())
 }
 
 /// a 128-bit hex session token from OS randomness.
-fn random_token() -> String {
+fn random_token() -> Result<String, String> {
     let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).expect("os rng");
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    getrandom::getrandom(&mut buf).map_err(|err| format!("os randomness: {err}"))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// hex bytes only — reject anything else before it reaches the node verb.
@@ -99,22 +102,49 @@ fn is_hex(s: &str) -> bool {
     !s.is_empty() && s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn token_matches(expected: &str, supplied: &str) -> bool {
+    let expected = expected.as_bytes();
+    let supplied = supplied.as_bytes();
+    let mut different = expected.len() ^ supplied.len();
+    for (index, byte) in expected.iter().enumerate() {
+        different |= usize::from(*byte ^ supplied.get(index).copied().unwrap_or(0));
+    }
+    different == 0
+}
+
+fn valid_p256_key(value: &str) -> bool {
+    value.len() == 66 && is_hex(value) && (value.starts_with("02") || value.starts_with("03"))
+}
+
+fn valid_compact_p256_signature(value: &str) -> bool {
+    value.len() == 128 && is_hex(value)
+}
+
+fn header(name: &[u8], value: &[u8]) -> Header {
+    Header::from_bytes(name, value).expect("static response header")
+}
+
 fn json(body: String) -> Response<Cursor<Vec<u8>>> {
-    Response::from_string(body).with_header(
-        Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("header"),
-    )
+    Response::from_string(body)
+        .with_header(header(b"Content-Type", b"application/json"))
+        .with_header(header(b"Cache-Control", b"no-store"))
+        .with_header(header(b"X-Content-Type-Options", b"nosniff"))
 }
 fn html(body: &str) -> Response<Cursor<Vec<u8>>> {
-    Response::from_string(body).with_header(
-        Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
-            .expect("header"),
-    )
+    Response::from_string(body)
+        .with_header(header(b"Content-Type", b"text/html; charset=utf-8"))
+        .with_header(header(b"Cache-Control", b"no-store"))
+        .with_header(header(b"X-Content-Type-Options", b"nosniff"))
+        .with_header(header(
+            b"Content-Security-Policy",
+            b"default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'",
+        ))
 }
 fn js(body: &str) -> Response<Cursor<Vec<u8>>> {
-    Response::from_string(body).with_header(
-        Header::from_bytes(&b"Content-Type"[..], &b"text/javascript; charset=utf-8"[..])
-            .expect("header"),
-    )
+    Response::from_string(body)
+        .with_header(header(b"Content-Type", b"text/javascript; charset=utf-8"))
+        .with_header(header(b"Cache-Control", b"no-store"))
+        .with_header(header(b"X-Content-Type-Options", b"nosniff"))
 }
 fn status(code: u16) -> Response<Cursor<Vec<u8>>> {
     Response::from_string("").with_status_code(code)
@@ -156,9 +186,17 @@ fn handle(req: &mut Request) -> Response<Cursor<Vec<u8>>> {
     }
 }
 
+const MAX_REQUEST_BODY_BYTES: u64 = 8 * 1024;
+
 fn read_json<T: for<'de> Deserialize<'de>>(req: &mut Request) -> Option<T> {
     let mut body = String::new();
-    req.as_reader().read_to_string(&mut body).ok()?;
+    req.as_reader()
+        .take(MAX_REQUEST_BODY_BYTES + 1)
+        .read_to_string(&mut body)
+        .ok()?;
+    if body.len() as u64 > MAX_REQUEST_BODY_BYTES {
+        return None;
+    }
     serde_json::from_str(&body).ok()
 }
 
@@ -168,29 +206,43 @@ fn payload(req: &mut Request) -> Response<Cursor<Vec<u8>>> {
     let Some(body) = read_json::<PayloadReq>(req) else {
         return status(400);
     };
-    let guard = state();
-    let Some(s) = guard.as_ref() else {
-        return status(410);
+    let (control, chain_id, account_id, nonce) = {
+        let guard = state();
+        let Some(s) = guard.as_ref() else {
+            return status(410);
+        };
+        if !token_matches(&s.token, &body.token) || !valid_p256_key(&body.new_key) {
+            return status(403);
+        }
+        (
+            s.control.clone(),
+            s.chain_id.clone(),
+            s.account_id.clone(),
+            s.nonce,
+        )
     };
-    if body.token != s.token || !is_hex(&body.new_key) {
-        return status(403);
-    }
-    let out = run_verb(
-        &s.node_bin,
-        &[
+    let new_key = body.new_key;
+    let out = control.run_blocking(move || {
+        run_verb(&[
             "user-p256-payload",
             "--chain-id",
-            &s.chain_id,
+            &chain_id,
             "--account-id",
-            &s.account_id,
+            &account_id,
             "--new-key",
-            &body.new_key,
+            &new_key,
             "--nonce",
-            &s.nonce.to_string(),
-        ],
-    );
+            &nonce.to_string(),
+        ])
+    });
     match out {
-        Ok(out) => json(format!(r#"{{"payload":"{}"}}"#, last_line(&out))),
+        Ok(out) => {
+            let payload = last_line(&out);
+            if payload.len() > 2048 || !is_hex(&payload) {
+                return status(500);
+            }
+            json(serde_json::json!({ "payload": payload }).to_string())
+        }
         Err(_) => status(500),
     }
 }
@@ -205,7 +257,10 @@ fn possession(req: &mut Request) -> Response<Cursor<Vec<u8>>> {
     let Some(s) = guard.as_mut() else {
         return status(410);
     };
-    if body.token != s.token || !is_hex(&body.new_key) || !is_hex(&body.sig) {
+    if !token_matches(&s.token, &body.token)
+        || !valid_p256_key(&body.new_key)
+        || !valid_compact_p256_signature(&body.sig)
+    {
         return status(403);
     }
     s.result = Some(Possession {
@@ -230,15 +285,20 @@ fn serve(server: Arc<Server>) {
 /// its current nonce (the caller reads it from the chain).
 #[tauri::command]
 pub fn enroll_start(
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
     chain_id: String,
     account_id: String,
     nonce: u64,
 ) -> Result<EnrollStart, String> {
-    if !is_hex(&account_id) {
+    require_main_window(&window)?;
+    if chain_id.is_empty() || chain_id.len() > 256 {
+        return Err("chain_id must be between 1 and 256 bytes".into());
+    }
+    if account_id.len() > 130 || !is_hex(&account_id) {
         return Err("account_id must be hex".into());
     }
-    let node_bin = crate::daemon::resolve_node_bin()?;
-    let token = random_token();
+    let token = random_token()?;
     let ip = lan_ipv4()?;
     let server = Arc::new(Server::http("0.0.0.0:0").map_err(|e| format!("bind: {e}"))?);
     let port = server
@@ -257,7 +317,7 @@ pub fn enroll_start(
             chain_id,
             account_id,
             nonce,
-            node_bin,
+            control: control.inner().clone(),
             server: server.clone(),
             result: None,
         });
@@ -274,7 +334,12 @@ pub fn enroll_start(
 /// poll for the phone's result. returns `null` until the phone posts its
 /// signature; then the caller signs the add-member authorizer + submits.
 #[tauri::command]
-pub fn enroll_poll() -> Option<(String, String)> {
+pub fn enroll_poll(window: tauri::WebviewWindow) -> Result<Option<(String, String)>, String> {
+    require_main_window(&window)?;
+    Ok(enroll_poll_inner())
+}
+
+fn enroll_poll_inner() -> Option<(String, String)> {
     state()
         .as_ref()
         .and_then(|s| s.result.clone())
@@ -283,7 +348,13 @@ pub fn enroll_poll() -> Option<(String, String)> {
 
 /// tear the enrollment server down (on success, cancel, or leaving the screen).
 #[tauri::command]
-pub fn enroll_cancel() {
+pub fn enroll_cancel(window: tauri::WebviewWindow) -> Result<(), String> {
+    require_main_window(&window)?;
+    enroll_cancel_inner();
+    Ok(())
+}
+
+fn enroll_cancel_inner() {
     if let Some(s) = state().take() {
         s.server.unblock();
     }
@@ -304,6 +375,22 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_auth_and_crypto_fields_are_strictly_shaped() {
+        assert!(token_matches("0123456789abcdef", "0123456789abcdef"));
+        assert!(!token_matches("0123456789abcdef", "0123456789abcdee"));
+        assert!(!token_matches("0123456789abcdef", "0123456789abcdef00"));
+        assert!(!token_matches("0123456789abcdef", "01234567"));
+
+        let compressed = format!("02{}", "11".repeat(32));
+        assert!(valid_p256_key(&compressed));
+        assert!(valid_p256_key(&format!("03{}", "aa".repeat(32))));
+        assert!(!valid_p256_key(&format!("04{}", "11".repeat(32))));
+        assert!(!valid_p256_key(&format!("02{}", "11".repeat(31))));
+        assert!(valid_compact_p256_signature(&"22".repeat(64)));
+        assert!(!valid_compact_p256_signature(&"22".repeat(63)));
+    }
+
+    #[test]
     fn server_serves_the_page_gates_on_token_and_stores_possession() {
         use std::io::{Read, Write};
         use std::net::TcpStream;
@@ -315,7 +402,7 @@ mod tests {
             chain_id: "chain".into(),
             account_id: "aa".into(),
             nonce: 0,
-            node_bin: PathBuf::from("/nonexistent"), // /payload isn't exercised here
+            control: NodeControl::new().unwrap(), // /payload isn't exercised here
             server: server.clone(),
             result: None,
         });
@@ -341,19 +428,36 @@ mod tests {
         // the page + its bundled signer are served.
         let page = req("GET /enroll HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         assert!(page.contains("200 OK") && page.contains("Add this device"));
-        assert!(req("GET /e.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").contains("200 OK"));
+        assert!(
+            req("GET /e.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").contains("200 OK")
+        );
+
+        let new_key = format!("02{}", "11".repeat(32));
+        let sig = "22".repeat(64);
 
         // a wrong token is refused and stores nothing.
-        assert!(req(&post("/possession", r#"{"token":"nope","new_key":"00ff","sig":"aabb"}"#))
-            .contains("403"));
-        assert!(enroll_poll().is_none());
+        let wrong = serde_json::json!({ "token": "nope", "new_key": new_key, "sig": sig });
+        assert!(req(&post("/possession", &wrong.to_string())).contains("403"));
+        assert!(enroll_poll_inner().is_none());
+
+        // oversized bodies are refused before JSON parsing or state mutation.
+        let oversized = "x".repeat(MAX_REQUEST_BODY_BYTES as usize + 1);
+        assert!(req(&post("/possession", &oversized)).contains("400"));
+        assert!(enroll_poll_inner().is_none());
 
         // the right token stores the possession for enroll_poll to hand off.
-        assert!(req(&post("/possession", r#"{"token":"tok123","new_key":"00ff","sig":"aabb"}"#))
-            .contains("200 OK"));
-        assert_eq!(enroll_poll(), Some(("00ff".into(), "aabb".into())));
+        let accepted = serde_json::json!({
+            "token": "tok123",
+            "new_key": new_key,
+            "sig": sig,
+        });
+        assert!(req(&post("/possession", &accepted.to_string())).contains("200 OK"));
+        assert_eq!(
+            enroll_poll_inner(),
+            Some((new_key.to_string(), sig.to_string()))
+        );
 
-        enroll_cancel();
+        enroll_cancel_inner();
         let _ = handle.join();
     }
 }
