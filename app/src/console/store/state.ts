@@ -316,6 +316,11 @@ export interface ConsoleState {
 
 export const DEFAULT_ACCENT = "#a05a3c";
 
+/** The boot placeholder author. The provider replaces it with the chain's
+ *  resolved name for our own node as soon as one hydrates — only a name the
+ *  USER typed (≠ this placeholder) is ever kept over the chain's. */
+export const DEFAULT_AUTHOR = "operator";
+
 // ── Accent persistence ──────────────────────────────────
 //
 // The chosen accent survives restarts. Values are validated as #rrggbb on
@@ -509,7 +514,7 @@ export const createInitialState = (): ConsoleState => {
     screen: viewMode === "operator" ? DEFAULT_OPERATOR_SCREEN : DEFAULT_USER_SCREEN,
     viewMode,
     accent: loadAccent(),
-    author: "operator",
+    author: DEFAULT_AUTHOR,
     connected: false,
     nodeUrl: null,
     managed: false,
