@@ -742,3 +742,129 @@ fn an_endpoint_less_record_signs_verifies_and_stays_wire_compatible() {
         "a stripped endpoint must break the owner signature"
     );
 }
+
+#[test]
+fn duplicate_requested_allowed_ips_is_rejected_even_though_the_signature_verifies() {
+    // The signed preimage sorts+dedups allowed-ips, so a request that REPEATS a
+    // canonical route keeps the SAME hash and a valid signature — yet the effect
+    // layer would materialize every entry into the WireGuard peer config. The
+    // validator must reject the duplicate-bearing vector. A legitimate request
+    // carries the canonical singleton (OverlayPolicy::allowed_ips_for returns one
+    // route), so this guard can never reject an honest upgrade.
+    let (a, b, set, view, policy) = mesh();
+    let overlay = OverlayPolicy::default_v4();
+
+    let canonical = overlay.allowed_ips_for(&view, id(&b)).unwrap();
+    assert_eq!(canonical.len(), 1, "canonical overlay routes are a singleton");
+
+    let request = TunnelUpgradeRequest::sign(
+        TunnelUpgradeRequestFields {
+            namespace: set.namespace.clone(),
+            epoch: set.epoch,
+            valset_root: set.valset_root,
+            admission_root: set.admission_root,
+            mesh_version: view.mesh_version,
+            initiator_identity: id(&a),
+            responder_identity: id(&b),
+            initiator_wireguard_public_key: xkey(1),
+            initiator_wireguard_endpoint: view.record(id(&a)).unwrap().wireguard_endpoint,
+            requested_allowed_ips: canonical.clone(),
+            port_policy_hash: policy.hash(),
+            expires_at_view: 40,
+            nonce: 1,
+        },
+        &a,
+    );
+    let response = TunnelUpgradeResponse::sign(
+        TunnelUpgradeResponseFields {
+            request_hash: request.hash(),
+            namespace: set.namespace.clone(),
+            epoch: set.epoch,
+            valset_root: set.valset_root,
+            admission_root: set.admission_root,
+            mesh_version: view.mesh_version,
+            responder_identity: id(&b),
+            initiator_identity: id(&a),
+            responder_wireguard_public_key: xkey(2),
+            responder_wireguard_endpoint: view.record(id(&b)).unwrap().wireguard_endpoint,
+            accepted_allowed_ips: overlay.allowed_ips_for(&view, id(&a)).unwrap(),
+            relay_candidates: view.relay_candidates(),
+            direct_dial_failure: Some(direct_dial_failure(
+                &a,
+                &set,
+                &view,
+                id(&b),
+                view.record(id(&b)).unwrap().wireguard_endpoint.unwrap(),
+                4,
+            )),
+            keepalive_seconds: Some(25),
+            expires_at_view: 40,
+            nonce: 2,
+        },
+        &b,
+    );
+    let ack = TunnelUpgradeAck::sign(
+        TunnelUpgradeAckFields {
+            request_hash: request.hash(),
+            response_hash: response.hash(),
+            namespace: set.namespace.clone(),
+            epoch: set.epoch,
+            valset_root: set.valset_root,
+            admission_root: set.admission_root,
+            mesh_version: view.mesh_version,
+            initiator_identity: id(&a),
+            responder_identity: id(&b),
+            installed_at_view: 11,
+            expires_at_view: 40,
+            nonce: 3,
+        },
+        &a,
+    );
+
+    // Sanity: the canonical (singleton) request validates.
+    validate_upgrade(
+        &view,
+        &policy,
+        &overlay,
+        12,
+        &request,
+        &response,
+        &ack,
+        &mut ReplayCache::default(),
+    )
+    .expect("the canonical request validates");
+
+    // Repeat the single canonical route. The dedup'd signing preimage makes the
+    // hash and signature UNCHANGED, so the response/ack still match — only the
+    // stored vector now carries a duplicate.
+    let mut dup = canonical.clone();
+    dup.push(canonical[0]);
+    let request_dup = TunnelUpgradeRequest::sign(
+        TunnelUpgradeRequestFields {
+            requested_allowed_ips: dup,
+            ..request.fields.clone()
+        },
+        &a,
+    );
+    assert_eq!(
+        request_dup.hash(),
+        request.hash(),
+        "the dedup'd signing preimage makes a duplicate hash-invariant"
+    );
+
+    let err = validate_upgrade(
+        &view,
+        &policy,
+        &overlay,
+        12,
+        &request_dup,
+        &response,
+        &ack,
+        &mut ReplayCache::default(),
+    )
+    .expect_err("a duplicate-bearing allowed-ips vector must be rejected");
+    assert!(
+        matches!(err, UpgradeError::InvalidAllowedIp),
+        "expected InvalidAllowedIp, got {err:?}"
+    );
+}

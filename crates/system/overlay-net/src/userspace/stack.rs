@@ -517,3 +517,76 @@ async fn sleep_maybe(delay: Option<Duration>) {
         None => std::future::pending().await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lone stack with live but unread device channels (kept open by returning
+    /// their far ends), so a dial to a peer with no route parks in SynSent.
+    fn test_stack() -> (VirtualStack, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        let (to_stack, from_device) = mpsc::channel::<Vec<u8>>(16);
+        let (to_device, from_stack) = mpsc::channel::<Vec<u8>>(16);
+        let stack = VirtualStack::spawn(
+            &tokio::runtime::Handle::current(),
+            Ipv6Addr::new(0xfda2, 0, 0, 0, 0, 0, 0, 1),
+            48,
+            from_device,
+            to_device,
+        );
+        (stack, to_stack, from_stack)
+    }
+
+    fn socket_count(stack: &VirtualStack) -> usize {
+        stack.shared.lock().sockets.iter().count()
+    }
+
+    #[tokio::test]
+    async fn cancelled_connect_tcp_does_not_leak_a_socket() {
+        // Regression for the cancel-safety fix: a connect_tcp future dropped
+        // before it resolves (e.g. wrapped in a timeout) must not leave its
+        // half-open smoltcp socket behind. Without the drop guard the socket
+        // added before the await leaked on every cancellation.
+        let (stack, _to_stack, _from_stack) = test_stack();
+        let before = socket_count(&stack);
+        let dead = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfda2, 0, 0, 0, 0, 0, 0, 0x99)),
+            8443,
+        );
+        // Cancel the dial by dropping its future when the timeout fires.
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(150), stack.connect_tcp(dead)).await;
+        assert!(
+            cancelled.is_err(),
+            "the connect must still be pending (no route) when cancelled"
+        );
+        // Let the drop guard run and the poll loop settle.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            socket_count(&stack),
+            before,
+            "a cancelled connect_tcp must not leak its half-open socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_cancelled_connects_do_not_accumulate_sockets() {
+        // The leak's real danger is accumulation toward ephemeral exhaustion:
+        // many cancelled dials must all be reclaimed, not pile up.
+        let (stack, _to_stack, _from_stack) = test_stack();
+        let before = socket_count(&stack);
+        for _ in 0..8 {
+            let dead = SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0xfda2, 0, 0, 0, 0, 0, 0, 0x99)),
+                8443,
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(30), stack.connect_tcp(dead)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            socket_count(&stack),
+            before,
+            "eight cancelled connects must all be reclaimed"
+        );
+    }
+}
