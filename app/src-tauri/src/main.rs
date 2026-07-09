@@ -15,6 +15,7 @@ mod daemon;
 mod forge_git;
 mod huddle;
 mod menu;
+mod notify;
 mod tray;
 mod user_identity;
 mod workspaces;
