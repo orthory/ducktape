@@ -120,7 +120,29 @@ describe("HuddleCard body", () => {
         participants={[]}
       />,
     );
-    expect(screen.getByText(/system settings/i)).toBeTruthy();
+    // jsdom is not the mac desktop shell: the platform-aware mic-denied copy
+    // must not send the user to a macOS-only System Settings pane here.
+    expect(screen.getByText(/mic access is blocked/i)).toBeTruthy();
+    expect(screen.queryByText(/system settings/i)).toBeNull();
     expect(screen.queryByText("Retry")).toBeNull();
+  });
+
+  it("routes mic-denied through System Settings on the mac desktop shell", async () => {
+    // The copy is chosen at module load, so the mac variant needs the platform
+    // predicate mocked before a fresh import of the module under test.
+    vi.resetModules();
+    vi.doMock("../../../domain/node-bootstrap", () => ({ isMacDesktop: () => true }));
+    const { HuddleCard: MacHuddleCard } = await import("./HuddleCard");
+    render(
+      <MacHuddleCard
+        {...baseProps}
+        status="error"
+        error="mic-denied"
+        participants={[]}
+      />,
+    );
+    expect(screen.getByText(/system settings/i)).toBeTruthy();
+    vi.doUnmock("../../../domain/node-bootstrap");
+    vi.resetModules();
   });
 });

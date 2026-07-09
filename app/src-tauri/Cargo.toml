@@ -26,3 +26,10 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 # registration is cfg-gated to debug + desktop in main.rs so a release runtime
 # registers nothing.
 tauri-plugin-agent = "0.0.1"
+
+# WebKitGTK asks the EMBEDDER to decide getUserMedia permission (no OS prompt
+# exists), and neither tauri nor wry answers — unhandled requests are denied, so
+# huddle mic/camera would always fail NotAllowedError. huddle.rs::allow_user_media
+# grants them. Same crate+version wry already compiles; adds no system deps.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = "2.0"
