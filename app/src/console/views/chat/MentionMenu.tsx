@@ -4,7 +4,7 @@
 // so a downward menu would render off-screen.
 
 import { color, font, radius, shadow } from "../../theme/tokens";
-import type { MentionCandidate } from "./mention";
+import { mentionCandidateToken, type MentionCandidate } from "./mention";
 
 export function MentionMenu({
   candidates,
@@ -13,7 +13,7 @@ export function MentionMenu({
 }: {
   candidates: MentionCandidate[];
   activeIndex: number;
-  onPick: (handle: string) => void;
+  onPick: (token: string) => void;
 }) {
   if (candidates.length === 0) return null;
   return (
@@ -42,7 +42,7 @@ export function MentionMenu({
           candidate.kind === "user"
             ? candidate.label
             : candidate.agent.display_name || candidate.agent.agent_id;
-        const handle = candidate.kind === "user" ? candidate.handle : candidate.agent.agent_id;
+        const token = mentionCandidateToken(candidate);
         return (
           <button
             key={key}
@@ -52,7 +52,7 @@ export function MentionMenu({
             onMouseDown={(event) => {
               // mousedown, not click: the textarea must not blur first.
               event.preventDefault();
-              onPick(handle);
+              onPick(token);
             }}
             style={{
               all: "unset",
@@ -87,7 +87,7 @@ export function MentionMenu({
                 flexShrink: 0,
               }}
             >
-              @{handle}
+              @{token}
             </span>
           </button>
         );

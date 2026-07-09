@@ -14,18 +14,15 @@ import { HoverButton } from "./HoverButton";
 import { MentionMenu } from "./MentionMenu";
 import {
   insertMention,
+  mentionCandidateToken,
   mentionableUsers,
   mentionCandidatesAll,
   mentionTokenAt,
-  type MentionCandidate,
 } from "./mention";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 
 const DEFAULT_MAX_HEIGHT = 168;
 const EMPTY_NODE_USERS: Record<string, { userKey: string; name: string | null }> = {};
-
-const mentionCandidateHandle = (candidate: MentionCandidate): string =>
-  candidate.kind === "user" ? candidate.handle : candidate.agent.agent_id;
 
 function FmtButton({
   label,
@@ -119,10 +116,10 @@ export function Composer({
     onChange(next);
   };
 
-  const pickMention = (handle: string) => {
+  const pickMention = (token: string) => {
     if (!mentionToken) return;
     const el = ref.current;
-    const next = insertMention(value, mentionToken, el?.selectionStart ?? caret, handle);
+    const next = insertMention(value, mentionToken, el?.selectionStart ?? caret, token);
     pendingSelection.current = [next.caret, next.caret];
     setCaret(next.caret);
     setMentionIndex(0);
@@ -224,7 +221,7 @@ export function Composer({
       if (event.key === "Enter" || event.key === "Tab") {
         event.preventDefault();
         pickMention(
-          mentionCandidateHandle(menuCandidates[Math.min(mentionIndex, menuCandidates.length - 1)]!),
+          mentionCandidateToken(menuCandidates[Math.min(mentionIndex, menuCandidates.length - 1)]!),
         );
         return;
       }

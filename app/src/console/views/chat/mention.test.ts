@@ -111,6 +111,27 @@ describe("mentionableUsers", () => {
       mentionableUsers({ node1: { userKey: jessKey, name: "Jess K" } }, [agent("jess-k", "Jess Agent")]),
     ).toEqual([{ kind: "user", userKeyHex: jessKey, handle: "jess-k-2", label: "Jess K" }]);
   });
+
+  it("suffixes handles when distinct users' display names slugify identically", () => {
+    const users = mentionableUsers(
+      {
+        node1: { userKey: jessKey, name: "Jess K" },
+        node2: { userKey: fallbackKey, name: "Jess K" },
+      },
+      [],
+    );
+
+    expect(users.map((user) => user.handle)).toEqual(["jess-k", "jess-k-2"]);
+  });
+
+  it("falls back to short hex when a symbols-only name has an empty slug", () => {
+    const [user] = mentionableUsers(
+      { node1: { userKey: fallbackKey, name: "!!!" } },
+      [],
+    );
+
+    expect(user?.handle).toBe(fallbackKey.slice(0, 8));
+  });
 });
 
 describe("mentionCandidatesAll", () => {
@@ -179,6 +200,18 @@ describe("mentionResolverOf", () => {
       agent: { module: "runs", agent_id: "quackbot" },
     });
     expect(resolver.has("paused-bot")).toBe(false);
+  });
+
+  it("gives an active agent precedence when a user handle collides with its agent_id", () => {
+    const jessKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const resolver = mentionResolverOf(
+      [agent("jess-k", "Jess Agent")],
+      [{ kind: "user", userKeyHex: jessKey, handle: "jess-k", label: "Jess K" }],
+    );
+
+    expect(resolver.get("jess-k")).toEqual({
+      agent: { module: "runs", agent_id: "jess-k" },
+    });
   });
 });
 

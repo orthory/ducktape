@@ -222,6 +222,20 @@ describe("Composer @mention typeahead", () => {
     expect((textarea as HTMLTextAreaElement).value).toBe("@jess-example ");
   });
 
+  it("Enter picks a person and inserts the user's handle", () => {
+    const { textarea, onSend } = setup(vi.fn(), {
+      nodeUsers: {
+        "01": { userKey: "ABCDEF1234567890", name: "Jess Example" },
+      },
+    });
+
+    type(textarea, "@je");
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect((textarea as HTMLTextAreaElement).value).toBe("@jess-example ");
+  });
+
   it("IME composition Enter neither picks nor sends", () => {
     const { textarea, onSend } = setup();
     type(textarea, "@qu");

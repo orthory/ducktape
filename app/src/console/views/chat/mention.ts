@@ -48,20 +48,25 @@ export interface AgentMentionCandidate {
 
 export type MentionCandidate = UserMentionCandidate | AgentMentionCandidate;
 
+/** The token inserted into the composer when a mention candidate is picked. */
+export const mentionCandidateToken = (candidate: MentionCandidate): string =>
+  candidate.kind === "user" ? candidate.handle : candidate.agent.agent_id;
+
+const agentIsPrefixed = (agent: AgentRecord, query: string): boolean =>
+  agent.agent_id.toLowerCase().startsWith(query) ||
+  agent.display_name.toLowerCase().startsWith(query);
+
 /** Active agents matching `query` against agent_id and display_name, case-
  *  insensitive. Prefix matches rank before mid-string ones; ties break on
  *  agent_id so the list is stable. */
 export const mentionCandidates = (agents: AgentRecord[], query: string): AgentRecord[] => {
   const q = query.toLowerCase();
   const matches = (value: string) => value.toLowerCase().includes(q);
-  const prefixed = (agent: AgentRecord) =>
-    agent.agent_id.toLowerCase().startsWith(q) ||
-    agent.display_name.toLowerCase().startsWith(q);
   return agents
     .filter((agent) => agent.status === "active")
     .filter((agent) => matches(agent.agent_id) || matches(agent.display_name))
     .sort((a, b) => {
-      const rank = Number(prefixed(b)) - Number(prefixed(a));
+      const rank = Number(agentIsPrefixed(b, q)) - Number(agentIsPrefixed(a, q));
       return rank !== 0 ? rank : a.agent_id.localeCompare(b.agent_id);
     });
 };
@@ -115,10 +120,6 @@ export const mentionableUsers = (
   return users;
 };
 
-const agentIsPrefixed = (agent: AgentRecord, query: string): boolean =>
-  agent.agent_id.toLowerCase().startsWith(query) ||
-  agent.display_name.toLowerCase().startsWith(query);
-
 const userMatches = (user: UserMentionCandidate, query: string): boolean =>
   user.handle.toLowerCase().includes(query) || user.label.toLowerCase().includes(query);
 
@@ -136,12 +137,8 @@ export const mentionCandidatesAll = (
   const q = query.toLowerCase();
   const agentHits = mentionCandidates(agents, query);
   const userHits = users
-    .map((user, index) => ({ user, index, prefixed: userIsPrefixed(user, q) }))
-    .filter(({ user }) => userMatches(user, q))
-    .sort((a, b) => {
-      const rank = Number(b.prefixed) - Number(a.prefixed);
-      return rank !== 0 ? rank : a.index - b.index;
-    });
+    .map((user) => ({ user, prefixed: userIsPrefixed(user, q) }))
+    .filter(({ user }) => userMatches(user, q));
 
   const prefixedAgents = agentHits.filter((agent) => agentIsPrefixed(agent, q));
   const otherAgents = agentHits.filter((agent) => !agentIsPrefixed(agent, q));
