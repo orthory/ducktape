@@ -62,6 +62,7 @@ use commonware_utils::{NZU32, ordered::Set};
 use dispatch::DispatchModule;
 use tagging::TaggingModule;
 use futures::{FutureExt as _, StreamExt as _};
+use tracing_subscriber::prelude::*;
 
 use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
 
@@ -2967,13 +2968,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // opt-in internals visibility: RUST_LOG=commonware_p2p=debug etc.
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .init();
+    let log_ring = noded::LogRing::default();
+    init_tracing(log_ring.clone());
 
-    run_node(config::resolve(&cfg_path)?, sync_only)
+    run_node(config::resolve(&cfg_path)?, sync_only, log_ring)
+}
+
+fn init_tracing(log_ring: noded::LogRing) {
+    // opt-in internals visibility: RUST_LOG=commonware_p2p=debug etc.
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+    // the stream's `logs` topic: info floor by default so hot-path debug/trace
+    // events never pay per-event formatting into the ring; RUST_LOG overrides.
+    let ring_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(log_ring)
+        .with_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        );
+    let _ = tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(ring_layer)
+        .try_init();
 }
 
 // ============================================================================
@@ -5753,7 +5771,11 @@ async fn reachability_plane(
 /// and you cannot start a runtime from inside one. so `main` is sync and hands
 /// off to `Runner::start`, which drives everything (including the engine's spawned
 /// tasks) on the runtime it owns.
-fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_node(
+    resolved: Resolved,
+    sync_only: bool,
+    log_ring: noded::LogRing,
+) -> Result<(), Box<dyn std::error::Error>> {
     let Resolved {
         signer,
         label,
@@ -5980,7 +6002,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // its OWN plain-tokio OS thread (noded's exact split — the host never
     // leaves the commonware runner thread; http handlers only send
     // NodeCommands over the lane), so the pump below is its single consumer.
-    let (http_handle, http_cmds, http_events) = noded::NodeHandle::channel();
+    let (http_handle, http_cmds, stream_hub) = noded::NodeHandle::channel_with_log_ring(log_ring);
     // the derived per-module index (noded's exact store, <storage>/index),
     // plus the blocks database the explorer reads: the pump folds sealed
     // blocks into it, boot heals it from verified state at sync/recovery
@@ -5990,6 +6012,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
     // is fatal-with-remedy rather than a silent no-index run: the tier is
     // rebuildable, so the fix is always "delete <storage>/index".
     let index = noded::open_index_store(&storage, &MODULE_IDS)?;
+    stream_hub.prime(index.resume_height()?, String::new());
     // the voice hub's session lane: /v1/call/ws handlers ask for huddle
     // audio sessions here. created up front because the app-surface thread
     // starts before the mesh exists; only the validator path below spawns the
@@ -7478,12 +7501,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             );
                         }
                         if let Some(root) = sealed_hash {
-                            let _ = http_events.send(noded::WsFrame::Block(
-                                noded::BlockSummary {
-                                    height,
-                                    app_hash: hex(&root),
-                                },
-                            ));
+                            stream_hub.publish_block(height, hex(&root));
                             last_indexed_root = Some(root);
                         }
                         *served_height = height;
@@ -7866,12 +7884,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                                  ascension tip {tip} refused: {err}"
                                             );
                                         }
-                                        let _ = http_events.send(noded::WsFrame::Block(
-                                            noded::BlockSummary {
-                                                height: tip,
-                                                app_hash: hex(&root),
-                                            },
-                                        ));
+                                        stream_hub.publish_block(tip, hex(&root));
                                         last_indexed_root = Some(root);
                                     }
                                     serving = Some((tip, node_r));
@@ -9864,10 +9877,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     if let Some(f) = node.finalized()
                         && last_published != Some(f.height)
                     {
-                        let _ = http_events.send(noded::WsFrame::Block(noded::BlockSummary {
-                            height: f.height,
-                            app_hash: hex(&f.app_hash),
-                        }));
+                        stream_hub.publish_block(f.height, hex(&f.app_hash));
                         last_published = Some(f.height);
                     }
 

@@ -42,7 +42,7 @@ use indexer::IndexStore;
 use jobs::Jobs;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
-    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, WsFrame, block_row, hex_bytes, hex_root,
+    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, StreamHub, block_row, hex_bytes, hex_root,
     payload_preview,
 };
 use pages::Pages;
@@ -51,7 +51,7 @@ use reactor::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
 use sdk::{Effect, Msg, Origin};
 use tasks::Tasks;
-use tokio::sync::broadcast;
+use tracing_subscriber::prelude::*;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
@@ -103,7 +103,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the tier is rebuildable, so the fix is always "delete <storage>/index".
     let index = noded::open_index_store(&storage, &MODULE_IDS)?;
 
-    let (handle, cmd_rx, event_tx) = NodeHandle::channel();
+    let log_ring = noded::LogRing::default();
+    init_tracing(log_ring.clone());
+
+    let (handle, cmd_rx, stream_hub) = NodeHandle::channel_with_log_ring(log_ring);
     let handle = handle
         // persist node-local blobs (op receipts, agent prompt pins) under
         // <storage>/blobstore so a daemon restart keeps serving them.
@@ -135,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 blobs,
                 oracle_cmds,
                 cmd_rx,
-                event_tx,
+                stream_hub,
             )
         })?;
 
@@ -156,6 +159,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
 }
 
+fn init_tracing(log_ring: noded::LogRing) {
+    // the stream's `logs` topic: info floor by default so debug/trace events
+    // never pay per-event formatting into the ring; RUST_LOG overrides.
+    let ring_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(log_ring)
+        .with_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        );
+    let _ = tracing_subscriber::registry().with(ring_layer).try_init();
+}
+
 /// own the host for the process lifetime: genesis the module set, then apply
 /// commands in arrival order — every submit is its own block.
 fn run_node(
@@ -165,7 +181,7 @@ fn run_node(
     blobs: noded::blobs::BlobHandle,
     oracle_cmds: mpsc::Sender<NodeCommand>,
     mut cmds: mpsc::Receiver<NodeCommand>,
-    events: broadcast::Sender<WsFrame>,
+    stream_hub: StreamHub,
 ) {
     // forge_repo is derived by the caller (shared with the http upload-pack lane).
     let duckfs_dir = storage.join("duckfs");
@@ -262,6 +278,7 @@ fn run_node(
         // log persists under --storage, and a counter restarting at 0 would
         // re-use indexed heights — every new block silently skipped.
         let mut height = index.resume_height().expect("read index watermarks");
+        stream_hub.prime(height, hex_root(&host.app_hash()));
         if height > 0 {
             println!("[noded] module index resumes at height {height}");
         }
@@ -307,7 +324,7 @@ fn run_node(
                         &mut height,
                         &index,
                         &op_blobs,
-                        &events,
+                        &stream_hub,
                         &metrics,
                         Origin::External(origin),
                         Msg { target, payload },
@@ -373,13 +390,13 @@ async fn submit_and_drain(
     height: &mut u64,
     index: &IndexStore,
     blobs: &noded::blobs::BlobHandle,
-    events: &broadcast::Sender<WsFrame>,
+    stream_hub: &StreamHub,
     metrics: &NodeMetrics,
     origin: Origin,
     msg: Msg,
 ) -> Result<BlockSummary, String> {
     let (included, effects) =
-        match submit_one(host, height, index, blobs, events, metrics, origin, msg).await
+        match submit_one(host, height, index, blobs, stream_hub, metrics, origin, msg).await
     {
         Ok(out) => out,
         Err(SubmitError::Fatal(err)) => {
@@ -416,7 +433,7 @@ async fn submit_and_drain(
             height,
             index,
             blobs,
-            events,
+            stream_hub,
             metrics,
             Origin::External(ORACLE_ORIGIN.to_vec()),
             follow,
@@ -445,7 +462,7 @@ async fn submit_one(
     height: &mut u64,
     index: &IndexStore,
     blobs: &noded::blobs::BlobHandle,
-    events: &broadcast::Sender<WsFrame>,
+    stream_hub: &StreamHub,
     metrics: &NodeMetrics,
     origin: Origin,
     msg: Msg,
@@ -492,9 +509,6 @@ async fn submit_one(
     metrics.record_block(*height, latency_us, &out.dispatches);
     metrics.record_ops(1); // this lane is one member op per block
 
-    // fan the block out live. no subscribers is fine — send only fails then.
-    let _ = events.send(WsFrame::Block(block.clone()));
-
     // fold the block into the derived per-module index LAST: canonical state
     // is already committed, so an index failure degrades the read models and
     // never the block. the store poisons itself on error (contiguity over
@@ -527,6 +541,10 @@ async fn submit_one(
             *height
         );
     }
+
+    // fan the block out live after the derived index had its chance to
+    // materialize rows. no subscribers is fine.
+    stream_hub.publish_block(block.height, block.app_hash.clone());
 
     Ok((block, out.effects))
 }
