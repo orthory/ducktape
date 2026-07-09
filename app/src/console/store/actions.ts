@@ -147,14 +147,19 @@ export interface ConsoleActions {
    *  huddling — so video tiles can bind their canvas / preview element to it.
    *  Ephemeral and per-client, exactly like the session itself. */
   getCallSession(): CallSession | null;
-  /** Pop the huddle out into its own desktop window (Tauri only) — the in-app
-   *  card yields while the window is open. No-op when not in a huddle. The
-   *  popped window is an AUDIO remote (mute/leave/retry); the camera toggle and
-   *  video tiles stay in the main-window dock, reached by popping back in. */
+  /** Pop the huddle out into its own desktop window (Tauri only). The media
+   *  session HANDS OFF to that window: main releases its session (WS/mic/camera)
+   *  — consensus membership untouched — and the window runs its own full video
+   *  session. No-op when not in a huddle. */
   popOutHuddle(): void;
-  /** Return the huddle to the in-app card, closing the window. Also invoked
-   *  when Rust reports the window destroyed (any way it dies). */
+  /** Return the huddle to the in-app card: close the window and re-take the
+   *  media session in the main window. Also invoked when Rust reports the window
+   *  destroyed (any way it dies), so a dead float always falls back to the dock. */
   popInHuddle(): void;
+  /** Re-establish the main-window media session for the huddle we are still a
+   *  consensus member of (after the popped window released it). Idempotent — a
+   *  no-op when a main session already exists or we are not in a huddle. */
+  retakeHuddleMedia(): void;
 
   commitForge(params: { path: string; content: string; message: string }): void;
 
@@ -563,6 +568,39 @@ export function createActions({
       (live) => chatClient.leaveHuddle(live, { channelId, origin: getState().author }),
       (prev) => optimistic.huddleLeft(prev, channelId, selfNodeHex()),
     );
+
+  // Re-establish the main-window media session for a huddle we are still a
+  // consensus member of, after the popped window released it. Idempotent — a
+  // no-op (just clears `popped`) when a session already exists or we are not in
+  // a huddle. A fresh session (never restart a stopped one); re-join MUTED,
+  // camera off — the safe default, exactly like a first join. Consensus
+  // membership is intact, so this is a media reconnect, not a re-join.
+  const retakeHuddleMedia = (): void => {
+    const state = getState();
+    const channelId = state.voice.channelId;
+    const nodeUrl = state.nodeUrl;
+    if (voice || !channelId || !nodeUrl) {
+      update((prev) => ({ voice: { ...prev.voice, popped: false } }));
+      return;
+    }
+    voice = createCallSession(onCallEvent);
+    voice.setMuted(true);
+    update((prev) => ({
+      voice: {
+        ...prev.voice,
+        popped: false,
+        muted: true,
+        status: "connecting",
+        error: null,
+        cameraOn: false,
+        peers: {},
+        sessionStartMs: Date.now(),
+        speaking: false,
+      },
+    }));
+    voice.start(callSocketUrl(nodeUrl, channelId));
+    pushRecipients(channelId);
+  };
 
   // The one write path: apply the op's PRECONFIRMED render immediately (the
   // optimistic projection plus a pending ledger record under the entity's
@@ -1345,14 +1383,22 @@ export function createActions({
 
     popOutHuddle: () => {
       if (!getState().voice.channelId) return;
+      // Hand the media session to the window: open it, then release ours FIRST
+      // (the hub is one-session-per-node — main must close before the window
+      // dials). Consensus membership + channelId stay; only the media goes.
       openHuddleWindow();
-      update((prev) => ({ voice: { ...prev.voice, popped: true } }));
+      stopVoice();
+      update((prev) => ({
+        voice: { ...prev.voice, popped: true, cameraOn: false, peers: {}, speaking: false },
+      }));
     },
 
     popInHuddle: () => {
       closeHuddleWindow();
-      update((prev) => ({ voice: { ...prev.voice, popped: false } }));
+      retakeHuddleMedia();
     },
+
+    retakeHuddleMedia,
 
     commitForge: (params) => {
       if (!params.path.trim() || params.content.length === 0) return;

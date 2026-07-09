@@ -40,9 +40,9 @@ import { hasFreshPending, pageSnapshotSuperseded } from "./finalization";
 import {
   HUDDLE_CLOSED_EVENT,
   HUDDLE_CMD_EVENT,
-  HUDDLE_STATE_EVENT,
+  HUDDLE_CONTEXT_EVENT,
   applyHuddleWindowCmd,
-  buildHuddleWindowState,
+  buildHuddleContext,
 } from "./huddle-window";
 import type { HuddleWindowCmd } from "./huddle-window";
 import { reducer } from "./reducer";
@@ -503,41 +503,36 @@ export function DucktapeProvider({
     return () => window.removeEventListener("pagehide", leaveOnHide);
   }, [state.voice.channelId, state.nodeUrl, state.author]);
 
-  // 2e. Huddle pop-out bridge, sender half (desktop): while the huddle window
-  //     is open, mirror the session's display state to it. A fingerprint
-  //     dedupes the per-block channels churn. Protocol: store/huddle-window.ts.
-  //     Member staleness is time-based, so a 1 Hz tick (only while popped) lets a
-  //     member cross the stale threshold and re-push without a state change.
-  const huddleStateFp = useRef("");
-  const [huddleStaleTick, setHuddleStaleTick] = useState(0);
+  // 2e. Huddle pop-out bridge, sender half (desktop): while the window is open,
+  //     push it the CONTEXT it needs to run its own media session (node url +
+  //     channel + raw roster + capability). A fingerprint dedupes the per-block
+  //     channels churn. Staleness now lives in the window (it owns the beacons),
+  //     so there is no re-push tick here. Protocol: store/huddle-window.ts.
+  const huddleCtxFp = useRef("");
   useEffect(() => {
     if (!state.voice.popped || !isTauri()) return;
-    const id = setInterval(() => setHuddleStaleTick((n) => n + 1), 1000);
-    return () => clearInterval(id);
-  }, [state.voice.popped]);
-  useEffect(() => {
-    if (!state.voice.popped || !isTauri()) return;
-    const snapshot = buildHuddleWindowState(
+    const ctx = buildHuddleContext(
       state.voice,
       state.channels,
       state.authorNames,
+      state.nodeUrl,
       state.status?.publicKey ?? "",
-      Date.now(),
+      state.videoCapability,
     );
-    if (!snapshot) return;
-    const fp = JSON.stringify(snapshot);
-    if (fp === huddleStateFp.current) return;
-    huddleStateFp.current = fp;
+    if (!ctx) return;
+    const fp = JSON.stringify(ctx);
+    if (fp === huddleCtxFp.current) return;
+    huddleCtxFp.current = fp;
     void import("@tauri-apps/api/event")
-      .then(({ emit }) => emit(HUDDLE_STATE_EVENT, snapshot))
+      .then(({ emit }) => emit(HUDDLE_CONTEXT_EVENT, ctx))
       .catch(() => {});
-  }, [state.voice, state.channels, state.authorNames, state.status?.publicKey, huddleStaleTick]);
+  }, [state.voice, state.channels, state.authorNames, state.nodeUrl, state.status?.publicKey, state.videoCapability]);
 
-  // 2f. ...and the receiver half: apply the window's commands to the store,
-  //     replay state on its ready handshake, and re-mount the in-app card when
-  //     Rust reports the window destroyed. Also closes a stale window left
-  //     over from a previous main-window life — the ephemeral session it
-  //     mirrored died with the reload.
+  // 2f. ...and the receiver half: apply the window's commands (leave / sweep) to
+  //     the store, replay the context on its ready handshake, and re-take the
+  //     media session when Rust reports the window destroyed (any way it dies,
+  //     incl. the window closing itself on a media failure). The mount-time
+  //     popInHuddle also re-takes any session left dangling by a reload.
   useEffect(() => {
     if (!isTauri()) return;
     actions.popInHuddle();
@@ -554,14 +549,15 @@ export function DucktapeProvider({
             const cmd = event.payload as HuddleWindowCmd;
             const current = stateRef.current;
             if (cmd.op === "ready") {
-              const snapshot = buildHuddleWindowState(
+              const ctx = buildHuddleContext(
                 current.voice,
                 current.channels,
                 current.authorNames,
+                current.nodeUrl,
                 current.status?.publicKey ?? "",
-                Date.now(),
+                current.videoCapability,
               );
-              if (snapshot) void emit(HUDDLE_STATE_EVENT, snapshot);
+              if (ctx) void emit(HUDDLE_CONTEXT_EVENT, ctx);
               return;
             }
             applyHuddleWindowCmd(cmd, actions, current.voice.channelId);

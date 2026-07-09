@@ -1,24 +1,24 @@
-// The popped-out huddle window (`index.html?view=huddle`) — a pure event
-// mirror of the main window's session. It renders exactly the state the main
-// window pushes (ducktape://huddle-state) and sends commands back
-// (ducktape://huddle-cmd); the audio session itself never leaves the main
-// window (real video-in-window is PR-B). Closing this window — the native button
-// or the pop-in control — fires Rust's Destroyed hook, which tells the main
-// window to re-mount its in-app card. Protocol constants + payload shape:
-// store/huddle-window.ts. The body reuses the shared HuddleCard + HuddleControls
-// so the popped surface matches the dock and stage; camera is absent here since
-// the window owns no media session yet.
+// The popped-out huddle window (`index.html?view=huddle`). In PR-B it is a real
+// video surface: it runs its OWN media session (useHuddleWindowSession), seeded
+// by the context the main window pushes (ducktape://huddle-context), and renders
+// the same CallTiles + HuddleControls the dock/stage use. Consensus stays in the
+// main window — only leave/sweep cross back over ducktape://huddle-cmd. If the
+// session dies (or the user closes the window), the window closes and Rust's
+// Destroyed hook tells main to re-take the session, so the call is never
+// stranded in a dead float. Protocol: store/huddle-window.ts.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import { HUDDLE_CMD_EVENT, HUDDLE_STATE_EVENT } from "../../store/huddle-window";
-import type { HuddleWindowCmd, HuddleWindowState } from "../../store/huddle-window";
+import { MAX_VIDEO_PARTICIPANTS } from "../../../domain/call-session";
+import { HUDDLE_CMD_EVENT, HUDDLE_CONTEXT_EVENT } from "../../store/huddle-window";
+import type { HuddleContext, HuddleWindowCmd } from "../../store/huddle-window";
 import { color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "../chat/HoverButton";
-import { HuddleCard } from "../chat/HuddleCard";
+import { CallTiles } from "./CallTiles";
 import { HuddleControls } from "./HuddleControls";
+import { useHuddleWindowSession } from "./useHuddleWindowSession";
 
 const send = (cmd: HuddleWindowCmd): void => {
   void emit(HUDDLE_CMD_EVENT, cmd);
@@ -36,18 +36,18 @@ function PopInGlyph({ size = 13 }: { size?: number }) {
 }
 
 export function HuddleWindow() {
-  const [card, setCard] = useState<HuddleWindowState | null>(null);
+  const [ctx, setCtx] = useState<HuddleContext | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
-    void listen(HUDDLE_STATE_EVENT, (event) => {
-      setCard(event.payload as HuddleWindowState);
+    void listen(HUDDLE_CONTEXT_EVENT, (event) => {
+      setCtx(event.payload as HuddleContext);
     }).then((un) => {
       if (cancelled) un();
       else unlisten = un;
     });
-    // the main window replays the current state in response.
+    // the main window replays the current context in response.
     send({ op: "ready" });
     return () => {
       cancelled = true;
@@ -55,31 +55,37 @@ export function HuddleWindow() {
     };
   }, []);
 
+  // A dead session (hard error / replaced) closes the window — Rust's Destroyed
+  // hook then tells main to re-take, so the call falls back to the working dock.
+  const onMediaEnded = useCallback(() => {
+    void getCurrentWindow().close();
+  }, []);
+
+  const view = useHuddleWindowSession(ctx, onMediaEnded);
+  const overCap = view ? view.participants.length > MAX_VIDEO_PARTICIPANTS : false;
+
   return (
     <div
       style={{
         minHeight: "100vh",
         boxSizing: "border-box",
         background: color.paper,
-        padding: "10px 12px",
         display: "flex",
         flexDirection: "column",
-        justifyContent: "center",
       }}
     >
-      {card ? (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <div style={{ display: "flex", alignItems: "flex-start", gap: 6 }}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <HuddleCard
-                channelName={card.channelName}
-                status={card.status}
-                error={card.error}
-                participants={card.participants}
-                ring={color.paper}
-                onSweep={(user) => send({ op: "sweep", user })}
-              />
-            </div>
+      {view ? (
+        <>
+          {/* header — channel + count + pop-in */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderBottom: `1px solid ${color.borderSoft}` }}>
+            <span
+              aria-label={view.status}
+              style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0, background: view.status === "live" ? color.green : view.status === "error" ? color.red : color.amber }}
+            />
+            <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", font: `600 12.5px ${font.sans}`, color: color.ink }}>
+              #{view.channelName}
+            </span>
+            <span style={{ font: `500 10.5px ${font.sans}`, color: color.muted2, flexShrink: 0 }}>{view.participants.length}</span>
             <HoverButton
               onClick={() => void getCurrentWindow().close()}
               title="Return to app"
@@ -89,21 +95,48 @@ export function HuddleWindow() {
               <PopInGlyph size={13} />
             </HoverButton>
           </div>
-          <HuddleControls
-            size="compact"
-            status={card.status}
-            muted={card.muted}
-            cameraOn={false}
-            canEncode={false}
-            onToggleMute={() => send({ op: "set-muted", muted: !card.muted })}
-            onLeave={() => send({ op: "leave" })}
-            onRetry={() => send({ op: "retry" })}
-          />
-        </div>
+
+          {/* tiles */}
+          <div style={{ flex: 1, minHeight: 0, padding: 10, overflow: "auto" }}>
+            {view.participants.length === 0 ? (
+              <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: color.muted2, font: `500 12px ${font.sans}` }}>
+                connecting…
+              </div>
+            ) : (
+              <CallTiles
+                layout="gallery"
+                participants={view.participants}
+                memberNodes={view.memberNodes}
+                peers={view.peers}
+                canEncode={view.canEncode}
+                canDecode={view.canDecode}
+                selfCameraOn={view.cameraOn}
+                bindPreview={view.bindPreview}
+                bindTile={view.bindTile}
+              />
+            )}
+          </div>
+
+          {/* control bar */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "8px 10px", borderTop: `1px solid ${color.borderSoft}` }}>
+            <HuddleControls
+              size="comfortable"
+              status={view.status}
+              muted={view.muted}
+              cameraOn={view.cameraOn}
+              canEncode={view.canEncode}
+              cameraDisabledReason={overCap ? "Video is capped at 8 participants" : undefined}
+              onToggleMute={() => view.setMuted(!view.muted)}
+              onToggleCamera={() => view.setCamera(!view.cameraOn)}
+              onLeave={() => send({ op: "leave" })}
+              onRetry={() => view.retry()}
+            />
+          </div>
+        </>
       ) : (
-        <span style={{ font: `400 11.5px ${font.sans}`, color: color.muted2, textAlign: "center" }}>
-          connecting to session…
-        </span>
+        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <span style={{ font: `400 11.5px ${font.sans}`, color: color.muted2 }}>connecting to session…</span>
+        </div>
       )}
     </div>
   );
