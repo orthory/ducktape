@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { BlockRecord } from "../../../domain/transport";
+import type { BlockRecord, RootOp } from "../../../domain/transport";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
@@ -9,10 +9,7 @@ import { ExplorerView } from "./ExplorerView";
 
 const proposerKey = "cc".repeat(32);
 
-const block = (height: number, patch: Partial<BlockRecord> = {}): BlockRecord => ({
-  height,
-  hash: "aa".repeat(32),
-  commitHash: "bb".repeat(32),
+const op = (patch: Partial<RootOp> = {}): RootOp => ({
   proposer: proposerKey,
   disposition: "applied",
   target: "chat",
@@ -21,6 +18,14 @@ const block = (height: number, patch: Partial<BlockRecord> = {}): BlockRecord =>
   ],
   payload: '{"Post":{}}',
   opHash: "dd".repeat(32),
+  ...patch,
+});
+
+const block = (height: number, patch: Partial<BlockRecord> = {}): BlockRecord => ({
+  height,
+  hash: "aa".repeat(32),
+  commitHash: "bb".repeat(32),
+  ops: [op()],
   ...patch,
 });
 
@@ -54,11 +59,40 @@ describe("ExplorerView", () => {
     expect(screen.getByText("dd".repeat(32))).toBeInTheDocument();
   });
 
-  it("renders a ring written before op hashes existed as an empty digest line", () => {
-    renderExplorer({ blocks: [block(7, { opHash: undefined })] });
+  it("renders an op carrying no content address as an empty digest line", () => {
+    renderExplorer({ blocks: [block(7, { ops: [op({ opHash: "" })] })] });
     fireEvent.click(screen.getByText("#7"));
     const label = screen.getByText("OP HASH");
     expect(label.nextElementSibling).toHaveTextContent("—");
+  });
+
+  it("fans a multi-op block out to one section per aggregated op", () => {
+    renderExplorer({
+      blocks: [
+        block(7, {
+          ops: [
+            op({ target: "chat", opHash: "11".repeat(32) }),
+            op({ target: "pages", opHash: "22".repeat(32), disposition: "rejected" }),
+          ],
+        }),
+      ],
+    });
+    // the list row summarizes the aggregate op count…
+    expect(screen.getByText("2")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("#7"));
+    // …and the detail renders a section per op (two OP HASH digest lines).
+    expect(screen.getAllByText("OP HASH")).toHaveLength(2);
+    expect(screen.getByText("11".repeat(32))).toBeInTheDocument();
+    expect(screen.getByText("22".repeat(32))).toBeInTheDocument();
+    expect(screen.getByText("rejected")).toBeInTheDocument();
+  });
+
+  it("renders an idle (empty-ops) block as a nop with no op sections", () => {
+    renderExplorer({ blocks: [block(7, { ops: [] })] });
+    expect(screen.getByText("nop")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("#7"));
+    expect(screen.queryByText("OP HASH")).not.toBeInTheDocument();
+    expect(screen.getByText(/Idle block/)).toBeInTheDocument();
   });
 
   it("consumes a cross-link hand-off: opens the focused block and clears it", () => {
@@ -86,7 +120,7 @@ describe("ExplorerView", () => {
   it("resolves a proposer to its profile display name and falls back to hex", () => {
     const anonKey = "ee".repeat(32);
     renderExplorer({
-      blocks: [block(7), block(8, { proposer: anonKey })],
+      blocks: [block(7), block(8, { ops: [op({ proposer: anonKey })] })],
       authorNames: { [proposerKey]: "Founder Rae" },
     });
     expect(screen.getByText("Founder Rae")).toBeInTheDocument();

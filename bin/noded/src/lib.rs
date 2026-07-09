@@ -110,43 +110,51 @@ pub enum BlockDisposition {
     Rejected,
 }
 
+/// one member op inside a finalized block — the per-op detail the explorer
+/// fans out over. a block now AGGREGATES the txs from its window, so it carries
+/// a vector of these in agreed (applied) order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RootOp {
+    /// hex of this op's authenticated author origin (the frame's VERIFIED
+    /// signer), or `"system"` / `"module:<id>"` for a non-external origin. on
+    /// the embedded daemon's frameless lane this is the SUBMITTER's origin
+    /// bytes instead (unverified — that lane authenticates nothing).
+    pub proposer: String,
+    /// how this op landed: `applied` mutated state; `rejected` finalized but
+    /// rolled back (a failed tx). deterministic on every validator.
+    pub disposition: BlockDisposition,
+    /// this op's target module.
+    pub target: String,
+    /// this op's dispatch trace, in drain order (empty for a rejected op).
+    pub operations: Vec<DispatchInfo>,
+    /// best-effort utf-8 preview of this op's payload (module `*Msg` json on
+    /// this lane), capped at [`PAYLOAD_PREVIEW_MAX`] chars.
+    pub payload: String,
+    /// hex of this op's payload content address — sha256 of the exact bytes the
+    /// host committed, staged in the node-local blob store so
+    /// `GET /v1/files/blob/{op_hash}` serves the full bytes back.
+    pub op_hash: String,
+}
+
 /// one non-empty finalized block, as the explorer reads it: the block's
-/// consensus coordinates (height, frame content hash, post-block app-hash),
-/// its authenticated proposer, and the op it carried with the deterministic
-/// dispatch trace. stored as the block's row in the index store's blocks
-/// database ([`indexer::BlockOps::record`]) and served by `GET /v1/blocks`.
+/// consensus coordinates (height, frame content hash, post-block app-hash) and
+/// the member ops it AGGREGATED, each with its deterministic dispatch trace.
+/// stored as the block's row in the index store's blocks database
+/// ([`indexer::BlockOps::record`]) and served by `GET /v1/blocks`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockRecord {
     pub height: u64,
-    /// hex of the frame's content address (sha256 over the exact bytes the
-    /// orderer carried) — the block's hash on this surface. empty on the
-    /// embedded daemon's lane: nothing is framed or signed there, so the
-    /// field stays honest rather than carrying a fabricated digest.
+    /// hex of the block's content address — the block's hash on this surface.
+    /// empty on the embedded daemon's lane: nothing is framed or signed there,
+    /// so the field stays honest rather than carrying a fabricated digest.
     pub hash: String,
     /// hex of the composed app-hash after this block settled — the commit.
     pub commit_hash: String,
-    /// hex of the proposing validator's ed25519 public key — the frame's
-    /// VERIFIED signer, not a claimed identity. on the embedded daemon's
-    /// frameless lane this is the SUBMITTER's origin bytes instead
-    /// (unverified — that lane authenticates nothing).
-    pub proposer: String,
-    pub disposition: BlockDisposition,
-    /// the root op's target module.
-    pub target: String,
-    /// the dispatch trace, in drain order — the "transactions" inside the
-    /// block. empty for a rejected op (a deterministic no-op leaves no trace).
-    pub operations: Vec<DispatchInfo>,
-    /// best-effort utf-8 preview of the root op's payload (module `*Msg` json
-    /// on this lane), capped at [`PAYLOAD_PREVIEW_MAX`] chars.
-    pub payload: String,
-    /// hex of the root op's content address — sha256 of the exact payload
-    /// bytes the host committed, staged in the node-local blob store as the
-    /// record is ringed, so `GET /v1/files/blob/{op_hash}` serves the full
-    /// bytes back. same semantics as [`SubmitReceipt::op_hash`]; this is the
-    /// only place the NETWORKED surface exposes it (its submit reply carries
-    /// height only until the noded→ordered-node convergence).
-    pub op_hash: String,
+    /// the member ops this block aggregated, in agreed (applied) order. empty
+    /// for an idle/nop block (nothing but the heartbeat filler).
+    pub ops: Vec<RootOp>,
 }
 
 /// the explorer's wire rendering of one dispatch. `Origin::External` renders
@@ -217,6 +225,7 @@ fn origin_kind(origin: &sdk::Origin) -> &'static str {
 pub struct NodeMetrics {
     block_height: Registered<raw::Gauge>,
     blocks_total: Registered<raw::Counter>,
+    ops_total: Registered<raw::Counter>,
     apply_latency: Registered<raw::Histogram>,
     dispatch_total: Registered<raw::Family<DispatchLabels, raw::Counter>>,
 }
@@ -237,6 +246,13 @@ impl NodeMetrics {
             blocks_total: context.counter(
                 "ducktape_blocks",
                 "committed local blocks since daemon start",
+            ),
+            // one BLOCK now aggregates N member ops; `ducktape_blocks_total`
+            // counts blocks, `ducktape_ops_total` counts the aggregated ops, so
+            // ops/blocks is the average batch size.
+            ops_total: context.counter(
+                "ducktape_ops",
+                "member ops aggregated into committed local blocks since daemon start",
             ),
             apply_latency: context.histogram(
                 "ducktape_block_apply_latency_seconds",
@@ -264,6 +280,14 @@ impl NodeMetrics {
                     origin: origin_kind(&d.origin).to_string(),
                 })
                 .inc();
+        }
+    }
+
+    /// count the member ops an applied block aggregated (`ducktape_ops_total`).
+    /// called once per applied block alongside [`record_block`](Self::record_block).
+    pub fn record_ops(&self, ops: usize) {
+        for _ in 0..ops {
+            self.ops_total.inc();
         }
     }
 
@@ -2181,23 +2205,36 @@ mod tests {
             height: 7,
             hash: String::new(),
             commit_hash: "aa".repeat(32),
-            proposer: "bb".repeat(32),
-            disposition: BlockDisposition::Applied,
-            target: "directory".into(),
-            operations: Vec::new(),
-            payload: "{}".into(),
-            op_hash: "ee".repeat(32),
+            ops: vec![
+                RootOp {
+                    proposer: "bb".repeat(32),
+                    disposition: BlockDisposition::Applied,
+                    target: "directory".into(),
+                    operations: Vec::new(),
+                    payload: "{}".into(),
+                    op_hash: "ee".repeat(32),
+                },
+                RootOp {
+                    proposer: "cc".repeat(32),
+                    disposition: BlockDisposition::Rejected,
+                    target: "chat".into(),
+                    operations: Vec::new(),
+                    payload: "{\"m\":1}".into(),
+                    op_hash: "ff".repeat(32),
+                },
+            ],
         };
         let row = block_row(&record);
         let back: BlockRecord = serde_json::from_slice(&row).expect("row is json");
         assert_eq!(back.height, 7);
         assert_eq!(back.hash, "", "frameless lanes keep an honest empty hash");
-        assert_eq!(back.proposer, "bb".repeat(32));
-        assert_eq!(back.op_hash, "ee".repeat(32));
+        assert_eq!(back.ops.len(), 2, "the block aggregated two member ops");
+        assert_eq!(back.ops[0].proposer, "bb".repeat(32));
+        assert_eq!(back.ops[1].op_hash, "ff".repeat(32));
         // the wire keys stay camelCase — the app reads these fields verbatim.
         let json: serde_json::Value = serde_json::from_slice(&row).unwrap();
         assert!(json.get("commitHash").is_some());
-        assert!(json.get("opHash").is_some());
+        assert!(json["ops"][0].get("opHash").is_some());
     }
 
     #[test]

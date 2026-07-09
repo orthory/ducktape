@@ -662,12 +662,15 @@ impl Sim {
                 height: self.height,
                 hash: String::new(),
                 commit_hash: block.app_hash.clone(),
-                proposer,
-                disposition: BlockDisposition::Applied,
-                target: target.clone(),
-                operations,
-                payload,
-                op_hash: op_hash.clone(),
+                // the sim commits one op per step/block.
+                ops: vec![noded::RootOp {
+                    proposer,
+                    disposition: BlockDisposition::Applied,
+                    target: target.clone(),
+                    operations,
+                    payload,
+                    op_hash: op_hash.clone(),
+                }],
             })),
         };
         if let Err(err) = self.index.apply_block(&block_ops) {

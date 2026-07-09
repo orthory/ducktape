@@ -51,11 +51,13 @@ export interface NodeStatus {
 
 // ── Blocks (explorer) ───────────────────────────────────
 //
-// The explorer plane: one record per NON-EMPTY finalized block — heartbeat
-// nops never enter the node's ring, so this is real history, not idle ticks.
-// Pulled via GET /v1/blocks; a node without the surface reads as "no blocks".
+// The explorer plane: one record per finalized block. Post tx-aggregation a
+// block carries EVERY op drained from its ~2s window (no longer one-op-per-
+// block), so a record holds an `ops` array instead of singular op fields; an
+// idle window commits an empty-`ops` heartbeat nop. Pulled via GET /v1/blocks;
+// a node without the surface reads as "no blocks".
 
-/** One dispatch in a block's drain — a module ran, triggered by `origin`. */
+/** One dispatch in an op's drain — a module ran, triggered by `origin`. */
 export interface DispatchInfo {
   module: string;
   /** `"external"`, `"external:<name>"`, `"system"`, or `"module:<id>"`. */
@@ -64,9 +66,31 @@ export interface DispatchInfo {
   emittedEvents: number;
 }
 
-/** How a block's op landed: an applied op mutated state; a rejected op
- *  finalized but rolled back — a failed tx. */
+/** How an op landed: an applied op mutated state; a rejected op finalized but
+ *  rolled back — a failed tx. */
 export type BlockDisposition = "applied" | "rejected";
+
+/** One aggregated op inside a block — the "transaction" the explorer renders a
+ *  row for. A block holds these in drain order; a block that aggregated its
+ *  whole 2s window carries one entry per included op. */
+export interface RootOp {
+  /** Hex of the op author's origin — the submitter's key, or `"system"` /
+   *  `"module:<id>"` for a module/system-triggered op. (On a frame-signing
+   *  lane this is the op's own author, not the block's proposing validator —
+   *  the aggregated record no longer carries a single block-level signer.) */
+  proposer: string;
+  disposition: BlockDisposition;
+  /** This op's target module. */
+  target: string;
+  /** This op's dispatch trace, in drain order — the modules it triggered.
+   *  Empty for a rejected op (a deterministic no-op leaves no trace). */
+  operations: DispatchInfo[];
+  /** Capped utf-8 preview of this op's payload (module `*Msg` json). */
+  payload: string;
+  /** Hex content address of this op — sha256 of the committed payload bytes,
+   *  fetchable via the blob lane (`GET /v1/files/blob/{opHash}`). */
+  opHash: string;
+}
 
 export interface BlockRecord {
   height: number;
@@ -74,21 +98,9 @@ export interface BlockRecord {
   hash: string;
   /** Hex app-hash after this block settled — the commit. */
   commitHash: string;
-  /** Hex ed25519 key of the proposing validator — the frame's VERIFIED
-   *  signer, not a claimed identity. */
-  proposer: string;
-  disposition: BlockDisposition;
-  /** The root op's target module. */
-  target: string;
-  /** The dispatch trace, in drain order — the transactions inside the block.
-   *  Empty for a rejected op (a deterministic no-op leaves no trace). */
-  operations: DispatchInfo[];
-  /** Capped utf-8 preview of the root op's payload (module `*Msg` json). */
-  payload: string;
-  /** Hex content address of the root op — sha256 of the committed payload
-   *  bytes, fetchable via the blob lane (`GET /v1/files/blob/{opHash}`).
-   *  Optional: rings written before the field existed lack it. */
-  opHash?: string;
+  /** Every op aggregated into this block, in drain order. Empty for an idle
+   *  window (a heartbeat nop): the block committed but carried no ops. */
+  ops: RootOp[];
 }
 
 // ── duckfs (the `files` module's CoW filesystem) ────────
@@ -278,8 +290,10 @@ export interface NodeTransport {
    */
   metrics(): Promise<string>;
   /**
-   * Recent non-empty blocks from the node's ring, oldest-first — the
-   * explorer's backing read. `limit` caps the count (default: all buffered).
+   * Recent finalized blocks from the node's ring, oldest-first — the explorer's
+   * backing read. Each record carries every op aggregated into its window (an
+   * idle window rides as an empty-`ops` nop). `limit` caps the count (default:
+   * all buffered).
    */
   blocks(limit?: number): Promise<BlockRecord[]>;
   /** Subscribe to finalized blocks. Returns the unsubscribe. */

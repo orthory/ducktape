@@ -1723,22 +1723,15 @@ async fn drive_sync_request(
 /// on the fold path the re-staging is load-bearing: the blob store is
 /// in-memory, so the live drain's staging dies with the process and this is
 /// what makes `GET /v1/files/blob/{op_hash}` answer again after a restart.
-#[allow(clippy::too_many_arguments)]
-fn explorer_block_row(
+fn explorer_root_op(
     blobs: &blobstore::BlobHandle,
-    height: u64,
-    frame_hash: &node::FrameId,
-    app_hash: &StateRoot,
     origin: &sdk::Origin,
     target: &str,
     payload: &[u8],
     dispatches: &[host::DispatchRecord],
     disposition: noded::BlockDisposition,
-) -> Vec<u8> {
-    noded::block_row(&noded::BlockRecord {
-        height,
-        hash: noded::hex_bytes(frame_hash),
-        commit_hash: hex(app_hash),
+) -> noded::RootOp {
+    noded::RootOp {
         proposer: match origin {
             sdk::Origin::External(key) => noded::hex_bytes(key),
             // frames only carry verified External authorship; label the
@@ -1751,7 +1744,7 @@ fn explorer_block_row(
         operations: dispatches.iter().map(noded::DispatchInfo::from).collect(),
         payload: noded::payload_preview(payload),
         op_hash: noded::hex_bytes(&blobs.put_chunk(payload.to_vec())),
-    })
+    }
 }
 
 /// rebuild the explorer row for a replayed sealed frame — the boot fold's
@@ -1764,26 +1757,44 @@ fn sealed_frame_block_row(
     blobs: &blobstore::BlobHandle,
     block: &recovery::FoldedBlock<'_>,
 ) -> Option<Vec<u8>> {
-    let (origin, msg) = node::decode_frame(block.frame).ok()?;
-    if msg.target == NOP_TARGET {
-        return None;
-    }
+    // the sealed frame is a BATCH: decode its members and show each as a block
+    // op. per-member dispositions/traces are not carried in the fold (recovery
+    // folds the block-level disposition + aggregate trace), so a replayed op
+    // shows the block disposition and an empty trace — the LIVE drain carries
+    // the full per-op detail.
+    let members = node::decode_batch(block.frame).ok()?;
     let disposition = match block.disposition {
         node::Disposition::Applied => noded::BlockDisposition::Applied,
         node::Disposition::Rejected => noded::BlockDisposition::Rejected,
         node::Disposition::Discarded => return None,
     };
-    Some(explorer_block_row(
-        blobs,
-        block.height,
-        &node::frame_id(block.frame),
-        &block.app_hash,
-        &origin,
-        &msg.target,
-        &msg.payload,
-        block.dispatches,
-        disposition,
-    ))
+    let mut ops = Vec::new();
+    for member in &members {
+        let Ok((origin, msg)) = node::decode_frame(member) else {
+            continue;
+        };
+        if msg.target == NOP_TARGET {
+            continue;
+        }
+        ops.push(explorer_root_op(
+            blobs,
+            &origin,
+            &msg.target,
+            &msg.payload,
+            &[],
+            disposition,
+        ));
+    }
+    if ops.is_empty() {
+        // a pure nop/idle block — the explorer hides it (same rule as live).
+        return None;
+    }
+    Some(noded::block_row(&noded::BlockRecord {
+        height: block.height,
+        hash: noded::hex_bytes(&node::frame_id(block.frame)),
+        commit_hash: hex(&block.app_hash),
+        ops,
+    }))
 }
 
 /// the resident's explorer row: a followed BOUNDARY, not a sealed frame. the
@@ -1797,12 +1808,8 @@ fn boundary_block_row(height: u64, app_hash: &StateRoot) -> Vec<u8> {
         height,
         hash: String::new(),
         commit_hash: hex(app_hash),
-        proposer: String::new(),
-        disposition: noded::BlockDisposition::Applied,
-        target: String::new(),
-        operations: Vec::new(),
-        payload: String::new(),
-        op_hash: String::new(),
+        // a resident follows boundaries, not frames: no member ops to show.
+        ops: Vec::new(),
     })
 }
 
@@ -1996,29 +2003,53 @@ async fn apply_verified_suffix_frame(
     served: &statesync::FinalizedFrame,
 ) -> Result<Vec<host::DispatchRecord>, String> {
     let expected = to_node_disposition(served.disposition);
-    let mut dispatches = Vec::new();
-    let outcome = match node::decode_frame(&served.frame) {
-        Ok((origin, msg)) => {
-            let protocol_version = host.effective_version(served.height).await;
-            host.set_active_version(protocol_version);
+    let protocol_version = host.effective_version(served.height).await;
+    host.set_active_version(protocol_version);
+    // the served frame is a BATCH: decode its members and apply as ONE block,
+    // exactly like the live drain and recovery replay, so the disposition,
+    // roots, and app-hash reproduce what the peer served. disposition is
+    // DRAIN-based (any member applied or a System injection ran), never
+    // app-hash-based.
+    let (outcome, dispatches) = match node::decode_batch(&served.frame) {
+        Ok(members) => {
+            let mut ops = Vec::new();
+            for member in &members {
+                if let Ok(pair) = node::decode_frame(member) {
+                    ops.push(pair);
+                }
+            }
             let ctx = host::BlockContext {
                 protocol_version,
                 height: served.height,
                 consensus_time: served.height,
-                origin,
+                origin: sdk::Origin::System,
             };
-            match host.submit_at(ctx, msg).await {
-                Ok(outcome) => {
-                    dispatches = outcome.dispatches;
-                    node::Disposition::Applied
+            match host.submit_block(ctx, ops).await {
+                Ok(batch) => {
+                    let mut dispatches = Vec::new();
+                    let mut any_applied = false;
+                    for member in batch.members {
+                        if let host::MemberOutcome::Applied { dispatches: d } = member {
+                            any_applied = true;
+                            dispatches.extend(d);
+                        }
+                    }
+                    let has_system = !batch.system_dispatches.is_empty();
+                    dispatches.extend(batch.system_dispatches);
+                    let outcome = if any_applied || has_system {
+                        node::Disposition::Applied
+                    } else {
+                        node::Disposition::Rejected
+                    };
+                    (outcome, dispatches)
                 }
-                Err(host::SubmitError::Rejected(_)) => node::Disposition::Rejected,
+                Err(host::SubmitError::Rejected(_)) => (node::Disposition::Rejected, Vec::new()),
                 Err(host::SubmitError::Fatal(f)) => {
                     return Err(format!("fatal host error applying suffix frame: {f}"));
                 }
             }
         }
-        Err(_) => node::Disposition::Rejected,
+        Err(_) => (node::Disposition::Rejected, Vec::new()),
     };
     if outcome != expected {
         return Err(format!(
@@ -8918,10 +8949,13 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         let mut block_dispatches: Vec<host::DispatchRecord> = Vec::new();
                         let mut block_latency = 0u64;
                         let mut any_applied = false;
-                        // the block-list row: the FIRST non-nop member represents
-                        // the block (full per-op block rendering is a read-model
-                        // follow-up). the idle nop and pre-first rejects carry none.
-                        let mut record = None;
+                        // the block record carries a RootOp for EVERY non-nop
+                        // member (agreed order); the block hash is the first
+                        // member's frame id and the commit is the members' shared
+                        // app-hash. a pure nop/idle block shows no ops.
+                        let mut block_ops: Vec<noded::RootOp> = Vec::new();
+                        let mut block_hash: Option<node::FrameId> = None;
+                        let mut block_app_hash: Option<StateRoot> = None;
                         while gi < drained.len() && drained[gi].height == height {
                             let d = &drained[gi];
                             gi += 1;
@@ -8937,8 +8971,7 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                 block_latency = block_latency.saturating_add(op.latency_us);
                                 block_dispatches.extend(op.dispatches.iter().cloned());
                             }
-                            if record.is_none()
-                                && let Some(op) = &d.op
+                            if let Some(op) = &d.op
                                 && op.target != NOP_TARGET
                             {
                                 let disposition = match d.disposition {
@@ -8948,11 +8981,12 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     // of the inner loop; kept for match exhaustiveness.
                                     node::Disposition::Discarded => continue,
                                 };
-                                record = Some(explorer_block_row(
+                                if block_hash.is_none() {
+                                    block_hash = Some(d.id);
+                                    block_app_hash = Some(d.app_hash);
+                                }
+                                block_ops.push(explorer_root_op(
                                     &blobs,
-                                    d.height,
-                                    &d.id,
-                                    &d.app_hash,
                                     &op.origin,
                                     &op.target,
                                     &op.payload,
@@ -8964,12 +8998,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         // one block per height: an APPLIED block records fully
                         // (count, this node's summed apply latency, per-module
                         // dispatch counters); an all-rejected block (the idle nop
-                        // lands here) only follows the height gauge.
+                        // lands here) only follows the height gauge. ops_total
+                        // counts the aggregated member ops.
                         if any_applied {
                             metrics.record_block(height, block_latency, &block_dispatches);
                         } else {
                             metrics.record_height(height);
                         }
+                        metrics.record_ops(block_ops.len());
+                        let record = (!block_ops.is_empty()).then(|| {
+                            noded::block_row(&noded::BlockRecord {
+                                height,
+                                hash: block_hash.map(|h| noded::hex_bytes(&h)).unwrap_or_default(),
+                                commit_hash: block_app_hash.map(|h| hex(&h)).unwrap_or_default(),
+                                ops: block_ops,
+                            })
+                        });
                         // this lane's agreed clock IS the height: the drain stamps
                         // BlockContext { consensus_time: height } for every block.
                         let ops = indexer::BlockOps {
@@ -10492,21 +10536,23 @@ mod tests {
     ) -> statesync::FinalizedFrame {
         let frame = node::encode_frame(signer, seq, &msg);
         let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
+        // a block is a BATCH super-frame: apply the single member via the batch
+        // API and serve the batch bytes, so the catch-up replay reproduces this.
         expected
-            .submit_at(
+            .submit_block(
                 host::BlockContext {
                     protocol_version: host::BASELINE_VERSION,
                     height,
                     consensus_time: height,
-                    origin,
+                    origin: origin.clone(),
                 },
-                msg,
+                vec![(origin, msg)],
             )
             .await
             .expect("apply");
         statesync::FinalizedFrame {
             height,
-            frame,
+            frame: node::encode_batch(&[frame]),
             disposition: statesync::FrameDisposition::Applied,
             roots: expected.module_roots(),
             app_hash: expected.app_hash(),
@@ -10529,21 +10575,24 @@ mod tests {
             },
         );
         let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
+        // a block is a BATCH super-frame: apply the single member through the
+        // batch API so the served app-hash matches what recovery reproduces on
+        // replay (which decodes the frame as a batch), and serve the batch bytes.
         expected
-            .submit_at(
+            .submit_block(
                 host::BlockContext {
                     protocol_version: host::BASELINE_VERSION,
                     height,
                     consensus_time: height,
-                    origin,
+                    origin: origin.clone(),
                 },
-                msg,
+                vec![(origin, msg)],
             )
             .await
             .expect("apply mixed frame");
         statesync::FinalizedFrame {
             height,
-            frame,
+            frame: node::encode_batch(&[frame]),
             disposition: statesync::FrameDisposition::Applied,
             roots: expected.module_roots(),
             app_hash: expected.app_hash(),
@@ -11005,11 +11054,15 @@ mod tests {
         }]
     }
 
-    /// the fold's row (rebuilt from sealed frame bytes) must be byte-identical
-    /// to the drain's row (built from its live decode) — GET /v1/blocks reads
-    /// one shape regardless of which writer survived the crash.
+    /// the boot fold rebuilds a block's per-op rows from its sealed BATCH frame,
+    /// re-staging each op's payload so `GET /v1/files/blob/{op_hash}` answers
+    /// again after a restart. the block coordinates and every op's identity
+    /// (proposer/target/payload/opHash) match the drain's live row; the only
+    /// difference is the per-op dispatch TRACE — recovery folds the block-level
+    /// aggregate, not per-member, so a replayed op carries an empty trace (a
+    /// documented degradation visible only when the index is rebuilt).
     #[test]
-    fn boot_fold_rebuilds_the_drain_row_byte_identical() {
+    fn boot_fold_rebuilds_a_batch_block_ops() {
         let signer = ed25519::PrivateKey::from_seed(42);
         let payload = br#"{"set":{"key":"who","value":"ducktape"}}"#.to_vec();
         let msg = Msg {
@@ -11021,50 +11074,56 @@ mod tests {
         let dispatches = row_dispatches(&payload, &origin);
         let app_hash = test_root(9);
 
-        // the drain's construction: decoded parts straight from its DrainedOp.
+        // the drain's construction: one member op with its full dispatch trace.
         let drain_blobs = blobstore::BlobHandle::default();
-        let drain_row = explorer_block_row(
-            &drain_blobs,
-            7,
-            &node::frame_id(&frame),
-            &app_hash,
-            &origin,
-            &decoded.target,
-            &decoded.payload,
-            &dispatches,
-            noded::BlockDisposition::Applied,
-        );
+        let drain_row = noded::block_row(&noded::BlockRecord {
+            height: 7,
+            hash: noded::hex_bytes(&node::frame_id(&frame)),
+            commit_hash: hex(&app_hash),
+            ops: vec![explorer_root_op(
+                &drain_blobs,
+                &origin,
+                &decoded.target,
+                &decoded.payload,
+                &dispatches,
+                noded::BlockDisposition::Applied,
+            )],
+        });
+        let drain: serde_json::Value = serde_json::from_slice(&drain_row).unwrap();
 
-        // the boot fold's construction: nothing but what the journal seals.
+        // the boot fold's construction: the sealed frame is a BATCH.
+        let batch = node::encode_batch(std::slice::from_ref(&frame));
         let fold_blobs = blobstore::BlobHandle::default();
         let fold_row = sealed_frame_block_row(
             &fold_blobs,
             &recovery::FoldedBlock {
                 height: 7,
-                frame: &frame,
+                frame: &batch,
                 disposition: node::Disposition::Applied,
                 app_hash,
                 dispatches: &dispatches,
             },
         )
-        .expect("an applied non-nop frame rebuilds its row");
-        assert_eq!(fold_row, drain_row, "fold row must equal the drain row byte-for-byte");
-
-        // field spot-checks through the served json shape.
+        .expect("an applied non-nop batch rebuilds its row");
         let row: serde_json::Value = serde_json::from_slice(&fold_row).expect("row json");
+
+        // block coordinates match the drain.
         assert_eq!(row["height"], 7);
-        assert_eq!(row["hash"], noded::hex_bytes(&node::frame_id(&frame)));
+        assert_eq!(row["hash"], noded::hex_bytes(&node::frame_id(&batch)));
         assert_eq!(row["commitHash"], hex(&app_hash));
-        assert_eq!(
-            row["proposer"],
-            noded::hex_bytes(signer.public_key().as_ref())
-        );
-        assert_eq!(row["target"], "directory");
+        assert_eq!(row["ops"].as_array().unwrap().len(), 1);
+        // the op's identity matches the drain byte-for-byte.
+        assert_eq!(row["ops"][0]["proposer"], drain["ops"][0]["proposer"]);
+        assert_eq!(row["ops"][0]["target"], "directory");
+        assert_eq!(row["ops"][0]["payload"], drain["ops"][0]["payload"]);
+        assert_eq!(row["ops"][0]["opHash"], drain["ops"][0]["opHash"]);
+        // the fold carries an empty per-op trace (recovery folds the aggregate).
+        assert_eq!(row["ops"][0]["operations"].as_array().unwrap().len(), 0);
 
         // the rebuild re-staged the payload: op_hash is dereferencable again
         // from the FOLD's (fresh, post-restart) blob store.
         let op_digest = drain_blobs.put_chunk(payload.clone());
-        assert_eq!(row["opHash"], noded::hex_bytes(&op_digest));
+        assert_eq!(row["ops"][0]["opHash"], noded::hex_bytes(&op_digest));
         assert!(fold_blobs.has_chunk(&op_digest));
     }
 
@@ -11114,11 +11173,12 @@ mod tests {
                 payload: b"garbage-the-module-rejects".to_vec(),
             },
         );
+        let batch = node::encode_batch(&[frame]);
         let row = sealed_frame_block_row(
             &blobs,
             &recovery::FoldedBlock {
                 height: 5,
-                frame: &frame,
+                frame: &batch,
                 disposition: node::Disposition::Rejected,
                 app_hash: test_root(2),
                 dispatches: &[],
@@ -11126,7 +11186,7 @@ mod tests {
         )
         .expect("a decoded non-nop reject still shows in the explorer");
         let row: serde_json::Value = serde_json::from_slice(&row).expect("row json");
-        assert_eq!(row["disposition"], "rejected");
-        assert_eq!(row["operations"].as_array().map(Vec::len), Some(0));
+        assert_eq!(row["ops"][0]["disposition"], "rejected");
+        assert_eq!(row["ops"][0]["operations"].as_array().map(Vec::len), Some(0));
     }
 }

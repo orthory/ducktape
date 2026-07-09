@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
-import type { BlockRecord } from "../../../domain/transport";
+import type { BlockDisposition, BlockRecord } from "../../../domain/transport";
 import type { Workspace } from "../../../domain/workspace-client";
 import { StatusView } from "./StatusView";
 
@@ -34,16 +34,12 @@ const RESIDENT_C = "22".repeat(32);
 const block = (
   height: number,
   proposer: string,
-  disposition: BlockRecord["disposition"] = "applied",
+  disposition: BlockDisposition = "applied",
 ): BlockRecord => ({
   height,
   hash: `hash${height}`,
   commitHash: `commit${height}`,
-  proposer,
-  disposition,
-  target: "chat",
-  operations: [],
-  payload: "",
+  ops: [{ proposer, disposition, target: "chat", operations: [], payload: "", opHash: "" }],
 });
 
 const renderStatus = (patch: Partial<ConsoleState> = {}) => {

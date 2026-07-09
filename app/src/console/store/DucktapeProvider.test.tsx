@@ -364,12 +364,16 @@ describe("DucktapeProvider", () => {
         height: 7,
         hash: "aa".repeat(32),
         commitHash: "bb".repeat(32),
-        proposer: "cc".repeat(32),
-        disposition: "applied",
-        target: "chat",
-        operations: [],
-        payload: "{}",
-        opHash: "dd".repeat(32),
+        ops: [
+          {
+            proposer: "cc".repeat(32),
+            disposition: "applied",
+            target: "chat",
+            operations: [],
+            payload: "{}",
+            opHash: "dd".repeat(32),
+          },
+        ],
       },
     ]);
     renderConsole(transport);

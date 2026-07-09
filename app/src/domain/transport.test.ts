@@ -129,14 +129,18 @@ describe("remoteTransport", () => {
         height: 7,
         hash: "aa".repeat(32),
         commitHash: "bb".repeat(32),
-        proposer: "cc".repeat(32),
-        disposition: "applied",
-        target: "chat",
-        operations: [
-          { module: "chat", origin: "external", emittedMsgs: 0, emittedEvents: 0 },
+        ops: [
+          {
+            proposer: "cc".repeat(32),
+            disposition: "applied",
+            target: "chat",
+            operations: [
+              { module: "chat", origin: "external", emittedMsgs: 0, emittedEvents: 0 },
+            ],
+            payload: '{"Post":{}}',
+            opHash: "dd".repeat(32),
+          },
         ],
-        payload: '{"Post":{}}',
-        opHash: "dd".repeat(32),
       },
     ];
     // a Response body reads once, and this test fetches twice — hand back a

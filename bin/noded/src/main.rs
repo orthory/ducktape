@@ -490,6 +490,7 @@ async fn submit_one(
     let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
     // fold this block into the Prometheus series (before `out` is consumed).
     metrics.record_block(*height, latency_us, &out.dispatches);
+    metrics.record_ops(1); // this lane is one member op per block
 
     // fan the block out live. no subscribers is fine — send only fails then.
     let _ = events.send(WsFrame::Block(block.clone()));
@@ -507,12 +508,16 @@ async fn submit_one(
             height: *height,
             hash: String::new(),
             commit_hash: hex_root(&out.app_hash),
-            proposer,
-            disposition: BlockDisposition::Applied,
-            target,
-            operations,
-            payload,
-            op_hash,
+            // the embedded daemon lane is 1-op-1-block (one host.submit per
+            // block), so the block carries exactly one member op.
+            ops: vec![noded::RootOp {
+                proposer,
+                disposition: BlockDisposition::Applied,
+                target,
+                operations,
+                payload,
+                op_hash,
+            }],
         })),
         ..noded::index_block_ops(*height, consensus_time, &out.dispatches)
     };
