@@ -442,6 +442,67 @@ export const clearRemoteUrl = (): void => {
   }
 };
 
+// ── Onboarding hand-off persistence ─────────────────────
+//
+// Two first-run facts that outlive the onboarding screens. The display name
+// chosen while creating the account can only land on-chain after the first
+// node connects (names are chain-scoped), so it parks here until then. The
+// "link this device to an EXISTING account" choice must stop auto-bind from
+// founding a duplicate account until the other device's AddMemberKey lands —
+// see auto-bind.ts's "deferred" branch.
+const PENDING_NAME_KEY = "ducktape.pendingDisplayName";
+const LINK_PENDING_KEY = "ducktape.accountLinkPending";
+
+export const loadPendingDisplayName = (): string | null => {
+  try {
+    const raw = localStorage.getItem(PENDING_NAME_KEY);
+    return raw && raw.trim().length > 0 ? raw : null;
+  } catch {
+    return null; // storage unavailable — no parked name
+  }
+};
+
+export const savePendingDisplayName = (name: string): void => {
+  try {
+    localStorage.setItem(PENDING_NAME_KEY, name);
+  } catch {
+    // best-effort; a failed write just loses the parked name.
+  }
+};
+
+export const clearPendingDisplayName = (): void => {
+  try {
+    localStorage.removeItem(PENDING_NAME_KEY);
+  } catch {
+    // best-effort; nothing to clean up if storage is unavailable.
+  }
+};
+
+export const loadLinkPending = (): boolean => {
+  try {
+    return localStorage.getItem(LINK_PENDING_KEY) === "1";
+  } catch {
+    return false; // storage unavailable — treat as no pending link
+  }
+};
+
+export const saveLinkPending = (): void => {
+  try {
+    localStorage.setItem(LINK_PENDING_KEY, "1");
+  } catch {
+    // best-effort; a failed write risks a duplicate account on next bind,
+    // the same exposure a pre-link build had.
+  }
+};
+
+export const clearLinkPending = (): void => {
+  try {
+    localStorage.removeItem(LINK_PENDING_KEY);
+  } catch {
+    // best-effort; nothing to clean up if storage is unavailable.
+  }
+};
+
 export const createInitialState = (): ConsoleState => {
   const viewMode = loadViewMode();
   return {
