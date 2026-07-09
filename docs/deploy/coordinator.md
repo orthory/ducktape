@@ -29,14 +29,39 @@ end-to-end encrypted **without** the coordinator:
 - The **data tunnel** is validator↔validator **WireGuard**, keyed and encrypted
   between the two validators' own keys.
 
-So the coordinator is at most a rendezvous point beside those planes — it is
-never *on* a data path at all. It **learns coarse topology and reflexive
-addresses and can observe rendezvous timing, but it cannot decrypt,
-impersonate, MITM, serve state, or join consensus** (design §"Trust and threat
-model"). Therefore it is safe to run as **throwaway infra with no key on the
-box**. The hardening in `ops/coordinator/ducktape-coordinator.service` makes that
-structural: if a reviewer can find a place a secret *would* live on this host,
-the recipe is wrong.
+So the coordinator sits beside those planes as a rendezvous point. What a
+compromised or malicious coordinator **cannot** do is the load-bearing
+guarantee: it **holds no key, and cannot decrypt, impersonate, forge, serve
+state, or join consensus** — WireGuard's end-to-end encryption and the
+`authenticated::discovery` dial-expects-key handshake hold regardless of what
+path delivers the bytes. Therefore it is safe to run as **throwaway infra with
+no key on the box**. The hardening in
+`ops/coordinator/ducktape-coordinator.service` makes that structural: if a
+reviewer can find a place a secret *would* live on this host, the recipe is
+wrong.
+
+> **What it CAN do — read this before trusting a third party's coordinator.**
+> The coordinator is untrusted for *confidentiality and authenticity*, but it is
+> **not** out of the data path in every case. It brokers the punched endpoint
+> each side installs, and the underlay endpoint is **not** cryptographically
+> bound to the peer's identity — only the peer's WireGuard *public key* is
+> pinned. So a malicious coordinator can answer a lookup with **its own**
+> address, punch from it, and become the **underlay relay** between two peers
+> that have no direct path. Riding that relay it can **observe traffic volume
+> and timing** and **censor** (drop) an established tunnel — but it still cannot
+> read, forge, or alter the WireGuard-encrypted payload. This is **inherent** to
+> rendezvous-based NAT traversal: for a peer pair with no direct route, the
+> party that tells each side where the other *is* must be trusted not to name
+> itself. A signed punch would not close it (the coordinator can relay the
+> peer's own valid packets); only a directly-reachable signed endpoint lets a
+> peer bypass the coordinator entirely.
+>
+> **Operational guidance:** run coordinators **you** trust (or your own), and run
+> **several** — a peer that can reach a direct signed endpoint never installs a
+> coordinator-punched override, and multiple coordinators dilute any single
+> one's leverage. Do not treat a stranger's coordinator as neutral: it cannot
+> steal your keys or your data, but it can watch and throttle the connections
+> that depend on it.
 
 ## What it is
 
@@ -181,13 +206,17 @@ does.
 
 Run **multiple** coordinators. A v3 invite carries a `Vec` of reach hints and
 `NatClient::discover_reflexive_failover` walks them (Slice 3), so a single
-coordinator outage is not fatal to entry. And an already-**punched** direct path
-survives a coordinator restart entirely — only *new* rendezvous depends on a
-live coordinator; no data path ever traverses one. This is the key contrast
-with an in-path [sentry](../sentry-deployment.md), which sits in the data path
-and is a single point of failure for the validator it fronts: an out-of-path
-coordinator is where the "established connections survive; only new ones depend
-on it" framing actually holds.
+coordinator outage is not fatal to entry. A tunnel punched to a peer's **own**
+address (a direct signed endpoint, or a reflexive that stayed valid) survives a
+coordinator restart entirely — only *new* rendezvous depends on a live
+coordinator. The one caveat is the relay case above: if a **malicious**
+coordinator made itself a peer's underlay endpoint, that tunnel rides *it*, so
+that tunnel does depend on it (and it can drop it) — which is exactly why you
+run coordinators you trust and prefer direct signed endpoints. This is still a
+sharp contrast with an in-path [sentry](../sentry-deployment.md), which is
+*always* in the data path and a single point of failure for the validator it
+fronts: an honest out-of-path coordinator is where the "established connections
+survive; only new ones depend on it" framing holds.
 
 ## What this recipe does NOT do
 
