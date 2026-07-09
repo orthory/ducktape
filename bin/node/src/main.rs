@@ -70,6 +70,7 @@ mod first_contact_join;
 mod lobby;
 mod oracle_pool;
 mod relay;
+mod replica;
 mod resident_announce;
 mod resident_dispatch;
 mod statesync_plane;
@@ -1526,6 +1527,71 @@ fn verify_manifest_floor(
     )
     .map_err(|e| format!("served finalization floor is stale: {e}"))?;
     Ok(Some(cert))
+}
+
+/// capture and persist the checkpoint (+ floor cert) that makes a synced
+/// boundary a valid recovery-boot base — the journal's genesis for an
+/// identity that never framed ops on this network (`next_seq = 1`). used by
+/// the replica's join-time journal init, and (until the promotion collapse
+/// lands) by the promotion path's pre-reboot fabrication. FATALs on
+/// persistence failure: a node that cannot journal its base must not proceed
+/// as if it had.
+async fn write_boundary_checkpoint<E>(
+    recovery: &mut Recovery<E>,
+    host: &Host,
+    boundary: &statesync::Manifest,
+    floor: &Option<recovery::FloorCert>,
+    label: &str,
+    diag_tag: &str,
+) where
+    E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
+{
+    let pos = recovery.oplog_pos().await;
+    let floor_height = floor
+        .as_ref()
+        .map(|floor| floor.height.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    diag_log(format!(
+        "DIAG {diag_tag} checkpoint_height={} checkpoint_hash={} \
+         floor_height={} floor_present={}",
+        boundary.height,
+        hex(&host.app_hash()),
+        floor_height,
+        floor.is_some()
+    ));
+    // stamp the real committed version fields so the captured checkpoint
+    // carries the same `required_min_version` a live checkpoint would; the
+    // next boot then preflights against them like any restart.
+    let (cv, pu) = read_upgrade_version_fields(host).await;
+    let ckpt = match Manifest::capture(
+        host,
+        Some(boundary.height),
+        boundary.epoch,
+        boundary.view_base,
+        boundary.participants.clone(),
+        boundary.residents.clone(),
+        None,
+        cv,
+        pu,
+        pos,
+        1,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("[node {label}] FATAL: {diag_tag} capture: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = recovery.write_manifest(&ckpt).await {
+        eprintln!("[node {label}] FATAL: {diag_tag} write: {e}");
+        std::process::exit(1);
+    }
+    if let Some(fc) = floor
+        && let Err(e) = recovery.write_floor_cert(fc).await
+    {
+        eprintln!("[node {label}] FATAL: {diag_tag} floor-cert write: {e}");
+        std::process::exit(1);
+    }
 }
 
 fn to_node_disposition(disposition: statesync::FrameDisposition) -> node::Disposition {
@@ -7461,57 +7527,19 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             }
 
             // fabricate the checkpoint a restart would have left; the normal
-            // recovery boot turns it into a live validator. next_seq starts
-            // at 1 — this identity never framed ops on this network. (a
-            // REJOINING key that later resubmits a byte-identical (seq,
-            // payload) pair could be dropped by a peer's in-process digest
-            // gate; accepted edge until submit sequences ride app state.)
-            let pos = recovery.oplog_pos().await;
-            let floor_height = floor
-                .as_ref()
-                .map(|floor| floor.height.to_string())
-                .unwrap_or_else(|| "none".to_string());
-            diag_log(format!(
-                "DIAG promotion_checkpoint checkpoint_height={} checkpoint_hash={} \
-                 floor_height={} floor_present={}",
-                boundary.height,
-                hex(&host.app_hash()),
-                floor_height,
-                floor.is_some()
-            ));
-            // stamp the real committed version fields so the fabricated checkpoint
-            // carries the same `required_min_version` a live checkpoint would; the
-            // promotion boot then preflights against them like any restart.
-            let (cv, pu) = read_upgrade_version_fields(&host).await;
-            let ckpt = match Manifest::capture(
+            // recovery boot turns it into a live validator. (a REJOINING key
+            // that later resubmits a byte-identical (seq, payload) pair could
+            // be dropped by a peer's in-process digest gate; accepted edge
+            // until submit sequences ride app state.)
+            write_boundary_checkpoint(
+                &mut recovery,
                 &host,
-                Some(boundary.height),
-                boundary.epoch,
-                boundary.view_base,
-                boundary.participants.clone(),
-                boundary.residents.clone(),
-                None,
-                cv,
-                pu,
-                pos,
-                1,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("[node {label}] FATAL: promotion checkpoint capture: {e}");
-                    std::process::exit(1);
-                }
-            };
-            if let Err(e) = recovery.write_manifest(&ckpt).await {
-                eprintln!("[node {label}] FATAL: promotion checkpoint write: {e}");
-                std::process::exit(1);
-            }
-            if let Some(fc) = &floor
-                && let Err(e) = recovery.write_floor_cert(fc).await
-            {
-                eprintln!("[node {label}] FATAL: promotion floor-cert write: {e}");
-                std::process::exit(1);
-            }
+                &boundary,
+                &floor,
+                &label,
+                "promotion_checkpoint",
+            )
+            .await;
             // tear the pre-warm interface down cleanly before the exec: the
             // in-process boringtun device dies with the process either way,
             // but only an orderly Shutdown unlinks its UAPI socket path —

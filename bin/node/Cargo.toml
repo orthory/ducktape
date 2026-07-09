@@ -120,6 +120,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 async-trait = { workspace = true }
 tempfile = "3"
+# replica::tests assembles real finalization certificates (sign -> assemble)
+# to exercise the cert-lane decode + fold planner.
+commonware-parallel = { workspace = true }
 # the phase-3 proof: duckfs_client_e2e drives the checkout/commit engine (as a
 # library, over each node's real http surface) across a two-validator cluster.
 duckfs-client = { workspace = true }
