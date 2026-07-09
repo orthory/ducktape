@@ -2128,7 +2128,13 @@ where
                 self.interface_live = false;
             }
             self.base_peers = None;
-            if !merged.is_empty() {
+            {
+                // Apply even when `merged` is empty: a single-member network
+                // (every fresh desktop workspace) and an all-peers-failed
+                // epoch still need the interface up — the node's own /128 is
+                // what the per-use media planes (voice/video hub) bind, so a
+                // peer-less interface is the difference between a working
+                // solo huddle and a join that hangs in "connecting" forever.
                 let peers: Vec<PeerTunnelConfig> = merged.values().cloned().collect();
                 // the plane's overlay is ula_v6: the local side is the same
                 // identity-derived /128 every validated plan carries.

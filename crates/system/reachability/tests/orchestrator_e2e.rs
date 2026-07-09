@@ -461,9 +461,17 @@ async fn single_member_mesh_and_stranger_traffic_are_inert() {
             await_applied(&mut collected, &[0], 1).await;
             {
                 let fake = nodes[0].effect.0.lock().unwrap();
+                // A peerless mesh still brings the interface up (own /128, no
+                // peers): the per-use media planes bind it, so a single-member
+                // network — every fresh desktop workspace — can huddle solo.
                 assert_eq!(
-                    fake.create_calls, 0,
-                    "a peerless mesh brings up no interface"
+                    fake.create_calls, 1,
+                    "a peerless mesh brings up its own interface"
+                );
+                assert_eq!(fake.applied.len(), 1, "one apply");
+                assert!(
+                    fake.applied[0].peers.is_empty(),
+                    "no peer tunnels on a peerless mesh"
                 );
             }
 
