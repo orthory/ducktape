@@ -16,7 +16,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import { keyHex } from "../../domain/chat-client";
-import { accountOfNode, submitRawMsg } from "../../domain/identity-client";
+import { enrollStart } from "../../domain/enroll-client";
+import { accountOfNode, hexToBytes, submitRawMsg } from "../../domain/identity-client";
 import type { AccountView } from "../../domain/identity-client";
 import type { NodeTransport } from "../../domain/transport";
 import { decodeLinkResponse } from "../views/account/link-device";
@@ -104,6 +105,65 @@ export const removeMemberKey = (
       .then((msg) => submitRawMsg(deps.transport, msg))
       .then(() => undefined, rethrowActionable),
   );
+
+// ── Phone enrollment (the LAN QR ceremony, enroll.rs) ────
+//
+// Same nonce discipline as the paste ceremony above: the phone signs a
+// payload pinned to the nonce `enroll_start` was called at, so approve
+// re-reads the account and refuses on drift instead of submitting a doomed
+// msg. The desktop stays the authority — the LAN server only relays a
+// CANDIDATE key; nothing lands until approve signs the authorizer here.
+
+/** One in-flight phone enrollment: the QR url plus the account facts the
+ *  phone's possession proof is pinned to. */
+export interface PhoneEnrollment {
+  url: string;
+  accountId: string;
+  nonce: number;
+}
+
+/** Stand up the LAN enrollment server for this account (fresh nonce) and
+ *  return the QR url + the pinned facts approve verifies against. */
+export const startPhoneEnrollment = (deps: AccountOpsDeps): Promise<PhoneEnrollment> =>
+  ownAccount(deps).then((account) => {
+    const accountId = keyHex(account.account_id);
+    return enrollStart(deps.chainId, accountId, account.nonce).then(({ url }) => ({
+      url,
+      accountId,
+      nonce: account.nonce,
+    }));
+  });
+
+/** Approve the phone's candidate key: authorize + submit `AddMemberKey` with
+ *  the P-256 possession (`MemberProof::Signature`, raw R‖S bytes). */
+export const approvePhoneEnrollment = (
+  deps: AccountOpsDeps,
+  enrollment: PhoneEnrollment,
+  newKeyHex: string,
+  sigHex: string,
+  label: string | null,
+): Promise<void> =>
+  ownAccount(deps).then((account) => {
+    if (account.nonce !== enrollment.nonce) {
+      throw new Error(
+        "the account changed since this QR was made — re-run the enrollment",
+      );
+    }
+    // The wire shape verify_authority expects for a native P-256 key:
+    // externally-tagged MemberProof, sig as raw bytes.
+    const possession = JSON.stringify({ signature: { sig: hexToBytes(sigHex) } });
+    return invoke<string>("user_sign_add_member", {
+      chainId: deps.chainId,
+      accountId: enrollment.accountId,
+      newPub: newKeyHex,
+      newKind: "p256",
+      nonce: enrollment.nonce,
+      possession,
+      label,
+    })
+      .then((msg) => submitRawMsg(deps.transport, msg))
+      .then(() => undefined, rethrowActionable);
+  });
 
 /** Evict `targetNodeHex` from this account — the lost-device affordance. The
  *  node keeps running; it just stops being yours (and the nonce bump kills

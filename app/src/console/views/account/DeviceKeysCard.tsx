@@ -1,16 +1,21 @@
 // Devices & keys — the account's collected member keys (any scheme), with the
-// two halves of the device-link ceremony and member-key removal. Linked: list
-// keys, mint/approve link codes (the inviter side), drop keys. Unlinked: offer
-// the NEW-device side of the ceremony (LinkDeviceFlow) so a device that
-// skipped linking during onboarding can still join an account from here.
+// two halves of the device-link ceremony, the phone QR enrollment (a P-256
+// key minted on a phone over the LAN — see src-tauri/src/enroll.rs), and
+// member-key removal. Linked: list keys, mint/approve link codes, enroll a
+// phone, drop keys. Unlinked: offer the NEW-device side of the ceremony
+// (LinkDeviceFlow) so a device that skipped linking during onboarding can
+// still join an account from here.
 
 import { useEffect, useState } from "react";
+import { renderSVG } from "uqr";
 
 import { keyHex } from "../../../domain/chat-client";
+import { enrollCancel, enrollPoll } from "../../../domain/enroll-client";
 import type { KeyKind, MemberKeyView } from "../../../domain/identity-client";
 import { shortKey } from "../../../domain/names";
 import type { IdentityStateReport } from "../../../domain/user-identity-client";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import type { PhoneEnrollment } from "../../store/account-ops";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font } from "../../theme/tokens";
 import {
@@ -142,6 +147,128 @@ function LinkInviterPanel({ onDone }: { onDone: () => void }) {
   );
 }
 
+/** The phone QR enrollment panel: stand the LAN server up on mount (tear it
+ *  down on unmount — the server's lifetime is exactly this panel's), render
+ *  the QR, poll for the phone's candidate key, and let the user approve it.
+ *  The desktop stays the authority: nothing lands until Approve signs the
+ *  add-member authorizer, and the possession is pinned to the nonce the QR
+ *  was minted at (approve refuses on drift). */
+function PhoneEnrollPanel({ onDone }: { onDone: () => void }) {
+  const { actions } = useDucktape();
+  const [enrollment, setEnrollment] = useState<PhoneEnrollment | null>(null);
+  const [candidate, setCandidate] = useState<{ newKey: string; sig: string } | null>(null);
+  const [label, setLabel] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Start on mount; cancel on unmount — leaving the panel (or the screen)
+  // must never leave the LAN listener up.
+  useEffect(() => {
+    let alive = true;
+    actions
+      .accountPhoneEnrollStart()
+      .then((started) => {
+        if (alive) setEnrollment(started);
+      })
+      .catch((err) => {
+        if (alive) setError(errMessage(err));
+      });
+    return () => {
+      alive = false;
+      void enrollCancel().catch(() => {});
+    };
+  }, [actions]);
+
+  // Poll for the phone's proof while the QR is up. Best-effort: a missed
+  // tick just means the next one picks it up.
+  useEffect(() => {
+    if (!enrollment || candidate) return;
+    const timer = setInterval(() => {
+      enrollPoll().then(
+        (result) => {
+          if (result) setCandidate({ newKey: result[0], sig: result[1] });
+        },
+        () => {},
+      );
+    }, 1200);
+    return () => clearInterval(timer);
+  }, [enrollment, candidate]);
+
+  if (error && !enrollment) {
+    return <span style={errorTextStyle}>{error}</span>;
+  }
+  if (!enrollment) {
+    return <span style={hintStyle}>Starting the enrollment…</span>;
+  }
+
+  if (candidate) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <span style={{ ...hintStyle, marginBottom: 0 }}>
+          Your phone created a key. Approving adds it to your account:
+        </span>
+        <span style={{ ...monoValue, maxWidth: "100%" }} title={candidate.newKey}>
+          Security key · {shortKey(candidate.newKey)}
+        </span>
+        <input
+          value={label}
+          onChange={(event) => setLabel(event.target.value)}
+          placeholder="Key label (optional, e.g. my phone)"
+          style={inputStyle}
+        />
+        {error && <span style={errorTextStyle}>{error}</span>}
+        <button
+          onClick={() => {
+            setBusy(true);
+            setError(null);
+            actions
+              .accountPhoneEnrollApprove(
+                enrollment,
+                candidate.newKey,
+                candidate.sig,
+                label.trim() || null,
+              )
+              .then(() => enrollCancel().catch(() => {}))
+              .then(onDone)
+              .catch((err) => setError(errMessage(err)))
+              .finally(() => setBusy(false));
+          }}
+          disabled={busy}
+          style={primaryButtonStyle(busy)}
+        >
+          {busy ? "Approving…" : "Approve key"}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <span style={{ ...hintStyle, marginBottom: 0 }}>
+        Scan with your phone on the same Wi-Fi. The key is generated on the
+        phone and nothing leaves your network — you approve it here.
+      </span>
+      {/* uqr emits pure path geometry, but an img data-URI keeps the SVG out
+          of the document's DOM entirely — no innerHTML anywhere. */}
+      <img
+        alt="Enrollment QR code"
+        width={190}
+        height={190}
+        style={{ alignSelf: "center", background: "#fff", padding: 8, borderRadius: 8 }}
+        src={`data:image/svg+xml;utf8,${encodeURIComponent(renderSVG(enrollment.url))}`}
+      />
+      <span
+        aria-label="Enrollment URL"
+        style={{ ...monoValue, maxWidth: "100%", textAlign: "center" }}
+        title={enrollment.url}
+      >
+        {enrollment.url}
+      </span>
+      <span style={{ ...hintStyle, marginBottom: 0 }}>Waiting for the phone…</span>
+    </div>
+  );
+}
+
 export function DeviceKeysCard({
   accountId,
   identity,
@@ -150,7 +277,7 @@ export function DeviceKeysCard({
   identity: IdentityStateReport | null;
 }) {
   const { state, actions } = useDucktape();
-  const [panel, setPanel] = useState<"none" | "invite" | "linkSelf">("none");
+  const [panel, setPanel] = useState<"none" | "invite" | "phone" | "linkSelf">("none");
   const [pendingRemove, setPendingRemove] = useState<MemberKeyView | null>(null);
   const [removeError, setRemoveError] = useState<string | null>(null);
 
@@ -233,7 +360,6 @@ export function DeviceKeysCard({
         <ControlRow
           title="Link a device"
           desc="Bring another machine into this account — it signs as you, with its own key."
-          last={panel !== "invite" && !removeError}
           control={
             <HoverButton
               onClick={() => setPanel(panel === "invite" ? "none" : "invite")}
@@ -245,8 +371,27 @@ export function DeviceKeysCard({
           }
         />
         {panel === "invite" && (
-          <CustodyPanel last={!removeError}>
+          <CustodyPanel>
             <LinkInviterPanel onDone={() => setPanel("none")} />
+          </CustodyPanel>
+        )}
+        <ControlRow
+          title="Add a key from your phone"
+          desc="Scan a QR over the LAN — the phone mints a security key you approve here."
+          last={panel !== "phone" && !removeError}
+          control={
+            <HoverButton
+              onClick={() => setPanel(panel === "phone" ? "none" : "phone")}
+              hoverBg={color.titlebar}
+              style={outlineButton}
+            >
+              {panel === "phone" ? "Cancel" : "Show QR"}
+            </HoverButton>
+          }
+        />
+        {panel === "phone" && (
+          <CustodyPanel last={!removeError}>
+            <PhoneEnrollPanel onDone={() => setPanel("none")} />
           </CustodyPanel>
         )}
         {removeError && (
