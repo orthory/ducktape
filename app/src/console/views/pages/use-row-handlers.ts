@@ -214,6 +214,9 @@ export function useRowHandlers({
       // walking off the top lands in the title; off the bottom, nowhere.
       if (delta === -1) focusRow(undefined);
       },
+      // the row owns its textarea's value, so it owns placing the caret in it.
+      // It calls this once the caret has actually landed.
+      focusApplied: (blockId) => setFocus((f) => (f?.id === blockId ? null : f)),
       registerInput: (blockId, el) => {
       if (el) inputs.current.set(blockId, el);
       else inputs.current.delete(blockId);
