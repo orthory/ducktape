@@ -35,6 +35,9 @@ const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// Handle to the spawned stream task. Dropping it does NOT stop the loop;
 /// call [`StreamHandle::shutdown`].
 pub struct StreamHandle {
+    /// Owned but never read: the task detaches on drop, so this exists only
+    /// to keep a join/abort route open for future lifecycle needs.
+    #[allow(dead_code)]
     task: tauri::async_runtime::JoinHandle<()>,
     shutdown: Arc<Notify>,
 }
@@ -109,8 +112,9 @@ pub async fn run_loop<S: Sink>(
         {
             ConnEnd::Shutdown => return,
             // a node_url change is a deliberate user action: reconnect
-            // immediately (the outer loop re-reads the config).
-            ConnEnd::Reconfigured => {}
+            // immediately, and re-floor the backoff — a failing streak against
+            // the OLD node must not penalise the first dial of the new one.
+            ConnEnd::Reconfigured => backoff = BACKOFF_FLOOR,
             ConnEnd::Dropped => {
                 if let ParkEnd::Shutdown = backoff_park(
                     &shared,
@@ -805,7 +809,7 @@ mod tests {
                 "target": "chat",
                 "payload": { "post_message": {
                     "channel_id": channel,
-                    "message_id": "notify-e2e-m1",
+                    "message_id": format!("{channel}-m1"),
                     "blocks": [{ "paragraph": [{
                         "text": "hey you",
                         "marks": [{ "mention": { "user": [18, 52] } }]

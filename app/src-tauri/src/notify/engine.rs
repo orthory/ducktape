@@ -26,6 +26,10 @@ pub enum Frame {
         topic: String,
         cursor: String,
     },
+    /// Never built by the stream loop (heartbeats only re-arm its watchdog,
+    /// in-loop); kept so the engine's frame taxonomy matches the wire's and
+    /// tests can pin that a heartbeat disturbs no engine state.
+    #[allow(dead_code)]
     Heartbeat,
 }
 

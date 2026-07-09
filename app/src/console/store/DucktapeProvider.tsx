@@ -75,7 +75,19 @@ const RECONNECT_POLL_MS = 3_000;
 // imports of one specifier both waste work and race vitest's module mocker
 // (the loser of the race resolves the REAL module past the test's mock).
 let tauriEventModule: Promise<typeof import("@tauri-apps/api/event")> | null = null;
-const tauriEventApi = () => (tauriEventModule ??= import("@tauri-apps/api/event"));
+const tauriEventApi = () => {
+  if (!tauriEventModule) {
+    tauriEventModule = import("@tauri-apps/api/event");
+    // Never cache a rejection: one failed load would otherwise leave the
+    // navigate listener and both huddle bridges dead for the whole session,
+    // with every consumer swallowing the same cached error silently.
+    tauriEventModule.catch((err) => {
+      tauriEventModule = null;
+      console.warn("[console] @tauri-apps/api/event failed to load; retrying on next use", err);
+    });
+  }
+  return tauriEventModule;
+};
 
 /** The structured deep-link a desktop notification navigates with. A plain
  *  string payload remains the tray popover's bare screen switch. Mirrored by
@@ -693,6 +705,10 @@ export function DucktapeProvider({
           const target = parseNavigateTarget(payload);
           if (!target) return;
           const { channelId, threadRoot } = target;
+          // Every structured navigate owns the parked-thread slot: a stale
+          // hand-off from an earlier navigate (channel never entered, or a
+          // no-thread target arriving next) must not open a thread later.
+          pendingThreadRef.current = null;
           // Park the thread hand-off BEFORE the channel switch dispatches:
           // openThread reads the ACTIVE channel, and the switch only lands on
           // the next render — effect 5b opens it once it has (an already-
