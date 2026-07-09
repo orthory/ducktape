@@ -83,17 +83,24 @@ impl AdvertBook {
     /// Boot/live registration at the nonce-0 baseline. The coordinator-observed
     /// `src` is authoritative. This establishes the baseline for a first-seen key
     /// and refreshes it while still at the baseline, but it is NOT unconditional:
-    /// once a rebind re-advertisement has advanced the stored nonce above 0, a
-    /// later (necessarily nonce-0) `Register` — which under UDP may be a
-    /// duplicated, reordered, or replayed datagram from the STALE mapping — must
-    /// not roll the fresh mapping back while that mapping is ALIVE. An expired
-    /// mapping is dead weight: its pinhole is gone, so the anti-rollback guard
-    /// yields and the fresh register takes the slot back (the reboot case).
+    /// a nonce-0 `Register` must never REPOINT a still-ALIVE mapping, because the
+    /// authenticator is not bound to the datagram source, so a captured `Register`
+    /// replayed from a DIFFERENT source within the freshness window would
+    /// otherwise hijack the owner's mapping to the attacker's observed address.
+    /// Two cases keep a live mapping fixed. When `nonce > 0`, a rebind
+    /// re-advertisement already superseded the baseline, so a later (necessarily
+    /// nonce-0) `Register` is stale by construction. When `nonce == 0` but the
+    /// source DIFFERS, a live baseline mapping is not repointed by a bare
+    /// `Register` from elsewhere: a genuine NAT rebind re-advertises under a
+    /// strictly-higher nonce (`readvertise`, the keepalive path), never a bare
+    /// nonce-0 `Register`, so no legitimate node needs this — while a SAME-source
+    /// `Register` still refreshes liveness. An EXPIRED mapping is dead weight (its
+    /// pinhole is gone), so both guards yield and the fresh register takes the
+    /// slot back — the reboot case.
     pub fn observe(&mut self, key: NodeKey, src: SocketAddr, now: u64) {
         match self.latest.get(&key) {
-            // Already superseded past the boot baseline AND still alive: a
-            // nonce-0 Register is stale by construction and cannot roll it back.
-            Some(prev) if prev.nonce > 0 && !self.expired(prev, now) => {}
+            Some(prev)
+                if !self.expired(prev, now) && (prev.nonce > 0 || prev.reflexive != src) => {}
             _ => self.insert_fresh(key, src, 0, now),
         }
     }
@@ -267,18 +274,60 @@ mod tests {
     }
 
     #[test]
-    fn observe_still_refreshes_while_at_the_boot_baseline() {
-        // Before any rebind (still nonce 0), a re-register updates the mapping —
-        // the fix only blocks rollback of an already-superseded mapping.
+    fn observe_refreshes_the_baseline_from_the_same_source_but_never_repoints_it() {
+        // A SAME-source nonce-0 re-register refreshes liveness (a legitimate node
+        // re-registering from its own pinhole while still at the baseline)...
         let key = NodeKey([0xee; 32]);
+        let mut book = AdvertBook::with_ttl(120);
+        book.observe(key, addr(1, 4000), 1_000);
+        book.observe(key, addr(1, 4000), 1_050);
+        assert_eq!(book.current(key, 1_160), Some(addr(1, 4000)), "life extended to 1_170");
+        assert_eq!(book.current(key, 1_171), None, "the same-source refresh moved last_seen");
+
+        // ...but a DIFFERENT-source nonce-0 register does NOT repoint a live
+        // baseline mapping. A genuine NAT rebind re-advertises under a higher
+        // nonce (readvertise); only a replayed/spoofed bare Register lands here.
+        let key = NodeKey([0xef; 32]);
         let mut book = AdvertBook::default();
         book.observe(key, addr(1, 4000), 0);
         book.observe(key, addr(3, 7000), 0);
         assert_eq!(
             book.current(key, 0),
-            Some(addr(3, 7000)),
-            "a nonce-0 re-register refreshes the baseline mapping"
+            Some(addr(1, 4000)),
+            "a different-source nonce-0 register cannot repoint a live baseline mapping"
         );
+    }
+
+    #[test]
+    fn replayed_register_from_another_source_cannot_hijack_a_live_mapping() {
+        // The H3 register-hijack: an on-path attacker captures a victim's valid
+        // Register and replays the identical (still-freshly-PoP'd) datagram from
+        // its OWN socket. At the coordinator that lands as observe(victim, attacker_src).
+        // The victim is at the nonce-0 baseline (registered, not yet keepalived),
+        // and its mapping is live — so the attacker's source must NOT take over.
+        let victim = NodeKey([0x77; 32]);
+        let victim_src = addr(1, 4000);
+        let attacker_src = addr(9, 6666);
+        let mut book = AdvertBook::with_ttl(120);
+        book.observe(victim, victim_src, 1_000); // victim boots, registers
+        book.observe(victim, attacker_src, 1_010); // attacker replays from its own src
+        assert_eq!(
+            book.current(victim, 1_010),
+            Some(victim_src),
+            "the replayed register cannot hijack the victim's reflexive mapping"
+        );
+        assert_eq!(
+            book.key_for_src(attacker_src, 1_010),
+            None,
+            "the attacker's source never became the victim's mapping"
+        );
+        // The victim's own keepalive readvertise (strictly-higher nonce) still
+        // works normally afterward — a genuine rebind is unaffected.
+        assert_eq!(
+            book.readvertise(victim, addr(1, 5000), 1_011, 1_020),
+            AdvertOutcome::Superseded
+        );
+        assert_eq!(book.current(victim, 1_020), Some(addr(1, 5000)));
     }
 
     #[test]

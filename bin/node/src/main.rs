@@ -134,7 +134,7 @@ const PEER_SET: u64 = 0;
 /// shows. the frame finalizes, rejects deterministically on every node (unknown
 /// module), advances the engine clock, and leaves no state.
 const NOP_TARGET: &str = "consensus.nop";
-// block cadence is a single knob: `consensus::BLOCK_TIME` (2s). the idle
+// block cadence is a single knob: `consensus::BLOCK_TIME` (1s). the idle
 // heartbeat beats one nop block per BLOCK_TIME so an idle chain still finalizes
 // (its height keeps ticking) and any pending cutover still crosses — paced to
 // the same interval the leader's idle-propose holds a view open, so the beat
@@ -215,6 +215,15 @@ const CHANNEL_VIDEO: u64 = 8;
 /// survive member restarts (the request queue is in-memory), quiet enough to
 /// stay out of the members' way.
 const LOBBY_ANNOUNCE_EVERY: usize = 5;
+/// the park loop's poll cadence while the joiner still knocks for standing or
+/// has no served boundary yet: fast, because this tick is all that paces the
+/// first sync and the `LOBBY_ANNOUNCE_EVERY` knock counter.
+const JOINER_POLL: Duration = Duration::from_secs(2);
+/// a standing, SERVING resident's fallback poll. head-following is wake-driven
+/// (cert-lane traffic nudges the park loop the moment a boundary seals), so
+/// this tick only covers a missed wake — a mesh hiccup swallowing a
+/// certificate burst, or an idle stretch with nothing to follow.
+const RESIDENT_FALLBACK_POLL: Duration = Duration::from_secs(12);
 /// how many epochs of engine channels are PRE-REGISTERED. discovery channels
 /// can only be registered before `network.start()`, and every epoch's respawned
 /// engine needs FRESH channels (an aborted old engine must never collide with
@@ -6179,14 +6188,22 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                 std::process::exit(1);
             }
             // the parked mesh identity: genesis set at the base index (no
-            // consensus coordinates yet), engine lanes black-holed exactly
-            // like the sync-only resident — an unregistered channel is a
-            // protocol violation that kills the very connection the sync
-            // client needs.
+            // consensus coordinates yet), engine lanes black-holed like the
+            // sync-only resident — an unregistered channel is a protocol
+            // violation that kills the very connection the sync client needs.
+            // EXCEPT the cert lanes: certificate traffic (notarizations,
+            // finalizations) is the push signal that the head advanced, so
+            // their drains nudge the park loop below instead of dropping on
+            // the floor — the resident re-syncs the moment a boundary seals
+            // rather than on the fallback poll. the nudge is a HINT only
+            // (coalesced, undecoded, unauthenticated): state is adopted
+            // exclusively through the verified manifest path, and a spurious
+            // nudge costs one height-gated no-op fetch.
             oracle.track(PEER_SET, mesh_participants.clone());
+            let (head_wake_tx, mut head_wake) = futures::channel::mpsc::channel::<()>(1);
             for epoch in 0..EPOCH_CHANNEL_BANK {
                 let (vote, cert, res, payload, fetch) = engine_channels(epoch);
-                for ch in [vote, cert, res, payload, fetch] {
+                for ch in [vote, res, payload, fetch] {
                     let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
                     let label: &'static str =
                         Box::leak(format!("blackhole_{ch}").into_boxed_str());
@@ -6194,6 +6211,17 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         while rx.recv().await.is_ok() {}
                     });
                 }
+                let (_tx, mut cert_rx) = network.register(cert, quota, MAX_BACKLOG);
+                let label: &'static str =
+                    Box::leak(format!("headwake_{cert}").into_boxed_str());
+                let mut wake = head_wake_tx.clone();
+                context.child(label).spawn(move |_ctx| async move {
+                    while cert_rx.recv().await.is_ok() {
+                        // full == a wake is already pending: coalesce, never
+                        // block the drain (an unread lane kills the peer).
+                        let _ = wake.try_send(());
+                    }
+                });
             }
             let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
             // the reachability lane: a parked joiner with a WireGuard config
@@ -6703,13 +6731,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     std::process::exit(1);
                 }
                 // the serve window: between manifest polls, pump the local
-                // read surfaces from the last pre-synced boundary. the tick
-                // both paces the polls and bounds a not-yet-serving joiner's
-                // wait. (a sync in flight below queues jobs here — bounded by
-                // the rpc bridge's buffer and the listener's reply timeout —
-                // so every answer reflects a whole boundary, never a torn one.)
+                // read surfaces from the last pre-synced boundary. the window
+                // closes on EITHER a head wake (cert-lane traffic — a boundary
+                // just sealed, fetch now) or the fallback tick; a knocking or
+                // not-yet-serving joiner keeps the fast tick, a serving
+                // resident stretches it since wakes carry the follow. (a sync
+                // in flight below queues jobs here — bounded by the rpc
+                // bridge's buffer and the listener's reply timeout — so every
+                // answer reflects a whole boundary, never a torn one.)
                 {
-                    let tick = context.sleep(Duration::from_secs(2)).fuse();
+                    let fallback = if resident_standing && serving.is_some() {
+                        RESIDENT_FALLBACK_POLL
+                    } else {
+                        JOINER_POLL
+                    };
+                    let tick = context.sleep(fallback).fuse();
                     futures::pin_mut!(tick);
                     loop {
                         futures::select_biased! {
@@ -6984,6 +7020,11 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                                     }
                                 }
                             }
+                            // a sealed boundary's certificate arrived: stop
+                            // serving the window and go fetch the manifest.
+                            // (None — every drain gone — only happens at mesh
+                            // shutdown; fall through to the tick's exit.)
+                            wake = head_wake.next() => if wake.is_some() { break },
                             _ = tick => break,
                         }
                     }

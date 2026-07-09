@@ -820,4 +820,64 @@ mod tests {
             "keepalive readvertises kept the mapping alive well past the boot TTL"
         );
     }
+
+    #[test]
+    fn replayed_authenticated_register_from_another_source_cannot_hijack() {
+        // H3 at the authenticated handler: an on-path attacker captures a
+        // victim's valid AuthRequest{Register} and replays the IDENTICAL bytes
+        // from its OWN socket within the freshness window. The PoP still verifies
+        // (it is the victim's real signature), so dispatch reaches
+        // observe(victim, attacker_src) — which must NOT repoint the live mapping.
+        use crate::AuthRequest;
+        use crate::auth::{AuthPolicy, now_secs, sign_authenticator};
+        use commonware_cryptography::{Signer as _, ed25519};
+
+        let node = ed25519::PrivateKey::from_seed(555);
+        let mut nb = [0u8; 32];
+        nb.copy_from_slice(node.public_key().as_ref());
+        let victim = NodeKey(nb);
+        let now = now_secs();
+
+        let mut c = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
+        let victim_src = addr(1, 4000);
+        let attacker_src = addr(9, 6666);
+        let b_src = addr(2, 2222);
+
+        // The victim registers from its own source (nonce-0 baseline, live).
+        let reg = Msg::Register { key: victim };
+        let auth = sign_authenticator(&node, &reg.encode(), now, None);
+        let authreq = AuthRequest {
+            caller: victim,
+            inner: reg,
+            auth,
+        };
+        assert!(c.handle_auth(victim_src, authreq.clone(), now).is_empty());
+
+        // The attacker replays the IDENTICAL captured AuthRequest from its own
+        // source. PoP re-verifies, but observe must refuse to repoint the mapping.
+        assert!(c.handle_auth(attacker_src, authreq, now).is_empty());
+
+        // A lookup still resolves the victim's ORIGINAL reflexive, and the punch
+        // fan-out targets it — never the attacker.
+        let out = c.handle_at(b_src, Msg::Lookup { key: victim }, now);
+        assert!(
+            out.contains(&(
+                b_src,
+                Msg::LookupResponse {
+                    key: victim,
+                    reflexive: Some(victim_src)
+                }
+            )),
+            "a replayed register from another source must not hijack the mapping"
+        );
+        assert!(
+            out.iter()
+                .any(|(dst, m)| *dst == victim_src && matches!(m, Msg::PunchSync { .. })),
+            "the punch fan-out targets the victim's real source"
+        );
+        assert!(
+            !out.iter().any(|(dst, _)| *dst == attacker_src),
+            "nothing is directed at the attacker's source"
+        );
+    }
 }
