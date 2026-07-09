@@ -4,6 +4,8 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
+import type { AgentRecord } from "../../domain/agent-client";
+import type { UserView } from "../../domain/identity-client";
 import type { BlockEvent, NodeTransport, SubmitReceipt } from "../../domain/transport";
 import type { BlockKind, PageBlock } from "../../domain/pages-client";
 import { DucktapeProvider } from "./DucktapeProvider";
@@ -65,6 +67,28 @@ const GENERAL_MESSAGE = {
   channel_head_seq: 1,
 };
 
+const JESS_USER_KEY = Array.from({ length: 32 }, (_, index) => index);
+
+const JESS_USER: UserView = {
+  user_key: JESS_USER_KEY,
+  display_name: "Jess K",
+  nonce: 0,
+  nodes: [[0xaa]],
+  updated_at: 1,
+};
+
+const QUACKBOT: AgentRecord = {
+  agent_id: "quackbot",
+  owner: { external: [1] },
+  display_name: "Quackbot",
+  capability: "echo",
+  prompt_hash: Array(32).fill(7),
+  allowed_actions: ["chat.post"],
+  status: "active",
+  created_at: 1,
+  updated_at: 1,
+};
+
 const wireChannel = (id: string, name: string, created_at: number) => ({
   id,
   name,
@@ -75,7 +99,10 @@ const wireChannel = (id: string, name: string, created_at: number) => ({
   pinned: [],
 });
 
-const makeFakeNode = () => {
+const makeFakeNode = ({
+  agents = [],
+  users = [],
+}: { agents?: AgentRecord[]; users?: UserView[] } = {}) => {
   const blockListeners = new Set<(block: BlockEvent) => void>();
   // channel-aware mini-node: CreateChannel grows the list, MessagesLatest
   // answers per channel — a stale-pane regression needs the distinction
@@ -117,7 +144,7 @@ const makeFakeNode = () => {
         return Promise.resolve({ head: forgeHead });
       }
       if (target === "agent") {
-        return Promise.resolve({ agents: [] });
+        return Promise.resolve({ agents });
       }
       if (target === "runs") {
         if (query === "watches") return Promise.resolve({ watches: [] });
@@ -127,7 +154,7 @@ const makeFakeNode = () => {
         return Promise.resolve({ profiles: [] });
       }
       if (target === "identity") {
-        return Promise.resolve({ users: [] });
+        return Promise.resolve({ users });
       }
       if (target === "valset") {
         if (query === "residents") {
@@ -257,6 +284,172 @@ describe("DucktapeProvider", () => {
     ]);
     expect(msg.post_message.thread).toBeNull();
     expect(msg.post_message.message_id).toBeTruthy();
+  });
+
+  it("sendMessage resolves a workspace user mention without creating an agent watch", async () => {
+    const { transport } = makeFakeNode({ users: [JESS_USER] });
+    renderConsole(transport);
+    await waitFor(() => {
+      expect(screen.getByTestId("channel").textContent).toBe("general");
+      expect(Object.keys(capturedState!.nodeUsers)).toHaveLength(1);
+    });
+
+    await act(async () => {
+      capturedActions!.sendMessage("hi @jess-k");
+    });
+
+    await waitFor(() => expect(transport.submit).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(transport.submit).mock.calls[0]).toEqual([
+      "chat",
+      {
+        post_message: {
+          channel_id: "general",
+          message_id: expect.any(String),
+          blocks: [
+            {
+              paragraph: [
+                { text: "hi ", marks: [] },
+                {
+                  text: "@jess-k",
+                  marks: [{ mention: { user: JESS_USER_KEY } }],
+                },
+              ],
+            },
+          ],
+          thread: null,
+          as_agent: null,
+        },
+      },
+      "operator",
+    ]);
+    expect(vi.mocked(transport.submit).mock.calls.some(([target]) => target === "runs"))
+      .toBe(false);
+  });
+
+  it("sendMessage preserves agent mention resolution and creates the watch before posting", async () => {
+    const { transport } = makeFakeNode({ agents: [QUACKBOT] });
+    renderConsole(transport);
+    await waitFor(() => {
+      expect(screen.getByTestId("channel").textContent).toBe("general");
+      expect(capturedState!.agents).toEqual([QUACKBOT]);
+    });
+
+    await act(async () => {
+      capturedActions!.sendMessage("hi @quackbot");
+    });
+
+    await waitFor(() => expect(transport.submit).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(transport.submit).mock.calls[0]).toEqual([
+      "runs",
+      {
+        watch_channel: {
+          channel_id: "general",
+          policy: "mention",
+        },
+      },
+      "operator",
+    ]);
+    expect(vi.mocked(transport.submit).mock.calls[1]).toEqual([
+      "chat",
+      {
+        post_message: {
+          channel_id: "general",
+          message_id: expect.any(String),
+          blocks: [
+            {
+              paragraph: [
+                { text: "hi ", marks: [] },
+                {
+                  text: "@quackbot",
+                  marks: [
+                    {
+                      mention: {
+                        agent: { module: "runs", agent_id: "quackbot" },
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+          thread: null,
+          as_agent: null,
+        },
+      },
+      "operator",
+    ]);
+  });
+
+  it("replyInThread resolves a workspace user mention in the submitted blocks", async () => {
+    const { transport } = makeFakeNode({ users: [JESS_USER] });
+    renderConsole(transport);
+    await waitFor(() => {
+      expect(screen.getByTestId("channel").textContent).toBe("general");
+      expect(Object.keys(capturedState!.nodeUsers)).toHaveLength(1);
+    });
+    await act(async () => {
+      capturedActions!.openThread(1);
+    });
+    await waitFor(() => expect(screen.getByTestId("thread").textContent).toBe("open"));
+
+    await act(async () => {
+      capturedActions!.replyInThread("reply @jess-k");
+    });
+
+    await waitFor(() => expect(transport.submit).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(transport.submit).mock.calls[0][1]).toMatchObject({
+      post_message: {
+        blocks: [
+          {
+            paragraph: [
+              { text: "reply ", marks: [] },
+              {
+                text: "@jess-k",
+                marks: [{ mention: { user: JESS_USER_KEY } }],
+              },
+            ],
+          },
+        ],
+        thread: 1,
+      },
+    });
+  });
+
+  it("editMessage resolves a workspace user mention in the submitted blocks", async () => {
+    const { transport } = makeFakeNode({ users: [JESS_USER] });
+    renderConsole(transport);
+    await waitFor(() => {
+      expect(screen.getByTestId("channel").textContent).toBe("general");
+      expect(Object.keys(capturedState!.nodeUsers)).toHaveLength(1);
+    });
+
+    await act(async () => {
+      capturedActions!.editMessage(1, "edited @jess-k");
+    });
+
+    await waitFor(() => expect(transport.submit).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(transport.submit).mock.calls[0]).toEqual([
+      "chat",
+      {
+        edit_message: {
+          channel_id: "general",
+          seq: 1,
+          blocks: [
+            {
+              paragraph: [
+                { text: "edited ", marks: [] },
+                {
+                  text: "@jess-k",
+                  marks: [{ mention: { user: JESS_USER_KEY } }],
+                },
+              ],
+            },
+          ],
+          base_rev: 0,
+        },
+      },
+      "operator",
+    ]);
   });
 
   it("re-queries committed state when a block finalizes", async () => {

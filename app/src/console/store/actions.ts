@@ -37,7 +37,11 @@ import * as valsetClient from "../../domain/valset-client";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
-import { hasAgentMention, mentionResolverOf } from "../views/chat/mention";
+import {
+  hasAgentMention,
+  mentionableUsers,
+  mentionResolverOf,
+} from "../views/chat/mention";
 import {
   defaultScreenForSection,
   sectionForScreen,
@@ -708,6 +712,14 @@ export function createActions({
     );
   };
 
+  const mentionResolver = () => {
+    const state = getState();
+    return mentionResolverOf(
+      state.agents,
+      mentionableUsers(state.nodeUsers, state.agents),
+    );
+  };
+
   // Re-pull the open thread's own ChatThread snapshot after a write that may
   // have touched the root or a reply. `submitTracked` already refreshed the
   // flat `state.messages` (every sequence, replies included), but the thread
@@ -1142,7 +1154,7 @@ export function createActions({
       const channelId = getState().activeChannel;
       if (!channelId || !body.trim()) return;
       const messageId = crypto.randomUUID();
-      const blocks = parseMessageInput(body, mentionResolverOf(getState().agents));
+      const blocks = parseMessageInput(body, mentionResolver());
       const author = getState().author;
       void ensureMentionWatch(channelId, blocks).then(() =>
         submitTracked(
@@ -1184,7 +1196,7 @@ export function createActions({
       const root = getState().activeThread?.root;
       if (!channelId || !root || !body.trim()) return;
       const messageId = crypto.randomUUID();
-      const blocks = parseMessageInput(body, mentionResolverOf(getState().agents));
+      const blocks = parseMessageInput(body, mentionResolver());
       const author = getState().author;
       void ensureMentionWatch(channelId, blocks)
         .then(() =>
@@ -1236,7 +1248,7 @@ export function createActions({
       // seeded the editor with "@agent_id", so re-parsing must resolve it
       // back or the edit silently strips the mention. No auto-watch here —
       // engagement is a post-time concern.
-      const blocks = parseMessageInput(body, mentionResolverOf(getState().agents));
+      const blocks = parseMessageInput(body, mentionResolver());
       submitTracked(
         opKey.messageSeq(channelId, seq),
         (live) =>
