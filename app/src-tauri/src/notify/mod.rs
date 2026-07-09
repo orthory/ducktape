@@ -3,6 +3,8 @@
 pub mod decode;
 pub mod engine;
 pub mod matchers;
+#[allow(dead_code)] // Constructed when the notification worker is wired into app startup.
+pub mod present;
 pub mod state;
 
 #[derive(Debug, Clone, serde::Deserialize)]

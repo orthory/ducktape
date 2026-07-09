@@ -65,7 +65,9 @@ fn main() {
             tray::tray_quit,
             huddle::huddle_pop_out,
             huddle::huddle_pop_in,
-        ])
+        ]);
+    builder = builder.plugin(tauri_plugin_notification::init());
+    builder = builder
         // Menu-bar icon + popover, and an app menu with no Cmd+W Close
         // Window so the webview owns the key (macOS only; no-ops elsewhere).
         .setup(|app| {
