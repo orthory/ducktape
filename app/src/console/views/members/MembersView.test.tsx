@@ -281,9 +281,9 @@ describe("MembersView", () => {
         [soloBoundKey]: "Solo Sam",
       },
       nodeUsers: {
-        [deviceAKey]: { userKey: "user-casey", name: "Casey" },
-        [deviceBKey]: { userKey: "user-casey", name: "Casey" },
-        [soloBoundKey]: { userKey: "user-sam", name: "Solo Sam" },
+        [deviceAKey]: { accountId: "user-casey", name: "Casey" },
+        [deviceBKey]: { accountId: "user-casey", name: "Casey" },
+        [soloBoundKey]: { accountId: "user-sam", name: "Solo Sam" },
       },
     });
 

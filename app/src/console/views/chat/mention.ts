@@ -87,12 +87,12 @@ const uniqueHandle = (base: string, used: Set<string>): string => {
   return handle;
 };
 
-/** Distinct users from state.nodeUsers (dedupe by userKey). handle = display
+/** Distinct users from state.nodeUsers (dedupe by account id). handle = display
  *  name slugified (lowercase, [^a-z0-9._-]+ -> "-", trimmed of leading/
  *  trailing "-"), falling back to userKeyHex.slice(0, 8) when empty; a handle
  *  colliding with an earlier user's or any agent_id gets "-2", "-3", ... */
 export const mentionableUsers = (
-  nodeUsers: Record<string, { userKey: string; name: string | null }>,
+  nodeUsers: Record<string, { accountId: string; name: string | null }>,
   agents: AgentRecord[],
 ): UserMentionCandidate[] => {
   const seenUserKeys = new Set<string>();
@@ -100,7 +100,7 @@ export const mentionableUsers = (
   const users: UserMentionCandidate[] = [];
 
   for (const nodeUser of Object.values(nodeUsers)) {
-    const userKeyHex = nodeUser.userKey.toLowerCase();
+    const userKeyHex = nodeUser.accountId.toLowerCase();
     if (seenUserKeys.has(userKeyHex)) continue;
     seenUserKeys.add(userKeyHex);
 

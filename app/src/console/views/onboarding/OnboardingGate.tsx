@@ -1,7 +1,7 @@
 // The front door (desktop): shown when there is no active workspace, or when
 // the user asks to add/switch one. Two paths — found a new network, or join one
 // from an invite blob — plus a list of existing workspaces to jump back into.
-// On submit the store mints identity + workspace and connects; a joiner then
+// On submit the store mints the node key + workspace and connects; a joiner
 // falls through to JoinProgress while its node parks.
 
 import { useState } from "react";
@@ -11,6 +11,7 @@ import { useDucktape } from "../../store/use-ducktape";
 import { LIVE_JOIN_SUPPORTED } from "../../../domain/workspace-client";
 import type { Workspace } from "../../../domain/workspace-client";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { OnboardingChrome } from "./OnboardingChrome";
 
 type Mode = "create" | "join" | "remote";
 
@@ -120,25 +121,20 @@ export function OnboardingGate() {
         : "Connect to a remote node";
   const subtitle =
     mode === "create"
-      ? "Found a new network — you become its first member, with a fresh identity."
+      ? "Found a new network — your account becomes its first member; this device runs its first node."
       : mode === "join"
         ? joinGated
           ? "Joining an existing network is temporarily unavailable."
-          : "Paste an invite from a member to join their network with a new identity."
+          : "Paste an invite from a member — this device joins their network with a fresh node key, owned by your account."
         : "Enter the http address of a node running on another device. It stays running there — this app just connects to it.";
 
+  // The step rail appears only on a true first run: the same gate doubles as
+  // the workspace SWITCHER for anyone who already has a workspace or a live
+  // connection, where a "step 2 of 3" would lie.
+  const firstRun = state.workspaces.length === 0 && !state.workspace && !state.nodeUrl;
+
   return (
-    <div
-      style={{
-        flex: 1,
-        minHeight: 0,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        background: color.paper,
-        padding: 24,
-      }}
-    >
+    <OnboardingChrome step={firstRun ? 2 : null}>
       <div
         style={{
           width: 440,
@@ -333,6 +329,7 @@ export function OnboardingGate() {
           </button>
         )}
       </div>
+
       {pendingDelete && (
         <ConfirmDialog
           title={
@@ -350,19 +347,19 @@ export function OnboardingGate() {
           {pendingDelete.force ? (
             <>
               Its node could not confirm it has left its validator set. Forcing deletes
-              the workspace without that confirmation: its directory, identity key,
+              the workspace without that confirmation: its directory, node key,
               and registry entry are removed for good. Only do this for a solo or
               defunct network.
             </>
           ) : (
             <>
               This stops its node and deletes the workspace locally: directory,
-              identity key, and registry entry. It is refused while its node is still
+              node key, and registry entry. It is refused while its node is still
               a current validator of a network with other members.
             </>
           )}
         </ConfirmDialog>
       )}
-    </div>
+    </OnboardingChrome>
   );
 }

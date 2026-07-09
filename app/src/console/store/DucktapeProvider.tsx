@@ -50,9 +50,11 @@ import {
 } from "./huddle-window";
 import type { HuddleWindowCmd } from "./huddle-window";
 import { reducer } from "./reducer";
+import { normalizeKey } from "../../domain/names";
 import {
   applySnapshot,
   createInitialState,
+  DEFAULT_AUTHOR,
   loadRemoteUrl,
   saveDocTabs,
 } from "./state";
@@ -490,6 +492,19 @@ export function DucktapeProvider({
   useEffect(() => {
     actions.syncHuddleRecipients();
   }, [state.channels, state.voice.channelId, actions]);
+
+  // 2c². Adopt the chain's name for our own node while the author is still the
+  //      boot placeholder — a returning user must read as themselves (Account
+  //      avatar initials, composer identity), not as "operator". A name the
+  //      user typed this session (≠ placeholder) always wins; the resolved
+  //      name folds identity's account display name over profiles already.
+  useEffect(() => {
+    if (state.author !== DEFAULT_AUTHOR) return;
+    const self = state.status?.publicKey;
+    if (!self) return;
+    const resolved = state.authorNames[normalizeKey(self)];
+    if (resolved) dispatch({ type: "patch", patch: { author: resolved } });
+  }, [state.author, state.status?.publicKey, state.authorNames]);
 
   // 2d. Best-effort roster reconciliation on the way out: quitting or
   //     reloading mid-huddle can't run the normal leave path, so fire a

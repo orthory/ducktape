@@ -158,7 +158,7 @@ export interface ConsoleState {
   /** hex(node key bytes) → its owning user, from the `identity` module — the
    *  node/user split's resolver: `name` is that user's chosen display name
    *  (null if unset), already folded into `authorNames` when present. */
-  nodeUsers: Record<string, { userKey: string; name: string | null }>;
+  nodeUsers: Record<string, { accountId: string; name: string | null }>;
   /** hex(account id) → the account's collected member keys (of any scheme),
    *  from the `identity` module. `nodeUsers`/`authorNames` carry the shared
    *  display name; this is the key list the account settings surface renders. */
@@ -338,6 +338,11 @@ export const DEFAULT_NOTIFY_PREFS: NotifyPrefs = {
   governance: true,
   mutedChannels: [],
 };
+
+/** The boot placeholder author. The provider replaces it with the chain's
+ *  resolved name for our own node as soon as one hydrates — only a name the
+ *  USER typed (≠ this placeholder) is ever kept over the chain's. */
+export const DEFAULT_AUTHOR = "operator";
 
 // ── Accent persistence ──────────────────────────────────
 //
@@ -521,6 +526,67 @@ export const clearRemoteUrl = (): void => {
   }
 };
 
+// ── Onboarding hand-off persistence ─────────────────────
+//
+// Two first-run facts that outlive the onboarding screens. The display name
+// chosen while creating the account can only land on-chain after the first
+// node connects (names are chain-scoped), so it parks here until then. The
+// "link this device to an EXISTING account" choice must stop auto-bind from
+// founding a duplicate account until the other device's AddMemberKey lands —
+// see auto-bind.ts's "deferred" branch.
+const PENDING_NAME_KEY = "ducktape.pendingDisplayName";
+const LINK_PENDING_KEY = "ducktape.accountLinkPending";
+
+export const loadPendingDisplayName = (): string | null => {
+  try {
+    const raw = localStorage.getItem(PENDING_NAME_KEY);
+    return raw && raw.trim().length > 0 ? raw : null;
+  } catch {
+    return null; // storage unavailable — no parked name
+  }
+};
+
+export const savePendingDisplayName = (name: string): void => {
+  try {
+    localStorage.setItem(PENDING_NAME_KEY, name);
+  } catch {
+    // best-effort; a failed write just loses the parked name.
+  }
+};
+
+export const clearPendingDisplayName = (): void => {
+  try {
+    localStorage.removeItem(PENDING_NAME_KEY);
+  } catch {
+    // best-effort; nothing to clean up if storage is unavailable.
+  }
+};
+
+export const loadLinkPending = (): boolean => {
+  try {
+    return localStorage.getItem(LINK_PENDING_KEY) === "1";
+  } catch {
+    return false; // storage unavailable — treat as no pending link
+  }
+};
+
+export const saveLinkPending = (): void => {
+  try {
+    localStorage.setItem(LINK_PENDING_KEY, "1");
+  } catch {
+    // best-effort; a failed write risks a duplicate account on next bind,
+    // the same exposure a pre-link build had.
+  }
+};
+
+export const clearLinkPending = (): void => {
+  try {
+    localStorage.removeItem(LINK_PENDING_KEY);
+  } catch {
+    // best-effort; nothing to clean up if storage is unavailable.
+  }
+};
+
 export const createInitialState = (): ConsoleState => {
   const viewMode = loadViewMode();
   return {
@@ -528,7 +594,7 @@ export const createInitialState = (): ConsoleState => {
     viewMode,
     accent: loadAccent(),
     notifyPrefs: loadNotifyPrefs(),
-    author: "operator",
+    author: DEFAULT_AUTHOR,
     connected: false,
     nodeUrl: null,
     managed: false,
@@ -610,7 +676,7 @@ export interface ConsoleSnapshot {
   activeChannel: string | null;
   messages: MessageView[];
   authorNames: Record<string, string>;
-  nodeUsers: Record<string, { userKey: string; name: string | null }>;
+  nodeUsers: Record<string, { accountId: string; name: string | null }>;
   accountKeys: Record<string, MemberKeyView[]>;
   pages: PageMeta[];
   activePageBlocks: PageBlock[];

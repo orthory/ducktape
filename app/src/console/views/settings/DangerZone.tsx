@@ -176,7 +176,7 @@ export function DangerZone() {
               <>
                 The guarded forget couldn’t confirm this node has left its
                 validator set — usually because it can’t start. Force skips that
-                check and deletes the workspace (directory, identity key, registry
+                check and deletes the workspace (directory, node key, registry
                 entry). Only for a solo or defunct network — if this node is still
                 a live validator elsewhere, this can permanently halt it.
               </>
@@ -222,7 +222,7 @@ export function DangerZone() {
           ) : (
             <>
               This skips the liveness confirmation and deletes the workspace,
-              including directory, identity key, and registry entry. Only use this
+              including directory, node key, and registry entry. Only use this
               for a solo or defunct network.
             </>
           )}

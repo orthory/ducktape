@@ -172,7 +172,7 @@ function makeMembers(
  *  (validators/residents) never merge — see groupMembersByUser. */
 interface MemberGroup {
   key: string;
-  userKey: string;
+  accountId: string;
   name: string;
   members: MemberVM[];
 }
@@ -191,7 +191,7 @@ type MemberItem =
  *  would only repeat the name directly above its own row. */
 function groupMembersByUser(
   members: MemberVM[],
-  nodeUsers: Record<string, { userKey: string; name: string | null }>,
+  nodeUsers: Record<string, { accountId: string; name: string | null }>,
 ): MemberItem[] {
   const items: MemberItem[] = [];
   const groups = new Map<string, MemberGroup>();
@@ -201,13 +201,13 @@ function groupMembersByUser(
       items.push({ kind: "member", member });
       continue;
     }
-    const groupKey = `${member.tier}:${bound.userKey}`;
+    const groupKey = `${member.tier}:${bound.accountId}`;
     let group = groups.get(groupKey);
     if (!group) {
       group = {
         key: groupKey,
-        userKey: bound.userKey,
-        name: bound.name ?? shortKey(bound.userKey),
+        accountId: bound.accountId,
+        name: bound.name ?? shortKey(bound.accountId),
         members: [],
       };
       groups.set(groupKey, group);

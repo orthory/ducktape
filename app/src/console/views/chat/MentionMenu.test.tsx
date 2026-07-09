@@ -207,7 +207,7 @@ describe("Composer @mention typeahead", () => {
   it("lists node users and inserts the picked user's handle", () => {
     const { textarea } = setup(vi.fn(), {
       nodeUsers: {
-        "01": { userKey: "ABCDEF1234567890", name: "Jess Example" },
+        "01": { accountId: "ABCDEF1234567890", name: "Jess Example" },
       },
     });
 
@@ -225,7 +225,7 @@ describe("Composer @mention typeahead", () => {
   it("Enter picks a person and inserts the user's handle", () => {
     const { textarea, onSend } = setup(vi.fn(), {
       nodeUsers: {
-        "01": { userKey: "ABCDEF1234567890", name: "Jess Example" },
+        "01": { accountId: "ABCDEF1234567890", name: "Jess Example" },
       },
     });
 

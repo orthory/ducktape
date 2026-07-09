@@ -477,8 +477,8 @@ pub fn user_sign_bind(
 /// [`user_sign_bind`], same one-line ready-to-submit JSON shape and the same
 /// `identity-locked` gating on an encrypted, uncached key.
 ///
-/// no TS caller exists yet: this is the deliberate seam for a future "unlink
-/// device" affordance — unbind is CLI-only in v1.
+/// consumed by the Account view's Nodes card (the lost-device "Unbind"
+/// affordance) via store/account-ops.ts.
 #[tauri::command]
 pub fn user_sign_unbind(
     app: tauri::AppHandle,

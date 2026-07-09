@@ -1,10 +1,14 @@
 // Node-local operational facts — the operator-rail home for what Settings
-// used to duplicate: where the workspace lives on disk, which ports the node
-// binds, and the quorum the validator set needs. Read-only projections of
-// the active workspace and roster.
+// used to duplicate: this node's key and which account owns it, where the
+// workspace lives on disk, which ports the node binds, and the quorum the
+// validator set needs. Read-only projections of the active workspace and
+// roster. (The node key lives HERE, on the node's page — it is not "your
+// identity"; the person is the Account view's business.)
 
+import { normalizeKey, shortKey } from "../../../domain/names";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
+import { copyText } from "../settings/parts";
 
 const workspaceDataDir = (id: string): string => `~/.ducktape/workspaces/${id}`;
 
@@ -61,6 +65,18 @@ export function NodeFactsCard() {
   const portLine = workspace
     ? `p2p ${workspace.ports.listen} · http ${workspace.ports.http} · rpc ${workspace.ports.rpc}`
     : "not available";
+  const nodeKey = workspace?.pubkey ?? "";
+  const owner = nodeKey ? state.nodeUsers[normalizeKey(nodeKey)] : undefined;
+  // Prefer the account's display name, then the profiles overlay (a name set
+  // before the bind landed) — never render the account id twice.
+  const ownerName = owner
+    ? (owner.name ?? state.authorNames[normalizeKey(nodeKey)] ?? null)
+    : null;
+  const ownerLine = owner
+    ? ownerName
+      ? `${ownerName} · ${shortKey(owner.accountId)}`
+      : shortKey(owner.accountId)
+    : "not linked to an account";
 
   return (
     <div
@@ -71,6 +87,15 @@ export function NodeFactsCard() {
         overflow: "hidden",
       }}
     >
+      <button
+        type="button"
+        onClick={() => nodeKey && copyText(nodeKey)}
+        title={nodeKey ? "Copy node key" : undefined}
+        style={{ all: "unset", cursor: nodeKey ? "pointer" : "default", display: "block", width: "100%", boxSizing: "border-box" }}
+      >
+        <FactRow label="Node key" value={nodeKey || "not available"} />
+      </button>
+      <FactRow label="Owned by" value={ownerLine} />
       <FactRow
         label="Data dir"
         value={workspace ? workspaceDataDir(workspace.id) : "not available"}

@@ -20,6 +20,7 @@ const markTauri = () => {
 
 afterEach(() => {
   delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  localStorage.removeItem("ducktape.accountLinkPending");
   vi.clearAllMocks();
 });
 
@@ -234,6 +235,68 @@ describe("autoBindUserIdentity", () => {
     );
     expect(invokeMock).not.toHaveBeenCalledWith("user_sign_bind", expect.anything());
     expect(transport.submit).not.toHaveBeenCalled();
+  });
+
+  it("defers instead of founding a duplicate account while a device link is pending", async () => {
+    // The user chose "link this device to an existing account": until the
+    // other device's AddMemberKey lands, this key has no membership — a bind
+    // now would FOUND a fresh account, the exact split the link is avoiding.
+    markTauri();
+    localStorage.setItem("ducktape.accountLinkPending", "1");
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_state")
+        return Promise.resolve({
+          state: "unlocked",
+          pubkey: "cd34",
+          mnemonicConfirmed: true,
+        });
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+    const transport = stubTransport((_target, q) => {
+      const query = q as Record<string, unknown>;
+      if ("of_node" in query) return { account: null };
+      if ("of_member" in query) return { account: null };
+      throw new Error(`unexpected query ${JSON.stringify(q)}`);
+    });
+
+    await expect(autoBindUserIdentity(transport, workspace)).resolves.toBe(
+      "deferred",
+    );
+    expect(invokeMock).not.toHaveBeenCalledWith("user_sign_bind", expect.anything());
+    expect(transport.submit).not.toHaveBeenCalled();
+    // The flag survives — the next connect retries the membership lookup.
+    expect(localStorage.getItem("ducktape.accountLinkPending")).toBe("1");
+  });
+
+  it("binds at the account's nonce and clears the pending-link flag once membership appears", async () => {
+    markTauri();
+    localStorage.setItem("ducktape.accountLinkPending", "1");
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_state")
+        return Promise.resolve({
+          state: "unlocked",
+          pubkey: "cd34",
+          mnemonicConfirmed: true,
+        });
+      if (cmd === "user_sign_bind") return Promise.resolve(boundMsg([5, 5, 5]));
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+    const transport = stubTransport((_target, q) => {
+      const query = q as Record<string, unknown>;
+      if ("of_node" in query) return { account: null };
+      if ("of_member" in query) return { account: wireAccount({ nonce: 2 }) };
+      throw new Error(`unexpected query ${JSON.stringify(q)}`);
+    });
+
+    await expect(autoBindUserIdentity(transport, workspace)).resolves.toBe(
+      "bound",
+    );
+    expect(invokeMock).toHaveBeenCalledWith("user_sign_bind", {
+      chainId: "team#abcd",
+      nodePub: "ab12",
+      nonce: 2,
+    });
+    expect(localStorage.getItem("ducktape.accountLinkPending")).toBeNull();
   });
 
   it("resolves 'failed' when identityState() rejects (e.g. the shell can't read the user key)", async () => {

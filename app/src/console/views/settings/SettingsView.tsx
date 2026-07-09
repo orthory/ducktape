@@ -1,15 +1,47 @@
 // The Settings screen: composition only. Sections own their content; shared
-// row/card primitives live in parts.tsx. Everything a module view owns
-// (membership → Members, daemon + ops facts → Node) lives THERE — Settings
-// keeps identity, custody, preferences, and workspace lifecycle.
+// row/card primitives live in parts.tsx. Everything with a canonical home
+// elsewhere lives THERE — the person (name, custody, member keys, nodes) on
+// the Account view, membership on Members, daemon + ops facts on Node.
+// Settings keeps preferences and workspace lifecycle, plus link rows.
 
 import { color, font } from "../../theme/tokens";
+import { useDucktape } from "../../store/use-ducktape";
 import { DangerZone } from "./DangerZone";
-import { DevicesSection } from "./DevicesSection";
-import { IdentityCard } from "./IdentityCard";
-import { SectionLabel } from "./parts";
+import {
+  ControlRow,
+  GroupCard,
+  HoverButton,
+  outlineButton,
+  SectionLabel,
+} from "./parts";
 import { PreferencesSection } from "./PreferencesSection";
 import { WorkspaceSection } from "./WorkspaceSection";
+
+function AccountLinkSection() {
+  const { actions } = useDucktape();
+  return (
+    <>
+      <SectionLabel marginTop={18}>ACCOUNT</SectionLabel>
+      <GroupCard>
+        <ControlRow
+          title="Your account"
+          desc="Display name, recovery phrase, linked devices, and your nodes."
+          last
+          control={
+            <HoverButton
+              ariaLabel="Open Account"
+              onClick={() => actions.setScreen("account")}
+              hoverBg={color.titlebar}
+              style={outlineButton}
+            >
+              Open Account
+            </HoverButton>
+          }
+        />
+      </GroupCard>
+    </>
+  );
+}
 
 export function SettingsView() {
   return (
@@ -31,10 +63,7 @@ export function SettingsView() {
       </div>
 
       <div style={{ maxWidth: 600 }}>
-        <SectionLabel marginTop={18}>YOUR IDENTITY</SectionLabel>
-        <IdentityCard />
-
-        <DevicesSection />
+        <AccountLinkSection />
 
         <PreferencesSection />
 

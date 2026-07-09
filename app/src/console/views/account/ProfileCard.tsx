@@ -1,13 +1,17 @@
-// YOUR IDENTITY — the person: display name (the canonical editor for the
-// origin-gated profiles SetName), role tier badge, and this device's node key.
+// The person at the top of the Account view: avatar initials, the canonical
+// display-name editor (setDisplayName routes bound → identity SetAccountName,
+// unbound → profiles SetName), and the account id this device's node resolves
+// to. The node key and workspace role deliberately do NOT render here — they
+// are the Node page's facts; this card is about the account.
 
 import { FinalizationMark } from "../../components/FinalizationMark";
+import { shortKey } from "../../../domain/names";
 import { opKey } from "../../store/finalization";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
-import { copyText, HoverButton, outlineButton, smallMono } from "./parts";
+import { copyText, HoverButton, outlineButton, smallMono } from "../settings/parts";
 
-const initialsOf = (name: string): string => {
+export const initialsOf = (name: string): string => {
   const parts = name
     .trim()
     .split(/\s+/)
@@ -19,48 +23,11 @@ const initialsOf = (name: string): string => {
     .join("");
 };
 
-function workspaceRole(workspace: {
-  founder: boolean;
-  member: boolean;
-} | null) {
-  if (workspace?.founder) {
-    return {
-      role: "genesis validator",
-      title: "Genesis validator",
-      tier: "GENESIS",
-      fg: color.onDark,
-      bg: color.dark,
-      bd: color.dark,
-    } as const;
-  }
-  if (workspace?.member) {
-    return {
-      role: "member validator",
-      title: "Member validator",
-      tier: "MEMBER",
-      fg: color.accentAlt2,
-      bg: "#eef5f0",
-      bd: "#cfe3d7",
-    } as const;
-  }
-  return {
-    role: "guest",
-    title: "Guest",
-    tier: "GUEST",
-    fg: color.amber,
-    bg: "#fbf4e6",
-    bd: "#ecdcae",
-  } as const;
-}
-
-export function IdentityCard() {
+export function ProfileCard({ accountId }: { accountId: string | undefined }) {
   const { state, actions } = useDucktape();
-  const workspace = state.workspace;
-  const role = workspaceRole(workspace);
-  const key = workspace?.pubkey ?? "";
-  const keyLine = key
-    ? `${key} · key on this device`
-    : "no workspace key loaded";
+  const accountLine = accountId
+    ? `${shortKey(accountId, 14, 8)} · account id`
+    : "not linked to an account yet";
 
   return (
     <div
@@ -117,39 +84,21 @@ export function IdentityCard() {
               color: color.ink,
             }}
           />
-          <span
-            title={
-              workspace?.founder
-                ? "Founding node — created the network at genesis. Provenance only; it confers no special governance authority."
-                : undefined
-            }
-            style={{
-              font: `600 9px ${font.mono}`,
-              color: role.fg,
-              background: role.bg,
-              border: `1px solid ${role.bd}`,
-              borderRadius: 4,
-              padding: "2px 6px",
-              letterSpacing: ".04em",
-            }}
-          >
-            {role.tier}
-          </span>
           <FinalizationMark op={state.ops[opKey.profile()]} />
         </div>
-        <div style={{ ...smallMono, marginTop: 3 }} title={keyLine}>
-          {keyLine}
+        <div style={{ ...smallMono, marginTop: 3 }} title={accountId ?? accountLine}>
+          {accountLine}
         </div>
       </div>
 
       <HoverButton
-        ariaLabel="Copy key"
-        onClick={() => copyText(key)}
+        ariaLabel="Copy account id"
+        onClick={() => accountId && copyText(accountId)}
         hoverBg={color.titlebar}
-        disabled={!key}
+        disabled={!accountId}
         style={outlineButton}
       >
-        Copy key
+        Copy id
       </HoverButton>
     </div>
   );

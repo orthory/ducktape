@@ -95,9 +95,9 @@ describe("mentionableUsers", () => {
   it("dedupes node users, slugifies names, falls back to short hex, and avoids agent handle collisions", () => {
     const users = mentionableUsers(
       {
-        node1: { userKey: jessKey, name: "Jess K" },
-        node2: { userKey: jessKey, name: "Jess K" },
-        node3: { userKey: fallbackKey, name: null },
+        node1: { accountId: jessKey, name: "Jess K" },
+        node2: { accountId: jessKey, name: "Jess K" },
+        node3: { accountId: fallbackKey, name: null },
       },
       [],
     );
@@ -108,15 +108,15 @@ describe("mentionableUsers", () => {
     ]);
 
     expect(
-      mentionableUsers({ node1: { userKey: jessKey, name: "Jess K" } }, [agent("jess-k", "Jess Agent")]),
+      mentionableUsers({ node1: { accountId: jessKey, name: "Jess K" } }, [agent("jess-k", "Jess Agent")]),
     ).toEqual([{ kind: "user", userKeyHex: jessKey, handle: "jess-k-2", label: "Jess K" }]);
   });
 
   it("suffixes handles when distinct users' display names slugify identically", () => {
     const users = mentionableUsers(
       {
-        node1: { userKey: jessKey, name: "Jess K" },
-        node2: { userKey: fallbackKey, name: "Jess K" },
+        node1: { accountId: jessKey, name: "Jess K" },
+        node2: { accountId: fallbackKey, name: "Jess K" },
       },
       [],
     );
@@ -126,7 +126,7 @@ describe("mentionableUsers", () => {
 
   it("falls back to short hex when a symbols-only name has an empty slug", () => {
     const [user] = mentionableUsers(
-      { node1: { userKey: fallbackKey, name: "!!!" } },
+      { node1: { accountId: fallbackKey, name: "!!!" } },
       [],
     );
 
