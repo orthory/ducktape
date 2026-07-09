@@ -1520,7 +1520,10 @@ export function createActions({
       // start the audio session and reflect "connecting"; push whatever roster
       // we already know (others may be huddling), self excluded. joins start
       // MUTED — joining a room must never be a hot-mic moment; unmuting is the
-      // deliberate act.
+      // deliberate act. Deliberately NOT startHuddleMedia: a join differs from
+      // a media re-establish (it sets channelId, forces muted, and must keep
+      // `popped` for a retry from the popped window) — folding them would break
+      // one or the other.
       // A fresh membership: reset the reconcile + reconnect bookkeeping so an
       // old session's history never bleeds into this one.
       huddleSelfSeen = false;

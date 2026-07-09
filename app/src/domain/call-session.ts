@@ -307,6 +307,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   const stopVideoLane = (): void => {
     cameraOn = false;
     sharing = false;
+    // A force-kill ends any pending share→camera restore too: a stale flag
+    // would surprise-enable the webcam at the end of a LATER, unrelated share.
+    resumeCameraAfterShare = false;
     stopCameraGraph();
     sendBeacon();
   };
