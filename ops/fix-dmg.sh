@@ -38,6 +38,18 @@ cd "$(dirname "$0")/.."
 
 log() { printf '\033[36m[fix-dmg]\033[0m %s\n' "$*"; }
 
+# transient "resource busy" on detach is the classic dmg-pipeline flake
+# (Spotlight/quicklook poking the fresh volume); retry briefly before letting
+# a final loud attempt fail the build.
+detach_mnt() { # $1 = mountpoint
+  local _try
+  for _try in 1 2 3 4 5; do
+    hdiutil detach -quiet "$1" 2>/dev/null && return 0
+    sleep 1
+  done
+  hdiutil detach "$1"
+}
+
 # x well beyond the bundler's default 660px window width; Finder never scrolls
 # an installer window there on its own.
 PARK_X=1200
@@ -91,7 +103,7 @@ EOF
     changed=1
   fi
 
-  hdiutil detach -quiet "$work/mnt"
+  detach_mnt "$work/mnt"
   if [ "$changed" -eq 1 ]; then
     hdiutil convert -quiet "$work/rw.dmg" -format UDZO -o "$work/out.dmg"
     mv "$work/out.dmg" "$dmg"
