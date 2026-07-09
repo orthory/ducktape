@@ -1,8 +1,9 @@
-// Render-level verification of the huddle card's new roster affordances: the
-// per-member mute glyph + stale "remove" (SweepHuddle) control that make mute
-// and eviction reachable in an audio-only huddle, the "+N more" tail, and the
-// "you're muted while talking" banner. Presentational + prop-driven, so it
-// renders in jsdom without a store or media.
+// Render-level verification of the huddle card BODY: the per-member mute glyph +
+// stale "remove" (SweepHuddle) control that make eviction reachable in an
+// audio-only huddle, the "+N more" tail, and the "you're muted while talking"
+// banner. Media controls now live in HuddleControls, so the card renders no
+// mute/leave/retry buttons. Presentational + prop-driven — renders in jsdom
+// without a store or media.
 
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
@@ -24,14 +25,10 @@ const baseProps = {
   channelName: "general",
   status: "live" as const,
   error: null,
-  muted: false,
-  onSetMuted: vi.fn(),
-  onLeave: vi.fn(),
-  onRetry: vi.fn(),
 };
 
-describe("HuddleCard roster", () => {
-  it("renders a row per member with the self marker", () => {
+describe("HuddleCard body", () => {
+  it("renders a row per member with the self marker and no control buttons", () => {
     render(
       <HuddleCard
         {...baseProps}
@@ -41,6 +38,9 @@ describe("HuddleCard roster", () => {
     expect(screen.getByText("me")).toBeTruthy();
     expect(screen.getByText("bob")).toBeTruthy();
     expect(screen.getByText(/you/i)).toBeTruthy(); // self " · you" marker
+    // Media controls moved to HuddleControls — the body has no mute/leave.
+    expect(screen.queryByRole("button", { name: /leave/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /mute/i })).toBeNull();
   });
 
   it("offers a 'remove' control on a stale member and fires onSweep with the user bytes", () => {
@@ -96,7 +96,6 @@ describe("HuddleCard roster", () => {
     const { rerender } = render(
       <HuddleCard
         {...baseProps}
-        muted
         participants={[participant({ name: "me", isSelf: true, muted: true, speaking: true })]}
       />,
     );
@@ -106,14 +105,13 @@ describe("HuddleCard roster", () => {
     rerender(
       <HuddleCard
         {...baseProps}
-        muted
         participants={[participant({ name: "me", isSelf: true, muted: true, speaking: false })]}
       />,
     );
     expect(screen.queryByText(/you.re muted/i)).toBeNull();
   });
 
-  it("shows the error copy and a Retry (not mute) on failure", () => {
+  it("shows the error copy on failure and no in-card Retry (that lives in the control bar)", () => {
     render(
       <HuddleCard
         {...baseProps}
@@ -123,6 +121,6 @@ describe("HuddleCard roster", () => {
       />,
     );
     expect(screen.getByText(/system settings/i)).toBeTruthy();
-    expect(screen.getByText("Retry")).toBeTruthy();
+    expect(screen.queryByText("Retry")).toBeNull();
   });
 });

@@ -2,25 +2,28 @@
 // to join/leave, a rail indicator on channels with a live huddle, and the
 // bottom-left dock for the session you're in. All roster reads come from
 // `channel.huddle` (committed consensus state); whether WE are in a live audio
-// session comes from the ephemeral `voice` slice. The card body itself lives in
-// HuddleCard.tsx, shared with the popped-out huddle window. Every affordance is
-// hidden when the daemon can't do voice (no status.publicKey).
+// session comes from the ephemeral `voice` slice. The dock composes the shared
+// HuddleCard (status + roster) + CallTiles (video strip) + HuddleControls (the
+// media bar) — the same pieces the full stage and popped window use. Every
+// affordance is hidden when the daemon can't do voice (no status.publicKey).
 
 import { useCallback, useEffect, useState } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, ReactNode } from "react";
 
 import { MAX_VIDEO_PARTICIPANTS } from "../../../domain/call-session";
-import { authorName, keyHex } from "../../../domain/chat-client";
-import type { Channel, HuddleMember } from "../../../domain/chat-client";
+import { keyHex } from "../../../domain/chat-client";
+import type { Channel } from "../../../domain/chat-client";
 import { isTauri } from "../../../domain/node-bootstrap";
 import { buildParticipants } from "../../store/huddle-roster";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "./HoverButton";
 import { HuddleCard } from "./HuddleCard";
+import { CallTiles } from "../huddle/CallTiles";
+import { HuddleControls } from "../huddle/HuddleControls";
 import { HuddleStage } from "../huddle/HuddleStage";
 
-// ── Local glyph (Icon.tsx isn't ours to extend — same pattern as MessageItem) ──
+// ── Local glyphs (Icon.tsx isn't ours to extend — same pattern as MessageItem) ──
 
 function HeadphonesGlyph({ size = 14 }: { size?: number }) {
   return (
@@ -32,28 +35,7 @@ function HeadphonesGlyph({ size = 14 }: { size?: number }) {
   );
 }
 
-function MicGlyph({ size = 15, muted = false }: { size?: number; muted?: boolean }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round">
-      <rect x="9" y="3" width="6" height="11" rx="3" />
-      <path d="M5.5 11a6.5 6.5 0 0 0 13 0" />
-      <path d="M12 17.5V21" />
-      {muted && <path d="M4 4l16 16" strokeWidth={1.9} />}
-    </svg>
-  );
-}
-
-function CameraGlyph({ size = 15, off = false }: { size?: number; off?: boolean }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round">
-      <rect x="2.5" y="6.5" width="12" height="11" rx="2.2" />
-      <path d="M14.5 10.5l6-3v9l-6-3z" />
-      {off && <path d="M4 4l16 16" strokeWidth={1.9} />}
-    </svg>
-  );
-}
-
-function ExpandGlyph({ size = 15 }: { size?: number }) {
+function ExpandGlyph({ size = 14 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
       <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
@@ -61,37 +43,28 @@ function ExpandGlyph({ size = 15 }: { size?: number }) {
   );
 }
 
-// ── Participant name / avatar ────────────────────────────
-
-/** A huddle member's display name — the `profiles` registry wins, else the
- *  utf-8/hex fallback (the app's user identities are readable origin strings). */
-const memberName = (member: HuddleMember, names: Record<string, string>): string =>
-  authorName({ user: member.user }, names);
-
-const initialsOf = (name: string): string => name.slice(0, 2).toUpperCase();
-
-function ParticipantAvatar({ name, size, ring }: { name: string; size: number; ring: string }) {
+/** Arrow leaving a box — open the huddle in its own window. */
+function PopGlyph({ size = 13 }: { size?: number }) {
   return (
-    <span
-      title={name}
-      aria-hidden="true"
-      style={{
-        width: size,
-        height: size,
-        borderRadius: "50%",
-        background: color.chip,
-        color: color.muted3,
-        border: `2px solid ${ring}`,
-        boxSizing: "border-box",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        font: `600 ${size <= 24 ? 9.5 : 11}px ${font.sans}`,
-        flexShrink: 0,
-      }}
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-3" />
+      <path d="M13 11l7-7" />
+      <path d="M14.5 4H20v5.5" />
+    </svg>
+  );
+}
+
+/** A small square icon button for the dock header's view cluster (expand / pop). */
+function HeaderIconButton({ title, onClick, children }: { title: string; onClick: () => void; children: ReactNode }) {
+  return (
+    <HoverButton
+      onClick={onClick}
+      title={title}
+      style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 24, height: 22, borderRadius: radius.sm, color: color.muted2 }}
+      hoverStyle={{ background: color.hover, color: color.ink }}
     >
-      {initialsOf(name)}
-    </span>
+      {children}
+    </HoverButton>
   );
 }
 
@@ -169,167 +142,13 @@ export function HuddleRailBadge({ channel }: { channel: Channel }) {
   );
 }
 
-// ── Video tiles ──────────────────────────────────────────
-
-const tileGrid: CSSProperties = {
-  display: "grid",
-  gridTemplateColumns: "repeat(2, 1fr)",
-  gap: 6,
-};
-
-const tileFrame: CSSProperties = {
-  position: "relative",
-  aspectRatio: "16 / 9",
-  borderRadius: radius.sm,
-  overflow: "hidden",
-  background: color.dark,
-  border: `1px solid ${color.borderSoft}`,
-};
-
-const tileMedia: CSSProperties = {
-  width: "100%",
-  height: "100%",
-  objectFit: "cover",
-  display: "block",
-};
-
-const tileIdle: CSSProperties = {
-  width: "100%",
-  height: "100%",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-};
-
-const tileName: CSSProperties = {
-  position: "absolute",
-  left: 4,
-  bottom: 4,
-  maxWidth: "calc(100% - 8px)",
-  display: "inline-flex",
-  alignItems: "center",
-  gap: 3,
-  padding: "2px 6px",
-  borderRadius: 999,
-  background: "rgba(38,37,31,.62)",
-  color: color.onDark,
-  font: `600 10px ${font.sans}`,
-};
-
-const tileNameText: CSSProperties = {
-  overflow: "hidden",
-  textOverflow: "ellipsis",
-  whiteSpace: "nowrap",
-};
-
-/** Our own camera preview — the raw local stream, bound to the live session so
- *  it renders whatever `setCamera` acquired. Muted (it's our own audio) and
- *  autoplaying (bindPreview only sets srcObject, it never calls play). */
-function SelfTile() {
-  const { state, actions } = useDucktape();
-  // Pin the ref callback so the 1 s staleness tick doesn't rebind every render.
-  const bindPreview = useCallback(
-    (el: HTMLVideoElement | null) => actions.getCallSession()?.bindPreview(el),
-    [actions],
-  );
-  const speaking = state.voice.speaking;
-  return (
-    <div style={speaking ? { ...tileFrame, border: `2px solid ${color.green}` } : tileFrame}>
-      <video ref={bindPreview} muted autoPlay playsInline style={tileMedia} />
-      <span style={tileName}>
-        <span style={tileNameText}>You</span>
-      </span>
-    </div>
-  );
-}
-
-function PeerTile({
-  member,
-  names,
-  canDecode,
-}: {
-  member: HuddleMember;
-  names: Record<string, string>;
-  canDecode: boolean;
-}) {
-  const { state, actions } = useDucktape();
-  // Beacons key by NODE hex, so two users huddling from one daemon share a
-  // beacon; the tile itself is keyed by USER (unique) upstream.
-  const nodeHex = keyHex(member.node);
-  const beacon = state.voice.peers[nodeHex];
-  const name = memberName(member, names);
-  // Only paint a <canvas> for a peer we can actually decode — a WebKitGTK viewer
-  // with no vp8 DECODER would otherwise show a black tile. Fall back to the
-  // initials avatar. Pin the ref callback so the 1 s tick doesn't rebind (and
-  // briefly drop) the peer's canvas every render.
-  const showVideo = canDecode && !!beacon?.cameraOn;
-  const bindTile = useCallback(
-    (canvas: HTMLCanvasElement | null) => actions.getCallSession()?.bindTile(nodeHex, canvas),
-    [actions, nodeHex],
-  );
-  return (
-    <div style={tileFrame}>
-      {showVideo ? (
-        <canvas ref={bindTile} style={tileMedia} />
-      ) : (
-        <div style={tileIdle}>
-          <ParticipantAvatar name={name} size={34} ring={color.sunken} />
-        </div>
-      )}
-      <span style={tileName}>
-        <span style={tileNameText}>{name}</span>
-        {/* Known-muted only: an absent beacon is "unknown", not muted. */}
-        {beacon?.muted && <MicGlyph size={10} muted />}
-      </span>
-    </div>
-  );
-}
-
-/** The tile grid: our preview (while our camera is on) plus one tile per OTHER
- *  roster member, capped at MAX_VIDEO_PARTICIPANTS with a "+N more" tail so a
- *  larger huddle doesn't silently drop its overflow. Self is matched by node, so
- *  a co-located second local user folds into our preview. */
-function TileGrid({
-  roster,
-  selfHex,
-  cameraOn,
-  names,
-  canDecode,
-}: {
-  roster: HuddleMember[];
-  selfHex: string;
-  cameraOn: boolean;
-  names: Record<string, string>;
-  canDecode: boolean;
-}) {
-  const others = roster.filter((m) => keyHex(m.node) !== selfHex);
-  const peers = others.slice(0, MAX_VIDEO_PARTICIPANTS);
-  const overflow = others.length - peers.length;
-  return (
-    <div>
-      <div style={tileGrid}>
-        {cameraOn && <SelfTile />}
-        {peers.map((m) => (
-          <PeerTile key={keyHex(m.user)} member={m} names={names} canDecode={canDecode} />
-        ))}
-      </div>
-      {overflow > 0 && (
-        <div style={{ marginTop: 4, font: `500 10px ${font.sans}`, color: color.muted2 }}>
-          +{overflow} more not shown
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ── Bottom-left dock ─────────────────────────────────────
 
 /** The persistent session card, docked at the foot of the channel rail while
- *  we're in a huddle: an optional video-tile grid over the shared HuddleCard
- *  (status + roster with mute/sweep + mute/leave), plus the main-window camera
- *  toggle. Yields entirely to the popped-out huddle window (voice.popped). Thin
- *  wrapper so the card and its per-session staleness tick mount fresh on each
- *  join, keyed by channel. */
+ *  we're in a huddle. Yields entirely to the popped-out huddle window
+ *  (voice.popped) and to the full-window stage (local `expanded`). Thin wrapper
+ *  so the card and its per-session staleness tick mount fresh on each join,
+ *  keyed by channel. */
 export function HuddleDock() {
   const { state } = useDucktape();
   if (!state.voice.channelId) return null;
@@ -342,7 +161,6 @@ function HuddleDockCard() {
 
   const channel = state.channels.find((c) => c.id === voice.channelId);
   const roster = channel?.huddle ?? [];
-  const live = voice.status === "live";
   // Encode gates the CAMERA (send); decode gates peer-tile RENDERING — they can
   // diverge (a box may decode but not encode). See domain/video-capability.ts.
   const canEncode = state.videoCapability.canEncode;
@@ -351,27 +169,39 @@ function HuddleDockCard() {
   // Self is matched by node hex (already-lowercase, like the beacon keys).
   const selfHex = (state.status?.publicKey ?? "").toLowerCase();
 
-  // The grid is up while OUR camera is on, or a peer's beacon says camera-on and
-  // we can actually decode it (else that peer shows an avatar row, no tile).
+  // The tile strip is up while OUR camera is on, or a peer's beacon says
+  // camera-on and we can actually decode it (else that peer shows a roster row).
   const showTiles =
     voice.cameraOn ||
     (canDecode && roster.some((m) => voice.peers[keyHex(m.node)]?.cameraOn));
-
-  // Staleness is time-driven, so re-render once a second WHILE this in-app dock
-  // is showing (not popped — the popped window drives its own re-push tick).
-  const [nowTick, setNowTick] = useState(() => Date.now());
-  useEffect(() => {
-    if (voice.popped) return;
-    const id = setInterval(() => setNowTick(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [voice.popped]);
 
   // The in-app "stage" — expand the compact dock into a full-window gallery /
   // spotlight. Local state, so it resets on join (the card is keyed by channel)
   // and never conflicts with the popped window (which owns its own surface).
   const [expanded, setExpanded] = useState(false);
 
-  // Yield to the popped-out window (it mirrors the same HuddleCard). Every hook
+  // Staleness is time-driven, so re-render once a second WHILE this compact dock
+  // is the visible surface — not while popped (the popped window drives its own
+  // re-push tick) and not while expanded (the stage owns its own tick; a second
+  // timer here would just re-render the stage subtree needlessly).
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    if (voice.popped || expanded) return;
+    const id = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [voice.popped, expanded]);
+
+  // Stable ref binders so the 1 Hz tick never detaches the tile canvases.
+  const bindPreview = useCallback(
+    (el: HTMLVideoElement | null) => actions.getCallSession()?.bindPreview(el),
+    [actions],
+  );
+  const bindTile = useCallback(
+    (nodeHex: string, el: HTMLCanvasElement | null) => actions.getCallSession()?.bindTile(nodeHex, el),
+    [actions],
+  );
+
+  // Yield to the popped-out window (it mirrors the same session). Every hook
   // above runs first, so this early return is rules-of-hooks safe.
   if (!voice.channelId || voice.popped) return null;
   const channelId = voice.channelId;
@@ -390,6 +220,7 @@ function HuddleDockCard() {
     sessionStartMs: voice.sessionStartMs,
     now: nowTick,
   });
+  const memberNodes = Object.fromEntries(roster.map((m) => [keyHex(m.user), keyHex(m.node)]));
 
   return (
     <div
@@ -402,86 +233,66 @@ function HuddleDockCard() {
         background: color.paper,
         border: `1px solid ${color.borderStrong}`,
         boxShadow: "0 1px 2px rgba(40,38,34,.05)",
+        display: "flex",
+        flexDirection: "column",
+        gap: 8,
       }}
     >
-      {showTiles && (
-        <div style={{ marginBottom: 8 }}>
-          <TileGrid
-            roster={roster}
-            selfHex={selfHex}
-            cameraOn={voice.cameraOn}
-            names={state.authorNames}
-            canDecode={canDecode}
+      {/* Status + roster body, with the view cluster (expand / pop) in the header
+          row — media controls live in the bottom bar. */}
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 6 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <HuddleCard
+            channelName={channel?.name ?? channelId}
+            status={voice.status}
+            error={voice.error}
+            participants={participants}
+            ring={color.paper}
+            maxRows={4}
+            onSweep={(user) => actions.sweepHuddle(channelId, user)}
           />
         </div>
+        <div style={{ display: "flex", gap: 2, flexShrink: 0 }}>
+          <HeaderIconButton title="Expand to full stage" onClick={() => setExpanded(true)}>
+            <ExpandGlyph size={14} />
+          </HeaderIconButton>
+          {isTauri() && (
+            <HeaderIconButton title="Open in window" onClick={() => actions.popOutHuddle()}>
+              <PopGlyph size={13} />
+            </HeaderIconButton>
+          )}
+        </div>
+      </div>
+
+      {showTiles && (
+        <CallTiles
+          layout="strip"
+          participants={participants}
+          memberNodes={memberNodes}
+          peers={voice.peers}
+          canEncode={canEncode}
+          canDecode={canDecode}
+          selfCameraOn={voice.cameraOn}
+          bindPreview={bindPreview}
+          bindTile={bindTile}
+          // +1 so the self tile rides on top of the peer cap, matching the old
+          // dock (self shown separately, peers capped at MAX_VIDEO_PARTICIPANTS).
+          maxTiles={MAX_VIDEO_PARTICIPANTS + 1}
+        />
       )}
 
-      <HuddleCard
-        channelName={channel?.name ?? channelId}
+      <HuddleControls
+        size="compact"
         status={voice.status}
-        error={voice.error}
         muted={voice.muted}
-        participants={participants}
-        ring={color.paper}
-        maxRows={4}
-        onSetMuted={(muted) => actions.setHuddleMuted(muted)}
+        cameraOn={voice.cameraOn}
+        canEncode={canEncode}
+        cameraDisabledReason={overCap ? "Video is capped at 8 participants" : undefined}
+        onToggleMute={() => actions.setHuddleMuted(!voice.muted)}
+        onToggleCamera={() => actions.setCamera(!voice.cameraOn)}
         onLeave={() => actions.leaveHuddle()}
         onRetry={() => actions.joinHuddle(channelId)}
-        onSweep={(user) => actions.sweepHuddle(channelId, user)}
-        onPopOut={isTauri() ? () => actions.popOutHuddle() : undefined}
       />
-
-      {/* Dock controls next to the card (never forked into HuddleCard, so the
-          popped window keeps rendering it unmodified): expand-to-stage (always)
-          and the camera toggle (encode-capable + live + cap-8). */}
-      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 8 }}>
-        <HoverButton
-          onClick={() => setExpanded(true)}
-          title="Expand to full stage"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            width: 30,
-            height: 28,
-            borderRadius: radius.sm,
-            border: `1px solid ${color.borderSoft}`,
-            background: color.sunken,
-            color: color.muted2,
-          }}
-          hoverStyle={{ background: color.hover, color: color.ink }}
-        >
-          <ExpandGlyph size={15} />
-        </HoverButton>
-
-        {canEncode && (
-          <HoverButton
-            onClick={() => actions.setCamera(!voice.cameraOn)}
-            title={
-              overCap
-                ? "Video is capped at 8 participants"
-                : voice.cameraOn
-                  ? "Turn camera off"
-                  : "Turn camera on"
-            }
-            disabled={!live || overCap}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              width: 30,
-              height: 28,
-              borderRadius: radius.sm,
-              border: `1px solid ${voice.cameraOn ? "transparent" : color.borderSoft}`,
-              background: voice.cameraOn ? accentVar : color.sunken,
-              color: voice.cameraOn ? color.onDark : color.muted2,
-            }}
-            hoverStyle={{ filter: "brightness(1.05)" }}
-          >
-            <CameraGlyph size={15} off={!voice.cameraOn} />
-          </HoverButton>
-        )}
-      </div>
     </div>
   );
 }
