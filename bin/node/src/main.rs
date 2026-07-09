@@ -1550,6 +1550,10 @@ async fn reopen_recovery(
     }
 }
 
+/// a backfilled height's served seal, held for the post-fold cross-check:
+/// `(disposition, app_hash, per-module roots)` as the quorum sealed them.
+type ServedSeal = (node::Disposition, StateRoot, Vec<(sdk::ModuleId, StateRoot)>);
+
 /// fold the committed views in `(after_view, up_to_view]` that never reached
 /// this replica as certificates — lost gossip, or ancestors committed by
 /// descent without their own finalization (the parent-linkage gap the fold
@@ -1566,7 +1570,7 @@ async fn replica_backfill<C>(
     view_base: u64,
     views: (u64, u64),
     watermark: &mut Option<u64>,
-    seal_checks: &mut std::collections::HashMap<u64, (node::Disposition, StateRoot)>,
+    seal_checks: &mut std::collections::HashMap<u64, ServedSeal>,
     label: &str,
 ) -> Result<(), String>
 where
@@ -1583,7 +1587,10 @@ where
     );
     for f in frames {
         let view = f.height.saturating_sub(view_base);
-        seal_checks.insert(f.height, (to_node_disposition(f.disposition), f.app_hash));
+        seal_checks.insert(
+            f.height,
+            (to_node_disposition(f.disposition), f.app_hash, f.roots.clone()),
+        );
         if node_r.orderer_mut().admit_backfilled(view, f.frame.clone()) {
             *watermark = Some(view);
         }
@@ -6850,10 +6857,8 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // served seals awaiting the post-fold cross-check: a BACKFILLED
             // frame's trust is the served seal, verified against what OUR
             // fold produced (height -> served (disposition, app_hash)).
-            let mut pending_seal_checks: std::collections::HashMap<
-                u64,
-                (node::Disposition, StateRoot),
-            > = std::collections::HashMap::new();
+            let mut pending_seal_checks: std::collections::HashMap<u64, ServedSeal> =
+                std::collections::HashMap::new();
             let mut blocks_since_checkpoint: u64 = 0;
             let mut last_cert_height: Option<u64> = None;
             // the serving replica's manifest-fetch pacer (see the gate at the
@@ -6966,10 +6971,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     .any(|k| k.as_slice() == me_bytes.as_slice());
                 println!(
                     "[node {label}] replica: restart replayed the journal to {} \
-                     (epoch {}, replayed {}, app_hash={})",
+                     (epoch {}, replayed {}, already-on-disk {}{}, app_hash={})",
                     tip,
                     rec.epoch,
                     rec.applied,
+                    rec.skipped,
+                    if rec.rolled_forward {
+                        ", rolled 1 forward"
+                    } else {
+                        ""
+                    },
                     hex(&root)
                 );
                 // the e2e / operator serve marker, truthful here too: the
@@ -7584,9 +7595,23 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         // a BACKFILLED height's trust is the served seal:
                         // what our fold produced must match it exactly, or
                         // this replica has diverged from the quorum's fold.
-                        if let Some((_, served_hash)) = pending_seal_checks.remove(&height)
+                        if let Some((_, served_hash, served_roots)) =
+                            pending_seal_checks.remove(&height)
                             && sealed_hash.is_some_and(|h| h != served_hash)
                         {
+                            // name the diverging module(s) — the one lead an
+                            // operator (or the next debugger) needs first.
+                            for (module, served_root) in &served_roots {
+                                let ours = node_r.host().module_root(module);
+                                if ours.as_ref() != Some(served_root) {
+                                    eprintln!(
+                                        "[node {label}] replica: diverged module={module} \
+                                         served={} ours={}",
+                                        hex(served_root),
+                                        ours.map(|r| hex(&r)).unwrap_or_else(|| "none".into())
+                                    );
+                                }
+                            }
                             eprintln!(
                                 "[node {label}] FATAL: backfilled height {height} folded to \
                                  {} but the quorum sealed {} — state diverged",
@@ -7802,7 +7827,16 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         );
                         match captured {
                             Ok(ckpt) => match node_r.sink_mut().write_manifest(&ckpt).await {
-                                Ok(()) => blocks_since_checkpoint = 0,
+                                Ok(()) => {
+                                    // MULE: capture-vs-live agreement probe.
+                                    eprintln!(
+                                        "[node {label}] MULE ckpt@{} capture_hash={} live_hash={}",
+                                        f.height,
+                                        hex(&ckpt.app_hash),
+                                        hex(&node_r.host().app_hash())
+                                    );
+                                    blocks_since_checkpoint = 0;
+                                }
                                 Err(e) => eprintln!(
                                     "[node {label}] replica checkpoint write failed \
                                      (will retry): {e}"

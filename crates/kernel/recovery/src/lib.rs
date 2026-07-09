@@ -1538,71 +1538,81 @@ where
                 }
                 disposition
             } else {
-                match trailing::classify_trailing(height, &moved, &trailing_claims)? {
-                    // no verified trailing claim among the movers: the apply
-                    // completed before the crash; the roots that moved are its
-                    // outcome. (single-disk-substrate blocks make this exact —
-                    // see the crate doc on the multi-store limit.)
-                    trailing::TrailingPlan::AssumeApplied => {
-                        if let Some(sink) = sink.as_mut() {
-                            sink.opaque_block(height);
-                        }
-                        Disposition::Applied
-                    }
-                    // exactly one disk module verifiably committed this block
-                    // (its height cursor claims the trailing WAL height) and
-                    // everything else is still at pre: re-execute the durable
-                    // frame committing ONLY the at-pre cohort — restoring any
-                    // writes the block fanned out to the in-memory cohort
-                    // (lost with RAM) — and aborting the claimant, whose
+                // classify for its FAIL-CLOSED rules (an unexplained mover
+                // alongside a verified claimant, or a >1-substrate claim, is
+                // damage). both surviving plans then RE-DERIVE: the legacy
+                // seal-the-observed-roots path (AssumeApplied) is exact only
+                // if every effect of the block is visible in the moved roots
+                // — unknowable here, because a member's dispatch follow-ups
+                // fan into modules the frame never names, and any in-memory
+                // write among them died with the process. sealing observed
+                // MIXED roots commits a state no validator ever held and
+                // every later fold diverges (observed: a replica restart's
+                // trailing [capability + chat] batch); re-derivation is a
+                // deterministic no-op when nothing was lost, and the
+                // reconstruction when something was.
+                let _ = trailing::classify_trailing(height, &moved, &trailing_claims)?;
+                {
+                    // re-execute the durable WAL frame committing ONLY the
+                    // still-at-pre cohort — reconstructing the writes the
+                    // block fanned out to the in-memory cohort (lost with
+                    // RAM) — and aborting every already-moved module, whose
                     // re-commit would move its op-log root and fork us.
-                    trailing::TrailingPlan::SelectiveReplay => {
-                        let commit_only: BTreeSet<ModuleId> = host
-                            .module_roots()
-                            .into_iter()
-                            .map(|(id, _)| id)
-                            .filter(|id| !moved.contains(id))
-                            .collect();
-                        let (disposition, dispatches) = apply_block_committing(
-                            host,
-                            height,
-                            &frame,
-                            protocol_version,
-                            None,
-                            &commit_only,
-                        )
-                        .await?;
-                        // consistency backstops: a claimant whose commit this
-                        // frame cannot explain is damage, not a roll-forward.
-                        if disposition != Disposition::Applied {
+                    let commit_only: BTreeSet<ModuleId> = host
+                        .module_roots()
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .filter(|id| !moved.contains(id))
+                        .collect();
+                    let (disposition, dispatches) = apply_block_committing(
+                        host,
+                        height,
+                        &frame,
+                        protocol_version,
+                        None,
+                        &commit_only,
+                    )
+                    .await?;
+                    // consistency backstops: a mover whose durable commit
+                    // this frame cannot explain is damage, not a roll-forward.
+                    if disposition != Disposition::Applied {
+                        return Err(Error::Torn(format!(
+                            "trailing block {height} re-landed as {disposition:?}, but \
+                             module(s) {moved:?} durably committed it — the observed state \
+                             cannot come from this frame. wipe app state and re-sync (keep \
+                             the consensus journal)"
+                        )));
+                    }
+                    // a mover the frame explains is either DISPATCHED by the
+                    // re-execution or directly TARGETED by a member. a
+                    // targeted-but-undispatched mover is the expected shape
+                    // of re-executing on post-state: the member re-lands as
+                    // a deterministic duplicate-reject against the mover's
+                    // own already-committed effect — evidence FOR the frame
+                    // explaining the state, never against it.
+                    let targets = frame_targets(&frame);
+                    for id in &moved {
+                        if !dispatches.iter().any(|d| d.module == *id)
+                            && !targets.contains(id)
+                        {
                             return Err(Error::Torn(format!(
-                                "trailing block {height} re-landed as {disposition:?}, but a \
-                                 disk module's height cursor claims its durable commit — the \
-                                 claimed state cannot come from this frame. wipe app state \
-                                 and re-sync (keep the consensus journal)"
+                                "trailing block {height} neither dispatched nor targeted \
+                                 module {id}, which durably committed it — the observed \
+                                 state cannot come from this frame. wipe app state and \
+                                 re-sync (keep the consensus journal)"
                             )));
                         }
-                        for id in &moved {
-                            if !dispatches.iter().any(|d| d.module == *id) {
-                                return Err(Error::Torn(format!(
-                                    "trailing block {height} never dispatched module {id}, \
-                                     which claims to have committed it — the claimed state \
-                                     cannot come from this frame. wipe app state and re-sync \
-                                     (keep the consensus journal)"
-                                )));
-                            }
-                        }
-                        if let Some(sink) = sink.as_mut() {
-                            sink.folded_block(&FoldedBlock {
-                                height,
-                                frame: &frame,
-                                disposition,
-                                app_hash: host.app_hash(),
-                                dispatches: &dispatches,
-                            });
-                        }
-                        disposition
                     }
+                    if let Some(sink) = sink.as_mut() {
+                        sink.folded_block(&FoldedBlock {
+                            height,
+                            frame: &frame,
+                            disposition,
+                            app_hash: host.app_hash(),
+                            dispatches: &dispatches,
+                        });
+                    }
+                    disposition
                 }
             };
             let seal = BlockSeal {
@@ -1722,6 +1732,22 @@ async fn apply_block_committing(
 /// committed upgrade state — the identical value the live node stamped, never the
 /// old baseline (which would fork a dual-path module's `root()` at/after an
 /// activation boundary). `ctx.origin` is unused on the batch path: each member
+/// the module ids a frame's decodable members DIRECTLY target — the trailing
+/// roll-forward's backstop widener: a moved module whose member re-executes
+/// as a duplicate-reject on its own post-state records no dispatch, but the
+/// frame still explains it. undecodable members target nothing
+/// (deterministic no-ops live and on replay alike).
+fn frame_targets(frame: &[u8]) -> BTreeSet<ModuleId> {
+    let Ok(members) = decode_batch(frame) else {
+        return BTreeSet::new();
+    };
+    members
+        .iter()
+        .filter_map(|m| decode_frame(m).ok())
+        .map(|(_, msg)| msg.target)
+        .collect()
+}
+
 /// carries its own origin, which the host stamps into that member's `Env`.
 async fn replay_batch(
     host: &mut Host,
