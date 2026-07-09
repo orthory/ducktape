@@ -8,10 +8,12 @@
 //! `daemon.log`. `~/.ducktape/registry.json` indexes them and records which one
 //! is active.
 //!
-//! every mutation shells out to the SAME onboarding verbs the CLI exposes
-//! (`init`/`join`/`invite`/`invite-accept`), so the registry never reimplements
-//! identity, descriptors, or governance — it only allocates ports, lays out
-//! directories, and remembers the result. NOTE a parked joiner may well serve
+//! mutations reuse the SAME onboarding verbs the CLI exposes
+//! (`init`/`join`/`invite`/`invite-accept`) behind the bounded
+//! [`crate::daemon::NodeControl`] actor, so no Tauri handler executes or waits
+//! on the node binary and the registry never reimplements identity,
+//! descriptors, or governance — it only allocates ports, lays out directories,
+//! and remembers the result. NOTE a parked joiner may well serve
 //! its http/rpc surface (newer node builds do — every read just answers
 //! "parked: no state to serve"), so an answering port is NOT admission;
 //! onboarding progress is read back from the stable marker lines the node
@@ -22,13 +24,36 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::Manager as _;
 
+use crate::daemon::{NodeControl, last_line, require_main_window, run_verb};
+
 const DEFAULT_PRIMARY_COORDINATOR: &str = "p2p.ducktape.byeongsu.dev:3478";
+const MAX_WORKSPACE_NAME_BYTES: usize = 128;
+const MAX_INVITE_BLOB_BYTES: usize = 256 * 1024;
+
+fn validate_workspace_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("a workspace needs a name".into());
+    }
+    if name.len() > MAX_WORKSPACE_NAME_BYTES {
+        return Err(format!(
+            "workspace name is too long ({} bytes; limit {MAX_WORKSPACE_NAME_BYTES})",
+            name.len()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_node_pubkey(pubkey: &str) -> Result<(), String> {
+    if pubkey.len() != 64 || !pubkey.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("node public key must be exactly 32 bytes of hex".into());
+    }
+    Ok(())
+}
 
 // ── The registry model ──────────────────────────────────
 
@@ -189,7 +214,8 @@ fn save_registry_at(path: &Path, reg: &Registry) -> Result<(), String> {
         let mut file = fs::File::create(&tmp).map_err(|err| format!("create {tmp:?}: {err}"))?;
         file.write_all(text.as_bytes())
             .map_err(|err| format!("write {tmp:?}: {err}"))?;
-        file.sync_all().map_err(|err| format!("fsync {tmp:?}: {err}"))?;
+        file.sync_all()
+            .map_err(|err| format!("fsync {tmp:?}: {err}"))?;
     }
     fs::rename(&tmp, path).map_err(|err| format!("rename {tmp:?} -> {path:?}: {err}"))
 }
@@ -277,136 +303,6 @@ fn reserved_ports(reg: &Registry) -> Vec<u16> {
         .collect()
 }
 
-/// how long a single onboarding verb may run before we give up on a wedged
-/// node. generous enough for a slow admit round-trip, bounded so a hung node
-/// can't freeze forget/delete (and, on repeats, the whole Tauri worker pool).
-const VERB_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// drain a spawned verb's stdout/stderr on threads and wait for it, bounded by
-/// [`VERB_TIMEOUT`] — the guts shared by [`run_verb`] and
-/// [`run_verb_with_stdin`], so the wedged-node kill/timeout/error-surfacing
-/// logic (see `run_verb`'s doc) lives in exactly one place. `verb` is only
-/// used for error text; `child` must have piped stdout+stderr (stdin is the
-/// caller's concern — already written-to-and-closed, or `Stdio::null()`).
-fn wait_for_verb(verb: &str, mut child: std::process::Child) -> Result<String, String> {
-    let mut out_pipe = child.stdout.take().expect("stdout piped");
-    let mut err_pipe = child.stderr.take().expect("stderr piped");
-    let out_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = out_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let err_reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = err_pipe.read_to_end(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + VERB_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "ducktape-node {verb} did not respond within {}s — the node may be \
-                         wedged; retry, or force if this is a teardown",
-                        VERB_TIMEOUT.as_secs()
-                    ));
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(err) => {
-                let _ = child.kill();
-                return Err(format!("wait ducktape-node {verb}: {err}"));
-            }
-        }
-    };
-
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
-    if !status.success() {
-        let detail = String::from_utf8_lossy(&stderr);
-        let detail = detail.trim();
-        return Err(if detail.is_empty() {
-            format!("ducktape-node {verb} exited {status}")
-        } else {
-            detail.to_string()
-        });
-    }
-    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
-}
-
-/// run a `ducktape-node` onboarding verb and return its stdout (trimmed). the
-/// verbs print the datum (chain-id, pubkey, invite blob) to stdout and human
-/// guidance to stderr; a non-zero exit surfaces stderr. bounded by
-/// [`VERB_TIMEOUT`]: a wedged node (one that accepts the rpc but never replies)
-/// used to make `.output()` block FOREVER — hanging forget/delete with the
-/// spinner stuck, and exhausting the worker pool on repeats until the whole UI
-/// stopped. now it is killed on the deadline and reported. stdout/stderr are
-/// drained on threads so a chatty verb can't fill a pipe and deadlock the wait.
-/// `pub(crate)` so [`crate::user_identity`] drives the `user-key`/
-/// `user-sign-bind`/`user-sign-unbind` verbs the same way.
-pub(crate) fn run_verb(node_bin: &Path, args: &[&str]) -> Result<String, String> {
-    let verb = args.first().copied().unwrap_or("");
-    let child = Command::new(node_bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("run ducktape-node {verb}: {err}"))?;
-    wait_for_verb(verb, child)
-}
-
-/// like [`run_verb`], but pipes `stdin_lines` to the child — one line per
-/// element, each newline-terminated, stdin then closed (EOF) — for the
-/// user-key verbs that read a password (and, for `restore`, a mnemonic) off
-/// stdin rather than argv, so a secret never touches argv/env (shell history,
-/// `ps`). `pub(crate)` so [`crate::user_identity`] can feed passwords to
-/// `user-key init/restore/unlock/reveal/encrypt` and to
-/// `user-sign-bind`/`user-sign-unbind` when the key is encrypted.
-pub(crate) fn run_verb_with_stdin(
-    node_bin: &Path,
-    args: &[&str],
-    stdin_lines: &[&str],
-) -> Result<String, String> {
-    let verb = args.first().copied().unwrap_or("");
-    let mut child = Command::new(node_bin)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("run ducktape-node {verb}: {err}"))?;
-    {
-        use std::io::Write as _;
-        // write, then let this handle drop (closing the pipe -> EOF) even if
-        // the child exited early (a rejected flag, say) and a write fails.
-        let mut stdin_pipe = child.stdin.take().expect("stdin piped");
-        for line in stdin_lines {
-            if writeln!(stdin_pipe, "{line}").is_err() {
-                break;
-            }
-        }
-    }
-    wait_for_verb(verb, child)
-}
-
-/// the last non-empty line of a verb's stdout — the datum (verbs may print a
-/// trailing summary line; the payload is always last). `pub(crate)` — shared
-/// with [`crate::user_identity`].
-pub(crate) fn last_line(stdout: &str) -> String {
-    stdout
-        .lines()
-        .map(str::trim)
-        .rfind(|l| !l.is_empty())
-        .unwrap_or("")
-        .to_string()
-}
-
 /// pull `chain_id` and `validators` out of a written `network.toml`.
 fn read_descriptor(dir: &Path) -> Result<(String, Vec<String>), String> {
     #[derive(Deserialize)]
@@ -436,13 +332,21 @@ fn find<'a>(reg: &'a Registry, id: &str) -> Result<&'a Workspace, String> {
 
 /// every workspace in the registry, in creation order.
 #[tauri::command]
-pub fn workspace_list(app: tauri::AppHandle) -> Result<Vec<Workspace>, String> {
+pub fn workspace_list(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Vec<Workspace>, String> {
+    require_main_window(&window)?;
     Ok(load_registry(&app)?.workspaces)
 }
 
 /// the active workspace, or null on first run / after none is selected.
 #[tauri::command]
-pub fn workspace_active(app: tauri::AppHandle) -> Result<Option<Workspace>, String> {
+pub fn workspace_active(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Option<Workspace>, String> {
+    require_main_window(&window)?;
     let reg = load_registry(&app)?;
     Ok(reg
         .active
@@ -455,12 +359,22 @@ pub fn workspace_active(app: tauri::AppHandle) -> Result<Option<Workspace>, Stri
 /// once), and record it active. does not spawn — the ui calls
 /// [`workspace_select`] next.
 #[tauri::command]
-pub fn workspace_create(app: tauri::AppHandle, name: String) -> Result<Workspace, String> {
+pub async fn workspace_create(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    name: String,
+) -> Result<Workspace, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_create_blocking(app, name))
+        .await
+}
+
+fn workspace_create_blocking(app: tauri::AppHandle, name: String) -> Result<Workspace, String> {
     let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err("a workspace needs a name".into());
-    }
-    let node_bin = crate::daemon::resolve_node_bin()?;
+    validate_workspace_name(&name)?;
     let mut reg = load_registry(&app)?;
     let id = unique_id(&name, &reg.workspaces);
     let dir = workspaces_dir(&app)?.join(&id);
@@ -489,41 +403,35 @@ pub fn workspace_create(app: tauri::AppHandle, name: String) -> Result<Workspace
     // desktop-spawned nodes run the TUN-less userspace WireGuard backend
     // (overlay-net ADR phase 4): no /dev/net/tun, no setcap, no host
     // mutation. self-managed configs keep the parse default (`tun`).
-    let chain_id = run_verb(
-        &node_bin,
-        &[
-            "init",
-            "--name",
-            &name,
-            "--dir",
-            &dir_s,
-            "--listen",
-            &listen,
-            "--http",
-            &http,
-            "--rpc",
-            &rpc,
-            "--primary-coordinator",
-            DEFAULT_PRIMARY_COORDINATOR,
-            "--wireguard-listen",
-            &wireguard,
-            "--invite-listen",
-            &invite,
-            "--wireguard-effect",
-            "socket",
-        ],
-    )
+    let chain_id = run_verb(&[
+        "init",
+        "--name",
+        &name,
+        "--dir",
+        &dir_s,
+        "--listen",
+        &listen,
+        "--http",
+        &http,
+        "--rpc",
+        &rpc,
+        "--primary-coordinator",
+        DEFAULT_PRIMARY_COORDINATOR,
+        "--wireguard-listen",
+        &wireguard,
+        "--invite-listen",
+        &invite,
+        "--wireguard-effect",
+        "socket",
+    ])
     .map(|out| last_line(&out))?;
     // read the pubkey back off the identity `init` just wrote (keygen reuses an
     // existing key and prints it) rather than parsing verb stderr.
-    let pubkey = run_verb(
-        &node_bin,
-        &[
-            "keygen",
-            "--out",
-            &dir.join("identity.key").to_string_lossy(),
-        ],
-    )
+    let pubkey = run_verb(&[
+        "keygen",
+        "--out",
+        &dir.join("identity.key").to_string_lossy(),
+    ])
     .map(|out| last_line(&out))?;
 
     let workspace = Workspace {
@@ -546,20 +454,37 @@ pub fn workspace_create(app: tauri::AppHandle, name: String) -> Result<Workspace
 /// will PARK when started until a member admits it — that is surfaced by
 /// [`workspace_phase`], not here.
 #[tauri::command]
-pub fn workspace_join(
+pub async fn workspace_join(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    name: String,
+    blob: String,
+) -> Result<Workspace, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_join_blocking(app, name, blob))
+        .await
+}
+
+fn workspace_join_blocking(
     app: tauri::AppHandle,
     name: String,
     blob: String,
 ) -> Result<Workspace, String> {
     let name = name.trim().to_string();
     let blob = blob.trim().to_string();
-    if name.is_empty() {
-        return Err("a workspace needs a name".into());
-    }
+    validate_workspace_name(&name)?;
     if blob.is_empty() {
         return Err("paste the invite blob to join".into());
     }
-    let node_bin = crate::daemon::resolve_node_bin()?;
+    if blob.len() > MAX_INVITE_BLOB_BYTES {
+        return Err(format!(
+            "invite blob is too large ({} bytes; limit {MAX_INVITE_BLOB_BYTES})",
+            blob.len()
+        ));
+    }
     let mut reg = load_registry(&app)?;
     let id = unique_id(&name, &reg.workspaces);
     let dir = workspaces_dir(&app)?.join(&id);
@@ -592,27 +517,24 @@ pub fn workspace_join(
     // join prints this identity's pubkey (for the inviter's admit) on stdout.
     // --wireguard-effect socket: the desktop default (overlay-net ADR phase
     // 4) — a WG-invite join brings the plane up TUN-less, no privileges.
-    let pubkey = run_verb(
-        &node_bin,
-        &[
-            "join",
-            &blob,
-            "--dir",
-            &dir_s,
-            "--listen",
-            &listen,
-            "--http",
-            &http,
-            "--rpc",
-            &rpc,
-            "--wireguard-listen",
-            &wireguard,
-            "--invite-listen",
-            &invite,
-            "--wireguard-effect",
-            "socket",
-        ],
-    )
+    let pubkey = run_verb(&[
+        "join",
+        &blob,
+        "--dir",
+        &dir_s,
+        "--listen",
+        &listen,
+        "--http",
+        &http,
+        "--rpc",
+        &rpc,
+        "--wireguard-listen",
+        &wireguard,
+        "--invite-listen",
+        &invite,
+        "--wireguard-effect",
+        "socket",
+    ])
     .map(|out| last_line(&out))?;
 
     let (chain_id, validators) = read_descriptor(&dir)?;
@@ -645,12 +567,24 @@ pub fn workspace_join(
 /// the one-line invite blob to hand a friend, refreshed with this member's dial
 /// hint. requires the workspace to have been founded/joined (it reads config).
 #[tauri::command]
-pub fn workspace_invite_blob(app: tauri::AppHandle, id: String) -> Result<String, String> {
-    let node_bin = crate::daemon::resolve_node_bin()?;
+pub async fn workspace_invite_blob(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+) -> Result<String, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_invite_blob_blocking(app, id))
+        .await
+}
+
+fn workspace_invite_blob_blocking(app: tauri::AppHandle, id: String) -> Result<String, String> {
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
-    run_verb(&node_bin, &["invite", "--config", &cfg.to_string_lossy()]).map(|out| last_line(&out))
+    run_verb(&["invite", "--config", &cfg.to_string_lossy()]).map(|out| last_line(&out))
 }
 
 /// the join requests parked joiners delivered to this member's running node
@@ -659,18 +593,27 @@ pub fn workspace_invite_blob(app: tauri::AppHandle, id: String) -> Result<String
 /// ballot). raw JSON array from the `join-requests` verb, parsed here so the
 /// frontend gets typed rows.
 #[tauri::command]
-pub fn workspace_join_requests(
+pub async fn workspace_join_requests(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_join_requests_blocking(app, id))
+        .await
+}
+
+fn workspace_join_requests_blocking(
     app: tauri::AppHandle,
     id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let node_bin = crate::daemon::resolve_node_bin()?;
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
-    let out = run_verb(
-        &node_bin,
-        &["join-requests", "--config", &cfg.to_string_lossy()],
-    )?;
+    let out = run_verb(&["join-requests", "--config", &cfg.to_string_lossy()])?;
     serde_json::from_str(last_line(&out).trim())
         .map_err(|e| format!("join-requests output is not json: {e}"))
 }
@@ -679,20 +622,32 @@ pub fn workspace_join_requests(
 /// running member node's local rpc. the node must be started (a member serves
 /// rpc); the joiner's parked node promotes itself once the epoch cuts over.
 #[tauri::command]
-pub fn workspace_admit(app: tauri::AppHandle, id: String, pubkey: String) -> Result<(), String> {
+pub async fn workspace_admit(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+    pubkey: String,
+) -> Result<(), String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_admit_blocking(app, id, pubkey))
+        .await
+}
+
+fn workspace_admit_blocking(
+    app: tauri::AppHandle,
+    id: String,
+    pubkey: String,
+) -> Result<(), String> {
     let pubkey = pubkey.trim().to_string();
-    if pubkey.is_empty() {
-        return Err("paste the joiner's identity pubkey to admit".into());
-    }
-    let node_bin = crate::daemon::resolve_node_bin()?;
+    validate_node_pubkey(&pubkey)
+        .map_err(|_| "paste the joiner's 32-byte identity pubkey to admit".to_string())?;
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
-    run_verb(
-        &node_bin,
-        &["invite-accept", &pubkey, "--config", &cfg.to_string_lossy()],
-    )
-    .map(|_| ())
+    run_verb(&["invite-accept", &pubkey, "--config", &cfg.to_string_lossy()]).map(|_| ())
 }
 
 /// remove a validator by pubkey: drive the governance RemoveValidator through
@@ -701,20 +656,32 @@ pub fn workspace_admit(app: tauri::AppHandle, id: String, pubkey: String) -> Res
 /// yes-ballot; the change only takes effect once a strict majority of members
 /// approve, and the removed node drops out at the next epoch cutover.
 #[tauri::command]
-pub fn workspace_demote(app: tauri::AppHandle, id: String, pubkey: String) -> Result<(), String> {
+pub async fn workspace_demote(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+    pubkey: String,
+) -> Result<(), String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_demote_blocking(app, id, pubkey))
+        .await
+}
+
+fn workspace_demote_blocking(
+    app: tauri::AppHandle,
+    id: String,
+    pubkey: String,
+) -> Result<(), String> {
     let pubkey = pubkey.trim().to_string();
-    if pubkey.is_empty() {
-        return Err("provide the validator's public key to remove".into());
-    }
-    let node_bin = crate::daemon::resolve_node_bin()?;
+    validate_node_pubkey(&pubkey)
+        .map_err(|_| "provide the validator's 32-byte public key to remove".to_string())?;
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
-    run_verb(
-        &node_bin,
-        &["member-remove", &pubkey, "--config", &cfg.to_string_lossy()],
-    )
-    .map(|_| ())
+    run_verb(&["member-remove", &pubkey, "--config", &cfg.to_string_lossy()]).map(|_| ())
 }
 
 /// promote a resident into the consensus quorum by pubkey: drive the
@@ -723,20 +690,32 @@ pub fn workspace_demote(app: tauri::AppHandle, id: String, pubkey: String) -> Re
 /// resident standing; this seats the (pre-synced, warm) key as a validator at
 /// the next epoch cutover. same majority ceremony as every membership change.
 #[tauri::command]
-pub fn workspace_promote(app: tauri::AppHandle, id: String, pubkey: String) -> Result<(), String> {
+pub async fn workspace_promote(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+    pubkey: String,
+) -> Result<(), String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_promote_blocking(app, id, pubkey))
+        .await
+}
+
+fn workspace_promote_blocking(
+    app: tauri::AppHandle,
+    id: String,
+    pubkey: String,
+) -> Result<(), String> {
     let pubkey = pubkey.trim().to_string();
-    if pubkey.is_empty() {
-        return Err("provide the resident's public key to promote".into());
-    }
-    let node_bin = crate::daemon::resolve_node_bin()?;
+    validate_node_pubkey(&pubkey)
+        .map_err(|_| "provide the resident's 32-byte public key to promote".to_string())?;
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
-    run_verb(
-        &node_bin,
-        &["promote", &pubkey, "--config", &cfg.to_string_lossy()],
-    )
-    .map(|_| ())
+    run_verb(&["promote", &pubkey, "--config", &cfg.to_string_lossy()]).map(|_| ())
 }
 
 /// revoke resident standing by pubkey: drive the governance RemoveResident
@@ -745,23 +724,37 @@ pub fn workspace_promote(app: tauri::AppHandle, id: String, pubkey: String) -> R
 /// and its node parks again; re-granting is another admit. a seated validator
 /// is [`workspace_demote`]'s job (the tiers never overlap).
 #[tauri::command]
-pub fn workspace_resident_remove(
+pub async fn workspace_resident_remove(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+    pubkey: String,
+) -> Result<(), String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_resident_remove_blocking(app, id, pubkey))
+        .await
+}
+
+fn workspace_resident_remove_blocking(
     app: tauri::AppHandle,
     id: String,
     pubkey: String,
 ) -> Result<(), String> {
     let pubkey = pubkey.trim().to_string();
-    if pubkey.is_empty() {
-        return Err("provide the resident's public key to revoke".into());
-    }
-    let node_bin = crate::daemon::resolve_node_bin()?;
+    validate_node_pubkey(&pubkey)
+        .map_err(|_| "provide the resident's 32-byte public key to revoke".to_string())?;
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
-    run_verb(
-        &node_bin,
-        &["resident-remove", &pubkey, "--config", &cfg.to_string_lossy()],
-    )
+    run_verb(&[
+        "resident-remove",
+        &pubkey,
+        "--config",
+        &cfg.to_string_lossy(),
+    ])
     .map(|_| ())
 }
 
@@ -784,16 +777,24 @@ pub fn workspace_resident_remove(
 /// errors surface to the caller (unlike forget, this is not best-effort — the
 /// user asked to submit an on-chain change and deserves to know if it failed).
 #[tauri::command]
-pub fn workspace_request_leave(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let node_bin = crate::daemon::resolve_node_bin()?;
+pub async fn workspace_request_leave(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+) -> Result<(), String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_request_leave_blocking(app, id))
+        .await
+}
+
+fn workspace_request_leave_blocking(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let cfg = node_toml(&workspaces_dir(&app)?.join(&ws.id));
-    run_verb(
-        &node_bin,
-        &["member-leave", "--config", &cfg.to_string_lossy()],
-    )
-    .map(|_| ())
+    run_verb(&["member-leave", "--config", &cfg.to_string_lossy()]).map(|_| ())
 }
 
 /// wrap a "couldn't reach/resolve the node" failure into the honest refusal we
@@ -872,15 +873,8 @@ fn classify_status(status_line: &str) -> ForgetVerdict {
 /// `Unconfirmed` (fail closed) — exactly the uncertainty a force forget may
 /// override for a node that can no longer start.
 fn probe_forget(dir: &Path) -> ForgetVerdict {
-    let node_bin = match crate::daemon::resolve_node_bin() {
-        Ok(bin) => bin,
-        Err(err) => return ForgetVerdict::Unconfirmed(unconfirmed_forget(err)),
-    };
     let cfg = node_toml(dir);
-    match run_verb(
-        &node_bin,
-        &["member-status", "--config", &cfg.to_string_lossy()],
-    ) {
+    match run_verb(&["member-status", "--config", &cfg.to_string_lossy()]) {
         Ok(status) => classify_status(&last_line(&status)),
         Err(err) => ForgetVerdict::Unconfirmed(unconfirmed_forget(err)),
     }
@@ -927,7 +921,21 @@ fn probe_forget(dir: &Path) -> ForgetVerdict {
 /// returns the newly-active workspace the registry repointed to, or `None` when
 /// none remain.
 #[tauri::command]
-pub fn workspace_forget(
+pub async fn workspace_forget(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+    force: bool,
+) -> Result<Option<Workspace>, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_forget_blocking(app, id, force))
+        .await
+}
+
+fn workspace_forget_blocking(
     app: tauri::AppHandle,
     id: String,
     force: bool,
@@ -987,8 +995,20 @@ pub fn workspace_forget(
 /// webview should dial. adopts an already-listening node (idempotent across
 /// re-selects and the promotion exec-reboot) instead of double-spawning.
 #[tauri::command]
-pub fn workspace_select(app: tauri::AppHandle, id: String) -> Result<Selection, String> {
-    let node_bin = crate::daemon::resolve_node_bin()?;
+pub async fn workspace_select(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+) -> Result<Selection, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || workspace_select_blocking(app, id))
+        .await
+}
+
+fn workspace_select_blocking(app: tauri::AppHandle, id: String) -> Result<Selection, String> {
     let mut reg = load_registry(&app)?;
     let ws = find(&reg, &id)?.clone();
     let dir = workspaces_dir(&app)?.join(&ws.id);
@@ -1008,28 +1028,17 @@ pub fn workspace_select(app: tauri::AppHandle, id: String) -> Result<Selection, 
     }
 
     let log_path = dir.join("daemon.log");
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|err| format!("open {log_path:?}: {err}"))?;
-    let log_err = log.try_clone().map_err(|err| err.to_string())?;
-    let mut cmd = Command::new(&node_bin);
-    cmd.arg("--config")
-        .arg(node_toml(&dir))
-        .stdin(Stdio::null())
-        .stdout(log)
-        .stderr(log_err);
-    crate::daemon::prepare_node_command_env(&mut cmd);
-    crate::daemon::detach(&mut cmd);
     // spawn AND verify the node survived. a bind conflict, an unparseable
     // node.toml, or a boot panic dies in milliseconds — and used to return Ok
     // with a dead http_url the webview would poll for 10s before giving a
     // generic timeout. spawn_verified reads the real reason back out of
     // daemon.log instead. http is the readiness signal for a member/founder; a
     // parking joiner never serves it, so "still alive after the grace" carries.
-    let child = crate::daemon::spawn_verified(cmd, &log_path, Some(ws.ports.http))
-        .map_err(|failure| format!("the node for \"{}\" exited on start: {failure}", ws.name))?;
+    let child =
+        crate::daemon::spawn_workspace_node(&node_toml(&dir), &log_path, Some(ws.ports.http))
+            .map_err(|failure| {
+                format!("the node for \"{}\" exited on start: {failure}", ws.name)
+            })?;
     // record the detached pid so teardown can address the process directly —
     // the http shutdown route alone can't reach a parked joiner (no surface).
     // best-effort: a failed write only degrades stop back to the pgrep sweep.
@@ -1063,7 +1072,12 @@ fn commit_active(app: &tauri::AppHandle, reg: &mut Registry, id: &str) -> Result
 /// webview treats a successful `/v1/status` as the authoritative "ready" and
 /// only falls back to this while the surface is still down.
 #[tauri::command]
-pub fn workspace_phase(app: tauri::AppHandle, id: String) -> Result<PhaseReport, String> {
+pub fn workspace_phase(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    id: String,
+) -> Result<PhaseReport, String> {
+    require_main_window(&window)?;
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let dir = workspaces_dir(&app)?.join(&ws.id);
@@ -1107,7 +1121,12 @@ pub struct LogTail {
 }
 
 #[tauri::command]
-pub fn workspace_log_tail(app: tauri::AppHandle, id: String) -> Result<LogTail, String> {
+pub fn workspace_log_tail(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    id: String,
+) -> Result<LogTail, String> {
+    require_main_window(&window)?;
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let log_path = workspaces_dir(&app)?.join(&ws.id).join("daemon.log");
@@ -1141,7 +1160,12 @@ pub struct RuntimeFacts {
 }
 
 #[tauri::command]
-pub fn workspace_runtime_facts(app: tauri::AppHandle, id: String) -> Result<RuntimeFacts, String> {
+pub fn workspace_runtime_facts(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    id: String,
+) -> Result<RuntimeFacts, String> {
+    require_main_window(&window)?;
     let reg = load_registry(&app)?;
     let ws = find(&reg, &id)?;
     let dir = workspaces_dir(&app)?.join(&ws.id);
@@ -1151,9 +1175,7 @@ pub fn workspace_runtime_facts(app: tauri::AppHandle, id: String) -> Result<Runt
         pid,
         alive: recorded_pid_alive(&dir),
         uptime_secs: pid.and_then(node_uptime_secs),
-        binary_path: crate::daemon::resolve_node_bin()
-            .ok()
-            .map(|path| path.display().to_string()),
+        binary_path: crate::daemon::node_binary_display(),
         log_path: log_path.display().to_string(),
         data_dir: dir.display().to_string(),
     })
@@ -1187,8 +1209,14 @@ pub(crate) fn set_mnemonic_confirmed(app: &tauri::AppHandle) -> Result<(), Strin
 /// launches. lives here (not `user_identity.rs`) because it is purely a
 /// `Registry` mutation, same as every other workspace-registry command.
 #[tauri::command]
-pub fn user_identity_confirm_mnemonic(app: tauri::AppHandle) -> Result<(), String> {
-    set_mnemonic_confirmed(&app)
+pub async fn user_identity_confirm_mnemonic(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+) -> Result<(), String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control.run(move || set_mnemonic_confirmed(&app)).await
 }
 
 // ── Phase classification ────────────────────────────────
@@ -1729,7 +1757,10 @@ mod tests {
             !path.with_extension("json.tmp").exists(),
             "the temp file is consumed by the rename"
         );
-        assert_eq!(load_registry_at(&path).unwrap().active.as_deref(), Some("team"));
+        assert_eq!(
+            load_registry_at(&path).unwrap().active.as_deref(),
+            Some("team")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

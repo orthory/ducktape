@@ -73,6 +73,7 @@ mod oracle_pool;
 mod relay;
 mod relay_runtime;
 mod replica;
+mod resource_limits;
 mod resident_announce;
 mod resident_dispatch;
 mod statesync_plane;
@@ -2964,6 +2965,7 @@ fn spawn_rpc_listener(
 }
 
 fn main() {
+    resource_limits::raise_open_file_limit();
     // Convert any terminal error into the same stable `FATAL:` marker the node
     // already prints for its other fatal paths (recovery, admission, promotion),
     // plus a non-zero exit. This closes the run-path boot failures (bind

@@ -31,6 +31,7 @@ toml = "0.8"
 tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros"] }
 tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+zeroize = { workspace = true }
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 
 # dev-only debug bridge: the tauri-agent debugger plugin the app/scripts/tauri-agent
@@ -45,3 +46,6 @@ tauri-plugin-agent = "0.0.1"
 # grants them. Same crate+version wry already compiles; adds no system deps.
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -15,8 +15,9 @@ role+name, run JS in the webview, and read logs. Drive it with the package
 `--app com.ducktape.app`), or with the native `tauri_*` MCP tools.
 
 Use this instead of the vite browser preview when you need the **actual Tauri
-window** — WebKitGTK native chrome, the `LOCAL` shell that spawns/adopts its own
-`ducktape-noded`, real daemon state over `/v1` — rather than the web build
+window** — WebKitGTK native chrome, the `LOCAL` shell that spawns/adopts the
+selected workspace's `ducktape-node`, real node state over `/v1` — rather than
+the web build
 (which is `isTauri()`-false: no daemon lifecycle, `REMOTE` badge, and the
 onboarding/workspace commands throw).
 
@@ -101,13 +102,14 @@ you can still `DISPLAY=:99 import -window root /tmp/fb.png` (imagemagick).
   and the guest by `import.meta.env.DEV`; a release build registers nothing and
   the inline server refuses to bind without `allowReleaseSocket` (never set).
   Don't move the registration out of those guards.
-- **Daemon.** The desktop shell spawns/adopts its own `ducktape-node` on
-  `127.0.0.1:8844` (`daemon_spawn` in `app/src-tauri/src/daemon.rs`; binary from
-  `DUCKTAPE_NODE_BIN` or the sibling next to the desktop bin). A stale/old node
-  binary shows the honest `REMOTE` + "could not reach the node" surface — stage a
-  fresh `ducktape-node` (`bun run sidecar`, or `cargo build -p node-bin` and point
-  `DUCKTAPE_NODE_BIN` at the copy). Seed state over `/v1/submit`; the app
-  re-renders on each finalized block.
+- **Node.** `workspace_select` asks the bounded `NodeControl` actor in
+  `app/src-tauri/src/daemon.rs` to spawn/adopt the selected workspace's
+  `ducktape-node`; its loopback port comes from `~/.ducktape/registry.json`, not
+  a fixed `:8844`. The binary comes from `DUCKTAPE_NODE_BIN` or the sibling next
+  to the desktop bin. A stale/old binary shows the honest `REMOTE` + "could not
+  reach the node" surface — stage a fresh one with `bun run sidecar`, or build
+  `cargo build -p node-bin` and point `DUCKTAPE_NODE_BIN` at that executable.
+  Seed state over `/v1/submit`; the app re-renders on each finalized block.
 - After Rust / `tauri.conf.json` changes, `tauri dev` rebuilds + restarts; the
   endpoint file drops and reappears — wait for a fresh
   `.../tauri-agent/com.ducktape.app/endpoint.json` before re-driving. Frontend

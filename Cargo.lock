@@ -2327,6 +2327,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "git2",
+ "libc",
  "serde",
  "serde_json",
  "tauri",
@@ -2338,6 +2339,7 @@ dependencies = [
  "tokio-tungstenite 0.24.0",
  "toml 0.8.23",
  "webkit2gtk",
+ "zeroize",
 ]
 
 [[package]]
@@ -4377,6 +4379,7 @@ dependencies = [
  "indexer",
  "jobs",
  "kv",
+ "libc",
  "nat-traversal",
  "node",
  "noded",
