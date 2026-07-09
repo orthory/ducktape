@@ -4,11 +4,14 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { BlockEvent, NodeTransport, SubmitReceipt } from "../../domain/transport";
+import { moduleTopic } from "../../domain/stream";
+import type { EventFrame, HeartbeatFrame } from "../../domain/stream";
+import type { NodeTransport, SubmitReceipt, StreamSignal, TopicHandlers } from "../../domain/transport";
 import type { BlockKind, PageBlock } from "../../domain/pages-client";
 import { DucktapeProvider } from "./DucktapeProvider";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
+import { makeTransportStub } from "../../test/transport-stub";
 
 // Switching nodes dials a new one via node-bootstrap. Mock only connectRemote
 // so the switch lands on a benign, empty node (its status rejects → the "no
@@ -31,7 +34,8 @@ vi.mock("../../domain/node-bootstrap", async (importOriginal) => {
     status: vi.fn().mockRejectedValue(new Error("empty test node")),
     metrics: vi.fn().mockResolvedValue(""),
     blocks: vi.fn().mockResolvedValue([]),
-    onBlock: vi.fn(() => () => {}),
+    subscribe: vi.fn(() => () => {}),
+    onStream: vi.fn(() => () => {}),
   };
   return {
     ...actual,
@@ -76,7 +80,8 @@ const wireChannel = (id: string, name: string, created_at: number) => ({
 });
 
 const makeFakeNode = () => {
-  const blockListeners = new Set<(block: BlockEvent) => void>();
+  const topicHandlers = new Map<string, Set<TopicHandlers>>();
+  const streamListeners = new Set<(signal: StreamSignal) => void>();
   // channel-aware mini-node: CreateChannel grows the list, MessagesLatest
   // answers per channel — a stale-pane regression needs the distinction
   const channels = [wireChannel("general", "General", 1)];
@@ -84,7 +89,16 @@ const makeFakeNode = () => {
     general: [GENERAL_MESSAGE],
   };
   let forgeHead: string | null = null;
-  const transport: NodeTransport = {
+  const nodeStatus = {
+    version: "0.1.0",
+    appHash: "aa".repeat(32),
+    height: 1,
+    modules: [
+      { id: "chat", root: "cc".repeat(32) },
+      { id: "agent", root: "ee".repeat(32) },
+    ],
+  };
+  const transport: NodeTransport = makeTransportStub({
     submit: vi.fn((target: string, payload: unknown) => {
       const create = (payload as { create_channel?: { channel_id: string; name: string } })
         .create_channel;
@@ -146,22 +160,86 @@ const makeFakeNode = () => {
     filesLs: vi.fn(),
     filesRead: vi.fn(),
     filesHistory: vi.fn(),
-    status: vi.fn().mockResolvedValue({
-      version: "0.1.0",
-      appHash: "aa".repeat(32),
-      height: 1,
-      modules: [{ id: "chat", root: "cc".repeat(32) }],
-    }),
+    // dynamic: emitOps advances the height and rolls the emitted module's
+    // root, so refreshScoped's root diff sees exactly what "the block"
+    // touched. deep-copied per call — the provider stores the previous
+    // status and diffs against the next one; aliasing would blank the diff.
+    status: vi.fn(() =>
+      Promise.resolve({
+        version: nodeStatus.version,
+        appHash: nodeStatus.appHash,
+        height: nodeStatus.height,
+        modules: nodeStatus.modules.map((m) => ({ ...m })),
+      }),
+    ),
     metrics: vi.fn().mockResolvedValue(""),
-    onBlock: vi.fn((listener: (block: BlockEvent) => void) => {
-      blockListeners.add(listener);
-      return () => blockListeners.delete(listener);
-    }),
     blocks: vi.fn().mockResolvedValue([]),
+    subscribe: vi.fn((topics: string[], handlers: TopicHandlers) => {
+      for (const topic of topics) {
+        let handlersForTopic = topicHandlers.get(topic);
+        if (!handlersForTopic) {
+          handlersForTopic = new Set();
+          topicHandlers.set(topic, handlersForTopic);
+        }
+        handlersForTopic.add(handlers);
+      }
+      return () => {
+        for (const topic of topics) {
+          const handlersForTopic = topicHandlers.get(topic);
+          if (!handlersForTopic) continue;
+          handlersForTopic.delete(handlers);
+          if (handlersForTopic.size === 0) topicHandlers.delete(topic);
+        }
+      };
+    }),
+    onStream: vi.fn((listener: (signal: StreamSignal) => void) => {
+      streamListeners.add(listener);
+      return () => streamListeners.delete(listener);
+    }),
+  });
+  const emitOps = (
+    module: string,
+    rows: Array<Partial<EventFrame["op"]> & { height: number }>,
+  ) => {
+    const topic = moduleTopic(module);
+    rows.forEach((row, index) => {
+      const frame: EventFrame = {
+        type: "event",
+        topic,
+        cursor: `op/${row.height.toString(16).padStart(16, "0")}/${String(index).padStart(4, "0")}`,
+        op: {
+          seq: index,
+          time: row.time ?? row.height,
+          origin: row.origin ?? { kind: "external", id: "tester" },
+          ...row,
+        },
+      };
+      topicHandlers.get(topic)?.forEach((handlers) => handlers.onEvent?.(frame));
+    });
+    // "the block" this batch represents: advance the tip and roll the folded
+    // module's root so the next scoped hydrate diffs exactly this module.
+    const tip = Math.max(...rows.map((row) => row.height));
+    if (tip > nodeStatus.height) nodeStatus.height = tip;
+    const folded = nodeStatus.modules.find((m) => m.id === module);
+    if (folded) {
+      folded.root = tip.toString(16).padStart(2, "0").repeat(32).slice(0, 64);
+    }
   };
-  const finalize = (block: BlockEvent) =>
-    blockListeners.forEach((notify) => notify(block));
-  return { transport, finalize };
+  const emitHeartbeat = (height: number, appHash = "dd".repeat(32)) => {
+    const frame: HeartbeatFrame = {
+      type: "heartbeat",
+      height,
+      appHash,
+      timeMs: Date.now(),
+      intervalMs: 3_000,
+    };
+    streamListeners.forEach((notify) => notify({ kind: "heartbeat", frame }));
+  };
+  const emitDown = (reason = "connection refused") =>
+    streamListeners.forEach((notify) => notify({ kind: "down", reason }));
+  const emitUp = () =>
+    streamListeners.forEach((notify) => notify({ kind: "up" }));
+  return { transport, emitOps, emitHeartbeat, emitDown, emitUp };
 };
 
 let capturedActions: ConsoleActions | null = null;
@@ -259,23 +337,37 @@ describe("DucktapeProvider", () => {
     expect(msg.post_message.message_id).toBeTruthy();
   });
 
-  it("re-queries committed state when a block finalizes", async () => {
-    const { transport, finalize } = makeFakeNode();
+  it("a chat event triggers a scoped hydrate: chat refetches, agents don't", async () => {
+    const { transport, emitOps } = makeFakeNode();
     renderConsole(transport);
     await waitFor(() =>
       expect(screen.getByTestId("channel").textContent).toBe("general"),
     );
 
-    const statusCalls = vi.mocked(transport.status).mock.calls.length;
+    const chatCalls = vi
+      .mocked(transport.query)
+      .mock.calls.filter((call) => call[0] === "chat").length;
+    const agentCalls = vi
+      .mocked(transport.query)
+      .mock.calls.filter((call) => call[0] === "agent").length;
     await act(async () => {
-      finalize({ height: 5, appHash: "dd".repeat(32) });
+      emitOps("chat", [{ height: 5 }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
     });
 
+    // the event drives refreshScoped: one status read roots the diff, the
+    // chat slice group re-queries, and untouched groups (agents) stay quiet.
     await waitFor(() =>
-      expect(vi.mocked(transport.status).mock.calls.length).toBeGreaterThan(
-        statusCalls,
-      ),
+      expect(
+        vi.mocked(transport.query).mock.calls.filter((call) => call[0] === "chat")
+          .length,
+      ).toBeGreaterThan(chatCalls),
     );
+    expect(
+      vi.mocked(transport.query).mock.calls.filter((call) => call[0] === "agent")
+        .length,
+    ).toBe(agentCalls);
+    expect(capturedState!.lastBlock).toBe(5);
   });
 
   it("createChannel enters the new channel: its messages load, the thread closes", async () => {
@@ -310,53 +402,71 @@ describe("DucktapeProvider", () => {
   // to disconnected, and must auto-reconnect when it returns. The block stream
   // alone can't do this (silence is ambiguous: a healthy idle node sends none
   // either), so the liveness heartbeat polls status() and drives `connected`.
-  it("detects a node that goes silently unreachable, then auto-reconnects", async () => {
-    vi.useFakeTimers();
-    try {
-      const { transport } = makeFakeNode();
-      let nodeUp = true;
-      vi.mocked(transport.status).mockImplementation(() =>
-        nodeUp
-          ? Promise.resolve({
-              version: "0.1.0",
-              appHash: "aa".repeat(32),
-              height: 1,
-              modules: [],
-            })
-          : Promise.reject(new Error("connection refused")),
-      );
+  it("marks down on stream watchdog death, then recovers on the up edge", async () => {
+    const { transport, emitDown, emitUp } = makeFakeNode();
 
-      renderConsole(transport);
-      // initial hydrate → connected
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(50);
-      });
-      expect(screen.getByTestId("connected").textContent).toBe("true");
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("connected").textContent).toBe("true"),
+    );
 
-      // node goes away: no error surfaces on the block stream, but the next
-      // heartbeat's status() rejects → the UI must reflect disconnected.
-      nodeUp = false;
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(3100);
-      });
-      expect(screen.getByTestId("connected").textContent).toBe("false");
+    await act(async () => {
+      emitDown("stream heartbeat timed out");
+    });
+    expect(screen.getByTestId("connected").textContent).toBe("false");
 
-      // node returns: the heartbeat's status() succeeds again → re-hydrate.
-      nodeUp = true;
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(3100);
-      });
-      expect(screen.getByTestId("connected").textContent).toBe("true");
-    } finally {
-      vi.useRealTimers();
-    }
+    await act(async () => {
+      emitUp();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("connected").textContent).toBe("true"),
+    );
+  });
+
+  it("rechecks the workspace node identity on the up edge", async () => {
+    const { transport, emitDown, emitUp } = makeFakeNode();
+    vi.mocked(transport.status).mockResolvedValue({
+      version: "0.1.0",
+      appHash: "aa".repeat(32),
+      height: 1,
+      modules: [{ id: "chat", root: "cc".repeat(32) }],
+      publicKey: "badc0de",
+    });
+
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("connected").textContent).toBe("true"),
+    );
+    capturedState!.workspace = {
+      id: "w1",
+      name: "Workspace",
+      chainId: "chain",
+      pubkey: "expected",
+      founder: true,
+      member: true,
+      ports: { listen: 1, http: 2, rpc: 3 },
+    };
+
+    await act(async () => {
+      emitDown("stream heartbeat timed out");
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("connected").textContent).toBe("false"),
+    );
+    await act(async () => {
+      emitUp();
+    });
+    await waitFor(() =>
+      expect(capturedState!.connectionDown?.impostor).toBe(true),
+    );
+    expect(screen.getByTestId("connected").textContent).toBe("false");
   });
 
   // Regression: the live chain tip and the node's own durable block history
   // are per-node — both must be dropped on a node switch, or the new node's
   // explorer shows the previous node's rows (and its tip) as if current.
   it("drops the previous node's chain tip and blocks when switching nodes", async () => {
-    const { transport, finalize } = makeFakeNode();
+    const { transport, emitOps } = makeFakeNode();
     // node 1 has durable block history AND a live block stream, so the switch
     // must zero BOTH (blocks 1→0, lastBlock 7→null).
     vi.mocked(transport.blocks).mockResolvedValue([
@@ -384,7 +494,8 @@ describe("DucktapeProvider", () => {
 
     // node 1's ws stream lands a block → the ungated tip follows it.
     await act(async () => {
-      finalize({ height: 7, appHash: "bb".repeat(32) });
+      emitOps("chat", [{ height: 7 }]);
+      await new Promise((resolve) => setTimeout(resolve, 150));
     });
     expect(capturedState!.lastBlock).toBe(7);
 

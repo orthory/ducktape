@@ -76,7 +76,8 @@ use indexer::{AppliedOp, BlockOps, IndexStore};
 use jobs::Jobs;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
-    NodeCommand, NodeHandle, NodeStatus, WsFrame, block_row, hex_bytes, hex_root, payload_preview,
+    NodeCommand, NodeHandle, NodeStatus, StreamHub, block_row, hex_bytes, hex_root,
+    payload_preview,
 };
 use pages::Pages;
 use profiles::Profiles;
@@ -85,7 +86,6 @@ use saga::SagaModule;
 use sdk::{Effect, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use tasks::Tasks;
-use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
@@ -265,7 +265,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
 
-    let (handle, cmd_rx, event_tx) = NodeHandle::channel();
+    let (handle, cmd_rx, stream_hub) = NodeHandle::channel();
     let handle = handle
         .with_forge_repo(forge_repo.clone())
         .with_index_store(index.clone());
@@ -288,7 +288,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 echo_oracle,
                 cmd_rx,
                 control_rx,
-                event_tx,
+                stream_hub,
             )
         })?;
 
@@ -346,7 +346,7 @@ struct Sim {
     workers: Vec<Box<dyn reactor::Worker>>,
     blobs: blobstore::BlobHandle,
     index: Arc<IndexStore>,
-    events: broadcast::Sender<WsFrame>,
+    stream_hub: StreamHub,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,7 +360,7 @@ fn run_sim(
     echo_oracle: bool,
     mut cmds: mpsc::Receiver<NodeCommand>,
     mut control: mpsc::Receiver<SimCommand>,
-    events: broadcast::Sender<WsFrame>,
+    stream_hub: StreamHub,
 ) {
     let duckfs_dir = storage.join("duckfs");
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
@@ -424,6 +424,7 @@ fn run_sim(
         // fresh dir this is 0; on a (discouraged) reused dir it keeps op-log
         // heights monotonic instead of silently skipping every new block.
         let height = index.resume_height().expect("read index watermarks");
+        stream_hub.prime(height, hex_root(&host.app_hash()));
 
         let mut sim = Sim {
             host,
@@ -439,7 +440,7 @@ fn run_sim(
             },
             blobs,
             index,
-            events,
+            stream_hub,
         };
 
         loop {
@@ -636,7 +637,6 @@ impl Sim {
             app_hash: hex_root(&out.app_hash),
         };
         let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
-        let _ = self.events.send(WsFrame::Block(block.clone()));
 
         // fold the block into the durable index LAST, like noded: canonical
         // state is already committed, so an index failure degrades the read
@@ -679,6 +679,9 @@ impl Sim {
                 self.height
             );
         }
+
+        self.stream_hub
+            .publish_block(block.height, block.app_hash.clone());
 
         offer_effects(&self.workers, out.effects, &mut self.oracle_queue).await;
         Ok(Committed {

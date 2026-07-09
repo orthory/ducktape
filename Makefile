@@ -13,7 +13,7 @@ BIN_DEST ?= $(HOME)/.cargo/bin
 
 UNAME_S := $(shell uname -s)
 
-.PHONY: all dev dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app test clean
+.PHONY: all dev dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean
 
 all: node web
 
@@ -101,6 +101,10 @@ install-app: app
 	bash ops/install-desktop-entry.sh "$(BIN_DEST)/ducktape"
 endif
 
+## regenerate app/src/domain/stream.gen.ts from the stream contract
+stream-types:
+	$(CARGO) test -p noded export_ts_bindings
+
 ## the full LOCAL verification gate (no hosted CI by design — run this before
 ## every push): the rust workspace including the process-level e2e suites
 ## (bin/node spawns a real 4-node cluster over localhost TCP, bin/noded drives
@@ -109,6 +113,8 @@ endif
 ## and the sim node staged so the provider scenario suite runs too.
 test: app/node_modules
 	$(CARGO) test --workspace
+	$(MAKE) stream-types
+	git diff --exit-code -- app/src/domain/stream.gen.ts
 	$(CARGO) build -p noded -p simnode
 	cd app && $(BUN) run typecheck
 	cd app && DUCKTAPE_NODED_BIN=$(abspath target/debug/ducktape-noded) DUCKTAPE_SIMNODE_BIN=$(abspath target/debug/ducktape-simnode) $(BUN) run test

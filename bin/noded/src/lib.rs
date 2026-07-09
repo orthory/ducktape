@@ -20,6 +20,11 @@
 //! this port.
 
 pub mod blobs;
+pub mod stream;
+pub use stream::{
+    ClientMsg, LogRing, RunOutputRegistry, RunStream, ServerFrame, StreamErrorCode, StreamHub,
+    StreamOpRow, StreamOrigin, StreamOriginKind, TailItem,
+};
 // the duckfs product surface lives in its own module (lib.rs is over the size
 // cap); re-exported flat so the router keeps its bare handler names and the
 // public param structs stay at `noded::CommitBody` &c.
@@ -52,12 +57,11 @@ use futures::SinkExt as _;
 use futures::channel::{mpsc, oneshot};
 use sdk::StateRoot;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 
 /// inbound command backlog before submit/query callers see backpressure.
 pub const COMMAND_BUFFER: usize = 64;
-/// block events buffered per lagging websocket subscriber before it skips ahead.
+/// internal block-note wakeups buffered per lagging websocket subscriber.
 pub const EVENT_BUFFER: usize = 64;
 
 /// one finalized block, as reported to clients (http response + ws frame).
@@ -548,14 +552,6 @@ pub enum CallServerControl {
     RateHint { max_kbps: u32 },
 }
 
-/// a ws frame. tagged so the stream can grow beyond block events without
-/// breaking subscribers — clients switch on `type` and ignore unknown kinds.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum WsFrame {
-    Block(BlockSummary),
-}
-
 /// a request to the actor that owns the host. replies cross the channel as
 /// wire-ready types so the http layer stays free of sdk conversions.
 pub enum NodeCommand {
@@ -584,12 +580,12 @@ pub enum NodeCommand {
 }
 
 /// the router's shared state: a command lane into the node actor, the
-/// block-event fan-out for websocket subscribers, the shutdown signal, and the
+/// stream hub for websocket subscribers, the shutdown signal, and the
 /// node-local blob store the files module shares.
 #[derive(Clone)]
 pub struct NodeHandle {
     cmds: mpsc::Sender<NodeCommand>,
-    events: broadcast::Sender<WsFrame>,
+    hub: StreamHub,
     shutdown: std::sync::Arc<tokio::sync::Notify>,
     /// the files blob lane. NOT a command into the actor: chunk bytes stay
     /// node-local by design (never consensus state, never an op), so the http
@@ -622,19 +618,21 @@ pub struct NodeHandle {
 
 impl NodeHandle {
     /// build the handle plus the actor-side ends: the command receiver the
-    /// actor drains and the event sender it publishes finalized blocks on.
+    /// actor drains and the stream hub it publishes finalized blocks on.
     /// the blob store is born here — BEFORE genesis — so the embedding daemon
     /// can hand [`Self::blob_handle`] clones to forge and its block loop.
-    pub fn channel() -> (
-        Self,
-        mpsc::Receiver<NodeCommand>,
-        broadcast::Sender<WsFrame>,
-    ) {
+    pub fn channel() -> (Self, mpsc::Receiver<NodeCommand>, StreamHub) {
+        Self::channel_with_log_ring(LogRing::default())
+    }
+
+    /// same as [`Self::channel`], but uses a caller-created log ring so a
+    /// tracing layer can feed the same ring before the handle is fully wired.
+    pub fn channel_with_log_ring(logs: LogRing) -> (Self, mpsc::Receiver<NodeCommand>, StreamHub) {
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
-        let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
+        let hub = StreamHub::with_log_ring(EVENT_BUFFER, logs);
         let handle = Self {
             cmds: cmd_tx,
-            events: event_tx.clone(),
+            hub: hub.clone(),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             blobs: crate::blobs::BlobHandle::default(),
             forge_repo: None,
@@ -642,7 +640,7 @@ impl NodeHandle {
             call: None,
             duckfs_workspaces: None,
         };
-        (handle, cmd_rx, event_tx)
+        (handle, cmd_rx, hub)
     }
 
     /// swap the blob store for a persistent one rooted at `root` (write-
@@ -702,6 +700,15 @@ impl NodeHandle {
     /// pool's completed provider runs re-enter as `Submit` commands here.
     pub fn command_sender(&self) -> mpsc::Sender<NodeCommand> {
         self.cmds.clone()
+    }
+
+    /// the multiplexed stream hub backing `/v1/ws`.
+    pub fn stream_hub(&self) -> StreamHub {
+        self.hub.clone()
+    }
+
+    pub(crate) fn stream_index(&self) -> Option<Arc<indexer::IndexStore>> {
+        self.index.clone()
     }
 
     /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
@@ -1996,25 +2003,7 @@ pub async fn serve(listener: tokio::net::TcpListener, handle: NodeHandle) -> std
 }
 
 async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Response {
-    let frames = handle.events.subscribe();
-    upgrade.on_upgrade(move |socket| stream_frames(socket, frames))
-}
-
-async fn stream_frames(mut socket: WebSocket, mut frames: broadcast::Receiver<WsFrame>) {
-    loop {
-        match frames.recv().await {
-            Ok(frame) => {
-                let text = serde_json::to_string(&frame).expect("ws frame serializes");
-                if socket.send(Message::Text(text.into())).await.is_err() {
-                    return; // client hung up
-                }
-            }
-            // this subscriber fell behind the buffer; skip ahead — clients
-            // re-query on every block anyway, missing one is harmless.
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => return,
-        }
-    }
+    upgrade.on_upgrade(move |socket| stream::stream_session(socket, handle))
 }
 
 #[derive(Debug, Deserialize)]

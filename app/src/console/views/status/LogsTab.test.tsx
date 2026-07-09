@@ -1,9 +1,12 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
+import { LOGS_TOPIC } from "../../../domain/stream";
+import type { NodeTransport, TopicHandlers } from "../../../domain/transport";
+import { makeTransportStub } from "../../../test/transport-stub";
 import type { RuntimeFacts, Workspace } from "../../../domain/workspace-client";
 import { LogsTab } from "./LogsTab";
 
@@ -31,6 +34,7 @@ const TAIL = "2026-07-09T12:03:01Z  INFO alpha up\n2026-07-09T12:03:02Z ERROR be
 interface Opts {
   log?: string | null;
   facts?: RuntimeFacts | null;
+  transport?: NodeTransport;
 }
 
 const renderLogs = (patch: Partial<ConsoleState> = {}, opts: Opts = {}) => {
@@ -71,7 +75,7 @@ const renderLogs = (patch: Partial<ConsoleState> = {}, opts: Opts = {}) => {
   ) as ConsoleActions;
 
   render(
-    <ConsoleContext.Provider value={{ state: initialState, actions }}>
+    <ConsoleContext.Provider value={{ state: initialState, actions, transport: opts.transport }}>
       <LogsTab />
     </ConsoleContext.Provider>,
   );
@@ -79,9 +83,24 @@ const renderLogs = (patch: Partial<ConsoleState> = {}, opts: Opts = {}) => {
 };
 
 describe("LogsTab", () => {
-  it("shows a managed-only empty state for a remote node and never reads the log", () => {
-    const { spies } = renderLogs({ managed: false });
-    expect(screen.getByText(/only available for the local daemon/i)).toBeInTheDocument();
+  it("streams remote node logs without reading the local daemon log", async () => {
+    let handlers: TopicHandlers | null = null;
+    const transport = makeTransportStub({
+      subscribe: vi.fn((_topics, h) => {
+        handlers = h;
+        return () => {};
+      }),
+    });
+    const { spies } = renderLogs({ managed: false }, { transport });
+    act(() => {
+      handlers!.onTail?.({
+        type: "tail",
+        topic: LOGS_TOPIC,
+        cursor: "1",
+        item: { line: "remote INFO stream line" },
+      });
+    });
+    expect(await screen.findByText(/remote INFO stream line/)).toBeInTheDocument();
     expect(screen.queryByText("RUNTIME")).not.toBeInTheDocument();
     expect(spies.readDaemonLog).toBeUndefined();
   });

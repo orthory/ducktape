@@ -6,25 +6,10 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { capabilities, capabilitiesByNode, providersOf } from "./capability-client";
-import type { NodeTransport } from "./transport";
+import { makeTransportStub } from "../test/transport-stub";
 
-const stubTransport = (reply?: unknown): NodeTransport => ({
-  submit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
-  query: vi.fn().mockResolvedValue(reply),
-  view: vi.fn(),
-  putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
-  getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
-  status: vi.fn(),
-  metrics: vi.fn(),
-  blocks: vi.fn(),
-  filesStage: vi.fn(),
-  filesCommit: vi.fn(),
-  filesStat: vi.fn(),
-  filesLs: vi.fn(),
-  filesRead: vi.fn(),
-  filesHistory: vi.fn(),
-  onBlock: vi.fn(),
-});
+const stubTransport = (reply?: unknown) =>
+  makeTransportStub({ query: vi.fn().mockResolvedValue(reply) });
 
 describe("capabilities", () => {
   it("sends the bare string All and flattens node->tags to a sorted, deduped list", async () => {

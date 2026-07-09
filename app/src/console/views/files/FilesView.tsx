@@ -28,6 +28,7 @@ import {
   uploadFiles,
 } from "../../../domain/files-client";
 import type { FileEntry, FileUploadEntry } from "../../../domain/files-client";
+import { FILES_WATCH_TOPIC } from "../../../domain/stream";
 import { Icon, type IconName } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius, shadow } from "../../theme/tokens";
@@ -1062,6 +1063,30 @@ export function FilesView() {
     dragDownloadFiles.current.clear();
     dragDownloadRequests.current.clear();
   }, [snapshot, transport]);
+
+  useEffect(() => {
+    if (!transport || !backed || snapshot !== null) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleReload = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        bumpReload();
+      }, 100);
+    };
+    const off = transport.subscribe([FILES_WATCH_TOPIC], {
+      onTail: (frame) => {
+        if (frame.topic === FILES_WATCH_TOPIC) scheduleReload();
+      },
+      onLagged: (topic) => {
+        if (topic === FILES_WATCH_TOPIC) scheduleReload();
+      },
+    });
+    return () => {
+      if (timer !== null) clearTimeout(timer);
+      off();
+    };
+  }, [transport, backed, snapshot, bumpReload]);
 
   // Track the live head for the history panel's diff base.
   useEffect(() => {

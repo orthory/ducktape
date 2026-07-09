@@ -18,6 +18,7 @@ import {
   resolveNode,
 } from "../../domain/node-bootstrap";
 import type { PageMeta } from "../../domain/pages-client";
+import { moduleTopic } from "../../domain/stream";
 import type { BlockRecord, NodeTransport } from "../../domain/transport";
 import * as ws from "../../domain/workspace-client";
 import { createActions } from "./actions";
@@ -64,9 +65,6 @@ export type { ConsoleContextValue } from "./context";
 
 /** How many recent non-empty blocks the explorer pulls per refresh. */
 const BLOCKS_KEEP = 200;
-
-/** How often to re-poll a resolved-but-unanswering node until it comes back. */
-const RECONNECT_POLL_MS = 3_000;
 
 export function DucktapeProvider({
   transport,
@@ -333,6 +331,15 @@ export function DucktapeProvider({
     [],
   );
 
+  const streamModuleKey = useMemo(
+    () =>
+      (state.status?.modules ?? [])
+        .map((m) => m.id)
+        .sort()
+        .join("\0"),
+    [state.status?.modules],
+  );
+
   // 1. Resolve the node once. Web: dial the configured url. Desktop: resolve
   //    via the ~/.ducktape registry — connect the active workspace, or raise
   //    the onboarding gate when there is none. Injected transports (tests) and
@@ -396,47 +403,82 @@ export function DucktapeProvider({
     };
   }, [transport, actions, fail]);
 
-  // 2. Hydrate once the node is resolved, then follow the block stream. The
-  //    lastBlock updater stays pure (StrictMode double-invokes it): it only
-  //    moves forward on the strictly-increasing block height.
+  // 2. Hydrate once the node is resolved.
   useEffect(() => {
     if (!node) return;
     refresh();
+  }, [node, refresh]);
 
-    const offBlock = node.onBlock((block) => {
-      // The live chain tip, UNGATED — recorded before the pending gate below,
-      // so the console always knows the chain moved even while an op of ours
-      // is in flight (a seam duplicate or reconnect replay never moves it back).
-      dispatch({
-        type: "update",
-        fn: (prev) =>
-          block.height > (prev.lastBlock ?? -1) ? { lastBlock: block.height } : {},
-      });
-      // A block landing while one of OUR ops is still in flight would re-query
-      // state that predates the op and clobber its preconfirmed projection —
-      // and the op's own completion refresh follows immediately anyway. Stale
+  // 2a. Follow the module stream topics: every finalized op streams as an
+  //     event, the chain tip patches UNGATED, and a trailing debounce
+  //     coalesces a block burst into ONE scoped hydrate — refreshScoped's
+  //     root diff fetches exactly the slice groups the blocks touched, so
+  //     the events are the trigger and the roots are the scope. The
+  //     fresh-pending gate carries over from the block-frame era; a lagged
+  //     topic hydrates immediately (the root diff covers whatever the gap
+  //     contained).
+  useEffect(() => {
+    if (!node || !streamModuleKey) return;
+    const modules = streamModuleKey.split("\0").filter(Boolean);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const clearFlush = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    };
+    const flush = () => {
+      timer = null;
+      void refreshScoped();
+    };
+    const schedule = () => {
+      // An op of OURS in flight: its own completion refresh follows, and a
+      // scoped re-query now would clobber the preconfirmed projection. Stale
       // pendings (a hung submit) stop gating so the stream can't be starved.
       if (hasFreshPending(stateRef.current.ops, Date.now())) return;
-      refreshScoped();
-    });
-    return offBlock;
-  }, [node, refresh, refreshScoped]);
+      clearFlush();
+      timer = setTimeout(flush, 100);
+    };
 
-  // 2b. Liveness heartbeat — the "no running node" detection AND recovery. The
-  //     block stream can't do this alone: a node that silently goes away (crash,
-  //     stop, remote endpoint unplugged) just stops sending blocks, with no error
-  //     to flip `connected` off — and a healthy but idle node also sends none, so
-  //     silence isn't a reliable signal. Instead, ping `status()` on an interval
-  //     whenever a node is resolved: a failure marks it down (so the UI reflects
-  //     it and this same loop keeps retrying), and the first success after a drop
-  //     re-hydrates via refresh(). Reads live `connected` through the ref so the
-  //     interval isn't torn down and rebuilt on every block. Skipped during
-  //     onboarding / a joiner's park phase (which has its own poll).
+    const off = node.subscribe(modules.map(moduleTopic), {
+      onEvent: (frame) => {
+        // The live chain tip, UNGATED — recorded before the pending gate so
+        // the console always knows the chain moved even while an op of ours
+        // is in flight. An event at height N also proves the node's tip is
+        // ≥ N, so status.height advances here too instead of waiting up to a
+        // heartbeat interval (appHash refreshes on the next beat).
+        dispatch({
+          type: "update",
+          fn: (prev) => {
+            const patch: { lastBlock?: number; status?: typeof prev.status } = {};
+            if (frame.op.height > (prev.lastBlock ?? -1)) {
+              patch.lastBlock = frame.op.height;
+            }
+            if (prev.status && frame.op.height > prev.status.height) {
+              patch.status = { ...prev.status, height: frame.op.height };
+            }
+            return patch;
+          },
+        });
+        schedule();
+      },
+      onLagged: () => {
+        clearFlush();
+        void refreshScoped();
+      },
+    });
+    return () => {
+      clearFlush();
+      off();
+    };
+  }, [node, streamModuleKey, refreshScoped]);
+
+  // 2b. Liveness heartbeat — connection banner, tip patching, and one-shot
+  //     recovery on the up edge. The transport's watchdog turns silent stream
+  //     death into a down signal; there is no separate reconnect poll here.
   useEffect(() => {
     if (!node) return;
     if (state.needsOnboarding || state.onboardingPhase) return;
-    const beat = () =>
-      node.status().then(
+    const recover = () => {
+      void node.status().then(
         (s) => {
           // Recovery identity re-check: a foreign / different-build node could
           // have grabbed the reused port while ours was down (only the INITIAL
@@ -460,17 +502,10 @@ export function DucktapeProvider({
             }
             return;
           }
-          // Healthy: on the down→up edge clear the banner and re-hydrate; while
-          // already connected the block stream keeps projections fresh.
-          if (!stateRef.current.connected || stateRef.current.connectionDown) {
-            dispatch({ type: "patch", patch: { connectionDown: null } });
-            refresh();
-          }
+          dispatch({ type: "patch", patch: { connectionDown: null } });
+          refresh();
         },
         (err: unknown) => {
-          // Unreachable: surface the REAL reason in a persistent reconnecting
-          // banner and keep this loop trying to recover. Patch only on the
-          // down-edge to avoid a re-render every beat.
           if (stateRef.current.connected || !stateRef.current.connectionDown) {
             const reason = err instanceof Error ? err.message : String(err);
             dispatch({
@@ -480,8 +515,46 @@ export function DucktapeProvider({
           }
         },
       );
-    const timer = setInterval(beat, RECONNECT_POLL_MS);
-    return () => clearInterval(timer);
+    };
+    const off = node.onStream((signal) => {
+      if (signal.kind === "heartbeat") {
+        const { height, appHash } = signal.frame;
+        if (height <= 0) return;
+        dispatch({
+          type: "update",
+          fn: (prev) => {
+            const patch: Partial<typeof prev> = {};
+            if (height > (prev.lastBlock ?? -1)) patch.lastBlock = height;
+            // Patch only on real movement: an idle chain heartbeats every 3s
+            // and an unconditional new status object would re-render each beat.
+            if (
+              prev.status &&
+              (prev.status.height !== height || prev.status.appHash !== appHash)
+            ) {
+              patch.status = { ...prev.status, height, appHash };
+            }
+            return patch;
+          },
+        });
+        return;
+      }
+      if (signal.kind === "down") {
+        if (stateRef.current.connected || !stateRef.current.connectionDown) {
+          dispatch({
+            type: "patch",
+            patch: {
+              connected: false,
+              connectionDown: { reason: signal.reason },
+            },
+          });
+        }
+        return;
+      }
+      if (!stateRef.current.connected || stateRef.current.connectionDown) {
+        recover();
+      }
+    });
+    return off;
   }, [node, state.needsOnboarding, state.onboardingPhase, refresh]);
 
   // 2c. Keep a live huddle's voice fan-out in step with the consensus roster:
