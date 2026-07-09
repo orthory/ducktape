@@ -338,6 +338,33 @@ and the split/merge tear under a real daemon settling two ops independently.
 jsdom render counts approximate the first; only WebKitGTK with a live node shows
 the second.
 
+### What only a browser engine could tell us
+
+jsdom has no layout and its textarea selection is a fake that no value change
+touches. Two things were therefore verified by mounting the real `PagesView` in
+headless Chromium against a mocked store — one confirming the design, one
+refuting it:
+
+- **Alignment (confirmed).** Title, paragraph, heading, to-do, bulleted and
+  numbered rows all lay out at the same `left`. The marker hangs 26.5px into the
+  margin (the checkbox, centred in its 20px box, inside the 28px hang) and its
+  centre sits on the first text line.
+- **Merge caret (refuted, then fixed).** After a merge the caret landed at the
+  END of the joined text, not the seam. `PagesView` was placing a caret into a
+  textarea whose value `BlockRow` owns: on a merge the target row still shows its
+  old, shorter draft, and the queued `setDraft` commits *after* the caret is set
+  — writing a textarea's value moves its selection to the end, stomping it. A
+  `requestAnimationFrame` does **not** fix this; it races React's re-render and
+  loses.
+
+  **The row owns its caret.** `BlockRow` applies it in a layout effect gated on
+  `draft === block.text` and reports back through `handlers.focusApplied`. No
+  timing assumption. The parent's `focus` state degrades to "which row wants the
+  caret, and where".
+
+  This class of defect is invisible to the unit suite by construction. Do not
+  add a jsdom test for it and believe it is guarded.
+
 ## Implementation order
 
 Both host files are at the line cap and all groups touch them, so the *edits*
