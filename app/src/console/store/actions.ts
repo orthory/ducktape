@@ -45,11 +45,13 @@ import {
 import type { Action } from "./reducer";
 import {
   addMemberFromResponse,
+  approvePhoneEnrollment,
   mintLinkChallenge,
   removeMemberKey,
+  startPhoneEnrollment,
   unbindNode,
 } from "./account-ops";
-import type { AccountOpsDeps } from "./account-ops";
+import type { AccountOpsDeps, PhoneEnrollment } from "./account-ops";
 import type { LinkChallenge } from "../views/account/link-device";
 import { autoBindUserIdentity } from "./auto-bind";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
@@ -124,6 +126,17 @@ export interface ConsoleActions {
   accountRemoveMember(targetKeyHex: string): Promise<void>;
   /** Evict a (lost) node from this account — its first UI consumer. */
   accountUnbindNode(targetNodeHex: string): Promise<void>;
+  /** Stand up the LAN QR-enrollment server for this account (fresh nonce);
+   *  the card polls enroll-client directly and cancels on unmount. */
+  accountPhoneEnrollStart(): Promise<PhoneEnrollment>;
+  /** Approve the phone's candidate P-256 key — submits AddMemberKey. Rejects
+   *  with an actionable error on nonce drift. */
+  accountPhoneEnrollApprove(
+    enrollment: PhoneEnrollment,
+    newKeyHex: string,
+    sigHex: string,
+    label: string | null,
+  ): Promise<void>;
   selectChannel(channelId: string): void;
   createChannel(name: string, postPolicy: PostPolicy): void;
   sendMessage(body: string): void;
@@ -1123,6 +1136,14 @@ export function createActions({
     accountUnbindNode: (targetNodeHex) =>
       Promise.resolve()
         .then(() => unbindNode(accountDeps(), targetNodeHex))
+        .then(() => refresh()),
+    accountPhoneEnrollStart: () =>
+      Promise.resolve().then(() => startPhoneEnrollment(accountDeps())),
+    accountPhoneEnrollApprove: (enrollment, newKeyHex, sigHex, label) =>
+      Promise.resolve()
+        .then(() =>
+          approvePhoneEnrollment(accountDeps(), enrollment, newKeyHex, sigHex, label),
+        )
         .then(() => refresh()),
 
     readMetrics: () => {

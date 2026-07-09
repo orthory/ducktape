@@ -230,6 +230,60 @@ describe("AccountView — devices & keys", () => {
     fireEvent.click(screen.getByRole("button", { name: /^link$/i }));
     expect(await screen.findByLabelText("Link challenge code")).toBeInTheDocument();
   });
+
+  it("walks the phone QR enrollment: QR up → phone posts → approve → server torn down", async () => {
+    markTauri();
+    const enrollment = {
+      url: "http://192.168.1.7:40123/enroll#tok",
+      accountId: ACCOUNT_ID,
+      nonce: 5,
+    };
+    let phonePosted = false;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "user_identity_state")
+        return Promise.resolve({ state: "unlocked", pubkey: DEVICE_KEY, mnemonicConfirmed: true });
+      if (cmd === "enroll_poll")
+        return Promise.resolve(phonePosted ? ["02ab", "0aff"] : null);
+      if (cmd === "enroll_cancel") return Promise.resolve(undefined);
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+    const { spies } = renderAccount(linkedState(), {
+      accountPhoneEnrollStart: () => Promise.resolve(enrollment),
+      accountPhoneEnrollApprove: () => Promise.resolve(),
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: /show qr/i }));
+
+    // The QR + its plain-text URL render while waiting for the phone.
+    expect(await screen.findByAltText("Enrollment QR code")).toBeInTheDocument();
+    expect(screen.getByText(enrollment.url)).toBeInTheDocument();
+    expect(spies.accountPhoneEnrollStart).toHaveBeenCalled();
+
+    // The phone posts its proof; the next poll tick surfaces the candidate.
+    phonePosted = true;
+    expect(await screen.findByText(/your phone created a key/i, undefined, {
+      timeout: 4000,
+    })).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(shortKey("02ab")))).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText("Key label (optional, e.g. my phone)"), {
+      target: { value: "my phone" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /approve key/i }));
+
+    await waitFor(() =>
+      expect(spies.accountPhoneEnrollApprove).toHaveBeenCalledWith(
+        enrollment,
+        "02ab",
+        "0aff",
+        "my phone",
+      ),
+    );
+    // Approve + panel close both tear the LAN server down.
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("enroll_cancel"),
+    );
+  });
 });
 
 describe("AccountView — nodes", () => {
