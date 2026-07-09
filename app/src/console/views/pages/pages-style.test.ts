@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { BlockKind } from "../../../domain/pages-client";
-import { headingTopSpace, INDENT, MARKER_HANG } from "./pages-style";
+import { headingTopSpace, INDENT, MARKER_HANG, ROW_PAD_Y } from "./pages-style";
 
 describe("pages-style", () => {
   it("hangs the marker exactly as far as the old in-flow gutter was wide", () => {
@@ -33,5 +33,11 @@ describe("pages-style", () => {
       "page",
     ];
     for (const kind of kinds) expect(headingTopSpace(kind)).toBe(0);
+  });
+});
+
+describe("row padding", () => {
+  it("is the offset a hanging marker must add back to sit on its line", () => {
+    expect(ROW_PAD_Y).toBe(2.5);
   });
 });

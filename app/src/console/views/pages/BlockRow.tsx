@@ -34,7 +34,7 @@ import { SlashMenu } from "./SlashMenu";
 import type { Row } from "./pages-model";
 import { FOCUS_NEXT_CARET, FOCUS_PREV_CARET, resolveKey } from "./block-keys";
 import type { Caret } from "./block-keys";
-import { INDENT, MARKER_HANG, headingTopSpace } from "./pages-style";
+import { INDENT, MARKER_HANG, ROW_PAD_Y, headingTopSpace } from "./pages-style";
 
 /** Per-kind typography for the block textarea. */
 function kindFont(kind: BlockKind): string {
@@ -449,7 +449,7 @@ function BlockRowInner({
         display: "flex",
         alignItems: "flex-start",
         gap: 8,
-        padding: "2.5px 0",
+        padding: `${ROW_PAD_Y}px 0`,
         marginLeft: depth * INDENT,
         marginTop: headingTopSpace(block.kind),
       }}
@@ -464,7 +464,11 @@ function BlockRowInner({
           style={{
             position: "absolute",
             left: -MARKER_HANG,
-            top: 0,
+            // an absolute box offsets from the row's PADDING box, but the
+            // marker used to be a flex item aligned to its CONTENT box — one
+            // row-padding lower. Match it, or every bullet rides high above
+            // its own line.
+            top: ROW_PAD_Y,
             width: 20,
             height: 24,
             display: "flex",

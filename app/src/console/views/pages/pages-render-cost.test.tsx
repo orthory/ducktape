@@ -33,6 +33,7 @@ const headingTopSpace = vi.fn(() => 0);
 vi.mock("./pages-style", () => ({
   INDENT: 26,
   MARKER_HANG: 28,
+  ROW_PAD_Y: 2.5,
   headingTopSpace: () => headingTopSpace(),
 }));
 
