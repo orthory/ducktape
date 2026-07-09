@@ -102,7 +102,7 @@ fn solo_validator_survives_crash_and_graceful_restart() {
             let rows = block_rows(&cluster, 0);
             (rows
                 .iter()
-                .filter(|(_, r)| r["target"] == "directory")
+                .filter(|(_, r)| r["ops"][0]["target"] == "directory")
                 .count()
                 >= 2)
                 .then_some(rows)
@@ -154,6 +154,21 @@ fn solo_validator_survives_crash_and_graceful_restart() {
             (rows.len() >= rows_before.len()).then_some(rows)
         },
     );
+    // the rebuilt fold row matches the drain row on block coordinates and every
+    // op's identity; the only difference is the per-op dispatch TRACE
+    // (`ops[].operations`), which is EMPTY on the fold — recovery carries the
+    // block-level aggregate trace, not per-member, so a replayed op cannot
+    // reproduce its own fan-out. a documented rebuild-only degradation; compare
+    // with the traces stripped.
+    let strip_traces = |r: &serde_json::Value| {
+        let mut r = r.clone();
+        if let Some(ops) = r["ops"].as_array_mut() {
+            for op in ops {
+                op["operations"] = serde_json::json!([]);
+            }
+        }
+        r
+    };
     for (height, row) in &rows_before {
         let recovered = rows_after
             .iter()
@@ -161,17 +176,19 @@ fn solo_validator_survives_crash_and_graceful_restart() {
             .map(|(_, r)| r)
             .unwrap_or_else(|| panic!("explorer row at height {height} lost across the crash"));
         assert_eq!(
-            recovered, row,
-            "rebuilt explorer row at height {height} must equal the drain's row"
+            strip_traces(recovered),
+            strip_traces(row),
+            "rebuilt explorer row at height {height} must equal the drain's row \
+             (modulo the fold's empty per-op dispatch trace)"
         );
     }
     // and the rebuilt rows' op payloads are dereferencable again — the blob
     // store is in-memory, so ONLY the fold's re-staging can answer this.
     for (_, row) in rows_before
         .iter()
-        .filter(|(_, r)| r["target"] == "directory")
+        .filter(|(_, r)| r["ops"][0]["target"] == "directory")
     {
-        let op_hash = row["opHash"].as_str().expect("row opHash");
+        let op_hash = row["ops"][0]["opHash"].as_str().expect("row opHash");
         let (code, _) = cluster.http(0, "GET", &format!("/v1/files/blob/{op_hash}"), None);
         assert_eq!(
             code, 200,
