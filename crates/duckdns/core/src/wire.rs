@@ -96,15 +96,25 @@ pub enum DuckDnsMsg {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DuckDnsQuery {
-    Resolve { name: DuckDnsName },
-    HandleOwner { handle: String },
-    NodeAnnouncements { node: Vec<u8> },
+    Resolve {
+        name: DuckDnsName,
+    },
+    /// Canonical currently published names for the active-workspace helper.
+    /// The system adapter applies live standing/identity filtering.
+    Namespace,
+    HandleOwner {
+        handle: String,
+    },
+    NodeAnnouncements {
+        node: Vec<u8>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DuckDnsReply {
     Resolved(Option<ResolvedService>),
+    Namespace(Vec<String>),
     HandleOwner(Option<Vec<u8>>),
     NodeAnnouncements(Vec<ServiceAnnouncement>),
 }

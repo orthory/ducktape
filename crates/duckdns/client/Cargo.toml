@@ -7,6 +7,7 @@ version.workspace = true
 # loopback targets; shared names and wire types come from duckdns-core.
 [dependencies]
 duckdns-core = { workspace = true }
+duckfs-core = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net"] }
 

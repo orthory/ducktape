@@ -4,8 +4,8 @@ use duckdns_core::ServiceIdentity;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::Publications;
-use crate::publication::validate_target;
+use crate::publication::validate_loopback;
+use crate::{PublicationTarget, Publications};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
@@ -13,6 +13,8 @@ pub enum ProxyError {
     Unpublished,
     #[error("DuckDNS target policy: {0}")]
     TargetPolicy(String),
+    #[error("DuckDNS publication is not a loopback HTTP target")]
+    NotLoopback,
     #[error("connect to published loopback target: {0}")]
     Connect(#[source] io::Error),
     #[error("proxy published HTTP stream: {0}")]
@@ -33,8 +35,11 @@ where
     let publication = publications.get(identity).ok_or(ProxyError::Unpublished)?;
     // Defense in depth: constructors validate, but never let a future mutation
     // path turn this function into an arbitrary address dialer.
-    validate_target(publication.target).map_err(ProxyError::TargetPolicy)?;
-    let mut target = TcpStream::connect(publication.target)
+    let PublicationTarget::Loopback(target) = &publication.target else {
+        return Err(ProxyError::NotLoopback);
+    };
+    validate_loopback(*target).map_err(ProxyError::TargetPolicy)?;
+    let mut target = TcpStream::connect(*target)
         .await
         .map_err(ProxyError::Connect)?;
     tokio::io::copy_bidirectional(stream, &mut target)

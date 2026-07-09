@@ -1,0 +1,42 @@
+[package]
+name = "duckdnsd"
+edition.workspace = true
+version.workspace = true
+
+[lib]
+name = "duckdnsd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "duckdnsd"
+path = "src/main.rs"
+required-features = ["server"]
+
+[features]
+default = ["server"]
+server = [
+    "dep:async-trait",
+    "dep:hickory-proto",
+    "dep:hickory-server",
+    "dep:rcgen",
+    "dep:rustls",
+    "dep:time",
+    "dep:tokio-rustls",
+]
+
+[dependencies]
+duckdns-core = { workspace = true }
+async-trait = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+hickory-proto = { version = "0.26.1", optional = true }
+hickory-server = { version = "0.26.1", optional = true }
+rcgen = { version = "0.14.8", optional = true }
+rustls = { version = "0.23.41", optional = true }
+tokio-rustls = { version = "0.26.4", optional = true }
+time = { version = "0.3", optional = true }
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }

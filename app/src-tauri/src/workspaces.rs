@@ -73,6 +73,10 @@ pub struct Ports {
     /// the UDP invite intro listener.
     #[serde(default)]
     pub invite: Option<u16>,
+    /// Dedicated loopback HTTP ingress from the device-local DuckDNS TLS
+    /// gateway. Optional only while registry v1 workspaces migrate in place.
+    #[serde(default)]
+    pub duckdns: Option<u16>,
 }
 
 /// one workspace, as stored in the registry and handed to the ui.
@@ -208,11 +212,20 @@ fn save_registry(app: &tauri::AppHandle, reg: &Registry) -> Result<(), String> {
 /// same-$HOME multi-instance is an edge case and the fleet isolates $HOME.)
 fn save_registry_at(path: &Path, reg: &Registry) -> Result<(), String> {
     let text = serde_json::to_string_pretty(reg).map_err(|err| err.to_string())?;
-    let tmp = path.with_extension("json.tmp");
+    write_atomic(path, text.as_bytes())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| format!("{extension}.tmp"))
+        .unwrap_or_else(|| "tmp".into());
+    let tmp = path.with_extension(extension);
     {
         use std::io::Write as _;
         let mut file = fs::File::create(&tmp).map_err(|err| format!("create {tmp:?}: {err}"))?;
-        file.write_all(text.as_bytes())
+        file.write_all(bytes)
             .map_err(|err| format!("write {tmp:?}: {err}"))?;
         file.sync_all()
             .map_err(|err| format!("fsync {tmp:?}: {err}"))?;
@@ -277,12 +290,15 @@ fn allocate_ports(reserved: &[u16]) -> Result<Ports, String> {
     let wireguard = free_port(&used)?;
     used.push(wireguard);
     let invite = free_port(&used)?;
+    used.push(invite);
+    let duckdns = free_port(&used)?;
     Ok(Ports {
         listen,
         http,
         rpc,
         wireguard: Some(wireguard),
         invite: Some(invite),
+        duckdns: Some(duckdns),
     })
 }
 
@@ -297,6 +313,7 @@ fn reserved_ports(reg: &Registry) -> Vec<u16> {
                 Some(w.ports.rpc),
                 w.ports.wireguard,
                 w.ports.invite,
+                w.ports.duckdns,
             ]
         })
         .flatten()
@@ -319,6 +336,43 @@ fn read_descriptor(dir: &Path) -> Result<(String, Vec<String>), String> {
 
 fn node_toml(dir: &Path) -> PathBuf {
     dir.join("node.toml")
+}
+
+fn set_duckdns_ingress(path: &Path, address: &str) -> Result<(), String> {
+    let text = fs::read_to_string(path).map_err(|err| format!("read {path:?}: {err}"))?;
+    let mut document = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|err| format!("parse {path:?}: {err}"))?;
+    document["duckdns"]["ingress_listen"] = toml_edit::value(address);
+    write_atomic(path, document.to_string().as_bytes())
+}
+
+/// Registry v1 predates the dedicated DuckDNS ingress. Migrate one selected
+/// workspace in place, stopping its node first so the new listener is present
+/// on the very next boot and preserving hand-edited TOML formatting/comments.
+fn ensure_duckdns_port(
+    app: &tauri::AppHandle,
+    reg: &mut Registry,
+    id: &str,
+) -> Result<(), String> {
+    let index = reg
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.id == id)
+        .ok_or_else(|| format!("no workspace {id:?}"))?;
+    if reg.workspaces[index].ports.duckdns.is_some() {
+        return Ok(());
+    }
+
+    let old = reg.workspaces[index].clone();
+    let dir = workspaces_dir(app)?.join(&old.id);
+    if port_listening(old.ports.listen) || port_listening(old.ports.http) {
+        stop_workspace_node(&dir, &old.ports, Duration::from_secs(6))?;
+    }
+    let port = free_port(&reserved_ports(reg))?;
+    set_duckdns_ingress(&node_toml(&dir), &format!("127.0.0.1:{port}"))?;
+    reg.workspaces[index].ports.duckdns = Some(port);
+    save_registry(app, reg)
 }
 
 fn find<'a>(reg: &'a Registry, id: &str) -> Result<&'a Workspace, String> {
@@ -399,6 +453,12 @@ fn workspace_create_blocking(app: tauri::AppHandle, name: String) -> Result<Work
             .invite
             .ok_or("workspace allocator did not assign an invite port")?
     );
+    let duckdns = format!(
+        "127.0.0.1:{}",
+        ports
+            .duckdns
+            .ok_or("workspace allocator did not assign a DuckDNS ingress port")?
+    );
     let dir_s = dir.to_string_lossy().to_string();
     // desktop-spawned nodes run the TUN-less userspace WireGuard backend
     // (overlay-net ADR phase 4): no /dev/net/tun, no setcap, no host
@@ -423,6 +483,8 @@ fn workspace_create_blocking(app: tauri::AppHandle, name: String) -> Result<Work
         &invite,
         "--wireguard-effect",
         "socket",
+        "--duckdns-ingress",
+        &duckdns,
     ])
     .map(|out| last_line(&out))?;
     // read the pubkey back off the identity `init` just wrote (keygen reuses an
@@ -513,6 +575,12 @@ fn workspace_join_blocking(
             .invite
             .ok_or("workspace allocator did not assign an invite port")?
     );
+    let duckdns = format!(
+        "127.0.0.1:{}",
+        ports
+            .duckdns
+            .ok_or("workspace allocator did not assign a DuckDNS ingress port")?
+    );
     let dir_s = dir.to_string_lossy().to_string();
     // join prints this identity's pubkey (for the inviter's admit) on stdout.
     // --wireguard-effect socket: the desktop default (overlay-net ADR phase
@@ -534,6 +602,8 @@ fn workspace_join_blocking(
         &invite,
         "--wireguard-effect",
         "socket",
+        "--duckdns-ingress",
+        &duckdns,
     ])
     .map(|out| last_line(&out))?;
 
@@ -1010,6 +1080,7 @@ pub async fn workspace_select(
 
 fn workspace_select_blocking(app: tauri::AppHandle, id: String) -> Result<Selection, String> {
     let mut reg = load_registry(&app)?;
+    ensure_duckdns_port(&app, &mut reg, &id)?;
     let ws = find(&reg, &id)?.clone();
     let dir = workspaces_dir(&app)?.join(&ws.id);
     let http_url = format!("http://127.0.0.1:{}", ws.ports.http);
@@ -1020,11 +1091,7 @@ fn workspace_select_blocking(app: tauri::AppHandle, id: String) -> Result<Select
     // while http may lag behind, so this is the one dependable liveness port.
     // a second spawn would collide on exactly this port anyway.
     if port_listening(ws.ports.listen) {
-        commit_active(&app, &mut reg, &ws.id)?;
-        return Ok(Selection {
-            id: ws.id,
-            http_url,
-        });
+        return finish_selection(&app, &mut reg, ws, http_url);
     }
 
     let log_path = dir.join("daemon.log");
@@ -1048,9 +1115,33 @@ fn workspace_select_blocking(app: tauri::AppHandle, id: String) -> Result<Select
     // commit `active` ONLY now the node is confirmed up: a select that fails to
     // start the node must not repoint `active` at a workspace the next boot
     // then can't launch (which would strand the app on that dead workspace).
-    commit_active(&app, &mut reg, &ws.id)?;
+    finish_selection(&app, &mut reg, ws, http_url)
+}
+
+fn finish_selection(
+    app: &tauri::AppHandle,
+    reg: &mut Registry,
+    workspace: Workspace,
+    http_url: String,
+) -> Result<Selection, String> {
+    commit_active(app, reg, &workspace.id)?;
+    let ingress = format!(
+        "127.0.0.1:{}",
+        workspace
+            .ports
+            .duckdns
+            .ok_or("active workspace has no DuckDNS ingress port")?
+    )
+    .parse()
+    .map_err(|error| format!("invalid active DuckDNS ingress: {error}"))?;
+    crate::duckdns::activate(
+        &app.state::<crate::duckdns::Registration>(),
+        workspace.id.clone(),
+        http_url.clone(),
+        ingress,
+    );
     Ok(Selection {
-        id: ws.id,
+        id: workspace.id,
         http_url,
     })
 }
@@ -1564,7 +1655,9 @@ fn stop_active_workspace_node_at(root: &Path, grace: std::time::Duration) -> Res
 /// is anything still listening on the ports this workspace owns? the mesh
 /// listener is bound in every phase (parked included); http only once serving.
 fn ports_held(ports: &Ports) -> bool {
-    port_listening(ports.listen) || port_listening(ports.http)
+    port_listening(ports.listen)
+        || port_listening(ports.http)
+        || ports.duckdns.is_some_and(port_listening)
 }
 
 /// best-effort "stop this node": POST /v1/shutdown to its http surface over a
@@ -1610,10 +1703,39 @@ mod tests {
                 rpc: 3,
                 wireguard: None,
                 invite: None,
+                duckdns: None,
             },
         }];
         assert_eq!(unique_id("My Team", &taken), "my-team-2");
         assert_eq!(unique_id("***", &taken), "workspace");
+    }
+
+    #[test]
+    fn duckdns_ingress_edit_preserves_publications_and_comments() {
+        let dir = std::env::temp_dir().join(format!(
+            "ducktape-duckdns-edit-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.toml");
+        fs::write(
+            &path,
+            "# keep me\nlisten = '127.0.0.1:1'\n\
+             [[duckdns.services]]\nscope = 'network'\nservice = 'docs'\n\
+             [duckdns.services.duckfs]\nprefix = '/shared/sites/docs'\n",
+        )
+        .unwrap();
+
+        set_duckdns_ingress(&path, "127.0.0.1:9443").unwrap();
+        let edited = fs::read_to_string(&path).unwrap();
+        assert!(edited.contains("# keep me"));
+        assert!(edited.contains("prefix = '/shared/sites/docs'"));
+        let parsed: toml::Value = toml::from_str(&edited).unwrap();
+        assert_eq!(
+            parsed["duckdns"]["ingress_listen"].as_str(),
+            Some("127.0.0.1:9443")
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1830,6 +1952,7 @@ mod tests {
             p.rpc,
             p.wireguard.expect("wireguard port"),
             p.invite.expect("invite port"),
+            p.duckdns.expect("DuckDNS ingress port"),
         ];
         for port in got {
             assert!(!reserved.contains(&port));
@@ -1860,12 +1983,13 @@ mod tests {
                     rpc: 40002,
                     wireguard: Some(40003),
                     invite: Some(40004),
+                    duckdns: Some(40005),
                 },
             }],
             mnemonic_confirmed: false,
         };
         let got = reserved_ports(&reg);
-        for port in [40000, 40001, 40002, 40003, 40004] {
+        for port in [40000, 40001, 40002, 40003, 40004, 40005] {
             assert!(got.contains(&port));
         }
     }
@@ -1924,6 +2048,7 @@ mod tests {
                 rpc: 0,
                 wireguard: None,
                 invite: None,
+                duckdns: None,
             }
         }
 
@@ -2022,6 +2147,7 @@ mod tests {
                 rpc: 0,
                 wireguard: None,
                 invite: None,
+                duckdns: None,
             };
 
             let err = stop_workspace_node(&dir, &ports, Duration::from_millis(400))

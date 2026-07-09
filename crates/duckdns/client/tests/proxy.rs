@@ -1,6 +1,6 @@
 use duckdns_client::{
-    ProxyError, Publication, Publications, ServiceAnnouncement, ServiceIdentity, ServiceScope,
-    proxy_to_publication,
+    ProxyError, Publication, PublicationTarget, Publications, ServiceAnnouncement, ServiceIdentity,
+    ServiceScope, proxy_to_publication,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -23,7 +23,7 @@ async fn declared_service_proxies_streaming_bytes_in_both_directions() {
             default_homepage: false,
             allow_cross_site: false,
         },
-        target,
+        target: PublicationTarget::Loopback(target),
     }])
     .unwrap();
 

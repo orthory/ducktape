@@ -67,9 +67,6 @@ use tracing_subscriber::prelude::*;
 use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
 
 mod config;
-mod duckdns_announce;
-mod duckdns_ingress;
-mod duckdns_plane;
 mod first_contact_join;
 mod lobby;
 mod oracle_pool;
@@ -4504,6 +4501,7 @@ mod userkey_verb_tests {
 /// `init --name <human name> [--dir .] [--listen a] [--advertised a] [--http a]
 /// [--rpc a] [--primary-coordinator host:port|none]
 /// [--wireguard-listen a] [--invite-listen a]
+/// [--duckdns-ingress a]
 /// [--wireguard-effect socket|tun|fake]` — found a network: mint the
 /// chain-id, write the descriptor + node config, seed the genesis validator
 /// set with this identity.
@@ -4540,6 +4538,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("wireguard-effect").map(String::as_str),
         flags.get("wireguard-listen").map(String::as_str),
         flags.get("invite-listen").map(String::as_str),
+        flags.get("duckdns-ingress").map(String::as_str),
     )?;
     if primary_coordinator.is_some() {
         if plumbing.wireguard_listen.is_none() {
@@ -5537,6 +5536,7 @@ fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 
 /// `join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a]
 /// [--rpc a] [--wireguard-listen a] [--invite-listen a]
+/// [--duckdns-ingress a]
 /// [--wireguard-effect socket|tun|fake]` — materialize a workspace
 /// from an invite: descriptor + identity (kept across re-joins) + node
 /// config. prints this identity for the inviter's pre-genesis `admit`.
@@ -5565,6 +5565,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("wireguard-effect").map(String::as_str),
         flags.get("wireguard-listen").map(String::as_str),
         flags.get("invite-listen").map(String::as_str),
+        flags.get("duckdns-ingress").map(String::as_str),
     )?;
     if config::invite_requires_reachability_defaults(&invite) {
         // a WireGuard or Coordinated invite makes the reachability plane the
@@ -6574,7 +6575,7 @@ fn run_node(
         Some(addr) if !sync_only => Some(std::net::TcpListener::bind(addr)?),
         _ => None,
     };
-    let duckdns_plane_slot: duckdns_plane::PlaneSlot =
+    let duckdns_plane_slot: duckdns_node::plane::PlaneSlot =
         std::sync::Arc::new(std::sync::OnceLock::new());
     let duckdns_ingress_listener = match duckdns_ingress_listen {
         Some(address) if !sync_only => {
@@ -6639,9 +6640,14 @@ fn run_node(
             noded::agent_provision::agent_runs_root(&storage)
                 .unwrap_or_else(|e| panic!("agent runs root failed D7 validation: {e}")),
         )));
+    // Reuse noded's established no-self-dial files adapter for DuckFS-backed
+    // DuckDNS sites. It holds only a clone of the actor command lane.
+    let duckdns_files = noded::ActorNodeApi::new(http_handle.clone());
     if let Some(listener) = duckdns_ingress_listener {
         let commands = http_handle.command_sender();
         let plane = std::sync::Arc::clone(&duckdns_plane_slot);
+        let publications = std::sync::Arc::clone(&duckdns_publications);
+        let files = duckdns_files.clone();
         let me: [u8; 32] = signer
             .public_key()
             .as_ref()
@@ -6657,7 +6663,15 @@ fn run_node(
                     .expect("DuckDNS ingress tokio runtime")
                     .block_on(async move {
                         if let Err(error) =
-                            duckdns_ingress::serve(listener, commands, plane, me).await
+                            duckdns_node::ingress::serve(
+                                listener,
+                                commands,
+                                plane,
+                                me,
+                                publications,
+                                files,
+                            )
+                            .await
                         {
                             eprintln!("[node {thread_label}] DuckDNS ingress failed: {error}");
                         }
@@ -7419,8 +7433,9 @@ fn run_node(
             // (awaiting a deliberate promote) — the not-admitted bail below
             // must never fire.
             let mut resident_standing = false;
-            let mut resident_duckdns_plane_book: Option<std::sync::Arc<duckdns_plane::WebPeers>> =
-                None;
+            let mut resident_duckdns_plane_book: Option<
+                std::sync::Arc<duckdns_node::plane::WebPeers>,
+            > = None;
             let mut send_announce = |targets: &[ed25519::PublicKey], attempt: usize| {
                 let Some(frame) = &announce_frame else { return };
                 if attempt % LOBBY_ANNOUNCE_EVERY != 1 || targets.is_empty() {
@@ -7698,7 +7713,7 @@ fn run_node(
                 resident_capabilities,
             );
             let mut resident_duckdns_announcer =
-                resident_announce::ResidentDuckDnsAnnouncer::new(
+                duckdns_node::ResidentAnnouncer::new(
                     me_bytes.clone(),
                     duckdns_announcements.clone(),
                 );
@@ -8469,17 +8484,18 @@ fn run_node(
                 } else if wireguard_listen.is_some()
                     && m.residents.iter().any(|key| key == &me_bytes)
                 {
-                    let book = duckdns_plane::WebPeers::new(
+                    let book = duckdns_node::plane::WebPeers::new(
                         String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
                     );
                     book.set_peers(duckdns_transport_keys.iter());
-                    duckdns_plane::spawn_bring_up(
+                    duckdns_node::plane::spawn_bring_up(
                         label.clone(),
                         std::sync::Arc::clone(&book),
                         signer.public_key(),
                         std::sync::Arc::clone(&duckdns_plane_slot),
                         statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
                         std::sync::Arc::clone(&duckdns_publications),
+                        duckdns_files.clone(),
                     );
                     resident_duckdns_plane_book = Some(book);
                 }
@@ -9982,17 +9998,18 @@ fn run_node(
         // for the requester-side local ingress; the accept loop always runs so
         // this node can provide its explicit local publications.
         let duckdns_plane_book = wireguard_listen.map(|_| {
-            let book = duckdns_plane::WebPeers::new(
+            let book = duckdns_node::plane::WebPeers::new(
                 String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
             );
             book.set_peers(initial_member_keys.iter().chain(initial_resident_keys.iter()));
-            duckdns_plane::spawn_bring_up(
+            duckdns_node::plane::spawn_bring_up(
                 label.clone(),
                 std::sync::Arc::clone(&book),
                 signer.public_key(),
                 std::sync::Arc::clone(&duckdns_plane_slot),
                 statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
                 std::sync::Arc::clone(&duckdns_publications),
+                duckdns_files.clone(),
             );
             book
         });
@@ -10439,7 +10456,7 @@ fn run_node(
             CapabilityAnnouncer::new(signer.public_key().as_ref().to_vec(), my_capabilities);
         // Local targets never enter this pump: it carries only the replicated
         // declarations projected from the validated node config.
-        let mut duckdns_announcer = duckdns_announce::DuckDnsAnnouncer::new(
+        let mut duckdns_announcer = duckdns_node::Announcer::new(
             signer.public_key().as_ref().to_vec(),
             duckdns_announcements.clone(),
         );

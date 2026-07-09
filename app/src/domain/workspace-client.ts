@@ -16,6 +16,9 @@ export interface WorkspacePorts {
   listen: number;
   http: number;
   rpc: number;
+  wireguard?: number | null;
+  invite?: number | null;
+  duckdns?: number | null;
 }
 
 export interface Workspace {

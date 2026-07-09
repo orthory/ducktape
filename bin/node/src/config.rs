@@ -1586,7 +1586,7 @@ pub struct NodeToml {
     pub duckdns: DuckDnsToml,
 }
 
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct DuckDnsToml {
     /// Dedicated loopback HTTP ingress fed by `duckdnsd` after local TLS
     /// termination. Absent keeps device ingress disabled.
@@ -1595,7 +1595,7 @@ pub struct DuckDnsToml {
     pub services: Vec<DuckDnsServiceToml>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct DuckDnsServiceToml {
     /// `user` or `network`.
     pub scope: String,
@@ -1604,11 +1604,27 @@ pub struct DuckDnsServiceToml {
     pub service: String,
     /// Numeric loopback socket only (`127.0.0.0/8` or `::1`). Hostnames and
     /// non-loopback addresses reject at config load.
-    pub target: String,
+    /// Secondary dynamic-app backend: a numeric loopback HTTP socket.
+    pub target: Option<String>,
+    /// Primary static-site backend: a DuckFS subtree served directly through
+    /// the files module actor lane.
+    pub duckfs: Option<DuckDnsDuckFsToml>,
     #[serde(default)]
     pub default_homepage: bool,
     #[serde(default)]
     pub allow_cross_site: bool,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct DuckDnsDuckFsToml {
+    pub prefix: String,
+    pub snapshot: Option<String>,
+    #[serde(default = "duckdns_default_index")]
+    pub index: String,
+}
+
+fn duckdns_default_index() -> String {
+    "index.html".into()
 }
 
 fn resolve_duckdns_services(raw: &DuckDnsToml) -> Result<duckdns_client::Publications, String> {
@@ -1644,10 +1660,32 @@ fn resolve_duckdns_services(raw: &DuckDnsToml) -> Result<duckdns_client::Publica
             default_homepage: service.default_homepage,
             allow_cross_site: service.allow_cross_site,
         };
-        let target: SocketAddr = service
-            .target
-            .parse()
-            .map_err(|e| format!("duckdns target {:?}: {e}", service.target))?;
+        let target = match (&service.target, &service.duckfs) {
+            (Some(value), None) => duckdns_client::PublicationTarget::Loopback(
+                value
+                    .parse()
+                    .map_err(|e| format!("duckdns target {value:?}: {e}"))?,
+            ),
+            (None, Some(site)) => {
+                duckdns_client::PublicationTarget::DuckFs(duckdns_client::DuckFsSite {
+                    prefix: site.prefix.clone(),
+                    snapshot: site.snapshot.clone(),
+                    index: site.index.clone(),
+                })
+            }
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "duckdns service {:?} must set exactly one of target or duckfs",
+                    service.service
+                ));
+            }
+            (None, None) => {
+                return Err(format!(
+                    "duckdns service {:?} requires target or duckfs",
+                    service.service
+                ));
+            }
+        };
         publications.push(duckdns_client::Publication {
             announcement,
             target,
@@ -1683,12 +1721,15 @@ fn reject_duckdns_admin_targets(
         ("node RPC administration surface", configured_port(rpc_listen)),
     ];
     for publication in publications.iter() {
+        let duckdns_client::PublicationTarget::Loopback(target) = &publication.target else {
+            continue;
+        };
         for (name, port) in reserved {
-            if port.is_some_and(|port| port != 0 && port == publication.target.port()) {
+            if port.is_some_and(|port| port != 0 && port == target.port()) {
                 return Err(format!(
                     "duckdns target {} collides with the {name}; node administration routes \
                      can never be published",
-                    publication.target
+                    target
                 ));
             }
         }
@@ -1738,6 +1779,9 @@ pub struct Plumbing {
     /// passes "socket" here (overlay-net ADR phase 4) while the parse
     /// default for a file without the key stays `tun`.
     pub wireguard_effect: Option<String>,
+    /// Node-local DuckDNS ingress and publication declarations. Existing
+    /// services survive init/join plumbing rewrites unchanged.
+    pub duckdns: DuckDnsToml,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1750,6 +1794,7 @@ pub fn merged_plumbing(
     wireguard_effect: Option<&str>,
     wireguard_listen: Option<&str>,
     invite_listen: Option<&str>,
+    duckdns_ingress: Option<&str>,
 ) -> Result<Plumbing, String> {
     let path = dir.join("node.toml");
     let existing: Option<NodeToml> = if path.exists() {
@@ -1761,6 +1806,10 @@ pub fn merged_plumbing(
     // reject a typo'd effect value at the verb, before anything lands on disk
     // — resolve() would only catch it on the node's NEXT boot.
     parse_wireguard_effect(wireguard_effect)?;
+    let mut duckdns = e.map(|raw| raw.duckdns.clone()).unwrap_or_default();
+    if let Some(ingress) = duckdns_ingress {
+        duckdns.ingress_listen = Some(ingress.to_owned());
+    }
     Ok(Plumbing {
         listen: listen
             .map(str::to_string)
@@ -1787,6 +1836,7 @@ pub fn merged_plumbing(
         wireguard_effect: wireguard_effect
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.wireguard_effect.clone())),
+        duckdns,
     })
 }
 
@@ -1818,6 +1868,19 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     }
     if let Some(w) = &p.wireguard_effect {
         s += &format!("wireguard_effect = \"{w}\"\n");
+    }
+    if p.duckdns.ingress_listen.is_some() || !p.duckdns.services.is_empty() {
+        #[derive(serde::Serialize)]
+        struct DuckDnsSection<'a> {
+            duckdns: &'a DuckDnsToml,
+        }
+        s.push('\n');
+        s.push_str(
+            &toml::to_string(&DuckDnsSection {
+                duckdns: &p.duckdns,
+            })
+            .map_err(|error| format!("serialize DuckDNS node config: {error}"))?,
+        );
     }
     let path = dir.join("node.toml");
     std::fs::write(&path, s).map_err(|e| format!("write {path:?}: {e}"))?;
@@ -3607,7 +3670,9 @@ mod tests {
                 [[duckdns.services]]
                 scope = "network"
                 service = "docs"
-                target = "[::1]:8080"
+                [duckdns.services.duckfs]
+                prefix = "/shared/sites/docs"
+                snapshot = "abababababababababababababababababababababababababababababababab"
             "#,
         )
         .unwrap();
@@ -3621,12 +3686,27 @@ mod tests {
             .iter()
             .find(|service| service.announcement.service == "blog")
             .unwrap();
-        assert_eq!(blog.target, "127.42.0.1:3000".parse().unwrap());
+        assert_eq!(
+            blog.target,
+            duckdns_client::PublicationTarget::Loopback("127.42.0.1:3000".parse().unwrap())
+        );
         assert!(blog.announcement.default_homepage);
         assert!(blog.announcement.allow_cross_site);
         assert!(matches!(
             blog.announcement.scope,
             duckdns::ServiceScope::User { ref handle } if handle == "orthory"
+        ));
+        let docs = services
+            .iter()
+            .find(|service| service.announcement.service == "docs")
+            .unwrap();
+        assert!(matches!(
+            &docs.target,
+            duckdns_client::PublicationTarget::DuckFs(site)
+                if site.prefix == "/shared/sites/docs"
+                    && site.index == "index.html"
+                    && site.snapshot.as_deref()
+                        == Some("abababababababababababababababababababababababababababababababab")
         ));
         let encoded = duckdns::encode_msg(&duckdns::DuckDnsMsg::ReplaceAnnouncements {
             announcements: services
@@ -3638,6 +3718,7 @@ mod tests {
         assert!(!wire.contains("3000"));
         assert!(!wire.contains("8080"));
         assert!(!wire.contains("127.42.0.1"));
+        assert!(!wire.contains("/shared/sites/docs"));
     }
 
     #[test]
@@ -3900,7 +3981,10 @@ mod tests {
         // an existing DEV-shape file (the desktop app's solo config).
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:0\"\nnamespace = \"ducktape-local\"\npeer_seeds = [0]\nhttp_listen = \"127.0.0.1:8844\"\nstorage_dir = '/data/ducktape'\n",
+            "id = 0\nlisten = \"127.0.0.1:0\"\nnamespace = \"ducktape-local\"\npeer_seeds = [0]\nhttp_listen = \"127.0.0.1:8844\"\nstorage_dir = '/data/ducktape'\n\
+             [duckdns]\ningress_listen = \"127.0.0.1:8855\"\n\
+             [[duckdns.services]]\nscope = \"network\"\nservice = \"docs\"\n\
+             [duckdns.services.duckfs]\nprefix = \"/shared/sites/docs\"\n",
         )
         .expect("write");
         // one flag overrides ONLY its field; the http port AND a hand-edited
@@ -3914,11 +3998,14 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
         assert_eq!(p.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(p.storage_dir, "/data/ducktape");
+        assert_eq!(p.duckdns.ingress_listen.as_deref(), Some("127.0.0.1:8855"));
+        assert_eq!(p.duckdns.services.len(), 1);
         assert!(p.rpc_listen.is_none());
         // and the merged write is network-shape.
         write_node_toml(&dir, &p).expect("write");
@@ -3927,32 +4014,73 @@ mod tests {
         assert_eq!(raw.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(raw.listen, "127.0.0.1:53000");
         assert_eq!(raw.storage_dir.as_deref(), Some("/data/ducktape"));
+        assert_eq!(
+            raw.duckdns.ingress_listen.as_deref(),
+            Some("127.0.0.1:8855")
+        );
+        assert_eq!(raw.duckdns.services[0].service, "docs");
+        assert_eq!(
+            raw.duckdns.services[0]
+                .duckfs
+                .as_ref()
+                .map(|site| site.prefix.as_str()),
+            Some("/shared/sites/docs")
+        );
     }
 
     #[test]
     fn plumbing_wireguard_effect_flag_wins_absence_preserves_and_typos_abort() {
         let dir = tmp("plumbing-wg-effect");
         // fresh dir + flag (the desktop app's init/join): written to disk.
-        let p =
-            merged_plumbing(&dir, None, None, None, None, Some("socket"), None, None)
-                .expect("merge");
+        let p = merged_plumbing(
+            &dir,
+            None,
+            None,
+            None,
+            None,
+            Some("socket"),
+            None,
+            None,
+            None,
+        )
+        .expect("merge");
         assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
         write_node_toml(&dir, &p).expect("write");
 
         // no flag: the hand-settable value on disk survives a re-merge.
-        let p = merged_plumbing(&dir, None, None, None, None, None, None, None)
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None)
             .expect("re-merge");
         assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
 
         // the flag wins over the file (merged_plumbing's standing precedence).
-        let p = merged_plumbing(&dir, None, None, None, None, Some("tun"), None, None)
-            .expect("override");
+        let p = merged_plumbing(
+            &dir,
+            None,
+            None,
+            None,
+            None,
+            Some("tun"),
+            None,
+            None,
+            None,
+        )
+        .expect("override");
         assert_eq!(p.wireguard_effect.as_deref(), Some("tun"));
 
         // a typo aborts the verb before anything is written.
-        let err = merged_plumbing(&dir, None, None, None, None, Some("sokcet"), None, None)
-            .err()
-            .expect("a bad effect value must abort the merge");
+        let err = merged_plumbing(
+            &dir,
+            None,
+            None,
+            None,
+            None,
+            Some("sokcet"),
+            None,
+            None,
+            None,
+        )
+        .err()
+        .expect("a bad effect value must abort the merge");
         assert!(err.contains("wireguard_effect"), "{err}");
     }
 

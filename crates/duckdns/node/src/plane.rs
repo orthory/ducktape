@@ -19,7 +19,7 @@ use data_plane::{
 use duckdns::{
     ServiceIdentity, WEB_STREAM_INTENT, decode_service_identity, encode_service_identity,
 };
-use duckdns_client::Publications;
+use duckdns_client::{PublicationTarget, Publications};
 
 const BIND_RETRY: Duration = Duration::from_secs(3);
 const WEB_PLANE_CONFIG: PlaneConfig = PlaneConfig {
@@ -33,20 +33,20 @@ fn ula_of(namespace: &str, raw: &[u8; 32]) -> Ipv6Addr {
 }
 
 /// Current standing member set plus its overlay address mapping.
-pub(crate) struct WebPeers {
+pub struct WebPeers {
     namespace: String,
     reverse: RwLock<HashMap<IpAddr, PeerId>>,
 }
 
 impl WebPeers {
-    pub(crate) fn new(namespace: String) -> Arc<Self> {
+    pub fn new(namespace: String) -> Arc<Self> {
         Arc::new(Self {
             namespace,
             reverse: RwLock::new(HashMap::new()),
         })
     }
 
-    pub(crate) fn set_peers<'a>(&self, keys: impl Iterator<Item = &'a ed25519::PublicKey>) {
+    pub fn set_peers<'a>(&self, keys: impl Iterator<Item = &'a ed25519::PublicKey>) {
         let reverse = keys
             .map(|key| {
                 let raw: [u8; 32] = key.as_ref().try_into().expect("ed25519 keys are 32 bytes");
@@ -100,9 +100,9 @@ impl AdmissionPolicy for WebPeers {
     }
 }
 
-pub(crate) type PlaneSlot = Arc<OnceLock<Arc<StreamService<OverlaySockets>>>>;
+pub type PlaneSlot = Arc<OnceLock<Arc<StreamService<OverlaySockets>>>>;
 
-pub(crate) fn web_flow(identity: &ServiceIdentity) -> Result<FlowId, String> {
+pub fn web_flow(identity: &ServiceIdentity) -> Result<FlowId, String> {
     let meta = encode_service_identity(identity)?;
     let mut preimage = Vec::with_capacity(WEB_FLOW_DOMAIN.len() + meta.len());
     preimage.extend_from_slice(WEB_FLOW_DOMAIN);
@@ -111,19 +111,22 @@ pub(crate) fn web_flow(identity: &ServiceIdentity) -> Result<FlowId, String> {
 }
 
 /// Bind the service lazily and run its provider accept loop for process life.
-pub(crate) fn spawn_bring_up(
+pub fn spawn_bring_up(
     label: String,
     peers: Arc<WebPeers>,
     me: ed25519::PublicKey,
     slot: PlaneSlot,
     factory: Arc<dyn SocketFactory>,
     publications: Arc<Publications>,
+    files: noded::ActorNodeApi,
 ) {
     tokio::spawn(async move {
         let own = peers.own_ip(&me);
         let datagram_bind = SocketAddr::new(own, Service::Web.overlay_datagram_port());
         let stream_bind = SocketAddr::new(own, Service::Web.overlay_stream_port());
+        let mut attempts = 0u64;
         let sockets = loop {
+            attempts += 1;
             match OverlaySockets::bind_with(
                 factory.clone(),
                 datagram_bind,
@@ -133,7 +136,15 @@ pub(crate) fn spawn_bring_up(
             .await
             {
                 Ok(sockets) => break sockets,
-                Err(_) => tokio::time::sleep(BIND_RETRY).await,
+                Err(error) => {
+                    if attempts == 1 || attempts.is_multiple_of(10) {
+                        eprintln!(
+                            "[node {label}] DuckDNS web plane waiting for overlay sockets at \
+                             {stream_bind} (attempt {attempts}): {error}"
+                        );
+                    }
+                    tokio::time::sleep(BIND_RETRY).await;
+                }
             }
         };
         let admission: Arc<dyn AdmissionPolicy> = peers.clone();
@@ -157,7 +168,7 @@ pub(crate) fn spawn_bring_up(
         let _ = slot.set(Arc::clone(&service));
         let _plane = plane;
         loop {
-            let Some((peer, hello, mut stream)) = service.accept().await else {
+            let Some((peer, hello, stream)) = service.accept().await else {
                 return;
             };
             if hello.intent != WEB_STREAM_INTENT || !peers.contains(peer) {
@@ -166,21 +177,49 @@ pub(crate) fn spawn_bring_up(
             let Ok(identity) = decode_service_identity(&hello.meta) else {
                 continue;
             };
-            if web_flow(&identity).ok() != Some(hello.flow) || publications.get(&identity).is_none()
-            {
+            if web_flow(&identity).ok() != Some(hello.flow) {
                 continue;
             }
+            let Some(publication) = publications.get(&identity).cloned() else {
+                continue;
+            };
             let publications = Arc::clone(&publications);
+            let files = files.clone();
             tokio::spawn(async move {
-                let _ = duckdns_client::proxy_to_publication(&identity, &publications, &mut stream)
-                    .await;
+                let _ =
+                    serve_publication(&identity, &publications, files, publication.target, stream)
+                        .await;
             });
         }
     });
 }
 
+/// Serve one already-authorized local declaration. Kept shared between an
+/// authenticated remote plane accept and the requesting node's self-provider
+/// fast path (a solo network intentionally has no peer tunnel to dial).
+pub async fn serve_publication<S>(
+    identity: &ServiceIdentity,
+    publications: &Publications,
+    files: noded::ActorNodeApi,
+    target: PublicationTarget,
+    mut stream: S,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    match target {
+        PublicationTarget::Loopback(_) => {
+            duckdns_client::proxy_to_publication(identity, publications, &mut stream)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+        PublicationTarget::DuckFs(site) => crate::site::serve(stream, files, site).await,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum WebOpenError {
+pub enum WebOpenError {
     #[error("DuckDNS web plane is unavailable")]
     Unavailable,
     #[error("provider node key must be 32 bytes")]
@@ -191,7 +230,7 @@ pub(crate) enum WebOpenError {
     Open(#[from] OpenError),
 }
 
-pub(crate) async fn open(
+pub async fn open(
     slot: &PlaneSlot,
     provider: &[u8],
     identity: &ServiceIdentity,

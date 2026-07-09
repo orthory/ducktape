@@ -3,26 +3,32 @@
 //! one authenticated web-plane stream, and then becomes an opaque byte proxy.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use duckdns::{DuckDnsQuery, DuckDnsReply, ResolvedService, decode_reply, encode_query};
+use duckdns_client::Publications;
 use futures::SinkExt as _;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::duckdns_plane;
+use crate::plane;
 
-pub(crate) async fn serve(
+pub async fn serve(
     listener: std::net::TcpListener,
     commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
-    plane: duckdns_plane::PlaneSlot,
+    plane: plane::PlaneSlot,
     me: [u8; 32],
+    publications: Arc<Publications>,
+    files: noded::ActorNodeApi,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::from_std(listener)?;
     loop {
         let (stream, peer) = listener.accept().await?;
         let commands = commands.clone();
         let plane = plane.clone();
+        let publications = Arc::clone(&publications);
+        let files = files.clone();
         tokio::spawn(async move {
-            let _ = handle(stream, peer.ip(), commands, plane, me).await;
+            let _ = handle(stream, peer.ip(), commands, plane, me, publications, files).await;
         });
     }
 }
@@ -31,8 +37,10 @@ async fn handle(
     mut client: tokio::net::TcpStream,
     client_ip: IpAddr,
     mut commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
-    plane: duckdns_plane::PlaneSlot,
+    plane: plane::PlaneSlot,
     me: [u8; 32],
+    publications: Arc<Publications>,
+    files: noded::ActorNodeApi,
 ) -> Result<(), ()> {
     let initial = match read_initial_request(&mut client).await {
         Ok(initial) => initial,
@@ -100,16 +108,33 @@ async fn handle(
     if !has_standing(&mut commands, &me).await {
         return respond(&mut client, 403, "workspace membership refused").await;
     }
-    if plane.get().is_none() {
-        return respond(&mut client, 502, "DuckDNS overlay is unavailable").await;
-    }
-
     let providers = ordered_providers(&resolved, &prepared.hostname);
-    let mut upstream = None;
+    let mut upstream: Option<Box<dyn WebStream>> = None;
     for provider in providers {
-        match duckdns_plane::open(&plane, &provider.node, &resolved.identity).await {
+        if provider.node.as_slice() == me {
+            let Some(publication) = publications.get(&resolved.identity).cloned() else {
+                continue;
+            };
+            let (requester, provider) = tokio::io::duplex(64 * 1024);
+            let identity = resolved.identity.clone();
+            let publications = Arc::clone(&publications);
+            let files = files.clone();
+            tokio::spawn(async move {
+                let _ = plane::serve_publication(
+                    &identity,
+                    &publications,
+                    files,
+                    publication.target,
+                    provider,
+                )
+                .await;
+            });
+            upstream = Some(Box::new(requester));
+            break;
+        }
+        match plane::open(&plane, &provider.node, &resolved.identity).await {
             Ok(stream) => {
-                upstream = Some(stream);
+                upstream = Some(Box::new(stream));
                 break;
             }
             Err(_) => continue,
@@ -129,6 +154,10 @@ async fn handle(
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
     Ok(())
 }
+
+trait WebStream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> WebStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 fn ordered_providers(resolved: &ResolvedService, hostname: &str) -> Vec<duckdns::ServiceProvider> {
     let mut providers = resolved.providers.clone();

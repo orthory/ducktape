@@ -10,7 +10,25 @@ use duckdns_core::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Publication {
     pub announcement: ServiceAnnouncement,
-    pub target: SocketAddr,
+    pub target: PublicationTarget,
+}
+
+/// A publication backend. DuckFS is the primary static-site path; loopback is
+/// retained for explicitly published dynamic HTTP/WebSocket applications.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublicationTarget {
+    DuckFs(DuckFsSite),
+    Loopback(SocketAddr),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DuckFsSite {
+    /// Canonical absolute subtree containing the site's files.
+    pub prefix: String,
+    /// Optional committed snapshot id. `None` follows the current head.
+    pub snapshot: Option<String>,
+    /// One file name used for directory requests.
+    pub index: String,
 }
 
 /// Validated allowlist keyed by stable service identity.
@@ -31,7 +49,7 @@ impl Publications {
         let mut homepages = BTreeMap::<String, String>::new();
         for publication in publications {
             publication.announcement.validate()?;
-            validate_target(publication.target)?;
+            publication.target.validate()?;
             let identity = ServiceIdentity {
                 scope: publication.announcement.scope.clone(),
                 service: publication.announcement.service.clone(),
@@ -82,7 +100,38 @@ impl Publications {
     }
 }
 
-pub(crate) fn validate_target(target: SocketAddr) -> Result<(), String> {
+impl PublicationTarget {
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::DuckFs(site) => site.validate(),
+            Self::Loopback(target) => validate_loopback(*target),
+        }
+    }
+}
+
+impl DuckFsSite {
+    pub fn validate(&self) -> Result<(), String> {
+        let segments = duckfs_core::paths::canonical(&self.prefix)?;
+        if segments.is_empty() {
+            return Err("duckdns: a DuckFS site cannot publish the filesystem root".into());
+        }
+        let index_segments = duckfs_core::paths::canonical(&format!("/{}", self.index))?;
+        if index_segments.len() != 1 {
+            return Err("duckdns: DuckFS site index must be one file name".into());
+        }
+        if let Some(snapshot) = &self.snapshot
+            && (snapshot.len() != 64
+                || !snapshot
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err("duckdns: DuckFS site snapshot must be 64 lowercase hex digits".into());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_loopback(target: SocketAddr) -> Result<(), String> {
     if !target.ip().is_loopback() {
         return Err(format!(
             "duckdns: target {target} is not loopback; only 127.0.0.0/8 and ::1 are allowed"
@@ -106,7 +155,7 @@ mod tests {
                 default_homepage: false,
                 allow_cross_site: false,
             },
-            target: target.parse().unwrap(),
+            target: PublicationTarget::Loopback(target.parse().unwrap()),
         }
     }
 
@@ -123,5 +172,22 @@ mod tests {
     fn service_identity_is_a_unique_dial_allowlist_key() {
         let p = publication("127.0.0.1:8080");
         assert!(Publications::new(vec![p.clone(), p]).is_err());
+    }
+
+    #[test]
+    fn validates_duckfs_site_boundaries() {
+        let mut p = publication("127.0.0.1:8080");
+        p.target = PublicationTarget::DuckFs(DuckFsSite {
+            prefix: "/shared/sites/docs".into(),
+            snapshot: Some("ab".repeat(32)),
+            index: "index.html".into(),
+        });
+        Publications::new(vec![p.clone()]).unwrap();
+
+        let PublicationTarget::DuckFs(site) = &mut p.target else {
+            unreachable!()
+        };
+        site.prefix = "/".into();
+        assert!(Publications::new(vec![p]).is_err());
     }
 }

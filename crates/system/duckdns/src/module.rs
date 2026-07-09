@@ -179,7 +179,7 @@ impl DuckDns {
 
     fn query_state(&self, query: DuckDnsQuery) -> Result<Vec<u8>, Error> {
         match query {
-            DuckDnsQuery::Resolve { .. } => Err(Error::Module(
+            DuckDnsQuery::Resolve { .. } | DuckDnsQuery::Namespace => Err(Error::Module(
                 "duckdns: resolution requires a host query context".into(),
             )),
             DuckDnsQuery::HandleOwner { handle } => {
@@ -253,6 +253,21 @@ impl Module for DuckDns {
                     None => None,
                 };
                 Ok(encode_reply(&DuckDnsReply::Resolved(resolved)))
+            }
+            DuckDnsQuery::Namespace => {
+                let mut names = Vec::new();
+                for name in self.registry.namespace_names() {
+                    let resolved = match self.registry.resolve(&name).map_err(Error::Module)? {
+                        Some(resolved) => self.filter_resolution(ctx, &name, resolved).await?,
+                        None => None,
+                    };
+                    if resolved.is_some() {
+                        names.push(name.hostname());
+                    }
+                }
+                names.sort();
+                names.dedup();
+                Ok(encode_reply(&DuckDnsReply::Namespace(names)))
             }
             query => self.query_state(query),
         }

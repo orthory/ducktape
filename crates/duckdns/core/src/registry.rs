@@ -58,6 +58,42 @@ impl Registry {
             .unwrap_or_default()
     }
 
+    /// Every canonical name implied by replicated declarations, before the
+    /// system adapter removes providers that lost standing/identity binding.
+    pub fn namespace_names(&self) -> Vec<DuckDnsName> {
+        let mut names = BTreeSet::new();
+        for (node, announcements) in &self.effective().announcements {
+            let node = node_label(node).expect("validated registry node key");
+            for announcement in announcements {
+                match &announcement.scope {
+                    ServiceScope::User { handle } => {
+                        names.insert(DuckDnsName::UserService {
+                            service: announcement.service.clone(),
+                            handle: handle.clone(),
+                        });
+                        if announcement.default_homepage {
+                            names.insert(DuckDnsName::User {
+                                handle: handle.clone(),
+                            });
+                        }
+                    }
+                    ServiceScope::Network => {
+                        names.insert(DuckDnsName::NetworkService {
+                            service: announcement.service.clone(),
+                            chain: self.chain_label.clone(),
+                        });
+                        names.insert(DuckDnsName::NodeService {
+                            service: announcement.service.clone(),
+                            node: node.clone(),
+                            chain: self.chain_label.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
     pub fn claim_handle(&mut self, account: &[u8], handle: String) -> Result<(), String> {
         validate_account(account)?;
         validate_handle(&handle)?;

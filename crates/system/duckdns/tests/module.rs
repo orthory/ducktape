@@ -125,6 +125,15 @@ fn resolve(module: &DuckDns, ctx: &TestCtx, name: DuckDnsName) -> DuckDnsReply {
     decode_reply(&bytes).unwrap()
 }
 
+fn namespace(module: &DuckDns, ctx: &TestCtx) -> Vec<String> {
+    let bytes =
+        block_on(module.query_with(ctx, &encode_query(&DuckDnsQuery::Namespace))).unwrap();
+    let DuckDnsReply::Namespace(names) = decode_reply(&bytes).unwrap() else {
+        panic!("namespace query returned another reply shape");
+    };
+    names
+}
+
 #[test]
 fn resident_can_claim_but_outsider_and_unbound_node_cannot() {
     let resident = node(1);
@@ -311,6 +320,62 @@ fn resolution_rechecks_standing_and_identity_binding() {
         ),
         DuckDnsReply::Resolved(None)
     );
+}
+
+#[test]
+fn namespace_snapshot_rechecks_live_standing_and_user_binding() {
+    let provider = node(1);
+    let stale = node(2);
+    let mut ctx = TestCtx::new(provider.clone());
+    ctx.validators = vec![provider.clone(), stale.clone()];
+    ctx.bind(provider.clone(), b"owner");
+    ctx.bind(stale.clone(), b"owner");
+    let mut module = DuckDns::new(
+        "duckdns",
+        "identity",
+        Some("valset".into()),
+        "team#a1b2c3d4",
+    )
+    .unwrap();
+    execute(
+        &mut module,
+        &mut ctx,
+        DuckDnsMsg::ClaimHandle {
+            handle: "orthory".into(),
+        },
+    )
+    .unwrap();
+    execute(
+        &mut module,
+        &mut ctx,
+        DuckDnsMsg::ReplaceAnnouncements {
+            announcements: vec![network("docs"), user("orthory", "home", true)],
+        },
+    )
+    .unwrap();
+    ctx.origin(stale.clone());
+    execute(
+        &mut module,
+        &mut ctx,
+        DuckDnsMsg::ReplaceAnnouncements {
+            announcements: vec![network("status")],
+        },
+    )
+    .unwrap();
+    block_on(module.commit_block()).unwrap();
+
+    let names = namespace(&module, &ctx);
+    assert!(names.contains(&"orthory.ducktape.quack".into()));
+    assert!(names.contains(&"docs.team-a1b2c3d4.net.ducktape.quack".into()));
+    assert!(names.contains(&"status.team-a1b2c3d4.net.ducktape.quack".into()));
+
+    ctx.validators.retain(|node| node != &stale);
+    let names = namespace(&module, &ctx);
+    assert!(!names.iter().any(|name| name.starts_with("status.")));
+    ctx.accounts.remove(&provider);
+    let names = namespace(&module, &ctx);
+    assert!(!names.iter().any(|name| name.contains("orthory")));
+    assert!(names.contains(&"docs.team-a1b2c3d4.net.ducktape.quack".into()));
 }
 
 #[test]

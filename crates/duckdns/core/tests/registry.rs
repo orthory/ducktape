@@ -186,6 +186,38 @@ fn user_default_and_service_names_share_one_identity() {
 }
 
 #[test]
+fn namespace_enumerates_every_canonical_published_name_once() {
+    let mut registry = Registry::new("team#a1b2c3d4").unwrap();
+    registry.claim_handle(b"owner", "orthory".into()).unwrap();
+    registry
+        .replace_announcements(
+            &node(1),
+            Some(b"owner"),
+            vec![user("orthory", "home", true), network("docs")],
+        )
+        .unwrap();
+    registry
+        .replace_announcements(&node(2), None, vec![network("docs")])
+        .unwrap();
+
+    let hostnames: Vec<String> = registry
+        .namespace_names()
+        .into_iter()
+        .map(|name| name.hostname())
+        .collect();
+    assert_eq!(
+        hostnames,
+        vec![
+            "orthory.ducktape.quack",
+            "home.orthory.ducktape.quack",
+            "docs.team-a1b2c3d4.net.ducktape.quack",
+            "docs.n-010101010101.team-a1b2c3d4.net.ducktape.quack",
+            "docs.n-020202020202.team-a1b2c3d4.net.ducktape.quack",
+        ]
+    );
+}
+
+#[test]
 fn provider_policy_and_default_homepage_are_service_wide() {
     let mut registry = Registry::new("team#a1b2c3d4").unwrap();
     registry.claim_handle(b"owner", "orthory".into()).unwrap();

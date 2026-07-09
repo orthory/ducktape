@@ -47,6 +47,7 @@ profiles = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
 duckdns-client = { workspace = true }
+duckdns-node = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }

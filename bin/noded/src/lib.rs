@@ -31,9 +31,10 @@ pub use stream::{
 mod files_http;
 pub use files_http::*;
 // the workspace RPC (`/v1/fs/workspaces`) and its actor-lane `NodeApi` adapter.
-// crate-internal: the router registers the handlers and the adapter is used only
-// by the workspace handlers — nothing outside the crate touches either.
+// The adapter is also the node-local DuckDNS static-site seam: both consumers
+// reuse the exact same typed files queries without self-dialing `/v1/*`.
 mod actor_api;
+pub use actor_api::ActorNodeApi;
 mod workspaces;
 // the REAL portable-agent-run provisioner (NodedProvisioner + agent_runs_root,
 // the D7 root). public so BOTH node binaries can build one and wire it into

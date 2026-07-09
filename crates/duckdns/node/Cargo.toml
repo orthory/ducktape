@@ -1,0 +1,30 @@
+[package]
+name = "duckdns-node"
+edition.workspace = true
+version.workspace = true
+
+# Node-side DuckDNS composition. The production binary supplies lifecycle and
+# transport handles; protocol, publication, ingress, and announcement logic
+# live here so bin/node stays a thin composition root.
+[dependencies]
+duckdns = { workspace = true }
+duckdns-client = { workspace = true }
+duckfs-client = { workspace = true }
+duckfs-core = { workspace = true }
+data-plane = { workspace = true }
+wireguard-upgrade = { workspace = true }
+host = { workspace = true }
+sdk = { workspace = true }
+node = { workspace = true }
+noded = { path = "../../../bin/noded" }
+valset = { workspace = true }
+commonware-cryptography = { workspace = true }
+futures = "0.3"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time", "sync"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+percent-encoding = "2"
+mime_guess = "2"
