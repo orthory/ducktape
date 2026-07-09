@@ -6833,9 +6833,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
             // the serving replica's manifest-fetch pacer (see the gate at the
             // fetch site). absolute, so per-cert window closes can't starve it.
             let mut next_manifest_fetch = std::time::Instant::now();
-            // the folded tip at promotion descend: the promotion boundary
-            // must reach it before the checkpoint lands (see the descend).
-            let mut replica_promotion_floor: u64 = 0;
             // the app-hash of the last boundary the derived tier followed:
             // the index feed (heal + explorer row + ws event) fires only when
             // the verified app-hash MOVED. an unchanged hash is an idle
@@ -8003,20 +8000,62 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                     eprintln!("[node {label}] FATAL: cannot promote — {e}");
                     std::process::exit(1);
                 }
-                // a promoted resident stops serving: drop the replica node
-                // (host, follower, journal handles) before the promotion
-                // sync reopens the same partitions, then reopen the journal
-                // for the promotion checkpoint below. remember how far the
-                // replica FOLDED — the promotion boundary must not sit below
-                // it (journal pruning is section-granular, so a sealed frame
-                // above a lower checkpoint survives and recovery would roll
-                // it forward past the boot base, booting this node ahead of
-                // its catch-up source).
-                if let Some((folded_tip, _)) = &serving {
-                    replica_promotion_floor = replica_promotion_floor.max(*folded_tip);
+                // THE PROMOTION COLLAPSE for a FOLDING replica: it is already
+                // at head with a journal that proved every block it folded —
+                // checkpoint OUR OWN state as the validator boot base and
+                // reboot. no re-sync against the source, no boundary wait: a
+                // quorum-widening cutover HALTS the source awaiting this very
+                // node's votes, so any wait-for-the-source flow deadlocks —
+                // the freshest member seats itself from its own state.
+                if serving.is_some() {
+                    let (folded_tip, mut node_r) =
+                        serving.take().expect("checked serving above");
+                    let mut base = m.clone();
+                    base.height = folded_tip;
+                    base.app_hash = node_r.host().app_hash();
+                    // a boundary at/below its epoch base needs no floor (the
+                    // fresh epoch starts from its genesis floor — exactly the
+                    // halted-cutover promotion); past the base, OUR persisted
+                    // floor cert anchors the replay window.
+                    let floor = if folded_tip <= base.view_base {
+                        None
+                    } else {
+                        match node_r.sink_mut().floor_cert() {
+                            Ok(fc) => fc.filter(|fc| fc.height <= folded_tip),
+                            Err(e) => {
+                                eprintln!(
+                                    "[node {label}] FATAL: replica promotion floor read: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    };
+                    let (sink, folded_host) = node_r.sink_and_host();
+                    write_boundary_checkpoint(
+                        sink,
+                        folded_host,
+                        &base,
+                        &floor,
+                        &label,
+                        "replica_promotion_checkpoint",
+                    )
+                    .await;
+                    println!(
+                        "[node {label}] promoted: validator at epoch {} boundary {} — rebooting",
+                        base.epoch, base.height
+                    );
+                    if let Some(cmd) = &reach_cmd {
+                        let _ = cmd.try_send(reachability::ReachabilityCommand::Shutdown);
+                        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                        while !cmd.is_closed() && std::time::Instant::now() < deadline {
+                            context.sleep(Duration::from_millis(20)).await;
+                        }
+                    }
+                    reboot_self();
                 }
-                serving = None;
-                replica_scheme = None;
+                // pre-ascension promotion (direct, un-staged admission): the
+                // node never folded, so the classic flow stands — sync the
+                // served boundary, fabricate its checkpoint, reboot.
                 if recovery_slot.is_none() {
                     recovery_slot =
                         Some(reopen_recovery(&context, &mut recovery_reopens, &label).await);
@@ -8061,14 +8100,6 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                         if let Err(e) = reopen_preflight_synced_host(&host, m.app_hash) {
                             eprintln!("[node {label}] FATAL: promotion preflight failed: {e}");
                             std::process::exit(1);
-                        }
-                        if latest.height < replica_promotion_floor {
-                            println!(
-                                "[node {label}] promotion boundary {} trails this replica's \
-                                 folded tip {} — waiting for the source to pass it",
-                                latest.height, replica_promotion_floor
-                            );
-                            continue;
                         }
                         match choose_promotion_boundary(host_hash, &latest, &me_bytes) {
                             PromotionBoundary::Promote { boundary, source } => {
@@ -8601,6 +8632,21 @@ fn run_node(resolved: Resolved, sync_only: bool) -> Result<(), Box<dyn std::erro
                             summary.from_height, summary.to_height, summary.frames
                         );
                         let Some(target) = summary.target.as_ref() else {
+                            if summary.to_height == recovered_height {
+                                // the source trails us: a quorum-widening
+                                // cutover halts the chain awaiting this very
+                                // node's votes, and a promoted replica boots
+                                // at its own folded tip — ahead of anything
+                                // the halted source can serve. the recovered
+                                // state is journal-proven; seat ourselves and
+                                // the chain resumes.
+                                println!(
+                                    "[node {label}] post-reboot catch-up: the source trails \
+                                     the recovered height {recovered_height} — proceeding as \
+                                     the freshest member"
+                                );
+                                break;
+                            }
                             eprintln!(
                                 "[node {label}] FATAL: post-catch-up target manifest unavailable"
                             );
