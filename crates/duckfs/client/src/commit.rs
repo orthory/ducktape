@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use duckfs_core::{Change, MAX_PAGE, MAX_SYNC_IDS, to_hex};
+use duckfs_core::{Change, MAX_PAGE, MAX_SYNC_IDS, SnapshotInfo, to_hex};
 
 use crate::api::{ApiError, CommitReceipt, ConflictReport, NodeApi};
 use crate::chunk::{chunk_ids, file_object_id};
@@ -112,7 +112,12 @@ pub fn commit_with(
 
     let (receipt, rebased) = submit_with_rebase(api, &index, message, &planned, opts.auto_rebase)?;
 
-    let snapshot = resolve_snapshot(api, receipt.height)?;
+    let snapshot = resolve_snapshot(
+        api,
+        receipt.height,
+        &change_paths(&planned.changes),
+        &index.prefix,
+    )?;
     rebuild_index(&index, &st, dir, &snapshot)?;
     Ok(CommitSummary {
         snapshot,
@@ -300,16 +305,71 @@ fn submit(
     }
 }
 
-/// resolve the snapshot id a commit produced: the history entry at the receipt's
-/// height, falling back to the current head.
-fn resolve_snapshot(api: &dyn NodeApi, height: u64) -> Result<String, CommitError> {
+/// resolve the snapshot id THIS commit produced. height alone is not a unique key
+/// once the node aggregates multiple member ops into one block (finding #3): N
+/// file commits then share one height, and the newest-first history entry at that
+/// height is NOT necessarily ours. so: a single entry at the height is
+/// unambiguous (the common case — a 1-op-1-block lane, or a single committer in a
+/// batch); multiple entries are disambiguated by matching each candidate's
+/// INTRODUCED changes (its diff from its own parent) against the paths we
+/// committed (`ours`) — concurrent applied commits touch DISJOINT paths, so
+/// exactly one candidate's diff intersects ours. if that is inconclusive we fail
+/// safe (a clear error, never a silently-wrong base that would corrupt the index).
+fn resolve_snapshot(
+    api: &dyn NodeApi,
+    height: u64,
+    ours: &BTreeSet<String>,
+    prefix: &str,
+) -> Result<String, CommitError> {
     let history = api.history(MAX_PAGE)?;
-    if let Some(snap) = history.iter().find(|s| s.height == height) {
-        return Ok(snap.id.clone());
+    let at_height: Vec<&SnapshotInfo> = history.iter().filter(|s| s.height == height).collect();
+    match at_height.as_slice() {
+        // nothing at that height yet (the window may have advanced past it): the
+        // head is the best the client can name.
+        [] => api
+            .refs()?
+            .head
+            .ok_or_else(|| CommitError::Transport("commit landed but head is empty".into())),
+        // exactly one commit at this height — unambiguous. the common case: a
+        // 1-op-1-block lane, or a single committer in an aggregated batch.
+        [only] => Ok(only.id.clone()),
+        // batch aggregation landed several commits at ONE height, so height alone
+        // is ambiguous. `ours` is the paths THIS commit changed; concurrent applied
+        // commits touch DISJOINT paths, so exactly one candidate's introduced diff
+        // (from its own parent) intersects ours — that one is ours.
+        candidates => {
+            let mut found: Option<String> = None;
+            for cand in candidates {
+                let from = cand.parent.clone().unwrap_or_default();
+                // a candidate we cannot diff (e.g. a parentless first commit the
+                // node won't diff) simply cannot be matched — skip it rather than
+                // fail the whole resolution on someone else's snapshot.
+                let touched: BTreeSet<String> = match api.diff(&from, &cand.id, prefix) {
+                    Ok(entries) => entries.into_iter().map(|e| e.path).collect(),
+                    Err(_) => continue,
+                };
+                if ours.is_disjoint(&touched) {
+                    continue;
+                }
+                if found.is_some() {
+                    // two candidates intersect ours — cannot safely disambiguate.
+                    found = None;
+                    break;
+                }
+                found = Some(cand.id.clone());
+            }
+            // fail SAFE: never silently record a wrong base (which would make the
+            // next status/commit treat a peer's concurrent files as deletions).
+            found.ok_or_else(|| {
+                CommitError::Transport(format!(
+                    "commit landed at height {height} but its snapshot is ambiguous among \
+                     {} same-height commits and could not be matched to the committed paths; \
+                     re-checkout to resync the base",
+                    candidates.len()
+                ))
+            })
+        }
     }
-    api.refs()?
-        .head
-        .ok_or_else(|| CommitError::Transport("commit landed but head is empty".into()))
 }
 
 /// rewrite the index after a successful commit: the working copy IS the new base.
@@ -403,4 +463,116 @@ fn hash_file(dir: &Path, prefix: &str, path: &str) -> Result<String, CommitError
         &chunk_ids(&bytes),
         &BTreeMap::new(),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::CommitReceipt;
+    use duckfs_core::{DiffEntry, DiffKind, EntryInfo, RefsInfo, SnapshotInfo};
+
+    /// a node whose block AGGREGATED two commits into ONE height (finding #3):
+    /// snap_a (parent H0, introduced /shared/x) then snap_b (parent snap_a,
+    /// introduced /shared/y). history is newest-first, so snap_b is the naive
+    /// first-by-height match — wrong for the /shared/x committer.
+    struct AggregatedNode;
+    const H0: &str = "00";
+    const SNAP_A: &str = "aa";
+    const SNAP_B: &str = "bb";
+
+    impl NodeApi for AggregatedNode {
+        fn history(&self, _limit: u64) -> Result<Vec<SnapshotInfo>, ApiError> {
+            let mk = |id: &str, parent: &str, msg: &str| SnapshotInfo {
+                id: id.into(),
+                parent: Some(parent.into()),
+                root_tree: String::new(),
+                author: String::new(),
+                height: 5,
+                consensus_time: 0,
+                message: msg.into(),
+            };
+            Ok(vec![mk(SNAP_B, SNAP_A, "b"), mk(SNAP_A, H0, "a")])
+        }
+        fn diff(&self, from: &str, to: &str, _prefix: &str) -> Result<Vec<DiffEntry>, ApiError> {
+            let path = match (from, to) {
+                (H0, SNAP_A) => "/shared/x",
+                (SNAP_A, SNAP_B) => "/shared/y",
+                _ => return Err(ApiError::Transport("no such diff".into())),
+            };
+            Ok(vec![DiffEntry {
+                path: path.into(),
+                kind: DiffKind::Modified,
+            }])
+        }
+        fn refs(&self) -> Result<RefsInfo, ApiError> {
+            Ok(RefsInfo {
+                head: Some(SNAP_B.into()),
+                pins: BTreeMap::new(),
+                window_len: 2,
+            })
+        }
+        fn stat(&self, _: &str, _: Option<&str>) -> Result<Option<EntryInfo>, ApiError> {
+            unimplemented!()
+        }
+        fn ls(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: u64,
+        ) -> Result<(Vec<EntryInfo>, Option<String>), ApiError> {
+            unimplemented!()
+        }
+        fn find(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: u64,
+        ) -> Result<(Vec<EntryInfo>, Option<String>), ApiError> {
+            unimplemented!()
+        }
+        fn read(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: u64,
+            _: u64,
+        ) -> Result<(Vec<u8>, bool), ApiError> {
+            unimplemented!()
+        }
+        fn has_chunks(&self, _: &[String]) -> Result<Vec<bool>, ApiError> {
+            unimplemented!()
+        }
+        fn stage_chunk(&self, _: &[u8]) -> Result<String, ApiError> {
+            unimplemented!()
+        }
+        fn commit(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: Vec<Change>,
+        ) -> Result<CommitReceipt, ApiError> {
+            unimplemented!()
+        }
+        fn pin(&self, _: &str, _: &str) -> Result<(), ApiError> {
+            unimplemented!()
+        }
+    }
+
+    fn paths(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_disambiguates_same_height_commits_by_changed_paths() {
+        let api = AggregatedNode;
+        // the FIRST committer (changed /shared/x => snap_a) must resolve snap_a,
+        // NOT the newest-first snap_b that height alone would pick.
+        let got = resolve_snapshot(&api, 5, &paths(&["/shared/x"]), "/shared").unwrap();
+        assert_eq!(got, SNAP_A, "resolve the commit whose diff matches our paths");
+        // the SECOND committer (changed /shared/y => snap_b) resolves snap_b.
+        let got = resolve_snapshot(&api, 5, &paths(&["/shared/y"]), "/shared").unwrap();
+        assert_eq!(got, SNAP_B);
+    }
 }

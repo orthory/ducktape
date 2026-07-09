@@ -114,9 +114,23 @@ impl ObjectStore for DiskStore {
     fn put(&mut self, kind: Kind, body: &[u8]) -> Result<ObjectId, String> {
         let id = object_id(kind, body);
         let (hex, dest) = self.object_path(&id);
-        // content-addressed + idempotent: an existing file is already exactly
-        // these bytes, so re-putting is a no-op (and cheap — no rewrite).
-        if dest.exists() {
+        // content-addressed + idempotent: an INTACT existing file already holds
+        // exactly these bytes, so re-putting is a no-op (and cheap — no rewrite).
+        // but the disk is untrusted: a corrupt existing object (a torn/truncated
+        // external write) must be REPLACED, not trusted as "already present", or a
+        // "possessed" object stays permanently unreadable and put could never
+        // repair it (finding #2). cheap guard, no body read on the hot path: the
+        // stored file must be exactly `[kind] ‖ body` = `body.len() + 1` bytes, so
+        // a length mismatch is definitely corrupt — fall through and atomically
+        // overwrite it via the same tmp+rename below. (a same-LENGTH bit-flip is
+        // caught by `verify` on the possession path, which deletes it so the next
+        // put lands on an absent name.)
+        let intact_len = (body.len() as u64) + 1;
+        if dest.exists()
+            && std::fs::metadata(&dest)
+                .map(|m| m.len() == intact_len)
+                .unwrap_or(false)
+        {
             return Ok(id);
         }
         let subdir = self.dir.join(&hex[..2]);
@@ -175,6 +189,36 @@ impl ObjectStore for DiskStore {
 
     fn has(&self, id: &ObjectId) -> bool {
         self.object_path(id).1.exists()
+    }
+
+    fn verify(&self, id: &ObjectId) -> Result<bool, String> {
+        // integrity-verified presence (finding #2): read the file, re-derive the
+        // id, and on a PROVEN mismatch (empty file, unknown kind tag, or hash
+        // mismatch) DELETE the corrupt object so it reads as absent and the
+        // self-heal fetch loop re-fetches a good copy (which `put` then lands). a
+        // NotFound is a clean `Ok(false)`; a genuine read error (not a proven
+        // corruption) propagates — we never delete on a transient io fault.
+        // removal is best-effort + path-based (idempotent), so verify stays
+        // `&self` like the rest of the read surface.
+        let (hex, path) = self.object_path(id);
+        let raw = match std::fs::read(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(format!("files: odb verify {hex}: {e}")),
+        };
+        let intact = match raw.split_first() {
+            Some((tag, body)) => match Kind::from_u8(*tag) {
+                Some(kind) => object_id(kind, body) == *id,
+                None => false,
+            },
+            None => false, // an empty file cannot be any object
+        };
+        if !intact {
+            // a racing writer or fs error here is harmless — the next verify
+            // re-checks, and an absent name is exactly the self-heal signal.
+            let _ = std::fs::remove_file(&path);
+        }
+        Ok(intact)
     }
 
     fn stat(&self, id: &ObjectId) -> Result<Option<(Kind, u64)>, String> {

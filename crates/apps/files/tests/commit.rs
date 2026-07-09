@@ -833,26 +833,21 @@ fn chunk_length_must_match_the_size_rule_at_commit() {
     assert_eq!(stat(&f, "/shared/ok", None).expect("present").size, 5);
 }
 
-/// a digest that names a durable NON-chunk object cannot pose as a chunk, even
-/// when its body length happens to match the size rule — the kind is checked,
-/// not just the byte count.
+/// a digest that names a NON-chunk object cannot pose as a chunk, even when its
+/// body length happens to match the size rule — the kind is checked, not just the
+/// byte count. availability is consensus-uniform now (finding #1), so the object
+/// must be produced IN-BLOCK for the kind guard to apply; a merely-durable odb
+/// object is rejected earlier as simply unavailable (see the core
+/// `consensus_uniformity` tests and the "reject a Content::Chunks that names an
+/// odb-only orphan" contract).
 #[test]
 fn a_non_chunk_object_cannot_pose_as_a_chunk() {
     let d = tempfile::tempdir().unwrap();
     let mut f = open_files(&d);
-    // block 1: an inline commit makes a FileObj durable in the odb.
-    commit(
-        &mut f,
-        ext(b"u"),
-        1,
-        None,
-        vec![put_inline("/shared/a", b"x")],
-    )
-    .expect("seed");
-    commit_block(&mut f);
 
-    // reconstruct that FileObj byte-for-byte and reference ITS id as a chunk
-    // digest, with the size chosen so the LENGTH rule alone would pass.
+    // the FileObj an inline `/shared/a` = b"x" produces, reconstructed
+    // byte-for-byte so we can reference ITS id as a chunk digest, with the size
+    // chosen so the LENGTH rule alone would pass.
     let fileobj = files::objects::FileObj {
         size: 1,
         chunks: vec![files::objects::object_id(files::Kind::Chunk, b"x")],
@@ -860,12 +855,19 @@ fn a_non_chunk_object_cannot_pose_as_a_chunk() {
     };
     let body = fileobj.encode();
     let hex = to_hex(&files::objects::object_id(files::Kind::File, &body));
+
+    // ONE block: change 1 stages that FileObj in-block; change 2 references its
+    // digest as a chunk. the in-block object index carries the kind, so the
+    // reference is rejected as "not a chunk" — the kind is checked, not the count.
     let err = commit(
         &mut f,
         ext(b"u"),
-        2,
+        1,
         None,
-        vec![put_chunks("/shared/fake", body.len() as u64, &[&hex])],
+        vec![
+            put_inline("/shared/a", b"x"),
+            put_chunks("/shared/fake", body.len() as u64, &[&hex]),
+        ],
     )
     .expect_err("a File object under a chunk reference rejects");
     assert!(
@@ -873,4 +875,45 @@ fn a_non_chunk_object_cannot_pose_as_a_chunk() {
         "got {err:?}"
     );
     abort_block(&mut f);
+}
+
+/// finding #2: a present-but-corrupt chunk must NOT count as possessed. after an
+/// on-disk bit-flip, `possession_complete()` reports incomplete (never a false
+/// "done"), and the verified pass removes the corrupt object so the self-heal
+/// fetch loop re-fetches a good copy.
+#[test]
+fn possession_is_incomplete_over_a_corrupt_chunk() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    commit(
+        &mut f,
+        ext(b"u"),
+        1,
+        None,
+        vec![put_inline("/shared/a", b"chunk-body")],
+    )
+    .expect("seed");
+    commit_block(&mut f);
+    assert!(
+        f.possession_complete().expect("possession"),
+        "an intact object set is fully possessed"
+    );
+
+    // bit-flip the committed chunk on disk, behind the module's back.
+    let chunk = files::objects::object_id(files::Kind::Chunk, b"chunk-body");
+    let hex = to_hex(&chunk);
+    let path = d.path().join("objects").join(&hex[..2]).join(&hex[2..]);
+    let mut raw = std::fs::read(&path).unwrap();
+    let last = raw.len() - 1;
+    raw[last] ^= 0xff; // same-length corruption: length checks alone miss it
+    std::fs::write(&path, raw).unwrap();
+
+    assert!(
+        !f.possession_complete().expect("possession"),
+        "a corrupt chunk is not possessed — possession must not report complete"
+    );
+    assert!(
+        !path.exists(),
+        "the verified pass removed the corrupt chunk so it re-fetches as absent"
+    );
 }

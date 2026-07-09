@@ -273,9 +273,6 @@ impl<S: ObjectStore> Fs<S> {
         // copy the entry caps out before the field borrows below, same as `quota`.
         let entry_cap = self.staging_entry_cap;
         let entry_cap_per_owner = self.staging_entry_cap_per_owner;
-        // disjoint field borrows: the sweep/stage touch `pending`, the dedup
-        // reads `store` — held at once only because they are distinct fields.
-        let store = &self.store;
         let pending = self.pending.as_mut().expect("require_pending set it");
         sweep_expired(&mut pending.refs, height);
 
@@ -291,13 +288,19 @@ impl<S: ObjectStore> Fs<S> {
 
         let digest = object_id(Kind::Chunk, bytes);
 
-        // already durable → no-op, no quota charge. either the committed odb holds
-        // it, or an earlier op THIS block already buffered it — whether a prior
-        // putblob (also in staging) OR a prior commit that chunked the same bytes
-        // inline (in objects, NOT in staging). the per-block object index covers
-        // both cases, so a putblob after an inline commit of the same chunk
-        // no-ops instead of double-staging.
-        if store.has(&digest) || pending.object_ids.contains_key(&digest) {
+        // already reachable in CONSENSUS-UNIFORM state → no-op, no quota charge.
+        // either the committed staging table already holds it, or an earlier op
+        // THIS block buffered it — a prior putblob (also in staging) OR a prior
+        // commit that chunked the same bytes inline (in objects, NOT in staging);
+        // the per-block object index covers both. the local odb is DELIBERATELY
+        // not consulted: an orphan present on some nodes only would make this
+        // no-op/stage decision node-dependent and split `refs.staging` — hence
+        // the root — across the set (finding #1). a durable-but-unstaged chunk is
+        // therefore re-staged; its bytes ride the block (consensus input), so
+        // every node lands the identical staging entry.
+        if pending.object_ids.contains_key(&digest)
+            || pending.refs.staging.contains_key(&digest)
+        {
             return Ok(());
         }
 
@@ -719,6 +722,17 @@ impl<S: ObjectStore> Fs<S> {
         Ok(missing.into_iter().take(limit).collect())
     }
 
+    /// whether every object the committed refs reach is present AND INTACT — the
+    /// verified possession gate (finding #2). where [`Fs::missing_objects`] drives
+    /// the per-round fetch loop with a cheap presence walk, this re-hashes every
+    /// reached chunk, so a present-but-corrupt chunk is caught (and, on a disk
+    /// store, deleted so it re-fetches) instead of passing as "possessed" and
+    /// letting a node go READY over an unreadable file. call it ONCE at a
+    /// possession boundary, never per fetch round.
+    pub fn possession_complete(&self) -> Result<bool, String> {
+        Ok(crate::gc::collect_missing_verified(&self.refs, &self.store)?.is_empty())
+    }
+
     /// verify-then-store one fetched object. the id must re-derive from the bytes
     /// (`object_id(kind, body) == *id`) or the object is rejected — the
     /// dishonest-server rule: a peer cannot smuggle bytes under an id they do not
@@ -1012,19 +1026,22 @@ fn commit_apply(
     }
 
     // step 6 (availability + stored length): every referenced chunk must be
-    // reachable — staged via putblob, durable in the odb, produced by a prior
-    // commit this block, or produced inline by THIS commit — AND its stored
-    // byte length must satisfy the exact-length rule for its position
-    // ([`verify_chunk_len_at`]). `validate_chunks` pinned the size/COUNT shape;
-    // without the length half a wrong-length digest would commit fine and only
-    // explode at read time — a committed-but-unreadable file. every source
-    // answers from metadata alone (the staging entry, the in-memory block
-    // indexes, an odb stat), so no chunk body is ever read on the execute
-    // path. checked after the plan pass so an inline chunk in a later change
-    // is visible to an earlier `Chunks` reference.
+    // reachable in CONSENSUS-UNIFORM state — staged via putblob (committed refs)
+    // or produced by a prior commit this block or inline by THIS commit — AND
+    // its stored byte length must satisfy the exact-length rule for its position
+    // ([`verify_chunk_len_at`]). the local odb is DELIBERATELY not a source: its
+    // orphan set differs across nodes (gc timing, join/rejoin history), so
+    // letting raw odb presence satisfy availability would make commit acceptance
+    // node-dependent and split the block app-hash (finding #1). `validate_chunks`
+    // pinned the size/COUNT shape; without the length half a wrong-length digest
+    // would commit fine and only explode at read time — a committed-but-
+    // unreadable file. every source answers from metadata alone (the staging
+    // entry, the in-memory block indexes), so no chunk body is ever read on the
+    // execute path. checked after the plan pass so an inline chunk in a later
+    // change is visible to an earlier `Chunks` reference.
     for (size, ids) in &chunks_to_check {
         for (index, id) in ids.iter().enumerate() {
-            let got = chunk_stat(id, &refs, pending_ids, &staged_ids, store)?
+            let got = chunk_stat(id, &refs, pending_ids, &staged_ids)?
                 .ok_or_else(|| "files: chunk not available".to_string())?;
             verify_chunk_len_at(*size, ids.len(), index, got)?;
         }
@@ -1124,20 +1141,24 @@ fn commit_apply(
     })
 }
 
-/// the stored byte length of one referenced chunk, from metadata only, across
-/// the four reachability sources commit accepts: the putblob staging table
-/// (which recorded the exact length it measured), this block's prior-object
-/// index, THIS commit's staged-object index (both in-memory), and the durable
-/// odb (a stat — kind tag + file length, never a body read). `Ok(None)` =
-/// reachable nowhere, the availability reject. a digest that resolves to a
-/// NON-chunk object is a malformed reference and errors — a File/Tree/Snapshot
-/// body must not pose as a chunk even when its byte length happens to fit.
+/// the stored byte length of one referenced chunk, from CONSENSUS-UNIFORM
+/// metadata only: the putblob staging table (committed refs, which recorded the
+/// exact length it measured), this block's prior-object index, and THIS commit's
+/// staged-object index (both in-memory, derived from this block's ops). the
+/// local odb is DELIBERATELY not a source — its orphan set is per-node (gc
+/// timing, join/rejoin history), so a chunk referenceable "because it happens to
+/// be on this node's disk" would let one validator accept a commit another
+/// rejects and split the app-hash (finding #1). a chunk must be STAGED or
+/// produced in-block to be referenceable; the client re-stages anything absent.
+/// `Ok(None)` = reachable in neither uniform source, the availability reject. a
+/// digest that resolves to a NON-chunk object is a malformed reference and errors
+/// — a File/Tree/Snapshot body must not pose as a chunk even when its byte
+/// length happens to fit.
 fn chunk_stat(
     id: &ObjectId,
     refs: &Refs,
     pending_ids: &BTreeMap<ObjectId, (Kind, u64)>,
     staged_ids: &BTreeMap<ObjectId, (Kind, u64)>,
-    store: &Store,
 ) -> Result<Option<u64>, String> {
     // staging entries are chunks by construction (putblob stages only chunks).
     if let Some(staged) = refs.staging.get(id) {
@@ -1149,11 +1170,7 @@ fn chunk_stat(
         }
         return Ok(Some(*len));
     }
-    match store.store.stat(id)? {
-        Some((Kind::Chunk, len)) => Ok(Some(len)),
-        Some(_) => Err("files: referenced digest is not a chunk".into()),
-        None => Ok(None),
-    }
+    Ok(None)
 }
 
 /// canonicalize a written path and authority-check it for `actor`.
@@ -1326,4 +1343,94 @@ fn stage_object(
         objects.push((kind, body));
     }
     id
+}
+
+// finding #1: a consensus op's outcome must be a pure function of AGREED state
+// (committed refs + this block's ops), never the local odb — whose orphan set
+// differs across nodes (deterministic gc still leaves join-history/rejoin
+// asymmetries: a fresh-synced node holds zero orphans, a genesis node holds
+// them until the next sweep). two nodes with divergent odb must apply the SAME
+// op to the SAME root, or the block app-hash splits and the network bricks.
+// these tests build under `--no-default-features` (pure core, no sdk/disk).
+#[cfg(test)]
+mod consensus_uniformity {
+    use std::collections::BTreeMap;
+
+    use crate::fs::Fs;
+    use crate::objects::{Kind, object_id};
+    use crate::state::Refs;
+    use crate::store::{MemStore, ObjectStore};
+    use crate::wire::{Change, Content, to_hex};
+
+    fn new_fs() -> Fs<MemStore> {
+        Fs::new(MemStore::new(), Refs::default())
+    }
+
+    /// drain the pending block, flush its objects into the store, and adopt —
+    /// the pure-core twin of `module.rs commit_block`.
+    fn commit_block(fs: &mut Fs<MemStore>) {
+        if let Some((refs, _height, objects)) = fs.commit_block() {
+            for (kind, body) in &objects {
+                fs.store_mut().put(*kind, body).unwrap();
+            }
+            fs.adopt_refs(refs);
+        }
+    }
+
+    #[test]
+    fn putblob_is_uniform_regardless_of_local_odb() {
+        // node A already holds these bytes as an ORPHAN (present in the odb,
+        // unstaged, unreferenced — the post-gc / rejoin state); node B does
+        // not. the putblob op and its bytes are consensus input, identical on
+        // both, so the staged refs MUST end identical.
+        let mut a = new_fs();
+        let mut b = new_fs();
+        a.store_mut().put(Kind::Chunk, b"orphan-payload").unwrap();
+
+        a.putblob("system", 1, b"orphan-payload").unwrap();
+        b.putblob("system", 1, b"orphan-payload").unwrap();
+        commit_block(&mut a);
+        commit_block(&mut b);
+
+        assert_eq!(
+            a.root_bytes(),
+            b.root_bytes(),
+            "putblob must not branch on local odb presence: divergent odb => \
+             divergent staging => divergent root => brick"
+        );
+    }
+
+    #[test]
+    fn commit_availability_is_uniform_regardless_of_local_odb() {
+        // the same Content::Chunks commit, referencing a chunk that is NEITHER
+        // staged NOR produced in-block. node A happens to hold it as an odb
+        // orphan; node B does not. both must reach the SAME verdict.
+        let orphan = object_id(Kind::Chunk, b"data-x");
+        let change = Change::Put {
+            path: "/shared/f".into(),
+            exec: false,
+            meta: BTreeMap::new(),
+            content: Content::Chunks {
+                size: 6,
+                chunks: vec![to_hex(&orphan)],
+            },
+        };
+
+        let mut a = new_fs();
+        a.store_mut().put(Kind::Chunk, b"data-x").unwrap(); // A holds the orphan
+        let mut b = new_fs(); // B does not
+
+        let ra = a.commit("system", 1, 1, None, "c".into(), vec![change.clone()]);
+        let rb = b.commit("system", 1, 1, None, "c".into(), vec![change]);
+
+        assert_eq!(
+            ra.is_ok(),
+            rb.is_ok(),
+            "commit acceptance must not depend on local odb presence (a brick otherwise)"
+        );
+        assert!(
+            ra.is_err(),
+            "an unstaged, not-in-block chunk is unavailable — regardless of a local odb orphan"
+        );
+    }
 }

@@ -11,6 +11,18 @@ pub trait ObjectStore {
     fn put(&mut self, kind: Kind, body: &[u8]) -> Result<ObjectId, String>;
     fn get(&self, id: &ObjectId) -> Result<Option<(Kind, Vec<u8>)>, String>;
     fn has(&self, id: &ObjectId) -> bool;
+    /// integrity-verified presence: `Ok(true)` iff the object is present AND its
+    /// stored bytes still hash to `id`. unlike [`ObjectStore::has`] (a path/key
+    /// existence check), this proves the bytes are the ones the id names, so a
+    /// self-heal terminator can distinguish "possessed" from "possessed-but-
+    /// corrupt". the default TRUSTS presence — an in-memory store's bytes are the
+    /// ones put and cannot bit-rot; a disk-backed store overrides to re-derive the
+    /// hash and, on a mismatch, DELETE the corrupt file so it reads as absent and
+    /// the fetch loop re-fetches a good copy. an absent object is `Ok(false)`, a
+    /// genuine read error (not a proven mismatch) is an `Err`.
+    fn verify(&self, id: &ObjectId) -> Result<bool, String> {
+        Ok(self.has(id))
+    }
     /// metadata-only: the stored object's kind and BODY byte length without
     /// reading the body. commit's execute-path chunk-length verification rides
     /// this, so an implementation must answer from metadata (a map lookup, a

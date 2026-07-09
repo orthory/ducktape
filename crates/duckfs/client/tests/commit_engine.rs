@@ -113,9 +113,9 @@ fn checkout_edit_commit_and_re_checkout_round_trip() {
 // ---- dedup + resume (stage counters) ----------------------------------------
 
 #[test]
-fn duplicate_bytes_stage_nothing() {
+fn duplicate_bytes_of_a_committed_file_restage() {
     let node = ModuleNode::new();
-    let big = pattern(2 * CHUNK_SIZE as usize + 1, 3);
+    let big = pattern(2 * CHUNK_SIZE as usize + 1, 3); // three distinct chunks
     node.seed_commit(
         None,
         "seed",
@@ -127,15 +127,22 @@ fn duplicate_bytes_stage_nothing() {
     let root = dir.path();
     checkout(&node, root, PREFIX, None).expect("checkout");
 
-    // a NEW path whose bytes duplicate the already-committed file.
+    // a NEW path whose bytes duplicate the already-committed file. those chunks
+    // are durable on disk but NO LONGER staged (a commit consumes the stage), and
+    // HasChunks now reports STAGING ONLY — odb presence is per-node (orphan sets
+    // diverge across the set), so it can't gate a consensus availability decision
+    // (finding #1). the client therefore RE-STAGES all three chunks. this drops
+    // the old cross-commit zero-byte dedup, but it is consensus-safe: the bytes
+    // ride the block, so every validator lands the identical staging entry — and
+    // dedup against the CURRENT staging table still holds (see the resume test).
     fs::write(root.join("dup.bin"), &big).unwrap();
 
     let before = node.stage_calls.get();
     commit(&node, root, "dup").expect("commit");
     assert_eq!(
-        node.stage_calls.get(),
-        before,
-        "duplicate chunks are already present (HasChunks) — nothing staged"
+        node.stage_calls.get() - before,
+        3,
+        "a committed-but-unstaged file's bytes re-stage (all three chunks)"
     );
     // and the duplicate really landed.
     let dir2 = tempfile::tempdir().unwrap();

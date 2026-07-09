@@ -147,15 +147,14 @@ impl Files {
         Ok(())
     }
 
-    /// whether the node holds every object its committed refs reach — the sync
-    /// terminator. `missing_objects(1)` is enough: a single reachable-but-absent
-    /// object means possession is incomplete.
+    /// whether the node holds every object its committed refs reach, INTACT — the
+    /// sync terminator. this is the integrity-VERIFIED possession walk (finding
+    /// #2): a present-but-corrupt chunk is caught and removed (so it re-fetches),
+    /// where the per-round fetch loop ([`Files::missing_objects`]) stays on the
+    /// cheap presence walk. running it here, once at the boundary, keeps the cost
+    /// off the loop.
     pub fn possession_complete(&self) -> Result<bool, Error> {
-        Ok(self
-            .fs
-            .missing_objects(1)
-            .map_err(Error::Module)?
-            .is_empty())
+        self.fs.possession_complete().map_err(Error::Module)
     }
 
     /// `#[doc(hidden)]` test seam: stage a pending block directly so the real
