@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use arrayvec::ArrayVec;
 use commonware_codec::DecodeExt as _;
@@ -38,15 +39,77 @@ pub type CoordinatorReply = (SocketAddr, Msg);
 /// the live UDP loop consumes this fixed-capacity form directly.
 pub type CoordinatorReplies = ArrayVec<CoordinatorReply, 3>;
 
+/// An authenticated request ready for the ordered rendezvous state machine.
+/// Authentication workers produce this value; it contains public identity and
+/// protocol data only.
+pub(crate) struct VerifiedRequest {
+    caller: NodeKey,
+    inner: Msg,
+}
+
+/// Stateful verifier owned by either the inline coordinator or one fixed auth
+/// worker. Its only state is policy plus a bounded cache of parsed PUBLIC keys.
+pub(crate) struct AuthVerifier {
+    policy: Arc<AuthPolicy>,
+    auth_keys: AuthKeyCache,
+    window: u64,
+}
+
+impl AuthVerifier {
+    fn new(policy: AuthPolicy) -> Self {
+        Self::with_shared_policy(Arc::new(policy))
+    }
+
+    pub(crate) fn with_shared_policy(policy: Arc<AuthPolicy>) -> Self {
+        Self {
+            policy,
+            auth_keys: None,
+            window: DEFAULT_FRESHNESS_WINDOW_SECS,
+        }
+    }
+
+    pub(crate) fn verify(&mut self, req: AuthRequest, now: u64) -> Option<VerifiedRequest> {
+        let inner_subject = req.inner.subject_key()?;
+        // Self-ops may mutate only the authenticated caller's own advert;
+        // Lookup intentionally names a different peer.
+        let is_self_op = !matches!(req.inner, Msg::Lookup { .. });
+        if is_self_op && inner_subject != req.caller {
+            return None;
+        }
+
+        let inner_bytes = req.inner.encode_inline();
+        // Authenticate the caller, never the peer named by Lookup.
+        verify_request_using(
+            &self.policy,
+            now,
+            self.window,
+            req.caller,
+            &inner_bytes,
+            &req.auth,
+            |caller| resolve_auth_key(&mut self.auth_keys, caller),
+        )
+        .ok()?;
+        Some(VerifiedRequest {
+            caller: req.caller,
+            inner: req.inner,
+        })
+    }
+
+    fn allows_legacy(&self) -> bool {
+        matches!(
+            self.policy.as_ref(),
+            AuthPolicy::Open { require_pop: false }
+        )
+    }
+}
+
 /// The untrusted entry helper. Maps a node key to the reflexive address the
 /// coordinator observed for it, and brokers a simultaneous-open. Holds no key
 /// material, no plaintext, no mesh authority — and never carries peer traffic:
 /// rendezvous only, no relay.
 pub struct Coordinator {
     adverts: AdvertBook,
-    policy: AuthPolicy,
-    auth_keys: AuthKeyCache,
-    window: u64,
+    auth: AuthVerifier,
     rejects: u64,
 }
 
@@ -54,9 +117,7 @@ impl Default for Coordinator {
     fn default() -> Self {
         Self {
             adverts: AdvertBook::default(),
-            policy: AuthPolicy::default(), // fully-open
-            auth_keys: None,
-            window: DEFAULT_FRESHNESS_WINDOW_SECS,
+            auth: AuthVerifier::new(AuthPolicy::default()), // fully-open
             rejects: 0,
         }
     }
@@ -69,9 +130,14 @@ impl Coordinator {
 
     /// Construct with an explicit authorization policy.
     pub fn with_policy(policy: AuthPolicy) -> Self {
+        Self::with_shared_policy(Arc::new(policy))
+    }
+
+    pub(crate) fn with_shared_policy(policy: Arc<AuthPolicy>) -> Self {
         Self {
-            policy,
-            ..Self::default()
+            adverts: AdvertBook::default(),
+            auth: AuthVerifier::with_shared_policy(policy),
+            rejects: 0,
         }
     }
 
@@ -110,36 +176,9 @@ impl Coordinator {
         req: AuthRequest,
         now: u64,
     ) -> CoordinatorReplies {
-        // Only request shapes are wrappable; a non-request inner is malformed.
-        let Some(inner_subject) = req.inner.subject_key() else {
-            self.rejects += 1;
-            return CoordinatorReplies::new();
-        };
-        // Anti-poisoning: for the SELF-ops (BindRequest/Register/Readvertise) the
-        // inner key IS the acting node, so it must equal the authenticated
-        // caller — otherwise an admitted member could register or re-advertise
-        // ANOTHER node's key. A `Lookup` has no such constraint: a member looks
-        // up a DIFFERENT peer, so its inner key is expected to differ.
-        let is_self_op = !matches!(req.inner, Msg::Lookup { .. });
-        if is_self_op && inner_subject != req.caller {
-            self.rejects += 1;
-            return CoordinatorReplies::new();
-        }
-        let inner_bytes = req.inner.encode_inline();
-        // Authenticate the CALLER (the PoP-signing identity), not the inner key.
-        let policy = &self.policy;
-        let auth_keys = &mut self.auth_keys;
-        match verify_request_using(
-            policy,
-            now,
-            self.window,
-            req.caller,
-            &inner_bytes,
-            &req.auth,
-            |caller| resolve_auth_key(auth_keys, caller),
-        ) {
-            Ok(()) => self.handle_with_caller_replies(from, req.inner, Some(req.caller), now),
-            Err(_) => {
+        match self.auth.verify(req, now) {
+            Some(req) => self.handle_verified_replies(from, req, now),
+            None => {
                 self.rejects += 1;
                 CoordinatorReplies::new()
             }
@@ -167,12 +206,25 @@ impl Coordinator {
         msg: Msg,
         now: u64,
     ) -> CoordinatorReplies {
-        if matches!(self.policy, AuthPolicy::Open { require_pop: false }) {
+        if self.auth.allows_legacy() {
             self.handle_with_caller_replies(from, msg, None, now)
         } else {
             self.rejects += 1;
             CoordinatorReplies::new()
         }
+    }
+
+    pub(crate) fn handle_verified_replies(
+        &mut self,
+        from: SocketAddr,
+        req: VerifiedRequest,
+        now: u64,
+    ) -> CoordinatorReplies {
+        self.handle_with_caller_replies(from, req.inner, Some(req.caller), now)
+    }
+
+    pub(crate) fn record_reject(&mut self) {
+        self.rejects += 1;
     }
 
     /// Handle one datagram observed from `from` at wall-clock `now` (seconds);
@@ -598,14 +650,14 @@ mod tests {
         let inner = Msg::BindRequest { from: caller };
         let mut coordinator = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
 
-        assert!(coordinator.auth_keys.is_none(), "cache starts lazy");
+        assert!(coordinator.auth.auth_keys.is_none(), "cache starts lazy");
         let good = AuthRequest {
             caller,
             inner: inner.clone(),
             auth: sign_authenticator(&node, &inner.encode(), now, None),
         };
         assert_eq!(coordinator.handle_auth_replies(source, good, now).len(), 1);
-        assert!(coordinator.auth_keys.is_some(), "valid key was cached");
+        assert!(coordinator.auth.auth_keys.is_some(), "valid key was cached");
 
         // This hits the cached parsed public key but carries a signature from a
         // different private key. The cache saves only key parsing; it must not
