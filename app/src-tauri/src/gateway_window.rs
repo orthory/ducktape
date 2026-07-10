@@ -1,9 +1,10 @@
-//! Capability-free native window for executable gateway content.
+//! Capability-free surfaces for executable gateway content.
 //!
-//! Tauri cannot distinguish iframe IPC from main-frame IPC on Linux, so
-//! publisher content must never share the privileged `main` WebView. This
-//! window label matches no capability and navigation stays pinned to one
-//! random, short-lived gateway-session origin.
+//! Publisher content never shares the privileged `main` webview: it renders in
+//! its own capability-free webview — inline in the Browser pane (a multiwebview
+//! child, the default) or a separate window (pop-out). On the CEF runtime each
+//! surface is its own renderer process, and navigation stays pinned to one
+//! random, short-lived gateway-session origin either way.
 
 use tauri::webview::{NewWindowResponse, WebviewWindowBuilder};
 use tauri::{Manager as _, WebviewUrl};
@@ -107,20 +108,18 @@ pub struct InlineRect {
 const INLINE_LABEL: &str = "gateway-inline";
 
 /// Whether this shell embeds gateway content inline in the Browser pane.
-/// CEF: every gateway session runs in its own renderer process and the
-/// `gateway-inline` label matches no capability, so an embedded child webview
-/// is exactly as isolated as the separate window. wry/WebKitGTK keeps the
-/// separate window — it cannot distinguish child/iframe IPC from the main
-/// frame on Linux (see the module doc).
+/// Always true on the CEF runtime: every gateway session runs in its own
+/// renderer process and the `gateway-inline` label matches no capability, so
+/// an embedded child webview is exactly as isolated as the separate window.
+/// (The command stays so the web build's client can probe and fall back.)
 #[tauri::command]
 pub fn gateway_inline_supported() -> bool {
-    cfg!(feature = "cef")
+    true
 }
 
 /// Open (or re-navigate) the inline gateway child webview at `rect`.
 /// Same validation and guards as `gateway_open_window`, same single-surface
 /// rule: opening inline closes any separate gateway window, and vice versa.
-#[cfg(feature = "cef")]
 #[tauri::command]
 pub fn gateway_open_inline(
     app: tauri::AppHandle,
@@ -174,7 +173,6 @@ pub fn gateway_open_inline(
 }
 
 /// Track the Browser pane as it resizes (ResizeObserver on the UI side).
-#[cfg(feature = "cef")]
 #[tauri::command]
 pub fn gateway_inline_place(
     app: tauri::AppHandle,
@@ -196,7 +194,6 @@ pub fn gateway_inline_place(
 
 /// Close the inline gateway view (idempotent) — navigation away, view switch,
 /// or the pop-out-to-window control.
-#[cfg(feature = "cef")]
 #[tauri::command]
 pub fn gateway_inline_close(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager as _;
@@ -208,7 +205,6 @@ pub fn gateway_inline_close(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "cef")]
 fn place_inline_webview(
     webview: &tauri::Webview,
     position: tauri::LogicalPosition<f64>,
@@ -220,29 +216,6 @@ fn place_inline_webview(
             size: size.into(),
         })
         .map_err(|error| format!("place inline gateway view: {error}"))
-}
-
-// wry: the inline surface does not exist; the UI never calls these because
-// gateway_inline_supported() is false, but the commands stay registered so
-// the invoke surface is identical across shells.
-#[cfg(not(feature = "cef"))]
-#[tauri::command]
-pub fn gateway_open_inline(url: String, rect: InlineRect) -> Result<(), String> {
-    let _ = (url, rect);
-    Err("inline gateway views require the cef shell".into())
-}
-
-#[cfg(not(feature = "cef"))]
-#[tauri::command]
-pub fn gateway_inline_place(rect: InlineRect) -> Result<(), String> {
-    let _ = rect;
-    Err("inline gateway views require the cef shell".into())
-}
-
-#[cfg(not(feature = "cef"))]
-#[tauri::command]
-pub fn gateway_inline_close() -> Result<(), String> {
-    Err("inline gateway views require the cef shell".into())
 }
 
 #[cfg(test)]

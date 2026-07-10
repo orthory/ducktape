@@ -15,7 +15,22 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # tray-icon: the macOS menu-bar icon + popover (src/tray.rs, gated to macOS).
 # image-png: decode the bundled tray.png for the icon.
-tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
+# cef: this branch runs on tauri-runtime-cef (bundled Chromium) — wry is fully
+# replaced (default-features off drops wry/x11/dbus; compression + dynamic-acl
+# are kept from the defaults). Requires the patched feat/cef checkout
+# (ops/cef-probe/setup.sh appends the [patch.crates-io] section); registry
+# tauri has no `cef` feature yet.
+# unstable: tauri's multiwebview API (Window::add_child) for the inline
+# gateway view (gateway_window.rs).
+tauri = { version = "2", default-features = false, features = [
+  "cef",
+  "unstable",
+  "compression",
+  "dynamic-acl",
+  "macos-private-api",
+  "tray-icon",
+  "image-png",
+] }
 # native OS toasts for the production notification sink (src/notify/present.rs).
 tauri-plugin-notification = "2"
 # in-app LAN key-enrollment server (pure Rust, no system libs): an ephemeral,
@@ -40,22 +55,6 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 # registration is cfg-gated to debug + desktop in main.rs so a release runtime
 # registers nothing.
 tauri-plugin-agent = "0.0.1"
-
-# WebKitGTK asks the EMBEDDER to decide getUserMedia permission (no OS prompt
-# exists), and neither tauri nor wry answers — unhandled requests are denied, so
-# huddle mic/camera would always fail NotAllowedError. huddle.rs::allow_user_media
-# grants them. Same crate+version wry already compiles; adds no system deps.
-[features]
-# CEF runtime probe: run the shell on tauri-runtime-cef instead of wry.
-# Gates out the WebKitGTK getUserMedia hook (CEF has its own permission path).
-# `unstable` unlocks tauri's multiwebview API (Window::add_child) — the inline
-# gateway view is a child webview positioned over the Browser pane.
-cef = ["tauri/cef", "tauri/unstable"]
-
-# webkit2gtk's only use (huddle::allow_user_media) is #[cfg]-gated off under
-# `cef`; the crate stays compiled-but-unused, which is harmless.
-[target.'cfg(target_os = "linux")'.dependencies]
-webkit2gtk = "2.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
