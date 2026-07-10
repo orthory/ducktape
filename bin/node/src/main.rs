@@ -95,7 +95,9 @@ mod voice;
 mod voice_plane;
 use config::{Resolved, hex_bytes, unhex};
 use constants::*;
-use explorer::{IndexFold, explorer_root_op, heal_index, sealed_frame_block_row, ship_index_blobs};
+use explorer::{IndexFold, explorer_root_op, heal_index, ship_index_blobs};
+#[cfg(test)]
+use explorer::sealed_frame_block_row;
 use host_reads::{
     read_members_from_host, read_redemptions_from_host, read_upgrade_state,
     read_upgrade_status_raw, read_upgrade_version_fields, read_valset_members,
@@ -105,20 +107,21 @@ use host_state::{
     NetworkBindings, SyncSubstrates, genesis_host, restore_host, run_output_sink, sync_all_modules,
 };
 use reachability_plane::wire_reachability_plane;
+#[cfg(test)]
 use replica::promotion::{
     choose_promotion_boundary, joiner_manifest_fetch_retry, PromotionBoundary,
     PromotionBoundarySource,
 };
 use rpc::{spawn_rpc_listener, JoinRequestRecord, JoinRequestView, RpcJob, RpcReply, RpcRequest, RpcStatus};
 use sync::catchup::{
-    advance_next_seq_from_frames, apply_post_reboot_catchup_frames, apply_verified_suffix_frame,
-    catch_up_post_reboot_frames, derive_pending_boot, write_post_reboot_catchup_checkpoint,
-    BootP2pSyncClient, PostRebootCatchupError,
+    advance_next_seq_from_frames, catch_up_post_reboot_frames, derive_pending_boot,
+    write_post_reboot_catchup_checkpoint, BootP2pSyncClient, PostRebootCatchupError,
 };
-use sync::serve::{
-    assert_floor_binds_view, drive_sync_request, verify_manifest_floor, SyncBoundary,
-    SyncStateRequest,
-};
+#[cfg(test)]
+use sync::catchup::{apply_post_reboot_catchup_frames, apply_verified_suffix_frame};
+use sync::serve::{drive_sync_request, verify_manifest_floor, SyncBoundary, SyncStateRequest};
+#[cfg(test)]
+use sync::serve::assert_floor_binds_view;
 use util::{diag_log, epoch_floor, hex, participant_bytes, resident_bytes, unix_ms};
 use validator::announce::{
     CapabilityAnnouncer, ReadinessSignaller, dispatch_pending_deliveries, saga_next_expiry,

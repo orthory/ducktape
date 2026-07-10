@@ -90,7 +90,7 @@ pub(crate) async fn run(
     // the voice lane: a sync-only resident serves no huddle audio,
     // but the channel must exist — black-hole. dropping the session
     // lane makes /v1/call/ws refuse instead of hang (this branch
-    // never reaches the validator hub below).
+    // never reaches main.rs's validator path).
     drop(voice_requests);
     {
         let (_tx, mut rx) = network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);

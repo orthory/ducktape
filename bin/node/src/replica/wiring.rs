@@ -312,7 +312,7 @@ pub(super) async fn wire(
     // the voice lane: a parked joiner serves no huddle audio, but the
     // channel must exist — black-hole. dropping the session lane makes
     // /v1/call/ws refuse instead of hang (this branch always ends in
-    // the promotion reboot, never the validator hub below).
+    // the promotion reboot, never main.rs's validator path).
     drop(voice_requests);
     {
         let (_tx, mut rx) = network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
@@ -331,9 +331,8 @@ pub(super) async fn wire(
     // the submit-relay lane: once resident standing lands, writes leave
     // here — this node signs its own frames and a validator takes
     // custody. replies (the frame's consensus fate) come back on the
-    // same lane. bound `mut` because the serve window's relay helper
-    // sends on `relay_tx`; `relay_rx` is bridged into the serve window
-    // below (a torn-down select must never drop its `recv()` mid-flight).
+    // same lane. `relay_rx` is bridged into the serve window below (a
+    // torn-down select must never drop its `recv()` mid-flight).
     let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
     // the lobby lane: where this parked node announces its key. member
     // replies are drained by a printer task — purely informational.

@@ -1,4 +1,5 @@
-//! the replica fold driver's PURE pieces (unified-node design, phase 2).
+//! the replica fold driver's PURE pieces, plus the joiner/replica role's
+//! entry point (unified-node design, phase 2).
 //!
 //! a standing resident follows the head by folding finalized frames like a
 //! validator instead of re-installing boundaries. the driver's inputs are the
@@ -24,8 +25,8 @@
 //!    no backfill is owed there.
 //!
 //! the driver LOOP itself (channel select, backfill execution, drain-pass
-//! side effects) is main.rs orchestration, like the resident announce and
-//! dispatch pumps.
+//! side effects), along with the resident announce and dispatch pumps,
+//! lives in `park.rs` (phases 6b–6d).
 
 use commonware_codec::{Decode as _, Encode as _};
 use commonware_consensus::simplex::types::Certificate;
@@ -177,7 +178,7 @@ pub(crate) async fn run(
 /// clean way to re-enter boot with a different network topology — discovery
 /// channels can only be registered before `network.start()`, so a promoted
 /// joiner cannot grow a consensus engine in-process.
-pub(crate) fn reboot_self() -> ! {
+fn reboot_self() -> ! {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
