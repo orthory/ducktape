@@ -11,9 +11,29 @@
 //! interface up, so binding retries in the background), and the
 //! prefer-plane-fall-back-to-mesh client the joiner paths consume.
 //!
-//! env-gated, default OFF (`DUCKTAPE_STATESYNC_PLANE=1`): the plane's on-path
-//! only does anything with real tunnels, and the mesh statesync path is the
-//! retained fallback either way.
+//! env-gated, default OFF (`DUCKTAPE_STATESYNC_PLANE=1`, see [`enabled`]):
+//! the plane's on-path only does anything with real tunnels.
+//!
+//! the mesh leg is not a legacy path pending deletion — it is NOT deletable,
+//! for four verified reasons (the wire-standardization ADR's D4 decision):
+//!
+//! 1. **default-off gate.** with the env var unset, mesh is today's PRIMARY
+//!    statesync path, not a fallback of a fallback.
+//! 2. **park-phase admission polling.** a parked (pre-admission) joiner
+//!    polls the manifest over statesync to detect its OWN admission, and
+//!    [`OverlayBook`]'s admission (members + standbys only) refuses that
+//!    joiner on the plane by construction — only the mesh can answer a
+//!    peer the network has not admitted yet.
+//! 3. **async bind window.** [`spawn_bring_up`]'s overlay bind retries every
+//!    3s until the interface exists, so a real window always exists where
+//!    the plane is enabled but not yet up.
+//! 4. **terminal punch failure.** a failed NAT punch is terminal (no relay
+//!    since its removal) — some peer pairs never get a tunnel at all, and
+//!    the mesh is their only path, permanently.
+//!
+//! [`PlaneFallbackClient`] is the resulting policy: prefer the plane,
+//! degrade to the mesh on transport failure, and log every fallback — the
+//! plane's steady-state degradation must be diagnosable, never silent.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -235,6 +255,10 @@ pub struct PlaneFallbackClient<M> {
     plane: PlaneSlot,
     server: PeerId,
     mesh: M,
+    /// the node's own log label — steady-state fallbacks are otherwise
+    /// invisible (silent per-request degradation), and a label-less
+    /// `eprintln` is useless once more than one node's logs interleave.
+    label: String,
 }
 
 impl<M: Clone> Clone for PlaneFallbackClient<M> {
@@ -243,12 +267,13 @@ impl<M: Clone> Clone for PlaneFallbackClient<M> {
             plane: Arc::clone(&self.plane),
             server: self.server,
             mesh: self.mesh.clone(),
+            label: self.label.clone(),
         }
     }
 }
 
 impl<M> PlaneFallbackClient<M> {
-    pub fn new(plane: PlaneSlot, server: &ed25519::PublicKey, mesh: M) -> Self {
+    pub fn new(plane: PlaneSlot, server: &ed25519::PublicKey, mesh: M, label: String) -> Self {
         let raw: [u8; 32] = server
             .as_ref()
             .try_into()
@@ -257,6 +282,7 @@ impl<M> PlaneFallbackClient<M> {
             plane,
             server: PeerId(raw),
             mesh,
+            label,
         }
     }
 
@@ -274,7 +300,12 @@ impl<M: SyncClient + Sync> SyncClient for PlaneFallbackClient<M> {
             match client.request(req.clone()).await {
                 // a transport-level failure (tunnel down, peer refused)
                 // falls back; protocol-level outcomes are authoritative.
-                Err(SyncError::Transport(_)) => {}
+                Err(SyncError::Transport(e)) => {
+                    let label = &self.label;
+                    eprintln!(
+                        "[node {label}] statesync: plane request failed, falling back to mesh: {e}"
+                    );
+                }
                 outcome => return outcome,
             }
         }

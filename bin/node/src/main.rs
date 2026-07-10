@@ -4049,7 +4049,12 @@ fn run_node(
                         None,
                     );
                 }
-                statesync_plane::PlaneFallbackClient::new(plane_slot, &server_peer, mesh_client)
+                statesync_plane::PlaneFallbackClient::new(
+                    plane_slot,
+                    &server_peer,
+                    mesh_client,
+                    label.clone(),
+                )
             };
 
             // the announce, built once: this key + the invite token + the
@@ -6181,7 +6186,12 @@ fn run_node(
                         None,
                     );
                 }
-                statesync_plane::PlaneFallbackClient::new(plane_slot, &server_peer, mesh_client)
+                statesync_plane::PlaneFallbackClient::new(
+                    plane_slot,
+                    &server_peer,
+                    mesh_client,
+                    label.clone(),
+                )
             };
             let mut attempts = 0usize;
             loop {
