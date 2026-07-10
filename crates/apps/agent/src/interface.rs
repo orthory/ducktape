@@ -68,14 +68,22 @@ pub const ACTION_CHAT_POST: &str = "chat.post";
 pub const ACTION_TASKS_CREATE: &str = "tasks.create";
 /// permission to move a task ([`AgentAction::UpdateTaskStatus`]).
 pub const ACTION_TASKS_UPDATE_STATUS: &str = "tasks.update_status";
+/// permission to anchor a comment to a page or block
+/// ([`AgentAction::AddPageComment`]).
+pub const ACTION_PAGES_COMMENT: &str = "pages.comment";
+/// permission to flip a todo block's checked state
+/// ([`AgentAction::SetPageChecked`]).
+pub const ACTION_PAGES_SET_CHECKED: &str = "pages.set_checked";
 
 /// every action name the platform knows. `RegisterAgent`/`UpdateAgent` reject
 /// an `allowed_actions` entry outside this vocabulary, so a granted permission
 /// always means something.
-pub const KNOWN_ACTIONS: [&str; 3] = [
+pub const KNOWN_ACTIONS: [&str; 5] = [
     ACTION_CHAT_POST,
     ACTION_TASKS_CREATE,
     ACTION_TASKS_UPDATE_STATUS,
+    ACTION_PAGES_COMMENT,
+    ACTION_PAGES_SET_CHECKED,
 ];
 
 // ---- runtime identity ---------------------------------------------------------
@@ -107,6 +115,11 @@ pub struct ResourceCaps {
     /// host-side and NEVER crosses consensus.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// page ids this agent may WRITE (comment on / check off). page ids are
+    /// opaque, so matching is exact — no prefix containment — with the one
+    /// literal entry `"*"` granting every page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages_write: Vec<String>,
     /// the D3 sub-agent spawn ceiling; 0 = none. consumption is the runtime's
     /// concern; the record only states the ceiling.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -161,6 +174,8 @@ pub enum CapRequest<'a> {
     Tool(&'a str),
     /// resolve the named vault secret ref.
     Secret(&'a str),
+    /// write (comment on / check off) the named page.
+    PagesWrite(&'a str),
     /// spawn a sub-agent (checked against the budget ceiling).
     SpawnSubagent,
 }
@@ -227,7 +242,9 @@ impl AgentRecord {
     /// positive budget check. forge/tool/
     /// secret use exact membership; duckfs uses path-PREFIX containment (a
     /// prefix grants itself and any child path, but never a sibling that merely
-    /// shares a textual prefix — `src` does not grant `srcx`). budget
+    /// shares a textual prefix — `src` does not grant `srcx`); pages use exact
+    /// membership with the literal `"*"` entry granting every page (ids are
+    /// opaque — never a prefix). budget
     /// CONSUMPTION is the runtime's concern; this only reads the ceiling.
     pub fn permits(&self, req: &CapRequest) -> bool {
         let c = &self.caps;
@@ -243,6 +260,7 @@ impl AgentRecord {
             CapRequest::DuckfsRead(p) => under(&c.duckfs_read, p) || under(&c.duckfs_write, p),
             CapRequest::Tool(t) => has(&c.tools, t),
             CapRequest::Secret(s) => has(&c.secrets, s),
+            CapRequest::PagesWrite(p) => has(&c.pages_write, "*") || has(&c.pages_write, p),
             CapRequest::SpawnSubagent => c.subagent_budget > 0,
         }
     }
@@ -289,6 +307,17 @@ pub enum AgentAction {
         task_id: String,
         status: String,
     },
+    /// anchor a comment to `target` — a page id or a block id in the pages
+    /// module ([`ACTION_PAGES_COMMENT`]).
+    AddPageComment {
+        target: String,
+        body: String,
+    },
+    /// flip a todo block's checked state ([`ACTION_PAGES_SET_CHECKED`]).
+    SetPageChecked {
+        block: String,
+        checked: bool,
+    },
 }
 
 impl AgentAction {
@@ -297,6 +326,8 @@ impl AgentAction {
         match self {
             AgentAction::CreateTask { .. } => ACTION_TASKS_CREATE,
             AgentAction::UpdateTaskStatus { .. } => ACTION_TASKS_UPDATE_STATUS,
+            AgentAction::AddPageComment { .. } => ACTION_PAGES_COMMENT,
+            AgentAction::SetPageChecked { .. } => ACTION_PAGES_SET_CHECKED,
         }
     }
 }
