@@ -163,9 +163,13 @@ source branch verbatim, so follow-up commits land on the same branch.
 While it works, the agent can `pages.comment` on spec blocks (comments land
 agent-authored on the page) and `pages.set_checked` the todo items — the
 block-anchored commentary layer. A pages action that fails its gate (cap
-deny, bad target, squatted id) degrades **individually** with a breadcrumb in
-the run's channel; the run still delivers. If a comment didn't land, read the
-breadcrumbs before suspecting the model.
+deny, bad target, squatted id) degrades **individually** — that one action is
+dropped and the run still delivers its reply and other effects. The drop
+reason is recorded as an internal `runs` breadcrumb event, but note (M3
+observability gap): breadcrumbs are **not yet surfaced in-app**, so today a
+degraded action is not visually distinguishable from one the model never
+emitted. If a comment didn't land, check the agent's caps (`pages_write` on
+the page) and that the target block/page id is correct.
 
 ## 6. Review in-app
 

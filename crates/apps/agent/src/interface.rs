@@ -270,8 +270,8 @@ impl AgentRecord {
 
 /// one reply block in this surface's OWN vocabulary — exactly the shape the
 /// strict-output instruction asks the model for. `kind` is one of
-/// "Paragraph", "Heading", or "Code" (anything else drops in normalization);
-/// the consuming module maps these to chat blocks at emission.
+/// "paragraph", "heading", or "code" (lowercase; anything else drops in
+/// normalization); the consuming module maps these to chat blocks at emission.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ReplyBlock {
     pub kind: String,
