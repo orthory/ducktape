@@ -164,9 +164,18 @@ impl WorkspaceProvisioner for NodedProvisioner {
         let slug = run_slug(&spec.run_id);
         let dir = self.root.join(&slug);
         // validate every skill mount name BEFORE materializing anything: a
-        // bad name fails the provision with ZERO debris on disk.
+        // bad name fails the provision with ZERO debris on disk. duplicates
+        // are refused too — two mounts sharing a name would silently merge
+        // into one checkout dir.
+        let mut names = std::collections::HashSet::new();
         for m in &spec.ro_mounts {
             mount_dir_name(&m.mount_subpath)?;
+            if !names.insert(m.mount_subpath.as_str()) {
+                return Err(format!(
+                    "duplicate skill mount subpath {:?}",
+                    m.mount_subpath
+                ));
+            }
         }
         let api = ActorNodeApi::new(self.handle.clone());
         let prefix = spec.source_prefix.clone();
