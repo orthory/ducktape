@@ -64,6 +64,11 @@ struct WireEnvelope {
     instructions: String,
     contract: String,
     conversation: String,
+    /// the deterministic forge item-context section (contract §1) — `None`
+    /// (key absent) for every non-forge run. assembled into the provider
+    /// input between the instructions and the contract; None-case assembly
+    /// stays byte-identical.
+    context: Option<String>,
     workspace: Option<WireWorkspace>,
     base_tools: Option<Vec<WireBaseTool>>,
     skills: Option<Vec<WireSkill>>,
@@ -198,11 +203,23 @@ pub async fn prepare(input: &str, resolver: Option<&BlobResolver>) -> Result<Pre
     } else {
         None
     };
-    Ok(Prepared {
-        input: format!(
+    // reading order (coordinator-decided M1 follow-up): system instructions →
+    // item context (forge runs only) → output contract → conversation. the
+    // context section is byte-exact from the envelope field, joined with the
+    // same "\n\n" delimiter as every other section; a context-less envelope
+    // assembles byte-identically to the pre-context worker.
+    let input = match &envelope.context {
+        Some(context) => format!(
+            "{prompt}\n\n{context}\n\n{}\n\n{}",
+            envelope.contract, envelope.conversation
+        ),
+        None => format!(
             "{prompt}\n\n{}\n\n{}",
             envelope.contract, envelope.conversation
         ),
+    };
+    Ok(Prepared {
+        input,
         ctx,
         workspace,
     })
@@ -591,15 +608,20 @@ mod tests {
     #[tokio::test]
     async fn a_forge_envelope_is_accepted_with_its_pinned_source_and_requested_sink() {
         // the whole worker half of the forge flag day: the tagged forge source
-        // surfaces on the plan, and the requested Pr sink decodes with
-        // DEFAULT-EMPTY title/body (the composer omits them; delivery derives
-        // them later — contract §1/§3).
+        // surfaces on the plan, the item context lands in the assembled input
+        // (instructions → context → contract → conversation), and the
+        // requested Pr sink decodes with DEFAULT-EMPTY title/body (the
+        // composer omits them; delivery derives them later — contract §1/§3).
         let Prepared {
             input,
             ctx,
             workspace,
         } = prepare(&forge_envelope_json(), None).await.unwrap();
-        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+        assert_eq!(
+            input,
+            "GENERIC\n\nForge item context — you are working this item as a session.\n\
+             repo: app\nitem: issue #7 (open)\n\nCONTRACT\n\nCONVERSATION"
+        );
         assert!(ctx.portable, "a forge v3 run is portable");
         assert_eq!(ctx.thread_key.as_deref(), Some("forge:app:7#2"));
         let plan = workspace.expect("a forge envelope surfaces its plan");
@@ -627,19 +649,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_v3_envelope_carrying_context_is_still_accepted() {
-        // `context` needs NO oracle handling (contract §1): decode-by-name
-        // tolerates it — this pins the tolerance so a stricter future decode
-        // cannot silently start rejecting forge envelopes. NOTE: prepare()
-        // does not fold context into the assembled input.
+    async fn context_reaches_the_provider_input_between_instructions_and_contract() {
+        // the coordinator-decided reading order (M1 follow-up to contract §1):
+        // system instructions → item context → output contract → conversation.
+        // the section is byte-exact from the envelope field, joined with the
+        // SAME "\n\n" delimiter the existing sections use.
         let mut with_context: serde_json::Value =
             serde_json::from_str(&v3_envelope_json(None)).unwrap();
         with_context["context"] = serde_json::json!("Forge item context — repo: app");
         let Prepared {
             input, workspace, ..
         } = prepare(&with_context.to_string(), None).await.unwrap();
-        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+        assert_eq!(
+            input,
+            "GENERIC\n\nForge item context — repo: app\n\nCONTRACT\n\nCONVERSATION"
+        );
         assert!(workspace.is_some(), "the plan still surfaces");
+
+        // the None case stays byte-identical — no stray delimiter: a
+        // context-less v3 assembles exactly the pre-context bytes (the v2
+        // pin lives in a_null_hash_envelope_assembles_…).
+        let Prepared { input, .. } = prepare(&v3_envelope_json(None), None).await.unwrap();
+        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
     }
 
     #[tokio::test]
