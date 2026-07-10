@@ -61,6 +61,10 @@ pub(super) enum PageError {
     NotAuthor,
     /// comment text over [`MAX_COMMENT_TEXT_BYTES`].
     TextTooLarge,
+    /// an AddComment thread_id/comment_id/target over its length cap —
+    /// bounded so the derived index/thread blocks can never exceed
+    /// [`MAX_BLOCK_LEN`] and abort a block.
+    IdTooLarge,
     /// a thread already holds [`MAX_COMMENTS_PER_THREAD`] comments.
     TooManyComments,
     /// a target already holds [`MAX_THREADS_PER_TARGET`] threads.
@@ -96,6 +100,7 @@ impl core::fmt::Display for PageError {
             PageError::TargetMismatch => "target mismatch",
             PageError::NotAuthor => "not the comment author",
             PageError::TextTooLarge => "comment text too large",
+            PageError::IdTooLarge => "comment id or target too large",
             PageError::TooManyComments => "too many comments in thread",
             PageError::TooManyThreads => "too many threads on target",
             PageError::TooManyTargets => "too many query targets",

@@ -278,6 +278,55 @@ fn same_block_thread_cap_degrades_the_overflow_comment_without_aborting() {
 }
 
 #[test]
+fn an_agent_minted_id_over_the_pages_cap_degrades_not_emits() {
+    // a pathologically long channel id pushes the agent's own minted
+    // comment_id (agent/{run_id}/comment/{index}) past pages'
+    // MAX_COMMENT_ID_BYTES. emitting it would make pages reject the
+    // AddComment (IdTooLarge) and abort the delivery block — the agent lane
+    // must degrade instead (run_id embeds a loosely-bounded channel id).
+    let channel = "c".repeat(120);
+    let mut registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_PAGES_COMMENT])]);
+    registry.get_mut("bot").unwrap().caps.pages_write = vec!["*".into()];
+    let mut m = module().with_pages_module("pages");
+    let mut ctx = CaptureCtx::new().with_origin(user(9)).with_registry(&registry);
+    exec(
+        &mut m,
+        &mut ctx,
+        &admin(&RunsMsg::WatchChannel {
+            channel_id: channel.clone(),
+            policy: TurnPolicy::All,
+        }),
+    )
+    .unwrap();
+    commit(&mut m);
+    let mut ctx = CaptureCtx::new()
+        .at(2)
+        .with_tagging_origin()
+        .with_registry(&registry)
+        .with_transcript(&channel, transcript(2));
+    exec(&mut m, &mut ctx, &engagement(&channel, 2, vec![])).unwrap();
+    commit(&mut m);
+    let run_id = run_id_for(&channel, 2, "bot");
+
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript(&channel, transcript(2))
+        .with_page("p1", page_blocks("p1", "Spec"));
+    deliver(&mut m, &mut ctx, &run_id, comment_effect("b-p"));
+
+    assert!(ctx.page_msgs().is_empty(), "the over-length id is not emitted");
+    assert!(
+        ctx.notes().iter().any(|n| n.contains("length cap")),
+        "the over-length id leaves a breadcrumb: {:?}",
+        ctx.notes()
+    );
+    assert_eq!(ctx.chat_msgs().len(), 1, "the reply still posts (no abort)");
+    assert_delivered(&mut m, &run_id);
+}
+
+#[test]
 fn an_unwired_pages_module_degrades_to_a_breadcrumb() {
     // the same run on a module WITHOUT with_pages_module: the forge-unwired
     // pattern — breadcrumb, no pages msg, delivery proceeds.

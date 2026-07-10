@@ -28,8 +28,9 @@ use agent::CapRequest;
 use super::response::allows;
 use super::{AgentAction, AgentRecord, Ctx, Msg, PendingState, RunsModule};
 use pages::{
-    MAX_COMMENT_TEXT_BYTES, MAX_THREADS_PER_TARGET, PageMsg, PageQuery, PageReply,
-    encode_msg as pages_encode_msg, encode_query as pages_encode_query,
+    MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES, MAX_THREAD_ID_BYTES,
+    MAX_THREADS_PER_TARGET, PageMsg, PageQuery, PageReply, encode_msg as pages_encode_msg,
+    encode_query as pages_encode_query,
 };
 
 /// whether an action belongs to this lane (and is therefore skipped by the
@@ -143,6 +144,21 @@ impl RunsModule {
                         "comment body is {} bytes; the cap is {MAX_COMMENT_TEXT_BYTES}",
                         body.len()
                     ));
+                }
+                // the target and our own minted ids must clear pages' length
+                // caps — an over-length id makes pages reject the AddComment
+                // (IdTooLarge) and abort the delivery block, so degrade here.
+                // run_id embeds a loosely-bounded channel/agent id, so this
+                // guard is load-bearing, not just belt.
+                if target.len() > MAX_COMMENT_TARGET_BYTES {
+                    return Err(format!(
+                        "target exceeds pages' {MAX_COMMENT_TARGET_BYTES}-byte cap"
+                    ));
+                }
+                if page_thread_id(run_id, index).len() > MAX_THREAD_ID_BYTES
+                    || page_comment_id(run_id, index).len() > MAX_COMMENT_ID_BYTES
+                {
+                    return Err("run id yields a comment id over pages' length cap".into());
                 }
                 // target → owning page (the cap is PAGE-scoped). a page root
                 // is itself a block that names itself as `page`, so GetBlock

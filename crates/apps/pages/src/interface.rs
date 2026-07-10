@@ -171,6 +171,20 @@ pub const MAX_COMMENTS_PER_THREAD: usize = 4096;
 pub const MAX_THREADS_PER_TARGET: usize = 1024;
 pub const MAX_QUERY_TARGETS: usize = 512;
 
+// client-minted id length caps (consensus constants). the shared DERIVED
+// blocks — the per-target thread index (a `Vec<thread_id>`, up to
+// `MAX_THREADS_PER_TARGET`) and a thread record (a `Vec<comment_id>`, up to
+// `MAX_COMMENTS_PER_THREAD`) — grow with these ids. WITHOUT a length cap a
+// user (AddComment needs no capability) can pre-bloat a target's index with
+// long ids until one more append trips `MAX_BLOCK_LEN` at stage time and
+// ABORTS the block (a permanent-re-abort R4 wedge). these caps keep those
+// derived blocks safely under `MAX_BLOCK_LEN` (768 KiB) at full count (JSON
+// overhead ≈ 3 B/entry): 1024 × (512+3) ≈ 515 KiB and 4096 × (128+3) ≈ 524
+// KiB, both a comfortable ~250 KiB clear.
+pub const MAX_THREAD_ID_BYTES: usize = 512;
+pub const MAX_COMMENT_ID_BYTES: usize = 128;
+pub const MAX_COMMENT_TARGET_BYTES: usize = 512;
+
 /// who authored a comment — derived from `Env.origin`, never a payload. own
 /// copy of chat's shape (each module's interface is self-contained).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

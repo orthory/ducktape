@@ -23,6 +23,79 @@ fn add_as_agent(thread: &str, comment: &str, target: &str, agent: &str) -> PageM
 }
 
 #[test]
+fn add_comment_rejects_over_length_ids_before_staging() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        let long_thread = "t".repeat(MAX_THREAD_ID_BYTES + 1);
+        apply_err_as(
+            &mut p,
+            &add(&long_thread, "m1", "b1", "hi"),
+            user("alice"),
+            "too large",
+        )
+        .await;
+        let long_comment = "m".repeat(MAX_COMMENT_ID_BYTES + 1);
+        apply_err_as(
+            &mut p,
+            &add("t1", &long_comment, "b1", "hi"),
+            user("alice"),
+            "too large",
+        )
+        .await;
+        let long_target = "b".repeat(MAX_COMMENT_TARGET_BYTES + 1);
+        apply_err_as(
+            &mut p,
+            &add("t1", "m1", &long_target, "hi"),
+            user("alice"),
+            "too large",
+        )
+        .await;
+        // nothing staged — an id at exactly the cap still lands.
+        apply_commit_as(
+            &mut p,
+            &add(&"t".repeat(MAX_THREAD_ID_BYTES), "m1", "b1", "hi"),
+            user("alice"),
+        )
+        .await;
+    });
+}
+
+/// the R4 invariant: at the count caps, ids bounded to their length caps keep
+/// the DERIVED shared blocks under MAX_BLOCK_LEN, so an AddComment append can
+/// never abort a block on size. proven by serializing the worst case.
+#[test]
+fn bounded_ids_keep_the_derived_blocks_under_max_block_len() {
+    // the per-target thread index is a Vec<thread_id> of up to
+    // MAX_THREADS_PER_TARGET entries.
+    let tid = "t".repeat(MAX_THREAD_ID_BYTES);
+    let index: Vec<String> = (0..MAX_THREADS_PER_TARGET).map(|_| tid.clone()).collect();
+    let index_bytes = serde_json::to_vec(&index).unwrap().len();
+    assert!(
+        index_bytes < MAX_BLOCK_LEN,
+        "full target index {index_bytes} >= {MAX_BLOCK_LEN}"
+    );
+
+    // a thread record holds comment_ids: Vec<comment_id> up to
+    // MAX_COMMENTS_PER_THREAD, plus its own (bounded) id/target fields.
+    let thread = Thread {
+        id: "t".repeat(MAX_THREAD_ID_BYTES),
+        target: "b".repeat(MAX_COMMENT_TARGET_BYTES),
+        opener: AuthorRef::System,
+        created_at: 0,
+        resolved: false,
+        resolved_by: None,
+        comment_ids: (0..MAX_COMMENTS_PER_THREAD)
+            .map(|_| "m".repeat(MAX_COMMENT_ID_BYTES))
+            .collect(),
+    };
+    let thread_bytes = serde_json::to_vec(&thread).unwrap().len();
+    assert!(
+        thread_bytes < MAX_BLOCK_LEN,
+        "full thread block {thread_bytes} >= {MAX_BLOCK_LEN}"
+    );
+}
+
+#[test]
 fn as_agent_refines_a_module_origin_into_an_agent_author() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = Pages::init(context, "pages").await;
