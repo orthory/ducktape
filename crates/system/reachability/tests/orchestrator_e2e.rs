@@ -92,9 +92,8 @@ fn spawn_mesh_gated(
     resolvers: Vec<StaticResolver>,
     links_up: Arc<std::sync::atomic::AtomicBool>,
 ) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
-    let filter: DeliveryFilter = Rc::new(move |_, _, _| {
-        usize::from(links_up.load(std::sync::atomic::Ordering::Relaxed))
-    });
+    let filter: DeliveryFilter =
+        Rc::new(move |_, _, _| usize::from(links_up.load(std::sync::atomic::Ordering::Relaxed)));
     spawn_mesh_filtered(local, dir, seeds, resolvers, filter)
 }
 
@@ -337,10 +336,7 @@ async fn three_member_mesh_converges_and_applies() {
             let identity_of_seed =
                 |seed: u64| binding::identity_of(&PrivateKey::from_seed(seed).public_key());
             let mut r0 = StaticResolver::default();
-            r0.0.insert(
-                NodeKey(identity_of_seed(3).0),
-                Resolution::Punched(punched),
-            );
+            r0.0.insert(NodeKey(identity_of_seed(3).0), Resolution::Punched(punched));
             let (nodes, mut collected) = spawn_mesh(
                 &local,
                 dir.path(),
@@ -379,10 +375,9 @@ async fn three_member_mesh_converges_and_applies() {
                     if i == j {
                         continue;
                     }
-                    let (peer_keys, _) = WireGuardKeypair::load_or_generate(
-                        &dir.path().join(format!("wg-{j}.key")),
-                    )
-                    .unwrap();
+                    let (peer_keys, _) =
+                        WireGuardKeypair::load_or_generate(&dir.path().join(format!("wg-{j}.key")))
+                            .unwrap();
                     let entry = config
                         .peers
                         .iter()
@@ -573,13 +568,10 @@ async fn private_coordinator_admits_authenticated_bind() {
 
     // a genesis member: admitted by membership, no cap needed.
     let member_key = node_key_of(&member.public_key());
-    let m = reachability::NatResolver::bind(
-        member_key,
-        vec![coord_addr],
-        Some((member.clone(), None)),
-    )
-    .await
-    .expect("a genesis member's authenticated bind is admitted");
+    let m =
+        reachability::NatResolver::bind(member_key, vec![coord_addr], Some((member.clone(), None)))
+            .await
+            .expect("a genesis member's authenticated bind is admitted");
     assert!(
         m.reflexive().is_some(),
         "the member discovered its reflexive through the private coordinator"
@@ -638,12 +630,9 @@ async fn private_coordinator_denies_uncredentialed_bind() {
 
     // control: a credentialed member binds against the same coordinator.
     let member_key = node_key_of(&member.public_key());
-    let ok = reachability::NatResolver::bind(
-        member_key,
-        vec![coord_addr],
-        Some((member.clone(), None)),
-    )
-    .await;
+    let ok =
+        reachability::NatResolver::bind(member_key, vec![coord_addr], Some((member.clone(), None)))
+            .await;
     assert!(
         ok.is_ok(),
         "a genesis member binds against the same coordinator: {:?}",
@@ -677,12 +666,14 @@ async fn private_coordinator_cross_peer_punch() {
     let a_cap = nat_traversal::mint_coord_cap(&g, a_key, nat_traversal::now_secs() + 3600);
     let b_cap = nat_traversal::mint_coord_cap(&g, b_key, nat_traversal::now_secs() + 3600);
 
-    let mut a = reachability::NatResolver::bind(a_key, vec![coord_addr], Some((a_signer, Some(a_cap))))
-        .await
-        .expect("A's authenticated bind is admitted");
-    let mut b = reachability::NatResolver::bind(b_key, vec![coord_addr], Some((b_signer, Some(b_cap))))
-        .await
-        .expect("B's authenticated bind is admitted");
+    let mut a =
+        reachability::NatResolver::bind(a_key, vec![coord_addr], Some((a_signer, Some(a_cap))))
+            .await
+            .expect("A's authenticated bind is admitted");
+    let mut b =
+        reachability::NatResolver::bind(b_key, vec![coord_addr], Some((b_signer, Some(b_cap))))
+            .await
+            .expect("B's authenticated bind is admitted");
     assert!(a.reflexive().is_some() && b.reflexive().is_some());
 
     // Cross-peer resolve on both sides: A looks up B's key, B looks up A's.
@@ -882,9 +873,8 @@ async fn star_topology_relays_gossip_through_the_hub() {
     let dir = tempfile::tempdir().unwrap();
     local
         .run_until(async {
-            let filter: DeliveryFilter = Rc::new(|from, to, _| {
-                usize::from(!matches!((from, to), (1, 2) | (2, 1)))
-            });
+            let filter: DeliveryFilter =
+                Rc::new(|from, to, _| usize::from(!matches!((from, to), (1, 2) | (2, 1))));
             let (nodes, mut collected) =
                 spawn_mesh_filtered(&local, dir.path(), &[1, 2, 3], vec![], filter);
             retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
@@ -1064,10 +1054,9 @@ async fn cold_restart_restores_the_mesh_with_no_transport_at_all() {
                     if i == j {
                         continue;
                     }
-                    let (peer_keys, _) = WireGuardKeypair::load_or_generate(
-                        &dir.path().join(format!("wg-{j}.key")),
-                    )
-                    .unwrap();
+                    let (peer_keys, _) =
+                        WireGuardKeypair::load_or_generate(&dir.path().join(format!("wg-{j}.key")))
+                            .unwrap();
                     let entry = config
                         .peers
                         .iter()
@@ -1121,13 +1110,8 @@ async fn cold_restart_filters_departed_members() {
     local
         .run_until(async {
             let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (nodes, mut collected) = spawn_mesh_gated(
-                &local,
-                dir.path(),
-                &[1, 2, 3],
-                vec![],
-                links_up,
-            );
+            let (nodes, mut collected) =
+                spawn_mesh_gated(&local, dir.path(), &[1, 2, 3], vec![], links_up);
             // the resumed epoch dropped node 2.
             retarget_all(&nodes, &[0, 1], &[], 2, 20).await;
 
@@ -1140,7 +1124,10 @@ async fn cold_restart_filters_departed_members() {
                 let other = &nodes[1 - i];
                 assert_eq!(fake.applied.len(), 1);
                 assert_eq!(fake.applied[0].peers.len(), 1);
-                assert_eq!(fake.applied[0].peers[0].allowed_ips, vec![ula(other.identity)]);
+                assert_eq!(
+                    fake.applied[0].peers[0].allowed_ips,
+                    vec![ula(other.identity)]
+                );
             }
         })
         .await;
@@ -1257,7 +1244,10 @@ async fn await_prewarmed(
 /// in place, so the last config is the interface's current truth.
 fn latest_config(node: &TestNode) -> defguard_wireguard_rs::InterfaceConfiguration {
     let fake = node.effect.0.lock().unwrap();
-    fake.applied.last().expect("node applied at least once").clone()
+    fake.applied
+        .last()
+        .expect("node applied at least once")
+        .clone()
 }
 
 /// The pre-warm headline: a standby's tunnels exist on BOTH sides before its
@@ -1433,12 +1423,9 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
             // the standby re-advertises from a new address (a NAT rebind):
             // same identity and WireGuard key, higher nonce, new endpoint.
             let policy = PortPolicy::production();
-            let set = reachability::active_set(
-                CHAIN,
-                1,
-                vec![nodes[0].identity, nodes[1].identity],
-            )
-            .unwrap();
+            let set =
+                reachability::active_set(CHAIN, 1, vec![nodes[0].identity, nodes[1].identity])
+                    .unwrap();
             let (standby_keys, _) =
                 WireGuardKeypair::load_or_generate(&dir.path().join("wg-2.key")).unwrap();
             let rebind = |nonce: u64, octet: u8| {
@@ -1575,7 +1562,11 @@ async fn record_from_neither_member_nor_standby_is_refused() {
             .expect("the stranger record surfaced");
             assert!(reason.contains("unknown identity"), "{reason}");
             let fake = nodes[0].effect.0.lock().unwrap();
-            assert_eq!(fake.applied.len(), 1, "nothing beyond the member mesh applied");
+            assert_eq!(
+                fake.applied.len(),
+                1,
+                "nothing beyond the member mesh applied"
+            );
         })
         .await;
 }
@@ -1642,13 +1633,11 @@ async fn standby_persists_the_member_mesh_for_its_promotion_reboot() {
                 // adverts must be on disk before this life ends.
                 tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
-                        let full = reachability::store::load(
-                            &dir.path().join("mesh-2.json"),
-                            CHAIN,
-                        )
-                        .ok()
-                        .flatten()
-                        .is_some_and(|mesh| mesh.adverts.len() == 2);
+                        let full =
+                            reachability::store::load(&dir.path().join("mesh-2.json"), CHAIN)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|mesh| mesh.adverts.len() == 2);
                         if full {
                             break;
                         }
@@ -1819,13 +1808,22 @@ async fn bootstrap_coordinated_invite_resolves_installs_and_acks() {
                 .expect("coordinated bootstrap replied in time")
                 .expect("reply channel intact")
                 .expect("coordinated bootstrap succeeded");
-            assert_eq!(got, ack, "the bootstrap returns the inviter's IntroAck bytes");
+            assert_eq!(
+                got, ack,
+                "the bootstrap returns the inviter's IntroAck bytes"
+            );
 
             // the intro went to the RESOLVED punched endpoint, not the advertised
             // one — the coordinated path used rendezvous, not a baked address.
             let (dest, intro) = sent.borrow().clone().expect("resolver saw the intro send");
-            assert_eq!(dest, punched, "intro sent to the coordinator-punched endpoint");
-            assert_eq!(intro, b"intro-request", "the joiner's own intro rode across");
+            assert_eq!(
+                dest, punched,
+                "intro sent to the coordinator-punched endpoint"
+            );
+            assert_eq!(
+                intro, b"intro-request",
+                "the joiner's own intro rode across"
+            );
 
             // the inviter is now a join-window peer on the interface.
             let installed = tokio::time::timeout(Duration::from_secs(5), async {

@@ -848,11 +848,7 @@ impl DispatchModule {
     /// the saga's current lease holder, read through the host-routed sibling
     /// lane — the filtered-facade pattern (cf. `upgrade::members`). read-only:
     /// this never stages, so it is safe inside `query_with`.
-    async fn saga_assignee(
-        &self,
-        ctx: &dyn Ctx,
-        saga_id: &str,
-    ) -> Result<Option<Vec<u8>>, Error> {
+    async fn saga_assignee(&self, ctx: &dyn Ctx, saga_id: &str) -> Result<Option<Vec<u8>>, Error> {
         let reply = ctx
             .query(
                 &self.saga,
@@ -1126,12 +1122,10 @@ mod tests {
         // the tests address dispatches by their composite state key; split it
         // back into the wire query's (receiver, local id) coordinates.
         let (receiver, dispatch_id) = key.split_once(SEP).expect("composite key");
-        let reply = block_on(m.query(&crate::encode_query(
-            &DispatchQuery::Dispatch {
-                receiver: receiver.into(),
-                dispatch_id: dispatch_id.into(),
-            },
-        )))
+        let reply = block_on(m.query(&crate::encode_query(&DispatchQuery::Dispatch {
+            receiver: receiver.into(),
+            dispatch_id: dispatch_id.into(),
+        })))
         .unwrap();
         match crate::decode_reply(&reply).unwrap() {
             DispatchReply::Dispatch(v) => v,
@@ -1139,10 +1133,8 @@ mod tests {
         }
     }
     fn pending_deliveries(m: &DispatchModule) -> u64 {
-        let reply = block_on(m.query(&crate::encode_query(
-            &DispatchQuery::PendingDeliveries,
-        )))
-        .unwrap();
+        let reply =
+            block_on(m.query(&crate::encode_query(&DispatchQuery::PendingDeliveries))).unwrap();
         match crate::decode_reply(&reply).unwrap() {
             DispatchReply::PendingDeliveries(n) => n,
             other => panic!("expected PendingDeliveries reply, got {other:?}"),
@@ -1255,14 +1247,11 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
-        let reply = block_on(
-            m.query(&crate::encode_query(&DispatchQuery::Recipe {
-                recipe_id: "summarize".into(),
-            })),
-        )
+        let reply = block_on(m.query(&crate::encode_query(&DispatchQuery::Recipe {
+            recipe_id: "summarize".into(),
+        })))
         .unwrap();
-        let DispatchReply::Recipe(Some(recipe)) = crate::decode_reply(&reply).unwrap()
-        else {
+        let DispatchReply::Recipe(Some(recipe)) = crate::decode_reply(&reply).unwrap() else {
             panic!("recipe committed");
         };
         assert_eq!(recipe.capability, "beta");

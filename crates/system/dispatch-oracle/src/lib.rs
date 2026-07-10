@@ -40,9 +40,9 @@ pub use pool::{
     DEFAULT_MAX_CONCURRENT_RUNS, DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env,
 };
 pub use provision::{
-    BaseTool, PortablePlan, ProvisionedWorkspace, RoMount, RunEffect, SharedProvisioner, Sink, Status,
-    WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec, assemble_runner_result, bind_workspace,
-    effects_from_response_text,
+    BaseTool, PortablePlan, ProvisionedWorkspace, RoMount, RunEffect, SharedProvisioner, Sink,
+    Status, WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec, assemble_runner_result,
+    bind_workspace, effects_from_response_text,
 };
 
 /// everything a provider execution needs, extracted by the gate so the
@@ -324,8 +324,7 @@ format = "text"
             .unwrap()
         {
             WorkOutcome::Handled(Some(msg)) => {
-                let SagaMsg::OracleResult { outcome, .. } =
-                    saga::decode_msg(&msg.payload).unwrap()
+                let SagaMsg::OracleResult { outcome, .. } = saga::decode_msg(&msg.payload).unwrap()
                 else {
                     panic!("expected an oracle result");
                 };
@@ -379,15 +378,13 @@ format = "text"
         );
         let worker = DispatchWorker::new(providers, b"me".to_vec());
         match worker.run(&effect_for(work_spec(), None)).await.unwrap() {
-            WorkOutcome::Handled(Some(msg)) => {
-                match saga::decode_msg(&msg.payload).unwrap() {
-                    SagaMsg::Accept { saga_id, attempt } => {
-                        assert_eq!(saga_id, "s");
-                        assert_eq!(attempt, 0);
-                    }
-                    other => panic!("expected an Accept claim, got {other:?}"),
+            WorkOutcome::Handled(Some(msg)) => match saga::decode_msg(&msg.payload).unwrap() {
+                SagaMsg::Accept { saga_id, attempt } => {
+                    assert_eq!(saga_id, "s");
+                    assert_eq!(attempt, 0);
                 }
-            }
+                other => panic!("expected an Accept claim, got {other:?}"),
+            },
             other => panic!("a claimable announcement must produce an op, got {other:?}"),
         }
 
@@ -436,8 +433,7 @@ format = "text"
         });
         match worker.run(&effect_for(spec, Some(b"me"))).await.unwrap() {
             WorkOutcome::Handled(Some(msg)) => {
-                let SagaMsg::OracleResult { outcome, .. } =
-                    saga::decode_msg(&msg.payload).unwrap()
+                let SagaMsg::OracleResult { outcome, .. } = saga::decode_msg(&msg.payload).unwrap()
                 else {
                     panic!("expected an oracle result");
                 };

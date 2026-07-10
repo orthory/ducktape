@@ -695,7 +695,10 @@ format = "text"
             "assembly order: prompt-or-instructions, contract, conversation"
         );
         let (input, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
-        assert!(!input.contains("ducktape_run"), "the provider never sees envelope JSON");
+        assert!(
+            !input.contains("ducktape_run"),
+            "the provider never sees envelope JSON"
+        );
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert_eq!(ctx.thread_key.as_deref(), Some("general#7"));
     }
@@ -745,7 +748,10 @@ format = "text"
             "the registered prompt replaces the generic instructions"
         );
         let (input, _) = probes.last_run.lock().unwrap().clone().unwrap();
-        assert!(!input.contains("GENERIC"), "no silent generic fallback: {input:?}");
+        assert!(
+            !input.contains("GENERIC"),
+            "no silent generic fallback: {input:?}"
+        );
     }
 
     #[tokio::test]
@@ -817,8 +823,8 @@ format = "text"
             spec: &WorkspaceSpec,
         ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
             self.provisioned.store(true, Ordering::SeqCst);
-            let dir = std::env::temp_dir()
-                .join(format!("mock-ws-{}", spec.run_id.replace(':', "_")));
+            let dir =
+                std::env::temp_dir().join(format!("mock-ws-{}", spec.run_id.replace(':', "_")));
             let mut env = BTreeMap::new();
             env.insert("DUCKTAPE_RUN_WORKSPACE".into(), dir.display().to_string());
             Ok(Box::new(MockWs {
@@ -926,10 +932,16 @@ format = "text"
         let bytes = outcome.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["ducktape_runner_result"], 1);
-        assert_eq!(v["response_text"], "answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION");
+        assert_eq!(
+            v["response_text"],
+            "answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION"
+        );
         assert_eq!(v["workspace_receipt"]["output_snapshot"], "cc".repeat(32));
         assert_eq!(v["workspace_receipt"]["commit_height"], 9);
-        assert_eq!(v["workspace_receipt"]["source_prefix"], "/shared/agent-workspaces/bot");
+        assert_eq!(
+            v["workspace_receipt"]["source_prefix"],
+            "/shared/agent-workspaces/bot"
+        );
         assert_eq!(v["workspace_receipt"]["no_changes"], false);
 
         // the full lifecycle fired, and the provider ran INSIDE the mount.
@@ -1036,13 +1048,22 @@ format = "text"
         let (_, _, outcome) = next_result(&mut rx).await;
 
         let err = outcome.unwrap_err();
-        assert!(err.contains("provider exploded"), "the run's error surfaces: {err}");
-        assert!(provisioned.load(Ordering::SeqCst), "the mount was materialized");
+        assert!(
+            err.contains("provider exploded"),
+            "the run's error surfaces: {err}"
+        );
+        assert!(
+            provisioned.load(Ordering::SeqCst),
+            "the mount was materialized"
+        );
         assert!(
             !committed.load(Ordering::SeqCst),
             "a failed run commits NOTHING — no output_ref for a discarded attempt"
         );
-        assert!(cleaned.load(Ordering::SeqCst), "cleanup still runs on failure (W5)");
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "cleanup still runs on failure (W5)"
+        );
     }
 
     #[tokio::test]
@@ -1070,11 +1091,13 @@ format = "text"
         let bytes = outcome.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["ducktape_runner_result"], 1);
-        assert_eq!(v["response_text"], "answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION");
+        assert_eq!(
+            v["response_text"],
+            "answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION"
+        );
         assert_eq!(v["status"], "degraded", "a failed capture degrades the run");
         assert_eq!(
-            v["workspace_receipt"]["commit_error"],
-            "commit conflict: head moved",
+            v["workspace_receipt"]["commit_error"], "commit conflict: head moved",
             "the receipt records the real failure for the audit lane (I4)"
         );
         assert_eq!(
@@ -1146,7 +1169,10 @@ format = "text"
 
         let bytes = outcome.expect("the run's answer still delivers (R4)");
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["status"], "degraded", "a timed-out capture degrades the run");
+        assert_eq!(
+            v["status"], "degraded",
+            "a timed-out capture degrades the run"
+        );
         assert!(
             v["workspace_receipt"]["commit_error"]
                 .as_str()
@@ -1180,7 +1206,9 @@ format = "text"
     async fn a_panicking_provider_still_cleans_up_and_fails_the_attempt() {
         let providers = Arc::new(ProviderSet::assemble(
             capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
-            vec![Box::new(PanicProvider { tag: "alpha".into() })],
+            vec![Box::new(PanicProvider {
+                tag: "alpha".into(),
+            })],
         ));
         let (provisioned, committed, cleaned) = flags();
         let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
@@ -1200,7 +1228,10 @@ format = "text"
             err.contains("panicked") && err.contains("provider crashed hard"),
             "the panic payload surfaces in the saga error: {err}"
         );
-        assert!(provisioned.load(Ordering::SeqCst), "the mount was materialized");
+        assert!(
+            provisioned.load(Ordering::SeqCst),
+            "the mount was materialized"
+        );
         assert!(
             !committed.load(Ordering::SeqCst),
             "a panicked run commits NOTHING"
@@ -1243,9 +1274,14 @@ format = "text"
         // without a provisioner.
         let (providers, _p) = slow_providers(Duration::from_millis(5), false);
         let (pool, mut rx) = pool_with(providers, 4);
-        pool.run(&effect_with_payload("s1", 0, Some(b"me"), &envelope_payload(None)))
-            .await
-            .unwrap();
+        pool.run(&effect_with_payload(
+            "s1",
+            0,
+            Some(b"me"),
+            &envelope_payload(None),
+        ))
+        .await
+        .unwrap();
         assert_eq!(next_result(&mut rx).await.2.unwrap(), expected);
 
         // with a provisioner wired: a v2 run carries no plan, so the bracket
@@ -1259,11 +1295,19 @@ format = "text"
             fail_commit: None,
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
-        pool.run(&effect_with_payload("s1", 0, Some(b"me"), &envelope_payload(None)))
-            .await
-            .unwrap();
+        pool.run(&effect_with_payload(
+            "s1",
+            0,
+            Some(b"me"),
+            &envelope_payload(None),
+        ))
+        .await
+        .unwrap();
         assert_eq!(next_result(&mut rx).await.2.unwrap(), expected);
-        assert!(!provisioned.load(Ordering::SeqCst), "a v2 run never provisions");
+        assert!(
+            !provisioned.load(Ordering::SeqCst),
+            "a v2 run never provisions"
+        );
         assert!(!committed.load(Ordering::SeqCst));
         assert!(!cleaned.load(Ordering::SeqCst));
     }
@@ -1351,12 +1395,22 @@ format = "text"
 
         // (1) the minimal shape (empty facets) still decodes and still yields
         //     response_text via the runs contract.
-        let minimal = assemble_runner_result("the answer", &receipt, None, Vec::new(), Sink::Chain, Status::Ok);
+        let minimal = assemble_runner_result(
+            "the answer",
+            &receipt,
+            None,
+            Vec::new(),
+            Sink::Chain,
+            Status::Ok,
+        );
         let parsed: RunsRunnerResult = serde_json::from_slice(&minimal)
             .expect("minimal bytes deserialize into the runs contract");
         assert_eq!(parsed.ducktape_runner_result, 1);
         assert_eq!(parsed.response_text, "the answer");
-        assert_eq!(parsed.workspace_receipt.output_snapshot, Some("cc".repeat(32)));
+        assert_eq!(
+            parsed.workspace_receipt.output_snapshot,
+            Some("cc".repeat(32))
+        );
         assert!(parsed.effects.is_empty());
         assert_eq!(parsed.sink, RunsSink::Chain);
         assert_eq!(parsed.status, RunsStatus::Ok);
@@ -1411,14 +1465,12 @@ format = "text"
 
         // a servable announcement: an immediate Accept claim.
         match pool.run(&effect_for("s1", 0, None)).await.unwrap() {
-            WorkOutcome::Handled(Some(msg)) => {
-                match saga::decode_msg(&msg.payload).unwrap() {
-                    SagaMsg::Accept { saga_id, attempt } => {
-                        assert_eq!((saga_id.as_str(), attempt), ("s1", 0));
-                    }
-                    other => panic!("expected an Accept claim, got {other:?}"),
+            WorkOutcome::Handled(Some(msg)) => match saga::decode_msg(&msg.payload).unwrap() {
+                SagaMsg::Accept { saga_id, attempt } => {
+                    assert_eq!((saga_id.as_str(), attempt), ("s1", 0));
                 }
-            }
+                other => panic!("expected an Accept claim, got {other:?}"),
+            },
             other => panic!("a servable announcement must claim, got {other:?}"),
         }
 
@@ -1445,13 +1497,8 @@ format = "text"
                 let _ = tx.unbounded_send(msg);
             })
         });
-        let pool = DispatchPool::with_limit(
-            providers,
-            b"me".to_vec(),
-            Box::new(|_fut| {}),
-            deliver,
-            0,
-        );
+        let pool =
+            DispatchPool::with_limit(providers, b"me".to_vec(), Box::new(|_fut| {}), deliver, 0);
         // a zero cap would deadlock every run; the pool clamps to 1.
         assert_eq!(pool.semaphore.available_permits(), 1);
     }

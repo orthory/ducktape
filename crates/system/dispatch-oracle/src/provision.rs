@@ -421,7 +421,8 @@ mod tests {
     #[test]
     fn assembled_runner_result_carries_marker_text_and_receipt() {
         let r = WorkspaceReceipt::committed(&spec(), "cc".repeat(32), 9, true);
-        let bytes = assemble_runner_result("the answer", &r, None, Vec::new(), Sink::Chain, Status::Ok);
+        let bytes =
+            assemble_runner_result("the answer", &r, None, Vec::new(), Sink::Chain, Status::Ok);
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["ducktape_runner_result"], 1);
         assert_eq!(v["response_text"], "the answer");
@@ -443,7 +444,10 @@ mod tests {
         assert!(obj.contains_key("response_text"));
         assert!(obj.contains_key("workspace_receipt"));
         assert!(!obj.contains_key("data"), "empty data must skip-serialize");
-        assert!(!obj.contains_key("effects"), "empty effects must skip-serialize");
+        assert!(
+            !obj.contains_key("effects"),
+            "empty effects must skip-serialize"
+        );
         assert!(!obj.contains_key("sink"), "chain sink must skip-serialize");
         assert!(!obj.contains_key("status"), "ok status must skip-serialize");
     }

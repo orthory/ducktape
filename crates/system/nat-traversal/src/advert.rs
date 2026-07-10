@@ -99,8 +99,8 @@ impl AdvertBook {
     /// slot back — the reboot case.
     pub fn observe(&mut self, key: NodeKey, src: SocketAddr, now: u64) {
         match self.latest.get(&key) {
-            Some(prev)
-                if !self.expired(prev, now) && (prev.nonce > 0 || prev.reflexive != src) => {}
+            Some(prev) if !self.expired(prev, now) && (prev.nonce > 0 || prev.reflexive != src) => {
+            }
             _ => self.insert_fresh(key, src, 0, now),
         }
     }
@@ -281,8 +281,16 @@ mod tests {
         let mut book = AdvertBook::with_ttl(120);
         book.observe(key, addr(1, 4000), 1_000);
         book.observe(key, addr(1, 4000), 1_050);
-        assert_eq!(book.current(key, 1_160), Some(addr(1, 4000)), "life extended to 1_170");
-        assert_eq!(book.current(key, 1_171), None, "the same-source refresh moved last_seen");
+        assert_eq!(
+            book.current(key, 1_160),
+            Some(addr(1, 4000)),
+            "life extended to 1_170"
+        );
+        assert_eq!(
+            book.current(key, 1_171),
+            None,
+            "the same-source refresh moved last_seen"
+        );
 
         // ...but a DIFFERENT-source nonce-0 register does NOT repoint a live
         // baseline mapping. A genuine NAT rebind re-advertises under a higher

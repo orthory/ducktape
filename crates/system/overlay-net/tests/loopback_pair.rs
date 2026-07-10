@@ -161,10 +161,7 @@ async fn handshake_and_datagram_echo() {
 async fn handshake_completes_toward_a_v4_endpoint() {
     let (mut a, mut b) = (stand_up(0x51, 0xa), stand_up(0x62, 0xb));
     // a dials b at its V4 loopback literal, not the v6 form.
-    let b_v4 = SocketAddr::new(
-        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        b.endpoint.port(),
-    );
+    let b_v4 = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), b.endpoint.port());
     let (a_port, b_port) = (a.endpoint.port(), b.endpoint.port());
     let peers_for_a = vec![peer_entry(&b, Some(b_v4))];
     let peers_for_b = vec![peer_entry(&a, None)];

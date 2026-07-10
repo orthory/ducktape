@@ -11,17 +11,17 @@
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
-use governance::invite::{
-    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof,
-};
+use governance::invite::{INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof};
 use governance::{
-    Governance, GovMsg, GovQuery, GovReply, decode_reply as gov_decode, encode_msg as gov_encode,
+    GovMsg, GovQuery, GovReply, Governance, decode_reply as gov_decode, encode_msg as gov_encode,
     encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Msg, Origin};
 use valset::Valset;
-use valset::{ValsetQuery, ValsetReply, decode_reply as valset_decode, encode_query as valset_query};
+use valset::{
+    ValsetQuery, ValsetReply, decode_reply as valset_decode, encode_query as valset_query,
+};
 
 const BINDING: &[u8] = b"testnet#00000000@feedface";
 
@@ -121,9 +121,14 @@ fn a_valid_redemption_grants_full_node_standing_without_a_ballot() {
         let (member, joiner) = (keypair(1), keypair(9));
         let token = mint(&member, 7);
 
-        submit_as(&mut host, &key_bytes(&member), 1, redeem_msg(&token, &joiner))
-            .await
-            .expect("redeem");
+        submit_as(
+            &mut host,
+            &key_bytes(&member),
+            1,
+            redeem_msg(&token, &joiner),
+        )
+        .await
+        .expect("redeem");
 
         assert_eq!(
             residents(&host).await,
@@ -145,14 +150,24 @@ fn a_token_is_single_use_and_survives_snapshot_round_trip() {
         let (member, joiner, second) = (keypair(1), keypair(9), keypair(10));
         let token = mint(&member, 7);
 
-        submit_as(&mut host, &key_bytes(&member), 1, redeem_msg(&token, &joiner))
-            .await
-            .expect("first redemption");
+        submit_as(
+            &mut host,
+            &key_bytes(&member),
+            1,
+            redeem_msg(&token, &joiner),
+        )
+        .await
+        .expect("first redemption");
 
         // the same token under a DIFFERENT key: single-use, deterministic reject.
-        let err = submit_as(&mut host, &key_bytes(&member), 2, redeem_msg(&token, &second))
-            .await
-            .expect_err("second redemption must be refused");
+        let err = submit_as(
+            &mut host,
+            &key_bytes(&member),
+            2,
+            redeem_msg(&token, &second),
+        )
+        .await
+        .expect_err("second redemption must be refused");
         assert!(
             matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("already redeemed")),
             "got {err:?}"
@@ -192,9 +207,14 @@ fn forged_or_unauthorized_redemptions_are_refused() {
         // a token minted by a NON-member verifies cryptographically but fails
         // the membership check — an outsider cannot admit anyone.
         let foreign = mint(&outsider, 3);
-        let err = submit_as(&mut host, &key_bytes(&member), 1, redeem_msg(&foreign, &joiner))
-            .await
-            .expect_err("non-member token must be refused");
+        let err = submit_as(
+            &mut host,
+            &key_bytes(&member),
+            1,
+            redeem_msg(&foreign, &joiner),
+        )
+        .await
+        .expect_err("non-member token must be refused");
         assert!(
             matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("no longer part")),
             "got {err:?}"
@@ -236,9 +256,14 @@ fn a_network_without_a_binding_refuses_redemption() {
 
         let (member, joiner) = (keypair(1), keypair(9));
         let token = mint(&member, 5);
-        let err = submit_as(&mut host, &key_bytes(&member), 1, redeem_msg(&token, &joiner))
-            .await
-            .expect_err("no binding — refuse");
+        let err = submit_as(
+            &mut host,
+            &key_bytes(&member),
+            1,
+            redeem_msg(&token, &joiner),
+        )
+        .await
+        .expect_err("no binding — refuse");
         assert!(
             matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("not wired")),
             "got {err:?}"

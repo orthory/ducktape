@@ -420,13 +420,19 @@ mod tests {
 
         let sk = SigningKey::from_slice(&[0x33u8; 32]).expect("valid scalar");
         // compressed SEC1 — the form commonware's secp256r1 PublicKey decodes.
-        let new_key = sk.verifying_key().to_encoded_point(true).as_bytes().to_vec();
+        let new_key = sk
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
         let account_id = [0xaau8; 33];
 
         let payload =
             crate::add_member_signing_payload("chain-a", &account_id, &new_key, KeyKind::P256, 7);
         let sig: Signature = sk.sign(&payload);
-        let proof = MemberProof::Signature { sig: sig.to_bytes().to_vec() };
+        let proof = MemberProof::Signature {
+            sig: sig.to_bytes().to_vec(),
+        };
 
         let preimage =
             crate::add_member_preimage("chain-a", &account_id, &new_key, KeyKind::P256, 7);
@@ -447,7 +453,9 @@ mod tests {
             KeyKind::P256,
             8,
         ));
-        let stale_proof = MemberProof::Signature { sig: stale.to_bytes().to_vec() };
+        let stale_proof = MemberProof::Signature {
+            sig: stale.to_bytes().to_vec(),
+        };
         assert!(!verify_authority(
             KeyKind::P256,
             &new_key,
