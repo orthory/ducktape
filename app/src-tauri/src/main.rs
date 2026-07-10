@@ -13,6 +13,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
+mod gateway_window;
 mod enroll;
 mod forge_git;
 mod huddle;
@@ -29,6 +30,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             workspaces::workspace_list,
             workspaces::workspace_active,
+            workspaces::gateway_route_bind,
+            workspaces::gateway_route_unbind,
+            workspaces::gateway_route_list,
+            gateway_window::gateway_open_window,
             workspaces::workspace_create,
             workspaces::workspace_join,
             workspaces::workspace_invite_blob,
@@ -54,6 +59,7 @@ fn main() {
             user_identity::user_identity_lock,
             user_identity::user_sign_bind,
             user_identity::user_sign_unbind,
+            user_identity::user_sign_gateway_route,
             user_identity::user_sign_possession,
             user_identity::user_sign_add_member,
             user_identity::user_sign_remove_member,

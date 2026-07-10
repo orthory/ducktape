@@ -422,7 +422,8 @@ fn full_surface_blocks_authorship_and_ws() {
             "forge",
             "files",
             "identity",
-            "duckdns"
+            "duckdns",
+            "gateway"
         ]
     );
     let genesis_hash = status["appHash"].as_str().expect("appHash").to_string();

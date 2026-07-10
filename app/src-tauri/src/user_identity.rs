@@ -630,6 +630,42 @@ fn user_sign_unbind_blocking(
     Ok(last_line(&out))
 }
 
+/// Sign one bounded global gateway route statement. The sidecar parses the
+/// exact typed statement and returns a ready-to-submit `GatewayMsg`; this is
+/// purpose-specific and never exposes a generic signing oracle.
+#[tauri::command]
+pub async fn user_sign_gateway_route(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    statement: String,
+) -> Result<String, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || user_sign_gateway_route_blocking(app, statement))
+        .await
+}
+
+fn user_sign_gateway_route_blocking(
+    app: tauri::AppHandle,
+    statement: String,
+) -> Result<String, String> {
+    let stdin_lines = signing_stdin(&app)?;
+    let stdin_refs: Vec<&str> = stdin_lines.iter().map(SecretString::as_ref).collect();
+    let out = run_verb_with_stdin(
+        &[
+            "user-sign-gateway-route",
+            "--key",
+            &user_key_path(&app)?.to_string_lossy(),
+            "--statement",
+            &statement,
+        ],
+        &stdin_refs,
+    )?;
+    Ok(last_line(&out))
+}
+
 /// sign this machine's ed25519 POSSESSION proof for joining `account_id` as a
 /// new member at `nonce` — the `MemberProof` JSON a new device produces to
 /// prove it holds its key. Pair it with this machine's pubkey (from

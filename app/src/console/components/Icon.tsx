@@ -38,6 +38,12 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M15.5 15.5L20 20" />
     </>
   ),
+  browser: (
+    <>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M3.8 9h16.4M8.7 3.9c-1.1 2.1-1.7 4.9-1.7 8.1s.6 6 1.7 8.1M15.3 3.9c1.1 2.1 1.7 4.9 1.7 8.1s-.6 6-1.7 8.1" />
+    </>
+  ),
   close: <path d="M6 6l12 12M18 6L6 18" />,
   plus: <path d="M12 5v14M5 12h14" />,
   check: <path d="M5 12.5l4 4 10-10" />,

@@ -193,6 +193,10 @@ const ALLOWED_VERBS: &[&str] = &[
     "user-sign-possession",
     "user-sign-add-member",
     "user-sign-remove-member",
+    "user-sign-gateway-route",
+    "gateway-route-bind",
+    "gateway-route-unbind",
+    "gateway-route-list",
     "user-p256-payload",
 ];
 
@@ -254,6 +258,7 @@ fn validate_invocation(args: &[&str], stdin_lines: &[&str]) -> Result<(), String
                 | "user-sign-possession"
                 | "user-sign-add-member"
                 | "user-sign-remove-member"
+                | "user-sign-gateway-route"
         )
     {
         return Err(format!(

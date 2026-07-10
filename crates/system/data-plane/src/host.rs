@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
-    AddressBook, AdmissionPolicy, DataPlane, OverlaySockets, PlaneConfig, RegisterError, Service,
-    SocketFactory, StreamPolicy, StreamService,
+    AddressBook, AdmissionPolicy, BulkPacer, DataPlane, OverlaySockets, PlaneConfig, RegisterError,
+    Service, SocketFactory, StreamPolicy, StreamService,
 };
 
 /// Everything [`bind_stream_plane`] needs to bind one service's overlay
@@ -24,12 +24,20 @@ pub struct StreamPlaneSpec {
     /// This node's own overlay `/128` — where the service's sockets bind.
     pub own_ip: IpAddr,
     pub service: Service,
-    pub config: PlaneConfig,
+    pub pacing: StreamPacing,
     pub policy: StreamPolicy,
     /// How long to wait between failed binds. The overlay `/128` only
     /// exists once the reachability plane has the interface up, so a fresh
     /// bring-up races that — this is the retry cadence while it waits.
     pub retry: Duration,
+}
+
+/// Whether one per-use plane owns its stream budget or participates in a
+/// process-wide link budget. This avoids accepting a local config that would
+/// be silently ignored whenever a shared pacer is present.
+pub enum StreamPacing {
+    Local(PlaneConfig),
+    Shared(BulkPacer),
 }
 
 /// Bind the service's overlay sockets (retrying on `spec.retry` until the
@@ -67,7 +75,10 @@ where
         }
     };
     let admission: Arc<dyn AdmissionPolicy> = book;
-    let plane = DataPlane::new(sockets, admission, spec.config);
+    let plane = match spec.pacing {
+        StreamPacing::Local(config) => DataPlane::new(sockets, admission, config),
+        StreamPacing::Shared(pacer) => DataPlane::new_with_pacer(sockets, admission, pacer),
+    };
     let svc = plane.stream_service(spec.service, spec.policy)?;
     Ok((plane, Arc::new(svc)))
 }
@@ -164,10 +175,10 @@ mod tests {
         let spec = StreamPlaneSpec {
             own_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
             service: Service::StateSync,
-            config: PlaneConfig {
+            pacing: StreamPacing::Local(PlaneConfig {
                 bulk_bytes_per_sec: 1_000_000,
                 bulk_burst_bytes: 64 * 1024,
-            },
+            }),
             policy: StreamPolicy { accept_backlog: 4 },
             retry: Duration::from_millis(10),
         };

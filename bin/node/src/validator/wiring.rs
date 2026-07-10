@@ -52,6 +52,7 @@ pub(super) struct RuntimeWiring {
     pub(super) mesh_oracle: discovery::Oracle<ed25519::PublicKey>,
     pub(super) channel_bank: super::ChannelBank,
     pub(super) sync_plane_book: Option<Arc<statesync_plane::OverlayBook>>,
+    pub(super) gateway_book: Option<Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) blob_fetcher: blob_fetch::BlobFetchFn,
     pub(super) sync_state_rx:
@@ -75,6 +76,10 @@ pub(super) async fn finish(
     namespace: Vec<u8>,
     wireguard_effect: config::WireGuardEffectKind,
     overlay_slot: overlay_net::userspace::StackSlot,
+    bulk_pacer: data_plane::BulkPacer,
+    gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
+    gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
+    gateway_workspace: std::path::PathBuf,
     blobs: noded::blobs::BlobHandle,
     initial_member_keys: Vec<ed25519::PublicKey>,
     initial_resident_keys: Vec<ed25519::PublicKey>,
@@ -235,7 +240,34 @@ pub(super) async fn finish(
             signer.public_key(),
             std::sync::Arc::new(std::sync::OnceLock::new()),
             statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+            bulk_pacer.clone(),
             Some(bridge_tx.clone()),
+        );
+        book
+    });
+    // Gateway has its own flow, socket, queue, and admission policy. It shares
+    // only the process-wide bulk pacer with state sync and follows the same
+    // finalized transport-member cut at boot and every epoch transition.
+    let gateway_book = gateway_requests.map(|requests| {
+        let book = crate::gateway_plane::OverlayBook::new(
+            String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+        );
+        book.set_peers(
+            initial_member_keys
+                .iter()
+                .chain(initial_resident_keys.iter()),
+        );
+        crate::gateway_plane::spawn(
+            crate::gateway_plane::SpawnConfig {
+                label: label.clone(),
+                book: std::sync::Arc::clone(&book),
+                me: signer.public_key(),
+                factory: statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                pacer: bulk_pacer,
+                commands: gateway_commands,
+                workspace: gateway_workspace,
+            },
+            requests,
         );
         book
     });
@@ -368,6 +400,7 @@ pub(super) async fn finish(
         mesh_oracle,
         channel_bank,
         sync_plane_book,
+        gateway_book,
         blob_peers,
         blob_fetcher,
         sync_state_rx,

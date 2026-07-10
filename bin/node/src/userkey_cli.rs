@@ -25,6 +25,7 @@ pub(super) fn dispatch(command: &str, args: &[String]) -> Option<CommandResult> 
         "user-sign-possession" => cmd_user_sign_possession(args, &mut stdin),
         "user-sign-add-member" => cmd_user_sign_add_member(args, &mut stdin),
         "user-sign-remove-member" => cmd_user_sign_remove_member(args, &mut stdin),
+        "user-sign-gateway-route" => cmd_user_sign_gateway_route(args, &mut stdin),
         "user-webauthn-challenge" => cmd_user_webauthn_challenge(args),
         "user-p256-payload" => cmd_user_p256_payload(args),
         _ => return None,
@@ -508,6 +509,52 @@ fn cmd_user_sign_unbind(
     stdin: &mut impl std::io::BufRead,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", user_sign_unbind(args, stdin)?);
+    Ok(())
+}
+
+/// Sign one canonical gateway route and return a ready-to-submit `GatewayMsg`.
+/// This remains a namespace-specific oracle: the CLI parses and validates the
+/// complete bounded route before the user key signs it.
+fn user_sign_gateway_route(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    if !pos.is_empty() {
+        return Err(format!("unexpected args: {pos:?}").into());
+    }
+    let key_path = PathBuf::from(
+        flags
+            .get("key")
+            .ok_or("user-sign-gateway-route needs --key <path>")?,
+    );
+    let statement_json = flags
+        .get("statement")
+        .ok_or("user-sign-gateway-route needs --statement <json>")?;
+    if statement_json.len() > gateway::MAX_ROUTE_STATEMENT_JSON_BYTES {
+        return Err("user-sign-gateway-route statement exceeds the byte cap".into());
+    }
+    let statement: gateway::RouteStatement = serde_json::from_str(statement_json)?;
+    let preimage = gateway::route_signing_preimage(&statement)?;
+    let user = load_user_signer(&key_path, stdin)?;
+    let message = gateway::GatewayMsg::SetRoute {
+        statement,
+        authorization: gateway::MemberAuthorization {
+            signer: user.public_key().as_ref().to_vec(),
+            signature: user
+                .sign(gateway::GATEWAY_ROUTE_NS, &preimage)
+                .as_ref()
+                .to_vec(),
+        },
+    };
+    Ok(String::from_utf8(gateway::encode_msg(&message)).expect("json is utf-8"))
+}
+
+fn cmd_user_sign_gateway_route(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_sign_gateway_route(args, stdin)?);
     Ok(())
 }
 
@@ -1257,6 +1304,76 @@ mod userkey_verb_tests {
                     "0",
                 ]),
                 &mut bad_stdin,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sign_gateway_route_is_namespace_scoped_strict_and_decodable() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = [81u8; 32];
+        let key_path = dir.path().join("user.key");
+        write_legacy(&key_path, &seed);
+        let signer = ed25519::PrivateKey::decode(seed.as_slice()).unwrap();
+        let statement = gateway::RouteStatement {
+            version: gateway::ROUTE_FORMAT_VERSION,
+            chain_id: "test-chain".into(),
+            account_id: signer.public_key().as_ref().to_vec(),
+            name: gateway::RouteName::named("api"),
+            publisher_node: pubkey_bytes(&[82u8; 32]),
+            revision: 1,
+            route: Some(gateway::RouteDefinition {
+                target: gateway::RouteTarget::LoopbackHttp,
+                policy: gateway::RoutePolicy {
+                    audience: gateway::RouteAudience::Network,
+                    methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
+                    max_request_bytes: 1024,
+                    max_response_bytes: 4096,
+                    allow_authorization: false,
+                },
+            }),
+        };
+        let mut stdin = empty_stdin();
+        let json = user_sign_gateway_route(
+            &args_of(&[
+                "--key",
+                &key_path.to_string_lossy(),
+                "--statement",
+                &serde_json::to_string(&statement).unwrap(),
+            ]),
+            &mut stdin,
+        )
+        .unwrap();
+        let gateway::GatewayMsg::SetRoute {
+            statement: decoded,
+            authorization,
+        } = gateway::decode_msg(json.as_bytes()).unwrap();
+        assert_eq!(decoded, statement);
+        assert_eq!(authorization.signer, signer.public_key().as_ref());
+        assert!(identity::verify_authority(
+            identity::KeyKind::Ed25519,
+            &authorization.signer,
+            None,
+            gateway::GATEWAY_ROUTE_NS,
+            &gateway::route_signing_preimage(&decoded).unwrap(),
+            &identity::MemberProof::Signature {
+                sig: authorization.signature,
+            },
+        ));
+
+        let mut unsafe_statement = statement;
+        unsafe_statement.name = gateway::RouteName::named("Api.Evil");
+        let mut stdin = empty_stdin();
+        assert!(
+            user_sign_gateway_route(
+                &args_of(&[
+                    "--key",
+                    &key_path.to_string_lossy(),
+                    "--statement",
+                    &serde_json::to_string(&unsafe_statement).unwrap(),
+                ]),
+                &mut stdin,
             )
             .is_err()
         );

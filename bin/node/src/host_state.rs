@@ -17,6 +17,7 @@ use duckfs_disk::SyncScratch;
 use files::Files;
 use forge::Forge;
 use governance::Governance;
+use gateway::Gateway;
 use host::Host;
 use identity::Identity;
 use inbox::Inbox;
@@ -144,6 +145,14 @@ pub(super) async fn genesis_host(
             "duckdns",
             "identity",
             Some("valset".into()),
+        )),
+        // Identity-signed, monotonic gateway routes. DuckDNS owns optional
+        // human names, Files owns DuckFS bytes, and loopback ports stay local.
+        Box::new(Gateway::new(
+            "gateway",
+            "identity",
+            Some("valset".into()),
+            bindings.identity_chain_id,
         )),
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
@@ -287,6 +296,17 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("duckdns install: {e}"))?;
 
+    let mut gateway = Gateway::new(
+        "gateway",
+        "identity",
+        Some("valset".into()),
+        bindings.identity_chain_id,
+    );
+    let (bytes, root) = snapshot_of("gateway")?;
+    gateway
+        .install(bytes, root)
+        .map_err(|e| format!("gateway install: {e}"))?;
+
     let mut inbox = Inbox::new("inbox");
     let (bytes, root) = snapshot_of("inbox")?;
     inbox
@@ -356,6 +376,7 @@ pub(super) async fn restore_host(
         Box::new(vaults),
         Box::new(identity),
         Box::new(duckdns),
+        Box::new(gateway),
         Box::new(inbox),
         Box::new(files),
         Box::new(jobs),
@@ -592,6 +613,17 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("duckdns install: {e}"))?;
 
+    let (bytes, root) = snapshot_of("gateway").await?;
+    let mut gateway = Gateway::new(
+        "gateway",
+        "identity",
+        Some("valset".into()),
+        bindings.identity_chain_id,
+    );
+    gateway
+        .install(&bytes, root)
+        .map_err(|e| format!("gateway install: {e}"))?;
+
     let (bytes, root) = snapshot_of("inbox").await?;
     let mut inbox = Inbox::new("inbox");
     inbox
@@ -691,6 +723,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(vaults),
         Box::new(identity),
         Box::new(duckdns),
+        Box::new(gateway),
         Box::new(inbox),
         Box::new(files),
         Box::new(jobs),

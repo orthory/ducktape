@@ -61,6 +61,8 @@ mod constants;
 mod drain_actions;
 mod explorer;
 mod first_contact_join;
+mod gateway_plane;
+mod gateway_routes;
 mod host_reads;
 mod host_state;
 #[cfg(test)]
@@ -152,6 +154,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "unexpected arg {other:?} (want a subcommand — \
                      keygen|user-key|user-sign-bind|user-sign-unbind|\
                      user-sign-possession|user-sign-add-member|user-sign-remove-member|\
+                     user-sign-gateway-route|gateway-route-bind|gateway-route-unbind|\
+                     gateway-route-list|\
                      user-webauthn-challenge|user-p256-payload|\
                      init|invite|admit|\
                      invite-accept|promote|resident-remove|\
@@ -209,6 +213,23 @@ fn init_tracing(log_ring: noded::LogRing) {
 /// and you cannot start a runtime from inside one. so `main` is sync and hands
 /// off to `Runner::start`, which drives everything (including the engine's spawned
 /// tasks) on the runtime it owns.
+fn gateway_can_start(
+    sync_only: bool,
+    gateway_listen: Option<&str>,
+    http_listen: Option<&str>,
+    wireguard_listen: Option<std::net::SocketAddr>,
+    wireguard_effect: config::WireGuardEffectKind,
+) -> bool {
+    let api_is_loopback = http_listen
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|address| address.ip().is_loopback());
+    !sync_only
+        && gateway_listen.is_some()
+        && api_is_loopback
+        && wireguard_listen.is_some()
+        && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake)
+}
+
 fn run_node(
     resolved: Resolved,
     sync_only: bool,
@@ -228,6 +249,7 @@ fn run_node(
         storage,
         rpc_listen,
         http_listen,
+        gateway_listen,
         wireguard_listen,
         wireguard_effect,
         wireguard_key_file,
@@ -251,6 +273,14 @@ fn run_node(
         joiner,
     } = boot::env::derive(resolved, sync_only);
 
+    let gateway_enabled = gateway_can_start(
+        sync_only,
+        gateway_listen.as_deref(),
+        http_listen.as_deref(),
+        wireguard_listen,
+        wireguard_effect,
+    );
+
     let boot::surfaces::Surfaces {
         rpc_listener,
         http_cmds,
@@ -259,14 +289,18 @@ fn run_node(
         voice_requests,
         blobs,
         agent_provisioner,
-    } = boot::surfaces::bind(
+        gateway_requests,
+        gateway_commands,
+    } = boot::surfaces::bind(boot::surfaces::BindConfig {
         sync_only,
-        &label,
-        &storage,
+        label: &label,
+        storage: &storage,
         rpc_listen,
         http_listen,
+        gateway_listen,
+        gateway_enabled,
         log_ring,
-    )?;
+    })?;
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
     let storage_for_sync = storage.clone();
@@ -317,6 +351,10 @@ fn run_node(
             wireguard_effect,
             overlay_slot.clone(),
         );
+        // One process-wide bulk budget: state sync and Gateway retain separate
+        // protocols, queues, sockets, and admission but cannot independently
+        // saturate the same WireGuard link.
+        let bulk_pacer = statesync_plane::shared_bulk_pacer();
 
         if sync_only {
             boot::sync_only::run(
@@ -414,6 +452,8 @@ fn run_node(
                 announce_capabilities,
                 rpc_listener,
                 http_cmds,
+                gateway_requests,
+                gateway_commands.clone(),
                 &stream_hub,
                 index,
                 voice_requests,
@@ -421,6 +461,7 @@ fn run_node(
                 &agent_provisioner,
                 &agent_dirs,
                 overlay_slot,
+                bulk_pacer.clone(),
                 storage_for_sync,
                 recovery,
                 &manifest,
@@ -461,6 +502,8 @@ fn run_node(
             announce_capabilities,
             rpc_listener,
             http_cmds,
+            gateway_requests,
+            gateway_commands,
             stream_hub,
             index,
             voice_requests,
@@ -468,6 +511,8 @@ fn run_node(
             agent_provisioner,
             agent_dirs,
             overlay_slot,
+            bulk_pacer,
+            workspace,
             recovery,
             manifest,
             forge_repo,
