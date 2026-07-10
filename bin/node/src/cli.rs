@@ -83,7 +83,7 @@ fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 /// `init --name <human name> [--dir .] [--listen a] [--advertised a] [--http a]
 /// [--rpc a] [--primary-coordinator host:port|none]
-/// [--wireguard-listen a] [--invite-listen a]
+/// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]
 /// [--wireguard-effect socket|tun|fake]` — found a network: mint the
 /// chain-id, write the descriptor + node config, seed the genesis validator
 /// set with this identity.
@@ -112,6 +112,12 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let primary_coordinator = config::primary_coordinator_or_default(
         flags.get("primary-coordinator").map(String::as_str),
     )?;
+    // node.toml carries the SAME raw flag value (not the defaulted/
+    // normalized `primary_coordinator` above) — an absent flag leaves the
+    // key absent too, so the runtime re-derives the identical compiled
+    // default `apply_primary_coordinator` just baked into the descriptor;
+    // an explicit "none"/host:port is persisted verbatim so the two never
+    // silently disagree (see `docs`: coordinator is ambient, node-local).
     let mut plumbing = config::merged_plumbing(
         &dir,
         flags.get("listen").map(String::as_str),
@@ -121,6 +127,8 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("wireguard-effect").map(String::as_str),
         flags.get("wireguard-listen").map(String::as_str),
         flags.get("invite-listen").map(String::as_str),
+        flags.get("primary-coordinator").map(String::as_str),
+        flags.get("wireguard-advertised").map(String::as_str),
     )?;
     if primary_coordinator.is_some() {
         if plumbing.wireguard_listen.is_none() {
@@ -245,25 +253,41 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .parse::<std::net::SocketAddr>()
                 .map(|a| a.port())
                 .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
-            let host =
-                match config::endpoint_host(raw.advertised.as_deref(), &raw.listen, wg_listen) {
-                    Ok(host) => Some(host),
-                    Err(_) if has_coordinated_reach => {
-                        // Coordinated reach gives the joiner a rendezvous
-                        // path; there is deliberately no inviter-hosted
-                        // underlay endpoint to bake into the blob.
-                        None
-                    }
-                    Err(err) => return Err(err.into()),
-                };
+            let host = match config::endpoint_host(
+                raw.advertised.as_deref(),
+                &raw.listen,
+                wg_listen,
+                raw.wireguard_advertised.as_deref(),
+            ) {
+                Ok(host) => Some(host),
+                Err(_) if has_coordinated_reach => {
+                    // Coordinated reach gives the joiner a rendezvous
+                    // path; there is deliberately no inviter-hosted
+                    // underlay endpoint to bake into the blob.
+                    None
+                }
+                Err(err) => return Err(err.into()),
+            };
             match host {
                 Some(host) => {
                     let intro_port =
                         config::resolved_invite_listen(raw.invite_listen.as_deref(), wg_listen)?
                             .port();
+                    // the tunnel endpoint carries the FULL advertised
+                    // host:port when `wireguard_advertised` is configured —
+                    // the external port can differ from the bind port in the
+                    // port-forwarded setup the key exists for. The intro
+                    // stays host + intro port (no advertise override exists
+                    // for the intro lane).
+                    let endpoint = config::invite_wireguard_endpoint(
+                        raw.advertised.as_deref(),
+                        &raw.listen,
+                        wg_listen,
+                        raw.wireguard_advertised.as_deref(),
+                    )?;
                     Some(config::InviteWireGuard {
                         public_key: wg_keypair.public_key().0,
-                        endpoint: Some(format!("{host}:{}", wg_listen.port())),
+                        endpoint: Some(endpoint),
                         intro: Some(format!("{host}:{intro_port}")),
                         mesh_port,
                     })
@@ -1110,10 +1134,14 @@ fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// `join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a]
-/// [--rpc a] [--wireguard-listen a] [--invite-listen a]
-/// [--wireguard-effect socket|tun|fake]` — materialize a workspace
+/// [--rpc a] [--wireguard-listen a] [--wireguard-advertised host:port]
+/// [--invite-listen a] [--wireguard-effect socket|tun|fake]
+/// [--primary-coordinator host:port|none]` — materialize a workspace
 /// from an invite: descriptor + identity (kept across re-joins) + node
 /// config. prints this identity for the inviter's pre-genesis `admit`.
+/// `--primary-coordinator` is node-local plumbing ONLY — it never touches
+/// the invite or the joined descriptor (the coordinator is always ambient,
+/// per docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md).
 fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     let [blob] = pos.as_slice() else {
@@ -1139,6 +1167,8 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("wireguard-effect").map(String::as_str),
         flags.get("wireguard-listen").map(String::as_str),
         flags.get("invite-listen").map(String::as_str),
+        flags.get("primary-coordinator").map(String::as_str),
+        flags.get("wireguard-advertised").map(String::as_str),
     )?;
     if config::invite_requires_reachability_defaults(&invite) {
         // a WireGuard or Coordinated invite makes the reachability plane the

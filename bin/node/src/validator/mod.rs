@@ -37,6 +37,8 @@ pub(crate) async fn run_validator(
     wireguard_listen: Option<std::net::SocketAddr>,
     wireguard_effect: crate::config::WireGuardEffectKind,
     wireguard_key_file: std::path::PathBuf,
+    primary_coordinator: Option<String>,
+    wireguard_advertised: Option<Ingress>,
     invite_listen: Option<std::net::SocketAddr>,
     coordination: crate::config::Coordination,
     coord_cap: Option<nat_traversal::CoordCap>,
@@ -117,6 +119,8 @@ pub(crate) async fn run_validator(
         chain_id,
         mesh_state_file,
         advertised_reach,
+        primary_coordinator,
+        wireguard_advertised,
         invite_listen,
         coord_cap,
         voice_requests,
@@ -230,8 +234,8 @@ pub(crate) async fn run_validator(
         dev_demo,
     )
     .await;
-    run::run_loop(
-        &context,
+    run::run(run::ValidatorLoopState {
+        context: &context,
         node,
         orchestrator,
         epoch_spawner,
@@ -268,7 +272,7 @@ pub(crate) async fn run_validator(
         metrics,
         status_public_key,
         coordination,
-    )
+    })
     .await;
 }
 

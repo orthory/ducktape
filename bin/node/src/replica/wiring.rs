@@ -61,6 +61,11 @@ pub(super) async fn wire(
     chain_id: String,
     mesh_state_file: std::path::PathBuf,
     advertised_reach: Ingress,
+    // the AMBIENT coordinator override (node.toml `primary_coordinator`);
+    // `None` = the compiled-in default, exactly as before the key existed.
+    primary_coordinator: Option<String>,
+    // the WireGuard bind/advertise split (node.toml `wireguard_advertised`).
+    wireguard_advertised: Option<Ingress>,
     coord_cap: &Option<nat_traversal::CoordCap>,
     invite_token: &Option<config::InviteToken>,
     invite_wireguard: &Option<config::StoredInviteWireGuard>,
@@ -162,17 +167,18 @@ pub(super) async fn wire(
                 // coordinator, NEVER one baked into the invite (the
                 // unified invite carries no coordinator address). See
                 // docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md.
-                let coordinators: Vec<Ingress> = match config::coordinator_ingress(None) {
-                    Ok(Some(ingress)) => vec![ingress],
-                    Ok(None) => Vec::new(),
-                    Err(e) => {
-                        eprintln!(
-                            "[node {label}] invite: ambient coordinator unusable ({e}) — \
-                             coordinated first-contact paths disabled"
-                        );
-                        Vec::new()
-                    }
-                };
+                let coordinators: Vec<Ingress> =
+                    match config::coordinator_ingress(primary_coordinator.as_deref()) {
+                        Ok(Some(ingress)) => vec![ingress],
+                        Ok(None) => Vec::new(),
+                        Err(e) => {
+                            eprintln!(
+                                "[node {label}] invite: ambient coordinator unusable ({e}) — \
+                                 coordinated first-contact paths disabled"
+                            );
+                            Vec::new()
+                        }
+                    };
                 Some(wire_reachability_plane(
                     &context,
                     &label,
@@ -184,6 +190,7 @@ pub(super) async fn wire(
                     wireguard_effect,
                     overlay_slot.clone(),
                     advertised_reach,
+                    wireguard_advertised,
                     coordinators,
                     // a joiner serves no intros — only members mint
                     // redeemable invites.

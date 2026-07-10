@@ -1581,6 +1581,20 @@ pub struct NodeToml {
     /// capable node. announcing stays truthful either way: this can hide a
     /// real provider, never fabricate one.
     pub announce_capabilities: Option<bool>,
+    /// the AMBIENT rendezvous coordinator this node's reachability plane
+    /// binds — never carried in an invite (see `coordinator_ingress`'s
+    /// doc). `"host:port"` overrides the compiled-in
+    /// `DEFAULT_PRIMARY_COORDINATOR`; `"none"`/`"off"`/`"direct"` disables
+    /// coordination outright; the key ABSENT (the pre-feature default)
+    /// re-derives the compiled default at runtime — bit-identical to today.
+    pub primary_coordinator: Option<String>,
+    /// the UDP endpoint this node advertises for its WireGuard tunnel,
+    /// independent of `wireguard_listen` (which stays bind-only): a
+    /// concrete `"host:port"` (hostname resolved once at plane start, like
+    /// the mesh `advertised`) always wins; the key ABSENT falls back to
+    /// today's derivation (`wireguard_listen`'s IP when concrete, endpoint-
+    /// less/roaming when unspecified) — bit-identical to today.
+    pub wireguard_advertised: Option<String>,
 }
 
 /// read a raw node.toml plus its base directory (which relative paths inside
@@ -1619,6 +1633,12 @@ pub struct Plumbing {
     /// passes "socket" here (overlay-net ADR phase 4) while the parse
     /// default for a file without the key stays `tun`.
     pub wireguard_effect: Option<String>,
+    /// merged like the rest; see `NodeToml::primary_coordinator`. Absent
+    /// (`None`) preserves today's behavior exactly (the runtime re-derives
+    /// the compiled default / whatever the descriptor already encodes).
+    pub primary_coordinator: Option<String>,
+    /// merged like the rest; see `NodeToml::wireguard_advertised`.
+    pub wireguard_advertised: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1631,6 +1651,8 @@ pub fn merged_plumbing(
     wireguard_effect: Option<&str>,
     wireguard_listen: Option<&str>,
     invite_listen: Option<&str>,
+    primary_coordinator: Option<&str>,
+    wireguard_advertised: Option<&str>,
 ) -> Result<Plumbing, String> {
     let path = dir.join("node.toml");
     let existing: Option<NodeToml> = if path.exists() {
@@ -1668,6 +1690,12 @@ pub fn merged_plumbing(
         wireguard_effect: wireguard_effect
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.wireguard_effect.clone())),
+        primary_coordinator: primary_coordinator
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.primary_coordinator.clone())),
+        wireguard_advertised: wireguard_advertised
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.wireguard_advertised.clone())),
     })
 }
 
@@ -1699,6 +1727,12 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     }
     if let Some(w) = &p.wireguard_effect {
         s += &format!("wireguard_effect = \"{w}\"\n");
+    }
+    if let Some(pc) = &p.primary_coordinator {
+        s += &format!("primary_coordinator = \"{pc}\"\n");
+    }
+    if let Some(wa) = &p.wireguard_advertised {
+        s += &format!("wireguard_advertised = \"{wa}\"\n");
     }
     let path = dir.join("node.toml");
     std::fs::write(&path, s).map_err(|e| format!("write {path:?}: {e}"))?;
@@ -1894,6 +1928,16 @@ pub struct Resolved {
     /// `None` for a genesis validator (admitted by membership), the dev shape,
     /// or a node that has not been issued one.
     pub coord_cap: Option<nat_traversal::CoordCap>,
+    /// the AMBIENT coordinator override (`NodeToml::primary_coordinator`),
+    /// raw and unvalidated — resolved through `coordinator_ingress` at the
+    /// point of use so a bad value DEGRADES (coordinated paths dark, loud
+    /// log) rather than aborting boot. `None` = re-derive the compiled
+    /// default, exactly like today.
+    pub primary_coordinator: Option<String>,
+    /// the WireGuard endpoint this node advertises, resolved once
+    /// (`NodeToml::wireguard_advertised`); `None` = derive it from
+    /// `wireguard_listen` exactly like today (see `reachability_plane.rs`).
+    pub wireguard_advertised: Option<Ingress>,
     /// the workspace base directory — where `identity.key`, `network.toml`,
     /// `wireguard.key` and `coord.cap` live (the network shape's config
     /// directory; the dev shape's `storage_dir`). Threaded so a parked
@@ -1990,6 +2034,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     let invite_listen = wireguard_listen
         .map(|wg| resolved_invite_listen(raw.invite_listen.as_deref(), wg))
         .transpose()?;
+    let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -2024,6 +2069,8 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         // the config directory: identity.key / network.toml / coord.cap live
         // here, so a joiner persists a delivered cap into it.
         workspace: base.to_path_buf(),
+        primary_coordinator: raw.primary_coordinator,
+        wireguard_advertised,
     })
 }
 
@@ -2039,6 +2086,20 @@ fn parse_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, Strin
 /// (the CLI verbs) rather than a full `resolve`.
 pub fn resolved_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, String> {
     parse_wireguard_listen(raw)
+}
+
+/// resolve `wireguard_advertised` into a dial ingress: absent = "derive from
+/// `wireguard_listen`" (the caller's job — see `reachability_plane.rs`), an
+/// explicit value must be dialable (a hostname is kept VERBATIM, resolved
+/// once at plane start, same discipline as the mesh `advertised`).
+fn parse_wireguard_advertised(raw: Option<&str>) -> Result<Option<Ingress>, String> {
+    match raw {
+        None => Ok(None),
+        Some(a) => ingress_of(a)
+            .map_err(|e| format!("wireguard_advertised: {e}"))?
+            .map(Some)
+            .ok_or_else(|| format!("wireguard_advertised addr {a:?} is not dialable")),
+    }
 }
 
 /// the invite intro listener endpoint: explicit `invite_listen`, else the
@@ -2061,15 +2122,24 @@ pub fn resolved_invite_listen(
     }
 }
 
-/// the HOST a minted invite's UDP endpoints carry: the WireGuard listen IP
-/// when it is concrete, else the advertised host (an invite must hand the
-/// joiner an underlay address that reaches this machine — the usual listen
-/// is unspecified, so `advertised` is the truth).
+/// the HOST a minted invite's UDP endpoints carry: an explicit
+/// `wireguard_advertised` wins outright (it IS the truth once configured),
+/// else the WireGuard listen IP when it is concrete, else the advertised
+/// host (an invite must hand the joiner an underlay address that reaches
+/// this machine — the usual listen is unspecified, so `advertised` is the
+/// truth).
 pub fn endpoint_host(
     advertised: Option<&str>,
     listen: &str,
     wireguard_listen: SocketAddr,
+    wireguard_advertised: Option<&str>,
 ) -> Result<String, String> {
+    if let Some(ingress) = parse_wireguard_advertised(wireguard_advertised)? {
+        return Ok(match ingress {
+            Ingress::Socket(addr) => addr.ip().to_string(),
+            Ingress::Dns { host, .. } => host.to_string(),
+        });
+    }
     if !wireguard_listen.ip().is_unspecified() {
         return Ok(wireguard_listen.ip().to_string());
     }
@@ -2082,6 +2152,29 @@ pub fn endpoint_host(
         Some((host, _)) => Ok(host.trim_matches(['[', ']']).to_string()),
         None => Ok(dial),
     }
+}
+
+/// the FULL `host:port` a minted invite's WireGuard `endpoint` carries: an
+/// explicit `wireguard_advertised` is used VERBATIM — host AND port — because
+/// in the port-forwarded setup the key exists for, the externally reachable
+/// port can differ from the local bind port (`wireguard_listen`); baking the
+/// advertised host with the bind port would mint an invite whose endpoint is
+/// silently wrong. Absent, the endpoint is today's derivation exactly:
+/// [`endpoint_host`]'s host at the bind port.
+pub fn invite_wireguard_endpoint(
+    advertised: Option<&str>,
+    listen: &str,
+    wireguard_listen: SocketAddr,
+    wireguard_advertised: Option<&str>,
+) -> Result<String, String> {
+    if let Some(ingress) = parse_wireguard_advertised(wireguard_advertised)? {
+        return Ok(match ingress {
+            Ingress::Socket(addr) => addr.to_string(),
+            Ingress::Dns { host, port } => format!("{host}:{port}"),
+        });
+    }
+    let host = endpoint_host(advertised, listen, wireguard_listen, None)?;
+    Ok(format!("{host}:{}", wireguard_listen.port()))
 }
 
 /// which `WireGuardEffect` implementation the reachability plane drives.
@@ -2216,6 +2309,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}")));
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
+    let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
@@ -2255,6 +2349,8 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         // the coordination mode defaults to Private and no cap is presented.
         coordination: Coordination::Private,
         coord_cap: None,
+        primary_coordinator: raw.primary_coordinator,
+        wireguard_advertised,
     })
 }
 
@@ -2314,6 +2410,28 @@ mod tests {
 
         let disabled = primary_coordinator_or_default(Some("none")).expect("disabled");
         assert_eq!(disabled, None);
+    }
+
+    /// `coordinator_ingress` — the AMBIENT source change (1) threads into
+    /// both runtime call sites (main.rs:954 joiner, main.rs:3201 member) —
+    /// resolves an explicit override, honors the disable sentinel, and
+    /// falls back to the compiled default exactly like `coordinator_ingress
+    /// (None)` did before change (1) existed (bit-identical absent case).
+    #[test]
+    fn coordinator_ingress_resolves_an_explicit_override() {
+        match coordinator_ingress(Some("203.0.113.9:3478")).expect("dialable override") {
+            Some(Ingress::Socket(addr)) => assert_eq!(addr, "203.0.113.9:3478".parse().unwrap()),
+            other => panic!("expected a concrete socket ingress, got {other:?}"),
+        }
+        assert_eq!(
+            coordinator_ingress(Some("none")).expect("disabled"),
+            None,
+            "the sentinel disables coordination outright — no ingress to bind"
+        );
+        match coordinator_ingress(None).expect("compiled default") {
+            Some(Ingress::Dns { port, .. }) => assert_eq!(port, 3478),
+            other => panic!("expected the compiled default's hostname ingress, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3444,6 +3562,192 @@ mod tests {
         );
     }
 
+    /// `primary_coordinator` (change 1, issue #331): the key ABSENT resolves
+    /// to `None` — bit-identical to today, since `main.rs` re-derives the
+    /// compiled default from `coordinator_ingress(None)` either way; the
+    /// disable sentinel and an explicit override both ride the raw string
+    /// through, unvalidated at resolve time (validated lazily at the point
+    /// of use so a bad value degrades rather than aborting boot — inv 12).
+    #[test]
+    fn primary_coordinator_key_survives_resolve_default_absent_and_explicit() {
+        let dir = tmp("primary-coordinator-key");
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
+        assert_eq!(
+            resolved.primary_coordinator, None,
+            "absent key: re-derive the compiled default at the point of use"
+        );
+
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             primary_coordinator = \"none\"\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve none");
+        assert_eq!(resolved.primary_coordinator.as_deref(), Some("none"));
+        assert_eq!(
+            coordinator_ingress(resolved.primary_coordinator.as_deref()).expect("resolves"),
+            None,
+            "the persisted sentinel disables coordination on every future read"
+        );
+
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             primary_coordinator = \"203.0.113.9:3478\"\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve override");
+        assert_eq!(
+            resolved.primary_coordinator.as_deref(),
+            Some("203.0.113.9:3478")
+        );
+    }
+
+    /// `wireguard_advertised` (change 3, issue #331): the key ABSENT resolves
+    /// to `None` — `reachability_plane.rs` then derives it from
+    /// `wireguard_listen` exactly like today; an explicit concrete override
+    /// parses to a socket ingress, and a hostname stays a hostname (DNS
+    /// deferred to plane start, same discipline as the mesh `advertised`).
+    #[test]
+    fn wireguard_advertised_key_absent_defaults_and_explicit_value_parses() {
+        let dir = tmp("wg-advertised-key");
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52270\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             wireguard_listen = \"0.0.0.0:51820\"\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
+        assert_eq!(
+            resolved.wireguard_advertised, None,
+            "absent key: reachability_plane.rs derives it from wireguard_listen, unchanged"
+        );
+
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52270\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             wireguard_listen = \"0.0.0.0:51820\"\nwireguard_advertised = \"203.0.113.9:41820\"\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve override");
+        assert_eq!(
+            resolved.wireguard_advertised,
+            Some(Ingress::Socket("203.0.113.9:41820".parse().unwrap()))
+        );
+
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52270\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             wireguard_listen = \"0.0.0.0:51820\"\n\
+             wireguard_advertised = \"definitely-not-resolvable.ducktape.invalid:41820\"\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("hostnames never block boot");
+        assert!(
+            matches!(
+                &resolved.wireguard_advertised,
+                Some(Ingress::Dns { port: 41820, .. })
+            ),
+            "wireguard_advertised stays a hostname: {:?}",
+            resolved.wireguard_advertised
+        );
+    }
+
+    #[test]
+    fn wireguard_advertised_rejects_an_unspecified_or_port_zero_value() {
+        let dir = tmp("wg-advertised-bad");
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52280\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             wireguard_listen = \"0.0.0.0:51820\"\nwireguard_advertised = \"0.0.0.0:0\"\n",
+        )
+        .expect("write");
+        let err = resolve(&dir.join("node.toml"))
+            .expect_err("an explicit unspecified/port0 value is a config error, not a silent \
+                          fallback to endpoint-less");
+        assert!(err.contains("wireguard_advertised"), "{err}");
+    }
+
+    /// `endpoint_host` (change 3's invite-mint analog, config.rs ~2068): an
+    /// explicit `wireguard_advertised` wins outright, including over a
+    /// concrete `wireguard_listen` IP; absent falls back to today's
+    /// derivation exactly (wireguard_listen IP, else `advertised`/`listen`).
+    #[test]
+    fn endpoint_host_prefers_wireguard_advertised_over_the_listen_derivation() {
+        let unspecified: SocketAddr = "0.0.0.0:51820".parse().unwrap();
+        let concrete: SocketAddr = "10.0.0.5:51820".parse().unwrap();
+
+        assert_eq!(
+            endpoint_host(None, "127.0.0.1:0", concrete, Some("203.0.113.9:9999")).unwrap(),
+            "203.0.113.9",
+            "wireguard_advertised wins even over a concrete wireguard_listen IP"
+        );
+        assert_eq!(
+            endpoint_host(None, "127.0.0.1:0", unspecified, Some("tunnel.example.com:9999"))
+                .unwrap(),
+            "tunnel.example.com",
+            "a hostname override stays a hostname"
+        );
+        assert_eq!(
+            endpoint_host(None, "127.0.0.1:0", concrete, None).unwrap(),
+            "10.0.0.5",
+            "absent: today's derivation — the concrete wireguard_listen IP wins"
+        );
+        assert_eq!(
+            endpoint_host(Some("203.0.113.1:443"), "127.0.0.1:0", unspecified, None).unwrap(),
+            "203.0.113.1",
+            "absent + unspecified listen: falls back to `advertised`/`listen`, unchanged"
+        );
+    }
+
+    /// The invite-mint endpoint (review fix, change 3): with
+    /// `wireguard_advertised` set the minted `endpoint` is the advertised
+    /// value VERBATIM — host AND port. The port-forwarded scenario the key
+    /// exists for: external 41820 forwarded to bind 51820 — baking the
+    /// advertised host with the BIND port would silently mint a wrong
+    /// endpoint. Absent, the derivation is bit-identical to before: the
+    /// `endpoint_host` host at the bind port.
+    #[test]
+    fn invite_endpoint_uses_the_advertised_value_verbatim_including_its_port() {
+        let unspecified: SocketAddr = "0.0.0.0:51820".parse().unwrap();
+        let concrete: SocketAddr = "10.0.0.5:51820".parse().unwrap();
+
+        assert_eq!(
+            invite_wireguard_endpoint(None, "127.0.0.1:0", unspecified, Some("203.0.113.9:41820"))
+                .unwrap(),
+            "203.0.113.9:41820",
+            "the advertised endpoint rides verbatim — 41820, never the bind port 51820"
+        );
+        assert_eq!(
+            invite_wireguard_endpoint(
+                None,
+                "127.0.0.1:0",
+                concrete,
+                Some("tunnel.example.com:41820")
+            )
+            .unwrap(),
+            "tunnel.example.com:41820",
+            "a hostname override stays a hostname, with ITS port — even over a concrete bind IP"
+        );
+        assert_eq!(
+            invite_wireguard_endpoint(None, "127.0.0.1:0", concrete, None).unwrap(),
+            "10.0.0.5:51820",
+            "absent: today's derivation exactly — the wireguard_listen IP at the bind port"
+        );
+        assert_eq!(
+            invite_wireguard_endpoint(Some("203.0.113.1:443"), "127.0.0.1:0", unspecified, None)
+                .unwrap(),
+            "203.0.113.1:51820",
+            "absent + unspecified listen: the advertised HOST at the WG bind port, unchanged"
+        );
+    }
+
     #[test]
     fn node_config_rejects_retired_duckdns_service_sections() {
         let retired = r#"
@@ -3609,6 +3913,8 @@ storage_dir = '/data/ducktape'
             None,
             None,
             None,
+            None,
+            None,
         )
         .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
@@ -3637,13 +3943,15 @@ storage_dir = '/data/ducktape'
             Some("socket"),
             None,
             None,
+            None,
+            None,
         )
         .expect("merge");
         assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
         write_node_toml(&dir, &p).expect("write");
 
         // no flag: the hand-settable value on disk survives a re-merge.
-        let p = merged_plumbing(&dir, None, None, None, None, None, None, None)
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None)
             .expect("re-merge");
         assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
 
@@ -3655,6 +3963,8 @@ storage_dir = '/data/ducktape'
             None,
             None,
             Some("tun"),
+            None,
+            None,
             None,
             None,
         )
@@ -3671,10 +3981,68 @@ storage_dir = '/data/ducktape'
             Some("sokcet"),
             None,
             None,
+            None,
+            None,
         )
         .err()
         .expect("a bad effect value must abort the merge");
         assert!(err.contains("wireguard_effect"), "{err}");
+    }
+
+    /// Both change (1)/(3) keys ride the SAME `Plumbing` chain as
+    /// `wireguard_effect` above: a flag wins, an existing file's value
+    /// survives an unflagged re-merge, and `write_node_toml` round-trips it
+    /// verbatim (config.rs's "GOTCHA" — a key not in `Plumbing` is silently
+    /// dropped on rewrite; this pins that it is NOT dropped).
+    #[test]
+    fn plumbing_primary_coordinator_and_wireguard_advertised_flag_wins_and_absence_preserves() {
+        let dir = tmp("plumbing-coord-wgadv");
+        // fresh dir + flags (the desktop app's init/join shape): written to disk.
+        let p = merged_plumbing(
+            &dir,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("203.0.113.9:3478"),
+            Some("198.51.100.5:41820"),
+        )
+        .expect("merge");
+        assert_eq!(p.primary_coordinator.as_deref(), Some("203.0.113.9:3478"));
+        assert_eq!(p.wireguard_advertised.as_deref(), Some("198.51.100.5:41820"));
+        write_node_toml(&dir, &p).expect("write");
+
+        // no flags: the hand-settable values on disk survive a re-merge.
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None)
+            .expect("re-merge");
+        assert_eq!(p.primary_coordinator.as_deref(), Some("203.0.113.9:3478"));
+        assert_eq!(p.wireguard_advertised.as_deref(), Some("198.51.100.5:41820"));
+
+        // the flags win over the file (merged_plumbing's standing precedence).
+        let p = merged_plumbing(
+            &dir,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("none"),
+            Some("203.0.113.9:41821"),
+        )
+        .expect("override");
+        assert_eq!(p.primary_coordinator.as_deref(), Some("none"));
+        assert_eq!(p.wireguard_advertised.as_deref(), Some("203.0.113.9:41821"));
+
+        // and the round trip re-reads verbatim — the survives-rewrite chain.
+        write_node_toml(&dir, &p).expect("write");
+        let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload");
+        assert_eq!(raw.primary_coordinator.as_deref(), Some("none"));
+        assert_eq!(raw.wireguard_advertised.as_deref(), Some("203.0.113.9:41821"));
     }
 
     #[test]
