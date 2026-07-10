@@ -25,9 +25,17 @@ mod tray;
 mod user_identity;
 mod workspaces;
 
+// On CEF, non-browser processes (renderer/GPU/plugin) re-exec this same binary;
+// the entry-point macro dispatches them to run_cef_helper_process and returns.
+#[cfg(feature = "cef")]
+type ShellRuntime = tauri::Cef;
+#[cfg(not(feature = "cef"))]
+type ShellRuntime = tauri::Wry;
+
+#[cfg_attr(feature = "cef", tauri::cef_entry_point)]
 fn main() {
     let node_control = daemon::NodeControl::new().expect("start desktop node-control actor");
-    let mut builder = tauri::Builder::default()
+    let mut builder = tauri::Builder::<ShellRuntime>::default()
         .manage(node_control)
         .invoke_handler(tauri::generate_handler![
             workspaces::workspace_list,
@@ -121,7 +129,9 @@ fn main() {
     // in tauri.conf.json under `plugins.agent`. The endpoint publishes to
     // ${XDG_RUNTIME_DIR|TMPDIR|TMP}/tauri-agent/com.ducktape.app/endpoint.json;
     // set XDG_RUNTIME_DIR per instance to isolate parallel worktree apps.
-    #[cfg(all(debug_assertions, desktop))]
+    // tauri-plugin-agent drives the wry webview; skip it on the CEF probe until
+    // its runtime compat is verified separately.
+    #[cfg(all(debug_assertions, desktop, not(feature = "cef")))]
     {
         builder = builder.plugin(tauri_plugin_agent::init());
     }

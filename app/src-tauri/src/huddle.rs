@@ -31,7 +31,10 @@ const MIN_HEIGHT: f64 = 220.0;
 /// (geolocation, notifications, …) is left to WebKit's default deny. macOS and
 /// Windows are untouched: WKWebView and WebView2 already run a real OS prompt.
 pub fn allow_user_media<R: Runtime>(window: &WebviewWindow<R>) -> tauri::Result<()> {
-    #[cfg(target_os = "linux")]
+    // WebKitGTK-only hook: CEF handles getUserMedia through its own permission
+    // path, so under the `cef` feature this is a no-op (the wry webview handle
+    // this closure needs doesn't exist on the CEF runtime).
+    #[cfg(all(target_os = "linux", not(feature = "cef")))]
     return window.with_webview(|webview| {
         use webkit2gtk::glib::Cast;
         use webkit2gtk::{PermissionRequestExt, UserMediaPermissionRequest, WebViewExt};
@@ -45,7 +48,7 @@ pub fn allow_user_media<R: Runtime>(window: &WebviewWindow<R>) -> tauri::Result<
             }
         });
     });
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(target_os = "linux"), feature = "cef"))]
     {
         let _ = window;
         Ok(())

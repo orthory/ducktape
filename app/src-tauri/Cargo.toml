@@ -45,6 +45,13 @@ tauri-plugin-agent = "0.0.1"
 # exists), and neither tauri nor wry answers — unhandled requests are denied, so
 # huddle mic/camera would always fail NotAllowedError. huddle.rs::allow_user_media
 # grants them. Same crate+version wry already compiles; adds no system deps.
+[features]
+# CEF runtime probe: run the shell on tauri-runtime-cef instead of wry.
+# Gates out the WebKitGTK getUserMedia hook (CEF has its own permission path).
+cef = ["tauri/cef"]
+
+# webkit2gtk's only use (huddle::allow_user_media) is #[cfg]-gated off under
+# `cef`; the crate stays compiled-but-unused, which is harmless.
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "2.0"
 
