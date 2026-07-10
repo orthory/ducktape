@@ -318,7 +318,10 @@ async fn bulk_push_client(
     stream.flush().await.expect("bulk flush");
     // dropping the stream sends FIN — the sink's EOF and end-of-measurement.
     drop(stream);
-    println!("{}", bulk_report("push", sent, started.elapsed().as_secs_f64()));
+    println!(
+        "{}",
+        bulk_report("push", sent, started.elapsed().as_secs_f64())
+    );
 }
 
 /// one line per measurement, fixed shape for the harness:

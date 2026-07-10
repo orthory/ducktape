@@ -54,8 +54,8 @@ use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::{Ingress, Manager, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
-use commonware_runtime::{Clock, IoBuf, Metrics, Quota, Runner, Spawner, Supervisor};
-use commonware_utils::{NZU32, ordered::Set};
+use commonware_runtime::{Clock, IoBuf, Metrics, Runner, Spawner, Supervisor};
+use commonware_utils::ordered::Set;
 use futures::{FutureExt as _, StreamExt as _};
 use tracing_subscriber::prelude::*;
 
@@ -713,29 +713,11 @@ fn run_node(
         // the ingress select arm and the drain-resolution/expiry code.
         let (mut relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
 
-        // the voice + video hub: huddle media between members. per the per-use
-        // data-plane ADR (docs/adr/2026-07-07-per-use-data-plane.mdx), media
-        // rides the OVERLAY — audio+control on Service::Voice's overlay socket
-        // (45902), camera on Service::Video's (45903) — NOT the mesh: two mesh
-        // channels to a peer funnel through one per-peer priority relay, so a
-        // multi-megabit video burst starved the 32 kbps voice stream behind it.
-        // CHANNEL_VOICE/CHANNEL_VIDEO stay REGISTERED + BLACKHOLED (an
-        // unregistered channel is a protocol violation that kills the peer's
-        // connection) so a peer still on the mesh-media build is absorbed, not
-        // disconnected; this node sends no media on them.
+        // the voice + video hub: huddle media between members. per the
+        // per-use data-plane ADR (docs/adr/2026-07-07-per-use-data-plane.mdx),
+        // media rides the OVERLAY — audio+control on Service::Voice's overlay
+        // socket (45902), camera on Service::Video's (45903) — never the mesh.
         let media_peers = {
-            let (_voice_p2p_tx, mut voice_p2p_rx) =
-                network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
-            let video_quota = Quota::per_second(NZU32!(512));
-            let (_video_p2p_tx, mut video_p2p_rx) =
-                network.register(CHANNEL_VIDEO, video_quota, MAX_BACKLOG);
-            context
-                .child("voice_blackhole")
-                .spawn(move |_ctx| async move { while voice_p2p_rx.recv().await.is_ok() {} });
-            context
-                .child("video_blackhole")
-                .spawn(move |_ctx| async move { while video_p2p_rx.recv().await.is_ok() {} });
-
             // media needs the overlay: with no overlay (fake effect, or the
             // reachability plane unconfigured) there is no media transport at
             // all (the overlay-only cutover — no mesh fallback), so drop the

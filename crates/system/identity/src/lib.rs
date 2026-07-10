@@ -56,9 +56,7 @@ pub use interface::*;
 // every scheme an account can collect. flattened at the crate root so the wire
 // types (`KeyKind`, `MemberProof`) and the account logic share one vocabulary.
 mod scheme;
-pub use scheme::{
-    KeyKind, MemberProof, verify_authority, webauthn_challenge, webauthn_rp_id_hash,
-};
+pub use scheme::{KeyKind, MemberProof, verify_authority, webauthn_challenge, webauthn_rp_id_hash};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -184,9 +182,10 @@ impl Identity {
         preimage: &[u8],
         auth: &MemberAuth,
     ) -> Result<(), Error> {
-        let meta = record.member_keys.get(&auth.key).ok_or_else(|| {
-            Error::Module("authorizer is not a member of this account".into())
-        })?;
+        let meta = record
+            .member_keys
+            .get(&auth.key)
+            .ok_or_else(|| Error::Module("authorizer is not a member of this account".into()))?;
         if meta.kind != auth.kind {
             return Err(Error::Module(
                 "authorizer kind does not match its registered kind".into(),
@@ -200,7 +199,9 @@ impl Identity {
             preimage,
             &auth.proof,
         ) {
-            return Err(Error::Module("authorizer certificate does not verify".into()));
+            return Err(Error::Module(
+                "authorizer certificate does not verify".into(),
+            ));
         }
         Ok(())
     }
@@ -376,7 +377,10 @@ impl Identity {
         let mut prev_account: Option<Vec<u8>> = None;
         for _ in 0..count {
             let account_id = cur.bytes()?.to_vec();
-            if prev_account.as_deref().is_some_and(|p| p >= account_id.as_slice()) {
+            if prev_account
+                .as_deref()
+                .is_some_and(|p| p >= account_id.as_slice())
+            {
                 return Err(Error::Module(
                     "snapshot account ids must be strictly increasing".into(),
                 ));
@@ -392,7 +396,13 @@ impl Identity {
 
             accounts.insert(
                 account_id,
-                AccountRecord { display_name, nonce, member_keys, nodes, updated_at },
+                AccountRecord {
+                    display_name,
+                    nonce,
+                    member_keys,
+                    nodes,
+                    updated_at,
+                },
             );
         }
         cur.finish()?;
@@ -459,7 +469,15 @@ impl Identity {
                 ));
             }
             let added_at = cur.u64()?;
-            members.insert(pubkey, MemberMeta { kind, label, rp_id_hash, added_at });
+            members.insert(
+                pubkey,
+                MemberMeta {
+                    kind,
+                    label,
+                    rp_id_hash,
+                    added_at,
+                },
+            );
         }
         Ok(members)
     }
@@ -615,9 +633,10 @@ impl Module for Identity {
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             IdentityMsg::BindNode { authorizer } => self.bind_node(ctx, authorizer).await,
-            IdentityMsg::UnbindNode { node_key, authorizer } => {
-                self.unbind_node(ctx, node_key, authorizer)
-            }
+            IdentityMsg::UnbindNode {
+                node_key,
+                authorizer,
+            } => self.unbind_node(ctx, node_key, authorizer),
             IdentityMsg::AddMemberKey {
                 new_key,
                 new_kind,
@@ -625,10 +644,13 @@ impl Module for Identity {
                 possession,
                 authorizer,
             } => self.add_member_key(ctx, new_key, new_kind, new_label, possession, authorizer),
-            IdentityMsg::RemoveMemberKey { target_key, authorizer } => {
-                self.remove_member_key(ctx, target_key, authorizer)
+            IdentityMsg::RemoveMemberKey {
+                target_key,
+                authorizer,
+            } => self.remove_member_key(ctx, target_key, authorizer),
+            IdentityMsg::SetAccountName { display_name } => {
+                self.set_account_name(ctx, display_name)
             }
-            IdentityMsg::SetAccountName { display_name } => self.set_account_name(ctx, display_name),
         }
     }
 
@@ -651,15 +673,25 @@ impl Module for Identity {
                     .map(|record| Self::account_view(&account_id, &record)),
             ))),
             IdentityQuery::OfNode { node_key } => {
-                let account = self.merged_node_index().get(&node_key).cloned().and_then(|id| {
-                    self.merged_record(&id).map(|record| Self::account_view(&id, &record))
-                });
+                let account = self
+                    .merged_node_index()
+                    .get(&node_key)
+                    .cloned()
+                    .and_then(|id| {
+                        self.merged_record(&id)
+                            .map(|record| Self::account_view(&id, &record))
+                    });
                 Ok(encode_reply(&IdentityReply::Account(account)))
             }
             IdentityQuery::OfMember { member_key } => {
-                let account = self.merged_member_index().get(&member_key).cloned().and_then(|id| {
-                    self.merged_record(&id).map(|record| Self::account_view(&id, &record))
-                });
+                let account = self
+                    .merged_member_index()
+                    .get(&member_key)
+                    .cloned()
+                    .and_then(|id| {
+                        self.merged_record(&id)
+                            .map(|record| Self::account_view(&id, &record))
+                    });
                 Ok(encode_reply(&IdentityReply::Account(account)))
             }
         }
@@ -713,48 +745,50 @@ impl Identity {
 
         // which account does this authorizer speak for -- an existing
         // membership, or a brand-new account it founds?
-        let (account_id, mut record) = match self.merged_member_index().get(&authorizer.key).cloned()
-        {
-            Some(account_id) => {
-                let record = self
-                    .merged_record(&account_id)
-                    .expect("member_index only ever points at an existing record");
-                (account_id, record)
-            }
-            None => {
-                if !authorizer.kind.pubkey_wellformed(&authorizer.key) {
-                    return Err(Error::Module("founding key is malformed for its kind".into()));
+        let (account_id, mut record) =
+            match self.merged_member_index().get(&authorizer.key).cloned() {
+                Some(account_id) => {
+                    let record = self
+                        .merged_record(&account_id)
+                        .expect("member_index only ever points at an existing record");
+                    (account_id, record)
                 }
-                if self.merged_record(&authorizer.key).is_some() {
-                    return Err(Error::Module(
-                        "account id already exists but its founding key is not a member".into(),
-                    ));
+                None => {
+                    if !authorizer.kind.pubkey_wellformed(&authorizer.key) {
+                        return Err(Error::Module(
+                            "founding key is malformed for its kind".into(),
+                        ));
+                    }
+                    if self.merged_record(&authorizer.key).is_some() {
+                        return Err(Error::Module(
+                            "account id already exists but its founding key is not a member".into(),
+                        ));
+                    }
+                    let rp_id_hash = if authorizer.kind.expects_rp_id_hash() {
+                        webauthn_rp_id_hash(&authorizer.proof)
+                    } else {
+                        None
+                    };
+                    let mut member_keys = BTreeMap::new();
+                    member_keys.insert(
+                        authorizer.key.clone(),
+                        MemberMeta {
+                            kind: authorizer.kind,
+                            label: None,
+                            rp_id_hash,
+                            added_at: ctx.env().consensus_time,
+                        },
+                    );
+                    let record = AccountRecord {
+                        display_name: None,
+                        nonce: 0,
+                        member_keys,
+                        nodes: BTreeSet::new(),
+                        updated_at: 0,
+                    };
+                    (authorizer.key.clone(), record)
                 }
-                let rp_id_hash = if authorizer.kind.expects_rp_id_hash() {
-                    webauthn_rp_id_hash(&authorizer.proof)
-                } else {
-                    None
-                };
-                let mut member_keys = BTreeMap::new();
-                member_keys.insert(
-                    authorizer.key.clone(),
-                    MemberMeta {
-                        kind: authorizer.kind,
-                        label: None,
-                        rp_id_hash,
-                        added_at: ctx.env().consensus_time,
-                    },
-                );
-                let record = AccountRecord {
-                    display_name: None,
-                    nonce: 0,
-                    member_keys,
-                    nodes: BTreeSet::new(),
-                    updated_at: 0,
-                };
-                (authorizer.key.clone(), record)
-            }
-        };
+            };
 
         // idempotent re-bind: node already bound to THIS account -> no-op, no
         // nonce bump. the proof is deliberately left unverified here (no state
@@ -832,24 +866,41 @@ impl Identity {
             .expect("member_index only ever points at an existing record");
 
         if !new_kind.pubkey_wellformed(&new_key) {
-            return Err(Error::Module("new member key is malformed for its kind".into()));
+            return Err(Error::Module(
+                "new member key is malformed for its kind".into(),
+            ));
         }
         if record.member_keys.contains_key(&new_key) {
-            return Err(Error::Module("key is already a member of this account".into()));
+            return Err(Error::Module(
+                "key is already a member of this account".into(),
+            ));
         }
         if self.merged_member_index().contains_key(&new_key) {
-            return Err(Error::Module("key already belongs to another account".into()));
+            return Err(Error::Module(
+                "key already belongs to another account".into(),
+            ));
         }
         let label = clean_label(new_label)?;
 
-        let preimage =
-            add_member_preimage(&self.chain_id, &account_id, &new_key, new_kind, record.nonce);
+        let preimage = add_member_preimage(
+            &self.chain_id,
+            &account_id,
+            &new_key,
+            new_kind,
+            record.nonce,
+        );
         // existing member consents ...
         Self::authorize(&record, IDENTITY_ADD_MEMBER_NS, &preimage, &authorizer)?;
         // ... and the new key proves it holds itself (no rp pin yet -- the
         // proof establishes it).
-        if !verify_authority(new_kind, &new_key, None, IDENTITY_ADD_MEMBER_NS, &preimage, &possession)
-        {
+        if !verify_authority(
+            new_kind,
+            &new_key,
+            None,
+            IDENTITY_ADD_MEMBER_NS,
+            &preimage,
+            &possession,
+        ) {
             return Err(Error::Module("possession proof does not verify".into()));
         }
         let rp_id_hash = if new_kind.expects_rp_id_hash() {
@@ -862,7 +913,12 @@ impl Identity {
 
         record.member_keys.insert(
             new_key,
-            MemberMeta { kind: new_kind, label, rp_id_hash, added_at: ctx.env().consensus_time },
+            MemberMeta {
+                kind: new_kind,
+                label,
+                rp_id_hash,
+                added_at: ctx.env().consensus_time,
+            },
         );
         record.nonce += 1;
         record.updated_at = ctx.env().consensus_time;
@@ -890,7 +946,9 @@ impl Identity {
             .expect("member_index only ever points at an existing record");
 
         if !record.member_keys.contains_key(&target_key) {
-            return Err(Error::Module("target key is not a member of this account".into()));
+            return Err(Error::Module(
+                "target key is not a member of this account".into(),
+            ));
         }
         if record.member_keys.len() == 1 {
             return Err(Error::Module(

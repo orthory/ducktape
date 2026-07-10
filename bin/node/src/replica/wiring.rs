@@ -309,25 +309,11 @@ pub(super) async fn wire(
             }
         }
     }
-    // the voice lane: a parked joiner serves no huddle audio, but the
-    // channel must exist — black-hole. dropping the session lane makes
-    // /v1/call/ws refuse instead of hang (this branch always ends in
-    // the promotion reboot, never main.rs's validator path).
+    // media rides the overlay (Service::Voice/Service::Video), never the
+    // mesh; a parked joiner serves no huddle media, so drop the session
+    // lane to make /v1/call/ws refuse instead of hang (this branch always
+    // ends in the promotion reboot, never main.rs's validator path).
     drop(voice_requests);
-    {
-        let (_tx, mut rx) = network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
-        context
-            .child("blackhole_voice")
-            .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
-    }
-    // the video lane: a parked joiner serves no huddle video, but the
-    // channel must exist — black-hole.
-    {
-        let (_tx, mut rx) = network.register(CHANNEL_VIDEO, quota, MAX_BACKLOG);
-        context
-            .child("blackhole_video")
-            .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
-    }
     // the submit-relay lane: once resident standing lands, writes leave
     // here — this node signs its own frames and a validator takes
     // custody. replies (the frame's consensus fate) come back on the

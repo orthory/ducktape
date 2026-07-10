@@ -87,25 +87,11 @@ pub(crate) async fn run(
             .child("blackhole_reachability")
             .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
     }
-    // the voice lane: a sync-only resident serves no huddle audio,
-    // but the channel must exist — black-hole. dropping the session
-    // lane makes /v1/call/ws refuse instead of hang (this branch
-    // never reaches main.rs's validator path).
+    // media rides the overlay (Service::Voice/Service::Video), never
+    // the mesh; a sync-only resident serves no huddle media, so drop
+    // the session lane to make /v1/call/ws refuse instead of hang
+    // (this branch never reaches main.rs's validator path).
     drop(voice_requests);
-    {
-        let (_tx, mut rx) = network.register(CHANNEL_VOICE, quota, MAX_BACKLOG);
-        context
-            .child("blackhole_voice")
-            .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
-    }
-    // the video lane: a sync-only resident serves no huddle video, but
-    // the channel must exist — black-hole.
-    {
-        let (_tx, mut rx) = network.register(CHANNEL_VIDEO, quota, MAX_BACKLOG);
-        context
-            .child("blackhole_video")
-            .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
-    }
     network.start();
 
     if sync_sources.is_empty() {

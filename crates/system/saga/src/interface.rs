@@ -235,7 +235,9 @@ pub enum SagaQuery {
     /// — the state-driven read a node that does NOT execute blocks (a synced
     /// RESIDENT) polls to discover its own assigned work. sorted by saga id;
     /// terminal sagas and other nodes' leases are excluded.
-    AssignedPending { assignee: Vec<u8> },
+    AssignedPending {
+        assignee: Vec<u8>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

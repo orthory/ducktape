@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
-use defguard_wireguard_rs::{key::Key, net::IpAddrMask, peer::Peer, InterfaceConfiguration};
+use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
 use wireguard_upgrade::{AllowedIp, TunnelInstallPlan, ValidatorIdentity, X25519PublicKey};
 
 use crate::WireGuardEffect;
@@ -261,7 +261,12 @@ mod tests {
                 validator_identity: id(sk),
                 wireguard_public_key: *wg,
                 control_endpoint: endpoint(&policy, [1, 1, 1, *octet], 443, Transport::Tcp),
-                wireguard_endpoint: Some(endpoint(&policy, [8, 8, 8, *octet], 51820, Transport::Udp)),
+                wireguard_endpoint: Some(endpoint(
+                    &policy,
+                    [8, 8, 8, *octet],
+                    51820,
+                    Transport::Udp,
+                )),
                 capabilities: vec![],
                 expires_at_view: 50,
                 nonce: 1,
@@ -359,10 +364,7 @@ mod tests {
             },
             initiator,
         );
-        validate_upgrade(
-            view, policy, overlay, 12, &request, &response, &ack, replay,
-        )
-        .unwrap()
+        validate_upgrade(view, policy, overlay, 12, &request, &response, &ack, replay).unwrap()
     }
 
     /// a minimal two-validator handshake, direct (no relay), yielding the
@@ -387,7 +389,12 @@ mod tests {
             1,
             2,
         );
-        let listen = view.record(id(&a)).unwrap().wireguard_endpoint.unwrap().port;
+        let listen = view
+            .record(id(&a))
+            .unwrap()
+            .wireguard_endpoint
+            .unwrap()
+            .port;
         (plan, listen)
     }
 
@@ -429,7 +436,12 @@ mod tests {
             3,
             4,
         );
-        let listen = view.record(id(&a)).unwrap().wireguard_endpoint.unwrap().port;
+        let listen = view
+            .record(id(&a))
+            .unwrap()
+            .wireguard_endpoint
+            .unwrap()
+            .port;
         (plan_ab, plan_ac, listen)
     }
 
@@ -466,7 +478,10 @@ mod tests {
         );
         assert_eq!(applied.peers.len(), 1);
         let peer = &applied.peers[0];
-        assert_eq!(peer.public_key.as_array(), plan.peer_wireguard_public_key().0);
+        assert_eq!(
+            peer.public_key.as_array(),
+            plan.peer_wireguard_public_key().0
+        );
         assert_eq!(peer.endpoint, Some(override_addr));
         assert_eq!(
             peer.allowed_ips,
@@ -569,11 +584,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(fake.create_calls, 1, "the live interface is never re-created");
+        assert_eq!(
+            fake.create_calls, 1,
+            "the live interface is never re-created"
+        );
         assert_eq!(fake.remove_calls, 0, "and never torn down");
         assert_eq!(fake.applied.len(), 2);
         assert_eq!(fake.applied[0].peers.len(), 1);
-        assert_eq!(fake.applied[1].peers.len(), 2, "the update carries the grown set");
+        assert_eq!(
+            fake.applied[1].peers.len(),
+            2,
+            "the update carries the grown set"
+        );
     }
 
     #[test]
@@ -613,11 +635,24 @@ mod tests {
         let parts = plan_peer_configs(&[plan_ab.clone(), plan_ac.clone()], &overrides);
 
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].wireguard_public_key, plan_ab.peer_wireguard_public_key());
-        assert_eq!(parts[0].endpoint, plan_ab.peer_endpoint().map(|e| e.socket_addr()));
+        assert_eq!(
+            parts[0].wireguard_public_key,
+            plan_ab.peer_wireguard_public_key()
+        );
+        assert_eq!(
+            parts[0].endpoint,
+            plan_ab.peer_endpoint().map(|e| e.socket_addr())
+        );
         assert_eq!(parts[0].allowed_ips, plan_ab.allowed_ips().to_vec());
-        assert_eq!(parts[1].wireguard_public_key, plan_ac.peer_wireguard_public_key());
-        assert_eq!(parts[1].endpoint, Some(punched), "override lands by identity");
+        assert_eq!(
+            parts[1].wireguard_public_key,
+            plan_ac.peer_wireguard_public_key()
+        );
+        assert_eq!(
+            parts[1].endpoint,
+            Some(punched),
+            "override lands by identity"
+        );
     }
 
     #[test]

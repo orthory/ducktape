@@ -9,10 +9,12 @@ surface and proved call media flows between them.
 ## Why this exists
 
 The huddle call path is: app webview → `/v1/call/ws` → node call hub
-(`bin/node/src/voice.rs`) → data-plane datagrams over the authenticated TCP mesh
-(`CHANNEL_VOICE`/`CHANNEL_VIDEO`) → remote hub → playout. The node's own tests
-wire two hubs through *in-process channels* — they never exercise the **real
-mesh**. This bed does, on two separate `ducktape-node` processes/containers.
+(`bin/node/src/voice.rs`) → data-plane datagrams over the WireGuard overlay
+(`Service::Voice`/`Service::Video`, one per-use plane each — see
+`docs/adr/2026-07-07-per-use-data-plane.mdx`) → remote hub → playout. The
+node's own tests wire two hubs through *in-process channels* — they never
+exercise the **real mesh**. This bed does, on two separate
+`ducktape-node` processes/containers.
 
 **A single node cannot host a real call**: the hub fans media out by *node key*
 and excludes self, so two webviews on one node produce an empty recipient set.
@@ -27,7 +29,7 @@ host). The `driver` exits `0` only when all of these cross the real mesh:
 - **audio**, both directions — a synthesized tone plays out at **RMS ≈ 5490**
   vs **0** for silence;
 - **video**, both directions — a synthetic multi-fragment frame fragments across
-  `Service::Video`/`CHANNEL_VIDEO` and reassembles **byte-exact** on the far node;
+  `Service::Video` and reassembles **byte-exact** on the far node;
 - **control** — `peerBeacon` presence frames cross both ways.
 
 The nodes reach a live 2-of-2 quorum (`height ≥ 1`) before the driver runs, so
@@ -46,9 +48,22 @@ docker compose -f ops/callbed/docker-compose.yml run --rm driver
 ```
 
 `bootstrap` runs the offline ceremony (`init → invite → join → admit → invite →
-join`) and writes `node0`/`node1` configs to a shared volume; the two nodes boot
-and reach a live 2-of-2 quorum; `driver` then synthesizes tones + camera frames
-on each node's call session and asserts they arrive on the other.
+join`) and writes `node0`/`node1` configs to a shared volume; the two nodes
+boot, reach a live 2-of-2 quorum, and bring their overlay tunnels up from the
+concrete WireGuard endpoints `node-entry.sh` bakes into each node's gossiped
+`EndpointRecord`; `driver` then synthesizes tones + camera frames on each
+node's call session and asserts they arrive on the other. A compose-local
+`coordinator` (private mode, pinned to the ceremony's genesis set) exercises
+the coordinator-auth registration lane — the founder registers and learns its
+reflexive address through it (only the founder: invites strip coordinated
+hints and `join` has no coordinator flag — see #331's product tier).
+
+Why a LOCAL coordinator: media is overlay-only, and both containers sit behind
+the same host NAT — the public coordinator would observe both at the host's
+reflexive address, and the punch would need NAT hairpinning, which never lands
+(issue #331). In-network, rendezvous hands out the real container addresses.
+The nodes use the TUN-less `socket` WireGuard effect (no `/dev/net/tun`, no
+`NET_ADMIN` needed).
 
 Do **not** use `up --abort-on-container-exit`: the one-shot `bootstrap` exits
 first and would tear the whole stack down before the nodes start.
@@ -72,10 +87,10 @@ Teardown: `docker compose -f ops/callbed/docker-compose.yml down -v`.
 
 | File | Role |
 |------|------|
-| `Dockerfile.node` | builds `ducktape-node`, ships it + the scripts + curl |
-| `bootstrap.sh` | offline peering ceremony → `node0`/`node1` configs in `/shared` |
+| `Dockerfile.node` | builds `ducktape-node` + `coordinator`, ships them + the scripts + curl |
+| `bootstrap.sh` | offline peering ceremony → `node0`/`node1` configs in `/shared` (socket WG effect, compose-local coordinator) |
 | `node-entry.sh` | waits for its config, runs the validator |
-| `docker-compose.yml` | `bootstrap` (one-shot) → `node0` + `node1` → `driver` |
+| `docker-compose.yml` | `bootstrap` (one-shot) → `coordinator` → `node0` + `node1` → `driver` |
 | `call-driver.ts` | bun ws client: synth tone + camera frame; assert audio RMS + byte-exact video reassembly; verdict |
 | `virtual-mic.sh` | PulseAudio null-sink → a capture source (for the app profile) |
 

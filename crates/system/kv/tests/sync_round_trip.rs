@@ -32,7 +32,9 @@ fn synced_store_reconstructs_source_root() {
 
         // JOINER: reconstruct on a FRESH context + namespace by pulling from the
         // resolver. no ops are applied in application order on this side.
-        let synced = Kv::sync_from(context.child("dst"), "dst", target, resolver).await.expect("sync_from");
+        let synced = Kv::sync_from(context.child("dst"), "dst", target, resolver)
+            .await
+            .expect("sync_from");
 
         // THE PROPERTY: identical qmdb root — the app-hash linkage a joiner needs
         // to be accepted as a consensus participant at the boundary height.

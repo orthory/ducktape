@@ -78,7 +78,7 @@ pub(crate) const DRAIN_TICK: Duration = Duration::from_millis(100);
 /// SIGNED (its own identity key is the frame origin — authorship) to one
 /// current validator, which takes consensus custody (`submit_frame`) and
 /// answers with the frame's fate when it drains. the last free static slot
-/// below CHANNEL_STATE_SYNC; engine banks start at 9 (statics run 3–8).
+/// below CHANNEL_STATE_SYNC; engine banks start at 9 (statics run 3–6).
 /// registered in EVERY
 /// mode like the lanes above — validators serve, residents speak, sync-only
 /// black-holes.
@@ -97,16 +97,6 @@ pub(crate) const CHANNEL_LOBBY: u64 = 5;
 /// EVERY mode — an unregistered channel is a protocol violation that kills
 /// the sender's connection — and black-holed where the plane does not run.
 pub(crate) const CHANNEL_REACHABILITY: u64 = 6;
-/// the voice channel: huddle audio datagrams between members (`chat::voice`
-/// media frames inside data-plane datagrams — the `voice` module's mesh
-/// transport arm). registered in EVERY mode like the lanes above; only the
-/// validator path runs the hub that consumes it, every other mode black-holes.
-pub(crate) const CHANNEL_VOICE: u64 = 7;
-/// the video channel: camera-frame fragments between huddle members
-/// (`chat::video` fragments inside data-plane datagrams). its own lane so
-/// keyframe bursts never queue ahead of voice, with its own per-peer quota
-/// sized for the top of the rate ladder plus keyframe bursts.
-pub(crate) const CHANNEL_VIDEO: u64 = 8;
 /// while parked and un-admitted, re-announce every N park-loop attempts
 /// (attempts tick ~2s apart, so this is roughly every 10s) — often enough to
 /// survive member restarts (the request queue is in-memory), quiet enough to
@@ -169,7 +159,7 @@ pub(crate) const SUBMIT_HOLD: Duration = Duration::from_secs(10);
 /// backstop — a validator that missed the one-shot relay gossip for a
 /// finalized op fetches its bytes by digest instead of wedging its apply
 /// prefix forever). starts at 9, clear of the fixed discovery channels
-/// (statesync 4, lobby 5, reachability 6, voice 7, video 8).
+/// (statesync 4, lobby 5, reachability 6).
 pub(crate) fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
     let base = 9 + epoch * 5;
     (base, base + 1, base + 2, base + 3, base + 4)

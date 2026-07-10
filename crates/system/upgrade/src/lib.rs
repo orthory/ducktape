@@ -35,8 +35,8 @@
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
-pub use interface::*;
 use crate::ScheduledUpgrade as UpgradeCoords;
+pub use interface::*;
 
 use std::collections::BTreeMap;
 
@@ -577,10 +577,10 @@ fn decode_state(bytes: &[u8]) -> Result<UpgradeState, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encode_msg;
+    use commonware_codec::DecodeExt as _;
     use commonware_cryptography::Signer as _;
     use commonware_cryptography::ed25519::PrivateKey;
-    use commonware_codec::DecodeExt as _;
-    use crate::encode_msg;
 
     // a Ctx that answers the valset Validators query with a configurable member
     // set (upgrade's only host-routed read) and carries a settable origin/height.
@@ -591,7 +591,8 @@ mod tests {
     impl TestCtx {
         fn new(origin: Origin, height: u64, members: Vec<Vec<u8>>) -> Self {
             Self {
-                env: sdk::Env { protocol_version: 0,
+                env: sdk::Env {
+                    protocol_version: 0,
                     height,
                     consensus_time: 0,
                     origin,
@@ -809,7 +810,10 @@ mod tests {
         commit(&mut u);
         run(&mut u, &mut sys, &schedule("c", 10, 2)).unwrap();
         commit(&mut u);
-        assert!(u.committed.readiness.is_empty(), "fresh schedule starts empty");
+        assert!(
+            u.committed.readiness.is_empty(),
+            "fresh schedule starts empty"
+        );
     }
 
     // ---- signal identity scope + idempotence --------------------------------
@@ -826,9 +830,15 @@ mod tests {
 
         // wrong name.
         let mut c1 = TestCtx::new(Origin::External(m1.clone()), 0, members.clone());
-        assert!(matches!(run(&mut u, &mut c1, &signal("b", 2)), Err(Error::Module(_))));
+        assert!(matches!(
+            run(&mut u, &mut c1, &signal("b", 2)),
+            Err(Error::Module(_))
+        ));
         // wrong to_version.
-        assert!(matches!(run(&mut u, &mut c1, &signal("a", 3)), Err(Error::Module(_))));
+        assert!(matches!(
+            run(&mut u, &mut c1, &signal("a", 3)),
+            Err(Error::Module(_))
+        ));
 
         // idempotent per pubkey: two signals from m1 collapse to one entry.
         run(&mut u, &mut c1, &signal("a", 2)).unwrap();
@@ -859,11 +869,17 @@ mod tests {
         commit(&mut u);
 
         // wrong name rejected.
-        assert!(matches!(run(&mut u, &mut sys, &cancel("b")), Err(Error::Module(_))));
+        assert!(matches!(
+            run(&mut u, &mut sys, &cancel("b")),
+            Err(Error::Module(_))
+        ));
 
         // at/after activation height rejected.
         let mut late = TestCtx::new(Origin::System, 10, members);
-        assert!(matches!(run(&mut u, &mut late, &cancel("a")), Err(Error::Module(_))));
+        assert!(matches!(
+            run(&mut u, &mut late, &cancel("a")),
+            Err(Error::Module(_))
+        ));
 
         // valid cancel clears BOTH pending and readiness.
         run(&mut u, &mut sys, &cancel("a")).unwrap();
@@ -920,7 +936,10 @@ mod tests {
         let mut boundary = TestCtx::new(Origin::System, 10, members.clone());
         run(&mut u, &mut boundary, &advance()).unwrap();
         commit(&mut u);
-        assert_eq!(u.committed.current_version, 0, "abort leaves version unchanged");
+        assert_eq!(
+            u.committed.current_version, 0,
+            "abort leaves version unchanged"
+        );
         assert!(u.committed.pending.is_none(), "abort clears pending");
         assert!(u.committed.readiness.is_empty(), "abort clears readiness");
 
@@ -972,7 +991,11 @@ mod tests {
         let mut c0 = TestCtx::new(Origin::External(m0.clone()), 1, members.clone());
         run(&mut u, &mut c0, &signal("a", 2)).unwrap();
         commit(&mut u);
-        assert_eq!(u.committed.readiness.len(), 1, "only m0 committed by end of H-1");
+        assert_eq!(
+            u.committed.readiness.len(),
+            1,
+            "only m0 committed by end of H-1"
+        );
 
         // block H (height 10): m1's SignalReady is THIS block's op — it stages
         // readiness=n — and the injected Advance runs in the SAME drain, before any
@@ -989,7 +1012,10 @@ mod tests {
             "a same-block late nth signal must NOT flip: the boundary quorum was unmet at H-1"
         );
         assert!(u.committed.pending.is_none(), "the upgrade aborts cleanly");
-        assert!(u.committed.readiness.is_empty(), "readiness cleared on abort");
+        assert!(
+            u.committed.readiness.is_empty(),
+            "readiness cleared on abort"
+        );
     }
 
     // ---- effective_version --------------------------------------------------
@@ -999,12 +1025,20 @@ mod tests {
         let members = vec![valid_key(1), valid_key(2)];
         // committed pending + full readiness, NOT yet advanced.
         let u = schedule_and_ready_all("a", 10, 2, &members);
-        assert_eq!(u.effective_version(10, &members), 2, "armed at/after H -> to_version");
+        assert_eq!(
+            u.effective_version(10, &members),
+            2,
+            "armed at/after H -> to_version"
+        );
         assert_eq!(u.effective_version(9, &members), 0, "below H -> current");
         // a boundary member not ready -> current.
         let mut plus = members.clone();
         plus.push(valid_key(3));
-        assert_eq!(u.effective_version(10, &plus), 0, "missing member -> current");
+        assert_eq!(
+            u.effective_version(10, &plus),
+            0,
+            "missing member -> current"
+        );
         // empty boundary -> current.
         assert_eq!(u.effective_version(10, &[]), 0);
     }
@@ -1021,7 +1055,11 @@ mod tests {
         // staged only: committed root still ZERO.
         assert_eq!(u.root(), StateRoot::ZERO);
         commit(&mut u);
-        assert_ne!(u.root(), StateRoot::ZERO, "committed schedule moves root off ZERO");
+        assert_ne!(
+            u.root(),
+            StateRoot::ZERO,
+            "committed schedule moves root off ZERO"
+        );
     }
 
     #[test]
@@ -1124,7 +1162,10 @@ mod tests {
         // a later dispatch in the same block errors -> the host aborts the block.
         futures::executor::block_on(u.abort_block()).unwrap();
         assert_eq!(u.root(), before, "aborted schedule leaves root untouched");
-        assert!(u.committed.pending.is_none(), "aborted schedule committed nothing");
+        assert!(
+            u.committed.pending.is_none(),
+            "aborted schedule committed nothing"
+        );
     }
 
     #[test]
@@ -1167,7 +1208,10 @@ mod tests {
         // bad pending tag (byte 4).
         let mut bad_pending = valid.clone();
         bad_pending[4] = 2;
-        assert!(decode_state(&bad_pending).is_err(), "bad pending tag rejected");
+        assert!(
+            decode_state(&bad_pending).is_err(),
+            "bad pending tag rejected"
+        );
 
         // forged readiness count (bytes 5..13) beyond what the buffer can hold.
         let mut forged = valid.clone();
@@ -1177,7 +1221,10 @@ mod tests {
         // bad commitment tag: first entry's tag at offset 13+8+1 = 22.
         let mut bad_commit = valid.clone();
         bad_commit[22] = 2;
-        assert!(decode_state(&bad_commit).is_err(), "bad commitment tag rejected");
+        assert!(
+            decode_state(&bad_commit).is_err(),
+            "bad commitment tag rejected"
+        );
 
         // non-increasing readiness keys: same shape but keys 0x02 then 0x01.
         let mut unordered = Vec::new();

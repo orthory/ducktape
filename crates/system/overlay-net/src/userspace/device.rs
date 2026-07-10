@@ -122,9 +122,7 @@ impl UnderlaySocket {
         // v4 endpoint, a punched v4 reflexive) must be sent as v4-MAPPED v6,
         // or the send is EINVAL on macOS (and family-mismatched everywhere).
         let dst = match dst {
-            SocketAddr::V4(v4) => {
-                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
-            }
+            SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port()),
             SocketAddr::V6(_) => dst,
         };
         self.udp.send_to(buf, dst).await

@@ -58,10 +58,9 @@ impl NatSocket {
                 // it as v4-MAPPED v6, or the send is EINVAL on macOS (and
                 // family-mismatched everywhere).
                 let dst = match (local, dst) {
-                    (SocketAddr::V6(_), SocketAddr::V4(v4)) => SocketAddr::new(
-                        std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()),
-                        v4.port(),
-                    ),
+                    (SocketAddr::V6(_), SocketAddr::V4(v4)) => {
+                        SocketAddr::new(std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+                    }
                     _ => dst,
                 };
                 socket.send_to(buf, dst).await
@@ -971,8 +970,7 @@ mod tests {
 
         // bind exactly like the production underlay: a std dual-stack
         // `[::]:0` socket handed to tokio.
-        let std_sock =
-            std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).unwrap();
+        let std_sock = std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).unwrap();
         std_sock.set_nonblocking(true).unwrap();
         let underlay = std::sync::Arc::new(UdpSocket::from_std(std_sock).unwrap());
         let underlay_port = underlay.local_addr().unwrap().port();
