@@ -363,15 +363,19 @@ export function ForgeView() {
   }, [desktop, selectedRepo, state.forgeHead]);
 
   // The tracker's per-screen slices (issues/PRs + consensus branch heads) —
-  // loaded on open/repo switch and re-pulled per forge HEAD advance, since a
-  // tracker write IS a forge commit.
+  // loaded on open/repo switch and re-pulled per forge WRITE. The forge
+  // module's state root is the trigger, not main's head: an externally-pushed
+  // branch (PushRefs over git smart-HTTP) and a peer's tracker op both move
+  // the root without moving main, and the PR form's source branches must
+  // follow list_refs without a reload. The root rides every status patch.
+  const forgeRoot = state.status?.modules.find((m) => m.id === "forge")?.root ?? null;
   useEffect(() => {
     if (!selectedRepo) return;
     void actions.loadForgeItems(selectedRepo.name);
     void actions.loadForgeBranches(selectedRepo.name);
     // actions is the store's stable facade — repo identity is the real dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedRepo?.name, state.forgeHead]);
+  }, [selectedRepo?.name, forgeRoot]);
 
   useEffect(() => {
     if (!desktop || !selectedRepo) return;

@@ -69,23 +69,28 @@ function renderForge(
     },
   ) as unknown as ConsoleActions;
 
-  render(
+  const tree = (overrides: Partial<ConsoleState>) => (
     <ConsoleContext.Provider
       value={{
         state: {
           ...createInitialState(),
           forgeHead: HEAD,
           connected: true,
-          ...stateOverrides,
+          ...overrides,
         },
         actions,
       }}
     >
       <ForgeView />
-    </ConsoleContext.Provider>,
+    </ConsoleContext.Provider>
   );
 
-  return { commitForge };
+  const view = render(tree(stateOverrides));
+
+  return {
+    commitForge,
+    rerender: (nextOverrides: Partial<ConsoleState>) => view.rerender(tree(nextOverrides)),
+  };
 }
 
 describe("ForgeView", () => {
@@ -300,6 +305,37 @@ describe("ForgeView", () => {
     });
     expect(screen.getByText("REPOSITORIES")).toBeInTheDocument();
     expect(getForgeItem).not.toHaveBeenCalled();
+  });
+
+  it("re-pulls tracker slices when the forge root moves without main's head", async () => {
+    // An external `git push` of a side branch (PushRefs over smart-HTTP) moves
+    // the forge module root but NOT main's head — the branch list must follow
+    // the root, or the PR form only sees the new branch after a full reload.
+    const loadForgeBranches = vi.fn();
+    const loadForgeItems = vi.fn();
+    const statusAt = (root: string) => ({
+      version: "test",
+      appHash: "hash",
+      height: 1,
+      modules: [{ id: "forge", root }],
+    });
+
+    const { rerender } = renderForge(
+      { status: statusAt("root-1") },
+      { loadForgeBranches, loadForgeItems },
+    );
+
+    fireEvent.click(await screen.findByText("ducktape/ducktape"));
+    await waitFor(() => {
+      expect(loadForgeBranches).toHaveBeenCalledTimes(1);
+    });
+
+    rerender({ status: statusAt("root-2") });
+    await waitFor(() => {
+      expect(loadForgeBranches).toHaveBeenCalledTimes(2);
+    });
+    expect(loadForgeBranches).toHaveBeenLastCalledWith("ducktape");
+    expect(loadForgeItems).toHaveBeenCalledTimes(2);
   });
 
   it("adds Issues and Pull requests tabs that render the tracker lists", async () => {
