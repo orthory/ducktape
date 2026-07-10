@@ -3,12 +3,17 @@
 // through `setDevicePrefs` (persisted + applied to the live session). The
 // speaker row is hidden where the runtime can't route output (WebKitGTK / macOS
 // WKWebView have no setSinkId) so it's never a dead control.
+//
+// Split in two: `DevicesMenuView` is store-free (options + prefs + onChange as
+// props) so the popped-out huddle window — which runs OUTSIDE the store/provider
+// — can reuse the exact same picker against its own session; `DevicesMenu` is
+// the store-connected wrapper the in-app dock/stage use.
 
 import { useEffect } from "react";
 import type { CSSProperties } from "react";
 
 import { canSelectSpeaker } from "../../../domain/media-devices";
-import type { DevicePrefs, MediaDeviceOption } from "../../../domain/media-devices";
+import type { DevicePrefs, HuddleDevices, MediaDeviceOption } from "../../../domain/media-devices";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 
@@ -60,19 +65,20 @@ function DeviceRow({
   );
 }
 
-export function DevicesMenu({ onClose }: { onClose: () => void }) {
-  const { state, actions } = useDucktape();
-  const { deviceOptions, devicePrefs } = state;
-
-  // Re-enumerate when the menu opens — labels populate only after a media grant,
-  // and devices can hot-plug.
-  useEffect(() => {
-    actions.refreshDevices();
-  }, [actions]);
-
-  const set = (patch: Partial<DevicePrefs>) => actions.setDevicePrefs({ ...devicePrefs, ...patch });
+/** The store-free picker: options + current prefs in, a merged patch out. Used
+ *  directly by the popped window and wrapped by `DevicesMenu` for the dock. */
+export function DevicesMenuView({
+  options,
+  prefs,
+  onChange,
+  onClose,
+}: {
+  options: HuddleDevices;
+  prefs: DevicePrefs;
+  onChange: (patch: Partial<DevicePrefs>) => void;
+  onClose: () => void;
+}) {
   const showSpeaker = canSelectSpeaker();
-
   return (
     <div
       role="menu"
@@ -99,11 +105,31 @@ export function DevicesMenu({ onClose }: { onClose: () => void }) {
         </button>
       </div>
 
-      <DeviceRow label="Microphone" options={deviceOptions.mics} value={devicePrefs.micId} onChange={(micId) => set({ micId })} />
-      <DeviceRow label="Camera" options={deviceOptions.cameras} value={devicePrefs.cameraId} onChange={(cameraId) => set({ cameraId })} />
+      <DeviceRow label="Microphone" options={options.mics} value={prefs.micId} onChange={(micId) => onChange({ micId })} />
+      <DeviceRow label="Camera" options={options.cameras} value={prefs.cameraId} onChange={(cameraId) => onChange({ cameraId })} />
       {showSpeaker && (
-        <DeviceRow label="Speaker" options={deviceOptions.speakers} value={devicePrefs.speakerId} onChange={(speakerId) => set({ speakerId })} />
+        <DeviceRow label="Speaker" options={options.speakers} value={prefs.speakerId} onChange={(speakerId) => onChange({ speakerId })} />
       )}
     </div>
+  );
+}
+
+export function DevicesMenu({ onClose }: { onClose: () => void }) {
+  const { state, actions } = useDucktape();
+  const { deviceOptions, devicePrefs } = state;
+
+  // Re-enumerate when the menu opens — labels populate only after a media grant,
+  // and devices can hot-plug.
+  useEffect(() => {
+    actions.refreshDevices();
+  }, [actions]);
+
+  return (
+    <DevicesMenuView
+      options={deviceOptions}
+      prefs={devicePrefs}
+      onChange={(patch) => actions.setDevicePrefs({ ...devicePrefs, ...patch })}
+      onClose={onClose}
+    />
   );
 }

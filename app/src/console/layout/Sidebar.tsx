@@ -11,9 +11,9 @@ import { useDucktape } from "../store/use-ducktape";
 import { color, font, radius } from "../theme/tokens";
 import { initialsOf } from "../views/account/ProfileCard";
 
-const navBg = (active: boolean) => (active ? "#e9e9e9" : "transparent");
-const navFg = (active: boolean) => (active ? "#3a3934" : "#959595");
-const navIc = (active: boolean) => (active ? "#26251f" : color.iconIdle);
+const navBg = (active: boolean) => (active ? color.hover : "transparent");
+const navFg = (active: boolean) => (active ? color.inkSoft : color.muted);
+const navIc = (active: boolean) => (active ? color.ink : color.iconIdle);
 
 const MODES: ReadonlyArray<{
   id: NavSection;
@@ -76,7 +76,7 @@ function ModeToggle({
               style={{
                 font: `700 8.5px ${font.mono}`,
                 letterSpacing: ".08em",
-                color: active ? color.onDark : "#959595",
+                color: active ? color.onDark : color.muted,
               }}
             >
               {entry.label}
@@ -178,7 +178,7 @@ export function Sidebar() {
           height: 34,
           borderRadius: "50%",
           marginBottom: 2,
-          background: state.screen === "account" ? color.dark : "#cdcdcd",
+          background: state.screen === "account" ? color.dark : color.iconIdle,
           color: state.screen === "account" ? color.onDark : color.muted3,
           font: `600 12px ${font.sans}`,
         }}
@@ -203,6 +203,29 @@ export function Sidebar() {
         }}
       >
         <Icon name="settings" size={18} color={navIc(state.screen === "settings")} />
+      </button>
+
+      {/* Light/dark switch — a peer of the gear, not a screen. The sun/moon
+          glyph keeps it distinct from Settings (which now wears a real cog). */}
+      <button
+        onClick={actions.toggleTheme}
+        title={state.theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+        aria-label="Toggle light/dark theme"
+        style={{
+          all: "unset",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: 34,
+          height: 34,
+          borderRadius: 9,
+          marginTop: 2,
+          background: "transparent",
+          color: color.iconIdle,
+        }}
+      >
+        <Icon name={state.theme === "dark" ? "moon" : "sun"} size={18} color={color.iconIdle} />
       </button>
     </div>
   );

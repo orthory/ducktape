@@ -69,6 +69,7 @@ import {
   loadPendingDisplayName,
   removeTab,
   saveAccent,
+  saveTheme,
   saveDocTabs,
   saveNotifyPrefs,
   saveRemoteUrl,
@@ -114,6 +115,8 @@ export interface ConsoleActions {
    *  to the other rail, so the body always matches the rail. */
   setViewMode(mode: ViewMode): void;
   setAccent(accent: string): void;
+  /** Flip the light/dark color theme and persist the choice. */
+  toggleTheme(): void;
   setNotifyPrefs(prefs: NotifyPrefs): void;
   toggleChannelMute(channelId: string): void;
   setAuthor(author: string): void;
@@ -704,6 +707,10 @@ export function createActions({
       update((prev) => ({ voice: { ...prev.voice, speaking: event.speaking } }));
       return;
     }
+    if (event.kind === "selfLevel") {
+      update((prev) => ({ voice: { ...prev.voice, level: event.level } }));
+      return;
+    }
     if (event.kind === "mediaNote") {
       if (mediaNoteTimer !== null) clearTimeout(mediaNoteTimer);
       update((prev) => ({ voice: { ...prev.voice, mediaNote: event.note } }));
@@ -1270,6 +1277,12 @@ export function createActions({
       saveAccent(accent);
       patch({ accent });
     },
+
+    toggleTheme: () => {
+      const next = getState().theme === "dark" ? "light" : "dark";
+      saveTheme(next);
+      patch({ theme: next });
+    },
     setNotifyPrefs,
     toggleChannelMute: (channelId) => {
       const prefs = getState().notifyPrefs;
@@ -1606,6 +1619,7 @@ export function createActions({
           peers: {},
           sessionStartMs: null,
           speaking: false,
+          level: 0,
         },
       });
       if (channelId) submitLeaveHuddle(channelId);

@@ -6,7 +6,7 @@ import { useState } from "react";
 import type { ModuleCategory, ModuleStatus } from "../../../domain/transport";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius, shadow, tint } from "../../theme/tokens";
 
 const shortRoot = (hex: string): string =>
   hex.length > 20 ? `${hex.slice(0, 10)}…${hex.slice(-8)}` : hex || "—";
@@ -90,10 +90,10 @@ function RootButton({
         gap: 6,
         padding: "4px 8px",
         borderRadius: radius.sm,
-        border: `1px solid ${copied ? "#cfe3d7" : color.borderSoft}`,
-        background: copied ? "#eef5f0" : color.sunken,
+        border: `1px solid ${copied ? tint(color.green).border : color.borderSoft}`,
+        background: copied ? tint(color.green).bg : color.sunken,
         font: `500 11px ${font.mono}`,
-        color: copied ? "#5f9e74" : color.muted3,
+        color: copied ? tint(color.green).text : color.muted3,
       }}
     >
       <span

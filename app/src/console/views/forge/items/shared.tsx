@@ -8,7 +8,7 @@ import { authorName, keyHex } from "../../../../domain/chat-client";
 import type { AuthorRef } from "../../../../domain/chat-client";
 import type { ForgeItemKind, ForgeItemState, ForgeItemSummary } from "../../../../domain/forge-client";
 import { useDucktape } from "../../../store/use-ducktape";
-import { color, font, radius } from "../../../theme/tokens";
+import { color, font, radius, tint } from "../../../theme/tokens";
 import { relTime, SegButton } from "../ui";
 
 /** GitHub's item-number form: `#42`. */
@@ -17,9 +17,9 @@ export const itemNumber = (n: number): string => `#${n}`;
 /** Badge tones per item state: open green / closed red / merged purple —
  *  the tracker's one non-negotiable color convention. */
 export const stateTone = {
-  open: { text: color.green, bg: "#eef5f0", border: "#cfe3d7" },
-  closed: { text: color.red, bg: "#fbeeec", border: "#eccfc9" },
-  merged: { text: color.purple, bg: "#f1edf5", border: "#ddd2e6" },
+  open: tint(color.green),
+  closed: tint(color.red),
+  merged: tint(color.purple),
 } as const;
 
 export function StateBadge({ state }: { state: ForgeItemState }) {

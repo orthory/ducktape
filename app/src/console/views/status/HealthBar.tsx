@@ -10,7 +10,7 @@ import type { CSSProperties } from "react";
 import { color, font, radius } from "../../theme/tokens";
 import type { HealthSeg } from "./node-health";
 
-const APPLIED = "#5f9e74"; // the synced-green used by the status pill
+const APPLIED = color.green; // the synced-green used by the status pill
 const REJECTED = color.amber;
 
 const BAR_HEIGHT = 30;

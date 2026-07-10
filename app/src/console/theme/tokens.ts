@@ -1,53 +1,82 @@
 // Design tokens carried over from the Ducktape Console design source.
 // Components reference these for shared surfaces; section-specific one-off
 // colors may still be written inline to stay faithful to the source.
+//
+// Every token resolves through a `--c-*` CSS variable so the whole app can
+// switch light ⇄ dark by flipping `data-theme` on <html> (see global.css and
+// the theme effect in DucktapeProvider). The hard-coded hex is the light-mode
+// fallback for any context where the var isn't set yet. Section-specific inline
+// hexes scattered in components do NOT switch — they're the known dark-mode
+// polish ceiling.
+const v = (name: string, light: string) => `var(--c-${name}, ${light})`;
 
 export const color = {
   // text / ink
-  ink: "#2c2b27",
-  inkSoft: "#3f3e39",
-  inkSofter: "#4a4843",
-  muted: "#878787",
-  muted2: "#a1a1a1",
-  muted3: "#676767",
-  iconIdle: "#c5c5c5",
+  ink: v("ink", "#2c2b27"),
+  inkSoft: v("ink-soft", "#3f3e39"),
+  inkSofter: v("ink-softer", "#4a4843"),
+  muted: v("muted", "#878787"),
+  muted2: v("muted2", "#a1a1a1"),
+  muted3: v("muted3", "#676767"),
+  iconIdle: v("icon-idle", "#c5c5c5"),
 
   // surfaces
-  paper: "#ffffff",
-  sidebar: "#f9f9f9",
-  titlebar: "#f1f1f1",
-  hover: "#ededed",
-  sunken: "#f5f5f5",
-  panel: "#efefef",
+  paper: v("paper", "#ffffff"),
+  // the app "page" the cards sit on — one notch recessed from paper. Its own
+  // token (not `sunken`) so inputs, which use `sunken`, still read as wells
+  // recessed below the page in both themes.
+  canvas: v("canvas", "#fcfcfc"),
+  sidebar: v("sidebar", "#f9f9f9"),
+  titlebar: v("titlebar", "#f1f1f1"),
+  hover: v("hover", "#ededed"),
+  sunken: v("sunken", "#f5f5f5"),
+  panel: v("panel", "#efefef"),
 
   // borders
-  windowBorder: "#d1d1d1",
-  border: "#e5e5e5",
-  borderSoft: "#ececec",
-  borderStrong: "#d6d6d6",
-  chip: "#e3e3e3",
+  windowBorder: v("window-border", "#d1d1d1"),
+  border: v("border", "#e5e5e5"),
+  borderSoft: v("border-soft", "#ececec"),
+  borderStrong: v("border-strong", "#d6d6d6"),
+  chip: v("chip", "#e3e3e3"),
 
-  // dark
-  dark: "#26251f",
-  onDark: "#efefef",
+  // "filled" high-contrast swatch (active buttons/badges). Inverts in dark so a
+  // filled control stays high-contrast against the surface.
+  dark: v("filled", "#26251f"),
+  onDark: v("on-filled", "#efefef"),
+  // Hover shade for a filled control: nudge the fill toward its own text. In
+  // light that lightens the dark fill; in dark (fill is now light) it darkens
+  // it — the right direction in both themes without a second inline hex.
+  filledHover: "color-mix(in srgb, var(--c-filled, #26251f) 85%, var(--c-on-filled, #efefef))",
 
-  // accent (overridable via --accent CSS var)
+  // accent (overridable via --accent CSS var) — same in both themes
   accent: "#a05a3c",
   accentAlt1: "#3d63b8",
   accentAlt2: "#3f7d54",
 
   // status
-  green: "#5cb45f",
-  amber: "#c08a3e",
-  blue: "#5f7a9e",
-  red: "#a35248",
-  purple: "#7a6f9e",
+  green: v("green", "#5cb45f"),
+  amber: v("amber", "#c08a3e"),
+  blue: v("blue", "#5f7a9e"),
+  red: v("red", "#a35248"),
+  purple: v("purple", "#7a6f9e"),
 
   // destructive actions (delete confirm)
-  danger: "#c0483c",
-  dangerSoft: "#faf1ef",
-  dangerBorder: "#eccbc5",
+  danger: v("danger", "#c0483c"),
+  dangerSoft: v("danger-soft", "#faf1ef"),
+  dangerBorder: v("danger-border", "#eccbc5"),
 } as const;
+
+/** A tinted status chip derived from one hue: vivid-but-readable text over a
+ *  faint wash of the same color, with a slightly stronger border. Every part is
+ *  mixed against the LIVE `--c-ink` / `--c-paper`, so a single call yields a
+ *  pale-on-white chip in light mode and a dark-tinted chip in dark mode — no
+ *  per-theme hexes. Pass a token (e.g. `color.green`), not a raw hex, so the
+ *  base hue itself also shifts with the theme. */
+export const tint = (base: string) => ({
+  text: `color-mix(in srgb, ${base} 72%, var(--c-ink, #2c2b27))`,
+  bg: `color-mix(in srgb, ${base} 14%, var(--c-paper, #ffffff))`,
+  border: `color-mix(in srgb, ${base} 34%, var(--c-paper, #ffffff))`,
+});
 
 export const font = {
   sans: "'Geist Sans', 'IBM Plex Sans KR', system-ui, -apple-system, sans-serif",

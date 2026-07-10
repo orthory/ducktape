@@ -117,7 +117,7 @@ export function AgentView() {
         minHeight: 0,
         display: "flex",
         flexDirection: "column",
-        background: "#fcfcfc",
+        background: color.canvas,
       }}
     >
       <div

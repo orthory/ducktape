@@ -226,7 +226,7 @@ export function CustodyCard({
                   ) : (
                     <HoverButton
                       onClick={() => transitionPanel("setPassword")}
-                      hoverBg="#38362e"
+                      hoverBg={color.filledHover}
                       disabled={busy}
                       style={darkButton}
                     >

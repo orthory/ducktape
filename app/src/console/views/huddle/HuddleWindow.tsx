@@ -14,13 +14,17 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { MAX_VIDEO_PARTICIPANTS } from "../../../domain/call-session";
+import { enumerateHuddleDevices, loadDevicePrefs, saveDevicePrefs } from "../../../domain/media-devices";
+import type { DevicePrefs, HuddleDevices } from "../../../domain/media-devices";
 import { HUDDLE_CMD_EVENT, HUDDLE_CONTEXT_EVENT } from "../../store/huddle-window";
 import type { HuddleContext, HuddleWindowCmd } from "../../store/huddle-window";
 import { color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "../chat/HoverButton";
 import { CardNotices, Roster } from "../chat/HuddleCard";
 import { CallTiles } from "./CallTiles";
+import { DevicesMenuView } from "./DevicesMenu";
 import { HuddleControls } from "./HuddleControls";
+import { SelfCheck } from "./SelfCheck";
 import { useHuddleWindowSession } from "./useHuddleWindowSession";
 
 const send = (cmd: HuddleWindowCmd): void => {
@@ -65,7 +69,33 @@ export function HuddleWindow() {
   }, []);
 
   const view = useHuddleWindowSession(ctx, onMediaEnded);
+
+  // The window runs OUTSIDE the store, so it owns its own device picker state —
+  // same localStorage main reads (loadDevicePrefs), so choices stay in sync — and
+  // applies them straight to its own session (view.setDevices).
+  const [devicesOpen, setDevicesOpen] = useState(false);
+  const [deviceOptions, setDeviceOptions] = useState<HuddleDevices>({ mics: [], cameras: [], speakers: [] });
+  const [devicePrefs, setDevicePrefs] = useState<DevicePrefs>(() => loadDevicePrefs());
+  useEffect(() => {
+    // Re-enumerate when the menu opens — labels populate only after a media
+    // grant, and devices hot-plug.
+    if (devicesOpen) void enumerateHuddleDevices().then(setDeviceOptions).catch(() => {});
+  }, [devicesOpen]);
+  const changeDevices = useCallback(
+    (patch: Partial<DevicePrefs>) => {
+      setDevicePrefs((prev) => {
+        const next = { ...prev, ...patch };
+        saveDevicePrefs(next);
+        view?.setDevices(next);
+        return next;
+      });
+    },
+    [view],
+  );
+
   const overCap = view ? view.participants.length > MAX_VIDEO_PARTICIPANTS : false;
+  // Alone: roster not settled (0) or the only member is us — show the self-check.
+  const solo = !!view && (view.participants.length === 0 || (view.participants.length === 1 && view.participants[0].isSelf));
   // Tiles are up while OUR video lane runs, or a peer beacons video we can
   // decode; otherwise the audio-style roster is the body (mute + sweep stay
   // reachable in an audio-only huddle — same rule as the dock).
@@ -121,7 +151,19 @@ export function HuddleWindow() {
             }}
           >
             <CardNotices failure={null} mutedWhileTalking={mutedWhileTalking} mediaNote={view.mediaNote} />
-            {showTiles ? (
+            {solo ? (
+              <SelfCheck
+                status={view.status}
+                cameraOn={view.cameraOn}
+                sharing={view.sharing}
+                canEncode={view.canEncode}
+                muted={view.muted}
+                level={view.level}
+                speaking={view.speaking}
+                bindPreview={view.bindPreview}
+                onToggleCamera={() => view.setCamera(!view.cameraOn)}
+              />
+            ) : showTiles ? (
               <CallTiles
                 layout="gallery"
                 participants={view.participants}
@@ -145,7 +187,19 @@ export function HuddleWindow() {
           </div>
 
           {/* control bar */}
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "8px 10px", borderTop: `1px solid ${color.borderSoft}` }}>
+          <div style={{ position: "relative", display: "flex", alignItems: "center", justifyContent: "center", padding: "8px 10px", borderTop: `1px solid ${color.borderSoft}` }}>
+            {devicesOpen && (
+              // Anchored ABOVE the bar so the tiles/self-check stay visible while
+              // switching devices — same placement as the in-app dock's menu.
+              <div style={{ position: "absolute", left: 10, right: 10, bottom: "calc(100% + 6px)", zIndex: 5 }}>
+                <DevicesMenuView
+                  options={deviceOptions}
+                  prefs={devicePrefs}
+                  onChange={changeDevices}
+                  onClose={() => setDevicesOpen(false)}
+                />
+              </div>
+            )}
             <div style={{ flex: 1, maxWidth: 420 }}>
               <HuddleControls
                 size="comfortable"
@@ -157,6 +211,7 @@ export function HuddleWindow() {
                 sharing={view.sharing}
                 canScreenShare={view.canScreenShare && !overCap}
                 onToggleScreen={() => view.setScreenShare(!view.sharing)}
+                onOpenDevices={() => setDevicesOpen((v) => !v)}
                 onToggleMute={() => {
                   const next = !view.muted;
                   view.setMuted(next);
