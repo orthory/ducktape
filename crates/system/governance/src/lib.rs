@@ -170,7 +170,10 @@ impl Governance {
     /// the standing a redeemed joiner already holds.
     async fn residents(&self, ctx: &dyn Ctx) -> Result<Vec<Vec<u8>>, Error> {
         let reply = ctx
-            .query(&self.valset_id, &valset_encode_query(&ValsetQuery::Residents))
+            .query(
+                &self.valset_id,
+                &valset_encode_query(&ValsetQuery::Residents),
+            )
             .await?;
         match valset_decode_reply(&reply).map_err(Error::Module)? {
             ValsetReply::Residents(residents) => Ok(residents),
@@ -554,7 +557,9 @@ impl Governance {
             return Err(Error::Module("joiner is already a validator".into()));
         }
         if self.residents(ctx).await?.iter().any(|o| o == &joiner) {
-            return Err(Error::Module("joiner already holds resident standing".into()));
+            return Err(Error::Module(
+                "joiner already holds resident standing".into(),
+            ));
         }
         // exactly-once: the nonce is the single-use key (pending-over-committed
         // read, so two redemptions in one block settle first-wins too).

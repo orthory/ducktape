@@ -235,14 +235,19 @@ pub enum SagaQuery {
     /// — the state-driven read a node that does NOT execute blocks (a synced
     /// RESIDENT) polls to discover its own assigned work. sorted by saga id;
     /// terminal sagas and other nodes' leases are excluded.
-    AssignedPending { assignee: Vec<u8> },
+    AssignedPending {
+        assignee: Vec<u8>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 // Query replies are the public serde wire surface; keep the ergonomic variant
 // payloads instead of boxing only to shrink this in-memory enum.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "this public serde wire enum keeps ergonomic unboxed payload variants"
+)]
 pub enum SagaReply {
     Saga(Option<SagaView>),
     NextExpiry(Option<u64>),

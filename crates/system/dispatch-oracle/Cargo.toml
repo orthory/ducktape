@@ -14,7 +14,7 @@ capability-host = { workspace = true }
 dispatch = { workspace = true }
 # the pool's spawn/deliver/resolver seams are boxed futures; the semaphore
 # caps concurrent provider runs (tokio::sync is runtime-agnostic).
-futures = "0.3"
+futures = { workspace = true }
 reactor = { workspace = true }
 saga = { workspace = true }
 sdk = { workspace = true }

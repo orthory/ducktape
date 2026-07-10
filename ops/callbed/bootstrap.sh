@@ -20,13 +20,28 @@ if [ -f "$A/node.toml" ] && [ -f "$B/node.toml" ]; then
 fi
 mkdir -p "$SH"
 
+# Containers have no /dev/net/tun and no NET_ADMIN, so the WireGuard effect
+# must be the TUN-less in-process socket backend. Rendezvous goes through the
+# compose-local coordinator service — the PUBLIC default would observe both
+# nodes at the host's reflexive address and the punch would need NAT
+# hairpinning, which never lands (#331).
+WG="--wireguard-effect socket"
+# Both #331 product-tier mechanisms are exercised here: `--primary-coordinator`
+# persists to node.toml on init AND join, so BOTH nodes register with the
+# compose-local coordinator (ambient override — the old TODO about joiners
+# falling back to the public default is resolved); `--wireguard-advertised`
+# is the bind/advertise split — each node advertises its compose DNS name,
+# resolved at plane start, so the gossiped EndpointRecords carry dialable
+# endpoints without node-entry.sh rewriting the bind IP.
+COORD="--primary-coordinator coordinator:3478"
+
 echo "[bootstrap] node0 (founder): init"
-"$BIN" init --name callbed --dir "$A" \
+"$BIN" init --name callbed --dir "$A" $WG $COORD --wireguard-advertised node0:51820 \
   --listen 0.0.0.0:$P2P --advertised node0:$P2P --http 0.0.0.0:$HTTP --rpc 0.0.0.0:$RPC >/dev/null
 inv=$("$BIN" invite --config "$A/node.toml")
 
 echo "[bootstrap] node1 (friend): join (identity pass)"
-fk=$("$BIN" join "$inv" --dir "$B" \
+fk=$("$BIN" join "$inv" --dir "$B" $WG $COORD --wireguard-advertised node1:51820 \
   --listen 0.0.0.0:$P2P --advertised node1:$P2P --http 0.0.0.0:$HTTP --rpc 0.0.0.0:$RPC)
 echo "[bootstrap]   node1 key: $fk"
 
@@ -35,7 +50,7 @@ echo "[bootstrap] node0 admits node1 + refreshes invite"
 inv2=$("$BIN" invite --config "$A/node.toml")
 
 echo "[bootstrap] node1: join (member pass)"
-"$BIN" join "$inv2" --dir "$B" \
+"$BIN" join "$inv2" --dir "$B" $WG $COORD --wireguard-advertised node1:51820 \
   --listen 0.0.0.0:$P2P --advertised node1:$P2P --http 0.0.0.0:$HTTP --rpc 0.0.0.0:$RPC >/dev/null
 
 echo "[bootstrap] done — configs at $A and $B"

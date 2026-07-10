@@ -6,7 +6,7 @@
 //! (whichever executor CLI the operator brought), feeds the payload to it,
 //! and submits the raw answer as a saga `OracleResult` op.
 //!
-//! the payload comes in two shapes (see [`envelope`]): a legacy flat string
+//! the payload comes in two shapes (see the envelope parser): a legacy flat string
 //! is fed to the provider VERBATIM, and a run ENVELOPE (marker
 //! `ducktape_run`) is assembled host-side — the agent's registered prompt
 //! resolved from the node's blob store by its committed content hash, plus
@@ -22,7 +22,7 @@
 //!
 //! - [`DispatchWorker`] awaits the provider INLINE — the simple embedding for
 //!   tests and in-process reactors.
-//! - [`DispatchPool`] (see [`pool`]) hands execution to a spawned background
+//! - [`DispatchPool`] hands execution to a spawned background
 //!   task and returns immediately — what real hosts run, so a minutes-long
 //!   CLI call never stalls the host's event loop.
 
@@ -41,9 +41,9 @@ pub use pool::{
     DEFAULT_MAX_CONCURRENT_RUNS, DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env,
 };
 pub use provision::{
-    BaseTool, PortablePlan, ProvisionedWorkspace, RoMount, RunEffect, SharedProvisioner, Sink, Status,
-    WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec, assemble_runner_result, bind_workspace,
-    effects_from_response_text,
+    BaseTool, PortablePlan, ProvisionedWorkspace, RoMount, RunEffect, SharedProvisioner, Sink,
+    Status, WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec, assemble_runner_result,
+    bind_workspace, effects_from_response_text,
 };
 pub use workspace_source::WorkspaceSource;
 
@@ -326,8 +326,7 @@ format = "text"
             .unwrap()
         {
             WorkOutcome::Handled(Some(msg)) => {
-                let SagaMsg::OracleResult { outcome, .. } =
-                    saga::decode_msg(&msg.payload).unwrap()
+                let SagaMsg::OracleResult { outcome, .. } = saga::decode_msg(&msg.payload).unwrap()
                 else {
                     panic!("expected an oracle result");
                 };
@@ -381,15 +380,13 @@ format = "text"
         );
         let worker = DispatchWorker::new(providers, b"me".to_vec());
         match worker.run(&effect_for(work_spec(), None)).await.unwrap() {
-            WorkOutcome::Handled(Some(msg)) => {
-                match saga::decode_msg(&msg.payload).unwrap() {
-                    SagaMsg::Accept { saga_id, attempt } => {
-                        assert_eq!(saga_id, "s");
-                        assert_eq!(attempt, 0);
-                    }
-                    other => panic!("expected an Accept claim, got {other:?}"),
+            WorkOutcome::Handled(Some(msg)) => match saga::decode_msg(&msg.payload).unwrap() {
+                SagaMsg::Accept { saga_id, attempt } => {
+                    assert_eq!(saga_id, "s");
+                    assert_eq!(attempt, 0);
                 }
-            }
+                other => panic!("expected an Accept claim, got {other:?}"),
+            },
             other => panic!("a claimable announcement must produce an op, got {other:?}"),
         }
 
@@ -438,8 +435,7 @@ format = "text"
         });
         match worker.run(&effect_for(spec, Some(b"me"))).await.unwrap() {
             WorkOutcome::Handled(Some(msg)) => {
-                let SagaMsg::OracleResult { outcome, .. } =
-                    saga::decode_msg(&msg.payload).unwrap()
+                let SagaMsg::OracleResult { outcome, .. } = saga::decode_msg(&msg.payload).unwrap()
                 else {
                     panic!("expected an oracle result");
                 };

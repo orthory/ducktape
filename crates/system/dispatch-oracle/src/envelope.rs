@@ -49,13 +49,10 @@ pub type BlobResolver = Arc<dyn Fn(&[u8; 32]) -> BoxFuture<'static, Option<Vec<u
 /// business (committed bytes); decoding here is by name. unknown fields are
 /// tolerated on purpose — an ADDITIVE field under the same version must not
 /// kill in-flight runs mid-upgrade; semantic changes bump the marker instead.
+/// `ducktape_run` is validated before this body is deserialized, so the marker
+/// is intentionally absent here.
 #[derive(Deserialize)]
 struct WireEnvelope {
-    #[allow(
-        dead_code,
-        reason = "the version routed decoding; carried for completeness"
-    )]
-    ducktape_run: u64,
     agent_id: String,
     /// lowercase 64-hex of the agent's prompt pin, or null when the record
     /// carries none (the generic `instructions` apply).
@@ -589,9 +586,7 @@ mod tests {
         let mut old_shape: serde_json::Value =
             serde_json::from_str(&v3_envelope_json(None)).unwrap();
         old_shape["workspace"]["mount_path"] = serde_json::json!("/tmp/ducktape-workspace");
-        let Prepared {
-            ctx, workspace, ..
-        } = prepare(&old_shape.to_string(), None).await.unwrap();
+        let Prepared { ctx, workspace, .. } = prepare(&old_shape.to_string(), None).await.unwrap();
         assert!(ctx.portable, "an old-shape v3 is still accepted + portable");
         let plan = workspace.expect("an old-shape v3 still surfaces its plan");
         assert!(
@@ -702,7 +697,10 @@ mod tests {
         let mut empty_prefix = base.clone();
         empty_prefix["workspace"]["source_prefix"] = serde_json::json!("");
         let err = prepare(&empty_prefix.to_string(), None).await.unwrap_err();
-        assert!(err.contains("source_prefix must not be empty"), "got {err:?}");
+        assert!(
+            err.contains("source_prefix must not be empty"),
+            "got {err:?}"
+        );
 
         let mut empty_tools = base.clone();
         empty_tools["base_tools"] = serde_json::json!([]);
@@ -746,9 +744,7 @@ mod tests {
 
     #[tokio::test]
     async fn v2_envelopes_remain_non_portable_for_legacy_in_flight_runs() {
-        let Prepared {
-            ctx, workspace, ..
-        } = prepare(&envelope_json(None), None).await.unwrap();
+        let Prepared { ctx, workspace, .. } = prepare(&envelope_json(None), None).await.unwrap();
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert!(!ctx.portable);
         assert!(ctx.workdir_override.is_none());

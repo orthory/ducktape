@@ -69,13 +69,18 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
+arrayvec = "0.7"
+lru = "0.18"
+smallvec = "1"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 async-trait = "0.1"
+futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+rand = "0.8"
 # Opus codec (voice) — pure Rust, no C toolchain. No FEC-decode / PLC in the
 # decoder (empty input errors), so the voice engine renders lost frames as
 # silence; see crates/apps/chat/src/voice.
@@ -113,6 +118,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
 # ed25519 signer's); static_secrets because the key persists across boots.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
+p256 = "0.13"
 # duckfs path normalization: NFC so visually-identical names collide instead
 # of coexisting (a consensus-determinism requirement, not cosmetics).
 unicode-normalization = "0.1"

@@ -54,7 +54,12 @@ fn record(
         validator_identity: id(signer),
         wireguard_public_key: wg,
         control_endpoint: endpoint(&policy, [1, 1, 1, last_octet], 443, Transport::Tcp),
-        wireguard_endpoint: Some(endpoint(&policy, [8, 8, 8, last_octet], 51820, Transport::Udp)),
+        wireguard_endpoint: Some(endpoint(
+            &policy,
+            [8, 8, 8, last_octet],
+            51820,
+            Transport::Udp,
+        )),
         capabilities,
         expires_at_view: 50,
         nonce,
@@ -107,7 +112,10 @@ struct Handshake {
 
 /// the full signed a->b conversation: request (initiator), response
 /// (responder, optionally with relay fallback), ack (initiator).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixture keeps both peers, keys, and validation context explicit"
+)]
 fn handshake(
     initiator: &PrivateKey,
     responder: &PrivateKey,
@@ -478,7 +486,12 @@ fn mesh_version_v2_fixed_vector() {
         // alone.
         wireguard_public_key: X25519PublicKey([identity_byte ^ 0x80; 32]),
         control_endpoint: endpoint(&policy, [1, 1, 1, host_octet], 443, Transport::Tcp),
-        wireguard_endpoint: Some(endpoint(&policy, [8, 8, 8, host_octet], 51820, Transport::Udp)),
+        wireguard_endpoint: Some(endpoint(
+            &policy,
+            [8, 8, 8, host_octet],
+            51820,
+            Transport::Udp,
+        )),
         capabilities: if relay {
             vec![MeshCapability::Relay]
         } else {

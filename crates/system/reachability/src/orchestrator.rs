@@ -38,7 +38,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use commonware_cryptography::{Signer as _, ed25519};
 use nat_traversal::{ClientEvent, NatClient, NodeKey, SocketEvent};
@@ -287,7 +287,10 @@ pub enum Resolution {
 /// Per-peer endpoint resolution, pluggable so the orchestrator's protocol
 /// logic tests deterministically without UDP. The real implementation is
 /// [`NatResolver`]; tests use [`StaticResolver`].
-#[allow(async_fn_in_trait)] // consumed on a single-thread block_on root; no Send bound wanted
+#[allow(
+    async_fn_in_trait,
+    reason = "the resolver is consumed on a single-thread block_on root; no Send bound is wanted"
+)]
 pub trait EndpointResolver {
     /// Resolve `peer`'s dialable UDP address given its advertised WireGuard
     /// endpoint. Errors mean the peer stays on its advertised endpoint and a
@@ -362,6 +365,43 @@ const PUNCH_TRIES: usize = 3;
 /// (`nat_traversal::REGISTRATION_TTL_SECS`). Distinct from the WireGuard
 /// `KEEPALIVE_SECONDS` — different plane, different socket.
 pub const RENDEZVOUS_KEEPALIVE: Duration = Duration::from_secs(25);
+
+/// Minimum spacing between by-identity rendezvous-fallback attempts for the
+/// same endpoint-less peer (change 2 / issue #331): `Nudge` fires every 2s
+/// and would otherwise re-attempt a stalled resolve before the resolver's
+/// own worst-case attempt (`COORD_STEP_TIMEOUT` + `PUNCH_TRIES` punch
+/// windows) could even finish, storming the coordinator. Matches the
+/// resolver's own timeout envelope — the same discipline the invite-
+/// bootstrap path gets for free by only ever trying once.
+const RENDEZVOUS_FALLBACK_BACKOFF: Duration = Duration::from_secs(
+    COORD_STEP_TIMEOUT.as_secs() + PUNCH_STEP_TIMEOUT.as_secs() * PUNCH_TRIES as u64,
+);
+
+/// Cap on rendezvous-fallback attempts per peer PER EPOCH. Each attempt
+/// blocks the single-threaded driver loop for up to the resolver's full
+/// timeout envelope, so an unbounded sweep against a peer that stays
+/// unpunchable — never registered, coordinator down, or already healed by
+/// WireGuard roaming (invisible to this layer) — would starve
+/// `Deliver`/gossip for healthy peers forever. After the cap the peer stops
+/// being swept for the epoch; the next `Retarget`'s fresh `EpochState`
+/// resets `rendezvous_attempted` and grants a new budget.
+const RENDEZVOUS_FALLBACK_MAX_ATTEMPTS: u32 = 3;
+
+/// Pure backoff/budget decision: attempt iff never attempted this epoch, or
+/// the backoff window has elapsed AND the per-epoch attempt budget remains.
+/// `previous` = `(elapsed since the last attempt, attempts made so far)`;
+/// `None` = never attempted — also the shape a fresh epoch's reset map
+/// produces, which is how "a new epoch resets the budget" happens. Split out
+/// from `resolve_peer` so the decision is testable without standing up a
+/// `Driver`/real clock races.
+fn should_attempt_rendezvous_fallback(previous: Option<(Duration, u32)>) -> bool {
+    match previous {
+        None => true,
+        Some((elapsed, attempts)) => {
+            attempts < RENDEZVOUS_FALLBACK_MAX_ATTEMPTS && elapsed >= RENDEZVOUS_FALLBACK_BACKOFF
+        }
+    }
+}
 
 /// How every coordinator request is presented: `Some((signer, cap))`
 /// authenticates each request with a proof-of-possession over `signer`
@@ -801,7 +841,10 @@ impl From<UpgradeError> for ReachabilityError {
 /// nonce, and a triple whose parts disagree can never validate on both
 /// sides (the ack pins request and response by hash).
 // a handful of entries per epoch — variant size imbalance is irrelevant.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "each epoch holds only a handful of handshakes; boxing would complicate the retry state"
+)]
 enum PeerHandshake {
     /// We initiated and sent the request; the peer's response is due.
     AwaitingResponse { request: TunnelUpgradeRequest },
@@ -838,6 +881,17 @@ struct RelaySlot {
     signer: ValidatorIdentity,
     msg: ReachabilityMsg,
     expires_at_view: u64,
+}
+
+/// A verified candidate to store and fan out through the relay mesh.
+/// Grouping the signed-message metadata keeps the relay boundary explicit.
+struct RelayedHandshake {
+    pair: (ValidatorIdentity, ValidatorIdentity),
+    stage: u8,
+    signer: ValidatorIdentity,
+    expires_at_view: u64,
+    verified: bool,
+    msg: ReachabilityMsg,
 }
 
 /// Which side of the plane this node runs for the epoch.
@@ -903,6 +957,13 @@ struct EpochState {
     relayed: BTreeMap<(ValidatorIdentity, ValidatorIdentity), RelaySlot>,
     plans: BTreeMap<ValidatorIdentity, TunnelInstallPlan>,
     overrides: BTreeMap<ValidatorIdentity, SocketAddr>,
+    /// By-identity rendezvous-fallback bookkeeping per endpoint-less peer
+    /// (change 2 / issue #331): `(last attempt instant, attempts so far)` —
+    /// backs `should_attempt_rendezvous_fallback`'s backoff + per-epoch
+    /// budget (`RENDEZVOUS_FALLBACK_MAX_ATTEMPTS`) so `Nudge`'s 2s cadence
+    /// neither storms the coordinator nor sweeps an unpunchable peer
+    /// forever. Fresh per epoch — a `Retarget` resets the budget.
+    rendezvous_attempted: BTreeMap<ValidatorIdentity, (Instant, u32)>,
     failed: HashSet<ValidatorIdentity>,
     applied: bool,
 }
@@ -1207,6 +1268,7 @@ where
             relayed: BTreeMap::new(),
             plans: BTreeMap::new(),
             overrides: BTreeMap::new(),
+            rendezvous_attempted: BTreeMap::new(),
             failed: HashSet::new(),
             applied: false,
         };
@@ -1497,6 +1559,36 @@ where
         for (peer, msg) in sends.into_iter().chain(prewarm_sends) {
             self.send_msg(peer, &msg).await?;
         }
+        // change 2 / issue #331: retry the by-identity rendezvous fallback
+        // for any MEMBER peer that is still endpoint-less and still missing
+        // a punched override. `resolve_peer`'s single attempt at handshake
+        // time can lose the race against the peer's own coordinator
+        // registration (both sides often boot together); `resolve_peer`'s
+        // own backoff + bounded per-epoch budget
+        // (`should_attempt_rendezvous_fallback` /
+        // `RENDEZVOUS_FALLBACK_MAX_ATTEMPTS`) keeps this from hammering the
+        // coordinator on every 2s `Nudge` and from sweeping an unpunchable
+        // peer forever — the sweep goes quiet once the budget is spent and
+        // re-arms only at the next epoch's `Retarget`.
+        let retry_targets: Vec<ValidatorIdentity> = match &self.state {
+            Some(state) if state.role == Role::Member => state
+                .peers
+                .iter()
+                .copied()
+                .filter(|peer| {
+                    !state.overrides.contains_key(peer)
+                        && state
+                            .view_state
+                            .as_ref()
+                            .and_then(|view| view.record(*peer))
+                            .is_some_and(|record| record.wireguard_endpoint.is_none())
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        for peer in retry_targets {
+            self.resolve_peer(peer).await?;
+        }
         Ok(())
     }
 
@@ -1569,12 +1661,14 @@ where
                 let verified = request.verify_signature().is_ok();
                 self.relay(
                     via,
-                    (initiator, responder),
-                    0,
-                    initiator,
-                    expires,
-                    verified,
-                    ReachabilityMsg::Request(request),
+                    RelayedHandshake {
+                        pair: (initiator, responder),
+                        stage: 0,
+                        signer: initiator,
+                        expires_at_view: expires,
+                        verified,
+                        msg: ReachabilityMsg::Request(request),
+                    },
                 )
                 .await
             }
@@ -1591,12 +1685,14 @@ where
                 let verified = response.verify_signature().is_ok();
                 self.relay(
                     via,
-                    (initiator, responder),
-                    1,
-                    responder,
-                    expires,
-                    verified,
-                    ReachabilityMsg::Response(response),
+                    RelayedHandshake {
+                        pair: (initiator, responder),
+                        stage: 1,
+                        signer: responder,
+                        expires_at_view: expires,
+                        verified,
+                        msg: ReachabilityMsg::Response(response),
+                    },
                 )
                 .await
             }
@@ -1613,12 +1709,14 @@ where
                 let verified = ack.verify_signature().is_ok();
                 self.relay(
                     via,
-                    (initiator, responder),
-                    2,
-                    initiator,
-                    expires,
-                    verified,
-                    ReachabilityMsg::Ack(ack),
+                    RelayedHandshake {
+                        pair: (initiator, responder),
+                        stage: 2,
+                        signer: initiator,
+                        expires_at_view: expires,
+                        verified,
+                        msg: ReachabilityMsg::Ack(ack),
+                    },
                 )
                 .await
             }
@@ -1629,17 +1727,19 @@ where
     /// `(initiator, responder)` with stage supersession, and fan out to every
     /// peer except the delivering one and the message's signer — this node
     /// cannot know which peer holds the working link to the addressee.
-    #[allow(clippy::too_many_arguments)]
     async fn relay(
         &mut self,
         via: ValidatorIdentity,
-        pair: (ValidatorIdentity, ValidatorIdentity),
-        stage: u8,
-        signer: ValidatorIdentity,
-        expires_at_view: u64,
-        verified: bool,
-        msg: ReachabilityMsg,
+        relayed: RelayedHandshake,
     ) -> Result<(), ReachabilityError> {
+        let RelayedHandshake {
+            pair,
+            stage,
+            signer,
+            expires_at_view,
+            verified,
+            msg,
+        } = relayed;
         if !verified {
             return self
                 .fail_peer(via, "relayed an unverifiable handshake message")
@@ -2248,11 +2348,13 @@ where
             .and_then(|view| view.record(peer))
             .and_then(|record| record.wireguard_endpoint)
             .map(|endpoint| endpoint.socket_addr());
-        // no record, or an endpoint-less peer: nothing to resolve or dial —
-        // the tunnel entry is installed without an endpoint and the peer's
-        // own initiation completes it.
+        // no record, or an endpoint-less peer: nothing to resolve AGAINST —
+        // but a configured coordinator can still rendezvous by identity
+        // (change 2 / issue #331); the base "the peer initiates and
+        // WireGuard roams to it" contract stands when there is no
+        // coordinator to ask.
         let Some(advertised) = advertised else {
-            return Ok(());
+            return self.resolve_peer_via_rendezvous_fallback(peer).await;
         };
         match self
             .resolver
@@ -2271,6 +2373,63 @@ where
                     self.emit(ReachabilityEvent::PeerFailed {
                         peer: pk,
                         reason: format!("endpoint resolution: {reason}"),
+                    })
+                    .await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The endpoint-less fallback (change 2 / issue #331): a member↔member
+    /// pair that both advertise no endpoint (the default for every
+    /// invite-joined node) can never initiate a WireGuard handshake — WITH a
+    /// coordinator configured, rendezvous the peer by identity instead
+    /// (`resolve_rendezvous_endpoint`, the same by-identity resolution the
+    /// invite bootstrap already uses). No coordinator configured ⇒ today's
+    /// behavior exactly: install endpoint-less and wait for the peer's own
+    /// initiation. A failed resolve stays terminal for THIS attempt — no
+    /// relay (locked design) — but a per-peer backoff lets a later `Nudge`
+    /// retry once the peer has had time to register, up to a bounded
+    /// per-epoch budget (`RENDEZVOUS_FALLBACK_MAX_ATTEMPTS`).
+    async fn resolve_peer_via_rendezvous_fallback(
+        &mut self,
+        peer: ValidatorIdentity,
+    ) -> Result<(), ReachabilityError> {
+        if self.config.coordinators.is_empty() {
+            return Ok(());
+        }
+        let state = self.state.as_ref().expect("resolving inside an epoch");
+        if state.overrides.contains_key(&peer) {
+            return Ok(()); // already resolved this epoch.
+        }
+        let now = Instant::now();
+        let previous = state
+            .rendezvous_attempted
+            .get(&peer)
+            .map(|(last, attempts)| (now.saturating_duration_since(*last), *attempts));
+        if !should_attempt_rendezvous_fallback(previous) {
+            return Ok(());
+        }
+        let pk = state.pk_of.get(&peer).cloned();
+        let state = self.state.as_mut().expect("still in epoch");
+        let entry = state.rendezvous_attempted.entry(peer).or_insert((now, 0));
+        *entry = (now, entry.1 + 1);
+        match self
+            .resolver
+            .resolve_rendezvous_endpoint(binding::node_key(peer))
+            .await
+        {
+            Ok(addr) => {
+                let state = self.state.as_mut().expect("still in epoch");
+                state.overrides.insert(peer, addr);
+                Ok(())
+            }
+            Err(reason) => {
+                if let Some(pk) = pk {
+                    self.emit(ReachabilityEvent::PeerFailed {
+                        peer: pk,
+                        reason: format!("rendezvous fallback: {reason}"),
                     })
                     .await?;
                 }
@@ -2855,6 +3014,60 @@ mod tests {
         // self-pairs never occur (a node has no tunnel to itself), and the
         // rule is strict either way.
         assert!(!initiates(low, low));
+    }
+
+    /// The endpoint-less rendezvous-fallback backoff + budget decision
+    /// (change 2 / issue #331): never-attempted always fires; immediately
+    /// after an attempt is suppressed; once the resolver's own worst-case
+    /// attempt window has elapsed, retrying is allowed again — until the
+    /// per-epoch attempt budget is spent, after which no amount of elapsed
+    /// time re-arms it. A new epoch resets the budget (a `Retarget` builds a
+    /// fresh `EpochState` whose empty `rendezvous_attempted` map yields the
+    /// `None` shape again).
+    #[test]
+    fn rendezvous_fallback_backoff_suppresses_immediate_retry_and_caps_attempts() {
+        assert!(
+            should_attempt_rendezvous_fallback(None),
+            "never attempted before (or a fresh epoch reset the map) — must fire"
+        );
+        assert!(
+            !should_attempt_rendezvous_fallback(Some((Duration::from_millis(1), 1))),
+            "1ms after the last attempt — must NOT storm the coordinator"
+        );
+        assert!(
+            !should_attempt_rendezvous_fallback(Some((
+                RENDEZVOUS_FALLBACK_BACKOFF - Duration::from_millis(1),
+                1
+            ))),
+            "just under the backoff window — still suppressed"
+        );
+        assert!(
+            should_attempt_rendezvous_fallback(Some((RENDEZVOUS_FALLBACK_BACKOFF, 1))),
+            "exactly the backoff window, budget remaining — allowed"
+        );
+        assert!(
+            should_attempt_rendezvous_fallback(Some((
+                RENDEZVOUS_FALLBACK_BACKOFF + Duration::from_secs(60),
+                RENDEZVOUS_FALLBACK_MAX_ATTEMPTS - 1
+            ))),
+            "well past the backoff window on the last budgeted attempt — allowed"
+        );
+        assert!(
+            !should_attempt_rendezvous_fallback(Some((
+                RENDEZVOUS_FALLBACK_BACKOFF + Duration::from_secs(3600),
+                RENDEZVOUS_FALLBACK_MAX_ATTEMPTS
+            ))),
+            "budget spent — suppressed no matter how much time has passed; only the next \
+             epoch's fresh EpochState (the None shape above) re-arms the sweep"
+        );
+        assert!(
+            !should_attempt_rendezvous_fallback(Some((
+                Duration::from_secs(3600),
+                RENDEZVOUS_FALLBACK_MAX_ATTEMPTS + 1
+            ))),
+            "past the cap stays suppressed (defensive: the counter never exceeds the cap in \
+             practice, but the decision must not wrap back to allowed)"
+        );
     }
 
     mod nat_pump {

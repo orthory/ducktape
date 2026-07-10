@@ -1,10 +1,10 @@
 //! Proof that the DEPLOYED invocation works: boot the real compiled
 //! `coordinator` binary exactly as `ops/coordinator/ducktape-coordinator.service`
-//! does (`coordinator --listen <addr>`), then drive a live `NatClient` against
-//! it. This is the "[WORKS TODAY]" claim in docs/deploy/coordinator.md, made
-//! executable. Hermetic: `--listen 127.0.0.1:0` -> the OS picks the port, which
-//! the test reads back from the binary's own stderr line (no fixed port, no
-//! sleep-as-sync).
+//! does (`coordinator --listen <addr> --workers 4`), then drive a live
+//! `NatClient` against it. This is the "[WORKS TODAY]" claim in
+//! docs/deploy/coordinator.md, made executable. Hermetic: `--listen
+//! 127.0.0.1:0` -> the OS picks the port, which the test reads back from the
+//! binary's own stderr line (no fixed port, no sleep-as-sync).
 
 use std::net::SocketAddr;
 use std::process::Stdio;
@@ -31,6 +31,7 @@ async fn help_prints_usage_without_binding() {
     let stdout = String::from_utf8(output.stdout).expect("help is utf8");
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("--listen <addr>"));
+    assert!(stdout.contains("--workers <1|4>"));
     assert!(stdout.contains("--genesis-set <network.toml>"));
     assert!(stdout.contains("--allow-anonymous"));
     assert!(
@@ -44,6 +45,10 @@ async fn cli_rejects_missing_and_unknown_flags() {
     for args in [
         vec!["--listen"],
         vec!["--listen", "--allow-anonymous"],
+        vec!["--workers"],
+        vec!["--workers", "0"],
+        vec!["--workers", "2"],
+        vec!["--workers", "many"],
         vec!["--wat"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_coordinator"))
@@ -62,6 +67,8 @@ async fn deployed_coordinator_binary_answers_a_bind_request() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_coordinator"))
         .arg("--listen")
         .arg("127.0.0.1:0")
+        .arg("--workers")
+        .arg("4")
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .kill_on_drop(true)

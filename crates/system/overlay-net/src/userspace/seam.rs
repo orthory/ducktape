@@ -3,7 +3,7 @@
 //! when the backend is userspace, as the `Virtual` arm of
 //! [`crate::OverlayListener`]/[`crate::OverlaySink`]/[`crate::OverlayStream`].
 //!
-//! [`bind`]/[`dial`] mirror [`crate::tun`]'s helpers: one function per
+//! `bind`/`dial` mirror the private `crate::tun` helpers: one function per
 //! `Network` verb, resolving the live stack from the [`StackSlot`] PER CALL
 //! (a rebuilt backend serves the next connection with no consumer rewiring;
 //! an empty slot is the tunnel being down, surfaced as the same bind/dial

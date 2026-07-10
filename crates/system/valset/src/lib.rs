@@ -40,7 +40,7 @@
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
-// the (not-yet-consumed) valset mesh wire surface, kept as its own namespace.
+// the validator mesh wire surface, kept as its own namespace.
 pub mod mesh;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,6 +52,7 @@ use sha2::{Digest, Sha256};
 
 /// a 32-byte ed25519 public key encoding.
 const KEY_LEN: usize = 32;
+type SnapshotMembership = (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>);
 
 pub struct Valset {
     id: ModuleId,
@@ -165,7 +166,12 @@ impl Valset {
     pub fn snapshot(&self) -> Vec<u8> {
         let sized = |set: &BTreeSet<Vec<u8>>| 8 + set.iter().map(|k| 8 + k.len()).sum::<usize>();
         let mut out = Vec::with_capacity(
-            sized(&self.validators) + if self.residents.is_empty() { 0 } else { sized(&self.residents) },
+            sized(&self.validators)
+                + if self.residents.is_empty() {
+                    0
+                } else {
+                    sized(&self.residents)
+                },
         );
         let section = |out: &mut Vec<u8>, set: &BTreeSet<Vec<u8>>| {
             out.extend_from_slice(&(set.len() as u64).to_le_bytes());
@@ -210,8 +216,7 @@ impl Valset {
     /// BEFORE any allocation, truncation and trailing bytes both reject, and
     /// keys must arrive strictly increasing per section — a peer cannot mint
     /// alternative byte streams for one state.
-    #[allow(clippy::type_complexity)]
-    fn decode_snapshot(bytes: &[u8]) -> Result<(BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>), Error> {
+    fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotMembership, Error> {
         fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
             let Some((head, rest)) = (*buf).split_first_chunk::<8>() else {
                 return Err(Error::Module("snapshot truncated".into()));
@@ -426,9 +431,9 @@ impl Module for Valset {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{encode_msg, encode_query};
     use commonware_cryptography::Signer as _;
     use commonware_cryptography::ed25519::PrivateKey;
-    use crate::{encode_msg, encode_query};
 
     // a minimal Ctx — valset's execute reads only env (origin + protocol_version).
     struct TestCtx {
@@ -840,12 +845,19 @@ mod tests {
         let obs = valid_key(2);
         futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
-        assert_eq!(residents(&v), vec![obs.clone()], "grant applied at protocol_version 0");
+        assert_eq!(
+            residents(&v),
+            vec![obs.clone()],
+            "grant applied at protocol_version 0"
+        );
 
         // revoke lands at v0 and clears it.
         futures::executor::block_on(v.execute(&mut ctx, &revoke(&obs))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
-        assert!(residents(&v).is_empty(), "revoke applied at protocol_version 0");
+        assert!(
+            residents(&v).is_empty(),
+            "revoke applied at protocol_version 0"
+        );
     }
 
     #[test]
@@ -865,7 +877,11 @@ mod tests {
         assert_eq!(v.root(), validators_only, "root reflects committed only");
         assert_eq!(residents(&v), vec![obs.clone()], "read-your-writes");
         futures::executor::block_on(v.commit_block()).unwrap();
-        assert_ne!(v.root(), validators_only, "a committed grant moves the root");
+        assert_ne!(
+            v.root(),
+            validators_only,
+            "a committed grant moves the root"
+        );
 
         futures::executor::block_on(v.execute(&mut ctx, &revoke(&obs))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();

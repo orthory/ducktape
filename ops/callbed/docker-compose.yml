@@ -39,15 +39,36 @@ services:
     command: ["/usr/local/bin/bootstrap.sh"]
     volumes:
       - shared:/shared
+      # live-mounted (like the driver's call-driver.ts): harness-script
+      # changes take effect without an image rebuild.
+      - ./bootstrap.sh:/usr/local/bin/bootstrap.sh:ro
+
+  # rendezvous coordinator, LOCAL to the compose network (#331): both nodes sit
+  # behind the same host NAT, so the PUBLIC coordinator observes them at the
+  # host's reflexive address — a hairpin punch that never lands. In-network it
+  # observes each node at its real container address, so coordinated
+  # rendezvous hands out directly-dialable endpoints. Private mode: admission
+  # pinned to the ceremony's genesis set (written by bootstrap).
+  coordinator:
+    image: ducktape-callbed-node
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    command: ["/usr/local/bin/coordinator", "--listen", "0.0.0.0:3478", "--genesis-set", "/shared/node0/network.toml"]
+    volumes:
+      - shared:/shared
 
   node0:
     image: ducktape-callbed-node
     depends_on:
       bootstrap:
         condition: service_completed_successfully
+      coordinator:
+        condition: service_started
     command: ["/usr/local/bin/node-entry.sh", "/shared/node0"]
     volumes:
       - shared:/shared
+      - ./node-entry.sh:/usr/local/bin/node-entry.sh:ro
     ports:
       - "127.0.0.1:8080:8080" # /v1/call/ws + /v1/status on the host
     healthcheck: *node-health
@@ -57,9 +78,12 @@ services:
     depends_on:
       bootstrap:
         condition: service_completed_successfully
+      coordinator:
+        condition: service_started
     command: ["/usr/local/bin/node-entry.sh", "/shared/node1"]
     volumes:
       - shared:/shared
+      - ./node-entry.sh:/usr/local/bin/node-entry.sh:ro
     ports:
       - "127.0.0.1:8081:8080"
     healthcheck: *node-health

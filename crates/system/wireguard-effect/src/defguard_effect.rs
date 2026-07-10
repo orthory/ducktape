@@ -97,10 +97,10 @@ impl WireGuardEffect for DefguardWireGuardEffect {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            return Err(WireguardInterfaceError::Interface(format!(
+            Err(WireguardInterfaceError::Interface(format!(
                 "interface {} still exists 2s after removal",
                 self.ifname
-            )));
+            )))
         }
         #[cfg(not(target_os = "linux"))]
         Ok(())
