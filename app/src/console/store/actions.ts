@@ -704,6 +704,10 @@ export function createActions({
       update((prev) => ({ voice: { ...prev.voice, speaking: event.speaking } }));
       return;
     }
+    if (event.kind === "selfLevel") {
+      update((prev) => ({ voice: { ...prev.voice, level: event.level } }));
+      return;
+    }
     if (event.kind === "mediaNote") {
       if (mediaNoteTimer !== null) clearTimeout(mediaNoteTimer);
       update((prev) => ({ voice: { ...prev.voice, mediaNote: event.note } }));
@@ -1612,6 +1616,7 @@ export function createActions({
           peers: {},
           sessionStartMs: null,
           speaking: false,
+          level: 0,
         },
       });
       if (channelId) submitLeaveHuddle(channelId);

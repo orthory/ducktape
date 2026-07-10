@@ -70,6 +70,9 @@ export interface VoiceSlice {
    *  speaking ring + the "you're muted while talking" banner). Detected off the
    *  capture frames, so it's true even while muted. */
   speaking: boolean;
+  /** OUR mic input level, 0..1 (throttled). Drives the solo self-check meter so a
+   *  lone user can see the mic responds; detected even while muted. */
+  level: number;
 }
 
 /** One search round-trip across the modules that ship materialized views —
@@ -673,6 +676,7 @@ export const createInitialState = (): ConsoleState => {
       peers: {},
       sessionStartMs: null,
       speaking: false,
+      level: 0,
     },
     videoCapability: { canEncode: false, canDecode: false, canScreenShare: false },
     devicePrefs: loadDevicePrefs(),

@@ -27,6 +27,7 @@ const voice = (over: Partial<VoiceSlice> = {}): VoiceSlice => ({
   peers: {},
   sessionStartMs: NOW - 1_000,
   speaking: false,
+  level: 0,
   ...over,
 });
 
