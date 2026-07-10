@@ -508,6 +508,19 @@ fn run_node(
             http_handle.clone(),
             noded::agent_provision::agent_runs_root(&storage)
                 .unwrap_or_else(|e| panic!("agent runs root failed D7 validation: {e}")),
+        )
+        // the forge worktree lane (agent-dogfood M1): repos come off the
+        // handle's forge base (the same <storage>/forge-repo the host
+        // materializes into); pushes dial THIS node's own http surface at
+        // loopback (mirroring the serve condition below — no surface, no push
+        // lane, and forge runs fail loudly at provision); the committer on
+        // every run commit is this node's signer identity (D2 — the author is
+        // the agent).
+        .with_forge(
+            noded::agent_provision::forge_push_base(
+                http_listen.as_deref().filter(|_| !sync_only),
+            ),
+            hex_bytes(signer.public_key().as_ref()),
         ),
     ));
     // (like the rpc surface above, a joiner binds and the park loop pumps —

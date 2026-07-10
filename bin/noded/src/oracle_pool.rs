@@ -41,6 +41,8 @@ fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::Outpu
 /// `agent_dirs` roots persistent agent workspaces + session files under the
 /// daemon's storage dir (host-local, never consensus). `storage` keys the
 /// portable run-workspace root's per-node salt and its D7 boot validation.
+/// `forge_push_base` is the loopback smart-HTTP base agent-run branch pushes
+/// dial (derived from the daemon's OWN listen address by the caller).
 pub(crate) fn oracle_workers<C>(
     context: &C,
     cmds: mpsc::Sender<NodeCommand>,
@@ -48,6 +50,7 @@ pub(crate) fn oracle_workers<C>(
     blobs: noded::blobs::BlobHandle,
     agent_dirs: capability_host::AgentDirs,
     storage: &std::path::Path,
+    forge_push_base: Option<String>,
 ) -> Vec<Box<dyn reactor::Worker>>
 where
     C: Spawner + Supervisor + 'static,
@@ -122,11 +125,21 @@ where
     // de-versioned activation — no flag day, pre-production re-genesis). a
     // misconfigured root (inside <storage>) is a boot error, never a silent
     // D7 hole.
-    let provisioner: SharedProvisioner = Arc::new(noded::agent_provision::NodedProvisioner::new(
-        node_handle,
-        noded::agent_provision::agent_runs_root(storage)
-            .unwrap_or_else(|e| panic!("agent runs root failed D7 validation: {e}")),
-    ));
+    let provisioner: SharedProvisioner = Arc::new(
+        noded::agent_provision::NodedProvisioner::new(
+            node_handle,
+            noded::agent_provision::agent_runs_root(storage)
+                .unwrap_or_else(|e| panic!("agent runs root failed D7 validation: {e}")),
+        )
+        // the forge worktree lane (agent-dogfood M1): repos come off the
+        // handle's forge base (<storage>/forge-git here); pushes dial the
+        // daemon's own listen address at loopback. the committer identity is
+        // the daemon's origin tag — this embedded daemon has no node key
+        // (NodeStatus reports an empty public_key), and DEFAULT_ORIGIN is the
+        // same identity its http push lane already submits under (D2: the
+        // author is the agent, the committer the executing node).
+        .with_forge(forge_push_base, noded::DEFAULT_ORIGIN),
+    );
 
     vec![Box::new(
         DispatchPool::new(

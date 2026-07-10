@@ -96,9 +96,10 @@ pub struct WorkspaceReceipt {
     /// healthy wire shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_error: Option<String>,
-    /// forge only (contract §5, additive): the PUSHED work branch — `Some`
-    /// exactly when a push landed; skip-serialized so duckfs receipt bytes are
-    /// unchanged.
+    /// forge only (contract §5, additive): the work branch — `Some` when a
+    /// push landed, and on a forge FAILURE receipt (`commit_failed`), where
+    /// the ATTEMPTED branch is known and rides the audit lane (task-2 review
+    /// call). skip-serialized so duckfs receipt bytes are unchanged.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub branch: Option<String>,
     /// forge only (contract §5, additive): the new commit oid — the forge
@@ -139,9 +140,14 @@ impl WorkspaceReceipt {
     /// forge: the agent's commit was PUSHED to the work branch — the forge
     /// `output_ref` is `<branch>@<output_commit>` (§5). duckfs's
     /// snapshot/height stay `None`: the artifact lives in the git substrate,
-    /// not a duckfs snapshot. meaningful only for a forge spec (the branch is
-    /// the spec's work branch; a duckfs spec yields `branch: None`).
+    /// not a duckfs snapshot. forge-ONLY: a duckfs success is `committed()`.
     pub fn pushed(spec: &WorkspaceSpec, output_commit: String) -> Self {
+        // loud in debug so a mixed-up caller can never mint a branchless
+        // "pushed" receipt for a duckfs spec (flagged in the task-2 review).
+        debug_assert!(
+            matches!(spec.source, WorkspaceSource::Forge { .. }),
+            "WorkspaceReceipt::pushed is forge-only (duckfs success is committed())"
+        );
         Self {
             branch: spec.source.forge_branch(),
             output_commit: Some(output_commit),
@@ -166,6 +172,10 @@ impl WorkspaceReceipt {
     pub fn commit_failed(spec: &WorkspaceSpec, error: String) -> Self {
         Self {
             commit_error: Some(error),
+            // forge: the ATTEMPTED work branch is known at failure time and
+            // rides the audit lane too (task-2 review call). duckfs specs
+            // carry no branch, so their receipt bytes are unchanged.
+            branch: spec.source.forge_branch(),
             ..Self::base(spec)
         }
     }
@@ -462,15 +472,21 @@ mod tests {
     fn forge_receipts_carry_repo_coords_and_the_pinned_commit() {
         // contract §5: source_prefix = "forge:<repo>", source_snapshot =
         // Some(pinned commit) — on EVERY constructor, success or not.
-        for r in [
-            WorkspaceReceipt::no_changes(&forge_spec()),
-            WorkspaceReceipt::commit_failed(&forge_spec(), "push CAS-rejected".into()),
-        ] {
-            assert_eq!(r.source_prefix, "forge:app");
-            assert_eq!(r.source_snapshot.as_deref(), Some("d0".repeat(20).as_str()));
-            assert_eq!(r.branch, None, "no push landed — no pushed branch");
-            assert_eq!(r.output_commit, None);
-        }
+        let r = WorkspaceReceipt::no_changes(&forge_spec());
+        assert_eq!(r.source_prefix, "forge:app");
+        assert_eq!(r.source_snapshot.as_deref(), Some("d0".repeat(20).as_str()));
+        assert_eq!(r.branch, None, "no push landed — no pushed branch");
+        assert_eq!(r.output_commit, None);
+
+        // a FAILURE receipt still names the ATTEMPTED branch (the audit lane
+        // knows where the push aimed; task-2 review call) — but never mints
+        // an output_commit.
+        let r = WorkspaceReceipt::commit_failed(&forge_spec(), "push CAS-rejected".into());
+        assert_eq!(r.source_prefix, "forge:app");
+        assert_eq!(r.source_snapshot.as_deref(), Some("d0".repeat(20).as_str()));
+        assert_eq!(r.branch.as_deref(), Some("agent/item-7"));
+        assert_eq!(r.output_commit, None);
+        assert_eq!(r.commit_error.as_deref(), Some("push CAS-rejected"));
     }
 
     #[test]
