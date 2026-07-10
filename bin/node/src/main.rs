@@ -6775,34 +6775,49 @@ fn run_node(
                         // both carriers land here: mesh frames ride an rpc
                         // envelope (multiplexed channel — the id correlates);
                         // a plane stream IS its own correlation and reply path.
-                        let (reply_to, rpc_id, body) = match job {
+                        let (reply_to, rpc_id, request) = match job {
                             statesync_plane::SyncJob::Mesh(peer, bytes) => {
                                 let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
                                     continue; // malformed rpc envelope: drop, never crash.
                                 };
-                                // a mesh frame answering one of OUR pending
-                                // blob fetches is a response, not a request —
-                                // route it to the waiting fetch and move on.
-                                if blob_fetch::route_response(&blob_pending, rpc_id, body) {
-                                    continue;
-                                }
-                                (
-                                    statesync_plane::SyncReplyTo::Mesh(peer),
+                                // the mesh demux: OUR fetch answers are consumed,
+                                // stray responses (a blob answer landing after its
+                                // fan-out's sweep) and unparseable frames are
+                                // DROPPED — answering either is how two serve
+                                // loops bounce Error frames forever. only a real
+                                // request proceeds; the reply-on-bad-frame lane is
+                                // stream-only below.
+                                match blob_fetch::classify_mesh_frame(
+                                    &blob_pending,
                                     rpc_id,
-                                    body.to_vec(),
-                                )
+                                    body,
+                                ) {
+                                    blob_fetch::MeshFrame::OurResponse
+                                    | blob_fetch::MeshFrame::StrayResponse
+                                    | blob_fetch::MeshFrame::Junk => continue,
+                                    blob_fetch::MeshFrame::Request(req) => (
+                                        statesync_plane::SyncReplyTo::Mesh(peer),
+                                        rpc_id,
+                                        Ok(req),
+                                    ),
+                                }
                             }
-                            statesync_plane::SyncJob::Plane(stream, req) => {
-                                (statesync_plane::SyncReplyTo::Plane(stream), 0, req)
-                            }
+                            statesync_plane::SyncJob::Plane(stream, req) => (
+                                statesync_plane::SyncReplyTo::Plane(stream),
+                                0,
+                                statesync::decode_request(&req),
+                            ),
                         };
-                        let resp = match statesync::decode_request(&body) {
+                        let resp = match request {
                             // blob fetches are host state — answered from the
                             // node-local store, never routed into SyncServer.
                             Ok(statesync::SyncRequest::Blob { digest }) => {
                                 blob_fetch::serve_blob(&sync_blobs, &digest)
                             }
                             Ok(req) => drive_sync_request(&mut server, &state_tx, req).await,
+                            // stream-only by construction: a plane stream is a
+                            // one-shot request/response, so an Error reply here
+                            // can never re-enter a serve loop and oscillate.
                             Err(e) => statesync::SyncResponse::Error(format!(
                                 "bad request frame: {e}"
                             )),
