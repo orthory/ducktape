@@ -5,10 +5,12 @@
 //! or join networks and allocate ports. A bounded, dedicated node-control actor
 //! drives onboarding/custody verbs and spawns the selected workspace's node
 //! DETACHED (its own process group, stdio to `daemon.log`), so Tauri runtime
-//! workers never execute or wait on the node binary. Closing the console window
-//! only hides to the menu-bar app instead of killing the network. A real app
-//! quit (tray Quit / Cmd-Q / OS exit) stops the active managed node through the
-//! workspace pidfile before the shell exits.
+//! workers never execute or wait on the node binary. On macOS, closing the
+//! console window only hides to the menu-bar app instead of killing the
+//! network (close-to-hide is wired in the mac-gated tray init); on
+//! Linux/Windows there is no tray to hide into, so close quits. A real app
+//! quit (tray Quit / Cmd-Q / OS exit / non-mac window close) stops the active
+//! managed node through the workspace pidfile before the shell exits.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 

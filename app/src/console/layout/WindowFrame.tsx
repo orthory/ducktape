@@ -21,6 +21,11 @@ import { ConnectionBanner } from "./ConnectionBanner";
 // on every finalized block).
 const TRAFFIC_LIGHT_INSET = isMacDesktop() ? 69 : 0;
 
+// The palette shortcut as the local platform types it (the handler accepts
+// both meta and ctrl — see ConsoleShell). Same module-load resolution as the
+// inset above.
+const SEARCH_KEY_LABEL = isMacDesktop() ? "⌘K" : "Ctrl K";
+
 // The centered search affordance in the title bar: a compact field that opens
 // the ⌘K palette (see ConsoleShell / SearchModal). It sits in the middle cell
 // of the bar's `1fr auto 1fr` grid, so it tracks the window's true midpoint
@@ -43,7 +48,7 @@ function SearchBar() {
     >
       <button
         onClick={actions.openSearch}
-        title="Search (⌘K)"
+        title={`Search (${SEARCH_KEY_LABEL})`}
         aria-label="Search"
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
@@ -90,7 +95,7 @@ function SearchBar() {
             background: color.paper,
           }}
         >
-          ⌘K
+          {SEARCH_KEY_LABEL}
         </span>
       </button>
     </div>
