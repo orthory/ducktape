@@ -20,7 +20,7 @@ use recovery::{Manifest, Recovery};
 use crate::blob_fetch;
 use crate::config::{self, hex_bytes, unhex};
 use crate::constants::*;
-use crate::drain_actions::{BlockAction, CutoverTrigger, block_actions, epoch_actions};
+use crate::drain_actions::{BlockAction, CutoverTrigger, EpochActions, block_actions};
 use crate::explorer::{boundary_block_row, heal_index, stage_shipped_index};
 use crate::host_reads::{
     joiner_epoch_mesh, read_upgrade_state, read_upgrade_version_fields, read_valset_members,
@@ -919,38 +919,34 @@ pub(super) async fn park(
                     .iter()
                     .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
                     .collect();
-                let boundary_upgrade = read_upgrade_state(node_r.host()).await;
-                let actions = epoch_actions(
-                    orch,
-                    folded_view,
-                    observed,
-                    observed_residents,
-                    boundary_upgrade,
-                );
-                if let Some(trigger) = actions.trigger {
-                    let cutover = trigger.cutover();
-                    match trigger {
-                        CutoverTrigger::Membership(_) => println!(
-                            "[node {label}] replica: membership change observed at view {} \
-                             — cutover to epoch {} at view {}",
-                            cutover.observed_view(),
-                            cutover.next_epoch(),
-                            cutover.cutover_view()
-                        ),
-                        CutoverTrigger::Upgrade {
-                            name,
-                            activation_height,
-                            ..
-                        } => println!(
-                            "[node {label}] replica: upgrade '{name}' armed — cutover to epoch \
-                             {} at view {} (activation height {activation_height})",
-                            cutover.next_epoch(),
-                            cutover.cutover_view()
-                        ),
-                    }
+                let mut actions =
+                    EpochActions::new(orch, folded_view, observed, observed_residents);
+                if let Some(CutoverTrigger::Membership(cutover)) = actions.observe_members() {
+                    println!(
+                        "[node {label}] replica: membership change observed at view {} \
+                         — cutover to epoch {} at view {}",
+                        cutover.observed_view(),
+                        cutover.next_epoch(),
+                        cutover.cutover_view()
+                    );
                     node_r.set_view_ceiling(cutover.cutover_view());
                 }
-                if let Some(plan) = actions.respawn {
+                let boundary_upgrade = read_upgrade_state(node_r.host()).await;
+                if let Some(CutoverTrigger::Upgrade {
+                    cutover,
+                    name,
+                    activation_height,
+                }) = actions.observe_upgrade(&boundary_upgrade)
+                {
+                    println!(
+                        "[node {label}] replica: upgrade '{name}' armed — cutover to epoch \
+                         {} at view {} (activation height {activation_height})",
+                        cutover.next_epoch(),
+                        cutover.cutover_view()
+                    );
+                    node_r.set_view_ceiling(cutover.cutover_view());
+                }
+                if let Some(plan) = actions.respawn(boundary_upgrade) {
                     let members = plan.valset().consensus_members();
                     let member_bytes: Vec<Vec<u8>> =
                         members.iter().map(|k| k.as_ref().to_vec()).collect();

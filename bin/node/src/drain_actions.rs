@@ -107,7 +107,7 @@ pub(crate) fn block_actions(
     actions
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CutoverTrigger {
     Membership(ScheduledCutover),
     Upgrade {
@@ -117,51 +117,71 @@ pub(crate) enum CutoverTrigger {
     },
 }
 
-impl CutoverTrigger {
-    pub(crate) fn cutover(&self) -> ScheduledCutover {
-        match self {
-            Self::Membership(cutover) | Self::Upgrade { cutover, .. } => *cutover,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct EpochActions {
-    pub(crate) trigger: Option<CutoverTrigger>,
-    pub(crate) respawn: Option<RespawnPlan<ed25519::PublicKey>>,
-}
-
-/// Advance the shared observe -> ceiling -> cutover state machine from one
-/// finalized boundary. The caller applies the returned ceiling and concrete
-/// orderer swap in its existing role-specific order.
-pub(crate) fn epoch_actions(
-    orchestrator: &mut ValsetOrchestrator<ed25519::PublicKey>,
+pub(crate) struct EpochActions<'a> {
+    orchestrator: &'a mut ValsetOrchestrator<ed25519::PublicKey>,
     finalized_view: u64,
     members: Vec<ed25519::PublicKey>,
     residents: Vec<ed25519::PublicKey>,
-    boundary_upgrade: BoundaryUpgrade<ed25519::PublicKey>,
-) -> EpochActions {
-    let mut trigger = match orchestrator.observe_members(
-        finalized_view,
-        members.iter().cloned(),
-        residents.iter().cloned(),
-    ) {
-        ObservationOutcome::Scheduled(cutover) => Some(CutoverTrigger::Membership(cutover)),
-        _ => None,
-    };
-    if let Some(pending) = &boundary_upgrade.pending
-        && let ObservationOutcome::Scheduled(cutover) =
-            orchestrator.observe_upgrade(finalized_view, pending.activation_height)
-    {
-        debug_assert!(trigger.is_none(), "only one cutover slot can be scheduled");
-        trigger = Some(CutoverTrigger::Upgrade {
-            cutover,
-            name: pending.name.clone(),
-            activation_height: pending.activation_height,
-        });
+}
+
+/// Staged shared observe -> ceiling -> cutover actions. Callers invoke these
+/// methods in order so each concrete loop keeps ceiling writes and async reads
+/// at the same visible points as before the refactor.
+impl<'a> EpochActions<'a> {
+    pub(crate) fn new(
+        orchestrator: &'a mut ValsetOrchestrator<ed25519::PublicKey>,
+        finalized_view: u64,
+        members: Vec<ed25519::PublicKey>,
+        residents: Vec<ed25519::PublicKey>,
+    ) -> Self {
+        Self {
+            orchestrator,
+            finalized_view,
+            members,
+            residents,
+        }
     }
-    let respawn = orchestrator.respawn_if_due(finalized_view, members, residents, boundary_upgrade);
-    EpochActions { trigger, respawn }
+
+    pub(crate) fn observe_members(&mut self) -> Option<CutoverTrigger> {
+        match self.orchestrator.observe_members(
+            self.finalized_view,
+            self.members.iter().cloned(),
+            self.residents.iter().cloned(),
+        ) {
+            ObservationOutcome::Scheduled(cutover) => Some(CutoverTrigger::Membership(cutover)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn observe_upgrade(
+        &mut self,
+        boundary_upgrade: &BoundaryUpgrade<ed25519::PublicKey>,
+    ) -> Option<CutoverTrigger> {
+        let pending = boundary_upgrade.pending.as_ref()?;
+        match self
+            .orchestrator
+            .observe_upgrade(self.finalized_view, pending.activation_height)
+        {
+            ObservationOutcome::Scheduled(cutover) => Some(CutoverTrigger::Upgrade {
+                cutover,
+                name: pending.name.clone(),
+                activation_height: pending.activation_height,
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn respawn(
+        self,
+        boundary_upgrade: BoundaryUpgrade<ed25519::PublicKey>,
+    ) -> Option<RespawnPlan<ed25519::PublicKey>> {
+        self.orchestrator.respawn_if_due(
+            self.finalized_view,
+            self.members,
+            self.residents,
+            boundary_upgrade,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -282,39 +302,39 @@ mod tests {
         let mut validator = ValsetOrchestrator::new(2, initial.clone());
         let mut replica = ValsetOrchestrator::new(2, initial);
 
-        let validator_arm = epoch_actions(
-            &mut validator,
-            7,
-            boundary.clone(),
-            Vec::new(),
-            upgrade.clone(),
+        let mut validator_arm = EpochActions::new(&mut validator, 7, boundary.clone(), Vec::new());
+        let mut replica_arm = EpochActions::new(&mut replica, 7, boundary.clone(), Vec::new());
+        let validator_trigger = validator_arm.observe_members();
+        let replica_trigger = replica_arm.observe_members();
+        assert_eq!(validator_trigger, replica_trigger);
+        assert!(matches!(
+            validator_trigger,
+            Some(CutoverTrigger::Membership(cutover)) if cutover.cutover_view() == 9
+        ));
+        assert_eq!(
+            validator_arm.observe_upgrade(&upgrade),
+            replica_arm.observe_upgrade(&upgrade)
         );
-        let replica_arm = epoch_actions(
-            &mut replica,
-            7,
-            boundary.clone(),
-            Vec::new(),
-            upgrade.clone(),
-        );
-        assert_eq!(validator_arm, replica_arm);
-        let trigger = validator_arm
-            .trigger
-            .expect("membership schedules the shared slot");
-        assert!(matches!(trigger, CutoverTrigger::Membership(_)));
-        assert_eq!(trigger.cutover().cutover_view(), 9);
-        assert!(validator_arm.respawn.is_none());
+        let validator_plan = validator_arm.respawn(upgrade.clone());
+        let replica_plan = replica_arm.respawn(upgrade.clone());
+        assert_eq!(validator_plan, replica_plan);
+        assert!(validator_plan.is_none());
 
-        let validator_cutover = epoch_actions(
-            &mut validator,
-            9,
-            boundary.clone(),
-            Vec::new(),
-            upgrade.clone(),
+        let mut validator_cutover =
+            EpochActions::new(&mut validator, 9, boundary.clone(), Vec::new());
+        let mut replica_cutover = EpochActions::new(&mut replica, 9, boundary, Vec::new());
+        assert_eq!(
+            validator_cutover.observe_members(),
+            replica_cutover.observe_members()
         );
-        let replica_cutover = epoch_actions(&mut replica, 9, boundary, Vec::new(), upgrade);
-        assert_eq!(validator_cutover, replica_cutover);
-        assert!(validator_cutover.trigger.is_none());
-        let plan = validator_cutover.respawn.expect("boundary cuts over");
+        assert_eq!(
+            validator_cutover.observe_upgrade(&upgrade),
+            replica_cutover.observe_upgrade(&upgrade)
+        );
+        let validator_plan = validator_cutover.respawn(upgrade.clone());
+        let replica_plan = replica_cutover.respawn(upgrade);
+        assert_eq!(validator_plan, replica_plan);
+        let plan = validator_plan.expect("boundary cuts over");
         assert_eq!(plan.epoch(), 1);
         assert_eq!(plan.cutover_app_height(), 9);
         assert_eq!(plan.boundary_version(), 1);

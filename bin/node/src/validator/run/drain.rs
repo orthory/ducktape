@@ -14,7 +14,7 @@ use sdk::Msg;
 use super::super::announce::{dispatch_pending_deliveries, saga_next_expiry};
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET};
-use crate::drain_actions::{BlockAction, CutoverTrigger, block_actions, epoch_actions};
+use crate::drain_actions::{BlockAction, CutoverTrigger, EpochActions, block_actions};
 use crate::host_reads::{
     read_upgrade_state, read_upgrade_status_raw, read_upgrade_version_fields, read_valset_members,
     read_valset_residents,
@@ -406,6 +406,17 @@ impl ValidatorRuntime<'_> {
                     observed_residents.push(pk);
                 }
             }
+            let mut actions =
+                EpochActions::new(orchestrator, engine_view, observed, observed_residents);
+            if let Some(CutoverTrigger::Membership(cutover)) = actions.observe_members() {
+                println!(
+                    "[node {label}] membership change observed at view {} — cutover to epoch {} at view {}",
+                    cutover.observed_view(),
+                    cutover.next_epoch(),
+                    cutover.cutover_view()
+                );
+                node.set_view_ceiling(cutover.cutover_view());
+            }
             // a pending upgrade arms the SAME single cutover slot at its
             // activation height (design §"One boundary carries both
             // concerns") — never a competing arm: when a membership
@@ -414,35 +425,20 @@ impl ValidatorRuntime<'_> {
             // boundary read in `respawn_if_due`. inert until the module is
             // registered (`read_upgrade_state` returns baseline/no-pending).
             let boundary_upgrade = read_upgrade_state(node.host()).await;
-            let actions = epoch_actions(
-                orchestrator,
-                engine_view,
-                observed,
-                observed_residents,
-                boundary_upgrade,
-            );
-            if let Some(trigger) = actions.trigger {
-                let cutover = trigger.cutover();
-                match trigger {
-                    CutoverTrigger::Membership(_) => println!(
-                        "[node {label}] membership change observed at view {} — cutover to epoch {} at view {}",
-                        cutover.observed_view(),
-                        cutover.next_epoch(),
-                        cutover.cutover_view()
-                    ),
-                    CutoverTrigger::Upgrade {
-                        name,
-                        activation_height,
-                        ..
-                    } => println!(
-                        "[node {label}] upgrade '{name}' armed — cutover to epoch {} at view {} (activation height {activation_height})",
-                        cutover.next_epoch(),
-                        cutover.cutover_view()
-                    ),
-                }
+            if let Some(CutoverTrigger::Upgrade {
+                cutover,
+                name,
+                activation_height,
+            }) = actions.observe_upgrade(&boundary_upgrade)
+            {
+                println!(
+                    "[node {label}] upgrade '{name}' armed — cutover to epoch {} at view {} (activation height {activation_height})",
+                    cutover.next_epoch(),
+                    cutover.cutover_view()
+                );
                 node.set_view_ceiling(cutover.cutover_view());
             }
-            if let Some(plan) = actions.respawn {
+            if let Some(plan) = actions.respawn(boundary_upgrade) {
                 let members = plan.valset().consensus_members();
                 let member_bytes: Vec<Vec<u8>> =
                     members.iter().map(|k| k.as_ref().to_vec()).collect();
