@@ -46,7 +46,7 @@ mod wiring;
 /// `boot::mesh::build` wires `Network`/`Oracle` over. shared by `wiring`
 /// and `park` so both name the identical `Network`/channel types `run`'s
 /// caller (`boot::mesh::MeshHead`) already produced.
-pub(super) type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tokio::Context>;
+pub(crate) type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tokio::Context>;
 
 /// the joiner/replica role (unified-node phase 2): park on the mesh,
 /// bootstrap a boundary, fold the head, and — on staged admission —
