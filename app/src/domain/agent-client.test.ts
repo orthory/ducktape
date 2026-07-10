@@ -78,6 +78,7 @@ describe("agent msgs", () => {
           capability: null,
           prompt_hash: null,
           allowed_actions: null,
+          caps: null,
         },
       },
       "operator",

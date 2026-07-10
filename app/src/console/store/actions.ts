@@ -344,6 +344,7 @@ export interface ConsoleActions {
     capability: string;
     prompt: string;
     allowedActions: string[];
+    caps?: agentClient.ResourceCaps;
   }): void;
   /** Pause / resume an agent (owner-gated). */
   pauseAgent(agentId: string): void;
@@ -364,6 +365,8 @@ export interface ConsoleActions {
     capability?: string;
     prompt?: string;
     allowedActions?: string[];
+    /** REPLACES the whole caps record when present; omit to keep it. */
+    caps?: agentClient.ResourceCaps;
   }): void;
   /** Opt the agent MODULE into (or out of) jobs-board work notifications, so it
    *  can process job-backed runs. */
@@ -1932,7 +1935,7 @@ export function createActions({
     },
 
     // ── Agents ──
-    registerAgent: ({ displayName, agentId, capability, prompt, allowedActions }) => {
+    registerAgent: ({ displayName, agentId, capability, prompt, allowedActions, caps }) => {
       const id = agentId.trim();
       const name = displayName.trim();
       const tag = capability.trim();
@@ -1950,6 +1953,7 @@ export function createActions({
               capability: tag,
               promptHash: agentClient.hexToBytes(digest),
               allowedActions,
+              caps,
               origin: getState().author,
             }),
           ),
@@ -2022,7 +2026,7 @@ export function createActions({
       );
     },
 
-    updateAgent: ({ agentId, displayName, capability, prompt, allowedActions }) => {
+    updateAgent: ({ agentId, displayName, capability, prompt, allowedActions, caps }) => {
       const id = agentId.trim();
       if (!id) return;
       submitTracked(
@@ -2045,6 +2049,7 @@ export function createActions({
               capability: capability?.trim() || null,
               promptHash,
               allowedActions: allowedActions ?? null,
+              caps: caps ?? null,
               origin: getState().author,
             }),
           ),

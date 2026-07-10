@@ -5,7 +5,7 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
 
-import type { AgentRecord } from "../../../domain/agent-client";
+import type { AgentRecord, ResourceCaps } from "../../../domain/agent-client";
 import { KNOWN_ACTIONS } from "../../../domain/agent-client";
 import { accentVar, color, font, radius } from "../../theme/tokens";
 import {
@@ -13,6 +13,8 @@ import {
   ACTION_LABEL,
   FieldLabel,
   inputStyle,
+  monoInputStyle,
+  parsePagesWrite,
   primaryButton,
   secondaryButton,
   SectionLabel,
@@ -34,6 +36,7 @@ export function AgentEditForm({
     capability?: string;
     prompt?: string;
     allowedActions?: string[];
+    caps?: ResourceCaps;
   }) => void;
   onClose: () => void;
 }) {
@@ -41,6 +44,9 @@ export function AgentEditForm({
   const [capability, setCapability] = useState(agent.capability);
   const [prompt, setPrompt] = useState("");
   const [allowedActions, setAllowedActions] = useState<string[]>(agent.allowed_actions);
+  const [pagesWrite, setPagesWrite] = useState(
+    (agent.caps?.pages_write ?? []).join(" "),
+  );
 
   const toggle = (name: string) =>
     setAllowedActions((prev) =>
@@ -54,6 +60,9 @@ export function AgentEditForm({
       displayName: displayName.trim(),
       capability: capability.trim(),
       allowedActions,
+      // caps REPLACE wholesale on update: send the record's current caps
+      // with only pages_write swapped so the other grants survive.
+      caps: { ...agent.caps, pages_write: parsePagesWrite(pagesWrite) },
       ...(prompt.trim() ? { prompt } : {}),
     });
     onClose();
@@ -153,6 +162,29 @@ export function AgentEditForm({
               </label>
             );
           })}
+        </div>
+        <div>
+          <FieldLabel htmlFor="agent-edit-pages-write">Page write access</FieldLabel>
+          <input
+            id="agent-edit-pages-write"
+            name="agent-edit-pages-write"
+            type="text"
+            spellCheck={false}
+            value={pagesWrite}
+            onChange={(event) => setPagesWrite(event.target.value)}
+            placeholder="page ids, or * for all"
+            style={monoInputStyle}
+          />
+          <div
+            style={{
+              marginTop: 5,
+              font: `400 10.5px ${font.sans}`,
+              color: color.muted2,
+            }}
+          >
+            Pages the agent may comment on or check off. Space-separated ids; * grants
+            every page.
+          </div>
         </div>
       </fieldset>
 
