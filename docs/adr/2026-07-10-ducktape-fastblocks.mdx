@@ -100,12 +100,12 @@ validator quorum that later finalizes the block.
 
 - Publish a new certified fastblock on a 100 ms target cadence when network,
   storage, and validator load permit.
-- Give clients a compact, independently verifiable receipt for a specific
+- Give clients a bounded, independently verifiable receipt for a specific
   `FrameId`.
 - Make a valid receipt survive assembler failure, Simplex view change, node
   restart, and ordinary message loss.
 - Preserve a single canonical consensus and execution path.
-- Fail closed to ordinary Simplex when PromiseNet is slow, partitioned,
+- Degrade safely to ordinary Simplex when PromiseNet is slow, partitioned,
   overloaded, incompatible, or disabled.
 - Bound promised work so every promise can fit in one canonical successor.
 - Tell the truth in the UI about custody, preconfirmation, rejection, and
@@ -391,7 +391,7 @@ struct FastblockProposalV1 {
     assembler_view: u64,
     assembler: ValidatorId,
     index: u8,                      // 0..=9
-    previous_promise_qc_hash: Option<[u8; 32]>,
+    previous_promise_subject: Option<[u8; 32]>,
     delta_frame_ids: Vec<FrameId>,
     delta_body_root: [u8; 32],
     cumulative_frame_count: u32,
@@ -401,6 +401,7 @@ struct FastblockProposalV1 {
 }
 
 struct AvailabilityVoteV1 {
+    codec_version: u16,
     parent: ParentBoundary,
     session_id: [u8; 32],
     index: u8,
@@ -410,26 +411,37 @@ struct AvailabilityVoteV1 {
 }
 
 struct AvailabilityQCV1 {
+    codec_version: u16,
     proposal_hash: [u8; 32],
     signer_bitmap: ValidatorBitmap,
     signatures: Vec<Signature>,     // >= 2f + 1, canonical validator order
 }
 
 struct PromiseAckV1 {
+    codec_version: u16,
     parent: ParentBoundary,
     session_id: [u8; 32],
     index: u8,
     proposal_hash: [u8; 32],
-    availability_qc_hash: [u8; 32],
     validator: ValidatorId,
     signature: Signature,
 }
 
 struct PromiseQCV1 {
+    codec_version: u16,
     proposal_hash: [u8; 32],
-    availability_qc_hash: [u8; 32],
     signer_bitmap: ValidatorBitmap,
     signatures: Vec<Signature>,     // >= 2f + 1, canonical validator order
+}
+
+struct LockNackV1 {
+    codec_version: u16,
+    parent: ParentBoundary,
+    session_id: [u8; 32],
+    proposal: FastblockProposalV1,
+    availability_qc: AvailabilityQCV1,
+    validator: ValidatorId,
+    signature: Signature,
 }
 
 struct CertifiedIncrementV1 {
@@ -444,6 +456,7 @@ struct PreparedIncrementV1 {
 }
 
 struct FastblockReceiptV1 {
+    codec_version: u16,
     parent: ParentBoundary,
     session_id: [u8; 32],
     index: u8,
@@ -464,18 +477,45 @@ Signed hashes use separate domains:
 ducktape/fastblocks/proposal/v1
 ducktape/fastblocks/availability-vote/v1
 ducktape/fastblocks/promise-ack/v1
+ducktape/fastblocks/promise-subject/v1
+ducktape/fastblocks/lock-nack/v1
 ducktape/fastblocks/canonical-seal/v1
 ```
 
 Every signed preimage binds the network, epoch, parent boundary, session,
-index, proposal hash, and role-specific fields. An object's hash covers its
-canonical payload without its own signature field; certificate hashes cover
-the canonical signer bitmap and ordered signatures. Validation uses the
-validator set at the bound epoch, rejects duplicate signers, checks
-bitmap/signature agreement, and counts voting power according to the consensus
-validator model. The initial implementation requires equal validator weight;
-weighted sets need an explicit quorum-function update in both Simplex and
-PromiseNet.
+index, proposal hash, and role-specific fields. An object's content hash covers
+its canonical payload without its own signature field; a certificate content
+hash also covers its canonical signer bitmap and ordered signatures.
+
+Certificate *identity* deliberately does not use that content hash. More than
+one signer subset can produce a valid quorum certificate for the same proposal.
+Those encodings are interchangeable proofs of one semantic subject:
+
+```text
+promise_subject = H(
+  "ducktape/fastblocks/promise-subject/v1",
+  proposal_hash
+)
+```
+
+The next increment links `previous_promise_subject`, never the serialized QC
+hash. A validator verifies any complete `PromiseQC` for that subject. Likewise,
+each `PromiseAck` signs the proposal hash after verifying any valid
+`AvailabilityQC` for that proposal; different valid availability signer sets
+cannot split the acknowledgement subject. Certificate content hashes remain
+useful for storage and deduplication but MUST NOT become branch, lock, or chain
+identities.
+
+Validation uses the validator set at the bound epoch, rejects duplicate
+signers, checks bitmap/signature agreement, and counts voting power according
+to the consensus validator model. The initial implementation requires equal
+validator weight; weighted sets need an explicit quorum-function update in
+both Simplex and PromiseNet.
+
+Every vector is bounded before allocation: at most ten certified increments,
+at most the epoch validator count's signatures and bitmap bits, at most one
+canonical batch's frame ids, and protocol-configured maximum proof/sidecar
+bytes. “Canonical encoding” does not permit an unbounded decoder.
 
 ## Validator State Machine
 
@@ -517,7 +557,8 @@ Before an availability vote, a validator MUST:
 
 - confirm the epoch, parent boundary, current view, elected assembler, session
   id, and index;
-- verify the assembler signature and exact previous `PromiseQC` link;
+- verify the assembler signature, exact previous promise-subject link, and a
+  complete `PromiseQC` proving that subject;
 - possess every full frame and verify each frame's size, signature, decoding,
   `FrameId`, and absence from the already certified prefix;
 - reconstruct the cumulative roots and encoded size using the canonical packer;
@@ -549,8 +590,9 @@ over the control stream, and produces per-frame receipts with Merkle proofs.
 The two certificate phases are deliberate. If the user accepted the first set
 of availability votes, a Byzantine assembler could show their signatures only
 to the user and disappear before honest validators learned that a quorum
-existed. `PromiseQC` proves that a quorum acknowledged the same availability
-certificate *after* durably installing the enforcement lock.
+existed. `PromiseQC` proves that a quorum acknowledged the same proposal after
+each signer verified a valid availability certificate and durably installed
+the enforcement lock.
 
 All writes are idempotent. After restart, a validator reconstructs its highest
 lock before joining Simplex or signing PromiseNet messages. A validator treats
@@ -559,8 +601,10 @@ the assembled `PromiseQC`; otherwise an assembler could hide a valid receipt
 from its signers.
 
 A partial acknowledgement set can leave fewer than `f + 1` honest validators
-locked even though no `PromiseQC` was possible. Those validators refuse an
-omitting proposal, but cannot prevent a valid Simplex quorum. If an omitting
+locked even though no `PromiseQC` was possible. Those validators still reject
+an omitting proposal and send the active proposer a signed `LockNack` carrying
+the unique availability certificate. This can delay a view, so recovery treats
+even one valid NACK as a reason to include the prepared tail. If an omitting
 canonical successor nevertheless finalizes, that finalization proves—under the
 same `f`-fault assumption—that no hidden `PromiseQC` existed, because a real
 one would have supplied at least `f + 1` honest blockers. The validator then
@@ -614,6 +658,12 @@ Before voting for a successor, a validator verifies:
 - every locally persisted promise lock for this parent is represented; and
 - the complete batch obeys the canonical size and frame rules.
 
+If its local lock is missing, the validator rejects the proposal and
+immediately sends a signed `LockNack` with the proposal and availability
+certificate over the PromiseNet control stream. The NACK is diagnostic and a
+liveness repair, not an extra consensus vote: the local lock is already the
+safety rule.
+
 The PromiseNet state machine and `ConsensusAutomaton::verify` MUST consult one
 shared `BoundaryLock`; two independently cached views of the lock are unsafe.
 Once a validator begins voting on a canonical successor, the boundary closes
@@ -638,21 +688,30 @@ The promise target is the first finalized successor of the parent boundary,
 not one temporary Simplex view. A view change therefore cannot erase a valid
 receipt.
 
-On taking leadership for a parent that did not finalize, a new assembler first
-runs recovery over PromiseNet control streams. It waits for `2f + 1` signed,
+On taking leadership for a parent that did not finalize, the new Simplex
+proposer first runs recovery over PromiseNet control streams. It waits for
+`2f + 1` signed,
 monotone responses containing each validator's highest persisted availability
 certificate, promise lock, and `PromiseQC`, plus body roots. Any set of
 `2f + 1` responders intersects the `f + 1` honest lockers behind a hidden valid
 receipt, so at least one response reveals the chain that must be carried.
+The proposer publishes its candidate seal before entering Simplex; any holder
+whose lock is absent proactively returns `LockNack`. If a candidate races past
+that repair and fails validation, the NACK accompanies the failed view so the
+next proposer learns the unique prepared tail. Under eventual synchrony this
+converges without requiring Byzantine validators to answer recovery.
 
 - If no validator reports an `AvailabilityQC` or promise lock, the previous
   unpromised candidates may be abandoned and the successor uses the ordinary
   canonical path. No second PromiseNet session starts for that parent.
-- If any valid `AvailabilityQC` or promise lock exists, the new assembler
+- If any valid `AvailabilityQC` or promise lock exists, the new proposer
   fetches its bodies and certificates and seals that unique chain immediately.
   It does not issue a conflicting session for the same parent.
-- If a `PromiseQC` exists, the new assembler carries its highest contiguous
-  prefix even if the former assembler never broadcast the certificate.
+- If any responder supplies a `PromiseQC`, the new proposer carries its
+  highest contiguous prefix. If a valid receipt was hidden from every signer,
+  at least `f + 1` honest `PromiseAck` locks still expose the same proposal as
+  a prepared tail; including those frames fulfills the receipt without needing
+  to reconstruct the withheld signer set.
 - If required bodies cannot be fetched, canonical progress pauses at that
   parent. At least `f + 1` honest promise signers MUST retain them; the
   resolver queries signers named in the certificates and uses the existing
@@ -673,6 +732,7 @@ append-only chain.
 | Assembler crashes before `AvailabilityQC` | Candidate abandoned after view close | Next proposer may build normally |
 | Assembler crashes after `AvailabilityQC`, before `PromiseQC` | No user receipt, but any installed locks are recovered and included | Next proposer seals recovered proposal |
 | Assembler crashes after `PromiseQC` | Receipt remains valid | Next proposer carries certified prefix |
+| Partial `PromiseAck` set, no `PromiseQC` | No user receipt | Lock NACK carries the prepared tail; recovery may cost a view |
 | Datagram loss/reordering | Stream copy/retry; cadence may be missed | No effect on safety |
 | Body unavailable to a validator | Validator does not availability-vote | Quorum may proceed without it or fall back |
 | Quorum cannot pin or fsync in 100 ms | Fewer/no fastblocks | Simplex remains available unless a lock already exists |
@@ -700,9 +760,10 @@ promise acknowledgement for a given session/index, two conflicting
 certificates cannot exist within the unique parent session. A view change
 recovers or seals that session; it cannot mint a competing one.
 
-The previous-certificate hash makes indices an append-only chain. A validator
-does not vote for index `i + 1` without validating the exact `PromiseQC` at
-index `i`, so two certified suffixes cannot fork from one prefix.
+The previous promise subject makes indices an append-only chain. A validator
+does not vote for index `i + 1` without validating a complete `PromiseQC` for
+index `i`'s exact proposal subject, so different serialized signer subsets
+cannot fork two certified suffixes from one prefix.
 
 ### Promise fulfillment
 
@@ -711,6 +772,15 @@ honest validators that installed the same durable lock. A conflicting Simplex
 finalization also needs `2f + 1` votes. Excluding those `f + 1` honest blockers
 leaves at most `2f` possible voters, so a canonical successor that omits or
 reorders the promised prefix cannot finalize.
+
+### Cross-protocol race
+
+The shared `BoundaryLock` makes “sign `PromiseAck`” and “vote for a canonical
+successor” mutually ordered at each honest validator. It cannot acknowledge a
+proposal after voting for an incompatible successor, or vote for an omitting
+successor after acknowledging the proposal. Any PromiseNet quorum and Simplex
+quorum intersect in at least one honest validator, so an omitting canonical
+certificate and a conflicting `PromiseQC` cannot both win a race.
 
 ### Data availability
 
@@ -852,6 +922,8 @@ Required metrics include:
 - promised/canonical bytes, unused budget, large-frame deferrals, and overflow
   carry;
 - recovery attempts, recovered locks, missing bodies, and time to seal;
+- lock NACKs sent/received, proposals repaired, and views lost to late lock
+  discovery;
 - preconfirmation receipts fulfilled, rejected-at-execution, and any
   receipt/canonical mismatch; and
 - canonical finalization latency with PromiseNet enabled, disabled, and
@@ -920,6 +992,8 @@ finality. Receipt-aware APIs are additive and versioned.
 - quorum arithmetic across supported validator counts;
 - no two conflicting `AvailabilityQC`s or `PromiseQC`s under generated vote
   schedules;
+- multiple valid signer subsets normalize to one promise subject and cannot
+  fork the certificate chain;
 - append-only prefix, capacity monotonicity, deduplication, and canonical
   packer equivalence;
 - state-machine transition generation, crash at every write boundary, and WAL
@@ -939,6 +1013,8 @@ finality. Receipt-aware APIs are additive and versioned.
 - assembler death before vote, after availability QC, after individual locks,
   after PromiseQC, and during canonical seal;
 - Simplex nullification and multiple view changes while carrying a promise;
+- adversarial recovery-response selection plus partial locks converges through
+  `LockNack` without requiring Byzantine votes;
 - no canonical omission/reordering can finalize after a valid receipt;
 - PromiseNet total failure leaves ordinary Simplex live when no lock exists;
 - epoch freeze/restart/cutover with custody and unresolved-lock recovery; and
