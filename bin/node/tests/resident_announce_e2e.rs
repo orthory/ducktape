@@ -245,23 +245,22 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
     // json-bodied, so the blob is the JSON-encoded string — opaque bytes as
     // far as this test cares (the provider script's answer is fixed).
     //
-    // uploaded to BOTH nodes because blob bytes are NODE-LOCAL: the pin
-    // replicates through consensus, the bytes do not (yet — the tracked
-    // remote-executor replication gap), and the RESIDENT is the executor
-    // here. this mirrors what a resident operator's own app does today; a
-    // fetch-on-miss lane makes the second upload obsolete.
+    // uploaded to the FOUNDER ONLY: blob bytes are node-local (the pin
+    // replicates through consensus, the bytes do not), and the RESIDENT is
+    // the executor here — so its run can only resolve the prompt through
+    // the mesh fetch-on-miss lane (#298), which this leg now exercises end
+    // to end.
     let prompt = serde_json::json!("You are quacker, a resident e2e test agent.");
-    let mut digests = Vec::new();
-    for port in [cluster.http_ports[0], cluster.http_ports[1]] {
-        let (blob_code, blob_reply) =
-            common::http_request(port, "POST", "/v1/files/blob", Some(&prompt));
-        assert_eq!(blob_code, 200, "prompt blob upload failed: {blob_reply}");
-        digests.push(common::unhex(
-            blob_reply["digest"].as_str().expect("blob reply carries a digest"),
-        ));
-    }
-    assert_eq!(digests[0], digests[1], "content addressing agrees across nodes");
-    let prompt_hash = digests.remove(0);
+    let (blob_code, blob_reply) = common::http_request(
+        cluster.http_ports[0],
+        "POST",
+        "/v1/files/blob",
+        Some(&prompt),
+    );
+    assert_eq!(blob_code, 200, "prompt blob upload failed: {blob_reply}");
+    let prompt_hash = common::unhex(
+        blob_reply["digest"].as_str().expect("blob reply carries a digest"),
+    );
     assert_eq!(prompt_hash.len(), 32, "sha256 digest bytes");
     cluster.submit(
         0,
