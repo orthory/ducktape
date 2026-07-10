@@ -22,6 +22,10 @@ export const color = {
 
   // surfaces
   paper: v("paper", "#ffffff"),
+  // the app "page" the cards sit on — one notch recessed from paper. Its own
+  // token (not `sunken`) so inputs, which use `sunken`, still read as wells
+  // recessed below the page in both themes.
+  canvas: v("canvas", "#fcfcfc"),
   sidebar: v("sidebar", "#f9f9f9"),
   titlebar: v("titlebar", "#f1f1f1"),
   hover: v("hover", "#ededed"),
@@ -39,6 +43,10 @@ export const color = {
   // filled control stays high-contrast against the surface.
   dark: v("filled", "#26251f"),
   onDark: v("on-filled", "#efefef"),
+  // Hover shade for a filled control: nudge the fill toward its own text. In
+  // light that lightens the dark fill; in dark (fill is now light) it darkens
+  // it — the right direction in both themes without a second inline hex.
+  filledHover: "color-mix(in srgb, var(--c-filled, #26251f) 85%, var(--c-on-filled, #efefef))",
 
   // accent (overridable via --accent CSS var) — same in both themes
   accent: "#a05a3c",
@@ -57,6 +65,18 @@ export const color = {
   dangerSoft: v("danger-soft", "#faf1ef"),
   dangerBorder: v("danger-border", "#eccbc5"),
 } as const;
+
+/** A tinted status chip derived from one hue: vivid-but-readable text over a
+ *  faint wash of the same color, with a slightly stronger border. Every part is
+ *  mixed against the LIVE `--c-ink` / `--c-paper`, so a single call yields a
+ *  pale-on-white chip in light mode and a dark-tinted chip in dark mode — no
+ *  per-theme hexes. Pass a token (e.g. `color.green`), not a raw hex, so the
+ *  base hue itself also shifts with the theme. */
+export const tint = (base: string) => ({
+  text: `color-mix(in srgb, ${base} 72%, var(--c-ink, #2c2b27))`,
+  bg: `color-mix(in srgb, ${base} 14%, var(--c-paper, #ffffff))`,
+  border: `color-mix(in srgb, ${base} 34%, var(--c-paper, #ffffff))`,
+});
 
 export const font = {
   sans: "'Geist Sans', 'IBM Plex Sans KR', system-ui, -apple-system, sans-serif",

@@ -8,7 +8,7 @@
 
 import type { ReactNode } from "react";
 
-import { color, font } from "../../theme/tokens";
+import { color, font, tint } from "../../theme/tokens";
 
 const STEP_LABELS = ["Account", "Workspace", "Connect"] as const;
 
@@ -43,10 +43,10 @@ export function StepRail({ active }: { active: 1 | 2 | 3 }) {
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
-                background: current ? color.dark : done ? "#eef5f0" : "transparent",
-                border: `1px solid ${current ? color.dark : done ? "#cfe3d7" : color.borderStrong}`,
+                background: current ? color.dark : done ? tint(color.green).bg : "transparent",
+                border: `1px solid ${current ? color.dark : done ? tint(color.green).border : color.borderStrong}`,
                 font: `600 9px ${font.mono}`,
-                color: current ? color.onDark : done ? "#5f9e74" : color.muted2,
+                color: current ? color.onDark : done ? tint(color.green).text : color.muted2,
               }}
             >
               {done ? "✓" : step}

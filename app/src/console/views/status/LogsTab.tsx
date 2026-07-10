@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import type { RuntimeFacts } from "../../../domain/workspace-client";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius, shadow, tint } from "../../theme/tokens";
 import {
   filterLines,
   levelCounts,
@@ -125,8 +125,8 @@ function Fact({
       style={{
         all: "unset",
         cursor: copyable && has ? "pointer" : "default",
-        border: `1px solid ${copied ? "#cfe3d7" : color.border}`,
-        background: copied ? "#eef5f0" : color.paper,
+        border: `1px solid ${copied ? tint(color.green).border : color.border}`,
+        background: copied ? tint(color.green).bg : color.paper,
         borderRadius: radius.md,
         padding: "8px 11px",
         minWidth: 0,
@@ -278,7 +278,7 @@ function Toolbar({
               width: 7,
               height: 7,
               borderRadius: "50%",
-              background: following ? "#5f9e74" : color.amber,
+              background: following ? color.green : color.amber,
               animation: following ? "ik-pulse 1.6s ease-in-out infinite" : undefined,
             }}
           />
@@ -385,7 +385,7 @@ function LogBody({
         overflow: "auto",
         border: `1px solid ${color.border}`,
         borderRadius: radius.md,
-        background: "#fbfaf7",
+        background: color.canvas,
         padding: "10px 12px",
         boxShadow: shadow.card,
       }}

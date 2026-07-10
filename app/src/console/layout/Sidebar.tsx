@@ -76,7 +76,7 @@ function ModeToggle({
               style={{
                 font: `700 8.5px ${font.mono}`,
                 letterSpacing: ".08em",
-                color: active ? color.onDark : "#959595",
+                color: active ? color.onDark : color.muted,
               }}
             >
               {entry.label}
@@ -178,7 +178,7 @@ export function Sidebar() {
           height: 34,
           borderRadius: "50%",
           marginBottom: 2,
-          background: state.screen === "account" ? color.dark : "#cdcdcd",
+          background: state.screen === "account" ? color.dark : color.iconIdle,
           color: state.screen === "account" ? color.onDark : color.muted3,
           font: `600 12px ${font.sans}`,
         }}

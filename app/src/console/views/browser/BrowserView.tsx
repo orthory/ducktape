@@ -6,7 +6,7 @@ import * as gateway from "../../../domain/gateway-client";
 import type { LoadedDuckPage } from "../../../domain/duck-browser";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, radius } from "../../theme/tokens";
+import { color, font, radius, tint } from "../../theme/tokens";
 
 const short = (value?: string, width = 8): string =>
   value ? `${value.slice(0, width)}…${value.slice(-4)}` : "—";
@@ -37,14 +37,14 @@ function SecurityBar({ page }: { page: LoadedDuckPage }) {
         gap: 9,
         padding: "0 14px",
         borderBottom: `1px solid ${color.borderSoft}`,
-        background: routed ? "#f5faf6" : "#f5f7fa",
+        background: routed ? tint(color.green).bg : tint(color.blue).bg,
       }}
     >
       <span style={{
         padding: "3px 7px",
         borderRadius: 999,
-        background: routed ? "#dfeee2" : "#e1e8f0",
-        color: routed ? "#397047" : "#4f6783",
+        background: routed ? tint(color.green).border : tint(color.blue).border,
+        color: routed ? tint(color.green).text : tint(color.blue).text,
         font: `700 9px ${font.mono}`,
         letterSpacing: ".06em",
       }}>
@@ -127,8 +127,8 @@ export function BrowserView() {
 
       {page && <SecurityBar page={page} />}
       <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
-        <div style={{ flex: 1, minWidth: 0, minHeight: 0, position: "relative", background: "#f4f4f2" }}>
-          {loading && <div role="status" style={{ position: "absolute", inset: 0, zIndex: 2, display: "grid", placeItems: "center", background: "rgba(255,255,255,.82)", color: color.muted3, font: `600 11px ${font.sans}` }}>Resolving route…</div>}
+        <div style={{ flex: 1, minWidth: 0, minHeight: 0, position: "relative", background: color.canvas }}>
+          {loading && <div role="status" style={{ position: "absolute", inset: 0, zIndex: 2, display: "grid", placeItems: "center", background: `color-mix(in srgb, ${color.paper} 82%, transparent)`, color: color.muted3, font: `600 11px ${font.sans}` }}>Resolving route…</div>}
           {error && !loading && <div role="alert" style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", padding: 30 }}><div style={{ maxWidth: 480, padding: 18, borderRadius: radius.lg, border: `1px solid ${color.dangerBorder}`, background: color.paper }}><div style={{ color: color.dark, font: `650 13px ${font.sans}` }}>Route refused</div><div style={{ marginTop: 7, color: color.muted3, font: `450 11px/1.55 ${font.sans}` }}>{error}</div></div></div>}
           {page?.hosting === "network" && !error && (
             <iframe title={page.title} data-testid="duck-browser-frame" sandbox="" allow="" referrerPolicy="no-referrer" srcDoc={page.srcDoc} style={{ width: "100%", height: "100%", display: "block", border: 0, background: color.paper }} />

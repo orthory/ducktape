@@ -11,7 +11,7 @@ import { useState } from "react";
 import { normalizeKey, sameKey, shortKey } from "../../../domain/names";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font } from "../../theme/tokens";
+import { color, font, tint } from "../../theme/tokens";
 import { errMessage, errorTextStyle } from "../onboarding/IdentityGateForms";
 import {
   GroupCard,
@@ -28,7 +28,7 @@ function StandingChip({ standing }: { standing: "Validator" | "Resident" | "No s
     standing === "Validator"
       ? { fg: color.onDark, bg: color.dark, bd: color.dark }
       : standing === "Resident"
-        ? { fg: "#5f9e74", bg: "#eef5f0", bd: "#cfe3d7" }
+        ? { fg: tint(color.green).text, bg: tint(color.green).bg, bd: tint(color.green).border }
         : { fg: color.muted2, bg: color.sunken, bd: color.border };
   return (
     <span
@@ -96,7 +96,7 @@ export function NodesCard({ accountId }: { accountId: string | undefined }) {
                           setUnbindError(null);
                           setPendingUnbind(nodeHex);
                         }}
-                        hoverBg="#fbeeec"
+                        hoverBg={color.dangerSoft}
                         style={{ ...outlineButton, color: color.red }}
                       >
                         Unbind
@@ -140,9 +140,9 @@ export function NodesCard({ accountId }: { accountId: string | undefined }) {
                         <span
                           style={{
                             font: `600 9px ${font.mono}`,
-                            color: "#5f9e74",
-                            background: "#eef5f0",
-                            border: "1px solid #cfe3d7",
+                            color: tint(color.green).text,
+                            background: tint(color.green).bg,
+                            border: `1px solid ${tint(color.green).border}`,
                             borderRadius: 4,
                             padding: "2px 6px",
                             letterSpacing: ".04em",

@@ -126,7 +126,7 @@ export function AgentDetail({
                   font: `700 9px ${font.mono}`,
                   letterSpacing: ".07em",
                   textTransform: "uppercase",
-                  color: active ? "#86cf9a" : "#e0b978",
+                  color: active ? color.green : color.amber,
                 }}
               >
                 <span
@@ -153,7 +153,7 @@ export function AgentDetail({
             <button
               type="button"
               onClick={() => (active ? onPause(agent.agent_id) : onResume(agent.agent_id))}
-              style={{ ...onDarkButton, color: active ? "#e0b978" : "#86cf9a" }}
+              style={{ ...onDarkButton, color: active ? color.amber : color.green }}
             >
               {active ? "Pause agent" : "Resume agent"}
             </button>
