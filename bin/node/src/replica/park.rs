@@ -20,7 +20,8 @@ use recovery::{Manifest, Recovery};
 use crate::blob_fetch;
 use crate::config::{self, hex_bytes, unhex};
 use crate::constants::*;
-use crate::explorer::{boundary_block_row, explorer_root_op, heal_index, stage_shipped_index};
+use crate::drain_actions::{BlockAction, CutoverTrigger, block_actions, epoch_actions};
+use crate::explorer::{boundary_block_row, heal_index, stage_shipped_index};
 use crate::host_reads::{
     joiner_epoch_mesh, read_upgrade_state, read_upgrade_version_fields, read_valset_members,
     read_valset_residents,
@@ -838,64 +839,16 @@ pub(super) async fn park(
                 std::process::exit(1);
             }
             let drained = node_r.take_drained();
-            // System-injection traces, merged per height after the
-            // members' dispatches — the same row order the validator
-            // drain and every replay path derive.
-            let mut system_dispatches: std::collections::BTreeMap<
-                u64,
-                Vec<host::DispatchRecord>,
-            > = node_r.take_system_dispatches().into_iter().collect();
-            let mut gi = 0;
-            while gi < drained.len() {
-                let height = drained[gi].height;
-                let mut block_dispatches: Vec<host::DispatchRecord> = Vec::new();
-                let mut block_ops: Vec<noded::RootOp> = Vec::new();
-                let mut block_hash: Option<node::FrameId> = None;
-                let mut block_app_hash: Option<StateRoot> = None;
-                let mut sealed_hash: Option<StateRoot> = None;
-                while gi < drained.len() && drained[gi].height == height {
-                    let d = &drained[gi];
-                    gi += 1;
-                    if d.disposition == node::Disposition::Discarded {
-                        continue;
-                    }
-                    sealed_hash = Some(d.app_hash);
-                    if let (node::Disposition::Applied, Some(op)) =
-                        (&d.disposition, &d.op)
-                    {
-                        block_dispatches.extend(op.dispatches.iter().cloned());
-                    }
-                    if let Some(op) = &d.op
-                        && op.target != NOP_TARGET
-                    {
-                        let disposition = match d.disposition {
-                            node::Disposition::Applied => {
-                                noded::BlockDisposition::Applied
-                            }
-                            node::Disposition::Rejected => {
-                                noded::BlockDisposition::Rejected
-                            }
-                            node::Disposition::Discarded => continue,
-                        };
-                        if block_hash.is_none() {
-                            block_hash = Some(d.id);
-                            block_app_hash = Some(d.app_hash);
-                        }
-                        block_ops.push(explorer_root_op(
-                            &blobs,
-                            &op.origin,
-                            &op.target,
-                            &op.payload,
-                            &op.dispatches,
-                            disposition,
-                        ));
-                    }
-                }
-                // System-injection dispatches index after the
-                // members' — see the validator drain's twin merge.
-                if let Some(sys) = system_dispatches.remove(&height) {
-                    block_dispatches.extend(sys);
-                }
+            // The same projection the validator consumes; this loop retains
+            // replica-only seal verification, streaming, and checkpoints.
+            for action in block_actions(&drained, node_r.take_system_dispatches(), &blobs) {
+                let BlockAction {
+                    height,
+                    dispatches,
+                    record,
+                    sealed_hash,
+                    ..
+                } = action;
                 // a BACKFILLED height's trust is the served seal:
                 // what our fold produced must match it exactly, or
                 // this replica has diverged from the quorum's fold.
@@ -924,21 +877,9 @@ pub(super) async fn park(
                     );
                     std::process::exit(1);
                 }
-                let record = (!block_ops.is_empty()).then(|| {
-                    noded::block_row(&noded::BlockRecord {
-                        height,
-                        hash: block_hash
-                            .map(|h| noded::hex_bytes(&h))
-                            .unwrap_or_default(),
-                        commit_hash: block_app_hash
-                            .map(|h| hex(&h))
-                            .unwrap_or_default(),
-                        ops: block_ops,
-                    })
-                });
                 let ops = indexer::BlockOps {
                     record,
-                    ..noded::index_block_ops(height, height, &block_dispatches)
+                    ..noded::index_block_ops(height, height, &dispatches)
                 };
                 if let Err(err) = index.apply_block(&ops) {
                     eprintln!(
@@ -978,43 +919,38 @@ pub(super) async fn park(
                     .iter()
                     .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
                     .collect();
-                if let consensus::ObservationOutcome::Scheduled(cutover) = orch
-                    .observe_members(
-                        folded_view,
-                        observed.iter().cloned(),
-                        observed_residents.iter().cloned(),
-                    )
-                {
-                    println!(
-                        "[node {label}] replica: membership change observed at view {} \
-                         — cutover to epoch {} at view {}",
-                        cutover.observed_view(),
-                        cutover.next_epoch(),
-                        cutover.cutover_view()
-                    );
-                    node_r.set_view_ceiling(cutover.cutover_view());
-                }
                 let boundary_upgrade = read_upgrade_state(node_r.host()).await;
-                if let Some(pending) = &boundary_upgrade.pending
-                    && let consensus::ObservationOutcome::Scheduled(cutover) =
-                        orch.observe_upgrade(folded_view, pending.activation_height)
-                {
-                    println!(
-                        "[node {label}] replica: upgrade '{}' armed — cutover to epoch \
-                         {} at view {} (activation height {})",
-                        pending.name,
-                        cutover.next_epoch(),
-                        cutover.cutover_view(),
-                        pending.activation_height
-                    );
-                    node_r.set_view_ceiling(cutover.cutover_view());
-                }
-                if let Some(plan) = orch.respawn_if_due(
+                let actions = epoch_actions(
+                    orch,
                     folded_view,
                     observed,
                     observed_residents,
                     boundary_upgrade,
-                ) {
+                );
+                if let Some(trigger) = actions.trigger {
+                    let cutover = trigger.cutover();
+                    match trigger {
+                        CutoverTrigger::Membership(_) => println!(
+                            "[node {label}] replica: membership change observed at view {} \
+                             — cutover to epoch {} at view {}",
+                            cutover.observed_view(),
+                            cutover.next_epoch(),
+                            cutover.cutover_view()
+                        ),
+                        CutoverTrigger::Upgrade {
+                            name,
+                            activation_height,
+                            ..
+                        } => println!(
+                            "[node {label}] replica: upgrade '{name}' armed — cutover to epoch \
+                             {} at view {} (activation height {activation_height})",
+                            cutover.next_epoch(),
+                            cutover.cutover_view()
+                        ),
+                    }
+                    node_r.set_view_ceiling(cutover.cutover_view());
+                }
+                if let Some(plan) = actions.respawn {
                     let members = plan.valset().consensus_members();
                     let member_bytes: Vec<Vec<u8>> =
                         members.iter().map(|k| k.as_ref().to_vec()).collect();

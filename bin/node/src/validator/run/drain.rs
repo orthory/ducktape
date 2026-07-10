@@ -9,12 +9,12 @@ use commonware_utils::ordered::Set;
 use consensus::ContentStore;
 use directory::{DirQuery, DirReply, decode_reply, encode_query};
 use recovery::Manifest;
-use sdk::{Msg, StateRoot};
+use sdk::Msg;
 
 use super::super::announce::{dispatch_pending_deliveries, saga_next_expiry};
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET};
-use crate::explorer::explorer_root_op;
+use crate::drain_actions::{BlockAction, CutoverTrigger, block_actions, epoch_actions};
 use crate::host_reads::{
     read_upgrade_state, read_upgrade_status_raw, read_upgrade_version_fields, read_valset_members,
     read_valset_residents,
@@ -114,13 +114,6 @@ impl ValidatorRuntime<'_> {
         // drain finished with; every disposition is deterministic,
         // so the reply faithfully reports the op's consensus fate.
         let drained = node.take_drained();
-        // the once-per-block System-injection traces (upgrade
-        // Advance, mailbox DeliverPending follow-ups) ride beside
-        // the member frames; each height's entry indexes AFTER
-        // that height's member dispatches, matching the replay
-        // paths' row order exactly.
-        let mut system_dispatches: std::collections::BTreeMap<u64, Vec<host::DispatchRecord>> =
-            node.take_system_dispatches().into_iter().collect();
         // sealed = journaled: one seal per BLOCK (height), whatever a
         // batch's member count. count DISTINCT sealed heights so the
         // checkpoint cadence stays per-block; applied and rejected
@@ -131,110 +124,34 @@ impl ValidatorRuntime<'_> {
             .map(|d| d.height)
             .collect::<std::collections::BTreeSet<u64>>()
             .len() as u64;
-        // fold every SEALED frame into the derived per-module
-        // index: an applied frame contributes its dispatch trace,
-        // a rejected one folds EMPTY (it still consumed its
-        // height, and every module's watermark must track the
-        // sealed tip or restart staleness checks would rebuild
-        // spuriously). discarded frames never sealed a height.
-        // a frame the explorer shows — a decoded op that isn't
-        // the heartbeat nop (the deliberately-empty block that
-        // only ticks an idle chain) — additionally carries its
-        // explorer row, so GET /v1/blocks survives restarts.
-        // canonical state committed above, so an index failure
-        // degrades read models only — the store poisons itself
-        // and stays loud until rebuilt.
-        // fold each BLOCK once: a batch delivers N DrainedFrames at
-        // ONE height (its members, contiguous in agreed order). the
-        // per-module index and the `ducktape_*` metrics series are
-        // per-BLOCK — folding per frame would over-count blocks as ops
-        // AND lose every member after the first to the index's
-        // idempotent same-height skip. group the run of same-height
-        // frames, concatenate their dispatch traces under one running
-        // seq (so `op_key(height, seq)` stays unique across members),
-        // and fold once. canonical state committed above, so an index
-        // failure degrades read models only — it stays loud.
-        let mut gi = 0;
-        while gi < drained.len() {
-            let height = drained[gi].height;
-            let mut block_dispatches: Vec<host::DispatchRecord> = Vec::new();
-            let mut block_latency = 0u64;
-            let mut any_applied = false;
-            // the block record carries a RootOp for EVERY non-nop
-            // member (agreed order); the block hash is the first
-            // member's frame id and the commit is the members' shared
-            // app-hash. a pure nop/idle block shows no ops.
-            let mut block_ops: Vec<noded::RootOp> = Vec::new();
-            let mut block_hash: Option<node::FrameId> = None;
-            let mut block_app_hash: Option<StateRoot> = None;
-            while gi < drained.len() && drained[gi].height == height {
-                let d = &drained[gi];
-                gi += 1;
-                // a DISCARD never sealed this height (it is carried, not
-                // applied) — it contributes nothing to the fold.
-                if d.disposition == node::Disposition::Discarded {
-                    continue;
-                }
-                if let (node::Disposition::Applied, Some(op)) = (&d.disposition, &d.op) {
-                    any_applied = true;
-                    block_latency = block_latency.saturating_add(op.latency_us);
-                    block_dispatches.extend(op.dispatches.iter().cloned());
-                }
-                if let Some(op) = &d.op
-                    && op.target != NOP_TARGET
-                {
-                    let disposition = match d.disposition {
-                        node::Disposition::Applied => noded::BlockDisposition::Applied,
-                        node::Disposition::Rejected => noded::BlockDisposition::Rejected,
-                        // unreachable: Discarded is filtered at the top
-                        // of the inner loop; kept for match exhaustiveness.
-                        node::Disposition::Discarded => continue,
-                    };
-                    if block_hash.is_none() {
-                        block_hash = Some(d.id);
-                        block_app_hash = Some(d.app_hash);
-                    }
-                    block_ops.push(explorer_root_op(
-                        blobs,
-                        &op.origin,
-                        &op.target,
-                        &op.payload,
-                        &op.dispatches,
-                        disposition,
-                    ));
-                }
-            }
-            // the block's System-injection dispatches index AFTER
-            // every member's (the replay paths' merge order) — an
-            // agent reply delivered via the mailbox injection is
-            // an op row here like anywhere else.
-            if let Some(sys) = system_dispatches.remove(&height) {
-                block_dispatches.extend(sys);
-            }
+        // The orderer-independent projection keeps member/System order,
+        // explorer rows, and discard handling identical to the replica.
+        for action in block_actions(&drained, node.take_system_dispatches(), blobs) {
+            let BlockAction {
+                height,
+                dispatches,
+                record,
+                applied,
+                latency_us,
+                op_count,
+                ..
+            } = action;
             // one block per height: an APPLIED block records fully
             // (count, this node's summed apply latency, per-module
             // dispatch counters); an all-rejected block (the idle nop
             // lands here) only follows the height gauge. ops_total
             // counts the aggregated member ops.
-            if any_applied {
-                metrics.record_block(height, block_latency, &block_dispatches);
+            if applied {
+                metrics.record_block(height, latency_us, &dispatches);
             } else {
                 metrics.record_height(height);
             }
-            metrics.record_ops(block_ops.len());
-            let record = (!block_ops.is_empty()).then(|| {
-                noded::block_row(&noded::BlockRecord {
-                    height,
-                    hash: block_hash.map(|h| noded::hex_bytes(&h)).unwrap_or_default(),
-                    commit_hash: block_app_hash.map(|h| hex(&h)).unwrap_or_default(),
-                    ops: block_ops,
-                })
-            });
+            metrics.record_ops(op_count);
             // this lane's agreed clock IS the height: the drain stamps
             // BlockContext { consensus_time: height } for every block.
             let ops = indexer::BlockOps {
                 record,
-                ..noded::index_block_ops(height, height, &block_dispatches)
+                ..noded::index_block_ops(height, height, &dispatches)
             };
             if let Err(err) = index.apply_block(&ops) {
                 eprintln!(
@@ -489,19 +406,6 @@ impl ValidatorRuntime<'_> {
                     observed_residents.push(pk);
                 }
             }
-            if let consensus::ObservationOutcome::Scheduled(cutover) = orchestrator.observe_members(
-                engine_view,
-                observed.iter().cloned(),
-                observed_residents.iter().cloned(),
-            ) {
-                println!(
-                    "[node {label}] membership change observed at view {} — cutover to epoch {} at view {}",
-                    cutover.observed_view(),
-                    cutover.next_epoch(),
-                    cutover.cutover_view()
-                );
-                node.set_view_ceiling(cutover.cutover_view());
-            }
             // a pending upgrade arms the SAME single cutover slot at its
             // activation height (design §"One boundary carries both
             // concerns") — never a competing arm: when a membership
@@ -510,25 +414,35 @@ impl ValidatorRuntime<'_> {
             // boundary read in `respawn_if_due`. inert until the module is
             // registered (`read_upgrade_state` returns baseline/no-pending).
             let boundary_upgrade = read_upgrade_state(node.host()).await;
-            if let Some(pending) = &boundary_upgrade.pending
-                && let consensus::ObservationOutcome::Scheduled(cutover) =
-                    orchestrator.observe_upgrade(engine_view, pending.activation_height)
-            {
-                println!(
-                    "[node {label}] upgrade '{}' armed — cutover to epoch {} at view {} (activation height {})",
-                    pending.name,
-                    cutover.next_epoch(),
-                    cutover.cutover_view(),
-                    pending.activation_height
-                );
-                node.set_view_ceiling(cutover.cutover_view());
-            }
-            if let Some(plan) = orchestrator.respawn_if_due(
+            let actions = epoch_actions(
+                orchestrator,
                 engine_view,
                 observed,
                 observed_residents,
                 boundary_upgrade,
-            ) {
+            );
+            if let Some(trigger) = actions.trigger {
+                let cutover = trigger.cutover();
+                match trigger {
+                    CutoverTrigger::Membership(_) => println!(
+                        "[node {label}] membership change observed at view {} — cutover to epoch {} at view {}",
+                        cutover.observed_view(),
+                        cutover.next_epoch(),
+                        cutover.cutover_view()
+                    ),
+                    CutoverTrigger::Upgrade {
+                        name,
+                        activation_height,
+                        ..
+                    } => println!(
+                        "[node {label}] upgrade '{name}' armed — cutover to epoch {} at view {} (activation height {activation_height})",
+                        cutover.next_epoch(),
+                        cutover.cutover_view()
+                    ),
+                }
+                node.set_view_ceiling(cutover.cutover_view());
+            }
+            if let Some(plan) = actions.respawn {
                 let members = plan.valset().consensus_members();
                 let member_bytes: Vec<Vec<u8>> =
                     members.iter().map(|k| k.as_ref().to_vec()).collect();
