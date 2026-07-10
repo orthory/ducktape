@@ -126,7 +126,7 @@ mod inject;
 mod sink;
 pub(crate) use sink::ForgeSinkQuery;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent,
@@ -184,6 +184,10 @@ pub const JOB_RUN_LEASE_VIEWS: u64 = 1000;
 
 /// jobs finalization payloads must fit the jobs module's 64 KiB cap.
 const JOB_FINALIZE_PAYLOAD_BYTES: usize = 64 * 1024;
+
+/// the delivered-runs ring keeps this many terminal runs (newest evicts
+/// oldest). derived observability state — never part of `root()`/snapshot.
+const RUN_HISTORY_CAP: usize = 100;
 /// reserved delimiter separating run-key fields — the registry rejects agent
 /// ids carrying it ([`RESERVED_ID_SEPARATOR`]), so run keys stay unambiguous.
 const RUN_KEY_SEPARATOR: char = RESERVED_ID_SEPARATOR;
@@ -299,6 +303,16 @@ struct WorkspaceReceipt {
     /// `branch@output_commit`. `Some` only when a push landed.
     #[serde(default)]
     output_commit: Option<String>,
+}
+
+/// the receipt's durable output reference for the delivered-runs ring: the
+/// forge `branch@output_commit` when a push landed, else the duckfs output
+/// snapshot, else `None` (nothing moved this run).
+fn output_ref_of(receipt: &WorkspaceReceipt) -> Option<String> {
+    match (&receipt.branch, &receipt.output_commit) {
+        (Some(branch), Some(oid)) => Some(format!("{branch}@{oid}")),
+        _ => receipt.output_snapshot.clone(),
+    }
 }
 
 /// one host-assembled declarative effect (R2). `kind` is a run-effect wire name
@@ -1092,6 +1106,14 @@ pub struct RunsModule {
     /// entry stages `None` for its prune.
     pending_watches: BTreeMap<String, Option<TurnPolicy>>,
     pending_overlay: BTreeMap<String, Option<PendingState>>,
+    /// the delivered-runs ring (last [`RUN_HISTORY_CAP`], oldest first —
+    /// queries serve it reversed). DERIVED state: recorded at delivery,
+    /// rebuilt by replay, never in `root()`/snapshot, empty after a
+    /// snapshot join.
+    history: VecDeque<RunRecord>,
+    /// this block's staged history records — merged into the ring only at
+    /// `commit_block` (an aborted block must leave no ghost record).
+    pending_history: Vec<RunRecord>,
 }
 
 impl RunsModule {
@@ -1148,6 +1170,8 @@ impl RunsModule {
             pending: BTreeMap::new(),
             pending_watches: BTreeMap::new(),
             pending_overlay: BTreeMap::new(),
+            history: VecDeque::new(),
+            pending_history: Vec::new(),
         }
     }
 
@@ -1886,10 +1910,26 @@ impl RunsModule {
     }
 
     /// the failure triple (breadcrumb note + threaded failure reply + job
-    /// finalize false) — unchanged behavior, was inlined three times.
+    /// finalize false) — unchanged behavior, was inlined three times. also
+    /// records the terminal run into the delivered-runs ring (derived state,
+    /// observation only: nothing emitted changes).
     async fn fail_run(&mut self, ctx: &mut dyn Ctx, run_id: &str, entry: &PendingState, reason: String) {
         self.note(ctx, format!("run {run_id} failed: {reason}"));
         self.emit_failure_reply(ctx, run_id, entry, &reason).await;
+        let executing_node = self.executing_node(&*ctx, run_id).await;
+        self.pending_history.push(RunRecord {
+            run_id: run_id.to_string(),
+            agent_id: entry.agent_id.clone(),
+            channel_id: entry.channel_id.clone(),
+            anchor_seq: entry.anchor_seq,
+            outcome: RunOutcome::Failed,
+            degraded: false,
+            created_at: entry.created_at,
+            delivered_at: ctx.env().consensus_time,
+            executing_node,
+            output_ref: None,
+            pr_number: None,
+        });
         self.emit_job_finalize_if_current_claimant(ctx, entry, false, reason)
             .await;
     }
@@ -1942,9 +1982,29 @@ impl RunsModule {
         let payload =
             encode_delivery_receipt(&response, valid_data(&result.data), &result.workspace_receipt, result.status);
         let message = sink::message_facet_text(&response.reply_blocks);
+        // the run's durable executor attribution (sink.rs's saga lookup) —
+        // computed once here, shared by the PR-body breadcrumb and the ring.
+        let executing_node = self.executing_node(&*ctx, run_id).await;
         self.emit_response(ctx, run_id, entry, response);
-        self.emit_sink(ctx, run_id, entry, &result.sink, &message, &result.workspace_receipt)
+        let pr_number = self
+            .emit_sink(ctx, run_id, entry, &result.sink, &message, &result.workspace_receipt, &executing_node)
             .await;
+        // record the delivery into the ring AFTER the sink so the record can
+        // carry the PR number the sink opened/updated. observation only —
+        // every emitted op above is byte-identical with or without it.
+        self.pending_history.push(RunRecord {
+            run_id: run_id.to_string(),
+            agent_id: entry.agent_id.clone(),
+            channel_id: entry.channel_id.clone(),
+            anchor_seq: entry.anchor_seq,
+            outcome: RunOutcome::Delivered,
+            degraded: result.status == WireStatus::Degraded,
+            created_at: entry.created_at,
+            delivered_at: ctx.env().consensus_time,
+            executing_node,
+            output_ref: output_ref_of(&result.workspace_receipt),
+            pr_number,
+        });
         self.emit_job_finalize_if_current_claimant(ctx, entry, true, payload)
             .await;
     }
@@ -2491,6 +2551,10 @@ impl RunsModule {
         self.pending = pending;
         self.pending_watches.clear();
         self.pending_overlay.clear();
+        // the ring is derived per-node state: a snapshot describes a block
+        // boundary this node never executed, so its history starts empty.
+        self.history.clear();
+        self.pending_history.clear();
         Ok(())
     }
 }
@@ -2576,6 +2640,10 @@ impl Module for RunsModule {
                     .collect();
                 Ok(encode_reply(&RunsReply::Watches(watches)))
             }
+            RunsQuery::RecentRuns => Ok(encode_reply(&RunsReply::RecentRuns(
+                // newest first: the ring appends at the back.
+                self.history.iter().rev().cloned().collect(),
+            ))),
         }
     }
 
@@ -2600,12 +2668,19 @@ impl Module for RunsModule {
                 }
             }
         }
+        for record in std::mem::take(&mut self.pending_history) {
+            self.history.push_back(record);
+            if self.history.len() > RUN_HISTORY_CAP {
+                self.history.pop_front();
+            }
+        }
         Ok(())
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.pending_watches.clear();
         self.pending_overlay.clear();
+        self.pending_history.clear();
         Ok(())
     }
 }
@@ -3163,6 +3238,14 @@ mod tests {
 
     fn get_pending(m: &RunsModule, run_id: &str) -> Option<PendingRun> {
         pending_runs(m).into_iter().find(|p| p.run_id == run_id)
+    }
+
+    fn recent_runs(m: &RunsModule) -> Vec<RunRecord> {
+        let reply = block_on(m.query(&encode_query(&RunsQuery::RecentRuns))).unwrap();
+        match runs_decode_reply(&reply).unwrap() {
+            RunsReply::RecentRuns(runs) => runs,
+            other => panic!("unexpected reply: {other:?}"),
+        }
     }
 
     /// a committed module with one watch on "general" under `policy`. the
@@ -4127,6 +4210,13 @@ mod tests {
                 target_branch: "main".into(),
             }
         );
+        // the delivered-runs ring observes the same delivery: the forge
+        // output ref and the number the fresh OpenPr gets (empty tracker → 1).
+        commit(&mut m);
+        let rec = &recent_runs(&m)[0];
+        assert_eq!(rec.output_ref, Some(format!("agent/x@{oid}")));
+        assert_eq!(rec.pr_number, Some(1));
+        assert_eq!(rec.executing_node, "ab".repeat(32));
     }
 
     #[test]
@@ -4160,6 +4250,9 @@ mod tests {
             "the breadcrumb names the updated PR: {:?}",
             breadcrumbs(&ctx)
         );
+        // the ring records the guard-found PR as this run's pr_number.
+        commit(&mut m);
+        assert_eq!(recent_runs(&m)[0].pr_number, Some(4));
     }
 
     #[test]
@@ -4247,6 +4340,10 @@ mod tests {
             1,
             "no open PR matches the source — OpenPr fires"
         );
+        // the ring records the number the fresh OpenPr gets: committed max
+        // item number (issue 6) + 1.
+        commit(&mut m);
+        assert_eq!(recent_runs(&m)[0].pr_number, Some(7));
     }
 
     #[test]
@@ -6676,6 +6773,110 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // ---- the delivered-runs ring -------------------------------------------------
+
+    #[test]
+    fn the_delivered_runs_ring_evicts_past_the_cap_and_serves_newest_first() {
+        let rec = |i: u64| RunRecord {
+            run_id: format!("run-{i}"),
+            agent_id: "bot".into(),
+            channel_id: "general".into(),
+            anchor_seq: i,
+            outcome: RunOutcome::Delivered,
+            degraded: false,
+            created_at: i,
+            delivered_at: i + 1,
+            executing_node: "unknown".into(),
+            output_ref: None,
+            pr_number: None,
+        };
+        let mut m = module();
+        m.pending_history.extend((1..=101).map(rec));
+        commit(&mut m);
+        let runs = recent_runs(&m);
+        assert_eq!(runs.len(), RUN_HISTORY_CAP, "the ring caps at 100");
+        assert_eq!(runs.first().unwrap().run_id, "run-101", "newest first");
+        assert_eq!(runs.last().unwrap().run_id, "run-2", "run-1 evicted");
+        // an aborted block leaves no ghost record.
+        m.pending_history.push(rec(999));
+        abort(&mut m);
+        assert_eq!(recent_runs(&m), runs, "aborted staging records nothing");
+    }
+
+    #[test]
+    fn replaying_the_same_ops_rebuilds_the_identical_delivered_runs_ring() {
+        let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        let run_id = run_id_for("general", 2, "bot");
+        let saga_id = sink::saga_id_for_dispatch("runs", &dispatch_id_for(&run_id));
+        let build = || {
+            let mut m = watched(TurnPolicy::Mention, &registry);
+            engage_post(&mut m, &registry, 2, &["bot"]);
+            commit(&mut m);
+            let mut ctx = CaptureCtx::new()
+                .at(9)
+                .with_dispatch_origin()
+                .with_registry(&registry)
+                .with_transcript("general", transcript(2))
+                .with_saga_assignee(&saga_id, &[0xcd; 32]);
+            exec(
+                &mut m,
+                &mut ctx,
+                &result_event(&run_id, Ok(response(&["done"], vec![]))),
+            )
+            .unwrap();
+            commit(&mut m);
+            recent_runs(&m)
+        };
+        let (left, right) = (build(), build());
+        assert_eq!(left, right, "same ops => same ring");
+        assert_eq!(left.len(), 1);
+        let rec = &left[0];
+        assert_eq!(rec.run_id, run_id);
+        assert_eq!(rec.agent_id, "bot");
+        assert_eq!(rec.channel_id, "general");
+        assert_eq!(rec.anchor_seq, 2);
+        assert_eq!(rec.outcome, RunOutcome::Delivered);
+        assert!(!rec.degraded);
+        assert_eq!(
+            (rec.created_at, rec.delivered_at),
+            (2, 9),
+            "the staging and delivery blocks' consensus counters"
+        );
+        assert_eq!(rec.executing_node, "cd".repeat(32), "the saga assignee");
+        assert_eq!(rec.output_ref, None, "a plain reply moves nothing");
+        assert_eq!(rec.pr_number, None);
+
+        // the failure path records too — outcome failed, delivery pruned.
+        let mut m = watched(TurnPolicy::Mention, &registry);
+        engage_post(&mut m, &registry, 2, &["bot"]);
+        commit(&mut m);
+        let mut ctx = CaptureCtx::new()
+            .at(11)
+            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        exec(&mut m, &mut ctx, &result_event(&run_id, Err("boom".into()))).unwrap();
+        commit(&mut m);
+        let failed = recent_runs(&m);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].outcome, RunOutcome::Failed);
+        assert_eq!(failed[0].executing_node, "unknown", "no saga record served");
+        assert_eq!(get_pending(&m, &run_id), None, "the entry still prunes");
+    }
+
+    #[test]
+    fn recent_runs_query_decodes_the_bare_string_and_replies_with_the_ring() {
+        // the TS client sends the serde unit variant — the bare string — and
+        // reads the snake_case-keyed reply. pin both wire shapes.
+        assert_eq!(
+            decode_query(br#""recent_runs""#).unwrap(),
+            RunsQuery::RecentRuns
+        );
+        let m = module();
+        let reply = block_on(m.query(&encode_query(&RunsQuery::RecentRuns))).unwrap();
+        assert_eq!(String::from_utf8(reply).unwrap(), r#"{"recent_runs":[]}"#);
     }
 
     #[test]

@@ -164,8 +164,16 @@ impl RunsModule {
     /// (an OPEN PR already sourcing this branch was UPDATED by the push — skip
     /// with a breadcrumb). the OpenPr's title/body derive from `message` (the
     /// rendered message facet) and `receipt` — the wire sink's echoed empty
-    /// title/body are IGNORED. Merge is inert in v1. any missing precondition
-    /// degrades to a breadcrumb — the sink NEVER aborts the delivery block.
+    /// title/body are IGNORED. `executing_node` is the caller-computed saga
+    /// attribution ([`Self::executing_node`]) the PR body breadcrumb names.
+    /// Merge is inert in v1. any missing precondition degrades to a breadcrumb
+    /// — the sink NEVER aborts the delivery block.
+    ///
+    /// returns the PR number this sink touched — the guard-found open PR the
+    /// push updated, or the number the emitted `OpenPr` gets (the tracker
+    /// numbers items sequentially: committed max + 1) — for the delivered-runs
+    /// ring. `None` when no PR was involved.
+    #[allow(clippy::too_many_arguments, reason = "delivery-scoped internal seam")]
     pub(crate) async fn emit_sink(
         &self,
         ctx: &mut dyn Ctx,
@@ -174,9 +182,10 @@ impl RunsModule {
         sink: &WireSink,
         message: &str,
         receipt: &WorkspaceReceipt,
-    ) {
+        executing_node: &str,
+    ) -> Option<u64> {
         match sink {
-            WireSink::Chain => {}
+            WireSink::Chain => None,
             WireSink::Pr {
                 repo,
                 source_branch,
@@ -188,49 +197,54 @@ impl RunsModule {
             } => {
                 // malformed pr sinks degrade to a breadcrumb.
                 if repo.is_empty() || source_branch.is_empty() || target_branch.is_empty() {
-                    return self.note(
+                    self.note(
                         ctx,
                         format!(
                             "run {run_id} pr sink skipped: incomplete pr sink (repo/source_branch/target_branch required)"
                         ),
                     );
+                    return None;
                 }
                 let Some(forge) = self.forge.clone() else {
-                    return self.note(ctx, format!("run {run_id} pr sink skipped: no forge module wired"));
+                    self.note(ctx, format!("run {run_id} pr sink skipped: no forge module wired"));
+                    return None;
                 };
                 let agent = match self.agent_record(&*ctx, &entry.agent_id).await {
                     Ok(Some(a)) => a,
                     _ => {
-                        return self
-                            .note(ctx, format!("run {run_id} pr sink skipped: agent not registered"));
+                        self.note(ctx, format!("run {run_id} pr sink skipped: agent not registered"));
+                        return None;
                     }
                 };
                 if !agent.permits(&CapRequest::ForgePush(repo.as_str())) {
-                    return self.note(
+                    self.note(
                         ctx,
                         format!("run {run_id} pr sink skipped: agent lacks forge_push for {repo}"),
                     );
+                    return None;
                 }
                 match self.forge_branch_born(&*ctx, &forge, repo, source_branch).await {
                     Ok(true) => {}
                     Ok(false) => {
-                        return self.note(
+                        self.note(
                             ctx,
                             format!("run {run_id} pr sink skipped: source branch not present"),
                         );
+                        return None;
                     }
                     Err(why) => {
-                        return self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
+                        self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
+                        return None;
                     }
                 }
                 // the duplicate-PR guard: an OPEN PR already sourcing this
                 // branch means the session's push WAS the feedback — never a
                 // second PR. worded honestly when this run pushed nothing.
-                match self
-                    .forge_open_pr_number(&*ctx, &forge, repo, source_branch)
+                let next_number = match self
+                    .forge_pr_probe(&*ctx, &forge, repo, source_branch)
                     .await
                 {
-                    Ok(Some(number)) => {
+                    Ok((Some(number), _)) => {
                         let what = if receipt.output_commit.is_some() {
                             format!("run {run_id} pr sink: updated PR #{number}")
                         } else if receipt.no_changes {
@@ -244,21 +258,23 @@ impl RunsModule {
                         } else {
                             format!("run {run_id} pr sink: PR #{number} already open, nothing new pushed")
                         };
-                        return self.note(ctx, what);
+                        self.note(ctx, what);
+                        return Some(number);
                     }
-                    Ok(None) => {}
+                    Ok((None, next_number)) => next_number,
                     Err(why) => {
                         // an unreadable tracker must not risk a duplicate PR.
-                        return self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
+                        self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
+                        return None;
                     }
-                }
-                let node = self.executing_node(&*ctx, run_id).await;
+                };
                 let title = derive_pr_title(message, run_id);
-                let body = derive_pr_body(message, run_id, receipt, &node);
+                let body = derive_pr_body(message, run_id, receipt, executing_node);
                 ctx.emit_msg(Msg {
                     target: forge,
                     payload: forge_open_pr_bytes(repo, &title, &body, source_branch, target_branch),
                 });
+                Some(next_number)
             }
             WireSink::Merge { repo, number, .. } => {
                 // v1: the merge sink needs a host-computed merge pack (a phase-2
@@ -268,6 +284,7 @@ impl RunsModule {
                     ctx,
                     format!("run {run_id} merge sink for {repo}#{number} is inert in v1 (treated as chain)"),
                 );
+                None
             }
         }
     }
@@ -300,19 +317,24 @@ impl RunsModule {
             .any(|r| r.get("name").and_then(|n| n.as_str()) == Some(branch)))
     }
 
-    /// the duplicate-PR guard's read: the lowest-numbered OPEN PR whose source
-    /// branch is `source_branch`, from COMMITTED tracker state (summaries via
-    /// the ListItems mirror, then one GetItem per open PR — `ItemSummary`
-    /// carries no branches). deterministic: the listing is ascending by
-    /// number, first match wins.
-    async fn forge_open_pr_number(
+    /// the duplicate-PR guard's read, plus the tracker's NEXT item number:
+    /// `(open_pr, next_number)`. `open_pr` is the lowest-numbered OPEN PR whose
+    /// source branch is `source_branch`, from COMMITTED tracker state
+    /// (summaries via the ListItems mirror, then one GetItem per open PR —
+    /// `ItemSummary` carries no branches); deterministic: the listing is
+    /// ascending by number, first match wins. `next_number` is the number a
+    /// fresh `OpenPr` gets — forge numbers items sequentially per repo, so it
+    /// is the committed max + 1.
+    async fn forge_pr_probe(
         &self,
         ctx: &dyn Ctx,
         forge: &str,
         repo: &str,
         source_branch: &str,
-    ) -> Result<Option<u64>, String> {
-        for summary in self.forge_item_summaries(ctx, forge, repo).await? {
+    ) -> Result<(Option<u64>, u64), String> {
+        let summaries = self.forge_item_summaries(ctx, forge, repo).await?;
+        let next_number = summaries.iter().map(|s| s.number).max().unwrap_or(0) + 1;
+        for summary in summaries {
             if summary.kind != ForgeItemKind::Pr || summary.state != ForgeItemState::Open {
                 continue;
             }
@@ -320,10 +342,10 @@ impl RunsModule {
                 continue;
             };
             if item.source_branch.as_deref() == Some(source_branch) {
-                return Ok(Some(summary.number));
+                return Ok((Some(summary.number), next_number));
             }
         }
-        Ok(None)
+        Ok((None, next_number))
     }
 
     /// the run's durable executor attribution: the `assignee` on its DONE saga
@@ -331,8 +353,10 @@ impl RunsModule {
     /// `OracleResult` settled the run), rendered as lowercase key hex. the
     /// saga id is derived by [`saga_id_for_dispatch`]; a missing/pruned saga
     /// or an unassigned attempt degrades to `"unknown"` — attribution is
-    /// breadcrumb material, never a gate.
-    async fn executing_node(&self, ctx: &dyn Ctx, run_id: &str) -> String {
+    /// breadcrumb material, never a gate. `pub(crate)`: the delivery path in
+    /// lib.rs computes it once per delivery for the PR-body breadcrumb AND
+    /// the delivered-runs ring.
+    pub(crate) async fn executing_node(&self, ctx: &dyn Ctx, run_id: &str) -> String {
         let saga_id = saga_id_for_dispatch(&self.id, &crate::dispatch_id_for(run_id));
         let Ok(reply) = ctx
             .query(&self.saga, &saga_encode_query(&SagaQuery::Get { saga_id }))
