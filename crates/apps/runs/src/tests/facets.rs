@@ -196,7 +196,7 @@ fn pr_sink_emits_open_pr_only_with_the_forge_push_cap() {
         "sink": {"mode":"pr","repo":"app","source_branch":"agent/x","target_branch":"main","title":"My PR","body":"details"}
     });
 
-    // (1) GRANTED forge_push (D3 cap) + branch born → OpenPr emitted.
+    // (1) GRANTED forge_push (D3 cap) + both branches born → OpenPr emitted.
     let mut granted = registry(&[("bot", &[ACTION_CHAT_POST])]);
     granted.get_mut("bot").unwrap().caps.forge_push = vec!["app".into()];
     let (mut m, run_id) = awaiting_run_with_forge(&granted);
@@ -205,7 +205,8 @@ fn pr_sink_emits_open_pr_only_with_the_forge_push_cap() {
         .with_dispatch_origin()
         .with_registry(&granted)
         .with_transcript("general", transcript(2))
-        .with_forge_ref("app", "agent/x");
+        .with_forge_ref("app", "agent/x")
+        .with_forge_ref("app", "main");
     exec(
         &mut m,
         &mut ctx,
@@ -342,6 +343,81 @@ fn pr_sink_with_an_unborn_branch_degrades_without_aborting() {
             .iter()
             .any(|e| String::from_utf8_lossy(&e.payload).contains("source branch not present"))
     );
+}
+
+#[test]
+fn pr_sink_with_an_unborn_target_branch_degrades_without_aborting() {
+    // forge rejects an OpenPr whose TARGET branch is unborn in committed
+    // refs, and a rejected follow-up aborts the whole delivery block — the
+    // sink must skip with a breadcrumb instead (R4). repro: the target (e.g.
+    // "dev") was deleted after earlier work, then the item is re-mentioned.
+    let (mut m, granted, run_id) = forge_push_run();
+    // source born, target "main" NOT born.
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&granted)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "agent/x");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(&run_id, Ok(forge_wrapper("done", None, None, true, None))),
+    )
+    .unwrap();
+    assert!(
+        ctx.msgs.iter().all(|m| m.target != "forge"),
+        "an unborn target branch must never emit an OpenPr (no-fail rule)"
+    );
+    assert!(
+        breadcrumbs(&ctx)
+            .contains(&format!("run {run_id} pr sink skipped: target branch main not born")),
+        "the breadcrumb names the unborn target: {:?}",
+        breadcrumbs(&ctx)
+    );
+    assert_eq!(ctx.chat_msgs().len(), 1, "the run still delivers its message");
+    // the delivered-runs ring still records the run — just with no PR.
+    commit(&mut m);
+    let rec = &recent_runs(&m)[0];
+    assert_eq!(rec.run_id, run_id);
+    assert_eq!(rec.pr_number, None);
+}
+
+#[test]
+fn pr_sink_with_source_equal_to_target_degrades_without_aborting() {
+    // forge rejects an OpenPr whose source and target are the same branch —
+    // degrade with a breadcrumb, never emit the aborting op.
+    let (mut m, granted, run_id) = forge_push_run();
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&granted)
+        .with_transcript("general", transcript(2))
+        .with_forge_ref("app", "agent/x");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(runner_wrapper(
+                "done",
+                serde_json::json!({"sink":{"mode":"pr","repo":"app","source_branch":"agent/x","target_branch":"agent/x","title":""}}),
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(
+        ctx.msgs.iter().all(|m| m.target != "forge"),
+        "source==target must never emit an OpenPr (no-fail rule)"
+    );
+    assert!(
+        breadcrumbs(&ctx).contains(&format!(
+            "run {run_id} pr sink skipped: source and target are the same branch"
+        )),
+        "the breadcrumb names the malformed pair: {:?}",
+        breadcrumbs(&ctx)
+    );
+    assert_eq!(ctx.chat_msgs().len(), 1, "the run still delivers its message");
 }
 
 #[test]
@@ -613,6 +689,7 @@ fn pr_sink_derives_title_and_body_from_the_message_facet_and_forge_receipt() {
         .with_registry(&granted)
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x")
+        .with_forge_ref("app", "main")
         .with_saga_assignee(&saga_id, &[0xab; 32]);
     let message = "Fix the flaky gate: retry twice\n\nDetails in the diff.";
     exec(
@@ -751,6 +828,7 @@ fn pr_sink_guard_ignores_closed_prs_issues_and_other_sources() {
         .with_registry(&granted)
         .with_transcript("general", transcript(2))
         .with_forge_ref("app", "agent/x")
+        .with_forge_ref("app", "main")
         .with_forge_item("app", closed)
         .with_forge_item("app", forge_pr(5, "other", "", "other/y", "main"))
         .with_forge_item("app", forge_issue(6, "an issue", ""));
@@ -785,7 +863,8 @@ fn a_no_changes_run_with_a_born_branch_and_no_open_pr_still_opens_the_pr() {
         .with_dispatch_origin()
         .with_registry(&granted)
         .with_transcript("general", transcript(2))
-        .with_forge_ref("app", "agent/x");
+        .with_forge_ref("app", "agent/x")
+        .with_forge_ref("app", "main");
     exec(
         &mut m,
         &mut ctx,

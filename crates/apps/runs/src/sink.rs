@@ -159,10 +159,11 @@ impl RunsModule {
     /// output_ref chaining is future work — the receipt already carries the
     /// output_ref for a downstream consumer). Pr emits a forge `OpenPr` gated on
     /// the agent's D3 `ForgePush` cap (Phase 4's `permits`, NOT a KNOWN_ACTIONS
-    /// grant), a committed-state branch-born probe (the no-fail rule: an OpenPr
-    /// for an unborn branch would abort the block), and the duplicate-PR guard
-    /// (an OPEN PR already sourcing this branch was UPDATED by the push — skip
-    /// with a breadcrumb). the OpenPr's title/body derive from `message` (the
+    /// grant), committed-state branch-born probes for BOTH the source and the
+    /// target (the no-fail rule: an OpenPr for an unborn branch — either end —
+    /// or with source == target would abort the block), and the duplicate-PR
+    /// guard (an OPEN PR already sourcing this branch was UPDATED by the push
+    /// — skip with a breadcrumb). the OpenPr's title/body derive from `message` (the
     /// rendered message facet) and `receipt` — the wire sink's echoed empty
     /// title/body are IGNORED. `executing_node` is the caller-computed saga
     /// attribution ([`Self::executing_node`]) the PR body breadcrumb names.
@@ -201,6 +202,17 @@ impl RunsModule {
                         ctx,
                         format!(
                             "run {run_id} pr sink skipped: incomplete pr sink (repo/source_branch/target_branch required)"
+                        ),
+                    );
+                    return None;
+                }
+                // forge rejects an OpenPr with identical branches — malformed,
+                // same degrade class as the incomplete sink above.
+                if source_branch == target_branch {
+                    self.note(
+                        ctx,
+                        format!(
+                            "run {run_id} pr sink skipped: source and target are the same branch"
                         ),
                     );
                     return None;
@@ -268,6 +280,30 @@ impl RunsModule {
                         return None;
                     }
                 };
+                // forge ALSO rejects an OpenPr whose TARGET branch is unborn
+                // in committed refs — and a rejected follow-up aborts the
+                // whole delivery block (R4), deterministically, on every
+                // retry. checked AFTER the duplicate-PR guard on purpose: an
+                // already-open PR emits nothing (no abort risk) and its
+                // "updated PR #n" breadcrumb stays honest even when the
+                // target was since deleted. born-in-committed-refs also
+                // implies the name normalizes (forge validates on push).
+                match self.forge_branch_born(&*ctx, &forge, repo, target_branch).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.note(
+                            ctx,
+                            format!(
+                                "run {run_id} pr sink skipped: target branch {target_branch} not born"
+                            ),
+                        );
+                        return None;
+                    }
+                    Err(why) => {
+                        self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
+                        return None;
+                    }
+                }
                 let title = derive_pr_title(message, run_id);
                 let body = derive_pr_body(message, run_id, receipt, executing_node);
                 ctx.emit_msg(Msg {
