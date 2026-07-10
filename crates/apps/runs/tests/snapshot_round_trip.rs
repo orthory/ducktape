@@ -20,11 +20,11 @@ use chat::{
 };
 use dispatch::{
     DispatchQuery, DispatchReply, decode_query as dispatch_decode_query,
-    encode_reply as dispatch_encode_reply,
+    encode_reply as dispatch_encode_reply, encode_result_event as dispatch_encode_result_event,
 };
 use futures::executor::block_on;
 use jobs::{JobsEvent, encode_event as jobs_encode_event};
-use runs::{RunsModule, job_run_id_for, job_spec_hash, run_id_for};
+use runs::{RunsModule, dispatch_id_for, job_run_id_for, job_spec_hash, run_id_for};
 use runs::{
     PendingRun, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply, encode_msg, encode_query,
 };
@@ -66,6 +66,9 @@ impl TestCtx {
                 status: AgentStatus::Active,
                 created_at: 0,
                 updated_at: 0,
+                recipe_hash: Vec::new(),
+                caps: agent::ResourceCaps::default(),
+                skills: Vec::new(),
             },
         );
         self
@@ -325,6 +328,43 @@ fn installed_snapshot_reconstructs_root_and_reads_across_both_keyspaces() {
         watches.iter().all(|w| w.channel_id != "staged"),
         "install must clear the staged overlay"
     );
+
+    // the delivered-runs ring is DERIVED state and must never enter the
+    // canonical bytes: deliver a run on the source (populating its ring +
+    // pruning the entry), then round-trip the new snapshot — it still
+    // installs under its root, and the joiner's ring is EMPTY while every
+    // canonical read matches.
+    let mut src = src;
+    let mut ctx = TestCtx::new(3, Origin::Module("dispatch".into()))
+        .with_agent("mod-bot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])
+        .with_transcript("dev", vec![message_in("dev", 1, "hello dev", None)]);
+    let msg = Msg {
+        target: "runs".into(),
+        payload: dispatch_encode_result_event(&dispatch::ResultEvent {
+            dispatch_id: dispatch_id_for(&run_id_for("dev", 1, "mod-bot")),
+            recipe_id: "agent/mod-bot".into(),
+            outcome: Ok(b"all done".to_vec()),
+        }),
+    };
+    block_on(src.execute(&mut ctx, &msg)).unwrap();
+    commit(&mut src);
+    let RunsReply::RecentRuns(recent) = query_reply(&src, &RunsQuery::RecentRuns) else {
+        panic!("recent runs reply expected");
+    };
+    assert_eq!(recent.len(), 1, "the delivery landed in the source's ring");
+
+    let delivered_root = src.root();
+    let mut joiner = module();
+    joiner.install(&src.snapshot(), delivered_root).unwrap();
+    assert_eq!(joiner.root(), delivered_root, "canonical bytes round-trip unchanged");
+    for q in [RunsQuery::Watches, RunsQuery::PendingRuns] {
+        assert_eq!(query_reply(&joiner, &q), query_reply(&src, &q));
+    }
+    assert_eq!(
+        query_reply(&joiner, &RunsQuery::RecentRuns),
+        RunsReply::RecentRuns(Vec::new()),
+        "the ring never crosses the snapshot"
+    );
 }
 
 #[test]
@@ -535,6 +575,6 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     // the untouched stream still installs — the rejection above is the
     // ordering check, not an artifact of the splicing.
     let mut dst = module();
-    dst.install(&snap, good_root.clone()).unwrap();
+    dst.install(&snap, good_root).unwrap();
     assert_eq!(dst.root(), good_root);
 }

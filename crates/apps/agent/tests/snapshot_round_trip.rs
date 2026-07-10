@@ -73,6 +73,9 @@ fn register(agent_id: &str, actions: &[&str]) -> AgentMsg {
         capability: "model-1".into(),
         prompt_hash: vec![7u8; 32],
         allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
+        recipe_hash: None,
+        caps: None,
+        skills: None,
     }
 }
 
@@ -245,8 +248,8 @@ fn truncated_or_padded_snapshot_is_rejected() {
 /// op path. the layout is pinned by the asserted length so the
 /// discriminant-tampering test can index into it:
 /// agents: count 8 | id 8+1 | owner disc 1 + key 8+1 | display 8+1
-///         | model 8+1 | prompt 8+32 | prompt-doc tag 1 | action count 8
-///         | status 1 | times 16
+///         | model 8+1 | prompt 8+32 | action count 8
+///         | status 1 | times 16 | runtime tail 72 (recipe 8 + caps 56 + skills 8)
 fn minimal_snapshot() -> Vec<u8> {
     let owner = Origin::External(vec![5]);
     let mut m = module();
@@ -259,11 +262,14 @@ fn minimal_snapshot() -> Vec<u8> {
             capability: "m".into(),
             prompt_hash: vec![7u8; 32],
             allowed_actions: Vec::new(),
+            recipe_hash: None,
+            caps: None,
+            skills: None,
         },
     );
     commit(&mut m);
     let snap = m.snapshot();
-    assert_eq!(snap.len(), 110, "the minimal layout this test indexes into");
+    assert_eq!(snap.len(), 182, "the minimal layout this test indexes into");
     snap
 }
 
@@ -312,24 +318,27 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
                 capability: "m".into(),
                 prompt_hash: vec![7u8; 32],
                 allowed_actions: Vec::new(),
+                recipe_hash: None,
+                caps: None,
+                skills: None,
             },
         );
     }
     commit(&mut m);
     let snap = m.snapshot();
     let good_root = m.root();
-    // agents section: count 8, then two 102-byte bodies.
-    assert_eq!(snap.len(), 8 + 102 * 2);
-    let body_a = snap[8..110].to_vec();
-    let body_b = snap[110..212].to_vec();
+    // agents section: count 8, then two 174-byte bodies (102 core + 72 tail).
+    assert_eq!(snap.len(), 8 + 174 * 2);
+    let body_a = snap[8..182].to_vec();
+    let body_b = snap[182..356].to_vec();
 
     for (first, second, what) in [
         (&body_b, &body_a, "descending ids"),
         (&body_a, &body_a, "duplicate ids"),
     ] {
         let mut bytes = snap.clone();
-        bytes[8..110].copy_from_slice(first);
-        bytes[110..212].copy_from_slice(second);
+        bytes[8..182].copy_from_slice(first);
+        bytes[182..356].copy_from_slice(second);
         let mut dst = module();
         let err = dst.install(&bytes, StateRoot::ZERO).unwrap_err();
         assert!(matches!(err, Error::Module(_)), "{what} must be rejected");
@@ -339,6 +348,6 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     // the untouched stream still installs — the rejection above is the
     // ordering check, not an artifact of the splicing.
     let mut dst = module();
-    dst.install(&snap, good_root.clone()).unwrap();
+    dst.install(&snap, good_root).unwrap();
     assert_eq!(dst.root(), good_root);
 }

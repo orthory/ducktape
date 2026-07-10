@@ -1,6 +1,19 @@
+---
+showAskAi: false
+---
+
 # Repository Map
 
+import { WorkspaceMap } from '../../../../components/diagram/WorkspaceMap.client'
+
 Use this map to find the authoritative surface before editing.
+
+<WorkspaceMap />
+
+Related: [human repository map](/en/human/reference/repository-map) is the
+reader-facing twin, [Product Modules](/en/human/modules/product-modules) expands
+the app crates, and [Implementation Status](/en/human/reference/implementation-status)
+lists what is checked in and tested.
 
 ## Kernel
 
@@ -18,6 +31,16 @@ Use this map to find the authoritative surface before editing.
 - `crates/system/valset`: validator membership state.
 - `crates/system/saga`: deterministic continuation state.
 - `crates/system/governance`: validator-set governance over valset.
+- `crates/system/identity`: canonical accounts, member keys, display names, and
+  node bindings.
+- `crates/duckdns/core` and `crates/system/duckdns`: optional
+  `<handle>.duck` → AccountId naming, with no node or service directory.
+- `crates/system/upgrade`, `capability`, `dispatch`, and `tagging`: protocol
+  upgrade state, capability registry, capability-routed dispatch, and engagement
+  routing.
+- `crates/duckfs/client`: OS-side duckfs checkout/commit engine — chunk hashing,
+  the versioned `.duckfs` index, worktree scan/status, change planning, and the
+  sync `NodeApi` transport (HTTP). Never on the consensus path.
 - wire surfaces: each module's typed payload and query shapes live at its crate root (`src/interface.rs`).
 
 ## Apps
@@ -28,11 +51,23 @@ Use this map to find the authoritative surface before editing.
 - `crates/apps/agent`: agent registry, watches, run records.
 - `crates/apps/tasks`: small canonical task state.
 - `crates/apps/vaults`: replicated opaque secret ciphertext.
+- `crates/apps/runs`: agent run composition, dispatch, response, and watch state.
 - `crates/apps/inbox`: per-member notification queues.
 - `crates/apps/automations`: operator rules over the chat hook seam.
-- `crates/apps/files`: consensus manifests over node-local chunk bytes.
-- `crates/apps/memory`: filesystem-shaped shared agent workspace.
+- `crates/apps/files`: the duckfs module adapter; it owns the consensus
+  filesystem surface and absorbed the old memory/workspace role as ordinary
+  duckfs snapshots, paths, and `duck://files/...` evidence.
 - `crates/apps/jobs`: consensus-native work board.
+
+## Binaries
+
+- `bin/node`: the p2p validator/mesh node (also serves the noded app surface).
+- `bin/noded`: the single embedded-host daemon behind the http/ws app surface.
+- `bin/fs`: `ducktape-fs`, the duckfs working-copy CLI (read verbs plus the
+  checkout/status/commit/pin loop over `crates/duckfs/client`). The
+  `mount` verb (FUSE, `src/fuse/`) is gated behind the `fuse` cargo feature —
+  read-only over `NodeApi` at a pinned snapshot, `--rw` over a backing checkout —
+  so a default build pulls in no libfuse/`fuser`.
 
 ## Docs
 

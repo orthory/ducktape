@@ -1,0 +1,46 @@
+[package]
+name = "fs-bin"
+edition.workspace = true
+version.workspace = true
+
+# `ducktape-fs`: the duckfs working-copy CLI. read verbs (ls/cat/stat/history/
+# diff) and the checkout/status/commit/pin loop over the node's http surface,
+# hand-rolled arg dispatch (no clap — the workspace forbids it). all real logic
+# lives in the `duckfs-client` engine; this binary is the thin veneer.
+[[bin]]
+name = "ducktape-fs"
+path = "src/main.rs"
+
+[features]
+# the FUSE `mount` verb. OPT-IN so the default workspace build needs no libfuse:
+# `fuser` 0.17's default feature set is empty, so it mounts through the setuid
+# `fusermount3` helper and never links libfuse (this box has the helper but no
+# libfuse-dev). building WITHOUT this feature keeps `mount` as a clear
+# "rebuild with --features fuse" error — the fuser/libc deps stay uncompiled.
+fuse = ["dep:fuser", "dep:libc"]
+
+[dependencies]
+# the checkout/commit engine + the `HttpNode` transport the verbs drive.
+duckfs-client = { workspace = true }
+# the pure core: the wire display types (EntryInfo/DiffEntry/...) the read verbs
+# format. the CLI never needs the native module glue for its production code.
+duckfs-core = { workspace = true }
+serde_json = { workspace = true }
+# FUSE mount only (feature `fuse`): the userspace filesystem driver and the libc
+# bindings for errno/uid/gid + SIGINT/SIGTERM handling. both optional so a
+# default build pulls in neither.
+fuser = { version = "0.17", optional = true }
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# cli_e2e stands a REAL host with ONLY the files module behind `noded::router`
+# on a local listener, then drives `env!(CARGO_BIN_EXE_ducktape-fs)` against it.
+noded = { path = "../noded" }
+host = { workspace = true }
+sdk = { workspace = true }
+# the native files module (default features on) the in-process node genesises;
+# path dep so it unifies with the default-features-off dep above (native wins).
+files = { path = "../../crates/apps/files" }
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+tempfile = { workspace = true }

@@ -24,7 +24,7 @@ import {
 } from "../../../domain/governance-client";
 import { sameKey, shortKey } from "../../../domain/names";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius, shadow, tint } from "../../theme/tokens";
 
 type FilterId = "all" | "open" | "settled";
 
@@ -35,8 +35,8 @@ const FILTER_TABS: ReadonlyArray<{ id: FilterId; label: string }> = [
 ];
 
 const STATUS_PILLS: Record<ProposalStatus, { text: string; bg: string; border: string }> = {
-  open: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
-  passed: { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7" },
+  open: tint(color.amber),
+  passed: tint(color.green),
   rejected: { text: color.danger, bg: color.dangerSoft, border: color.dangerBorder },
 };
 
@@ -169,8 +169,8 @@ function HoverButton({
   const dark = variant === "dark";
   const approve = variant === "approve";
   const reject = variant === "reject";
-  const accent = approve ? "#5f9e74" : reject ? color.danger : color.borderStrong;
-  const activeBg = approve ? "#eef5f0" : reject ? color.dangerSoft : color.titlebar;
+  const accent = approve ? tint(color.green).border : reject ? color.danger : color.borderStrong;
+  const activeBg = approve ? tint(color.green).bg : reject ? color.dangerSoft : color.titlebar;
   return (
     <button
       type={type}
@@ -192,7 +192,7 @@ function HoverButton({
           ? color.sunken
           : dark
             ? hover
-              ? "#38362e"
+              ? color.filledHover
               : color.dark
             : active || hover
               ? activeBg
@@ -202,7 +202,7 @@ function HoverButton({
           : dark
             ? color.onDark
             : approve
-              ? "#3f7d54"
+              ? color.accentAlt2
               : reject
                 ? color.danger
                 : color.inkSoft,
@@ -251,8 +251,8 @@ function TallyBar({ proposal }: { proposal: ProposalVM }) {
           display: "flex",
         }}
       >
-        <span style={{ width: `${yesPct}%`, background: "#7cc08f" }} />
-        <span style={{ flex: 1, background: "#e4b0a8" }} />
+        <span style={{ width: `${yesPct}%`, background: `color-mix(in srgb, ${color.green} 50%, var(--c-paper))` }} />
+        <span style={{ flex: 1, background: `color-mix(in srgb, ${color.red} 50%, var(--c-paper))` }} />
       </div>
       <div
         style={{
@@ -265,7 +265,7 @@ function TallyBar({ proposal }: { proposal: ProposalVM }) {
           flexWrap: "wrap",
         }}
       >
-        <span style={{ color: "#3f7d54" }}>approve {proposal.yes}</span>
+        <span style={{ color: color.accentAlt2 }}>approve {proposal.yes}</span>
         <span style={{ color: color.danger }}>reject {proposal.no}</span>
         <span>· {proposal.total} cast</span>
         <span style={{ marginLeft: "auto" }}>needs {proposal.threshold} to pass</span>
@@ -443,7 +443,6 @@ function ProposeForm({
               <input
                 aria-label="Proposal text"
                 name="proposal-text"
-                autoComplete="off"
                 spellCheck
                 value={text}
                 placeholder="Describe what the set should signal…"
@@ -536,7 +535,7 @@ export function GovernanceView() {
         minWidth: 0,
         minHeight: 0,
         display: "flex",
-        background: "#fcfcfc",
+        background: color.canvas,
         overflow: "hidden",
       }}
     >
@@ -608,7 +607,7 @@ export function GovernanceView() {
             minHeight: 0,
             overflowY: "auto",
             padding: "12px",
-            background: "#fcfcfc",
+            background: color.canvas,
             display: "flex",
             flexDirection: "column",
             gap: 10,

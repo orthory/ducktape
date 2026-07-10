@@ -290,21 +290,26 @@ fn cluster_lifecycle() {
     assert_eq!(code, 200, "explorer blocks fetch failed: {body}");
     let records = body["blocks"].as_array().expect("blocks is an array");
     assert!(
-        records.iter().all(|b| b["target"] != "consensus.nop"),
+        records
+            .iter()
+            .all(|b| b["ops"][0]["target"] != "consensus.nop"),
         "heartbeat nops must never reach the explorer: {body}"
     );
     let submitted = records
         .iter()
         .find(|b| b["height"] == block["height"])
         .unwrap_or_else(|| panic!("held submit's block missing from the explorer: {body}"));
-    assert_eq!(submitted["target"], "directory");
-    assert_eq!(submitted["disposition"], "applied");
+    // the held submit is its block's member op; a block carries its ops under
+    // `ops[]` now.
+    let op = &submitted["ops"][0];
+    assert_eq!(op["target"], "directory");
+    assert_eq!(op["disposition"], "applied");
     assert_eq!(
         submitted["commitHash"], block["appHash"],
         "explorer commit hash must equal the held reply's app-hash"
     );
     assert_eq!(
-        submitted["proposer"].as_str().unwrap_or_default(),
+        op["proposer"].as_str().unwrap_or_default(),
         common::hex(&Cluster::identity(0)),
         "proposer is node 0's verified signer key"
     );
@@ -314,10 +319,10 @@ fn cluster_lifecycle() {
         "the frame content hash is 64 hex chars"
     );
     assert!(
-        submitted["operations"]
+        op["operations"]
             .as_array()
             .is_some_and(|ops| !ops.is_empty()),
-        "an applied block carries its dispatch trace: {submitted}"
+        "an applied op carries its dispatch trace: {submitted}"
     );
     // 8c-bis. the metrics plane: the drain that applied the held submit folded
     // it into the validator's `ducktape_*` Prometheus series BEFORE the held
@@ -352,7 +357,7 @@ fn cluster_lifecycle() {
     // 8d. the record's op hash is a real content address: staging at the
     // drain keys the committed payload bytes by sha256, so the blob lane
     // must serve the exact submitted payload back under that digest.
-    let op_hash = submitted["opHash"].as_str().unwrap_or_default();
+    let op_hash = submitted["ops"][0]["opHash"].as_str().unwrap_or_default();
     assert_eq!(
         op_hash.len(),
         64,

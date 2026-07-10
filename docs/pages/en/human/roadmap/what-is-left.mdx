@@ -1,3 +1,7 @@
+---
+showAskAi: false
+---
+
 # What Is Left
 
 The core architecture and the live control plane are in place: network state
@@ -7,6 +11,13 @@ network all run over real sockets in the node e2e suite
 invite/join/admit ceremony in `bin/node/examples/demo-invite.sh`. What remains
 is durability edges, demotion behavior, WireGuard runtime wiring, and product
 depth.
+
+Related: [agent Open Work](/en/agent/roadmap/open-work) is the edit-oriented
+gap list, [Implementation Status](/en/human/reference/implementation-status)
+marks built/tested surfaces, [Product Modules](/en/human/modules/product-modules)
+explains duckfs and agents, [Coordination](/en/human/network/coordination)
+covers rendezvous, and [Node Upgrades](/en/human/network/node-upgrades) covers
+height-gated activation.
 
 ## Done (was open)
 
@@ -20,6 +31,15 @@ depth.
   membership.
 - **Governance and vaults.** Member-gated proposals drive membership; vaults
   replicate opaque secret ciphertext with owner-gated write integrity.
+- **duckfs (files as a real filesystem).** The `files` module is now a
+  consensus-replicated, copy-on-write, content-addressed filesystem — every byte
+  is consensus state that survives restart, with staged uploads, atomic
+  per-path-CAS commits, pinned snapshots, snapshot-addressed reads,
+  resolver-backed state sync to full possession, and a noded HTTP surface. The
+  checkout/commit engine (`crates/duckfs/client`), `ducktape-fs`
+  checkout/status/commit/pin loop, and FUSE-gated `mount` verb also exist. The
+  old memory/workspace role is absorbed by duckfs snapshots and `duck://files/...`
+  evidence. Remaining work is the app FilesView/UX rebuilt on duckfs verbs.
 
 ## Durability And Promotion
 
@@ -40,9 +60,10 @@ depth.
 
 - Origin-bound message authorship (signed frames make this available — the author
   is still a caller-supplied string).
-- The agent module should plug into the reactor worker seam so LLM output is
-  committed as ordered data, not hidden non-determinism, and connect to the
-  tasks module for agent task management.
+- The basic agent/runs/dispatch/jobs loop is registered in the live node.
+  Remaining product depth is richer app UX, packaged agents and harnesses,
+  broader action vocabularies, and durable task obligations that feel native
+  rather than like a debug surface.
 
 ## Mesh
 

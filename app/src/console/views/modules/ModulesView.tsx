@@ -6,7 +6,7 @@ import { useState } from "react";
 import type { ModuleCategory, ModuleStatus } from "../../../domain/transport";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius, shadow, tint } from "../../theme/tokens";
 
 const shortRoot = (hex: string): string =>
   hex.length > 20 ? `${hex.slice(0, 10)}…${hex.slice(-8)}` : hex || "—";
@@ -24,13 +24,14 @@ const MODULE_INFO: Record<string, { label: string; desc: string }> = {
   governance: { label: "Governance", desc: "Validator-set proposals and quorum voting." },
   vaults: { label: "Vaults", desc: "Encrypted team secrets with an owner/reader ACL." },
   valset: { label: "Validator set", desc: "The active validator set backing consensus." },
-  profiles: { label: "Profiles", desc: "Display names bound to member public keys." },
   inbox: { label: "Inbox", desc: "Per-member notification queues." },
   automations: { label: "Automations", desc: "Event-triggered rules over module events." },
   jobs: { label: "Jobs", desc: "A consensus-native job / claim board." },
-  memory: { label: "Memory", desc: "A shared, filesystem-shaped agent workspace." },
-  files: { label: "Files", desc: "Content-addressed file manifests + chunk sync." },
+  files: { label: "Files", desc: "A copy-on-write, content-addressed filesystem (duckfs)." },
   saga: { label: "Saga", desc: "The deterministic async-RPC ledger behind agents." },
+  identity: { label: "Identity", desc: "Accounts, member keys, and node bindings." },
+  duckdns: { label: "DuckDNS", desc: "Optional global .duck handles resolved to accounts." },
+  gateway: { label: "Gateway", desc: "Signed account routes to DuckFS or local HTTP." },
   kv: { label: "KV", desc: "A key-value store (internal scaffold)." },
   directory: { label: "Directory", desc: "An example / demo module (internal)." },
 };
@@ -89,10 +90,10 @@ function RootButton({
         gap: 6,
         padding: "4px 8px",
         borderRadius: radius.sm,
-        border: `1px solid ${copied ? "#cfe3d7" : color.borderSoft}`,
-        background: copied ? "#eef5f0" : color.sunken,
+        border: `1px solid ${copied ? tint(color.green).border : color.borderSoft}`,
+        background: copied ? tint(color.green).bg : color.sunken,
         font: `500 11px ${font.mono}`,
-        color: copied ? "#5f9e74" : color.muted3,
+        color: copied ? tint(color.green).text : color.muted3,
       }}
     >
       <span

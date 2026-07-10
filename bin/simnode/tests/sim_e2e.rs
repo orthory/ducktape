@@ -290,8 +290,9 @@ fn personas_shape_receipts_and_ring() {
     assert_eq!(code, 200);
     let records = body["blocks"].as_array().expect("blocks is an array");
     assert_eq!(records.len(), 1, "networked persona fills the ring: {body}");
-    assert_eq!(records[0]["target"], "chat");
-    let op_hash = records[0]["opHash"].as_str().unwrap_or_default();
+    // a block carries its member ops under `ops[]`; the sim is one op per block.
+    assert_eq!(records[0]["ops"][0]["target"], "chat");
+    let op_hash = records[0]["ops"][0]["opHash"].as_str().unwrap_or_default();
     assert_eq!(op_hash.len(), 64, "ring records carry the content address");
     let (code, blob) = sim.request("GET", &format!("/v1/files/blob/{op_hash}"), None);
     assert_eq!(code, 200, "op hash must dereference on the blob lane");

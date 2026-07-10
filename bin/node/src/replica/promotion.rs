@@ -1,0 +1,75 @@
+use sdk::StateRoot;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromotionBoundarySource {
+    Latest,
+}
+
+impl PromotionBoundarySource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PromotionBoundarySource::Latest => "latest",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromotionBoundary<'a> {
+    Promote {
+        boundary: &'a statesync::Manifest,
+        source: PromotionBoundarySource,
+    },
+    Retry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestFetchRetry {
+    pub(crate) log_line: String,
+    pub(crate) announce: bool,
+}
+
+pub(crate) fn joiner_manifest_fetch_retry(
+    label: &str,
+    resident_standing: bool,
+    error: impl std::fmt::Display,
+) -> ManifestFetchRetry {
+    if resident_standing {
+        return ManifestFetchRetry {
+            log_line: format!("[node {label}] resident: boundary fetch retrying ({error})"),
+            announce: false,
+        };
+    }
+    ManifestFetchRetry {
+        log_line: format!(
+            "[node {label}] joining: redemption not landed yet (or the mesh is unreachable) — \
+             the announce keeps retrying and a member node redeems it automatically. retrying \
+             ({error})"
+        ),
+        announce: true,
+    }
+}
+
+pub(crate) fn latest_boundary_has_floor(latest: &statesync::Manifest) -> bool {
+    latest.height <= latest.view_base || latest.floor_cert.is_some()
+}
+
+pub(crate) fn choose_promotion_boundary<'a>(
+    synced_host_hash: StateRoot,
+    latest: &'a statesync::Manifest,
+    self_public_key: &[u8],
+) -> PromotionBoundary<'a> {
+    if !latest.participants.iter().any(|key| key == self_public_key) {
+        return PromotionBoundary::Retry;
+    }
+    if latest.app_hash == synced_host_hash {
+        return if latest_boundary_has_floor(latest) {
+            PromotionBoundary::Promote {
+                boundary: latest,
+                source: PromotionBoundarySource::Latest,
+            }
+        } else {
+            PromotionBoundary::Retry
+        };
+    }
+    PromotionBoundary::Retry
+}

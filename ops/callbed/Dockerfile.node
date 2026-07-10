@@ -1,0 +1,23 @@
+# The call-bed node image: builds ducktape-node, ships it with the bootstrap +
+# entrypoint scripts and curl (for the compose healthcheck). One image serves
+# four roles — bootstrap (ceremony), coordinator, node0, node1 — differing only by command.
+#
+# Build context MUST be the repo root:
+#   docker build -f ops/callbed/Dockerfile.node -t ducktape-callbed-node .
+FROM rust:1.96-bookworm AS build
+WORKDIR /src
+COPY . .
+# The two shipped binaries (+ their workspace deps): the node itself and the
+# rendezvous coordinator, which runs LOCAL to the compose network (see the
+# coordinator service in docker-compose.yml and issue #331).
+RUN cargo build --release -p node-bin --bin ducktape-node -p coordinator-bin --bin coordinator
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl bash && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/ducktape-node /usr/local/bin/ducktape-node
+COPY --from=build /src/target/release/coordinator /usr/local/bin/coordinator
+COPY ops/callbed/bootstrap.sh ops/callbed/node-entry.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/bootstrap.sh /usr/local/bin/node-entry.sh
+# default command is overridden per-service in docker-compose.yml
+CMD ["/usr/local/bin/bootstrap.sh"]

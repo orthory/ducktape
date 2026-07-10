@@ -252,10 +252,14 @@ where
         // whole op-set — NOT on drain==0 (drain is 0 before the first finalization,
         // so a per-node "drain to 0" fixpoint would complete at genesis and fork).
         let target = ops.len();
-        let mut applied = vec![0usize; N];
+        let mut applied = [0usize; N];
         loop {
             context.sleep(Duration::from_millis(50)).await;
             for (i, n) in nodes.iter_mut().enumerate() {
+                // the production drain flushes the batch window every BLOCK_TIME tick
+                // (bin/node main); enqueue-only submits never propose without it — the
+                // sim mirrors that cadence (a no-op when nothing is pending).
+                n.flush_batch().await.expect("flush");
                 applied[i] += n.drain_delivered().await.expect("drain");
             }
             if applied.iter().all(|&c| c == target) {

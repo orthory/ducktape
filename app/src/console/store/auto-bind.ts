@@ -10,17 +10,26 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
-import { getUser, submitRawMsg, userOf } from "../../domain/identity-client";
+import {
+  accountOfMember,
+  accountOfNode,
+  submitRawMsg,
+} from "../../domain/identity-client";
 import { isTauri } from "../../domain/node-bootstrap";
 import type { NodeTransport } from "../../domain/transport";
 import { identityState } from "../../domain/user-identity-client";
+import { clearLinkPending, loadLinkPending } from "./state";
 
 export type AutoBindResult =
   | "bound"
   | "already"
   | "skipped"
   | "failed"
-  | "locked";
+  | "locked"
+  /** A device link is pending and this key has no membership yet — binding
+   *  now would FOUND a duplicate account, so the bind waits for the other
+   *  device's AddMemberKey to land (the next connect/refresh retries). */
+  | "deferred";
 
 export const autoBindUserIdentity = (
   transport: NodeTransport,
@@ -42,23 +51,36 @@ export const autoBindUserIdentity = (
         return "locked" as const;
       }
 
-      return userOf(transport, workspace.pubkey).then((bound) => {
+      return accountOfNode(transport, workspace.pubkey).then((bound) => {
         if (bound) return "already" as const;
         // Belt-and-suspenders: "unlocked"/"plaintext" always carry a pubkey
         // in the clear (v2 files included), so this should never trip in
         // practice. No pubkey means nothing to sign a bind with, either way.
         if (!userKey) return "failed" as const;
-        return getUser(transport, userKey)
-          .then((user) => user?.nonce ?? 0)
-          .then((nonce) =>
-            invoke<string>("user_sign_bind", {
-              chainId: workspace.chainId,
-              nodePub: workspace.pubkey,
-              nonce,
-            }),
-          )
-          .then((msg) => submitRawMsg(transport, msg))
-          .then(() => "bound" as const);
+        // The nonce is the ACCOUNT's, resolved via the key's membership —
+        // not `getAccount(userKey)`, which only matches when this key is the
+        // FOUNDER. Once this machine's key was added to an existing account as
+        // a non-founding member, its account is keyed by a different id, so the
+        // bind must sign over that account's current nonce. A brand-new key
+        // (no account yet) resolves null → nonce 0, and the bind founds it.
+        return accountOfMember(transport, userKey).then((account) => {
+          if (account) {
+            // Membership resolved — if a device link was pending, it landed.
+            clearLinkPending();
+          } else if (loadLinkPending()) {
+            // No membership AND the user chose "link to an existing account":
+            // founding a fresh account here would create the exact duplicate
+            // the link exists to avoid. Wait for AddMemberKey instead.
+            return "deferred" as const;
+          }
+          return invoke<string>("user_sign_bind", {
+            chainId: workspace.chainId,
+            nodePub: workspace.pubkey,
+            nonce: account?.nonce ?? 0,
+          })
+            .then((msg) => submitRawMsg(transport, msg))
+            .then(() => "bound" as const);
+        });
       });
     })
     .catch((): AutoBindResult => "failed");

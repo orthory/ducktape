@@ -7,7 +7,7 @@
 // never propose — are reported as statesync standing, not as "offline".
 
 import { displayNameForKey, normalizeKey, sameKey, shortKey } from "../../../domain/names";
-import type { BlockRecord } from "../../../domain/transport";
+import type { BlockDisposition, BlockRecord } from "../../../domain/transport";
 
 // ── Proposal window (liveness from the block ring) ──────────
 
@@ -32,14 +32,17 @@ export interface ProposalWindow {
 }
 
 /** Tally proposals across the given blocks (any order; heights compared
- *  numerically). Blocks with a blank proposer are counted toward `total` but
- *  attributed to no key. */
+ *  numerically). Each block is attributed to its primary op's author
+ *  (`ops[0].proposer`) — post-aggregation the record no longer carries a
+ *  single block-level frame signer, so the first op stands in for the block.
+ *  Blocks with a blank or absent proposer (an idle nop) are counted toward
+ *  `total` but attributed to no key. */
 export function proposalWindow(blocks: readonly BlockRecord[]): ProposalWindow {
   const byProposer = new Map<string, ProposerActivity>();
   let low: number | null = null;
   let high: number | null = null;
   for (const block of blocks) {
-    const key = normalizeKey(block.proposer);
+    const key = normalizeKey(block.ops[0]?.proposer);
     if (key) {
       const cur = byProposer.get(key);
       if (cur) {
@@ -144,24 +147,28 @@ export function buildPeers(input: BuildPeersInput): PeerVM[] {
 
 // ── Health strip (recent commit outcomes) ───────────────────
 
-/** One tick of the status-page health bar — a finalized block and how its op
- *  settled (an `applied` op mutated state; a `rejected` op finalized but rolled
- *  back — a failed tx, normal texture rather than a node fault). */
+/** One tick of the status-page health bar — a finalized block and how its ops
+ *  settled. A block reads `rejected` when ANY of its aggregated ops rolled back
+ *  (a failed tx landed in the block — normal texture rather than a node fault);
+ *  a block whose ops all applied (or an idle nop) reads `applied`. */
 export interface HealthSeg {
   height: number;
-  disposition: BlockRecord["disposition"];
+  disposition: BlockDisposition;
 }
 
 /**
  * The last `slots` finalized blocks as health ticks, oldest-first so a
  * left→right render puts the newest commit on the right. `state.blocks` is
- * already oldest-first, so this is a tail slice.
+ * already oldest-first, so this is a tail slice. A block's tick is `rejected`
+ * when any op it aggregated was rejected, else `applied`.
  */
 export function healthSegments(blocks: readonly BlockRecord[], slots: number): HealthSeg[] {
   const start = Math.max(0, blocks.length - slots);
   return blocks.slice(start).map((block) => ({
     height: block.height,
-    disposition: block.disposition,
+    disposition: block.ops.some((op) => op.disposition === "rejected")
+      ? "rejected"
+      : "applied",
   }));
 }
 

@@ -4,7 +4,7 @@
 use coordinator_bin::select_policy;
 use nat_traversal::AuthPolicy;
 
-use commonware_cryptography::{ed25519, Signer as _};
+use commonware_cryptography::{Signer as _, ed25519};
 
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -57,17 +57,32 @@ fn genesis_set_pins_the_validators_from_network_toml() {
 }
 
 #[test]
-fn genesis_set_flag_beats_allow_anonymous_is_not_the_precedence_but_anon_wins() {
-    // Documented precedence: --allow-anonymous short-circuits before
-    // --genesis-set, so an operator who passes both gets the (explicit) open
-    // policy and never has to have a valid file on disk.
-    let policy = select_policy(&[
+fn conflicting_allow_anonymous_and_genesis_set_is_a_hard_error() {
+    // --allow-anonymous and --genesis-set are mutually exclusive (the USAGE
+    // string declares them with `|`). Passing BOTH must fail closed with a hard
+    // error rather than silently picking the weaker (fully-open) policy — a
+    // stray or env-templated --allow-anonymous must never quietly disable a
+    // genesis pin. The file need not even exist: the conflict is rejected first.
+    let err = select_policy(&[
         "--allow-anonymous".into(),
         "--genesis-set".into(),
         "/does/not/exist.toml".into(),
     ])
-    .unwrap();
-    assert!(matches!(policy, AuthPolicy::Open { require_pop: false }));
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("mutually exclusive"),
+        "expected a mutual-exclusion message, got: {err}"
+    );
+
+    // Order-independent: --genesis-set first, --allow-anonymous second still conflicts.
+    let err = select_policy(&[
+        "--genesis-set".into(),
+        "/does/not/exist.toml".into(),
+        "--allow-anonymous".into(),
+    ])
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[test]
@@ -96,8 +111,12 @@ fn genesis_set_with_no_value_is_a_hard_error_not_a_downgrade() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
     // `--genesis-set` immediately followed by another flag is likewise valueless.
-    let err = select_policy(&["--genesis-set".into(), "--listen".into(), "0.0.0.0:1".into()])
-        .unwrap_err();
+    let err = select_policy(&[
+        "--genesis-set".into(),
+        "--listen".into(),
+        "0.0.0.0:1".into(),
+    ])
+    .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
 

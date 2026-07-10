@@ -1,3 +1,7 @@
+---
+showAskAi: false
+---
+
 # Open Work
 
 이 page는 agent가 실수로 완료된 것처럼 말하면 안 되는 implementation gap을 기록한다.
@@ -48,10 +52,23 @@ truthful tag set을 announce하며, 자기 key에 assign된 lease만 dispatch wo
 UX와 package-level behavior다: packaged agent와 harness, 더 넓은 action vocabulary,
 task obligation, debug surface가 아닌 native하게 느껴지는 durable agent workflow.
 
+## duckfs Product Edges
+
+duckfs Phase 1–5의 core stack은 구현되어 있다: 다시 만든 `files` module(staging, atomic
+per-path-CAS commit, snapshot, pin, watch, snapshot-addressed read),
+full possession까지 가는 resolver-backed state sync, restart durability, noded
+HTTP surface, checkout/commit engine(`crates/duckfs/client`, `.duckfs/` index),
+CLI, FUSE mount. 이것들을 missing으로 기록하면 안 된다. 남은 duckfs work는
+duckfs verb 위로 다시 만드는 app FilesView product integration이다.
+`memory` module은 삭제되었다 — duckfs가 흡수했다(generation은 snapshot이 되고,
+`duck://memory/...`는 `duck://files/...`가 되었다). automations memory-watch
+trigger도 함께 제거되었다. filesystem-change automation은 migration이 아니라
+새 duckfs-watch trigger라는 fresh feature로 돌아온다.
+
 ## Module Integration Wave
 
 다음 module wave는 이미 존재하는 module 사이의 integration work다. automations가
-inbox `Deliver`를 emit하고, automations trigger source가 memory watch에서 오고, 64
-KiB를 넘는 memory body가 files manifest를 통해 이동하고, package harness가 agent와
-action route를 소유하고, tasks가 deadline state, cure/escalation lineage,
-atomic cross-module creation을 갖춘 obligation pattern이 되어야 한다.
+inbox `Deliver`를 emit하고, automations trigger source가 duckfs(files) watch에서
+오고, agent가 jobs를 claim하고, package harness가 agent와 action route를 소유하고,
+tasks가 deadline state, cure/escalation lineage, atomic cross-module creation을
+갖춘 obligation pattern이 되어야 한다.

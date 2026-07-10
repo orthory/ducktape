@@ -8,10 +8,13 @@ import type { PendingRun, WatchView } from "../../domain/runs-client";
 import type {
   Channel,
   ChatSearchHit,
+  ChatTagRow,
   ChatThread,
   MessageView,
 } from "../../domain/chat-client";
-import type { Manifest } from "../../domain/files-client";
+import type { FileEntry } from "../../domain/files-client";
+import type { MemberKeyView } from "../../domain/identity-client";
+import type { ForgeItemSummary, ForgeRefHead } from "../../domain/forge-client";
 import type { ProposalView } from "../../domain/governance-client";
 import type {
   PageBlock,
@@ -21,6 +24,9 @@ import type {
 } from "../../domain/pages-client";
 import type { BlockRecord, NodeStatus } from "../../domain/transport";
 import type { VoiceError } from "../../domain/voice-session";
+import type { VideoCapability } from "../../domain/video-capability";
+import { loadDevicePrefs } from "../../domain/media-devices";
+import type { DevicePrefs, HuddleDevices } from "../../domain/media-devices";
 import type { OpLedger } from "./finalization";
 import type { PhaseReport, Workspace } from "../../domain/workspace-client";
 
@@ -37,17 +43,36 @@ export type ViewMode = "user" | "operator";
 export interface VoiceSlice {
   channelId: string | null;
   muted: boolean;
-  status: "idle" | "connecting" | "live" | "error";
+  /** "reconnecting" = the live session dropped unexpectedly and ONE automatic
+   *  media re-establish is in flight — consensus membership is kept. */
+  status: "idle" | "connecting" | "reconnecting" | "live" | "error";
   /** Why `status` is "error" — picks the dock's message. Null otherwise. */
   error: VoiceError | null;
+  /** A transient media failure note (camera/screen acquire failed) — shown for a
+   *  few seconds by the card surfaces, then auto-cleared. Never fatal. */
+  mediaNote: "camera-failed" | "screen-failed" | null;
   /** The huddle lives in its own desktop window right now — the in-app card
    *  yields to it (desktop only; see store/huddle-window.ts). */
   popped: boolean;
   /** Local camera state (ephemeral, beaconed to peers — never consensus). */
   cameraOn: boolean;
+  /** Whether OUR video lane is a screen share rather than the camera (camera XOR
+   *  screen — ephemeral, beaconed, never consensus). */
+  sharing: boolean;
   /** Per-peer ephemeral call state from 1 Hz beacons, keyed by NODE hex.
    *  Staleness (no beacon for >10 s) drives the sweep affordance. */
-  peers: Record<string, { muted: boolean; cameraOn: boolean; atMs: number }>;
+  peers: Record<string, { muted: boolean; cameraOn: boolean; sharing: boolean; atMs: number }>;
+  /** Epoch ms our current session started (set on join, null when idle) — the
+   *  staleness baseline for a never-beaconed member. Shared so the dock and the
+   *  popped window agree on who is sweepable. */
+  sessionStartMs: number | null;
+  /** Whether OUR mic is currently above the speaking threshold (drives the self
+   *  speaking ring + the "you're muted while talking" banner). Detected off the
+   *  capture frames, so it's true even while muted. */
+  speaking: boolean;
+  /** OUR mic input level, 0..1 (throttled). Drives the solo self-check meter so a
+   *  lone user can see the mic responds; detected even while muted. */
+  level: number;
 }
 
 /** One search round-trip across the modules that ship materialized views —
@@ -57,6 +82,15 @@ export interface SearchResults {
   query: string;
   chat: ChatSearchHit[];
   docs: PageSearchHit[];
+}
+
+/** The active #tag filter on the chat surface: while set, the message pane
+ *  renders the tag's `tagSearch` hits instead of the live slice. `tag` keeps
+ *  the as-typed display form (the node's index normalizes); `channelId` is
+ *  the channel the filter was set in — switching channels clears it. */
+export interface TagFilter {
+  tag: string;
+  channelId: string | null;
 }
 
 /** A managed (app-spawned) node failed to START or CONNECT — the dedicated
@@ -98,6 +132,9 @@ export interface ConsoleState {
    *  Kept in sync with `screen`: navigating to a surface adopts its section. */
   viewMode: ViewMode;
   accent: string;
+  /** Light/dark color theme. Reflected onto <html data-theme> by the provider. */
+  theme: ThemeMode;
+  notifyPrefs: NotifyPrefs;
   author: string;
   /** The node answered the last status query. */
   connected: boolean;
@@ -113,18 +150,46 @@ export interface ConsoleState {
   /** Messages of the active channel only (all sequences; views filter). */
   messages: MessageView[];
   activeThread: ChatThread | null;
-  /** hex(user key bytes) → display name, from the `profiles` module; threaded
-   *  into author rendering so messages show chosen names, not hex handles.
-   *  OVERLAID by `identity`'s per-user display name for every node it binds —
-   *  see DucktapeProvider's snapshot build. */
+  /** The active #tag filter (see TagFilter), or null for the live view. */
+  tagFilter: TagFilter | null;
+  /** The active tag filter's hits (newest first) — query-driven, like
+   *  `search`; never part of the per-block snapshot. */
+  tagHits: ChatSearchHit[];
+  /** A tagSearch round-trip is in flight. */
+  tagHitsPending: boolean;
+  /** The active channel's tag catalog (count-ordered), loaded on demand for
+   *  the header's tag dropdown. Cleared on channel switch. */
+  channelTags: ChatTagRow[];
+  /** hex(node key bytes) → canonical account display name, projected from
+   *  `identity` for author rendering. Unbound nodes deliberately have no
+   *  replicated display-name record. */
   authorNames: Record<string, string>;
   /** hex(node key bytes) → its owning user, from the `identity` module — the
    *  node/user split's resolver: `name` is that user's chosen display name
    *  (null if unset), already folded into `authorNames` when present. */
-  nodeUsers: Record<string, { userKey: string; name: string | null }>;
+  nodeUsers: Record<string, { accountId: string; name: string | null }>;
+  /** hex(account id) → the account's collected member keys (of any scheme),
+   *  from the `identity` module. `nodeUsers`/`authorNames` carry the shared
+   *  display name; this is the key list the account settings surface renders. */
+  accountKeys: Record<string, MemberKeyView[]>;
+  /** hex(account id) → its optional DuckDNS handle (without `.duck`). Identity
+   *  exists independently when no entry is registered. */
+  accountHandles: Record<string, string>;
   /** This client's live voice-huddle session — ephemeral, never in the
    *  committed snapshot (see VoiceSlice). */
   voice: VoiceSlice;
+  /** Runtime VP8 encode/decode support, resolved once from a real codec probe.
+   *  Stable (a device capability, not session state), so it lives OUTSIDE the
+   *  voice slice — the huddle-reset paths must never wipe it. `canEncode` gates
+   *  the camera control; `canDecode` gates peer-tile rendering. */
+  videoCapability: VideoCapability;
+  /** The user's chosen huddle input/output devices (persisted; undefined =
+   *  system default). Stable across sessions, so it lives OUTSIDE the voice slice
+   *  — a leave/rejoin keeps the selection. */
+  devicePrefs: DevicePrefs;
+  /** The enumerated mic/camera/speaker options for the picker — refreshed on
+   *  demand (labels appear only after a media-permission grant). */
+  deviceOptions: HuddleDevices;
 
   // ── Members / validator roster ──
   /** Hex-encoded validator public keys from the `valset` module. */
@@ -142,6 +207,17 @@ export interface ConsoleState {
   // ── Forge ──
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
   forgeHead: string | null;
+  /** The repo whose tracker slices below are loaded. Repo SELECTION lives in
+   *  the forge view (component-local); the loaders stamp this so a slow load
+   *  for a repo the view has since left can never land (see loadForgeItems).
+   *  Null until the first load. */
+  forgeRepo: string | null;
+  /** `forgeRepo`'s issues/PRs (ListItems). Per-screen loaded — the forge view
+   *  calls loadForgeItems on open/repo switch; never in the per-block refresh. */
+  forgeItems: ForgeItemSummary[];
+  /** `forgeRepo`'s branch heads (ListRefs) — the PR forms' branch pickers and
+   *  the branches rail. Per-screen loaded like forgeItems. */
+  forgeBranches: ForgeRefHead[];
 
   // ── Docs (block-tree notebook over the `pages` module) ──
   /** Every page (id + live title), from ListPages, re-queried per block.
@@ -189,9 +265,11 @@ export interface ConsoleState {
   /** The ⌘K command-palette search overlay is open. Global UI, not per-block. */
   searchOpen: boolean;
 
-  // ── Files (content-addressed manifests) ──
-  /** Every file manifest (List, prefix ""), re-queried per block. */
-  files: Manifest[];
+  // ── Files (duckfs) ──
+  /** A flat index of file entries under the tree root (Find, prefix "/"),
+   *  re-queried per block. Feeds the command palette's file filter; the files
+   *  browser pages the tree live off the transport instead. */
+  files: FileEntry[];
 
   /** The newest finalized height seen on the ws block stream — updated
    *  UNGATED (unlike the refresh the same stream drives, which is held while
@@ -208,6 +286,13 @@ export interface ConsoleState {
    *  cross-link's hand-off (openExplorerAt sets it, the explorer consumes it
    *  once `blocks` has data and clears it). Null when nothing is pending. */
   explorerFocus: number | null;
+
+  /** The forge item the forge view should open on next render — a clicked
+   *  desktop notification's hand-off (the explorerFocus idiom: the provider's
+   *  navigate listener sets it, ForgeView consumes it, and the provider
+   *  retires it when the user leaves the forge screen). `number` null means
+   *  a repo-only focus. Null when nothing is pending. */
+  forgeFocus: { repo: string; number: number | null } | null;
 
   /** Per-operation finalization ledger (entity key → newest op touching that
    *  row): pending while a write is in flight, then finalized with the
@@ -250,6 +335,145 @@ export interface ConsoleState {
 }
 
 export const DEFAULT_ACCENT = "#a05a3c";
+
+export interface NotifyPrefs {
+  enabled: boolean;
+  mentions: boolean;
+  replies: boolean;
+  huddles: boolean;
+  runs: boolean;
+  forge: boolean;
+  governance: boolean;
+  mutedChannels: string[];
+}
+
+export const DEFAULT_NOTIFY_PREFS: NotifyPrefs = {
+  enabled: true,
+  mentions: true,
+  replies: true,
+  huddles: true,
+  runs: true,
+  forge: true,
+  governance: true,
+  mutedChannels: [],
+};
+
+/** The boot placeholder author. The provider replaces it with the chain's
+ *  resolved name for our own node as soon as one hydrates — only a name the
+ *  USER typed (≠ this placeholder) is ever kept over the chain's. */
+export const DEFAULT_AUTHOR = "operator";
+
+// ── Accent persistence ──────────────────────────────────
+//
+// The chosen accent survives restarts. Values are validated as #rrggbb on
+// load so a corrupt/foreign string can never reach inline styles.
+const ACCENT_KEY = "ducktape.accent";
+
+export const loadAccent = (): string => {
+  try {
+    const raw = localStorage.getItem(ACCENT_KEY);
+    return raw && /^#[0-9a-f]{6}$/i.test(raw) ? raw : DEFAULT_ACCENT;
+  } catch {
+    return DEFAULT_ACCENT; // storage unavailable (private mode / quota)
+  }
+};
+
+export const saveAccent = (accent: string): void => {
+  try {
+    localStorage.setItem(ACCENT_KEY, accent);
+  } catch {
+    // persistence is best-effort; a failed write just doesn't survive restart.
+  }
+};
+
+// ── Theme (light/dark) persistence ─────────────────────
+//
+// The chosen theme survives restarts. First run (no stored choice) follows the
+// OS `prefers-color-scheme`; anything else falls back to light.
+export type ThemeMode = "light" | "dark";
+export const DEFAULT_THEME: ThemeMode = "light";
+const THEME_KEY = "ducktape.theme";
+
+export const loadTheme = (): ThemeMode => {
+  try {
+    const raw = localStorage.getItem(THEME_KEY);
+    if (raw === "light" || raw === "dark") return raw;
+  } catch {
+    return DEFAULT_THEME; // storage unavailable (private mode / quota)
+  }
+  try {
+    if (typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches) {
+      return "dark";
+    }
+  } catch {
+    // matchMedia unavailable (non-browser env) — fall through to the default.
+  }
+  return DEFAULT_THEME;
+};
+
+export const saveTheme = (theme: ThemeMode): void => {
+  try {
+    localStorage.setItem(THEME_KEY, theme);
+  } catch {
+    // best-effort; a failed write just doesn't survive restart.
+  }
+};
+
+// ── Notification prefs persistence ─────────────────────
+//
+// Desktop notification preferences survive restarts. Each field is validated
+// independently so a partial or corrupt blob falls back only where needed.
+const NOTIFY_PREFS_KEY = "ducktape.notifyPrefs";
+
+const defaultNotifyPrefs = (): NotifyPrefs => ({
+  ...DEFAULT_NOTIFY_PREFS,
+  mutedChannels: [...DEFAULT_NOTIFY_PREFS.mutedChannels],
+});
+
+const loadNotifyPrefsFrom = (value: unknown): NotifyPrefs => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return defaultNotifyPrefs();
+  }
+  const prefs = value as Record<string, unknown>;
+  return {
+    enabled:
+      typeof prefs.enabled === "boolean" ? prefs.enabled : DEFAULT_NOTIFY_PREFS.enabled,
+    mentions:
+      typeof prefs.mentions === "boolean" ? prefs.mentions : DEFAULT_NOTIFY_PREFS.mentions,
+    replies:
+      typeof prefs.replies === "boolean" ? prefs.replies : DEFAULT_NOTIFY_PREFS.replies,
+    huddles:
+      typeof prefs.huddles === "boolean" ? prefs.huddles : DEFAULT_NOTIFY_PREFS.huddles,
+    runs: typeof prefs.runs === "boolean" ? prefs.runs : DEFAULT_NOTIFY_PREFS.runs,
+    forge: typeof prefs.forge === "boolean" ? prefs.forge : DEFAULT_NOTIFY_PREFS.forge,
+    governance:
+      typeof prefs.governance === "boolean"
+        ? prefs.governance
+        : DEFAULT_NOTIFY_PREFS.governance,
+    mutedChannels:
+      Array.isArray(prefs.mutedChannels) &&
+      prefs.mutedChannels.every((channel): channel is string => typeof channel === "string")
+        ? [...prefs.mutedChannels]
+        : [...DEFAULT_NOTIFY_PREFS.mutedChannels],
+  };
+};
+
+export const loadNotifyPrefs = (): NotifyPrefs => {
+  try {
+    const raw = localStorage.getItem(NOTIFY_PREFS_KEY);
+    return loadNotifyPrefsFrom(raw ? JSON.parse(raw) : null);
+  } catch {
+    return defaultNotifyPrefs();
+  }
+};
+
+export const saveNotifyPrefs = (prefs: NotifyPrefs): void => {
+  try {
+    localStorage.setItem(NOTIFY_PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    // persistence is best-effort; a failed write just doesn't survive restart.
+  }
+};
 
 // ── View-mode persistence ───────────────────────────────
 //
@@ -354,13 +578,76 @@ export const clearRemoteUrl = (): void => {
   }
 };
 
+// ── Onboarding hand-off persistence ─────────────────────
+//
+// Two first-run facts that outlive the onboarding screens. The display name
+// chosen while creating the account can only land on-chain after the first
+// node connects (names are chain-scoped), so it parks here until then. The
+// "link this device to an EXISTING account" choice must stop auto-bind from
+// founding a duplicate account until the other device's AddMemberKey lands —
+// see auto-bind.ts's "deferred" branch.
+const PENDING_NAME_KEY = "ducktape.pendingDisplayName";
+const LINK_PENDING_KEY = "ducktape.accountLinkPending";
+
+export const loadPendingDisplayName = (): string | null => {
+  try {
+    const raw = localStorage.getItem(PENDING_NAME_KEY);
+    return raw && raw.trim().length > 0 ? raw : null;
+  } catch {
+    return null; // storage unavailable — no parked name
+  }
+};
+
+export const savePendingDisplayName = (name: string): void => {
+  try {
+    localStorage.setItem(PENDING_NAME_KEY, name);
+  } catch {
+    // best-effort; a failed write just loses the parked name.
+  }
+};
+
+export const clearPendingDisplayName = (): void => {
+  try {
+    localStorage.removeItem(PENDING_NAME_KEY);
+  } catch {
+    // best-effort; nothing to clean up if storage is unavailable.
+  }
+};
+
+export const loadLinkPending = (): boolean => {
+  try {
+    return localStorage.getItem(LINK_PENDING_KEY) === "1";
+  } catch {
+    return false; // storage unavailable — treat as no pending link
+  }
+};
+
+export const saveLinkPending = (): void => {
+  try {
+    localStorage.setItem(LINK_PENDING_KEY, "1");
+  } catch {
+    // best-effort; a failed write risks a duplicate account on next bind,
+    // the same exposure a pre-link build had.
+  }
+};
+
+export const clearLinkPending = (): void => {
+  try {
+    localStorage.removeItem(LINK_PENDING_KEY);
+  } catch {
+    // best-effort; nothing to clean up if storage is unavailable.
+  }
+};
+
 export const createInitialState = (): ConsoleState => {
   const viewMode = loadViewMode();
   return {
     screen: viewMode === "operator" ? DEFAULT_OPERATOR_SCREEN : DEFAULT_USER_SCREEN,
     viewMode,
-    accent: DEFAULT_ACCENT,
-    author: "operator",
+    accent: loadAccent(),
+    theme: loadTheme(),
+    notifyPrefs: loadNotifyPrefs(),
+    author: DEFAULT_AUTHOR,
     connected: false,
     nodeUrl: null,
     managed: false,
@@ -369,21 +656,38 @@ export const createInitialState = (): ConsoleState => {
     activeChannel: null,
     messages: [],
     activeThread: null,
+    tagFilter: null,
+    tagHits: [],
+    tagHitsPending: false,
+    channelTags: [],
     authorNames: {},
     nodeUsers: {},
+    accountKeys: {},
+    accountHandles: {},
     voice: {
       channelId: null,
       muted: false,
       status: "idle",
       error: null,
+      mediaNote: null,
       popped: false,
       cameraOn: false,
+      sharing: false,
       peers: {},
+      sessionStartMs: null,
+      speaking: false,
+      level: 0,
     },
+    videoCapability: { canEncode: false, canDecode: false, canScreenShare: false },
+    devicePrefs: loadDevicePrefs(),
+    deviceOptions: { mics: [], cameras: [], speakers: [] },
     members: [],
     residents: [],
     proposals: [],
     forgeHead: null,
+    forgeRepo: null,
+    forgeItems: [],
+    forgeBranches: [],
     pages: [],
     activePage: null,
     activePageBlocks: [],
@@ -402,6 +706,7 @@ export const createInitialState = (): ConsoleState => {
     lastBlock: null,
     blocks: [],
     explorerFocus: null,
+    forgeFocus: null,
     ops: {},
     error: null,
     bootError: null,
@@ -428,7 +733,9 @@ export interface ConsoleSnapshot {
   activeChannel: string | null;
   messages: MessageView[];
   authorNames: Record<string, string>;
-  nodeUsers: Record<string, { userKey: string; name: string | null }>;
+  nodeUsers: Record<string, { accountId: string; name: string | null }>;
+  accountKeys: Record<string, MemberKeyView[]>;
+  accountHandles: Record<string, string>;
   pages: PageMeta[];
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
@@ -437,7 +744,7 @@ export interface ConsoleSnapshot {
   pendingRuns: PendingRun[];
   capabilitiesByNode: Map<string, string[]>;
   runAssignee: Map<string, string>;
-  files: Manifest[];
+  files: FileEntry[];
   blocks: BlockRecord[];
 }
 
@@ -455,6 +762,8 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   messages: snapshot.messages,
   authorNames: snapshot.authorNames,
   nodeUsers: snapshot.nodeUsers,
+  accountKeys: snapshot.accountKeys,
+  accountHandles: snapshot.accountHandles,
   pages: snapshot.pages,
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,
@@ -469,6 +778,32 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
 
 // ── Pure helpers ────────────────────────────────────────
 
+/** The identity committed rows actually carry for OUR writes. The submit
+ *  lane SIGNS frames on networked nodes: committed authorship is the NODE's
+ *  pubkey and the client's origin string is deliberately ignored — so self
+ *  is `status.publicKey` whenever the node reports one. The embedded daemon
+ *  (empty publicKey) stores the origin string verbatim, so the author
+ *  string remains its self there. This is the follow-the-head handoff's
+ *  bug A: every self-comparison (optimistic rows, canModify,
+ *  reaction-"mine", huddle roster) must use THESE bytes, never the literal
+ *  author string. */
+export const selfAuthorBytes = (
+  status: NodeStatus | null,
+  author: string,
+): number[] => {
+  const pk = (status?.publicKey ?? "").toLowerCase();
+  if (pk.length >= 64 && pk.length % 2 === 0) {
+    const bytes: number[] = [];
+    for (let i = 0; i < pk.length; i += 2) {
+      const byte = parseInt(pk.slice(i, i + 2), 16);
+      if (Number.isNaN(byte)) return Array.from(new TextEncoder().encode(author));
+      bytes.push(byte);
+    }
+    return bytes;
+  }
+  return Array.from(new TextEncoder().encode(author));
+};
+
 /** A channel id from a display name: lowercase, dash-separated, wire-safe. */
 export const channelIdOf = (name: string): string =>
   name
@@ -476,4 +811,3 @@ export const channelIdOf = (name: string): string =>
     .trim()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
-

@@ -11,8 +11,10 @@
 import { useEffect, useMemo, useState } from "react";
 import type { CSSProperties, FormEvent, ReactNode } from "react";
 
+import { isModuleChannel } from "../../../domain/chat-client";
 import type { ChatSearchHit } from "../../../domain/chat-client";
-import type { Manifest } from "../../../domain/files-client";
+import { basename } from "../../../domain/files-client";
+import type { FileEntry } from "../../../domain/files-client";
 import type { PageSearchHit } from "../../../domain/pages-client";
 import { displayNameForKey, shortKey } from "../../../domain/names";
 import { Icon } from "../../components/Icon";
@@ -209,8 +211,8 @@ export function SearchModal() {
 
   const fileHits = useMemo(() => {
     const q = query.toLowerCase();
-    if (!q) return [] as Manifest[];
-    return state.files.filter((f) => f.name.toLowerCase().includes(q)).slice(0, RESULT_CAP);
+    if (!q) return [] as FileEntry[];
+    return state.files.filter((f) => f.path.toLowerCase().includes(q)).slice(0, RESULT_CAP);
   }, [query, state.files]);
 
   // Only surface node-index hits when they belong to the CURRENT input — a
@@ -219,7 +221,12 @@ export function SearchModal() {
   // round-trip), and drives the "Searching…" line instead of a false empty
   // state. Client-side member/file hits are always live off the input.
   const matched = query !== "" && results?.query === query;
-  const chatHits: ChatSearchHit[] = matched ? (results?.chat ?? []) : [];
+  // Hits in module-reserved channels (forge's hidden `forge:<repo>:<n>` item
+  // threads) are dropped: opening them would land the chat surface on a hidden
+  // channel. A follow-up will deep-link these into the forge view instead.
+  const chatHits: ChatSearchHit[] = matched
+    ? (results?.chat ?? []).filter((hit) => !isModuleChannel(hit.channelId))
+    : [];
   const docHits: PageSearchHit[] = matched ? (results?.docs ?? []) : [];
   const searching = query !== "" && !matched;
   const total = chatHits.length + docHits.length + memberHits.length + fileHits.length;
@@ -254,9 +261,8 @@ export function SearchModal() {
             value={text}
             autoFocus
             // A search box, not prose: kill WebKit's autocorrect/-capitalize so
-            // typing "test" isn't "corrected" to "Test", and drop the native
-            // autocomplete dropdown. Matches the members search input.
-            autoComplete="off"
+            // typing "test" isn't "corrected" to "Test". Matches the members
+            // search input. (Autocomplete is off globally — see main.tsx.)
             autoCorrect="off"
             autoCapitalize="off"
             spellCheck={false}
@@ -329,9 +335,9 @@ export function SearchModal() {
             <Group title="Files" count={fileHits.length}>
               {fileHits.map((hit) => (
                 <HitButton
-                  key={hit.file_id}
-                  meta={hit.mime || "file"}
-                  text={hit.name}
+                  key={hit.path}
+                  meta={hit.path}
+                  text={basename(hit.path)}
                   onOpen={() => goto("files")}
                 />
               ))}

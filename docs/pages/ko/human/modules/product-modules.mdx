@@ -1,4 +1,12 @@
+---
+showAskAi: false
+---
+
 # Product Modules
+
+import { ModuleMap } from '../../../../components/diagram/ModuleMap.client'
+
+<ModuleMap />
 
 product module은 platform이 호스팅하는 업무용 surface다. 같은 module contract를
 공유하지만, 각 module은 자기 작업에 맞는 storage substrate와 interface를 고른다.
@@ -18,13 +26,14 @@ product module은 platform이 호스팅하는 업무용 surface다. 같은 modul
 - `vaults`는 owner-gated write로 opaque secret ciphertext를 복제한다.
 - `inbox`는 follow-up op로 배달되는 per-member notification queue를 저장한다.
 - `automations`는 chat hook seam 위에서 도는 operator-defined rule을 저장한다.
-- `files`는 content-addressed file manifest를 commit한다. chunk byte는
-  node-local에 남는다.
-- `memory`는 immutable generation을 가진 filesystem 모양의 shared agent
-  workspace다.
+- `files`는 duckfs다: consensus-replicated, copy-on-write, content-addressed
+  filesystem — 모든 node가 모든 byte를 들고 있고, byte는 restart를 견딘다.
 - `jobs`는 first-claim-wins claim을 쓰는 consensus-native work board다.
-- `identity`는 node key를 user key에 묶는다 — 여러 node를 굴리는 한 사람이
-  mesh/valset 위에서 하나의 identity로 resolve되게 하는 replicated registry다.
+- `identity`는 member key, display name, bound node를 한 AccountId 아래 두는
+  canonical account registry다.
+- `duckdns`는 선택적인 `<handle>.duck` → AccountId 이름만 더한다. node,
+  service, route directory는 소유하지 않으며 workspace identity는 이름 등록을
+  요구하지 않는다.
 - `kv`, `valset`, `saga`, `governance`, `directory`, `greeter`는 infrastructure,
   example, test를 지원한다.
 
@@ -108,50 +117,76 @@ atomic unit으로 commit되거나 abort된다(P2).
 
 ## Files
 
-files는 절대 섞이면 안 되는 두 plane을 유지한다. metadata control plane은
-consensus state다: `file_id`로 key된 manifest가 file 이름, size, 순서 있는
-per-chunk sha256 digest, 그리고 whole-file digest-of-digests를 고정한다. root에
-접히는 files state는 이것뿐이고, state sync가 옮기는 것도 이것뿐이다. body
-store는 node-local이다: 자기 자신의 sha256으로 key된 chunk byte는 op stream에도
-consensus에도 절대 들어가지 않는다. write는 `AddManifest`, `RemoveManifest`로,
-read는 `Stat`, `List`로 간다. chunk byte는 전용 `serve_sync` lane으로
-peer-to-peer 이동한다. size cap은 execute에서 rejection으로 강제되어 oversized
-value가 root preimage에 들어가지 않는다.
+files는 duckfs다: consensus-replicated, copy-on-write, content-addressed
+filesystem. 모든 node가 모든 byte를 consensus state로 들고 있다 — byte는
+block을 타고 이동하며 restart를 견딘다. 그래서 commit된 file은 어느 node에서든
+읽을 수 있다. chunk를 마침 들고 있던 node에 묶인 promise가 아니다. state는
+둘로 나뉜다: immutable object store(chunk, file, tree, snapshot — 전부
+content-addressed)와 작은 mutable refs cell(live head, pin table, bounded
+history window, staging table, watch set)이다. root는 refs cell만 hash하고,
+tree 전체에는 transitively commit한다. writable root 둘이 authority를
+gate한다: `/home/<owner>/**`는 origin에서 유도된 owner 본인만,
+`/shared/**`는 아무 member나 쓸 수 있다. read는 어디서든 cluster-visible하다 —
+`/home`은 write만 gate한다.
 
-receiver contract가 부정직한 server를 무해하게 만든다: fetch한 모든 chunk는
-`verify_chunk`를 통과해야 하고, 이 함수는 sha256 digest와 manifest가 그 위치에
-암시하는 정확한 length를 둘 다 검사한다. length 검사는 belt-and-braces가 아니라
-load-bearing이다 — digest 동등성만으로는 digest가 맞는 zero-byte chunk를
-받아들여 잘못된 file을 재구성하게 된다.
+write는 stage하고 commit한다. `PutBlob`은 raw chunk 하나를 stage한다(binary op
+frame이고, owner별 quota가 걸리며, 참조되지 않으면 deterministic하게
+만료된다). `Commit`이 atomic unit이다 — path change 묶음(`Put`, `Mkdir`, `Rm`,
+`Mv`, `Symlink`)이 base snapshot에 대한 per-path compare-and-swap 아래
+들어간다: 바뀐 모든 path는 base와 live head 사이에서 untouched여야 하고,
+아니면 commit 전체가 reject된다. 그래서 겹치지 않는 동시 commit은 false
+conflict 없이 interleave되고, 겹치는 commit은 소리 내며 실패한다. 성공한
+commit은 immutable snapshot을 append하고 — copy-on-write라서 바뀌지 않은
+subtree는 version 간에 hash로 공유된다 — head를 전진시키며, 구독한 module로
+watch notification을 같은 block에서 fan-out한다(P2). `Pin`과 `Unpin`은 named
+snapshot을 bounded history window 너머까지 살려둔다. cap은 execute에서
+rejection으로 강제되어 oversized value가 root preimage에 들어가지 않는다.
 
-## Memory
+read는 snapshot-addressable한 순수 함수다: `Stat`, `Ls`, `Read`(byte-range),
+`Find`, `Grep`, `History`, `Diff`, `Refs` — 각각 cursor-paged이고 head에서든
+resolvable한 아무 snapshot에서든 답한다. duckfs는 agent memory이기도 하다 —
+삭제된 `memory` module을 흡수했고, memory가 immutable generation으로 하던 일을
+duckfs는 snapshot으로 한다. agent workspace는 `/home`과 `/shared` 아래의
+평범한 file이다. `Grep` hit는 인용 가능한
+`duck://files/<path>@<snapshot>#L<line>` evidence URI를 담고, per-file meta는
+`kind=skill` 같은 convention을 지원하며(shared skill은 `/shared/skills/` 아래
+산다), segment 단위로 match하는 prefix watch(`/a`는 `/a/b`에 match하고
+`/ab`에는 절대 match하지 않는다)가 어느 module에든 trigger한 commit과
+atomic하게 배달되는 change notification을 준다.
 
-memory는 filesystem 모양의 shared agent workspace다 — NoKV 철학: agent가 원하는
-것은 key-value store가 아니라 filesystem이다. namespace는 절대 경로들의
-집합이고 directory는 암묵적이다. 모든 file은 immutable generation의 stack이며,
-publish는 write-once다 — 무언가를 제자리에서 고치는 대신 다음 generation을
-append한다. `(path, generation)` pair는 stable하고 hash-pinned된 reference로,
-무언가 pin하고 있는 동안 절대 rebind되거나 재사용되지 않는다. write는
-`Publish`, `Delete`, `Snapshot`, `DropSnapshot`, `RegisterWatch`,
-`UnregisterWatch`로 간다. read는 progressive-disclosure verb인 `Ls`, `Stat`,
-`Read`, `Find`, `Grep`이고, grep hit는 인용 가능한
-`duck://memory/<path>@<generation>#L<line>` evidence URI를 담는다.
-큰 body는 files manifest reference로 publish할 수 있다. memory는 committed
-manifest를 probe한 뒤 digest와 size를 immutable generation에 복사하고, 그
-복사된 값을 generation의 truth로 삼는다. 나중에 manifest를 remove해도
-generation은 invalidate되지 않는다. bytes는 files chunk lane으로 fetch하고
-receiver가 `verify_chunk`로 검증한다. `Grep`은 inline body만 scan하고 file-backed
-body는 deterministic하게 skip한다.
-
-`Snapshot`은 namespace 전체의 현재 path-to-generation mapping을 pin한다 —
-mapping만이고 body 복사는 절대 아니다. `Delete`는 snapshot이 아직 pin한
-generation을 retain한다. generation record는 live file도 snapshot도 참조하지
-않을 때 정확히 그때 drop된다. watch는 canonical path prefix에 module을
-구독시키며 segment 단위로 match한다(`/a`는 `/a/b`에 match하고 `/ab`에는 절대
-match하지 않는다). 성공한 publish마다 match하는 watcher별 follow-up event
-하나가 같은 block에서 emit된다(P2). skill 공유도 같은 namespace를 탄다: shared
-skill은 `kind=skill` meta를 가진 `/skills/<name>` 아래 document이고, `/skills/`
-위의 `Find`로 발견한다.
+client 절반은 OS-side checkout/commit engine(`crates/duckfs/client`)과
+`ducktape-fs` CLI다. checkout은 duckfs subtree를 실제 working directory로
+materialize하고 그 옆에 `.duckfs/index.json`을 둔다 — git의 index discipline:
+working copy가 내려온 base snapshot, 대화하는 node, 그리고 per-path
+hash/size/mtime record. `ducktape-fs`는 read verb(`ls`, `cat`, `stat`,
+`history`, `diff`)과 working-copy loop(`checkout`, `status`, `commit`, `pin`)을
+갖는다. engine은 모든 object를 client-side에서 hash하고 이름 붙이며(validator가
+derive하는 것과 byte-identical), cluster에 없는 chunk만 stage하고, 하나의 atomic
+`Commit`을 submit한다. conflict 처리는 구조적으로 안전하다: CAS rejection에서
+engine은 겹치지 않는 upstream 작업만 auto-rebase하고(절대 silent merge가 아니다),
+겹치는 edit에는 structured conflict report를 낸다(single daemon 기준; multi-validator
+cluster에서는 module의 reason string이 consensus finalization을 넘어 살아남지 못해
+지금은 overlap을 평범한 rejection으로 보고한다). workspace RPC(`POST /v1/fs/workspaces`,
+`.../commit`, `DELETE`)는 jobs/sandbox seam이다: daemon이 자기 root 아래에서
+checkout을 관리하며 같은 engine을 actor lane으로 구동하므로 self-dial 없이 job이
+disk의 file을 편집하고 commit할 수 있다. `ducktape-fs mount <prefix> <dir>`는
+duckfs subtree를 실제 kernel filesystem으로 내세운다 — `fuse` cargo feature 뒤에
+있고(unprivileged, `fusermount3` 경유 — default build은 libfuse가 필요 없고 verb를
+"`--features fuse`로 rebuild하라"는 분명한 error로 남긴다). 기본은 read-only로,
+sync `NodeApi` 위에서 한 번 resolve해 mount 수명 동안 PIN한 snapshot을 serve한다 —
+stable하고 reproducible한 view이며, immutable한 content라 강하게 cache한다(lazy
+`ls`/`stat` inode table + bounded read-through block cache). read는 움직이는 head를
+절대 보지 않으므로, 새 commit을 보려면 remount한다. `--rw`는 REAL working copy를
+내세운다 — 숨겨진 `<dir>.duckfs-backing` 디렉터리로 checkout해 passthrough로 serve
+한다 — 그리고 write는 commit할 때만 cluster truth가 된다: 기본은 명시적(unmount
+시 commit 방법을 출력하고, 아무것도 자동으로 land하지 않는다), 또는 `--auto-commit N`
+으로 dirty할 때 N초마다 commit한다(겹치지 않는 upstream 작업은 auto-rebase; 진짜
+conflict는 크게 log하고 mount는 계속 serve한다 — silent merge 없음, write drop
+없음). SIGINT/SIGTERM은 깔끔하게 unmount한다. 문서화된 non-goal: cross-node lock/mmap
+coherence 없음; uid/gid/mode는 synthetic(단 size, mtime, exec bit은 `--rw`에서
+passthrough된다); case-insensitive host에서는 case가 충돌하는 sibling 이름을
+materialize할 수 없다; crash는 stale mountpoint를 남기며 `fusermount3 -u <dir>`로
+복구한다.
 
 ## Jobs
 
@@ -186,44 +221,44 @@ claim하면, 두 번째 `Claim`은 첫 번째 staged claim을 보고 reject하�
 
 ## Identity
 
-identity는 user/node binding registry다(`crates/system/identity`). user는
-사람이 app에서 들고 있는 ed25519 keypair이고, node는 workspace의 mesh/valset
-identity다. 이 module은 user마다 display name, replay-guard nonce, 그리고
-bound node key 집합을 저장한다 — 한 사람이 여러 node를 같은 user에 bind할 수
-있다.
+identity는 canonical account registry다(`crates/system/identity`). account는
+founding member key에서 정해진 stable AccountId, 여러 scheme의 member key,
+공유 display name과 replay nonce, 그리고 여러 bound node key를 가진다. node는
+계속 workspace의 mesh/valset identity이므로, 여러 device와 node가 한 account에
+속해도 network identity 자체가 합쳐지지는 않는다.
 
 `BindNode`는 SUBMIT하는 node(검증된 origin이며 절대 payload field가 아니다)를
-user에 bind하며, chain-id ‖ node-key ‖ nonce preimage 위의 user-key
-signature로 동의를 증명한다 — certificate는 다른 network로 절대 replay될 수
-없고, node A를 위해 mint된 cert는 node B를 절대 bind할 수 없으며, stale
-nonce(이전 bind/unbind에서 남은)는 reject된다. 네트워크에 연결된
-node에서는 `BindNode`가 추가로 현재 member에게 gate된다: origin이 validator나
-observer여야 하므로, 아무 standing도 없는 node는 스스로에게 user를 mint할 수
-없다. `UnbindNode`는 이런 gate가 없고 어떤 external origin에서든 accept된다 —
-살아남은 device가 잃어버린 device를 evict할 수 있다는 뜻이다 — 그리고
-user의 nonce를 bump해서 evict된 node를 위해 잡혀 있던 bind certificate를
-영원히 죽인다. user의 마지막 node를 unbind해도 user record는 남는다 — name과
-nonce가 zero node로 persist하므로, 나중의 bind는 같은 identity로 resolve된다.
-`SetUserName`은 origin-gated일 뿐이다(bound node는 신뢰된
-hardware이므로 user signature가 필요 없다): submit하는 node가 bound된 user의
-display name을 profiles와 같은 64바이트 한도로 설정하며, nonce는 bump하지
-않는다 — user signature를 소비하지 않기 때문이다.
+authorizing member key의 account에 bind한다. member proof는
+chain-id ‖ node-key ‖ nonce preimage를 덮으므로 다른 network, node, nonce로
+replay할 수 없다. 아직 어느 account에도 속하지 않은 새 member key는 첫 bind에서
+account를 만든다. networked node에서는 submit node가 현재 validator 또는
+resident여야 한다. `UnbindNode`는 account의 살아남은 아무 member key나
+authorize할 수 있고, `AddMemberKey`는 기존 member의 동의와 새 key의 possession
+proof를 모두 요구하며, `RemoveMemberKey`는 마지막 live member를 보존한다.
+member-signed 변경이 accept될 때마다 shared nonce가 증가한다. 마지막 node를
+unbind해도 account, member key, name, nonce는 남으므로 나중의 bind는 같은
+identity로 resolve된다.
+
+`SetAccountName`은 origin-gated일 뿐이다(bound node는 신뢰된
+hardware이므로 member-key signature가 필요 없다): submit하는 node가 bound된
+account의 display name을 64바이트 한도로 설정하며, nonce는 bump하지 않는다 —
+member-key signature를 소비하지 않기 때문이다.
 
 bind는 per-node로 남는 것들을 바꾸지 않는다: mesh tracking, valset seat,
 quorum arithmetic은 이 module의 영향을 받지 않는다. validator 셋을 굴리는
-user는 여전히 세 자리를 차지하고 세 표를 던진다 — identity는 display와
-authorship resolution을 위해 key를 사람에게 매핑할 뿐, consensus weight를
-합치지 않는다.
+account는 여전히 세 자리를 차지하고 세 표를 던진다 — identity는 authority,
+display, authorship resolution을 위해 node를 account에 매핑할 뿐 consensus
+weight를 합치지 않는다.
 
 identity가 없던 network에 이를 추가하는 것은 다른 module-set 변경과
 마찬가지다: genesis app-hash가 옮겨가므로, 이미 돌고 있는 network가 이를
 적용하려면 coordinated rebuild — rolling이 아닌, 모든 validator에 걸친
 lockstep upgrade — 가 필요하다.
 
-이 module은 key를 저장할 뿐이고, user key 자체의 custody는 그 위에 얹힌
-desktop-app의 관심사다(`bin/node`의 `user-key` verb;
-`docs/superpowers/specs/2026-07-07-identity-onboarding-design.md` 참고).
-24-word mnemonic은 raw ed25519 seed를 그대로 encoding한 것이라 — entropy를
+이 module은 public membership과 binding state만 저장한다. private member key의
+custody는 그 위에 얹힌 desktop-app의 관심사이며 `bin/node`의 `user-key` verb를
+통해 다룬다. primary native member의 24-word mnemonic은 raw ed25519 seed를
+그대로 encoding한 것이라 — entropy를
 보존하고 identity를 보존한다 — 새 identity를 derive하는 게 아니라 정확히 같은
 identity를 복구한다. password는 local encryption 용도일 뿐이다 — argon2id가
 key를 만들고 그 key로 XChaCha20-Poly1305가 seed를 at rest 상태로 암호화한다 —
@@ -244,6 +279,6 @@ route한다. product module은 implementation API가 아니라 typed message와 
 
 checked-in module에서 유용한 pressure point가 보인다. chat은 QMDB-backed
 channel storage 위의 live product read를 검증하고, forge는 authenticated
-project state를 검증하며, module wave — inbox, automations, files, memory,
-jobs — 는 follow-up atomicity, hook fan-out, 그리고 앞으로의 collaboration
-기능이 기댈 consensus-metadata/node-local-bytes split을 검증한다.
+project state를 검증하며, module wave — inbox, automations, files, jobs — 는
+follow-up atomicity, hook fan-out, 그리고 앞으로의 collaboration 기능이 기댈
+snapshot history를 가진 fully replicated consensus byte를 검증한다.

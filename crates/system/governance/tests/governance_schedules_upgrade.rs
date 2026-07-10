@@ -273,7 +273,10 @@ fn outsider_cannot_propose_schedule_upgrade() {
         .await
         .expect_err("outsider propose must be refused");
         assert!(matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("member")));
-        assert!(seen.borrow().is_empty(), "no follow-up on a refused propose");
+        assert!(
+            seen.borrow().is_empty(),
+            "no follow-up on a refused propose"
+        );
     });
 }
 
@@ -433,7 +436,11 @@ fn snapshot_install_round_trips_a_schedule_upgrade_proposal() {
         // so tag 3 (ScheduleUpgrade) round-trips through encode/decode_state.
         let mut rebuilt = Governance::new("governance", "valset", "upgrade");
         rebuilt.install(&bytes, root).expect("install");
-        assert_eq!(rebuilt.root(), root, "installed root equals the source root");
+        assert_eq!(
+            rebuilt.root(),
+            root,
+            "installed root equals the source root"
+        );
         assert_ne!(root, StateRoot::ZERO, "the proposal is actually present");
 
         // and the round-tripped view still carries the exact action fields.
@@ -560,7 +567,11 @@ fn snapshot_install_round_trips_a_cancel_upgrade_proposal() {
         // tag 4 (CancelUpgrade) round-trips through encode/decode_state.
         let mut rebuilt = Governance::new("governance", "valset", "upgrade");
         rebuilt.install(&bytes, root).expect("install");
-        assert_eq!(rebuilt.root(), root, "installed root equals the source root");
+        assert_eq!(
+            rebuilt.root(),
+            root,
+            "installed root equals the source root"
+        );
         assert_ne!(root, StateRoot::ZERO, "the proposal is actually present");
 
         let reply = rebuilt

@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
-use defguard_wireguard_rs::{key::Key, net::IpAddrMask, peer::Peer, InterfaceConfiguration};
-use wireguard_upgrade::{AllowedIp, Endpoint, TunnelInstallPlan, ValidatorIdentity, X25519PublicKey};
+use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
+use wireguard_upgrade::{AllowedIp, TunnelInstallPlan, ValidatorIdentity, X25519PublicKey};
 
 use crate::WireGuardEffect;
 
@@ -22,7 +22,7 @@ pub fn apply_tunnel_plan<E: WireGuardEffect>(
     effect: &mut E,
     ifname: impl Into<String>,
     private_key_base64: impl Into<String>,
-    listen_endpoint: Endpoint,
+    listen_port: u16,
     plan: &TunnelInstallPlan,
     peer_endpoint_override: Option<SocketAddr>,
 ) -> Result<(), E::Error> {
@@ -33,7 +33,7 @@ pub fn apply_tunnel_plan<E: WireGuardEffect>(
         effect,
         ifname,
         private_key_base64,
-        listen_endpoint,
+        listen_port,
         std::slice::from_ref(plan),
         &overrides,
     )
@@ -49,7 +49,7 @@ pub fn apply_tunnel_plans<E: WireGuardEffect>(
     effect: &mut E,
     ifname: impl Into<String>,
     private_key_base64: impl Into<String>,
-    listen_endpoint: Endpoint,
+    listen_port: u16,
     plans: &[TunnelInstallPlan],
     endpoint_overrides: &BTreeMap<ValidatorIdentity, SocketAddr>,
 ) -> Result<(), E::Error> {
@@ -62,7 +62,7 @@ pub fn apply_tunnel_plans<E: WireGuardEffect>(
         effect,
         ifname,
         private_key_base64,
-        listen_endpoint,
+        listen_port,
         &local_interface_ips,
         &peers,
     )
@@ -86,7 +86,7 @@ pub fn plan_peer_configs(
             endpoint: endpoint_overrides
                 .get(&plan.peer_identity())
                 .copied()
-                .unwrap_or_else(|| plan.peer_endpoint().socket_addr()),
+                .or_else(|| plan.peer_endpoint().map(|e| e.socket_addr())),
             allowed_ips: plan.allowed_ips().to_vec(),
             keepalive_seconds: plan.keepalive_seconds(),
         })
@@ -99,10 +99,22 @@ pub fn plan_peer_configs(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerTunnelConfig {
     pub wireguard_public_key: X25519PublicKey,
-    pub endpoint: SocketAddr,
+    /// `None` for an endpoint-less peer (it advertises no dialable address):
+    /// the entry is installed without an endpoint and WireGuard waits for the
+    /// peer's own authenticated initiation, then roams to its source.
+    pub endpoint: Option<SocketAddr>,
     pub allowed_ips: Vec<AllowedIp>,
     pub keepalive_seconds: Option<u16>,
 }
+
+/// The tunnel MTU every applied interface gets: the conventional WireGuard
+/// value (1500 minus WG overhead), and the same constant the userspace
+/// backend's smoltcp host is built on. `None` would leave a TUN at the
+/// kernel's 1500 — every full-size inner packet then rides a FRAGMENTED
+/// outer UDP datagram on a 1500-MTU underlay, and overruns the userspace
+/// stack's device MTU on mixed tun↔socket pairs (phase-4 bench,
+/// docs/adr/2026-07-07-userspace-overlay-net.mdx).
+pub const TUNNEL_MTU: u32 = 1420;
 
 /// The parts-level core both appliers share: ONE interface (own overlay
 /// addresses, listen port, private key) carrying every peer relationship.
@@ -113,14 +125,14 @@ pub fn apply_peer_tunnels<E: WireGuardEffect>(
     effect: &mut E,
     ifname: impl Into<String>,
     private_key_base64: impl Into<String>,
-    listen_endpoint: Endpoint,
+    listen_port: u16,
     local_interface_ips: &[AllowedIp],
     peers: &[PeerTunnelConfig],
 ) -> Result<(), E::Error> {
     let config = interface_config(
         ifname,
         private_key_base64,
-        listen_endpoint,
+        listen_port,
         local_interface_ips,
         peers,
     );
@@ -150,14 +162,14 @@ pub fn update_peer_tunnels<E: WireGuardEffect>(
     effect: &mut E,
     ifname: impl Into<String>,
     private_key_base64: impl Into<String>,
-    listen_endpoint: Endpoint,
+    listen_port: u16,
     local_interface_ips: &[AllowedIp],
     peers: &[PeerTunnelConfig],
 ) -> Result<(), E::Error> {
     let config = interface_config(
         ifname,
         private_key_base64,
-        listen_endpoint,
+        listen_port,
         local_interface_ips,
         peers,
     );
@@ -169,7 +181,7 @@ pub fn update_peer_tunnels<E: WireGuardEffect>(
 fn interface_config(
     ifname: impl Into<String>,
     private_key_base64: impl Into<String>,
-    listen_endpoint: Endpoint,
+    listen_port: u16,
     local_interface_ips: &[AllowedIp],
     peers: &[PeerTunnelConfig],
 ) -> InterfaceConfiguration {
@@ -185,7 +197,7 @@ fn interface_config(
         .iter()
         .map(|cfg| {
             let mut peer = Peer::new(Key::new(cfg.wireguard_public_key.0));
-            peer.endpoint = Some(cfg.endpoint);
+            peer.endpoint = cfg.endpoint;
             peer.persistent_keepalive_interval = cfg.keepalive_seconds;
             peer.set_allowed_ips(
                 cfg.allowed_ips
@@ -200,9 +212,9 @@ fn interface_config(
         name: ifname.into(),
         prvkey: private_key_base64.into(),
         addresses,
-        port: listen_endpoint.port,
+        port: listen_port,
         peers,
-        mtu: None,
+        mtu: Some(TUNNEL_MTU),
         fwmark: None,
     }
 }
@@ -249,7 +261,12 @@ mod tests {
                 validator_identity: id(sk),
                 wireguard_public_key: *wg,
                 control_endpoint: endpoint(&policy, [1, 1, 1, *octet], 443, Transport::Tcp),
-                wireguard_endpoint: endpoint(&policy, [8, 8, 8, *octet], 51820, Transport::Udp),
+                wireguard_endpoint: Some(endpoint(
+                    &policy,
+                    [8, 8, 8, *octet],
+                    51820,
+                    Transport::Udp,
+                )),
                 capabilities: vec![],
                 expires_at_view: 50,
                 nonce: 1,
@@ -271,7 +288,10 @@ mod tests {
     /// signed handshake exactly like `wireguard-upgrade`'s own e2e tests do.
     /// `req_nonce`/`ack_nonce` keep an initiator's REPEATED handshakes fresh
     /// in a shared `ReplayCache` (replay state is keyed by identity+nonce).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the signed-handshake fixture keeps both peers and nonces explicit"
+    )]
     fn plan_between(
         initiator: &PrivateKey,
         responder: &PrivateKey,
@@ -347,16 +367,13 @@ mod tests {
             },
             initiator,
         );
-        validate_upgrade(
-            view, policy, overlay, 12, &request, &response, &ack, replay,
-        )
-        .unwrap()
+        validate_upgrade(view, policy, overlay, 12, &request, &response, &ack, replay).unwrap()
     }
 
     /// a minimal two-validator handshake, direct (no relay), yielding the
-    /// INITIATOR's (a's) validated install plan and a's own listen endpoint —
+    /// INITIATOR's (a's) validated install plan and a's own listen port —
     /// everything `apply_tunnel_plan` needs.
-    fn two_party_plan() -> (TunnelInstallPlan, Endpoint) {
+    fn two_party_plan() -> (TunnelInstallPlan, u16) {
         let a = PrivateKey::from_seed(1);
         let b = PrivateKey::from_seed(2);
         let policy = PortPolicy::production();
@@ -375,13 +392,18 @@ mod tests {
             1,
             2,
         );
-        let listen = view.record(id(&a)).unwrap().wireguard_endpoint;
+        let listen = view
+            .record(id(&a))
+            .unwrap()
+            .wireguard_endpoint
+            .unwrap()
+            .port;
         (plan, listen)
     }
 
     /// a's validated plans toward BOTH b and c — the full-mesh shape: one
     /// interface, two peer relationships, one shared replay cache.
-    fn three_party_plans() -> (TunnelInstallPlan, TunnelInstallPlan, Endpoint) {
+    fn three_party_plans() -> (TunnelInstallPlan, TunnelInstallPlan, u16) {
         let a = PrivateKey::from_seed(1);
         let b = PrivateKey::from_seed(2);
         let c = PrivateKey::from_seed(3);
@@ -417,7 +439,12 @@ mod tests {
             3,
             4,
         );
-        let listen = view.record(id(&a)).unwrap().wireguard_endpoint;
+        let listen = view
+            .record(id(&a))
+            .unwrap()
+            .wireguard_endpoint
+            .unwrap()
+            .port;
         (plan_ab, plan_ac, listen)
     }
 
@@ -454,7 +481,10 @@ mod tests {
         );
         assert_eq!(applied.peers.len(), 1);
         let peer = &applied.peers[0];
-        assert_eq!(peer.public_key.as_array(), plan.peer_wireguard_public_key().0);
+        assert_eq!(
+            peer.public_key.as_array(),
+            plan.peer_wireguard_public_key().0
+        );
         assert_eq!(peer.endpoint, Some(override_addr));
         assert_eq!(
             peer.allowed_ips,
@@ -514,7 +544,7 @@ mod tests {
 
         assert_eq!(
             fake.applied[0].peers[0].endpoint,
-            Some(plan.peer_endpoint().socket_addr())
+            plan.peer_endpoint().map(|e| e.socket_addr())
         );
     }
 
@@ -557,11 +587,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(fake.create_calls, 1, "the live interface is never re-created");
+        assert_eq!(
+            fake.create_calls, 1,
+            "the live interface is never re-created"
+        );
         assert_eq!(fake.remove_calls, 0, "and never torn down");
         assert_eq!(fake.applied.len(), 2);
         assert_eq!(fake.applied[0].peers.len(), 1);
-        assert_eq!(fake.applied[1].peers.len(), 2, "the update carries the grown set");
+        assert_eq!(
+            fake.applied[1].peers.len(),
+            2,
+            "the update carries the grown set"
+        );
     }
 
     #[test]
@@ -601,11 +638,24 @@ mod tests {
         let parts = plan_peer_configs(&[plan_ab.clone(), plan_ac.clone()], &overrides);
 
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].wireguard_public_key, plan_ab.peer_wireguard_public_key());
-        assert_eq!(parts[0].endpoint, plan_ab.peer_endpoint().socket_addr());
+        assert_eq!(
+            parts[0].wireguard_public_key,
+            plan_ab.peer_wireguard_public_key()
+        );
+        assert_eq!(
+            parts[0].endpoint,
+            plan_ab.peer_endpoint().map(|e| e.socket_addr())
+        );
         assert_eq!(parts[0].allowed_ips, plan_ab.allowed_ips().to_vec());
-        assert_eq!(parts[1].wireguard_public_key, plan_ac.peer_wireguard_public_key());
-        assert_eq!(parts[1].endpoint, punched, "override lands by identity");
+        assert_eq!(
+            parts[1].wireguard_public_key,
+            plan_ac.peer_wireguard_public_key()
+        );
+        assert_eq!(
+            parts[1].endpoint,
+            Some(punched),
+            "override lands by identity"
+        );
     }
 
     #[test]
@@ -646,7 +696,7 @@ mod tests {
         );
         assert_eq!(
             applied.peers[0].endpoint,
-            Some(plan_ab.peer_endpoint().socket_addr()),
+            plan_ab.peer_endpoint().map(|e| e.socket_addr()),
             "peer absent from the override map keeps its advertised endpoint"
         );
         assert_eq!(

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { BlockRecord } from "../../../domain/transport";
+import type { BlockDisposition, BlockRecord } from "../../../domain/transport";
 import {
   buildPeers,
   commitHealth,
@@ -10,20 +10,17 @@ import {
   proposalWindow,
 } from "./node-health";
 
-// A minimal block: only the fields the derivations read matter here.
+// A minimal block: a single aggregated op carries the proposer + disposition
+// the derivations read (the block attributes to its first op's author).
 const block = (
   height: number,
   proposer: string,
-  disposition: BlockRecord["disposition"] = "applied",
+  disposition: BlockDisposition = "applied",
 ): BlockRecord => ({
   height,
   hash: `hash${height}`,
   commitHash: `commit${height}`,
-  proposer,
-  disposition,
-  target: "chat",
-  operations: [],
-  payload: "",
+  ops: [{ proposer, disposition, target: "chat", operations: [], payload: "", opHash: "" }],
 });
 
 const KEY_A = "aa".repeat(32); // 64-hex validator keys

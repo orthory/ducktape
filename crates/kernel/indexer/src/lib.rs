@@ -57,7 +57,7 @@
 //! re-fires on the next boot — the rebuild is idempotent by re-trigger.
 //!
 //! the full "indexable" contract a per-module mapper must satisfy (fold
-//! rules, view rules, when NOT to index) is `docs/indexable-spec.md`.
+//! rules, view rules, when NOT to index) is `docs/records/specs/indexable-spec.md`.
 
 pub mod search;
 
@@ -724,13 +724,13 @@ impl IndexStore {
         // the explorer row lands AFTER the module folds: a visible block row
         // never precedes its op rows. same idempotent-skip and one-batch-with-
         // watermark discipline, on the blocks database's own watermark.
-        if let Some(record) = &block.record {
-            if read_height(&self.blocks)? < block.height {
-                let mut batch = WriteBatch::new();
-                batch.put(block_key(block.height), record.clone());
-                batch.put(META_HEIGHT, block.height.to_be_bytes());
-                self.blocks.write(batch)?;
-            }
+        if let Some(record) = &block.record
+            && read_height(&self.blocks)? < block.height
+        {
+            let mut batch = WriteBatch::new();
+            batch.put(block_key(block.height), record.clone());
+            batch.put(META_HEIGHT, block.height.to_be_bytes());
+            self.blocks.write(batch)?;
         }
         Ok(())
     }

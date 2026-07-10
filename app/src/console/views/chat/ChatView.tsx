@@ -8,8 +8,10 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
+import { isModuleChannel } from "../../../domain/chat-client";
 import type { PostPolicy } from "../../../domain/chat-client";
 import { Icon } from "../../components/Icon";
+import { selfAuthorBytes } from "../../store/state";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 import { selfAuthorKeyOf } from "./chat-helpers";
@@ -17,6 +19,7 @@ import { Composer } from "./Composer";
 import { HoverButton } from "./HoverButton";
 import { HuddleHeaderButton, HuddleRailBadge } from "./Huddle";
 import { MessageList } from "./MessageList";
+import { ChannelTagsButton, TagFilterBar, TagHitList } from "./TagFilter";
 import { ThreadPanel } from "./ThreadPanel";
 
 function LockGlyph({ size = 11 }: { size?: number }) {
@@ -76,6 +79,10 @@ function ChannelRail() {
   const [draft, setDraft] = useState("");
   const [policy, setPolicy] = useState<PostPolicy>("open");
   const [creating, setCreating] = useState(false);
+  // module-reserved channels (forge's per-item discussion threads,
+  // `forge:<repo>:<n>`) are hidden from the chat surface — their messages
+  // render inside the owning module's view, never in this rail.
+  const channels = state.channels.filter((channel) => !isModuleChannel(channel.id));
 
   const create = (event: FormEvent) => {
     event.preventDefault();
@@ -167,7 +174,7 @@ function ChannelRail() {
       )}
 
       <div style={{ overflowY: "auto", flex: 1 }}>
-        {state.channels.map((channel) => {
+        {channels.map((channel) => {
           const active = channel.id === state.activeChannel;
           return (
             <button
@@ -197,7 +204,7 @@ function ChannelRail() {
             </button>
           );
         })}
-        {state.channels.length === 0 && (
+        {channels.length === 0 && (
           <div style={{ padding: "6px 15px", font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
             No channels yet — create one.
           </div>
@@ -213,7 +220,9 @@ function EmptyChannelState() {
   const { state, actions } = useDucktape();
   const [draft, setDraft] = useState("");
   const [policy, setPolicy] = useState<PostPolicy>("open");
-  const hasChannels = state.channels.length > 0;
+  // module-reserved channels are hidden (see ChannelRail) — a workspace whose
+  // only channels are module-owned still reads "No channels yet".
+  const hasChannels = state.channels.some((channel) => !isModuleChannel(channel.id));
 
   const create = (event: FormEvent) => {
     event.preventDefault();
@@ -295,7 +304,7 @@ function EmptyChannelState() {
 export function ChatView() {
   const { state, actions } = useDucktape();
   const channel = state.channels.find((c) => c.id === state.activeChannel);
-  const selfKey = selfAuthorKeyOf(state.author);
+  const selfKey = selfAuthorKeyOf(selfAuthorBytes(state.status, state.author));
   const workspaceId = state.workspace?.id ?? null;
   const rootMessageCount = state.messages.filter((message) => message.head.thread === null).length;
 
@@ -398,32 +407,41 @@ export function ChatView() {
               <LockGlyph size={10} /> Members only
             </span>
           )}
+          {channel && <ChannelTagsButton />}
           {channel && <HuddleHeaderButton channel={channel} />}
         </div>
 
         {channel ? (
           <>
-            <MessageList
-              channelName={channel.name}
-              messages={state.messages}
-              names={state.authorNames}
-              ops={state.ops}
-              selfKey={selfKey}
-              workspaceId={workspaceId}
-              hoverMsg={hoverMsg}
-              menuOpenId={msgMenuId}
-              listRef={listRef}
-              onScroll={(event) => {
-                const el = event.currentTarget;
-                pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-              }}
-              onHover={setHoverMsg}
-              onMenuToggle={setMsgMenuId}
-              onOpenThread={actions.openThread}
-              onReact={actions.toggleReaction}
-              onEdit={actions.editMessage}
-              onDelete={actions.deleteMessage}
-            />
+            <TagFilterBar />
+            {state.tagFilter ? (
+              // filtering: the tag's hits (read-only, newest first) replace
+              // the live slice until the bar's ✕ clears the filter.
+              <TagHitList />
+            ) : (
+              <MessageList
+                channelName={channel.name}
+                messages={state.messages}
+                names={state.authorNames}
+                ops={state.ops}
+                selfKey={selfKey}
+                workspaceId={workspaceId}
+                hoverMsg={hoverMsg}
+                menuOpenId={msgMenuId}
+                listRef={listRef}
+                onScroll={(event) => {
+                  const el = event.currentTarget;
+                  pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+                }}
+                onHover={setHoverMsg}
+                onMenuToggle={setMsgMenuId}
+                onOpenThread={actions.openThread}
+                onReact={actions.toggleReaction}
+                onEdit={actions.editMessage}
+                onDelete={actions.deleteMessage}
+                onTagClick={actions.setTagFilter}
+              />
+            )}
             <Composer
               value={draft}
               onChange={setDraft}

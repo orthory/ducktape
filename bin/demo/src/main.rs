@@ -2,9 +2,9 @@
 //! sync in-memory directory, a stateless greeter, a GIT-backed forge, a
 //! qmdb-backed block-based CHAT module, an
 //! ed25519 permissionless VALSET, the SAGA async-RPC ledger, the AGENT
-//! orchestrator, a TASKS ledger, the origin-gated PROFILES name registry, the
-//! AUTOMATIONS rule engine, the INBOX notification queues, a content-addressed
-//! FILES module, the MEMORY shared agent workspace, and the JOBS work board —
+//! orchestrator, a TASKS ledger, the IDENTITY account registry, the AUTOMATIONS
+//! rule engine, the INBOX notification queues, a content-addressed FILES module,
+//! the MEMORY shared agent workspace, and the JOBS work board —
 //! dispatched over ONE host, showing
 //! the app-hash evolve as typed cross-module ops flow, ending on the
 //! agent-collaboration beat: a mention becomes a run and a pending saga in one
@@ -34,6 +34,8 @@ use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
 use directory::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
+use duckdns::DuckDns;
+use gateway::Gateway;
 use files::Files;
 use forge::Forge;
 use forge::{
@@ -49,8 +51,6 @@ use inbox::{
     encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
 };
 use jobs::Jobs;
-use memory::Memory;
-use profiles::Profiles;
 use saga::SagaModule;
 use saga::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
@@ -68,13 +68,19 @@ fn main() {
     // genesis starts from an unborn repo (root == ZERO) and output is reproducible.
     let forge_repo = std::env::temp_dir().join("ducktape-forge-demo");
     let _ = std::fs::remove_dir_all(&forge_repo);
+    // duckfs gets the same treatment: a wiped per-run data dir keeps output
+    // reproducible (the skeleton runs in-memory; tasks 5/6 use the dir).
+    let duckfs_dir = std::env::temp_dir().join("ducktape-duckfs-demo");
+    let _ = std::fs::remove_dir_all(&duckfs_dir);
 
     deterministic::Runner::default().start(|context| async move {
         // genesis: the module registry (would be consensus state on a real chain).
         let kv = kv::Kv::init(context.child("kv"), "kv").await;
         let directory = Directory::new("directory");
         let greeter = Greeter::new("greeter");
-        let forge = Forge::init("forge", forge_repo.clone()).expect("forge init");
+        let forge = Forge::init("forge", forge_repo.clone())
+            .expect("forge init")
+            .with_chat("chat");
         let chat = Chat::init(context.child("chat"), "chat")
             .await
             .with_tagging("tagging");
@@ -83,13 +89,13 @@ fn main() {
         let dispatch = dispatch::DispatchModule::new("dispatch", "saga");
         let tagging = tagging::TaggingModule::new("tagging");
         let tasks = Tasks::new("tasks");
-        let profiles = Profiles::new("profiles");
         // the deterministic user->nodes binding registry: no valset gating and
         // a fixed demo chain id (the demo has no real network descriptor).
         let identity = Identity::new("identity", None, "demo".into());
+        let duckdns = DuckDns::new("duckdns", "identity", None);
+        let gateway = Gateway::new("gateway", "identity", None, "demo");
         let inbox = Inbox::new("inbox");
-        let files = Files::new("files");
-        let memory = Memory::new("memory", "files");
+        let files = Files::open("files", duckfs_dir.clone()).expect("duckfs open");
         let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
@@ -102,7 +108,7 @@ fn main() {
             Some("tasks".into()),
             Some("jobs".into()),
         );
-        let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
+        let automations = Automations::new("automations", "chat", "tasks", "inbox");
         let mut host = Host::genesis(vec![
             Box::new(kv),
             Box::new(directory),
@@ -114,11 +120,11 @@ fn main() {
             Box::new(dispatch),
             Box::new(tagging),
             Box::new(tasks),
-            Box::new(profiles),
             Box::new(identity),
+            Box::new(duckdns),
+            Box::new(gateway),
             Box::new(inbox),
             Box::new(files),
-            Box::new(memory),
             Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
@@ -410,6 +416,9 @@ fn main() {
                     capability: "mock-llm-1".into(),
                     prompt_hash: vec![7u8; 32],
                     allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
+                    recipe_hash: None,
+                    caps: None,
+                    skills: None,
                 }),
             },
         )
@@ -577,6 +586,8 @@ fn main() {
             "agent",
             "chat",
             "directory",
+            "duckdns",
+            "gateway",
             "files",
             "forge",
             "greeter",
@@ -584,7 +595,6 @@ fn main() {
             "inbox",
             "jobs",
             "kv",
-            "profiles",
             "saga",
             "tasks",
             "valset",

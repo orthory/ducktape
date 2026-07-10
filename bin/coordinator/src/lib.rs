@@ -10,6 +10,51 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use serde::Deserialize;
 
+/// Linux process CPU time across every thread, in nanoseconds.
+#[cfg(target_os = "linux")]
+pub fn process_cpu_ns() -> Option<u64> {
+    let mut total = 0u64;
+    let mut found = false;
+    for entry in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("schedstat")) else {
+            continue;
+        };
+        let Some(runtime) = text
+            .split_whitespace()
+            .next()
+            .and_then(|raw| raw.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        total = total.saturating_add(runtime);
+        found = true;
+    }
+    found.then_some(total)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_cpu_ns() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    kib.checked_mul(1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_rss_bytes() -> Option<u64> {
+    None
+}
+
 /// The one field of `network.toml` the coordinator cares about: the genesis
 /// validators, as hex ed25519 public keys. Every other key (chain_id, scheme,
 /// bootstrap, reach, coordination, …) is ignored — serde drops unknown fields —
@@ -25,7 +70,24 @@ struct GenesisPin {
 /// `--allow-anonymous`    => fully-open (legacy);
 /// otherwise              => public with proof-of-possession (deployed default).
 pub fn select_policy(args: &[String]) -> std::io::Result<nat_traversal::AuthPolicy> {
-    if args.iter().any(|a| a == "--allow-anonymous") {
+    let allow_anonymous = args.iter().any(|a| a == "--allow-anonymous");
+    let has_genesis_set = args.iter().any(|a| a == "--genesis-set");
+    // `--allow-anonymous` and `--genesis-set` are mutually exclusive (the USAGE
+    // string declares them so with `|`). Passing BOTH is contradictory, so it is
+    // a HARD error and NOT a silent pick of the weaker policy. Failing closed
+    // here is what keeps a stray or env-templated `--allow-anonymous` from
+    // quietly disabling a genesis pin — the same "malformed/conflicting args
+    // hard-fail, never downgrade to a weaker policy" contract the value-less
+    // `--genesis-set` check below already upholds. (Previously `--allow-anonymous`
+    // short-circuited first and silently won, downgrading a Private coordinator
+    // to fully-open on a config mistake.)
+    if allow_anonymous && has_genesis_set {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--allow-anonymous and --genesis-set are mutually exclusive",
+        ));
+    }
+    if allow_anonymous {
         return Ok(nat_traversal::AuthPolicy::Open { require_pop: false });
     }
     // `--genesis-set` presence is detected SEPARATELY from its value: a present

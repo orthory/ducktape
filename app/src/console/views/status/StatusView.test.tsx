@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
-import type { BlockRecord } from "../../../domain/transport";
+import type { BlockDisposition, BlockRecord } from "../../../domain/transport";
 import type { Workspace } from "../../../domain/workspace-client";
 import { StatusView } from "./StatusView";
 
@@ -34,16 +34,12 @@ const RESIDENT_C = "22".repeat(32);
 const block = (
   height: number,
   proposer: string,
-  disposition: BlockRecord["disposition"] = "applied",
+  disposition: BlockDisposition = "applied",
 ): BlockRecord => ({
   height,
   hash: `hash${height}`,
   commitHash: `commit${height}`,
-  proposer,
-  disposition,
-  target: "chat",
-  operations: [],
-  payload: "",
+  ops: [{ proposer, disposition, target: "chat", operations: [], payload: "", opHash: "" }],
 });
 
 const renderStatus = (patch: Partial<ConsoleState> = {}) => {
@@ -105,6 +101,20 @@ describe("StatusView", () => {
     expect(screen.getByText("COPIED")).toBeInTheDocument();
     expect(screen.getByText("chat")).toBeInTheDocument();
     expect(screen.getByText("tasks")).toBeInTheDocument();
+  });
+
+  it("shows the node ops facts that moved here from Settings", () => {
+    renderStatus({ members: [workspace.pubkey, PEER_B, RESIDENT_C] });
+
+    expect(screen.getByText("Data dir")).toBeInTheDocument();
+    expect(
+      screen.getByText("~/.ducktape/workspaces/acme-research"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Ports")).toBeInTheDocument();
+    expect(screen.getByText("p2p 7420 · http 8844 · rpc 9020")).toBeInTheDocument();
+    expect(screen.getByText("Quorum threshold")).toBeInTheDocument();
+    // floor(3 * 2/3) + 1 = 3 of the 3 validators.
+    expect(screen.getByText("3 of 3 validators")).toBeInTheDocument();
   });
 
   it("lists connections with derived liveness on the Connections tab", () => {

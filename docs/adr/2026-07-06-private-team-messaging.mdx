@@ -11,8 +11,7 @@ members.** A conversation's content must be readable by its participants and
 by no one else — including every other member node in the same private
 network, each of which replicates the full consensus state. The network
 perimeter (WireGuard data plane, E2E-encrypted authenticated mesh,
-rendezvous-only coordinator, no third-party services — see
-`docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`)
+rendezvous-only coordinator, no third-party services)
 is necessary but is NOT the read barrier; the read barrier must be
 cryptographic, because state replication hands every member node every byte.
 
@@ -25,7 +24,8 @@ What already holds and any future build leans on:
   One workspace = one node = one member identity.
 - **Membership = network membership.** valset
   (`crates/system/valset/src/lib.rs`) is the consensus roster; the WireGuard
-  peer set derives from it; profiles maps keys to display names.
+  peer set derives from it; identity maps node keys to canonical account
+  display names.
 - **Ordering, durability, late-join.** Consensus total order, per-channel
   gap-free sequences, revisions, statesync of full history.
 - **Trust-model precedent.** vaults
@@ -70,9 +70,9 @@ unauthenticated origin — privacy claims only ever hold on the signed-frame
    get all epochs wrapped — Slack history semantics); message bodies gain a
    `sealed {epoch, nonce, ct}` arm (XChaCha20-Poly1305, AAD =
    `(channel_id, message_id, epoch, author_key)`), stored opaquely, no
-   crypto in `execute`; members publish a messaging X25519 pubkey via an
-   origin-gated profiles write (consensus authorship is the ed25519↔X25519
-   binding, same trick as WireGuard tunnel keys); crypto runs in the
+   crypto in `execute`; members publish a messaging X25519 pubkey through a
+   future origin-gated identity extension (consensus authorship binds the
+   account to X25519, the same trick as WireGuard tunnel keys); crypto runs in the
    member's **node** behind `/v1/crypto/{pubkey,seal,open}` routes (keys
    never in the webview; also finally serves vaults); DMs are two-member
    private channels with deterministic id `dm:<min>:<max>`, created
@@ -110,9 +110,7 @@ unauthenticated origin — privacy claims only ever hold on the signed-frame
 
 ## Full design detail
 
-The complete spec this ADR condenses (threat-model table, slice plan,
-test/acceptance list, app-surface notes, code anchors) lived at
-`docs/superpowers/specs/2026-07-06-private-team-messaging-design.md` and is
-preserved in this file's git history (removed in the same commit that added
-this ADR; see also branch `feat/private-messaging-design` history
-9db8c06/8177fde).
+The complete draft this ADR condensed (threat-model table, slice plan,
+test/acceptance list, app-surface notes, code anchors) is preserved in this
+file's git history (removed in the same commit that added this ADR; see also
+branch `feat/private-messaging-design` history 9db8c06/8177fde).

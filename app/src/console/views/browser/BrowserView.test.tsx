@@ -1,0 +1,94 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import * as duckBrowser from "../../../domain/duck-browser";
+import * as gateway from "../../../domain/gateway-client";
+import { makeTransportStub } from "../../../test/transport-stub";
+import type { ConsoleActions } from "../../store/actions";
+import type { ConsoleState } from "../../store/state";
+import type { NodeTransport } from "../../../domain/transport";
+import { ConsoleContext } from "../../store/context";
+import { createInitialState } from "../../store/state";
+import { BrowserView } from "./BrowserView";
+
+const actions = new Proxy({}, { get: () => vi.fn() }) as ConsoleActions;
+
+const renderBrowser = (
+  patch: Partial<ConsoleState> = {},
+  transport: NodeTransport = makeTransportStub(),
+) => render(
+  <ConsoleContext.Provider value={{
+    state: { ...createInitialState(), connected: true, ...patch },
+    actions,
+    transport,
+  }}>
+    <BrowserView />
+  </ConsoleContext.Provider>,
+);
+
+afterEach(() => vi.restoreAllMocks());
+
+describe("BrowserView security boundary", () => {
+  it("renders net.duck only in an empty-sandbox iframe", async () => {
+    vi.spyOn(duckBrowser, "loadDuckPage").mockResolvedValue({
+      address: {
+        kind: "network",
+        handle: "net",
+        name: { label: null },
+        hostname: "net.duck",
+        pathAndQuery: "/",
+        canonical: "net.duck",
+      },
+      hosting: "network",
+      snapshot: "44".repeat(32),
+      title: "Network",
+      srcDoc: "<!doctype html><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'none'\"><main>network</main>",
+      fileCount: 1,
+      totalBytes: 7,
+    });
+    renderBrowser();
+    fireEvent.submit(screen.getByRole("textbox", { name: "Duck address" }).closest("form")!);
+
+    const frame = await screen.findByTestId("duck-browser-frame");
+    expect(frame.getAttribute("sandbox")).toBe("");
+    expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
+    expect(frame.getAttribute("srcdoc")).toContain("script-src 'none'");
+    expect(screen.getByText("NETWORK SNAPSHOT")).toBeInTheDocument();
+  });
+
+  it("opens every account target in a capability-free gateway window", async () => {
+    const openWindow = vi.spyOn(gateway, "openWindow").mockResolvedValue();
+    vi.spyOn(duckBrowser, "loadDuckPage").mockResolvedValue({
+      address: {
+        kind: "account",
+        handle: "alice",
+        name: { label: "api" },
+        hostname: "api.alice.duck",
+        pathAndQuery: "/v1",
+        canonical: "api.alice.duck/v1",
+      },
+      hosting: "gateway",
+      target: "loopback_http",
+      accountId: "11".repeat(32),
+      publisherNode: "22".repeat(32),
+      signer: "33".repeat(32),
+      revision: 3,
+      title: "api.alice.duck",
+      srcUrl: "http://0123456789abcdef0123456789abcdef.localhost:49152/v1",
+      fileCount: 0,
+      totalBytes: 0,
+    });
+    renderBrowser();
+    const address = screen.getByRole("textbox", { name: "Duck address" });
+    fireEvent.change(address, { target: { value: "api.alice.duck/v1" } });
+    fireEvent.submit(address.closest("form")!);
+
+    await waitFor(() => expect(openWindow).toHaveBeenCalledWith(
+      "http://0123456789abcdef0123456789abcdef.localhost:49152/v1",
+      "api.alice.duck",
+    ));
+    expect(screen.queryByTestId("duck-browser-frame")).toBeNull();
+    expect(screen.getByText("SIGNED GATEWAY ROUTE")).toBeInTheDocument();
+    expect(screen.getByText("Opened in an isolated gateway window")).toBeInTheDocument();
+  });
+});

@@ -11,9 +11,29 @@
 //! interface up, so binding retries in the background), and the
 //! prefer-plane-fall-back-to-mesh client the joiner paths consume.
 //!
-//! env-gated, default OFF (`DUCKTAPE_STATESYNC_PLANE=1`): the plane's on-path
-//! only does anything with real tunnels, and the mesh statesync path is the
-//! retained fallback either way.
+//! env-gated, default OFF (`DUCKTAPE_STATESYNC_PLANE=1`, see [`enabled`]):
+//! the plane's on-path only does anything with real tunnels.
+//!
+//! the mesh leg is not a legacy path pending deletion — it is NOT deletable,
+//! for four verified reasons (the wire-standardization ADR's D4 decision):
+//!
+//! 1. **default-off gate.** with the env var unset, mesh is today's PRIMARY
+//!    statesync path, not a fallback of a fallback.
+//! 2. **park-phase admission polling.** a parked (pre-admission) joiner
+//!    polls the manifest over statesync to detect its OWN admission, and
+//!    [`OverlayBook`]'s admission (members + standbys only) refuses that
+//!    joiner on the plane by construction — only the mesh can answer a
+//!    peer the network has not admitted yet.
+//! 3. **async bind window.** [`spawn_bring_up`]'s overlay bind retries every
+//!    3s until the interface exists, so a real window always exists where
+//!    the plane is enabled but not yet up.
+//! 4. **terminal punch failure.** a failed NAT punch is terminal (no relay
+//!    since its removal) — some peer pairs never get a tunnel at all, and
+//!    the mesh is their only path, permanently.
+//!
+//! [`PlaneFallbackClient`] is the resulting policy: prefer the plane,
+//! degrade to the mesh on transport failure, and log every fallback — the
+//! plane's steady-state degradation must be diagnosable, never silent.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -21,8 +41,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use commonware_cryptography::ed25519;
 use data_plane::{
-    AddressBook, AdmissionPolicy, DataPlane, FlowId, OverlaySockets, PeerId, PlaneConfig, Service,
-    StreamPolicy, StreamService,
+    AddressBook, AdmissionPolicy, BulkPacer, FlowId, OverlaySockets, PeerId, Service,
+    StreamPacing, StreamPlaneSpec, StreamPolicy, StreamService, bind_stream_plane,
 };
 use statesync::dataplane::{DataPlaneSyncClient, statesync_flow};
 use statesync::{SyncClient, SyncError, SyncRequest, SyncResponse};
@@ -32,11 +52,36 @@ pub fn enabled() -> bool {
     std::env::var("DUCKTAPE_STATESYNC_PLANE").is_ok_and(|v| v == "1")
 }
 
-/// bulk ceiling for the statesync plane instance: below a typical uplink so
-/// real-time consumers on their own planes keep headroom (isolation layer 2;
-/// cross-plane coordination arrives with the second bulk consumer).
-const BULK_BYTES_PER_SEC: u64 = 8_000_000;
+/// the socket seam's factory selection, in one place for every
+/// [`spawn_bring_up`] caller: the plane's backend follows `wireguard_effect`
+/// exactly as the mesh context's does (fake stages no data plane, so it
+/// keeps the OS factory's downed-interface behavior).
+pub fn socket_factory(
+    kind: crate::config::WireGuardEffectKind,
+    slot: &overlay_net::userspace::StackSlot,
+) -> Arc<dyn data_plane::SocketFactory> {
+    match kind {
+        crate::config::WireGuardEffectKind::Socket => Arc::new(
+            overlay_net::userspace::VirtualSocketFactory::new(slot.clone()),
+        ),
+        crate::config::WireGuardEffectKind::Tun | crate::config::WireGuardEffectKind::Fake => {
+            Arc::new(data_plane::OsSocketFactory)
+        }
+    }
+}
+
+/// bulk ceiling for the statesync plane instance: a static compromise between
+/// sync time (~24 MB/s ≈ 42 s/GB) and real-time headroom. State sync and
+/// gateway now share this one process ceiling; adaptive per-link shaping is a
+/// separate concern.
+const BULK_BYTES_PER_SEC: u64 = 24_000_000;
 const BULK_BURST_BYTES: u64 = 512 * 1024;
+
+/// One link-headroom budget shared by every stream-class per-use plane in this
+/// process (state sync and gateway responses today).
+pub fn shared_bulk_pacer() -> BulkPacer {
+    BulkPacer::new(BULK_BYTES_PER_SEC, BULK_BURST_BYTES)
+}
 
 /// derive a peer's overlay ULA from its raw ed25519 key bytes — the same
 /// `(namespace, identity)` function the reachability plane routes by.
@@ -143,31 +188,27 @@ pub fn spawn_bring_up(
     book: Arc<OverlayBook>,
     me: ed25519::PublicKey,
     slot: PlaneSlot,
+    // the socket seam (overlay-net ADR): `OsSocketFactory` in tun mode (the
+    // kernel routes the /128 through the wireguard interface),
+    // `VirtualSocketFactory` in socket mode (the /128 lives in the
+    // in-process stack). either way its bind errors while the overlay is
+    // down are absorbed by the retry loop below.
+    factory: Arc<dyn data_plane::SocketFactory>,
+    pacer: BulkPacer,
     serve: Option<futures::channel::mpsc::Sender<SyncJob>>,
 ) {
     tokio::spawn(async move {
         let own = book.own_addr(&me);
-        let datagram_bind = SocketAddr::new(own, Service::StateSync.overlay_datagram_port());
-        let stream_bind = SocketAddr::new(own, Service::StateSync.overlay_stream_port());
-        let sockets = loop {
-            match OverlaySockets::bind(datagram_bind, stream_bind, book.clone()).await {
-                Ok(sockets) => break sockets,
-                // the interface (or our /128) is not up yet — retry quietly.
-                Err(_) => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
-            }
+        let spec = StreamPlaneSpec {
+            own_ip: own,
+            service: Service::StateSync,
+            pacing: StreamPacing::Shared(pacer),
+            policy: StreamPolicy { accept_backlog: 32 },
+            // the interface (or our /128) is not up yet — retry quietly.
+            retry: std::time::Duration::from_secs(3),
         };
-        let admission: Arc<dyn AdmissionPolicy> = book;
-        let plane = DataPlane::new(
-            sockets,
-            admission,
-            PlaneConfig {
-                bulk_bytes_per_sec: BULK_BYTES_PER_SEC,
-                bulk_burst_bytes: BULK_BURST_BYTES,
-            },
-        );
-        let svc = match plane.stream_service(Service::StateSync, StreamPolicy { accept_backlog: 32 })
-        {
-            Ok(svc) => Arc::new(svc),
+        let (plane, svc) = match bind_stream_plane(spec, factory, book).await {
+            Ok(bound) => bound,
             Err(e) => {
                 eprintln!("[node {label}] statesync plane: register failed ({e}) — mesh only");
                 return;
@@ -217,6 +258,10 @@ pub struct PlaneFallbackClient<M> {
     plane: PlaneSlot,
     server: PeerId,
     mesh: M,
+    /// the node's own log label — steady-state fallbacks are otherwise
+    /// invisible (silent per-request degradation), and a label-less
+    /// `eprintln` is useless once more than one node's logs interleave.
+    label: String,
 }
 
 impl<M: Clone> Clone for PlaneFallbackClient<M> {
@@ -225,12 +270,13 @@ impl<M: Clone> Clone for PlaneFallbackClient<M> {
             plane: Arc::clone(&self.plane),
             server: self.server,
             mesh: self.mesh.clone(),
+            label: self.label.clone(),
         }
     }
 }
 
 impl<M> PlaneFallbackClient<M> {
-    pub fn new(plane: PlaneSlot, server: &ed25519::PublicKey, mesh: M) -> Self {
+    pub fn new(plane: PlaneSlot, server: &ed25519::PublicKey, mesh: M, label: String) -> Self {
         let raw: [u8; 32] = server
             .as_ref()
             .try_into()
@@ -239,6 +285,7 @@ impl<M> PlaneFallbackClient<M> {
             plane,
             server: PeerId(raw),
             mesh,
+            label,
         }
     }
 
@@ -250,21 +297,21 @@ impl<M> PlaneFallbackClient<M> {
 }
 
 impl<M: SyncClient + Sync> SyncClient for PlaneFallbackClient<M> {
-    fn request(
-        &self,
-        req: SyncRequest,
-    ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
-        async move {
-            if let Some(svc) = self.plane.get() {
-                let client = DataPlaneSyncClient::new(Arc::clone(svc), self.server);
-                match client.request(req.clone()).await {
-                    // a transport-level failure (tunnel down, peer refused)
-                    // falls back; protocol-level outcomes are authoritative.
-                    Err(SyncError::Transport(_)) => {}
-                    outcome => return outcome,
+    async fn request(&self, req: SyncRequest) -> Result<SyncResponse, SyncError> {
+        if let Some(svc) = self.plane.get() {
+            let client = DataPlaneSyncClient::new(Arc::clone(svc), self.server);
+            match client.request(req.clone()).await {
+                // a transport-level failure (tunnel down, peer refused)
+                // falls back; protocol-level outcomes are authoritative.
+                Err(SyncError::Transport(e)) => {
+                    let label = &self.label;
+                    eprintln!(
+                        "[node {label}] statesync: plane request failed, falling back to mesh: {e}"
+                    );
                 }
+                outcome => return outcome,
             }
-            self.mesh.request(req).await
         }
+        self.mesh.request(req).await
     }
 }

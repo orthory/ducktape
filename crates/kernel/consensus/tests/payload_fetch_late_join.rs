@@ -203,10 +203,14 @@ async fn run_late_join(mut context: deterministic::Context) {
     // PUMP to convergence: stop only when EVERY node (incl. the starved one, which
     // must FETCH four of five ops) has applied the whole op-set.
     let target = ops.len();
-    let mut applied = vec![0usize; N];
+    let mut applied = [0usize; N];
     loop {
         context.sleep(Duration::from_millis(50)).await;
         for (i, n) in nodes.iter_mut().enumerate() {
+            // the production drain flushes the batch window every BLOCK_TIME tick
+            // (bin/node main); enqueue-only submits never propose without it — the
+            // sim mirrors that cadence (a no-op when nothing is pending).
+            n.flush_batch().await.expect("flush");
             applied[i] += n.drain_delivered().await.expect("drain");
         }
         if applied.iter().all(|&c| c == target) {

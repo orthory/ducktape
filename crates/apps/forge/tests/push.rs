@@ -69,8 +69,10 @@ fn repo_dir(base: &Path) -> PathBuf {
     base.join(DEFAULT_REPO)
 }
 
-/// parse forge's multi-repo snapshot container into `(name, head_oid, pack)`
-/// entries — the test-side inverse of `Forge::snapshot`.
+/// parse forge's multi-branch snapshot container into `(name, main_oid, pack)`
+/// entries — the test-side inverse of `Forge::snapshot` (per repo: name,
+/// ref_count, per-ref branch+oid, pack; the trailing tracker section is
+/// irrelevant here).
 fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     fn u32_at(bytes: &[u8], p: &mut usize) -> usize {
         let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap()) as usize;
@@ -84,12 +86,22 @@ fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
         let nl = u32_at(bytes, &mut p);
         let name = String::from_utf8(bytes[p..p + nl].to_vec()).unwrap();
         p += nl;
-        let oid = bytes[p..p + OID_LEN].to_vec();
-        p += OID_LEN;
+        let ref_count = u32_at(bytes, &mut p);
+        let mut main_oid = Vec::new();
+        for _ in 0..ref_count {
+            let bl = u32_at(bytes, &mut p);
+            let branch = String::from_utf8(bytes[p..p + bl].to_vec()).unwrap();
+            p += bl;
+            let oid = bytes[p..p + OID_LEN].to_vec();
+            p += OID_LEN;
+            if branch == "main" {
+                main_oid = oid;
+            }
+        }
         let pl = u32_at(bytes, &mut p);
         let pack = bytes[p..p + pl].to_vec();
         p += pl;
-        out.push((name, oid, pack));
+        out.push((name, main_oid, pack));
     }
     out
 }
@@ -126,7 +138,7 @@ impl Captured {
         git2::Oid::from_bytes(&self.head).unwrap()
     }
     /// store the pack in a blob handle and return the digest to push with.
-    fn stash(&self, blobs: &files::BlobHandle) -> Vec<u8> {
+    fn stash(&self, blobs: &blobstore::BlobHandle) -> Vec<u8> {
         blobs.put_chunk(self.pack.clone()).to_vec()
     }
 }
@@ -227,7 +239,7 @@ fn push_to_unborn_moves_head_and_materializes_content() {
     assert_ne!(cap.root, StateRoot::ZERO, "source has real state");
 
     // a blob store that HOLDS the pack (the submitter's situation).
-    let blobs = files::BlobHandle::default();
+    let blobs = blobstore::BlobHandle::default();
     let digest = cap.stash(&blobs);
 
     let dst_dir = tmp_repo("unborn-dst");
@@ -258,7 +270,7 @@ fn fast_forward_push_advances_the_head() {
     commit_one(&mut src, 2, "b.txt", "two", "c2");
     let c2 = capture(&src);
 
-    let blobs = files::BlobHandle::default();
+    let blobs = blobstore::BlobHandle::default();
     let d1 = c1.stash(&blobs);
     let d2 = c2.stash(&blobs);
 
@@ -295,7 +307,7 @@ fn stale_prev_oid_is_rejected_and_head_is_unchanged() {
     commit_one(&mut src, 2, "b.txt", "two", "c2");
     let c2 = capture(&src);
 
-    let blobs = files::BlobHandle::default();
+    let blobs = blobstore::BlobHandle::default();
     let d1 = c1.stash(&blobs);
     let d2 = c2.stash(&blobs);
 
@@ -331,14 +343,14 @@ fn determinism_a_pushed_root_is_identical_without_the_pack() {
     let (src_dir, _src, cap) = source_one("det-src");
 
     // node WITH the pack.
-    let with_blobs = files::BlobHandle::default();
+    let with_blobs = blobstore::BlobHandle::default();
     let digest = cap.stash(&with_blobs);
     let with_dir = tmp_repo("det-with");
     let mut with = Forge::with_blobs("forge", with_dir.clone(), with_blobs).unwrap();
     push(&mut with, None, &cap.head, &digest);
 
     // node WITHOUT the pack: an EMPTY blob store, but the SAME op (same digest).
-    let without_blobs = files::BlobHandle::default();
+    let without_blobs = blobstore::BlobHandle::default();
     assert!(
         !without_blobs.has_chunk(&<[u8; 32]>::try_from(digest.as_slice()).unwrap()),
         "this store must not hold the pack"
@@ -382,7 +394,7 @@ fn determinism_a_pushed_root_is_identical_without_the_pack() {
     assert_eq!(on_disk_head(&without_dir), None);
 
     // once the pack arrives, a retry catches the on-disk ref up — root unchanged.
-    let arrived = files::BlobHandle::default();
+    let arrived = blobstore::BlobHandle::default();
     let d2 = cap.stash(&arrived); // digest is identical (content-addressed)
     assert_eq!(d2, digest, "content-addressed digest is stable");
     let mut caught_up = Forge::with_blobs("forge", without_dir.clone(), arrived).unwrap();
@@ -445,7 +457,7 @@ fn commit_and_push_coexist_on_one_module() {
     let c2 = capture(&src);
 
     let dst_dir = tmp_repo("coexist-dst");
-    let blobs = files::BlobHandle::default();
+    let blobs = blobstore::BlobHandle::default();
     let d2 = c2.stash(&blobs);
     let mut dst = Forge::with_blobs("forge", dst_dir.clone(), blobs).unwrap();
     commit_one(&mut dst, 1, "a.txt", "one", "c1");

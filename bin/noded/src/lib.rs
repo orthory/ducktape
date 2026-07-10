@@ -9,38 +9,63 @@
 //! carries the module's own `*Msg`/`*Query` enum as a json value, encoded to the
 //! exact bytes the modules' crate-root `encode_*` helpers would produce
 //! (`serde_json::to_vec`), so the daemon needs no per-module knowledge —
-//! with ONE deliberate exception: the files blob lane. chunk bytes must never
-//! transit consensus (no op carries them), so POST `/v1/files/blob` and GET
-//! `/v1/files/blob/{digest}` bypass the actor entirely and talk straight to
-//! the node-local [`files::BlobHandle`] the registered files module shares.
+//! with ONE deliberate exception: the op-receipt blob lane. receipt bytes
+//! never transit consensus (no op carries them), so POST `/v1/files/blob` and
+//! GET `/v1/files/blob/{digest}` bypass the actor entirely and talk straight
+//! to the node-local [`crate::blobs::BlobHandle`] forge and the block loop share.
 //!
 //! lifecycle is part of the surface: `/v1/status` carries the daemon's build
 //! version (so a newer app can spot a stale orphan), and POST `/v1/shutdown`
 //! asks the process to exit gracefully — the managing app has no pid, only
 //! this port.
 
+pub mod blobs;
+pub mod stream;
+pub use stream::{
+    ClientMsg, LogRing, RunOutputRegistry, RunStream, ServerFrame, StreamErrorCode, StreamHub,
+    StreamOpRow, StreamOrigin, StreamOriginKind, TailItem,
+};
+// the duckfs product surface lives in its own module (lib.rs is over the size
+// cap); re-exported flat so the router keeps its bare handler names and the
+// public param structs stay at `noded::CommitBody` &c.
+mod files_http;
+pub use files_http::*;
+// the workspace RPC (`/v1/fs/workspaces`) and its actor-lane `NodeApi` adapter.
+// crate-internal: the router registers the handlers and the adapter is used only
+// by the workspace handlers — nothing outside the crate touches either.
+mod actor_api;
+mod workspaces;
+// the REAL portable-agent-run provisioner (NodedProvisioner + agent_runs_root,
+// the D7 root). public so BOTH node binaries can build one and wire it into
+// their DispatchPool via `with_provisioner`.
+pub mod agent_provision;
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
+use duckfs_core::CHUNK_SIZE;
 use futures::SinkExt as _;
 use futures::channel::{mpsc, oneshot};
+use rand::RngCore as _;
 use sdk::StateRoot;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 
 /// inbound command backlog before submit/query callers see backpressure.
 pub const COMMAND_BUFFER: usize = 64;
-/// block events buffered per lagging websocket subscriber before it skips ahead.
+/// internal block-note wakeups buffered per lagging websocket subscriber.
 pub const EVENT_BUFFER: usize = 64;
 
 /// one finalized block, as reported to clients (http response + ws frame).
@@ -97,43 +122,51 @@ pub enum BlockDisposition {
     Rejected,
 }
 
+/// one member op inside a finalized block — the per-op detail the explorer
+/// fans out over. a block now AGGREGATES the txs from its window, so it carries
+/// a vector of these in agreed (applied) order.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RootOp {
+    /// hex of this op's authenticated author origin (the frame's VERIFIED
+    /// signer), or `"system"` / `"module:<id>"` for a non-external origin. on
+    /// the embedded daemon's frameless lane this is the SUBMITTER's origin
+    /// bytes instead (unverified — that lane authenticates nothing).
+    pub proposer: String,
+    /// how this op landed: `applied` mutated state; `rejected` finalized but
+    /// rolled back (a failed tx). deterministic on every validator.
+    pub disposition: BlockDisposition,
+    /// this op's target module.
+    pub target: String,
+    /// this op's dispatch trace, in drain order (empty for a rejected op).
+    pub operations: Vec<DispatchInfo>,
+    /// best-effort utf-8 preview of this op's payload (module `*Msg` json on
+    /// this lane), capped at [`PAYLOAD_PREVIEW_MAX`] chars.
+    pub payload: String,
+    /// hex of this op's payload content address — sha256 of the exact bytes the
+    /// host committed, staged in the node-local blob store so
+    /// `GET /v1/files/blob/{op_hash}` serves the full bytes back.
+    pub op_hash: String,
+}
+
 /// one non-empty finalized block, as the explorer reads it: the block's
-/// consensus coordinates (height, frame content hash, post-block app-hash),
-/// its authenticated proposer, and the op it carried with the deterministic
-/// dispatch trace. stored as the block's row in the index store's blocks
-/// database ([`indexer::BlockOps::record`]) and served by `GET /v1/blocks`.
+/// consensus coordinates (height, frame content hash, post-block app-hash) and
+/// the member ops it AGGREGATED, each with its deterministic dispatch trace.
+/// stored as the block's row in the index store's blocks database
+/// ([`indexer::BlockOps::record`]) and served by `GET /v1/blocks`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockRecord {
     pub height: u64,
-    /// hex of the frame's content address (sha256 over the exact bytes the
-    /// orderer carried) — the block's hash on this surface. empty on the
-    /// embedded daemon's lane: nothing is framed or signed there, so the
-    /// field stays honest rather than carrying a fabricated digest.
+    /// hex of the block's content address — the block's hash on this surface.
+    /// empty on the embedded daemon's lane: nothing is framed or signed there,
+    /// so the field stays honest rather than carrying a fabricated digest.
     pub hash: String,
     /// hex of the composed app-hash after this block settled — the commit.
     pub commit_hash: String,
-    /// hex of the proposing validator's ed25519 public key — the frame's
-    /// VERIFIED signer, not a claimed identity. on the embedded daemon's
-    /// frameless lane this is the SUBMITTER's origin bytes instead
-    /// (unverified — that lane authenticates nothing).
-    pub proposer: String,
-    pub disposition: BlockDisposition,
-    /// the root op's target module.
-    pub target: String,
-    /// the dispatch trace, in drain order — the "transactions" inside the
-    /// block. empty for a rejected op (a deterministic no-op leaves no trace).
-    pub operations: Vec<DispatchInfo>,
-    /// best-effort utf-8 preview of the root op's payload (module `*Msg` json
-    /// on this lane), capped at [`PAYLOAD_PREVIEW_MAX`] chars.
-    pub payload: String,
-    /// hex of the root op's content address — sha256 of the exact payload
-    /// bytes the host committed, staged in the node-local blob store as the
-    /// record is ringed, so `GET /v1/files/blob/{op_hash}` serves the full
-    /// bytes back. same semantics as [`SubmitReceipt::op_hash`]; this is the
-    /// only place the NETWORKED surface exposes it (its submit reply carries
-    /// height only until the noded→ordered-node convergence).
-    pub op_hash: String,
+    /// the member ops this block aggregated, in agreed (applied) order. empty
+    /// for an idle/nop block (nothing but the heartbeat filler).
+    pub ops: Vec<RootOp>,
 }
 
 /// the explorer's wire rendering of one dispatch. `Origin::External` renders
@@ -204,6 +237,7 @@ fn origin_kind(origin: &sdk::Origin) -> &'static str {
 pub struct NodeMetrics {
     block_height: Registered<raw::Gauge>,
     blocks_total: Registered<raw::Counter>,
+    ops_total: Registered<raw::Counter>,
     apply_latency: Registered<raw::Histogram>,
     dispatch_total: Registered<raw::Family<DispatchLabels, raw::Counter>>,
 }
@@ -225,10 +259,17 @@ impl NodeMetrics {
                 "ducktape_blocks",
                 "committed local blocks since daemon start",
             ),
+            // one BLOCK now aggregates N member ops; `ducktape_blocks_total`
+            // counts blocks, `ducktape_ops_total` counts the aggregated ops, so
+            // ops/blocks is the average batch size.
+            ops_total: context.counter(
+                "ducktape_ops",
+                "member ops aggregated into committed local blocks since daemon start",
+            ),
             apply_latency: context.histogram(
                 "ducktape_block_apply_latency_seconds",
                 "node-local wall-clock cost of applying one block",
-                LATENCY_BUCKETS.into_iter(),
+                LATENCY_BUCKETS,
             ),
             dispatch_total: context.family(
                 "ducktape_dispatch",
@@ -239,12 +280,7 @@ impl NodeMetrics {
 
     /// fold one applied block into the series: height, count, this node's
     /// wall-clock apply latency, and the per-module dispatch counters.
-    pub fn record_block(
-        &self,
-        height: u64,
-        latency_us: u64,
-        dispatches: &[host::DispatchRecord],
-    ) {
+    pub fn record_block(&self, height: u64, latency_us: u64, dispatches: &[host::DispatchRecord]) {
         self.block_height.set(height as i64);
         self.blocks_total.inc();
         // microseconds → seconds for the Prometheus convention.
@@ -256,6 +292,14 @@ impl NodeMetrics {
                     origin: origin_kind(&d.origin).to_string(),
                 })
                 .inc();
+        }
+    }
+
+    /// count the member ops an applied block aggregated (`ducktape_ops_total`).
+    /// called once per applied block alongside [`record_block`](Self::record_block).
+    pub fn record_ops(&self, ops: usize) {
+        for _ in 0..ops {
+            self.ops_total.inc();
         }
     }
 
@@ -314,7 +358,7 @@ pub enum ModuleCategory {
 
 impl ModuleCategory {
     /// The category a module id belongs to. Ids not listed here —
-    /// infrastructure and internal modules (files, memory, saga, profiles, kv,
+    /// infrastructure and internal modules (files, saga, identity, kv,
     /// valset, governance, vaults, directory, …) — fall to `System`, so a new
     /// or unknown module always groups sensibly rather than breaking the view.
     pub fn of(id: &str) -> Self {
@@ -358,52 +402,27 @@ pub struct QueryRequest {
 // lane below; a daemon without a hub answers 503, and every refusal path says
 // WHY as one text frame before closing.
 //
-// binary frames are tagged by their first byte (`WS_TAG_*`):
-//   audio `[0x01][1920 B pcm]` — both directions; one 20 ms mono 48 kHz frame
-//     (960 × i16 LE, exactly `PCM_FRAME_BYTES` after the tag — see
-//     `chat::voice::FRAME_SAMPLES`). client→server is a captured mic frame,
-//     server→client a mixed playout frame.
-//   video — client→server `[0x02][flags u8][ts_ms u32 LE][vp8 chunk]` captured
-//     camera; server→client `[0x03][flags u8][ts_ms u32 LE][peer 32 raw]
-//     [vp8 chunk]` a reassembled peer frame. `flags` bit 0 (`WS_FLAG_KEYFRAME`)
-//     marks a decoder sync point. little-endian on THIS leg (browser
-//     `DataView`-friendly); the mesh leg stays big-endian.
-// text frames are json control: client→server `CallClientControl` (recipients /
-// beacon / keyframeRequest), server→client `CallServerControl` (keyframeRequest
-// / peerBeacon / rateHint).
+// the binary frame layout (tag byte, header fields, BE headers/LE pcm payload
+// per D1) and its encode/decode functions live in `chat::call_wire` — the
+// single definition site this handler ports onto below. text frames are json
+// control: client→server `CallClientControl` (recipients / beacon /
+// keyframeRequest), server→client `CallServerControl` (keyframeRequest /
+// peerBeacon / rateHint).
 //
 // the hub side lives with the mesh (only the p2p validator runs one): it
 // fragments/reassembles the video ends over `Service::Video` and routes control
 // (keyframe kicks, presence beacons, rate hints — see `chat::video`).
 
-/// one captured, encoded camera frame handed webview → hub for fan-out. the
-/// hub fragments `data` across `Service::Video` datagrams; `frame_no` is the
-/// hub's own monotone counter, so only the frame's own fields ride here.
-pub struct CapturedVideo {
-    /// this frame is a decoder sync point (a full keyframe, not a delta).
-    pub keyframe: bool,
-    /// capture timestamp in ms (opaque to the hub; echoed to the far webview).
-    pub ts_ms: u32,
-    /// the encoded (VP8) frame bytes.
-    pub data: Vec<u8>,
-}
-
-/// one reassembled camera frame handed hub → webview, tagged with the mesh-
-/// authenticated sender so the webview routes it to the right tile.
-pub struct PeerVideo {
-    /// the sending peer's raw ed25519 node key.
-    pub peer: [u8; 32],
-    pub keyframe: bool,
-    pub ts_ms: u32,
-    /// the reassembled encoded (VP8) frame bytes.
-    pub data: Vec<u8>,
-}
-
 /// call-control the WEBVIEW asks the hub to act on (webview → hub).
 pub enum CallControlIn {
     /// our local presence/state, pushed immediately AND repeated at 1 Hz as
-    /// this session's beacon to every recipient.
-    Beacon { muted: bool, camera_on: bool },
+    /// this session's beacon to every recipient. `sharing` = the video lane is a
+    /// screen share rather than the camera.
+    Beacon {
+        muted: bool,
+        camera_on: bool,
+        sharing: bool,
+    },
     /// our decoder lost `peer`'s stream — ask `peer` for a fresh keyframe.
     KeyframeRequest { peer: [u8; 32] },
 }
@@ -413,11 +432,13 @@ pub enum CallControlOut {
     /// a peer's receiver asked us to send it a fresh keyframe — the webview
     /// tells its encoder to emit one (rate-limited to ≤1 Hz by the hub).
     KeyframeRequest,
-    /// a peer's 1 Hz presence beacon — drives the tile's mute/camera badges.
+    /// a peer's 1 Hz presence beacon — drives the tile's mute/camera badges +
+    /// the screen-share treatment.
     PeerBeacon {
         peer: [u8; 32],
         muted: bool,
         camera_on: bool,
+        sharing: bool,
     },
     /// the effective outbound bitrate cap (min of every peer's hint) — the
     /// webview retargets its encoder. emitted only when the value changes.
@@ -434,9 +455,9 @@ pub struct CallSession {
     /// (raw ed25519 bytes), steered by the client as consensus state changes.
     pub recipients: tokio::sync::watch::Sender<Vec<[u8; 32]>>,
     /// captured camera frames webview → hub (fragmented onto `Service::Video`).
-    pub video_in: tokio::sync::mpsc::Sender<CapturedVideo>,
+    pub video_in: tokio::sync::mpsc::Sender<chat::call_wire::CapturedFrame>,
     /// reassembled peer camera frames hub → webview.
-    pub video_out: tokio::sync::mpsc::Receiver<PeerVideo>,
+    pub video_out: tokio::sync::mpsc::Receiver<chat::call_wire::PeerFrame>,
     /// call-control webview → hub (local beacon, keyframe asks).
     pub control_in: tokio::sync::mpsc::Sender<CallControlIn>,
     /// call-control hub → webview (peer beacons, keyframe kicks, rate hints).
@@ -453,45 +474,53 @@ pub struct CallSessionRequest {
 /// the request lane into the call hub.
 pub type CallLane = tokio::sync::mpsc::Sender<CallSessionRequest>;
 
-/// binary ws frame tags on /v1/call/ws (first byte).
-const WS_TAG_AUDIO: u8 = 0x01;
-const WS_TAG_VIDEO_CAPTURED: u8 = 0x02; // client → server
-const WS_TAG_VIDEO_PEER: u8 = 0x03; // server → client
-const WS_VIDEO_CAPTURED_HEADER: usize = 6; // tag + flags + ts_ms
-const WS_VIDEO_PEER_HEADER: usize = 38; // tag + flags + ts_ms + peer key
-const WS_FLAG_KEYFRAME: u8 = 0b0000_0001;
-
 /// client → server control messages on the call socket (text frames).
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum CallClientControl {
     /// replace the fan-out set with these hex node keys (self excluded —
     /// the client tracks the consensus huddle roster).
     Recipients { peers: Vec<String> },
     /// this client's ephemeral state; the hub beacons it to peers at 1 Hz.
-    Beacon { muted: bool, camera_on: bool },
+    /// `sharing` defaults false so a pre-share client (no field) still parses.
+    Beacon {
+        muted: bool,
+        camera_on: bool,
+        #[serde(default)]
+        sharing: bool,
+    },
     /// the decoder lost sync with `peer` — ask it for a keyframe.
     KeyframeRequest { peer: String },
 }
 
 /// server → client control messages on the call socket (text frames).
 #[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum CallServerControl {
     /// a peer lost sync with US: encode the next frame as a keyframe.
     KeyframeRequest,
     /// a peer's 1 Hz beacon (ephemeral presence/state — never consensus).
-    PeerBeacon { peer: String, muted: bool, camera_on: bool },
+    PeerBeacon {
+        peer: String,
+        muted: bool,
+        camera_on: bool,
+        sharing: bool,
+    },
     /// send at no more than this (min across peers' loss reports).
-    RateHint { max_kbps: u32 },
-}
-
-/// a ws frame. tagged so the stream can grow beyond block events without
-/// breaking subscribers — clients switch on `type` and ignore unknown kinds.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum WsFrame {
-    Block(BlockSummary),
+    RateHint {
+        #[cfg_attr(test, ts(type = "number"))]
+        max_kbps: u32,
+    },
 }
 
 /// a request to the actor that owns the host. replies cross the channel as
@@ -521,18 +550,64 @@ pub enum NodeCommand {
     },
 }
 
+/// One bounded invocation through a globally signed gateway route. The
+/// full node drains this lane through `Service::Gateway`; the embedded daemon
+/// leaves it unwired because it has no authenticated network transport.
+pub struct GatewayJob {
+    /// Derived from the locally finalized RouteRecord, never client input.
+    pub publisher_node: [u8; 32],
+    pub max_response_bytes: u64,
+    pub head: gateway::ProxyRequestHead,
+    pub body: Vec<u8>,
+    pub reply: oneshot::Sender<Result<GatewayResponse, GatewayFailure>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayResponse {
+    pub head: gateway::ProxyResponseHead,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayFailure {
+    Invalid(String),
+    Forbidden(String),
+    NotFound(String),
+    Conflict(String),
+    Unavailable(String),
+}
+
+pub type GatewayLane = tokio::sync::mpsc::Sender<GatewayJob>;
+
+const GATEWAY_SESSION_IDLE: Duration = Duration::from_secs(10 * 60);
+const MAX_GATEWAY_SESSIONS: usize = 64;
+
+#[derive(Clone)]
+struct GatewaySession {
+    account_id: Vec<u8>,
+    name: gateway::RouteName,
+    revision: u64,
+    last_used: Instant,
+}
+
+#[derive(Clone)]
+struct BrowserGateway {
+    listen: SocketAddr,
+    sessions: Arc<tokio::sync::Mutex<HashMap<String, GatewaySession>>>,
+}
+
 /// the router's shared state: a command lane into the node actor, the
-/// block-event fan-out for websocket subscribers, the shutdown signal, and the
+/// stream hub for websocket subscribers, the shutdown signal, and the
 /// node-local blob store the files module shares.
 #[derive(Clone)]
 pub struct NodeHandle {
     cmds: mpsc::Sender<NodeCommand>,
-    events: broadcast::Sender<WsFrame>,
+    hub: StreamHub,
     shutdown: std::sync::Arc<tokio::sync::Notify>,
     /// the files blob lane. NOT a command into the actor: chunk bytes stay
     /// node-local by design (never consensus state, never an op), so the http
     /// handlers read/write this store directly.
-    blobs: files::BlobHandle,
+    blobs: crate::blobs::BlobHandle,
     /// the forge module's on-disk repo base dir (`<storage>/<forge subdir>`);
     /// each named repo lives at `<forge_repo>/<name>` as a real libgit2 repo.
     /// threaded in so the git upload-pack (clone/fetch) handler can open a repo
@@ -551,30 +626,58 @@ pub struct NodeHandle {
     /// the call hub's session-request lane. `None` on daemons without a mesh
     /// (the embedded daemon, router tests) — `/v1/call/ws` answers 503 there.
     call: Option<CallLane>,
+    /// Purpose-specific gateway request lane. No raw peer, filesystem, or
+    /// arbitrary socket proxy is exposed through the client surface.
+    gateway: Option<GatewayLane>,
+    /// Dedicated least-privilege browser origin for gateway rendering. It is
+    /// a separate loopback listener, never the node API origin.
+    browser_gateway: Option<BrowserGateway>,
+    /// the root dir the duckfs workspace RPC materializes managed checkouts
+    /// under (`<storage>/duckfs-workspaces`). node-local disk state, threaded in
+    /// like `forge_repo`; `None` on a handle that never serves the seam (the
+    /// router tests' fake handle), which makes `/v1/fs/workspaces` a clean 503.
+    duckfs_workspaces: Option<PathBuf>,
 }
 
 impl NodeHandle {
     /// build the handle plus the actor-side ends: the command receiver the
-    /// actor drains and the event sender it publishes finalized blocks on.
+    /// actor drains and the stream hub it publishes finalized blocks on.
     /// the blob store is born here — BEFORE genesis — so the embedding daemon
-    /// can register its files module over [`Self::blob_handle`].
-    pub fn channel() -> (
-        Self,
-        mpsc::Receiver<NodeCommand>,
-        broadcast::Sender<WsFrame>,
-    ) {
+    /// can hand [`Self::blob_handle`] clones to forge and its block loop.
+    pub fn channel() -> (Self, mpsc::Receiver<NodeCommand>, StreamHub) {
+        Self::channel_with_log_ring(LogRing::default())
+    }
+
+    /// same as [`Self::channel`], but uses a caller-created log ring so a
+    /// tracing layer can feed the same ring before the handle is fully wired.
+    pub fn channel_with_log_ring(logs: LogRing) -> (Self, mpsc::Receiver<NodeCommand>, StreamHub) {
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
-        let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
+        let hub = StreamHub::with_log_ring(EVENT_BUFFER, logs);
         let handle = Self {
             cmds: cmd_tx,
-            events: event_tx.clone(),
+            hub: hub.clone(),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
-            blobs: files::BlobHandle::default(),
+            blobs: crate::blobs::BlobHandle::default(),
             forge_repo: None,
             index: None,
             call: None,
+            gateway: None,
+            browser_gateway: None,
+            duckfs_workspaces: None,
         };
-        (handle, cmd_rx, event_tx)
+        (handle, cmd_rx, hub)
+    }
+
+    /// swap the blob store for a persistent one rooted at `root` (write-
+    /// through to `<root>/<sha256-hex>`, disk fallback on a memory miss) so
+    /// node-local blobs — an agent's registered prompt above all — survive a
+    /// daemon restart. still never consensus state, never in any root. must
+    /// run BEFORE any [`Self::blob_handle`] clone is handed out (the daemons
+    /// chain it right after [`Self::channel`]); an unusable root is a loud
+    /// startup error, not a silently-forgetful store.
+    pub fn with_blob_root(mut self, root: impl Into<PathBuf>) -> std::io::Result<Self> {
+        self.blobs = crate::blobs::BlobHandle::persistent(root)?;
+        Ok(self)
     }
 
     /// point this handle at the forge module's on-disk repo base dir so the git
@@ -602,11 +705,52 @@ impl NodeHandle {
         self
     }
 
-    /// the blob store this surface serves. the daemon constructs its files
-    /// module over a clone (`Files::with_blobs`) so http uploads land exactly
-    /// where the module's `serve_sync` reads.
-    pub fn blob_handle(&self) -> files::BlobHandle {
+    /// Point gateway requests at the full node's authenticated overlay
+    /// stream. `net.duck` remains a local network-content read.
+    pub fn with_gateway(mut self, lane: GatewayLane) -> Self {
+        self.gateway = Some(lane);
+        self
+    }
+
+    /// Enable gateway browsing on a separately bound loopback listener. The
+    /// caller binds first so port 0 becomes an actual session-returned port.
+    pub fn with_browser_gateway(mut self, listen: SocketAddr) -> Self {
+        self.browser_gateway = Some(BrowserGateway {
+            listen,
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        });
+        self
+    }
+
+    /// point this handle at the root dir the duckfs workspace RPC manages
+    /// checkouts under. the daemon passes `<storage>/duckfs-workspaces`; an
+    /// unset root makes `/v1/fs/workspaces` answer 503.
+    pub fn with_duckfs_workspaces(mut self, root: impl Into<PathBuf>) -> Self {
+        self.duckfs_workspaces = Some(root.into());
+        self
+    }
+
+    /// the blob store this surface serves. the daemon hands clones to forge
+    /// (push packfiles) and its block loop (op receipts) so http uploads land
+    /// exactly where those consumers read.
+    pub fn blob_handle(&self) -> crate::blobs::BlobHandle {
         self.blobs.clone()
+    }
+
+    /// a clone of the command lane's sender, for embedder-side producers
+    /// that inject commands exactly as the http layer does — the oracle
+    /// pool's completed provider runs re-enter as `Submit` commands here.
+    pub fn command_sender(&self) -> mpsc::Sender<NodeCommand> {
+        self.cmds.clone()
+    }
+
+    /// the multiplexed stream hub backing `/v1/ws`.
+    pub fn stream_hub(&self) -> StreamHub {
+        self.hub.clone()
+    }
+
+    pub(crate) fn stream_index(&self) -> Option<Arc<indexer::IndexStore>> {
+        self.index.clone()
     }
 
     /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
@@ -666,14 +810,57 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/ws", get(ws))
         .route("/v1/call/ws", get(call_ws))
         .route(
-            "/v1/files/blob",
-            // one chunk per request, so the body cap IS the chunk cap. the
-            // json routes keep axum's (smaller) default limit.
-            post(put_blob).layer(DefaultBodyLimit::max(
-                files::MAX_CHUNK_SIZE as usize,
+            "/v1/gateway/proxy",
+            post(gateway_proxy).layer(DefaultBodyLimit::max(
+                gateway::MAX_REQUEST_BODY_BYTES as usize * 2 + gateway::MAX_PROXY_HEAD_BYTES,
             )),
         )
+        .route("/v1/gateway/session", post(gateway_session))
+        .route(
+            "/v1/files/blob",
+            // one receipt per request; the json routes keep axum's (smaller)
+            // default limit.
+            post(put_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BODY_BYTES)),
+        )
         .route("/v1/files/blob/{digest}", get(get_blob))
+        // ---- duckfs product surface ----
+        // thin convenience wrappers over the files module's ops/queries: each
+        // encodes the duckfs wire server-side and threads it through the SAME
+        // submit/query actor seam /v1/submit and /v1/query use — no new
+        // consensus path. distinct plane from the op-receipt /v1/files/blob lane
+        // above (the node-local blobstore), which these never touch.
+        .route(
+            "/v1/files/stage",
+            // one duckfs chunk per request, so the body cap IS the single-chunk
+            // cap (CHUNK_SIZE, the module's own putblob ceiling); a larger body
+            // could never be a valid staged chunk, so the layer rejects it 413.
+            post(files_stage).layer(DefaultBodyLimit::max(CHUNK_SIZE as usize)),
+        )
+        .route("/v1/files/commit", post(files_commit))
+        .route("/v1/files/pin", post(files_pin))
+        .route("/v1/files/watch", post(files_watch))
+        .route("/v1/files/stat", get(files_stat))
+        .route("/v1/files/ls", get(files_ls))
+        .route("/v1/files/read", get(files_read))
+        .route("/v1/files/find", get(files_find))
+        .route("/v1/files/grep", get(files_grep))
+        .route("/v1/files/history", get(files_history))
+        // the read/probe surface the checkout/commit engine drives.
+        .route("/v1/files/refs", get(files_refs))
+        .route("/v1/files/diff", get(files_diff))
+        .route("/v1/files/has-chunks", get(files_has_chunks))
+        // ---- duckfs workspace RPC (the jobs/sandbox seam) ----
+        // managed checkouts under the injected root: create, commit (409 on a
+        // structured conflict), delete. `None` root → 503.
+        .route("/v1/fs/workspaces", post(workspaces::create_workspace))
+        .route(
+            "/v1/fs/workspaces/{id}/commit",
+            post(workspaces::commit_workspace),
+        )
+        .route(
+            "/v1/fs/workspaces/{id}",
+            delete(workspaces::delete_workspace),
+        )
         .route("/forge/{repo}/info/refs", get(git_info_refs))
         // git smart-HTTP: forge is a full push+fetch remote over one route pair.
         //   `git push  http://<node>/forge/<repo> main` — receive-pack (push)
@@ -696,6 +883,459 @@ pub fn router(handle: NodeHandle) -> Router {
 
 /// the fallback submitter identity when a client sends no `origin`.
 pub const DEFAULT_ORIGIN: &str = "noded";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GatewayProxyRequest {
+    pub head: gateway::ProxyRequestHead,
+    pub body_b64: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayProxyReply {
+    pub head: gateway::ProxyResponseHead,
+    pub body_b64: String,
+}
+
+/// The node surface predates gateway and intentionally has permissive CORS for
+/// the web console. Gateway is a network pivot, so its two API entries add a
+/// narrower browser boundary: native clients omit Origin, while only the
+/// bundled Tauri console origins may call from a WebView. Publisher sessions
+/// and arbitrary websites fail before route resolution or overlay work.
+fn gateway_api_origin_allowed(headers: &HeaderMap) -> bool {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let first = origins.next();
+    if origins.next().is_some() {
+        return false;
+    }
+    match first {
+        Some(value) => {
+            let Ok(origin) = value.to_str() else {
+                return false;
+            };
+            matches!(
+                origin,
+                "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+            ) || (cfg!(debug_assertions) && origin == "http://localhost:1430")
+        }
+        // A real native client has neither header. Browser requests without an
+        // Origin still carry Fetch Metadata, so do not let that omission turn
+        // into a bypass (for example from a sandboxed publisher document).
+        None => !headers.contains_key("sec-fetch-site"),
+    }
+}
+
+fn gateway_api_origin_guard(headers: &HeaderMap) -> Option<Response> {
+    (!gateway_api_origin_allowed(headers)).then(|| {
+        error_response(
+            StatusCode::FORBIDDEN,
+            "gateway API is limited to the trusted Ducktape console and native clients",
+        )
+    })
+}
+
+async fn current_route(
+    handle: &NodeHandle,
+    account_id: &[u8],
+    name: &gateway::RouteName,
+) -> Result<gateway::RouteRecord, GatewayFailure> {
+    gateway::validate_account_id(account_id).map_err(GatewayFailure::Invalid)?;
+    name.validate().map_err(GatewayFailure::Invalid)?;
+    let (reply, rx) = oneshot::channel();
+    let mut commands = handle.cmds.clone();
+    commands
+        .send(NodeCommand::Query {
+            target: "gateway".into(),
+            req: gateway::encode_query(&gateway::GatewayQuery::Get {
+                account_id: account_id.to_vec(),
+                name: name.clone(),
+            }),
+            reply,
+        })
+        .await
+        .map_err(|_| GatewayFailure::Unavailable("node actor is gone".into()))?;
+    let bytes = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .map_err(|_| GatewayFailure::Unavailable("gateway route query timed out".into()))?
+        .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
+        .map_err(GatewayFailure::Unavailable)?;
+    match gateway::decode_reply(&bytes) {
+        Ok(gateway::GatewayReply::Route(route)) => match *route {
+            Some(record) if record.statement.route.is_some() => Ok(record),
+            _ => Err(GatewayFailure::NotFound(
+                "gateway route is not published".into(),
+            )),
+        },
+        Ok(gateway::GatewayReply::Routes(_)) => Err(GatewayFailure::Unavailable(
+            "gateway returned an unexpected route-list reply".into(),
+        )),
+        Err(error) => Err(GatewayFailure::Unavailable(error)),
+    }
+}
+
+async fn proxy_current(
+    handle: &NodeHandle,
+    head: gateway::ProxyRequestHead,
+    body: Vec<u8>,
+) -> Result<GatewayResponse, GatewayFailure> {
+    gateway::validate_proxy_request_head(&head).map_err(GatewayFailure::Invalid)?;
+    if body.len() as u64 != head.body_len {
+        return Err(GatewayFailure::Invalid(
+            "gateway body length does not match its request head".into(),
+        ));
+    }
+    let record = current_route(handle, &head.account_id, &head.name).await?;
+    if record.statement.revision != head.revision {
+        return Err(GatewayFailure::Conflict(
+            "gateway route changed; resolve the name again".into(),
+        ));
+    }
+    if !gateway::request_matches_record(&head, &record) {
+        return Err(GatewayFailure::Forbidden(
+            "gateway request is outside the current signed policy".into(),
+        ));
+    }
+    let publisher_node: [u8; 32] = record
+        .statement
+        .publisher_node
+        .as_slice()
+        .try_into()
+        .map_err(|_| GatewayFailure::Unavailable("invalid publisher in route state".into()))?;
+    let max_response_bytes = record
+        .statement
+        .route
+        .as_ref()
+        .expect("current_route rejects tombstones")
+        .policy
+        .max_response_bytes;
+    let Some(lane) = handle.gateway.clone() else {
+        return Err(GatewayFailure::Unavailable(
+            "gateway request requires an active network overlay".into(),
+        ));
+    };
+    let (reply, rx) = oneshot::channel();
+    lane.send(GatewayJob {
+        publisher_node,
+        max_response_bytes,
+        head,
+        body,
+        reply,
+    })
+    .await
+    .map_err(|_| GatewayFailure::Unavailable("gateway plane is not available".into()))?;
+    let response = tokio::time::timeout(Duration::from_secs(15), rx)
+        .await
+        .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))?
+        .map_err(|_| GatewayFailure::Unavailable("gateway plane dropped the request".into()))??;
+    gateway::validate_response_head(&response.head).map_err(GatewayFailure::Unavailable)?;
+    if response.body.len() as u64 > max_response_bytes {
+        return Err(GatewayFailure::Unavailable(
+            "publisher exceeded the route response cap".into(),
+        ));
+    }
+    Ok(response)
+}
+
+async fn gateway_proxy(
+    State(handle): State<NodeHandle>,
+    headers: HeaderMap,
+    Json(request): Json<GatewayProxyRequest>,
+) -> Response {
+    use base64::Engine as _;
+    if let Some(response) = gateway_api_origin_guard(&headers) {
+        return response;
+    }
+    let body = match base64::engine::general_purpose::STANDARD.decode(request.body_b64) {
+        Ok(body) => body,
+        Err(error) => {
+            return error_response(StatusCode::BAD_REQUEST, &format!("body_b64: {error}"));
+        }
+    };
+    match proxy_current(&handle, request.head, body).await {
+        Ok(response) => Json(GatewayProxyReply {
+            head: response.head,
+            body_b64: base64::engine::general_purpose::STANDARD.encode(response.body),
+        })
+        .into_response(),
+        Err(failure) => gateway_failure_response(failure),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GatewaySessionRequest {
+    pub account_id: Vec<u8>,
+    pub name: gateway::RouteName,
+    pub revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GatewaySessionReply {
+    url: String,
+}
+
+async fn gateway_session(
+    State(handle): State<NodeHandle>,
+    headers: HeaderMap,
+    Json(request): Json<GatewaySessionRequest>,
+) -> Response {
+    if let Some(response) = gateway_api_origin_guard(&headers) {
+        return response;
+    }
+    let Some(gateway) = handle.browser_gateway.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway browser gateway is not configured",
+        );
+    };
+    if handle.gateway.is_none() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway browsing requires an active network overlay",
+        );
+    }
+    let record = match current_route(&handle, &request.account_id, &request.name).await {
+        Ok(record) => record,
+        Err(failure) => return gateway_failure_response(failure),
+    };
+    if record.statement.revision != request.revision {
+        return error_response(
+            StatusCode::CONFLICT,
+            "gateway route changed; resolve the name again",
+        );
+    }
+
+    let now = Instant::now();
+    let mut sessions = gateway.sessions.lock().await;
+    sessions.retain(|_, session| now.duration_since(session.last_used) < GATEWAY_SESSION_IDLE);
+    if sessions.len() >= MAX_GATEWAY_SESSIONS
+        && let Some(oldest) = sessions
+            .iter()
+            .min_by_key(|(_, session)| session.last_used)
+            .map(|(token, _)| token.clone())
+    {
+        sessions.remove(&oldest);
+    }
+    let token = loop {
+        let mut random = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut random);
+        let candidate = hex_bytes(&random);
+        if !sessions.contains_key(&candidate) {
+            break candidate;
+        }
+    };
+    sessions.insert(
+        token.clone(),
+        GatewaySession {
+            account_id: request.account_id,
+            name: request.name,
+            revision: request.revision,
+            last_used: now,
+        },
+    );
+    Json(GatewaySessionReply {
+        url: format!("http://{token}.localhost:{}/", gateway.listen.port()),
+    })
+    .into_response()
+}
+
+/// Dedicated gateway-rendering router: no node API, no permissive CORS, and
+/// no route that can address another `.duck` route with ambient user power.
+pub fn gateway_browser_router(handle: NodeHandle) -> Router {
+    Router::new()
+        .fallback(gateway_browser_proxy)
+        .layer(DefaultBodyLimit::max(
+            gateway::MAX_REQUEST_BODY_BYTES as usize,
+        ))
+        .with_state(handle)
+}
+
+fn gateway_method(method: &Method) -> Option<gateway::RouteMethod> {
+    match *method {
+        Method::GET => Some(gateway::RouteMethod::Get),
+        Method::HEAD => Some(gateway::RouteMethod::Head),
+        Method::POST => Some(gateway::RouteMethod::Post),
+        Method::PUT => Some(gateway::RouteMethod::Put),
+        Method::PATCH => Some(gateway::RouteMethod::Patch),
+        Method::DELETE => Some(gateway::RouteMethod::Delete),
+        _ => None,
+    }
+}
+
+fn gateway_request_headers(headers: &HeaderMap) -> Result<Vec<gateway::ProxyHeader>, String> {
+    if headers.contains_key(header::COOKIE) {
+        return Err("gateway browser never accepts ambient Cookie credentials".into());
+    }
+    let mut forwarded = Vec::new();
+    for name in gateway::ALLOWED_REQUEST_HEADERS {
+        let values = headers.get_all(*name);
+        let mut values = values.iter();
+        let Some(value) = values.next() else {
+            continue;
+        };
+        if values.next().is_some() {
+            return Err(format!("gateway browser rejects duplicate {name} headers"));
+        }
+        forwarded.push(gateway::ProxyHeader {
+            name: (*name).to_string(),
+            value: value
+                .to_str()
+                .map_err(|_| format!("gateway browser received non-ASCII {name}"))?
+                .to_string(),
+        });
+    }
+    gateway::validate_headers(&forwarded, gateway::ALLOWED_REQUEST_HEADERS, "request")?;
+    Ok(forwarded)
+}
+
+async fn gateway_browser_proxy(
+    State(handle): State<NodeHandle>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(gateway) = handle.browser_gateway.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway browser is disabled",
+        );
+    };
+    let Some(method) = gateway_method(&method) else {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, "GET, HEAD, POST, PUT, PATCH, DELETE")],
+            "method is not part of the gateway protocol",
+        )
+            .into_response();
+    };
+    let expected_suffix = format!(".localhost:{}", gateway.listen.port());
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return error_response(
+            StatusCode::MISDIRECTED_REQUEST,
+            "invalid gateway session origin",
+        );
+    };
+    let Some(token) = host.strip_suffix(&expected_suffix).filter(|token| {
+        token.len() == 32
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) else {
+        return error_response(
+            StatusCode::MISDIRECTED_REQUEST,
+            "invalid gateway session origin",
+        );
+    };
+    let session_origin = format!("http://{host}");
+    if headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|origin| origin != session_origin)
+    {
+        return error_response(StatusCode::FORBIDDEN, "cross-origin gateway call denied");
+    }
+    if headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|site| site != "same-origin" && site != "none")
+    {
+        return error_response(StatusCode::FORBIDDEN, "cross-site gateway call denied");
+    }
+    let now = Instant::now();
+    let session = {
+        let mut sessions = gateway.sessions.lock().await;
+        sessions.retain(|_, session| now.duration_since(session.last_used) < GATEWAY_SESSION_IDLE);
+        let Some(session) = sessions.get_mut(token) else {
+            return error_response(StatusCode::GONE, "gateway session expired");
+        };
+        session.last_used = now;
+        session.clone()
+    };
+    let forwarded = match gateway_request_headers(&headers) {
+        Ok(headers) => headers,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+    };
+    let head = gateway::ProxyRequestHead {
+        account_id: session.account_id,
+        name: session.name,
+        revision: session.revision,
+        method,
+        path_and_query: uri
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/")
+            .to_string(),
+        headers: forwarded,
+        body_len: body.len() as u64,
+    };
+    let response = match proxy_current(&handle, head, body.to_vec()).await {
+        Ok(response) => response,
+        Err(failure) => return gateway_failure_response(failure),
+    };
+    let status = StatusCode::from_u16(response.head.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    if status.is_informational() || status == StatusCode::SWITCHING_PROTOCOLS {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "publisher returned an invalid status",
+        );
+    }
+    let content_security_policy = format!(
+        "default-src 'none'; script-src 'unsafe-inline' {session_origin}; style-src 'unsafe-inline' {session_origin}; img-src {session_origin} data: blob:; connect-src {session_origin}; font-src {session_origin} data:; media-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'; object-src 'none'; form-action {session_origin}; base-uri 'none'; frame-ancestors 'none'; sandbox allow-scripts allow-same-origin allow-forms; webrtc 'block'"
+    );
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .header("x-dns-prefetch-control", "off")
+        .header("referrer-policy", "no-referrer")
+        .header("cross-origin-resource-policy", "same-origin")
+        .header("cross-origin-opener-policy", "same-origin")
+        .header("origin-agent-cluster", "?1")
+        .header("access-control-allow-origin", &session_origin)
+        .header(header::VARY, "Origin")
+        .header(
+            "permissions-policy",
+            "accelerometer=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), idle-detection=(), local-fonts=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), storage-access=(), usb=(), window-management=()",
+        )
+        .header(header::CONTENT_SECURITY_POLICY, content_security_policy);
+    builder = builder.header(
+        header::CONTENT_TYPE,
+        gateway::header_value(&response.head.headers, "content-type")
+            .unwrap_or("application/octet-stream"),
+    );
+    for name in ["etag", "last-modified", "location", "retry-after"] {
+        if let Some(value) = gateway::header_value(&response.head.headers, name) {
+            builder = builder.header(name, value);
+        }
+    }
+    let body = if method == gateway::RouteMethod::Head
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+    {
+        Body::empty()
+    } else {
+        Body::from(response.body)
+    };
+    builder
+        .body(body)
+        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "invalid publisher response"))
+}
+
+fn gateway_failure_response(failure: GatewayFailure) -> Response {
+    match failure {
+        GatewayFailure::Invalid(detail) => error_response(StatusCode::BAD_REQUEST, &detail),
+        GatewayFailure::Forbidden(detail) => error_response(StatusCode::FORBIDDEN, &detail),
+        GatewayFailure::NotFound(detail) => error_response(StatusCode::NOT_FOUND, &detail),
+        GatewayFailure::Conflict(detail) => error_response(StatusCode::CONFLICT, &detail),
+        GatewayFailure::Unavailable(detail) => error_response(StatusCode::BAD_GATEWAY, &detail),
+    }
+}
 
 async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>) -> Response {
     let payload = serde_json::to_vec(&req.payload).expect("a decoded json value re-serializes");
@@ -952,20 +1592,17 @@ struct IndexOpsResponse {
     next_after: Option<String>,
 }
 
-fn index_store(handle: &NodeHandle) -> Result<&Arc<indexer::IndexStore>, Response> {
-    handle.index.as_ref().ok_or_else(|| {
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no index store configured",
-        )
-    })
+fn index_store(handle: &NodeHandle) -> Option<&Arc<indexer::IndexStore>> {
+    handle.index.as_ref()
+}
+
+fn no_index_store_response() -> Response {
+    error_response(StatusCode::SERVICE_UNAVAILABLE, "no index store configured")
 }
 
 fn index_error(err: indexer::Error) -> Response {
     let status = match err {
-        indexer::Error::UnknownModule(_) | indexer::Error::ViewUnsupported => {
-            StatusCode::NOT_FOUND
-        }
+        indexer::Error::UnknownModule(_) | indexer::Error::ViewUnsupported => StatusCode::NOT_FOUND,
         indexer::Error::View(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -979,9 +1616,8 @@ fn index_error(err: indexer::Error) -> Response {
 /// was never folded from ops (heights are boundary-stamped, the op log
 /// starts above it) — the gap stays visible instead of papered over.
 async fn index_status(State(handle): State<NodeHandle>) -> Response {
-    let store = match index_store(&handle) {
-        Ok(store) => store,
-        Err(resp) => return resp,
+    let Some(store) = index_store(&handle) else {
+        return no_index_store_response();
     };
     let mut modules = serde_json::Map::new();
     let mut backfilled = serde_json::Map::new();
@@ -1016,9 +1652,8 @@ async fn index_ops(
     Path(module): Path<String>,
     Query(params): Query<IndexScanParams>,
 ) -> Response {
-    let store = match index_store(&handle) {
-        Ok(store) => store,
-        Err(resp) => return resp,
+    let Some(store) = index_store(&handle) else {
+        return no_index_store_response();
     };
     let page = match store.scan(
         &module,
@@ -1061,18 +1696,14 @@ async fn index_view(
     Path(module): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> Response {
-    let store = match index_store(&handle) {
-        Ok(store) => store,
-        Err(resp) => return resp,
+    let Some(store) = index_store(&handle) else {
+        return no_index_store_response();
     };
     let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
     match store.view(&module, &req_bytes) {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(value) => Json(value).into_response(),
-            Err(_) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "view reply was not json",
-            ),
+            Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "view reply was not json"),
         },
         Err(err) => index_error(err),
     }
@@ -1086,9 +1717,8 @@ async fn index_scan(
     Path(module): Path<String>,
     Query(params): Query<IndexScanParams>,
 ) -> Response {
-    let store = match index_store(&handle) {
-        Ok(store) => store,
-        Err(resp) => return resp,
+    let Some(store) = index_store(&handle) else {
+        return no_index_store_response();
     };
     let prefix = params.prefix.unwrap_or_default();
     let page = match store.scan(
@@ -1104,8 +1734,7 @@ async fn index_scan(
         .entries
         .iter()
         .map(|(key, value)| {
-            let json: Option<Box<serde_json::value::RawValue>> =
-                serde_json::from_slice(value).ok();
+            let json: Option<Box<serde_json::value::RawValue>> = serde_json::from_slice(value).ok();
             IndexEntry {
                 key: String::from_utf8_lossy(key).into_owned(),
                 value_hex: json.is_none().then(|| hex_bytes(value)),
@@ -1137,10 +1766,7 @@ pub struct BlocksParams {
 /// history survives a restart. heartbeat nops never get a row, so an empty
 /// reply means no real ops have finalized, not an idle chain. a handle with
 /// no index store configured serves the same "no blocks yet" shape.
-async fn blocks(
-    State(handle): State<NodeHandle>,
-    Query(params): Query<BlocksParams>,
-) -> Response {
+async fn blocks(State(handle): State<NodeHandle>, Query(params): Query<BlocksParams>) -> Response {
     let Some(store) = handle.index.as_ref() else {
         return Json(serde_json::json!({ "blocks": [] })).into_response();
     };
@@ -1193,13 +1819,15 @@ async fn shutdown(State(handle): State<NodeHandle>) -> Response {
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 
-/// POST /v1/files/blob — raw chunk bytes in, `{"digest":"<64-hex>"}` out.
+/// body cap for the op-receipt blob lane. a receipt-lane bound only —
+/// unrelated to duckfs chunking, which rides the op stream.
+const MAX_BLOB_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// POST /v1/files/blob — raw receipt bytes in, `{"digest":"<64-hex>"}` out.
 ///
 /// bytes go straight into the node-local blob store; NOTHING reaches the node
-/// actor and no op is submitted — committing a manifest that references the
-/// digest is a separate, explicit `/v1/submit`. the route's body limit is
-/// `MAX_CHUNK_SIZE` (a bigger chunk could never be referenced by a valid
-/// manifest anyway), and an oversized body is a 413 in the daemon's json
+/// actor and no op is submitted. the route's body limit is
+/// `MAX_BLOB_BODY_BYTES`, and an oversized body is a 413 in the daemon's json
 /// error envelope.
 async fn put_blob(
     State(handle): State<NodeHandle>,
@@ -1219,7 +1847,7 @@ async fn put_blob(
 /// a malformed digest (anything but 64 lowercase hex chars) is a 400; a
 /// well-formed digest this node holds no bytes for is a 404.
 async fn get_blob(State(handle): State<NodeHandle>, Path(digest): Path<String>) -> Response {
-    let Some(raw) = files::from_hex_32(&digest) else {
+    let Some(raw) = duckfs_core::from_hex_32(&digest) else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "digest must be 64 characters of lowercase hex",
@@ -1280,9 +1908,9 @@ const GIT_PACK_BODY_LIMIT: usize = 512 * 1024 * 1024;
 /// id, plus the 4-byte pkt length header, this yields a 65520-byte line — git's
 /// `LARGE_PACKET_MAX`, the ceiling a side-band-64k client accepts.
 const GIT_SIDE_BAND_CHUNK: usize = 65515;
-/// the only ref this MVP applies a push to; multi-branch is future work. both
-/// `git push <remote> main` and `git push <remote> HEAD:main` send this ref.
-const GIT_MAIN_REF: &str = "refs/heads/main";
+/// the ref namespace pushes may touch: any branch. a command outside
+/// `refs/heads/*` (tags, notes) is refused with a per-ref `ng`.
+const GIT_HEADS_PREFIX: &str = "refs/heads/";
 /// 40 ascii zeros: git's "null" oid — the old value of a ref being created, and
 /// the head advertised for an unborn repo.
 const GIT_ZERO_OID: &str = "0000000000000000000000000000000000000000";
@@ -1358,10 +1986,10 @@ fn norm_repo(repo: &str) -> Option<String> {
         .then(|| repo.to_string())
 }
 
-/// query the forge module for a repo's committed HEAD oid hex (`None` == unborn).
+/// query the forge module for a repo's committed branches (`[]` == unborn).
 /// errors surface as an http `Response` so callers can early-return them.
-async fn forge_head(handle: &NodeHandle, repo: &str) -> Result<Option<String>, Response> {
-    let req = forge::encode_query(&forge::ForgeQuery::HeadOf {
+async fn forge_refs(handle: &NodeHandle, repo: &str) -> Result<Vec<forge::RefHead>, Response> {
+    let req = forge::encode_query(&forge::ForgeQuery::ListRefs {
         repo: repo.to_string(),
     });
     let (reply, rx) = oneshot::channel();
@@ -1377,27 +2005,30 @@ async fn forge_head(handle: &NodeHandle, repo: &str) -> Result<Option<String>, R
         .map_err(|_| actor_gone())?
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, &err))?;
     match forge::decode_reply(&bytes) {
-        Ok(forge::ForgeReply::Head(head)) => Ok(head),
+        Ok(forge::ForgeReply::Refs(refs)) => Ok(refs),
         Ok(_) => Err(error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "unexpected forge reply to HeadOf",
+            "unexpected forge reply to ListRefs",
         )),
         Err(err) => Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, &err)),
     }
 }
 
-/// build a receive-pack `report-status` body: `unpack ok`, one ref status line,
-/// then a flush. `err` is `None` for success (`ok <ref>`) or `Some(reason)` for
-/// a rejection (`ng <ref> <reason>`). the pack is always received by the time we
-/// answer, so `unpack ok` is unconditional (we don't verify closure here).
-fn git_report_status(refname: &str, err: Option<&str>) -> Response {
+/// build a receive-pack `report-status` body: `unpack ok`, one status line per
+/// ref, then a flush. each entry is `(full refname, None == ok | Some(reason)
+/// == ng)`. forge's PushRefs is ATOMIC, so callers report one shared fate for
+/// every ref of a push. the pack is always received by the time we answer, so
+/// `unpack ok` is unconditional (we don't verify closure here).
+fn git_report_status(results: &[(String, Option<String>)]) -> Response {
     let mut body = Vec::new();
     body.extend_from_slice(&pkt_line(b"unpack ok\n"));
-    let status_line = match err {
-        None => format!("ok {refname}\n"),
-        Some(reason) => format!("ng {refname} {reason}\n"),
-    };
-    body.extend_from_slice(&pkt_line(status_line.as_bytes()));
+    for (refname, err) in results {
+        let status_line = match err {
+            None => format!("ok {refname}\n"),
+            Some(reason) => format!("ng {refname} {reason}\n"),
+        };
+        body.extend_from_slice(&pkt_line(status_line.as_bytes()));
+    }
     body.extend_from_slice(GIT_FLUSH_PKT);
     (
         StatusCode::OK,
@@ -1480,13 +2111,13 @@ async fn git_info_refs(
 /// build the smart-HTTP ref advertisement for `service`: the service banner, a
 /// flush, the ref line(s), then a flush. an unborn repo advertises the null oid
 /// against the magic `capabilities^{}` ref (so caps ride along with no real ref)
-/// — a clone then reports an empty repository. a born repo advertises its head
-/// against refs/heads/main with caps after a NUL; a fetch advertisement ALSO
-/// emits a `HEAD` line at the same oid so `git clone` resolves the branch to
-/// check out (git matches HEAD's oid to refs/heads/main).
+/// — a clone then reports an empty repository. a born repo advertises EVERY
+/// committed branch; a fetch advertisement leads with a `HEAD` line at main's
+/// oid so `git clone` resolves the default branch to check out. capabilities
+/// ride the first emitted line after a NUL, per the v0 protocol.
 async fn git_advertise_refs(handle: &NodeHandle, repo: &str, service: GitService) -> Response {
-    let head = match forge_head(handle, repo).await {
-        Ok(head) => head,
+    let refs = match forge_refs(handle, repo).await {
+        Ok(refs) => refs,
         Err(resp) => return resp,
     };
     let caps = service.caps();
@@ -1496,19 +2127,26 @@ async fn git_advertise_refs(handle: &NodeHandle, repo: &str, service: GitService
         format!("# service={}\n", service.name()).as_bytes(),
     ));
     body.extend_from_slice(GIT_FLUSH_PKT);
-    match head {
-        Some(oid) => {
-            body.extend_from_slice(&pkt_line(
-                format!("{oid} {GIT_MAIN_REF}\0{caps}\n").as_bytes(),
-            ));
-            if matches!(service, GitService::Upload) {
-                body.extend_from_slice(&pkt_line(format!("{oid} HEAD\n").as_bytes()));
-            }
+    if refs.is_empty() {
+        body.extend_from_slice(&pkt_line(
+            format!("{GIT_ZERO_OID} capabilities^{{}}\0{caps}\n").as_bytes(),
+        ));
+    } else {
+        let mut lines: Vec<String> = Vec::new();
+        if matches!(service, GitService::Upload)
+            && let Some(main) = refs.iter().find(|r| r.name == "main")
+        {
+            lines.push(format!("{} HEAD", main.head));
         }
-        None => {
-            body.extend_from_slice(&pkt_line(
-                format!("{GIT_ZERO_OID} capabilities^{{}}\0{caps}\n").as_bytes(),
-            ));
+        for r in &refs {
+            lines.push(format!("{} {GIT_HEADS_PREFIX}{}", r.head, r.name));
+        }
+        for (i, line) in lines.iter().enumerate() {
+            if i == 0 {
+                body.extend_from_slice(&pkt_line(format!("{line}\0{caps}\n").as_bytes()));
+            } else {
+                body.extend_from_slice(&pkt_line(format!("{line}\n").as_bytes()));
+            }
         }
     }
     body.extend_from_slice(GIT_FLUSH_PKT);
@@ -1544,8 +2182,9 @@ fn decode_git_body(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> 
 
 /// POST /forge/{repo}/git-receive-pack — receive a push: parse the ref-update
 /// command list + packfile, stash the whole pack in the node-local blob store,
-/// and CAS the repo head through forge's `Push` op (one submit == one block).
-/// the response is a git `report-status` reflecting whether the CAS committed.
+/// and CAS every branch through ONE atomic forge `PushRefs` op (one submit ==
+/// one block). branch deletions (`:feature`) ride the same op pack-free. the
+/// response is a git `report-status` reflecting the push's shared fate.
 async fn git_receive_pack(
     State(handle): State<NodeHandle>,
     Path(repo): Path<String>,
@@ -1575,7 +2214,7 @@ async fn git_receive_pack(
             );
         }
     };
-    let Some(first) = commands.first() else {
+    if commands.is_empty() {
         // a push whose pack exceeds git's `http.postBuffer` (1 MiB default) is
         // preceded by a flush-only PROBE POST (Content-Length: 4, body `0000`,
         // zero commands) before git streams the real chunked request. an empty
@@ -1585,55 +2224,89 @@ async fn git_receive_pack(
         return (
             StatusCode::OK,
             [
-                (header::CONTENT_TYPE, "application/x-git-receive-pack-result"),
+                (
+                    header::CONTENT_TYPE,
+                    "application/x-git-receive-pack-result",
+                ),
                 (header::CACHE_CONTROL, "no-cache"),
             ],
             GIT_FLUSH_PKT.to_vec(),
         )
             .into_response();
-    };
-
-    // the first command carries the ref update, with capabilities after a NUL.
-    // strip the caps (from the first NUL on) and any trailing newline.
-    let nul = first.iter().position(|&b| b == 0).unwrap_or(first.len());
-    let line = std::str::from_utf8(&first[..nul])
-        .map(str::trim_end)
-        .unwrap_or("");
-    let mut parts = line.split(' ');
-    let (Some(old), Some(new), Some(refname)) = (parts.next(), parts.next(), parts.next()) else {
-        return error_response(StatusCode::BAD_REQUEST, "malformed ref-update command");
-    };
-
-    if refname != GIT_MAIN_REF {
-        // consume-and-refuse: the pack was fully received; we just don't apply
-        // it. reporting `ng` (not an http error) lets git print a clean reason.
-        return git_report_status(refname, Some(&format!("only {GIT_MAIN_REF} is supported")));
     }
 
-    // old == the null oid means "create" (unborn -> prev_oid None); otherwise it
-    // is the 40-hex prev the forge CAS must match. new is always a real oid.
-    let prev_oid = if old == GIT_ZERO_OID {
-        None
+    // each command line is `<old> <new> <refname>`, with capabilities after a
+    // NUL on the FIRST line. parse every command — one push may update several
+    // branches, and forge applies them ATOMICALLY.
+    let mut cmds: Vec<(String, String, String)> = Vec::new();
+    for raw in &commands {
+        let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let line = std::str::from_utf8(&raw[..nul])
+            .map(str::trim_end)
+            .unwrap_or("");
+        let mut parts = line.split(' ');
+        let (Some(old), Some(new), Some(refname)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return error_response(StatusCode::BAD_REQUEST, "malformed ref-update command");
+        };
+        cmds.push((old.to_string(), new.to_string(), refname.to_string()));
+    }
+
+    // only branches are pushable (no tags/notes). consume-and-refuse: the pack
+    // was fully received; reporting `ng` (not an http error) lets git print a
+    // clean per-ref reason.
+    if cmds
+        .iter()
+        .any(|(_, _, r)| !r.starts_with(GIT_HEADS_PREFIX))
+    {
+        let results: Vec<(String, Option<String>)> = cmds
+            .into_iter()
+            .map(|(_, _, r)| (r, Some(format!("only {GIT_HEADS_PREFIX}* is supported"))))
+            .collect();
+        return git_report_status(&results);
+    }
+
+    // old/new == the null oid mean "create" (prev_oid None) / "delete" (new_oid
+    // None); otherwise 40-hex oids the forge per-branch CAS must match.
+    let mut updates = Vec::new();
+    for (old, new, refname) in &cmds {
+        let prev_oid = if old == GIT_ZERO_OID {
+            None
+        } else {
+            match hex_to_bytes(old).filter(|b| b.len() == GIT_OID_RAW_LEN) {
+                Some(bytes) => Some(bytes),
+                None => return error_response(StatusCode::BAD_REQUEST, "malformed old oid"),
+            }
+        };
+        let new_oid = if new == GIT_ZERO_OID {
+            None
+        } else {
+            match hex_to_bytes(new).filter(|b| b.len() == GIT_OID_RAW_LEN) {
+                Some(bytes) => Some(bytes),
+                None => return error_response(StatusCode::BAD_REQUEST, "malformed new oid"),
+            }
+        };
+        updates.push(forge::RefUpdate {
+            ref_name: refname[GIT_HEADS_PREFIX.len()..].to_string(),
+            prev_oid,
+            new_oid,
+        });
+    }
+
+    // stash the WHOLE packfile as one node-local blob, keyed by its sha256;
+    // forge materializes it by this digest (the bytes never cross consensus).
+    // a delete-only push carries no objects, so nothing is stashed.
+    let pack_digest = if updates.iter().any(|u| u.new_oid.is_some()) {
+        Some(handle.blobs.put_chunk(pack.to_vec()).to_vec())
     } else {
-        match hex_to_bytes(old).filter(|b| b.len() == GIT_OID_RAW_LEN) {
-            Some(bytes) => Some(bytes),
-            None => return error_response(StatusCode::BAD_REQUEST, "malformed old oid"),
-        }
-    };
-    let Some(new_oid) = hex_to_bytes(new).filter(|b| b.len() == GIT_OID_RAW_LEN) else {
-        return error_response(StatusCode::BAD_REQUEST, "malformed new oid");
+        None
     };
 
-    // stash the WHOLE packfile as one node-local blob, keyed by its sha256; forge
-    // materializes it by this digest. the bytes never cross consensus.
-    let pack_digest = handle.blobs.put_chunk(pack.to_vec());
-
-    // CAS the head through a forge Push op and await the block result.
-    let payload = forge::encode_msg(&forge::ForgeMsg::Push {
+    // CAS every branch through ONE atomic PushRefs op and await the block.
+    let payload = forge::encode_msg(&forge::ForgeMsg::PushRefs {
         repo,
-        prev_oid,
-        new_oid,
-        pack_digest: pack_digest.to_vec(),
+        updates,
+        pack_digest,
     });
     let (reply, rx) = oneshot::channel();
     if let Err(resp) = handle
@@ -1647,18 +2320,28 @@ async fn git_receive_pack(
     {
         return resp;
     }
+    let refnames: Vec<String> = cmds.into_iter().map(|(_, _, r)| r).collect();
     match rx.await {
-        Ok(Ok(_block)) => git_report_status(GIT_MAIN_REF, None),
+        Ok(Ok(_block)) => {
+            let results: Vec<(String, Option<String>)> =
+                refnames.into_iter().map(|r| (r, None)).collect();
+            git_report_status(&results)
+        }
         Ok(Err(reason)) => {
             // a CAS mismatch's rejection carries "non-fast-forward" — surface
             // exactly that token so git prints its standard "fetch first" hint.
-            // any other rejection passes through as a single-line reason.
+            // any other rejection passes through as a single-line reason. the
+            // op is atomic, so every ref shares the fate.
             let reason = if reason.contains("non-fast-forward") {
                 "non-fast-forward".to_string()
             } else {
                 reason.replace('\n', " ")
             };
-            git_report_status(GIT_MAIN_REF, Some(&reason))
+            let results: Vec<(String, Option<String>)> = refnames
+                .into_iter()
+                .map(|r| (r, Some(reason.clone())))
+                .collect();
+            git_report_status(&results)
         }
         Err(_) => actor_gone(),
     }
@@ -1824,35 +2507,26 @@ pub async fn serve(listener: tokio::net::TcpListener, handle: NodeHandle) -> std
         .await
 }
 
-async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Response {
-    let frames = handle.events.subscribe();
-    upgrade.on_upgrade(move |socket| stream_frames(socket, frames))
+/// Serve only isolated gateway-rendering traffic on the pre-bound loopback
+/// listener. The router contains no node API.
+pub async fn serve_browser_gateway(
+    listener: tokio::net::TcpListener,
+    handle: NodeHandle,
+) -> std::io::Result<()> {
+    let shutdown = handle.clone();
+    axum::serve(listener, gateway_browser_router(handle))
+        .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
+        .await
 }
 
-async fn stream_frames(mut socket: WebSocket, mut frames: broadcast::Receiver<WsFrame>) {
-    loop {
-        match frames.recv().await {
-            Ok(frame) => {
-                let text = serde_json::to_string(&frame).expect("ws frame serializes");
-                if socket.send(Message::Text(text.into())).await.is_err() {
-                    return; // client hung up
-                }
-            }
-            // this subscriber fell behind the buffer; skip ahead — clients
-            // re-query on every block anyway, missing one is harmless.
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => return,
-        }
-    }
+async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| stream::stream_session(socket, handle))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CallParams {
     channel: String,
 }
-
-/// one pcm sample is an i16 — two wire bytes, little endian.
-const PCM_FRAME_BYTES: usize = chat::voice::FRAME_SAMPLES * 2;
 
 async fn call_ws(
     State(handle): State<NodeHandle>,
@@ -1872,18 +2546,15 @@ async fn call_ws(
 }
 
 /// pump one huddle's audio, camera video, and call control between the webview
-/// websocket and the hub session. binary client frames are tag-dispatched:
-/// `0x01` audio → `pcm_in`, `0x02` captured video → `video_in`; the hub's
-/// `mixed_out`/`video_out`/`control_out` ends flow back as tagged binary + json
-/// text. text client frames steer fan-out and carry beacons/keyframe asks.
-/// either side closing ends the session — dropping the ends is the teardown
-/// signal the hub watches.
+/// websocket and the hub session. binary client frames are decoded via
+/// `chat::call_wire` and tag-dispatched: audio → `pcm_in`, captured video →
+/// `video_in`; the hub's `mixed_out`/`video_out`/`control_out` ends flow back
+/// as `chat::call_wire`-encoded binary + json text. text client frames steer
+/// fan-out and carry beacons/keyframe asks. either side closing ends the
+/// session — dropping the ends is the teardown signal the hub watches.
 async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String) {
     let (reply, opened) = tokio::sync::oneshot::channel();
-    let request = CallSessionRequest {
-        channel_id,
-        reply,
-    };
+    let request = CallSessionRequest { channel_id, reply };
     // every refusal path says WHY as a text frame before closing — the client
     // surfaces it as a session error instead of a silent no-op.
     const NO_HUB: &str = "calls are not available on this node (no live call hub)";
@@ -1919,44 +2590,37 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
     loop {
         tokio::select! {
             inbound = socket.recv() => match inbound {
-                Some(Ok(Message::Binary(bytes))) => match bytes.first() {
-                    Some(&WS_TAG_AUDIO) if bytes.len() == 1 + PCM_FRAME_BYTES => {
-                        let frame: Vec<i16> = bytes[1..]
-                            .chunks_exact(2)
-                            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
-                            .collect();
+                Some(Ok(Message::Binary(bytes))) => {
+                    if let Some(frame) = chat::call_wire::decode_audio(&bytes) {
                         // full lane = the hub is behind; late audio is dead
                         // audio, so drop the frame rather than backpressure.
                         let _ = pcm_in.try_send(frame);
-                    }
-                    Some(&WS_TAG_VIDEO_CAPTURED)
-                        if bytes.len() > WS_VIDEO_CAPTURED_HEADER =>
-                    {
-                        let _ = video_in.try_send(CapturedVideo {
-                            keyframe: bytes[1] & WS_FLAG_KEYFRAME != 0,
-                            ts_ms: u32::from_le_bytes(
-                                bytes[2..6].try_into().expect("4 bytes"),
-                            ),
-                            data: bytes[WS_VIDEO_CAPTURED_HEADER..].to_vec(),
-                        });
-                    }
-                    _ => {} // unknown/short frame — drop, stay alive
-                },
+                    } else if let Some(frame) = chat::call_wire::decode_captured(&bytes) {
+                        let _ = video_in.try_send(frame);
+                    } // unknown/short frame — drop, stay alive
+                }
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<CallClientControl>(&text) {
                         Ok(CallClientControl::Recipients { peers }) => {
                             let keys: Vec<[u8; 32]> = peers
                                 .iter()
-                                .filter_map(|hex| files::from_hex_32(hex))
+                                .filter_map(|hex| duckfs_core::from_hex_32(hex))
                                 .collect();
                             let _ = recipients.send(keys);
                         }
-                        Ok(CallClientControl::Beacon { muted, camera_on }) => {
-                            let _ = control_in
-                                .try_send(CallControlIn::Beacon { muted, camera_on });
+                        Ok(CallClientControl::Beacon {
+                            muted,
+                            camera_on,
+                            sharing,
+                        }) => {
+                            let _ = control_in.try_send(CallControlIn::Beacon {
+                                muted,
+                                camera_on,
+                                sharing,
+                            });
                         }
                         Ok(CallClientControl::KeyframeRequest { peer }) => {
-                            if let Some(key) = files::from_hex_32(&peer) {
+                            if let Some(key) = duckfs_core::from_hex_32(&peer) {
                                 let _ = control_in
                                     .try_send(CallControlIn::KeyframeRequest { peer: key });
                             }
@@ -1969,11 +2633,7 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
             },
             mixed = mixed_out.recv() => match mixed {
                 Some(frame) => {
-                    let mut bytes = Vec::with_capacity(1 + frame.len() * 2);
-                    bytes.push(WS_TAG_AUDIO);
-                    for sample in frame {
-                        bytes.extend_from_slice(&sample.to_le_bytes());
-                    }
+                    let bytes = chat::call_wire::encode_audio(&frame);
                     if socket.send(Message::Binary(bytes.into())).await.is_err() {
                         break;
                     }
@@ -1982,13 +2642,7 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
             },
             video = video_out.recv() => match video {
                 Some(frame) => {
-                    let mut bytes =
-                        Vec::with_capacity(WS_VIDEO_PEER_HEADER + frame.data.len());
-                    bytes.push(WS_TAG_VIDEO_PEER);
-                    bytes.push(if frame.keyframe { WS_FLAG_KEYFRAME } else { 0 });
-                    bytes.extend_from_slice(&frame.ts_ms.to_le_bytes());
-                    bytes.extend_from_slice(&frame.peer);
-                    bytes.extend_from_slice(&frame.data);
+                    let bytes = chat::call_wire::encode_peer(&frame);
                     if socket.send(Message::Binary(bytes.into())).await.is_err() {
                         break;
                     }
@@ -1999,11 +2653,12 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
                 Some(out) => {
                     let message = match out {
                         CallControlOut::KeyframeRequest => CallServerControl::KeyframeRequest,
-                        CallControlOut::PeerBeacon { peer, muted, camera_on } => {
+                        CallControlOut::PeerBeacon { peer, muted, camera_on, sharing } => {
                             CallServerControl::PeerBeacon {
                                 peer: hex_bytes(&peer),
                                 muted,
                                 camera_on,
+                                sharing,
                             }
                         }
                         CallControlOut::RateHint { max_kbps } => {
@@ -2021,7 +2676,6 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2034,23 +2688,36 @@ mod tests {
             height: 7,
             hash: String::new(),
             commit_hash: "aa".repeat(32),
-            proposer: "bb".repeat(32),
-            disposition: BlockDisposition::Applied,
-            target: "directory".into(),
-            operations: Vec::new(),
-            payload: "{}".into(),
-            op_hash: "ee".repeat(32),
+            ops: vec![
+                RootOp {
+                    proposer: "bb".repeat(32),
+                    disposition: BlockDisposition::Applied,
+                    target: "directory".into(),
+                    operations: Vec::new(),
+                    payload: "{}".into(),
+                    op_hash: "ee".repeat(32),
+                },
+                RootOp {
+                    proposer: "cc".repeat(32),
+                    disposition: BlockDisposition::Rejected,
+                    target: "chat".into(),
+                    operations: Vec::new(),
+                    payload: "{\"m\":1}".into(),
+                    op_hash: "ff".repeat(32),
+                },
+            ],
         };
         let row = block_row(&record);
         let back: BlockRecord = serde_json::from_slice(&row).expect("row is json");
         assert_eq!(back.height, 7);
         assert_eq!(back.hash, "", "frameless lanes keep an honest empty hash");
-        assert_eq!(back.proposer, "bb".repeat(32));
-        assert_eq!(back.op_hash, "ee".repeat(32));
+        assert_eq!(back.ops.len(), 2, "the block aggregated two member ops");
+        assert_eq!(back.ops[0].proposer, "bb".repeat(32));
+        assert_eq!(back.ops[1].op_hash, "ff".repeat(32));
         // the wire keys stay camelCase — the app reads these fields verbatim.
         let json: serde_json::Value = serde_json::from_slice(&row).unwrap();
         assert!(json.get("commitHash").is_some());
-        assert!(json.get("opHash").is_some());
+        assert!(json["ops"][0].get("opHash").is_some());
     }
 
     #[test]
@@ -2081,10 +2748,10 @@ mod tests {
         // and anything unknown, so the view never breaks on a new module.
         for id in [
             "files",
-            "memory",
             "saga",
-            "profiles",
             "identity",
+            "duckdns",
+            "gateway",
             "kv",
             "valset",
             "governance",

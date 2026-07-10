@@ -1,7 +1,7 @@
 // The front door (desktop): shown when there is no active workspace, or when
 // the user asks to add/switch one. Two paths — found a new network, or join one
 // from an invite blob — plus a list of existing workspaces to jump back into.
-// On submit the store mints identity + workspace and connects; a joiner then
+// On submit the store mints the node key + workspace and connects; a joiner
 // falls through to JoinProgress while its node parks.
 
 import { useState } from "react";
@@ -10,8 +10,18 @@ import { color, font, radius, shadow } from "../../theme/tokens";
 import { useDucktape } from "../../store/use-ducktape";
 import { LIVE_JOIN_SUPPORTED } from "../../../domain/workspace-client";
 import type { Workspace } from "../../../domain/workspace-client";
+import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { OnboardingChrome } from "./OnboardingChrome";
 
 type Mode = "create" | "join" | "remote";
+
+// An invite blob is 🦆 + base64url — whitespace is never part of it. Terminal
+// and chat copies hard-wrap the long blob, so a paste arrives with embedded
+// newlines/spaces (and chat apps sometimes inject zero-width characters, which
+// \s does not cover); strip them all so the field always holds the canonical
+// single-line blob.
+const sanitizeInviteBlob = (raw: string): string =>
+  raw.replace(/[\s\u200B-\u200D\u2060]+/g, "");
 
 const inputStyle: React.CSSProperties = {
   width: "100%",
@@ -74,6 +84,7 @@ export function OnboardingGate() {
   const [name, setName] = useState("");
   const [blob, setBlob] = useState("");
   const [url, setUrl] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<{ workspace: Workspace; force: boolean } | null>(null);
 
   const busy = state.onboardingBusy;
   // live join is enabled (LIVE_JOIN_SUPPORTED); joinGated is the kill-switch
@@ -95,28 +106,11 @@ export function OnboardingGate() {
   };
 
   const confirmDelete = (w: Workspace): void => {
-    const ok = window.confirm(
-      `Delete "${w.name}"?\n\n` +
-        `This stops its node and deletes the workspace locally — its ` +
-        `directory, identity key, and registry entry are removed. It is ` +
-        `refused while its node is still a current validator of a network ` +
-        `with other members (that would halt the network's quorum).`,
-    );
-    if (ok) actions.deleteWorkspace(w.id);
+    setPendingDelete({ workspace: w, force: false });
   };
 
   const confirmForceDelete = (w: Workspace): void => {
-    const ok = window.confirm(
-      `Force-delete "${w.name}"?\n\n` +
-        `Its node couldn't confirm it has left its validator set — usually ` +
-        `because it can't start or was never admitted. Forcing deletes the ` +
-        `workspace WITHOUT that confirmation: its directory, identity key, ` +
-        `and registry entry are removed for good.\n\n` +
-        `Only do this for a network you know is solo or defunct. If this ` +
-        `node is still a validator of a network with OTHER live members, ` +
-        `destroying its identity can PERMANENTLY halt that network.`,
-    );
-    if (ok) actions.deleteWorkspace(w.id, true);
+    setPendingDelete({ workspace: w, force: true });
   };
 
   const title =
@@ -127,25 +121,20 @@ export function OnboardingGate() {
         : "Connect to a remote node";
   const subtitle =
     mode === "create"
-      ? "Found a new network — you become its first member, with a fresh identity."
+      ? "Found a new network — your account becomes its first member; this device runs its first node."
       : mode === "join"
         ? joinGated
           ? "Joining an existing network is temporarily unavailable."
-          : "Paste an invite from a member to join their network with a new identity."
+          : "Paste an invite from a member — this device joins their network with a fresh node key, owned by your account."
         : "Enter the http address of a node running on another device. It stays running there — this app just connects to it.";
 
+  // The step rail appears only on a true first run: the same gate doubles as
+  // the workspace SWITCHER for anyone who already has a workspace or a live
+  // connection, where a "step 2 of 3" would lie.
+  const firstRun = state.workspaces.length === 0 && !state.workspace && !state.nodeUrl;
+
   return (
-    <div
-      style={{
-        flex: 1,
-        minHeight: 0,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        background: color.paper,
-        padding: 24,
-      }}
-    >
+    <OnboardingChrome step={firstRun ? 2 : null}>
       <div
         style={{
           width: 440,
@@ -196,7 +185,7 @@ export function OnboardingGate() {
             }}
           >
             Joining a running network is temporarily unavailable. Found a new
-            network to get started, and invite others from Settings.
+            network to get started, and invite others from the Members view.
           </div>
         ) : (
           <>
@@ -207,7 +196,6 @@ export function OnboardingGate() {
                   placeholder="http://192.168.1.50:8844"
                   onChange={(event) => setUrl(event.target.value)}
                   onKeyDown={(event) => event.key === "Enter" && submit()}
-                  autoComplete="off"
                   autoCapitalize="off"
                   spellCheck={false}
                   style={{ ...inputStyle, font: `500 11.5px ${font.mono}` }}
@@ -224,8 +212,8 @@ export function OnboardingGate() {
                   {mode === "join" && (
                     <textarea
                       value={blob}
-                      placeholder="Paste invite blob (ducktape:…)"
-                      onChange={(event) => setBlob(event.target.value)}
+                      placeholder="Paste invite blob (🦆…)"
+                      onChange={(event) => setBlob(sanitizeInviteBlob(event.target.value))}
                       rows={3}
                       style={{ ...inputStyle, resize: "vertical", font: `500 11px ${font.mono}` }}
                     />
@@ -341,6 +329,37 @@ export function OnboardingGate() {
           </button>
         )}
       </div>
-    </div>
+
+      {pendingDelete && (
+        <ConfirmDialog
+          title={
+            pendingDelete.force
+              ? `Force-delete ${pendingDelete.workspace.name}?`
+              : `Delete ${pendingDelete.workspace.name}?`
+          }
+          confirmLabel={pendingDelete.force ? "Force delete" : "Delete workspace"}
+          onCancel={() => setPendingDelete(null)}
+          onConfirm={() => {
+            actions.deleteWorkspace(pendingDelete.workspace.id, pendingDelete.force);
+            setPendingDelete(null);
+          }}
+        >
+          {pendingDelete.force ? (
+            <>
+              Its node could not confirm it has left its validator set. Forcing deletes
+              the workspace without that confirmation: its directory, node key,
+              and registry entry are removed for good. Only do this for a solo or
+              defunct network.
+            </>
+          ) : (
+            <>
+              This stops its node and deletes the workspace locally: directory,
+              node key, and registry entry. It is refused while its node is still
+              a current validator of a network with other members.
+            </>
+          )}
+        </ConfirmDialog>
+      )}
+    </OnboardingChrome>
   );
 }

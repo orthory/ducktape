@@ -7,7 +7,17 @@ import { describe, expect, it } from "vitest";
 import { keyBytes, keyHex } from "./chat-client";
 import type { HuddleMember } from "./chat-client";
 import { callSocketUrl } from "./transport";
-import { FRAME_SAMPLES, floatToPcm16, huddleRecipients, pcm16ToFloat, voiceErrorOf } from "./voice-session";
+import {
+  FRAME_SAMPLES,
+  SPEAKING_HOLD_MS,
+  SPEAKING_RMS,
+  floatToPcm16,
+  huddleRecipients,
+  nextSpeaking,
+  pcm16ToFloat,
+  rms,
+  voiceErrorOf,
+} from "./voice-session";
 
 describe("pcm conversion", () => {
   it("round-trips Float32 → Int16 → Float32 within one quantization step", () => {
@@ -28,6 +38,42 @@ describe("pcm conversion", () => {
     const pcm = floatToPcm16(new Float32Array(FRAME_SAMPLES));
     expect(pcm.length).toBe(960);
     expect(pcm.buffer.byteLength).toBe(1920);
+  });
+});
+
+describe("rms", () => {
+  it("is 0 for silence", () => {
+    expect(rms(new Float32Array(960))).toBe(0);
+  });
+  it("is the amplitude for a full-scale constant signal", () => {
+    expect(rms(new Float32Array([1, -1, 1, -1]))).toBeCloseTo(1, 6);
+  });
+  it("rises with louder input", () => {
+    expect(rms(new Float32Array([0.2, -0.2]))).toBeLessThan(rms(new Float32Array([0.8, -0.8])));
+  });
+});
+
+describe("nextSpeaking (threshold + hold)", () => {
+  it("goes active immediately once RMS crosses the threshold", () => {
+    const s = nextSpeaking(SPEAKING_RMS + 0.01, 1000, 0);
+    expect(s.speaking).toBe(true);
+    expect(s.holdUntil).toBe(1000 + SPEAKING_HOLD_MS);
+  });
+
+  it("stays silent below the threshold with no active hold", () => {
+    expect(nextSpeaking(SPEAKING_RMS - 0.001, 1000, 0)).toEqual({ speaking: false, holdUntil: 0 });
+  });
+
+  it("holds 'speaking' through a brief dip below threshold (anti-flicker)", () => {
+    const loud = nextSpeaking(SPEAKING_RMS + 0.05, 1000, 0); // holdUntil = 1000 + HOLD
+    const dip = nextSpeaking(0, 1000 + SPEAKING_HOLD_MS - 1, loud.holdUntil);
+    expect(dip.speaking).toBe(true); // still within the hold window
+  });
+
+  it("drops 'speaking' once the hold window elapses", () => {
+    const loud = nextSpeaking(SPEAKING_RMS + 0.05, 1000, 0);
+    const after = nextSpeaking(0, 1000 + SPEAKING_HOLD_MS + 1, loud.holdUntil);
+    expect(after.speaking).toBe(false);
   });
 });
 

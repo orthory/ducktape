@@ -5,7 +5,7 @@
 //! `directory`'s shape — an in-memory `BTreeMap` with a `pending` overlay
 //! staged during a block and merged at the boundary, and a state-based
 //! `root()` — and implements three of the platform's ordering-contract
-//! promises (docs/agent-collaboration-design.md §2, §4):
+//! promises (docs/records/architecture/agent-collaboration-design.md §2, §4):
 //!
 //! - **P5 — result singularity.** exactly one `OracleResult` transitions a
 //!   given attempt: the `(saga_id, attempt)` pair is the idempotency key, so
@@ -319,17 +319,17 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
         8 + 1 + 1 + 8 + 8 + 1 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8;
     if count
         .checked_mul(MIN_SAGA_BYTES)
-        .map_or(true, |need| need > buf.len() as u64)
+        .is_none_or(|need| need > buf.len() as u64)
     {
         return Err("snapshot saga count exceeds input".into());
     }
     let mut sagas: BTreeMap<String, Saga> = BTreeMap::new();
     for _ in 0..count {
         let id = take_lp_string(&mut buf)?;
-        if let Some((last, _)) = sagas.iter().next_back() {
-            if last.as_str() >= id.as_str() {
-                return Err("snapshot saga ids not strictly ascending".into());
-            }
+        if let Some((last, _)) = sagas.iter().next_back()
+            && last.as_str() >= id.as_str()
+        {
+            return Err("snapshot saga ids not strictly ascending".into());
         }
         let origin = match take(&mut buf, 1)?[0] {
             0 => SagaOrigin::External(take_lp_bytes(&mut buf)?),
@@ -752,12 +752,12 @@ impl Module for SagaModule {
                 // an empty pinned key is a caller bug, rejected rather than
                 // silently read as "no binding" (the same rule as an empty
                 // capability tag).
-                if let Some(key) = &pinned_assignee {
-                    if key.is_empty() {
-                        return Err(Error::Module(
-                            "trigger pinned_assignee must be non-empty when set".into(),
-                        ));
-                    }
+                if let Some(key) = &pinned_assignee
+                    && key.is_empty()
+                {
+                    return Err(Error::Module(
+                        "trigger pinned_assignee must be non-empty when set".into(),
+                    ));
                 }
                 // the callback-poison rule (design §4): a callback aimed at an
                 // unknown module — or at this module itself, which cannot
@@ -836,13 +836,13 @@ impl Module for SagaModule {
                 // an oversized error string is the same abort-don't-commit
                 // case as an oversized result: the Failed arm stores it in the
                 // root preimage and echoes it in the callback.
-                if let Err(error) = &outcome {
-                    if error.len() > MAX_ERROR_BYTES {
-                        return Err(Error::Module(format!(
-                            "oracle error is {} bytes; the cap is {MAX_ERROR_BYTES}",
-                            error.len()
-                        )));
-                    }
+                if let Err(error) = &outcome
+                    && error.len() > MAX_ERROR_BYTES
+                {
+                    return Err(Error::Module(format!(
+                        "oracle error is {} bytes; the cap is {MAX_ERROR_BYTES}",
+                        error.len()
+                    )));
                 }
                 let mut saga = current.clone();
                 saga.updated_at = ctx.env().consensus_time;
@@ -1019,6 +1019,31 @@ impl Module for SagaModule {
                     .min();
                 Ok(encode_reply(&SagaReply::NextExpiry(next)))
             }
+            SagaQuery::AssignedPending { assignee } => {
+                // the resident worker pump's read: reconstruct exactly the
+                // WorkerRequest the effect lane carried for every pending
+                // attempt leased to `assignee`. a node that installs synced
+                // boundaries (and so never observes effects) discovers its
+                // own assigned work here; visible_ids is sorted, so the
+                // projection is deterministic.
+                let requests = self
+                    .visible_ids()
+                    .into_iter()
+                    .filter_map(|id| self.get(&id).map(|saga| (id, saga)))
+                    .filter(|(_, saga)| {
+                        !saga.status.is_terminal()
+                            && saga.assignee.as_deref() == Some(assignee.as_slice())
+                    })
+                    .map(|(id, saga)| WorkerRequest {
+                        saga_id: id,
+                        attempt: saga.attempt,
+                        spec: saga.spec.clone(),
+                        deadline: saga.deadline,
+                        assignee: saga.assignee.clone(),
+                    })
+                    .collect();
+                Ok(encode_reply(&SagaReply::AssignedPending(requests)))
+            }
         }
     }
 
@@ -1045,10 +1070,8 @@ impl Module for SagaModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{decode_callback, decode_reply, decode_worker_request, encode_msg, encode_query};
     use futures::executor::block_on;
-    use crate::{
-        decode_callback, decode_reply, decode_worker_request, encode_msg, encode_query,
-    };
     use sdk::{Env, Event};
 
     /// a minimal `Ctx` that captures emitted msgs/effects and serves a canned
@@ -1087,7 +1110,7 @@ mod tests {
             self.env.consensus_time = height;
             self
         }
-        fn from_origin(mut self, origin: Origin) -> Self {
+        fn with_origin(mut self, origin: Origin) -> Self {
             self.env.origin = origin;
             self
         }
@@ -1129,15 +1152,13 @@ mod tests {
         async fn query(&self, target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
             match target {
                 "valset" => match &self.validators {
-                    Some(v) => Ok(valset::encode_reply(&ValsetReply::Validators(
-                        v.clone(),
-                    ))),
+                    Some(v) => Ok(valset::encode_reply(&ValsetReply::Validators(v.clone()))),
                     None => Err(Error::QueryUnsupported),
                 },
                 "capability" => match &self.providers {
-                    Some(p) => Ok(capability::encode_reply(
-                        &CapabilityReply::Providers(p.clone()),
-                    )),
+                    Some(p) => Ok(capability::encode_reply(&CapabilityReply::Providers(
+                        p.clone(),
+                    ))),
                     None => Err(Error::QueryUnsupported),
                 },
                 _ => Err(Error::QueryUnsupported),
@@ -1198,6 +1219,16 @@ mod tests {
         match decode_reply(&reply).unwrap() {
             SagaReply::NextExpiry(v) => v,
             other => panic!("expected NextExpiry reply, got {other:?}"),
+        }
+    }
+    fn assigned_pending(m: &SagaModule, assignee: &[u8]) -> Vec<WorkerRequest> {
+        let reply = block_on(m.query(&encode_query(&SagaQuery::AssignedPending {
+            assignee: assignee.to_vec(),
+        })))
+        .unwrap();
+        match decode_reply(&reply).unwrap() {
+            SagaReply::AssignedPending(v) => v,
+            other => panic!("expected AssignedPending reply, got {other:?}"),
         }
     }
     fn exec(m: &mut SagaModule, ctx: &mut CaptureCtx, op: &Msg) -> Result<(), Error> {
@@ -1893,7 +1924,7 @@ mod tests {
 
         let mut m = SagaModule::new("saga");
         let mut ctx = CaptureCtx::new()
-            .from_origin(alice.clone())
+            .with_origin(alice.clone())
             .knowing("agent");
         exec(
             &mut m,
@@ -1916,7 +1947,7 @@ mod tests {
 
         // a FOREIGN cancel is a no-op, not an error — a finalized foreign
         // cancel must not abort blocks.
-        let mut ctx = CaptureCtx::new().from_origin(mallory).knowing("agent");
+        let mut ctx = CaptureCtx::new().with_origin(mallory).knowing("agent");
         exec(
             &mut m,
             &mut ctx,
@@ -1932,7 +1963,7 @@ mod tests {
         // the trigger origin cancels: terminal + callback.
         let mut ctx = CaptureCtx::new()
             .at(9)
-            .from_origin(alice.clone())
+            .with_origin(alice.clone())
             .knowing("agent");
         exec(
             &mut m,
@@ -1955,7 +1986,7 @@ mod tests {
         let cancelled_root = m.root();
 
         // cancelling a TERMINAL saga (and an unknown one) is a no-op.
-        let mut ctx = CaptureCtx::new().from_origin(alice).knowing("agent");
+        let mut ctx = CaptureCtx::new().with_origin(alice).knowing("agent");
         exec(
             &mut m,
             &mut ctx,
@@ -1984,10 +2015,10 @@ mod tests {
 
         let mut m = SagaModule::new("saga");
         // "done" and "open" belong to alice; "theirs" to mallory.
-        let mut ctx = CaptureCtx::new().from_origin(alice.clone());
+        let mut ctx = CaptureCtx::new().with_origin(alice.clone());
         exec(&mut m, &mut ctx, &trigger("done", b"a")).unwrap();
         exec(&mut m, &mut ctx, &trigger("open", b"b")).unwrap();
-        let mut ctx = CaptureCtx::new().from_origin(mallory);
+        let mut ctx = CaptureCtx::new().with_origin(mallory);
         exec(&mut m, &mut ctx, &trigger("theirs", b"c")).unwrap();
         commit(&mut m);
         let mut ctx = CaptureCtx::new();
@@ -1998,7 +2029,7 @@ mod tests {
         // alice prunes everything she can name: only HER TERMINAL saga goes.
         // "open" (non-terminal), "theirs" (foreign), "ghost" (unknown) are
         // skipped as no-ops.
-        let mut ctx = CaptureCtx::new().from_origin(alice);
+        let mut ctx = CaptureCtx::new().with_origin(alice);
         exec(
             &mut m,
             &mut ctx,
@@ -2053,7 +2084,7 @@ mod tests {
         // open policy: a NON-assignee's result still lands.
         let outsider = Origin::External(b"outsider".to_vec());
         let mut ctx = CaptureCtx::new()
-            .from_origin(outsider)
+            .with_origin(outsider)
             .with_validators(validators);
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
         commit(&mut m);
@@ -2077,7 +2108,7 @@ mod tests {
 
         // a non-assignee result is a deterministic no-op under strict.
         let mut ctx = CaptureCtx::new()
-            .from_origin(Origin::External(non_assignee))
+            .with_origin(Origin::External(non_assignee))
             .with_validators(validators.clone());
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"intruder".to_vec()))).unwrap();
         commit(&mut m);
@@ -2090,7 +2121,7 @@ mod tests {
 
         // the assignee's result lands.
         let mut ctx = CaptureCtx::new()
-            .from_origin(Origin::External(assignee))
+            .with_origin(Origin::External(assignee))
             .with_validators(validators);
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"legit".to_vec()))).unwrap();
         commit(&mut m);
@@ -2119,7 +2150,7 @@ mod tests {
         // an unclaimed result is a no-op — the accept-any hole is closed.
         let pending_root = m.root();
         let mut ctx = CaptureCtx::new()
-            .from_origin(Origin::External(b"anyone".to_vec()))
+            .with_origin(Origin::External(b"anyone".to_vec()))
             .with_validators(Vec::new());
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
         commit(&mut m);
@@ -2130,7 +2161,7 @@ mod tests {
         // work order re-emitted naming the winner.
         let mut ctx = CaptureCtx::new()
             .at(7)
-            .from_origin(Origin::External(b"node-a".to_vec()))
+            .with_origin(Origin::External(b"node-a".to_vec()))
             .with_validators(Vec::new());
         exec(
             &mut m,
@@ -2157,7 +2188,7 @@ mod tests {
         // a late accept loses quietly: nothing staged, no second work order.
         let claimed_root = m.root();
         let mut ctx = CaptureCtx::new()
-            .from_origin(Origin::External(b"node-b".to_vec()))
+            .with_origin(Origin::External(b"node-b".to_vec()))
             .with_validators(Vec::new());
         exec(
             &mut m,
@@ -2174,13 +2205,13 @@ mod tests {
 
         // the loser's result is a no-op; the winner's lands.
         let mut ctx = CaptureCtx::new()
-            .from_origin(Origin::External(b"node-b".to_vec()))
+            .with_origin(Origin::External(b"node-b".to_vec()))
             .with_validators(Vec::new());
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"stolen".to_vec()))).unwrap();
         commit(&mut m);
         assert_eq!(get(&m, "s1").unwrap().status, SagaStatus::Pending);
         let mut ctx = CaptureCtx::new()
-            .from_origin(Origin::External(b"node-a".to_vec()))
+            .with_origin(Origin::External(b"node-a".to_vec()))
             .with_validators(Vec::new());
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"legit".to_vec()))).unwrap();
         commit(&mut m);
@@ -2209,7 +2240,7 @@ mod tests {
             Origin::External(Vec::new()),
         ] {
             let mut ctx = CaptureCtx::new()
-                .from_origin(origin)
+                .with_origin(origin)
                 .with_validators(validators.clone());
             assert!(
                 exec(
@@ -2230,7 +2261,7 @@ mod tests {
         let before = m.root();
         for (saga_id, attempt) in [("assigned", 0u32), ("ghost", 0), ("assigned", 9)] {
             let mut ctx = CaptureCtx::new()
-                .from_origin(Origin::External(b"node-x".to_vec()))
+                .with_origin(Origin::External(b"node-x".to_vec()))
                 .with_validators(validators.clone());
             exec(
                 &mut m,
@@ -2291,7 +2322,7 @@ mod tests {
         // strict: a validator that is NOT a provider cannot land the result...
         let pending_root = m.root();
         let mut ctx = CaptureCtx::new()
-            .from_origin(Origin::External(validators[0].clone()))
+            .with_origin(Origin::External(validators[0].clone()))
             .with_validators(validators.clone())
             .with_providers(vec![provider.clone()]);
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"intruder".to_vec()))).unwrap();
@@ -2300,7 +2331,7 @@ mod tests {
 
         // ... the provider can.
         let mut ctx = CaptureCtx::new()
-            .from_origin(Origin::External(provider))
+            .with_origin(Origin::External(provider))
             .with_validators(validators)
             .with_providers(vec![vec![9u8; 32]]);
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"legit".to_vec()))).unwrap();
@@ -2327,7 +2358,7 @@ mod tests {
 
         // unclaimed: no result lands under strict.
         let mut ctx = CaptureCtx::new()
-            .from_origin(Origin::External(b"anyone".to_vec()))
+            .with_origin(Origin::External(b"anyone".to_vec()))
             .with_validators(vec![vec![1u8; 32]])
             .with_providers(Vec::new());
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
@@ -2336,7 +2367,7 @@ mod tests {
 
         // a node that CAN run the capability claims it, then its result lands.
         let mut ctx = CaptureCtx::new()
-            .from_origin(Origin::External(b"provider".to_vec()))
+            .with_origin(Origin::External(b"provider".to_vec()))
             .with_validators(vec![vec![1u8; 32]])
             .with_providers(Vec::new());
         exec(
@@ -2350,7 +2381,7 @@ mod tests {
         .unwrap();
         commit(&mut m);
         let mut ctx = CaptureCtx::new()
-            .from_origin(Origin::External(b"provider".to_vec()))
+            .with_origin(Origin::External(b"provider".to_vec()))
             .with_validators(vec![vec![1u8; 32]])
             .with_providers(Vec::new());
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"r".to_vec()))).unwrap();
@@ -2410,7 +2441,7 @@ mod tests {
 
         // strict: the announced provider does NOT hold this lease...
         let pending_root = m.root();
-        let mut ctx = CaptureCtx::new().from_origin(Origin::External(vec![9u8; 32]));
+        let mut ctx = CaptureCtx::new().with_origin(Origin::External(vec![9u8; 32]));
         exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"foreign".to_vec()))).unwrap();
         commit(&mut m);
         assert_eq!(m.root(), pending_root, "a non-pinned result is a no-op");
@@ -2419,7 +2450,7 @@ mod tests {
         // leased to the pinned key again, never rendezvous-reassigned.
         let mut ctx = CaptureCtx::new()
             .at(5)
-            .from_origin(Origin::External(pinned.clone()))
+            .with_origin(Origin::External(pinned.clone()))
             .with_validators(vec![vec![1u8; 32]])
             .with_providers(vec![vec![9u8; 32]]);
         exec(&mut m, &mut ctx, &oracle("s1", 0, Err("transient".into()))).unwrap();
@@ -2532,6 +2563,65 @@ mod tests {
     }
 
     #[test]
+    fn assigned_pending_projects_own_leases_as_worker_requests() {
+        // the resident worker pump's read: a capability-tagged saga leased to
+        // `me` surfaces as exactly the WorkerRequest the effect carried;
+        // other keys see nothing, and a landed result retires it.
+        let me = b"resident-key".to_vec();
+        let other = b"someone-else".to_vec();
+        let mut m =
+            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+        assert!(
+            assigned_pending(&m, &me).is_empty(),
+            "an empty ledger assigns nothing"
+        );
+
+        // a single-provider pool makes the rendezvous pick deterministic.
+        let mut ctx = CaptureCtx::new().at(4).with_providers(vec![me.clone()]);
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
+                saga_id: "job".into(),
+                spec: b"the work spec".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: Some(90),
+                max_attempts: 3,
+                lease_views: Some(10),
+                capability: Some("codex".into()),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        // the projection IS the effect's work order, field for field.
+        let emitted = ctx.worker_requests();
+        assert_eq!(emitted.len(), 1, "the trigger emitted one request");
+        assert_eq!(
+            assigned_pending(&m, &me),
+            emitted,
+            "the state projection matches the effect lane's request"
+        );
+        assert!(
+            assigned_pending(&m, &other).is_empty(),
+            "another key's read excludes foreign leases"
+        );
+
+        // the assignee's result settles the saga: nothing pending remains.
+        let mut ctx = CaptureCtx::new()
+            .at(5)
+            .with_origin(Origin::External(me.clone()));
+        exec(&mut m, &mut ctx, &oracle("job", 0, Ok(b"done".to_vec()))).unwrap();
+        commit(&mut m);
+        assert!(
+            assigned_pending(&m, &me).is_empty(),
+            "a terminal saga is no longer assigned work"
+        );
+    }
+
+    #[test]
     fn two_instances_replaying_one_script_land_on_byte_identical_roots() {
         // the determinism pin: the same op script, replayed on two fresh
         // instances, must produce byte-identical snapshots (and thus roots)
@@ -2589,7 +2679,7 @@ mod tests {
             for (height, block) in script().into_iter().enumerate() {
                 let mut ctx = CaptureCtx::new()
                     .at(height as u64 * 10)
-                    .from_origin(Origin::External(b"alice".to_vec()));
+                    .with_origin(Origin::External(b"alice".to_vec()));
                 for op in &block {
                     exec(&mut m, &mut ctx, op).unwrap();
                 }

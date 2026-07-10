@@ -148,6 +148,9 @@ fn register_quackbot(actions: Vec<String>) -> Msg {
             capability: "mock-llm-1".into(),
             prompt_hash: vec![7u8; 32],
             allowed_actions: actions,
+            recipe_hash: None,
+            caps: None,
+            skills: None,
         }),
     }
 }
@@ -385,6 +388,9 @@ fn register_duck() -> Msg {
             capability: "mock-llm-1".into(),
             prompt_hash: vec![9u8; 32],
             allowed_actions: vec![ACTION_TASKS_CREATE.into()],
+            recipe_hash: None,
+            caps: None,
+            skills: None,
         }),
     }
 }
@@ -667,10 +673,17 @@ fn a_completed_job_run_finalizes_the_jobs_board_with_the_validated_response() {
         assert_eq!(job.status, JobStatus::Done);
         let result = job.result.expect("finalize result");
         assert!(result.ok);
+        // the finalize payload is a faceted DeliveryReceipt whose `response` is
+        // the normalized AgentResponse (a message-only result carries no facets).
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.payload).expect("delivery receipt json");
+        assert_eq!(payload["ducktape_delivery"], 1);
+        assert_eq!(payload["status"], "ok");
+        let expected: serde_json::Value =
+            serde_json::from_slice(&raw).expect("agent response json");
         assert_eq!(
-            result.payload,
-            String::from_utf8(raw).expect("json response is utf8"),
-            "the normalized response JSON is the finalize payload"
+            payload["response"], expected,
+            "the normalized response JSON is the finalize payload's response facet"
         );
         assert_eq!(task_ids(&host).await, vec!["job-task".to_string()]);
     });
@@ -832,7 +845,7 @@ fn a_failed_job_run_finalizes_the_jobs_board_with_error_detail() {
 }
 
 #[test]
-fn a_failed_oracle_fails_the_run_without_any_follow_ups() {
+fn a_failed_oracle_fails_the_run_and_surfaces_a_failure_reply() {
     deterministic::Runner::default().start(|context| async move {
         let mut host = genesis(context).await;
         for (height, origin, op) in scripted_ops() {
@@ -873,10 +886,23 @@ fn a_failed_oracle_fails_the_run_without_any_follow_ups() {
             None,
             "the failed run's entry pruned"
         );
+        // the failure surfaces under the run's ONE reply id, authored as the
+        // agent — a real chat post through the same path a success takes.
+        let reply = chat_message(&host, &reply_message_id(&run_id))
+            .await
+            .expect("the failure posted a reply");
         assert_eq!(
-            chat_message(&host, &reply_message_id(&run_id)).await,
-            None,
-            "no reply was ever posted"
+            reply.head.author,
+            chat::AuthorRef::Agent {
+                module: "runs".into(),
+                agent_id: "quackbot".into(),
+            }
+        );
+        assert_eq!(
+            reply.head.blocks,
+            vec![chat::Block::paragraph(
+                "⚠ Quackbot failed: model unavailable"
+            )]
         );
         assert_eq!(
             task_ids(&host).await,
@@ -904,8 +930,8 @@ fn a_response_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
 
         // the oracle answers with a response that includes a task action the
         // agent was never granted: the delivery block commits (no-fail rule),
-        // the run fails deterministically, and NOTHING was written to chat
-        // or tasks.
+        // the run fails deterministically, no task lands — and the failure
+        // surfaces as the agent's ⚠ reply (quackbot holds chat.post).
         host.submit_at(
             at(10, Origin::External(b"oracle".to_vec())),
             Msg {
@@ -933,7 +959,15 @@ fn a_response_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
             DispatchStatus::Delivered,
             "the dispatch itself delivered — the RUN failed, not the block"
         );
-        assert_eq!(chat_message(&host, &reply_message_id(&run_id)).await, None);
+        let reply = chat_message(&host, &reply_message_id(&run_id))
+            .await
+            .expect("the failure posted a reply");
+        assert_eq!(
+            reply.head.blocks,
+            vec![chat::Block::paragraph(
+                "⚠ Quackbot failed: agent quackbot is not allowed to tasks.create"
+            )]
+        );
         assert_eq!(task_ids(&host).await, Vec::<String>::new());
     });
 }

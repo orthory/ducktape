@@ -100,14 +100,20 @@ const TARGET = "chat";
 /** Query page bound mirrored from the interface crate (MAX_QUERY_LIMIT). */
 export const MAX_QUERY_LIMIT = 256;
 
+/** Module-reserved channel? A ":" in the id marks a channel a module minted
+ *  for its own surface (forge's per-item discussion channels are
+ *  `forge:<repo>:<number>`) — user-created ids can never carry one
+ *  (channelIdOf strips to [a-z0-9-]). These are HIDDEN from the chat UI: the
+ *  rail, default-channel selection, and search results all filter on this. */
+export const isModuleChannel = (id: string): boolean => id.includes(":");
+
 // ── Rendering helpers (wire → display) ──────────────────
 
-/** hex(User key bytes) → display name — the resolved `profiles` registry, keyed
- *  so `authorName` can look a User author up by its origin bytes. */
+/** hex(node key bytes) → display name — projected from the node's bound
+ * identity account so `authorName` can resolve a User author. */
 export type AuthorNames = Record<string, string>;
 
-/** Lowercase hex of a User author's key bytes — the map key into AuthorNames
- *  (and the `profiles` Profile.key, which IS these same origin bytes). */
+/** Lowercase hex of a User author's key bytes — the map key into AuthorNames. */
 export const keyHex = (bytes: number[]): string =>
   bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
 
@@ -117,9 +123,9 @@ export const keyHex = (bytes: number[]): string =>
  *  agent-client's `hexToBytes` under the roster's vocabulary. */
 export { hexToBytes as keyBytes } from "./agent-client";
 
-/** A display name for an author. A User author's bytes are the submitter
- *  identity the daemon stamped; when the `profiles` registry (`names`) resolves
- *  those bytes it wins, else we fall back to the utf-8/hex handle. */
+/** A display name for an author. A User author's bytes are the submitter node
+ * identity the daemon stamped; the bound account's Identity name wins, else we
+ * fall back to the utf-8/hex handle. */
 export const authorName = (author: AuthorRef, names?: AuthorNames): string => {
   if (author === "system") return "system";
   if ("user" in author)
@@ -131,7 +137,7 @@ export const authorName = (author: AuthorRef, names?: AuthorNames): string => {
 /** User author bytes are a claimed display name on the embedded daemon but a
  * raw ed25519 pubkey on the networked node (the signed frame origin). Render
  * printable UTF-8 as-is and anything else as a short hex handle until the
- * name registry resolves keys to display names. */
+ * identity projection resolves keys to display names. */
 const displayUserBytes = (bytes: number[]): string => {
   try {
     const text = new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
@@ -350,6 +356,8 @@ export interface ChatSearchHit {
   deleted: boolean;
   edited: boolean;
   thread?: number;
+  /** Normalized #tag labels the head carries (absent when untagged). */
+  tags?: string[];
 }
 
 /** Full-text search over message heads, newest first — served by the node's
@@ -362,6 +370,44 @@ export const searchMessages = (
     .then(() =>
       transport.view(TARGET, {
         search: { text: params.text, channelId: params.channelId, limit: params.limit },
+      }),
+    )
+    .then((reply) => replyVariant<ChatSearchHit[]>(reply, "hits"));
+
+/** One row of the tag catalog: a normalized label, how many live messages
+ *  carry it in the asked scope, and the newest such message's seq. */
+export interface ChatTagRow {
+  tag: string;
+  count: number;
+  lastSeq: number;
+}
+
+/** The tag catalog — a channel's live #tags ordered by count desc then tag
+ *  asc (no channelId aggregates the whole workspace). Served by the same
+ *  node-local derived index as `searchMessages`. */
+export const tags = (
+  transport: NodeTransport,
+  params: { channelId?: string; limit?: number } = {},
+): Promise<ChatTagRow[]> =>
+  Promise.resolve()
+    .then(() =>
+      transport.view(TARGET, {
+        tags: { channelId: params.channelId, limit: params.limit },
+      }),
+    )
+    .then((reply) => replyVariant<ChatTagRow[]>(reply, "tags"));
+
+/** Every live message carrying one exact #tag, newest first. The node
+ *  normalizes the queried tag (NFC + lowercase, leading `#` stripped), so an
+ *  as-typed display form can be passed straight through. */
+export const tagSearch = (
+  transport: NodeTransport,
+  params: { tag: string; channelId?: string; limit?: number },
+): Promise<ChatSearchHit[]> =>
+  Promise.resolve()
+    .then(() =>
+      transport.view(TARGET, {
+        tagSearch: { tag: params.tag, channelId: params.channelId, limit: params.limit },
       }),
     )
     .then((reply) => replyVariant<ChatSearchHit[]>(reply, "hits"));

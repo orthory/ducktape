@@ -85,21 +85,30 @@ fn a_single_validator_finalizes_sequential_blocks() {
 
         let genesis = node.app_hash();
 
-        // two ops from distinct origins -> two distinct frames -> the automaton
-        // proposes them across successive self-led views.
+        // two ops from distinct origins, flushed as two SEPARATE batches so
+        // the engine finalizes two SEQUENTIAL blocks (the property under
+        // test). one flush would pack both members into a single block —
+        // `drain_delivered` counts finalized FRAMES, and the sequential-
+        // blocks claim would silently degrade to a one-block claim.
         let a = ed25519::PrivateKey::from_seed(201);
         let b = ed25519::PrivateKey::from_seed(202);
         node.submit(&a, 0, dir_set("solo", "first"))
             .await
             .expect("submit first");
+        node.flush_batch().await.expect("flush first block");
         node.submit(&b, 0, dir_set("solo2", "second"))
             .await
             .expect("submit second");
+        node.flush_batch().await.expect("flush second block");
 
-        // pump simulated time until BOTH ops applied in finalized order.
+        // pump simulated time until BOTH blocks applied in finalized order.
         let mut applied = 0usize;
         while applied < 2 {
             context.sleep(Duration::from_millis(50)).await;
+            // the production drain flushes the batch window every BLOCK_TIME tick
+            // (bin/node main); enqueue-only submits never propose without it — the
+            // sim mirrors that cadence (a no-op when nothing is pending).
+            node.flush_batch().await.expect("flush");
             applied += node.drain_delivered().await.expect("drain");
         }
 

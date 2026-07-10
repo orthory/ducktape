@@ -21,17 +21,20 @@ import {
 } from "../../../domain/metrics";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius, shadow, tint } from "../../theme/tokens";
 import { HealthBar, HealthLegend } from "./HealthBar";
+import { LogsTab } from "./LogsTab";
 import { commitHealth, healthSegments, nodeLiveness } from "./node-health";
+import { NodeFactsCard } from "./NodeFactsCard";
 import { PeersTab } from "./PeersTab";
 
-type TabId = "overview" | "peers" | "permissions";
+type TabId = "overview" | "peers" | "permissions" | "logs";
 
 const TABS: ReadonlyArray<readonly [TabId, string]> = [
   ["overview", "Overview"],
   ["peers", "Connections"],
   ["permissions", "Permissions"],
+  ["logs", "Logs"],
 ];
 
 const sectionLabelStyle = {
@@ -43,24 +46,24 @@ const sectionLabelStyle = {
 const STATUS_PILLS = {
   synced: {
     label: "Synced",
-    text: "#5f9e74",
+    text: tint(color.green).text,
     dot: color.green,
-    bg: "#eef5f0",
-    border: "#cfe3d7",
+    bg: tint(color.green).bg,
+    border: tint(color.green).border,
   },
   stopped: {
     label: "Stopped",
-    text: color.red,
-    dot: "#cf6a5e",
-    bg: "#fbeeec",
-    border: "#eccfc9",
+    text: tint(color.red).text,
+    dot: color.red,
+    bg: tint(color.red).bg,
+    border: tint(color.red).border,
   },
   offline: {
     label: "Offline",
-    text: "#a07b32",
-    dot: "#e3b443",
-    bg: "#fbf4e6",
-    border: "#ecdcae",
+    text: tint(color.amber).text,
+    dot: color.amber,
+    bg: tint(color.amber).bg,
+    border: tint(color.amber).border,
   },
 } as const;
 
@@ -90,8 +93,8 @@ function workspaceRole(workspace: {
       title: "Genesis validator",
       badge: "VALIDATOR",
       tint: color.dark,
-      bg: "#f4f1ec",
-      border: "#ded6ca",
+      bg: tint(color.accent).bg,
+      border: tint(color.accent).border,
       body:
         "This node created the network at genesis. That is provenance only: it validates committed state as an equal member and holds no special governance authority.",
       validator: true,
@@ -104,8 +107,8 @@ function workspaceRole(workspace: {
       title: "Member validator",
       badge: "VALIDATOR",
       tint: color.accentAlt2,
-      bg: "#f3f8f4",
-      border: "#d7e3d9",
+      bg: tint(color.green).bg,
+      border: tint(color.green).border,
       body:
         "This workspace is admitted as a member and runs a validator for the network.",
       validator: true,
@@ -116,9 +119,9 @@ function workspaceRole(workspace: {
     pill: "guest",
     title: "Guest",
     badge: "READ",
-    tint: color.amber,
-    bg: "#fbf4e6",
-    border: "#ecdcae",
+    tint: tint(color.amber).text,
+    bg: tint(color.amber).bg,
+    border: tint(color.amber).border,
     body:
       "No desktop workspace validator identity is loaded. This view can still inspect committed node state.",
     validator: false,
@@ -160,9 +163,9 @@ function RolePill({ text, active }: { text: string; active: boolean }) {
       style={{
         font: `600 9.5px ${font.mono}`,
         letterSpacing: ".05em",
-        color: active ? color.onDark : color.amber,
-        background: active ? color.dark : "#fbf4e6",
-        border: `1px solid ${active ? color.dark : "#ecdcae"}`,
+        color: active ? color.onDark : tint(color.amber).text,
+        background: active ? color.dark : tint(color.amber).bg,
+        border: `1px solid ${active ? color.dark : tint(color.amber).border}`,
         borderRadius: radius.sm,
         padding: "4px 9px",
         textTransform: "uppercase",
@@ -184,7 +187,7 @@ function NodeButton({
 }) {
   const palette =
     tone === "danger"
-      ? { fg: color.red, bg: color.paper, bd: "#e7cdc8" }
+      ? { fg: color.red, bg: color.paper, bd: tint(color.red).border }
       : tone === "primary"
         ? { fg: color.onDark, bg: color.dark, bd: color.dark }
         : { fg: color.inkSoft, bg: color.paper, bd: color.borderStrong };
@@ -328,8 +331,8 @@ function CheckRow({ text, active }: { text: string; active: boolean }) {
           width: 17,
           height: 17,
           borderRadius: "50%",
-          background: active ? "#e7f1ea" : color.titlebar,
-          color: active ? "#5f9e74" : color.muted2,
+          background: active ? tint(color.green).bg : color.titlebar,
+          color: active ? tint(color.green).text : color.muted2,
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
@@ -535,8 +538,8 @@ function CopyValue({
         alignItems: prominent ? "start" : "center",
         padding: prominent ? "13px 14px" : "10px 13px",
         borderRadius: radius.md,
-        border: `1px solid ${copied ? "#cfe3d7" : color.border}`,
-        background: copied ? "#eef5f0" : prominent ? color.sunken : color.paper,
+        border: `1px solid ${copied ? tint(color.green).border : color.border}`,
+        background: copied ? tint(color.green).bg : prominent ? color.sunken : color.paper,
         minWidth: 0,
         boxSizing: "border-box",
       }}
@@ -744,9 +747,11 @@ function useLiveMetrics(): LiveMetrics {
 }
 
 const LIVENESS_DOT: Record<string, string> = {
-  live: "#5f9e74",
+  live: color.green,
   idle: color.amber,
-  stopped: "#cf6a5e",
+  stopped: color.red,
+  // a distinct brighter yellow — keeps offline visually apart from idle (both
+  // otherwise amber); a vivid status dot reads fine on either theme.
   offline: "#e3b443",
 };
 
@@ -853,6 +858,9 @@ function OverviewTab() {
       <div style={{ marginTop: 9 }}>
         <AccessCard />
       </div>
+      <div style={{ marginTop: 10 }}>
+        <NodeFactsCard />
+      </div>
 
       <SectionLabel style={{ marginTop: 22 }}>NETWORK</SectionLabel>
       <div
@@ -936,12 +944,12 @@ function MatrixCell({
       style={{
         textAlign: "center",
         padding: "12px 0",
-        background: active ? "#f6f3ee" : "transparent",
+        background: active ? color.canvas : "transparent",
       }}
     >
       <span
         style={{
-          color: on ? "#5f9e74" : color.muted2,
+          color: on ? tint(color.green).text : color.muted2,
           font: `700 13px ${font.sans}`,
         }}
       >
@@ -966,7 +974,7 @@ function HeaderCell({
         padding: "10px 0",
         font: `700 10.5px ${font.sans}`,
         color: color.inkSoft,
-        background: active ? "#ebebeb" : "transparent",
+        background: active ? color.hover : "transparent",
       }}
     >
       {label}
@@ -1145,7 +1153,7 @@ export function StatusView() {
         height: "100%",
         display: "flex",
         flexDirection: "column",
-        background: "#fcfcfc",
+        background: color.canvas,
       }}
     >
       <div style={{ flexShrink: 0, padding: "20px 22px 0" }}>
@@ -1166,6 +1174,8 @@ export function StatusView() {
           <PeersTab />
         ) : activeTab === "permissions" ? (
           <PermissionsTab />
+        ) : activeTab === "logs" ? (
+          <LogsTab />
         ) : (
           <OverviewTab />
         )}

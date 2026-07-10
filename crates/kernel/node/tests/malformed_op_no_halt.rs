@@ -51,13 +51,15 @@ fn a_rejected_finalized_op_is_a_noop_not_a_halt() {
             host::Host::genesis(vec![Box::new(Picky { seen: seen.clone() })]).expect("genesis");
         let mut node = OrderedNode::new(host, RoundOrderer::new());
 
-        // a good op applies.
+        // a good op applies (submit -> flush into a batch -> drain).
         node.submit(&sk(1), 0, op(b"good1")).await.expect("submit");
+        node.flush_batch().await.expect("flush");
         assert!(node.drain_delivered().await.is_ok(), "good op drains ok");
 
         // a POISON op the module rejects: drain MUST still be Ok (no halt) — it is
         // processed as an inert no-op. before the fix this returned Err and stalled.
         node.submit(&sk(2), 0, op(b"poison")).await.expect("submit");
+        node.flush_batch().await.expect("flush");
         assert!(
             node.drain_delivered().await.is_ok(),
             "a rejected finalized op must NOT halt the node"
@@ -65,6 +67,7 @@ fn a_rejected_finalized_op_is_a_noop_not_a_halt() {
 
         // the node keeps going — a later good op still lands.
         node.submit(&sk(1), 1, op(b"good2")).await.expect("submit");
+        node.flush_batch().await.expect("flush");
         assert!(
             node.drain_delivered().await.is_ok(),
             "node continues past the rejected op"

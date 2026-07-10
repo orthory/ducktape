@@ -2,16 +2,19 @@ import type { Dispatch } from "react";
 
 import * as agentClient from "../../domain/agent-client";
 import * as chatClient from "../../domain/chat-client";
-import type { PostPolicy } from "../../domain/chat-client";
-import * as filesClient from "../../domain/files-client";
-import type { Manifest } from "../../domain/files-client";
+import * as duckdnsClient from "../../domain/duckdns-client";
+import type { ChatBlock, PostPolicy } from "../../domain/chat-client";
 import * as forgeClient from "../../domain/forge-client";
+import type {
+  ForgeItemDetail,
+  ForgeReviewComment,
+  ForgeReviewVerdict,
+} from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import * as identityClient from "../../domain/identity-client";
 import { normalizeKey } from "../../domain/names";
 import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
-import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
 import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
@@ -22,10 +25,12 @@ import { callSocketUrl } from "../../domain/transport";
 // camera video + control on one socket); this store drives it via CallEvent.
 import {
   createCallSession,
-  supportsVideoCalls,
   MAX_VIDEO_PARTICIPANTS,
 } from "../../domain/call-session";
 import type { CallSession, CallEvent } from "../../domain/call-session";
+import { probeVideoCapability } from "../../domain/video-capability";
+import { enumerateHuddleDevices, saveDevicePrefs } from "../../domain/media-devices";
+import type { DevicePrefs } from "../../domain/media-devices";
 import { huddleRecipients } from "../../domain/voice-session";
 import { keyBytes, keyHex } from "../../domain/chat-client";
 import * as valsetClient from "../../domain/valset-client";
@@ -33,10 +38,25 @@ import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
 import {
+  hasAgentMention,
+  mentionableUsers,
+  mentionResolverOf,
+} from "../views/chat/mention";
+import {
   defaultScreenForSection,
   sectionForScreen,
 } from "../modules/registry";
 import type { Action } from "./reducer";
+import {
+  addMemberFromResponse,
+  approvePhoneEnrollment,
+  mintLinkChallenge,
+  removeMemberKey,
+  startPhoneEnrollment,
+  unbindNode,
+} from "./account-ops";
+import type { AccountOpsDeps, PhoneEnrollment } from "./account-ops";
+import type { LinkChallenge } from "../views/account/link-device";
 import { autoBindUserIdentity } from "./auto-bind";
 import { beginOp, failOp, finalizeOp, opKey, receiptOf } from "./finalization";
 import * as optimistic from "./optimistic";
@@ -44,19 +64,36 @@ import { closeHuddleWindow, openHuddleWindow } from "./huddle-window";
 import {
   addTab,
   channelIdOf,
+  clearPendingDisplayName,
   clearRemoteUrl,
+  loadPendingDisplayName,
   removeTab,
+  saveAccent,
+  saveTheme,
   saveDocTabs,
+  saveNotifyPrefs,
   saveRemoteUrl,
   saveViewMode,
+  selfAuthorBytes,
 } from "./state";
-import type { ConsoleState, ViewMode } from "./state";
+import type { ConsoleState, NotifyPrefs, ViewMode } from "./state";
 
 /** How often a parked joiner's phase is polled while it promotes. */
 const JOIN_POLL_MS = 1500;
 
 const wait = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+const hasValsetStanding = (transport: NodeTransport, pubkey: string): Promise<boolean> =>
+  Promise.all([
+    valsetClient.validators(transport).catch((): number[][] => []),
+    valsetClient.residents(transport).catch((): number[][] => []),
+  ]).then(([validators, residents]) => {
+    const wanted = pubkey.toLowerCase();
+    return validators
+      .concat(residents)
+      .some((key) => keyHex(key).toLowerCase() === wanted);
+  });
 
 /** Replace a workspace by id, else append — keeps the registry list current. */
 const mergeWorkspace = (list: Workspace[], next: Workspace): Workspace[] =>
@@ -78,13 +115,47 @@ export interface ConsoleActions {
    *  to the other rail, so the body always matches the rail. */
   setViewMode(mode: ViewMode): void;
   setAccent(accent: string): void;
+  /** Flip the light/dark color theme and persist the choice. */
+  toggleTheme(): void;
+  setNotifyPrefs(prefs: NotifyPrefs): void;
+  toggleChannelMute(channelId: string): void;
   setAuthor(author: string): void;
-  /** Set our own display name in the `profiles` module (origin-gated SetName)
-   *  and keep it as the local author identity, so it propagates to everyone. */
+  /** Set this node's bound identity account display name. */
   setDisplayName(name: string): void;
+  /** Declaratively set or clear the bound account's optional `.duck` name. */
+  setDuckHandle(handle: string | null): void;
+
+  // ── Account (the person: member keys, bound nodes) ──
+  /** Mint a fresh device-link challenge for this node's account — the Account
+   *  view encodes it for display and holds it to approve the response against
+   *  (the possession proof is pinned to the challenge's nonce). */
+  accountLinkChallenge(): Promise<LinkChallenge>;
+  /** Approve a pasted link response against `challenge` — submits
+   *  AddMemberKey. Rejects with an actionable error on nonce drift. */
+  accountAddMember(challenge: LinkChallenge, responseBlob: string): Promise<void>;
+  /** Drop a member key from this account (the module refuses the last one). */
+  accountRemoveMember(targetKeyHex: string): Promise<void>;
+  /** Evict a (lost) node from this account — its first UI consumer. */
+  accountUnbindNode(targetNodeHex: string): Promise<void>;
+  /** Stand up the LAN QR-enrollment server for this account (fresh nonce);
+   *  the card polls enroll-client directly and cancels on unmount. */
+  accountPhoneEnrollStart(): Promise<PhoneEnrollment>;
+  /** Approve the phone's candidate P-256 key — submits AddMemberKey. Rejects
+   *  with an actionable error on nonce drift. */
+  accountPhoneEnrollApprove(
+    enrollment: PhoneEnrollment,
+    newKeyHex: string,
+    sigHex: string,
+    label: string | null,
+  ): Promise<void>;
   selectChannel(channelId: string): void;
   createChannel(name: string, postPolicy: PostPolicy): void;
   sendMessage(body: string): void;
+  /** Post `body` into ANY channel (not just the active one) with the same
+   *  mention parsing + first-agent-mention watch arming as `sendMessage` —
+   *  the forge item Discussion's post path into its hidden channel. Resolves
+   *  when the tracked submit settles (errors surface via the ops ledger). */
+  postInChannel(channelId: string, body: string): Promise<void>;
   openThread(rootSeq: number): void;
   closeThread(): void;
   replyInThread(body: string): void;
@@ -120,9 +191,16 @@ export interface ConsoleActions {
    *  peers. Guarded: no-op with no session, on a runtime that can't do video,
    *  or when the roster already EXCEEDS the video cap (audio-only past it). */
   setCamera(on: boolean): void;
-  /** Whether this runtime can do video calls — WebKitGTK can't (no WebCodecs),
-   *  its Chromium companion window can. Drives the camera control's enablement. */
-  videoSupported(): boolean;
+  /** Toggle screen share on the single video lane (camera XOR screen). Gated on
+   *  `videoCapability.canScreenShare` (VP8 encode + getDisplayMedia) + the video
+   *  cap. Enabling swaps the camera off; beacons `sharing` to peers. */
+  setScreenShare(on: boolean): void;
+  /** Re-enumerate the mic/camera/speaker options into `deviceOptions` (labels
+   *  appear only after a media grant). Called when the devices menu opens. */
+  refreshDevices(): void;
+  /** Choose input/output devices: persist, apply to the live session, and store
+   *  on `devicePrefs`. A leave/rejoin keeps the selection. */
+  setDevicePrefs(prefs: DevicePrefs): void;
   /** Evict a stale huddle member (one whose beacons went silent) from the
    *  channel roster on consensus — the cleanup for a client that died without
    *  leaving. Keyed by the target's submitter identity bytes, not its node. */
@@ -131,16 +209,81 @@ export interface ConsoleActions {
    *  huddling — so video tiles can bind their canvas / preview element to it.
    *  Ephemeral and per-client, exactly like the session itself. */
   getCallSession(): CallSession | null;
-  /** Pop the huddle out into its own desktop window (Tauri only) — the in-app
-   *  card yields while the window is open. No-op when not in a huddle. The
-   *  popped window is an AUDIO remote (mute/leave/retry); the camera toggle and
-   *  video tiles stay in the main-window dock, reached by popping back in. */
+  /** Pop the huddle out into its own desktop window (Tauri only). The media
+   *  session HANDS OFF to that window: main releases its session (WS/mic/camera)
+   *  — consensus membership untouched — and the window runs its own full video
+   *  session. No-op when not in a huddle. */
   popOutHuddle(): void;
-  /** Return the huddle to the in-app card, closing the window. Also invoked
-   *  when Rust reports the window destroyed (any way it dies). */
+  /** Return the huddle to the in-app card: close the window and re-take the
+   *  media session in the main window. Also invoked when Rust reports the window
+   *  destroyed (any way it dies), so a dead float always falls back to the dock. */
   popInHuddle(): void;
+  /** Re-establish the main-window media session for the huddle we are still a
+   *  consensus member of (after the popped window released it). Idempotent — a
+   *  no-op when a main session already exists or we are not in a huddle. */
+  retakeHuddleMedia(): void;
+  /** Record the popped window's current mute (it owns mute locally) so a re-take
+   *  reconnects with the same mute — no consensus, no session touch (main has
+   *  none while popped). */
+  noteHuddleMuted(muted: boolean): void;
 
   commitForge(params: { path: string; content: string; message: string }): void;
+
+  // ── Forge tracker (issues / PRs / reviews over the `forge` module) ──
+  //
+  // Per-screen data: the forge view owns repo selection (component-local), so
+  // it calls these imperatively — loaders on open/repo switch, tracked writes
+  // from its forms. The loaders land in `state.forgeItems`/`forgeBranches`
+  // stamped with `state.forgeRepo`; nothing here rides the per-block refresh.
+
+  /** Load `repo`'s issue/PR summaries into `state.forgeItems` (and stamp
+   *  `state.forgeRepo`). Awaitable; a load for a repo the view has since left
+   *  is dropped. */
+  loadForgeItems(repo: string): Promise<void>;
+  /** Load `repo`'s branch heads into `state.forgeBranches` — same stamping and
+   *  staleness contract as loadForgeItems. */
+  loadForgeBranches(repo: string): Promise<void>;
+  /** One item in full (body, reviews, PR branches), resolved to the caller —
+   *  detail is view-local (like the files browser's reads), never store state. */
+  getForgeItem(repo: string, number: number): Promise<ForgeItemDetail | null>;
+  /** Open an issue on `repo`; reloads the repo's item list once committed. */
+  openForgeIssue(params: { repo: string; title: string; body: string }): Promise<void>;
+  /** Open a PR from `sourceBranch` into `targetBranch` ("" → the repo's main). */
+  openForgePr(params: {
+    repo: string;
+    title: string;
+    body: string;
+    sourceBranch: string;
+    targetBranch: string;
+  }): Promise<void>;
+  /** Retitle/rebody an item; null leaves that field untouched. */
+  editForgeItem(params: {
+    repo: string;
+    number: number;
+    title: string | null;
+    body: string | null;
+  }): Promise<void>;
+  /** Close (open: false) or reopen (open: true) an issue or PR. */
+  setForgeItemState(params: { repo: string; number: number; open: boolean }): Promise<void>;
+  /** Merge a PR: CAS against both heads, referencing a pack already staged via
+   *  forge-client's uploadMergePack (`packDigest`). */
+  mergeForgePr(params: {
+    repo: string;
+    number: number;
+    prevTargetOid: string;
+    expectedSourceOid: string;
+    mergeOid: string;
+    packDigest: string;
+  }): Promise<void>;
+  /** Submit a review on a PR, pinned to the source head it looked at. */
+  submitForgeReview(params: {
+    repo: string;
+    number: number;
+    verdict: ForgeReviewVerdict;
+    body: string;
+    commitOid: string;
+    comments: ForgeReviewComment[];
+  }): Promise<void>;
 
   // ── Docs (block-tree notebook over the `pages` module) ──
   /** Re-query the page enumeration into `state.pages`. */
@@ -249,17 +392,24 @@ export interface ConsoleActions {
   openSearch(): void;
   closeSearch(): void;
 
-  // ── Files (content-addressed manifests over the `files` module) ──
-  /** Chunk + stage a file's bytes into the blob store, then commit its manifest. */
-  uploadFile(params: { name: string; mime: string; bytes: Uint8Array<ArrayBuffer> }): void;
-  /** Remove a manifest (owner-gated; rides the daemon identity that added it). */
-  removeFile(fileId: string): void;
-  /** Reassemble a file's bytes, verifying every chunk against the manifest.
-   *  Returns the manifest + bytes for the view to hand to a browser download,
-   *  or null when the file/node is unavailable. */
-  downloadFile(
-    fileId: string,
-  ): Promise<{ manifest: Manifest; bytes: Uint8Array<ArrayBuffer> } | null>;
+  // ── Chat tags (the chat index's derived #tag view) ──
+  /** Filter the active channel by a #tag (leading `#` optional — the display
+   *  form as clicked): runs the chat index's tagSearch and shows its hits
+   *  instead of the live message slice until cleared. Channel-scoped, so a
+   *  channel switch clears it. */
+  setTagFilter(tag: string): void;
+  /** Drop the tag filter and return to the live view. */
+  clearTagFilter(): void;
+  /** Load the active channel's tag catalog into `state.channelTags` for the
+   *  header's tag dropdown. Best-effort: a node without the index tier just
+   *  leaves the list empty. */
+  loadChannelTags(): void;
+
+  // ── Files (duckfs) ──
+  // The files browser drives duckfs reads/writes directly off the live
+  // transport (context.transport) via domain/files-client — no store action,
+  // like the forge browser. The per-block Find projection into `state.files`
+  // (DucktapeProvider) is all the store keeps, feeding the command palette.
 
   /** Ask the managed daemon to exit (desktop only). */
   stopNode(): void;
@@ -272,6 +422,13 @@ export interface ConsoleActions {
   /** Scrape + parse the node's `/metrics`. Null when no node is resolved or the
    *  scrape fails — best-effort, for the poll-driven Metrics view. */
   readMetrics(): Promise<NodeMetrics | null>;
+  /** The active workspace's `daemon.log` path + last 64 KB — polled by the
+   *  Node → Logs tab. Null when there is no managed workspace or the read
+   *  fails (node stopped mid-view); the viewer keeps its last good frame. */
+  readDaemonLog(): Promise<ws.LogTail | null>;
+  /** The active managed node's runtime facts (pid, uptime, binary, paths) for
+   *  the Logs tab's facts row. Null when unmanaged or the read fails. */
+  readRuntimeFacts(): Promise<ws.RuntimeFacts | null>;
   dismissError(): void;
 
   // ── Onboarding / workspaces (desktop only) ──
@@ -356,25 +513,63 @@ export function createActions({
   const update = (fn: (state: ConsoleState) => Partial<ConsoleState>) =>
     dispatch({ type: "update", fn });
 
+  /** The live transport + active workspace the account writes sign against.
+   *  Throws when disconnected — callers wrap it in a promise chain, so the
+   *  rejection lands in the Account view's inline error slot. */
+  const accountDeps = (): AccountOpsDeps => {
+    const live = getNode();
+    const { workspace } = getState();
+    if (!live || !workspace) throw new Error("not connected to a workspace node");
+    return { transport: live, chainId: workspace.chainId, nodePub: workspace.pubkey };
+  };
+
   // Monotonic token gating the async search fan-out: each runSearch/clearSearch
   // bumps it, and a resolving fan-out only writes results if its token is still
   // current — so a slow or out-of-order response can never clobber a newer
   // query's results (or repopulate a cleared palette).
   let searchToken = 0;
 
+  // The tag filter's own token, same discipline: setTagFilter/clearTagFilter
+  // (and a channel switch) bump it so a stale tagSearch can't land.
+  let tagToken = 0;
+
   // The live call session (the browser audio graph + camera + ws), or null when
   // not in a huddle. Ephemeral and per-client — it lives here, not in state;
   // the `voice` slice mirrors only its status + camera/peer beacons for the ui.
   let voice: CallSession | null = null;
 
+  // Resolve real VP8 encode/decode support ONCE (isConfigSupported is async, and
+  // API presence lies on WebKitGTK). Until it lands, videoCapability stays
+  // {false,false} so the camera toggle never appears as a dead control.
+  void probeVideoCapability()
+    .then((capability) => patch({ videoCapability: capability }))
+    .catch(() => {}); // stay at {false,false} — no camera — on any probe failure
+
   /** Our own node key hex — the fan-out set excludes it. Empty on a daemon
    *  that can't do voice. */
   const selfNodeHex = (): string => getState().status?.publicKey ?? "";
+
+  const setNotifyPrefs = (prefs: NotifyPrefs): void => {
+    saveNotifyPrefs(prefs);
+    patch({ notifyPrefs: prefs });
+  };
 
   // The last fan-out set pushed into the live session — refresh() lands a new
   // channels array every block, so pushes are deduped by value here rather
   // than by effect identity upstream.
   let lastRecipients: string | null = null;
+  // Membership reconciliation bookkeeping: whether the FINALIZED roster has
+  // carried our node at least once this membership — only then does a roster
+  // without us mean "we were removed" rather than "the join hasn't landed yet".
+  let huddleSelfSeen = false;
+  // Auto-reconnect damping: one re-establish per window. A second unexpected
+  // close inside the window (flapping network, or another client of this node
+  // taking the session — a fight we must not enter) fails honestly instead.
+  const RECONNECT_DAMP_MS = 30_000;
+  let lastReconnectAtMs = 0;
+  // The transient media-failure note auto-clears; keep the timer so a newer
+  // note supersedes an older one cleanly.
+  let mediaNoteTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Recompute + push the fan-out set for `channelId` (default: the active
    *  huddle) into the live session. No-op when not huddling or unchanged. */
@@ -395,16 +590,97 @@ export function createActions({
     lastRecipients = null;
   };
 
+  /** Reconcile our session against the FINALIZED roster: once the roster has
+   *  carried our node and then drops it while the session runs (a sweep by
+   *  another member, or another client of this identity leaving), end the media
+   *  and say so — the server keeps mixing audio for any authenticated member
+   *  regardless of roster, so without this a removed participant keeps hearing
+   *  the huddle behind a card that shows nobody in it. Runs on every channel
+   *  refresh (beside the recipients push). */
+  const reconcileHuddleMembership = (): void => {
+    const state = getState();
+    const { channelId, status } = state.voice;
+    const active = status === "live" || status === "connecting" || status === "reconnecting";
+    if (!channelId || !active) {
+      huddleSelfSeen = false;
+      return;
+    }
+    const channel = state.channels.find((c) => c.id === channelId);
+    if (!channel) return; // channel list mid-refresh — never treat as removal.
+    const self = selfNodeHex();
+    const inRoster = (channel.huddle ?? []).some((m) => keyHex(m.node) === self);
+    if (inRoster) {
+      huddleSelfSeen = true;
+      return;
+    }
+    // Not in the roster: before the join lands that's expected (the optimistic
+    // projection usually covers even that); after we've been seen, it's removal.
+    if (!huddleSelfSeen) return;
+    huddleSelfSeen = false;
+    stopVoice();
+    closeHuddleWindow();
+    update((prev) => ({
+      voice: {
+        ...prev.voice,
+        popped: false,
+        status: "error",
+        error: "removed",
+        mediaNote: null,
+        cameraOn: false,
+        sharing: false,
+        peers: {},
+        speaking: false,
+      },
+    }));
+  };
+
+  /** Build + start a fresh media session for `channelId` (consensus membership
+   *  untouched) and put the slice in `status`. The shared core of the pop-in
+   *  retake and the auto-reconnect — a CallSession can never restart, so any
+   *  re-establish is a new instance. Camera resets off (a stream cannot survive
+   *  its session); mute is carried for call continuity. */
+  const startHuddleMedia = (
+    channelId: string,
+    seedMuted: boolean,
+    status: "connecting" | "reconnecting",
+  ): void => {
+    const nodeUrl = getState().nodeUrl;
+    if (voice || !nodeUrl) return;
+    voice = createCallSession(onCallEvent);
+    voice.setMuted(seedMuted);
+    voice.setDevices(getState().devicePrefs); // start() reads these at acquire
+    update((prev) => ({
+      voice: {
+        ...prev.voice,
+        popped: false,
+        muted: seedMuted,
+        status,
+        error: null,
+        mediaNote: null,
+        cameraOn: false,
+        sharing: false,
+        peers: {},
+        sessionStartMs: Date.now(),
+        speaking: false,
+      },
+    }));
+    voice.start(callSocketUrl(nodeUrl, channelId));
+    pushRecipients(channelId);
+  };
+
   // Session events → the voice slice. A `peerBeacon` merges that peer's latest
   // ephemeral call state (keyed by its already-lowercase node hex) into the
-  // slice. A `status` event drives lifecycle: any terminal end reconciles the
-  // consensus roster (submit leave) so peers never keep showing a dead
-  // participant, and clears local camera/peer state (the session is gone) —
-  // 'closed' (the session was replaced) clears the slice entirely (and closes
-  // the popped-out window); 'error' (hub refusal, socket failure, mic denial)
-  // keeps the dock up in its error state so the failure is visible — the status
-  // event carries WHY (error), which the slice mirrors for the dock's message.
-  // Leave dismisses it.
+  // slice. A `status` event drives lifecycle:
+  //   - 'closed' on a LIVE session (socket drop, node restart, session replaced)
+  //     gets ONE automatic media re-establish — membership is kept, the slice
+  //     shows "reconnecting". Damped by RECONNECT_DAMP_MS so a flapping link (or
+  //     another client of this node repeatedly taking the session) converges on
+  //     a visible failure instead of a silent steal loop.
+  //   - any other terminal end ('error', or 'closed' when not live / inside the
+  //     damp window) reconciles the consensus roster (submit leave) so peers
+  //     never keep showing a dead participant, and keeps the dock up in its
+  //     error state — a huddle must end visibly, never vanish.
+  // Leave dismisses the error card.
   const onCallEvent = (event: CallEvent): void => {
     if (event.kind === "peerBeacon") {
       update((prev) => ({
@@ -412,45 +688,80 @@ export function createActions({
           ...prev.voice,
           peers: {
             ...prev.voice.peers,
-            [event.peer]: { muted: event.muted, cameraOn: event.cameraOn, atMs: event.atMs },
+            [event.peer]: { muted: event.muted, cameraOn: event.cameraOn, sharing: event.sharing, atMs: event.atMs },
           },
         },
       }));
       return;
     }
+    if (event.kind === "selfVideo") {
+      // Authoritative lane state — corrects a failed acquire / encoder death /
+      // the browser's native "Stop sharing" that the optimistic action missed.
+      update((prev) => ({ voice: { ...prev.voice, cameraOn: event.cameraOn, sharing: event.sharing } }));
+      return;
+    }
+    if (event.kind === "selfSpeaking") {
+      update((prev) => ({ voice: { ...prev.voice, speaking: event.speaking } }));
+      return;
+    }
+    if (event.kind === "selfLevel") {
+      update((prev) => ({ voice: { ...prev.voice, level: event.level } }));
+      return;
+    }
+    if (event.kind === "mediaNote") {
+      if (mediaNoteTimer !== null) clearTimeout(mediaNoteTimer);
+      update((prev) => ({ voice: { ...prev.voice, mediaNote: event.note } }));
+      mediaNoteTimer = setTimeout(() => {
+        mediaNoteTimer = null;
+        update((prev) => ({ voice: { ...prev.voice, mediaNote: null } }));
+      }, 5_000);
+      return;
+    }
     const status = event.status;
     const error = event.error;
     if (status === "closed" || status === "error") {
-      const channelId = getState().voice.channelId;
+      const prevVoice = getState().voice;
+      const channelId = prevVoice.channelId;
       stopVoice();
-      if (channelId) submitLeaveHuddle(channelId);
-      if (status === "closed") {
-        closeHuddleWindow();
-        patch({
-          voice: {
-            channelId: null,
-            muted: false,
-            status: "idle",
-            error: null,
-            popped: false,
-            cameraOn: false,
-            peers: {},
-          },
-        });
-      } else {
-        update((prev) => ({
-          voice: {
-            ...prev.voice,
-            status: "error",
-            error: error ?? "connection",
-            cameraOn: false,
-            peers: {},
-          },
-        }));
+      if (
+        status === "closed" &&
+        channelId &&
+        prevVoice.status === "live" &&
+        Date.now() - lastReconnectAtMs > RECONNECT_DAMP_MS
+      ) {
+        lastReconnectAtMs = Date.now();
+        startHuddleMedia(channelId, prevVoice.muted, "reconnecting");
+        return;
       }
+      if (channelId) submitLeaveHuddle(channelId);
+      closeHuddleWindow();
+      update((prev) => ({
+        voice: {
+          ...prev.voice,
+          popped: false,
+          status: "error",
+          error: error ?? "connection",
+          mediaNote: null,
+          cameraOn: false,
+          sharing: false,
+          peers: {},
+          speaking: false,
+        },
+      }));
       return;
     }
-    update((prev) => ({ voice: { ...prev.voice, status, error: null } }));
+    update((prev) => ({
+      voice: {
+        ...prev.voice,
+        // A re-establish's own session reports 'connecting' — keep the visible
+        // "reconnecting" until it actually lands ('live' promotes both).
+        status:
+          prev.voice.status === "reconnecting" && status === "connecting"
+            ? "reconnecting"
+            : status,
+        error: null,
+      },
+    }));
   };
 
   /** Submit a leave_huddle for `channelId` with the optimistic roster prune. */
@@ -460,6 +771,23 @@ export function createActions({
       (live) => chatClient.leaveHuddle(live, { channelId, origin: getState().author }),
       (prev) => optimistic.huddleLeft(prev, channelId, selfNodeHex()),
     );
+
+  // Re-establish the main-window media session for a huddle we are still a
+  // consensus member of, after the popped window released it. Idempotent — a
+  // no-op (just clears `popped`) when a session already exists or we are not in
+  // a huddle. A fresh session (never restart a stopped one). This is a media
+  // reconnect, NOT a re-join, so it PRESERVES the current mute (the window
+  // reported its mute via `noteHuddleMuted`) for call continuity; camera resets
+  // off (the stream can't transfer between webviews). Consensus is intact.
+  const retakeHuddleMedia = (): void => {
+    const state = getState();
+    const channelId = state.voice.channelId;
+    if (voice || !channelId || !state.nodeUrl) {
+      update((prev) => ({ voice: { ...prev.voice, popped: false } }));
+      return;
+    }
+    startHuddleMedia(channelId, state.voice.muted, "connecting");
+  };
 
   // The one write path: apply the op's PRECONFIRMED render immediately (the
   // optimistic projection plus a pending ledger record under the entity's
@@ -492,19 +820,91 @@ export function createActions({
       });
   };
 
-  // switching channels means: new active channel, thread panel closed, and
-  // THAT channel's messages loaded — every path into a channel goes here
+  // switching channels means: new active channel, thread panel closed, any
+  // channel-scoped tag filter/catalog dropped, and THAT channel's messages
+  // loaded — every path into a channel goes here
   const enterChannel = (channelId: string) => {
     const live = getNode();
     if (!live) return;
+    tagToken += 1; // supersede any in-flight tagSearch so it can't repopulate
     patch({
       activeChannel: channelId,
       activeThread: null,
+      tagFilter: null,
+      tagHits: [],
+      tagHitsPending: false,
+      channelTags: [],
     });
     Promise.resolve()
       .then(() => chatClient.latestMessages(live, channelId))
       .then((messages) => patch({ messages }))
       .catch(fail);
+  };
+
+  // A first agent mention in an UNWATCHED channel creates the runs watch the
+  // engagement pipeline requires (policy "mention") and awaits its ack BEFORE
+  // the post — otherwise the mention commits with nothing routing it to the
+  // agent. An existing watch of ANY policy is respected, never overwritten.
+  const ensureMentionWatch = (channelId: string, blocks: ChatBlock[]): Promise<unknown> => {
+    if (!hasAgentMention(blocks)) return Promise.resolve();
+    if (getState().watches.some((watch) => watch.channel_id === channelId))
+      return Promise.resolve();
+    return submitTracked(
+      opKey.watch(channelId),
+      (live) =>
+        runsClient.watchChannel(live, {
+          channelId,
+          policy: "mention",
+          origin: getState().author,
+        }),
+      (prev) => optimistic.watchSet(prev, { channelId, policy: "mention" }),
+    );
+  };
+
+  const mentionResolver = () => {
+    const state = getState();
+    return mentionResolverOf(
+      state.agents,
+      mentionableUsers(state.nodeUsers, state.agents),
+    );
+  };
+
+  // THE channel-parameterized post every composer shares: parse mentions with
+  // the live resolver, arm the first-mention watch, then submit the tracked
+  // post. `sendMessage`/`replyInThread` route the ACTIVE channel through it;
+  // the forge item Discussion posts into its hidden channel via
+  // `postInChannel`. The optimistic patch self-guards on the active channel
+  // (`optimistic.postedMessage` returns {} for a background channel).
+  const postToChannel = (
+    channelId: string,
+    body: string,
+    thread: number | null,
+  ): Promise<unknown> => {
+    const messageId = crypto.randomUUID();
+    const blocks = parseMessageInput(body, mentionResolver());
+    const author = getState().author;
+    return ensureMentionWatch(channelId, blocks).then(() =>
+      submitTracked(
+        opKey.message(channelId, messageId),
+        (live) =>
+          chatClient.postMessage(live, {
+            channelId,
+            messageId,
+            blocks,
+            origin: author,
+            ...(thread !== null ? { thread } : {}),
+          }),
+        (prev) =>
+          optimistic.postedMessage(prev, {
+            channelId,
+            messageId,
+            blocks,
+            authorBytes: selfAuthorBytes(prev.status, prev.author),
+            at: Date.now(),
+            thread,
+          }),
+      ),
+    );
   };
 
   // Re-pull the open thread's own ChatThread snapshot after a write that may
@@ -537,7 +937,11 @@ export function createActions({
       return Promise.resolve();
     }
     const blocks = blocksOverride ?? getState().activePageBlocks;
-    const targets = [page, ...blocks.map((b) => b.id)];
+    // dedupe: the tree's root block carries the page's own id, so naively
+    // prepending `page` requests it twice — and the module answers with one
+    // group PER REQUESTED target, duplicating every page-level thread in the
+    // panel.
+    const targets = [...new Set([page, ...blocks.map((b) => b.id)])];
     // the module rejects a ThreadsForTargets over MAX_QUERY_TARGETS (512), so a
     // large page must chunk its targets across several queries.
     const CHUNK = 512;
@@ -598,6 +1002,43 @@ export function createActions({
       activePage: active,
       ...(active ? {} : { activePageBlocks: [], pageThreads: [] }),
     });
+  };
+
+  // ── Forge tracker loaders ──
+  // Per-screen data (never in the per-block refresh): the forge view calls
+  // these on open/repo switch. Stamp the repo synchronously — clearing the
+  // previous repo's slices on a switch — then land the fetch ONLY while the
+  // stamp still matches, so a slow load for a repo the view has since left
+  // can never clobber the current one (loadChannelTags' guard, repo-keyed).
+  const enterForgeRepo = (repo: string): void =>
+    update((prev) =>
+      prev.forgeRepo === repo
+        ? {}
+        : { forgeRepo: repo, forgeItems: [], forgeBranches: [] },
+    );
+
+  const loadForgeItems = (repo: string): Promise<void> => {
+    const live = getNode();
+    if (!live || !repo) return Promise.resolve();
+    enterForgeRepo(repo);
+    return forgeClient
+      .listItems(live, repo)
+      .then((items) =>
+        update((prev) => (prev.forgeRepo === repo ? { forgeItems: items } : {})),
+      )
+      .catch(fail);
+  };
+
+  const loadForgeBranches = (repo: string): Promise<void> => {
+    const live = getNode();
+    if (!live || !repo) return Promise.resolve();
+    enterForgeRepo(repo);
+    return forgeClient
+      .listRefs(live, repo)
+      .then((refs) =>
+        update((prev) => (prev.forgeRepo === repo ? { forgeBranches: refs } : {})),
+      )
+      .catch(fail);
   };
 
   // Connect the app to a workspace's node: select it (Rust spawns/adopts),
@@ -673,7 +1114,27 @@ export function createActions({
     const adopt = (transport: NodeTransport): void => {
       patch({ onboardingPhase: null });
       setNode(transport);
-      autoBindUserIdentity(transport, target).catch(() => {});
+      autoBindUserIdentity(transport, target)
+        .then((outcome) => {
+          // First-run hand-off: the name chosen while creating the account
+          // parks in localStorage (names are chain-scoped) and lands here, on
+          // the first adopted node. When the bind landed, the name belongs on
+          // the ACCOUNT (identity SetAccountName) so it travels with the
+          // person across devices. An unbound outcome leaves it parked for the
+          // next connect; there is no second per-node name registry.
+          const pending = loadPendingDisplayName();
+          if (!pending) return;
+          patch({ author: pending });
+          if (outcome !== "bound" && outcome !== "already") return;
+          return identityClient
+            .setAccountName(transport, {
+              displayName: pending,
+              origin: pending,
+            })
+            .then(() => clearPendingDisplayName())
+            .catch(() => {});
+        })
+        .catch(() => {});
     };
     return Promise.resolve()
       .then(() => ws.selectWorkspace(target.id))
@@ -693,10 +1154,11 @@ export function createActions({
           });
         }
         // joiner: the node parks until a member admits it and the epoch cuts
-        // over; it then promotes into the validator set. Poll until that
-        // happens. NOTE a parked joiner may well serve its http surface
-        // (newer node builds do) — a mere status answer is NOT admission, so
-        // adoption additionally requires OUR key in the committed valset.
+        // over. It may stop at resident standing (mesh + statesync, no quorum
+        // seat) or later promote into the validator set. NOTE a parked joiner
+        // may serve its http surface — a mere status answer is NOT admission,
+        // so adoption additionally requires OUR key in either committed valset
+        // tier.
         const park = (): Promise<void> =>
           ws.workspacePhase(target.id).then((report) => {
             if (stale()) return;
@@ -713,23 +1175,11 @@ export function createActions({
             (s) => {
               if (stale()) return;
               if (!identityMatches(s.publicKey)) return rejectImpostor();
-              return valsetClient
-                .validators(transport)
-                .then(
-                  (keys) =>
-                    keys.some(
-                      (key) =>
-                        valsetClient.validatorHex(key).toLowerCase() ===
-                        target.pubkey.toLowerCase(),
-                    ),
-                  // an unreadable valset proves nothing — keep waiting.
-                  () => false,
-                )
-                .then((seated) => {
-                  if (stale()) return;
-                  if (!seated) return park();
-                  adopt(transport);
-                });
+              return hasValsetStanding(transport, target.pubkey).then((seated) => {
+                if (stale()) return;
+                if (!seated) return park();
+                adopt(transport);
+              });
             },
             () => park(),
           );
@@ -820,8 +1270,55 @@ export function createActions({
       });
     },
 
-    setAccent: (accent) => patch({ accent }),
+    setAccent: (accent) => {
+      saveAccent(accent);
+      patch({ accent });
+    },
+
+    toggleTheme: () => {
+      const next = getState().theme === "dark" ? "light" : "dark";
+      saveTheme(next);
+      patch({ theme: next });
+    },
+    setNotifyPrefs,
+    toggleChannelMute: (channelId) => {
+      const prefs = getState().notifyPrefs;
+      setNotifyPrefs({
+        ...prefs,
+        mutedChannels: prefs.mutedChannels.includes(channelId)
+          ? prefs.mutedChannels.filter((id) => id !== channelId)
+          : [...prefs.mutedChannels, channelId],
+      });
+    },
     setAuthor: (author) => patch({ author }),
+
+    // ── Account writes (see account-ops.ts) ──
+    // Each resolves the live transport + active workspace up front; callers
+    // (the Account view) surface the rejection inline. The refresh() after a
+    // landed submit re-reads the identity projections promptly instead of
+    // waiting for the next block tick.
+    accountLinkChallenge: () =>
+      Promise.resolve().then(() => mintLinkChallenge(accountDeps())),
+    accountAddMember: (challenge, responseBlob) =>
+      Promise.resolve()
+        .then(() => addMemberFromResponse(accountDeps(), challenge, responseBlob))
+        .then(() => refresh()),
+    accountRemoveMember: (targetKeyHex) =>
+      Promise.resolve()
+        .then(() => removeMemberKey(accountDeps(), targetKeyHex))
+        .then(() => refresh()),
+    accountUnbindNode: (targetNodeHex) =>
+      Promise.resolve()
+        .then(() => unbindNode(accountDeps(), targetNodeHex))
+        .then(() => refresh()),
+    accountPhoneEnrollStart: () =>
+      Promise.resolve().then(() => startPhoneEnrollment(accountDeps())),
+    accountPhoneEnrollApprove: (enrollment, newKeyHex, sigHex, label) =>
+      Promise.resolve()
+        .then(() =>
+          approvePhoneEnrollment(accountDeps(), enrollment, newKeyHex, sigHex, label),
+        )
+        .then(() => refresh()),
 
     readMetrics: () => {
       const live = getNode();
@@ -830,27 +1327,53 @@ export function createActions({
         : Promise.resolve(null);
     },
 
-    // Keep the local author identity (still the web-origin string) AND submit
-    // a name write so the chosen name propagates: it's origin-gated, so
-    // passing our origin only ever writes OUR OWN name. Once this node is
-    // bound to a user (state.nodeUsers has it), the durable identity is the
-    // USER, not the node — so the write goes through identity's SetUserName
-    // instead of profiles' SetName, the same way MembersView's inline
-    // self-rename (canRename row, also wired to this action) picks up the
-    // bound-vs-unbound distinction for free. An unbound node keeps the
-    // original profiles path unchanged. Refresh re-reads authorNames/nodeUsers.
+    // The Logs tab surfaces the LOCAL daemon.log — a per-workspace file only the
+    // desktop shell that spawned the node can read. Both reads are best-effort:
+    // a stopped/forgotten node just yields null and the tab keeps its last frame
+    // (or shows its managed-only empty state). Keyed on the active workspace id.
+    readDaemonLog: () => {
+      const { managed, workspace } = getState();
+      if (!managed || !workspace) return Promise.resolve(null);
+      return ws.workspaceLogTail(workspace.id).catch(() => null);
+    },
+
+    readRuntimeFacts: () => {
+      const { managed, workspace } = getState();
+      if (!managed || !workspace) return Promise.resolve(null);
+      return ws.workspaceRuntimeFacts(workspace.id).catch(() => null);
+    },
+
+    // Identity is the only durable display-name authority. The module derives
+    // the account from the authenticated node and rejects an unbound origin.
     setDisplayName: (name) => {
       const current = getState();
       const origin = current.author;
-      const nodeKeyNorm = normalizeKey(current.workspace?.pubkey);
-      const bound = nodeKeyNorm ? current.nodeUsers[nodeKeyNorm] : undefined;
       submitTracked(
-        opKey.profile(),
-        (live) =>
-          bound
-            ? identityClient.setUserName(live, { displayName: name, origin })
-            : profilesClient.setName(live, { displayName: name, origin }),
+        opKey.accountName(),
+        (live) => identityClient.setAccountName(live, { displayName: name, origin }),
         () => ({ author: name }),
+      );
+    },
+
+    setDuckHandle: (handle) => {
+      const current = getState();
+      const nodeKey = normalizeKey(current.status?.publicKey || current.workspace?.pubkey);
+      const accountId = nodeKey
+        ? current.nodeUsers[nodeKey]?.accountId
+        : undefined;
+      if (!accountId) {
+        fail("bind this node to an identity account before registering a .duck name");
+        return;
+      }
+      submitTracked(
+        opKey.duckHandle(),
+        (live) => duckdnsClient.setHandle(live, { handle, origin: current.author }),
+        (prev) => {
+          const accountHandles = { ...prev.accountHandles };
+          if (handle) accountHandles[accountId] = handle;
+          else delete accountHandles[accountId];
+          return { accountHandles };
+        },
       );
     },
 
@@ -881,23 +1404,12 @@ export function createActions({
     sendMessage: (body) => {
       const channelId = getState().activeChannel;
       if (!channelId || !body.trim()) return;
-      const messageId = crypto.randomUUID();
-      const blocks = parseMessageInput(body);
-      const author = getState().author;
-      submitTracked(
-        opKey.message(channelId, messageId),
-        (live) =>
-          chatClient.postMessage(live, { channelId, messageId, blocks, origin: author }),
-        (prev) =>
-          optimistic.postedMessage(prev, {
-            channelId,
-            messageId,
-            blocks,
-            author,
-            at: Date.now(),
-            thread: null,
-          }),
-      );
+      void postToChannel(channelId, body, null);
+    },
+
+    postInChannel: (channelId, body) => {
+      if (!channelId || !body.trim()) return Promise.resolve();
+      return postToChannel(channelId, body, null).then(() => undefined);
     },
 
     openThread: (rootSeq) => {
@@ -921,40 +1433,7 @@ export function createActions({
       const channelId = getState().activeChannel;
       const root = getState().activeThread?.root;
       if (!channelId || !root || !body.trim()) return;
-      const messageId = crypto.randomUUID();
-      const blocks = parseMessageInput(body);
-      const author = getState().author;
-      submitTracked(
-        opKey.message(channelId, messageId),
-        (live) =>
-          chatClient.postMessage(live, {
-            channelId,
-            messageId,
-            blocks,
-            origin: author,
-            thread: root.seq,
-          }),
-        (prev) =>
-          optimistic.postedMessage(prev, {
-            channelId,
-            messageId,
-            blocks,
-            author,
-            at: Date.now(),
-            thread: root.seq,
-          }),
-      ).then(() => {
-        const live = getNode();
-        if (!live) return;
-        return chatClient
-          .thread(live, { channelId, rootSeq: root.seq })
-          .then((activeThread) =>
-            update((prev) =>
-              prev.activeThread?.root.seq === root.seq ? { activeThread } : {},
-            ),
-          )
-          .catch(fail);
-      });
+      void postToChannel(channelId, body, root.seq).then(() => resyncOpenThread());
     },
 
     editMessage: (seq, body) => {
@@ -966,7 +1445,11 @@ export function createActions({
         (activeThread?.root.seq === seq
           ? activeThread.root
           : activeThread?.replies.find((m) => m.seq === seq));
-      const blocks = parseMessageInput(body);
+      // The resolver keeps an edited mention's mark intact: blocksToInput
+      // seeded the editor with "@agent_id", so re-parsing must resolve it
+      // back or the edit silently strips the mention. No auto-watch here —
+      // engagement is a post-time concern.
+      const blocks = parseMessageInput(body, mentionResolver());
       submitTracked(
         opKey.messageSeq(channelId, seq),
         (live) =>
@@ -1061,7 +1544,7 @@ export function createActions({
           optimistic.huddleJoined(prev, {
             channelId,
             node,
-            author: prev.author,
+            authorBytes: selfAuthorBytes(prev.status, prev.author),
             at: Math.floor(Date.now() / 1000),
           }),
       ).then(() => {
@@ -1075,16 +1558,24 @@ export function createActions({
           stopVoice();
           // the session is gone — camera/beacon state must not outlive it.
           update((prev) => ({
-            voice: { ...prev.voice, status: "error", error: "refused", cameraOn: false, peers: {} },
+            voice: { ...prev.voice, status: "error", error: "refused", cameraOn: false, sharing: false, peers: {} },
           }));
         }
       });
       // start the audio session and reflect "connecting"; push whatever roster
       // we already know (others may be huddling), self excluded. joins start
       // MUTED — joining a room must never be a hot-mic moment; unmuting is the
-      // deliberate act.
+      // deliberate act. Deliberately NOT startHuddleMedia: a join differs from
+      // a media re-establish (it sets channelId, forces muted, and must keep
+      // `popped` for a retry from the popped window) — folding them would break
+      // one or the other.
+      // A fresh membership: reset the reconcile + reconnect bookkeeping so an
+      // old session's history never bleeds into this one.
+      huddleSelfSeen = false;
+      lastReconnectAtMs = 0;
       voice = createCallSession(onCallEvent);
       voice.setMuted(true);
+      voice.setDevices(getState().devicePrefs); // start() reads these at acquire
       // a retry from the popped window must keep it popped — spread, don't reset;
       // camera/peer state resets since this is a fresh session.
       update((prev) => ({
@@ -1094,8 +1585,13 @@ export function createActions({
           muted: true,
           status: "connecting",
           error: null,
+          mediaNote: null,
           cameraOn: false,
+          sharing: false,
           peers: {},
+          // Fresh session → fresh staleness baseline (a retry replaces the session).
+          sessionStartMs: Date.now(),
+          speaking: false,
         },
       }));
       voice.start(callSocketUrl(nodeUrl, channelId));
@@ -1104,6 +1600,7 @@ export function createActions({
 
     leaveHuddle: () => {
       const channelId = getState().voice.channelId;
+      huddleSelfSeen = false;
       stopVoice();
       closeHuddleWindow();
       patch({
@@ -1112,9 +1609,14 @@ export function createActions({
           muted: false,
           status: "idle",
           error: null,
+          mediaNote: null,
           popped: false,
           cameraOn: false,
+          sharing: false,
           peers: {},
+          sessionStartMs: null,
+          speaking: false,
+          level: 0,
         },
       });
       if (channelId) submitLeaveHuddle(channelId);
@@ -1125,20 +1627,44 @@ export function createActions({
       update((prev) => ({ voice: { ...prev.voice, muted } }));
     },
 
-    syncHuddleRecipients: () => pushRecipients(),
+    syncHuddleRecipients: () => {
+      reconcileHuddleMembership();
+      pushRecipients();
+    },
 
     setCamera: (on) => {
       if (!voice) return;
-      if (on && !supportsVideoCalls()) return; // capability-gated UI should prevent this
+      if (on && !getState().videoCapability.canEncode) return; // capability-gated UI should prevent this
       const channel = getState().channels.find((c) => c.id === getState().voice.channelId);
       // block turning the camera on once the roster EXCEEDS the video cap — the
       // grid can't render more tiles, so those huddles stay audio-only.
       if (on && (channel?.huddle?.length ?? 0) > MAX_VIDEO_PARTICIPANTS) return;
       voice.setCamera(on);
-      update((prev) => ({ voice: { ...prev.voice, cameraOn: on } }));
+      // Camera XOR screen: enabling the camera swaps any screen share off.
+      update((prev) => ({ voice: { ...prev.voice, cameraOn: on, ...(on ? { sharing: false } : {}) } }));
     },
 
-    videoSupported: () => supportsVideoCalls(),
+    setScreenShare: (on) => {
+      if (!voice) return;
+      if (on && !getState().videoCapability.canScreenShare) return; // capability-gated UI should prevent this
+      const channel = getState().channels.find((c) => c.id === getState().voice.channelId);
+      if (on && (channel?.huddle?.length ?? 0) > MAX_VIDEO_PARTICIPANTS) return; // same tile cap as the camera
+      voice.setScreenShare(on);
+      // Camera XOR screen: enabling the share swaps the camera off.
+      update((prev) => ({ voice: { ...prev.voice, sharing: on, ...(on ? { cameraOn: false } : {}) } }));
+    },
+
+    refreshDevices: () => {
+      void enumerateHuddleDevices()
+        .then((deviceOptions) => patch({ deviceOptions }))
+        .catch(() => {});
+    },
+
+    setDevicePrefs: (prefs) => {
+      saveDevicePrefs(prefs);
+      voice?.setDevices(prefs);
+      patch({ devicePrefs: prefs });
+    },
 
     sweepHuddle: (channelId, user) => {
       submitTracked(
@@ -1152,14 +1678,24 @@ export function createActions({
 
     popOutHuddle: () => {
       if (!getState().voice.channelId) return;
+      // Hand the media session to the window: open it, then release ours FIRST
+      // (the hub is one-session-per-node — main must close before the window
+      // dials). Consensus membership + channelId stay; only the media goes.
       openHuddleWindow();
-      update((prev) => ({ voice: { ...prev.voice, popped: true } }));
+      stopVoice();
+      update((prev) => ({
+        voice: { ...prev.voice, popped: true, cameraOn: false, peers: {}, speaking: false },
+      }));
     },
 
     popInHuddle: () => {
       closeHuddleWindow();
-      update((prev) => ({ voice: { ...prev.voice, popped: false } }));
+      retakeHuddleMedia();
     },
+
+    retakeHuddleMedia,
+
+    noteHuddleMuted: (muted) => update((prev) => ({ voice: { ...prev.voice, muted } })),
 
     commitForge: (params) => {
       if (!params.path.trim() || params.content.length === 0) return;
@@ -1171,6 +1707,95 @@ export function createActions({
           origin: getState().author,
         }),
       );
+    },
+
+    // ── Forge tracker ──
+    // Writes follow the one tracked path (preconfirm-less — the tracker has no
+    // optimistic projection yet), then re-load the repo's per-screen item list,
+    // since the global refresh deliberately excludes it. Detail (getForgeItem)
+    // resolves to the caller: the item panel re-fetches after its own writes.
+    loadForgeItems,
+    loadForgeBranches,
+
+    getForgeItem: (repo, number) => {
+      const live = getNode();
+      if (!live || !repo) return Promise.resolve(null);
+      return forgeClient.getItem(live, { repo, number }).catch((err) => {
+        fail(err);
+        return null;
+      });
+    },
+
+    openForgeIssue: ({ repo, title, body }) => {
+      if (!repo || !title.trim()) return Promise.resolve();
+      return submitTracked(opKey.forgeItemOpen(repo), (live) =>
+        forgeClient.openIssue(live, {
+          repo,
+          title: title.trim(),
+          body,
+          origin: getState().author,
+        }),
+      ).then(() => loadForgeItems(repo));
+    },
+
+    openForgePr: ({ repo, title, body, sourceBranch, targetBranch }) => {
+      if (!repo || !title.trim() || !sourceBranch) return Promise.resolve();
+      return submitTracked(opKey.forgeItemOpen(repo), (live) =>
+        forgeClient.openPr(live, {
+          repo,
+          title: title.trim(),
+          body,
+          sourceBranch,
+          targetBranch,
+          origin: getState().author,
+        }),
+      ).then(() => loadForgeItems(repo));
+    },
+
+    editForgeItem: ({ repo, number, title, body }) => {
+      // an all-null edit is a wire no-op — don't spend a block on it.
+      if (!repo || (title === null && body === null)) return Promise.resolve();
+      return submitTracked(opKey.forgeItem(repo, number), (live) =>
+        forgeClient.editItem(live, { repo, number, title, body, origin: getState().author }),
+      ).then(() => loadForgeItems(repo));
+    },
+
+    setForgeItemState: ({ repo, number, open }) => {
+      if (!repo) return Promise.resolve();
+      return submitTracked(opKey.forgeItem(repo, number), (live) =>
+        forgeClient.setItemState(live, { repo, number, open, origin: getState().author }),
+      ).then(() => loadForgeItems(repo));
+    },
+
+    mergeForgePr: ({ repo, number, prevTargetOid, expectedSourceOid, mergeOid, packDigest }) => {
+      if (!repo) return Promise.resolve();
+      return submitTracked(opKey.forgeItem(repo, number), (live) =>
+        forgeClient.mergePr(live, {
+          repo,
+          number,
+          prevTargetOid,
+          expectedSourceOid,
+          mergeOid,
+          packDigest,
+          origin: getState().author,
+        }),
+        // a merge moves the target branch head too — reload both slices.
+      ).then(() => Promise.all([loadForgeItems(repo), loadForgeBranches(repo)])).then(() => {});
+    },
+
+    submitForgeReview: ({ repo, number, verdict, body, commitOid, comments }) => {
+      if (!repo) return Promise.resolve();
+      return submitTracked(opKey.forgeItem(repo, number), (live) =>
+        forgeClient.submitReview(live, {
+          repo,
+          number,
+          verdict,
+          body,
+          commitOid,
+          comments,
+          origin: getState().author,
+        }),
+      ).then(() => loadForgeItems(repo));
     },
 
     // ── Docs ──
@@ -1520,46 +2145,45 @@ export function createActions({
 
     closeSearch: () => patch({ searchOpen: false }),
 
-    // ── Files ──
-    uploadFile: ({ name, mime, bytes }) => {
-      const cleanName = name.trim();
-      if (!cleanName) return;
-      const fileId = crypto.randomUUID();
-      submitTracked(opKey.file(fileId), (live) =>
-        filesClient.uploadFile(live, {
-          fileId,
-          name: cleanName,
-          mime: mime || "application/octet-stream",
-          bytes,
-        }),
-      );
-    },
-
-    removeFile: (fileId) => {
-      if (!fileId) return;
-      submitTracked(
-        opKey.file(fileId),
-        (live) => filesClient.removeManifest(live, fileId),
-        (prev) => optimistic.fileRemoved(prev, fileId),
-      );
-    },
-
-    downloadFile: (fileId) => {
+    // ── Chat tags (derived-index view) ──
+    setTagFilter: (tag) => {
       const live = getNode();
-      if (!live || !fileId) return Promise.resolve(null);
-      return Promise.resolve()
-        .then(() => filesClient.stat(live, fileId))
-        .then((manifest) =>
-          manifest
-            ? filesClient
-                .downloadFile(live, manifest)
-                .then((bytes) => ({ manifest, bytes }))
-            : null,
-        )
+      // keep the as-typed display form for the bar; the node normalizes.
+      const clean = tag.trim().replace(/^#+/, "");
+      const channelId = getState().activeChannel;
+      if (!live || !clean) return;
+      const token = ++tagToken;
+      patch({ tagFilter: { tag: clean, channelId }, tagHits: [], tagHitsPending: true });
+      chatClient
+        .tagSearch(live, { tag: clean, channelId: channelId ?? undefined, limit: 100 })
+        .then((hits) => {
+          if (token !== tagToken) return; // superseded by a newer filter/clear
+          patch({ tagHits: hits, tagHitsPending: false });
+        })
         .catch((err) => {
+          if (token !== tagToken) return;
+          patch({ tagHitsPending: false });
           fail(err);
-          return null;
         });
+    },
+
+    clearTagFilter: () => {
+      tagToken += 1; // supersede any in-flight tagSearch so it can't repopulate
+      patch({ tagFilter: null, tagHits: [], tagHitsPending: false });
+    },
+
+    loadChannelTags: () => {
+      const live = getNode();
+      const channelId = getState().activeChannel;
+      if (!live || !channelId) return;
+      chatClient
+        .tags(live, { channelId, limit: 20 })
+        .then((rows) => {
+          // only land on the channel the load was asked for.
+          if (getState().activeChannel === channelId) patch({ channelTags: rows });
+        })
+        // best-effort: an older node without the index tier 404s the view.
+        .catch(() => {});
     },
 
     stopNode: () => {
@@ -1650,6 +2274,9 @@ export function createActions({
           activeChannel: null,
           activeThread: null,
           authorNames: {},
+          nodeUsers: {},
+          accountKeys: {},
+          accountHandles: {},
           pages: [],
           activePage: null,
           activePageBlocks: [],
@@ -1715,6 +2342,9 @@ export function createActions({
         activeChannel: null,
         activeThread: null,
         authorNames: {},
+        nodeUsers: {},
+        accountKeys: {},
+        accountHandles: {},
         members: [],
         proposals: [],
         forgeHead: null,
@@ -1823,6 +2453,9 @@ export function createActions({
             activeChannel: null,
             activeThread: null,
             authorNames: {},
+            nodeUsers: {},
+            accountKeys: {},
+            accountHandles: {},
             pages: [],
             activePage: null,
             activePageBlocks: [],
@@ -1888,6 +2521,9 @@ export function createActions({
             activeChannel: null,
             activeThread: null,
             authorNames: {},
+            nodeUsers: {},
+            accountKeys: {},
+            accountHandles: {},
             pages: [],
             activePage: null,
             activePageBlocks: [],

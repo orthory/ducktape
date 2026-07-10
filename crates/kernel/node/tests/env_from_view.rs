@@ -23,12 +23,14 @@ struct Seen {
     origin: Vec<u8>,
 }
 
+type ProbeLog = Arc<Mutex<Vec<(Vec<u8>, Seen)>>>;
+
 /// a stateless module that records the `Env` of every op routed to it into a
 /// shared log (keyed by payload). its root never moves — it exists only to
 /// observe the environment the host stamps.
 #[derive(Clone)]
 struct Probe {
-    log: Arc<Mutex<Vec<(Vec<u8>, Seen)>>>,
+    log: ProbeLog,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -57,7 +59,7 @@ impl Module for Probe {
     }
 }
 
-fn probe_host(log: Arc<Mutex<Vec<(Vec<u8>, Seen)>>>) -> host::Host {
+fn probe_host(log: ProbeLog) -> host::Host {
     host::Host::genesis(vec![Box::new(Probe { log })]).expect("genesis")
 }
 
@@ -78,7 +80,7 @@ fn env_reflects_agreed_view_height_time_and_real_origin() {
         const N: usize = 3;
 
         // N validators, each with its own probe log.
-        let mut logs: Vec<Arc<Mutex<Vec<(Vec<u8>, Seen)>>>> = Vec::new();
+        let mut logs: Vec<ProbeLog> = Vec::new();
         let mut nodes: Vec<OrderedNode<RoundOrderer>> = Vec::new();
         for _ in 0..N {
             let log = Arc::new(Mutex::new(Vec::new()));
@@ -90,9 +92,10 @@ fn env_reflects_agreed_view_height_time_and_real_origin() {
         }
 
         // PHASE 1: every validator proposes the SAME op (submitter "alice"),
-        // then drains. one frame per round -> agreed view 0.
+        // FLUSHES it into a batch, then drains. one op per batch -> agreed view 0.
         for node in nodes.iter_mut() {
             node.submit(&sk(10), 0, op(b"first")).await.expect("submit");
+            node.flush_batch().await.expect("flush");
             drain_to_fixpoint(node).await;
         }
 
@@ -101,6 +104,7 @@ fn env_reflects_agreed_view_height_time_and_real_origin() {
             node.submit(&sk(11), 0, op(b"second"))
                 .await
                 .expect("submit");
+            node.flush_batch().await.expect("flush");
             drain_to_fixpoint(node).await;
         }
 

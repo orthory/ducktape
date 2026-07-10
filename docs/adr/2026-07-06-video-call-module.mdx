@@ -1,13 +1,15 @@
 # ADR: Video Calls in Chat ("concall") — direction fixed, build not scheduled
 
-Date: 2026-07-06 · Status: **Built** (2026-07-07, `feat/video-calls`) — see
-`docs/superpowers/specs/2026-07-06-video-call-build.md` for what shipped vs
-this text. Structural deviations: the webview↔node leg is the huddle build's
+Date: 2026-07-06 · Status: **Built** (2026-07-07, `feat/video-calls`).
+Structural deviations from the accepted direction: the webview↔node leg is the huddle build's
 typed websocket + WebCodecs, not the §4 str0m WebRTC gateway (the inter-node
 wire below shipped as written); admission is the huddle build's locally-live-
 flows posture, not §3's consensus-roster policy (still the hardening seam);
-and media rides the authenticated TCP mesh arm rather than waiting on the
-slice-0 overlay socket, which remains a drop-in behind the same trait.
+and media initially rode the authenticated TCP mesh arm rather than waiting on
+the slice-0 overlay socket. **Update 2026-07-09:** media has since moved to the
+overlay-socket arm — one per-use plane per service — because the shared mesh
+relay queue starved voice behind video under load; see the 2026-07-09 update in
+`docs/adr/2026-07-07-per-use-data-plane.mdx`.
 
 Original status: Accepted as direction, build not scheduled —
 recorded so the architecture is not re-litigated when calls become current.
@@ -145,8 +147,7 @@ the design leans on:
 
 ## Full design detail
 
-The complete spec this ADR condenses (evidence dossier with sources, layer
-diagram, failure modes, test plan, code anchors) lived at
-`docs/superpowers/specs/2026-07-06-video-call-module-design.md` and is
-preserved in git history: added in 5ae8235, removed in the commit that adds
-this ADR (branch `feat/video-call-design`).
+The complete draft this ADR condensed (evidence dossier with sources, layer
+diagram, failure modes, test plan, code anchors) is preserved in git history:
+added in 5ae8235, removed in the commit that adds this ADR (branch
+`feat/video-call-design`).

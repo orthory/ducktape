@@ -8,25 +8,17 @@ import {
   cancelRun,
   enableJobWorker,
   pendingRuns,
+  recentRuns,
   requestRun,
   unwatchChannel,
   watchChannel,
   watches,
 } from "./runs-client";
-import type { PendingRun, WatchView } from "./runs-client";
-import type { NodeTransport } from "./transport";
+import type { PendingRun, RunRecord, WatchView } from "./runs-client";
+import { makeTransportStub } from "../test/transport-stub";
 
-const stubTransport = (reply?: unknown): NodeTransport => ({
-  submit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
-  query: vi.fn().mockResolvedValue(reply),
-  view: vi.fn(),
-  putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
-  getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
-  status: vi.fn(),
-  metrics: vi.fn(),
-  blocks: vi.fn(),
-  onBlock: vi.fn(),
-});
+const stubTransport = (reply?: unknown) =>
+  makeTransportStub({ query: vi.fn().mockResolvedValue(reply) });
 
 describe("runs msgs", () => {
   it("encodes WatchChannel — a unit policy and the Assigned newtype", async () => {
@@ -120,5 +112,32 @@ describe("runs queries", () => {
     const transport = stubTransport({ watches: [watch] });
     await expect(watches(transport)).resolves.toEqual([watch]);
     expect(transport.query).toHaveBeenCalledWith("runs", "watches");
+  });
+
+  it("sends the bare string RecentRuns and decodes the delivered-runs ring", async () => {
+    const record: RunRecord = {
+      run_id: "run-1",
+      agent_id: "helper",
+      channel_id: "forge:app:12",
+      anchor_seq: 4,
+      outcome: "delivered",
+      degraded: false,
+      created_at: 2,
+      delivered_at: 9,
+      executing_node: "ab".repeat(32),
+      output_ref: "agent/x@1a2b3c4d5e6f",
+      pr_number: 7,
+    };
+    const failed: RunRecord = {
+      ...record,
+      run_id: "run-2",
+      outcome: "failed",
+      executing_node: "unknown",
+      output_ref: null,
+      pr_number: null,
+    };
+    const transport = stubTransport({ recent_runs: [record, failed] });
+    await expect(recentRuns(transport)).resolves.toEqual([record, failed]);
+    expect(transport.query).toHaveBeenCalledWith("runs", "recent_runs");
   });
 });

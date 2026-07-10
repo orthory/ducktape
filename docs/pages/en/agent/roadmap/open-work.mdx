@@ -1,7 +1,18 @@
+---
+showAskAi: false
+---
+
 # Open Work
 
 This page tracks implementation gaps that agents should not accidentally present
 as finished.
+
+Related: [human What Is Left](/en/human/roadmap/what-is-left) is the reader
+version, [Product Modules](/en/human/modules/product-modules) explains built
+module behavior, [Coordination](/en/human/network/coordination) covers
+rendezvous, [Node Upgrades](/en/agent/network/node-upgrades) covers live
+upgrade work, and [Implementation Status](/en/human/reference/implementation-status)
+is the built/tested checklist.
 
 ## WireGuard Tunnel Runtime
 
@@ -52,10 +63,24 @@ agent execution loop; it is richer operator UX and package-level behavior:
 packaged agents and harnesses, broader action vocabularies, task obligations,
 and durable agent workflows that feel native rather than a debug surface.
 
+## duckfs Client Stack
+
+duckfs Phases 1–2 are shipped: the rebuilt `files` module (staging, atomic
+per-path-CAS commits, snapshots, pins, watches, snapshot-addressed reads),
+resolver-backed state sync to full possession, restart durability, and the
+noded HTTP surface are present. The client side is also built: `crates/duckfs/client`
+owns the checkout/status/commit engine, `ducktape-fs` ships read verbs plus
+checkout/status/commit/pin, and `mount` exists behind the `fuse` cargo feature.
+Do not list the engine, CLI, or mount as missing. Remaining work is the app
+FilesView/UX rebuilt on duckfs verbs. The old memory/workspace surface was
+absorbed by duckfs snapshots and `duck://files/...` evidence. Filesystem-change
+automations would return as a new duckfs-watch trigger, a fresh feature, not a
+migration.
+
 ## Module Integration Wave
 
 The next module wave is integration work across modules that already exist:
-automations deliver to inbox via `Deliver`; automations can trigger from memory
-watches; memory bodies over 64 KiB ride through files manifests; package
-harnesses can own agents and action routes; and tasks can become obligations
-with deadline state, cure/escalation lineage, and atomic cross-module creation.
+automations deliver to inbox via `Deliver`; automations can trigger from duckfs
+(files) watches; agents can claim jobs; package harnesses can own agents and
+action routes; and tasks can become obligations with deadline state,
+cure/escalation lineage, and atomic cross-module creation.

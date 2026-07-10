@@ -9,7 +9,7 @@
 
 use futures::executor::block_on;
 use host::Host;
-use node::{OrderedNode, Orderer, RoundOrderer, encode_frame};
+use node::{OrderedNode, Orderer, RoundOrderer, encode_batch, encode_frame};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 
 /// counts executes; `commit_block` fails once armed.
@@ -57,13 +57,20 @@ fn a_commit_fault_halts_the_drain_with_fatal() {
         };
         // op 1 commits cleanly; op 2 arms the commit fault; op 3 must never
         // apply — the drain halts AT the fault instead of continuing past it.
+        // each op is flushed into its OWN batch so the fault halts BEFORE op 3's
+        // batch is applied (executes stays at 2). were op 2 and op 3 packed into
+        // one batch, both would execute and the batch's atomic commit would fail
+        // as a unit — still no root published, but op 3 would have executed.
         node.submit(&sk(1), 0, op.clone()).await.expect("submit 1");
+        node.flush_batch().await.expect("flush 1");
         let applied = node.drain_delivered().await.expect("first drain is clean");
         assert_eq!(applied, 1);
         let after_first = node.app_hash();
 
         node.submit(&sk(1), 1, op.clone()).await.expect("submit 2");
+        node.flush_batch().await.expect("flush 2");
         node.submit(&sk(1), 2, op.clone()).await.expect("submit 3");
+        node.flush_batch().await.expect("flush 3");
 
         let err = node
             .drain_delivered()
@@ -107,35 +114,28 @@ fn a_deterministic_rejection_does_not_halt_the_drain() {
     block_on(async {
         let host = Host::genesis(vec![Box::new(RejectAll)]).expect("genesis");
         let mut orderer = RoundOrderer::new();
+        // seed the orderer with two single-member BATCH super-frames (each op
+        // wrapped by `encode_batch`), modelling two batches finalized by
+        // consensus — the drain decodes each batch and finds a rejecting member.
+        let reject_op = Msg {
+            target: "reject".into(),
+            payload: Vec::new(),
+        };
         orderer
-            .submit(encode_frame(
-                &sk(1),
-                0,
-                &Msg {
-                    target: "reject".into(),
-                    payload: Vec::new(),
-                },
-            ))
+            .submit(encode_batch(&[encode_frame(&sk(1), 0, &reject_op)]))
             .await
-            .expect("frame 1");
+            .expect("batch 1");
         orderer
-            .submit(encode_frame(
-                &sk(1),
-                1,
-                &Msg {
-                    target: "reject".into(),
-                    payload: Vec::new(),
-                },
-            ))
+            .submit(encode_batch(&[encode_frame(&sk(1), 1, &reject_op)]))
             .await
-            .expect("frame 2");
+            .expect("batch 2");
         let mut node = OrderedNode::new(host, orderer);
 
         let applied = node
             .drain_delivered()
             .await
             .expect("rejections must not error the drain");
-        assert_eq!(applied, 2, "both rejected frames count as processed no-ops");
+        assert_eq!(applied, 2, "both rejected batches count as processed no-ops");
     });
 }
 

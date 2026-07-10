@@ -85,6 +85,9 @@ async fn broadcast<O: Orderer>(
 ) {
     for n in nodes.iter_mut() {
         n.submit(signer, seq, msg.clone()).await.expect("submit");
+        // flush each node's single op into its own batch super-frame: every node
+        // orders the IDENTICAL op -> identical single-member batch -> converges.
+        n.flush_batch().await.expect("flush");
     }
 }
 

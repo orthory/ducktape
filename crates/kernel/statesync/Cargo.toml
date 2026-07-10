@@ -35,6 +35,12 @@ futures = "0.3"
 
 [dev-dependencies]
 kv = { workspace = true }
+# the duckfs-odb resolver path proof: a real `files` module drives the generic
+# object-possession loop over an in-process ModuleLane (dev-only; statesync
+# never depends on an app crate at build time).
+files = { workspace = true }
+duckfs-core = { workspace = true }
+base64 = { workspace = true }
 futures = "0.3"
 async-trait = { workspace = true }
 # the shipped-index lane's end-to-end proof: real fluent31 databases cut,

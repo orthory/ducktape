@@ -31,11 +31,19 @@ members = [
     "crates/system/nat-traversal",
     "crates/system/reachability",
     "crates/system/data-plane",
+    "crates/system/overlay-net",
     "crates/system/saga",
-    "crates/system/capability", 
-    "crates/system/dispatch", 
+    "crates/system/capability",
+    "crates/system/blobstore",
+    "crates/system/dispatch",
     "crates/system/dispatch-oracle",
-    "crates/system/tagging", 
+    "crates/system/tagging",
+    "crates/duckdns/core",
+    "crates/system/duckdns",
+    "crates/system/gateway",
+    "crates/duckfs/core",
+    "crates/duckfs/disk",
+    "crates/duckfs/client",
     # apps — product feature modules
     "crates/apps/forge",
     "crates/apps/pages",
@@ -44,16 +52,15 @@ members = [
     "crates/apps/runs", 
     "crates/apps/tasks", 
     "crates/apps/vaults", 
-    "crates/apps/profiles", 
     "crates/apps/automations", 
     "crates/apps/inbox", 
-    "crates/apps/files", 
-    "crates/apps/memory", 
+    "crates/apps/files",
     "crates/apps/jobs",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
+    "bin/fs",
     # app — the desktop shell of the react client (web twin ships from app/)
     "app/src-tauri",
 ]
@@ -63,13 +70,19 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
+arrayvec = "0.7"
+crossbeam-channel = "0.5"
+lru = "0.18"
+smallvec = "1"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 async-trait = "0.1"
+futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+rand = "0.8"
 # Opus codec (voice) — pure Rust, no C toolchain. No FEC-decode / PLC in the
 # decoder (empty input errors), so the voice engine renders lost frames as
 # silence; see crates/apps/chat/src/voice.
@@ -89,10 +102,30 @@ commonware-parallel = "2026.5.0"
 commonware-utils = "2026.5.0"
 commonware-actor = "2026.5.0"
 defguard_wireguard_rs = "0.10.0"
+# the userspace overlay backend (overlay-net/userspace): the SAME BoringTun
+# core the TUN path already runs (defguard_wireguard_rs's fork), used sans-io
+# (`noise::Tunn`, no device layer) — wire compat between socket-mode and
+# tun-mode nodes is by construction, not by hope. version pinned to the one
+# defguard_wireguard_rs 0.10 resolves, so both paths share one build of the
+# crypto core.
+defguard_boringtun = "0.6.5"
+# the userspace backend's virtual host: a TUN-less TCP/UDP stack terminating
+# at the node's overlay ULA, entirely in-process. `medium-ip` because the
+# tunnel carries raw IP (WireGuard has no link layer), `async` for the
+# waker-based socket surface.
+smoltcp = { version = "0.13", default-features = false, features = [
+    "std", "medium-ip", "proto-ipv6", "socket-udp", "socket-tcp", "async",
+] }
 # the node's own WireGuard identity is X25519 (WireGuard's curve, not the
 # ed25519 signer's); static_secrets because the key persists across boots.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
+p256 = "0.13"
+# duckfs path normalization: NFC so visually-identical names collide instead
+# of coexisting (a consensus-determinism requirement, not cosmetics).
+unicode-normalization = "0.1"
+# tests only: isolated on-disk module data dirs.
+tempfile = "3"
 # user-key v2 at-rest custody (bin/node/src/userkey.rs only): BIP39
 # wordlist + entropy checksum (the PBKDF2 `to_seed` path is deliberately
 # unused — see the identity-onboarding design doc's custody model),
@@ -130,9 +163,13 @@ identity = { path = "crates/system/identity" }
 upgrade = { path = "crates/system/upgrade" }
 saga = { path = "crates/system/saga" }
 capability = { path = "crates/system/capability" }
+blobstore = { path = "crates/system/blobstore" }
 dispatch = { path = "crates/system/dispatch" }
 dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }
+duckdns-core = { path = "crates/duckdns/core" }
+duckdns = { path = "crates/system/duckdns" }
+gateway = { path = "crates/system/gateway" }
 forge = { path = "crates/apps/forge" }
 pages = { path = "crates/apps/pages" }
 chat = { path = "crates/apps/chat" }
@@ -140,11 +177,12 @@ agent = { path = "crates/apps/agent" }
 runs = { path = "crates/apps/runs" }
 tasks = { path = "crates/apps/tasks" }
 vaults = { path = "crates/apps/vaults" }
-profiles = { path = "crates/apps/profiles" }
 automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }
-memory = { path = "crates/apps/memory" }
+duckfs-core = { path = "crates/duckfs/core" }
+duckfs-disk = { path = "crates/duckfs/disk" }
+duckfs-client = { path = "crates/duckfs/client" }
 jobs = { path = "crates/apps/jobs" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
@@ -154,3 +192,11 @@ wireguard-effect = { path = "crates/system/wireguard-effect" }
 nat-traversal = { path = "crates/system/nat-traversal" }
 reachability = { path = "crates/system/reachability" }
 data-plane = { path = "crates/system/data-plane" }
+overlay-net = { path = "crates/system/overlay-net" }
+
+# overlay-net's wrapper context implements commonware-runtime's `Clock` and
+# rng bounds, whose supertraits live in these crates — pinned to the exact
+# versions commonware-runtime 2026.5.0 depends on (a different semver-major
+# would be a different trait).
+governor = "0.10.2"
+rand_core = "0.6.4"

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { shortKey } from "../../../domain/names";
@@ -114,39 +114,47 @@ describe("MembersView", () => {
     expect(screen.queryByRole("button", { name: /admit joiner/i })).not.toBeInTheDocument();
   });
 
-  it("offers a confirmed removal per row but never for this node itself", () => {
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  it("offers an in-app confirmed removal per row but never for this node itself", () => {
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const { spies } = renderMembers();
 
-    // The peer gets a removal control; this node (the local key) never does.
-    const removePeer = screen.getByRole("button", {
-      name: /remove Ben Validator from validator set/i,
-    });
-    expect(removePeer).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /remove Founder Rae from validator set/i }),
-    ).not.toBeInTheDocument();
+    try {
+      // The peer gets a removal control; this node (the local key) never does.
+      const removePeer = screen.getByRole("button", {
+        name: /remove Ben Validator from validator set/i,
+      });
+      expect(removePeer).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: /remove Founder Rae from validator set/i }),
+      ).not.toBeInTheDocument();
 
-    fireEvent.click(removePeer);
-    expect(confirm).toHaveBeenCalledOnce();
-    expect(spies.demoteMember).toHaveBeenCalledWith(peerKey);
+      fireEvent.click(removePeer);
+      const dialog = screen.getByRole("dialog", { name: /remove Ben Validator/i });
+      expect(nativeConfirm).not.toHaveBeenCalled();
 
-    confirm.mockRestore();
+      fireEvent.click(within(dialog).getByRole("button", { name: /remove from validators/i }));
+      expect(spies.demoteMember).toHaveBeenCalledWith(peerKey);
+    } finally {
+      nativeConfirm.mockRestore();
+    }
   });
 
-  it("aborts the removal when the confirm is dismissed", () => {
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+  it("aborts the removal when the dialog is cancelled", () => {
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     const { spies } = renderMembers();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /remove Ben Validator from validator set/i }),
-    );
-    expect(confirm).toHaveBeenCalledOnce();
-    // Dismissed confirm -> demoteMember is never even referenced, so the proxy
-    // never minted a spy for it.
-    expect(spies.demoteMember?.mock.calls ?? []).toHaveLength(0);
+    try {
+      fireEvent.click(
+        screen.getByRole("button", { name: /remove Ben Validator from validator set/i }),
+      );
+      const dialog = screen.getByRole("dialog", { name: /remove Ben Validator/i });
+      expect(nativeConfirm).not.toHaveBeenCalled();
 
-    confirm.mockRestore();
+      fireEvent.click(within(dialog).getByRole("button", { name: /cancel/i }));
+      expect(spies.demoteMember?.mock.calls ?? []).toHaveLength(0);
+    } finally {
+      nativeConfirm.mockRestore();
+    }
   });
 
   it("hides the removal control when this workspace cannot administer", () => {
@@ -158,8 +166,8 @@ describe("MembersView", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("renders resident standing with confirmed promote and revoke actions", () => {
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  it("renders resident standing with in-app confirmed promote and revoke actions", () => {
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const { spies } = renderMembers({
       residents: [residentKey],
       authorNames: {
@@ -176,18 +184,25 @@ describe("MembersView", () => {
       screen.queryByRole("button", { name: /remove Olive Resident from validator set/i }),
     ).not.toBeInTheDocument();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /promote Olive Resident into the validator set/i }),
-    );
-    expect(confirm).toHaveBeenCalledOnce();
-    expect(spies.promoteMember).toHaveBeenCalledWith(residentKey);
+    try {
+      fireEvent.click(
+        screen.getByRole("button", { name: /promote Olive Resident into the validator set/i }),
+      );
+      let dialog = screen.getByRole("dialog", { name: /promote Olive Resident/i });
+      expect(nativeConfirm).not.toHaveBeenCalled();
+      fireEvent.click(within(dialog).getByRole("button", { name: /promote to validator/i }));
+      expect(spies.promoteMember).toHaveBeenCalledWith(residentKey);
 
-    fireEvent.click(
-      screen.getByRole("button", { name: /revoke resident standing from Olive Resident/i }),
-    );
-    expect(spies.removeResident).toHaveBeenCalledWith(residentKey);
-
-    confirm.mockRestore();
+      fireEvent.click(
+        screen.getByRole("button", { name: /revoke resident standing from Olive Resident/i }),
+      );
+      dialog = screen.getByRole("dialog", { name: /revoke Olive Resident/i });
+      fireEvent.click(within(dialog).getByRole("button", { name: /revoke standing/i }));
+      expect(spies.removeResident).toHaveBeenCalledWith(residentKey);
+      expect(nativeConfirm).not.toHaveBeenCalled();
+    } finally {
+      nativeConfirm.mockRestore();
+    }
   });
 
   it("hides the resident controls when this workspace cannot administer", () => {
@@ -218,7 +233,7 @@ describe("MembersView", () => {
 
     fireEvent.change(input, { target: { value: "  Rae the Founder  " } });
     fireEvent.click(screen.getByRole("button", { name: /save display name/i }));
-    // trimmed and written through the origin-gated profiles action.
+    // trimmed and written through the origin-gated identity action.
     expect(spies.setDisplayName).toHaveBeenCalledWith("Rae the Founder");
   });
 
@@ -259,16 +274,16 @@ describe("MembersView", () => {
     renderMembers({
       members: [deviceAKey, deviceBKey, soloBoundKey, unboundKey],
       // Mirror the provider overlay: a bound node's authorNames entry IS the
-      // user's display name (identity overlays profiles at each bound key).
+      // account's display name (identity projects it at each bound node key).
       authorNames: {
         [deviceAKey]: "Casey",
         [deviceBKey]: "Casey",
         [soloBoundKey]: "Solo Sam",
       },
       nodeUsers: {
-        [deviceAKey]: { userKey: "user-casey", name: "Casey" },
-        [deviceBKey]: { userKey: "user-casey", name: "Casey" },
-        [soloBoundKey]: { userKey: "user-sam", name: "Solo Sam" },
+        [deviceAKey]: { accountId: "user-casey", name: "Casey" },
+        [deviceBKey]: { accountId: "user-casey", name: "Casey" },
+        [soloBoundKey]: { accountId: "user-sam", name: "Solo Sam" },
       },
     });
 
@@ -296,12 +311,35 @@ describe("MembersView", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows each node's announced capabilities as chips", () => {
+  it("collapses a node's announced executors to one pill per provider", () => {
     renderMembers({
-      capabilitiesByNode: new Map([[peerKey, ["codex", "claude"]]]),
+      capabilitiesByNode: new Map([
+        [peerKey, ["claude", "claude_opus_high", "claude_fable_low", "codex"]],
+      ]),
     });
-    // The peer announced two executors — both render as chips on its row.
-    expect(screen.getByText("codex")).toBeInTheDocument();
-    expect(screen.getByText("claude")).toBeInTheDocument();
+    // Four tags, two providers — the row shows the providers, not every combo.
+    const claudePill = screen.getByText("Claude").parentElement as HTMLElement;
+    expect(screen.getByText("Codex")).toBeInTheDocument();
+    // The Claude pill counts its distinct models (opus, fable → 2) and the raw
+    // combo tags never render as chips on the row.
+    expect(claudePill.textContent).toBe("Claude2");
+    expect(claudePill).toHaveAttribute("title", expect.stringContaining("opus"));
+    expect(screen.queryByText("claude_opus_high")).not.toBeInTheDocument();
+  });
+
+  it("lists a node's models (not effort permutations) in the detail pane", () => {
+    renderMembers({
+      capabilitiesByNode: new Map([
+        [peerKey, ["claude_opus_high", "claude_opus_low", "claude_fable_max", "codex"]],
+      ]),
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Open member Ben Validator" }));
+    // Distinct models surface once; the effort suffix never does.
+    expect(screen.getByText("opus")).toBeInTheDocument();
+    expect(screen.getByText("fable")).toBeInTheDocument();
+    expect(screen.queryByText("opus_high")).not.toBeInTheDocument();
+    expect(screen.queryByText("claude_opus_high")).not.toBeInTheDocument();
+    // A base-only provider (codex) reads as its default executor, no models.
+    expect(screen.getByText("default executor")).toBeInTheDocument();
   });
 });

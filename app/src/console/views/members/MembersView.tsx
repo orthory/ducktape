@@ -17,6 +17,10 @@ import {
 } from "react";
 
 import {
+  providersOf,
+  type ProviderGroup,
+} from "../../../domain/capability-client";
+import {
   displayNameForKey,
   normalizeKey,
   sameKey,
@@ -27,9 +31,10 @@ import {
   joinRequests as fetchJoinRequests,
   type JoinRequest,
 } from "../../../domain/workspace-client";
+import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius, shadow, tint } from "../../theme/tokens";
 
 type FilterId = "all" | "validators" | "genesis" | "local";
 
@@ -58,6 +63,11 @@ interface MemberVM {
   capabilities: string[];
 }
 
+type MemberConfirm =
+  | { kind: "remove"; member: MemberVM }
+  | { kind: "promote"; member: MemberVM }
+  | { kind: "revoke"; member: MemberVM };
+
 const FILTER_TABS: ReadonlyArray<{ id: FilterId; label: string }> = [
   { id: "all", label: "All" },
   { id: "validators", label: "Validators" },
@@ -65,14 +75,16 @@ const FILTER_TABS: ReadonlyArray<{ id: FilterId; label: string }> = [
   { id: "local", label: "This Node" },
 ];
 
+// Tinted from status hues so the chips re-skin with the theme (was a set of
+// baked-in pale pastels that stayed bright in dark mode).
 const STATUS_PILLS = {
-  validator: { text: "#5f9e74", bg: "#eef5f0", border: "#cfe3d7" },
+  validator: tint(color.green),
   // amber: standing granted but not seated — the warming, in-between tier.
-  resident: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
+  resident: tint(color.amber),
   genesis: { text: color.onDark, bg: color.dark, border: color.dark },
-  local: { text: color.accentAlt2, bg: "#eef5f0", border: "#cfe3d7" },
+  local: tint(color.accentAlt2),
   muted: { text: color.muted3, bg: color.paper, border: color.borderStrong },
-  unavailable: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
+  unavailable: tint(color.amber),
 } as const;
 
 const initialsOf = (name: string): string => {
@@ -108,7 +120,7 @@ const sectionLabel: CSSProperties = {
   color: color.muted2,
 };
 
-// mirrors `profiles::MAX_NAME_LEN` — the module rejects a longer display name.
+// mirrors identity's MAX_DISPLAY_NAME_LEN — consensus rejects a longer name.
 const MAX_NAME_LEN = 64;
 
 function makeMembers(
@@ -162,7 +174,7 @@ function makeMembers(
  *  (validators/residents) never merge — see groupMembersByUser. */
 interface MemberGroup {
   key: string;
-  userKey: string;
+  accountId: string;
   name: string;
   members: MemberVM[];
 }
@@ -181,7 +193,7 @@ type MemberItem =
  *  would only repeat the name directly above its own row. */
 function groupMembersByUser(
   members: MemberVM[],
-  nodeUsers: Record<string, { userKey: string; name: string | null }>,
+  nodeUsers: Record<string, { accountId: string; name: string | null }>,
 ): MemberItem[] {
   const items: MemberItem[] = [];
   const groups = new Map<string, MemberGroup>();
@@ -191,13 +203,13 @@ function groupMembersByUser(
       items.push({ kind: "member", member });
       continue;
     }
-    const groupKey = `${member.tier}:${bound.userKey}`;
+    const groupKey = `${member.tier}:${bound.accountId}`;
     let group = groups.get(groupKey);
     if (!group) {
       group = {
         key: groupKey,
-        userKey: bound.userKey,
-        name: bound.name ?? shortKey(bound.userKey),
+        accountId: bound.accountId,
+        name: bound.name ?? shortKey(bound.accountId),
         members: [],
       };
       groups.set(groupKey, group);
@@ -303,9 +315,55 @@ function Pill({
   );
 }
 
+/** A node runs one tag per model×effort combo, so a busy node announces dozens.
+ *  The row only needs to say WHICH providers it runs: one pill per provider,
+ *  with a badge counting its distinct models when there's more than one. The
+ *  model list rides the native tooltip, one hover away. */
+function ProviderPill({ group }: { group: ProviderGroup }) {
+  const count = group.models.length;
+  return (
+    <span
+      title={(count ? group.models : group.tags).join("\n")}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 5,
+        padding: count > 1 ? "2px 5px 2px 9px" : "2px 9px",
+        borderRadius: 999,
+        background: color.sunken,
+        border: `1px solid ${color.border}`,
+        whiteSpace: "nowrap",
+      }}
+    >
+      <span style={{ font: `600 10.5px ${font.sans}`, color: color.inkSoft }}>
+        {group.label}
+      </span>
+      {count > 1 && (
+        <span
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            minWidth: 16,
+            height: 15,
+            padding: "0 4px",
+            borderRadius: 999,
+            background: color.paper,
+            border: `1px solid ${color.borderSoft}`,
+            font: `600 9px ${font.mono}`,
+            color: color.muted3,
+          }}
+        >
+          {count}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function Avatar({ member, size = 32 }: { member: MemberVM; size?: number }) {
-  const bg = member.isFounder ? color.dark : member.isLocal ? "#dfeee4" : color.chip;
-  const fg = member.isFounder ? color.onDark : member.isLocal ? color.accentAlt2 : color.muted3;
+  const bg = member.isFounder ? color.dark : member.isLocal ? STATUS_PILLS.local.bg : color.chip;
+  const fg = member.isFounder ? color.onDark : member.isLocal ? STATUS_PILLS.local.text : color.muted3;
   return (
     <span
       aria-hidden="true"
@@ -365,7 +423,7 @@ function HoverButton({
           ? color.sunken
           : hover
             ? dark
-              ? "#38362e"
+              ? color.filledHover
               : color.titlebar
             : dark
               ? color.dark
@@ -405,7 +463,7 @@ function MemberRow({
   onPromote: () => void;
   onRevoke: () => void;
   /** Show the rename control for this row — the local node's own entry, the
-   *  only profile an origin-gated `SetName` may write. */
+   *  only account name an origin-gated `SetAccountName` may write. */
   canRename: boolean;
   onRename: (name: string) => void;
 }) {
@@ -413,7 +471,7 @@ function MemberRow({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
 
-  // Inline self-rename: the same origin-gated profiles write Settings uses,
+  // Inline self-rename: the same origin-gated identity write Account uses,
   // surfaced on your own row. Enter/Save commits, Escape/Cancel discards; an
   // empty name is treated as no change (Settings owns clearing).
   if (canRename && editing) {
@@ -552,21 +610,9 @@ function MemberRow({
             {member.shortKey} · {member.status}
           </div>
           {member.capabilities.length > 0 && (
-            <div style={{ marginTop: 5, display: "flex", flexWrap: "wrap", gap: 4 }}>
-              {member.capabilities.map((tag) => (
-                <span
-                  key={tag}
-                  style={{
-                    padding: "1px 6px",
-                    borderRadius: 4,
-                    background: color.paper,
-                    border: `1px solid ${color.borderStrong}`,
-                    font: `500 9.5px ${font.mono}`,
-                    color: color.muted2,
-                  }}
-                >
-                  {tag}
-                </span>
+            <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 5 }}>
+              {providersOf(member.capabilities).map((group) => (
+                <ProviderPill key={group.provider} group={group} />
               ))}
             </div>
           )}
@@ -799,7 +845,8 @@ function AdminActions({
                   Invite a Member
                 </div>
                 <div style={{ marginTop: 2, font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
-                  Reveal the workspace invite blob for sharing.
+                  Reveal the workspace invite blob for sharing. One invite admits one
+                  person — mint a fresh one per member.
                 </div>
               </div>
               <div style={{ marginLeft: "auto", flexShrink: 0 }}>
@@ -866,7 +913,6 @@ function AdminActions({
                 <input
                   aria-label="Joiner public key"
                   name="joiner-public-key"
-                  autoComplete="off"
                   spellCheck={false}
                   value={joinerKey}
                   placeholder="Paste joiner public key…"
@@ -1064,14 +1110,51 @@ function MemberDetailPane({
           <InfoRow label="genesis" value={member.isFounder ? "yes" : "no"} />
           <InfoRow label="this node" value={member.isLocal ? "yes" : "no"} />
           <InfoRow label="presence" value="not exposed by this node" />
-          <InfoRow
-            label="capabilities"
-            value={
-              member.capabilities.length
-                ? member.capabilities.join(", ")
-                : "none announced"
-            }
-          />
+        </div>
+
+        <div style={{ marginTop: 18 }}>
+          <div style={{ ...sectionLabel, marginBottom: 9 }}>RUNS ON</div>
+          {member.capabilities.length === 0 ? (
+            <div style={{ font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
+              No executors announced by this node.
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {providersOf(member.capabilities).map((group) => (
+                <div key={group.provider}>
+                  <div style={{ font: `600 11.5px ${font.sans}`, color: color.inkSoft }}>
+                    {group.label}
+                  </div>
+                  {group.models.length > 0 ? (
+                    <div
+                      style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 4 }}
+                    >
+                      {group.models.map((model) => (
+                        <span
+                          key={model}
+                          translate="no"
+                          style={{
+                            padding: "2px 8px",
+                            borderRadius: 999,
+                            background: color.paper,
+                            border: `1px solid ${color.border}`,
+                            font: `500 10px ${font.mono}`,
+                            color: color.muted3,
+                          }}
+                        >
+                          {model}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 4, font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
+                      default executor
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </aside>
@@ -1083,6 +1166,7 @@ export function MembersView() {
   const [filter, setFilter] = useState<FilterId>("all");
   const [query, setQuery] = useState("");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<MemberConfirm | null>(null);
 
   const rows = useMemo(
     () =>
@@ -1152,44 +1236,34 @@ export function MembersView() {
     // Never remove your own node — that would drop this workspace out of the
     // set it is driving governance through.
     if (member.isLocal) return;
-    const ok = window.confirm(
-      `Remove ${member.displayName} from the validator set?\n\n` +
-        `This opens a removal proposal and casts THIS node's yes-ballot. ` +
-        `It only takes effect once a strict majority of members (n / 2 + 1) ` +
-        `approve — every other member must run the same removal.`,
-    );
-    if (!ok) return;
-    actions.demoteMember(member.key);
-    if (selectedKey && normalizeKey(selectedKey) === member.keyNorm) {
-      setSelectedKey(null);
-    }
+    setPendingConfirm({ kind: "remove", member });
   };
 
   const requestPromote = (member: MemberVM): void => {
-    const ok = window.confirm(
-      `Promote ${member.displayName} into the validator set?\n\n` +
-        `This opens an AddValidator proposal and casts THIS node's yes-ballot. ` +
-        `It only takes effect once a strict majority of members (n / 2 + 1) ` +
-        `approve — every other member must run the same promotion. The ` +
-        `pre-synced resident then joins the quorum at the next epoch cutover.`,
-    );
-    if (!ok) return;
-    actions.promoteMember(member.key);
+    setPendingConfirm({ kind: "promote", member });
   };
 
   const requestRevoke = (member: MemberVM): void => {
-    const ok = window.confirm(
-      `Revoke resident standing from ${member.displayName}?\n\n` +
-        `This opens a RemoveResident proposal and casts THIS node's yes-ballot. ` +
-        `Once a strict majority of members approve, the key drops off the mesh ` +
-        `at the next epoch cutover and its node parks again — approving a new ` +
-        `join request re-grants.`,
-    );
-    if (!ok) return;
-    actions.removeResident(member.key);
-    if (selectedKey && normalizeKey(selectedKey) === member.keyNorm) {
-      setSelectedKey(null);
+    setPendingConfirm({ kind: "revoke", member });
+  };
+
+  const confirmPendingAction = () => {
+    if (!pendingConfirm) return;
+    const { kind, member } = pendingConfirm;
+    if (kind === "remove") {
+      actions.demoteMember(member.key);
+      if (selectedKey && normalizeKey(selectedKey) === member.keyNorm) {
+        setSelectedKey(null);
+      }
+    } else if (kind === "promote") {
+      actions.promoteMember(member.key);
+    } else {
+      actions.removeResident(member.key);
+      if (selectedKey && normalizeKey(selectedKey) === member.keyNorm) {
+        setSelectedKey(null);
+      }
     }
+    setPendingConfirm(null);
   };
 
   // Shared row renderer — a group's nested rows and a standalone row get the
@@ -1219,7 +1293,7 @@ export function MembersView() {
         minWidth: 0,
         minHeight: 0,
         display: "flex",
-        background: "#fcfcfc",
+        background: color.canvas,
         overflow: "hidden",
       }}
     >
@@ -1286,7 +1360,6 @@ export function MembersView() {
             <input
               aria-label="Search members"
               name="member-search"
-              autoComplete="off"
               spellCheck={false}
               value={query}
               placeholder="Search name or key…"
@@ -1319,7 +1392,7 @@ export function MembersView() {
             minHeight: 0,
             overflowY: "auto",
             padding: "6px 12px",
-            background: "#fcfcfc",
+            background: color.canvas,
           }}
         >
           {visibleRows.length === 0 ? (
@@ -1356,6 +1429,46 @@ export function MembersView() {
       {selected ? (
         <MemberDetailPane member={selected} onClose={() => setSelectedKey(null)} />
       ) : null}
+      {pendingConfirm && (
+        <ConfirmDialog
+          title={
+            pendingConfirm.kind === "remove"
+              ? `Remove ${pendingConfirm.member.displayName}?`
+              : pendingConfirm.kind === "promote"
+                ? `Promote ${pendingConfirm.member.displayName}?`
+                : `Revoke ${pendingConfirm.member.displayName}?`
+          }
+          confirmLabel={
+            pendingConfirm.kind === "remove"
+              ? "Remove from validators"
+              : pendingConfirm.kind === "promote"
+                ? "Promote to validator"
+                : "Revoke standing"
+          }
+          danger={pendingConfirm.kind !== "promote"}
+          onCancel={() => setPendingConfirm(null)}
+          onConfirm={confirmPendingAction}
+        >
+          {pendingConfirm.kind === "remove" ? (
+            <>
+              This opens a removal proposal and casts this node's yes ballot.
+              It only takes effect once a strict majority approves.
+            </>
+          ) : pendingConfirm.kind === "promote" ? (
+            <>
+              This opens an AddValidator proposal and casts this node's yes ballot.
+              The pre-synced resident joins quorum at the next epoch cutover after
+              majority approval.
+            </>
+          ) : (
+            <>
+              This opens a RemoveResident proposal and casts this node's yes ballot.
+              After majority approval, the key drops off the mesh at the next epoch
+              cutover and its node parks again.
+            </>
+          )}
+        </ConfirmDialog>
+      )}
     </div>
   );
 }

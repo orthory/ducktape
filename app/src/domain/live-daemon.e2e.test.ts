@@ -28,8 +28,9 @@ import {
   postMessage,
   thread,
 } from "./chat-client";
+import { moduleTopic, type EventFrame } from "./stream";
 import { remoteTransport } from "./transport";
-import type { BlockEvent, NodeTransport } from "./transport";
+import type { NodeTransport } from "./transport";
 
 const binaryPath = (): string | null => {
   const fromEnv = process.env.DUCKTAPE_NODED_BIN;
@@ -133,9 +134,9 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
       "pages",
       "forge",
       "files",
-      "memory",
-      "profiles",
       "identity",
+      "duckdns",
+      "gateway",
     ]);
   });
 
@@ -183,44 +184,68 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
     expect(authorName(t!.replies[0].head.author)).toBe("jess");
   });
 
-  it("streams committed blocks over the websocket", async () => {
-    // the transport dials the shared socket lazily on first subscribe and
-    // exposes no "connected" signal, so there is no way to sequence
-    // subscribe-then-submit deterministically from here. instead: keep
-    // committing probe blocks (its OWN channel — no dependence on earlier
-    // tests) until one fans out to the listener. any heard event proves the
-    // ws wire; a dead stream exhausts the probes and fails.
-    let unsubscribe = () => {};
-    const heard = new Promise<BlockEvent>((done) => {
-      unsubscribe = transport.onBlock(done);
+  it("streams committed chat events and heartbeats over the websocket", async () => {
+    let unsubscribeEvents = () => {};
+    let unsubscribeStream = () => {};
+    let resolveEvents!: (frames: EventFrame[]) => void;
+    const events: EventFrame[] = [];
+    const twoEvents = new Promise<EventFrame[]>((done) => {
+      resolveEvents = done;
+    });
+    let resolveUp!: () => void;
+    const up = new Promise<void>((done) => {
+      resolveUp = done;
+    });
+    let resolveHeartbeat!: () => void;
+    const heartbeat = new Promise<void>((done) => {
+      resolveHeartbeat = done;
+    });
+    unsubscribeStream = transport.onStream((signal) => {
+      if (signal.kind === "up") resolveUp();
+      if (signal.kind === "heartbeat") resolveHeartbeat();
+    });
+    unsubscribeEvents = transport.subscribe([moduleTopic("chat")], {
+      onEvent: (frame) => {
+        events.push(frame);
+        if (events.length >= 2) resolveEvents(events);
+      },
     });
     try {
+      await up;
       await createChannel(transport, {
         channelId: "ws-probe",
         name: "Ws Probe",
         postPolicy: "open",
         origin: "eddy",
       });
-      let event: BlockEvent | null = null;
-      for (let probe = 0; probe < 20 && !event; probe += 1) {
-        await postMessage(transport, {
-          channelId: "ws-probe",
-          messageId: `probe-${probe}`,
-          blocks: [{ paragraph: [{ text: "block event probe", marks: [] }] }],
-          origin: "eddy",
-        });
-        event = await Promise.race([
-          heard,
-          new Promise<null>((r) => setTimeout(() => r(null), 500)),
-        ]);
-      }
-      expect(event, "no block event ever reached the ws subscriber").not.toBeNull();
-      expect(event!.height).toBeGreaterThan(0);
-      expect(event!.appHash).toMatch(/^[0-9a-f]{64}$/);
+      const posted = await postMessage(transport, {
+        channelId: "ws-probe",
+        messageId: "probe-0",
+        blocks: [{ paragraph: [{ text: "event frame probe", marks: [] }] }],
+        origin: "eddy",
+      });
+      const heard = await Promise.race([
+        twoEvents,
+        new Promise<null>((r) => setTimeout(() => r(null), 10_000)),
+      ]);
+      expect(heard, "no chat event frames ever reached the ws subscriber").not.toBeNull();
+      expect(heard!.map((frame) => frame.topic)).toEqual([
+        moduleTopic("chat"),
+        moduleTopic("chat"),
+      ]);
+      expect(heard!.some((frame) => frame.op.height === posted.height)).toBe(true);
+      expect(heard![0]!.cursor).toMatch(/^op\/[0-9a-f]{16}\/[0-9a-f]{4}$/);
+      await expect(
+        Promise.race([
+          heartbeat.then(() => true),
+          new Promise<false>((r) => setTimeout(() => r(false), 10_000)),
+        ]),
+      ).resolves.toBe(true);
     } finally {
       // always detach — a leaked listener keeps the transport reconnecting
       // to a daemon that afterAll is about to retire.
-      unsubscribe();
+      unsubscribeEvents();
+      unsubscribeStream();
     }
-  }, 20_000);
+  }, 25_000);
 });

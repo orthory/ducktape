@@ -31,8 +31,9 @@ pub const SCHEME_ED25519: &str = "ed25519";
 
 /// the invite blob prefix. UNVERSIONED on purpose (bootstrapping posture): the
 /// network re-mints invites on a format change, and a stale paste fails loudly
-/// at decode — the old `ducktape-invite-v*:` prefixes no longer decode at all.
-const INVITE_PREFIX: &str = "ducktape:";
+/// at decode — the old `ducktape:` / `ducktape-invite-v*:` prefixes no longer
+/// decode at all.
+const INVITE_PREFIX: &str = "🦆";
 
 // ============================================================================
 // hex — dependency-free codecs for keys, roots, and the invite blob.
@@ -53,7 +54,7 @@ pub fn unhex(s: &str) -> Result<Vec<u8>, String> {
     if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("hex string contains non-hex characters".into());
     }
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("hex string has odd length".into());
     }
     (0..s.len())
@@ -117,40 +118,35 @@ pub fn load_identity(path: &Path) -> Result<ed25519::PrivateKey, String> {
         .map_err(|e| format!("{path:?} is not an ed25519 secret: {e}"))
 }
 
-/// mint a bind certificate: the USER key's signature over
-/// [`identity::bind_preimage`] in the [`identity::IDENTITY_BIND_NS`] domain --
-/// the consent artifact `IdentityMsg::BindNode` carries as `user_sig`. chain-
-/// and nonce-scoped, so a certificate can never replay across networks or
-/// after an unbind bumps the nonce.
-pub fn mint_bind_cert(
+/// wrap an ed25519 user key's signature over `preimage` (under `namespace`) as
+/// the [`identity::MemberAuth`] every account op carries -- the node's user key
+/// is always an ed25519 account member, so this is the one authorizer shape the
+/// CLI mints.
+pub fn ed25519_member_auth(
     user: &ed25519::PrivateKey,
-    chain_id: &str,
-    node_pub: &[u8],
-    nonce: u64,
-) -> Vec<u8> {
-    user.sign(
-        identity::IDENTITY_BIND_NS,
-        &identity::bind_preimage(chain_id, node_pub, nonce),
-    )
-    .as_ref()
-    .to_vec()
+    namespace: &[u8],
+    preimage: &[u8],
+) -> identity::MemberAuth {
+    identity::MemberAuth {
+        key: user.public_key().as_ref().to_vec(),
+        kind: identity::KeyKind::Ed25519,
+        proof: identity::MemberProof::Signature {
+            sig: user.sign(namespace, preimage).as_ref().to_vec(),
+        },
+    }
 }
 
-/// mint an unbind certificate (same shape as [`mint_bind_cert`], but signed
-/// over [`identity::unbind_preimage`] in the [`identity::IDENTITY_UNBIND_NS`]
-/// domain -- the consent artifact `IdentityMsg::UnbindNode` carries).
-pub fn mint_unbind_cert(
+/// the possession proof an ed25519 key produces over `preimage` -- what a NEW
+/// device signs to prove it holds the key it is asking to enroll (the other
+/// half of an `AddMemberKey`, alongside an existing member's [`ed25519_member_auth`]).
+pub fn ed25519_possession(
     user: &ed25519::PrivateKey,
-    chain_id: &str,
-    node_pub: &[u8],
-    nonce: u64,
-) -> Vec<u8> {
-    user.sign(
-        identity::IDENTITY_UNBIND_NS,
-        &identity::unbind_preimage(chain_id, node_pub, nonce),
-    )
-    .as_ref()
-    .to_vec()
+    namespace: &[u8],
+    preimage: &[u8],
+) -> identity::MemberProof {
+    identity::MemberProof::Signature {
+        sig: user.sign(namespace, preimage).as_ref().to_vec(),
+    }
 }
 
 /// mint a chain-id: the human-readable name plus a short salt, so two
@@ -293,6 +289,7 @@ impl NetworkDescriptor {
     /// config error; an unspecified ip / port 0 is advisory and skipped. the
     /// live dial path is [`NetworkDescriptor::reach_entries`], which folds these
     /// Direct entries in alongside the typed `reach` hints.
+    #[cfg(test)]
     pub fn bootstrap_entries(&self) -> Result<Vec<(ed25519::PublicKey, Ingress)>, String> {
         let mut out = Vec::new();
         for entry in &self.bootstrap {
@@ -333,29 +330,69 @@ impl NetworkDescriptor {
     /// `Direct` hint (so a v2/legacy descriptor yields all-`Direct` hints with
     /// no data duplicated and no double-dial).
     pub fn reach_hints(&self) -> Result<Vec<ReachHint>, String> {
-        // the UNION of typed `reach` and `bootstrap`, keyed by expected pubkey:
-        // a typed reach hint wins over a bootstrap-synthesised Direct for the
-        // same member, but a member present only in `bootstrap` (e.g. a
-        // second-generation inviter that ran `add_bootstrap`) is never dropped.
-        // returning `reach` XOR `bootstrap` would silently lose that inviter's
-        // own dial hint from every re-issued invite.
-        let mut by_key: std::collections::BTreeMap<Vec<u8>, ReachHint> =
+        // the UNION of typed `reach` and legacy `bootstrap`: explicit typed
+        // hints win over bootstrap-synthesised Direct hints for the same
+        // member, but typed entries are a route set, not a per-key map. A
+        // node may need both a rendezvous route and a tunnel-overlay route for
+        // the same expected key.
+        let mut bootstrap_by_key: std::collections::BTreeMap<Vec<u8>, ReachHint> =
             std::collections::BTreeMap::new();
         for entry in &self.bootstrap {
             let (k, addr) = entry
                 .split_once('@')
                 .ok_or_else(|| format!("bootstrap entry {entry:?} is not pubkey@addr"))?;
             let expected_key = decode_key(k)?;
-            by_key.insert(
+            bootstrap_by_key.insert(
                 expected_key.as_ref().to_vec(),
                 ReachHint { expected_key, reach: Reach::Direct(addr.to_string()) },
             );
         }
+        let mut typed = Vec::new();
+        let mut typed_keys = std::collections::BTreeSet::new();
         for s in &self.reach {
             let hint = ReachHint::parse(s)?;
-            by_key.insert(hint.expected_key.as_ref().to_vec(), hint);
+            // only a typed DIRECT/FRONTED route supersedes a bootstrap-
+            // synthesised Direct for the same key (the member's dial address
+            // moved/upgraded). a Coordinated route is an ADDITIONAL rendezvous
+            // path, not a replacement — it must not erase a real direct dial
+            // hint, or a founder that advertises a public address AND enables a
+            // coordinator would ship coordinator-only reach and lose its direct
+            // fallback (terminal once a punch fails, since there is no relay).
+            // an overlay-ULA Direct (this chain's tunnel /48) is likewise an
+            // ADDITIONAL route: it is only dialable once the reachability
+            // plane's tunnels apply, so letting it evict the underlay hint
+            // strands the member behind a plane that has not assembled yet
+            // (first join, promotion reboot, same-host tests).
+            if matches!(hint.reach, Reach::Direct(_) | Reach::Fronted(_))
+                && !self.overlay_route(&hint)?
+            {
+                typed_keys.insert(hint.expected_key.as_ref().to_vec());
+            }
+            typed.push(hint);
         }
-        Ok(by_key.into_values().collect())
+        bootstrap_by_key.retain(|k, _| !typed_keys.contains(k));
+        let mut out: Vec<_> = bootstrap_by_key.into_values().chain(typed).collect();
+        out.sort_by_key(|h| h.to_canonical());
+        Ok(out)
+    }
+
+    /// whether a hint's address lives inside this chain's overlay ULA /48 —
+    /// the tunnel-plane addresses [`wireguard_upgrade::ula_v6_member_addr`]
+    /// derives. such a route needs applied tunnels to be dialable, so it is
+    /// classified as an overlay route, never an underlay replacement.
+    fn overlay_route(&self, hint: &ReachHint) -> Result<bool, String> {
+        let addr = match &hint.reach {
+            Reach::Direct(a) | Reach::Fronted(a) => a,
+            Reach::Coordinated(_) => return Ok(false),
+        };
+        let Some(Ingress::Socket(sock)) = ingress_of(addr)? else {
+            return Ok(false); // hostnames and advisory noise are underlay-class.
+        };
+        let std::net::IpAddr::V6(v6) = sock.ip() else {
+            return Ok(false);
+        };
+        let prefix = wireguard_upgrade::ula_v6_prefix(&self.genesis_namespace()).octets();
+        Ok(v6.octets()[..6] == prefix[..6])
     }
 
     /// record a reach hint for a member, replacing any previous hint for the
@@ -372,6 +409,17 @@ impl NetworkDescriptor {
         self.reach.sort();
     }
 
+    /// record one explicit typed reach route without collapsing other typed
+    /// routes for the same expected key. Use this when the descriptor needs a
+    /// real route set, such as rendezvous plus a tunnel-overlay ingress.
+    pub fn add_reach_route(&mut self, hint: &ReachHint) {
+        let canonical = hint.to_canonical();
+        if !self.reach.contains(&canonical) {
+            self.reach.push(canonical);
+            self.reach.sort();
+        }
+    }
+
     /// reach hints resolved to typed dial routes, hostname-native: `Direct`/
     /// `Fronted` become an [`Ingress`] the mesh dials (a hostname stays a
     /// hostname, re-resolved per attempt); `Coordinated` becomes a route the
@@ -380,6 +428,14 @@ impl NetworkDescriptor {
     /// dialable ingress (unspecified ip / port 0 / malformed host) is skipped.
     pub fn reach_entries(&self) -> Result<Vec<(ed25519::PublicKey, ReachDial)>, String> {
         let mut out = Vec::new();
+        // one DIRECT ingress per key, underlay preferred: discovery keeps one
+        // dial address per peer, and an overlay ULA only answers once the
+        // reachability plane's tunnels apply — so when a key carries both an
+        // underlay route and its overlay route, the mesh dialer gets the
+        // underlay and the plane owns the tunnel path. a key whose ONLY route
+        // is the overlay (a fully-NATed member) still dials it, as before.
+        let mut direct_at: std::collections::BTreeMap<Vec<u8>, (usize, bool)> =
+            std::collections::BTreeMap::new();
         for hint in self.reach_hints()? {
             let dial = match &hint.reach {
                 Reach::Direct(a) | Reach::Fronted(a) => match ingress_of(a)? {
@@ -391,6 +447,24 @@ impl NetworkDescriptor {
                     None => continue,
                 },
             };
+            if matches!(dial, ReachDial::Direct(_)) {
+                let key = hint.expected_key.as_ref().to_vec();
+                let overlay = self.overlay_route(&hint)?;
+                match direct_at.get(&key) {
+                    None => {
+                        direct_at.insert(key, (out.len(), overlay));
+                    }
+                    Some(&(at, held_overlay)) => {
+                        if held_overlay && !overlay {
+                            // the held slot is the overlay route — replace it
+                            // in place with the underlay one.
+                            out[at] = (hint.expected_key.clone(), dial);
+                            direct_at.insert(key, (at, false));
+                        }
+                        continue;
+                    }
+                }
+            }
             out.push((hint.expected_key.clone(), dial));
         }
         Ok(out)
@@ -407,6 +481,43 @@ pub enum Coordination {
     Private,
 }
 
+/// Shared public rendezvous coordinator used when a network is created without
+/// an explicit direct-only override.
+pub const DEFAULT_PRIMARY_COORDINATOR: &str = "p2p.ducktape.byeongsu.dev:3478";
+
+/// The typed invite format still carries a coordinator key, but the deployed
+/// coordinator is intentionally keyless. Keep one stable valid key in the
+/// signed envelope until coordinator response signing exists.
+pub fn keyless_coordinator_placeholder_key() -> ed25519::PublicKey {
+    ed25519::PrivateKey::from_seed(0).public_key()
+}
+
+/// Resolve the primary coordinator option. `None` means "use the product
+/// default"; `"none"`/`"off"` keeps the old direct-only posture.
+pub fn primary_coordinator_or_default(raw: Option<&str>) -> Result<Option<String>, String> {
+    let coord = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_PRIMARY_COORDINATOR);
+    if matches!(coord, "none" | "off" | "direct") {
+        return Ok(None);
+    }
+    match ingress_of(coord)? {
+        Some(_) => Ok(Some(coord.to_string())),
+        None => Err(format!("primary coordinator {coord:?} is not dialable")),
+    }
+}
+
+/// Resolve the ambient coordinator to a dial [`Ingress`] — the AMBIENT source
+/// a joiner's NAT resolver binds (config/default), never one carried in an
+/// invite. `None` when coordination is disabled (`"none"`/`"off"`/`"direct"`).
+pub fn coordinator_ingress(raw: Option<&str>) -> Result<Option<Ingress>, String> {
+    match primary_coordinator_or_default(raw)? {
+        Some(addr) => ingress_of(&addr),
+        None => Ok(None),
+    }
+}
+
 impl NetworkDescriptor {
     pub fn coordination(&self) -> Coordination {
         match self.coordination.as_deref() {
@@ -414,6 +525,39 @@ impl NetworkDescriptor {
             _ => Coordination::Private,
         }
     }
+
+    /// Make `key` reachable through the configured public coordinator. This is
+    /// advisory reachability state, not part of the genesis fingerprint.
+    pub fn apply_primary_coordinator(
+        &mut self,
+        key: &ed25519::PublicKey,
+        coord_addr: &str,
+    ) -> Result<(), String> {
+        let coord_addr = primary_coordinator_or_default(Some(coord_addr))?
+            .ok_or("primary coordinator cannot be disabled here")?;
+        self.coordination = Some("public".into());
+        self.add_reach(&ReachHint {
+            expected_key: key.clone(),
+            reach: Reach::Coordinated(CoordRef {
+                coord_addr,
+                coord_key: keyless_coordinator_placeholder_key(),
+            }),
+        });
+        Ok(())
+    }
+
+    pub fn has_coordinated_reach(&self) -> Result<bool, String> {
+        Ok(self
+            .reach_hints()?
+            .iter()
+            .any(|h| matches!(h.reach, Reach::Coordinated(_))))
+    }
+}
+
+/// Joining through coordinated reach needs the local reachability plane even
+/// when the invite does not contain a direct inviter-hosted tunnel bootstrap.
+pub fn invite_requires_reachability_defaults(invite: &Invite) -> bool {
+    invite.wireguard.is_some() || invite.descriptor.has_coordinated_reach().unwrap_or(false)
 }
 
 /// a reach hint resolved to how the mesh actually reaches a member. `Direct`
@@ -532,10 +676,14 @@ pub struct StoredInviteWireGuard {
     pub issuer: String,
     /// the inviter's X25519 WireGuard public key, hex.
     pub public_key: String,
-    /// the inviter's underlay WireGuard UDP endpoint, `host:port`.
-    pub endpoint: String,
-    /// the inviter's underlay UDP intro endpoint, `host:port`.
-    pub intro: String,
+    /// the inviter's underlay WireGuard UDP endpoint, `host:port`. Absent for
+    /// coordinated invites, where the endpoint is resolved through the
+    /// rendezvous coordinator at run time.
+    pub endpoint: Option<String>,
+    /// the inviter's underlay UDP intro endpoint, `host:port`. Absent for
+    /// coordinated invites; the intro rides the shared WireGuard underlay
+    /// socket after rendezvous.
+    pub intro: Option<String>,
     /// the inviter's control-mesh listen port on the overlay.
     pub mesh_port: u16,
 }
@@ -583,6 +731,70 @@ pub fn load_invite_wireguard(dir: &Path) -> Result<Option<StoredInviteWireGuard>
     toml::from_str(&text)
         .map(Some)
         .map_err(|e| format!("{path:?}: {e}"))
+}
+
+const INVITE_FRONTS_FILE: &str = "invite-fronts.json";
+
+/// the on-disk shape of a persisted [`Front`] — raw key arrays as hex so the
+/// file is human-readable and stable, mirroring [`StoredInviteWireGuard`].
+#[derive(Serialize, Deserialize)]
+struct StoredFront {
+    member_key: String,
+    wireguard_public_key: String,
+    mesh_port: u16,
+    endpoint: Option<String>,
+}
+
+/// persist the invite's fronts beside the token so a later `run` can race the
+/// whole union of first-contact paths, not just the inviter. Empty fronts write
+/// nothing (absence decodes as empty). Overwrites — a re-join replaces them.
+pub fn save_invite_fronts(dir: &Path, fronts: &[Front]) -> Result<(), String> {
+    let path = dir.join(INVITE_FRONTS_FILE);
+    if fronts.is_empty() {
+        // a re-join with a front-less invite must not leave a stale set behind.
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+    let stored: Vec<StoredFront> = fronts
+        .iter()
+        .map(|f| StoredFront {
+            member_key: hex_bytes(&f.member_key),
+            wireguard_public_key: hex_bytes(&f.wireguard_public_key),
+            mesh_port: f.mesh_port,
+            endpoint: f.endpoint.clone(),
+        })
+        .collect();
+    let text = serde_json::to_string_pretty(&stored).map_err(|e| format!("encode {path:?}: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("write {path:?}: {e}"))
+}
+
+/// the fronts a previous `join` stored; empty when absent. Fail-closed decode.
+pub fn load_invite_fronts(dir: &Path) -> Result<Vec<Front>, String> {
+    let path = dir.join(INVITE_FRONTS_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {path:?}: {e}")),
+    };
+    let stored: Vec<StoredFront> =
+        serde_json::from_str(&text).map_err(|e| format!("decode {path:?}: {e}"))?;
+    stored
+        .into_iter()
+        .map(|s| {
+            let member_key = unhex(&s.member_key)?
+                .try_into()
+                .map_err(|_| "front member_key must be 32 bytes".to_string())?;
+            let wireguard_public_key = unhex(&s.wireguard_public_key)?
+                .try_into()
+                .map_err(|_| "front wireguard_public_key must be 32 bytes".to_string())?;
+            Ok(Front {
+                member_key,
+                wireguard_public_key,
+                mesh_port: s.mesh_port,
+                endpoint: s.endpoint,
+            })
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -867,12 +1079,70 @@ const INVITE_B64: base64::engine::GeneralPurpose = base64::engine::general_purpo
 pub struct InviteWireGuard {
     /// the inviter's X25519 WireGuard public key, raw.
     pub public_key: [u8; 32],
-    /// the inviter's underlay WireGuard UDP endpoint, `host:port`.
-    pub endpoint: String,
-    /// the inviter's underlay UDP intro endpoint, `host:port`.
-    pub intro: String,
+    /// the inviter's underlay WireGuard UDP endpoint, `host:port`. `None`
+    /// means the invite uses coordinated rendezvous instead of baking in a
+    /// direct endpoint.
+    pub endpoint: Option<String>,
+    /// the inviter's underlay UDP intro endpoint, `host:port`. `None` means
+    /// the intro is sent over the coordinated WireGuard underlay socket.
+    pub intro: Option<String>,
     /// the inviter's control-mesh listen port, dialed at its overlay ULA.
     pub mesh_port: u16,
+}
+
+/// one member the inviter offers as an ADDITIONAL first-contact path: the
+/// joiner may bring its tunnel up against this member instead of the inviter
+/// (the unified all-paths invite — `docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md`).
+/// Only PUBLIC keys ever ride the wire; the WireGuard private key never leaves
+/// the node. `endpoint` is the member's routable WireGuard UNDERLAY endpoint
+/// (`host:wg_port`) when it is host-capable — the joiner dials it directly and
+/// announces its intro at `wg_port + 1` (the product-wide `invite_listen`
+/// default). `None` means the member is only reachable BY IDENTITY through the
+/// joiner's ambient coordinator (a punchable, NAT'd member).
+///
+/// Fronts live OUTSIDE the genesis fingerprint (they are advisory reachability,
+/// never validator identity) — see the fingerprint-exclusion test.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Front {
+    /// the member's real ed25519 node identity the joiner authenticates.
+    pub member_key: [u8; 32],
+    /// the member's X25519 WireGuard public key, raw.
+    pub wireguard_public_key: [u8; 32],
+    /// the member's control-mesh listen port, dialed at its overlay ULA once
+    /// the tunnel routes.
+    pub mesh_port: u16,
+    /// the member's routable WireGuard underlay endpoint `host:wg_port`, or
+    /// `None` for a punchable member reached by identity via the coordinator.
+    pub endpoint: Option<String>,
+}
+
+/// Map a persisted mesh's signed adverts to invite [`Front`]s, skipping the
+/// inviter's own advert (`own`, its raw ed25519 identity — it already rides
+/// the invite as the `wireguard` bootstrap). A member with a concrete routable
+/// WireGuard underlay endpoint becomes a DIRECT front (`endpoint:
+/// Some(host:wg_port)` — the joiner dials it and announces its intro at
+/// `wg_port + 1`); a member with no dialable underlay becomes a COORDINATED
+/// front (`endpoint: None`, reached BY IDENTITY through the joiner's ambient
+/// coordinator). Every registered member is at least punchable, so all
+/// non-self adverts are offered as fronts.
+pub fn fronts_from_adverts(
+    adverts: &[wireguard_upgrade::EndpointAdvertisement],
+    own: &[u8; 32],
+) -> Vec<Front> {
+    adverts
+        .iter()
+        .map(|advert| &advert.record)
+        .filter(|record| &record.validator_identity.0 != own)
+        .map(|record| Front {
+            member_key: record.validator_identity.0,
+            wireguard_public_key: record.wireguard_public_key.0,
+            mesh_port: record.control_endpoint.port,
+            endpoint: record
+                .wireguard_endpoint
+                .as_ref()
+                .map(|ep| ep.socket_addr().to_string()),
+        })
+        .collect()
 }
 
 /// a decoded, VERIFIED invite — the only constructor is [`decode_invite`].
@@ -883,6 +1153,10 @@ pub struct Invite {
     /// `None` when the inviter runs no reachability plane (a TCP-reachable
     /// network) — the joiner then rides the descriptor's reach hints alone.
     pub wireguard: Option<InviteWireGuard>,
+    /// additional first-contact paths the inviter offers (its reachable
+    /// members). Empty on a pre-feature blob or when the inviter has no
+    /// persisted mesh state. Never part of `genesis_namespace`.
+    pub fronts: Vec<Front>,
     pub expires_unix_secs: u64,
 }
 
@@ -892,6 +1166,7 @@ pub fn encode_invite(
     descriptor: &NetworkDescriptor,
     token: &InviteToken,
     wireguard: Option<&InviteWireGuard>,
+    fronts: &[Front],
     expires_unix_secs: u64,
     signer: &ed25519::PrivateKey,
 ) -> Result<String, String> {
@@ -899,7 +1174,7 @@ pub fn encode_invite(
     if signer.public_key() != token.issuer {
         return Err("invite envelope must be signed by the token's issuer".into());
     }
-    let mut out = pack_invite(descriptor, token, wireguard, expires_unix_secs)?;
+    let mut out = pack_invite(descriptor, token, wireguard, fronts, expires_unix_secs)?;
     let sig = signer.sign(INVITE_ENVELOPE_NAMESPACE, &out);
     out.extend_from_slice(sig.encode().as_ref());
     Ok(format!("{INVITE_PREFIX}{}", INVITE_B64.encode(out)))
@@ -928,7 +1203,8 @@ pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String
         .ok_or_else(|| {
             format!(
                 "not a ducktape invite (expected {INVITE_PREFIX}...); an older \
-                 ducktape-invite-v*: blob no longer decodes — ask for a fresh invite"
+                 ducktape:/ducktape-invite-v*: blob no longer decodes — ask for a \
+                 fresh invite"
             )
         })?;
     let bytes = INVITE_B64
@@ -968,6 +1244,7 @@ fn pack_invite(
     d: &NetworkDescriptor,
     token: &InviteToken,
     wireguard: Option<&InviteWireGuard>,
+    fronts: &[Front],
     expires_unix_secs: u64,
 ) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
@@ -1004,13 +1281,19 @@ fn pack_invite(
     }
 
     match wireguard {
-        Some(wg) => {
+        Some(wg) if wg.endpoint.is_some() && wg.intro.is_some() => {
             out.push(1);
             out.extend_from_slice(&wg.public_key);
-            put_str_u8(&mut out, &wg.endpoint)?;
-            put_str_u8(&mut out, &wg.intro)?;
+            put_str_u8(&mut out, wg.endpoint.as_ref().expect("checked"))?;
+            put_str_u8(&mut out, wg.intro.as_ref().expect("checked"))?;
             out.extend_from_slice(&wg.mesh_port.to_le_bytes());
         }
+        Some(wg) if wg.endpoint.is_none() && wg.intro.is_none() => {
+            out.push(2);
+            out.extend_from_slice(&wg.public_key);
+            out.extend_from_slice(&wg.mesh_port.to_le_bytes());
+        }
+        Some(_) => return Err("wireguard invite must carry both endpoint and intro, or neither".into()),
         None => out.push(0),
     }
 
@@ -1025,6 +1308,27 @@ fn pack_invite(
 
     out.extend_from_slice(&expires_unix_secs.to_le_bytes());
     out.extend_from_slice(&pack_invite_token(token));
+
+    // the fronts block rides AFTER the fixed-length token, inside the signed
+    // envelope, but is NEVER fed to `genesis_namespace` (advisory reachability,
+    // not validator identity). Absent when empty, so an invite with no fronts
+    // stays BYTE-IDENTICAL to a pre-feature blob and old blobs still decode
+    // (the reader treats "nothing after the token" as `fronts: []`).
+    if !fronts.is_empty() {
+        out.push(u8::try_from(fronts.len()).map_err(|_| format!("too many fronts ({})", fronts.len()))?);
+        for f in fronts {
+            out.extend_from_slice(&f.member_key);
+            out.extend_from_slice(&f.wireguard_public_key);
+            out.extend_from_slice(&f.mesh_port.to_le_bytes());
+            match &f.endpoint {
+                Some(endpoint) => {
+                    out.push(1);
+                    put_str_u8(&mut out, endpoint)?;
+                }
+                None => out.push(0),
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -1082,8 +1386,19 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
             let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
             Some(InviteWireGuard {
                 public_key,
-                endpoint,
-                intro,
+                endpoint: Some(endpoint),
+                intro: Some(intro),
+                mesh_port,
+            })
+        }
+        2 => {
+            let mut public_key = [0u8; 32];
+            public_key.copy_from_slice(r.take(32)?);
+            let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
+            Some(InviteWireGuard {
+                public_key,
+                endpoint: None,
+                intro: None,
                 mesh_port,
             })
         }
@@ -1103,6 +1418,35 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         return Err("this invite has expired — ask for a fresh one".into());
     }
     let token = unpack_invite_token(r.take(INVITE_TOKEN_LEN)?)?;
+
+    // the optional fronts block. A pre-feature blob has nothing after the
+    // token (`r.done()`), decoding to an empty set; a feature blob carries a
+    // u8 count then each front. Fail-closed on a malformed entry.
+    let fronts = if r.done() {
+        Vec::new()
+    } else {
+        let fcount = r.u8()? as usize;
+        let mut fronts = Vec::with_capacity(fcount);
+        for _ in 0..fcount {
+            let mut member_key = [0u8; 32];
+            member_key.copy_from_slice(r.take(32)?);
+            let mut wireguard_public_key = [0u8; 32];
+            wireguard_public_key.copy_from_slice(r.take(32)?);
+            let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
+            let endpoint = match r.u8()? {
+                0 => None,
+                1 => Some(r.take_str_u8()?),
+                other => return Err(format!("unknown front endpoint flag {other} in invite")),
+            };
+            fronts.push(Front {
+                member_key,
+                wireguard_public_key,
+                mesh_port,
+                endpoint,
+            });
+        }
+        fronts
+    };
     if !r.done() {
         return Err("invite payload has trailing bytes".into());
     }
@@ -1119,6 +1463,7 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         },
         token,
         wireguard,
+        fronts,
         expires_unix_secs,
     })
 }
@@ -1179,6 +1524,7 @@ impl<'a> InviteReader<'a> {
 // ============================================================================
 
 #[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeToml {
     // --- the network shape ---
     /// path to the network descriptor; PRESENT means the network shape.
@@ -1199,6 +1545,10 @@ pub struct NodeToml {
     pub storage_dir: Option<String>,
     pub rpc_listen: Option<String>,
     pub http_listen: Option<String>,
+    /// Dedicated, least-privilege browser gateway. It exposes no node API and
+    /// is normally loopback-only; route windows use per-session
+    /// `<token>.localhost` origins on this listener.
+    pub gateway_listen: Option<String>,
     /// sealed blocks between recovery checkpoints (node-local operator
     /// policy — never part of the network descriptor). default 32.
     pub checkpoint_blocks: Option<u64>,
@@ -1206,11 +1556,14 @@ pub struct NodeToml {
     /// PRESENT stages the node-driven reachability plane (node-local
     /// operator policy, like checkpoint_blocks). absent = plane off.
     pub wireguard_listen: Option<String>,
-    /// which `WireGuardEffect` the reachability plane drives: "real"
+    /// which `WireGuardEffect` the reachability plane drives: "tun"
     /// (default — configure an actual interface via the userspace WireGuard
-    /// runtime; needs root/CAP_NET_ADMIN) or "fake" (record configs in
-    /// memory; for dev/sim runs, and for several same-chain nodes on one
-    /// host, which would otherwise fight over one interface name).
+    /// runtime; needs root/CAP_NET_ADMIN; "real" is the legacy alias),
+    /// "socket" (the ADR's TUN-less in-process backend: no privilege, no
+    /// host mutation — overlay reachability exists only inside this
+    /// process), or "fake" (record configs in memory; for dev/sim runs, and
+    /// for several same-chain nodes on one host, which would otherwise
+    /// fight over one interface name).
     pub wireguard_effect: Option<String>,
     /// the UDP endpoint this node's invite intro listener binds — where a
     /// fresh joiner announces its keys (token-authenticated) so the tunnel
@@ -1232,6 +1585,20 @@ pub struct NodeToml {
     /// capable node. announcing stays truthful either way: this can hide a
     /// real provider, never fabricate one.
     pub announce_capabilities: Option<bool>,
+    /// the AMBIENT rendezvous coordinator this node's reachability plane
+    /// binds — never carried in an invite (see `coordinator_ingress`'s
+    /// doc). `"host:port"` overrides the compiled-in
+    /// `DEFAULT_PRIMARY_COORDINATOR`; `"none"`/`"off"`/`"direct"` disables
+    /// coordination outright; the key ABSENT (the pre-feature default)
+    /// re-derives the compiled default at runtime — bit-identical to today.
+    pub primary_coordinator: Option<String>,
+    /// the UDP endpoint this node advertises for its WireGuard tunnel,
+    /// independent of `wireguard_listen` (which stays bind-only): a
+    /// concrete `"host:port"` (hostname resolved once at plane start, like
+    /// the mesh `advertised`) always wins; the key ABSENT falls back to
+    /// today's derivation (`wireguard_listen`'s IP when concrete, endpoint-
+    /// less/roaming when unspecified) — bit-identical to today.
+    pub wireguard_advertised: Option<String>,
 }
 
 /// read a raw node.toml plus its base directory (which relative paths inside
@@ -1257,22 +1624,41 @@ pub struct Plumbing {
     pub listen: String,
     pub advertised: Option<String>,
     pub http_listen: Option<String>,
+    pub gateway_listen: Option<String>,
     pub rpc_listen: Option<String>,
     /// merged like the rest — a hand-edited storage_dir survives rewrites.
     pub storage_dir: String,
     /// merged from an existing file only (no flag); a WireGuard join seeds a
     /// default AFTER the merge when the invite carries a tunnel bootstrap.
     pub wireguard_listen: Option<String>,
-    /// merged from an existing file only — a hand-set "fake" survives.
+    /// merged from explicit flags or existing file; defaults from
+    /// `wireguard_listen` when absent.
+    pub invite_listen: Option<String>,
+    /// merged like the rest — a hand-set value survives; the desktop app
+    /// passes "socket" here (overlay-net ADR phase 4) while the parse
+    /// default for a file without the key stays `tun`.
     pub wireguard_effect: Option<String>,
+    /// merged like the rest; see `NodeToml::primary_coordinator`. Absent
+    /// (`None`) preserves today's behavior exactly (the runtime re-derives
+    /// the compiled default / whatever the descriptor already encodes).
+    pub primary_coordinator: Option<String>,
+    /// merged like the rest; see `NodeToml::wireguard_advertised`.
+    pub wireguard_advertised: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn merged_plumbing(
     dir: &Path,
     listen: Option<&str>,
     advertised: Option<&str>,
     http_listen: Option<&str>,
+    gateway_listen: Option<&str>,
     rpc_listen: Option<&str>,
+    wireguard_effect: Option<&str>,
+    wireguard_listen: Option<&str>,
+    invite_listen: Option<&str>,
+    primary_coordinator: Option<&str>,
+    wireguard_advertised: Option<&str>,
 ) -> Result<Plumbing, String> {
     let path = dir.join("node.toml");
     let existing: Option<NodeToml> = if path.exists() {
@@ -1281,6 +1667,9 @@ pub fn merged_plumbing(
         None
     };
     let e = existing.as_ref();
+    // reject a typo'd effect value at the verb, before anything lands on disk
+    // — resolve() would only catch it on the node's NEXT boot.
+    parse_wireguard_effect(wireguard_effect)?;
     Ok(Plumbing {
         listen: listen
             .map(str::to_string)
@@ -1292,14 +1681,30 @@ pub fn merged_plumbing(
         http_listen: http_listen
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.http_listen.clone())),
+        gateway_listen: gateway_listen
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.gateway_listen.clone())),
         rpc_listen: rpc_listen
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.rpc_listen.clone())),
         storage_dir: e
             .and_then(|r| r.storage_dir.clone())
             .unwrap_or_else(|| "storage".into()),
-        wireguard_listen: e.and_then(|r| r.wireguard_listen.clone()),
-        wireguard_effect: e.and_then(|r| r.wireguard_effect.clone()),
+        wireguard_listen: wireguard_listen
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.wireguard_listen.clone())),
+        invite_listen: invite_listen
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.invite_listen.clone())),
+        wireguard_effect: wireguard_effect
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.wireguard_effect.clone())),
+        primary_coordinator: primary_coordinator
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.primary_coordinator.clone())),
+        wireguard_advertised: wireguard_advertised
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.wireguard_advertised.clone())),
     })
 }
 
@@ -1320,14 +1725,26 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     if let Some(h) = &p.http_listen {
         s += &format!("http_listen = \"{h}\"\n");
     }
+    if let Some(d) = &p.gateway_listen {
+        s += &format!("gateway_listen = \"{d}\"\n");
+    }
     if let Some(r) = &p.rpc_listen {
         s += &format!("rpc_listen = \"{r}\"\n");
     }
     if let Some(w) = &p.wireguard_listen {
         s += &format!("wireguard_listen = \"{w}\"\n");
     }
+    if let Some(i) = &p.invite_listen {
+        s += &format!("invite_listen = \"{i}\"\n");
+    }
     if let Some(w) = &p.wireguard_effect {
         s += &format!("wireguard_effect = \"{w}\"\n");
+    }
+    if let Some(pc) = &p.primary_coordinator {
+        s += &format!("primary_coordinator = \"{pc}\"\n");
+    }
+    if let Some(wa) = &p.wireguard_advertised {
+        s += &format!("wireguard_advertised = \"{wa}\"\n");
     }
     let path = dir.join("node.toml");
     std::fs::write(&path, s).map_err(|e| format!("write {path:?}: {e}"))?;
@@ -1340,6 +1757,7 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
 /// key is in the validator set — otherwise a joiner pins a peer that can
 /// never answer and retries forever. preference: first validator bootstrap
 /// hint, else any validator that is not us. None = nobody can serve (solo).
+#[cfg(test)]
 pub fn choose_sync_source<A>(
     bootstrappers: &[(ed25519::PublicKey, A)],
     validators: &[ed25519::PublicKey],
@@ -1478,6 +1896,7 @@ pub struct Resolved {
     pub storage_dir: PathBuf,
     pub rpc_listen: Option<String>,
     pub http_listen: Option<String>,
+    pub gateway_listen: Option<String>,
     /// the staged WireGuard reachability plane's advertised UDP endpoint;
     /// None = plane off.
     pub wireguard_listen: Option<SocketAddr>,
@@ -1502,6 +1921,10 @@ pub struct Resolved {
     /// the joining node brings up BEFORE any p2p. always `None` for the dev
     /// shape and for members.
     pub invite_wireguard: Option<StoredInviteWireGuard>,
+    /// the inviter's offered member fronts a `join` stored, if any — the
+    /// ADDITIONAL first-contact paths the joiner races alongside the inviter.
+    /// Empty for the dev shape, for members, and for pre-feature invites.
+    pub invite_fronts: Vec<Front>,
     /// opt-in shipped-index warm start when joining; see `NodeToml::sync_index`.
     pub sync_index: bool,
     /// publish the discovered provider set into the capability registry; see
@@ -1518,6 +1941,16 @@ pub struct Resolved {
     /// `None` for a genesis validator (admitted by membership), the dev shape,
     /// or a node that has not been issued one.
     pub coord_cap: Option<nat_traversal::CoordCap>,
+    /// the AMBIENT coordinator override (`NodeToml::primary_coordinator`),
+    /// raw and unvalidated — resolved through `coordinator_ingress` at the
+    /// point of use so a bad value DEGRADES (coordinated paths dark, loud
+    /// log) rather than aborting boot. `None` = re-derive the compiled
+    /// default, exactly like today.
+    pub primary_coordinator: Option<String>,
+    /// the WireGuard endpoint this node advertises, resolved once
+    /// (`NodeToml::wireguard_advertised`); `None` = derive it from
+    /// `wireguard_listen` exactly like today (see `reachability_plane.rs`).
+    pub wireguard_advertised: Option<Ingress>,
     /// the workspace base directory — where `identity.key`, `network.toml`,
     /// `wireguard.key` and `coord.cap` live (the network shape's config
     /// directory; the dev shape's `storage_dir`). Threaded so a parked
@@ -1614,6 +2047,14 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     let invite_listen = wireguard_listen
         .map(|wg| resolved_invite_listen(raw.invite_listen.as_deref(), wg))
         .transpose()?;
+    let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
+    // Existing workspaces predate `gateway_listen`. Any node already exposing
+    // the app surface gets the safe loopback/ephemeral gateway automatically;
+    // no registry or node.toml migration (and no stale port) is required.
+    let gateway_listen = raw
+        .gateway_listen
+        .clone()
+        .or_else(|| raw.http_listen.as_ref().map(|_| "127.0.0.1:0".to_string()));
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -1629,6 +2070,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         storage_dir: base.join(raw.storage_dir.as_deref().unwrap_or("storage")),
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
+        gateway_listen,
         wireguard_listen,
         wireguard_effect,
         wireguard_key_file: base.join("wireguard.key"),
@@ -1637,6 +2079,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: load_invite_token(base)?,
         invite_wireguard: load_invite_wireguard(base)?,
+        invite_fronts: load_invite_fronts(base)?,
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
         coordination: descriptor.coordination(),
@@ -1647,6 +2090,8 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         // the config directory: identity.key / network.toml / coord.cap live
         // here, so a joiner persists a delivered cap into it.
         workspace: base.to_path_buf(),
+        primary_coordinator: raw.primary_coordinator,
+        wireguard_advertised,
     })
 }
 
@@ -1662,6 +2107,20 @@ fn parse_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, Strin
 /// (the CLI verbs) rather than a full `resolve`.
 pub fn resolved_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, String> {
     parse_wireguard_listen(raw)
+}
+
+/// resolve `wireguard_advertised` into a dial ingress: absent = "derive from
+/// `wireguard_listen`" (the caller's job — see `reachability_plane.rs`), an
+/// explicit value must be dialable (a hostname is kept VERBATIM, resolved
+/// once at plane start, same discipline as the mesh `advertised`).
+fn parse_wireguard_advertised(raw: Option<&str>) -> Result<Option<Ingress>, String> {
+    match raw {
+        None => Ok(None),
+        Some(a) => ingress_of(a)
+            .map_err(|e| format!("wireguard_advertised: {e}"))?
+            .map(Some)
+            .ok_or_else(|| format!("wireguard_advertised addr {a:?} is not dialable")),
+    }
 }
 
 /// the invite intro listener endpoint: explicit `invite_listen`, else the
@@ -1684,15 +2143,24 @@ pub fn resolved_invite_listen(
     }
 }
 
-/// the HOST a minted invite's UDP endpoints carry: the WireGuard listen IP
-/// when it is concrete, else the advertised host (an invite must hand the
-/// joiner an underlay address that reaches this machine — the usual listen
-/// is unspecified, so `advertised` is the truth).
+/// the HOST a minted invite's UDP endpoints carry: an explicit
+/// `wireguard_advertised` wins outright (it IS the truth once configured),
+/// else the WireGuard listen IP when it is concrete, else the advertised
+/// host (an invite must hand the joiner an underlay address that reaches
+/// this machine — the usual listen is unspecified, so `advertised` is the
+/// truth).
 pub fn endpoint_host(
     advertised: Option<&str>,
     listen: &str,
     wireguard_listen: SocketAddr,
+    wireguard_advertised: Option<&str>,
 ) -> Result<String, String> {
+    if let Some(ingress) = parse_wireguard_advertised(wireguard_advertised)? {
+        return Ok(match ingress {
+            Ingress::Socket(addr) => addr.ip().to_string(),
+            Ingress::Dns { host, .. } => host.to_string(),
+        });
+    }
     if !wireguard_listen.ip().is_unspecified() {
         return Ok(wireguard_listen.ip().to_string());
     }
@@ -1707,21 +2175,50 @@ pub fn endpoint_host(
     }
 }
 
+/// the FULL `host:port` a minted invite's WireGuard `endpoint` carries: an
+/// explicit `wireguard_advertised` is used VERBATIM — host AND port — because
+/// in the port-forwarded setup the key exists for, the externally reachable
+/// port can differ from the local bind port (`wireguard_listen`); baking the
+/// advertised host with the bind port would mint an invite whose endpoint is
+/// silently wrong. Absent, the endpoint is today's derivation exactly:
+/// [`endpoint_host`]'s host at the bind port.
+pub fn invite_wireguard_endpoint(
+    advertised: Option<&str>,
+    listen: &str,
+    wireguard_listen: SocketAddr,
+    wireguard_advertised: Option<&str>,
+) -> Result<String, String> {
+    if let Some(ingress) = parse_wireguard_advertised(wireguard_advertised)? {
+        return Ok(match ingress {
+            Ingress::Socket(addr) => addr.to_string(),
+            Ingress::Dns { host, port } => format!("{host}:{port}"),
+        });
+    }
+    let host = endpoint_host(advertised, listen, wireguard_listen, None)?;
+    Ok(format!("{host}:{}", wireguard_listen.port()))
+}
+
 /// which `WireGuardEffect` implementation the reachability plane drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireGuardEffectKind {
+    /// the TUN-less in-process backend (overlay-net ADR): BoringTun `Tunn`s
+    /// + smoltcp behind the overlay seam, no privilege, no host mutation.
+    Socket,
     /// configure an actual interface through the userspace WireGuard runtime.
-    Real,
+    Tun,
     /// record configurations in memory without touching the network stack.
     Fake,
 }
 
 fn parse_wireguard_effect(raw: Option<&str>) -> Result<WireGuardEffectKind, String> {
     match raw {
-        None | Some("real") => Ok(WireGuardEffectKind::Real),
+        Some("socket") => Ok(WireGuardEffectKind::Socket),
+        // "real" predates the socket backend and stays as an alias for the
+        // interface-backed path it always meant.
+        None | Some("tun") | Some("real") => Ok(WireGuardEffectKind::Tun),
         Some("fake") => Ok(WireGuardEffectKind::Fake),
         Some(other) => Err(format!(
-            "wireguard_effect: {other:?} is not \"real\" or \"fake\""
+            "wireguard_effect: {other:?} is not \"socket\", \"tun\" (alias \"real\"), or \"fake\""
         )),
     }
 }
@@ -1833,6 +2330,11 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         .unwrap_or_else(|| std::env::temp_dir().join(format!("ducktape-node-{id}")));
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
+    let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
+    let gateway_listen = raw
+        .gateway_listen
+        .clone()
+        .or_else(|| raw.http_listen.as_ref().map(|_| "127.0.0.1:0".to_string()));
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
@@ -1856,6 +2358,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         storage_dir,
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
+        gateway_listen,
         wireguard_listen,
         wireguard_effect,
         invite_listen: wireguard_listen
@@ -1865,12 +2368,15 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         invite_token: None,
         invite_wireguard: None,
+        invite_fronts: Vec::new(),
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
         // the dev shape wires direct sockets only — no real coordinator, so
         // the coordination mode defaults to Private and no cap is presented.
         coordination: Coordination::Private,
         coord_cap: None,
+        primary_coordinator: raw.primary_coordinator,
+        wireguard_advertised,
     })
 }
 
@@ -1924,6 +2430,86 @@ mod tests {
     }
 
     #[test]
+    fn primary_coordinator_defaults_to_deployed_public_rendezvous() {
+        let coord = primary_coordinator_or_default(None).expect("default coordinator");
+        assert_eq!(coord.as_deref(), Some("p2p.ducktape.byeongsu.dev:3478"));
+
+        let disabled = primary_coordinator_or_default(Some("none")).expect("disabled");
+        assert_eq!(disabled, None);
+    }
+
+    /// `coordinator_ingress` — the AMBIENT source change (1) threads into
+    /// both runtime call sites (main.rs:954 joiner, main.rs:3201 member) —
+    /// resolves an explicit override, honors the disable sentinel, and
+    /// falls back to the compiled default exactly like `coordinator_ingress
+    /// (None)` did before change (1) existed (bit-identical absent case).
+    #[test]
+    fn coordinator_ingress_resolves_an_explicit_override() {
+        match coordinator_ingress(Some("203.0.113.9:3478")).expect("dialable override") {
+            Some(Ingress::Socket(addr)) => assert_eq!(addr, "203.0.113.9:3478".parse().unwrap()),
+            other => panic!("expected a concrete socket ingress, got {other:?}"),
+        }
+        assert_eq!(
+            coordinator_ingress(Some("none")).expect("disabled"),
+            None,
+            "the sentinel disables coordination outright — no ingress to bind"
+        );
+        match coordinator_ingress(None).expect("compiled default") {
+            Some(Ingress::Dns { port, .. }) => assert_eq!(port, 3478),
+            other => panic!("expected the compiled default's hostname ingress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_primary_coordinator_records_public_coordinated_self_hint() {
+        let me = ed25519::PrivateKey::from_seed(7).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+
+        d.apply_primary_coordinator(&me, "p2p.ducktape.byeongsu.dev:3478")
+            .expect("coordinator hint");
+
+        assert_eq!(d.coordination(), Coordination::Public);
+        let hints = d.reach_hints().expect("hints");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].expected_key, me);
+        match &hints[0].reach {
+            Reach::Coordinated(coord) => {
+                assert_eq!(coord.coord_addr, "p2p.ducktape.byeongsu.dev:3478");
+                assert_eq!(coord.coord_key, keyless_coordinator_placeholder_key());
+            }
+            other => panic!("expected coordinated reach hint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coordinated_invite_needs_reachability_defaults_without_tunnel_bootstrap() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let mut d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.apply_primary_coordinator(&issuer.public_key(), "p2p.ducktape.byeongsu.dev:3478")
+            .expect("coordinator hint");
+        let invite = decode_invite(&encode_test_invite(&d, &issuer, None)).expect("decode");
+
+        assert!(
+            invite_requires_reachability_defaults(&invite),
+            "a coordinated invite must start the joiner's reachability plane even without a direct tunnel bootstrap"
+        );
+    }
+
+    #[test]
     fn identity_roundtrips_and_reuses() {
         let dir = tmp("identity");
         let path = dir.join("identity.key");
@@ -1944,7 +2530,7 @@ mod tests {
         wireguard: Option<&InviteWireGuard>,
     ) -> String {
         let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes());
-        encode_invite(d, &token, wireguard, u64::MAX, issuer).expect("encode")
+        encode_invite(d, &token, wireguard, &[], u64::MAX, issuer).expect("encode")
     }
 
     // ---- user-key bind/unbind certificates ---------------------------------
@@ -1952,12 +2538,18 @@ mod tests {
     #[test]
     fn mint_bind_cert_verifies_against_module_preimage() {
         use commonware_cryptography::{
-            Verifier as _,
+            Signer as _, Verifier as _,
             ed25519::Signature,
         };
         let user = ed25519::PrivateKey::from_seed(1);
         let node_pub = [9u8; 32];
-        let cert = mint_bind_cert(&user, "chain-a", &node_pub, 0);
+        let cert = user
+            .sign(
+                identity::IDENTITY_BIND_NS,
+                &identity::bind_preimage("chain-a", &node_pub, 0),
+            )
+            .as_ref()
+            .to_vec();
         let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
         let preimage = identity::bind_preimage("chain-a", &node_pub, 0);
         assert!(user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage, &sig));
@@ -1966,12 +2558,18 @@ mod tests {
     #[test]
     fn mint_bind_cert_is_chain_scoped() {
         use commonware_cryptography::{
-            Verifier as _,
+            Signer as _, Verifier as _,
             ed25519::Signature,
         };
         let user = ed25519::PrivateKey::from_seed(1);
         let node_pub = [9u8; 32];
-        let cert = mint_bind_cert(&user, "chain-a", &node_pub, 0);
+        let cert = user
+            .sign(
+                identity::IDENTITY_BIND_NS,
+                &identity::bind_preimage("chain-a", &node_pub, 0),
+            )
+            .as_ref()
+            .to_vec();
         let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
         // a cert minted for chain-a must NOT verify against chain-b's preimage.
         let preimage_b = identity::bind_preimage("chain-b", &node_pub, 0);
@@ -1981,12 +2579,18 @@ mod tests {
     #[test]
     fn mint_bind_cert_does_not_verify_under_unbind_namespace() {
         use commonware_cryptography::{
-            Verifier as _,
+            Signer as _, Verifier as _,
             ed25519::Signature,
         };
         let user = ed25519::PrivateKey::from_seed(1);
         let node_pub = [9u8; 32];
-        let cert = mint_bind_cert(&user, "chain-a", &node_pub, 0);
+        let cert = user
+            .sign(
+                identity::IDENTITY_BIND_NS,
+                &identity::bind_preimage("chain-a", &node_pub, 0),
+            )
+            .as_ref()
+            .to_vec();
         let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
         let preimage = identity::bind_preimage("chain-a", &node_pub, 0);
         // signed under IDENTITY_BIND_NS -- must NOT verify under the unbind ns.
@@ -1996,12 +2600,18 @@ mod tests {
     #[test]
     fn mint_unbind_cert_verifies_against_module_preimage() {
         use commonware_cryptography::{
-            Verifier as _,
+            Signer as _, Verifier as _,
             ed25519::Signature,
         };
         let user = ed25519::PrivateKey::from_seed(2);
         let node_pub = [11u8; 32];
-        let cert = mint_unbind_cert(&user, "chain-a", &node_pub, 3);
+        let cert = user
+            .sign(
+                identity::IDENTITY_UNBIND_NS,
+                &identity::unbind_preimage("chain-a", &node_pub, 3),
+            )
+            .as_ref()
+            .to_vec();
         let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
         let preimage = identity::unbind_preimage("chain-a", &node_pub, 3);
         assert!(user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage, &sig));
@@ -2010,12 +2620,18 @@ mod tests {
     #[test]
     fn mint_unbind_cert_is_chain_scoped() {
         use commonware_cryptography::{
-            Verifier as _,
+            Signer as _, Verifier as _,
             ed25519::Signature,
         };
         let user = ed25519::PrivateKey::from_seed(2);
         let node_pub = [11u8; 32];
-        let cert = mint_unbind_cert(&user, "chain-a", &node_pub, 3);
+        let cert = user
+            .sign(
+                identity::IDENTITY_UNBIND_NS,
+                &identity::unbind_preimage("chain-a", &node_pub, 3),
+            )
+            .as_ref()
+            .to_vec();
         let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
         let preimage_b = identity::unbind_preimage("chain-b", &node_pub, 3);
         assert!(!user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage_b, &sig));
@@ -2024,12 +2640,18 @@ mod tests {
     #[test]
     fn mint_unbind_cert_does_not_verify_under_bind_namespace() {
         use commonware_cryptography::{
-            Verifier as _,
+            Signer as _, Verifier as _,
             ed25519::Signature,
         };
         let user = ed25519::PrivateKey::from_seed(2);
         let node_pub = [11u8; 32];
-        let cert = mint_unbind_cert(&user, "chain-a", &node_pub, 3);
+        let cert = user
+            .sign(
+                identity::IDENTITY_UNBIND_NS,
+                &identity::unbind_preimage("chain-a", &node_pub, 3),
+            )
+            .as_ref()
+            .to_vec();
         let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
         let preimage = identity::unbind_preimage("chain-a", &node_pub, 3);
         // signed under IDENTITY_UNBIND_NS -- must NOT verify under the bind ns.
@@ -2045,20 +2667,25 @@ mod tests {
         let user = ed25519::PrivateKey::from_seed(3);
         let node_pub = [42u8; 32];
 
-        let bind_sig = mint_bind_cert(&user, "test@abc", &node_pub, 0);
         let bind_msg = identity::IdentityMsg::BindNode {
-            user_key: user.public_key().as_ref().to_vec(),
-            user_sig: bind_sig,
+            authorizer: ed25519_member_auth(
+                &user,
+                identity::IDENTITY_BIND_NS,
+                &identity::bind_preimage("test@abc", &node_pub, 0),
+            ),
         };
         let encoded = identity::encode_msg(&bind_msg);
         // the wire contract: a single utf-8 JSON line, decodable as-is.
         assert_eq!(String::from_utf8(encoded.clone()).unwrap().lines().count(), 1);
         assert_eq!(identity::decode_msg(&encoded).unwrap(), bind_msg);
 
-        let unbind_sig = mint_unbind_cert(&user, "test@abc", &node_pub, 1);
         let unbind_msg = identity::IdentityMsg::UnbindNode {
             node_key: node_pub.to_vec(),
-            user_sig: unbind_sig,
+            authorizer: ed25519_member_auth(
+                &user,
+                identity::IDENTITY_UNBIND_NS,
+                &identity::unbind_preimage("test@abc", &node_pub, 1),
+            ),
         };
         let encoded = identity::encode_msg(&unbind_msg);
         assert_eq!(String::from_utf8(encoded.clone()).unwrap().lines().count(), 1);
@@ -2136,12 +2763,192 @@ mod tests {
         };
         let wg = InviteWireGuard {
             public_key: [42u8; 32],
-            endpoint: "203.0.113.7:51820".into(),
-            intro: "203.0.113.7:51821".into(),
+            endpoint: Some("203.0.113.7:51820".into()),
+            intro: Some("203.0.113.7:51821".into()),
             mesh_port: 52200,
         };
         let invite = decode_invite(&encode_test_invite(&d, &issuer, Some(&wg))).expect("decode");
         assert_eq!(invite.wireguard, Some(wg));
+        // a wireguard invite with no fronts decodes to an empty set.
+        assert!(invite.fronts.is_empty());
+    }
+
+    /// mint + encode with the test defaults, carrying a set of fronts.
+    fn encode_test_invite_with_fronts(
+        d: &NetworkDescriptor,
+        issuer: &ed25519::PrivateKey,
+        wireguard: Option<&InviteWireGuard>,
+        fronts: &[Front],
+    ) -> String {
+        let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes());
+        encode_invite(d, &token, wireguard, fronts, u64::MAX, issuer).expect("encode")
+    }
+
+    fn front_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
+        NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: Some("private".into()),
+        }
+    }
+
+    #[test]
+    fn invite_blob_roundtrips_fronts() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_descriptor(&issuer);
+        // one host-capable member (direct endpoint), one punchable (coordinated).
+        let fronts = vec![
+            Front {
+                member_key: [11u8; 32],
+                wireguard_public_key: [12u8; 32],
+                mesh_port: 52201,
+                endpoint: Some("198.51.100.9:51820".into()),
+            },
+            Front {
+                member_key: [21u8; 32],
+                wireguard_public_key: [22u8; 32],
+                mesh_port: 52202,
+                endpoint: None,
+            },
+        ];
+        let blob = encode_test_invite_with_fronts(&d, &issuer, None, &fronts);
+        let invite = decode_invite(&blob).expect("decode");
+        assert_eq!(invite.fronts, fronts);
+    }
+
+    #[test]
+    fn pre_feature_invite_decodes_to_empty_fronts() {
+        use base64::Engine as _;
+        // an invite minted WITHOUT fronts carries NO fronts block — its signed
+        // payload ends at the fixed-length token, byte-for-byte like a
+        // pre-feature blob — so an old blob (nothing after the token) decodes
+        // to an empty set. Token nonces are random, so we compare the ENCODED
+        // LENGTH (identical when the fronts block is absent), not the bytes.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_descriptor(&issuer);
+        let empty = encode_test_invite_with_fronts(&d, &issuer, None, &[]);
+        let baseline = encode_test_invite(&d, &issuer, None);
+        let len = |blob: &str| {
+            INVITE_B64
+                .decode(blob.strip_prefix(INVITE_PREFIX).unwrap())
+                .unwrap()
+                .len()
+        };
+        assert_eq!(
+            len(&empty),
+            len(&baseline),
+            "an empty-fronts invite adds no bytes over a pre-feature blob"
+        );
+        assert!(decode_invite(&empty).expect("decode").fronts.is_empty());
+    }
+
+    fn sample_advert(
+        seed: u64,
+        octet: u8,
+        wireguard_endpoint: Option<u16>,
+    ) -> wireguard_upgrade::EndpointAdvertisement {
+        use std::net::{IpAddr, Ipv4Addr};
+        use wireguard_upgrade::{
+            AdmissionRoot, Endpoint, EndpointRecord, MeshVersion, PortPolicy, Root, Transport,
+            ValidatorIdentity, X25519PublicKey,
+        };
+        let policy = PortPolicy::production();
+        let signer = ed25519::PrivateKey::from_seed(seed);
+        let endpoint = |port: u16, transport| {
+            Endpoint::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, octet)), port, transport, &policy)
+                .unwrap()
+        };
+        let record = EndpointRecord {
+            namespace: "net#fronts".into(),
+            epoch: 3,
+            valset_root: Root([1; 32]),
+            admission_root: AdmissionRoot([2; 32]),
+            validator_identity: ValidatorIdentity::try_from(signer.public_key().as_ref()).unwrap(),
+            wireguard_public_key: X25519PublicKey([octet; 32]),
+            control_endpoint: endpoint(443, Transport::Tcp),
+            wireguard_endpoint: wireguard_endpoint.map(|port| endpoint(port, Transport::Udp)),
+            capabilities: vec![],
+            expires_at_view: 50,
+            nonce: 1,
+        };
+        wireguard_upgrade::EndpointAdvertisement::sign(record, MeshVersion([7; 32]), &signer)
+    }
+
+    #[test]
+    fn fronts_from_adverts_maps_reachable_members_and_skips_self() {
+        // three adverts: self (skipped), a host-capable member (direct
+        // endpoint), and a punchable member (no underlay endpoint → coordinated).
+        let me = ed25519::PrivateKey::from_seed(1);
+        let host_capable = sample_advert(2, 20, Some(51820));
+        let punchable = sample_advert(3, 30, None);
+        let adverts = vec![sample_advert(1, 10, Some(51820)), host_capable.clone(), punchable.clone()];
+
+        let own: [u8; 32] = me.public_key().as_ref().try_into().unwrap();
+        let fronts = fronts_from_adverts(&adverts, &own);
+
+        assert_eq!(fronts.len(), 2, "the inviter's own advert is skipped");
+        let direct = fronts
+            .iter()
+            .find(|f| f.member_key == host_capable.record.validator_identity.0)
+            .expect("host-capable front");
+        assert_eq!(direct.endpoint.as_deref(), Some("8.8.8.20:51820"));
+        assert_eq!(direct.mesh_port, 443);
+        assert_eq!(direct.wireguard_public_key, [20u8; 32]);
+        let coordinated = fronts
+            .iter()
+            .find(|f| f.member_key == punchable.record.validator_identity.0)
+            .expect("punchable front");
+        assert_eq!(coordinated.endpoint, None);
+    }
+
+    #[test]
+    fn fronts_are_excluded_from_the_genesis_fingerprint() {
+        // two invites that differ ONLY in their fronts must fingerprint
+        // identically: fronts are advisory reachability, never validator
+        // identity, so `genesis_namespace` cannot see them.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_descriptor(&issuer);
+        let a = decode_invite(&encode_test_invite_with_fronts(&d, &issuer, None, &[]))
+            .expect("decode a");
+        let b = decode_invite(&encode_test_invite_with_fronts(
+            &d,
+            &issuer,
+            None,
+            &[Front {
+                member_key: [11u8; 32],
+                wireguard_public_key: [12u8; 32],
+                mesh_port: 52201,
+                endpoint: Some("198.51.100.9:51820".into()),
+            }],
+        ))
+        .expect("decode b");
+        assert_ne!(a.fronts, b.fronts, "the two invites differ only in fronts");
+        assert_eq!(
+            a.descriptor.genesis_namespace(),
+            b.descriptor.genesis_namespace(),
+            "fronts must not perturb the genesis fingerprint"
+        );
+        // Non-tautological both ways: the round-tripped fingerprint equals the
+        // source descriptor's (fronts on the wire never fold into it), AND the
+        // fingerprint IS sensitive to validator identity — proving it tracks the
+        // consensus set, not the advisory reachability payload.
+        assert_eq!(
+            a.descriptor.genesis_namespace(),
+            d.genesis_namespace(),
+            "encoding/decoding fronts must not change the source fingerprint"
+        );
+        let mut with_extra_validator = front_descriptor(&issuer);
+        with_extra_validator
+            .validators
+            .push(hex_bytes(ed25519::PrivateKey::from_seed(8).public_key().as_ref()));
+        assert_ne!(
+            d.genesis_namespace(),
+            with_extra_validator.genesis_namespace(),
+            "the fingerprint must change when the validator set changes"
+        );
     }
 
     #[test]
@@ -2158,7 +2965,7 @@ mod tests {
         let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
 
         // expiry is enforced at decode, deterministically via the injected clock.
-        let blob = encode_invite(&d, &token, None, 1_000, &issuer).expect("encode");
+        let blob = encode_invite(&d, &token, None, &[], 1_000, &issuer).expect("encode");
         assert!(decode_invite_at(&blob, 999).is_ok());
         let err = decode_invite_at(&blob, 1_000).expect_err("expired");
         assert!(err.contains("expired"), "{err}");
@@ -2178,7 +2985,7 @@ mod tests {
         // an envelope signed by someone other than the token's issuer is
         // refused at encode (and would fail decode's issuer verify anyway).
         let outsider = ed25519::PrivateKey::from_seed(8);
-        assert!(encode_invite(&d, &token, None, u64::MAX, &outsider).is_err());
+        assert!(encode_invite(&d, &token, None, &[], u64::MAX, &outsider).is_err());
 
         // the old versioned prefixes are gone: a stale paste fails loudly
         // with re-mint guidance.
@@ -2217,6 +3024,83 @@ mod tests {
         let invite =
             decode_invite(&encode_test_invite(&base, &issuer, None)).expect("roundtrip");
         assert_eq!(invite.descriptor.coordination.as_deref(), Some("private"));
+    }
+
+    /// helper: a descriptor whose only validator is `issuer` (the minimal
+    /// well-formed shape the invite tests need).
+    fn front_test_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
+        NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        }
+    }
+
+    #[test]
+    fn invite_blob_roundtrips_member_fronts() {
+        // (a) two fronts — one with a direct endpoint, one reachable only by
+        // identity (endpoint None) — survive the signed envelope byte-for-byte.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_test_descriptor(&issuer);
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+        let fronts = vec![
+            Front {
+                member_key: [11u8; 32],
+                wireguard_public_key: [12u8; 32],
+                mesh_port: 52210,
+                endpoint: Some("198.51.100.9:51820".into()),
+            },
+            Front {
+                member_key: [21u8; 32],
+                wireguard_public_key: [22u8; 32],
+                mesh_port: 52211,
+                endpoint: None,
+            },
+        ];
+        let blob =
+            encode_invite(&d, &token, None, &fronts, u64::MAX, &issuer).expect("encode");
+        let invite = decode_invite(&blob).expect("decode");
+        assert_eq!(invite.fronts, fronts, "fronts roundtrip through the envelope");
+    }
+
+    #[test]
+    fn a_pre_feature_blob_decodes_to_empty_fronts() {
+        // (b) the fronts block is OMITTED when empty, so a zero-fronts encode is
+        // byte-identical to a blob minted BEFORE this feature (which ended at
+        // the token). such a blob must decode to `fronts: vec![]`, never error
+        // on a "missing" block.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = front_test_descriptor(&issuer);
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+
+        let empty_blob =
+            encode_invite(&d, &token, None, &[], u64::MAX, &issuer).expect("encode");
+        let invite = decode_invite(&empty_blob).expect("decode pre-feature-shaped blob");
+        assert!(invite.fronts.is_empty(), "no fronts block => empty fronts");
+
+        // and the omission is real: adding a front lengthens the blob, proving
+        // the empty case appended nothing (i.e. matches the old wire).
+        let with_front = encode_invite(
+            &d,
+            &token,
+            None,
+            &[Front {
+                member_key: [1u8; 32],
+                wireguard_public_key: [2u8; 32],
+                mesh_port: 1,
+                endpoint: None,
+            }],
+            u64::MAX,
+            &issuer,
+        )
+        .expect("encode");
+        assert!(
+            with_front.len() > empty_blob.len(),
+            "a front appends bytes the empty blob lacks"
+        );
     }
 
     /// the FULL delivery chain at the crypto level: a genesis validator mints a
@@ -2407,6 +3291,38 @@ mod tests {
             !r.validators.contains(&lobby),
             "lobby key never becomes a participant"
         );
+    }
+
+    #[test]
+    fn a_non_wg_joiner_resolves_with_zero_reachability_config() {
+        // the zero-config joiner contract, non-WG shape: a network-shape
+        // config with NO `advertised` and a listen that is not dialable
+        // (loopback-ephemeral — cmd_join's non-WG default plumbing) must
+        // resolve: the joiner only ever dials OUT to the descriptor's reach
+        // hints, so nothing may demand it be reachable itself.
+        let dir = tmp("nonwgjoin");
+        let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        let founder = ed25519::PrivateKey::from_seed(7).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "net#44444444".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(founder.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_bootstrap(&founder, "203.0.113.7:41000");
+        d.save(&dir.join("network.toml")).expect("save");
+        std::fs::write(
+            dir.join("node.toml"),
+            "network = \"network.toml\"\nlisten = \"127.0.0.1:0\"\n",
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect(
+            "a joiner with no advertised and a non-dialable listen must resolve",
+        );
+        assert_eq!(r.signer.public_key(), me.public_key());
+        assert_eq!(r.bootstrappers.len(), 1, "it dials the founder's hint");
     }
 
     #[test]
@@ -2672,6 +3588,206 @@ mod tests {
         );
     }
 
+    /// `primary_coordinator` (change 1, issue #331): the key ABSENT resolves
+    /// to `None` — bit-identical to today, since `main.rs` re-derives the
+    /// compiled default from `coordinator_ingress(None)` either way; the
+    /// disable sentinel and an explicit override both ride the raw string
+    /// through, unvalidated at resolve time (validated lazily at the point
+    /// of use so a bad value degrades rather than aborting boot — inv 12).
+    #[test]
+    fn primary_coordinator_key_survives_resolve_default_absent_and_explicit() {
+        let dir = tmp("primary-coordinator-key");
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
+        assert_eq!(
+            resolved.primary_coordinator, None,
+            "absent key: re-derive the compiled default at the point of use"
+        );
+
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             primary_coordinator = \"none\"\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve none");
+        assert_eq!(resolved.primary_coordinator.as_deref(), Some("none"));
+        assert_eq!(
+            coordinator_ingress(resolved.primary_coordinator.as_deref()).expect("resolves"),
+            None,
+            "the persisted sentinel disables coordination on every future read"
+        );
+
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             primary_coordinator = \"203.0.113.9:3478\"\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve override");
+        assert_eq!(
+            resolved.primary_coordinator.as_deref(),
+            Some("203.0.113.9:3478")
+        );
+    }
+
+    /// `wireguard_advertised` (change 3, issue #331): the key ABSENT resolves
+    /// to `None` — `reachability_plane.rs` then derives it from
+    /// `wireguard_listen` exactly like today; an explicit concrete override
+    /// parses to a socket ingress, and a hostname stays a hostname (DNS
+    /// deferred to plane start, same discipline as the mesh `advertised`).
+    #[test]
+    fn wireguard_advertised_key_absent_defaults_and_explicit_value_parses() {
+        let dir = tmp("wg-advertised-key");
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52270\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             wireguard_listen = \"0.0.0.0:51820\"\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
+        assert_eq!(
+            resolved.wireguard_advertised, None,
+            "absent key: reachability_plane.rs derives it from wireguard_listen, unchanged"
+        );
+
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52270\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             wireguard_listen = \"0.0.0.0:51820\"\nwireguard_advertised = \"203.0.113.9:41820\"\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve override");
+        assert_eq!(
+            resolved.wireguard_advertised,
+            Some(Ingress::Socket("203.0.113.9:41820".parse().unwrap()))
+        );
+
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52270\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             wireguard_listen = \"0.0.0.0:51820\"\n\
+             wireguard_advertised = \"definitely-not-resolvable.ducktape.invalid:41820\"\n",
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("hostnames never block boot");
+        assert!(
+            matches!(
+                &resolved.wireguard_advertised,
+                Some(Ingress::Dns { port: 41820, .. })
+            ),
+            "wireguard_advertised stays a hostname: {:?}",
+            resolved.wireguard_advertised
+        );
+    }
+
+    #[test]
+    fn wireguard_advertised_rejects_an_unspecified_or_port_zero_value() {
+        let dir = tmp("wg-advertised-bad");
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nlisten = \"127.0.0.1:52280\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             wireguard_listen = \"0.0.0.0:51820\"\nwireguard_advertised = \"0.0.0.0:0\"\n",
+        )
+        .expect("write");
+        let err = resolve(&dir.join("node.toml"))
+            .expect_err("an explicit unspecified/port0 value is a config error, not a silent \
+                          fallback to endpoint-less");
+        assert!(err.contains("wireguard_advertised"), "{err}");
+    }
+
+    /// `endpoint_host` (change 3's invite-mint analog, config.rs ~2068): an
+    /// explicit `wireguard_advertised` wins outright, including over a
+    /// concrete `wireguard_listen` IP; absent falls back to today's
+    /// derivation exactly (wireguard_listen IP, else `advertised`/`listen`).
+    #[test]
+    fn endpoint_host_prefers_wireguard_advertised_over_the_listen_derivation() {
+        let unspecified: SocketAddr = "0.0.0.0:51820".parse().unwrap();
+        let concrete: SocketAddr = "10.0.0.5:51820".parse().unwrap();
+
+        assert_eq!(
+            endpoint_host(None, "127.0.0.1:0", concrete, Some("203.0.113.9:9999")).unwrap(),
+            "203.0.113.9",
+            "wireguard_advertised wins even over a concrete wireguard_listen IP"
+        );
+        assert_eq!(
+            endpoint_host(None, "127.0.0.1:0", unspecified, Some("tunnel.example.com:9999"))
+                .unwrap(),
+            "tunnel.example.com",
+            "a hostname override stays a hostname"
+        );
+        assert_eq!(
+            endpoint_host(None, "127.0.0.1:0", concrete, None).unwrap(),
+            "10.0.0.5",
+            "absent: today's derivation — the concrete wireguard_listen IP wins"
+        );
+        assert_eq!(
+            endpoint_host(Some("203.0.113.1:443"), "127.0.0.1:0", unspecified, None).unwrap(),
+            "203.0.113.1",
+            "absent + unspecified listen: falls back to `advertised`/`listen`, unchanged"
+        );
+    }
+
+    /// The invite-mint endpoint (review fix, change 3): with
+    /// `wireguard_advertised` set the minted `endpoint` is the advertised
+    /// value VERBATIM — host AND port. The port-forwarded scenario the key
+    /// exists for: external 41820 forwarded to bind 51820 — baking the
+    /// advertised host with the BIND port would silently mint a wrong
+    /// endpoint. Absent, the derivation is bit-identical to before: the
+    /// `endpoint_host` host at the bind port.
+    #[test]
+    fn invite_endpoint_uses_the_advertised_value_verbatim_including_its_port() {
+        let unspecified: SocketAddr = "0.0.0.0:51820".parse().unwrap();
+        let concrete: SocketAddr = "10.0.0.5:51820".parse().unwrap();
+
+        assert_eq!(
+            invite_wireguard_endpoint(None, "127.0.0.1:0", unspecified, Some("203.0.113.9:41820"))
+                .unwrap(),
+            "203.0.113.9:41820",
+            "the advertised endpoint rides verbatim — 41820, never the bind port 51820"
+        );
+        assert_eq!(
+            invite_wireguard_endpoint(
+                None,
+                "127.0.0.1:0",
+                concrete,
+                Some("tunnel.example.com:41820")
+            )
+            .unwrap(),
+            "tunnel.example.com:41820",
+            "a hostname override stays a hostname, with ITS port — even over a concrete bind IP"
+        );
+        assert_eq!(
+            invite_wireguard_endpoint(None, "127.0.0.1:0", concrete, None).unwrap(),
+            "10.0.0.5:51820",
+            "absent: today's derivation exactly — the wireguard_listen IP at the bind port"
+        );
+        assert_eq!(
+            invite_wireguard_endpoint(Some("203.0.113.1:443"), "127.0.0.1:0", unspecified, None)
+                .unwrap(),
+            "203.0.113.1:51820",
+            "absent + unspecified listen: the advertised HOST at the WG bind port, unchanged"
+        );
+    }
+
+    #[test]
+    fn node_config_rejects_retired_duckdns_service_sections() {
+        let retired = r#"
+            listen = "127.0.0.1:1"
+            [[duckdns.services]]
+            scope = "account"
+            service = "huddle"
+        "#;
+        assert!(
+            toml::from_str::<NodeToml>(retired).is_err(),
+            "naming-only DuckDNS must not retain service configuration"
+        );
+    }
+
     #[test]
     fn mixed_case_duplicate_validators_are_caught_at_the_decoded_key() {
         let a = ed25519::PrivateKey::from_seed(21).public_key();
@@ -2795,21 +3911,39 @@ mod tests {
         );
 
         // solo network: nobody can serve.
-        assert_eq!(choose_sync_source(no_hints, &[me.clone()], &me), None);
+        assert_eq!(choose_sync_source(no_hints, std::slice::from_ref(&me), &me), None);
     }
 
     #[test]
     fn plumbing_merges_flags_over_existing_file_over_defaults() {
         let dir = tmp("plumbing");
-        // an existing DEV-shape file (the desktop app's solo config).
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:0\"\nnamespace = \"ducktape-local\"\npeer_seeds = [0]\nhttp_listen = \"127.0.0.1:8844\"\nstorage_dir = '/data/ducktape'\n",
+            r#"id = 0
+listen = "127.0.0.1:0"
+namespace = "ducktape-local"
+peer_seeds = [0]
+http_listen = "127.0.0.1:8844"
+storage_dir = '/data/ducktape'
+"#,
         )
         .expect("write");
         // one flag overrides ONLY its field; the http port AND a hand-edited
         // storage_dir survive.
-        let p = merged_plumbing(&dir, Some("127.0.0.1:53000"), None, None, None).expect("merge");
+        let p = merged_plumbing(
+            &dir,
+            Some("127.0.0.1:53000"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
         assert_eq!(p.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(p.storage_dir, "/data/ducktape");
@@ -2821,6 +3955,126 @@ mod tests {
         assert_eq!(raw.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(raw.listen, "127.0.0.1:53000");
         assert_eq!(raw.storage_dir.as_deref(), Some("/data/ducktape"));
+    }
+
+    #[test]
+    fn plumbing_wireguard_effect_flag_wins_absence_preserves_and_typos_abort() {
+        let dir = tmp("plumbing-wg-effect");
+        // fresh dir + flag (the desktop app's init/join): written to disk.
+        let p = merged_plumbing(
+            &dir,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("socket"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("merge");
+        assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
+        write_node_toml(&dir, &p).expect("write");
+
+        // no flag: the hand-settable value on disk survives a re-merge.
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None, None)
+            .expect("re-merge");
+        assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
+
+        // the flag wins over the file (merged_plumbing's standing precedence).
+        let p = merged_plumbing(
+            &dir,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("tun"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("override");
+        assert_eq!(p.wireguard_effect.as_deref(), Some("tun"));
+
+        // a typo aborts the verb before anything is written.
+        let err = merged_plumbing(
+            &dir,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("sokcet"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .err()
+        .expect("a bad effect value must abort the merge");
+        assert!(err.contains("wireguard_effect"), "{err}");
+    }
+
+    /// Both change (1)/(3) keys ride the SAME `Plumbing` chain as
+    /// `wireguard_effect` above: a flag wins, an existing file's value
+    /// survives an unflagged re-merge, and `write_node_toml` round-trips it
+    /// verbatim (config.rs's "GOTCHA" — a key not in `Plumbing` is silently
+    /// dropped on rewrite; this pins that it is NOT dropped).
+    #[test]
+    fn plumbing_primary_coordinator_and_wireguard_advertised_flag_wins_and_absence_preserves() {
+        let dir = tmp("plumbing-coord-wgadv");
+        // fresh dir + flags (the desktop app's init/join shape): written to disk.
+        let p = merged_plumbing(
+            &dir,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("203.0.113.9:3478"),
+            Some("198.51.100.5:41820"),
+        )
+        .expect("merge");
+        assert_eq!(p.primary_coordinator.as_deref(), Some("203.0.113.9:3478"));
+        assert_eq!(p.wireguard_advertised.as_deref(), Some("198.51.100.5:41820"));
+        write_node_toml(&dir, &p).expect("write");
+
+        // no flags: the hand-settable values on disk survive a re-merge.
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None, None)
+            .expect("re-merge");
+        assert_eq!(p.primary_coordinator.as_deref(), Some("203.0.113.9:3478"));
+        assert_eq!(p.wireguard_advertised.as_deref(), Some("198.51.100.5:41820"));
+
+        // the flags win over the file (merged_plumbing's standing precedence).
+        let p = merged_plumbing(
+            &dir,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("none"),
+            Some("203.0.113.9:41821"),
+        )
+        .expect("override");
+        assert_eq!(p.primary_coordinator.as_deref(), Some("none"));
+        assert_eq!(p.wireguard_advertised.as_deref(), Some("203.0.113.9:41821"));
+
+        // and the round trip re-reads verbatim — the survives-rewrite chain.
+        write_node_toml(&dir, &p).expect("write");
+        let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload");
+        assert_eq!(raw.primary_coordinator.as_deref(), Some("none"));
+        assert_eq!(raw.wireguard_advertised.as_deref(), Some("203.0.113.9:41821"));
     }
 
     #[test]
@@ -2868,12 +4122,31 @@ bootstrapper_addr = "127.0.0.1:52200"
     }
 
     #[test]
-    fn wireguard_effect_defaults_real_and_rejects_unknown_values() {
+    fn wireguard_effect_defaults_tun_and_rejects_unknown_values() {
         let dir = tmp("wgeffect");
         let base = "id = 0\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
         std::fs::write(dir.join("node.toml"), base).expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
-        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Real);
+        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Tun);
+
+        // "real" is the legacy alias for the interface-backed path.
+        for spelled in ["tun", "real"] {
+            std::fs::write(
+                dir.join("node.toml"),
+                format!("{base}wireguard_effect = \"{spelled}\"\n"),
+            )
+            .expect("write");
+            let r = resolve(&dir.join("node.toml")).expect("resolve");
+            assert_eq!(r.wireguard_effect, WireGuardEffectKind::Tun, "{spelled}");
+        }
+
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{base}wireguard_effect = \"socket\"\n"),
+        )
+        .expect("write");
+        let r = resolve(&dir.join("node.toml")).expect("resolve");
+        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Socket);
 
         std::fs::write(
             dir.join("node.toml"),
@@ -3014,6 +4287,156 @@ bootstrapper_addr = "127.0.0.1:52200"
         let mut sorted = d.reach.clone();
         sorted.sort();
         assert_eq!(d.reach, sorted);
+    }
+
+    #[test]
+    fn add_reach_route_keeps_coordinated_and_overlay_routes_for_same_key() {
+        let a = ed25519::PrivateKey::from_seed(25).public_key();
+        let coord = ed25519::PrivateKey::from_seed(26).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "r#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_reach(&ReachHint {
+            expected_key: a.clone(),
+            reach: Reach::Coordinated(CoordRef {
+                coord_addr: "127.0.0.1:3478".into(),
+                coord_key: coord,
+            }),
+        });
+        d.add_reach_route(&ReachHint {
+            expected_key: a.clone(),
+            reach: Reach::Direct("[fd87::1]:52200".into()),
+        });
+
+        let hints = d.reach_hints().expect("hints");
+        assert_eq!(hints.len(), 2);
+        assert!(hints.iter().any(|h| matches!(h.reach, Reach::Coordinated(_))));
+        assert!(hints.iter().any(|h| matches!(h.reach, Reach::Direct(_))));
+
+        let entries = d.reach_entries().expect("entries");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|(_, r)| matches!(r, ReachDial::Coordinated { .. })));
+        assert!(entries.iter().any(|(_, r)| matches!(r, ReachDial::Direct(_))));
+    }
+
+    #[test]
+    fn a_coordinated_hint_does_not_suppress_a_founders_direct_bootstrap_route() {
+        // a founder that advertises a real dial address AND enables a
+        // coordinator must keep BOTH: the direct bootstrap route (punch-free
+        // first choice) and the coordinated rendezvous route. a Coordinated
+        // typed hint must not erase the bootstrap-synthesised Direct for the
+        // same key — otherwise every invite ships coordinator-only reach and a
+        // failed punch is terminal (no relay fallback).
+        let me = ed25519::PrivateKey::from_seed(41).public_key();
+        let coord = ed25519::PrivateKey::from_seed(42).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "fp#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_bootstrap(&me, "203.0.113.7:52200");
+        d.add_reach(&ReachHint {
+            expected_key: me.clone(),
+            reach: Reach::Coordinated(CoordRef {
+                coord_addr: "127.0.0.1:3478".into(),
+                coord_key: coord,
+            }),
+        });
+
+        let hints = d.reach_hints().expect("hints");
+        assert_eq!(
+            hints.len(),
+            2,
+            "the direct bootstrap route must survive alongside the coordinated hint"
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|h| matches!(&h.reach, Reach::Direct(a) if a == "203.0.113.7:52200")),
+            "the founder's advertised direct route was dropped"
+        );
+        assert!(hints.iter().any(|h| matches!(h.reach, Reach::Coordinated(_))));
+
+        // a typed DIRECT hint for the same key still supersedes the bootstrap
+        // Direct (the member's dial address moved) — no stale duplicate.
+        d.add_reach_route(&ReachHint {
+            expected_key: me.clone(),
+            reach: Reach::Direct("[fd87::2]:52200".into()),
+        });
+        let hints = d.reach_hints().expect("hints");
+        let directs: Vec<_> = hints
+            .iter()
+            .filter(|h| matches!(h.reach, Reach::Direct(_)))
+            .collect();
+        assert_eq!(
+            directs.len(),
+            1,
+            "a typed Direct supersedes the bootstrap Direct for the same key"
+        );
+        assert!(matches!(&directs[0].reach, Reach::Direct(a) if a == "[fd87::2]:52200"));
+    }
+
+    #[test]
+    fn an_overlay_ula_route_keeps_the_underlay_bootstrap_dial() {
+        // the join path records the inviter's tunnel address (the chain's
+        // overlay ULA) as a typed Direct route. that route is only dialable
+        // once the reachability plane's tunnels apply, so it must ride
+        // ALONGSIDE the underlay bootstrap hint — not evict it — and the mesh
+        // dialer must keep dialing the underlay while the plane assembles.
+        let me = ed25519::PrivateKey::from_seed(51).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "fp#00000000".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_bootstrap(&me, "203.0.113.7:52200");
+        // the EXACT derivation cmd_join uses for the inviter's tunnel route.
+        let identity = wireguard_upgrade::ValidatorIdentity::try_from(me.as_ref())
+            .expect("test key is a valid identity");
+        let ula = wireguard_upgrade::ula_v6_member_addr(&d.genesis_namespace(), identity);
+        d.add_reach_route(&ReachHint {
+            expected_key: me.clone(),
+            reach: Reach::Direct(format!("[{ula}]:52200")),
+        });
+
+        // the union keeps BOTH routes…
+        let hints = d.reach_hints().expect("hints");
+        let directs: Vec<_> = hints
+            .iter()
+            .filter(|h| matches!(h.reach, Reach::Direct(_)))
+            .collect();
+        assert_eq!(
+            directs.len(),
+            2,
+            "the overlay ULA route must not evict the underlay bootstrap hint"
+        );
+
+        // …and the dialer gets ONE Direct ingress for the key: the underlay.
+        let entries = d.reach_entries().expect("entries");
+        let dials: Vec<_> = entries
+            .iter()
+            .filter(|(k, r)| *k == me && matches!(r, ReachDial::Direct(_)))
+            .collect();
+        assert_eq!(dials.len(), 1, "one Direct ingress per key");
+        assert!(
+            matches!(
+                &dials[0].1,
+                ReachDial::Direct(Ingress::Socket(s)) if s.to_string() == "203.0.113.7:52200"
+            ),
+            "the mesh dialer must prefer the underlay route, got {:?}",
+            dials[0].1
+        );
     }
 
     #[test]

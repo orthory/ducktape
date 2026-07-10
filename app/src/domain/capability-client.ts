@@ -48,3 +48,71 @@ export const capabilitiesByNode = (
     .then(() => transport.query(TARGET, "all"))
     .then((reply) => replyVariant<RegistryEntry[]>(reply, "all"))
     .then((entries) => new Map(entries.map(([key, tags]) => [keyHex(key), tags])));
+
+/** One provider's slice of a node's announced executor tags. */
+export interface ProviderGroup {
+  /** The provider key — the tag text before the first `_`, or the whole tag
+   *  when it has none. `claude`, `claude_opus_high`, and `claude_fable_low` all
+   *  collapse to `claude`; `codex`, `codex_gpt-5.5_high`, and
+   *  `codex_gpt-5.3-codex-spark_xhigh` all collapse to `codex`. */
+  provider: string;
+  /** Title-cased provider name for display ("claude" → "Claude"). */
+  label: string;
+  /** Distinct models under the provider, in first-seen order, with the effort
+   *  suffix dropped: `claude_opus_high` → `opus`, `codex_gpt-5.5_low` →
+   *  `gpt-5.5`, `codex_gpt-5.3-codex-spark_xhigh` → `gpt-5.3-codex-spark`.
+   *  Empty when the node announced only the provider's bare default tag. This
+   *  is what a member/peer surface shows — a node runs "Claude: opus, sonnet",
+   *  not every effort permutation. */
+  models: string[];
+  /** Every raw tag this node announced under the provider, deduped in announced
+   *  order. Kept for fidelity (tooltips / exact routing tags). */
+  tags: string[];
+}
+
+/** The model a tag names, effort dropped. Tags are `provider_model_effort`
+ *  (the host spec composes `{provider}_{suffix}` where a variant suffix is
+ *  `<model>_<effort>`), and neither model nor effort contains `_` — so the
+ *  model is everything between the first and last `_`. The bare provider tag
+ *  (`claude`) names no model → null. */
+const modelOf = (tag: string, provider: string): string | null => {
+  if (tag === provider || !tag.startsWith(`${provider}_`)) return null;
+  const rest = tag.slice(provider.length + 1);
+  const cut = rest.lastIndexOf("_");
+  return cut > 0 ? rest.slice(0, cut) : rest;
+};
+
+/** Collapse a node's announced executor tags into one entry per provider, each
+ *  carrying its distinct models. The registry announces a distinct tag per
+ *  provider×model×effort combo, so a busy node lists dozens
+ *  (`claude_opus_high`, `codex_gpt-5.5_xhigh`, …); a member or peer surface
+ *  only wants WHICH providers it runs and, one level down, WHICH models — never
+ *  the effort permutations. Grouping is by the provider key (text before the
+ *  first `_`); first-seen order is preserved so the display stays stable across
+ *  renders. */
+export const providersOf = (tags: string[]): ProviderGroup[] => {
+  const order: string[] = [];
+  const byProvider = new Map<string, { tags: string[]; models: string[] }>();
+  for (const tag of tags) {
+    const cut = tag.indexOf("_");
+    const provider = cut > 0 ? tag.slice(0, cut) : tag;
+    let group = byProvider.get(provider);
+    if (!group) {
+      group = { tags: [], models: [] };
+      byProvider.set(provider, group);
+      order.push(provider);
+    }
+    if (!group.tags.includes(tag)) group.tags.push(tag);
+    const model = modelOf(tag, provider);
+    if (model !== null && !group.models.includes(model)) group.models.push(model);
+  }
+  return order.map((provider) => {
+    const group = byProvider.get(provider) as { tags: string[]; models: string[] };
+    return {
+      provider,
+      label: provider ? provider[0].toUpperCase() + provider.slice(1) : provider,
+      models: group.models,
+      tags: group.tags,
+    };
+  });
+};

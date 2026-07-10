@@ -9,9 +9,17 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use common::{NetworkShapeCluster, serial};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use common::{NetworkShapeCluster, poll_until, serial};
+use files::{
+    Change, Content, EntryInfo, FilesMsg, FilesQuery, FilesReply, Kind, RefsInfo,
+    decode_reply as files_decode_reply, encode_msg as files_encode_msg, encode_putblob,
+    encode_query as files_encode_query, objects::object_id, to_hex,
+};
 
 const CONVERGE: Duration = Duration::from_secs(180);
 
@@ -67,6 +75,330 @@ fn network_shape_joiner_parks_until_promote() {
     cluster.wait_marker(1, "synced app_hash=", CONVERGE);
     cluster.wait_marker(1, "shipped index staged", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
+}
+
+/// the promotion REBOOT leg the markers above stop short of: after
+/// `promoted: validator at epoch` the node exec-reboots and must complete a
+/// post-reboot catch-up dialogue against the founder BEFORE it can serve or
+/// vote — and the founder must keep answering the statesync channel through
+/// that whole window, cutover included. every other promote leg in this
+/// suite latches the `promoted:` marker and stops, so a founder that goes
+/// silent right after the cutover (the field failure: ten
+/// `catch-up manifest unavailable ... timed out` retries, then FATAL, in a
+/// supervisor crash-loop) was invisible to CI. the exec keeps the same log
+/// fd, so markers span the reboot; a FATAL exit panics `wait_marker` with
+/// BOTH log tails — the founder's tail is the diagnosis.
+#[test]
+fn promoted_resident_boots_through_post_reboot_catchup() {
+    use directory::{DirMsg, DirQuery, DirReply};
+
+    let _serial = serial();
+    let mut cluster = NetworkShapeCluster::new();
+
+    let chain_id = cluster.init_founder("promote-reboot");
+    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+
+    // resident standing first — the field node parked as a resident (staged
+    // admission) before its promote, so the reboot starts from a warm,
+    // boundary-following node exactly as it did in the field.
+    let invite = cluster.invite();
+    let friend_key = cluster.join_friend_manual(&invite);
+    cluster.spawn(1);
+    cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
+    let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
+    assert!(ok, "invite-accept failed:\n{out}");
+    cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
+
+    let (ok, out) = cluster.run_promote(&friend_key);
+    assert!(ok, "promote failed:\n{out}");
+    cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
+
+    // THE property: the catch-up completes — the success line's " frames)"
+    // suffix is printed by no failure path ("unavailable" retries included).
+    cluster.wait_marker(1, " frames)", CONVERGE);
+
+    // and the network the reboot lands in is LIVE end to end: a write
+    // finalized through the founder becomes readable from the promoted
+    // friend's own surface…
+    cluster.submit(
+        0,
+        "directory",
+        &directory::encode_msg(&DirMsg::Set {
+            key: "post-promote-founder".into(),
+            value: "landed".into(),
+        }),
+    );
+    poll_until("the promoted friend to serve the founder's write", CONVERGE, || {
+        cluster
+            .query(
+                1,
+                "directory",
+                &directory::encode_query(&DirQuery::Get {
+                    key: "post-promote-founder".into(),
+                }),
+            )
+            .and_then(|raw| directory::decode_reply(&raw).ok())
+            .and_then(|r| match r {
+                DirReply::Value(Some(v)) if v == "landed" => Some(()),
+                _ => None,
+            })
+    });
+    // …and the promoted friend's own ordered lane finalizes into the widened
+    // quorum (a halted founder can never land this).
+    cluster.submit(
+        1,
+        "directory",
+        &directory::encode_msg(&DirMsg::Set {
+            key: "post-promote-friend".into(),
+            value: "landed".into(),
+        }),
+    );
+    poll_until("the founder to serve the friend's write", CONVERGE, || {
+        cluster
+            .query(
+                0,
+                "directory",
+                &directory::encode_query(&DirQuery::Get {
+                    key: "post-promote-friend".into(),
+                }),
+            )
+            .and_then(|raw| directory::decode_reply(&raw).ok())
+            .and_then(|r| match r {
+                DirReply::Value(Some(v)) if v == "landed" => Some(()),
+                _ => None,
+            })
+    });
+}
+
+// ---- duckfs joiner proof: full object possession over the REAL wire ---------
+//
+// the in-process `duckfs_resolver` test (statesync/tests) proves the resolver
+// moves bytes at the module level. THIS proves it end to end over the real mesh
+// transport: a founder holds non-trivial duckfs state (inline files, a putblob-
+// staged chunk-object file, and a pin), a fresh node joins through the real
+// `join`/`promote` ceremony, and its `sync_all_modules` pass loops GetObjects to
+// FULL object possession over the p2p statesync lane before the joiner reads a
+// file back BYTE-IDENTICAL. (`synced app_hash=` latches only after the resolver
+// reports `possession_complete`, so the promoted read is proof bytes crossed.)
+
+fn df_put_inline(path: &str, bytes: &[u8]) -> Change {
+    Change::Put {
+        path: path.into(),
+        exec: false,
+        meta: BTreeMap::new(),
+        content: Content::Inline {
+            b64: STANDARD.encode(bytes),
+        },
+    }
+}
+
+fn df_chunk_hex(bytes: &[u8]) -> String {
+    to_hex(&object_id(Kind::Chunk, bytes))
+}
+
+/// a distinctive, non-uniform byte pattern (251 is prime — a truncated or
+/// corrupt sync is caught, not masked by a run of a repeated byte).
+fn df_pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+fn df_stat(cluster: &NetworkShapeCluster, idx: usize, path: &str) -> Option<EntryInfo> {
+    let reply = cluster.query(
+        idx,
+        "files",
+        &files_encode_query(&FilesQuery::Stat {
+            path: path.into(),
+            snapshot: None,
+        }),
+    )?;
+    match files_decode_reply(&reply).ok()? {
+        FilesReply::Stat(info) => info,
+        _ => None,
+    }
+}
+
+fn df_read(
+    cluster: &NetworkShapeCluster,
+    idx: usize,
+    path: &str,
+    offset: u64,
+    len: u64,
+) -> Option<Vec<u8>> {
+    let reply = cluster.query(
+        idx,
+        "files",
+        &files_encode_query(&FilesQuery::Read {
+            path: path.into(),
+            snapshot: None,
+            offset,
+            len,
+        }),
+    )?;
+    match files_decode_reply(&reply).ok()? {
+        FilesReply::Read { b64, .. } => STANDARD.decode(b64.as_bytes()).ok(),
+        _ => None,
+    }
+}
+
+fn df_refs(cluster: &NetworkShapeCluster, idx: usize) -> Option<RefsInfo> {
+    let reply = cluster.query(idx, "files", &files_encode_query(&FilesQuery::Refs {}))?;
+    match files_decode_reply(&reply).ok()? {
+        FilesReply::Refs(info) => Some(info),
+        _ => None,
+    }
+}
+
+fn df_head(cluster: &NetworkShapeCluster, idx: usize) -> Option<String> {
+    df_refs(cluster, idx)?.head
+}
+
+#[test]
+fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
+    let _serial = serial();
+    let mut cluster = NetworkShapeCluster::new();
+
+    let chain_id = cluster.init_founder("duckfs-joiner");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+
+    // ---- seed non-trivial duckfs state on the founder BEFORE the join, so the
+    //      boundary the friend syncs carries it -------------------------------
+    // (1) two inline files in nested dirs, one commit off the empty tree.
+    cluster.submit(
+        0,
+        "files",
+        &files_encode_msg(&FilesMsg::Commit {
+            base_snapshot: None,
+            message: "seed inline".into(),
+            changes: vec![
+                df_put_inline("/shared/a", b"alpha"),
+                df_put_inline("/shared/dir/b", b"beta"),
+            ],
+        }),
+    );
+    poll_until("founder inline files to finalize", CONVERGE, || {
+        df_stat(&cluster, 0, "/shared/a").map(|_| ())
+    });
+    let s1 = poll_until("founder head after inline commit", CONVERGE, || {
+        df_head(&cluster, 0)
+    });
+
+    // (2) a file whose bytes are STAGED as a chunk object via putblob and
+    // referenced by digest in a Chunks commit — the odb-object path. 128 KiB is
+    // a real, multi-page odb object that keeps THIS test about admission, not
+    // payload size; the full-CHUNK_SIZE multi-chunk graph over the op path is
+    // large_file_e2e's job (#215: the binary frame codec carries a 1 MiB chunk
+    // whole). same-origin submits finalize in seq order.
+    let chunk = df_pattern(128 * 1024);
+    let chunk_size = chunk.len() as u64;
+    cluster.submit(0, "files", &encode_putblob(&chunk));
+    cluster.submit(
+        0,
+        "files",
+        &files_encode_msg(&FilesMsg::Commit {
+            base_snapshot: Some(s1.clone()),
+            message: "seed chunked".into(),
+            changes: vec![Change::Put {
+                path: "/shared/big".into(),
+                exec: false,
+                meta: BTreeMap::new(),
+                content: Content::Chunks {
+                    size: chunk_size,
+                    chunks: vec![df_chunk_hex(&chunk)],
+                },
+            }],
+        }),
+    );
+    poll_until("founder chunked file to finalize", CONVERGE, || {
+        df_stat(&cluster, 0, "/shared/big")
+            .filter(|e| e.size == chunk_size)
+            .map(|_| ())
+    });
+    let s2 = poll_until("founder head after chunked commit", CONVERGE, || {
+        df_head(&cluster, 0)
+    });
+
+    // (3) pin the head — a gc root the joiner must reconstruct too.
+    cluster.submit(
+        0,
+        "files",
+        &files_encode_msg(&FilesMsg::Pin {
+            snapshot: s2.clone(),
+            name: "release".into(),
+        }),
+    );
+    poll_until("founder pin to finalize", CONVERGE, || {
+        df_refs(&cluster, 0)
+            .filter(|r| r.pins.contains_key("release"))
+            .map(|_| ())
+    });
+    // the source bytes the joiner must reconstruct byte-for-byte.
+    let src_chunk =
+        df_read(&cluster, 0, "/shared/big", 0, chunk_size).expect("founder read chunked");
+    assert_eq!(src_chunk, chunk, "founder holds the seeded bytes");
+
+    // ---- invite -> park -> promote the friend (real join verb, real mesh) ----
+    let invite = cluster.invite();
+    let friend_key = cluster.join_friend_manual(&invite);
+    cluster.spawn(1);
+    cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
+    cluster.wait_marker(1, "joining:", Duration::from_secs(60));
+
+    let (ok, out) = cluster.run_promote(&friend_key);
+    assert!(ok, "promote failed:\n{out}");
+    assert!(
+        out.contains("admitted"),
+        "unexpected promote output:\n{out}"
+    );
+
+    cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
+    cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
+    // `synced app_hash=` latches only AFTER `sync_all_modules` -> the duckfs
+    // resolver reaches FULL object possession over the real p2p statesync lane
+    // (it loops GetObjects until `possession_complete`). this marker alone is the
+    // production proof that every duckfs object crossed the wire.
+    cluster.wait_marker(1, "synced app_hash=", CONVERGE);
+    cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
+
+    // ---- THE property: the promoted joiner reads the founder's files back
+    // BYTE-IDENTICAL. it holds them only because the possession loop moved every
+    // chunk / file / tree / snapshot object over the wire and its post-promotion
+    // reboot recovered them from disk; an empty odb errors on Read.
+    let joined_chunk = poll_until("joiner to read the chunked file", CONVERGE, || {
+        df_read(&cluster, 1, "/shared/big", 0, chunk_size)
+    });
+    assert_eq!(
+        joined_chunk, chunk,
+        "joiner rebuilt the chunked file byte-identical over the wire"
+    );
+    assert_eq!(
+        df_read(&cluster, 1, "/shared/a", 0, 64).as_deref(),
+        Some(b"alpha".as_ref()),
+        "joiner rebuilt inline /shared/a"
+    );
+    assert_eq!(
+        df_read(&cluster, 1, "/shared/dir/b", 0, 64).as_deref(),
+        Some(b"beta".as_ref()),
+        "joiner rebuilt nested inline /shared/dir/b"
+    );
+    // head and pin (the refs image) match the source's exactly.
+    let refs = df_refs(&cluster, 1).expect("joiner refs");
+    assert_eq!(
+        refs.head.as_deref(),
+        Some(s2.as_str()),
+        "joiner head matches the source"
+    );
+    assert_eq!(
+        refs.pins.get("release").map(String::as_str),
+        Some(s2.as_str()),
+        "joiner pin matches the source"
+    );
 }
 
 /// the STAGED admission flow end-to-end: invite → resident (mesh + pre-sync,
@@ -358,19 +690,23 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
                 })
             })
     }));
-    //     …and /v1/index/* answers from boundary-healed read models: every
-    //     watermark sits at a followed boundary, visibly boundary-stamped
-    //     (the backfill floor), with the store healthy. polled: a heal drops
-    //     the watermark FIRST (crash-safety by re-trigger), so a read racing
-    //     an in-flight heal legitimately sees 0 for a moment.
-    poll("the resident index to report boundary-stamped watermarks", Box::new(|| {
+    //     …and /v1/index/* answers from healthy read models. under the
+    //     replica pipeline the resident FOLDS blocks, so watermarks advance
+    //     per block PAST the ascension heal's backfill floor (the old
+    //     boundary-healed model pinned them equal — that trailing-watermark
+    //     era is exactly what the fold retired). polled: a heal drops the
+    //     watermark FIRST (crash-safety by re-trigger), so a read racing an
+    //     in-flight heal legitimately sees 0 for a moment.
+    poll("the resident index to report folding watermarks", Box::new(|| {
         let (status, index_status) =
             common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
         let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
         status == 200
             && index_status["poisoned"] == serde_json::json!(false)
             && watermark > 0
-            && index_status["backfilled"]["directory"].as_u64() == Some(watermark)
+            && index_status["backfilled"]["directory"]
+                .as_u64()
+                .is_some_and(|floor| floor <= watermark)
     }));
 
     // (3) quorum untouched: kill the resident; the founder keeps finalizing.
@@ -474,13 +810,15 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "back"))
     }));
 
-    // (7) promote: the warm resident becomes a validator through the normal
-    //     promotion path; valset Join clears its resident standing.
+    // (7) promote: the warm resident becomes a validator through the replica
+    //     promotion collapse — it checkpoints its OWN folded state and
+    //     reboots (no re-sync: at a quorum-widening cutover the founder
+    //     halts awaiting this very node, so there is nothing to sync FROM);
+    //     valset Join clears its resident standing.
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected promote output:\n{out}");
     cluster.wait_marker(1, "admitted at epoch", CONVERGE);
-    cluster.wait_marker(1, "synced app_hash=", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
     let residents = cluster
         .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))

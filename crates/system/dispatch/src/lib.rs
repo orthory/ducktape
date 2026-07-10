@@ -303,7 +303,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     const MIN_RECIPE_BYTES: u64 = 8 + 1 + 8 + 8 + 1 + 1 + 4 + 1 + 1 + 8 + 8;
     if recipes
         .checked_mul(MIN_RECIPE_BYTES)
-        .map_or(true, |need| need > buf.len() as u64)
+        .is_none_or(|need| need > buf.len() as u64)
     {
         return Err("snapshot recipe count exceeds input".into());
     }
@@ -346,7 +346,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     const MIN_DISPATCH_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 8 + 1 + 1 + 8 + 8;
     if dispatches
         .checked_mul(MIN_DISPATCH_BYTES)
-        .map_or(true, |need| need > buf.len() as u64)
+        .is_none_or(|need| need > buf.len() as u64)
     {
         return Err("snapshot dispatch count exceeds input".into());
     }
@@ -392,16 +392,16 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     const MIN_MAILBOX_BYTES: u64 = 8 + 8;
     if mailbox
         .checked_mul(MIN_MAILBOX_BYTES)
-        .map_or(true, |need| need > buf.len() as u64)
+        .is_none_or(|need| need > buf.len() as u64)
     {
         return Err("snapshot mailbox count exceeds input".into());
     }
     for _ in 0..mailbox {
         let seq = take_u64(&mut buf)?;
-        if let Some((last, _)) = c.mailbox.iter().next_back() {
-            if *last >= seq {
-                return Err("snapshot mailbox seqs not strictly ascending".into());
-            }
+        if let Some((last, _)) = c.mailbox.iter().next_back()
+            && *last >= seq
+        {
+            return Err("snapshot mailbox seqs not strictly ascending".into());
         }
         let key = take_lp_string(&mut buf)?;
         c.mailbox.insert(seq, key);
@@ -499,10 +499,10 @@ impl DispatchModule {
         description: &str,
     ) -> Result<(), Error> {
         validate_tag(capability).map_err(Error::Module)?;
-        if let Routing::Pinned(key) = routing {
-            if key.is_empty() {
-                return Err(Error::Module("routing Pinned key must be non-empty".into()));
-            }
+        if let Routing::Pinned(key) = routing
+            && key.is_empty()
+        {
+            return Err(Error::Module("routing Pinned key must be non-empty".into()));
         }
         if max_attempts == 0 {
             return Err(Error::Module("max_attempts must be >= 1".into()));
@@ -848,11 +848,7 @@ impl DispatchModule {
     /// the saga's current lease holder, read through the host-routed sibling
     /// lane — the filtered-facade pattern (cf. `upgrade::members`). read-only:
     /// this never stages, so it is safe inside `query_with`.
-    async fn saga_assignee(
-        &self,
-        ctx: &dyn Ctx,
-        saga_id: &str,
-    ) -> Result<Option<Vec<u8>>, Error> {
+    async fn saga_assignee(&self, ctx: &dyn Ctx, saga_id: &str) -> Result<Option<Vec<u8>>, Error> {
         let reply = ctx
             .query(
                 &self.saga,
@@ -1025,7 +1021,7 @@ mod tests {
             self.env.consensus_time = height;
             self
         }
-        fn from_origin(mut self, origin: Origin) -> Self {
+        fn with_origin(mut self, origin: Origin) -> Self {
             self.env.origin = origin;
             self
         }
@@ -1099,11 +1095,11 @@ mod tests {
     /// run register (as the external owner) + dispatch (as module "caller"),
     /// committed — the shared preamble of the callback/delivery tests.
     fn registered_and_dispatched(m: &mut DispatchModule, kind: OutputContract) -> String {
-        let mut ctx = CaptureCtx::new().from_origin(owner());
+        let mut ctx = CaptureCtx::new().with_origin(owner());
         exec(m, &mut ctx, &register(kind, Routing::Rendezvous)).unwrap();
         let mut ctx = CaptureCtx::new()
             .at(5)
-            .from_origin(Origin::Module("caller".into()));
+            .with_origin(Origin::Module("caller".into()));
         exec(m, &mut ctx, &dispatch_op("d1", b"input")).unwrap();
         commit(m);
         dispatch_key("caller", "d1")
@@ -1111,7 +1107,7 @@ mod tests {
     fn callback_for(m: &mut DispatchModule, key: &str, outcome: SagaOutcome) -> Result<(), Error> {
         let mut ctx = CaptureCtx::new()
             .at(9)
-            .from_origin(Origin::Module("saga".into()));
+            .with_origin(Origin::Module("saga".into()));
         let msg = Msg {
             target: "dispatch".into(),
             payload: encode_callback(&SagaCallback {
@@ -1126,12 +1122,10 @@ mod tests {
         // the tests address dispatches by their composite state key; split it
         // back into the wire query's (receiver, local id) coordinates.
         let (receiver, dispatch_id) = key.split_once(SEP).expect("composite key");
-        let reply = block_on(m.query(&crate::encode_query(
-            &DispatchQuery::Dispatch {
-                receiver: receiver.into(),
-                dispatch_id: dispatch_id.into(),
-            },
-        )))
+        let reply = block_on(m.query(&crate::encode_query(&DispatchQuery::Dispatch {
+            receiver: receiver.into(),
+            dispatch_id: dispatch_id.into(),
+        })))
         .unwrap();
         match crate::decode_reply(&reply).unwrap() {
             DispatchReply::Dispatch(v) => v,
@@ -1139,10 +1133,8 @@ mod tests {
         }
     }
     fn pending_deliveries(m: &DispatchModule) -> u64 {
-        let reply = block_on(m.query(&crate::encode_query(
-            &DispatchQuery::PendingDeliveries,
-        )))
-        .unwrap();
+        let reply =
+            block_on(m.query(&crate::encode_query(&DispatchQuery::PendingDeliveries))).unwrap();
         match crate::decode_reply(&reply).unwrap() {
             DispatchReply::PendingDeliveries(n) => n,
             other => panic!("expected PendingDeliveries reply, got {other:?}"),
@@ -1152,7 +1144,7 @@ mod tests {
     #[test]
     fn recipe_registration_validates_and_gates_mutation_by_owner() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().from_origin(owner());
+        let mut ctx = CaptureCtx::new().with_origin(owner());
         exec(
             &mut m,
             &mut ctx,
@@ -1215,7 +1207,7 @@ mod tests {
         }
 
         // a foreign origin cannot update or remove.
-        let mut foreign = CaptureCtx::new().from_origin(Origin::External(b"other".to_vec()));
+        let mut foreign = CaptureCtx::new().with_origin(Origin::External(b"other".to_vec()));
         let err = exec(
             &mut m,
             &mut foreign,
@@ -1255,14 +1247,11 @@ mod tests {
         )
         .unwrap();
         commit(&mut m);
-        let reply = block_on(
-            m.query(&crate::encode_query(&DispatchQuery::Recipe {
-                recipe_id: "summarize".into(),
-            })),
-        )
+        let reply = block_on(m.query(&crate::encode_query(&DispatchQuery::Recipe {
+            recipe_id: "summarize".into(),
+        })))
         .unwrap();
-        let DispatchReply::Recipe(Some(recipe)) = crate::decode_reply(&reply).unwrap()
-        else {
+        let DispatchReply::Recipe(Some(recipe)) = crate::decode_reply(&reply).unwrap() else {
             panic!("recipe committed");
         };
         assert_eq!(recipe.capability, "beta");
@@ -1272,7 +1261,7 @@ mod tests {
     #[test]
     fn dispatch_stages_trigger_with_recipe_routing_and_dedups_per_receiver() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().from_origin(owner());
+        let mut ctx = CaptureCtx::new().with_origin(owner());
         exec(
             &mut m,
             &mut ctx,
@@ -1282,14 +1271,14 @@ mod tests {
         commit(&mut m);
 
         // external dispatch is refused.
-        let mut external = CaptureCtx::new().from_origin(owner());
+        let mut external = CaptureCtx::new().with_origin(owner());
         let err = exec(&mut m, &mut external, &dispatch_op("d1", b"x")).unwrap_err();
         assert!(err.to_string().contains("module-origin only"), "got {err}");
 
         // an unknown recipe is an error; an oversized payload is an error.
         let mut caller = CaptureCtx::new()
             .at(5)
-            .from_origin(Origin::Module("caller".into()));
+            .with_origin(Origin::Module("caller".into()));
         let err = exec(
             &mut m,
             &mut caller,
@@ -1347,7 +1336,7 @@ mod tests {
         // ...but another receiver's identical id is a distinct dispatch.
         let mut other = CaptureCtx::new()
             .at(5)
-            .from_origin(Origin::Module("other".into()));
+            .with_origin(Origin::Module("other".into()));
         exec(&mut m, &mut other, &dispatch_op("d1", b"input")).unwrap();
         assert_eq!(other.msgs.len(), 1);
         commit(&mut m);
@@ -1394,7 +1383,7 @@ mod tests {
         let key = registered_and_dispatched(&mut m, OutputContract::Text);
         let before = m.root();
         callback_for(&mut m, "caller\x1fnope", SagaOutcome::Done(b"x".to_vec())).unwrap();
-        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("saga".into()));
+        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("saga".into()));
         let msg = Msg {
             target: "dispatch".into(),
             payload: encode_callback(&SagaCallback {
@@ -1411,7 +1400,7 @@ mod tests {
     #[test]
     fn deliver_pending_is_system_only_bounded_and_fifo() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().from_origin(owner());
+        let mut ctx = CaptureCtx::new().with_origin(owner());
         exec(
             &mut m,
             &mut ctx,
@@ -1423,7 +1412,7 @@ mod tests {
             let receiver = if i % 2 == 0 { "even" } else { "odd" };
             let mut caller = CaptureCtx::new()
                 .at(5)
-                .from_origin(Origin::Module(receiver.into()));
+                .with_origin(Origin::Module(receiver.into()));
             exec(
                 &mut m,
                 &mut caller,
@@ -1449,12 +1438,12 @@ mod tests {
         );
 
         // non-System origins cannot force a delivery sweep.
-        let mut foreign = CaptureCtx::new().from_origin(owner());
+        let mut foreign = CaptureCtx::new().with_origin(owner());
         let err = exec(&mut m, &mut foreign, &DispatchMsg::DeliverPending {}).unwrap_err();
         assert!(err.to_string().contains("System-origin"), "got {err}");
 
         // the System sweep drains FIFO, bounded per block.
-        let mut sys = CaptureCtx::new().at(9).from_origin(Origin::System);
+        let mut sys = CaptureCtx::new().at(9).with_origin(Origin::System);
         exec(&mut m, &mut sys, &DispatchMsg::DeliverPending {}).unwrap();
         commit(&mut m);
         assert_eq!(sys.msgs.len(), MAX_DELIVERIES_PER_BLOCK);
@@ -1472,7 +1461,7 @@ mod tests {
         );
 
         // the next sweep drains the remainder.
-        let mut sys = CaptureCtx::new().at(10).from_origin(Origin::System);
+        let mut sys = CaptureCtx::new().at(10).with_origin(Origin::System);
         exec(&mut m, &mut sys, &DispatchMsg::DeliverPending {}).unwrap();
         commit(&mut m);
         assert_eq!(sys.msgs.len(), 1);
@@ -1513,14 +1502,14 @@ mod tests {
     fn abort_discards_every_staged_write() {
         let mut m = module();
         let before = m.root();
-        let mut ctx = CaptureCtx::new().from_origin(owner());
+        let mut ctx = CaptureCtx::new().with_origin(owner());
         exec(
             &mut m,
             &mut ctx,
             &register(OutputContract::Text, Routing::Rendezvous),
         )
         .unwrap();
-        let mut caller = CaptureCtx::new().from_origin(Origin::Module("caller".into()));
+        let mut caller = CaptureCtx::new().with_origin(Origin::Module("caller".into()));
         exec(&mut m, &mut caller, &dispatch_op("d1", b"in")).unwrap();
         block_on(m.abort_block()).unwrap();
         assert_eq!(m.root(), before, "aborted block leaves no trace");
@@ -1536,17 +1525,17 @@ mod tests {
         };
 
         // an external submitter has no cancel surface.
-        let mut ctx = CaptureCtx::new().from_origin(owner());
+        let mut ctx = CaptureCtx::new().with_origin(owner());
         assert!(exec(&mut m, &mut ctx, &cancel).is_err());
 
         // a foreign module's cancel lands in its OWN receiver namespace —
         // an unknown key, a deterministic no-op.
-        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("other".into()));
+        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("other".into()));
         exec(&mut m, &mut ctx, &cancel).unwrap();
         assert!(ctx.msgs.is_empty());
 
         // the receiver's cancel tells exactly the dispatch's own saga.
-        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("caller".into()));
+        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("caller".into()));
         exec(&mut m, &mut ctx, &cancel).unwrap();
         assert_eq!(ctx.msgs.len(), 1);
         assert_eq!(ctx.msgs[0].target, "saga");
@@ -1560,7 +1549,7 @@ mod tests {
         callback_for(&mut m, &key, SagaOutcome::Cancelled).unwrap();
         commit(&mut m);
         assert_eq!(pending_deliveries(&m), 1);
-        let mut ctx = CaptureCtx::new().from_origin(Origin::Module("caller".into()));
+        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("caller".into()));
         exec(&mut m, &mut ctx, &cancel).unwrap();
         assert!(ctx.msgs.is_empty());
     }

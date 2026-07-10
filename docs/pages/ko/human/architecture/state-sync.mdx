@@ -1,4 +1,12 @@
+---
+showAskAi: false
+---
+
 # State Sync
+
+import { StateSyncFlow } from '../../../../components/diagram/StateSyncFlow.client'
+
+<StateSyncFlow />
 
 joining node는 byte를 제공하는 peer를 신뢰하지 않고 authenticated module state를
 재구축해야 한다. Ducktape는 module root를 trust anchor로 취급한다.

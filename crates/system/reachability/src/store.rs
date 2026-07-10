@@ -162,7 +162,7 @@ mod tests {
             validator_identity: ValidatorIdentity::try_from(signer.public_key().as_ref()).unwrap(),
             wireguard_public_key: X25519PublicKey([octet; 32]),
             control_endpoint: endpoint(443, Transport::Tcp),
-            wireguard_endpoint: endpoint(51820, Transport::Udp),
+            wireguard_endpoint: Some(endpoint(51820, Transport::Udp)),
             capabilities: vec![],
             expires_at_view: 50,
             nonce: 1,

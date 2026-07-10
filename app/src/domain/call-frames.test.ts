@@ -1,6 +1,8 @@
 // The pure binary framing of /v1/call/ws. These assertions pin the wire layout
-// to bin/noded/src/lib.rs byte-for-byte (little-endian on this leg): the tag
+// to chat::call_wire (the single definition site) byte-for-byte: the tag
 // bytes, the captured-video header, and the peer-video header + 32-byte key.
+// Structural header fields (ts_ms) are big-endian (D1); the pcm audio payload
+// stays little-endian (loopback-only leg, JS Int16Array).
 
 import { describe, expect, it } from "vitest";
 
@@ -36,20 +38,45 @@ describe("encodeAudioFrame", () => {
 });
 
 describe("encodeCapturedVideo", () => {
-  it("lays out [0x02][flags][ts_ms u32 LE][data] with the keyframe flag set", () => {
+  it("lays out [0x02][flags][ts_ms u32 BE][data] with the keyframe flag set", () => {
     const data = new Uint8Array([0xaa, 0xbb, 0xcc]);
     const bytes = new Uint8Array(encodeCapturedVideo(true, 0x01020304, data));
     expect(bytes[0]).toBe(WS_TAG_VIDEO_CAPTURED);
     expect(bytes[1]).toBe(0x01); // WS_FLAG_KEYFRAME
-    // ts_ms 0x01020304 little-endian
-    expect(Array.from(bytes.subarray(2, 6))).toEqual([0x04, 0x03, 0x02, 0x01]);
+    // ts_ms 0x01020304 big-endian
+    expect(Array.from(bytes.subarray(2, 6))).toEqual([0x01, 0x02, 0x03, 0x04]);
     expect(Array.from(bytes.subarray(6))).toEqual([0xaa, 0xbb, 0xcc]);
   });
 
   it("clears the flags byte for a delta frame", () => {
     const bytes = new Uint8Array(encodeCapturedVideo(false, 7, new Uint8Array([1])));
     expect(bytes[1]).toBe(0x00);
-    expect(Array.from(bytes.subarray(2, 6))).toEqual([7, 0, 0, 0]);
+    expect(Array.from(bytes.subarray(2, 6))).toEqual([0, 0, 0, 7]);
+  });
+});
+
+// Mirrors chat::call_wire's Rust golden tests (crates/apps/chat/src/call_wire.rs
+// golden_captured_video_be / golden_peer_video_be) byte-for-byte — the two
+// sides of the wire must agree on the exact same vectors, not just on the
+// layout rule.
+describe("golden vectors — mirror chat::call_wire's Rust goldens", () => {
+  it("golden_captured_video_be: encodeCapturedVideo matches the Rust vector", () => {
+    const bytes = new Uint8Array(
+      encodeCapturedVideo(true, 0x0102_0304, new Uint8Array([0xaa, 0xbb])),
+    );
+    expect(Array.from(bytes)).toEqual([0x02, 0x01, 0x01, 0x02, 0x03, 0x04, 0xaa, 0xbb]);
+  });
+
+  it("golden_peer_video_be: decodeServerFrame matches the Rust vector", () => {
+    const want = [0x03, 0x00, 0x0a, 0x0b, 0x0c, 0x0d, ...Array(32).fill(0x11), 0xf0];
+    const frame = decodeServerFrame(new Uint8Array(want).buffer);
+    expect(frame).toEqual({
+      kind: "video",
+      peer: "11".repeat(32),
+      keyframe: false,
+      tsMs: 0x0a0b_0c0d,
+      data: new Uint8Array([0xf0]),
+    });
   });
 });
 
@@ -88,7 +115,7 @@ describe("decodeServerFrame — peer video", () => {
     const out = new Uint8Array(38 + data.length);
     out[0] = WS_TAG_VIDEO_PEER;
     out[1] = keyframe ? 0x01 : 0x00;
-    new DataView(out.buffer).setUint32(2, tsMs, true);
+    new DataView(out.buffer).setUint32(2, tsMs); // big-endian (D1)
     out.set(peerKey, 6);
     out.set(data, 38);
     return out.buffer;

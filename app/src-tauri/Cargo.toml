@@ -4,11 +4,10 @@ edition.workspace = true
 version.workspace = true
 
 # the desktop shell of the ducktape app: the SAME react console the web build
-# serves, in a native window. the node does NOT live here — the shell spawns
-# `ducktape-noded` as a detached orphan (see src/daemon.rs) and the webview
-# talks to it over the daemon's http/ws surface exactly like the web build
-# does. keeping this crate free of host/module deps is the point: one node
-# process, every ui a client.
+# serves, in a native window. the node does NOT live here — the shell spawns a
+# workspace node as a detached process so closing the console can hide to the
+# menu bar, then stops the active managed node on a real app quit. keeping this
+# crate free of host/module deps is the point: one node process, every ui a client.
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -17,12 +16,40 @@ tauri-build = { version = "2", features = [] }
 # tray-icon: the macOS menu-bar icon + popover (src/tray.rs, gated to macOS).
 # image-png: decode the bundled tray.png for the icon.
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
+# native OS toasts for the production notification sink (src/notify/present.rs).
+tauri-plugin-notification = "2"
+# in-app LAN key-enrollment server (pure Rust, no system libs): an ephemeral,
+# session-token-gated HTTP relay a phone hits over the Wi-Fi LAN to enroll a key.
+tiny_http = "0.12"
+getrandom = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
 toml = "0.8"
+# notify/stream.rs: the async ws client of the node's typed /v1/ws stream.
+# tokio-tungstenite deliberately builds without TLS features — the stream dials
+# the local workspace node over plain localhost http.
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros"] }
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+zeroize = { workspace = true }
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 
-# dev-only debug bridge: a local unix socket the app/scripts/tauri-debug.mjs
-# helper drives (screenshot / execute_js / input). registration is cfg-gated to
-# debug + desktop in main.rs so a release runtime never opens the socket.
-tauri-plugin-mcp = { git = "https://github.com/P3GLEG/tauri-plugin-mcp" }
+# dev-only debug bridge: the tauri-agent debugger plugin the app/scripts/tauri-agent
+# CLI / tauri-agent MCP server drive (semantic tree / input / DOM-SVG shot / logs).
+# registration is cfg-gated to debug + desktop in main.rs so a release runtime
+# registers nothing.
+tauri-plugin-agent = "0.0.1"
+
+# WebKitGTK asks the EMBEDDER to decide getUserMedia permission (no OS prompt
+# exists), and neither tauri nor wry answers — unhandled requests are denied, so
+# huddle mic/camera would always fail NotAllowedError. huddle.rs::allow_user_media
+# grants them. Same crate+version wry already compiles; adds no system deps.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }

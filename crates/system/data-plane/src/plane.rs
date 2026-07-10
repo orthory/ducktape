@@ -181,6 +181,22 @@ pub struct DataPlane<T: DataPlaneTransport> {
     shared: Arc<Shared<T>>,
 }
 
+/// A process-wide stream-class byte budget that can be injected into multiple
+/// per-use planes. Planes keep separate sockets/queues/admission, while bulk
+/// consumers share the one link-headroom ceiling required by the per-use ADR.
+#[derive(Clone)]
+pub struct BulkPacer {
+    bucket: Arc<TokenBucket>,
+}
+
+impl BulkPacer {
+    pub fn new(bytes_per_sec: u64, burst_bytes: u64) -> Self {
+        Self {
+            bucket: Arc::new(TokenBucket::new(bytes_per_sec, burst_bytes)),
+        }
+    }
+}
+
 impl<T: DataPlaneTransport> Clone for DataPlane<T> {
     fn clone(&self) -> Self {
         DataPlane {
@@ -191,13 +207,24 @@ impl<T: DataPlaneTransport> Clone for DataPlane<T> {
 
 impl<T: DataPlaneTransport> DataPlane<T> {
     pub fn new(transport: T, admission: Arc<dyn AdmissionPolicy>, config: PlaneConfig) -> Self {
+        Self::new_with_pacer(
+            transport,
+            admission,
+            BulkPacer::new(config.bulk_bytes_per_sec, config.bulk_burst_bytes),
+        )
+    }
+
+    /// Construct a per-use plane that draws stream writes from an injected
+    /// process-wide budget. Datagram paths never touch this pacer.
+    pub fn new_with_pacer(
+        transport: T,
+        admission: Arc<dyn AdmissionPolicy>,
+        pacer: BulkPacer,
+    ) -> Self {
         let shared = Arc::new(Shared {
             transport: Arc::new(transport),
             admission,
-            bucket: Arc::new(TokenBucket::new(
-                config.bulk_bytes_per_sec,
-                config.bulk_burst_bytes,
-            )),
+            bucket: pacer.bucket,
             datagram_flows: Mutex::new(HashMap::new()),
             stream_services: Mutex::new(HashMap::new()),
             stats: Stats::default(),
@@ -608,7 +635,3 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PacedStream<S> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
-
-// `Future` is used via `std::task::ready!` polling `Sleep`.
-#[allow(unused_imports)]
-use std::future::Future as _;

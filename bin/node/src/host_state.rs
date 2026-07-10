@@ -1,0 +1,782 @@
+//! Application-host construction, restoration, and state synchronization.
+//!
+//! This module owns the module registry and the durable swap from scratch
+//! state into the canonical host. The live node loop only consumes the three
+//! lifecycle operations and output adapter exported below.
+
+use agent::AgentModule;
+use automations::Automations;
+use capability::CapabilityRegistry;
+use chat::Chat;
+use commonware_cryptography::ed25519;
+use commonware_runtime::Supervisor as _;
+use directory::Directory;
+use dispatch::DispatchModule;
+use duckdns::DuckDns;
+use duckfs_disk::SyncScratch;
+use files::Files;
+use forge::Forge;
+use governance::Governance;
+use gateway::Gateway;
+use host::Host;
+use identity::Identity;
+use inbox::Inbox;
+use jobs::Jobs;
+use kv::Kv;
+use pages::Pages;
+use recovery::Manifest;
+use runs::RunsModule;
+use saga::{LeasePolicy, SagaModule};
+use sdk::StateRoot;
+use statesync::{fetch_snapshot, qmdb::RemoteQmdbResolver};
+use tagging::TaggingModule;
+use tasks::Tasks;
+use upgrade::Upgrade;
+use valset::Valset;
+use vaults::Vaults;
+
+use crate::util::hex;
+
+/// Consensus-visible network names shared by genesis, restore, and state sync.
+#[derive(Clone, Copy)]
+pub(super) struct NetworkBindings<'a> {
+    pub(super) invite: &'a [u8],
+    pub(super) identity_chain_id: &'a str,
+}
+
+/// Node-local substrates used only while reconstructing a host from state sync.
+pub(super) struct SyncSubstrates<'a> {
+    pub(super) forge_repo: &'a std::path::Path,
+    pub(super) duckfs_dir: &'a std::path::Path,
+    pub(super) blobs: blobstore::BlobHandle,
+}
+
+pub(super) fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
+    std::sync::Arc::new(move |ctx, line| {
+        let Some(run_key) = ctx.run_key.as_deref() else {
+            return;
+        };
+        let stream = match line.stream {
+            capability_host::OutputStream::Stdout => noded::RunStream::Stdout,
+            capability_host::OutputStream::Stderr => noded::RunStream::Stderr,
+        };
+        registry.append(run_key, stream, line.line);
+    })
+}
+
+/// the PRODUCTION module set — genesis state, identical on every node (a
+/// different set composes a different app-hash and the network forks at
+/// genesis). system infrastructure (kv, valset seeded with the genesis
+/// validators, saga) plus every product module. `forge_repo` is this node's
+/// on-disk git substrate; wrapper modules run EMBEDDED substrates for now.
+pub(super) async fn genesis_host(
+    context: &commonware_runtime::tokio::Context,
+    forge_repo: &std::path::Path,
+    duckfs_dir: &std::path::Path,
+    genesis_validators: &[ed25519::PublicKey],
+    bindings: NetworkBindings<'_>,
+    blobs: blobstore::BlobHandle,
+) -> Host {
+    let kv = Kv::init(context.child("kv"), "kv").await;
+    let pages = Pages::init(context.child("pages"), "pages").await;
+    let chat = Chat::init(context.child("chat"), "chat")
+        .await
+        .with_tagging("tagging");
+    // forge shares the blob plane so a Push's packfile (staged on the blob
+    // lane before submit) can materialize locally; the pack never touches root.
+    let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
+        .expect("forge init")
+        .with_chat("chat");
+    let mut valset = Valset::new("valset");
+    // genesis-seed the validator set from config — deterministic and identical
+    // on every node, so membership is IN consensus state from block zero (the
+    // substrate epoch cutover + governance will drive).
+    for v in genesis_validators {
+        valset.insert(v.as_ref().to_vec());
+    }
+    Host::genesis(vec![
+        Box::new(kv),
+        Box::new(pages),
+        Box::new(chat),
+        Box::new(forge),
+        Box::new(valset),
+        // governance is the SOLE authorized author of valset changes: member
+        // proposals + ballots, deterministic tally, follow-up membership ops.
+        Box::new(
+            Governance::new("governance", "valset", "upgrade").with_invite_binding(bindings.invite),
+        ),
+        // the no-downtime upgrade coordinator: holds the at-most-one pending
+        // upgrade + per-validator readiness set (valset-gated). its mere
+        // presence in the registry is its genesis app-hash contribution.
+        Box::new(Upgrade::new("upgrade", "valset")),
+        // capability-aware strict leases: a saga whose trigger names a
+        // capability is assigned over that tag's announced providers, and
+        // only the assignee's result lands. an UNASSIGNED attempt (empty
+        // provider pool) accepts no result at all: its WorkerRequest is an
+        // announcement a capable node must first claim via `SagaMsg::Accept`.
+        Box::new(SagaModule::with_assignment(
+            "saga",
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        )),
+        // the network-wide registry of node host capabilities ("codex",
+        // "claude", ...): member-gated self-announcements, so every node holds
+        // an identical view of who can run what. its genesis contribution is an
+        // empty registry (ZERO root) until nodes announce.
+        Box::new(CapabilityRegistry::new("capability", Some("valset".into()))),
+        // the task plane: recipe manifests + capability-routed dispatch with
+        // next-block result delivery (the host's DeliverPending injection).
+        Box::new(DispatchModule::new("dispatch", "saga")),
+        // the engagement plane: content modules report tags, subscriber
+        // modules receive engagement events — router only, module-agnostic.
+        Box::new(TaggingModule::new("tagging")),
+        Box::new(Tasks::new("tasks")),
+        Box::new(Vaults::new("vaults")),
+        // the deterministic user->nodes binding registry: certificates are
+        // chain-scoped (this network's chain id), member-gated binds via valset,
+        // and account display names have this single canonical owner.
+        Box::new(Identity::new(
+            "identity",
+            Some("valset".into()),
+            bindings.identity_chain_id.to_string(),
+        )),
+        Box::new(DuckDns::new(
+            "duckdns",
+            "identity",
+            Some("valset".into()),
+        )),
+        // Identity-signed, monotonic gateway routes. DuckDNS owns optional
+        // human names, Files owns DuckFS bytes, and loopback ports stay local.
+        Box::new(Gateway::new(
+            "gateway",
+            "identity",
+            Some("valset".into()),
+            bindings.identity_chain_id,
+        )),
+        // per-member notification queues; other modules deliver via follow-up
+        // ops so a notification commits atomically with the causing event (P2).
+        Box::new(Inbox::new("inbox")),
+        Box::new(Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open")),
+        Box::new(Jobs::new("jobs")),
+        // the agent registry: a self-contained record book; its hook keeps
+        // each agent's dispatch recipe in lockstep via the runs module.
+        Box::new(AgentModule::new("agent", "saga", Some("runs".into()))),
+        // the collaboration loop's actor: watches, engagement, composition,
+        // dispatch, and response delivery — reads the registry by query.
+        Box::new(
+            RunsModule::new(
+                "runs",
+                "chat",
+                "saga",
+                "tagging",
+                "dispatch",
+                "agent",
+                Some("tasks".into()),
+                Some("jobs".into()),
+            )
+            // the duckfs/files module the portable (v3) composer pins its source
+            // head from (W2). its presence is what selects the v3 composer;
+            // unwired, the composer emits the v2 wire.
+            .with_files_module("files")
+            // the forge module the composer resolves forge:<repo>:<n> channels
+            // against and the PR sink queries; unwired, forge-channel mentions
+            // skip at compose.
+            .with_sink_forge("forge"),
+        ),
+        Box::new(Directory::new("directory")),
+        // user-defined rules over chat posts: trusts the "chat" origin for hook
+        // events and emits chat/tasks follow-ups.
+        Box::new(Automations::new("automations", "chat", "tasks", "inbox")),
+    ])
+    .expect("genesis host")
+}
+
+/// the RESTORE twin of [`genesis_host`]: the disk substrates (qmdb modules,
+/// forge's git repo) reopen themselves at their own committed positions; the
+/// in-memory cohort installs its checkpoint snapshots, root-checked. the
+/// recovery replay then rolls everything forward to the journal tip.
+pub(super) async fn restore_host(
+    context: &commonware_runtime::tokio::Context,
+    forge_repo: &std::path::Path,
+    duckfs_dir: &std::path::Path,
+    manifest: &Manifest,
+    bindings: NetworkBindings<'_>,
+    blobs: blobstore::BlobHandle,
+) -> Result<Host, String> {
+    let kv = Kv::init(context.child("kv"), "kv").await;
+    let pages = Pages::init(context.child("pages"), "pages").await;
+    let chat = Chat::init(context.child("chat"), "chat")
+        .await
+        .with_tagging("tagging");
+    // forge shares the blob plane (see genesis_host) for Push materialization.
+    let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
+        .map_err(|e| format!("forge: {e}"))?
+        .with_chat("chat");
+    // establish the checkpoint boundary's dual-path branch selector so the
+    // restored forge `root()` matches at any block the replay SKIPS (disk already
+    // held it) before the first replayed block re-derives it per height. the
+    // checkpoint is a settled boundary, so `current_version` IS its effective
+    // version. baseline no-op before Phase 9.
+    forge.set_active_version(manifest.current_version);
+
+    let snapshot_of = |id: &str| -> Result<(&[u8], StateRoot), String> {
+        let bytes = manifest
+            .snapshot(id)
+            .ok_or_else(|| format!("checkpoint has no snapshot for module {id}"))?;
+        let root = manifest
+            .root(id)
+            .ok_or_else(|| format!("checkpoint has no root for module {id}"))?;
+        Ok((bytes, root))
+    };
+
+    let mut valset = Valset::new("valset");
+    let (bytes, root) = snapshot_of("valset")?;
+    valset
+        .install(bytes, root)
+        .map_err(|e| format!("valset install: {e}"))?;
+
+    let mut governance =
+        Governance::new("governance", "valset", "upgrade").with_invite_binding(bindings.invite);
+    let (bytes, root) = snapshot_of("governance")?;
+    governance
+        .install(bytes, root)
+        .map_err(|e| format!("governance install: {e}"))?;
+
+    let mut upgrade = Upgrade::new("upgrade", "valset");
+    let (bytes, root) = snapshot_of("upgrade")?;
+    upgrade
+        .install(bytes, root)
+        .map_err(|e| format!("upgrade install: {e}"))?;
+
+    let mut saga = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+    let (bytes, root) = snapshot_of("saga")?;
+    saga.install(bytes, root)
+        .map_err(|e| format!("saga install: {e}"))?;
+
+    let mut capability = CapabilityRegistry::new("capability", Some("valset".into()));
+    let (bytes, root) = snapshot_of("capability")?;
+    capability
+        .install(bytes, root)
+        .map_err(|e| format!("capability install: {e}"))?;
+
+    let mut dispatch = DispatchModule::new("dispatch", "saga");
+    let (bytes, root) = snapshot_of("dispatch")?;
+    dispatch
+        .install(bytes, root)
+        .map_err(|e| format!("dispatch install: {e}"))?;
+
+    let mut tagging = TaggingModule::new("tagging");
+    let (bytes, root) = snapshot_of("tagging")?;
+    tagging
+        .install(bytes, root)
+        .map_err(|e| format!("tagging install: {e}"))?;
+
+    let mut tasks = Tasks::new("tasks");
+    let (bytes, root) = snapshot_of("tasks")?;
+    tasks
+        .install(bytes, root)
+        .map_err(|e| format!("tasks install: {e}"))?;
+
+    let mut vaults = Vaults::new("vaults");
+    let (bytes, root) = snapshot_of("vaults")?;
+    vaults
+        .install(bytes, root)
+        .map_err(|e| format!("vaults install: {e}"))?;
+
+    let mut identity = Identity::new(
+        "identity",
+        Some("valset".into()),
+        bindings.identity_chain_id.to_string(),
+    );
+    let (bytes, root) = snapshot_of("identity")?;
+    identity
+        .install(bytes, root)
+        .map_err(|e| format!("identity install: {e}"))?;
+
+    let mut duckdns = DuckDns::new("duckdns", "identity", Some("valset".into()));
+    let (bytes, root) = snapshot_of("duckdns")?;
+    duckdns
+        .install(bytes, root)
+        .map_err(|e| format!("duckdns install: {e}"))?;
+
+    let mut gateway = Gateway::new(
+        "gateway",
+        "identity",
+        Some("valset".into()),
+        bindings.identity_chain_id,
+    );
+    let (bytes, root) = snapshot_of("gateway")?;
+    gateway
+        .install(bytes, root)
+        .map_err(|e| format!("gateway install: {e}"))?;
+
+    let mut inbox = Inbox::new("inbox");
+    let (bytes, root) = snapshot_of("inbox")?;
+    inbox
+        .install(bytes, root)
+        .map_err(|e| format!("inbox install: {e}"))?;
+
+    // files is a duckfs-odb resolver module — NOT in the checkpoint's snapshot
+    // set (like the qmdb modules above, which `init` from their own on-disk
+    // stores). `Files::open` already recovers its committed refs, durable height,
+    // and objects from the on-disk odb/refs envelope, and recovery replays
+    // forward from that height — so a reboot needs no checkpoint bytes and no
+    // object fetch here.
+    let files =
+        Files::open("files", duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
+
+    let mut jobs = Jobs::new("jobs");
+    let (bytes, root) = snapshot_of("jobs")?;
+    jobs.install(bytes, root)
+        .map_err(|e| format!("jobs install: {e}"))?;
+
+    let mut agent = AgentModule::new("agent", "saga", Some("runs".into()));
+    let (bytes, root) = snapshot_of("agent")?;
+    agent
+        .install(bytes, root)
+        .map_err(|e| format!("agent install: {e}"))?;
+
+    let mut runs = RunsModule::new(
+        "runs",
+        "chat",
+        "saga",
+        "tagging",
+        "dispatch",
+        "agent",
+        Some("tasks".into()),
+        Some("jobs".into()),
+    )
+    .with_files_module("files")
+    .with_sink_forge("forge");
+    let (bytes, root) = snapshot_of("runs")?;
+    runs.install(bytes, root)
+        .map_err(|e| format!("runs install: {e}"))?;
+
+    let mut directory = Directory::new("directory");
+    let (bytes, root) = snapshot_of("directory")?;
+    directory
+        .install(bytes, root)
+        .map_err(|e| format!("directory install: {e}"))?;
+
+    let mut automations = Automations::new("automations", "chat", "tasks", "inbox");
+    let (bytes, root) = snapshot_of("automations")?;
+    automations
+        .install(bytes, root)
+        .map_err(|e| format!("automations install: {e}"))?;
+
+    Host::genesis(vec![
+        Box::new(kv),
+        Box::new(pages),
+        Box::new(chat),
+        Box::new(forge),
+        Box::new(valset),
+        Box::new(governance),
+        Box::new(upgrade),
+        Box::new(saga),
+        Box::new(capability),
+        Box::new(dispatch),
+        Box::new(tagging),
+        Box::new(tasks),
+        Box::new(vaults),
+        Box::new(identity),
+        Box::new(duckdns),
+        Box::new(gateway),
+        Box::new(inbox),
+        Box::new(files),
+        Box::new(jobs),
+        Box::new(agent),
+        Box::new(runs),
+        Box::new(directory),
+        Box::new(automations),
+    ])
+    .map_err(|e| format!("restore host: {e}"))
+}
+
+/// the object-store ([`statesync::ObjectFetch`]) adapter over the live `files`
+/// module: the statesync possession driver owns the loop + the full-possession
+/// gate, this owns the duckfs `serve_sync` wire (refs image + `GetObjects`).
+///
+/// SCRATCH NAMESPACE (#219): like the qmdb modules — whose `sync_from` lands
+/// under an ATTEMPT-scoped runtime child (`{name}_scratch_a{n}`) — the module
+/// this adapter wraps is opened over `duckfs_disk::SyncScratch`'s attempt-scoped
+/// scratch dir, NEVER the canonical `duckfs_dir`. the canonical dir is written
+/// only by the verified promotion after `sync_all_modules`' composite app-hash
+/// gate, so a failed join leaves it byte-untouched.
+struct FilesOdb<'a>(&'a mut Files);
+
+impl statesync::ObjectFetch for FilesOdb<'_> {
+    fn refs_request(&self) -> Vec<u8> {
+        duckfs_core::encode_get_refs()
+    }
+
+    fn install_refs(&mut self, reply: &[u8], root: StateRoot, height: u64) -> Result<(), String> {
+        let bytes = duckfs_core::decode_refs_reply(reply)?;
+        // persist the refs envelope at the SYNCED boundary height so a restart
+        // right after the join resumes replay from the boundary, not genesis.
+        self.0
+            .install(&bytes, root, height)
+            .map_err(|e| e.to_string())
+    }
+
+    fn missing_request(&self, limit: usize) -> Result<Option<Vec<u8>>, String> {
+        let ids = self.0.missing_objects(limit).map_err(|e| e.to_string())?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(duckfs_core::encode_get_objects(&ids)))
+    }
+
+    fn ingest(&mut self, reply: &[u8]) -> Result<usize, String> {
+        let batch = duckfs_core::decode_objects_reply(reply)?;
+        let landed = batch.len();
+        self.0.ingest_objects(&batch).map_err(|e| e.to_string())?;
+        Ok(landed)
+    }
+
+    fn possession_complete(&self) -> Result<bool, String> {
+        self.0.possession_complete().map_err(|e| e.to_string())
+    }
+}
+
+/// rebuild EVERY production module from a peer's statesync service at
+/// `manifest`'s boundary and compose them into a [`Host`], verified against
+/// the manifest's app-hash. the disk substrates land under their canonical
+/// ids in this process's storage root — this IS the node's state afterwards,
+/// not a scratch copy. `attempt` disambiguates runtime child labels across
+/// retries (a busy source moves its qmdb targets past the captured boundary;
+/// the caller refetches the manifest and tries again, and metrics labels
+/// must not collide).
+pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
+    context: &commonware_runtime::tokio::Context,
+    client: &C,
+    manifest: &statesync::Manifest,
+    bindings: NetworkBindings<'_>,
+    substrates: SyncSubstrates<'_>,
+    attempt: usize,
+) -> Result<Host, String> {
+    let SyncSubstrates {
+        forge_repo,
+        duckfs_dir,
+        blobs,
+    } = substrates;
+    let entry_root = |module: &str| -> Result<StateRoot, String> {
+        Ok(manifest
+            .entry(module)
+            .ok_or_else(|| format!("module {module} missing from the manifest"))?
+            .root)
+    };
+    let scratch_context = context.child(Box::leak(
+        format!("sync_scratch_a{attempt}").into_boxed_str(),
+    ));
+    let child_label = |name: &str| -> &'static str {
+        Box::leak(format!("{name}_scratch_a{attempt}").into_boxed_str())
+    };
+    let pinned_target = |module: &'static str| -> Result<statesync::qmdb::SyncTarget, String> {
+        let entry = manifest
+            .entry(module)
+            .ok_or_else(|| format!("module {module} missing from the manifest"))?;
+        let pinned = entry
+            .resolver_target
+            .as_ref()
+            .ok_or_else(|| format!("module {module} missing pinned resolver target"))?;
+        pinned.to_sync_target().map_err(|e| format!("{module} {e}"))
+    };
+
+    // resolver lane: adopt the manifest's pinned target, then fetch only
+    // boundary-scoped op batches through the remote resolver.
+    let fetch_target = |module: &'static str| {
+        let resolver = RemoteQmdbResolver::new(client.clone(), manifest.boundary_id(), module);
+        async move {
+            let target = pinned_target(module)?;
+            let root = entry_root(module)?;
+            if StateRoot(target.root.0) != root {
+                return Err(format!(
+                    "{module} pinned target root does not match the manifest root"
+                ));
+            }
+            Ok::<_, String>((target, resolver))
+        }
+    };
+
+    let (target, resolver) = fetch_target("kv").await?;
+    let kv = Kv::sync_from(
+        scratch_context.child(child_label("kv")),
+        "kv",
+        target,
+        resolver,
+    )
+    .await?;
+
+    let (target, resolver) = fetch_target("pages").await?;
+    let pages = Pages::sync_from(
+        scratch_context.child(child_label("pages")),
+        "pages",
+        target,
+        resolver,
+    )
+    .await?;
+
+    let (target, resolver) = fetch_target("chat").await?;
+    let chat = Chat::sync_from(
+        scratch_context.child(child_label("chat")),
+        "chat",
+        target,
+        resolver,
+    )
+    .await?
+    .with_tagging("tagging");
+
+    // snapshot lane: chunked bytes from the captured boundary, install gated
+    // on the manifest root (verify-then-adopt inside each module).
+    let snapshot_of = |module: &'static str| {
+        let client = client.clone();
+        let boundary = manifest.boundary_id();
+        let root = entry_root(module);
+        async move {
+            let root = root?;
+            let bytes = fetch_snapshot(&client, boundary, module)
+                .await
+                .map_err(|e| format!("{module} snapshot: {e}"))?;
+            Ok::<_, String>((bytes, root))
+        }
+    };
+
+    let (bytes, root) = snapshot_of("directory").await?;
+    let mut directory = Directory::new("directory");
+    directory
+        .install(&bytes, root)
+        .map_err(|e| format!("directory install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("valset").await?;
+    let mut valset = Valset::new("valset");
+    valset
+        .install(&bytes, root)
+        .map_err(|e| format!("valset install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("saga").await?;
+    let mut saga = SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
+    saga.install(&bytes, root)
+        .map_err(|e| format!("saga install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("capability").await?;
+    let mut capability = CapabilityRegistry::new("capability", Some("valset".into()));
+    capability
+        .install(&bytes, root)
+        .map_err(|e| format!("capability install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("dispatch").await?;
+    let mut dispatch = DispatchModule::new("dispatch", "saga");
+    dispatch
+        .install(&bytes, root)
+        .map_err(|e| format!("dispatch install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("tagging").await?;
+    let mut tagging = TaggingModule::new("tagging");
+    tagging
+        .install(&bytes, root)
+        .map_err(|e| format!("tagging install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("governance").await?;
+    let mut governance =
+        Governance::new("governance", "valset", "upgrade").with_invite_binding(bindings.invite);
+    governance
+        .install(&bytes, root)
+        .map_err(|e| format!("governance install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("upgrade").await?;
+    let mut upgrade = Upgrade::new("upgrade", "valset");
+    upgrade
+        .install(&bytes, root)
+        .map_err(|e| format!("upgrade install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("tasks").await?;
+    let mut tasks = Tasks::new("tasks");
+    tasks
+        .install(&bytes, root)
+        .map_err(|e| format!("tasks install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("vaults").await?;
+    let mut vaults = Vaults::new("vaults");
+    vaults
+        .install(&bytes, root)
+        .map_err(|e| format!("vaults install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("identity").await?;
+    let mut identity = Identity::new(
+        "identity",
+        Some("valset".into()),
+        bindings.identity_chain_id.to_string(),
+    );
+    identity
+        .install(&bytes, root)
+        .map_err(|e| format!("identity install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("duckdns").await?;
+    let mut duckdns = DuckDns::new("duckdns", "identity", Some("valset".into()));
+    duckdns
+        .install(&bytes, root)
+        .map_err(|e| format!("duckdns install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("gateway").await?;
+    let mut gateway = Gateway::new(
+        "gateway",
+        "identity",
+        Some("valset".into()),
+        bindings.identity_chain_id,
+    );
+    gateway
+        .install(&bytes, root)
+        .map_err(|e| format!("gateway install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("inbox").await?;
+    let mut inbox = Inbox::new("inbox");
+    inbox
+        .install(&bytes, root)
+        .map_err(|e| format!("inbox install: {e}"))?;
+
+    // files is a duckfs-odb resolver module: its refs image AND its
+    // content-addressed objects both ride the Module/`serve_sync` lane. a fresh
+    // joiner's odb is EMPTY, so install the boundary refs (root-verified) at the
+    // sync-target height and then loop GetObjects to full object possession —
+    // the snapshot lane would leave this node refs-only (every file listed, not
+    // one byte readable). the sync lands in an ATTEMPT-scoped scratch dir
+    // (`duckfs_scratch_a{attempt}`, mirroring the qmdb scratch namespaces);
+    // the canonical `duckfs_dir` is written only by the verified promotion
+    // after the composite app-hash gate below (#219).
+    let files_scratch =
+        SyncScratch::prepare(duckfs_dir, attempt).map_err(|e| format!("duckfs scratch: {e}"))?;
+    let mut files = Files::open("files", files_scratch.dir().to_path_buf())
+        .map_err(|e| format!("duckfs open: {e}"))?;
+    let files_root = entry_root("files")?;
+    let files_lane = statesync::ClientModuleLane::new(client.clone(), manifest.boundary_id());
+    statesync::sync_object_possession(
+        &files_lane,
+        "files",
+        files_root,
+        manifest.height,
+        &mut FilesOdb(&mut files),
+        duckfs_core::MAX_SYNC_IDS,
+    )
+    .await
+    .map_err(|e| format!("files sync: {e}"))?;
+
+    let (bytes, root) = snapshot_of("jobs").await?;
+    let mut jobs = Jobs::new("jobs");
+    jobs.install(&bytes, root)
+        .map_err(|e| format!("jobs install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("agent").await?;
+    let mut agent = AgentModule::new("agent", "saga", Some("runs".into()));
+    agent
+        .install(&bytes, root)
+        .map_err(|e| format!("agent install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("runs").await?;
+    let mut runs = RunsModule::new(
+        "runs",
+        "chat",
+        "saga",
+        "tagging",
+        "dispatch",
+        "agent",
+        Some("tasks".into()),
+        Some("jobs".into()),
+    )
+    .with_files_module("files")
+    .with_sink_forge("forge");
+    runs.install(&bytes, root)
+        .map_err(|e| format!("runs install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("automations").await?;
+    let mut automations = Automations::new("automations", "chat", "tasks", "inbox");
+    automations
+        .install(&bytes, root)
+        .map_err(|e| format!("automations install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("forge").await?;
+    let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
+        .map_err(|e| format!("forge init: {e}"))?
+        .with_chat("chat");
+    // set the dual-path branch selector to the SERVED boundary version BEFORE
+    // install: `Forge::install` (and `root()`) branch on `active_version`, so a
+    // joiner installing a post-H snapshot must select the boundary's format or the
+    // install/root would mismatch. `manifest.current_version` IS the effective
+    // version at any settled boundary (the in-block `Advance` reconciles it before
+    // the boundary is captured, so a post-H manifest carries `to_version` with no
+    // pending). baseline/no-op before the forge v2 dual path lands (Phase 9).
+    forge.set_active_version(manifest.current_version);
+    forge
+        .install(&bytes, root)
+        .map_err(|e| format!("forge install: {e}"))?;
+
+    // compose and check THE property: the rebuilt app-hash IS the manifest's.
+    // keep this registry in sync with [`genesis_host`] — a missing module
+    // composes a different app-hash and the join fails its final check.
+    let host = Host::genesis(vec![
+        Box::new(kv),
+        Box::new(pages),
+        Box::new(chat),
+        Box::new(forge),
+        Box::new(valset),
+        Box::new(governance),
+        Box::new(upgrade),
+        Box::new(saga),
+        Box::new(capability),
+        Box::new(dispatch),
+        Box::new(tagging),
+        Box::new(tasks),
+        Box::new(vaults),
+        Box::new(identity),
+        Box::new(duckdns),
+        Box::new(gateway),
+        Box::new(inbox),
+        Box::new(files),
+        Box::new(jobs),
+        Box::new(agent),
+        Box::new(runs),
+        Box::new(automations),
+        Box::new(directory),
+    ])
+    .map_err(|e| format!("compose synced host: {e}"))?;
+    // realize the served boundary version into EVERY dual-path module's branch
+    // selector so `root()` (and with it the app-hash check below) recomputes over
+    // the boundary's format — the state-sync analogue of the activation hook the
+    // live/recovery paths run. NON-hashed; idempotent for forge (set pre-install
+    // above); baseline no-op before Phase 9.
+    let mut host = host;
+    host.set_active_version(manifest.current_version);
+    if host.app_hash() != manifest.app_hash {
+        return Err(format!(
+            "composed {} != manifest {}",
+            hex(&host.app_hash()),
+            hex(&manifest.app_hash)
+        ));
+    }
+    // the composite gate passed — promote files' scratch into the canonical
+    // `duckfs_dir` (verify-then-replace refs + content-addressed object merge,
+    // gated on the exact files root this composition certified) and swap the
+    // registry onto a canonical-backed module. the returned host must run in
+    // place over the canonical dir: the post-reboot full-sync fallback keeps
+    // it live without a reboot, and a joiner's promotion reboot re-opens the
+    // same dir. on any error the host is discarded and the retry re-syncs —
+    // an already-promoted canonical dir is verified state, never damage.
+    files_scratch
+        .promote(files_root.0)
+        .map_err(|e| format!("duckfs promote: {e}"))?;
+    host.register(Box::new(
+        Files::open("files", duckfs_dir.to_path_buf())
+            .map_err(|e| format!("duckfs reopen: {e}"))?,
+    ));
+    // re-realize the boundary version over the swapped registry (idempotent),
+    // then re-check THE property against the canonical-backed composition.
+    host.set_active_version(manifest.current_version);
+    if host.app_hash() != manifest.app_hash {
+        return Err(format!(
+            "canonical duckfs reopen composed {} != manifest {}",
+            hex(&host.app_hash()),
+            hex(&manifest.app_hash)
+        ));
+    }
+    Ok(host)
+}

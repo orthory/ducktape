@@ -5,11 +5,15 @@
 //
 // Supported: fenced ```lang\n…``` → Code blocks; > quote lines → Quote blocks;
 // ---/___/*** lines → Divider blocks; **bold**, *italic*, markdown links, and
-// bare http(s) URLs → marked spans inside Paragraphs/Quotes. Mentions are a
-// later increment (an "@name" stays plain text here; MessageItem still tints
-// @/# tokens).
+// bare http(s) URLs → marked spans inside Paragraphs/Quotes. With a resolver,
+// known "@name" tokens become mention-marked spans (unknown ones stay plain
+// text; MessageItem still tints those visually).
 
-import type { ChatBlock, Span } from "../../../domain/chat-client";
+import type { AuthorRef, ChatBlock, Span } from "../../../domain/chat-client";
+
+/** agent_id → the AuthorRef its mention mark carries (see mention.ts's
+ *  `mentionResolverOf` for why the agent module is always "runs"). */
+export type MentionResolver = Map<string, AuthorRef>;
 
 // One pass over text: [label](https://url) | **bold** | *italic* | bare URL,
 // else plain.
@@ -20,7 +24,33 @@ import type { ChatBlock, Span } from "../../../domain/chat-client";
 const INLINE =
   /(\[(?<label>[^\]\n]+)\]\((?<href>https?:\/\/[^\s<)]+)\))|(\*\*(?<b>[^*\s](?:[^*]*[^*\s])?)\*\*)|(\*(?<i>[^*\s](?:[^*\n]*[^*\s])?)\*)|(?<url>https?:\/\/[^\s<]+)/g;
 
-const parseInline = (text: string): Span[] => {
+// The composer's mention-token grammar: `@` + the agent-id charset. Boundary
+// checks live in `splitMentions` (start-of-span or whitespace before the `@`).
+const MENTION_TOKEN = /@([a-z0-9._-]+)/g;
+
+// Split a PLAIN span around @tokens the resolver knows, marking each hit with
+// its AuthorRef. Marked spans (bold/link/…) pass through untouched — a
+// mention nested in bold isn't a supported composition, and unknown @tokens
+// stay plain text by simply not splitting on them.
+const splitMentions = (span: Span, resolver: MentionResolver): Span[] => {
+  if (span.marks.length > 0) return [span];
+  const out: Span[] = [];
+  let last = 0;
+  for (const match of span.text.matchAll(MENTION_TOKEN)) {
+    const idx = match.index ?? 0;
+    if (idx > 0 && !/\s/.test(span.text[idx - 1]!)) continue;
+    const ref = resolver.get(match[1]!);
+    if (!ref) continue;
+    if (idx > last) out.push({ text: span.text.slice(last, idx), marks: [] });
+    out.push({ text: match[0], marks: [{ mention: ref }] });
+    last = idx + match[0].length;
+  }
+  if (out.length === 0) return [span];
+  if (last < span.text.length) out.push({ text: span.text.slice(last), marks: [] });
+  return out;
+};
+
+const parseInline = (text: string, mentions?: MentionResolver): Span[] => {
   const spans: Span[] = [];
   let last = 0;
   for (const match of text.matchAll(INLINE)) {
@@ -35,7 +65,8 @@ const parseInline = (text: string): Span[] => {
     last = idx + match[0].length;
   }
   if (last < text.length) spans.push({ text: text.slice(last), marks: [] });
-  return spans.length > 0 ? spans : [{ text, marks: [] }];
+  const flat = spans.length > 0 ? spans : [{ text, marks: [] } as Span];
+  return mentions ? flat.flatMap((span) => splitMentions(span, mentions)) : flat;
 };
 
 // Fenced code: ```lang\n…``` (lang optional). The trailing newline before the
@@ -43,22 +74,31 @@ const parseInline = (text: string): Span[] => {
 const FENCE = /```([\w+#-]*)\n?([\s\S]*?)```/g;
 const DIVIDER = /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/;
 
-const pushMarkedBlock = (blocks: ChatBlock[], kind: "paragraph" | "quote", raw: string) => {
+const pushMarkedBlock = (
+  blocks: ChatBlock[],
+  kind: "paragraph" | "quote",
+  raw: string,
+  mentions?: MentionResolver,
+) => {
   const text = raw.trim();
   if (!text) return;
-  blocks.push(kind === "paragraph" ? { paragraph: parseInline(text) } : { quote: parseInline(text) });
+  blocks.push(
+    kind === "paragraph"
+      ? { paragraph: parseInline(text, mentions) }
+      : { quote: parseInline(text, mentions) },
+  );
 };
 
-const pushTextBlocks = (blocks: ChatBlock[], chunk: string) => {
+const pushTextBlocks = (blocks: ChatBlock[], chunk: string, mentions?: MentionResolver) => {
   const paragraphLines: string[] = [];
   const quoteLines: string[] = [];
 
   const flushParagraph = () => {
-    pushMarkedBlock(blocks, "paragraph", paragraphLines.join("\n"));
+    pushMarkedBlock(blocks, "paragraph", paragraphLines.join("\n"), mentions);
     paragraphLines.length = 0;
   };
   const flushQuote = () => {
-    pushMarkedBlock(blocks, "quote", quoteLines.join("\n"));
+    pushMarkedBlock(blocks, "quote", quoteLines.join("\n"), mentions);
     quoteLines.length = 0;
   };
 
@@ -92,18 +132,19 @@ const pushTextBlocks = (blocks: ChatBlock[], chunk: string) => {
 
 /** Parse composer text into the block body the node stores. Never returns an
  *  empty list — a message that is all whitespace still yields one paragraph so
- *  callers that already guarded `body.trim()` get a well-formed body. */
-export const parseMessageInput = (raw: string): ChatBlock[] => {
+ *  callers that already guarded `body.trim()` get a well-formed body. With a
+ *  `mentions` resolver, known @tokens become mention-marked spans. */
+export const parseMessageInput = (raw: string, mentions?: MentionResolver): ChatBlock[] => {
   const text = raw.replace(/\r\n/g, "\n");
   const blocks: ChatBlock[] = [];
   let last = 0;
   for (const match of text.matchAll(FENCE)) {
     const idx = match.index ?? 0;
-    if (idx > last) pushTextBlocks(blocks, text.slice(last, idx));
+    if (idx > last) pushTextBlocks(blocks, text.slice(last, idx), mentions);
     blocks.push({ code: { lang: match[1] || null, text: match[2].replace(/\n$/, "") } });
     last = idx + match[0].length;
   }
-  if (last < text.length) pushTextBlocks(blocks, text.slice(last));
+  if (last < text.length) pushTextBlocks(blocks, text.slice(last), mentions);
   return blocks.length > 0 ? blocks : [{ paragraph: [{ text: raw.trim(), marks: [] }] }];
 };
 
@@ -112,7 +153,13 @@ const spanToInput = (span: Span): string => {
   if (link) return span.text === link.link ? link.link : `[${span.text}](${link.link})`;
   if (span.marks.includes("bold")) return `**${span.text}**`;
   if (span.marks.includes("italic")) return `*${span.text}*`;
-  // Mentions render as their handle.
+  const mention = span.marks.find(
+    (mark): mark is { mention: AuthorRef } => typeof mark === "object" && "mention" in mark,
+  );
+  // An agent mention renders back to `@agent_id` so re-parsing with the same
+  // resolver reproduces the mark; other mention kinds keep their span text.
+  if (mention && typeof mention.mention === "object" && "agent" in mention.mention)
+    return `@${mention.mention.agent.agent_id}`;
   return span.text;
 };
 

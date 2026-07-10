@@ -48,7 +48,7 @@ fn record_for(
         validator_identity: id(signer),
         wireguard_public_key: wg,
         control_endpoint: endpoint([1, 1, 1, wg_addr[3]], 443, Transport::Tcp, &policy),
-        wireguard_endpoint: endpoint(wg_addr, 51820, Transport::Udp, &policy),
+        wireguard_endpoint: Some(endpoint(wg_addr, 51820, Transport::Udp, &policy)),
         capabilities: vec![MeshCapability::Bootnode, MeshCapability::Relay],
         expires_at_view: 50,
         nonce,
@@ -214,7 +214,7 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
                 &set,
                 &view,
                 id(&b),
-                view.record(id(&b)).unwrap().wireguard_endpoint,
+                view.record(id(&b)).unwrap().wireguard_endpoint.unwrap(),
                 4,
             )),
             keepalive_seconds: Some(25),
@@ -313,7 +313,7 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
 
     let mut bad_request = request.clone();
     bad_request.fields.initiator_wireguard_endpoint =
-        endpoint([8, 8, 8, 99], 51820, Transport::Udp, &policy);
+        Some(endpoint([8, 8, 8, 99], 51820, Transport::Udp, &policy));
     let mut fresh_cache = ReplayCache::default();
     assert!(
         validate_upgrade(
@@ -409,7 +409,7 @@ fn valid_plan_builds_defguard_peer_config() {
                 &set,
                 &view,
                 id(&b),
-                view.record(id(&b)).unwrap().wireguard_endpoint,
+                view.record(id(&b)).unwrap().wireguard_endpoint.unwrap(),
                 4,
             )),
             keepalive_seconds: Some(25),
@@ -441,7 +441,10 @@ fn valid_plan_builds_defguard_peer_config() {
     .unwrap();
 
     let peer = DefguardPeerConfig::from_plan(&plan);
-    assert_eq!(peer.peer.endpoint, Some(plan.peer_endpoint().socket_addr()));
+    assert_eq!(
+        peer.peer.endpoint,
+        plan.peer_endpoint().map(|e| e.socket_addr())
+    );
     assert_eq!(peer.allowed_ips, plan.allowed_ips());
 
     let interface = DefguardInterfaceConfig::from_plan(
@@ -548,7 +551,7 @@ fn signed_record_verifies_owner_and_rejects_tamper_and_cross_domain() {
 
     // an advertisement signature over the same record must not verify under
     // the record domain.
-    let version = compute_mesh_version(&[record.clone()]).unwrap();
+    let version = compute_mesh_version(std::slice::from_ref(&record)).unwrap();
     let ad = EndpointAdvertisement::sign(record.clone(), version, &a);
     let grafted = SignedEndpointRecord {
         record,
@@ -657,7 +660,8 @@ fn record_check_mirrors_the_per_record_view_rules() {
     let set = active_set(id(&a), id(&PrivateKey::from_seed(2)));
     let good = record_for(&a, &set, [8, 8, 8, 10], xkey(1), 1);
 
-    good.check(&policy, 10).expect("a fresh, policy-clean record checks");
+    good.check(&policy, 10)
+        .expect("a fresh, policy-clean record checks");
 
     // expired: current view past `expires_at_view` (50 in the fixture).
     assert_eq!(good.check(&policy, 51).unwrap_err(), UpgradeError::Expired);
@@ -683,11 +687,192 @@ fn record_check_mirrors_the_per_record_view_rules() {
         allow_private_ip: true,
     };
     let private_wg = EndpointRecord {
-        wireguard_endpoint: endpoint([10, 0, 0, 9], 51820, Transport::Udp, &open),
+        wireguard_endpoint: Some(endpoint([10, 0, 0, 9], 51820, Transport::Udp, &open)),
         ..good.clone()
     };
     assert!(matches!(
         private_wg.check(&policy, 10).unwrap_err(),
         UpgradeError::InvalidEndpoint(_)
     ));
+}
+
+#[test]
+fn an_endpoint_less_record_signs_verifies_and_stays_wire_compatible() {
+    // the NAT'd-joiner shape: a record advertising NO WireGuard endpoint.
+    // it must (a) pass the per-record checks (there is no endpoint to
+    // policy-check), (b) sign and verify, (c) omit the field on the JSON
+    // wire, and (d) leave endpoint-FUL records exactly as they were — an
+    // old-wire record (field present, no Option wrapper) still decodes.
+    let a = PrivateKey::from_seed(1);
+    let policy = prod_policy();
+    let set = active_set(id(&a), id(&PrivateKey::from_seed(2)));
+    let endpoint_less = EndpointRecord {
+        wireguard_endpoint: None,
+        ..record_for(&a, &set, [8, 8, 8, 10], xkey(1), 1)
+    };
+
+    endpoint_less
+        .check(&policy, 10)
+        .expect("no endpoint means nothing to policy-check");
+
+    let signed = SignedEndpointRecord::sign(endpoint_less.clone(), &a);
+    signed.verify().expect("owner signature verifies");
+
+    // None omits the field entirely — an endpoint-ful record's JSON is
+    // byte-identical to the pre-Option wire.
+    let json = serde_json::to_string(&endpoint_less).unwrap();
+    assert!(
+        !json.contains("wireguard_endpoint"),
+        "None must be absent on the wire: {json}"
+    );
+    let round: EndpointRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(round, endpoint_less);
+
+    // the legacy wire shape (field present) decodes as Some — old records
+    // from an un-upgraded peer keep working.
+    let with_endpoint = record_for(&a, &set, [8, 8, 8, 10], xkey(1), 1);
+    let legacy_json = serde_json::to_string(&with_endpoint).unwrap();
+    assert!(legacy_json.contains("wireguard_endpoint"), "{legacy_json}");
+    let legacy: EndpointRecord = serde_json::from_str(&legacy_json).unwrap();
+    assert_eq!(legacy.wireguard_endpoint, with_endpoint.wireguard_endpoint);
+
+    // and the two SIGNING encodings can never collide: flipping the same
+    // record between None and Some changes its signature domain bytes.
+    let signed_some = SignedEndpointRecord::sign(with_endpoint, &a);
+    let mut forged = signed_some.clone();
+    forged.record.wireguard_endpoint = None;
+    assert!(
+        forged.verify().is_err(),
+        "a stripped endpoint must break the owner signature"
+    );
+}
+
+#[test]
+fn duplicate_requested_allowed_ips_is_rejected_even_though_the_signature_verifies() {
+    // The signed preimage sorts+dedups allowed-ips, so a request that REPEATS a
+    // canonical route keeps the SAME hash and a valid signature — yet the effect
+    // layer would materialize every entry into the WireGuard peer config. The
+    // validator must reject the duplicate-bearing vector. A legitimate request
+    // carries the canonical singleton (OverlayPolicy::allowed_ips_for returns one
+    // route), so this guard can never reject an honest upgrade.
+    let (a, b, set, view, policy) = mesh();
+    let overlay = OverlayPolicy::default_v4();
+
+    let canonical = overlay.allowed_ips_for(&view, id(&b)).unwrap();
+    assert_eq!(
+        canonical.len(),
+        1,
+        "canonical overlay routes are a singleton"
+    );
+
+    let request = TunnelUpgradeRequest::sign(
+        TunnelUpgradeRequestFields {
+            namespace: set.namespace.clone(),
+            epoch: set.epoch,
+            valset_root: set.valset_root,
+            admission_root: set.admission_root,
+            mesh_version: view.mesh_version,
+            initiator_identity: id(&a),
+            responder_identity: id(&b),
+            initiator_wireguard_public_key: xkey(1),
+            initiator_wireguard_endpoint: view.record(id(&a)).unwrap().wireguard_endpoint,
+            requested_allowed_ips: canonical.clone(),
+            port_policy_hash: policy.hash(),
+            expires_at_view: 40,
+            nonce: 1,
+        },
+        &a,
+    );
+    let response = TunnelUpgradeResponse::sign(
+        TunnelUpgradeResponseFields {
+            request_hash: request.hash(),
+            namespace: set.namespace.clone(),
+            epoch: set.epoch,
+            valset_root: set.valset_root,
+            admission_root: set.admission_root,
+            mesh_version: view.mesh_version,
+            responder_identity: id(&b),
+            initiator_identity: id(&a),
+            responder_wireguard_public_key: xkey(2),
+            responder_wireguard_endpoint: view.record(id(&b)).unwrap().wireguard_endpoint,
+            accepted_allowed_ips: overlay.allowed_ips_for(&view, id(&a)).unwrap(),
+            relay_candidates: view.relay_candidates(),
+            direct_dial_failure: Some(direct_dial_failure(
+                &a,
+                &set,
+                &view,
+                id(&b),
+                view.record(id(&b)).unwrap().wireguard_endpoint.unwrap(),
+                4,
+            )),
+            keepalive_seconds: Some(25),
+            expires_at_view: 40,
+            nonce: 2,
+        },
+        &b,
+    );
+    let ack = TunnelUpgradeAck::sign(
+        TunnelUpgradeAckFields {
+            request_hash: request.hash(),
+            response_hash: response.hash(),
+            namespace: set.namespace.clone(),
+            epoch: set.epoch,
+            valset_root: set.valset_root,
+            admission_root: set.admission_root,
+            mesh_version: view.mesh_version,
+            initiator_identity: id(&a),
+            responder_identity: id(&b),
+            installed_at_view: 11,
+            expires_at_view: 40,
+            nonce: 3,
+        },
+        &a,
+    );
+
+    // Sanity: the canonical (singleton) request validates.
+    validate_upgrade(
+        &view,
+        &policy,
+        &overlay,
+        12,
+        &request,
+        &response,
+        &ack,
+        &mut ReplayCache::default(),
+    )
+    .expect("the canonical request validates");
+
+    // Repeat the single canonical route. The dedup'd signing preimage makes the
+    // hash and signature UNCHANGED, so the response/ack still match — only the
+    // stored vector now carries a duplicate.
+    let mut dup = canonical.clone();
+    dup.push(canonical[0]);
+    let request_dup = TunnelUpgradeRequest::sign(
+        TunnelUpgradeRequestFields {
+            requested_allowed_ips: dup,
+            ..request.fields.clone()
+        },
+        &a,
+    );
+    assert_eq!(
+        request_dup.hash(),
+        request.hash(),
+        "the dedup'd signing preimage makes a duplicate hash-invariant"
+    );
+
+    let err = validate_upgrade(
+        &view,
+        &policy,
+        &overlay,
+        12,
+        &request_dup,
+        &response,
+        &ack,
+        &mut ReplayCache::default(),
+    )
+    .expect_err("a duplicate-bearing allowed-ips vector must be rejected");
+    assert!(
+        matches!(err, UpgradeError::InvalidAllowedIp),
+        "expected InvalidAllowedIp, got {err:?}"
+    );
 }

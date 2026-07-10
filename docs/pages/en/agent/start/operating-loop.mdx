@@ -1,13 +1,24 @@
+---
+showAskAi: false
+---
+
 # Operating Loop
 
 Agents should work from repo evidence and keep unrelated worktree state out of
 the change.
 
+Related: [Verification Matrix](/en/agent/reference/verification-matrix) lists
+the gates, [Repository Map](/en/agent/reference/repository-map) locates source
+surfaces, [Quick Start](/en/human/start/quick-start) is the reader-mode entry,
+[Node Upgrades](/en/agent/network/node-upgrades) covers live upgrade work, and
+[State Sync Contract](/en/agent/architecture/state-sync-contract) covers sync
+claims.
+
 ## Before Editing
 
 - Check the current path, branch, and worktree list.
 - Continue an existing task worktree when it already matches the branch.
-- Fetch `origin` before publishing or rebasing claims against `main`.
+- Fetch `origin` before publishing or rebasing claims against `dev`.
 - Read the module or docs surface you are about to edit instead of relying on
   summaries.
 
@@ -42,4 +53,4 @@ cargo test -p demo --test joiner_rebuilds_global_app_hash
 ## Publishing
 
 For docs-only PR updates, include the Bun docs check, a draft-text scan, and
-`git diff --check origin/main...HEAD` in the PR evidence.
+`git diff --check origin/dev...HEAD` in the PR evidence.

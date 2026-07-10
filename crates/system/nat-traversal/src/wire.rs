@@ -1,24 +1,45 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use arrayvec::ArrayVec;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeKey(pub [u8; 32]);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Msg {
-    BindRequest { from: NodeKey },
-    BindResponse { reflexive: SocketAddr },
-    Register { key: NodeKey },
+    BindRequest {
+        from: NodeKey,
+    },
+    BindResponse {
+        reflexive: SocketAddr,
+    },
+    Register {
+        key: NodeKey,
+    },
     /// Rebind re-advertisement: republish the sender's reflexive under a
     /// strictly-monotonic `nonce`. Unlike `Register` (an unconditional nonce-0
     /// boot baseline), the coordinator applies the `AdvertBook` staleness guard
     /// so a replayed/reordered equal-or-lower nonce cannot roll a fresh mapping
     /// back. The reflexive stored is still the coordinator-observed source, never
     /// this datagram's self-report — the nonce only orders adverts.
-    Readvertise { key: NodeKey, nonce: u64 },
-    Lookup { key: NodeKey },
-    LookupResponse { key: NodeKey, reflexive: Option<SocketAddr> },
-    PunchSync { peer: NodeKey, peer_reflexive: SocketAddr },
-    Punch { from: NodeKey },
+    Readvertise {
+        key: NodeKey,
+        nonce: u64,
+    },
+    Lookup {
+        key: NodeKey,
+    },
+    LookupResponse {
+        key: NodeKey,
+        reflexive: Option<SocketAddr>,
+    },
+    PunchSync {
+        peer: NodeKey,
+        peer_reflexive: SocketAddr,
+    },
+    Punch {
+        from: NodeKey,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -50,26 +71,31 @@ const TAG_PUNCH: u8 = 7;
 const TAG_READVERTISE: u8 = 10;
 const TAG_AUTH_REQUEST: u8 = 11;
 
-fn put_key(out: &mut Vec<u8>, k: &NodeKey) {
-    out.extend_from_slice(&k.0);
+fn put<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, bytes: &[u8]) {
+    out.try_extend_from_slice(bytes)
+        .expect("wire buffer capacity covers every message");
 }
 
-fn put_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_be_bytes());
+fn put_key<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, key: &NodeKey) {
+    put(out, &key.0);
 }
 
-fn put_addr(out: &mut Vec<u8>, a: &SocketAddr) {
-    match a.ip() {
-        IpAddr::V4(v4) => {
+fn put_u64<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, value: u64) {
+    put(out, &value.to_be_bytes());
+}
+
+fn put_addr<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, addr: &SocketAddr) {
+    match addr.ip() {
+        IpAddr::V4(ip) => {
             out.push(4);
-            out.extend_from_slice(&v4.octets());
+            put(out, &ip.octets());
         }
-        IpAddr::V6(v6) => {
+        IpAddr::V6(ip) => {
             out.push(6);
-            out.extend_from_slice(&v6.octets());
+            put(out, &ip.octets());
         }
     }
-    out.extend_from_slice(&a.port().to_be_bytes());
+    put(out, &addr.port().to_be_bytes());
 }
 
 struct Reader<'a> {
@@ -134,59 +160,77 @@ impl<'a> Reader<'a> {
 }
 
 impl Msg {
+    /// Largest encoded bare message. This fixed upper bound lets the hot UDP
+    /// loop encode replies on its stack instead of allocating per datagram.
+    pub const MAX_ENCODED_LEN: usize = 1 + 32 + 1 + 1 + 16 + 2;
+
+    /// Encode into a stack-backed, fixed-capacity vector.
+    pub fn encode_inline(&self) -> ArrayVec<u8, { Self::MAX_ENCODED_LEN }> {
+        let mut out = ArrayVec::new();
+        self.write(&mut out);
+        out
+    }
+
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(48);
+        self.encode_inline().into_iter().collect()
+    }
+
+    fn write<const CAP: usize>(&self, out: &mut ArrayVec<u8, CAP>) {
         match self {
             Msg::BindRequest { from } => {
                 out.push(TAG_BIND_REQ);
-                put_key(&mut out, from);
+                put_key(out, from);
             }
             Msg::BindResponse { reflexive } => {
                 out.push(TAG_BIND_RESP);
-                put_addr(&mut out, reflexive);
+                put_addr(out, reflexive);
             }
             Msg::Register { key } => {
                 out.push(TAG_REGISTER);
-                put_key(&mut out, key);
+                put_key(out, key);
             }
             Msg::Readvertise { key, nonce } => {
                 out.push(TAG_READVERTISE);
-                put_key(&mut out, key);
-                put_u64(&mut out, *nonce);
+                put_key(out, key);
+                put_u64(out, *nonce);
             }
             Msg::Lookup { key } => {
                 out.push(TAG_LOOKUP);
-                put_key(&mut out, key);
+                put_key(out, key);
             }
             Msg::LookupResponse { key, reflexive } => {
                 out.push(TAG_LOOKUP_RESP);
-                put_key(&mut out, key);
+                put_key(out, key);
                 match reflexive {
                     Some(a) => {
                         out.push(1);
-                        put_addr(&mut out, a);
+                        put_addr(out, a);
                     }
                     None => out.push(0),
                 }
             }
-            Msg::PunchSync { peer, peer_reflexive } => {
+            Msg::PunchSync {
+                peer,
+                peer_reflexive,
+            } => {
                 out.push(TAG_PUNCH_SYNC);
-                put_key(&mut out, peer);
-                put_addr(&mut out, peer_reflexive);
+                put_key(out, peer);
+                put_addr(out, peer_reflexive);
             }
             Msg::Punch { from } => {
                 out.push(TAG_PUNCH);
-                put_key(&mut out, from);
+                put_key(out, from);
             }
         }
-        out
     }
 
     /// The claimed identity of a client→coordinator *request*, if this is one.
     pub fn subject_key(&self) -> Option<NodeKey> {
         match self {
             Msg::BindRequest { from } => Some(*from),
-            Msg::Register { key } | Msg::Readvertise { key, .. } | Msg::Lookup { key } => Some(*key),
+            Msg::Register { key } | Msg::Readvertise { key, .. } | Msg::Lookup { key } => {
+                Some(*key)
+            }
             _ => None,
         }
     }
@@ -213,9 +257,14 @@ impl Msg {
         let tag = r.take(1)?[0];
         let msg = match tag {
             TAG_BIND_REQ => Msg::BindRequest { from: r.key()? },
-            TAG_BIND_RESP => Msg::BindResponse { reflexive: r.addr()? },
+            TAG_BIND_RESP => Msg::BindResponse {
+                reflexive: r.addr()?,
+            },
             TAG_REGISTER => Msg::Register { key: r.key()? },
-            TAG_READVERTISE => Msg::Readvertise { key: r.key()?, nonce: r.u64()? },
+            TAG_READVERTISE => Msg::Readvertise {
+                key: r.key()?,
+                nonce: r.u64()?,
+            },
             TAG_LOOKUP => Msg::Lookup { key: r.key()? },
             TAG_LOOKUP_RESP => {
                 let key = r.key()?;
@@ -256,32 +305,35 @@ pub struct AuthRequest {
     pub auth: Authenticator,
 }
 
-fn put_sig(out: &mut Vec<u8>, s: &commonware_cryptography::ed25519::Signature) {
-    use commonware_codec::Encode as _;
-    out.extend_from_slice(s.encode().as_ref());
-}
-fn put_pubkey(out: &mut Vec<u8>, p: &commonware_cryptography::ed25519::PublicKey) {
-    out.extend_from_slice(p.as_ref());
-}
-
 impl AuthRequest {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(288);
+    /// Largest accepted envelope, including a capability and the largest bare
+    /// `Msg`. Valid request inners are smaller; the broader bound also covers
+    /// malformed response inners so they can still be encoded for rejection
+    /// tests without an allocation fallback.
+    pub const MAX_ENCODED_LEN: usize = 1 + 32 + Msg::MAX_ENCODED_LEN + 8 + 64 + 1 + 32 + 8 + 64;
+
+    /// Encode into a stack-backed, fixed-capacity vector.
+    pub fn encode_inline(&self) -> ArrayVec<u8, { Self::MAX_ENCODED_LEN }> {
+        let mut out = ArrayVec::new();
         out.push(TAG_AUTH_REQUEST);
-        put_key(&mut out, &self.caller); // authenticating identity
-        out.extend_from_slice(&self.inner.encode()); // inner tag + body
+        put_key(&mut out, &self.caller);
+        self.inner.write(&mut out);
         put_u64(&mut out, self.auth.timestamp);
-        put_sig(&mut out, &self.auth.pop_sig);
+        put(&mut out, self.auth.pop_sig.as_ref());
         match &self.auth.cap {
             None => out.push(0),
             Some(cap) => {
                 out.push(1);
-                put_pubkey(&mut out, &cap.issuer);
+                put(&mut out, cap.issuer.as_ref());
                 put_u64(&mut out, cap.not_after);
-                put_sig(&mut out, &cap.issuer_sig);
+                put(&mut out, cap.issuer_sig.as_ref());
             }
         }
         out
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        self.encode_inline().into_iter().collect()
     }
 
     pub fn decode(buf: &[u8]) -> Result<AuthRequest, WireError> {
@@ -309,34 +361,73 @@ impl AuthRequest {
         if r.pos != buf.len() {
             return Err(WireError::Trailing);
         }
-        Ok(AuthRequest { caller, inner, auth: Authenticator { timestamp, pop_sig, cap } })
+        Ok(AuthRequest {
+            caller,
+            inner,
+            auth: Authenticator {
+                timestamp,
+                pop_sig,
+                cap,
+            },
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     fn addr(o: u8, p: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, o)), p)
     }
 
+    fn addr6(last: u16, port: u16) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last)),
+            port,
+        )
+    }
+
     #[test]
     fn every_variant_roundtrips() {
         let cases = vec![
-            Msg::BindRequest { from: NodeKey([1u8; 32]) },
-            Msg::BindResponse { reflexive: addr(2, 51820) },
-            Msg::Register { key: NodeKey([3u8; 32]) },
-            Msg::Readvertise { key: NodeKey([13u8; 32]), nonce: 0x0102_0304_dead_beef },
-            Msg::Lookup { key: NodeKey([4u8; 32]) },
-            Msg::LookupResponse { key: NodeKey([5u8; 32]), reflexive: Some(addr(6, 443)) },
-            Msg::LookupResponse { key: NodeKey([7u8; 32]), reflexive: None },
-            Msg::PunchSync { peer: NodeKey([8u8; 32]), peer_reflexive: addr(9, 7000) },
-            Msg::Punch { from: NodeKey([10u8; 32]) },
+            Msg::BindRequest {
+                from: NodeKey([1u8; 32]),
+            },
+            Msg::BindResponse {
+                reflexive: addr(2, 51820),
+            },
+            Msg::Register {
+                key: NodeKey([3u8; 32]),
+            },
+            Msg::Readvertise {
+                key: NodeKey([13u8; 32]),
+                nonce: 0x0102_0304_dead_beef,
+            },
+            Msg::Lookup {
+                key: NodeKey([4u8; 32]),
+            },
+            Msg::LookupResponse {
+                key: NodeKey([5u8; 32]),
+                reflexive: Some(addr6(6, 443)),
+            },
+            Msg::LookupResponse {
+                key: NodeKey([7u8; 32]),
+                reflexive: None,
+            },
+            Msg::PunchSync {
+                peer: NodeKey([8u8; 32]),
+                peer_reflexive: addr6(9, 7000),
+            },
+            Msg::Punch {
+                from: NodeKey([10u8; 32]),
+            },
         ];
         for m in cases {
             let bytes = m.encode();
+            let inline = m.encode_inline();
+            assert_eq!(&inline[..], bytes);
             let back = Msg::decode(&bytes).expect("decode");
             assert_eq!(m, back);
         }
@@ -370,19 +461,28 @@ mod tests {
         // A well-formed message with extra bytes appended (oversized /
         // malformed datagram) must be rejected outright, not silently
         // accepted by ignoring whatever the reader didn't consume.
-        let mut bytes = Msg::BindRequest { from: NodeKey([9u8; 32]) }.encode();
+        let mut bytes = Msg::BindRequest {
+            from: NodeKey([9u8; 32]),
+        }
+        .encode();
         bytes.push(0xff);
         assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
 
-        let mut bytes = Msg::PunchSync { peer: NodeKey([1u8; 32]), peer_reflexive: addr(2, 51820) }
-            .encode();
+        let mut bytes = Msg::PunchSync {
+            peer: NodeKey([1u8; 32]),
+            peer_reflexive: addr(2, 51820),
+        }
+        .encode();
         bytes.extend_from_slice(&[0, 0, 0]);
         assert_eq!(Msg::decode(&bytes), Err(WireError::Trailing));
     }
 
     #[test]
     fn readvertise_carries_key_and_nonce() {
-        let m = Msg::Readvertise { key: NodeKey([0xab; 32]), nonce: 0xffff_0000_ffff_0001 };
+        let m = Msg::Readvertise {
+            key: NodeKey([0xab; 32]),
+            nonce: 0xffff_0000_ffff_0001,
+        };
         let back = Msg::decode(&m.encode()).expect("decode");
         assert_eq!(m, back);
         // Trailing garbage after a Readvertise is rejected like any other message.
@@ -393,8 +493,8 @@ mod tests {
 
     #[test]
     fn auth_request_roundtrips_for_every_request_shape() {
-        use crate::auth::{sign_authenticator, mint_coord_cap};
-        use commonware_cryptography::{ed25519, Signer as _};
+        use crate::auth::{mint_coord_cap, sign_authenticator};
+        use commonware_cryptography::{Signer as _, ed25519};
 
         let node = ed25519::PrivateKey::from_seed(1);
         let g = ed25519::PrivateKey::from_seed(2);
@@ -405,8 +505,13 @@ mod tests {
         let inners = vec![
             Msg::BindRequest { from: subject },
             Msg::Register { key: subject },
-            Msg::Readvertise { key: subject, nonce: 42 },
-            Msg::Lookup { key: NodeKey([7u8; 32]) },
+            Msg::Readvertise {
+                key: subject,
+                nonce: 42,
+            },
+            Msg::Lookup {
+                key: NodeKey([7u8; 32]),
+            },
         ];
         for inner in inners {
             // With and without a cap.
@@ -414,8 +519,14 @@ mod tests {
                 let auth = sign_authenticator(&node, &inner.encode(), 1234, cap);
                 // caller is the authenticating identity — for a cross-peer
                 // Lookup it deliberately differs from the inner key.
-                let req = AuthRequest { caller: subject, inner: inner.clone(), auth };
+                let req = AuthRequest {
+                    caller: subject,
+                    inner: inner.clone(),
+                    auth,
+                };
                 let bytes = req.encode();
+                let inline = req.encode_inline();
+                assert_eq!(&inline[..], bytes);
                 let back = AuthRequest::decode(&bytes).expect("decode");
                 assert_eq!(req, back);
             }
@@ -425,28 +536,57 @@ mod tests {
     #[test]
     fn auth_request_rejects_response_inner() {
         use crate::auth::sign_authenticator;
-        use commonware_cryptography::{ed25519, Signer as _};
+        use commonware_cryptography::{Signer as _, ed25519};
         let node = ed25519::PrivateKey::from_seed(1);
         // Hand-encode an envelope whose inner is a RESPONSE (LookupResponse).
-        let inner = Msg::LookupResponse { key: NodeKey([1u8; 32]), reflexive: None };
+        let inner = Msg::LookupResponse {
+            key: NodeKey([1u8; 32]),
+            reflexive: None,
+        };
         let auth = sign_authenticator(&node, &inner.encode(), 1, None);
-        let bytes = AuthRequest { caller: NodeKey([9u8; 32]), inner, auth }.encode();
+        let bytes = AuthRequest {
+            caller: NodeKey([9u8; 32]),
+            inner,
+            auth,
+        }
+        .encode();
         assert_eq!(AuthRequest::decode(&bytes), Err(WireError::NotARequest));
     }
 
     #[test]
     fn auth_request_rejects_trailing_and_bare_msg_decode_rejects_tag_11() {
         use crate::auth::sign_authenticator;
-        use commonware_cryptography::{ed25519, Signer as _};
+        use commonware_cryptography::{Signer as _, ed25519};
         let node = ed25519::PrivateKey::from_seed(1);
-        let inner = Msg::Register { key: NodeKey([2u8; 32]) };
+        let inner = Msg::Register {
+            key: NodeKey([2u8; 32]),
+        };
         let auth = sign_authenticator(&node, &inner.encode(), 1, None);
-        let mut bytes = AuthRequest { caller: NodeKey([2u8; 32]), inner, auth }.encode();
+        let mut bytes = AuthRequest {
+            caller: NodeKey([2u8; 32]),
+            inner,
+            auth,
+        }
+        .encode();
         bytes.push(0xff);
         assert_eq!(AuthRequest::decode(&bytes), Err(WireError::Trailing));
         // A tag-11 envelope must NOT decode as a bare Msg.
-        let clean = AuthRequest { caller: NodeKey([2u8; 32]), inner: Msg::Register { key: NodeKey([2u8; 32]) },
-            auth: sign_authenticator(&node, &Msg::Register { key: NodeKey([2u8; 32]) }.encode(), 1, None) }.encode();
+        let clean = AuthRequest {
+            caller: NodeKey([2u8; 32]),
+            inner: Msg::Register {
+                key: NodeKey([2u8; 32]),
+            },
+            auth: sign_authenticator(
+                &node,
+                &Msg::Register {
+                    key: NodeKey([2u8; 32]),
+                }
+                .encode(),
+                1,
+                None,
+            ),
+        }
+        .encode();
         assert_eq!(Msg::decode(&clean), Err(WireError::BadTag(11)));
     }
 }

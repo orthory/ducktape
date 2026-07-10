@@ -5,19 +5,10 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { assigneeHex, dispatch, type DispatchView } from "./dispatch-client";
-import type { NodeTransport } from "./transport";
+import { makeTransportStub } from "../test/transport-stub";
 
-const stubTransport = (reply?: unknown): NodeTransport => ({
-  submit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
-  query: vi.fn().mockResolvedValue(reply),
-  view: vi.fn(),
-  putBlob: vi.fn().mockResolvedValue("ab".repeat(32)),
-  getBlob: vi.fn().mockResolvedValue(new Uint8Array()),
-  status: vi.fn(),
-  metrics: vi.fn(),
-  blocks: vi.fn(),
-  onBlock: vi.fn(),
-});
+const stubTransport = (reply?: unknown) =>
+  makeTransportStub({ query: vi.fn().mockResolvedValue(reply) });
 
 describe("dispatch", () => {
   it("addresses the dispatch under receiver 'runs' by default", async () => {

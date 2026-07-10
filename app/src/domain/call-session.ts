@@ -35,8 +35,12 @@ import {
   encodeCapturedVideo,
   decodeServerFrame,
 } from "./call-frames";
-import { SAMPLE_RATE, floatToPcm16, pcm16ToFloat, voiceErrorOf } from "./voice-session";
+import { SAMPLE_RATE, floatToPcm16, nextSpeaking, pcm16ToFloat, rms, voiceErrorOf } from "./voice-session";
 import type { VoiceStatus, VoiceError } from "./voice-session";
+// The control-frame shapes are generated from the node's `CallClientControl`/
+// `CallServerControl` serde enums (`make stream-types`) — a hand-rolled
+// mirror here would drift the moment either side adds a variant.
+import type { CallClientControl, CallServerControl } from "./stream.gen";
 
 export type { VoiceStatus, VoiceError };
 
@@ -60,10 +64,37 @@ const START_BITRATE_KBPS = 800;
  *  would fail the encoder's configure and silently kill the camera. */
 const MIN_BITRATE_KBPS = 300;
 const MAX_BITRATE_KBPS = 1200;
+/** How long an OPEN socket may sit with no inbound frame before the session is
+ *  declared failed. The hub emits a mixed frame every 20 ms once it serves the
+ *  session, so a silent open socket means the hub can't (media planes not up,
+ *  request queued forever) — without this bound the dock shows "connecting…"
+ *  indefinitely. Timed from socket open, NOT from start(): getUserMedia's
+ *  permission prompt can legitimately hold `start` open for minutes. */
+const CONNECT_TIMEOUT_MS = 12_000;
+/** RMS that reads as a "full" mic meter (0..1). Ordinary speech sits ~0.05–0.15
+ *  (SPEAKING_RMS is 0.02), so this scale gives a lively, reassuring self-check
+ *  bar without pinning to the top on every syllable. */
+const LEVEL_FULL_RMS = 0.25;
 
 export type CallEvent =
   | { kind: "status"; status: VoiceStatus; error?: VoiceError }
-  | { kind: "peerBeacon"; peer: string; muted: boolean; cameraOn: boolean; atMs: number };
+  | { kind: "peerBeacon"; peer: string; muted: boolean; cameraOn: boolean; sharing: boolean; atMs: number }
+  // Our own mic went above/below the speaking threshold — drives the self
+  // speaking ring and the "you're muted while talking" banner. Emitted only on a
+  // change (mute keeps capturing, so this fires even while muted).
+  | { kind: "selfSpeaking"; speaking: boolean }
+  // Our own mic input level, 0..1 (rms scaled), throttled to ~12 Hz. Drives the
+  // solo self-check meter so a lone user can SEE the mic responds — emitted even
+  // while muted (capture runs regardless), so the check needs no hot-mic moment.
+  | { kind: "selfLevel"; level: number }
+  // Our own video-lane state SETTLED — the authoritative source for the slice's
+  // cameraOn/sharing (fires on toggle, on a failed acquire, on encoder death, and
+  // when the browser's own "Stop sharing" ends a screen share).
+  | { kind: "selfVideo"; cameraOn: boolean; sharing: boolean }
+  // A camera/screen acquire FAILED after the user asked for it — the lane stays
+  // off (selfVideo already said so); this carries the WHY so the surface can say
+  // something instead of a button that silently snaps back.
+  | { kind: "mediaNote"; note: "camera-failed" | "screen-failed" };
 
 export interface CallSession {
   /** Open the mic graph and dial the call ws. Idempotent — a second call while
@@ -75,8 +106,17 @@ export interface CallSession {
   /** Stop forwarding captured frames (true) without dropping the track; beacons. */
   setMuted(muted: boolean): void;
   /** Enable/disable the camera. Enabling acquires + encodes asynchronously; a
-   *  failed acquire leaves the camera off. Beacons on every settled change. */
+   *  failed acquire leaves the camera off. Beacons on every settled change.
+   *  Turning the camera on while screen-sharing swaps the lane. */
   setCamera(on: boolean): void;
+  /** Enable/disable screen share on the SAME video lane (camera XOR screen).
+   *  Enabling acquires getDisplayMedia; a denial/cancel leaves it off. Beacons
+   *  `sharing` so peers letterbox + label the tile. */
+  setScreenShare(on: boolean): void;
+  /** Select input/output devices (undefined = system default). Applied live: the
+   *  mic swaps into the running capture graph, a live camera re-acquires, and the
+   *  speaker routes via setSinkId where supported. Also read at the next acquire. */
+  setDevices(prefs: { micId?: string; cameraId?: string; speakerId?: string }): void;
   /** Bind (or unbind, with null) the canvas a peer's video decodes onto. */
   bindTile(peerHex: string, canvas: HTMLCanvasElement | null): void;
   /** Bind (or unbind, with null) the local camera preview <video>. */
@@ -84,25 +124,9 @@ export interface CallSession {
   /** Tear the whole session down: ws, audio graph, camera, every decoder. */
   stop(): void;
 }
-
-/** Whether this runtime can do video calls (Chromium companion window on Linux;
- *  WebKitGTK lacks WebCodecs). Audio-only huddles work without it. */
-export const supportsVideoCalls = (): boolean =>
-  typeof VideoEncoder !== "undefined" &&
-  typeof VideoDecoder !== "undefined" &&
-  typeof (HTMLVideoElement.prototype as { requestVideoFrameCallback?: unknown })
-    .requestVideoFrameCallback === "function" &&
-  !!navigator.mediaDevices?.getUserMedia;
-
-/** A hub → webview control frame — camelCase tags and fields, mirroring the
- *  node's `CallServerControl` serde attributes. */
-interface ServerControl {
-  type?: string;
-  peer?: string;
-  muted?: boolean;
-  cameraOn?: boolean;
-  maxKbps?: number;
-}
+// Runtime video capability now lives in domain/video-capability.ts (a REAL codec
+// probe via isConfigSupported — WebKitGTK exposes the WebCodecs API but may not
+// register a vp8 encoder, and encode/decode capability can diverge).
 
 /** Create a call session. `onEvent` receives status transitions and peer
  *  beacons; the caller maps status into the ephemeral voice slice (and treats
@@ -118,6 +142,18 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   let muted = false;
   let started = false;
   let stopped = false;
+  // Chosen input/output devices (undefined = system default). Applied at acquire
+  // time (start / startVideo) and swapped live by setDevices.
+  let micId: string | undefined;
+  let cameraId: string | undefined;
+  let speakerId: string | undefined;
+  // Self active-speaker detection off the capture frames (runs even while muted).
+  let speaking = false;
+  let speakingHoldUntil = 0;
+  // Self mic-level meter (solo self-check): throttle emits and only push when the
+  // displayed level actually moves, so a 50 Hz capture doesn't spam React.
+  let lastLevelAtMs = 0;
+  let lastLevel = -1;
   // recipients requested before the socket was open — flushed on open.
   let pendingRecipients: string[] | null = null;
 
@@ -127,6 +163,15 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   // suppress the browser's follow-up close, so the caller keeps a visible error
   // state instead of having it wiped by 'closed'.
   let failed = false;
+  // armed when the socket opens; a session still 'connecting' when it fires is
+  // stuck against a hub that will never serve it (see CONNECT_TIMEOUT_MS).
+  let connectTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearConnectTimer = () => {
+    if (connectTimer !== null) {
+      clearTimeout(connectTimer);
+      connectTimer = null;
+    }
+  };
   const setStatus = (next: VoiceStatus, error?: VoiceError) => {
     status = next;
     onEvent({ kind: "status", status: next, error });
@@ -134,15 +179,24 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   // the first inbound frame that proves the hub is live promotes us out of
   // 'connecting'; anything after error/closed is left alone.
   const markLive = () => {
+    clearConnectTimer();
     if (status === "connecting") setStatus("live");
   };
 
-  // ── camera / encode ─────────────────────────────────────
+  // ── video lane (camera XOR screen) / encode ──────────────
+  // One VP8 lane, sourced from EITHER the camera or a screen share — the two are
+  // mutually exclusive (a mode-swap), beaconed as `cameraOn` / `sharing`.
   let camStream: MediaStream | null = null;
   let camVideo: HTMLVideoElement | null = null; // hidden frame source
   let encoder: VideoEncoder | null = null;
   let previewEl: HTMLVideoElement | null = null;
   let cameraOn = false;
+  let sharing = false; // the lane is a screen share rather than the camera
+  // A screen share that displaced a live camera puts it back when it ends (the
+  // user's "Stop sharing", a cancelled picker, our own toggle) — sharing a
+  // screen mid-video-call must not end your video. Cleared by any explicit
+  // camera toggle: the user's own act supersedes the remembered state.
+  let resumeCameraAfterShare = false;
   let forceKeyframe = true; // first frame, and on server keyframeRequest
   let framesSinceKey = 0;
   let bitrateKbps = START_BITRATE_KBPS; // rateHint moves it
@@ -179,11 +233,24 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     forceKeyframe = true; // the next enable opens with a keyframe
   };
 
-  const startCamera = async () => {
-    const media = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-    });
-    if (stopped || !cameraOn) {
+  const startVideo = async (screen: boolean) => {
+    // Guard on the mode WE were asked to start, not "any video" — a swap that
+    // flipped the lane to the other mode while our getUserMedia/getDisplayMedia
+    // was in flight must make this stale acquire bail (else it overwrites the
+    // live stream/encoder, leaking a track and mislabeling the beacon).
+    const wanted = () => (screen ? sharing : cameraOn);
+    const media = screen
+      ? await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } } })
+      : await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30 },
+            // `ideal` (bare string) so an absent camera falls back, not throws.
+            ...(cameraId ? { deviceId: cameraId } : {}),
+          },
+        });
+    if (stopped || !wanted()) {
       media.getTracks().forEach((t) => t.stop());
       return;
     }
@@ -197,7 +264,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
           encodeCapturedVideo(chunk.type === "key", Math.round(chunk.timestamp / 1000), data),
         );
       },
-      error: () => setCamera(false), // encoder death = camera off, session lives
+      error: () => stopVideoLane(), // encoder death = lane off, session lives
     });
     configureEncoder();
     const video = document.createElement("video");
@@ -205,18 +272,23 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     video.playsInline = true;
     video.srcObject = media;
     await video.play();
-    if (stopped || !cameraOn) {
+    if (stopped || !wanted()) {
       stopCameraGraph();
       return;
     }
     camVideo = video;
     if (previewEl) previewEl.srcObject = media;
+    // A screen share can be ended from the browser's OWN "Stop sharing" UI —
+    // mirror that back into our lane state so the beacon + button stay honest.
+    if (screen) {
+      media.getVideoTracks()[0]?.addEventListener("ended", () => setScreenShare(false));
+    }
     const pump = () => {
-      if (!cameraOn || !camVideo || !encoder || encoder.state === "closed") return;
+      if (!wanted() || !camVideo || !encoder || encoder.state === "closed") return;
       // rVFC is the portable frame source (Chromium + WebKit) — no
       // MediaStreamTrackProcessor dependency.
       camVideo.requestVideoFrameCallback((_now, meta) => {
-        if (cameraOn && encoder && encoder.state === "configured" && encoder.encodeQueueSize < 2) {
+        if (wanted() && encoder && encoder.state === "configured" && encoder.encodeQueueSize < 2) {
           const frame = new VideoFrame(camVideo!, {
             timestamp: Math.round(meta.mediaTime * 1_000_000),
           });
@@ -236,29 +308,94 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     pump();
   };
 
+  /** Force the whole video lane off (encoder death, or a swap failure). */
+  const stopVideoLane = (): void => {
+    cameraOn = false;
+    sharing = false;
+    // A force-kill ends any pending share→camera restore too: a stale flag
+    // would surprise-enable the webcam at the end of a LATER, unrelated share.
+    resumeCameraAfterShare = false;
+    stopCameraGraph();
+    sendBeacon();
+  };
+
   const sendBeacon = () => {
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "beacon", muted, cameraOn }));
+      socket.send(
+        JSON.stringify({ type: "beacon", muted, cameraOn, sharing } satisfies CallClientControl),
+      );
     }
+    // Mirror the settled lane state to the store — authoritative for paths the
+    // store can't see (failed acquire, encoder death, native "Stop sharing").
+    onEvent({ kind: "selfVideo", cameraOn, sharing });
   };
 
   const setCamera = (on: boolean): void => {
+    // The user's explicit camera choice supersedes any share-displaced state.
+    resumeCameraAfterShare = false;
     if (on === cameraOn) return; // idempotent
     if (on) {
+      if (sharing) {
+        // swap the lane from screen → camera.
+        sharing = false;
+        stopCameraGraph();
+      }
       cameraOn = true;
-      startCamera()
+      startVideo(false)
         .then(() => {
           if (cameraOn) sendBeacon();
         })
         .catch(() => {
-          // acquire/encode setup failed: stay off, surface nothing fatal.
+          // acquire/encode setup failed: the lane stays off, the session lives —
+          // but say so, or the button just snaps back with no explanation.
           cameraOn = false;
           stopCameraGraph();
+          sendBeacon();
+          onEvent({ kind: "mediaNote", note: "camera-failed" });
         });
     } else {
       cameraOn = false;
       stopCameraGraph();
       sendBeacon();
+    }
+  };
+
+  /** End-of-share hook: put a camera the share displaced back on. */
+  const maybeResumeCamera = (): void => {
+    if (!resumeCameraAfterShare || stopped) return;
+    resumeCameraAfterShare = false;
+    setCamera(true);
+  };
+
+  const setScreenShare = (on: boolean): void => {
+    if (on === sharing) return; // idempotent
+    if (on) {
+      if (cameraOn) {
+        // swap the lane from camera → screen, and remember to swap back.
+        resumeCameraAfterShare = true;
+        cameraOn = false;
+        stopCameraGraph();
+      }
+      sharing = true;
+      startVideo(true)
+        .then(() => {
+          if (sharing) sendBeacon();
+        })
+        .catch(() => {
+          // getDisplayMedia denied / cancelled: the share stays off — restore a
+          // camera it displaced (cancelling a share must not end your video),
+          // and say what happened.
+          sharing = false;
+          stopCameraGraph();
+          sendBeacon();
+          onEvent({ kind: "mediaNote", note: "screen-failed" });
+          maybeResumeCamera();
+        });
+    } else {
+      sharing = false;
+      stopCameraGraph();
+      sendBeacon();
+      maybeResumeCamera();
     }
   };
 
@@ -277,7 +414,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     if (now - pipe.lastRequestMs < 1000) return; // ≥1 s, mirroring the hub
     pipe.lastRequestMs = now;
     if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "keyframeRequest", peer: peerHex }));
+      socket.send(
+        JSON.stringify({ type: "keyframeRequest", peer: peerHex } satisfies CallClientControl),
+      );
     }
   };
 
@@ -319,6 +458,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   };
 
   const onPeerVideo = (peer: string, keyframe: boolean, tsMs: number, data: Uint8Array) => {
+    // No decode support on this runtime → ignore peer video rather than throw
+    // constructing a VideoDecoder on every frame (a decoder-less WKWebView).
+    if (typeof VideoDecoder === "undefined") return;
     const pipe = pipeFor(peer);
     if (pipe.awaitingKey && !keyframe) {
       requestPeerKeyframe(peer, pipe); // deltas are useless until a sync point
@@ -335,7 +477,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   };
 
   // ── control ─────────────────────────────────────────────
-  const parseControl = (text: string): ServerControl | null => {
+  const parseControl = (text: string): CallServerControl | null => {
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -343,14 +485,14 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
       return null;
     }
     if (!parsed || typeof parsed !== "object") return null;
-    const msg = parsed as ServerControl;
+    const msg = parsed as CallServerControl;
     if (msg.type === "keyframeRequest" || msg.type === "peerBeacon" || msg.type === "rateHint") {
       return msg;
     }
     return null;
   };
 
-  const applyControl = (msg: ServerControl) => {
+  const applyControl = (msg: CallServerControl) => {
     switch (msg.type) {
       case "keyframeRequest":
         // a peer lost sync with US — the next encoded frame must be a key.
@@ -369,6 +511,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
             peer: msg.peer.toLowerCase(),
             muted: !!msg.muted,
             cameraOn: !!msg.cameraOn,
+            sharing: !!msg.sharing,
             atMs: Date.now(),
           });
         }
@@ -395,7 +538,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   // ── socket ──────────────────────────────────────────────
   const sendRecipients = (peers: string[]) => {
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "recipients", peers }));
+      socket.send(JSON.stringify({ type: "recipients", peers } satisfies CallClientControl));
     } else {
       pendingRecipients = peers;
     }
@@ -405,6 +548,19 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     socket = ws;
+    // A hub that upgrades the socket but never serves the session (media planes
+    // down, request parked) would otherwise hold 'connecting' forever.
+    connectTimer = setTimeout(() => {
+      connectTimer = null;
+      if (stopped || status !== "connecting") return;
+      failed = true;
+      setStatus("error", "connection");
+      try {
+        ws.close();
+      } catch {
+        // already closing — the error status above is what matters.
+      }
+    }, CONNECT_TIMEOUT_MS);
     ws.onopen = () => {
       if (stopped) return;
       // NB: no 'live' here — that waits on the first inbound frame so a refusal
@@ -433,10 +589,12 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
       }
     };
     ws.onclose = () => {
+      clearConnectTimer();
       if (stopped || failed) return;
       setStatus("closed");
     };
     ws.onerror = () => {
+      clearConnectTimer();
       if (stopped) return;
       failed = true;
       setStatus("error", "connection");
@@ -444,15 +602,68 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   };
 
   // ── lifecycle ───────────────────────────────────────────
+  const audioConstraints = (): MediaTrackConstraints => ({
+    echoCancellation: true,
+    noiseSuppression: true,
+    channelCount: 1,
+    // `ideal` (bare string), NOT { exact } — a persisted-but-now-absent device
+    // must fall back to the system default, not OverconstrainedError the join.
+    ...(micId ? { deviceId: micId } : {}),
+  });
+
+  /** Route playout to the chosen speaker — AudioContext.setSinkId is Chromium
+   *  only; WebKitGTK / macOS WKWebView lack it, so this is a no-op there and the
+   *  speaker picker hides itself (media-devices.canSelectSpeaker). */
+  const applySpeaker = (): void => {
+    const sink = ctx as (AudioContext & { setSinkId?: (id: string) => Promise<void> }) | null;
+    if (speakerId && typeof sink?.setSinkId === "function") void sink.setSinkId(speakerId).catch(() => {});
+  };
+
+  /** Re-acquire the mic on a new device, swapping it into the LIVE capture graph
+   *  without rebuilding the worklet (playout + encode untouched). */
+  const swapMic = async (): Promise<void> => {
+    if (!ctx || !capture) return; // not live yet — start() picks up micId at acquire
+    try {
+      const media = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints() });
+      if (stopped) {
+        media.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      const next = ctx.createMediaStreamSource(media);
+      source?.disconnect();
+      stream?.getTracks().forEach((t) => t.stop());
+      stream = media;
+      source = next;
+      source.connect(capture);
+    } catch {
+      // keep the current mic on a failed acquire.
+    }
+  };
+
+  const setDevices = (prefs: { micId?: string; cameraId?: string; speakerId?: string }): void => {
+    const micChanged = prefs.micId !== micId;
+    const cameraChanged = prefs.cameraId !== cameraId;
+    micId = prefs.micId;
+    cameraId = prefs.cameraId;
+    speakerId = prefs.speakerId;
+    applySpeaker();
+    if (micChanged) void swapMic();
+    // Re-acquire the live camera on the new device (a screen share is
+    // unaffected). A bad/exact deviceId can OverconstrainedError — turn the lane
+    // off cleanly rather than leak an unhandled rejection + a stuck camera flag.
+    if (cameraChanged && cameraOn) {
+      stopCameraGraph();
+      void startVideo(false).catch(() => stopVideoLane());
+    }
+  };
+
   const start = (wsUrl: string) => {
     if (started) return;
     started = true;
     setStatus("connecting");
     Promise.resolve()
       .then(() =>
-        navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
-        }),
+        navigator.mediaDevices.getUserMedia({ audio: audioConstraints() }),
       )
       .then(async (media) => {
         if (stopped) {
@@ -472,8 +683,26 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
           numberOfOutputs: 0,
         });
         cap.port.onmessage = (event) => {
+          const frame = event.data as Float32Array;
+          // Speaking detection first, so it fires even when muted (below).
+          const now = Date.now();
+          const amplitude = rms(frame);
+          const detected = nextSpeaking(amplitude, now, speakingHoldUntil);
+          speakingHoldUntil = detected.holdUntil;
+          if (detected.speaking !== speaking) {
+            speaking = detected.speaking;
+            onEvent({ kind: "selfSpeaking", speaking });
+          }
+          // Meter level: rms scaled so ordinary speech fills a visible chunk.
+          // ~12 Hz + a 0.03 dead-band keeps it smooth without flooding React.
+          const level = Math.min(1, amplitude / LEVEL_FULL_RMS);
+          if (now - lastLevelAtMs > 80 && Math.abs(level - lastLevel) > 0.03) {
+            lastLevelAtMs = now;
+            lastLevel = level;
+            onEvent({ kind: "selfLevel", level });
+          }
           if (muted || !socket || socket.readyState !== WebSocket.OPEN) return;
-          socket.send(encodeAudioFrame(floatToPcm16(event.data as Float32Array)));
+          socket.send(encodeAudioFrame(floatToPcm16(frame)));
         };
         source.connect(cap);
         capture = cap;
@@ -486,6 +715,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
         });
         play.connect(context.destination);
         playback = play;
+        applySpeaker(); // route to the chosen speaker if one is set + supported
 
         openSocket(wsUrl);
       })
@@ -522,6 +752,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     if (stopped) return;
     stopped = true;
     cameraOn = false;
+    sharing = false;
+    resumeCameraAfterShare = false;
+    clearConnectTimer();
     if (socket) {
       // drop handlers first so our own close doesn't fire onEvent('closed').
       socket.onopen = null;
@@ -560,5 +793,5 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     tileBindings.clear();
   };
 
-  return { start, setRecipients, setMuted, setCamera, bindTile, bindPreview, stop };
+  return { start, setRecipients, setMuted, setCamera, setScreenShare, setDevices, bindTile, bindPreview, stop };
 };

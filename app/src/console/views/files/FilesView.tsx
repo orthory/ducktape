@@ -1,54 +1,193 @@
-// The files surface over the node's `files` module — content-addressed
-// manifests. Upload chunks + stages bytes into the blob store then commits a
-// manifest (consensus write); download reassembles the bytes from the blob
-// store and verifies every chunk against the committed manifest before
-// handing them to the browser; delete tombstones the manifest (owner-gated).
+// The duckfs browser: a live directory tree over the node's `files` module (a
+// consensus-replicated, copy-on-write filesystem). It pages `ls` off the live
+// transport (context.transport) with breadcrumb navigation, opens a file panel
+// (preview + download) on click, uploads into the current directory (staging
+// chunks with per-chunk progress), deletes with a confirm, and — via the
+// history panel — browses any past snapshot and diffs it against head.
 //
-// The chunk BYTES never enter consensus — only the manifest (identity, size,
-// ordered chunk digests) does, so this view is a thin shell over
-// `actions.uploadFile` / `downloadFile` / `removeFile`.
+// Reads/writes go straight to domain/files-client (like the forge browser);
+// the store keeps only a flat Find projection for the command palette.
 
-import { useEffect, useRef, useState } from "react";
-import type { ChangeEvent } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  ChangeEvent,
+  DragEvent as ReactDragEvent,
+  FormEvent,
+  MouseEvent as ReactMouseEvent,
+  ReactNode,
+} from "react";
 
-import type { Manifest } from "../../../domain/files-client";
-import { FinalizationMark } from "../../components/FinalizationMark";
-import { Icon } from "../../components/Icon";
-import { opKey } from "../../store/finalization";
-import type { OpRecord } from "../../store/finalization";
+import {
+  deletePath,
+  joinPath,
+  ls,
+  mkdir,
+  readAll,
+  refs,
+  uploadFile,
+  uploadFiles,
+} from "../../../domain/files-client";
+import type { FileEntry, FileUploadEntry } from "../../../domain/files-client";
+import { FILES_WATCH_TOPIC } from "../../../domain/stream";
+import { Icon, type IconName } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
-import { color, font, radius, shadow } from "../../theme/tokens";
+import { color, font, radius, shadow, tint } from "../../theme/tokens";
+import { FilePreview } from "./FilePreview";
+import { errMsg, humanBytes } from "./files-format";
+import { HistoryPanel } from "./HistoryPanel";
 
-/** How long an armed delete-confirm or an upload hint stays visible before it
- *  resets on its own (in case the follow-up interaction never lands). */
-const CONFIRM_TIMEOUT_MS = 3000;
-const UPLOAD_HINT_TIMEOUT_MS = 20_000;
+/** Where the browser opens and where root-level writes land by default. */
+const DEFAULT_DIR = "/shared";
 
-const humanBytes = (n: number): string => {
-  if (!Number.isFinite(n) || n <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  let value = n;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
+interface UploadState {
+  name: string;
+  targetDir: string;
+  staged: number;
+  total: number;
+}
+
+type BrowserUploadEntry =
+  | { kind: "file"; file: File; relativePath: string }
+  | { kind: "dir"; relativePath: string };
+
+interface WebkitFileSystemEntry {
+  isFile: boolean;
+  isDirectory: boolean;
+  name: string;
+  fullPath: string;
+}
+
+interface WebkitFileSystemFileEntry extends WebkitFileSystemEntry {
+  file: (success: (file: File) => void, error?: (err: DOMException) => void) => void;
+}
+
+interface WebkitFileSystemDirectoryReader {
+  readEntries: (
+    success: (entries: WebkitFileSystemEntry[]) => void,
+    error?: (err: DOMException) => void,
+  ) => void;
+}
+
+interface WebkitFileSystemDirectoryEntry extends WebkitFileSystemEntry {
+  createReader: () => WebkitFileSystemDirectoryReader;
+}
+
+interface ContextMenuState {
+  x: number;
+  y: number;
+  entry: FileEntry | null;
+}
+
+interface DirectoryColumn {
+  path: string;
+  entries: FileEntry[];
+  cursor: string | null;
+  loading: boolean;
+  error: string | null;
+}
+
+/** dirs before files, then case-insensitive by name — a stable browse order on
+ *  top of the module's raw name-order page. */
+const sortEntries = (entries: FileEntry[]): FileEntry[] =>
+  [...entries].sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === "dir" ? -1 : b.kind === "dir" ? 1 : 0;
+    return a.path.localeCompare(b.path);
+  });
+
+const writeTargetDir = (dir: string): string => (dir === "/" ? DEFAULT_DIR : dir);
+const basename = (path: string): string => path.split("/").pop() || path;
+const uploadRelativePath = (file: File): string => {
+  const candidate = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+  return candidate && candidate.length > 0 ? candidate : file.name;
+};
+const uploadTopName = (entries: { relativePath: string }[]): string | null => {
+  if (entries.length === 0) return null;
+  const top = entries[0].relativePath.split("/").filter(Boolean)[0] ?? null;
+  if (!top) return null;
+  return entries.every((entry) => entry.relativePath.split("/").filter(Boolean)[0] === top)
+    ? top
+    : null;
+};
+const uploadMessage = (entries: { relativePath: string }[]): string => {
+  const top = uploadTopName(entries);
+  if (top && entries.some((entry) => entry.relativePath.includes("/"))) {
+    return `upload folder ${top}`;
   }
-  const rendered = unit === 0 ? String(Math.round(value)) : value.toFixed(value < 10 ? 1 : 0);
-  return `${rendered} ${units[unit]}`;
+  return entries.length === 1 ? `upload ${basename(entries[0].relativePath)}` : `upload ${entries.length} files`;
+};
+const makeDirectoryColumn = (path: string): DirectoryColumn => ({
+  path,
+  entries: [],
+  cursor: null,
+  loading: true,
+  error: null,
+});
+const parentDir = (path: string): string => {
+  const trimmed = path.replace(/\/+$/, "");
+  const slash = trimmed.lastIndexOf("/");
+  return slash <= 0 ? "/" : trimmed.slice(0, slash);
+};
+const columnPathsFor = (path: string): string[] => {
+  if (path === "/") return ["/"];
+  const segments = path.replace(/^\/+|\/+$/g, "").split("/").filter(Boolean);
+  let acc = "";
+  return segments.map((segment) => {
+    acc += `/${segment}`;
+    return acc;
+  });
+};
+const fileFromEntry = (entry: WebkitFileSystemFileEntry): Promise<File> =>
+  new Promise((resolve, reject) => entry.file(resolve, reject));
+const readDirectoryEntries = async (
+  reader: WebkitFileSystemDirectoryReader,
+): Promise<WebkitFileSystemEntry[]> => {
+  const out: WebkitFileSystemEntry[] = [];
+  for (;;) {
+    const batch = await new Promise<WebkitFileSystemEntry[]>((resolve, reject) =>
+      reader.readEntries(resolve, reject),
+    );
+    if (batch.length === 0) return out;
+    out.push(...batch);
+  }
+};
+const stripEntryPath = (path: string): string => path.replace(/^\/+/, "");
+const collectEntryUploads = async (
+  entry: WebkitFileSystemEntry,
+): Promise<BrowserUploadEntry[]> => {
+  if (entry.isFile) {
+    const file = await fileFromEntry(entry as WebkitFileSystemFileEntry);
+    return [{ kind: "file", file, relativePath: stripEntryPath(entry.fullPath) || file.name }];
+  }
+  if (!entry.isDirectory) return [];
+  const dir = entry as WebkitFileSystemDirectoryEntry;
+  const children = await readDirectoryEntries(dir.createReader());
+  if (children.length === 0) {
+    return [{ kind: "dir", relativePath: stripEntryPath(entry.fullPath) || entry.name }];
+  }
+  const nested = await Promise.all(children.map((child) => collectEntryUploads(child)));
+  return nested.flat();
+};
+const collectDroppedUploads = async (dataTransfer: DataTransfer): Promise<BrowserUploadEntry[]> => {
+  const items = Array.from(dataTransfer.items ?? []);
+  const entries = items
+    .map(
+      (item) =>
+        (item as { webkitGetAsEntry?: () => WebkitFileSystemEntry | null }).webkitGetAsEntry?.() ??
+        null,
+    )
+    .filter((entry): entry is WebkitFileSystemEntry => entry !== null);
+  if (entries.length > 0) {
+    const nested = await Promise.all(entries.map((entry) => collectEntryUploads(entry)));
+    return nested.flat();
+  }
+  return Array.from(dataTransfer.files ?? []).map((file) => ({
+    kind: "file",
+    file,
+    relativePath: uploadRelativePath(file),
+  }));
 };
 
-const shortOwner = (owner: string): string =>
-  owner.length > 10 ? `${owner.slice(0, 10)}…` : owner || "—";
-
-function CenterState({
-  title,
-  detail,
-  muted,
-}: {
-  title: string;
-  detail: string;
-  muted?: boolean;
-}) {
+function CenterState({ title, detail, muted }: { title: string; detail: string; muted?: boolean }) {
   return (
     <div
       style={{
@@ -68,7 +207,7 @@ function CenterState({
           height: 36,
           borderRadius: radius.md,
           border: `1px solid ${color.border}`,
-          background: muted ? color.sunken : "#eef5f0",
+          background: muted ? color.sunken : tint(color.green).bg,
           color: muted ? color.muted : color.green,
           display: "flex",
           alignItems: "center",
@@ -78,94 +217,660 @@ function CenterState({
         <Icon name="files" size={17} strokeWidth={1.7} />
       </span>
       <div style={{ font: `600 14px ${font.sans}`, color: color.muted3 }}>{title}</div>
-      <div
-        style={{
-          maxWidth: 360,
-          font: `400 11.5px ${font.sans}`,
-          color: color.muted2,
-          lineHeight: 1.55,
-        }}
-      >
+      <div style={{ maxWidth: 360, font: `400 11.5px ${font.sans}`, color: color.muted2, lineHeight: 1.55 }}>
         {detail}
       </div>
     </div>
   );
 }
 
-function MimeChip({ mime }: { mime: string }) {
-  return (
-    <span
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        borderRadius: radius.sm,
-        border: `1px solid ${color.borderSoft}`,
-        background: color.sunken,
-        color: color.muted3,
-        padding: "2px 7px",
-        font: `500 10px ${font.mono}`,
-        whiteSpace: "nowrap",
-        flexShrink: 0,
-      }}
-    >
-      {mime || "unknown"}
-    </span>
-  );
-}
-
-function RowButton({
+function HeaderButton({
   label,
-  ariaLabel,
-  busy,
+  icon,
   disabled,
-  tone,
+  active,
   onClick,
-  onBlur,
 }: {
   label: string;
-  ariaLabel: string;
-  busy?: boolean;
+  icon: IconName;
   disabled?: boolean;
-  tone?: "danger";
+  active?: boolean;
   onClick: () => void;
-  onBlur?: () => void;
 }) {
   const [hover, setHover] = useState(false);
-  const danger = tone === "danger";
-  const isDisabled = Boolean(disabled) || Boolean(busy);
-
   return (
     <button
       type="button"
-      aria-label={ariaLabel}
-      aria-busy={busy || undefined}
-      disabled={isDisabled}
+      disabled={disabled}
+      aria-pressed={active}
       onClick={onClick}
-      onBlur={onBlur}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
         all: "unset",
         boxSizing: "border-box",
-        height: 28,
-        padding: "0 10px",
+        height: 32,
+        padding: "0 12px",
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 6,
+        borderRadius: radius.sm,
+        border: `1px solid ${disabled ? color.borderSoft : color.borderStrong}`,
+        background: disabled ? color.sunken : active ? color.sidebar : hover ? color.hover : color.paper,
+        color: disabled ? color.muted2 : color.inkSoft,
+        cursor: disabled ? "default" : "pointer",
+        font: `600 12px ${font.sans}`,
+        whiteSpace: "nowrap",
+      }}
+    >
+      <Icon name={icon} size={13} strokeWidth={1.9} />
+      {label}
+    </button>
+  );
+}
+
+function UploadNotice({ upload }: { upload: UploadState | null }) {
+  if (!upload) return null;
+
+  const progress = upload.total > 0 ? Math.min(1, upload.staged / upload.total) : 0;
+  const detail = `${upload.name} to ${upload.targetDir}`;
+
+  return (
+    <div
+      role="status"
+      aria-label="Upload file"
+      aria-live="polite"
+      style={{
+        position: "absolute",
+        top: 18,
+        left: "50%",
+        transform: "translateX(-50%)",
+        zIndex: 30,
+        pointerEvents: "none",
+        boxSizing: "border-box",
+        width: "min(360px, calc(100% - 32px))",
+        borderRadius: radius.lg,
+        border: `1px solid ${color.borderStrong}`,
+        background: "rgba(255, 255, 255, 0.96)",
+        boxShadow: shadow.pop,
+        padding: 14,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <span
+          style={{
+            width: 34,
+            height: 34,
+            borderRadius: radius.md,
+            border: `1px solid ${color.border}`,
+            background: tint(color.green).bg,
+            color: color.green,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="refresh" size={16} strokeWidth={1.9} />
+        </span>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ font: `700 14px ${font.sans}`, color: color.dark }}>Upload file</div>
+          <div
+            style={{
+              marginTop: 3,
+              font: `500 12px ${font.sans}`,
+              color: color.muted3,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {detail}
+          </div>
+        </div>
+      </div>
+      <div style={{ marginTop: 12 }}>
+        <div
+          style={{
+            height: 6,
+            borderRadius: 999,
+            background: color.sunken,
+            overflow: "hidden",
+            border: `1px solid ${color.borderSoft}`,
+          }}
+        >
+          <div
+            style={{
+              width: upload.total > 0 ? `${progress * 100}%` : "28%",
+              height: "100%",
+              borderRadius: 999,
+              background: color.green,
+            }}
+          />
+        </div>
+        <div style={{ marginTop: 6, font: `600 10.5px ${font.mono}`, color: color.muted2 }}>
+          {upload.total > 0 ? `chunk ${upload.staged}/${upload.total}` : "preparing upload"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The prominent drop-zone shown over the whole file browser while an OS file
+ *  drag is in flight — the reaction that replaced the old flickery top hint.
+ *  Purely visual: `pointerEvents:none` lets the drag/drop bubble to the card's
+ *  own handlers (and stops a freshly-mounted overlay from firing spurious
+ *  dragenter/dragleave that would break the depth counter). */
+function UploadDropOverlay({ targetDir }: { targetDir: string }) {
+  return (
+    <div
+      role="dialog"
+      aria-label="Drop files to upload"
+      style={{
+        position: "absolute",
+        inset: 0,
+        zIndex: 60,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 24,
+        background: "rgba(38, 37, 31, 0.16)",
+        pointerEvents: "none",
+      }}
+    >
+      <div
+        style={{
+          boxSizing: "border-box",
+          width: "min(420px, 100%)",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          gap: 14,
+          padding: "34px 28px",
+          borderRadius: radius.lg,
+          border: `2px dashed ${color.green}`,
+          background: "rgba(255, 255, 255, 0.97)",
+          boxShadow: shadow.pop,
+          textAlign: "center",
+        }}
+      >
+        <span
+          style={{
+            width: 52,
+            height: 52,
+            borderRadius: radius.md,
+            border: `1px solid ${color.border}`,
+            background: tint(color.green).bg,
+            color: color.green,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Icon name="plus" size={24} strokeWidth={1.9} />
+        </span>
+        <div style={{ font: `700 16px ${font.sans}`, color: color.dark }}>Drop files to upload</div>
+        <div
+          style={{
+            font: `500 13px ${font.sans}`,
+            color: color.muted3,
+            maxWidth: "100%",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          Release to add them to {targetDir}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Breadcrumb({ dir, onNavigate }: { dir: string; onNavigate: (path: string) => void }) {
+  const segments = dir === "/" ? [] : dir.replace(/^\//, "").split("/");
+  const crumbs = [{ name: "/", path: "/" }];
+  let acc = "";
+  for (const segment of segments) {
+    acc += `/${segment}`;
+    crumbs.push({ name: segment, path: acc });
+  }
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 3, minWidth: 0, overflow: "hidden" }}>
+      {crumbs.map((crumb, index) => {
+        const last = index === crumbs.length - 1;
+        return (
+          <span key={crumb.path} style={{ display: "inline-flex", alignItems: "center", gap: 3, minWidth: 0 }}>
+            {index > 0 && <Icon name="chevronRight" size={11} strokeWidth={1.9} color={color.muted2} />}
+            <button
+              type="button"
+              disabled={last}
+              onClick={() => onNavigate(crumb.path)}
+              style={{
+                all: "unset",
+                cursor: last ? "default" : "pointer",
+                font: `${last ? 600 : 500} 13px ${font.sans}`,
+                color: last ? color.dark : color.muted,
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
+            >
+              {crumb.name === "/" ? "root" : crumb.name}
+            </button>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+function EntryRow({
+  entry,
+  selected,
+  onOpen,
+  onContextMenu,
+  onPrepareDownload,
+  onDragStart,
+}: {
+  entry: FileEntry;
+  selected: boolean;
+  onOpen: () => void;
+  onContextMenu: (event: ReactMouseEvent<HTMLButtonElement>) => void;
+  onPrepareDownload: () => void;
+  onDragStart: (event: ReactDragEvent<HTMLButtonElement>) => void;
+}) {
+  const [hover, setHover] = useState(false);
+  const isDir = entry.kind === "dir";
+  const name = basename(entry.path);
+  return (
+    <button
+      type="button"
+      aria-label={`${isDir ? "Open folder" : "Open file"} ${name}`}
+      draggable={!isDir}
+      onClick={onOpen}
+      onContextMenu={onContextMenu}
+      onMouseDown={() => {
+        if (!isDir) onPrepareDownload();
+      }}
+      onDragStart={(event) => {
+        if (!isDir) onDragStart(event);
+      }}
+      onMouseEnter={() => {
+        setHover(true);
+        if (!isDir) onPrepareDownload();
+      }}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        all: "unset",
+        boxSizing: "border-box",
+        width: "100%",
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        gap: 12,
+        padding: "11px 16px",
+        borderBottom: `1px solid ${color.borderSoft}`,
+        background: selected ? color.sidebar : hover ? color.hover : "transparent",
+      }}
+    >
+      <span
+        style={{
+          width: 28,
+          height: 28,
+          borderRadius: radius.sm,
+          border: `1px solid ${color.border}`,
+          background: isDir ? tint(color.green).bg : color.sunken,
+          color: isDir ? color.green : color.muted3,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          flexShrink: 0,
+        }}
+      >
+        <Icon name={isDir ? "modules" : "files"} size={14} strokeWidth={1.7} />
+      </span>
+      <span
+        title={name}
+        style={{
+          flex: 1,
+          minWidth: 0,
+          font: `${isDir ? 600 : 500} 13.5px ${font.sans}`,
+          color: color.ink,
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+        }}
+      >
+        {name}
+        {entry.kind === "symlink" ? " ↪" : ""}
+      </span>
+      <span style={{ font: `400 11px ${font.mono}`, color: color.muted2, flexShrink: 0 }}>
+        {isDir ? "" : humanBytes(entry.size)}
+        {entry.exec ? " · exec" : ""}
+      </span>
+      {isDir && <Icon name="chevronRight" size={14} strokeWidth={1.9} color={color.muted2} />}
+    </button>
+  );
+}
+
+function DirectoryColumnView({
+  column,
+  selectedPath,
+  childPath,
+  onOpen,
+  onContextMenu,
+  onLoadMore,
+  onPrepareDownload,
+  onFileDragStart,
+}: {
+  column: DirectoryColumn;
+  selectedPath: string | null;
+  childPath: string | null;
+  onOpen: (entry: FileEntry) => void;
+  onContextMenu: (
+    event: ReactMouseEvent<HTMLButtonElement | HTMLElement>,
+    entry: FileEntry | null,
+  ) => void;
+  onLoadMore: (path: string) => void;
+  onPrepareDownload: (entry: FileEntry) => void;
+  onFileDragStart: (event: ReactDragEvent<HTMLButtonElement>, entry: FileEntry) => void;
+}) {
+  const rows = sortEntries(column.entries);
+  const label = column.path === "/" ? "root" : basename(column.path);
+
+  return (
+    <section
+      role="region"
+      aria-label={`Column ${column.path}`}
+      onContextMenu={(event) => onContextMenu(event, null)}
+      style={{
+        width: 286,
+        flex: "0 0 286px",
+        minHeight: 0,
+        display: "flex",
+        flexDirection: "column",
+        borderRight: `1px solid ${color.borderSoft}`,
+        background: color.paper,
+      }}
+    >
+      <div
+        style={{
+          height: 38,
+          flexShrink: 0,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "0 12px",
+          borderBottom: `1px solid ${color.borderSoft}`,
+          background: color.sunken,
+        }}
+      >
+        <Icon name="modules" size={13} strokeWidth={1.8} color={color.muted3} />
+        <span
+          title={column.path}
+          style={{
+            minWidth: 0,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            font: `700 12px ${font.sans}`,
+            color: color.ink,
+          }}
+        >
+          {label}
+        </span>
+      </div>
+
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
+        {column.loading ? (
+          <CenterState title="Loading…" detail="Reading this directory." muted />
+        ) : column.error ? (
+          <CenterState title="Could not read folder" detail={column.error} muted />
+        ) : rows.length === 0 ? (
+          <CenterState title="Empty directory" detail="Nothing here." muted />
+        ) : (
+          <>
+            {rows.map((entry) => (
+              <EntryRow
+                key={entry.path}
+                entry={entry}
+                selected={selectedPath === entry.path || childPath === entry.path}
+                onOpen={() => onOpen(entry)}
+                onContextMenu={(event) => onContextMenu(event, entry)}
+                onPrepareDownload={() => onPrepareDownload(entry)}
+                onDragStart={(event) => onFileDragStart(event, entry)}
+              />
+            ))}
+            {column.cursor && (
+              <button
+                type="button"
+                onClick={() => onLoadMore(column.path)}
+                style={{
+                  all: "unset",
+                  boxSizing: "border-box",
+                  width: "100%",
+                  cursor: "pointer",
+                  textAlign: "center",
+                  padding: "10px 0",
+                  font: `600 11.5px ${font.sans}`,
+                  color: color.muted,
+                }}
+              >
+                Load more
+              </button>
+            )}
+          </>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ContextMenuItem({
+  label,
+  icon,
+  danger,
+  disabled,
+  onSelect,
+}: {
+  label: string;
+  icon: IconName;
+  danger?: boolean;
+  disabled?: boolean;
+  onSelect: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      disabled={disabled}
+      onClick={(event) => {
+        event.stopPropagation();
+        if (!disabled) onSelect();
+      }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        all: "unset",
+        boxSizing: "border-box",
+        width: "100%",
+        minHeight: 30,
+        padding: "0 9px",
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        borderRadius: radius.sm,
+        background: hover && !disabled ? (danger ? color.dangerSoft : color.hover) : "transparent",
+        color: disabled ? color.muted2 : danger ? color.danger : color.inkSoft,
+        cursor: disabled ? "default" : "pointer",
+        font: `500 12.5px ${font.sans}`,
+      }}
+    >
+      <Icon name={icon} size={13} strokeWidth={1.8} />
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function FilesContextMenu({
+  menu,
+  readOnly,
+  onClose,
+  onOpen,
+  onNewFolder,
+  onUpload,
+  onUploadFolder,
+  onDelete,
+  onRefresh,
+}: {
+  menu: ContextMenuState;
+  readOnly: boolean;
+  onClose: () => void;
+  onOpen: (entry: FileEntry) => void;
+  onNewFolder: () => void;
+  onUpload: () => void;
+  onUploadFolder: () => void;
+  onDelete: (entry: FileEntry) => void;
+  onRefresh: () => void;
+}) {
+  const entry = menu.entry;
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    const timer = setTimeout(() => document.addEventListener("click", onClose), 0);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("click", onClose);
+      clearTimeout(timer);
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      role="menu"
+      aria-label="File actions"
+      onClick={(event) => event.stopPropagation()}
+      style={{
+        position: "fixed",
+        left: Math.max(8, menu.x),
+        top: Math.max(8, menu.y),
+        zIndex: 60,
+        width: 184,
+        padding: 4,
+        border: `1px solid ${color.border}`,
+        borderRadius: radius.md,
+        background: color.paper,
+        boxShadow: shadow.pop,
+      }}
+    >
+      {entry && (
+        <>
+          <ContextMenuItem
+            label="Open"
+            icon={entry.kind === "dir" ? "modules" : "files"}
+            onSelect={() => {
+              onOpen(entry);
+              onClose();
+            }}
+          />
+          <ContextMenuItem
+            label="Delete"
+            icon="close"
+            danger
+            disabled={readOnly}
+            onSelect={() => {
+              onDelete(entry);
+              onClose();
+            }}
+          />
+          <div style={{ height: 1, margin: "4px 6px", background: color.borderSoft }} />
+        </>
+      )}
+      <ContextMenuItem
+        label="New folder"
+        icon="modules"
+        disabled={readOnly}
+        onSelect={() => {
+          onNewFolder();
+          onClose();
+        }}
+      />
+      <ContextMenuItem
+        label="Upload"
+        icon="plus"
+        disabled={readOnly}
+        onSelect={() => {
+          onUpload();
+          onClose();
+        }}
+      />
+      <ContextMenuItem
+        label="Upload folder"
+        icon="files"
+        disabled={readOnly}
+        onSelect={() => {
+          onUploadFolder();
+          onClose();
+        }}
+      />
+      <ContextMenuItem
+        label="Refresh"
+        icon="refresh"
+        onSelect={() => {
+          onRefresh();
+          onClose();
+        }}
+      />
+    </div>
+  );
+}
+
+function DialogButton({
+  label,
+  variant,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  variant?: "primary" | "danger";
+  disabled?: boolean;
+  onClick?: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  const activeBg = variant === "danger" ? color.danger : color.green;
+  return (
+    <button
+      type={onClick ? "button" : "submit"}
+      disabled={disabled}
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        all: "unset",
+        boxSizing: "border-box",
+        height: 32,
+        minWidth: 74,
+        padding: "0 12px",
         display: "inline-flex",
         alignItems: "center",
         justifyContent: "center",
         borderRadius: radius.sm,
-        border: `1px solid ${danger ? color.dangerBorder : color.borderStrong}`,
-        background: danger
-          ? color.dangerSoft
-          : isDisabled
-            ? color.sunken
+        border: `1px solid ${variant ? activeBg : color.borderStrong}`,
+        background: disabled
+          ? color.sunken
+          : variant
+            ? activeBg
             : hover
               ? color.hover
               : color.paper,
-        color: danger ? color.danger : isDisabled ? color.muted2 : color.inkSoft,
-        cursor: isDisabled ? "default" : "pointer",
-        font: `600 11px ${font.sans}`,
+        color: disabled ? color.muted2 : variant ? "#fff" : color.inkSoft,
+        cursor: disabled ? "default" : "pointer",
+        font: `600 12px ${font.sans}`,
         whiteSpace: "nowrap",
-        flexShrink: 0,
       }}
     >
       {label}
@@ -173,254 +878,565 @@ function RowButton({
   );
 }
 
-function FileRow({
-  manifest,
-  downloading,
-  op,
-  onDownload,
-  onDelete,
-}: {
-  manifest: Manifest;
-  downloading: boolean;
-  /** The manifest's finalization record — the meta line draws the mark. */
-  op: OpRecord | undefined;
-  onDownload: () => void;
-  onDelete: () => void;
-}) {
-  const [hover, setHover] = useState(false);
-  const [expanded, setExpanded] = useState(false);
-  const [confirming, setConfirming] = useState(false);
-  const confirmTimer = useRef<number | null>(null);
-
-  useEffect(
-    () => () => {
-      if (confirmTimer.current !== null) window.clearTimeout(confirmTimer.current);
-    },
-    [],
-  );
-
-  const resetConfirm = () => {
-    if (confirmTimer.current !== null) {
-      window.clearTimeout(confirmTimer.current);
-      confirmTimer.current = null;
-    }
-    setConfirming(false);
-  };
-
-  const handleDeleteClick = () => {
-    if (confirming) {
-      resetConfirm();
-      onDelete();
-      return;
-    }
-    setConfirming(true);
-    if (confirmTimer.current !== null) window.clearTimeout(confirmTimer.current);
-    confirmTimer.current = window.setTimeout(() => setConfirming(false), CONFIRM_TIMEOUT_MS);
-  };
-
+function ModalShell({ children }: { children: ReactNode }) {
   return (
     <div
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
       style={{
-        borderBottom: `1px solid ${color.borderSoft}`,
-        background: hover ? color.sidebar : "transparent",
+        position: "fixed",
+        inset: 0,
+        zIndex: 70,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 20,
+        background: "rgba(38, 37, 31, 0.18)",
       }}
     >
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 13,
-          padding: "13px 16px",
-        }}
-      >
-        <span
-          style={{
-            width: 30,
-            height: 30,
-            borderRadius: radius.sm,
-            border: `1px solid ${color.border}`,
-            background: color.sunken,
-            color: color.muted3,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            flexShrink: 0,
-          }}
-        >
-          <Icon name="files" size={15} strokeWidth={1.7} />
-        </span>
-
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-            <span
-              title={manifest.name}
-              style={{
-                font: `600 14px ${font.sans}`,
-                color: color.ink,
-                whiteSpace: "nowrap",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-              }}
-            >
-              {manifest.name}
-            </span>
-            <MimeChip mime={manifest.mime} />
-          </div>
-          <div
-            style={{
-              marginTop: 5,
-              display: "flex",
-              alignItems: "center",
-              gap: 6,
-              flexWrap: "wrap",
-              font: `400 11px ${font.mono}`,
-              color: color.muted2,
-            }}
-          >
-            <span>{humanBytes(manifest.size)}</span>
-            <span>·</span>
-            <span>{manifest.chunks.length} chunks</span>
-            <span>·</span>
-            <span title={manifest.owner}>{shortOwner(manifest.owner)}</span>
-            <span>·</span>
-            <span>h{manifest.created_at_height}</span>
-            <FinalizationMark op={op} />
-          </div>
-        </div>
-
-        <button
-          type="button"
-          aria-label={expanded ? `Hide digest for ${manifest.name}` : `Show digest for ${manifest.name}`}
-          aria-expanded={expanded}
-          onClick={() => setExpanded((v) => !v)}
-          style={{
-            all: "unset",
-            boxSizing: "border-box",
-            width: 24,
-            height: 24,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            borderRadius: radius.sm,
-            color: color.muted2,
-            cursor: "pointer",
-            flexShrink: 0,
-          }}
-        >
-          <span
-            style={{
-              display: "inline-flex",
-              transform: `rotate(${expanded ? 90 : 0}deg)`,
-              transition: "transform 120ms ease",
-            }}
-          >
-            <Icon name="chevronRight" size={13} strokeWidth={1.9} />
-          </span>
-        </button>
-
-        <RowButton
-          label={downloading ? "Downloading…" : "Download"}
-          ariaLabel={`Download ${manifest.name}`}
-          busy={downloading}
-          onClick={onDownload}
-        />
-        <RowButton
-          label={confirming ? "Confirm" : "Delete"}
-          ariaLabel={confirming ? `Confirm delete ${manifest.name}` : `Delete ${manifest.name}`}
-          tone={confirming ? "danger" : undefined}
-          onClick={handleDeleteClick}
-          onBlur={resetConfirm}
-        />
-      </div>
-
-      {expanded ? (
-        <div style={{ padding: "0 16px 13px 59px" }}>
-          <div
-            style={{
-              padding: "8px 10px",
-              borderRadius: radius.sm,
-              border: `1px solid ${color.borderSoft}`,
-              background: color.sunken,
-              font: `400 10.5px ${font.mono}`,
-              color: color.muted3,
-              wordBreak: "break-all",
-            }}
-          >
-            {manifest.digest}
-          </div>
-        </div>
-      ) : null}
+      {children}
     </div>
   );
 }
 
-export function FilesView() {
-  const { state, actions } = useDucktape();
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const [uploadingName, setUploadingName] = useState<string | null>(null);
-  const uploadTimer = useRef<number | null>(null);
-  const [downloadingId, setDownloadingId] = useState<string | null>(null);
-  const [uploadHover, setUploadHover] = useState(false);
+function NewFolderDialog({
+  value,
+  busy,
+  onChange,
+  onSubmit,
+  onCancel,
+}: {
+  value: string;
+  busy: boolean;
+  onChange: (value: string) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <ModalShell>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="new-folder-title"
+        style={{
+          width: "min(360px, 100%)",
+          borderRadius: radius.lg,
+          border: `1px solid ${color.border}`,
+          background: color.paper,
+          boxShadow: shadow.pop,
+          padding: 16,
+        }}
+      >
+        <form onSubmit={onSubmit}>
+          <div id="new-folder-title" style={{ font: `700 15px ${font.sans}`, color: color.dark }}>
+            New folder
+          </div>
+          <label
+            htmlFor="new-folder-name"
+            style={{
+              display: "block",
+              marginTop: 14,
+              marginBottom: 6,
+              font: `600 11px ${font.sans}`,
+              color: color.muted3,
+            }}
+          >
+            Folder name
+          </label>
+          <input
+            id="new-folder-name"
+            autoFocus
+            value={value}
+            disabled={busy}
+            onChange={(event) => onChange(event.target.value)}
+            style={{
+              boxSizing: "border-box",
+              width: "100%",
+              height: 36,
+              borderRadius: radius.sm,
+              border: `1px solid ${color.borderStrong}`,
+              background: color.paper,
+              color: color.ink,
+              padding: "0 10px",
+              font: `500 13px ${font.sans}`,
+              outline: "none",
+            }}
+          />
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+            <DialogButton label="Cancel" disabled={busy} onClick={onCancel} />
+            <DialogButton label="Create folder" variant="primary" disabled={busy || value.trim() === ""} />
+          </div>
+        </form>
+      </div>
+    </ModalShell>
+  );
+}
 
-  const loading = state.status === null;
+function DeleteEntryDialog({
+  entry,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  entry: FileEntry;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const name = basename(entry.path);
+  return (
+    <ModalShell>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="delete-entry-title"
+        style={{
+          width: "min(360px, 100%)",
+          borderRadius: radius.lg,
+          border: `1px solid ${color.dangerBorder}`,
+          background: color.paper,
+          boxShadow: shadow.pop,
+          padding: 16,
+        }}
+      >
+        <div id="delete-entry-title" style={{ font: `700 15px ${font.sans}`, color: color.dark }}>
+          Delete {name}
+        </div>
+        <div style={{ marginTop: 8, font: `400 12px ${font.sans}`, color: color.muted3, lineHeight: 1.5 }}>
+          This removes the selected {entry.kind === "dir" ? "folder" : "file"} from the live filesystem.
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+          <DialogButton label="Cancel" disabled={busy} onClick={onCancel} />
+          <DialogButton label="Delete" variant="danger" disabled={busy} onClick={onConfirm} />
+        </div>
+      </div>
+    </ModalShell>
+  );
+}
+
+export function FilesView() {
+  const { state, transport } = useDucktape();
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
+  const dragDownloadUrls = useRef<Map<string, string>>(new Map());
+  const dragDownloadFiles = useRef<Map<string, File>>(new Map());
+  const dragDownloadRequests = useRef<Set<string>>(new Set());
+  // dragenter/dragleave fire per descendant, so we count entry depth instead of
+  // toggling on each one — the overlay stays put as the pointer crosses columns.
+  const dragDepth = useRef(0);
+
+  const [columns, setColumns] = useState<DirectoryColumn[]>([makeDirectoryColumn(DEFAULT_DIR)]);
+  const [snapshot, setSnapshot] = useState<string | null>(null);
+  const [head, setHead] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<FileEntry | null>(null);
+  const [upload, setUpload] = useState<UploadState | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [reloadToken, setReloadToken] = useState(0);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [newFolderOpen, setNewFolderOpen] = useState(false);
+  const [newFolderName, setNewFolderName] = useState("");
+  const [creatingFolder, setCreatingFolder] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<FileEntry | null>(null);
+
   const backed = Boolean(state.status?.modules.some((m) => m.id === "files"));
+  const readOnly = snapshot !== null;
+  const bumpReload = useCallback(() => setReloadToken((n) => n + 1), []);
+  const dir = columns[columns.length - 1]?.path ?? DEFAULT_DIR;
+  const error = actionError ?? columns.find((column) => column.error)?.error ?? null;
+  const columnKey = columns.map((column) => column.path).join("\0");
+  const dragDownloadKey = (entry: FileEntry): string => `${snapshot ?? "live"}:${entry.path}`;
 
   useEffect(
     () => () => {
-      if (uploadTimer.current !== null) window.clearTimeout(uploadTimer.current);
+      dragDownloadUrls.current.forEach((url) => URL.revokeObjectURL?.(url));
+      dragDownloadUrls.current.clear();
+      dragDownloadFiles.current.clear();
+      dragDownloadRequests.current.clear();
     },
     [],
   );
 
   useEffect(() => {
-    if (!uploadingName) return;
-    if (state.files.some((f) => f.name === uploadingName)) {
-      if (uploadTimer.current !== null) {
-        window.clearTimeout(uploadTimer.current);
-        uploadTimer.current = null;
-      }
-      setUploadingName(null);
-    }
-  }, [uploadingName, state.files]);
+    dragDownloadUrls.current.forEach((url) => URL.revokeObjectURL?.(url));
+    dragDownloadUrls.current.clear();
+    dragDownloadFiles.current.clear();
+    dragDownloadRequests.current.clear();
+  }, [snapshot, transport]);
 
-  const armUploadHint = (name: string) => {
-    setUploadingName(name);
-    if (uploadTimer.current !== null) window.clearTimeout(uploadTimer.current);
-    uploadTimer.current = window.setTimeout(() => {
-      setUploadingName(null);
-      uploadTimer.current = null;
-    }, UPLOAD_HINT_TIMEOUT_MS);
+  useEffect(() => {
+    if (!transport || !backed || snapshot !== null) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleReload = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        bumpReload();
+      }, 100);
+    };
+    const off = transport.subscribe([FILES_WATCH_TOPIC], {
+      onTail: (frame) => {
+        if (frame.topic === FILES_WATCH_TOPIC) scheduleReload();
+      },
+      onLagged: (topic) => {
+        if (topic === FILES_WATCH_TOPIC) scheduleReload();
+      },
+    });
+    return () => {
+      if (timer !== null) clearTimeout(timer);
+      off();
+    };
+  }, [transport, backed, snapshot, bumpReload]);
+
+  // Track the live head for the history panel's diff base.
+  useEffect(() => {
+    if (!transport) return;
+    let alive = true;
+    refs(transport)
+      .then((r) => alive && setHead(r.head))
+      .catch(() => alive && setHead(null));
+    return () => {
+      alive = false;
+    };
+  }, [transport, reloadToken]);
+
+  // Page each visible browser column. A fresh live network may not have /shared
+  // yet; keep that as an empty writeable default instead of drifting writes to root.
+  useEffect(() => {
+    if (!transport) return;
+    let alive = true;
+    const paths = columns.map((column) => column.path);
+
+    setColumns((prev) =>
+      prev.map((column) =>
+        paths.includes(column.path) ? { ...column, loading: true, error: null } : column,
+      ),
+    );
+
+    paths.forEach((path) => {
+      ls(transport, { path, snapshot: snapshot ?? undefined })
+        .then((page) => {
+          if (!alive) return;
+          setColumns((prev) =>
+            prev.map((column) =>
+              column.path === path
+                ? { ...column, entries: page.entries, cursor: page.next, loading: false, error: null }
+                : column,
+            ),
+          );
+        })
+        .catch((err) => {
+          if (!alive) return;
+          setColumns((prev) =>
+            prev.map((column) => {
+              if (column.path !== path) return column;
+              if (path === DEFAULT_DIR && snapshot === null) {
+                return { ...column, entries: [], cursor: null, loading: false, error: null };
+              }
+              return { ...column, entries: [], cursor: null, loading: false, error: errMsg(err) };
+            }),
+          );
+        });
+    });
+
+    return () => {
+      alive = false;
+    };
+  }, [transport, columnKey, snapshot, reloadToken]);
+
+  const navigate = (path: string) => {
+    setContextMenu(null);
+    setSelected(null);
+    setColumns((prev) =>
+      columnPathsFor(path).map(
+        (columnPath) => prev.find((column) => column.path === columnPath) ?? makeDirectoryColumn(columnPath),
+      ),
+    );
+  };
+
+  const selectSnapshot = (id: string | null) => {
+    setSelected(null);
+    setSnapshot(id);
+    setColumns((prev) =>
+      prev.map((column) => ({
+        ...column,
+        entries: [],
+        cursor: null,
+        loading: true,
+        error: null,
+      })),
+    );
+  };
+
+  const loadMore = (path: string) => {
+    const cursor = columns.find((column) => column.path === path)?.cursor ?? null;
+    if (!transport || !cursor) return;
+    ls(transport, { path, snapshot: snapshot ?? undefined, after: cursor })
+      .then((page) => {
+        setColumns((prev) =>
+          prev.map((column) =>
+            column.path === path
+              ? { ...column, entries: [...column.entries, ...page.entries], cursor: page.next, error: null }
+              : column,
+          ),
+        );
+      })
+      .catch((err) =>
+        setColumns((prev) =>
+          prev.map((column) => (column.path === path ? { ...column, error: errMsg(err) } : column)),
+        ),
+      );
+  };
+
+  const openEntry = (entry: FileEntry) => {
+    setContextMenu(null);
+    if (entry.kind === "dir") {
+      navigate(entry.path);
+    } else {
+      setColumns((prev) =>
+        columnPathsFor(parentDir(entry.path)).map(
+          (columnPath) => prev.find((column) => column.path === columnPath) ?? makeDirectoryColumn(columnPath),
+        ),
+      );
+      setSelected(entry);
+    }
+  };
+
+  const openContextMenu = (event: ReactMouseEvent, entry: FileEntry | null) => {
+    if (!transport || !backed) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({ x: event.clientX, y: event.clientY, entry });
+  };
+
+  const openNewFolderDialog = () => {
+    if (!transport || readOnly) return;
+    setContextMenu(null);
+    setNewFolderName("");
+    setNewFolderOpen(true);
+  };
+
+  const openUploadPicker = () => {
+    if (!transport || readOnly) return;
+    setContextMenu(null);
+    fileInputRef.current?.click();
+  };
+
+  const openFolderUploadPicker = () => {
+    if (!transport || readOnly) return;
+    setContextMenu(null);
+    folderInputRef.current?.click();
+  };
+
+  const refreshDirectory = () => {
+    setContextMenu(null);
+    bumpReload();
+  };
+
+  const uploadBrowserEntries = async (entries: BrowserUploadEntry[], targetDir: string) => {
+    if (!transport || readOnly || entries.length === 0) return;
+    const writeDir = writeTargetDir(targetDir);
+    setActionError(null);
+    try {
+      if (
+        entries.length === 1 &&
+        entries[0].kind === "file" &&
+        entries[0].relativePath === entries[0].file.name
+      ) {
+        const file = entries[0].file;
+        setUpload({ name: file.name, targetDir: writeDir, staged: 0, total: 0 });
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        await uploadFile(transport, {
+          path: joinPath(writeDir, file.name),
+          bytes,
+          meta: file.type ? { mime: file.type } : {},
+          onProgress: (staged, total) => setUpload({ name: file.name, targetDir: writeDir, staged, total }),
+        });
+      } else {
+        const uploadEntries: FileUploadEntry[] = [];
+        for (const entry of entries) {
+          if (entry.kind === "dir") {
+            uploadEntries.push({ kind: "dir", relativePath: entry.relativePath });
+            continue;
+          }
+          setUpload({ name: entry.relativePath, targetDir: writeDir, staged: 0, total: 0 });
+          uploadEntries.push({
+            kind: "file",
+            relativePath: entry.relativePath,
+            bytes: new Uint8Array(await entry.file.arrayBuffer()),
+            meta: entry.file.type ? { mime: entry.file.type } : {},
+          });
+        }
+        const message = uploadMessage(uploadEntries);
+        setUpload({ name: uploadTopName(uploadEntries) ?? message, targetDir: writeDir, staged: 0, total: 0 });
+        await uploadFiles(transport, {
+          targetDir: writeDir,
+          entries: uploadEntries,
+          message,
+          onProgress: ({ relativePath, staged, total }) =>
+            setUpload({ name: relativePath, targetDir: writeDir, staged, total }),
+        });
+      }
+      setUpload(null);
+      bumpReload();
+    } catch (err) {
+      setUpload(null);
+      setActionError(errMsg(err));
+    }
   };
 
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const input = event.target;
-    const file = input.files?.[0] ?? null;
+    const files = Array.from(input.files ?? []);
     input.value = "";
-    if (!file || !backed) return;
-    const buf = await file.arrayBuffer();
-    const bytes = new Uint8Array(buf);
-    armUploadHint(file.name);
-    actions.uploadFile({ name: file.name, mime: file.type || "application/octet-stream", bytes });
+    if (files.length === 0) return;
+    await uploadBrowserEntries(
+      files.map((file) => ({ kind: "file", file, relativePath: file.name })),
+      dir,
+    );
   };
 
-  const handleDownload = async (fileId: string) => {
-    if (downloadingId) return;
-    setDownloadingId(fileId);
-    try {
-      const res = await actions.downloadFile(fileId);
-      if (!res) return;
-      const blob = new Blob([res.bytes], { type: res.manifest.mime || "application/octet-stream" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = res.manifest.name;
-      a.click();
-      URL.revokeObjectURL(url);
-    } finally {
-      setDownloadingId(null);
+  const handleFolderChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.target;
+    const files = Array.from(input.files ?? []);
+    input.value = "";
+    if (files.length === 0) return;
+    await uploadBrowserEntries(
+      files.map((file) => ({ kind: "file", file, relativePath: uploadRelativePath(file) })),
+      dir,
+    );
+  };
+
+  const canUpload = Boolean(transport) && !readOnly && backed;
+
+  // An inbound OS file drag. Internal file-download drags also expose "Files"
+  // (we add a File to the dataTransfer), so exclude anything carrying our own
+  // file-path type — dragging a file out must not trigger the upload overlay.
+  const isUploadDrag = (event: ReactDragEvent<HTMLElement>): boolean => {
+    const types = Array.from(event.dataTransfer?.types ?? []);
+    return types.includes("Files") && !types.includes("application/x-ducktape-file-path");
+  };
+
+  const handleZoneDragEnter = (event: ReactDragEvent<HTMLElement>) => {
+    if (!canUpload || !isUploadDrag(event)) return;
+    event.preventDefault();
+    dragDepth.current += 1;
+    setDragActive(true);
+  };
+
+  const handleZoneDragOver = (event: ReactDragEvent<HTMLElement>) => {
+    if (!canUpload || !isUploadDrag(event)) return;
+    // preventDefault marks this a valid drop target; without it the browser
+    // rejects the drop. Re-assert visibility in case dragenter was missed.
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    if (!dragActive) setDragActive(true);
+  };
+
+  const handleZoneDragLeave = (event: ReactDragEvent<HTMLElement>) => {
+    if (!isUploadDrag(event)) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragActive(false);
+  };
+
+  const handleZoneDrop = (event: ReactDragEvent<HTMLElement>) => {
+    if (!isUploadDrag(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepth.current = 0;
+    setDragActive(false);
+    if (!canUpload) return;
+    event.dataTransfer.dropEffect = "copy";
+    void collectDroppedUploads(event.dataTransfer)
+      .then((entries) => uploadBrowserEntries(entries, dir))
+      .catch((err) => setActionError(errMsg(err)));
+  };
+
+  const prepareDragDownload = (entry: FileEntry) => {
+    if (!transport || entry.kind !== "file" || typeof URL.createObjectURL !== "function") return;
+    const key = dragDownloadKey(entry);
+    if (dragDownloadUrls.current.has(key) || dragDownloadRequests.current.has(key)) return;
+    dragDownloadRequests.current.add(key);
+    readAll(transport, { path: entry.path, snapshot: snapshot ?? undefined })
+      .then((bytes) => {
+        const mime = entry.meta.mime || "application/octet-stream";
+        const name = basename(entry.path);
+        const file = new File([bytes], name, { type: mime });
+        const url = URL.createObjectURL(file);
+        const previous = dragDownloadUrls.current.get(key);
+        if (previous) URL.revokeObjectURL?.(previous);
+        dragDownloadFiles.current.set(key, file);
+        dragDownloadUrls.current.set(key, url);
+      })
+      .catch((err) => setActionError(errMsg(err)))
+      .finally(() => dragDownloadRequests.current.delete(key));
+  };
+
+  const handleFileDragStart = (event: ReactDragEvent<HTMLButtonElement>, entry: FileEntry) => {
+    if (entry.kind !== "file") return;
+    const name = basename(entry.path);
+    const mime = entry.meta.mime || "application/octet-stream";
+    const key = dragDownloadKey(entry);
+    const downloadUrl = dragDownloadUrls.current.get(key);
+    const downloadFile = dragDownloadFiles.current.get(key);
+    event.dataTransfer.effectAllowed = "copy";
+    if (downloadFile && event.dataTransfer.items?.add) {
+      event.dataTransfer.items.add(downloadFile);
     }
+    event.dataTransfer.setData("application/x-ducktape-file-path", entry.path);
+    event.dataTransfer.setData("text/plain", entry.path);
+    if (downloadUrl) {
+      event.dataTransfer.setData("DownloadURL", `${mime}:${name}:${downloadUrl}`);
+    } else {
+      prepareDragDownload(entry);
+    }
+  };
+
+  const handleNewFolderSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!transport || readOnly) return;
+    const name = newFolderName.trim();
+    if (!name) return;
+    setActionError(null);
+    setCreatingFolder(true);
+    try {
+      await mkdir(transport, { path: joinPath(writeTargetDir(dir), name) });
+      setNewFolderOpen(false);
+      setNewFolderName("");
+      bumpReload();
+    } catch (err) {
+      setActionError(errMsg(err));
+    } finally {
+      setCreatingFolder(false);
+    }
+  };
+
+  const deleteEntry = async (entry: FileEntry) => {
+    if (!transport || readOnly) return;
+    setDeleting(true);
+    try {
+      await deletePath(transport, { path: entry.path });
+      setSelected((current) => (current?.path === entry.path ? null : current));
+      if (entry.kind === "dir") {
+        setColumns((prev) => {
+          const next = prev.filter(
+            (column) => column.path !== entry.path && !column.path.startsWith(`${entry.path}/`),
+          );
+          return next.length > 0 ? next : [makeDirectoryColumn(parentDir(entry.path))];
+        });
+      }
+      setDeleteTarget(null);
+      bumpReload();
+    } catch (err) {
+      setActionError(errMsg(err));
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!selected) return;
+    await deleteEntry(selected);
   };
 
   return (
@@ -441,118 +1457,212 @@ export function FilesView() {
           flexShrink: 0,
           display: "flex",
           alignItems: "center",
-          gap: 10,
-          padding: "0 22px",
+          gap: 12,
+          padding: "0 20px",
           borderBottom: `1px solid ${color.borderSoft}`,
           background: color.paper,
         }}
       >
         <span style={{ font: `600 16px ${font.sans}`, color: color.dark }}>Files</span>
-        <span style={{ font: `400 13px ${font.mono}`, color: color.muted2 }}>
-          {state.files.length}
-        </span>
-
-        <div style={{ marginLeft: "auto" }}>
-          <input
-            ref={fileInputRef}
-            type="file"
-            onChange={handleFileChange}
-            style={{ display: "none" }}
-          />
-          <button
-            type="button"
-            disabled={!backed}
-            onClick={() => fileInputRef.current?.click()}
-            onMouseEnter={() => setUploadHover(true)}
-            onMouseLeave={() => setUploadHover(false)}
+        <Breadcrumb dir={dir} onNavigate={navigate} />
+        {readOnly && (
+          <span
             style={{
-              all: "unset",
-              boxSizing: "border-box",
-              height: 32,
-              padding: "0 13px",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
+              font: `600 10px ${font.mono}`,
+              color: color.amber,
+              border: `1px solid ${color.borderSoft}`,
               borderRadius: radius.sm,
-              border: `1px solid ${backed ? color.borderStrong : color.borderSoft}`,
-              background: backed ? (uploadHover ? color.hover : color.paper) : color.sunken,
-              color: backed ? color.inkSoft : color.muted2,
-              cursor: backed ? "pointer" : "default",
-              font: `600 12px ${font.sans}`,
+              padding: "2px 7px",
               whiteSpace: "nowrap",
             }}
           >
-            <Icon name="plus" size={13} strokeWidth={1.9} />
-            Upload
-          </button>
+            snapshot
+          </span>
+        )}
+
+        <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+          <input
+            ref={fileInputRef}
+            data-upload-kind="file"
+            type="file"
+            multiple
+            onChange={handleFileChange}
+            style={{ display: "none" }}
+          />
+          <input
+            ref={folderInputRef}
+            data-upload-kind="folder"
+            type="file"
+            multiple
+            onChange={handleFolderChange}
+            style={{ display: "none" }}
+            {...({ directory: "", webkitdirectory: "" } as Record<string, string>)}
+          />
+          <HeaderButton
+            label="New folder"
+            icon="modules"
+            disabled={!backed || readOnly}
+            onClick={openNewFolderDialog}
+          />
+          <HeaderButton
+            label="Upload"
+            icon="plus"
+            disabled={!backed || readOnly}
+            onClick={openUploadPicker}
+          />
+          <HeaderButton
+            label="Folder"
+            icon="files"
+            disabled={!backed || readOnly}
+            onClick={openFolderUploadPicker}
+          />
+          <HeaderButton
+            label="History"
+            icon="metrics"
+            disabled={!backed}
+            active={showHistory}
+            onClick={() => setShowHistory((v) => !v)}
+          />
         </div>
       </div>
 
-      <div
-        style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 18, background: color.sidebar }}
-      >
-        <div
-          style={{
-            minHeight: "100%",
-            borderRadius: radius.lg,
-            border: `1px solid ${color.border}`,
-            background: color.paper,
-            boxShadow: shadow.card,
-            overflow: "hidden",
-          }}
-        >
-          {loading ? (
-            <CenterState
-              title="Loading files…"
-              detail="Waiting for this node's committed file manifests."
-              muted
-            />
-          ) : !backed ? (
-            <CenterState
-              title="Files module is not available"
-              detail="This node did not report a files module, so uploads and downloads are disabled."
-              muted
-            />
-          ) : (
-            <>
-              {uploadingName ? (
+      <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
+        <div style={{ flex: 1, minWidth: 0, minHeight: 0, overflowY: "auto", padding: 18, background: color.sidebar }}>
+          <div
+            onContextMenu={(event) => openContextMenu(event, null)}
+            onDragEnter={handleZoneDragEnter}
+            onDragOver={handleZoneDragOver}
+            onDragLeave={handleZoneDragLeave}
+            onDrop={handleZoneDrop}
+            style={{
+              position: "relative",
+              height: "100%",
+              minHeight: 360,
+              display: "flex",
+              flexDirection: "column",
+              borderRadius: radius.lg,
+              border: `1px solid ${color.border}`,
+              background: color.paper,
+              boxShadow: shadow.card,
+              overflow: "hidden",
+            }}
+          >
+            {!transport ? (
+              <CenterState title="No node connected" detail="Connect a node to browse its files." muted />
+            ) : state.status === null ? (
+              <CenterState title="Loading files…" detail="Waiting for this node's filesystem." muted />
+            ) : !backed ? (
+              <CenterState
+                title="Files module is not available"
+                detail="This node did not report a files module, so browsing and uploads are disabled."
+                muted
+              />
+            ) : (
+              <>
+                <UploadNotice upload={upload} />
+                {error && (
+                  <div
+                    style={{
+                      padding: "10px 16px",
+                      borderBottom: `1px solid ${color.dangerBorder}`,
+                      background: color.dangerSoft,
+                      font: `500 12px ${font.sans}`,
+                      color: color.danger,
+                    }}
+                  >
+                    {error}
+                  </div>
+                )}
+
                 <div
                   style={{
+                    flex: 1,
+                    minHeight: 0,
                     display: "flex",
-                    alignItems: "center",
-                    gap: 9,
-                    padding: "10px 16px",
-                    borderBottom: `1px solid ${color.borderSoft}`,
-                    background: color.sunken,
-                    font: `500 12px ${font.sans}`,
-                    color: color.muted3,
+                    overflowX: "auto",
+                    overflowY: "hidden",
                   }}
                 >
-                  <Icon name="refresh" size={13} strokeWidth={1.9} />
-                  uploading {uploadingName}…
+                  {columns.map((column, index) => (
+                    <DirectoryColumnView
+                      key={column.path}
+                      column={column}
+                      selectedPath={selected?.path ?? null}
+                      childPath={columns[index + 1]?.path ?? null}
+                      onOpen={openEntry}
+                      onContextMenu={openContextMenu}
+                      onLoadMore={loadMore}
+                      onPrepareDownload={prepareDragDownload}
+                      onFileDragStart={handleFileDragStart}
+                    />
+                  ))}
+                  {selected && transport && (
+                    <FilePreview
+                      transport={transport}
+                      entry={selected}
+                      snapshot={snapshot}
+                      readOnly={readOnly}
+                      deleting={deleting}
+                      onClose={() => setSelected(null)}
+                      onDelete={handleDelete}
+                    />
+                  )}
                 </div>
-              ) : null}
-
-              {state.files.length === 0 ? (
-                <CenterState
-                  title="No files yet"
-                  detail="No files yet — upload one to store it on this node."
-                />
-              ) : (
-                state.files.map((manifest) => (
-                  <FileRow
-                    key={manifest.file_id}
-                    manifest={manifest}
-                    downloading={downloadingId === manifest.file_id}
-                    op={state.ops[opKey.file(manifest.file_id)]}
-                    onDownload={() => handleDownload(manifest.file_id)}
-                    onDelete={() => actions.removeFile(manifest.file_id)}
-                  />
-                ))
-              )}
-            </>
-          )}
+              </>
+            )}
+            {dragActive && <UploadDropOverlay targetDir={writeTargetDir(dir)} />}
+          </div>
         </div>
+
+        {contextMenu && (
+          <FilesContextMenu
+            menu={contextMenu}
+            readOnly={readOnly}
+            onClose={() => setContextMenu(null)}
+            onOpen={openEntry}
+            onNewFolder={openNewFolderDialog}
+            onUpload={openUploadPicker}
+            onUploadFolder={openFolderUploadPicker}
+            onDelete={setDeleteTarget}
+            onRefresh={refreshDirectory}
+          />
+        )}
+
+        {newFolderOpen && (
+          <NewFolderDialog
+            value={newFolderName}
+            busy={creatingFolder}
+            onChange={setNewFolderName}
+            onSubmit={handleNewFolderSubmit}
+            onCancel={() => {
+              if (creatingFolder) return;
+              setNewFolderOpen(false);
+              setNewFolderName("");
+            }}
+          />
+        )}
+
+        {deleteTarget && (
+          <DeleteEntryDialog
+            entry={deleteTarget}
+            busy={deleting}
+            onCancel={() => {
+              if (!deleting) setDeleteTarget(null);
+            }}
+            onConfirm={() => void deleteEntry(deleteTarget)}
+          />
+        )}
+
+        {showHistory && transport && backed && (
+          <HistoryPanel
+            transport={transport}
+            head={head}
+            snapshot={snapshot}
+            reloadToken={reloadToken}
+            onSelectSnapshot={selectSnapshot}
+            onClose={() => setShowHistory(false)}
+          />
+        )}
       </div>
     </div>
   );

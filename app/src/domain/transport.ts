@@ -12,6 +12,22 @@
 
 // ── Types ───────────────────────────────────────────────
 
+import type { ClientMsg, ServerFrame } from "./stream.gen";
+import type {
+  EventFrame,
+  HeartbeatFrame,
+  TailFrame,
+} from "./stream";
+import {
+  isErrorFrame,
+  isEventFrame,
+  isHeartbeatFrame,
+  isLaggedFrame,
+  isServerFrame,
+  isSubscribedFrame,
+  isTailFrame,
+} from "./stream";
+
 export interface BlockEvent {
   height: number;
   appHash: string;
@@ -51,11 +67,13 @@ export interface NodeStatus {
 
 // ── Blocks (explorer) ───────────────────────────────────
 //
-// The explorer plane: one record per NON-EMPTY finalized block — heartbeat
-// nops never enter the node's ring, so this is real history, not idle ticks.
-// Pulled via GET /v1/blocks; a node without the surface reads as "no blocks".
+// The explorer plane: one record per finalized block. Post tx-aggregation a
+// block carries EVERY op drained from its ~2s window (no longer one-op-per-
+// block), so a record holds an `ops` array instead of singular op fields; an
+// idle window commits an empty-`ops` heartbeat nop. Pulled via GET /v1/blocks;
+// a node without the surface reads as "no blocks".
 
-/** One dispatch in a block's drain — a module ran, triggered by `origin`. */
+/** One dispatch in an op's drain — a module ran, triggered by `origin`. */
 export interface DispatchInfo {
   module: string;
   /** `"external"`, `"external:<name>"`, `"system"`, or `"module:<id>"`. */
@@ -64,9 +82,31 @@ export interface DispatchInfo {
   emittedEvents: number;
 }
 
-/** How a block's op landed: an applied op mutated state; a rejected op
- *  finalized but rolled back — a failed tx. */
+/** How an op landed: an applied op mutated state; a rejected op finalized but
+ *  rolled back — a failed tx. */
 export type BlockDisposition = "applied" | "rejected";
+
+/** One aggregated op inside a block — the "transaction" the explorer renders a
+ *  row for. A block holds these in drain order; a block that aggregated its
+ *  whole 2s window carries one entry per included op. */
+export interface RootOp {
+  /** Hex of the op author's origin — the submitter's key, or `"system"` /
+   *  `"module:<id>"` for a module/system-triggered op. (On a frame-signing
+   *  lane this is the op's own author, not the block's proposing validator —
+   *  the aggregated record no longer carries a single block-level signer.) */
+  proposer: string;
+  disposition: BlockDisposition;
+  /** This op's target module. */
+  target: string;
+  /** This op's dispatch trace, in drain order — the modules it triggered.
+   *  Empty for a rejected op (a deterministic no-op leaves no trace). */
+  operations: DispatchInfo[];
+  /** Capped utf-8 preview of this op's payload (module `*Msg` json). */
+  payload: string;
+  /** Hex content address of this op — sha256 of the committed payload bytes,
+   *  fetchable via the blob lane (`GET /v1/files/blob/{opHash}`). */
+  opHash: string;
+}
 
 export interface BlockRecord {
   height: number;
@@ -74,21 +114,146 @@ export interface BlockRecord {
   hash: string;
   /** Hex app-hash after this block settled — the commit. */
   commitHash: string;
-  /** Hex ed25519 key of the proposing validator — the frame's VERIFIED
-   *  signer, not a claimed identity. */
-  proposer: string;
-  disposition: BlockDisposition;
-  /** The root op's target module. */
-  target: string;
-  /** The dispatch trace, in drain order — the transactions inside the block.
-   *  Empty for a rejected op (a deterministic no-op leaves no trace). */
-  operations: DispatchInfo[];
-  /** Capped utf-8 preview of the root op's payload (module `*Msg` json). */
-  payload: string;
-  /** Hex content address of the root op — sha256 of the committed payload
-   *  bytes, fetchable via the blob lane (`GET /v1/files/blob/{opHash}`).
-   *  Optional: rings written before the field existed lack it. */
-  opHash?: string;
+  /** Every op aggregated into this block, in drain order. Empty for an idle
+   *  window (a heartbeat nop): the block committed but carried no ops. */
+  ops: RootOp[];
+}
+
+// ── duckfs (the `files` module's CoW filesystem) ────────
+//
+// Wire shapes for the daemon's `/v1/files/*` surface. duckfs replaced the old
+// CAS manifest plane with a path-addressed, snapshot-versioned filesystem, so
+// these are the exact json the noded `files_*` handlers emit/accept: snake_case
+// like the module wire, except the commit reply, which is the camelCase block
+// envelope (BlockEvent). files-client.ts re-exports these and layers the
+// operations + consensus caps on top — one home for the whole files plane.
+
+export type FileEntryKind = "file" | "dir" | "symlink";
+
+/** One directory entry / stat result — the module's `EntryInfo`. `object` is
+ *  the content object id (64-char hex); `meta` is a free-form string map. */
+export interface FileEntry {
+  path: string;
+  kind: FileEntryKind;
+  size: number;
+  exec: boolean;
+  object: string;
+  meta: Record<string, string>;
+}
+
+/** One commit in the bounded history window — the module's `SnapshotInfo`. */
+export interface FileSnapshot {
+  id: string;
+  parent: string | null;
+  root_tree: string;
+  author: string;
+  height: number;
+  consensus_time: number;
+  message: string;
+}
+
+/** The refs image — live head, named pins, and the history window length
+ *  (`RefsInfo`). `head` is null on an empty filesystem (no commits yet). */
+export interface FileRefs {
+  head: string | null;
+  pins: Record<string, string>;
+  window_len: number;
+}
+
+export type FileDiffKind = "added" | "removed" | "modified";
+
+export interface FileDiffEntry {
+  path: string;
+  kind: FileDiffKind;
+}
+
+/** A file's bytes in a commit: small files ride inline (b64, ≤256 KiB total
+ *  inline per commit); large files reference chunks staged via `filesStage`. */
+export type FileContent =
+  | { inline: { b64: string } }
+  | { chunks: { size: number; chunks: string[] } };
+
+/** One path mutation in a commit — the module's `Change` enum. */
+export type FileChange =
+  | {
+      put: {
+        path: string;
+        exec: boolean;
+        meta: Record<string, string>;
+        content: FileContent;
+      };
+    }
+  | { mkdir: { path: string } }
+  | { rm: { path: string } }
+  | { mv: { from: string; to: string } }
+  | { symlink: { path: string; target: string } };
+
+/** POST /v1/files/commit body — snake_case, the `FilesMsg::Commit` spec.
+ *  `base_snapshot` null means the empty tree (a first commit). */
+export interface FilesCommitBody {
+  base_snapshot: string | null;
+  message: string;
+  changes: FileChange[];
+}
+
+/** One page of a directory listing (or find): entries plus a `next` cursor to
+ *  echo as the following `after`, null once the listing is exhausted. */
+export interface FilePage {
+  entries: FileEntry[];
+  next: string | null;
+}
+
+/** A byte range read: base64 bytes plus whether the range reached end-of-file. */
+export interface FileReadRange {
+  b64: string;
+  eof: boolean;
+}
+
+export interface GatewayRouteName {
+  label: string | null;
+}
+
+export type GatewayMethod = "get" | "head" | "post" | "put" | "patch" | "delete";
+
+export interface GatewayHeader {
+  name: string;
+  value: string;
+}
+
+/** Snake-case fields mirror `gateway::ProxyRequestHead` exactly. */
+export interface GatewayProxyHead {
+  account_id: number[];
+  name: GatewayRouteName;
+  revision: number;
+  method: GatewayMethod;
+  path_and_query: string;
+  headers: GatewayHeader[];
+  body_len: number;
+}
+
+export interface GatewayResponseHead {
+  status: number;
+  headers: GatewayHeader[];
+}
+
+export interface GatewayProxyRequest {
+  head: GatewayProxyHead;
+  body: Uint8Array<ArrayBuffer>;
+}
+
+export interface GatewayProxyReply {
+  head: GatewayResponseHead;
+  body: Uint8Array<ArrayBuffer>;
+}
+
+export interface GatewaySessionRequest {
+  accountId: number[];
+  name: GatewayRouteName;
+  revision: number;
+}
+
+export interface GatewaySessionReply {
+  url: string;
 }
 
 export interface NodeTransport {
@@ -123,11 +288,69 @@ export interface NodeTransport {
   /**
    * Read raw bytes back out of the node's content-addressed blob store by their
    * sha256 `digest` (64 lowercase hex) — the GET counterpart to `putBlob`. This
-   * is how the files module's chunks are fetched for reassembly; the caller MUST
-   * still `verifyChunk` the bytes against a committed manifest before trusting
-   * them. Rejects when the digest is absent (the node replies 404).
+   * is the node-local op-receipt store (a submit's `opHash` bytes); it is NOT
+   * the duckfs chunk plane (that rides `filesStage`/`filesRead`). Rejects when
+   * the digest is absent (the node replies 404).
    */
   getBlob(digest: string): Promise<Uint8Array<ArrayBuffer>>;
+
+  // ── duckfs (`files` module) ──
+  //
+  // The typed `/v1/files/*` surface. These wrap the daemon's dedicated files
+  // routes; refs + diff have no route yet and ride the generic `query` lane
+  // (see files-client). This is a DIFFERENT plane from putBlob/getBlob (the
+  // node-local op-receipt store): `filesStage` moves consensus state.
+
+  /**
+   * Stage raw chunk bytes as a duckfs op (POST /v1/files/stage): the chunk
+   * lands in the object store + the staging table (staging IS consensus state,
+   * so a stage moves the files root) and its object-id `digest` (64-char hex)
+   * comes back for a later `filesCommit` to reference. Body ≤ 1 MiB
+   * (`CHUNK_SIZE`). Bytes must be plain-ArrayBuffer backed for the fetch body.
+   */
+  filesStage(bytes: Uint8Array<ArrayBuffer>): Promise<{ digest: string }>;
+  /**
+   * Commit an atomic multi-path change set (POST /v1/files/commit). Resolves to
+   * the block that included it; a module rejection — notably a per-path CAS
+   * conflict (`files: conflict: <path> changed since base`) — throws a NodeError
+   * carrying that detail so the ui can surface it.
+   */
+  filesCommit(body: FilesCommitBody): Promise<BlockEvent>;
+  /**
+   * The entry at `path` (GET /v1/files/stat), or null when nothing is there
+   * (the node's 404). `snapshot` reads a historical tree; omitted reads head.
+   */
+  filesStat(params: { path: string; snapshot?: string }): Promise<FileEntry | null>;
+  /**
+   * One page of a directory's entries in name order (GET /v1/files/ls), with a
+   * `next` cursor to echo as the following `after`.
+   */
+  filesLs(params: {
+    path: string;
+    snapshot?: string;
+    after?: string;
+    limit?: number;
+  }): Promise<FilePage>;
+  /**
+   * A byte range of a file (GET /v1/files/read); `len` is clamped by the module
+   * to its 1 MiB read cap, and `eof` marks the range reaching end-of-file.
+   */
+  filesRead(params: {
+    path: string;
+    snapshot?: string;
+    offset?: number;
+    len?: number;
+  }): Promise<FileReadRange>;
+  /** The bounded commit history, newest-first (GET /v1/files/history). */
+  filesHistory(params?: { limit?: number }): Promise<FileSnapshot[]>;
+
+  /** Invoke one finalized, policy-bounded route over the authenticated
+   * gateway plane. Optional because the embedded daemon has no mesh. */
+  gatewayProxy?(request: GatewayProxyRequest): Promise<GatewayProxyReply>;
+  /** Mint a short-lived, route-scoped origin on the dedicated browser
+   * listener. That listener exposes no node API or cross-route primitive. */
+  gatewaySession?(request: GatewaySessionRequest): Promise<GatewaySessionReply>;
+
   status(): Promise<NodeStatus>;
   /**
    * The node's Prometheus/OpenMetrics scrape (`GET /metrics`) as raw text —
@@ -137,23 +360,32 @@ export interface NodeTransport {
    */
   metrics(): Promise<string>;
   /**
-   * Recent non-empty blocks from the node's ring, oldest-first — the
-   * explorer's backing read. `limit` caps the count (default: all buffered).
+   * Recent finalized blocks from the node's ring, oldest-first — the explorer's
+   * backing read. Each record carries every op aggregated into its window (an
+   * idle window rides as an empty-`ops` nop). `limit` caps the count (default:
+   * all buffered).
    */
   blocks(limit?: number): Promise<BlockRecord[]>;
-  /** Subscribe to finalized blocks. Returns the unsubscribe. */
-  onBlock(listener: (block: BlockEvent) => void): () => void;
+  /** Subscribe to one or more node stream topics. Returns the unsubscribe. */
+  subscribe(
+    topics: string[],
+    handlers: TopicHandlers,
+    resume?: Record<string, string>,
+  ): () => void;
+  /** Subscribe to stream connection/liveness signals. Returns the unsubscribe. */
+  onStream(listener: (signal: StreamSignal) => void): () => void;
 }
 
-// ── The transport ───────────────────────────────────────
-
-interface WsBlockFrame {
-  type: "block";
-  height: number;
-  appHash: string;
+export interface TopicHandlers {
+  onEvent?(frame: EventFrame): void;
+  onTail?(frame: TailFrame): void;
+  onLagged?(topic: string, cursor: string): void;
 }
 
-type WsFrame = WsBlockFrame;
+export type StreamSignal =
+  | { kind: "heartbeat"; frame: HeartbeatFrame }
+  | { kind: "up" }
+  | { kind: "down"; reason: string };
 
 // ── Error classification + bounded fetch ────────────────
 
@@ -221,6 +453,7 @@ const errorDetail = async (res: Response): Promise<string> => {
 
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_CAP_MS = 30_000;
+export const STREAM_WATCHDOG_FALLBACK_MS = 7_500;
 
 const postJson = async <T>(url: string, body: unknown): Promise<T> => {
   const res = await fetchDeadline(url, {
@@ -236,6 +469,33 @@ const postJson = async <T>(url: string, body: unknown): Promise<T> => {
   } catch {
     throw new NodeError("badBody", `${url} returned an invalid or empty response`);
   }
+};
+
+/** GET → json with the SAME deadline + error envelope as postJson: a non-2xx
+ *  surfaces the node's `{error}` detail (so a `files: …` rejection reads
+ *  through), a 2xx with an unparseable body is a `badBody`. */
+const getJson = async <T>(url: string): Promise<T> => {
+  const res = await fetchDeadline(url);
+  if (!res.ok) {
+    throw new NodeError("httpError", (await errorDetail(res)) || `node replied ${res.status}`, res.status);
+  }
+  try {
+    return (await res.json()) as T;
+  } catch {
+    throw new NodeError("badBody", `${url} returned an invalid or empty response`);
+  }
+};
+
+/** Build a `?a=1&b=2` query string, dropping undefined values. `path` and other
+ *  present values are encoded verbatim — an empty string IS a value the caller
+ *  chose (never elided), so the root path `/` and a deliberate `""` both ride. */
+const queryString = (params: Record<string, string | number | undefined>): string => {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined) search.set(key, String(value));
+  }
+  const rendered = search.toString();
+  return rendered ? `?${rendered}` : "";
 };
 
 /** A node base url in its websocket form: trailing slash stripped, http→ws
@@ -255,12 +515,124 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
   const base = baseUrl.replace(/\/$/, "");
   const wsUrl = `${wsBase(baseUrl)}/v1/ws`;
 
-  // One shared socket for every block subscriber; reconnects while any
-  // remain, closes once all unsubscribe.
-  const blockListeners = new Set<(block: BlockEvent) => void>();
-  const hasSubscribers = (): boolean => blockListeners.size > 0;
+  // One shared socket for every topic and liveness subscriber; reconnects
+  // while any remain, closes once all unsubscribe.
+  const topicSubs = new Map<string, Set<TopicHandlers>>();
+  const streamListeners = new Set<(signal: StreamSignal) => void>();
+  const cursors = new Map<string, string>();
+  const refusedTopics = new Set<string>();
+  const loggedTopicErrors = new Set<string>();
+  const hasSubscribers = (): boolean =>
+    topicSubs.size > 0 || streamListeners.size > 0;
+  const activeTopics = (): string[] =>
+    [...topicSubs.keys()].filter((topic) => !refusedTopics.has(topic));
   let socket: WebSocket | null = null;
   let retries = 0;
+  let watchdog: ReturnType<typeof setTimeout> | null = null;
+  let watchdogMs = STREAM_WATCHDOG_FALLBACK_MS;
+  let closeReason = "stream socket closed";
+
+  const emitStream = (signal: StreamSignal): void => {
+    streamListeners.forEach((notify) => notify(signal));
+  };
+
+  const clearWatchdog = (): void => {
+    if (watchdog !== null) clearTimeout(watchdog);
+    watchdog = null;
+  };
+
+  const closeWithReason = (reason: string): void => {
+    closeReason = reason;
+    socket?.close();
+  };
+
+  const armWatchdog = (timeoutMs = watchdogMs): void => {
+    clearWatchdog();
+    watchdogMs = timeoutMs;
+    watchdog = setTimeout(
+      () => closeWithReason("stream heartbeat timed out"),
+      timeoutMs,
+    );
+  };
+
+  const socketIsOpen = (): boolean => {
+    const state = socket?.readyState as number | undefined;
+    return state === WebSocket.OPEN || state === 1;
+  };
+
+  const sendFrame = (frame: ClientMsg): void => {
+    if (!socketIsOpen()) return;
+    socket?.send(JSON.stringify(frame));
+  };
+
+  const subscribeFrame = (topics: string[]): ClientMsg => {
+    const resume: Record<string, string> = {};
+    for (const topic of topics) {
+      const cursor = cursors.get(topic);
+      if (cursor) resume[topic] = cursor;
+    }
+    return { op: "subscribe", topics, resume };
+  };
+
+  const sendSubscribe = (topics: string[]): void => {
+    const wanted = topics.filter((topic) => topicSubs.has(topic) && !refusedTopics.has(topic));
+    if (wanted.length === 0) return;
+    sendFrame(subscribeFrame(wanted));
+  };
+
+  const sendUnsubscribe = (topics: string[]): void => {
+    const wanted = topics.filter((topic) => !refusedTopics.has(topic));
+    if (wanted.length === 0) return;
+    sendFrame({ op: "unsubscribe", topics: wanted });
+  };
+
+  const dispatchFrame = (frame: ServerFrame): void => {
+    if (isSubscribedFrame(frame)) {
+      for (const [topic, cursor] of Object.entries(frame.topics)) {
+        if (typeof cursor === "string") cursors.set(topic, cursor);
+      }
+      return;
+    }
+    if (isEventFrame(frame)) {
+      cursors.set(frame.topic, frame.cursor);
+      topicSubs.get(frame.topic)?.forEach((handlers) => handlers.onEvent?.(frame));
+      return;
+    }
+    if (isTailFrame(frame)) {
+      cursors.set(frame.topic, frame.cursor);
+      topicSubs.get(frame.topic)?.forEach((handlers) => handlers.onTail?.(frame));
+      return;
+    }
+    if (isLaggedFrame(frame)) {
+      cursors.set(frame.topic, frame.cursor);
+      topicSubs
+        .get(frame.topic)
+        ?.forEach((handlers) => handlers.onLagged?.(frame.topic, frame.cursor));
+      return;
+    }
+    if (isHeartbeatFrame(frame)) {
+      const timeout = Math.max(
+        STREAM_WATCHDOG_FALLBACK_MS,
+        Math.ceil(frame.intervalMs * 2.5),
+      );
+      armWatchdog(timeout);
+      emitStream({ kind: "heartbeat", frame });
+      return;
+    }
+    if (isErrorFrame(frame)) {
+      if (frame.topic) {
+        refusedTopics.add(frame.topic);
+        cursors.delete(frame.topic);
+        const key = `${frame.topic}:${frame.code}`;
+        if (!loggedTopicErrors.has(key)) {
+          loggedTopicErrors.add(key);
+          console.warn(
+            `stream topic ${frame.topic} refused (${frame.code}): ${frame.detail}`,
+          );
+        }
+      }
+    }
+  };
 
   const connect = (): void => {
     if (socket || !hasSubscribers()) return;
@@ -268,39 +640,43 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
     socket = ws;
     ws.onopen = () => {
       retries = 0; // a clean connection resets the backoff
+      closeReason = "stream socket closed";
+      watchdogMs = STREAM_WATCHDOG_FALLBACK_MS;
+      // a fresh connection may face a different node build/module set —
+      // retry refused topics once per connection instead of pinning them.
+      refusedTopics.clear();
+      emitStream({ kind: "up" });
+      armWatchdog(STREAM_WATCHDOG_FALLBACK_MS);
+      sendSubscribe(activeTopics());
     };
     ws.onmessage = (event) => {
-      let frame: WsFrame;
+      armWatchdog();
+      let frame: unknown;
       try {
-        frame = JSON.parse(String(event.data)) as WsFrame;
+        frame = JSON.parse(String(event.data));
       } catch {
         return; // a malformed / non-json frame is a no-op, not an uncaught throw
       }
-      switch (frame.type) {
-        case "block": {
-          const block = { height: frame.height, appHash: frame.appHash };
-          blockListeners.forEach((notify) => notify(block));
-          break;
-        }
-        default:
-          break; // unknown frame kinds are fine — the stream may grow
-      }
+      if (isServerFrame(frame)) dispatchFrame(frame);
     };
     ws.onclose = () => {
+      clearWatchdog();
       socket = null;
       if (!hasSubscribers()) return;
+      emitStream({ kind: "down", reason: closeReason });
       // exponential backoff (capped) + jitter, instead of the blind 2s retry
       // loop that spammed the console every 2s forever against a dead node.
       const backoff = Math.min(RECONNECT_CAP_MS, RECONNECT_BASE_MS * 2 ** retries);
       retries += 1;
       setTimeout(connect, backoff * (0.5 + Math.random() * 0.5));
     };
-    ws.onerror = () => ws.close();
+    ws.onerror = () => closeWithReason("stream socket error");
   };
 
   /** Drop the socket once nothing is subscribed. */
   const closeIfIdle = (): void => {
     if (!hasSubscribers()) {
+      clearWatchdog();
       socket?.close();
       socket = null;
     }
@@ -347,6 +723,75 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
             .catch(() => "");
           throw new Error(detail || `node replied ${res.status}`);
         }),
+    // ── duckfs (`files` module) ──
+    // raw chunk bytes in, `{"digest":"<64-hex>"}` out — octet-stream, not json
+    // in, so it bypasses postJson; the error envelope is still the node's json
+    // `{error}` shape (413 on an oversized body, a module rejection otherwise).
+    filesStage: async (bytes) => {
+      const res = await fetchDeadline(`${base}/v1/files/stage`, {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream" },
+        body: bytes,
+      });
+      if (!res.ok) {
+        throw new NodeError(
+          "httpError",
+          (await errorDetail(res)) || `node replied ${res.status}`,
+          res.status,
+        );
+      }
+      try {
+        return (await res.json()) as { digest: string };
+      } catch {
+        throw new NodeError("badBody", "/v1/files/stage returned an invalid response");
+      }
+    },
+    filesCommit: (body) => postJson<BlockEvent>(`${base}/v1/files/commit`, body),
+    filesStat: async ({ path, snapshot }) => {
+      try {
+        return await getJson<FileEntry>(
+          `${base}/v1/files/stat${queryString({ path, snapshot })}`,
+        );
+      } catch (err) {
+        // the module answers a 404 for an absent path — the caller's "no entry"
+        // signal, mapped to null (the CAS-era stat's absent shape), not an error.
+        if (err instanceof NodeError && err.status === 404) return null;
+        throw err;
+      }
+    },
+    filesLs: ({ path, snapshot, after, limit }) =>
+      getJson<FilePage>(`${base}/v1/files/ls${queryString({ path, snapshot, after, limit })}`),
+    filesRead: ({ path, snapshot, offset, len }) =>
+      getJson<FileReadRange>(
+        `${base}/v1/files/read${queryString({ path, snapshot, offset, len })}`,
+      ),
+    filesHistory: async (params) => {
+      const body = await getJson<{ snapshots: FileSnapshot[] }>(
+        `${base}/v1/files/history${queryString({ limit: params?.limit })}`,
+      );
+      return body.snapshots;
+    },
+    gatewayProxy: async (request) => {
+      const encode = (bytes: Uint8Array): string => {
+        let binary = "";
+        for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+          binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+        }
+        return btoa(binary);
+      };
+      const wire = await postJson<{ head: GatewayResponseHead; bodyB64: string }>(
+        `${base}/v1/gateway/proxy`,
+        { head: request.head, bodyB64: encode(request.body) },
+      );
+      const binary = atob(wire.bodyB64);
+      const body = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        body[index] = binary.charCodeAt(index);
+      }
+      return { head: wire.head, body };
+    },
+    gatewaySession: (request) =>
+      postJson<GatewaySessionReply>(`${base}/v1/gateway/session`, request),
     status: async () => {
       const res = await fetchDeadline(`${base}/v1/status`, undefined, STATUS_TIMEOUT_MS);
       if (!res.ok) throw new NodeError("httpError", `node replied ${res.status}`, res.status);
@@ -386,11 +831,43 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
       const body = (await res.json().catch(() => ({}))) as { blocks?: BlockRecord[] };
       return body.blocks ?? [];
     },
-    onBlock: (listener) => {
-      blockListeners.add(listener);
+    subscribe: (topics, handlers, resume) => {
+      const wanted = [...new Set(topics)];
+      const firstTopics: string[] = [];
+      for (const topic of wanted) {
+        if (resume?.[topic]) cursors.set(topic, resume[topic]);
+        let subs = topicSubs.get(topic);
+        if (!subs) {
+          subs = new Set();
+          topicSubs.set(topic, subs);
+          firstTopics.push(topic);
+        }
+        subs.add(handlers);
+      }
+      connect();
+      sendSubscribe(firstTopics);
+      return () => {
+        const lastTopics: string[] = [];
+        for (const topic of wanted) {
+          const subs = topicSubs.get(topic);
+          if (!subs) continue;
+          subs.delete(handlers);
+          if (subs.size === 0) {
+            topicSubs.delete(topic);
+            cursors.delete(topic);
+            refusedTopics.delete(topic);
+            lastTopics.push(topic);
+          }
+        }
+        sendUnsubscribe(lastTopics);
+        closeIfIdle();
+      };
+    },
+    onStream: (listener) => {
+      streamListeners.add(listener);
       connect();
       return () => {
-        blockListeners.delete(listener);
+        streamListeners.delete(listener);
         closeIfIdle();
       };
     },

@@ -63,6 +63,8 @@ use axum::{Json, Router};
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
+use duckdns::DuckDns;
+use gateway::Gateway;
 use tagging::TaggingModule;
 use files::Files;
 use forge::Forge;
@@ -74,19 +76,17 @@ use identity::Identity;
 use inbox::Inbox;
 use indexer::{AppliedOp, BlockOps, IndexStore};
 use jobs::Jobs;
-use memory::Memory;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
-    NodeCommand, NodeHandle, NodeStatus, WsFrame, block_row, hex_bytes, hex_root, payload_preview,
+    NodeCommand, NodeHandle, NodeStatus, StreamHub, block_row, hex_bytes, hex_root,
+    payload_preview,
 };
 use pages::Pages;
-use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
 use sdk::{Effect, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use tasks::Tasks;
-use tokio::sync::broadcast;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
@@ -104,9 +104,9 @@ const MODULE_IDS: [&str; 16] = [
     "pages",
     "forge",
     "files",
-    "memory",
-    "profiles",
     "identity",
+    "duckdns",
+    "gateway",
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 const PEER_ORIGIN: &[u8] = b"peer";
@@ -267,7 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
 
-    let (handle, cmd_rx, event_tx) = NodeHandle::channel();
+    let (handle, cmd_rx, stream_hub) = NodeHandle::channel();
     let handle = handle
         .with_forge_repo(forge_repo.clone())
         .with_index_store(index.clone());
@@ -290,7 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 echo_oracle,
                 cmd_rx,
                 control_rx,
-                event_tx,
+                stream_hub,
             )
         })?;
 
@@ -346,9 +346,9 @@ struct Sim {
     /// touching the next command, and step order mirrors that.
     oracle_queue: VecDeque<Msg>,
     workers: Vec<Box<dyn reactor::Worker>>,
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
     index: Arc<IndexStore>,
-    events: broadcast::Sender<WsFrame>,
+    stream_hub: StreamHub,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -356,14 +356,15 @@ fn run_sim(
     storage: PathBuf,
     forge_repo: PathBuf,
     index: Arc<IndexStore>,
-    blobs: files::BlobHandle,
+    blobs: blobstore::BlobHandle,
     persona: Arc<Mutex<Persona>>,
     auto: bool,
     echo_oracle: bool,
     mut cmds: mpsc::Receiver<NodeCommand>,
     mut control: mpsc::Receiver<SimCommand>,
-    events: broadcast::Sender<WsFrame>,
+    stream_hub: StreamHub,
 ) {
+    let duckfs_dir = storage.join("duckfs");
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
@@ -378,7 +379,7 @@ fn run_sim(
         let tagging = TaggingModule::new("tagging");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
-        let automations = Automations::new("automations", "chat", "tasks", "inbox", "memory");
+        let automations = Automations::new("automations", "chat", "tasks", "inbox");
         let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
@@ -392,13 +393,16 @@ fn run_sim(
             Some("jobs".into()),
         );
         let pages = Pages::init(context.child("pages"), "pages").await;
-        let forge = Forge::with_blobs("forge", forge_repo, blobs.clone()).expect("forge init");
-        let files = Files::with_blobs("files", blobs.clone());
-        let memory = Memory::new("memory", "files");
-        let profiles = Profiles::new("profiles");
+        let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
+            .expect("forge init")
+            .with_chat("chat");
+        let files = Files::open("files", duckfs_dir).expect("duckfs open");
         // the deterministic user->nodes binding registry — no valset, no chain
-        // (the simulator has neither), matching noded's daemon wiring.
+        // (the simulator has neither), matching noded's daemon wiring. It is
+        // also the canonical account display-name registry.
         let identity = Identity::new("identity", None, String::new());
+        let duckdns = DuckDns::new("duckdns", "identity", None);
+        let gateway = Gateway::new("gateway", "identity", None, "local");
         let host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),
@@ -413,9 +417,9 @@ fn run_sim(
             Box::new(pages),
             Box::new(forge),
             Box::new(files),
-            Box::new(memory),
-            Box::new(profiles),
             Box::new(identity),
+            Box::new(duckdns),
+            Box::new(gateway),
         ])
         .expect("genesis");
 
@@ -425,6 +429,7 @@ fn run_sim(
         // fresh dir this is 0; on a (discouraged) reused dir it keeps op-log
         // heights monotonic instead of silently skipping every new block.
         let height = index.resume_height().expect("read index watermarks");
+        stream_hub.prime(height, hex_root(&host.app_hash()));
 
         let mut sim = Sim {
             host,
@@ -440,7 +445,7 @@ fn run_sim(
             },
             blobs,
             index,
-            events,
+            stream_hub,
         };
 
         loop {
@@ -637,7 +642,6 @@ impl Sim {
             app_hash: hex_root(&out.app_hash),
         };
         let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
-        let _ = self.events.send(WsFrame::Block(block.clone()));
 
         // fold the block into the durable index LAST, like noded: canonical
         // state is already committed, so an index failure degrades the read
@@ -663,12 +667,15 @@ impl Sim {
                 height: self.height,
                 hash: String::new(),
                 commit_hash: block.app_hash.clone(),
-                proposer,
-                disposition: BlockDisposition::Applied,
-                target: target.clone(),
-                operations,
-                payload,
-                op_hash: op_hash.clone(),
+                // the sim commits one op per step/block.
+                ops: vec![noded::RootOp {
+                    proposer,
+                    disposition: BlockDisposition::Applied,
+                    target: target.clone(),
+                    operations,
+                    payload,
+                    op_hash: op_hash.clone(),
+                }],
             })),
         };
         if let Err(err) = self.index.apply_block(&block_ops) {
@@ -677,6 +684,9 @@ impl Sim {
                 self.height
             );
         }
+
+        self.stream_hub
+            .publish_block(block.height, block.app_hash.clone());
 
         offer_effects(&self.workers, out.effects, &mut self.oracle_queue).await;
         Ok(Committed {

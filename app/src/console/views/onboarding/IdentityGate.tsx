@@ -1,14 +1,15 @@
-// The identity gate (desktop only): renders BEFORE the workspace onboarding
-// gate, driven by `user_identity_state()`. Identity is machine-scoped and
-// orthogonal to any workspace/node — so unlike OnboardingGate (which reads
+// The account gate (desktop only): renders BEFORE the workspace onboarding
+// gate, driven by `user_identity_state()`. The account key is machine-scoped
+// and orthogonal to any workspace/node — so unlike OnboardingGate (which reads
 // `state.needsOnboarding` off the console store, gated on node/workspace
 // resolution), this gate fetches its own boot state directly: a local
 // `useEffect` + `useState`, self-contained, no store wiring. See
 // IdentityGate.test.tsx / the task report for the full wiring rationale.
 //
-// State machine (spec: docs/superpowers/specs/2026-07-07-identity-onboarding-design.md):
-//   absent    → Create | Restore chooser
-//   plaintext → dismissable "Secure your identity" interstitial (dismiss = this
+// State machine (spec: docs/superpowers/specs/2026-07-07-identity-onboarding-design.md,
+// vocabulary + link path: docs/superpowers/specs/2026-07-10-account-console-onboarding-design.md):
+//   absent    → Create | Restore | Link-device chooser (first-run step 1 of 3)
+//   plaintext → dismissable "Secure your account" interstitial (dismiss = this
 //               launch only, plain component state, never persisted)
 //   locked    → unlock form, "skip for now" proceeds to the console
 //   unlocked  → no gate
@@ -22,8 +23,8 @@
 // launch, same as an unconfirmed mnemonic always has.
 //
 // The card chrome, password form, mnemonic grid, and confirm-words step live
-// in the sibling IdentityGateForms.tsx (this file passed the ~400-line split
-// threshold); that file is also what Task 6's Settings view reuses.
+// in the sibling IdentityGateForms.tsx; the first-run step rail lives in
+// OnboardingChrome.tsx; the new-device link wizard in LinkDeviceFlow.tsx.
 
 import { useCallback, useEffect, useState } from "react";
 import type { ReactNode } from "react";
@@ -40,7 +41,8 @@ import {
   unlockIdentity,
 } from "../../../domain/user-identity-client";
 import type { IdentityStateReport } from "../../../domain/user-identity-client";
-import { font } from "../../theme/tokens";
+import { saveLinkPending, savePendingDisplayName } from "../../store/state";
+import { color, font } from "../../theme/tokens";
 import {
   ConfirmWords,
   GateCard,
@@ -53,6 +55,18 @@ import {
   linkButtonStyle,
   primaryButtonStyle,
 } from "./IdentityGateForms";
+import { LinkDeviceFlow } from "./LinkDeviceFlow";
+import { OnboardingChrome } from "./OnboardingChrome";
+
+// ── absent: the three entry paths ────────────────────────────────────────
+
+const ABSENT_TABS = [
+  { id: "create", label: "Create" },
+  { id: "restore", label: "Restore" },
+  { id: "link", label: "Link device" },
+] as const;
+
+type AbsentMode = (typeof ABSENT_TABS)[number]["id"];
 
 // ── absent: create ──────────────────────────────────────────────────────
 
@@ -60,12 +74,13 @@ type CreateStep = "password" | "grid" | "confirm";
 
 function CreateFlow({
   onDone,
-  onSwitchToRestore,
+  onSwitchMode,
 }: {
   onDone: () => void;
-  onSwitchToRestore: () => void;
+  onSwitchMode: (mode: AbsentMode) => void;
 }) {
   const [step, setStep] = useState<CreateStep>("password");
+  const [name, setName] = useState("");
   const [mnemonic, setMnemonic] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -73,20 +88,31 @@ function CreateFlow({
   if (step === "password") {
     return (
       <GateCard
-        title="Create your identity"
-        subtitle="Set a password to encrypt this machine's identity key at rest. You'll get a 24-word recovery phrase next — write it down; it's the only backup."
+        title="Create your account"
+        subtitle="One account for all your devices and workspaces. Set a password to protect it on this device — your 24-word recovery phrase comes next."
       >
-        <ModeTabs mode="create" onSelect={(m) => m === "restore" && onSwitchToRestore()} />
+        <ModeTabs tabs={ABSENT_TABS} mode="create" onSelect={onSwitchMode} />
+        <input
+          aria-label="Display name"
+          value={name}
+          placeholder="Your name (optional)"
+          onChange={(event) => setName(event.target.value)}
+          style={inputStyle}
+        />
         <PasswordForm
           mode="set"
           busy={busy}
           error={error}
-          submitLabel={busy ? "Creating…" : "Create identity"}
+          submitLabel={busy ? "Creating…" : "Create account"}
           onSubmit={(password) => {
             setBusy(true);
             setError(null);
             createIdentity(password)
               .then((created) => {
+                // The chosen name can only land on-chain after the first node
+                // connects (names are chain-scoped) — park it until then.
+                const trimmed = name.trim();
+                if (trimmed) savePendingDisplayName(trimmed);
                 setMnemonic(created.mnemonic);
                 setStep("grid");
               })
@@ -102,7 +128,7 @@ function CreateFlow({
     return (
       <GateCard
         title="Save your recovery phrase"
-        subtitle="Write these 24 words down in order and keep them somewhere safe. Anyone with these words can restore your identity — this is shown only once."
+        subtitle="These 24 words ARE your account — anyone holding them can restore it anywhere. Write them down in order; they're shown only once."
       >
         <MnemonicGrid
           mnemonic={mnemonic}
@@ -139,10 +165,10 @@ function CreateFlow({
 
 function RestoreFlow({
   onDone,
-  onSwitchToCreate,
+  onSwitchMode,
 }: {
   onDone: () => void;
-  onSwitchToCreate: () => void;
+  onSwitchMode: (mode: AbsentMode) => void;
 }) {
   const [words, setWords] = useState("");
   const [busy, setBusy] = useState(false);
@@ -177,10 +203,10 @@ function RestoreFlow({
 
   return (
     <GateCard
-      title="Restore your identity"
+      title="Restore your account"
       subtitle="Enter your 24-word recovery phrase and set a new password for this device."
     >
-      <ModeTabs mode="restore" onSelect={(m) => m === "create" && onSwitchToCreate()} />
+      <ModeTabs tabs={ABSENT_TABS} mode="restore" onSelect={onSwitchMode} />
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         <textarea
           value={words}
@@ -195,7 +221,7 @@ function RestoreFlow({
           error={error}
           placeholder="New password"
           confirmPlaceholder="Confirm new password"
-          submitLabel={busy ? "Restoring…" : "Restore identity"}
+          submitLabel={busy ? "Restoring…" : "Restore account"}
           onSubmit={submit}
         />
       </div>
@@ -203,13 +229,71 @@ function RestoreFlow({
   );
 }
 
-function AbsentScreen({ onDone }: { onDone: () => void }) {
-  const [mode, setMode] = useState<"create" | "restore">("create");
-  return mode === "create" ? (
-    <CreateFlow onDone={onDone} onSwitchToRestore={() => setMode("restore")} />
-  ) : (
-    <RestoreFlow onDone={onDone} onSwitchToCreate={() => setMode("create")} />
+// ── absent: link this device to an existing account ────────────────────
+
+type LinkStep = "password" | "wizard";
+
+function LinkFlow({
+  onDone,
+  onSwitchMode,
+}: {
+  onDone: () => void;
+  onSwitchMode: (mode: AbsentMode) => void;
+}) {
+  const [step, setStep] = useState<LinkStep>("password");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (step === "password") {
+    return (
+      <GateCard
+        title="Link this device"
+        subtitle="Your account lives on another device. Set a password for this device's own key — you'll approve the link from your other device next."
+      >
+        <ModeTabs tabs={ABSENT_TABS} mode="link" onSelect={onSwitchMode} />
+        <PasswordForm
+          mode="set"
+          busy={busy}
+          error={error}
+          submitLabel={busy ? "Creating…" : "Create this device's key"}
+          onSubmit={(password) => {
+            setBusy(true);
+            setError(null);
+            createIdentity(password)
+              // A linked device's own phrase is a secondary backup — the
+              // account's recovery lives on the other device — so the
+              // shown-once confirm ceremony is skipped here (the flag is
+              // UX-only); the phrase stays viewable from the Account view.
+              .then(() => confirmMnemonic())
+              .then(() => {
+                // From here on, auto-bind must NOT found a fresh account for
+                // this key — it waits for the other device's AddMemberKey.
+                saveLinkPending();
+                setStep("wizard");
+              })
+              .catch((err) => setError(errMessage(err)))
+              .finally(() => setBusy(false));
+          }}
+        />
+      </GateCard>
+    );
+  }
+
+  return (
+    <GateCard
+      title="Approve from your other device"
+      subtitle="On your other device, open Account → Link a device, then swap the two codes below. You can continue and finish the link later."
+    >
+      <LinkDeviceFlow onDone={onDone} doneLabel="Continue" />
+    </GateCard>
   );
+}
+
+function AbsentScreen({ onDone }: { onDone: () => void }) {
+  const [mode, setMode] = useState<AbsentMode>("create");
+  if (mode === "create") return <CreateFlow onDone={onDone} onSwitchMode={setMode} />;
+  if (mode === "restore") return <RestoreFlow onDone={onDone} onSwitchMode={setMode} />;
+  return <LinkFlow onDone={onDone} onSwitchMode={setMode} />;
 }
 
 // ── plaintext (legacy) ──────────────────────────────────────────────────
@@ -226,8 +310,8 @@ function PlaintextScreen({ onDone, onDismiss }: { onDone: () => void; onDismiss:
   if (step === "interstitial") {
     return (
       <GateCard
-        title="Secure your identity"
-        subtitle="This identity isn't password-protected yet. Set a password so a stolen device can't be used to sign as you. You can do this later from Settings."
+        title="Secure your account"
+        subtitle="This account isn't password-protected yet. Set a password so a stolen device can't be used to sign as you. You can do this later from the Account view."
       >
         <button onClick={() => setStep("password")} style={primaryButtonStyle(false)}>
           Set a password
@@ -241,12 +325,12 @@ function PlaintextScreen({ onDone, onDismiss }: { onDone: () => void; onDismiss:
 
   if (step === "password") {
     return (
-      <GateCard title="Set a password" subtitle="This encrypts your identity key at rest on this device.">
+      <GateCard title="Set a password" subtitle="This encrypts your account key at rest on this device.">
         <PasswordForm
           mode="set"
           busy={busy}
           error={error}
-          submitLabel={busy ? "Securing…" : "Secure identity"}
+          submitLabel={busy ? "Securing…" : "Secure account"}
           onSubmit={(pw) => {
             setBusy(true);
             setError(null);
@@ -269,7 +353,7 @@ function PlaintextScreen({ onDone, onDismiss }: { onDone: () => void; onDismiss:
   return (
     <GateCard
       title="View your recovery phrase"
-      subtitle="You can write down your 24-word recovery phrase now, or do this later from Settings."
+      subtitle="You can write down your 24-word recovery phrase now, or do this later from the Account view."
     >
       {mnemonic ? (
         <MnemonicGrid mnemonic={mnemonic} onContinue={onDone} continueLabel="Done" />
@@ -308,8 +392,8 @@ function LockedScreen({ onDone, onSkip }: { onDone: () => void; onSkip: () => vo
 
   return (
     <GateCard
-      title="Unlock your identity"
-      subtitle="Enter your password to unlock this device's identity for this session."
+      title="Unlock your account"
+      subtitle="Enter your password to unlock your account on this device for this session."
     >
       <PasswordForm
         mode="confirm"
@@ -328,6 +412,16 @@ function LockedScreen({ onDone, onSkip }: { onDone: () => void; onSkip: () => vo
       <button onClick={onSkip} style={linkButtonStyle}>
         Skip for now
       </button>
+      <span
+        style={{
+          font: `400 10.5px ${font.sans}`,
+          color: color.muted2,
+          textAlign: "center",
+          lineHeight: 1.4,
+        }}
+      >
+        Until you unlock, nodes you start stay unlinked to your account.
+      </span>
     </GateCard>
   );
 }
@@ -346,7 +440,7 @@ function ResumeScreen({ onDone, onSkip }: { onDone: () => void; onSkip: () => vo
     return (
       <GateCard
         title="Confirm your recovery phrase"
-        subtitle="You created this identity but never confirmed its recovery phrase. Enter your password to view it and finish."
+        subtitle="You created this account but never confirmed its recovery phrase. Enter your password to view it and finish."
       >
         <PasswordForm
           mode="confirm"
@@ -437,35 +531,54 @@ export function IdentityGate({ children }: { children: ReactNode }) {
 
   if (bootError) {
     return (
-      <GateCard title="Couldn't read your identity" subtitle={bootError}>
-        <button onClick={() => void refresh()} style={primaryButtonStyle(false)}>
-          Retry
-        </button>
-      </GateCard>
+      <OnboardingChrome step={null}>
+        <GateCard title="Couldn't read your account key" subtitle={bootError}>
+          <button onClick={() => void refresh()} style={primaryButtonStyle(false)}>
+            Retry
+          </button>
+        </GateCard>
+      </OnboardingChrome>
     );
   }
 
-  if (!report) return null; // resolving identity state — nothing to show yet
+  if (!report) return null; // resolving account state — nothing to show yet
 
   if (report.state === "absent") {
-    return <AbsentScreen onDone={refresh} />;
+    // A true first run: the step rail numbers this Account stage 1 of 3.
+    return (
+      <OnboardingChrome step={1}>
+        <AbsentScreen onDone={refresh} />
+      </OnboardingChrome>
+    );
   }
 
   if (report.state === "plaintext") {
     if (dismissedPlaintext) return <>{children}</>;
-    return <PlaintextScreen onDone={refresh} onDismiss={() => setDismissedPlaintext(true)} />;
+    return (
+      <OnboardingChrome step={null}>
+        <PlaintextScreen onDone={refresh} onDismiss={() => setDismissedPlaintext(true)} />
+      </OnboardingChrome>
+    );
   }
 
   // locked or unlocked from here — an interrupted create resumes first,
   // regardless of which of those two the session cache landed on.
   if (!report.mnemonicConfirmed) {
     if (skippedResume) return <>{children}</>;
-    return <ResumeScreen onDone={refresh} onSkip={() => setSkippedResume(true)} />;
+    return (
+      <OnboardingChrome step={null}>
+        <ResumeScreen onDone={refresh} onSkip={() => setSkippedResume(true)} />
+      </OnboardingChrome>
+    );
   }
 
   if (report.state === "locked") {
     if (skippedUnlock) return <>{children}</>;
-    return <LockedScreen onDone={refresh} onSkip={() => setSkippedUnlock(true)} />;
+    return (
+      <OnboardingChrome step={null}>
+        <LockedScreen onDone={refresh} onSkip={() => setSkippedUnlock(true)} />
+      </OnboardingChrome>
+    );
   }
 
   return <>{children}</>; // unlocked, confirmed

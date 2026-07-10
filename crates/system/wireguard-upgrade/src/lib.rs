@@ -282,7 +282,15 @@ pub struct EndpointRecord {
     /// substitute its own key without breaking the record signature.
     pub wireguard_public_key: X25519PublicKey,
     pub control_endpoint: Endpoint,
-    pub wireguard_endpoint: Endpoint,
+    /// The member's dialable WireGuard UDP endpoint — `None` for a NAT'd
+    /// member with no dialable underlay address (a joiner behind a home
+    /// router). Peers install its tunnel WITHOUT an endpoint and wait: the
+    /// endpoint-less side holds every peer's endpoint from these records, so
+    /// it initiates, and WireGuard's roaming pins the observed source. On the
+    /// wire `None` omits the field, keeping endpoint-ful records bit-identical
+    /// to the pre-Option encoding (and old records decodable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireguard_endpoint: Option<Endpoint>,
     pub capabilities: Vec<MeshCapability>,
     pub expires_at_view: u64,
     pub nonce: u64,
@@ -301,7 +309,9 @@ impl EndpointRecord {
             return Err(UpgradeError::Expired);
         }
         policy.check_endpoint(&self.control_endpoint)?;
-        policy.check_endpoint(&self.wireguard_endpoint)?;
+        if let Some(wireguard_endpoint) = &self.wireguard_endpoint {
+            policy.check_endpoint(wireguard_endpoint)?;
+        }
         ensure_x25519(self.wireguard_public_key)
     }
 }
@@ -408,7 +418,9 @@ impl MeshView {
                 return Err(UpgradeError::Expired);
             }
             policy.check_endpoint(&record.control_endpoint)?;
-            policy.check_endpoint(&record.wireguard_endpoint)?;
+            if let Some(wireguard_endpoint) = &record.wireguard_endpoint {
+                policy.check_endpoint(wireguard_endpoint)?;
+            }
             ensure_x25519(record.wireguard_public_key)?;
             match selected.get(&record.validator_identity) {
                 Some(prev) if record.nonce <= prev.record.nonce => {
@@ -466,7 +478,7 @@ impl MeshView {
     }
 }
 
-/// the documented v2 preimage (docs/wireguard-tunnel-upgrade.md "Mesh
+/// the documented v2 preimage (docs/records/protocols/wireguard-tunnel-upgrade.md "Mesh
 /// Version"): HASH(domain || namespace || epoch || valset_root ||
 /// admission_root || SORT_ASC(endpoint_record_hashes)). v2 differs from v1
 /// only in each record hash now covering `wireguard_public_key` (and the
@@ -664,9 +676,20 @@ impl OverlayPolicy {
         if routes.is_empty() {
             return Err(UpgradeError::InvalidAllowedIp);
         }
-        for route in routes {
+        for (i, route) in routes.iter().enumerate() {
             reject_stealing_route(*route)?;
             if !canonical.contains(route) {
+                return Err(UpgradeError::InvalidAllowedIp);
+            }
+            // Reject a duplicate-bearing vector. The signed preimage sorts+dedups
+            // (`put_allowed_ips`), so a signature still verifies over a vector that
+            // repeats a canonical route many times — but the effect layer
+            // materializes EVERY entry into the WireGuard peer config. Without this
+            // an admitted validator could sign ONE request that inflates a peer's
+            // allowed-ips into a memory/CPU DoS. A legitimate sender advertises a
+            // set (a subset of the canonical routes), never a repeat, so bounding
+            // `routes` to distinct canonical entries caps it at `canonical.len()`.
+            if routes[..i].contains(route) {
                 return Err(UpgradeError::InvalidAllowedIp);
             }
         }
@@ -684,7 +707,10 @@ pub struct TunnelUpgradeRequestFields {
     pub initiator_identity: ValidatorIdentity,
     pub responder_identity: ValidatorIdentity,
     pub initiator_wireguard_public_key: X25519PublicKey,
-    pub initiator_wireguard_endpoint: Endpoint,
+    /// `None` when the initiator advertises no WireGuard endpoint (NAT'd,
+    /// endpoint-less); must equal the initiator's record either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator_wireguard_endpoint: Option<Endpoint>,
     pub requested_allowed_ips: Vec<AllowedIp>,
     pub port_policy_hash: PolicyHash,
     pub expires_at_view: u64,
@@ -783,7 +809,10 @@ pub struct TunnelUpgradeResponseFields {
     pub responder_identity: ValidatorIdentity,
     pub initiator_identity: ValidatorIdentity,
     pub responder_wireguard_public_key: X25519PublicKey,
-    pub responder_wireguard_endpoint: Endpoint,
+    /// `None` when the responder advertises no WireGuard endpoint (NAT'd,
+    /// endpoint-less); must equal the responder's record either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responder_wireguard_endpoint: Option<Endpoint>,
     pub accepted_allowed_ips: Vec<AllowedIp>,
     pub relay_candidates: Vec<ValidatorIdentity>,
     pub direct_dial_failure: Option<DirectDialFailureEvidence>,
@@ -927,7 +956,7 @@ pub struct TunnelInstallPlan {
     peer_identity: ValidatorIdentity,
     local_wireguard_public_key: X25519PublicKey,
     peer_wireguard_public_key: X25519PublicKey,
-    peer_endpoint: Endpoint,
+    peer_endpoint: Option<Endpoint>,
     local_interface_ips: Vec<AllowedIp>,
     allowed_ips: Vec<AllowedIp>,
     relay_candidates: Vec<ValidatorIdentity>,
@@ -955,7 +984,7 @@ impl TunnelInstallPlan {
         self.peer_wireguard_public_key
     }
 
-    pub fn peer_endpoint(&self) -> Endpoint {
+    pub fn peer_endpoint(&self) -> Option<Endpoint> {
         self.peer_endpoint
     }
 
@@ -986,7 +1015,10 @@ pub enum Perspective {
     Responder,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the public validation boundary keeps every signed transcript and context input explicit"
+)]
 pub fn validate_upgrade(
     view: &MeshView,
     policy: &PortPolicy,
@@ -1018,7 +1050,10 @@ pub fn validate_upgrade(
 /// the responder-side counterpart the `tunnel_e2e` "PINNED GAP" test
 /// documents: before this function existed, only the initiator's plan was
 /// derivable.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the public validation boundary keeps every signed transcript and context input explicit"
+)]
 pub fn validate_upgrade_as(
     perspective: Perspective,
     view: &MeshView,
@@ -1103,8 +1138,12 @@ pub fn validate_upgrade_as(
     }
     ensure_x25519(rq.initiator_wireguard_public_key)?;
     ensure_x25519(rs.responder_wireguard_public_key)?;
-    policy.check_endpoint(&rq.initiator_wireguard_endpoint)?;
-    policy.check_endpoint(&rs.responder_wireguard_endpoint)?;
+    if let Some(endpoint) = &rq.initiator_wireguard_endpoint {
+        policy.check_endpoint(endpoint)?;
+    }
+    if let Some(endpoint) = &rs.responder_wireguard_endpoint {
+        policy.check_endpoint(endpoint)?;
+    }
     if current_view > rq.expires_at_view
         || current_view > rs.expires_at_view
         || current_view > ak.expires_at_view
@@ -1136,13 +1175,18 @@ pub fn validate_upgrade_as(
         return Err(UpgradeError::InvalidRelay);
     }
     if let Some(failure) = &rs.direct_dial_failure {
+        // dial-failure evidence is about a dial toward an ADVERTISED
+        // endpoint — an endpoint-less responder has nothing to fail against.
+        let Some(responder_endpoint) = responder_record.wireguard_endpoint else {
+            return Err(UpgradeError::InvalidDialFailure);
+        };
         validate_direct_dial_failure(
             failure,
             view,
             current_view,
             rq.initiator_identity,
             rq.responder_identity,
-            responder_record.wireguard_endpoint,
+            responder_endpoint,
         )?;
     }
     for relay in &rs.relay_candidates {
@@ -1298,7 +1342,7 @@ pub struct DefguardPeerConfig {
 impl DefguardPeerConfig {
     pub fn from_plan(plan: &TunnelInstallPlan) -> Self {
         let mut peer = DefguardPeer::new(DefguardKey::new(plan.peer_wireguard_public_key.0));
-        peer.endpoint = Some(plan.peer_endpoint.socket_addr());
+        peer.endpoint = plan.peer_endpoint.map(|endpoint| endpoint.socket_addr());
         peer.persistent_keepalive_interval = plan.keepalive_seconds;
         peer.set_allowed_ips(to_defguard_allowed_ips(&plan.allowed_ips));
         Self {
@@ -1516,7 +1560,7 @@ fn put_endpoint_record(out: &mut Vec<u8>, record: &EndpointRecord) {
     put_identity(out, record.validator_identity);
     put_x25519(out, record.wireguard_public_key);
     put_endpoint(out, record.control_endpoint);
-    put_endpoint(out, record.wireguard_endpoint);
+    put_opt_endpoint(out, record.wireguard_endpoint);
     put_capabilities(out, &record.capabilities);
     put_u64(out, record.expires_at_view);
     put_u64(out, record.nonce);
@@ -1540,7 +1584,7 @@ fn put_request_fields(out: &mut Vec<u8>, fields: &TunnelUpgradeRequestFields) {
     put_identity(out, fields.initiator_identity);
     put_identity(out, fields.responder_identity);
     put_x25519(out, fields.initiator_wireguard_public_key);
-    put_endpoint(out, fields.initiator_wireguard_endpoint);
+    put_opt_endpoint(out, fields.initiator_wireguard_endpoint);
     put_allowed_ips(out, &fields.requested_allowed_ips);
     put_policy_hash(out, fields.port_policy_hash);
     put_u64(out, fields.expires_at_view);
@@ -1572,7 +1616,7 @@ fn put_response_fields(out: &mut Vec<u8>, fields: &TunnelUpgradeResponseFields) 
     put_identity(out, fields.responder_identity);
     put_identity(out, fields.initiator_identity);
     put_x25519(out, fields.responder_wireguard_public_key);
-    put_endpoint(out, fields.responder_wireguard_endpoint);
+    put_opt_endpoint(out, fields.responder_wireguard_endpoint);
     put_allowed_ips(out, &fields.accepted_allowed_ips);
     put_identities(out, &fields.relay_candidates);
     match &fields.direct_dial_failure {
@@ -1666,6 +1710,16 @@ fn put_x25519(out: &mut Vec<u8>, value: X25519PublicKey) {
 
 fn put_signature(out: &mut Vec<u8>, value: &SignatureBytes) {
     put_bytes(out, &value.0);
+}
+
+/// `None` is a single `0` where a present endpoint's transport byte (1|2)
+/// would sit — unambiguous, and `Some` bytes stay identical to the
+/// pre-Option encoding, so existing signatures keep verifying.
+fn put_opt_endpoint(out: &mut Vec<u8>, endpoint: Option<Endpoint>) {
+    match endpoint {
+        Some(endpoint) => put_endpoint(out, endpoint),
+        None => out.push(0),
+    }
 }
 
 fn put_endpoint(out: &mut Vec<u8>, endpoint: Endpoint) {

@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ChatSearchHit } from "../../../domain/chat-client";
-import type { Manifest } from "../../../domain/files-client";
+import type { FileEntry } from "../../../domain/files-client";
 import type { PageSearchHit } from "../../../domain/pages-client";
 import { shortKey } from "../../../domain/names";
 import type { ConsoleActions } from "../../store/actions";
@@ -24,16 +24,13 @@ const makeActions = () => {
   return { actions, spies };
 };
 
-const fileOf = (name: string, id: string): Manifest => ({
-  file_id: id,
-  name,
-  mime: "text/plain",
+const fileOf = (name: string): FileEntry => ({
+  path: `/${name}`,
+  kind: "file",
   size: 1,
-  chunk_size: 1,
-  chunks: [],
-  digest: "",
-  owner: "",
-  created_at_height: 0,
+  exec: false,
+  object: "",
+  meta: {},
 });
 
 const renderModal = (patch: Partial<ConsoleState> = {}) => {
@@ -41,7 +38,7 @@ const renderModal = (patch: Partial<ConsoleState> = {}) => {
     ...createInitialState(),
     members: ["aa".repeat(32), "bb".repeat(32)],
     authorNames: { ["aa".repeat(32)]: "Alice", ["bb".repeat(32)]: "Bob" },
-    files: [fileOf("roadmap.md", "f1"), fileOf("budget.csv", "f2")],
+    files: [fileOf("roadmap.md"), fileOf("budget.csv")],
     searchOpen: true,
     ...patch,
   };
@@ -114,6 +111,24 @@ describe("SearchModal", () => {
     expect(screen.queryByText(new RegExp(known))).not.toBeInTheDocument();
     // an unknown key collapses to a short handle, not garbage or full hex.
     expect(screen.getByText(new RegExp(shortKey(unknown)))).toBeInTheDocument();
+  });
+
+  it("drops chat hits from module-reserved channels (forge:* item threads)", () => {
+    renderModal({
+      search: {
+        query: "ship",
+        chat: [
+          { channelId: "general", seq: 3, author: "Alice", edited: false, text: "ship it" } as ChatSearchHit,
+          { channelId: "forge:ducktape:1", seq: 1, author: "Alice", edited: false, text: "ship the fix" } as ChatSearchHit,
+        ],
+        docs: [],
+      },
+    });
+    fireEvent.change(screen.getByLabelText("Search"), { target: { value: "ship" } });
+    // hidden discussion channels never surface as chat hits — a follow-up will
+    // deep-link them into the forge view instead.
+    expect(screen.getByText("ship it")).toBeInTheDocument();
+    expect(screen.queryByText("ship the fix")).not.toBeInTheDocument();
   });
 
   it("hides node-index results whose query does not match the current input", () => {

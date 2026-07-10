@@ -28,6 +28,12 @@ pub struct MsgError(#[from] serde_json::Error);
 /// first, then signed advertisements over the agreed set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+// This enum is the reachability channel's serde protocol surface. Keep direct
+// variant payloads so callers match and construct the signed messages verbatim.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "this serde protocol enum preserves direct signed-message payload variants"
+)]
 pub enum ReachabilityMsg {
     /// Pre-version gossip: a member's OWNER-SIGNED record for the current
     /// epoch — self-signed so a relaying member can neither forge nor alter
@@ -84,7 +90,7 @@ mod tests {
             validator_identity: ValidatorIdentity::try_from(signer.public_key().as_ref()).unwrap(),
             wireguard_public_key: X25519PublicKey([4; 32]),
             control_endpoint: endpoint(10, 443, Transport::Tcp),
-            wireguard_endpoint: endpoint(10, 51820, Transport::Udp),
+            wireguard_endpoint: Some(endpoint(10, 51820, Transport::Udp)),
             capabilities: vec![MeshCapability::Relay],
             expires_at_view: 50,
             nonce: 1,

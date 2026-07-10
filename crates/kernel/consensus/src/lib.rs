@@ -223,11 +223,12 @@ pub fn digest_of(bytes: &[u8]) -> Digest {
 /// past the cap the OLDEST cached entry is evicted FIFO. own submissions are
 /// PINNED instead (never evicted) until finalization demotes them, so this
 /// node's proposals always resolve locally and always remain servable to a
-/// fetching peer while in flight. sizing: worst case cap × max payload
-/// (1 MiB on the node's mesh) bounds cache memory; ops are typically small
-/// json frames, so in practice this holds thousands of blocks of history for
-/// peers catching up. a peer that has fallen further behind than the cache
-/// window must rebuild through module state sync, not per-op fetch.
+/// fetching peer while in flight. sizing: worst case cap × max message
+/// (2 MiB on the node's mesh) bounds cache memory; honest frames are capped
+/// at ~1 MiB (`node::MAX_FRAME_BYTES`) and typically far smaller, so in
+/// practice this holds thousands of blocks of history for peers catching up.
+/// a peer that has fallen further behind than the cache window must rebuild
+/// through module state sync, not per-op fetch.
 pub const PAYLOAD_CACHE_CAP: usize = 16_384;
 
 /// digest->bytes map: resolves the opaque digests simplex finalizes back into
@@ -416,14 +417,24 @@ impl ConsensusHandle {
 /// is a no-op `true` — in this single-app sim every payload asked about is one we
 /// stored. generic over the public key `P` so `Context<Digest, P>` lines up with
 /// whatever scheme the engine runs.
+/// the single block-time knob: the target interval between finalized blocks.
+/// an idle chain ticks exactly one nop block per `BLOCK_TIME`; a busy window's
+/// ops all aggregate into the single block that closes the window. the node's
+/// flush/heartbeat loop AND this automaton's idle-wait both pace off this one
+/// value, so no producer can outpace it (the 1-tx-1-block + faster-than-intended
+/// beat regime is gone). raising it slows the visibly-live height tick 1:1.
+pub const BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 /// how long a leader holds an otherwise-idle view open, polling for an op or the
-/// node's heartbeat nop before declining. keeping a solo validator (no quorum to
-/// wait on) from spinning nullifications — and the height they stamp — at CPU
-/// speed. MUST exceed the node's heartbeat interval (`HEARTBEAT_INTERVAL`, 1s) so
-/// the beat always lands inside the window and the view advances by a single
-/// finalized block per beat (a clean ~1s block time), never a nullify + a
-/// finalize per beat.
-const IDLE_BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+/// node's heartbeat nop before declining — keeping a solo validator (no quorum
+/// to wait on) from spinning nullifications, and the height they stamp, at CPU
+/// speed. equal to [`BLOCK_TIME`]: the node's flush loop is the real pacer, so
+/// this is only the safety ceiling for a node whose flush loop is disabled. it
+/// MUST be >= the beat interval so the beat lands inside the window and the view
+/// advances by a single finalized block per beat, never a nullify + a finalize.
+const IDLE_BLOCK_TIME: std::time::Duration = BLOCK_TIME;
+/// how often [`ConsensusAutomaton::propose`] polls the pending FIFO while it
+/// holds an idle view open. matches the node's `DRAIN_TICK`.
+const POLL_STEP: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub struct ConsensusAutomaton<P, C> {
     pending: Arc<Mutex<VecDeque<Digest>>>,
@@ -514,7 +525,7 @@ where
         // nop is proposed within a tick. still empty at the deadline → drop `tx`
         // (the engine reads that as "can't propose" and nullifies), now paced to
         // ~1 block per block-time.
-        let step = std::time::Duration::from_millis(100);
+        let step = POLL_STEP;
         let mut waited = std::time::Duration::ZERO;
         loop {
             if let Some(digest) = self
@@ -1634,6 +1645,11 @@ impl SimplexOrderer {
 /// encoding; a decode failure means the persisted floor is damaged — callers
 /// FAIL rather than silently fall back to a genesis floor, which would
 /// resurrect the journal-replay wedge the floor exists to prevent.
+///
+/// decode-ONLY — reserved for certificates this node itself persisted (its
+/// own respawn floor, read back from its own disk). anything received from
+/// ANOTHER node goes through [`verify_finalization`] instead: same decode,
+/// plus the cryptographic quorum check.
 pub fn decode_finalization<S>(scheme: &S, bytes: &[u8]) -> Result<Finalization<S, Digest>, String>
 where
     S: Scheme,
@@ -1642,9 +1658,367 @@ where
         .map_err(|e| format!("persisted finalization floor does not decode: {e}"))
 }
 
+// ============================================================================
+// the FOLLOWER orderer — the replica pipeline's engine-free `node::Orderer`.
+// ============================================================================
+
+/// decode AND cryptographically verify an externally-received finalization
+/// certificate against `scheme` — a signer or verifier-only instance over the
+/// epoch's participant set (`Scheme::verifier(namespace, participants)` needs
+/// no signing key). the quorum arithmetic (`N3f1`, 2f+1) is baked into
+/// [`Finalization::verify`]. both failure modes are loud and distinct: a
+/// structural failure means damaged bytes, a verification failure means the
+/// bytes were never assembled by the epoch's quorum — either way the source
+/// is lying and the caller must treat it as such, never fall back to the
+/// decode-only path.
+pub fn verify_finalization<S, R>(
+    rng: &mut R,
+    scheme: &S,
+    bytes: &[u8],
+) -> Result<Finalization<S, Digest>, String>
+where
+    S: commonware_consensus::simplex::scheme::Scheme<Digest>,
+    R: rand_core::CryptoRngCore,
+{
+    use commonware_parallel::Sequential;
+    let finalization = Finalization::<S, Digest>::decode_cfg(
+        bytes,
+        &scheme.certificate_codec_config(),
+    )
+    .map_err(|e| format!("finalization certificate does not decode: {e}"))?;
+    if !finalization.verify(rng, scheme, &Sequential) {
+        return Err(
+            "finalization certificate does not carry the epoch quorum's signatures".to_string(),
+        );
+    }
+    Ok(finalization)
+}
+
+/// the engine-free [`node::Orderer`] — the replica pipeline's ordered lane
+/// (unified-node design, phase 1). a node that FOLLOWS consensus instead of
+/// participating in it: externally-received finalization certificates enter
+/// through [`FollowerOrderer::observe_finalization`] — verified against the
+/// epoch's participant set, never trusted — and release through the SAME
+/// ordered gate ([`FinalizedInbox`]) + payload machinery a validator's
+/// reporter drives, so `poll_delivered` hands `OrderedNode` byte-identical
+/// input either way. `submit` refuses loudly: a follower holds no proposal
+/// rights (a resident's writes relay to a validator; that lane is unchanged).
+/// the outcome of one [`FollowerOrderer::observe_finalization`] — what the
+/// follower's DRIVER (the loop feeding certs off the wire) must do next.
+/// the ordered gate releases in ADMISSION order and the host fold is
+/// order-dependent, so the driver owns delivering certs in ascending
+/// finalized-view order; these variants are how the seam holds it to that.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Observed {
+    /// verified and admitted to the ordered gate at this view (bytes ready,
+    /// or awaiting the resolver fetch that was just issued).
+    Admitted(u64),
+    /// verified, but at or below the last admitted view: a replay or an
+    /// out-of-order straggler for a slot this follower already admitted —
+    /// idempotently skipped, the gate untouched.
+    Stale(u64),
+    /// verified, but the payload bytes are neither in the store nor
+    /// fetchable (no resolver wired): admitting would silently drop the
+    /// block. NOT admitted — the driver must supply the bytes another way
+    /// (the statesync Frames lane) before re-observing.
+    Unresolvable(u64),
+}
+
+pub struct FollowerOrderer {
+    store: ContentStore,
+    inbox: FinalizedInbox,
+    /// the highest ADMITTED finalized view — the ascending-order guard. the
+    /// validator reporter gets this ordering from its own engine's monotone
+    /// view progression; an external cert feed has no such guarantee, and a
+    /// lower view admitted after a higher one would fold out of agreed order
+    /// (order-dependent roots would diverge). views are NOT dense (nullified
+    /// views leave gaps), so this guards descent only — a forward jump is
+    /// normal and the phase-2 driver cross-checks it against its journal
+    /// heights, backfilling any missed finalization over the Frames lane.
+    last_admitted: Option<u64>,
+    /// the shared latest-finalization slot (see [`LatestFinalization`]) —
+    /// monotonic by view here, unlike the reporter's blind overwrite: the
+    /// engine reports ascending views by construction, but a follower can be
+    /// handed a REPLAYED old certificate, and regressing the slot would
+    /// persist a stale respawn floor.
+    latest_final: LatestFinalization,
+    /// the catch-up fetch mailbox, `Some` only on the [`FollowerOrderer::spawn`]
+    /// path. a finalization MISS without it drops the slot — the eager-only
+    /// semantics of the bare constructor.
+    mailbox: Option<PayloadMailbox>,
+    /// fetches the mailbox did not accept, retried on the next observe —
+    /// same never-silently-drop contract as [`SimplexReporter`].
+    deferred_fetches: VecDeque<Digest>,
+    /// the resolver fetch engine — aborted on `Drop` (a bare handle drop
+    /// leaks the task, the same trap `SimplexOrderer` documents).
+    resolver_fetch: Option<commonware_runtime::Handle<()>>,
+    /// the eager payload-gossip drain — aborted on `Drop`.
+    payload_drain: Option<commonware_runtime::Handle<()>>,
+}
+
+impl Drop for FollowerOrderer {
+    fn drop(&mut self) {
+        if let Some(fetch) = &self.resolver_fetch {
+            fetch.abort();
+        }
+        if let Some(drain) = &self.payload_drain {
+            drain.abort();
+        }
+    }
+}
+
+impl FollowerOrderer {
+    /// the bare follower over a shared [`ContentStore`]: no payload drain, no
+    /// resolver. a finalization whose bytes miss the store is DROPPED (never
+    /// logged) — exactly the no-resolver semantics of the eager validator
+    /// path. the in-process / unit-test constructor; production wiring is
+    /// [`FollowerOrderer::spawn`].
+    pub fn new(store: ContentStore) -> Self {
+        Self {
+            store,
+            inbox: FinalizedInbox::new(),
+            last_admitted: None,
+            latest_final: LatestFinalization::default(),
+            mailbox: None,
+            deferred_fetches: VecDeque::new(),
+            resolver_fetch: None,
+            payload_drain: None,
+        }
+    }
+
+    /// the production follower WITHOUT its own payload drain: the content
+    /// store is fed EXTERNALLY (a caller that drains many epochs' payload
+    /// lanes into one shared store), and only the resolver fetch engine runs
+    /// here — the same producer/consumer/gate wiring
+    /// [`SimplexOrderer::spawn_with_resolver`] gives a validator.
+    /// [`FollowerOrderer::spawn`] composes this with the standard drain.
+    pub fn spawn_resolver<E, B, D, FS, FR>(
+        context: E,
+        blocker: B,
+        provider: D,
+        me: commonware_cryptography::ed25519::PublicKey,
+        store: ContentStore,
+        fetch: (FS, FR),
+    ) -> Self
+    where
+        E: commonware_runtime::Spawner
+            + commonware_runtime::Clock
+            + commonware_runtime::Storage
+            + commonware_runtime::Metrics
+            + commonware_runtime::BufferPooler
+            + rand_core::CryptoRngCore
+            + Send
+            + Sync
+            + 'static,
+        B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        D: commonware_p2p::Provider<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        FS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        FR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+    {
+        use commonware_utils::NZUsize;
+        use std::time::Duration;
+
+        let inbox = FinalizedInbox::new();
+        let fetch_cfg = ResolverConfig {
+            peer_provider: provider,
+            blocker,
+            consumer: PayloadConsumer {
+                store: store.clone(),
+                inbox: inbox.clone(),
+            },
+            producer: PayloadProducer {
+                store: store.clone(),
+            },
+            mailbox_size: NZUsize!(1024),
+            me: Some(me),
+            initial: Duration::from_millis(100),
+            timeout: Duration::from_millis(400),
+            fetch_retry_timeout: Duration::from_millis(100),
+            priority_requests: false,
+            priority_responses: false,
+        };
+        let (fetch_engine, mailbox) =
+            ResolverEngine::new(context.child("payload_fetch"), fetch_cfg);
+        let fetch_handle = fetch_engine.start(fetch);
+
+        Self {
+            store,
+            inbox,
+            last_admitted: None,
+            latest_final: LatestFinalization::default(),
+            mailbox: Some(mailbox),
+            deferred_fetches: VecDeque::new(),
+            resolver_fetch: Some(fetch_handle),
+            payload_drain: None,
+        }
+    }
+
+    /// admit one BACKFILLED finalized frame — bytes fetched over the
+    /// statesync Frames lane rather than proven by an observed certificate.
+    /// THE CALLER OWNS THIS LANE'S TRUST: after the fold it must cross-check
+    /// the folded seal (disposition / app-hash) against the served one, the
+    /// same per-frame verification the post-reboot catch-up performs — this
+    /// method only stores the bytes content-addressed and logs the gate
+    /// slot. the latest-finalization floor slot is deliberately NOT advanced
+    /// (it only ever holds real certificates). refused (`false`) at or below
+    /// the admission watermark.
+    pub fn admit_backfilled(&mut self, view: u64, bytes: Vec<u8>) -> bool {
+        if self.last_admitted.is_some_and(|last| view <= last) {
+            return false;
+        }
+        let digest = self.store.put(bytes);
+        // a guaranteed store hit (just put): the slot logs ready, no fetch.
+        let _ = self.inbox.record(view, digest, &self.store, false);
+        self.last_admitted = Some(view);
+        true
+    }
+
+    /// the production follower: drain payload gossip store-only AND run the
+    /// resolver fetch engine, so a finalization observed before (or without)
+    /// its gossip resolves by fetching peers — the identical
+    /// producer/consumer/gate wiring [`SimplexOrderer::spawn_with_resolver`]
+    /// gives a validator, minus the engine, automaton, and relay.
+    pub fn spawn<E, B, D, PR, FS, FR>(
+        context: E,
+        blocker: B,
+        provider: D,
+        me: commonware_cryptography::ed25519::PublicKey,
+        store: ContentStore,
+        payload_receiver: PR,
+        fetch: (FS, FR),
+    ) -> Self
+    where
+        E: commonware_runtime::Spawner
+            + commonware_runtime::Clock
+            + commonware_runtime::Storage
+            + commonware_runtime::Metrics
+            + commonware_runtime::BufferPooler
+            + rand_core::CryptoRngCore
+            + Send
+            + Sync
+            + 'static,
+        B: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        D: commonware_p2p::Provider<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        PR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>
+            + Send
+            + 'static,
+        FS: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+        FR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
+    {
+        let drain_handle = spawn_payload_drain(
+            context.child("payload_drain"),
+            payload_receiver,
+            store.clone(),
+        );
+        let mut follower = Self::spawn_resolver(context, blocker, provider, me, store, fetch);
+        follower.payload_drain = Some(drain_handle);
+        follower
+    }
+
+    /// issue (or re-issue) a payload fetch; an unaccepted submission parks
+    /// for retry on the next observe — same contract as the reporter's.
+    fn fetch_or_defer(&mut self, digest: Digest) {
+        let Some(mailbox) = self.mailbox.as_mut() else {
+            return;
+        };
+        if !mailbox.fetch(digest).accepted() {
+            self.deferred_fetches.push_back(digest);
+        }
+    }
+
+    /// verify and admit one externally-received finalization certificate.
+    /// `Err` means the certificate itself is bad (damaged bytes, or not the
+    /// epoch quorum's signatures) — the SOURCE is lying. `Ok` carries the
+    /// [`Observed`] admission outcome the driver acts on. on admission the
+    /// slot enters the ordered gate (bytes from the store if gossip already
+    /// delivered them, else awaiting the resolver fetch just issued) and the
+    /// latest-finalization slot advances. verification is NOT bypassable:
+    /// there is deliberately no unverified admission path.
+    pub fn observe_finalization<S, R>(
+        &mut self,
+        rng: &mut R,
+        scheme: &S,
+        cert_bytes: &[u8],
+    ) -> Result<Observed, String>
+    where
+        S: commonware_consensus::simplex::scheme::Scheme<Digest>,
+        R: rand_core::CryptoRngCore,
+    {
+        // retry fetches a previous observe failed to enqueue — a dropped
+        // fetch would stall its gate slot (and the release prefix) forever.
+        for _ in 0..self.deferred_fetches.len() {
+            let Some(digest) = self.deferred_fetches.pop_front() else {
+                break;
+            };
+            self.fetch_or_defer(digest);
+        }
+        let finalization = verify_finalization(rng, scheme, cert_bytes)?;
+        let digest = finalization.proposal.payload;
+        let view = finalization.proposal.round.view().get();
+        if self.last_admitted.is_some_and(|last| view <= last) {
+            return Ok(Observed::Stale(view));
+        }
+        if self.mailbox.is_none() && !self.store.contains(&digest) {
+            // no bytes and no way to fetch them: admitting would hand the
+            // gate a slot nothing can ever fill (bare path) — refuse instead
+            // so the driver backfills over the Frames lane and re-observes.
+            return Ok(Observed::Unresolvable(view));
+        }
+        let need_fetch = self
+            .inbox
+            .record(view, digest, &self.store, self.mailbox.is_some());
+        if need_fetch {
+            self.fetch_or_defer(digest);
+        }
+        self.last_admitted = Some(view);
+        let mut latest = self
+            .latest_final
+            .lock()
+            .expect("latest finalization poisoned");
+        if latest.as_ref().is_none_or(|(v, _)| view > *v) {
+            *latest = Some((view, cert_bytes.to_vec()));
+        }
+        Ok(Observed::Admitted(view))
+    }
+
+    /// the newest finalization certificate observed: `(view, encoded bytes)`.
+    /// see [`LatestFinalization`] — the recovery layer persists this as the
+    /// respawn floor once everything at or below it has drained.
+    pub fn latest_finalization(&self) -> Option<(u64, Vec<u8>)> {
+        self.latest_final
+            .lock()
+            .expect("latest finalization poisoned")
+            .clone()
+    }
+
+    /// count of finalized slots not yet released by `poll_delivered` — the
+    /// same floor-persistence gate [`SimplexOrderer::unreleased_len`] serves.
+    pub fn unreleased_len(&self) -> usize {
+        self.inbox.unreleased_len()
+    }
+}
+
+impl node::Orderer for FollowerOrderer {
+    // a follower holds no proposal rights — nothing it submits can enter
+    // the agreed order. loud, so a miswired write path fails at the seam
+    // instead of silently vanishing; residents relay writes to a validator.
+    async fn submit(&mut self, _frame: Vec<u8>) -> Result<(), node::Error> {
+        Err(node::Error::NotAParticipant)
+    }
+
+    fn poll_delivered(&mut self) -> Vec<(u64, Vec<u8>)> {
+        self.inbox.drain()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_block_time_is_one_second() {
+        assert_eq!(BLOCK_TIME, std::time::Duration::from_secs(1));
+    }
 
     #[test]
     fn content_store_round_trips_by_digest() {

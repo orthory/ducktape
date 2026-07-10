@@ -14,12 +14,10 @@ pre-shipped dual-path binary: the new binary is byte-identical to the old below
 the activation height `H`, and every ready validator flips to new logic together
 at `H`.
 
-The design of record is
-`docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md`. Read it
-before driving a real upgrade; this skill is the operational runbook for that
-spec. The `ScheduleUpgrade` / `SignalReady` op surface and the `upgrade` system
-module referenced below ship **in the dual-path binary** per that spec — confirm
-they exist in the build you are rolling before you begin.
+This skill is the maintained operational runbook for the upgrade policy. The
+`ScheduleUpgrade` / `SignalReady` op surface and the `upgrade` system module
+referenced below must ship **in the dual-path binary** — confirm they exist in
+the build you are rolling before you begin.
 
 ## Guardrails (non-negotiable ordering)
 

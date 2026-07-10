@@ -1,8 +1,22 @@
+---
+showAskAi: false
+---
+
 # Product Modules
+
+import { ModuleMap } from '../../../../components/diagram/ModuleMap.client'
+
+<ModuleMap />
 
 Product modules are the workplace surface hosted by the platform. They share the
 same module contract, but each module chooses the storage substrate and interface
 that fits its job.
+
+Related: [Module Model](/en/human/architecture/module-model) explains the shared
+contract, [State Sync](/en/human/architecture/state-sync) covers rebuild
+surfaces, [Implementation Status](/en/human/reference/implementation-status)
+marks what is tested, and [Open Work](/en/agent/roadmap/open-work) tracks
+agent-facing gaps.
 
 ## Built or Started
 
@@ -19,12 +33,13 @@ that fits its job.
 - `vaults` replicates opaque secret ciphertext with owner-gated writes.
 - `inbox` stores per-member notification queues delivered as follow-up ops.
 - `automations` stores operator-defined rules that run over the chat hook seam.
-- `files` commits content-addressed file manifests; chunk bytes stay node-local.
-- `memory` is a filesystem-shaped shared agent workspace with immutable
-  generations.
+- `files` is duckfs: a consensus-replicated, copy-on-write, content-addressed
+  filesystem — every node holds every byte, and bytes survive restart.
 - `jobs` is a consensus-native work board with first-claim-wins claims.
-- `identity` binds node keys to user keys — a replicated registry so a person
-  running several nodes still resolves to one identity above mesh/valset.
+- `identity` is the canonical account registry: member keys, display name, and
+  bound node keys let a person running several nodes resolve to one identity.
+- `duckdns` adds an optional `<handle>.duck` → AccountId name. It owns no node,
+  service, or route directory; workspace identity does not require a name.
 - `kv`, `valset`, `saga`, `governance`, `directory`, and `greeter` support
   infrastructure, examples, and tests.
 
@@ -114,50 +129,77 @@ commits or aborts with the triggering post as one atomic unit (P2).
 
 ## Files
 
-Files keeps two planes that never blur. The metadata control plane is consensus
-state: manifests keyed by `file_id`, each pinning the file name, size, ordered
-per-chunk sha256 digests, and a whole-file digest-of-digests. That is the only
-files state folded into the root and the only thing state sync transfers. The
-body store is node-local: chunk bytes keyed by their own sha256, never in the op
-stream and never in consensus. Writes go through `AddManifest` and
-`RemoveManifest`; reads through `Stat` and `List`; chunk bytes move peer-to-peer
-over a dedicated `serve_sync` lane. Size caps are enforced at execute with
-rejection, so an oversized value never enters the root preimage.
+Files is duckfs: a consensus-replicated, copy-on-write, content-addressed
+filesystem. Every node holds every byte as consensus state — bytes travel
+through blocks and survive restart — so a committed file is readable on any
+node, not a promise pinned to whichever node happened to hold the chunks. State
+splits into an immutable object store (chunks, files, trees, and snapshots, all
+content-addressed) and a small mutable refs cell (the live head, the pin table,
+a bounded history window, the staging table, and the watch set); the root
+hashes the refs cell alone and commits to the whole tree transitively. Two
+writable roots gate authority: `/home/<owner>/**` is writable only by the
+matching origin-derived owner, `/shared/**` by any member; reads are
+cluster-visible everywhere — `/home` gates writes only.
 
-The receiver contract makes a dishonest server harmless: every fetched chunk
-goes through `verify_chunk`, which checks both the sha256 digest and the exact
-length the manifest implies for that position. The length check is load-bearing,
-not belt-and-braces — digest equality alone would accept a zero-byte chunk whose
-digest matches and reconstruct the wrong file.
+Writes stage, then commit. `PutBlob` stages one raw chunk (a binary op frame,
+quota'd per owner, expiring deterministically if never referenced); `Commit` is
+the atomic unit — a batch of path changes (`Put`, `Mkdir`, `Rm`, `Mv`,
+`Symlink`) under per-path compare-and-swap against a base snapshot: every
+changed path must be untouched between the base and the live head or the whole
+commit rejects, so disjoint concurrent commits interleave without false
+conflicts and overlapping ones fail loudly. A successful commit appends an
+immutable snapshot — copy-on-write, so unchanged subtrees are shared by hash
+across versions — advances the head, and fans out watch notifications to
+subscribed modules in the same block (P2). `Pin` and `Unpin` keep named
+snapshots alive past the bounded history window. Caps are enforced at execute
+with rejection, so an oversized value never enters the root preimage.
 
-## Memory
+Reads are snapshot-addressable pure functions: `Stat`, `Ls`, `Read`
+(byte-range), `Find`, `Grep`, `History`, `Diff`, and `Refs`, each cursor-paged
+and answerable at the head or at any resolvable snapshot. duckfs is also the
+agent memory — it absorbed the deleted `memory` module, and what memory did
+with immutable generations, duckfs does with snapshots. Agent workspaces are
+ordinary files under `/home` and `/shared`; `Grep` hits carry citable
+`duck://files/<path>@<snapshot>#L<line>` evidence URIs; per-file meta powers
+conventions like `kind=skill` (shared skills live under `/shared/skills/`); and
+prefix watches with segment-aware matching (`/a` matches `/a/b`, never `/ab`)
+give any module change notifications delivered atomically with the triggering
+commit.
 
-Memory is a shared agent workspace shaped like a filesystem — the NoKV
-philosophy: agents want filesystems, not key-value stores. The namespace is a
-set of absolute paths with implicit directories; every file is a stack of
-immutable generations, and a publish is write-once — it appends the next
-generation rather than editing anything in place. A `(path, generation)` pair is
-a stable, hash-pinned reference that is never rebound or reused while anything
-still pins it. Writes go through `Publish`, `Delete`, `Snapshot`,
-`DropSnapshot`, `RegisterWatch`, and `UnregisterWatch`; reads are the
-progressive-disclosure verbs `Ls`, `Stat`, `Read`, `Find`, and `Grep`, and grep
-hits carry citable `duck://memory/<path>@<generation>#L<line>` evidence URIs.
-Large bodies can be published by reference to a files manifest: memory probes
-the committed manifest, copies its digest and size into the immutable
-generation, and treats those copied values as the generation's truth. Removing
-the manifest later does not invalidate the generation; bytes remain fetched over
-the files chunk lane and receiver-verified with `verify_chunk`. `Grep` scans
-inline bodies only and skips file-backed bodies deterministically.
-
-`Snapshot` pins the current path-to-generation mapping of the whole namespace —
-the mapping only, never a copy of the bodies. `Delete` retains any generation a
-snapshot still pins; a generation record is dropped exactly when neither a live
-file nor a snapshot references it. Watches subscribe a module to a canonical
-path prefix with segment-aware matching (`/a` matches `/a/b`, never `/ab`), and
-each successful publish emits one follow-up event per matching watcher in the
-same block (P2). Skills sharing rides the same namespace: a shared skill is a
-document under `/skills/<name>` with `kind=skill` meta, discovered with `Find`
-over `/skills/`.
+The client half is the OS-side checkout/commit engine (`crates/duckfs/client`)
+and the `ducktape-fs` CLI. A checkout materializes a duckfs subtree into a real
+working directory beside a `.duckfs/index.json` — git's index discipline: the
+base snapshot the copy descends from, the node it talks to, and a per-path
+hash/size/mtime record. `ducktape-fs` has read verbs (`ls`, `cat`, `stat`,
+`history`, `diff`) and the working-copy loop (`checkout`, `status`, `commit`,
+`pin`); the engine hashes and names every object client-side (byte-identical to
+what validators derive), stages only the chunks the cluster lacks, and submits
+one atomic `Commit`. Conflict handling is safe by construction: on a CAS
+rejection the engine auto-rebases **only** disjoint upstream work (never a silent
+merge) and surfaces a structured conflict report for overlapping edits (over a
+single daemon; a multi-validator cluster currently reports overlaps as a plain
+rejection, since the module's reason string does not survive consensus
+finalization). The workspace RPC (`POST /v1/fs/workspaces`, `.../commit`,
+`DELETE`) is the jobs/sandbox seam: the daemon manages checkouts under its own
+root, driving the same engine over the actor lane so a job can edit files on disk
+and commit them without a self-dial. `ducktape-fs mount <prefix> <dir>` fronts a
+duckfs subtree as a real kernel filesystem, behind the `fuse` cargo feature
+(unprivileged, via `fusermount3` — a default build needs no libfuse and keeps the
+verb a clear "rebuild with `--features fuse`" error). Read-only by default, it
+serves over the sync `NodeApi` at a snapshot resolved ONCE and PINNED for the
+mount's lifetime — a stable, reproducible view whose immutable content caches
+hard (a lazy `ls`/`stat` inode table and a bounded read-through block cache);
+reads never see the moving head, so a remount is how you observe newer commits.
+`--rw` fronts a REAL working copy — a checkout into a hidden `<dir>.duckfs-backing`
+directory served passthrough — whose writes become cluster truth only on commit:
+explicit by default (unmount prints how to commit; nothing auto-lands), or
+`--auto-commit N` to commit every N seconds while dirty (auto-rebasing disjoint
+upstream work; a genuine conflict is logged loudly and the mount KEEPS serving —
+never a silent merge, never a dropped write). SIGINT/SIGTERM unmounts cleanly.
+Documented non-goals: no cross-node lock or mmap coherence; uid/gid/mode are
+synthetic (size, mtime, and the exec bit still pass through on `--rw`);
+case-colliding sibling names cannot materialize on a case-insensitive host; and a
+crash leaves a stale mountpoint recoverable with `fusermount3 -u <dir>`.
 
 ## Jobs
 
@@ -193,33 +235,34 @@ strategies, not for multiple in-cascade claimants of the same kind.
 
 ## Identity
 
-Identity is the user/node binding registry (`crates/system/identity`): a user
-is an ed25519 keypair held by the person in the app; a node is a workspace's
-mesh/valset identity. The module stores, per user, a display name, a
-replay-guard nonce, and the set of bound node keys — one person can bind
-several nodes to the same user.
+Identity is the canonical account registry (`crates/system/identity`). An
+account has a stable AccountId (its founding member key as an identifier), one
+or more member keys of supported schemes, a shared display name and replay
+nonce, and any number of bound node keys. A node remains a workspace's
+mesh/valset identity; several nodes and devices can belong to one account
+without collapsing their network identities.
 
 `BindNode` binds the SUBMITTING node (the verified origin, never a payload
-field) to a user, consented to by a user-key signature over a
-chain-id ‖ node-key ‖ nonce preimage — a certificate can never replay onto a
-different network, a cert minted for node A can never bind node B, and a
-stale nonce (from a prior bind/unbind) rejects. On
-the networked node, `BindNode` is additionally gated to current members: the
-origin must be a validator or an observer, so a node with no standing at all
-cannot mint itself a user. `UnbindNode` carries no such gate and is accepted
-from ANY external origin — a surviving device can evict a lost one — and it
-bumps the user's nonce so a captured bind certificate for the evicted node is
-dead forever; unbinding a user's last node keeps the user record — name and
-nonce persist with zero nodes, so a later bind resolves the same identity.
-`SetUserName` is origin-gated only (a bound node is trusted
-hardware, no user signature required): it sets the display name of the user
-the submitting node is bound to, under the same 64-byte limit as profiles,
-and it does not bump the nonce — no user signature is consumed.
+field) to the authorizing member key's account. The member proof covers a
+chain-id ‖ node-key ‖ nonce preimage, so it cannot replay across networks,
+nodes, or nonce changes. A brand-new member key founds an account on its first
+bind. On a networked node, the submitting node must also be a current validator
+or resident. `UnbindNode` is authorized by any surviving member key in the
+account; `AddMemberKey` requires both an existing member's consent and proof of
+possession by the new key; `RemoveMemberKey` preserves at least one live member.
+Each accepted member-signed change advances the shared nonce. Unbinding the
+last node leaves the account, member keys, name, and nonce intact, so a later
+bind resolves the same identity.
+
+`SetAccountName` is origin-gated only (a bound node is trusted hardware, no
+member-key signature required): it sets the display name of the account the
+submitting node is bound to, under a 64-byte limit, and it does not bump the
+nonce — no member-key signature is consumed.
 
 Binding does not change what stays per node: mesh tracking, valset seats, and
-quorum arithmetic are untouched by this module. A user running three
-validators still holds three seats and casts three votes — identity maps keys
-to a person for display and authorship resolution, it does not collapse
+quorum arithmetic are untouched by this module. An account running three
+validators still holds three seats and casts three votes — Identity resolves
+nodes to an account for authority, display, and authorship without collapsing
 consensus weight.
 
 Adding identity to a network that predates it is a module-set change like any
@@ -227,10 +270,10 @@ other: the genesis app-hash moves, so an already-running network needs a
 coordinated rebuild — a lockstep upgrade across every validator, not a rolling
 one — to adopt it.
 
-The module stores keys; custody of the user key itself is a desktop-app
-concern layered on top (`bin/node`'s `user-key` verbs; see
-`docs/superpowers/specs/2026-07-07-identity-onboarding-design.md`). The
-24-word mnemonic is an entropy-preserving, identity-preserving encoding of the
+The module stores public membership and binding state; custody of private
+member keys is a desktop-app concern layered on top through `bin/node`'s
+`user-key` verbs. The primary native member's 24-word mnemonic is an
+entropy-preserving, identity-preserving encoding of the
 raw ed25519 seed, so it recovers the identity exactly rather than deriving a
 new one. The password is local-encryption only — argon2id wraps a key that
 encrypts the seed at rest with XChaCha20-Poly1305 — and never enters key
@@ -252,6 +295,6 @@ share typed messages and queries, not implementation APIs.
 The currently useful pressure points are clear from the checked-in modules:
 chat exercises live product reads over QMDB-backed channel storage, forge
 exercises authenticated project state, and the module wave — inbox, automations,
-files, memory, jobs — exercises follow-up atomicity, hook fan-out, and the
-consensus-metadata/node-local-bytes split that fuller collaboration features
-will lean on.
+files, jobs — exercises follow-up atomicity, hook fan-out, and fully replicated
+consensus bytes with snapshot history that fuller collaboration features will
+lean on.

@@ -38,8 +38,13 @@ fn ip(o: u8) -> IpAddr {
 async fn reflexive_discovery() {
     let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
-    tokio::spawn(run_coordinator(coord_sock, nat_traversal::AuthPolicy::Open { require_pop: false }));
-    let client = NatClient::bind(NodeKey([1u8; 32]), coord_addr).await.unwrap();
+    tokio::spawn(run_coordinator(
+        coord_sock,
+        nat_traversal::AuthPolicy::Open { require_pop: false },
+    ));
+    let client = NatClient::bind(NodeKey([1u8; 32]), coord_addr)
+        .await
+        .unwrap();
     let reflexive = timeout(Duration::from_secs(2), client.discover_reflexive())
         .await
         .expect("no timeout")
@@ -94,7 +99,10 @@ fn endpoint_churn_readvertise_reconnect() {
 async fn multi_coordinator_failover() {
     let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let live_addr = live.local_addr().unwrap();
-    tokio::spawn(run_coordinator(live, nat_traversal::AuthPolicy::Open { require_pop: false }));
+    tokio::spawn(run_coordinator(
+        live,
+        nat_traversal::AuthPolicy::Open { require_pop: false },
+    ));
     let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = dead.local_addr().unwrap();
 
@@ -122,7 +130,10 @@ async fn punched_path_survives_coordinator_death() {
     // its own named test even where a unit test covers the same contract.
     let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
-    let coord = tokio::spawn(run_coordinator(coord_sock, nat_traversal::AuthPolicy::Open { require_pop: false }));
+    let coord = tokio::spawn(run_coordinator(
+        coord_sock,
+        nat_traversal::AuthPolicy::Open { require_pop: false },
+    ));
     let a_key = NodeKey([0xaa; 32]);
     let b_key = NodeKey([0xbb; 32]);
     let a = NatClient::bind(a_key, coord_addr).await.unwrap();

@@ -48,22 +48,28 @@ fn ceiling_discards_and_cutover_rebases_heights() {
         let host = Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
         let mut node = OrderedNode::new(host, RoundOrderer::new());
 
-        // epoch 0, view 0: a normal op applies.
+        // epoch 0, view 0: a normal op applies (submit -> flush a one-op batch
+        // -> drain). each op is flushed into its OWN batch so it lands at its own
+        // view, preserving the per-view cutover-ceiling semantics.
         node.submit(&sk(1), 0, set("k0", "v0"))
             .await
             .expect("submit k0");
+        node.flush_batch().await.expect("flush k0");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(node.finalized().expect("boundary").height, 0);
         assert_eq!(node.last_engine_view(), Some(0));
 
-        // views 1 and 2 arrive in one round; the agreed cutover is view 2 —
-        // view 1 applies, view 2 is DISCARDED (but still counts as processed).
+        // views 1 and 2 arrive in one round (each its own batch); the agreed
+        // cutover is view 2 — view 1 applies, view 2 is DISCARDED (but still
+        // counts as processed).
         node.submit(&sk(1), 1, set("k1", "v1"))
             .await
             .expect("submit k1");
+        node.flush_batch().await.expect("flush k1");
         node.submit(&sk(1), 2, set("k2", "v2"))
             .await
             .expect("submit k2");
+        node.flush_batch().await.expect("flush k2");
         node.set_view_ceiling(2);
         assert_eq!(node.drain_delivered().await.expect("drain"), 2);
         assert_eq!(get(&node, "k1").await.as_deref(), Some("v1"));
@@ -87,20 +93,22 @@ fn ceiling_discards_and_cutover_rebases_heights() {
         node.submit(&sk(1), 3, set("k3", "v3"))
             .await
             .expect("submit k3");
+        node.flush_batch().await.expect("flush k3");
 
         // CUTOVER: fresh orderer (engine views restart at 0), app heights
         // rebased at the cutover height. the BOUNDARY CARRY re-proposes both
         // unresolved accepted frames — k2 (finalized past the ceiling,
         // discarded) and k3 (queued in the torn-down engine) — into the new
-        // epoch; k0/k1 resolved below the ceiling and are NOT carried. no
-        // client resubmit anywhere.
+        // epoch AS ONE fresh batch (both fit); k0/k1 resolved below the ceiling
+        // and are NOT carried. no client resubmit anywhere.
         let carried = node
             .cutover(RoundOrderer::new(), 1, 2, &[], &[])
             .await
             .expect("cutover");
         assert_eq!(carried, 2, "exactly the unresolved accepted frames carry");
         assert_eq!(node.last_engine_view(), None, "engine view resets");
-        assert_eq!(node.drain_delivered().await.expect("drain"), 2);
+        // the two carried members form ONE batch at engine view 0 -> ONE block.
+        assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(
             get(&node, "k2").await.as_deref(),
             Some("v2"),
@@ -111,15 +119,15 @@ fn ceiling_discards_and_cutover_rebases_heights() {
             Some("v3"),
             "the old engine's queued op re-applied in the new epoch"
         );
-        // the discarded view's height is taken by the new epoch's first block
-        // — identically on every node, and cleanly: the discard never claimed
-        // it, so the boundary advances strictly (1 -> 2 -> 3).
+        // the carried batch is the new epoch's first block at engine view 0 —
+        // base 2 = height 2, advancing the boundary strictly (1 -> 2). both
+        // carried members share that one height and its one app-hash.
         let boundary = node.finalized().expect("boundary");
-        assert_eq!(boundary.height, 3, "engine views 0,1 + base 2 = heights 2,3");
+        assert_eq!(boundary.height, 2, "engine view 0 + base 2 = height 2");
         assert_eq!(
             node.last_engine_view(),
-            Some(1),
-            "engine-relative view restarted"
+            Some(0),
+            "engine-relative view restarted at 0"
         );
     });
 }
@@ -136,27 +144,24 @@ impl BlockSink for PinRecorder {
         self.0.borrow_mut().push(frame.to_vec());
         async { Ok(()) }
     }
-    fn pre_apply(
+    async fn pre_apply(
         &mut self,
         _height: u64,
         _frame: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        async { Ok(()) }
+    ) -> Result<(), node::Error> {
+        Ok(())
     }
-    fn seal(
-        &mut self,
-        _seal: &node::BlockSeal,
-    ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        async { Ok(()) }
+    async fn seal(&mut self, _seal: &node::BlockSeal) -> Result<(), node::Error> {
+        Ok(())
     }
-    fn cutover(
+    async fn cutover(
         &mut self,
         _epoch: u64,
         _view_base: u64,
         _participants: &[Vec<u8>],
         _residents: &[Vec<u8>],
-    ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        async { Ok(()) }
+    ) -> Result<(), node::Error> {
+        Ok(())
     }
 }
 
@@ -167,8 +172,10 @@ fn carry_repins_byte_identical_frames() {
         let pins = PinRecorder::default();
         let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), pins.clone());
 
-        // accepted (one pin), then finalized AT the ceiling — discarded.
+        // accepted, flushed (one pin of the batch super-frame), then finalized
+        // AT the ceiling — discarded.
         node.submit(&sk(1), 0, set("k", "v")).await.expect("submit");
+        node.flush_batch().await.expect("flush");
         node.set_view_ceiling(0);
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(get_sinked(&node, "k").await, None, "discarded, not applied");

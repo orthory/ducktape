@@ -105,6 +105,13 @@ describe("slash menu + list continuation", () => {
     expect(filterSlashKinds("").length).toBeGreaterThan(8);
   });
 
+  it("offers a subpage entry last, without crowding the text kinds", () => {
+    expect(filterSlashKinds("pag").map((o) => o.kind)).toContain("page");
+    const all = filterSlashKinds("");
+    expect(all).toHaveLength(13);
+    expect(all[all.length - 1].kind).toBe("page");
+  });
+
   it("continues list kinds on Enter and resets the rest to paragraphs", () => {
     expect(continuationKind("bulleted")).toBe("bulleted");
     expect(continuationKind("todo")).toBe("todo");

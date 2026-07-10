@@ -6,7 +6,7 @@ import { selfAuthorKeyOf } from "./chat-helpers";
 import { MessageItem } from "./MessageItem";
 
 const SELF = "operator";
-const selfKey = selfAuthorKeyOf(SELF);
+const selfKey = selfAuthorKeyOf(Array.from(new TextEncoder().encode(SELF)));
 const ownAuthor: AuthorRef = { user: Array.from(new TextEncoder().encode(SELF)) };
 const otherAuthor: AuthorRef = { user: Array.from(new TextEncoder().encode("someone-else")) };
 
@@ -110,5 +110,31 @@ describe("MessageItem edit/delete", () => {
 
     fireEvent.click(screen.getByText("Delete", { selector: "button" }));
     expect(onDelete).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("MessageItem #tags", () => {
+  it("makes a grammar-valid #tag clickable when onTagClick is wired", () => {
+    const onTagClick = vi.fn();
+    render(
+      <MessageItem
+        {...baseProps}
+        onTagClick={onTagClick}
+        message={msg(otherAuthor, "shipping #Rust-지원 today, not foo#bar")}
+      />,
+    );
+
+    // the tag (without its trailing prose) is a button; clicking hands the
+    // label over WITHOUT the leading #.
+    fireEvent.click(screen.getByRole("button", { name: "#Rust-지원" }));
+    expect(onTagClick).toHaveBeenCalledWith("Rust-지원");
+    // a mid-word # never becomes an affordance.
+    expect(screen.queryByRole("button", { name: /#bar/ })).toBeNull();
+  });
+
+  it("keeps #tags inert (tinted text, no button) without onTagClick", () => {
+    render(<MessageItem {...baseProps} message={msg(otherAuthor, "plain #tag here")} />);
+    expect(screen.getByText("#tag")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "#tag" })).toBeNull();
   });
 });

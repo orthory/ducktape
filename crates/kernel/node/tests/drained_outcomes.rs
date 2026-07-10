@@ -51,6 +51,9 @@ fn drained_outcomes_correlate_submits_with_dispositions() {
             .expect("submit rejectable op");
         assert_ne!(ok_id, bad_id, "distinct frames get distinct ids");
 
+        // both ops flush into ONE batch -> ONE block at ONE height with TWO
+        // member outcomes sharing the block app-hash.
+        node.flush_batch().await.expect("flush");
         node.drain_delivered().await.expect("drain");
         let drained = node.take_drained();
         assert_eq!(drained.len(), 2, "every finalized frame gets an outcome");
@@ -91,6 +94,28 @@ fn drained_outcomes_correlate_submits_with_dispositions() {
         assert_eq!(ok_frame.app_hash, node.app_hash());
         assert_eq!(bad_frame.app_hash, node.app_hash());
 
+        // node-local observability: the rejected frame carries the MODULE's
+        // verbatim reason string (a submitter's held reply surfaces it), while
+        // an applied frame carries none. verbatim = the module's own string
+        // UNWRAPPED (no `op rejected:` / `Module(..)` prefix), because a
+        // submitter (duckfs-client) string-matches the module's own prefix on
+        // the front of the reply detail.
+        assert!(
+            ok_frame.reason.is_none(),
+            "an applied frame carries no reason"
+        );
+        let module_err = directory::decode_msg(b"not-json").expect_err("not-json is undecodable");
+        assert_eq!(
+            bad_frame.reason.as_deref(),
+            Some(module_err.as_str()),
+            "a module-rejected frame carries the module's verbatim error string"
+        );
+        let reason = bad_frame.reason.as_deref().expect("reason present");
+        assert!(
+            !reason.starts_with("op rejected") && !reason.contains("Module("),
+            "the reason is the module string unwrapped, not a SubmitError/Error wrapper: {reason}"
+        );
+
         assert!(node.take_drained().is_empty(), "take clears the queue");
     });
 }
@@ -105,6 +130,7 @@ fn frames_past_the_ceiling_drain_as_discarded() {
             .submit(&signer, 0, dir_set("k", "v"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         node.set_view_ceiling(0); // every view >= 0 is past the cutover.
 
         node.drain_delivered().await.expect("drain");

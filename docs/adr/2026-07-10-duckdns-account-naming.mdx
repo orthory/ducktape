@@ -1,0 +1,60 @@
+# ADR: DuckDNS Is Account Naming Only
+
+Date: 2026-07-10. Status: **Accepted**.
+
+## Context
+
+The first DuckDNS implementation projected HTTP services into the host DNS
+stack, installed a device root CA, terminated TLS, and proxied an extra data
+plane. A later design removed that machinery but retained a replicated node and
+service-discovery registry.
+
+That second directory still duplicated authorities Ducktape already has:
+Identity owns AccountId → NodeIds, valset/mesh owns eligible peers,
+reachability owns fresh routes, and application rosters such as Huddle own
+active participants. Routing those decisions through DuckDNS would add another
+state-sync and convergence surface without improving selection.
+
+## Decision
+
+DuckDNS owns exactly one optional mapping:
+
+```text
+<handle>.duck → AccountId
+```
+
+Identity remains the canonical account, member-key, node-binding, and display-
+name registry. An account may register at most one `.duck` handle, handles are
+unique, and replacement or removal is declarative and atomic. Not registering a
+name changes no identity, workspace, membership, peer, or transport behavior.
+Workspace create/join and the initial Identity bind never register one
+implicitly.
+
+`net.duck` is reserved directly below `.duck` and has no behavior. Reserving the
+label prevents an account claim from blocking a future namespace, but no node,
+network, or service name form is implemented before a real consumer exists.
+
+Resolution stops at AccountId. DuckDNS stores and returns no NodeId, provider,
+service, endpoint, port, route, health, transport, filesystem path, or local
+target. A caller that genuinely needs nodes asks Identity and then uses the
+existing peer/reachability plane.
+
+The `.duck` suffix is internal presentation syntax. Ducktape does not install an
+OS resolver, local CA, TLS proxy, helper sidecar, or privileged system setting.
+
+## Consequences
+
+- `duckdns-core` contains only account-name grammar, the handle registry, wire
+  types, and canonical snapshot/root logic.
+- The `duckdns` system module derives AccountId from the authenticated node via
+  Identity and gates namespace mutations through current network standing.
+- The node-side DuckDNS announcer crate and `[[duckdns.services]]` configuration
+  are removed. Retired service configuration is rejected, not ignored.
+- Huddle, state-sync peer selection, capability routing, and WireGuard continue
+  to use their existing authoritative state. They do not query DuckDNS.
+- DuckDNS's small naming registry still participates in ordinary authenticated
+  module state sync; that does not make it a state-sync peer directory.
+- Snapshot version 2 intentionally removes v1 provider records. Existing dev
+  networks require a coordinated rebuild or lockstep upgrade.
+- A future service or delegated namespace must arrive with a concrete consumer
+  and authority model; `net.duck` reservation alone promises no wire shape.

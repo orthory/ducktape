@@ -119,7 +119,10 @@ mod tests {
         let internal = a([192, 168, 1, 5], 51820);
         let peer = a([198, 51, 100, 2], 51820);
         let mapped = nat.send(internal, a([203, 0, 113, 9], 40000)); // hole to coordinator only
-        assert!(!nat.allow_inbound(mapped, peer), "unsolicited inbound is dropped");
+        assert!(
+            !nat.allow_inbound(mapped, peer),
+            "unsolicited inbound is dropped"
+        );
         let _ = nat.send(internal, peer); // now punch toward peer
         assert!(nat.allow_inbound(mapped, peer), "hole toward peer now open");
     }
@@ -132,7 +135,10 @@ mod tests {
 
         let old = nat.send(internal, a([192, 0, 2, 1], 3478)); // reflexive toward coordinator
         let _ = nat.send(internal, peer); // punch a hole toward the peer
-        assert!(nat.allow_inbound(old, peer), "hole toward peer is open pre-rebind");
+        assert!(
+            nat.allow_inbound(old, peer),
+            "hole toward peer is open pre-rebind"
+        );
 
         // The NAT rebinds: mapping + holes are dropped.
         nat.rebind();
@@ -141,7 +147,10 @@ mod tests {
         // superseded), and the old mapping admits nobody anymore.
         let new = nat.send(internal, a([192, 0, 2, 1], 3478));
         assert_ne!(old, new, "rebind must move the reflexive to a fresh port");
-        assert!(!nat.allow_inbound(old, peer), "the old mapping no longer admits the peer");
+        assert!(
+            !nat.allow_inbound(old, peer),
+            "the old mapping no longer admits the peer"
+        );
     }
 
     #[test]
@@ -152,7 +161,10 @@ mod tests {
         let old = nat.send(internal, coord);
         nat.rebind();
         let new = nat.send(internal, coord);
-        assert_ne!(old, new, "symmetric rebind also moves the coordinator-facing mapping");
+        assert_ne!(
+            old, new,
+            "symmetric rebind also moves the coordinator-facing mapping"
+        );
     }
 
     #[test]

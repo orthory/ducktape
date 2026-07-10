@@ -108,11 +108,24 @@ const agentKo = [
 
 export default defineConfig({
   title: 'Ducktape',
+  titleTemplate: '%s · Ducktape',
   description:
-    'A consensus-based workplace super-app built from isolated authenticated modules.',
+    'A consensus-based workplace super-app: one BFT-replicated state machine that hosts isolated, authenticated product modules.',
   srcDir: '.',
   renderStrategy: 'full-static',
   aiCta: false,
+  showAskAi: false,
+  accentColor: 'light-dark(#B8700B, #F0B54A)',
+  colorScheme: 'light dark',
+  iconUrl: '/mark.svg',
+  logoUrl: '/logo.svg',
+  banner: {
+    content: 'New — interactive architecture, topology & consensus diagrams',
+    variant: 'info',
+    href: '/en/human/architecture/module-model',
+    dismissable: true,
+    dismissId: 'ducktape-diagrams-2026-07',
+  },
   topNav: [
     {
       text: 'For Human',

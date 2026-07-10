@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use commonware_cryptography::{Signer as _, ed25519};
 use common::{Cluster, poll_until, serial};
-use identity::{IdentityMsg, IdentityQuery, IdentityReply, UserView, decode_reply, encode_msg, encode_query};
+use identity::{
+    AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth, decode_reply, encode_msg,
+    encode_query,
+};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.
@@ -37,42 +40,62 @@ fn boot(cluster: &mut Cluster) {
     }
 }
 
-/// mint a bind certificate exactly like `config::mint_bind_cert`: the user
-/// key's signature over `identity::bind_preimage` in the bind NS domain.
-fn mint_bind_cert(user: &ed25519::PrivateKey, chain_id: &str, node_pub: &[u8], nonce: u64) -> Vec<u8> {
-    user.sign(
-        identity::IDENTITY_BIND_NS,
-        &identity::bind_preimage(chain_id, node_pub, nonce),
-    )
-    .as_ref()
-    .to_vec()
+/// build the `MemberAuth` a bind op carries, exactly like
+/// `config::ed25519_member_auth` over the bind preimage: the user (ed25519)
+/// key's signature in the bind NS domain, wrapped as an ed25519 member.
+fn bind_auth(user: &ed25519::PrivateKey, chain_id: &str, node_pub: &[u8], nonce: u64) -> MemberAuth {
+    MemberAuth {
+        key: user.public_key().as_ref().to_vec(),
+        kind: identity::KeyKind::Ed25519,
+        proof: identity::MemberProof::Signature {
+            sig: user
+                .sign(
+                    identity::IDENTITY_BIND_NS,
+                    &identity::bind_preimage(chain_id, node_pub, nonce),
+                )
+                .as_ref()
+                .to_vec(),
+        },
+    }
 }
 
-/// mint an unbind certificate exactly like `config::mint_unbind_cert`.
-fn mint_unbind_cert(user: &ed25519::PrivateKey, chain_id: &str, node_pub: &[u8], nonce: u64) -> Vec<u8> {
-    user.sign(
-        identity::IDENTITY_UNBIND_NS,
-        &identity::unbind_preimage(chain_id, node_pub, nonce),
-    )
-    .as_ref()
-    .to_vec()
+/// the `MemberAuth` an unbind op carries (same shape, unbind NS domain).
+fn unbind_auth(
+    user: &ed25519::PrivateKey,
+    chain_id: &str,
+    node_pub: &[u8],
+    nonce: u64,
+) -> MemberAuth {
+    MemberAuth {
+        key: user.public_key().as_ref().to_vec(),
+        kind: identity::KeyKind::Ed25519,
+        proof: identity::MemberProof::Signature {
+            sig: user
+                .sign(
+                    identity::IDENTITY_UNBIND_NS,
+                    &identity::unbind_preimage(chain_id, node_pub, nonce),
+                )
+                .as_ref()
+                .to_vec(),
+        },
+    }
 }
 
 /// `UserOf(node_key)` on node `idx`. `None` covers both a rejected query and
 /// a query that resolved successfully to "not bound" — the caller only ever
 /// needs to distinguish "resolved as user X" from "not (yet) that", and
 /// `poll_until` already treats both as "not yet" while a bind is landing.
-fn user_of(cluster: &Cluster, idx: usize, node_key: &[u8]) -> Option<UserView> {
+fn account_of_node(cluster: &Cluster, idx: usize, node_key: &[u8]) -> Option<AccountView> {
     let reply = cluster.query(
         idx,
         "identity",
-        &encode_query(&IdentityQuery::UserOf {
+        &encode_query(&IdentityQuery::OfNode {
             node_key: node_key.to_vec(),
         }),
     )?;
     match decode_reply(&reply).ok()? {
-        IdentityReply::User(u) => u,
-        IdentityReply::Users(_) => None,
+        IdentityReply::Account(a) => a,
+        IdentityReply::Accounts(_) => None,
     }
 }
 
@@ -102,12 +125,11 @@ fn identity_two_nodes_one_user() {
         0,
         "identity",
         &encode_msg(&IdentityMsg::BindNode {
-            user_key: user_pub.clone(),
-            user_sig: mint_bind_cert(&user, &chain_id, &a_pub, 0),
+            authorizer: bind_auth(&user, &chain_id, &a_pub, 0),
         }),
     );
     poll_until("node A's bind to finalize", FINALIZE, || {
-        user_of(&cluster, 0, &a_pub).filter(|v| v.user_key == user_pub)
+        account_of_node(&cluster, 0, &a_pub).filter(|v| v.account_id == user_pub)
     });
 
     // node B binds itself to the SAME user. A's bind already bumped the
@@ -116,25 +138,34 @@ fn identity_two_nodes_one_user() {
         1,
         "identity",
         &encode_msg(&IdentityMsg::BindNode {
-            user_key: user_pub.clone(),
-            user_sig: mint_bind_cert(&user, &chain_id, &b_pub, 1),
+            authorizer: bind_auth(&user, &chain_id, &b_pub, 1),
         }),
     );
     poll_until("node B's bind to finalize", FINALIZE, || {
-        user_of(&cluster, 1, &b_pub).filter(|v| v.user_key == user_pub)
+        account_of_node(&cluster, 1, &b_pub).filter(|v| v.account_id == user_pub)
     });
 
     // both binds must be visible from EITHER node's rpc: UserOf(A) and
     // UserOf(B) resolve to the same user, with both nodes in its set.
+    let sees_both = |view: &AccountView| {
+        view.account_id == user_pub
+            && view.nodes.len() == 2
+            && view.nodes.contains(&a_pub)
+            && view.nodes.contains(&b_pub)
+    };
     for reader in [0usize, 1] {
-        let a_view = poll_until(&format!("UserOf(A) to resolve on node {reader}"), FINALIZE, || {
-            user_of(&cluster, reader, &a_pub)
-        });
-        let b_view = poll_until(&format!("UserOf(B) to resolve on node {reader}"), FINALIZE, || {
-            user_of(&cluster, reader, &b_pub)
-        });
-        assert_eq!(a_view.user_key, user_pub, "node {reader}: UserOf(A) wrong user");
-        assert_eq!(b_view.user_key, user_pub, "node {reader}: UserOf(B) wrong user");
+        let a_view = poll_until(
+            &format!("OfNode(A) to show both bindings on node {reader}"),
+            FINALIZE,
+            || account_of_node(&cluster, reader, &a_pub).filter(&sees_both),
+        );
+        let b_view = poll_until(
+            &format!("OfNode(B) to show both bindings on node {reader}"),
+            FINALIZE,
+            || account_of_node(&cluster, reader, &b_pub).filter(&sees_both),
+        );
+        assert_eq!(a_view.account_id, user_pub, "node {reader}: OfNode(A) wrong account");
+        assert_eq!(b_view.account_id, user_pub, "node {reader}: OfNode(B) wrong account");
         assert_eq!(a_view.nodes.len(), 2, "node {reader}: expected both nodes bound (via A)");
         assert_eq!(b_view.nodes.len(), 2, "node {reader}: expected both nodes bound (via B)");
         let mut nodes = a_view.nodes.clone();
@@ -158,21 +189,21 @@ fn identity_two_nodes_one_user() {
         "identity",
         &encode_msg(&IdentityMsg::UnbindNode {
             node_key: a_pub.clone(),
-            user_sig: mint_unbind_cert(&user, &chain_id, &a_pub, 2),
+            authorizer: unbind_auth(&user, &chain_id, &a_pub, 2),
         }),
     );
     for reader in [0usize, 1] {
         poll_until(&format!("UnbindNode(A) to finalize on node {reader}"), FINALIZE, || {
-            user_of(&cluster, reader, &a_pub).is_none().then_some(())
+            account_of_node(&cluster, reader, &a_pub).is_none().then_some(())
         });
     }
 
     // node B remains bound, alone, on both nodes' views.
     for reader in [0usize, 1] {
-        let b_view = poll_until(&format!("UserOf(B) after unbind on node {reader}"), FINALIZE, || {
-            user_of(&cluster, reader, &b_pub)
+        let b_view = poll_until(&format!("OfNode(B) after unbind on node {reader}"), FINALIZE, || {
+            account_of_node(&cluster, reader, &b_pub)
         });
-        assert_eq!(b_view.user_key, user_pub, "node {reader}: B should remain bound");
+        assert_eq!(b_view.account_id, user_pub, "node {reader}: B should remain bound");
         assert_eq!(b_view.nodes, vec![b_pub.clone()], "node {reader}: only B should remain bound");
     }
 

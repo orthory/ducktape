@@ -34,6 +34,7 @@
 //!   traffic never queues behind it.
 
 pub mod flow;
+pub mod host;
 pub mod plane;
 pub mod real;
 #[cfg(feature = "sim")]
@@ -42,11 +43,15 @@ pub mod transport;
 pub mod wire;
 
 pub use flow::{DatagramPolicy, FlowId, StreamPolicy};
+pub use host::{StreamPacing, StreamPlaneSpec, bind_stream_plane};
 pub use plane::{
-    AdmissionPolicy, DataPlane, DatagramFlow, OpenError, PlaneConfig, RegisterError, SendError,
-    StatsSnapshot, StreamService,
+    AdmissionPolicy, BulkPacer, DataPlane, DatagramFlow, OpenError, PlaneConfig, RegisterError,
+    SendError, StatsSnapshot, StreamService,
 };
-pub use real::{AddressBook, OverlaySockets};
+pub use real::{
+    AddressBook, BoxFuture, DatagramSocket, Duplex, OsSocketFactory, OverlaySockets, PlaneStream,
+    SocketFactory, StreamListener,
+};
 pub use transport::{DataPlaneTransport, PeerId, TransportError};
 pub use wire::{Hello, MAX_DATAGRAM, MAX_DATAGRAM_PAYLOAD};
 
@@ -62,6 +67,11 @@ pub enum Service {
     /// Real-time camera video (chat module): encoded frames fragmented
     /// across datagrams — see `chat::video` for the frame layer.
     Video = 3,
+    // 4 is a permanent tombstone for the removed DuckDNS Web plane.
+    // 5 is reserved for PromiseNet. Never reuse either suffix.
+    /// Gateway reverse-proxy requests. The overlay authenticates both
+    /// nodes; signed routes bind account authority, target, and access policy.
+    Gateway = 6,
 }
 
 impl Service {
@@ -76,6 +86,7 @@ impl Service {
             Service::StateSync => 45801,
             Service::Voice => 45802,
             Service::Video => 45803,
+            Service::Gateway => 45806,
         }
     }
 
@@ -86,6 +97,7 @@ impl Service {
             Service::StateSync => 45901,
             Service::Voice => 45902,
             Service::Video => 45903,
+            Service::Gateway => 45906,
         }
     }
 }
@@ -98,6 +110,7 @@ impl TryFrom<u8> for Service {
             1 => Ok(Service::StateSync),
             2 => Ok(Service::Voice),
             3 => Ok(Service::Video),
+            6 => Ok(Service::Gateway),
             other => Err(other),
         }
     }

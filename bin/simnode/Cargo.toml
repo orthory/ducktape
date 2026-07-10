@@ -19,8 +19,9 @@ host = { workspace = true }
 sdk = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
-profiles = { workspace = true }
 identity = { workspace = true }
+duckdns = { workspace = true }
+gateway = { workspace = true }
 inbox = { workspace = true }
 automations = { workspace = true }
 jobs = { workspace = true }
@@ -32,7 +33,8 @@ saga = { workspace = true }
 pages = { workspace = true }
 forge = { workspace = true }
 files = { workspace = true }
-memory = { workspace = true }
+# the node-local op-receipt blob store shared with forge + the files module.
+blobstore = { workspace = true }
 reactor = { workspace = true }
 noded = { path = "../noded" }
 # the durable block index — /v1/blocks and /v1/index/* read it, the sim actor

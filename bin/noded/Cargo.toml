@@ -20,8 +20,9 @@ host = { workspace = true }
 sdk = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
-profiles = { workspace = true }
 identity = { workspace = true }
+duckdns = { workspace = true }
+gateway = { workspace = true }
 inbox = { workspace = true }
 automations = { workspace = true }
 jobs = { workspace = true }
@@ -39,20 +40,31 @@ forge = { workspace = true }
 # the forge module's wire types — the git smart-HTTP receive-pack bridge encodes
 # ForgeMsg::Push / ForgeQuery::HeadOf onto the actor lane (the ONE forge-specific
 # route pair; every other route stays module-agnostic opaque json).
+# the duckfs module registration plus digest-hex validation on the blob route.
 files = { workspace = true }
-memory = { workspace = true }
+# duckfs wire/path/object helpers used by the daemon's HTTP and workspace
+# adapter surfaces without depending on the module adapter re-export.
+duckfs-core = { workspace = true }
+# the node-local op-receipt blob store (the http blob lane): op payloads staged
+# at submit time, served back by digest. re-exported by `src/blobs.rs`.
+blobstore = { workspace = true }
 reactor = { workspace = true }
-# the blob lane shares the files wire constants (chunk cap) and, in tests, the
-# manifest verification helpers.
 # the derived read-model tier: the actor materializes per-module fluent31
 # indexes as blocks commit; /v1/index/* serves snapshot reads of them, and
 # each module registers its `::index` mapper as its own view endpoint.
 indexer = { workspace = true }
+# the duckfs checkout/commit engine: the workspace RPC (/v1/fs/workspaces) drives
+# it over an actor-lane `NodeApi` adapter, so the daemon manages checkouts with
+# no self-dial. NOT a consensus-path crate — a client engine, OS-side only.
+duckfs-client = { workspace = true }
+# the workspace RPC decodes file-read replies (base64) off the actor lane.
+base64 = { workspace = true }
 
 commonware-runtime = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
+rand = "0.8"
 async-trait = { workspace = true }
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
@@ -65,12 +77,18 @@ flate2 = "1"
 # ssh/https transport forge doesn't use either.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+ts-rs = { version = "12.0.1", features = ["serde-compat", "serde-json-impl"] }
+tokio = { version = "1", features = ["test-util"] }
 # daemon_e2e spawns the real binary and needs isolated storage roots.
 tempfile = "3"
 # daemon_e2e registers agents with a live prompt doc: prompt_hash pins sha256
 # of the doc's canonical rendering, computed test-side.
 sha2 = { workspace = true }
+# (duckfs-client and base64 are now direct deps above — daemon_e2e drives the
+# `HttpNode` transport through them as the full-stack proof of the client
+# transport, alongside the workspace RPC that uses them at runtime.)

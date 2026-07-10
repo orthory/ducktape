@@ -1,0 +1,201 @@
+# ADR: Global Gateway Routes and `.duck` Browsing
+
+Date: 2026-07-10. Status: **Accepted**.
+
+## Context
+
+DuckDNS is an optional human-name registry:
+`<account>.duck -> AccountId`. Identity, node admission, peer connectivity, and
+state synchronization already have their own authorities. Making DNS perform
+those jobs would duplicate working peer state and turn a convenient name into
+an ambient network capability.
+
+The useful missing primitive is narrower: an account should be able to publish
+one globally resolvable name whose traffic reaches either immutable DuckFS
+content or an HTTP server bound to loopback on one of that account's nodes.
+The same primitive must support pages, assets, and API methods without defining
+separate product modes.
+
+## Decision
+
+The module and protocol are named `gateway`. The `duck` name is reserved for
+the `.duck` address syntax and DuckDNS itself.
+
+The architecture has three independent layers:
+
+1. DuckDNS optionally resolves a handle to an `AccountId`.
+2. Gateway resolves `(AccountId, RouteName)` to one signed `RouteRecord`.
+3. The gateway data plane authorizes and reverse-proxies one bounded request to
+   the record's publisher.
+
+Nameability is not reachability. A route may resolve globally while its
+publisher is offline, no longer admitted, or unavailable to the current mesh.
+
+### One route model
+
+`RouteName` is either the account apex or one lowercase DNS-shaped label:
+
+- apex: `<account>.duck`;
+- named: `<label>.<account>.duck`.
+
+`net.duck` is reserved for network-owned DuckFS content and cannot be
+registered by an account. `net.<account>.duck` remains a valid named account
+route because the reservation applies only at the `.duck` root.
+
+Every live `RouteRecord` contains:
+
+- chain id, account id, route name, publisher node, and monotonic revision;
+- one typed target: `duck_fs` or `loopback_http`; and
+- one signed policy: audience, methods, request/response byte caps, and whether
+  an explicit `Authorization` header may be forwarded.
+
+A null route is a signed tombstone. Apex and named routes use the same record,
+signature namespace, validation, query, proxy, and browser paths; each
+`(account, name)` has its own revision stream. There are no separate page,
+application, or API record types.
+
+The management query lists bounded summaries (name, publisher, revision, and
+target kind) for every live route of one account in canonical apex-then-label
+order. DuckFS manifests, policies, signatures, and tombstones remain behind the
+exact-name query, so a list cannot multiply the largest route payload by the
+account route limit. Tombstones stay queryable for revision continuity but
+never appear as live management entries.
+
+### Consensus authority
+
+The gateway module accepts a mutation only when all of these hold:
+
+- the transaction origin is a current validator or admitted resident;
+- Identity currently binds that exact origin node to the statement's account;
+- the publisher in the statement equals the authenticated origin node;
+- a current Ed25519 member of the account signed the canonical statement under
+  `ducktape-gateway-route-v1`; and
+- the chain and next revision match.
+
+The module stores no URL, IP address, port, content byte, browser session, or
+transport state. Its canonical snapshot participates in ordinary host state
+sync, so no gateway-specific state-sync protocol exists.
+
+### DuckFS target
+
+A `duck_fs` target signs a sorted, bounded manifest of path, MIME, size, and
+SHA-256. Files are read from:
+
+`/home/ext:<publisher-node>/.duck/gateway/<_apex-or-label>/...`
+
+The publisher pins one DuckFS snapshot per request, rejects symlinks and
+undeclared paths, and verifies the exact size and hash before replying. Content
+routes permit only bodyless GET and HEAD, never `Authorization`. The manifest
+is capped at 128 files, 1 MiB per file, and 4 MiB total.
+
+### Loopback HTTP target
+
+A `loopback_http` target publishes no local address. The publisher keeps only
+`RouteName -> u16 port` in canonical node-local workspace state. For each
+authorized request it dials exactly:
+
+`http://127.0.0.1:<bound-port><validated-origin-form>`
+
+Proxy environment variables, redirects, alternate schemes, hostnames,
+absolute URLs, and caller-selected peers are disabled. Bind and unbind take
+effect without changing consensus, and removing the final binding removes the
+local file so no inert state remains.
+
+### Authenticated data plane
+
+`Service::Gateway = 6` retains the append-only service id and ports 45806/45906.
+It has a purpose-specific flow, socket, queue, admission book, and codec. The
+node shares only the process-wide bulk pacer with state sync; it does not share
+state-sync messages, routing, or authorization.
+
+The consumer derives the publisher from finalized route state. The publisher
+derives the caller node from the authenticated WireGuard peer and resolves it
+through Identity to a caller account. Caller-supplied account or peer identity
+is never trusted. Before touching DuckFS or loopback, the publisher re-resolves
+the route and Identity state and applies the signed audience:
+
+- `owner`: a node of the route's account;
+- `network`: any admitted node with an Identity account;
+- `accounts`: an explicit sorted account allowlist.
+
+The signed method set supports GET, HEAD, POST, PUT, PATCH, and DELETE. Body and
+response caps are enforced at every hop. Request headers are limited to
+Accept, Content-Type, Idempotency-Key, conditional headers, and explicitly
+enabled Authorization. Cookie, Host, Origin, forwarding headers, and arbitrary
+hop-by-hop headers never enter the wire contract. Response headers are limited
+to Content-Type, ETag, Last-Modified, Retry-After, and same-origin relative
+Location. `Set-Cookie` is never forwarded.
+
+### Browser boundary
+
+The node API can invoke a route programmatically through
+`POST /v1/gateway/proxy`. These gateway API entries accept native clients and
+the exact bundled Tauri origins, but reject arbitrary browser origins even
+though the older general node API retains permissive CORS. A full node enables
+the gateway lane only when that API listener is loopback. Publisher-side IO
+diagnostics are reduced to a typed generic failure before crossing the overlay,
+so local paths and bound ports do not leak. Browsing mints a separate random
+128-bit, route-and-revision-scoped origin:
+
+`http://<token>.localhost:<ephemeral-port>/`
+
+The dedicated listener exposes no node API and cannot select another route.
+Sessions expire after ten idle minutes and the store is bounded to 64 entries.
+Cookie, cross-origin `Origin`, and cross-site Fetch Metadata are rejected.
+Every response supplies fixed no-store, nosniff, referrer, opener, resource,
+device-permission, CSP sandbox, and WebRTC restrictions.
+
+Executable publisher content never enters the privileged console WebView.
+The desktop opens an incognito `gateway-*` WebView whose label matches no
+Tauri capability. Navigation is pinned to the exact random origin; popups,
+downloads, developer tools, persistent browsing data, and application IPC are
+disabled. Tauri application commands are registered explicitly and granted
+only to trusted bundled windows. This follows Tauri's iframe capability
+warning on Linux and Android: <https://v2.tauri.app/security/capabilities/>.
+The WebRTC denial follows CSP Level 3:
+<https://www.w3.org/TR/CSP/#directive-webrtc>.
+
+`net.duck` remains a separate, network-owned path under `/shared/.duck/net`.
+The app reads one pinned DuckFS snapshot and renders allowlisted HTML in an
+empty-sandbox iframe with scripts, forms, network, and external navigation
+disabled. It has no account, signature, peer hop, or gateway session.
+
+No local CA, hosts-file change, OS DNS interception, public ingress, or
+ambient browser trust is installed.
+
+### Routes management and health
+
+The product surface is **Routes**, not separate DNS, reverse-proxy, and gateway
+forms. An account claims its optional DuckDNS handle once. A route editor then
+derives `<label>.<account>.duck` and saves the signed route together with its
+node-local loopback binding, rolling the binding back when publication fails.
+The local port never enters DuckDNS or consensus.
+
+Publication and availability remain distinct. For a selected live route, the
+trusted console may send a bodyless, credential-free `HEAD` through the normal
+node API and authenticated gateway plane. The probe therefore exercises the
+finalized record, current publisher and Identity authority, audience policy,
+overlay stream, and the real DuckFS or loopback source. It follows no redirect
+and receives the ordinary route byte caps and header filtering. DuckFS probes
+the declared default (or first) file; loopback probes `/`. A response below 400
+is healthy, a 4xx proves the route is reachable, and a 5xx is reported as
+failing.
+Routes that did not explicitly sign `HEAD` are never probed. Results are
+short-lived UI diagnostics only: they are neither consensus state nor an
+admission or failover signal.
+
+## Consequences
+
+- Identity exists whether or not an account publishes a route or registers a
+  DuckDNS handle.
+- DuckDNS remains naming only; peer discovery and connectivity remain in the
+  authenticated network and Identity layers.
+- Static content and HTTP servers share one standardizable route/policy/proxy
+  contract without erasing their target-specific byte boundary.
+- Operators configure one derived address and source in Routes; the UI keeps
+  published state separate from its end-to-end health result.
+- Backend methods are possible but must be explicitly signed. Cookie-based
+  ambient authority is impossible, and Authorization is opt-in.
+- A loopback service can stay private to its node while network peers use its
+  stable account name. Taking the publisher offline makes the route
+  unavailable, not silently rerouted.

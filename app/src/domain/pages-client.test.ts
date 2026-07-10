@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   addComment,
   createPage,
@@ -8,19 +8,20 @@ import {
   threadsForTargets,
 } from "./pages-client";
 import type { NodeTransport } from "./transport";
+import { makeTransportStub } from "../test/transport-stub";
 
 function fakeTransport(sink: unknown[], reply: unknown = {}): NodeTransport {
-  return {
-    submit: (target: string, payload: unknown) => {
+  return makeTransportStub({
+    submit: vi.fn((target: string, payload: unknown) => {
       sink.push({ target, payload });
       return Promise.resolve({ height: 1, opHash: "x" } as never);
-    },
-    query: (target: string, payload: unknown) => {
+    }),
+    query: vi.fn((target: string, payload: unknown) => {
       sink.push({ target, payload });
       return Promise.resolve(reply as never);
-    },
-    view: () => Promise.resolve({} as never),
-  } as unknown as NodeTransport;
+    }),
+    view: vi.fn(() => Promise.resolve({} as never)),
+  });
 }
 
 describe("pages-client nesting", () => {

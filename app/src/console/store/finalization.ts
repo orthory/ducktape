@@ -45,8 +45,10 @@ export const OP_STALE_MS = 10_000;
 // overwrite each other's record, so a row always shows its latest write.
 
 export const opKey = {
-  /** The local member's own profile (the Settings display-name row). */
-  profile: () => "profile/self",
+  /** The local identity account's canonical display-name row. */
+  accountName: () => "account/name/self",
+  /** The local identity account's optional `.duck` name row. */
+  duckHandle: () => "account/duck-handle/self",
   channel: (channelId: string) => `chat/channel/${channelId}`,
   /** A NEW message — keyed by the client-minted message id (the committed row
    *  carries it in `head.message_id`, so the row matches after refresh too). */
@@ -64,6 +66,12 @@ export const opKey = {
    *  optimistic roster change carries a finalization record. */
   huddle: (channelId: string) => `chat/huddle/${channelId}`,
   forgeHead: () => "forge/head",
+  /** An op on an EXISTING forge issue/PR (edit/state/merge/review) — keyed by
+   *  the repo-scoped item number the row renders. */
+  forgeItem: (repo: string, number: number) => `forge/${repo}/item/${number}`,
+  /** An OpenIssue/OpenPr submit — the item number is minted by the module, so
+   *  the mark anchors to the repo's tracker list instead (cf. runRequest). */
+  forgeItemOpen: (repo: string) => `forge/${repo}/item/open`,
   page: (pageId: string) => `page/${pageId}`,
   /** Page block ids are module-global — no page qualifier needed. */
   pageBlock: (blockId: string) => `page-block/${blockId}`,
@@ -133,6 +141,23 @@ export const failOp = (ops: OpLedger, key: string, error: string): OpLedger => {
 export const hasFreshPending = (ops: OpLedger, now: number): boolean =>
   Object.values(ops).some(
     (op) => op.phase === "pending" && now - op.startedAt < OP_STALE_MS,
+  );
+
+/** The read-your-writes floor: the highest inclusion height among finalized
+ *  ops. A snapshot whose `status.height` sits below it predates a write this
+ *  console already holds a receipt for — applying it would un-render the
+ *  confirmed row until a later refresh (the "message disappears and
+ *  reappears" bug on nodes whose local fold trails the receipt's validator).
+ *  Unbounded on purpose: on one honest node heights are monotonic, so the
+ *  floor can never wedge hydration — and the ledger resets on node switches,
+ *  which is what makes that safe across connections. */
+export const receiptFloor = (ops: OpLedger): number =>
+  Object.values(ops).reduce(
+    (max, op) =>
+      op.phase === "finalized" && op.height !== undefined
+        ? Math.max(max, op.height)
+        : max,
+    0,
   );
 
 /** Entity-key prefixes whose optimistic projections live in the pages slices

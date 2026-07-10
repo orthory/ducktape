@@ -1,0 +1,36 @@
+[package]
+name = "overlay-net"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+commonware-runtime = { workspace = true }
+# the wrapper context implements commonware-runtime's `Clock`, whose
+# supertraits live in governor; and its rng bounds, which live in rand_core.
+# both pinned to the exact versions commonware-runtime itself depends on —
+# a different semver-major here would be a different trait.
+governor = { workspace = true }
+rand_core = { workspace = true }
+
+# ── the userspace backend (ADR phase 1) ─────────────────
+# the sans-io WireGuard core: one `noise::Tunn` per peer — the same BoringTun
+# build the TUN path runs inside defguard's device layer.
+defguard_boringtun = { workspace = true }
+# `InterfaceConfiguration`/`Peer` — the shape `WireGuardEffect::apply` takes;
+# types only, the device layer stays unused here.
+defguard_wireguard_rs = { workspace = true }
+# the `WireGuardEffect` trait this backend implements (ADR: the orchestration
+# boundary does not move).
+wireguard-effect = { workspace = true }
+# the virtual host terminating TCP/UDP at the node's overlay ULA.
+smoltcp = { workspace = true }
+# the socket seam this backend feeds (ADR phase 2): `VirtualSocketFactory`
+# implements data-plane's `SocketFactory` over the virtual stack. traits
+# only — the plane itself stays instantiated in the node layer.
+data-plane = { workspace = true }
+# the pumps: underlay UDP, timer driver, and the async socket surface —
+# tokio to match data-plane's transport arm (the factory this backend feeds).
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "io-util", "net"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }

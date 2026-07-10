@@ -44,7 +44,10 @@ export const postedMessage = (
     channelId: string;
     messageId: string;
     blocks: ChatBlock[];
-    author: string;
+    /** The COMMITTED self identity (`selfAuthorBytes`): the node pubkey on a
+     *  networked node, the origin bytes on the embedded daemon — so the
+     *  optimistic row's author matches what the refresh confirms. */
+    authorBytes: number[];
     at: number;
     /** Root seq when this is a thread reply. */
     thread: number | null;
@@ -60,7 +63,7 @@ export const postedMessage = (
     seq,
     head: {
       message_id: params.messageId,
-      author: { user: Array.from(new TextEncoder().encode(params.author)) },
+      author: { user: params.authorBytes },
       blocks: params.blocks,
       created_at: params.at,
       rev: 0,
@@ -175,7 +178,7 @@ export const channelCreated = (
  *  refresh replaces the roster (with the module-assigned join order) after. */
 export const huddleJoined = (
   prev: ConsoleState,
-  params: { channelId: string; node: number[]; author: string; at: number },
+  params: { channelId: string; node: number[]; authorBytes: number[]; at: number },
 ): Partial<ConsoleState> => {
   const channel = prev.channels.find((c) => c.id === params.channelId);
   if (!channel) return {};
@@ -183,7 +186,7 @@ export const huddleJoined = (
   const roster = channel.huddle ?? [];
   if (roster.some((m) => keyHex(m.node) === selfHex)) return {};
   const member: HuddleMember = {
-    user: Array.from(new TextEncoder().encode(params.author)),
+    user: params.authorBytes,
     node: params.node,
     joined_at: params.at,
   };
@@ -359,13 +362,4 @@ export const runCancelled = (
   // a cancel resolves through the dispatch plane's Err("cancelled") delivery,
   // which prunes the entry node-side a block later — mirror that prune.
   pendingRuns: prev.pendingRuns.filter((r) => r.run_id !== runId),
-});
-
-// ── Files ───────────────────────────────────────────────
-
-export const fileRemoved = (
-  prev: ConsoleState,
-  fileId: string,
-): Partial<ConsoleState> => ({
-  files: prev.files.filter((m) => m.file_id !== fileId),
 });

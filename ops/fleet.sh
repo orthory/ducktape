@@ -129,9 +129,11 @@ up_one(){
   local path="$1" branch="$2" id="$3"
   local slot; slot="$(slot_for "$id")"
   local disp=":$((DISP_BASE+slot))" vite=$((VITE_BASE+slot)) vnc=$((VNC_BASE+slot))
-  local mcp="/tmp/tauri-mcp-$id.sock" home="$STATE/$id/home" wsdir="$STATE/$id"
+  local home="$STATE/$id/home" wsdir="$STATE/$id"
+  local endpoint="$wsdir/tauri-agent/com.ducktape.app/endpoint.json"
   local app="$path/app"
   mkdir -p "$home" "$wsdir"
+  chmod 700 "$wsdir"   # XDG_RUNTIME_DIR for this instance — must be user-private
   log "[$id] slot $slot  disp $disp  vite $vite  vnc $vnc"
 
   # real isolation: stage the node bin once + seed this instance's own workspace
@@ -155,12 +157,12 @@ up_one(){
 { "build": { "beforeDevCommand": null, "devUrl": "http://localhost:$vite" } }
 JSON
 
-  # a dead instance leaves a stale socket file that would block restart; if the
+  # a dead instance leaves a stale endpoint file that would block restart; if the
   # VNC (started after the app) is gone, the instance is dead — clear it.
-  if [ -S "$mcp" ] && ! port_up "$vnc"; then rm -f "$mcp"; fi
+  if [ -f "$endpoint" ] && ! port_up "$vnc"; then rm -f "$endpoint"; fi
 
   # the app — isolated HOME, warm build caches, headless WebKit flags
-  if ! [ -S "$mcp" ]; then
+  if ! [ -f "$endpoint" ]; then
     ( cd "$app" && \
       HOME="$home" \
       CARGO_HOME="$REAL_HOME/.cargo" RUSTUP_HOME="$REAL_HOME/.rustup" \
@@ -168,7 +170,7 @@ JSON
       PATH="$REAL_HOME/.local/bin:$PATH" \
       DISPLAY="$disp" WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 \
       LIBGL_ALWAYS_SOFTWARE=1 GDK_BACKEND=x11 \
-      DUCKTAPE_TAURI_DEV_PORT="$vite" DUCKTAPE_TAURI_MCP_SOCKET="$mcp" \
+      DUCKTAPE_TAURI_DEV_PORT="$vite" XDG_RUNTIME_DIR="$wsdir" \
       DUCKTAPE_NODE_BIN="$NODE_BIN" \
       setsid dbus-run-session -- bunx tauri dev --config "$wsdir/no-before.json" --no-dev-server-wait \
       >"$wsdir/tauri.log" 2>&1 < /dev/null & )
@@ -210,7 +212,7 @@ up_web(){
 emit_json(){
   MAIN_ROOT="$MAIN_ROOT" BASE_BRANCH="$BASE_BRANCH" TSIP="$TSIP" WEB_PORT="$WEB_PORT" \
   DISP_BASE="$DISP_BASE" VITE_BASE="$VITE_BASE" VNC_BASE="$VNC_BASE" \
-  STATE="$STATE" DIST="$DIST" \
+  STATE="$STATE" DIST="$DIST" TAURI_AGENT_APP_ID="com.ducktape.app" \
   python3 - <<'PY'
 import json, os, socket, subprocess, datetime, re
 env = os.environ
@@ -218,6 +220,7 @@ main, base = env["MAIN_ROOT"], env["BASE_BRANCH"]
 tsip, web = env["TSIP"], int(env["WEB_PORT"])
 disp_b, vite_b, vnc_b = int(env["DISP_BASE"]), int(env["VITE_BASE"]), int(env["VNC_BASE"])
 state, dist = env["STATE"], env["DIST"]
+agent_app_id = env["TAURI_AGENT_APP_ID"]
 
 def slug(s): return re.sub(r"-+","-", re.sub(r"[^a-z0-9]","-", s.lower())).strip("-")
 def sh(*a):
@@ -268,12 +271,30 @@ for w in wts:
     if wid in slots:
         slot = slots[wid]
         vnc = vnc_b + slot
+        runtime_dir = os.path.join(state, wid)
+        endpoint = os.path.join(runtime_dir, "tauri-agent", agent_app_id, "endpoint.json")
         node.update({"slot": slot, "display": f":{disp_b+slot}", "vncPort": vnc,
-                     "token": wid})
-        # "up" means the APP is live (its tauri-mcp socket exists) AND reachable
+                     "token": wid,
+                     "agent": {
+                         "appId": agent_app_id,
+                         "runtimeDir": runtime_dir,
+                         "endpointPath": endpoint,
+                         "endpointReady": os.path.exists(endpoint),
+                         "observe": {
+                             "protocol": "tauri-agent-observe-ndjson",
+                             "cwd": os.path.relpath(path, main),
+                             "env": {"XDG_RUNTIME_DIR": runtime_dir},
+                             "argv": [
+                                 "app/scripts/tauri-agent",
+                                 "observe",
+                                 "--app", agent_app_id,
+                                 "--format", "ndjson",
+                             ],
+                         },
+                     }})
+        # "up" means the APP is live (its endpoint registry exists) AND reachable
         # over VNC — a bare x11vnc on an empty Xvfb is not "up".
-        sock = f"/tmp/tauri-mcp-{wid}.sock"
-        if os.path.exists(sock) and port_open(vnc): node["status"] = "up"
+        if os.path.exists(endpoint) and port_open(vnc): node["status"] = "up"
         elif os.path.isfile(os.path.join(state, wid, "tauri.log")): node["status"] = "building"
         else: node["status"] = "down"
     out.append(node)
@@ -316,11 +337,10 @@ case "$cmd" in
     while IFS=$'\t' read -r path br id; do
       slot="$(slot_for "$id")"; disp=":$((DISP_BASE+slot))"; vnc=$((VNC_BASE+slot))
       pkill -f "target/debug/ducktape-desktop" 2>/dev/null || true
-      pkill -f "tauri-mcp-$id.sock" 2>/dev/null || true
       "$X11VNC" -R stop >/dev/null 2>&1 || true
       pkill -f "rfbport $vnc" 2>/dev/null || true
       pkill -f "Xvfb $disp " 2>/dev/null || true
-      rm -f "$TOKENS/$id" "/tmp/tauri-mcp-$id.sock"
+      rm -f "$TOKENS/$id" "$STATE/$id/tauri-agent/com.ducktape.app/endpoint.json"
       log "[$id] stopped"
     done < <(selected "$@")
     [ "$#" -eq 0 ] && { pkill -f 'python3 -m websockify' 2>/dev/null || true; log "web stopped"; }

@@ -30,8 +30,9 @@ pub use binding::{
 pub use keys::{KeyError, WireGuardKeypair};
 pub use msg::{MsgError, ReachabilityMsg};
 pub use orchestrator::{
-    run, EndpointResolver, InstallReply, MeshEpochEvent, NatResolver, ReachabilityCommand,
+    ADVERT_TTL_VIEWS, CoordinatedInviteReply, EndpointResolver, HANDSHAKE_TTL_VIEWS, InstallReply,
+    KEEPALIVE_SECONDS, MeshEpochEvent, NatResolver, RENDEZVOUS_KEEPALIVE, ReachabilityCommand,
     ReachabilityConfig, ReachabilityError, ReachabilityEvent, Resolution, StaticResolver,
-    initiates, ADVERT_TTL_VIEWS, HANDSHAKE_TTL_VIEWS, KEEPALIVE_SECONDS,
+    initiates, run,
 };
 pub use store::{MESH_STORE_FORMAT, PersistedMesh, StoreError};

@@ -16,6 +16,8 @@ export interface WorkspacePorts {
   listen: number;
   http: number;
   rpc: number;
+  wireguard?: number | null;
+  invite?: number | null;
 }
 
 export interface Workspace {
@@ -60,6 +62,24 @@ export interface PhaseReport {
 export interface LogTail {
   path: string;
   tail: string;
+}
+
+/** The running node's operational identity for the Node → Logs tab. Every
+ *  process field is best-effort: a node we adopted (didn't spawn) has no
+ *  pidfile, so pid/alive/uptimeSecs come back null. Verbatim from workspaces.rs
+ *  RuntimeFacts (camelCase). */
+export interface RuntimeFacts {
+  pid: number | null;
+  alive: boolean | null;
+  uptimeSecs: number | null;
+  binaryPath: string | null;
+  dataDir: string;
+  logPath: string;
+}
+
+export interface GatewayLocalRoute {
+  name: { label: string | null };
+  port: number;
 }
 
 /** One pending join request a parked joiner delivered over the lobby channel.
@@ -117,6 +137,11 @@ export const workspacePhase = (id: string): Promise<PhaseReport> =>
  *  node fails to answer, to surface the real reason and back "Open daemon.log". */
 export const workspaceLogTail = (id: string): Promise<LogTail> =>
   invoke<LogTail>("workspace_log_tail", { id });
+
+/** The running node's pid/uptime/binary/paths — polled by the Node → Logs tab's
+ *  runtime-facts row. Best-effort per field (see RuntimeFacts). */
+export const workspaceRuntimeFacts = (id: string): Promise<RuntimeFacts> =>
+  invoke<RuntimeFacts>("workspace_runtime_facts", { id });
 
 export const inviteBlob = (id: string): Promise<string> =>
   invoke<string>("workspace_invite_blob", { id });
@@ -193,3 +218,17 @@ export const forgetWorkspace = (
  *  url to dial. Idempotent — adopts an already-listening node. */
 export const selectWorkspace = (id: string): Promise<WorkspaceSelection> =>
   invoke<WorkspaceSelection>("workspace_select", { id });
+
+/** Node-local half of a loopback-backed gateway route. A null label means the
+ * account apex; the globally signed record never contains this port. */
+export const bindGatewayRoute = (
+  id: string,
+  label: string | null,
+  port: number,
+): Promise<void> => invoke<void>("gateway_route_bind", { id, label, port });
+
+export const unbindGatewayRoute = (id: string, label: string | null): Promise<void> =>
+  invoke<void>("gateway_route_unbind", { id, label });
+
+export const listGatewayRoutes = (id: string): Promise<GatewayLocalRoute[]> =>
+  invoke<GatewayLocalRoute[]>("gateway_route_list", { id });

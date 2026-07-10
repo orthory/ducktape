@@ -4,27 +4,25 @@
 //!
 //! Runtime shape mirrors the reachability plane's split exactly: the hub runs
 //! on its OWN plain-tokio OS thread (the engine's pump and the 20 ms playout
-//! tick are tokio-native), and mesh I/O crosses to the commonware runner over
-//! channel pumps `main.rs` owns on two dedicated lanes: audio and call control
-//! ride `CHANNEL_VOICE`, camera video rides `CHANNEL_VIDEO` so a keyframe burst
-//! can't queue ahead of voice. Each datagram still carries the plane's
-//! per-(service, flow) header, which demultiplexes the flows within a lane.
+//! tick are tokio-native). On that thread it binds the per-service overlay
+//! media planes ([`crate::voice_plane`]) and serves sessions over them —
+//! audio + call control on `Service::Voice`'s overlay socket, camera video on
+//! `Service::Video`'s. Distinct overlay ports mean the two streams never share
+//! a socket or a send queue, so a video keyframe burst can't starve voice (the
+//! failure the mesh-encapsulation arm this replaced was prone to — see
+//! [`crate::voice_plane`]). Media rides ONLY the overlay: no overlay, no media.
 //!
 //! Three pieces, all off-consensus:
-//! - [`ChannelTransport`] — a datagram-only [`DataPlaneTransport`] arm over
-//!   the pump channels. The designed transport is UDP on the reachability
-//!   plane's WireGuard overlay; riding the authenticated TCP mesh instead
-//!   trades head-of-line latency (absorbed by the engine's jitter buffer) for
-//!   zero new infrastructure, and swaps out later behind the same trait
-//!   without touching the engine.
-//! - An [`AdmissionPolicy`] over the node's ACTIVE flows, now keyed by
+//! - Two per-use [`DataPlane`]s over the overlay ([`crate::voice_plane`]),
+//!   built lazily once the reachability plane has the interface up.
+//! - An [`AdmissionPolicy`] over the node's ACTIVE flows, keyed by
 //!   `(Service, FlowId)`: this node receives (and emits) call media only for
 //!   flows its own operator has a live huddle session on — the mic and control
-//!   flows on `Service::Voice`, the camera flow on `Service::Video`. The mesh
-//!   already authenticates every peer as a workspace member; roster-level
-//!   gating is the client's job (it steers the fan-out from consensus state),
-//!   and unadmitted traffic drops counted at the plane per its default-deny
-//!   contract.
+//!   flows on `Service::Voice`, the camera flow on `Service::Video`. The
+//!   overlay already authenticates every peer by its source `/128`;
+//!   roster-level gating is the client's job (it steers the fan-out from
+//!   consensus state), and unadmitted traffic drops counted at the plane per
+//!   its default-deny contract.
 //! - The hub loop — drains [`noded::CallSessionRequest`]s from the app
 //!   surface and runs AT MOST ONE session at a time (Slack semantics: you are
 //!   in one huddle). A session owns a [`VoiceEngine`] on the channel-derived
@@ -43,23 +41,12 @@ use std::time::{Duration, Instant};
 use chat::voice::{FRAME_MILLIS, FRAME_SAMPLES, VoiceConfig, VoiceEngine};
 use data_plane::{
     AdmissionPolicy, DataPlane, DataPlaneTransport, DatagramFlow, DatagramPolicy, FlowId, PeerId,
-    PlaneConfig, Service, TransportError,
+    Service, SocketFactory,
 };
 use tokio::sync::{mpsc, watch};
 
-/// One call datagram crossing the mesh pumps: (raw ed25519 peer key, frame).
-/// Outbound the key names the recipient; inbound it is the authenticated
-/// sender the mesh reports. The frame carries the plane's `(service, flow)`
-/// header; [`ChannelTransport`] routes each outbound datagram to the voice or
-/// video mesh lane by that header's service byte.
-pub type VoiceDatagram = ([u8; 32], Vec<u8>);
+use crate::voice_plane::MediaPeers;
 
-/// Voice mesh-pump lane depth: ~5 s of one speaker's frames. Call media is
-/// fire-and-forget, so overflow drops rather than backpressures.
-const WIRE_LANE: usize = 256;
-/// Video mesh-pump lane depth: ~4 keyframes of fragments. Its own outbound
-/// lane so a keyframe burst can't queue ahead of voice.
-const VIDEO_WIRE_LANE: usize = 512;
 /// Inbound audio queue per flow: ~2.5 s of one speaker's frames. Overflow
 /// drops the oldest inside the flow (the plane's drop-oldest contract).
 const FLOW_QUEUE: usize = 128;
@@ -92,24 +79,22 @@ fn ctl_flow(channel_id: &str) -> FlowId {
     FlowId::derive(format!("callctl-channel:{channel_id}").as_bytes())
 }
 
-/// Stand up the call runtime on its own OS thread and return the mesh ends:
-/// `main.rs` drains the voice outbound receiver into the `CHANNEL_VOICE`
-/// sender and the video outbound receiver into the `CHANNEL_VIDEO` sender, and
-/// feeds mesh receipts from both lanes into the one inbound sender.
-/// [`ChannelTransport`] routes each datagram to a lane by its plane header's
-/// service byte (`frame[1]`); audio and call control ride voice, camera video
-/// rides video. `requests` is the app surface's session lane
-/// ([`noded::NodeHandle::with_call`]).
+/// Stand up the call runtime on its own OS thread. The hub binds the voice and
+/// video overlay planes on that thread's runtime (retrying until the overlay
+/// `/128` is up) and serves one huddle session at a time over them. `requests`
+/// is the app surface's session lane ([`noded::NodeHandle::with_call`]);
+/// `factory`/`peers`/`me` are the overlay socket seam, the tracked media peer
+/// set (refreshed by the host on valset cutover), and this node's own key.
+///
+/// Media rides ONLY the overlay — with no overlay there is no media transport
+/// (the overlay-only cutover, no mesh fallback), so the host spawns the hub
+/// only where the overlay is reachable.
 pub fn spawn_hub(
     requests: mpsc::Receiver<noded::CallSessionRequest>,
-) -> (
-    mpsc::Receiver<VoiceDatagram>,
-    mpsc::Receiver<VoiceDatagram>,
-    mpsc::Sender<VoiceDatagram>,
-) {
-    let (outbound_voice_tx, outbound_voice_rx) = mpsc::channel(WIRE_LANE);
-    let (outbound_video_tx, outbound_video_rx) = mpsc::channel(VIDEO_WIRE_LANE);
-    let (inbound_tx, inbound_rx) = mpsc::channel(WIRE_LANE);
+    factory: Arc<dyn SocketFactory>,
+    peers: Arc<MediaPeers>,
+    me: [u8; 32],
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("voice-hub".into())
         .spawn(move || {
@@ -118,62 +103,9 @@ pub fn spawn_hub(
                 .enable_all()
                 .build()
                 .expect("voice-hub tokio runtime")
-                .block_on(hub_loop(
-                    requests,
-                    outbound_voice_tx,
-                    outbound_video_tx,
-                    inbound_rx,
-                ));
+                .block_on(hub_loop(requests, factory, peers, me));
         })
-        .expect("spawn voice-hub thread");
-    (outbound_voice_rx, outbound_video_rx, inbound_tx)
-}
-
-/// The datagram-only transport arm over the mesh pump channels. Call media
-/// never opens streams, so the stream half reports [`TransportError::Closed`]
-/// — the plane's acceptor loop exits immediately and `connect` refuses.
-struct ChannelTransport {
-    outbound_voice: mpsc::Sender<VoiceDatagram>,
-    outbound_video: mpsc::Sender<VoiceDatagram>,
-    inbound: tokio::sync::Mutex<mpsc::Receiver<VoiceDatagram>>,
-}
-
-impl DataPlaneTransport for ChannelTransport {
-    type Stream = tokio::io::DuplexStream;
-
-    fn max_datagram(&self) -> usize {
-        data_plane::MAX_DATAGRAM
-    }
-
-    async fn send_datagram(&self, to: PeerId, frame: Vec<u8>) -> Result<(), TransportError> {
-        // fire-and-forget per the trait: a full pump lane drops the frame —
-        // call media retries nothing, the jitter buffer / next keyframe
-        // renders the gap.
-        // route by the plane header's service byte: video fragments ride
-        // their own mesh lane so a keyframe burst can't queue ahead of voice.
-        let lane = if frame.get(1) == Some(&(Service::Video as u8)) {
-            &self.outbound_video
-        } else {
-            &self.outbound_voice
-        };
-        let _ = lane.try_send((to.0, frame));
-        Ok(())
-    }
-
-    async fn recv_datagram(&self) -> Result<(PeerId, Vec<u8>), TransportError> {
-        match self.inbound.lock().await.recv().await {
-            Some((peer, bytes)) => Ok((PeerId(peer), bytes)),
-            None => Err(TransportError::Closed),
-        }
-    }
-
-    async fn connect(&self, _to: PeerId) -> Result<Self::Stream, TransportError> {
-        Err(TransportError::Closed)
-    }
-
-    async fn accept(&self) -> Result<(PeerId, Self::Stream), TransportError> {
-        Err(TransportError::Closed)
-    }
+        .expect("spawn voice-hub thread")
 }
 
 /// The `(service, flow)` pairs this node's operator is live on. Shared between
@@ -220,40 +152,49 @@ impl SessionGuard {
     }
 }
 
+/// Build the two overlay media planes on the hub runtime (blocking until the
+/// overlay is up), then serve sessions over them. One shared active-flow set
+/// answers admission for both planes.
 async fn hub_loop(
-    mut requests: mpsc::Receiver<noded::CallSessionRequest>,
-    outbound_voice: mpsc::Sender<VoiceDatagram>,
-    outbound_video: mpsc::Sender<VoiceDatagram>,
-    inbound: mpsc::Receiver<VoiceDatagram>,
+    requests: mpsc::Receiver<noded::CallSessionRequest>,
+    factory: Arc<dyn SocketFactory>,
+    peers: Arc<MediaPeers>,
+    me: [u8; 32],
 ) {
     let flows = Arc::new(ActiveFlows::default());
-    let plane = DataPlane::new(
-        ChannelTransport {
-            outbound_voice,
-            outbound_video,
-            inbound: tokio::sync::Mutex::new(inbound),
-        },
+    let (voice_plane, video_plane) = crate::voice_plane::bind_media_planes(
+        factory,
+        peers,
+        me,
         flows.clone() as Arc<dyn AdmissionPolicy>,
-        // stream-class pacing config; call media runs no streams, so these
-        // only need to exist.
-        PlaneConfig {
-            bulk_bytes_per_sec: 1 << 20,
-            bulk_burst_bytes: 1 << 20,
-        },
-    );
+    )
+    .await;
+    serve_sessions(requests, voice_plane, video_plane, flows).await;
+}
+
+/// The session request loop: run AT MOST ONE session at a time (Slack
+/// semantics), each over the shared voice + video planes. Generic over the
+/// transport so tests drive it over an in-memory link.
+async fn serve_sessions<T: DataPlaneTransport>(
+    mut requests: mpsc::Receiver<noded::CallSessionRequest>,
+    voice_plane: DataPlane<T>,
+    video_plane: DataPlane<T>,
+    flows: Arc<ActiveFlows>,
+) {
     let mut active: Option<SessionGuard> = None;
     while let Some(request) = requests.recv().await {
         // one huddle at a time: a new join replaces the current session.
         if let Some(previous) = active.take() {
             previous.teardown().await;
         }
-        let (session, guard) = match open_session(&plane, &flows, &request.channel_id).await {
-            Ok(opened) => opened,
-            Err(refusal) => {
-                let _ = request.reply.send(Err(refusal));
-                continue;
-            }
-        };
+        let (session, guard) =
+            match open_session(&voice_plane, &video_plane, &flows, &request.channel_id).await {
+                Ok(opened) => opened,
+                Err(refusal) => {
+                    let _ = request.reply.send(Err(refusal));
+                    continue;
+                }
+            };
         if request.reply.send(Ok(session)).is_err() {
             // the websocket died before the session opened.
             guard.teardown().await;
@@ -298,7 +239,8 @@ async fn register_datagram_flow<T: DataPlaneTransport>(
 }
 
 async fn open_session<T: DataPlaneTransport>(
-    plane: &DataPlane<T>,
+    voice_plane: &DataPlane<T>,
+    video_plane: &DataPlane<T>,
     flows: &Arc<ActiveFlows>,
     channel_id: &str,
 ) -> Result<(noded::CallSession, SessionGuard), String> {
@@ -307,12 +249,21 @@ async fn open_session<T: DataPlaneTransport>(
     let control_flow = ctl_flow(channel_id);
 
     // register all three datagram flows (each behind the retry loop, since a
-    // torn-down predecessor releases them asynchronously).
-    let mic_dgram =
-        register_datagram_flow(plane, Service::Voice, mic_flow, FLOW_QUEUE, channel_id, "voice")
-            .await?;
+    // torn-down predecessor releases them asynchronously). mic + control ride
+    // the voice plane (Service::Voice, overlay port 45902); camera rides the
+    // video plane (Service::Video, port 45903) — separate sockets, so a video
+    // burst can't queue ahead of voice.
+    let mic_dgram = register_datagram_flow(
+        voice_plane,
+        Service::Voice,
+        mic_flow,
+        FLOW_QUEUE,
+        channel_id,
+        "voice",
+    )
+    .await?;
     let cam_dgram = register_datagram_flow(
-        plane,
+        video_plane,
         Service::Video,
         cam_flow,
         VIDEO_FLOW_QUEUE,
@@ -321,7 +272,7 @@ async fn open_session<T: DataPlaneTransport>(
     )
     .await?;
     let ctl_dgram = register_datagram_flow(
-        plane,
+        voice_plane,
         Service::Voice,
         control_flow,
         CTL_FLOW_QUEUE,
@@ -420,8 +371,8 @@ async fn run_session<T: DataPlaneTransport>(
     ctl: DatagramFlow<T>,
     mut pcm_in: mpsc::Receiver<Vec<i16>>,
     mixed_out: mpsc::Sender<Vec<i16>>,
-    mut video_in: mpsc::Receiver<noded::CapturedVideo>,
-    video_out: mpsc::Sender<noded::PeerVideo>,
+    mut video_in: mpsc::Receiver<chat::call_wire::CapturedFrame>,
+    video_out: mpsc::Sender<chat::call_wire::PeerFrame>,
     mut control_in: mpsc::Receiver<noded::CallControlIn>,
     control_out: mpsc::Sender<noded::CallControlOut>,
     recipients: watch::Receiver<Vec<[u8; 32]>>,
@@ -435,7 +386,7 @@ async fn run_session<T: DataPlaneTransport>(
     let mut frame_no: u32 = 0;
     let mut peer_lanes: HashMap<[u8; 32], PeerLane> = HashMap::new();
     // what the webview last told us — repeated at 1 Hz as our beacon.
-    let (mut muted, mut camera_on) = (true, false);
+    let (mut muted, mut camera_on, mut sharing) = (true, false, false);
     // rate hints RECEIVED from each peer about OUR sending; effective = min.
     let mut inbound_hints: HashMap<[u8; 32], u32> = HashMap::new();
     let mut effective_kbps: u32 = chat::video::RATE_LADDER_KBPS[0];
@@ -501,7 +452,7 @@ async fn run_session<T: DataPlaneTransport>(
                         // full lane = the webview is behind; a dropped frame
                         // is recovered by the next keyframe request from the
                         // browser decoder, so shed rather than backpressure.
-                        let _ = video_out.try_send(noded::PeerVideo {
+                        let _ = video_out.try_send(chat::call_wire::PeerFrame {
                             peer: peer.0,
                             keyframe: done.keyframe,
                             ts_ms: done.ts_ms,
@@ -534,9 +485,9 @@ async fn run_session<T: DataPlaneTransport>(
                             let _ = control_out.try_send(noded::CallControlOut::KeyframeRequest);
                         }
                     }
-                    chat::video::CallControl::Beacon { muted, camera_on } => {
+                    chat::video::CallControl::Beacon { muted, camera_on, sharing } => {
                         let _ = control_out.try_send(noded::CallControlOut::PeerBeacon {
-                            peer: peer.0, muted, camera_on,
+                            peer: peer.0, muted, camera_on, sharing,
                         });
                     }
                     chat::video::CallControl::RateHint { max_kbps } => {
@@ -561,11 +512,11 @@ async fn run_session<T: DataPlaneTransport>(
             state = control_in.recv() => {
                 let Some(state) = state else { break };
                 match state {
-                    noded::CallControlIn::Beacon { muted: m, camera_on: c } => {
-                        (muted, camera_on) = (m, c);
+                    noded::CallControlIn::Beacon { muted: m, camera_on: c, sharing: s } => {
+                        (muted, camera_on, sharing) = (m, c, s);
                         // push immediately so toggles feel live; the 1 Hz
                         // tick keeps late joiners current.
-                        send_beacon(&ctl, &recipients, muted, camera_on).await;
+                        send_beacon(&ctl, &recipients, muted, camera_on, sharing).await;
                     }
                     noded::CallControlIn::KeyframeRequest { peer } => {
                         if let Some(lane) = peer_lanes.get_mut(&peer) {
@@ -575,7 +526,7 @@ async fn run_session<T: DataPlaneTransport>(
                 }
             }
             _ = ctl_tick.tick() => {
-                send_beacon(&ctl, &recipients, muted, camera_on).await;
+                send_beacon(&ctl, &recipients, muted, camera_on, sharing).await;
                 // hints from peers no longer in the roster must not pin our rate.
                 let live: HashSet<[u8; 32]> = recipients.borrow().iter().copied().collect();
                 inbound_hints.retain(|peer, _| live.contains(peer));
@@ -623,8 +574,14 @@ async fn send_beacon<T: DataPlaneTransport>(
     recipients: &watch::Receiver<Vec<[u8; 32]>>,
     muted: bool,
     camera_on: bool,
+    sharing: bool,
 ) {
-    let frame = chat::video::CallControl::Beacon { muted, camera_on }.encode();
+    let frame = chat::video::CallControl::Beacon {
+        muted,
+        camera_on,
+        sharing,
+    }
+    .encode();
     let peers: Vec<PeerId> = recipients.borrow().iter().map(|raw| PeerId(*raw)).collect();
     for peer in peers {
         let _ = ctl.send_to(peer, &frame).await;
@@ -695,6 +652,85 @@ async fn evaluate_rate_windows<T: DataPlaneTransport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data_plane::{PlaneConfig, TransportError};
+
+    /// Per-hub in-memory single-service transport (test only). Production media
+    /// rides two OVERLAY sockets, one per service; tests wire two hubs over a
+    /// pair of in-memory single-service links per direction, which reproduces
+    /// the same per-service isolation (voice frames and video frames never
+    /// touch the same channel) without standing up a real overlay stack.
+    struct MemLink {
+        outbound: mpsc::Sender<(PeerId, Vec<u8>)>,
+        inbound: tokio::sync::Mutex<mpsc::Receiver<(PeerId, Vec<u8>)>>,
+    }
+
+    impl DataPlaneTransport for MemLink {
+        type Stream = tokio::io::DuplexStream;
+
+        fn max_datagram(&self) -> usize {
+            data_plane::MAX_DATAGRAM
+        }
+
+        async fn send_datagram(&self, to: PeerId, frame: Vec<u8>) -> Result<(), TransportError> {
+            // fire-and-forget: a full lane drops the frame, exactly as an
+            // overlay UDP send would on buffer pressure.
+            let _ = self.outbound.try_send((to, frame));
+            Ok(())
+        }
+
+        async fn recv_datagram(&self) -> Result<(PeerId, Vec<u8>), TransportError> {
+            match self.inbound.lock().await.recv().await {
+                Some(framed) => Ok(framed),
+                None => Err(TransportError::Closed),
+            }
+        }
+
+        async fn connect(&self, _to: PeerId) -> Result<Self::Stream, TransportError> {
+            Err(TransportError::Closed)
+        }
+
+        async fn accept(&self) -> Result<(PeerId, Self::Stream), TransportError> {
+            Err(TransportError::Closed)
+        }
+    }
+
+    /// in-memory link depth: generous so a test never drops on backpressure.
+    const LANE: usize = 512;
+
+    fn media_plane(
+        outbound: mpsc::Sender<(PeerId, Vec<u8>)>,
+        inbound: mpsc::Receiver<(PeerId, Vec<u8>)>,
+        flows: Arc<ActiveFlows>,
+    ) -> DataPlane<MemLink> {
+        DataPlane::new(
+            MemLink {
+                outbound,
+                inbound: tokio::sync::Mutex::new(inbound),
+            },
+            flows as Arc<dyn AdmissionPolicy>,
+            PlaneConfig {
+                bulk_bytes_per_sec: 1 << 20,
+                bulk_burst_bytes: 1 << 20,
+            },
+        )
+    }
+
+    /// One hub over caller-supplied voice/video links; returns its session
+    /// request lane. The inbound halves are fed by the caller (a forwarder
+    /// from the peer hub, or a direct injector).
+    fn hub_over(
+        voice_out: mpsc::Sender<(PeerId, Vec<u8>)>,
+        voice_in: mpsc::Receiver<(PeerId, Vec<u8>)>,
+        video_out: mpsc::Sender<(PeerId, Vec<u8>)>,
+        video_in: mpsc::Receiver<(PeerId, Vec<u8>)>,
+    ) -> mpsc::Sender<noded::CallSessionRequest> {
+        let flows = Arc::new(ActiveFlows::default());
+        let voice_plane = media_plane(voice_out, voice_in, flows.clone());
+        let video_plane = media_plane(video_out, video_in, flows.clone());
+        let (req_tx, req_rx) = mpsc::channel(4);
+        tokio::spawn(serve_sessions(req_rx, voice_plane, video_plane, flows));
+        req_tx
+    }
 
     /// open (or replace) a session on channel "general" over a hub lane.
     async fn open(lane: mpsc::Sender<noded::CallSessionRequest>) -> noded::CallSession {
@@ -708,37 +744,15 @@ mod tests {
         opened.await.expect("hub replies").expect("session opens")
     }
 
-    /// two hubs wired back-to-back through their mesh lanes: a frame sent by
-    /// one operator's session comes out of the other's mixed playout, and a
-    /// replacement session (same hub) tears the first down and still works —
-    /// proving flow re-registration after teardown.
+    /// two hubs wired back-to-back through their per-service links: a frame
+    /// sent by one operator's session comes out of the other's mixed playout,
+    /// and a replacement session (same hub) tears the first down and still
+    /// works — proving flow re-registration after teardown.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sessions_carry_audio_between_two_hubs_and_survive_replacement() {
         let key_a = [0xaa_u8; 32];
         let key_b = [0xbb_u8; 32];
-
-        let (req_a_tx, req_a) = mpsc::channel(4);
-        let (req_b_tx, req_b) = mpsc::channel(4);
-        let (voice_out_a, video_out_a, in_a) = spawn_hub(req_a);
-        let (voice_out_b, video_out_b, in_b) = spawn_hub(req_b);
-        // the "mesh": a's outbound datagrams — BOTH the voice and video lanes —
-        // appear on b's inbound stamped with a's key, and vice versa.
-        for mut out in [voice_out_a, video_out_a] {
-            let in_b = in_b.clone();
-            tokio::spawn(async move {
-                while let Some((_to, frame)) = out.recv().await {
-                    let _ = in_b.send((key_a, frame)).await;
-                }
-            });
-        }
-        for mut out in [voice_out_b, video_out_b] {
-            let in_a = in_a.clone();
-            tokio::spawn(async move {
-                while let Some((_to, frame)) = out.recv().await {
-                    let _ = in_a.send((key_b, frame)).await;
-                }
-            });
-        }
+        let (req_a_tx, req_b_tx) = two_hubs(key_a, key_b, |_| true);
 
         // both request lanes must outlive the sessions: a closed lane means
         // app-surface shutdown and the hub tears its active session down.
@@ -776,9 +790,12 @@ mod tests {
         drop((req_a_tx, req_b_tx));
     }
 
-    /// wire two hubs A→B / B→A applying `a_to_b` to every A→B datagram (it may
-    /// swallow a frame to model loss). returns the two request lanes; keep them
-    /// alive for the test's duration.
+    /// wire two hubs A↔B over per-service in-memory links, applying `a_to_b`
+    /// to every A→B datagram (it may swallow a frame to model loss). Returns
+    /// the two request lanes; keep them alive for the test's duration. Each
+    /// forwarder relabels the frame with the SENDER's key (the overlay's
+    /// source-`/128` authentication in production) and routes to the peer's
+    /// matching-service ingress by the plane header's service byte (`frame[1]`).
     fn two_hubs(
         key_a: [u8; 32],
         key_b: [u8; 32],
@@ -787,35 +804,57 @@ mod tests {
         mpsc::Sender<noded::CallSessionRequest>,
         mpsc::Sender<noded::CallSessionRequest>,
     ) {
-        let (req_a_tx, req_a) = mpsc::channel(4);
-        let (req_b_tx, req_b) = mpsc::channel(4);
-        let (mut voice_out_a, mut video_out_a, in_a) = spawn_hub(req_a);
-        let (voice_out_b, video_out_b, in_b) = spawn_hub(req_b);
-        // A→B: the loss filter guards BOTH of A's outbound lanes, so a
-        // per-frame decision (e.g. "drop the first frag_index==1") sees every
-        // A→B datagram regardless of which lane carried it. Merge the two
-        // lanes into one filtered forwarder to keep the filter single-owner.
+        let (a_id, b_id) = (PeerId(key_a), PeerId(key_b));
+        // each hub's egress lanes and each hub's ingress lanes, per service.
+        let (a_voice_out, mut a_voice_out_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+        let (a_video_out, mut a_video_out_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+        let (b_voice_out, mut b_voice_out_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+        let (b_video_out, mut b_video_out_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+        let (a_voice_in, a_voice_in_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+        let (a_video_in, a_video_in_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+        let (b_voice_in, b_voice_in_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+        let (b_video_in, b_video_in_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+
+        // A→B: the loss filter guards BOTH of A's outbound lanes, so a per-frame
+        // decision (e.g. "drop the first frag_index==1") sees every A→B datagram
+        // regardless of service. Merge into one filtered forwarder (single-owner
+        // filter) that routes to B's voice/video ingress by the service byte.
         tokio::spawn(async move {
             loop {
                 let frame = tokio::select! {
-                    Some((_to, f)) = voice_out_a.recv() => f,
-                    Some((_to, f)) = video_out_a.recv() => f,
+                    Some((_to, f)) = a_voice_out_rx.recv() => f,
+                    Some((_to, f)) = a_video_out_rx.recv() => f,
                     else => break,
                 };
                 if a_to_b(&frame) {
-                    let _ = in_b.send((key_a, frame)).await;
+                    let dst = if frame.get(1) == Some(&(Service::Video as u8)) {
+                        &b_video_in
+                    } else {
+                        &b_voice_in
+                    };
+                    let _ = dst.send((a_id, frame)).await;
                 }
             }
         });
-        // B→A: unfiltered; forward both of B's lanes.
-        for mut out in [voice_out_b, video_out_b] {
-            let in_a = in_a.clone();
-            tokio::spawn(async move {
-                while let Some((_to, frame)) = out.recv().await {
-                    let _ = in_a.send((key_b, frame)).await;
-                }
-            });
-        }
+        // B→A: unfiltered; route both of B's lanes to A's ingress, stamped B.
+        tokio::spawn(async move {
+            loop {
+                let frame = tokio::select! {
+                    Some((_to, f)) = b_voice_out_rx.recv() => f,
+                    Some((_to, f)) = b_video_out_rx.recv() => f,
+                    else => break,
+                };
+                let dst = if frame.get(1) == Some(&(Service::Video as u8)) {
+                    &a_video_in
+                } else {
+                    &a_voice_in
+                };
+                let _ = dst.send((b_id, frame)).await;
+            }
+        });
+
+        let req_a_tx = hub_over(a_voice_out, a_voice_in_rx, a_video_out, a_video_in_rx);
+        let req_b_tx = hub_over(b_voice_out, b_voice_in_rx, b_video_out, b_video_in_rx);
         (req_a_tx, req_b_tx)
     }
 
@@ -850,7 +889,7 @@ mod tests {
         // a 5000-byte keyframe fragments across ≥4 datagrams.
         session_a
             .video_in
-            .send(noded::CapturedVideo {
+            .send(chat::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 7,
                 data: keyframe_data.clone(),
@@ -869,7 +908,7 @@ mod tests {
         // a second (delta) frame with a different fill crosses intact too.
         session_a
             .video_in
-            .send(noded::CapturedVideo {
+            .send(chat::call_wire::CapturedFrame {
                 keyframe: false,
                 ts_ms: 40,
                 data: delta_data.clone(),
@@ -927,7 +966,7 @@ mod tests {
         // frame 0 loses a fragment (incomplete); frame 1 completes.
         session_a
             .video_in
-            .send(noded::CapturedVideo {
+            .send(chat::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 1,
                 data: vec![0xA0; 5000],
@@ -936,7 +975,7 @@ mod tests {
             .expect("session a alive");
         session_a
             .video_in
-            .send(noded::CapturedVideo {
+            .send(chat::call_wire::CapturedFrame {
                 keyframe: false,
                 ts_ms: 2,
                 data: vec![0xB1; 5000],
@@ -992,12 +1031,14 @@ mod tests {
             .send(noded::CallControlIn::Beacon {
                 muted: false,
                 camera_on: true,
+                sharing: true,
             })
             .await
             .expect("session a alive");
 
         // B's control_out yields A's beacon as peer state (the 1 Hz tick also
-        // repeats it, so a generous timeout is safe).
+        // repeats it, so a generous timeout is safe). `sharing` must survive the
+        // cross-node encode/decode + hub relay.
         let state = loop {
             let msg = tokio::time::timeout(Duration::from_secs(10), session_b.control_out.recv())
                 .await
@@ -1007,12 +1048,13 @@ mod tests {
                 peer,
                 muted,
                 camera_on,
+                sharing,
             } = msg
             {
-                break (peer, muted, camera_on);
+                break (peer, muted, camera_on, sharing);
             }
         };
-        assert_eq!(state, (key_a, false, true));
+        assert_eq!(state, (key_a, false, true, true));
 
         drop((req_a_tx, req_b_tx));
     }
@@ -1037,7 +1079,7 @@ mod tests {
         let first: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
         session_a
             .video_in
-            .send(noded::CapturedVideo {
+            .send(chat::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 1,
                 data: first.clone(),
@@ -1068,7 +1110,7 @@ mod tests {
         let rejoined: Vec<u8> = (0..5000).map(|i| ((i * 3 + 1) % 251) as u8).collect();
         session_a2
             .video_in
-            .send(noded::CapturedVideo {
+            .send(chat::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 2,
                 data: rejoined.clone(),
@@ -1108,14 +1150,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rate_hint_is_clamped_to_the_ladder() {
         let peer = [0xcc_u8; 32];
-        let (req_tx, req) = mpsc::channel(4);
-        let (_voice_out, _video_out, inbound) = spawn_hub(req);
+        // a lone hub whose voice-plane ingress we drive directly, as a peer
+        // would over the overlay. hold the egress receivers so sends don't
+        // fail closed.
+        let (voice_out, _voice_out_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+        let (voice_in, voice_in_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+        let (video_out, _video_out_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+        let (_video_in, video_in_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
+        let req_tx = hub_over(voice_out, voice_in_rx, video_out, video_in_rx);
+
         let session = open(req_tx.clone()).await;
         session.recipients.send(vec![peer]).expect("session alive");
         let mut control_out = session.control_out;
 
         // hand-craft a control datagram on the session's ctl flow, exactly as a
-        // hostile peer could inject over the mesh.
+        // hostile peer could inject over the overlay.
         let flow = ctl_flow("general");
         let inject = |max_kbps: u32| {
             data_plane::wire::encode_datagram(
@@ -1126,8 +1175,8 @@ mod tests {
             .expect("datagram encodes")
         };
 
-        inbound
-            .send((peer, inject(1)))
+        voice_in
+            .send((PeerId(peer), inject(1)))
             .await
             .expect("inbound alive");
         let hint = tokio::time::timeout(Duration::from_secs(5), next_rate_hint(&mut control_out))
@@ -1135,8 +1184,8 @@ mod tests {
             .expect("a rate hint must reach the encoder");
         assert_eq!(hint, 300, "a 1 kbps hint must clamp up to the ladder bottom");
 
-        inbound
-            .send((peer, inject(4_000_000_000)))
+        voice_in
+            .send((PeerId(peer), inject(4_000_000_000)))
             .await
             .expect("inbound alive");
         let hint = tokio::time::timeout(Duration::from_secs(5), next_rate_hint(&mut control_out))
@@ -1145,5 +1194,226 @@ mod tests {
         assert_eq!(hint, 1200, "a 4e9 kbps hint must clamp down to the ladder top");
 
         drop(req_tx);
+    }
+
+    /// The dropout this whole cutover fixes, stated as an invariant. On the
+    /// retired mesh arm, every channel to a peer funnelled through ONE bounded
+    /// per-peer send queue, so a multi-megabit video flood filled it and the
+    /// sparse 32 kbps voice stream was dropped behind it — audio out for the
+    /// length of the congestion. The overlay arm binds a SEPARATE socket per
+    /// service, so voice and video never share a queue. Modelled with a bounded
+    /// queue apiece: a video flood that saturates the shared queue starves
+    /// audio, but the same flood on an isolated video queue leaves voice's
+    /// queue free. A future change that re-merges media onto one queue breaks
+    /// this — that is the point.
+    #[test]
+    fn per_service_isolation_keeps_a_video_flood_from_starving_audio() {
+        // one peer's send backlog, sized like the mesh relay's (MAX_BACKLOG).
+        const CAP: usize = 128;
+        let video_frame = || vec![0xDDu8; 200];
+        let voice_frame = || vec![0xAAu8; 80];
+
+        // shared arm (the retired mesh): both services on ONE queue. A video
+        // flood saturates it; no voice frame can enqueue behind the backlog.
+        let (shared, _shared_rx) = mpsc::channel::<Vec<u8>>(CAP);
+        while shared.try_send(video_frame()).is_ok() {} // flood to saturation
+        let voice_through_shared = (0..CAP)
+            .take_while(|_| shared.try_send(voice_frame()).is_ok())
+            .count();
+        assert_eq!(
+            voice_through_shared, 0,
+            "a video flood saturating a SHARED queue starves audio — the mesh bug"
+        );
+
+        // overlay arm (this cutover): a queue per service. The same video flood
+        // saturates only the video queue; voice's queue is untouched.
+        let (voice_q, _voice_rx) = mpsc::channel::<Vec<u8>>(CAP);
+        let (video_q, _video_rx) = mpsc::channel::<Vec<u8>>(CAP);
+        while video_q.try_send(video_frame()).is_ok() {} // saturate video only
+        let voice_through_isolated = (0..CAP)
+            .take_while(|_| voice_q.try_send(voice_frame()).is_ok())
+            .count();
+        assert_eq!(
+            voice_through_isolated, CAP,
+            "per-service isolation keeps voice flowing under a video flood — the fix"
+        );
+    }
+}
+
+/// Headless end-to-end proof that huddle audio crosses the REAL userspace
+/// WireGuard overlay — no TUN, no root, no mics, no GUI (the
+/// `crates/system/overlay-net/tests/loopback_pair` harness shape). Two voice
+/// hubs run on their OWN runtimes (`spawn_hub`) and bind the per-service
+/// overlay sockets over two loopback-peered virtual stacks; audio fed into one
+/// comes out the other, Opus-decoded. Unlike the in-memory tests above, this
+/// exercises the exact production runtime topology — hub runtime + stack
+/// runtime + cross-runtime socket driving + a real WireGuard tunnel — which is
+/// the one thing unit-level transports cannot cover.
+#[cfg(test)]
+mod overlay_e2e {
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+
+    use commonware_cryptography::{Signer as _, ed25519};
+    use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
+    use overlay_net::userspace::{UserspaceWireGuardEffect, VirtualSocketFactory};
+    use wireguard_effect::WireGuardEffect;
+
+    use super::*;
+
+    /// a fixture chain namespace — both hubs derive every member's overlay
+    /// `/128` from it, exactly as production derives it from the chain id.
+    const NS: &str = "e2e-huddle-overlay";
+
+    /// one overlay node: the WireGuard effect (the only handle we drive), its
+    /// ed25519 identity (which fixes its overlay `/128`), and the loopback
+    /// underlay endpoint of its bound WG socket.
+    struct OverlayNode {
+        effect: UserspaceWireGuardEffect,
+        wg_secret: Key,
+        node_key: ed25519::PublicKey,
+        raw_key: [u8; 32],
+        ula: Ipv6Addr,
+        endpoint: SocketAddr,
+    }
+
+    /// any 32 bytes are a valid X25519 secret (the curve clamps); each node
+    /// needs a distinct one.
+    fn wg_secret(seed: u8) -> Key {
+        let mut bytes = [seed; 32];
+        bytes[0] = seed.wrapping_add(1);
+        Key::new(bytes)
+    }
+
+    fn config(node: &OverlayNode, port: u16, peers: Vec<Peer>) -> InterfaceConfiguration {
+        InterfaceConfiguration {
+            name: "dt-huddle".into(),
+            prvkey: node.wg_secret.to_string(),
+            addresses: vec![IpAddrMask::new(IpAddr::V6(node.ula), 128)],
+            port,
+            peers,
+            mtu: None,
+            fwmark: None,
+        }
+    }
+
+    fn peer_entry(of: &OverlayNode, endpoint: Option<SocketAddr>) -> Peer {
+        let mut peer = Peer::new(of.wg_secret.public_key());
+        peer.endpoint = endpoint;
+        peer.set_allowed_ips(vec![IpAddrMask::new(IpAddr::V6(of.ula), 128)]);
+        peer
+    }
+
+    /// stand a node up: its overlay `/128` is `ula_v6_member_addr(NS, key)` —
+    /// the SAME function the media `AddressBook` resolves peers by, so the two
+    /// ends agree with no coordination. first apply is empty-peer/port-0 so the
+    /// OS allocates the underlay port before the peered re-apply.
+    fn stand_up(node_seed: u64, wg_seed: u8) -> OverlayNode {
+        let node_key = ed25519::PrivateKey::from_seed(node_seed).public_key();
+        let raw_key: [u8; 32] = node_key.as_ref().try_into().expect("ed25519 is 32 bytes");
+        let ula = wireguard_upgrade::ula_v6_member_addr(
+            NS,
+            wireguard_upgrade::ValidatorIdentity(raw_key),
+        );
+        let mut node = OverlayNode {
+            effect: UserspaceWireGuardEffect::new(tokio::runtime::Handle::current()),
+            wg_secret: wg_secret(wg_seed),
+            node_key,
+            raw_key,
+            ula,
+            endpoint: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        };
+        node.effect.create_interface().expect("create interface");
+        node.effect
+            .apply(&config(&node, 0, Vec::new()))
+            .expect("first apply binds the underlay");
+        let bound = node.effect.local_underlay_addr().expect("underlay bound");
+        node.endpoint.set_port(bound.port());
+        node
+    }
+
+    /// peer `a`↔`b`: `a` knows `b`'s endpoint, `b` learns `a`'s from the first
+    /// authenticated inbound datagram (the zero-config joiner shape).
+    fn peer_up(a: &mut OverlayNode, b: &mut OverlayNode) {
+        let (a_port, b_port) = (a.endpoint.port(), b.endpoint.port());
+        a.effect
+            .apply(&config(a, a_port, vec![peer_entry(b, Some(b.endpoint))]))
+            .expect("peered re-apply on a");
+        b.effect
+            .apply(&config(b, b_port, vec![peer_entry(a, None)]))
+            .expect("peered re-apply on b");
+    }
+
+    /// the media peer set both hubs track: both members, so each resolves the
+    /// other's `/128` (forward) and authenticates its source (reverse).
+    fn media_peers(nodes: &[&OverlayNode]) -> Arc<MediaPeers> {
+        let peers = MediaPeers::new(NS.to_string());
+        peers.set_peers(nodes.iter().map(|n| &n.node_key));
+        peers
+    }
+
+    /// spawn a hub over a node's overlay stack (its OWN runtime binds the media
+    /// sockets; the stack keeps polling on this test's runtime).
+    fn spawn_over(
+        node: &OverlayNode,
+        peers: Arc<MediaPeers>,
+    ) -> mpsc::Sender<noded::CallSessionRequest> {
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let factory: Arc<dyn SocketFactory> =
+            Arc::new(VirtualSocketFactory::new(node.effect.stack_slot()));
+        spawn_hub(req_rx, factory, peers, node.raw_key);
+        req_tx
+    }
+
+    async fn open(lane: &mpsc::Sender<noded::CallSessionRequest>) -> noded::CallSession {
+        let (reply, opened) = tokio::sync::oneshot::channel();
+        lane.send(noded::CallSessionRequest {
+            channel_id: "general".into(),
+            reply,
+        })
+        .await
+        .expect("hub alive");
+        opened.await.expect("hub replies").expect("session opens")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn audio_crosses_a_real_overlay_between_two_hubs() {
+        let mut a = stand_up(1, 0x11);
+        let mut b = stand_up(2, 0x22);
+        peer_up(&mut a, &mut b);
+
+        let req_a = spawn_over(&a, media_peers(&[&a, &b]));
+        let req_b = spawn_over(&b, media_peers(&[&a, &b]));
+
+        let session_a = open(&req_a).await;
+        let mut session_b = open(&req_b).await;
+        session_a
+            .recipients
+            .send(vec![b.raw_key])
+            .expect("session a alive");
+        session_b
+            .recipients
+            .send(vec![a.raw_key])
+            .expect("session b alive");
+
+        // loud constant audio from A must surface as energy in B's mixed
+        // playout, having crossed: A's hub runtime → its overlay socket → the
+        // WireGuard tunnel → B's overlay socket → B's jitter buffer → Opus
+        // decode → mix. A generous deadline covers the handshake + the bind
+        // retry loop.
+        let loud = vec![8000i16; FRAME_SAMPLES];
+        let heard = async {
+            loop {
+                let _ = session_a.pcm_in.send(loud.clone()).await;
+                let Some(mixed) = session_b.mixed_out.recv().await else {
+                    panic!("session b ended early");
+                };
+                if mixed.iter().any(|s| s.abs() > 1000) {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), heard)
+            .await
+            .expect("audio must cross the real overlay between the two hubs");
     }
 }

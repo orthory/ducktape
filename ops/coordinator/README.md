@@ -1,17 +1,17 @@
 # `ops/coordinator/` — deploy artifacts for the untrusted coordinator
 
 Three ready-to-use artifacts for running `bin/coordinator` as
-`p2p.ducktape.industries`. The coordinator is the private-cutover reachability
+`p2p.ducktape.byeongsu.dev`. The coordinator is the private-cutover reachability
 helper: STUN reflexive + rendezvous over a single UDP socket — rendezvous
 only, it never carries peer traffic. It **holds no keys, serves no state, and
-is untrusted by design** — see
-`docs/deploy/coordinator.md` for the full recipe and the design of record at
-`docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`.
+is untrusted by design** — see `docs/deploy/coordinator.md` for the maintained
+operator recipe and trust-model notes.
 
 - **`ducktape-coordinator.service`** — hardened systemd unit (DynamicUser,
   empty capability set, read-only filesystem, UDP-only address families).
 - **`coordinator.env.example`** — the single operator-edited line, the bind
-  address. **Not a secret**; the coordinator has none.
+  address, plus optional auth-mode args. **Not a secret**; the coordinator has
+  none.
 - **`Dockerfile`** — multi-stage, distroless `cc-debian12:nonroot` runtime.
 
 ## systemd (bare VPS)
@@ -19,7 +19,7 @@ is untrusted by design** — see
 ```sh
 cargo build --release -p coordinator-bin
 sudo install -m 0755 target/release/coordinator /usr/local/bin/ducktape-coordinator
-sudo install -D -m 0644 ops/coordinator/coordinator.env.example /etc/ducktape/coordinator.env  # edit the bind addr
+sudo install -D -m 0644 ops/coordinator/coordinator.env.example /etc/ducktape/coordinator.env  # edit bind/auth mode
 sudo cp ops/coordinator/ducktape-coordinator.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now ducktape-coordinator
 ```
@@ -30,6 +30,16 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ducktape-coordinator
 docker build -f ops/coordinator/Dockerfile -t ducktape-coordinator .
 docker run --rm -p 3478:3478/udp ducktape-coordinator
 ```
+
+Auth modes:
+
+- default: public proof-of-possession (`COORDINATOR_ARGS=--workers 4 --metrics-interval 10`).
+- private: append `--genesis-set /etc/ducktape/network.toml`.
+- local/dev legacy: append `--allow-anonymous`.
+
+`coordinator_metrics` lines report request counters, bounded-window saturation,
+in-flight work, process CPU, and RSS. The cross-host/flood/24-hour probe commands
+are in `docs/deploy/coordinator.md`.
 
 A `--listen 0.0.0.0:3478` wildcard bind is fully functional on a single-IP
 host: every answer derives from the datagram's observed source. On a

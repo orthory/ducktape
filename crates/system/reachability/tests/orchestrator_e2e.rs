@@ -7,6 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,7 +22,7 @@ use reachability::{
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use wireguard_effect::{FakeWireGuardEffect, FakeWireGuardEffectError, WireGuardEffect};
-use wireguard_upgrade::{Endpoint, PortPolicy, Transport, ValidatorIdentity};
+use wireguard_upgrade::{Endpoint, PortPolicy, Transport, ValidatorIdentity, X25519PublicKey};
 
 /// `run()` owns its effect; tests need to inspect it afterwards — a shared
 /// handle delegating to the fake underneath.
@@ -91,9 +92,8 @@ fn spawn_mesh_gated(
     resolvers: Vec<StaticResolver>,
     links_up: Arc<std::sync::atomic::AtomicBool>,
 ) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
-    let filter: DeliveryFilter = Rc::new(move |_, _, _| {
-        usize::from(links_up.load(std::sync::atomic::Ordering::Relaxed))
-    });
+    let filter: DeliveryFilter =
+        Rc::new(move |_, _, _| usize::from(links_up.load(std::sync::atomic::Ordering::Relaxed)));
     spawn_mesh_filtered(local, dir, seeds, resolvers, filter)
 }
 
@@ -111,13 +111,19 @@ fn spawn_mesh_filtered(
     resolvers: Vec<StaticResolver>,
     filter: DeliveryFilter,
 ) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
-    spawn_mesh_transported(local, dir, seeds, resolvers, filter, vec![], None)
+    spawn_mesh_transported(local, dir, seeds, resolvers, filter, vec![], None, &[], &[])
 }
 
 /// The full-parameter core: `transport_pks[i]`, when set, is the identity
 /// node i's deliveries arrive UNDER (and are routed back to) — the parked
 /// standby's lobby shape, where the transport key and the record identity
 /// differ. `gossip_ingress` lands in every node's `ReachabilityConfig`.
+/// `endpointless[i]` drops node i's `wireguard_advertised` to `None`
+/// (change 2 / issue #331's endpoint-less shape); `coordinators_configured[i]`
+/// gives node i a non-empty `ReachabilityConfig.coordinators` (the gate the
+/// rendezvous fallback checks) — independent knobs so a test can cover
+/// "endpoint-less WITHOUT a coordinator" too.
+#[allow(clippy::too_many_arguments)]
 fn spawn_mesh_transported(
     local: &LocalSet,
     dir: &std::path::Path,
@@ -126,6 +132,8 @@ fn spawn_mesh_transported(
     filter: DeliveryFilter,
     transport_pks: Vec<Option<commonware_cryptography::ed25519::PublicKey>>,
     gossip_ingress: Option<commonware_cryptography::ed25519::PublicKey>,
+    endpointless: &[usize],
+    coordinators_configured: &[usize],
 ) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
     let policy = PortPolicy::production();
     let signers: Vec<PrivateKey> = seeds.iter().map(|s| PrivateKey::from_seed(*s)).collect();
@@ -160,9 +168,18 @@ fn spawn_mesh_transported(
             chain_id: CHAIN.into(),
             signer: signer.clone(),
             wireguard_key_file: dir.join(format!("wg-{i}.key")),
-            wireguard_listen: endpoint(&policy, octet, 51820, Transport::Udp),
+            wireguard_port: 51820,
+            wireguard_advertised: if endpointless.contains(&i) {
+                None
+            } else {
+                Some(endpoint(&policy, octet, 51820, Transport::Udp))
+            },
             control_endpoint: endpoint(&policy, octet, 443, Transport::Tcp),
-            coordinators: vec![],
+            coordinators: if coordinators_configured.contains(&i) {
+                vec!["203.0.113.53:3478".parse().unwrap()]
+            } else {
+                vec![]
+            },
             port_policy: policy.clone(),
             // every node persists into the shared test dir — respawning
             // from the same dir IS the cold-restart scenario.
@@ -335,10 +352,7 @@ async fn three_member_mesh_converges_and_applies() {
             let identity_of_seed =
                 |seed: u64| binding::identity_of(&PrivateKey::from_seed(seed).public_key());
             let mut r0 = StaticResolver::default();
-            r0.0.insert(
-                NodeKey(identity_of_seed(3).0),
-                Resolution::Punched(punched),
-            );
+            r0.0.insert(NodeKey(identity_of_seed(3).0), Resolution::Punched(punched));
             let (nodes, mut collected) = spawn_mesh(
                 &local,
                 dir.path(),
@@ -377,10 +391,9 @@ async fn three_member_mesh_converges_and_applies() {
                     if i == j {
                         continue;
                     }
-                    let (peer_keys, _) = WireGuardKeypair::load_or_generate(
-                        &dir.path().join(format!("wg-{j}.key")),
-                    )
-                    .unwrap();
+                    let (peer_keys, _) =
+                        WireGuardKeypair::load_or_generate(&dir.path().join(format!("wg-{j}.key")))
+                            .unwrap();
                     let entry = config
                         .peers
                         .iter()
@@ -459,9 +472,17 @@ async fn single_member_mesh_and_stranger_traffic_are_inert() {
             await_applied(&mut collected, &[0], 1).await;
             {
                 let fake = nodes[0].effect.0.lock().unwrap();
+                // A peerless mesh still brings the interface up (own /128, no
+                // peers): the per-use media planes bind it, so a single-member
+                // network — every fresh desktop workspace — can huddle solo.
                 assert_eq!(
-                    fake.create_calls, 0,
-                    "a peerless mesh brings up no interface"
+                    fake.create_calls, 1,
+                    "a peerless mesh brings up its own interface"
+                );
+                assert_eq!(fake.applied.len(), 1, "one apply");
+                assert!(
+                    fake.applied[0].peers.is_empty(),
+                    "no peer tunnels on a peerless mesh"
                 );
             }
 
@@ -527,6 +548,60 @@ async fn nat_resolver_punches_over_loopback() {
     }
 }
 
+/// The REAL `send_datagram_and_recv` over loopback UDP: the addressed peer's
+/// reply is returned (matched by src) while a STRANGER's datagram arriving
+/// mid-wait is forwarded to the datagram sink instead of being swallowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolver_datagram_roundtrip_over_loopback() {
+    let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let coord_addr = coord_sock.local_addr().unwrap();
+    tokio::spawn(nat_traversal::client::run_coordinator(
+        coord_sock,
+        nat_traversal::AuthPolicy::Open { require_pop: false },
+    ));
+
+    let client = nat_traversal::NatClient::bind_multi(NodeKey([0xcc; 32]), vec![coord_addr])
+        .await
+        .unwrap();
+    let (sink_tx, mut sink_rx) = mpsc::channel(8);
+    let mut resolver = reachability::NatResolver::from_client_with_datagram_sink(
+        client,
+        reachability::RENDEZVOUS_KEEPALIVE,
+        Some(sink_tx),
+    )
+    .await
+    .unwrap();
+
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stranger_addr = stranger.local_addr().unwrap();
+
+    // the peer echoes an ack — but only after the stranger's datagram has hit
+    // the resolver socket mid-wait, the one that must be sinked, not eaten.
+    tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        let (n, resolver_addr) = peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"intro");
+        stranger.send_to(b"unrelated", resolver_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        peer.send_to(b"intro-ack", resolver_addr).await.unwrap();
+    });
+
+    let reply = resolver
+        .send_datagram_and_recv(peer_addr, b"intro".to_vec(), Duration::from_secs(5))
+        .await
+        .expect("the peer's reply is returned");
+    assert_eq!(reply, b"intro-ack");
+
+    let (src, bytes) = tokio::time::timeout(Duration::from_secs(2), sink_rx.recv())
+        .await
+        .expect("bounded")
+        .expect("sink stays open");
+    assert_eq!(src, stranger_addr, "the sinked datagram is the stranger's");
+    assert_eq!(bytes, b"unrelated");
+}
+
 /// A `NodeKey` whose bytes ARE the ed25519 public key — the subject a signed
 /// coordinator request proves possession of.
 fn node_key_of(pk: &commonware_cryptography::ed25519::PublicKey) -> NodeKey {
@@ -563,13 +638,10 @@ async fn private_coordinator_admits_authenticated_bind() {
 
     // a genesis member: admitted by membership, no cap needed.
     let member_key = node_key_of(&member.public_key());
-    let m = reachability::NatResolver::bind(
-        member_key,
-        vec![coord_addr],
-        Some((member.clone(), None)),
-    )
-    .await
-    .expect("a genesis member's authenticated bind is admitted");
+    let m =
+        reachability::NatResolver::bind(member_key, vec![coord_addr], Some((member.clone(), None)))
+            .await
+            .expect("a genesis member's authenticated bind is admitted");
     assert!(
         m.reflexive().is_some(),
         "the member discovered its reflexive through the private coordinator"
@@ -628,12 +700,9 @@ async fn private_coordinator_denies_uncredentialed_bind() {
 
     // control: a credentialed member binds against the same coordinator.
     let member_key = node_key_of(&member.public_key());
-    let ok = reachability::NatResolver::bind(
-        member_key,
-        vec![coord_addr],
-        Some((member.clone(), None)),
-    )
-    .await;
+    let ok =
+        reachability::NatResolver::bind(member_key, vec![coord_addr], Some((member.clone(), None)))
+            .await;
     assert!(
         ok.is_ok(),
         "a genesis member binds against the same coordinator: {:?}",
@@ -667,12 +736,14 @@ async fn private_coordinator_cross_peer_punch() {
     let a_cap = nat_traversal::mint_coord_cap(&g, a_key, nat_traversal::now_secs() + 3600);
     let b_cap = nat_traversal::mint_coord_cap(&g, b_key, nat_traversal::now_secs() + 3600);
 
-    let mut a = reachability::NatResolver::bind(a_key, vec![coord_addr], Some((a_signer, Some(a_cap))))
-        .await
-        .expect("A's authenticated bind is admitted");
-    let mut b = reachability::NatResolver::bind(b_key, vec![coord_addr], Some((b_signer, Some(b_cap))))
-        .await
-        .expect("B's authenticated bind is admitted");
+    let mut a =
+        reachability::NatResolver::bind(a_key, vec![coord_addr], Some((a_signer, Some(a_cap))))
+            .await
+            .expect("A's authenticated bind is admitted");
+    let mut b =
+        reachability::NatResolver::bind(b_key, vec![coord_addr], Some((b_signer, Some(b_cap))))
+            .await
+            .expect("B's authenticated bind is admitted");
     assert!(a.reflexive().is_some() && b.reflexive().is_some());
 
     // Cross-peer resolve on both sides: A looks up B's key, B looks up A's.
@@ -872,9 +943,8 @@ async fn star_topology_relays_gossip_through_the_hub() {
     let dir = tempfile::tempdir().unwrap();
     local
         .run_until(async {
-            let filter: DeliveryFilter = Rc::new(|from, to, _| {
-                usize::from(!matches!((from, to), (1, 2) | (2, 1)))
-            });
+            let filter: DeliveryFilter =
+                Rc::new(|from, to, _| usize::from(!matches!((from, to), (1, 2) | (2, 1))));
             let (nodes, mut collected) =
                 spawn_mesh_filtered(&local, dir.path(), &[1, 2, 3], vec![], filter);
             retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
@@ -914,7 +984,7 @@ async fn forged_relayed_record_is_refused() {
                     validator_identity: nodes[1].identity,
                     wireguard_public_key: wireguard_upgrade::X25519PublicKey([4; 32]),
                     control_endpoint: endpoint(&policy, 20, 443, Transport::Tcp),
-                    wireguard_endpoint: endpoint(&policy, 20, 51820, Transport::Udp),
+                    wireguard_endpoint: Some(endpoint(&policy, 20, 51820, Transport::Udp)),
                     capabilities: vec![],
                     expires_at_view: 100,
                     nonce: 9,
@@ -1054,10 +1124,9 @@ async fn cold_restart_restores_the_mesh_with_no_transport_at_all() {
                     if i == j {
                         continue;
                     }
-                    let (peer_keys, _) = WireGuardKeypair::load_or_generate(
-                        &dir.path().join(format!("wg-{j}.key")),
-                    )
-                    .unwrap();
+                    let (peer_keys, _) =
+                        WireGuardKeypair::load_or_generate(&dir.path().join(format!("wg-{j}.key")))
+                            .unwrap();
                     let entry = config
                         .peers
                         .iter()
@@ -1111,13 +1180,8 @@ async fn cold_restart_filters_departed_members() {
     local
         .run_until(async {
             let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (nodes, mut collected) = spawn_mesh_gated(
-                &local,
-                dir.path(),
-                &[1, 2, 3],
-                vec![],
-                links_up,
-            );
+            let (nodes, mut collected) =
+                spawn_mesh_gated(&local, dir.path(), &[1, 2, 3], vec![], links_up);
             // the resumed epoch dropped node 2.
             retarget_all(&nodes, &[0, 1], &[], 2, 20).await;
 
@@ -1130,7 +1194,10 @@ async fn cold_restart_filters_departed_members() {
                 let other = &nodes[1 - i];
                 assert_eq!(fake.applied.len(), 1);
                 assert_eq!(fake.applied[0].peers.len(), 1);
-                assert_eq!(fake.applied[0].peers[0].allowed_ips, vec![ula(other.identity)]);
+                assert_eq!(
+                    fake.applied[0].peers[0].allowed_ips,
+                    vec![ula(other.identity)]
+                );
             }
         })
         .await;
@@ -1247,7 +1314,10 @@ async fn await_prewarmed(
 /// in place, so the last config is the interface's current truth.
 fn latest_config(node: &TestNode) -> defguard_wireguard_rs::InterfaceConfiguration {
     let fake = node.effect.0.lock().unwrap();
-    fake.applied.last().expect("node applied at least once").clone()
+    fake.applied
+        .last()
+        .expect("node applied at least once")
+        .clone()
 }
 
 /// The pre-warm headline: a standby's tunnels exist on BOTH sides before its
@@ -1423,12 +1493,9 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
             // the standby re-advertises from a new address (a NAT rebind):
             // same identity and WireGuard key, higher nonce, new endpoint.
             let policy = PortPolicy::production();
-            let set = reachability::active_set(
-                CHAIN,
-                1,
-                vec![nodes[0].identity, nodes[1].identity],
-            )
-            .unwrap();
+            let set =
+                reachability::active_set(CHAIN, 1, vec![nodes[0].identity, nodes[1].identity])
+                    .unwrap();
             let (standby_keys, _) =
                 WireGuardKeypair::load_or_generate(&dir.path().join("wg-2.key")).unwrap();
             let rebind = |nonce: u64, octet: u8| {
@@ -1441,13 +1508,15 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
                         validator_identity: nodes[2].identity,
                         wireguard_public_key: standby_keys.public_key(),
                         control_endpoint: endpoint(&policy, 30, 443, Transport::Tcp),
-                        wireguard_endpoint: Endpoint::new(
-                            std::net::IpAddr::V4(std::net::Ipv4Addr::new(9, 9, 9, octet)),
-                            51820,
-                            Transport::Udp,
-                            &policy,
-                        )
-                        .unwrap(),
+                        wireguard_endpoint: Some(
+                            Endpoint::new(
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::new(9, 9, 9, octet)),
+                                51820,
+                                Transport::Udp,
+                                &policy,
+                            )
+                            .unwrap(),
+                        ),
                         capabilities: vec![],
                         expires_at_view: 10 + reachability::ADVERT_TTL_VIEWS,
                         nonce,
@@ -1533,7 +1602,7 @@ async fn record_from_neither_member_nor_standby_is_refused() {
                     validator_identity: binding::identity_of(&stranger.public_key()),
                     wireguard_public_key: wireguard_upgrade::X25519PublicKey([9; 32]),
                     control_endpoint: endpoint(&policy, 99, 443, Transport::Tcp),
-                    wireguard_endpoint: endpoint(&policy, 99, 51820, Transport::Udp),
+                    wireguard_endpoint: Some(endpoint(&policy, 99, 51820, Transport::Udp)),
                     capabilities: vec![],
                     expires_at_view: 1000,
                     nonce: 1,
@@ -1563,7 +1632,11 @@ async fn record_from_neither_member_nor_standby_is_refused() {
             .expect("the stranger record surfaced");
             assert!(reason.contains("unknown identity"), "{reason}");
             let fake = nodes[0].effect.0.lock().unwrap();
-            assert_eq!(fake.applied.len(), 1, "nothing beyond the member mesh applied");
+            assert_eq!(
+                fake.applied.len(),
+                1,
+                "nothing beyond the member mesh applied"
+            );
         })
         .await;
 }
@@ -1588,6 +1661,8 @@ async fn standby_gossip_rides_the_lobby_ingress_identity() {
                 deliver_all,
                 vec![None, None, Some(lobby.clone())],
                 Some(lobby),
+                &[],
+                &[],
             );
             retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
             spawn_nudgers(&local, &nodes);
@@ -1630,13 +1705,11 @@ async fn standby_persists_the_member_mesh_for_its_promotion_reboot() {
                 // adverts must be on disk before this life ends.
                 tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
-                        let full = reachability::store::load(
-                            &dir.path().join("mesh-2.json"),
-                            CHAIN,
-                        )
-                        .ok()
-                        .flatten()
-                        .is_some_and(|mesh| mesh.adverts.len() == 2);
+                        let full =
+                            reachability::store::load(&dir.path().join("mesh-2.json"), CHAIN)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|mesh| mesh.adverts.len() == 2);
                         if full {
                             break;
                         }
@@ -1689,6 +1762,290 @@ async fn standby_persists_the_member_mesh_for_its_promotion_reboot() {
                         .iter()
                         .any(|p| p.allowed_ips == vec![ula(member.identity)]),
                     "restored peer for each member"
+                );
+            }
+        })
+        .await;
+}
+
+/// A [`StaticResolver`] that ALSO answers the coordinated invite's intro
+/// datagram: `resolve` returns the punched underlay endpoint from the fixed
+/// map (so `resolve_rendezvous_endpoint` succeeds), and `send_datagram_and_recv`
+/// hands back a canned ack — the inviter's `IntroAck` riding home over the same
+/// punched socket. Lets an orchestrator test drive
+/// [`ReachabilityCommand::BootstrapCoordinatedInvitePeer`] end to end
+/// (resolve -> install -> ack) with no real UDP.
+/// what the resolver's `send_datagram_and_recv` observed — `(dest, intro
+/// bytes)`, shared back to the test that drove the bootstrap.
+type SentIntro = Rc<RefCell<Option<(SocketAddr, Vec<u8>)>>>;
+
+struct CoordinatedAckResolver {
+    inner: StaticResolver,
+    ack: Vec<u8>,
+    sent: SentIntro,
+}
+
+impl reachability::EndpointResolver for CoordinatedAckResolver {
+    async fn resolve(
+        &mut self,
+        peer: NodeKey,
+        advertised: SocketAddr,
+    ) -> Result<Resolution, String> {
+        self.inner.resolve(peer, advertised).await
+    }
+
+    async fn send_datagram_and_recv(
+        &mut self,
+        peer: SocketAddr,
+        bytes: Vec<u8>,
+        _timeout: Duration,
+    ) -> Result<Vec<u8>, String> {
+        *self.sent.borrow_mut() = Some((peer, bytes));
+        Ok(self.ack.clone())
+    }
+}
+
+/// `BootstrapCoordinatedInvitePeer` over a [`StaticResolver`]: the inviter's
+/// node-key resolves to a punched underlay endpoint, the orchestrator installs
+/// it as a join-window tunnel peer, sends the intro over that same socket, and
+/// the reply carries the inviter's ack back. Proves the whole
+/// resolve -> install -> ack path #260 built, with no real WireGuard or UDP.
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_coordinated_invite_resolves_installs_and_acks() {
+    let dir = tempfile::tempdir().expect("orchestrator tempdir");
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let me = PrivateKey::from_seed(1);
+            let inviter = PrivateKey::from_seed(2);
+            let inviter_pk = inviter.public_key();
+
+            // the resolver punches the inviter's node-key to a concrete underlay
+            // endpoint and answers its intro with a canned ack.
+            let punched: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+            let mut map = HashMap::new();
+            map.insert(
+                binding::node_key(binding::identity_of(&inviter_pk)),
+                Resolution::Punched(punched),
+            );
+            let ack = b"coordinated-intro-ack".to_vec();
+            let sent = Rc::new(RefCell::new(None));
+            let resolver = CoordinatedAckResolver {
+                inner: StaticResolver(map),
+                ack: ack.clone(),
+                sent: sent.clone(),
+            };
+
+            let policy = PortPolicy::production();
+            let effect = SharedFake::default();
+            let config = ReachabilityConfig {
+                chain_id: CHAIN.into(),
+                signer: me.clone(),
+                wireguard_key_file: dir.path().join("wg-me.key"),
+                wireguard_port: 51820,
+                wireguard_advertised: Some(endpoint(&policy, 10, 51820, Transport::Udp)),
+                control_endpoint: endpoint(&policy, 10, 443, Transport::Tcp),
+                coordinators: vec![],
+                port_policy: policy.clone(),
+                persist_file: None,
+                gossip_ingress: None,
+            };
+            let (cmd_tx, cmd_rx) = mpsc::channel(8);
+            let (ev_tx, mut ev_rx) = mpsc::channel(64);
+            tokio::task::spawn_local(reachability::run(
+                config,
+                effect.clone(),
+                resolver,
+                cmd_rx,
+                ev_tx,
+            ));
+
+            // drive the coordinated bootstrap.
+            let inviter_wg = X25519PublicKey([9u8; 32]);
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            cmd_tx
+                .send(ReachabilityCommand::BootstrapCoordinatedInvitePeer {
+                    peer: inviter_pk.clone(),
+                    wireguard_public_key: inviter_wg,
+                    intro: b"intro-request".to_vec(),
+                    reply: reachability::CoordinatedInviteReply(reply_tx),
+                })
+                .await
+                .expect("bootstrap command accepted");
+
+            // the reply carries the ack the resolver sent back over the punched
+            // underlay — resolve -> install -> ack completed.
+            let got = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+                .await
+                .expect("coordinated bootstrap replied in time")
+                .expect("reply channel intact")
+                .expect("coordinated bootstrap succeeded");
+            assert_eq!(
+                got, ack,
+                "the bootstrap returns the inviter's IntroAck bytes"
+            );
+
+            // the intro went to the RESOLVED punched endpoint, not the advertised
+            // one — the coordinated path used rendezvous, not a baked address.
+            let (dest, intro) = sent.borrow().clone().expect("resolver saw the intro send");
+            assert_eq!(
+                dest, punched,
+                "intro sent to the coordinator-punched endpoint"
+            );
+            assert_eq!(
+                intro, b"intro-request",
+                "the joiner's own intro rode across"
+            );
+
+            // the inviter is now a join-window peer on the interface.
+            let installed = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match ev_rx.recv().await.expect("event stream open") {
+                        ReachabilityEvent::InvitePeerInstalled { peer, .. } => break peer,
+                        _ => continue,
+                    }
+                }
+            })
+            .await
+            .expect("InvitePeerInstalled emitted");
+            assert_eq!(installed, inviter_pk, "the inviter identity was installed");
+
+            // inspect the applied interface in a tight scope so the mutex guard
+            // is released before the shutdown await below.
+            {
+                let fake = effect.0.lock().unwrap();
+                let last = fake
+                    .applied
+                    .last()
+                    .expect("the coordinated install applied an interface config");
+                assert!(
+                    last.peers
+                        .iter()
+                        .any(|p| p.public_key.as_array() == [9u8; 32]),
+                    "the inviter's wireguard key is a peer on the applied interface"
+                );
+            }
+
+            cmd_tx
+                .send(ReachabilityCommand::Shutdown)
+                .await
+                .expect("shutdown accepted");
+        })
+        .await;
+}
+
+// ============================================================================
+// change 2 / issue #331: coordinated rendezvous fallback for endpoint-less
+// admitted members. Two members who each advertise NO WireGuard endpoint (the
+// product default for every invite-joined node — `wireguard_advertised:
+// None`) can never initiate a handshake on their own; WITH a coordinator
+// configured, `resolve_peer` now falls back to by-identity rendezvous
+// (`resolve_rendezvous_endpoint`, the same machinery `BootstrapCoordinated-
+// InvitePeer` already uses) instead of installing the peer endpoint-less and
+// waiting forever.
+// ============================================================================
+
+/// RED-first proof of the fallback: two endpoint-less members, each with a
+/// coordinator configured, whose `StaticResolver`s are rigged to punch each
+/// other. Before change 2, `resolve_peer` returned immediately for an
+/// endpoint-less record (ORCH:2251-2256, pre-change) and the resolver was
+/// NEVER consulted — both sides would apply with `peer.endpoint == None`.
+/// After change 2, the fallback resolves and installs the punched addr.
+#[tokio::test]
+async fn endpoint_less_members_resolve_via_coordinator_rendezvous_fallback() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let identity_of_seed =
+                |seed: u64| binding::identity_of(&PrivateKey::from_seed(seed).public_key());
+            let punched_by_0: SocketAddr = "198.51.100.10:41001".parse().unwrap();
+            let punched_by_1: SocketAddr = "198.51.100.20:41002".parse().unwrap();
+
+            let mut r0 = StaticResolver::default();
+            r0.0.insert(
+                binding::node_key(identity_of_seed(2)),
+                Resolution::Punched(punched_by_0),
+            );
+            let mut r1 = StaticResolver::default();
+            r1.0.insert(
+                binding::node_key(identity_of_seed(1)),
+                Resolution::Punched(punched_by_1),
+            );
+
+            let (nodes, mut collected) = spawn_mesh_transported(
+                &local,
+                dir.path(),
+                &[1, 2],
+                vec![r0, r1],
+                Rc::new(|_, _, _| 1),
+                vec![],
+                None,
+                // both nodes endpoint-less...
+                &[0, 1],
+                // ...and both have a coordinator configured.
+                &[0, 1],
+            );
+
+            retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            // await_applied panics on any PeerFailed — a healthy fallback
+            // resolve never emits one.
+            await_applied(&mut collected, &[0, 1], 1).await;
+
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                let config = fake.applied.last().expect("node applied");
+                let peer = config.peers.first().expect("the one peer entry");
+                let expected = if i == 0 { punched_by_0 } else { punched_by_1 };
+                assert_eq!(
+                    peer.endpoint,
+                    Some(expected),
+                    "node {i}: the fallback-resolved punched endpoint must be installed, not None"
+                );
+            }
+        })
+        .await;
+}
+
+/// Regression / "no resolver -> today's behavior": two endpoint-less members
+/// with NO coordinator configured. The fallback must never even touch the
+/// resolver (both `StaticResolver`s are empty maps — any query would default
+/// to `Resolution::Advertised`, which `resolve_rendezvous_endpoint` turns
+/// into an `Err`, which would emit a `PeerFailed` and fail this test via
+/// `await_applied`'s panic). Both peers stay installed endpoint-less, exactly
+/// like before change 2 — the peer's own initiation is still what completes
+/// the tunnel.
+#[tokio::test]
+async fn endpoint_less_members_without_a_coordinator_stay_endpoint_less() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh_transported(
+                &local,
+                dir.path(),
+                &[1, 2],
+                vec![StaticResolver::default(), StaticResolver::default()],
+                Rc::new(|_, _, _| 1),
+                vec![],
+                None,
+                &[0, 1], // endpoint-less...
+                &[],     // ...but no coordinator configured for either.
+            );
+
+            retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            await_applied(&mut collected, &[0, 1], 1).await;
+
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                let config = fake.applied.last().expect("node applied");
+                let peer = config.peers.first().expect("the one peer entry");
+                assert_eq!(
+                    peer.endpoint, None,
+                    "node {i}: no coordinator configured — must stay endpoint-less exactly like \
+                     before change 2"
                 );
             }
         })

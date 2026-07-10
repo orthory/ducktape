@@ -1080,7 +1080,7 @@ fn root_of_bytes(bytes: &[u8]) -> StateRoot {
 fn install_rejects_execute_unreachable_shapes() {
     block_on(async {
         // (status byte, claim, result, expected rejection)
-        let cases: Vec<(u8, Option<(&str, u64, u64)>, Option<(bool, &str)>, &str)> = vec![
+        let cases = vec![
             // Processing without a claim would be permanently wedged: no
             // transition (finalize/release/reclaim) can repair it.
             (1, None, None, "processing job without claim"),
@@ -1116,7 +1116,7 @@ fn install_rejects_execute_unreachable_shapes() {
 
         // sanity: shapes satisfying the enforced invariants install fine —
         // install checks exactly those four, nothing stricter.
-        let ok_cases: Vec<(u8, Option<(&str, u64, u64)>, Option<(bool, &str)>)> = vec![
+        let ok_cases = vec![
             (0, None, None),                                    // Pending
             (1, Some(("ext:00", 1, 10)), None),                 // Processing
             (2, Some(("ext:00", 1, 10)), Some((true, "done"))), // Done

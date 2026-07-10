@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 # user-defined rules over the chat hook seam: match posts, emit chat/tasks
-# follow-ups. composes chat/tasks/inbox/memory through their crate-root wire
+# follow-ups. composes chat/tasks/inbox through their crate-root wire
 # types only — never their module internals.
 [dependencies]
 sdk = { workspace = true }
@@ -13,7 +13,6 @@ serde_json = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
 inbox = { workspace = true }
-memory = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
 

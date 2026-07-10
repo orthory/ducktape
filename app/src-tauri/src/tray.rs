@@ -223,6 +223,10 @@ fn show_main<R: Runtime>(app: &AppHandle<R>) {
 #[serde(rename_all = "camelCase")]
 pub struct OpenConsole {
     pub screen: Option<String>,
+    /// Structured deep-link (screen + optional channel/thread/forge item),
+    /// forwarded VERBATIM as the `ducktape://navigate` payload; the webview
+    /// listener parses it. Takes precedence over the plain `screen` string.
+    pub target: Option<serde_json::Value>,
 }
 
 /// Show the console (optionally navigating to a screen) and hide the popover.
@@ -236,9 +240,13 @@ pub fn tray_open_console<R: Runtime>(
     if let Some(popover) = app.get_webview_window("tray") {
         let _ = popover.hide();
     }
-    if let Some(screen) = request.and_then(|r| r.screen) {
+    if let Some(request) = request {
         use tauri::Emitter;
-        let _ = app.emit("ducktape://navigate", screen);
+        if let Some(target) = request.target {
+            let _ = app.emit("ducktape://navigate", target);
+        } else if let Some(screen) = request.screen {
+            let _ = app.emit("ducktape://navigate", screen);
+        }
     }
     Ok(())
 }
@@ -247,4 +255,37 @@ pub fn tray_open_console<R: Runtime>(
 #[tauri::command]
 pub fn tray_quit<R: Runtime>(app: AppHandle<R>) {
     app.exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenConsole;
+
+    #[test]
+    fn open_console_deserializes_the_empty_payload() {
+        let request: OpenConsole = serde_json::from_str("{}").expect("empty object");
+        assert!(request.screen.is_none());
+        assert!(request.target.is_none());
+    }
+
+    #[test]
+    fn open_console_deserializes_the_plain_screen_payload() {
+        let request: OpenConsole =
+            serde_json::from_str(r#"{"screen":"chat"}"#).expect("plain screen");
+        assert_eq!(request.screen.as_deref(), Some("chat"));
+        assert!(request.target.is_none());
+    }
+
+    #[test]
+    fn open_console_deserializes_the_structured_target_payload() {
+        let request: OpenConsole =
+            serde_json::from_str(r#"{"target":{"screen":"chat","channelId":"general"}}"#)
+                .expect("structured target");
+        assert!(request.screen.is_none());
+        assert_eq!(
+            request.target,
+            Some(serde_json::json!({"screen": "chat", "channelId": "general"})),
+            "the structured target is carried verbatim"
+        );
+    }
 }

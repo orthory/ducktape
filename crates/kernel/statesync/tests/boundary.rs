@@ -4,7 +4,8 @@ use host::Host;
 use sdk::StateRoot;
 use statesync::{
     BoundaryCoords, BoundaryId, MAX_CAPTURES, Manifest, ManifestEntry, PayloadKind, ResolverTarget,
-    SyncError, SyncRequest, SyncResponse, SyncServer, decode_response, encode_response,
+    ServeStep, SyncError, SyncRequest, SyncResponse, SyncServer, TipCoords, decode_request,
+    decode_response, encode_request, encode_response,
 };
 
 #[test]
@@ -47,6 +48,41 @@ fn leased_capture_survives_eviction() {
 }
 
 #[test]
+fn fresh_install_serves_its_manifest_under_full_lease_pressure() {
+    // the self-eviction regression: with every cache slot's capture leased
+    // (leases only age out by overflow, never by client release), a newly
+    // installed boundary was the sole unleased entry — install-time eviction
+    // removed it before its own manifest_for could lease it, and every
+    // manifest fetch at a fresh boundary failed with "no capture at boundary
+    // N (refetch manifest)".
+    let mut srv = SyncServer::new();
+    for h in 1..=(MAX_CAPTURES as u64) {
+        let b = BoundaryId {
+            height: h,
+            app_hash: StateRoot([(h % 251) as u8; 32]),
+        };
+        srv.install_capture_for_test(b);
+        srv.lease(b);
+    }
+
+    let tip = BoundaryId {
+        height: 1000,
+        app_hash: StateRoot([42u8; 32]),
+    };
+    srv.install_capture_for_test(tip);
+    let manifest = srv.manifest_for(tip);
+    assert!(
+        matches!(manifest, Ok(SyncResponse::Manifest(_))),
+        "a fresh install must serve its own manifest even when every older \
+         capture holds a lease: {manifest:?}",
+    );
+    assert!(
+        srv.known_boundaries().len() <= MAX_CAPTURES,
+        "manifest_for's lease must rebalance the cache back under its cap",
+    );
+}
+
+#[test]
 fn leased_boundaries_are_bounded_and_oldest_is_released() {
     let mut srv = SyncServer::new();
     let mut leased = Vec::new();
@@ -78,6 +114,56 @@ fn leased_boundaries_are_bounded_and_oldest_is_released() {
         srv.is_leased_for_test(*leased.last().unwrap()),
         "most recently leased boundary remains active",
     );
+}
+
+#[test]
+fn tip_coords_roundtrip_over_the_wire() {
+    let req_bytes = encode_request(&SyncRequest::TipCoords);
+    assert!(matches!(
+        decode_request(&req_bytes),
+        Ok(SyncRequest::TipCoords)
+    ));
+
+    let coords = TipCoords {
+        height: 1880,
+        app_hash: StateRoot([7u8; 32]),
+        epoch: 3,
+        view_base: 1800,
+        participants: vec![vec![1u8; 32], vec![2u8; 32]],
+        residents: vec![vec![3u8; 32]],
+        has_floor: true,
+    };
+    let bytes = encode_response(&SyncResponse::TipCoords(coords.clone()));
+    let SyncResponse::TipCoords(back) = decode_response(&bytes).unwrap() else {
+        panic!("tip coords response expected");
+    };
+    assert_eq!(back, coords);
+
+    // empty sets ride the same wire — a fresh net has no residents yet.
+    let bare = TipCoords {
+        residents: Vec::new(),
+        has_floor: false,
+        ..coords
+    };
+    let bytes = encode_response(&SyncResponse::TipCoords(bare.clone()));
+    let SyncResponse::TipCoords(back) = decode_response(&bytes).unwrap() else {
+        panic!("tip coords response expected");
+    };
+    assert_eq!(back, bare);
+}
+
+#[test]
+fn tip_coords_request_never_touches_the_capture_cache() {
+    // the detection lane's whole point: a TipCoords request routes to the
+    // state owner (NeedCoords) without leasing or installing anything —
+    // routine resident polling must not churn the join-shaped capture cache.
+    let mut srv = SyncServer::new();
+    assert!(matches!(
+        srv.serve(SyncRequest::TipCoords),
+        ServeStep::NeedCoords
+    ));
+    assert!(srv.known_boundaries().is_empty());
+    assert_eq!(srv.leased_count_for_test(), 0);
 }
 
 #[test]

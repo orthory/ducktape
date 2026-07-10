@@ -78,14 +78,16 @@ pub struct Cluster {
     /// `None` -> `127.0.0.1:p2p_ports[0]` (identical to today); `Some(addr)`
     /// points bootstrap at a forwarder in front of node 0.
     pub bootstrap_addr_override: Option<String>,
-    /// when true every config gets `wireguard_listen` (the node's own p2p
-    /// port, UDP — distinct per node, never actually bound) plus
-    /// `wireguard_effect = "fake"`, so the reachability plane runs its full
-    /// rendezvous/handshake protocol without needing privilege. several
-    /// same-host nodes with the REAL effect would fight over the one
-    /// `dt-<chainid>` interface name, so the fake is the only correct
-    /// same-host shape.
+    /// When true every config gets `wireguard_listen` on the node's distinct
+    /// UDP port. The default fake effect exercises orchestration only;
+    /// `wireguard_socket` upgrades it to the real, unprivileged userspace
+    /// encrypted transport. The OS-interface effect is intentionally absent
+    /// because same-host nodes would contend for one interface name.
     pub wireguard: bool,
+    /// Use the TUN-less in-process WireGuard stack instead of the fake effect.
+    /// Unlike the OS-interface backend this is safe for multiple same-host
+    /// nodes and exercises encrypted overlay sockets end to end.
+    pub wireguard_socket: bool,
     /// extra `node.toml` lines appended verbatim to EVERY node's generated
     /// config (`spawn` regenerates the file, so a hand-edit after the fact
     /// would not survive a respawn). set before the first spawn; empty by
@@ -111,6 +113,9 @@ pub struct NetworkShapeCluster {
     pub http_ports: Vec<u16>,
     pub founder_dir: PathBuf,
     pub friend_dir: PathBuf,
+    /// extra process env per node (set before `spawn`) — the same knob
+    /// [`Cluster::env`] exposes, e.g. capability spec-dir overrides.
+    pub env: Vec<Vec<(String, String)>>,
     nodes: Vec<Option<NodeProc>>,
     dir: tempfile::TempDir,
 }
@@ -127,6 +132,7 @@ impl NetworkShapeCluster {
             http_ports: http_ports.to_vec(),
             founder_dir: dir.path().join("founder"),
             friend_dir: dir.path().join("friend"),
+            env: vec![Vec::new(), Vec::new()],
             nodes: vec![None, None],
             dir,
         }
@@ -138,6 +144,14 @@ impl NetworkShapeCluster {
                 "init",
                 "--name",
                 name,
+                // hermetic: no ambient coordinator. the default would dial the
+                // LIVE public coordinator from inside the test AND flip both
+                // nodes into the overlay shape (wireguard on a shared port +
+                // ULA-advertised mesh) — same-host nodes then fight over one
+                // interface and the underlay never assembles. the coordinated
+                // shape has its own e2e (coordinated_invite_cli).
+                "--primary-coordinator",
+                "none",
                 "--dir",
                 self.founder_dir.to_str().expect("utf-8 founder dir"),
                 "--listen",
@@ -252,6 +266,7 @@ impl NetworkShapeCluster {
         let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
             .arg("--config")
             .arg(&cfg)
+            .envs(self.env[idx].iter().map(|(k, v)| (k.clone(), v.clone())))
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
@@ -418,6 +433,7 @@ impl Cluster {
             advertised: peer_ids.iter().map(|_| None).collect(),
             bootstrap_addr_override: None,
             wireguard: false,
+            wireguard_socket: false,
             extra_toml: Vec::new(),
             env: peer_ids.iter().map(|_| Vec::new()).collect(),
             dir,
@@ -469,7 +485,11 @@ impl Cluster {
                 "wireguard_listen = \"127.0.0.1:{}\"\n",
                 self.p2p_ports[idx]
             ));
-            cfg.push_str("wireguard_effect = \"fake\"\n");
+            cfg.push_str(if self.wireguard_socket {
+                "wireguard_effect = \"socket\"\n"
+            } else {
+                "wireguard_effect = \"fake\"\n"
+            });
         }
         for line in &self.extra_toml {
             cfg.push_str(line);
@@ -533,6 +553,14 @@ impl Cluster {
         self.dir
             .path()
             .join(format!("node{}.toml", self.peer_ids[idx]))
+    }
+
+    /// Node-local workspace used by dev-shape operational commands. In this
+    /// shape it is the same directory as `storage_dir`.
+    pub fn workspace(&self, idx: usize) -> PathBuf {
+        self.dir
+            .path()
+            .join(format!("storage-{}", self.peer_ids[idx]))
     }
 
     /// the bootstrapper address every non-founder / joiner dials: the override
@@ -743,18 +771,24 @@ impl Cluster {
     /// submit an op via node `idx`'s rpc and assert the lane accepted it
     /// (accepted != finalized — follow with a query poll).
     pub fn submit(&self, idx: usize, target: &str, payload: &[u8]) {
-        let reply = self.rpc(
+        let reply = self.try_submit(idx, target, payload);
+        assert_eq!(
+            reply["ok"], true,
+            "submit to {target} via node idx {idx} rejected: {reply}"
+        );
+    }
+
+    /// submit an op via node `idx`'s rpc and return the raw reply — for tests
+    /// that assert a submit is REJECTED (cleanly, with the node still live).
+    pub fn try_submit(&self, idx: usize, target: &str, payload: &[u8]) -> serde_json::Value {
+        self.rpc(
             idx,
             serde_json::json!({
                 "cmd": "submit",
                 "target": target,
                 "payload_hex": hex(payload),
             }),
-        );
-        assert_eq!(
-            reply["ok"], true,
-            "submit to {target} via node idx {idx} rejected: {reply}"
-        );
+        )
     }
 
     /// query a module through node `idx`'s rpc. `None` on a module error —
@@ -798,6 +832,12 @@ impl Cluster {
     /// json-parsing [`Self::http`] twin would flatten to `Null`.
     pub fn http_text(&self, idx: usize, path: &str) -> (u16, String) {
         http_text_request(self.http_ports[idx], path)
+    }
+
+    /// the http base url of node `idx`'s app surface — what a `duckfs-client`
+    /// `HttpNode` (or any plain http client) dials.
+    pub fn http_base(&self, idx: usize) -> String {
+        format!("http://127.0.0.1:{}", self.http_ports[idx])
     }
 
     /// every running node's log tail — the panic payload that makes a stalled

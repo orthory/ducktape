@@ -1,36 +1,30 @@
 // The identity client mirrors identity-interface: IdentityMsg encoding
-// (BindNode/UnbindNode carry a user-signed cert minted by the tauri shell,
-// SetUserName is origin-gated) + IdentityReply decoding for All/Get/UserOf.
+// (BindNode/UnbindNode/AddMemberKey/RemoveMemberKey carry a MemberAuth minted
+// by the tauri shell, SetAccountName is origin-gated) + IdentityReply decoding
+// for All/Get/OfNode/OfMember over the account registry.
 
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  allUsers,
-  getUser,
+  accountOfMember,
+  accountOfNode,
+  allAccounts,
+  getAccount,
   hexToBytes,
-  setUserName,
+  setAccountName,
   submitRawMsg,
-  userOf,
 } from "./identity-client";
-import type { UserView } from "./identity-client";
-import type { NodeTransport } from "./transport";
+import type { AccountView } from "./identity-client";
+import { makeTransportStub } from "../test/transport-stub";
 
-const stubTransport = (reply?: unknown): NodeTransport => ({
-  submit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
-  query: vi.fn().mockResolvedValue(reply),
-  view: vi.fn(),
-  putBlob: vi.fn(),
-  getBlob: vi.fn(),
-  status: vi.fn(),
-  metrics: vi.fn(),
-  blocks: vi.fn(),
-  onBlock: vi.fn(),
-});
+const stubTransport = (reply?: unknown) =>
+  makeTransportStub({ query: vi.fn().mockResolvedValue(reply) });
 
-const wireUser = (patch: Partial<UserView> = {}): UserView => ({
-  user_key: [1, 2, 3],
+const wireAccount = (patch: Partial<AccountView> = {}): AccountView => ({
+  account_id: [1, 2, 3],
   display_name: "jess",
   nonce: 0,
+  member_keys: [{ pubkey: [1, 2, 3], kind: "ed25519", label: null, added_at: 1 }],
   nodes: [[4, 5, 6]],
   updated_at: 1,
   ...patch,
@@ -47,50 +41,59 @@ describe("hexToBytes", () => {
 });
 
 describe("identity queries", () => {
-  it("sends All with from/limit and decodes Users", async () => {
-    const wire = [wireUser()];
-    const transport = stubTransport({ users: wire });
-    await expect(allUsers(transport)).resolves.toEqual(wire);
+  it("sends All with from/limit and decodes Accounts", async () => {
+    const wire = [wireAccount()];
+    const transport = stubTransport({ accounts: wire });
+    await expect(allAccounts(transport)).resolves.toEqual(wire);
     expect(transport.query).toHaveBeenCalledWith("identity", {
       all: { from: 0, limit: 256 },
     });
   });
 
   it("passes explicit from/limit through", async () => {
-    const transport = stubTransport({ users: [] });
-    await allUsers(transport, { from: 10, limit: 5 });
+    const transport = stubTransport({ accounts: [] });
+    await allAccounts(transport, { from: 10, limit: 5 });
     expect(transport.query).toHaveBeenCalledWith("identity", {
       all: { from: 10, limit: 5 },
     });
   });
 
   it("throws on a mismatched reply variant", async () => {
-    const transport = stubTransport({ profiles: [] });
-    await expect(allUsers(transport)).rejects.toThrow(
-      "unexpected module reply: wanted users",
+    const transport = stubTransport({ tasks: [] });
+    await expect(allAccounts(transport)).rejects.toThrow(
+      "unexpected module reply: wanted accounts",
     );
   });
 
-  it("userOf hex-decodes the node key and decodes the User reply", async () => {
-    const user = wireUser();
-    const transport = stubTransport({ user });
-    await expect(userOf(transport, "040506")).resolves.toEqual(user);
+  it("accountOfNode hex-decodes the node key and decodes the Account reply", async () => {
+    const account = wireAccount();
+    const transport = stubTransport({ account });
+    await expect(accountOfNode(transport, "040506")).resolves.toEqual(account);
     expect(transport.query).toHaveBeenCalledWith("identity", {
-      user_of: { node_key: [4, 5, 6] },
+      of_node: { node_key: [4, 5, 6] },
     });
   });
 
-  it("userOf resolves null when the node is unbound", async () => {
-    const transport = stubTransport({ user: null });
-    await expect(userOf(transport, "ff")).resolves.toBeNull();
+  it("accountOfNode resolves null when the node is unbound", async () => {
+    const transport = stubTransport({ account: null });
+    await expect(accountOfNode(transport, "ff")).resolves.toBeNull();
   });
 
-  it("getUser hex-decodes the user key and decodes the User reply", async () => {
-    const user = wireUser();
-    const transport = stubTransport({ user });
-    await expect(getUser(transport, "010203")).resolves.toEqual(user);
+  it("accountOfMember hex-decodes the member key and decodes the Account reply", async () => {
+    const account = wireAccount();
+    const transport = stubTransport({ account });
+    await expect(accountOfMember(transport, "010203")).resolves.toEqual(account);
     expect(transport.query).toHaveBeenCalledWith("identity", {
-      get: { user_key: [1, 2, 3] },
+      of_member: { member_key: [1, 2, 3] },
+    });
+  });
+
+  it("getAccount hex-decodes the account id and decodes the Account reply", async () => {
+    const account = wireAccount();
+    const transport = stubTransport({ account });
+    await expect(getAccount(transport, "010203")).resolves.toEqual(account);
+    expect(transport.query).toHaveBeenCalledWith("identity", {
+      get: { account_id: [1, 2, 3] },
     });
   });
 });
@@ -99,20 +102,24 @@ describe("identity msgs", () => {
   it("submitRawMsg parses the tauri-signed payload and submits it untouched", async () => {
     const transport = stubTransport();
     const raw = JSON.stringify({
-      bind_node: { user_key: [1, 2, 3], user_sig: [9, 9, 9] },
+      bind_node: {
+        authorizer: { key: [1, 2, 3], kind: "ed25519", proof: { signature: { sig: [9, 9, 9] } } },
+      },
     });
     await submitRawMsg(transport, raw);
     expect(transport.submit).toHaveBeenCalledWith("identity", {
-      bind_node: { user_key: [1, 2, 3], user_sig: [9, 9, 9] },
+      bind_node: {
+        authorizer: { key: [1, 2, 3], kind: "ed25519", proof: { signature: { sig: [9, 9, 9] } } },
+      },
     });
   });
 
-  it("setUserName encodes SetUserName and stamps the origin (origin-gated write)", async () => {
+  it("setAccountName encodes SetAccountName and stamps the origin (origin-gated write)", async () => {
     const transport = stubTransport();
-    await setUserName(transport, { displayName: "jess", origin: "jess" });
+    await setAccountName(transport, { displayName: "jess", origin: "jess" });
     expect(transport.submit).toHaveBeenCalledWith(
       "identity",
-      { set_user_name: { display_name: "jess" } },
+      { set_account_name: { display_name: "jess" } },
       "jess",
     );
   });

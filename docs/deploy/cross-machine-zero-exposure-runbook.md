@@ -3,35 +3,29 @@
 The step-by-step for standing up two validators behind **real, distinct NATs**
 (neither exposing an inbound port) plus a public coordinator, using the **real
 binaries**. This is the procedure for the design's §"Acceptance" item 2. It is
-written so it is unambiguous which steps run today and which are blocked on node
-wiring.
+written so it is unambiguous which steps run today and which remain dependent on
+the two real NATs being punchable.
 
 > **Legend.** `[WORKS TODAY]` — runs now with shipped binaries.
-> `[NEEDS NODE WIRING]` — the mechanism exists and is CI-proven in
-> `crates/system/nat-traversal` and/or `crates/system/wireguard-effect`, but
-> was not yet called by `ducktape-node` when the step was tagged. See
-> [`private-cutover-integration-gap.md`](private-cutover-integration-gap.md).
+> `[NAT-DEPENDENT]` — the node drives the mechanism, but success depends on the
+> two real NATs admitting a direct punched path. There is no relay fallback.
 >
-> **Status update (2026-07-06).** Two things changed since the tags were
-> written. (1) The node-side reachability plane landed on `dev`, staged behind
-> `wireguard_listen`: `bin/node` now depends on `reachability`/`wireguard-effect`
-> and constructs a `NatResolver` (reflexive discovery, `register`, hole-punch)
-> — so several `[NEEDS NODE WIRING]` tags below are stale; the integration-gap
-> doc is the authoritative works-today line. (2) The DERP-style relay was
+> **Status update (2026-07-08).** The node-side reachability plane is wired
+> behind `wireguard_listen`: `bin/node` constructs a `NatResolver` (reflexive
+> discovery, `register`, hole-punch), consumes v3 `Coordinated` hints as
+> reachability routes, and desktop-created workspaces default to the public
+> coordinator at `p2p.ducktape.byeongsu.dev:3478`. The DERP-style relay remains
 > removed; the coordinator is rendezvous-only (step 8 below).
 >
-> **This runbook does not yet yield a working zero-exposure tunnel.** It stands
-> up the real coordinator and shows the invite/entry path that works today, then
-> marks precisely where the node must learn to discover its reflexive,
-> hole-punch, and bring up WireGuard. The CI simulated-NAT suite (Slice 3,
-> `crates/system/nat-traversal/tests/simnat_ci.rs`) proves the *logic*; this
-> runbook is what turns it into a *deployment* once the node is wired.
+> **This runbook can still fail on specific NAT pairs.** The coordinator only
+> performs rendezvous; if the two NATs will not punch, resolution fails
+> honestly instead of routing traffic through the coordinator.
 
 ## Topology
 
 Three hosts:
 
-- **Coordinator** — a public VPS, `p2p.ducktape.industries`, deployed per
+- **Coordinator** — a public VPS, `p2p.ducktape.byeongsu.dev`, deployed per
   [`coordinator.md`](coordinator.md). Untrusted; no key; UDP `:3478`.
 - **Validator A** — behind its own NAT, no inbound port-forward.
 - **Validator B** — behind a *different* NAT, no inbound port-forward.
@@ -39,7 +33,7 @@ Three hosts:
 ```
    Validator A ──┐                          ┌── Validator B
    (NAT, no      │      Coordinator         │   (NAT, no
-    inbound)     └────▶ p2p.ducktape ◀──────┘    inbound)
+    inbound)     └────▶ p2p.ducktape.byeongsu.dev ◀──────┘    inbound)
                         (public VPS)
      A and B dial OUT to the coordinator; ideally they then hole-punch a
      direct A<->B WireGuard tunnel and drop the coordinator out of the path.
@@ -54,19 +48,19 @@ gotcha, the 2-validator-quorum teardown caveat).
   verify with the Task-2 subprocess proof or `ss -lunp 'sport = :3478'`).
 - Validator A and Validator B each have a built `ducktape-node`.
 - A founder able to mint v3 invites.
-- For the (future) tunnel steps: real WireGuard userspace/kernel on A and B.
+- For the tunnel steps: real WireGuard userspace/kernel on A and B.
 
 ## The tagged procedure
 
 1. **Deploy the coordinator on the VPS.** `[WORKS TODAY]` — follow [`coordinator.md`](coordinator.md); confirm it binds UDP `:3478` (`ss -lunp 'sport = :3478'`) and answers a live `BindRequest` (the `deploy_smoke.rs` subprocess proof exercises exactly this).
-2. **Mint a v3 invite carrying a `Coordinated` reach hint.** `[WORKS TODAY]` (encoding only) — Slice 1's `INVITE_PREFIX_V3` + `ReachHint`/`CoordRef` produce `coordinated:<ek>@p2p.ducktape.industries:3478#<coord_key>`, and it round-trips through `bin/node/src/config.rs` `pack`/`unpack`/`parse`. **Partial:** the invite *encodes* the coordinator correctly, but the node does not yet *consume* the hint as a reachability path — see step 5.
+2. **Mint a v3 invite carrying a `Coordinated` reach hint.** `[WORKS TODAY]` — default `init` records `coordinated:<ek>@p2p.ducktape.byeongsu.dev:3478#<coord_key>` and public coordination in `network.toml`; the invite round-trips through `bin/node/src/config.rs` `pack`/`unpack`/`parse`.
 3. **A and B each generate an identity and get admitted.** `[WORKS TODAY]` — the founder runs `invite-accept`; this is the unchanged admission path, independent of reachability.
-4. **A and B boot dial-out-only against the coordinator's reflexive/rendezvous service.** `[NEEDS NODE WIRING]` — the node never constructs a `NatClient`, never sends a `BindRequest`, never `register`s. The coordinator *would* answer (Task 2 proves it), but nothing in `bin/node` asks. Mechanism exists, unwired: `nat_traversal::NatClient::{bind_multi, discover_reflexive_failover, register}`.
-5. **A `Coordinated` hint is consumed as a reachability path.** `[NEEDS NODE WIRING]` — verified stub: `reach_entries()` (config.rs ~337-354) feeds `coord_addr` into the commonware **TCP** `bootstrappers`, so today the node would try to open a *mesh* connection to the coordinator's **UDP** port and fail. The hint must instead be routed to a `NatClient`. (This is why step 2 is only *partial*.)
-6. **A and B publish their reflexive endpoints and rendezvous.** `[NEEDS NODE WIRING]` — no reflexive is discovered or published into `EndpointAdvertisementV1.wireguard_endpoint`; no `lookup`/`recv_punch_sync`. Mechanism exists (`nat-traversal` rendezvous + the `wireguard-upgrade` advertisement + Slice 3's `AdvertBook`), unwired.
-7. **A and B hole-punch a direct WireGuard tunnel (coordinator-timed simultaneous open).** `[NEEDS NODE WIRING]` — `send_punch_to`/`recv_punch_from` exist and are CI-proven (`drive_simulated`), but the node never drives them, and no WireGuard interface is created (`wireguard_effect::apply_tunnel_plan` / `DefguardWireGuardEffect` is never called — the crate's own module doc says nothing in the workspace calls `WGApi::configure_interface` today).
-8. **On hole-punch failure, resolution fails honestly.** `[BY DESIGN]` — there is no relay fallback (the DERP-style relay was removed 2026-07-06; the coordinator is rendezvous-only). A pair that cannot punch surfaces a `PeerFailed` and rides its advertised endpoint; a symmetric↔symmetric pair needs a routable endpoint on one side.
-9. **Real state-sync / app-hash flows over the tunnel.** `[NEEDS NODE WIRING]` — depends on steps 6-7; there is nothing to run today.
+4. **A and B boot dial-out-only against the coordinator's reflexive/rendezvous service.** `[WORKS TODAY]` — with `wireguard_listen` configured, the node constructs a `NatResolver`, sends `BindRequest`, registers, and keeps the mapping warm.
+5. **A `Coordinated` hint is consumed as a reachability path.** `[WORKS TODAY]` — `NetworkDescriptor::reach_entries()` returns `ReachDial::Coordinated`, and `bin/node` routes those entries into the reachability resolver instead of dialing the coordinator as a TCP mesh peer.
+6. **A and B publish their reflexive endpoints and rendezvous.** `[NAT-DEPENDENT]` — the node drives lookup and punch through `NatResolver`; success depends on the observed NAT mappings being punchable.
+7. **A and B hole-punch a direct WireGuard tunnel (coordinator-timed simultaneous open).** `[NAT-DEPENDENT]` — the library path is CI-proven and the node drives it, but a NAT pair that cannot punch fails honestly because there is no relay fallback.
+8. **On hole-punch failure, resolution fails honestly.** `[BY DESIGN]` — there is no relay fallback (the DERP-style relay was removed 2026-07-06; the coordinator is rendezvous-only). A pair that cannot punch surfaces a `PeerFailed` or falls back only to a real advertised endpoint if one exists; a symmetric↔symmetric pair with no routable endpoint needs a different entry path.
+9. **Real state-sync / app-hash flows over the tunnel.** `[NAT-DEPENDENT]` — depends on steps 6-7 establishing a direct path.
 
 ## What you CAN demo today vs. what proves the tunnel
 
@@ -74,19 +68,14 @@ gotcha, the 2-validator-quorum teardown caveat).
 
 - Deploy the coordinator and prove it answers (the `deploy_smoke.rs` subprocess
   proof; step 1).
-- Mint and parse a v3 `Coordinated` invite (step 2, encoding).
+- Mint and parse a v3 `Coordinated` invite, and have the node consume that hint
+  as coordinated reach (steps 2 and 5).
 - Admit A and B (step 3).
+- Register with the public coordinator and discover a coordinator-observed
+  reflexive mapping (step 4).
 
-**You cannot yet** demonstrate the end-to-end tunnel this runbook targets: a
-v3 `Coordinated` hint is still not consumed as a reachability path (step 5) and
-coordinator-auth is open — though the node-side plane itself has since landed
-staged behind `wireguard_listen` (see the status update above), so the
-per-step tags overstate what is missing today. The logic behind those steps is
-proven at the library level by the CI simulated-NAT suite
-(`crates/system/nat-traversal/tests/simnat_ci.rs`, Slice 3) with a fake NAT and a
-`FakeWireGuardEffect`. The moment the node wiring lands (the
-[integration-gap handoff](private-cutover-integration-gap.md) §3 checklist, the
-"Slice 5" follow-on), this runbook becomes the Acceptance §2 procedure verbatim —
-the `[NEEDS NODE WIRING]` tags flip to `[WORKS TODAY]` step by step, and the real
-cross-machine run additionally needs the user's infra (two real, punchable NATs,
-a VPS, real WireGuard on A and B).
+**What still needs real infra proof:** an end-to-end tunnel across two distinct,
+punchable NATs. The logic is proven at the library level by the CI simulated-NAT
+suite (`crates/system/nat-traversal/tests/simnat_ci.rs`, Slice 3), but the real
+cross-machine run still needs two NATs that admit a direct punched path plus a
+VPS coordinator.

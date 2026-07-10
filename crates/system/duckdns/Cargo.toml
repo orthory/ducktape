@@ -1,0 +1,17 @@
+[package]
+name = "duckdns"
+edition.workspace = true
+version.workspace = true
+
+# Ducktape module adapter for duckdns-core's account-name registry. The pure
+# state machine and wire surface live in duckdns-core; this crate derives the
+# authenticated AccountId through Identity.
+[dependencies]
+duckdns-core = { workspace = true }
+sdk = { workspace = true }
+identity = { workspace = true }
+valset = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }

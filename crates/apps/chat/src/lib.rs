@@ -30,6 +30,11 @@ pub mod voice;
 // over the data plane's Service::Video / Service::Voice flows. Off-consensus
 // like `voice`, for the same reason: consensus never carries media.
 pub mod video;
+// the single-definition-site codec for the webview call socket
+// (`/v1/call/ws`) — audio + camera video framing shared by `noded` and the
+// app's TypeScript leg. See the module doc for the D1 (big-endian headers)
+// rule. Off-consensus, same reasoning as `voice`/`video`.
+pub mod call_wire;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
@@ -182,10 +187,10 @@ fn collect_mentions(blocks: &[Block]) -> Vec<AuthorRef> {
         };
         for span in spans {
             for mark in &span.marks {
-                if let Mark::Mention(author) = mark {
-                    if !mentions.contains(author) {
-                        mentions.push(author.clone());
-                    }
+                if let Mark::Mention(author) = mark
+                    && !mentions.contains(author)
+                {
+                    mentions.push(author.clone());
                 }
             }
         }
@@ -419,8 +424,39 @@ where
         }
     }
 
+    /// enforce the reserved channel-id namespace: ids containing ':' belong
+    /// to modules, and a module may only mint ids under its own `"{module}:"`
+    /// prefix (e.g. forge's per-issue discussion channels `forge:<repo>:<n>`),
+    /// so no origin can squat another's namespace. system origin is
+    /// unrestricted. unconditional consensus rule — not version-gated.
+    fn validate_channel_namespace(author: &AuthorRef, channel_id: &str) -> Result<(), Error> {
+        match author {
+            AuthorRef::User(_) => {
+                if channel_id.contains(':') {
+                    return Err(Error::Module(
+                        "chat: channel ids containing ':' are reserved for modules".into(),
+                    ));
+                }
+                Ok(())
+            }
+            // an agent author is a module origin refined by `as_agent`
+            // (PostMessage only), so it cannot reach CreateChannel — but the
+            // hosting module's prefix rule is the right one if it ever does.
+            AuthorRef::Module(module) | AuthorRef::Agent { module, .. } => {
+                if !channel_id.starts_with(&format!("{module}:")) {
+                    return Err(Error::Module(format!(
+                        "chat: module '{module}' may only create channel ids prefixed '{module}:'"
+                    )));
+                }
+                Ok(())
+            }
+            AuthorRef::System => Ok(()),
+        }
+    }
+
     async fn stage_channel(
         &mut self,
+        author: &AuthorRef,
         channel_id: String,
         name: String,
         post_policy: PostPolicy,
@@ -428,6 +464,7 @@ where
     ) -> Result<(), Error> {
         Self::validate_non_empty("channel_id", &channel_id)?;
         Self::validate_non_empty("name", &name)?;
+        Self::validate_channel_namespace(author, &channel_id)?;
         if self.channel(&channel_id).await?.is_some() {
             return Err(Error::Module(format!(
                 "channel already exists: {channel_id}"
@@ -1183,7 +1220,10 @@ where
                 channel_id,
                 name,
                 post_policy,
-            } => self.stage_channel(channel_id, name, post_policy, now).await,
+            } => {
+                self.stage_channel(&author, channel_id, name, post_policy, now)
+                    .await
+            }
             ChatMsg::PostMessage {
                 channel_id,
                 message_id,

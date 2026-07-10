@@ -16,16 +16,6 @@ export const errMessage = (err: unknown): string =>
 
 // ── Shared styling ───────────────────────────────────────────────────────
 
-const outerStyle: React.CSSProperties = {
-  flex: 1,
-  minHeight: 0,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  background: color.paper,
-  padding: 24,
-};
-
 const cardStyle: React.CSSProperties = {
   width: 440,
   maxWidth: "100%",
@@ -73,7 +63,7 @@ export const primaryButtonStyle = (disabled: boolean): React.CSSProperties => ({
   font: `600 12.5px ${font.sans}`,
 });
 
-const secondaryButtonStyle: React.CSSProperties = {
+export const secondaryButtonStyle: React.CSSProperties = {
   all: "unset",
   textAlign: "center",
   cursor: "pointer",
@@ -123,23 +113,34 @@ function Tab({ label, active, onClick }: { label: string; active: boolean; onCli
   );
 }
 
-export function ModeTabs({
+/** The gate's mode switcher, generalized over the caller's tab set (the
+ *  absent screen runs create/restore/link; other callers may run fewer). */
+export function ModeTabs<M extends string>({
+  tabs,
   mode,
   onSelect,
 }: {
-  mode: "create" | "restore";
-  onSelect: (mode: "create" | "restore") => void;
+  tabs: ReadonlyArray<{ readonly id: M; readonly label: string }>;
+  mode: M;
+  onSelect: (mode: M) => void;
 }) {
   return (
     <div style={tabRowStyle}>
-      <Tab label="Create" active={mode === "create"} onClick={() => onSelect("create")} />
-      <Tab label="Restore" active={mode === "restore"} onClick={() => onSelect("restore")} />
+      {tabs.map((tab) => (
+        <Tab
+          key={tab.id}
+          label={tab.label}
+          active={mode === tab.id}
+          onClick={() => onSelect(tab.id)}
+        />
+      ))}
     </div>
   );
 }
 
-/** The gate's card chrome — title/subtitle + content, identical shape to
- *  OnboardingGate's outer wrapper so the two gates read as one visual family. */
+/** The gate's card chrome — title/subtitle + content. The centered outer
+ *  wrapper lives in OnboardingChrome now (it also carries the first-run step
+ *  rail); every GateCard renders inside one. */
 export function GateCard({
   title,
   subtitle,
@@ -150,14 +151,12 @@ export function GateCard({
   children: ReactNode;
 }) {
   return (
-    <div style={outerStyle}>
-      <div style={cardStyle}>
-        <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-          <span style={titleStyle}>{title}</span>
-          {subtitle && <span style={subtitleStyle}>{subtitle}</span>}
-        </div>
-        {children}
+    <div style={cardStyle}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+        <span style={titleStyle}>{title}</span>
+        {subtitle && <span style={subtitleStyle}>{subtitle}</span>}
       </div>
+      {children}
     </div>
   );
 }
@@ -381,7 +380,6 @@ export function ConfirmWords({
             const value = event.target.value;
             setAnswers((prev) => ({ ...prev, [i]: value }));
           }}
-          autoComplete="off"
           autoCapitalize="off"
           spellCheck={false}
           style={inputStyle}

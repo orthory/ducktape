@@ -68,7 +68,9 @@ fn oid_hex(raw: &[u8]) -> String {
     git2::Oid::from_bytes(raw).unwrap().to_string()
 }
 
-/// parse forge's multi-repo snapshot container into `(name, head_oid, pack)`.
+/// parse forge's multi-branch snapshot container into `(name, main_oid, pack)`
+/// (per repo: name, ref_count, per-ref branch+oid, pack; trailing tracker
+/// section ignored here).
 fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     fn u32_at(bytes: &[u8], p: &mut usize) -> usize {
         let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap()) as usize;
@@ -82,12 +84,22 @@ fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
         let nl = u32_at(bytes, &mut p);
         let name = String::from_utf8(bytes[p..p + nl].to_vec()).unwrap();
         p += nl;
-        let oid = bytes[p..p + OID_LEN].to_vec();
-        p += OID_LEN;
+        let ref_count = u32_at(bytes, &mut p);
+        let mut main_oid = Vec::new();
+        for _ in 0..ref_count {
+            let bl = u32_at(bytes, &mut p);
+            let branch = String::from_utf8(bytes[p..p + bl].to_vec()).unwrap();
+            p += bl;
+            let oid = bytes[p..p + OID_LEN].to_vec();
+            p += OID_LEN;
+            if branch == "main" {
+                main_oid = oid;
+            }
+        }
         let pl = u32_at(bytes, &mut p);
         let pack = bytes[p..p + pl].to_vec();
         p += pl;
-        out.push((name, oid, pack));
+        out.push((name, main_oid, pack));
     }
     out
 }
@@ -197,7 +209,7 @@ fn two_repos_compose_and_are_order_independent() {
 
     // forge 1: push "a" then "b".
     let base1 = tmp_base("ab");
-    let blobs1 = files::BlobHandle::default();
+    let blobs1 = blobstore::BlobHandle::default();
     let da1 = blobs1.put_chunk(pa.clone()).to_vec();
     let db1 = blobs1.put_chunk(pb.clone()).to_vec();
     let mut f1 = Forge::with_blobs("forge", base1.clone(), blobs1).unwrap();
@@ -214,7 +226,7 @@ fn two_repos_compose_and_are_order_independent() {
 
     // forge 2: push "b" then "a" (reverse order).
     let base2 = tmp_base("ba");
-    let blobs2 = files::BlobHandle::default();
+    let blobs2 = blobstore::BlobHandle::default();
     let da2 = blobs2.put_chunk(pa.clone()).to_vec();
     let db2 = blobs2.put_chunk(pb.clone()).to_vec();
     let mut f2 = Forge::with_blobs("forge", base2.clone(), blobs2).unwrap();
@@ -243,7 +255,7 @@ fn stale_push_on_one_repo_does_not_touch_another() {
     let (hc, _pc) = make_closure("cas-c", 3, "c.txt", "c", "cc");
 
     let base = tmp_base("cas");
-    let blobs = files::BlobHandle::default();
+    let blobs = blobstore::BlobHandle::default();
     let da = blobs.put_chunk(pa).to_vec();
     let db = blobs.put_chunk(pb).to_vec();
     let mut f = Forge::with_blobs("forge", base.clone(), blobs).unwrap();
@@ -349,7 +361,7 @@ fn multi_repo_snapshot_round_trips_and_pack_less_node_composes_the_same_root() {
     // a source with three repos: two by Commit, one by Push (the submitter holds
     // the pack, so gamma materializes on disk).
     let src_base = tmp_base("rt-src");
-    let src_blobs = files::BlobHandle::default();
+    let src_blobs = blobstore::BlobHandle::default();
     let dp = src_blobs.put_chunk(pp.clone()).to_vec();
     let mut src = Forge::with_blobs("forge", src_base.clone(), src_blobs).unwrap();
     commit_named(&mut src, 1, "alpha", "a.txt", "AAA", "ca");
@@ -382,7 +394,7 @@ fn multi_repo_snapshot_round_trips_and_pack_less_node_composes_the_same_root() {
     // LACKS the push pack. root must still compose to src_root — pack possession
     // is per-node, root is not.
     let nopack_base = tmp_base("rt-nopack");
-    let nopack_blobs = files::BlobHandle::default(); // never holds pp
+    let nopack_blobs = blobstore::BlobHandle::default(); // never holds pp
     let mut nopack = Forge::with_blobs("forge", nopack_base.clone(), nopack_blobs).unwrap();
     commit_named(&mut nopack, 1, "alpha", "a.txt", "AAA", "ca");
     commit_named(&mut nopack, 2, "beta", "b.txt", "BBB", "cb");

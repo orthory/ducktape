@@ -17,14 +17,17 @@ pub mod punch;
 pub mod simnat;
 pub mod wire;
 
-pub use advert::{AdvertBook, AdvertOutcome, ReflexiveAdvert};
+pub use advert::{AdvertBook, AdvertOutcome, REGISTRATION_TTL_SECS, ReflexiveAdvert};
 pub use auth::{
-    mint_coord_cap, now_secs, sign_authenticator, verify_request, AuthError, AuthPolicy,
-    Authenticator, CoordCap, COORD_CAP_NS, COORD_CAP_TTL_SECS, COORD_REQ_NS,
-    DEFAULT_FRESHNESS_WINDOW_SECS,
+    AuthError, AuthPolicy, Authenticator, COORD_CAP_NS, COORD_CAP_TTL_SECS, COORD_REQ_NS, CoordCap,
+    DEFAULT_FRESHNESS_WINDOW_SECS, mint_coord_cap, now_secs, sign_authenticator, verify_request,
 };
-pub use client::{NatClient, run_coordinator};
-pub use coordinator::Coordinator;
+pub use client::{
+    ClientEvent, CoordinatorMetrics, CoordinatorMetricsSnapshot, NatClient, NatSocket, SocketEvent,
+    run_coordinator, run_coordinator_with, run_coordinator_workers,
+    run_coordinator_workers_with_metrics,
+};
+pub use coordinator::{Coordinator, CoordinatorReplies, CoordinatorReply};
 #[cfg(any(test, feature = "simnat"))]
 pub use punch::{PunchError, PunchPlan, RebindProof, drive_rebind_reconnect, drive_simulated};
 #[cfg(any(test, feature = "simnat"))]

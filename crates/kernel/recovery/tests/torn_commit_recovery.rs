@@ -327,6 +327,7 @@ fn a_torn_block_recovers_by_committing_only_the_in_memory_cohort() {
         node.submit(&signer, 0, set("fanout", "k", "v"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         let tip = node.finalized().expect("boundary");
         let tip_hash = node.app_hash();
@@ -431,6 +432,287 @@ fn recovered_disk_root(cell: &Cell) -> StateRoot {
         &cell.counter.to_le_bytes(),
         &encode_map(&cell.committed),
     ])
+}
+
+// ---- the torn-BRICK regression: a disk substrate N blocks past a checkpoint ---
+//
+// the crate's checkpoint only persists on a cadence (default 32 blocks), while a
+// per-block-durable disk substrate commits to its OWN disk EVERY block. so at a
+// hard kill (no final checkpoint), the disk can sit many blocks AHEAD of the last
+// checkpoint: its live root equals a recorded post-root well above the checkpoint,
+// matching NEITHER the checkpoint pre-root NOR the first replayed block's
+// post-root. the pre-fix single-height classifier had no forward lookahead and
+// fail-stopped (`Error::Torn`) at the first replayed height — bricking any node
+// carrying sustained disk traffic under the shipped cadence. these pin the
+// forward-pre-scan heal at cadence >= 2 with >= 2 durable disk blocks.
+
+/// a REAL (non-genesis) checkpoint at height C, then TWO more torn-shaped blocks
+/// the checkpoint does not cover — each fanning out to the disk, which commits
+/// durably per block, so the disk ends TWO blocks past C. boot must roll the
+/// in-memory cohort forward and heal the ahead disk WITHOUT re-committing it.
+#[test]
+fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let cell: Cell = Rc::new(RefCell::new(DiskCell::default()));
+
+        let recovery = Recovery::open(context.child("r1"))
+            .await
+            .expect("open recovery");
+        let host = Host::genesis(vec![
+            Box::new(Fanout::new("fanout")),
+            Box::new(Diskish::open("diskish", cell.clone())),
+        ])
+        .expect("genesis");
+        let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
+        let signer = sk(1);
+
+        // block 0: one torn-shaped block, then CHECKPOINT at height 0 (C = 0).
+        node.submit(&signer, 0, set("fanout", "k0", "v0"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 1);
+        let checkpoint_height = node.finalized().expect("boundary").height;
+        assert_eq!(cell.borrow().counter, 1, "disk committed block 0");
+
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest = Manifest::capture(
+            node.host(),
+            Some(checkpoint_height),
+            0,
+            0,
+            vec![],
+            vec![],
+            None,
+            0,
+            None,
+            pos,
+            1,
+        )
+        .expect("capture");
+        node.sink_mut()
+            .write_manifest(&manifest)
+            .await
+            .expect("write checkpoint");
+
+        // blocks 1 and 2: TWO more torn-shaped blocks the checkpoint does NOT
+        // cover. the disk commits each (counter 1 -> 2 -> 3), ending TWO blocks
+        // past the checkpoint.
+        node.submit(&signer, 1, set("fanout", "k1", "v1"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        node.submit(&signer, 2, set("fanout", "k2", "v2"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 2);
+        let tip = node.finalized().expect("boundary");
+        let tip_hash = node.app_hash();
+        assert_eq!(cell.borrow().counter, 3, "disk committed once per block");
+        assert!(
+            tip.height - checkpoint_height >= 2,
+            "the disk raced >= 2 blocks past the checkpoint"
+        );
+
+        // graceful WAL barrier (seals durable), then the "crash": drop memory,
+        // KEEP the disk cell. NO checkpoint was written past height C.
+        node.sink_mut().sync().await.expect("sync");
+        drop(node);
+
+        // ---- boot: the in-memory cohort rolls back to the checkpoint, the disk
+        // stays TWO blocks ahead. the pre-fix loop bricks here with Error::Torn.
+        let mut recovery = Recovery::open(context.child("r2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery.manifest().expect("decodes").expect("present");
+        assert_eq!(manifest.height, Some(checkpoint_height));
+
+        let mut fanout = Fanout::new("fanout");
+        fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
+        let diskish = Diskish::reopen("diskish", cell.clone());
+        let mut host =
+            Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
+
+        // the disk's live root matches NEITHER the checkpoint root NOR block 1's
+        // post-root — it is TWO blocks past the checkpoint.
+        assert_eq!(host.module_root("fanout"), manifest.root("fanout"));
+        assert_ne!(host.module_root("diskish"), manifest.root("diskish"));
+
+        let recovered = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .expect("a disk two blocks past the checkpoint recovers cleanly");
+
+        assert_eq!(recovered.height, Some(tip.height));
+        assert_eq!(
+            recovered.app_hash, tip_hash,
+            "recomposed app-hash is byte-identical to the sealed tip"
+        );
+        assert_eq!(recovered.applied, 2, "both post-checkpoint blocks replayed");
+        assert_eq!(recovered.skipped, 0);
+        // the durable disk was NEVER re-committed: no op-log root move, no fork.
+        assert_eq!(
+            cell.borrow().counter,
+            3,
+            "the ahead disk was left alone (no re-commit)"
+        );
+        // the in-memory cohort rolled forward from the WAL to the tip.
+        assert_eq!(host.query("fanout", b"k0").await.expect("q"), b"v0".to_vec());
+        assert_eq!(host.query("fanout", b"k1").await.expect("q"), b"v1".to_vec());
+        assert_eq!(host.query("fanout", b"k2").await.expect("q"), b"v2".to_vec());
+    });
+}
+
+/// the PURE-disk shape (the "sustained disk traffic" case): blocks that touch
+/// ONLY the per-block-durable disk substrate (no in-memory cohort change). the
+/// disk races several blocks past the genesis checkpoint; boot must SKIP every
+/// such block as already-durable (the all-durable fast path), never Torn.
+#[test]
+fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let cell: Cell = Rc::new(RefCell::new(DiskCell::default()));
+
+        let recovery = Recovery::open(context.child("r1"))
+            .await
+            .expect("open recovery");
+        let host = Host::genesis(vec![
+            Box::new(Fanout::new("fanout")),
+            Box::new(Diskish::open("diskish", cell.clone())),
+        ])
+        .expect("genesis");
+        let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
+
+        // GENESIS checkpoint only (height None) — nothing checkpointed after.
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest0 =
+            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1)
+                .expect("capture");
+        node.sink_mut()
+            .write_manifest(&manifest0)
+            .await
+            .expect("write genesis manifest");
+
+        // THREE blocks targeting the disk DIRECTLY — the in-memory cohort is
+        // never touched. the disk ends three blocks ahead of the checkpoint.
+        let signer = sk(1);
+        node.submit(&signer, 0, set("diskish", "k0", "v0"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        node.submit(&signer, 1, set("diskish", "k1", "v1"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        node.submit(&signer, 2, set("diskish", "k2", "v2"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 3);
+        let tip = node.finalized().expect("boundary");
+        let tip_hash = node.app_hash();
+        assert_eq!(cell.borrow().counter, 3, "disk committed once per block");
+
+        node.sink_mut().sync().await.expect("sync");
+        drop(node);
+
+        // ---- boot: only the disk is ahead; every block is a pure-disk block ---
+        let mut recovery = Recovery::open(context.child("r2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery.manifest().expect("decodes").expect("present");
+        let mut fanout = Fanout::new("fanout");
+        fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
+        let diskish = Diskish::reopen("diskish", cell.clone());
+        let mut host =
+            Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
+
+        let recovered = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .expect("pure-disk blocks ahead of the checkpoint recover cleanly");
+
+        assert_eq!(recovered.height, Some(tip.height));
+        assert_eq!(recovered.app_hash, tip_hash);
+        // nothing rolled back, so every ahead-disk block is SKIPPED, not replayed.
+        assert_eq!(recovered.applied, 0, "no in-memory cohort to re-commit");
+        assert_eq!(recovered.skipped, 3, "every ahead-disk block was skipped");
+        assert_eq!(cell.borrow().counter, 3, "the disk was never re-committed");
+        assert_eq!(host.query("diskish", b"k2").await.expect("q"), b"v2".to_vec());
+    });
+}
+
+/// the PRESERVED corruption-detection property. the forward pre-scan seeds a
+/// durable floor ONLY from an EXACT live-root match, so a disk substrate whose
+/// live root matches NEITHER the checkpoint pre-root NOR any recorded post-root
+/// is genuine damage (a torn write / corruption) and MUST still fail-stop as
+/// `Error::Torn` — recovery never heals from a nearest/approximate record.
+#[test]
+fn a_disk_root_matching_no_record_still_fail_stops() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let cell: Cell = Rc::new(RefCell::new(DiskCell::default()));
+
+        let recovery = Recovery::open(context.child("r1"))
+            .await
+            .expect("open recovery");
+        let host = Host::genesis(vec![
+            Box::new(Fanout::new("fanout")),
+            Box::new(Diskish::open("diskish", cell.clone())),
+        ])
+        .expect("genesis");
+        let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest0 =
+            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1)
+                .expect("capture");
+        node.sink_mut()
+            .write_manifest(&manifest0)
+            .await
+            .expect("write genesis manifest");
+
+        // one torn-shaped block: fanout fans out to diskish (durable at post).
+        let signer = sk(1);
+        node.submit(&signer, 0, set("fanout", "k", "v"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 1);
+        assert_eq!(cell.borrow().counter, 1);
+        node.sink_mut().sync().await.expect("sync");
+        drop(node);
+
+        // CORRUPT the durable disk: move the commit counter to a value that
+        // matches NO recorded root (neither the genesis pre-root nor block 0's
+        // post-root). this is a torn write, not a legitimate race-ahead.
+        cell.borrow_mut().counter = 99;
+
+        let mut recovery = Recovery::open(context.child("r2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery.manifest().expect("decodes").expect("present");
+        let mut fanout = Fanout::new("fanout");
+        fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
+        let diskish = Diskish::reopen("diskish", cell.clone());
+        let mut host =
+            Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
+
+        // the disk root matches NOTHING recorded.
+        assert_ne!(host.module_root("diskish"), manifest.root("diskish"));
+
+        let err = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .expect_err("a disk root matching no record must fail-stop");
+        assert!(
+            matches!(err, recovery::Error::Torn(_)),
+            "expected Error::Torn (genuine corruption), got {err:?}"
+        );
+        // the corrupt disk was NOT re-committed by the refused replay.
+        assert_eq!(cell.borrow().counter, 99, "the refused replay touched nothing");
+    });
 }
 
 // ---- FanoutTwo: an in-memory cohort module fanning out to TWO disks ---------
@@ -546,6 +828,7 @@ fn a_multi_disk_torn_block_fail_stops() {
         node.submit(&signer, 0, set("fanout", "k", "v"))
             .await
             .expect("submit");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(cell_a.borrow().counter, 1, "diskA committed once");
         assert_eq!(cell_b.borrow().counter, 1, "diskB committed once");
@@ -817,6 +1100,7 @@ fn a_boundary_torn_block_heals_under_the_pre_activation_version() {
         )
         .await
         .expect("submit below H");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         let checkpoint_height = node.finalized().expect("boundary").height;
         assert!(checkpoint_height < H, "checkpoint sits below H");
@@ -864,6 +1148,7 @@ fn a_boundary_torn_block_heals_under_the_pre_activation_version() {
         node.submit(&signer, 1, set("dual", "k", "v"))
             .await
             .expect("submit at H");
+        node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         let tip = node.finalized().expect("boundary");
         assert_eq!(

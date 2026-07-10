@@ -12,6 +12,7 @@ import type { AuthorNames, AuthorRef, ChatBlock, MessageView, Span } from "../..
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { ConsoleContext } from "../../store/context";
 import type { OpRecord } from "../../store/finalization";
+import { AskAgentButton } from "./AskAgentButton";
 import { authorKey, hasReacted, isAgentAuthor, isWallClock } from "./chat-helpers";
 import { blocksToInput } from "./chat-input";
 import { EmojiPicker } from "./EmojiPicker";
@@ -158,7 +159,38 @@ function AgentPill() {
 
 // ── Block rendering (mark-aware where the wire actually carries marks) ──
 
-function renderSpan(span: Span, names: AuthorNames, key: number): ReactNode {
+// The index's tag grammar, mirrored for display: `#` + 1..=64 Unicode
+// letters/digits/`_`/`-` at a whitespace boundary (parts are already
+// whitespace-split). Only what the node indexed reads as clickable.
+const TAG_TOKEN = /^#([\p{L}\p{N}_-]{1,64})/u;
+
+function TagToken({ token, onClick }: { token: string; onClick: (tag: string) => void }) {
+  return (
+    <button
+      type="button"
+      title={`Filter by ${token}`}
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick(token.slice(1));
+      }}
+      style={{
+        all: "unset",
+        cursor: "pointer",
+        color: accentVar,
+        fontWeight: 500,
+      }}
+    >
+      {token}
+    </button>
+  );
+}
+
+function renderSpan(
+  span: Span,
+  names: AuthorNames,
+  key: number,
+  onTagClick?: (tag: string) => void,
+): ReactNode {
   const mentionMark = span.marks.find(
     (m): m is { mention: AuthorRef } => typeof m === "object" && "mention" in m,
   );
@@ -194,24 +226,38 @@ function renderSpan(span: Span, names: AuthorNames, key: number): ReactNode {
   }
   // No real Mark::Mention crosses the wire from the composer yet. Fall back to
   // sniffing @/# tokens in plain text so mentions/channel refs still read
-  // visually distinct.
+  // visually distinct. A #token matching the index's tag grammar becomes a
+  // click-to-filter affordance when the surface wires one up.
   const parts = span.text.split(/(\s+)/);
   return (
     <span key={key} style={style}>
-      {parts.map((part, i) =>
-        part.startsWith("@") || part.startsWith("#") ? (
+      {parts.map((part, i) => {
+        const tag = part.startsWith("#") ? TAG_TOKEN.exec(part) : null;
+        if (tag && onTagClick) {
+          return (
+            <span key={i}>
+              <TagToken token={tag[0]} onClick={onTagClick} />
+              {part.slice(tag[0].length)}
+            </span>
+          );
+        }
+        return part.startsWith("@") || part.startsWith("#") ? (
           <span key={i} style={{ color: accentVar, fontWeight: 500 }}>
             {part}
           </span>
         ) : (
           part
-        ),
-      )}
+        );
+      })}
     </span>
   );
 }
 
-function renderBlocks(blocks: ChatBlock[], names: AuthorNames): ReactNode {
+function renderBlocks(
+  blocks: ChatBlock[],
+  names: AuthorNames,
+  onTagClick?: (tag: string) => void,
+): ReactNode {
   return blocks.map((block, i) => {
     if (block === "divider") {
       return <div key={i} style={{ height: 1, background: color.borderSoft, margin: "7px 0" }} />;
@@ -228,7 +274,7 @@ function renderBlocks(blocks: ChatBlock[], names: AuthorNames): ReactNode {
             minWidth: 0,
           }}
         >
-          {block.paragraph.map((span, j) => renderSpan(span, names, j))}
+          {block.paragraph.map((span, j) => renderSpan(span, names, j, onTagClick))}
         </div>
       );
     }
@@ -248,7 +294,7 @@ function renderBlocks(blocks: ChatBlock[], names: AuthorNames): ReactNode {
             maxWidth: "100%",
           }}
         >
-          {block.quote.map((span, j) => renderSpan(span, names, j))}
+          {block.quote.map((span, j) => renderSpan(span, names, j, onTagClick))}
         </div>
       );
     }
@@ -732,12 +778,16 @@ function OverflowMenu({
 }
 
 function HoverBar({
+  channelId,
+  seq,
   onQuickReact,
   onOpenPicker,
   onOpenThread,
   onMoreToggle,
   threadable,
 }: {
+  channelId: string;
+  seq: number;
   onQuickReact: (emoji: string) => void;
   onOpenPicker: () => void;
   onOpenThread: () => void;
@@ -793,6 +843,7 @@ function HoverBar({
         <AddReactGlyph size={15} />
       </HoverButton>
       <div style={{ width: 1, height: 16, background: color.borderSoft, margin: "0 2px" }} />
+      <AskAgentButton channelId={channelId} seq={seq} style={btnStyle} />
       {threadable && (
         <HoverButton
           title="Reply in thread"
@@ -828,6 +879,7 @@ export function MessageItem({
   onReact,
   onEdit,
   onDelete,
+  onTagClick,
   threadable = true,
   op,
 }: {
@@ -850,6 +902,9 @@ export function MessageItem({
   onEdit: (text: string) => void;
   /** Tombstone this message (author-gated; only offered on own messages). */
   onDelete: () => void;
+  /** Make body #tags click-to-filter (tag passed WITHOUT the `#`). Absent —
+   *  e.g. in the ThreadPanel — tags stay tinted but inert. */
+  onTagClick?: (tag: string) => void;
   /** False inside the ThreadPanel — a thread reply can't itself spawn a
    *  nested thread, so the thread affordances are hidden there. */
   threadable?: boolean;
@@ -974,7 +1029,7 @@ export function MessageItem({
           ) : editing ? (
             <EditBox draft={editDraft} onChange={setEditDraft} onSave={saveEdit} onCancel={() => setEditing(false)} />
           ) : (
-            renderBlocks(message.head.blocks, names)
+            renderBlocks(message.head.blocks, names, onTagClick)
           )}
         </div>
         {confirmingDelete && (
@@ -1003,6 +1058,8 @@ export function MessageItem({
       </div>
       {showBar && (
         <HoverBar
+          channelId={message.channel_id}
+          seq={message.seq}
           onQuickReact={onReact}
           onOpenPicker={() => {
             onMenuToggle(false);

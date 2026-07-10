@@ -9,6 +9,7 @@ import {
   blocksText,
   channels,
   createChannel,
+  isModuleChannel,
   joinHuddle,
   keyBytes,
   keyHex,
@@ -17,22 +18,15 @@ import {
   postMessage,
   searchMessages,
   sweepHuddle,
+  tagSearch,
+  tags,
   thread,
 } from "./chat-client";
 import type { MessageView } from "./chat-client";
-import type { NodeTransport } from "./transport";
+import { makeTransportStub } from "../test/transport-stub";
 
-const stubTransport = (reply?: unknown): NodeTransport => ({
-  submit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
-  query: vi.fn().mockResolvedValue(reply),
-  view: vi.fn(),
-  putBlob: vi.fn(),
-  getBlob: vi.fn(),
-  status: vi.fn(),
-  metrics: vi.fn(),
-  blocks: vi.fn(),
-  onBlock: vi.fn(),
-});
+const stubTransport = (reply?: unknown) =>
+  makeTransportStub({ query: vi.fn().mockResolvedValue(reply) });
 
 const wireMessage = (over: Partial<MessageView["head"]> = {}): MessageView => ({
   channel_id: "general",
@@ -198,6 +192,15 @@ describe("chat queries", () => {
   });
 });
 
+describe("isModuleChannel", () => {
+  it("reserves ':' ids for modules and passes user ids through", () => {
+    expect(isModuleChannel("forge:ducktape:1")).toBe(true);
+    expect(isModuleChannel("forge:my-repo:42")).toBe(true);
+    expect(isModuleChannel("general")).toBe(false);
+    expect(isModuleChannel("release-2026")).toBe(false);
+  });
+});
+
 describe("rendering helpers", () => {
   it("decodes every AuthorRef variant to a display name", () => {
     expect(authorName({ user: Array.from(new TextEncoder().encode("jess")) })).toBe("jess");
@@ -237,6 +240,41 @@ describe("materialized view (search)", () => {
     const hits = await searchMessages(transport, { text: "fluent", channelId: "general" });
     expect(transport.view).toHaveBeenCalledWith("chat", {
       search: { text: "fluent", channelId: "general", limit: undefined },
+    });
+    expect(hits).toEqual([hit]);
+  });
+
+  it("posts the tag-catalog request and unwraps tag rows", async () => {
+    const row = { tag: "rust", count: 3, lastSeq: 7 };
+    const transport = stubTransport();
+    (transport.view as ReturnType<typeof vi.fn>).mockResolvedValue({ tags: [row] });
+
+    const rows = await tags(transport, { channelId: "general" });
+    expect(transport.view).toHaveBeenCalledWith("chat", {
+      tags: { channelId: "general", limit: undefined },
+    });
+    expect(rows).toEqual([row]);
+  });
+
+  it("posts the tagSearch request (display form passes through) and unwraps hits", async () => {
+    const hit = {
+      channelId: "general",
+      seq: 2,
+      messageId: "m2",
+      author: "user:jess",
+      height: 5,
+      time: 1_001,
+      text: "shipping #Rust today",
+      deleted: false,
+      edited: false,
+      tags: ["rust"],
+    };
+    const transport = stubTransport();
+    (transport.view as ReturnType<typeof vi.fn>).mockResolvedValue({ hits: [hit] });
+
+    const hits = await tagSearch(transport, { tag: "Rust", channelId: "general", limit: 100 });
+    expect(transport.view).toHaveBeenCalledWith("chat", {
+      tagSearch: { tag: "Rust", channelId: "general", limit: 100 },
     });
     expect(hits).toEqual([hit]);
   });

@@ -25,13 +25,15 @@ content is intentionally reader-specific.
   build, and index it.
 - Put accepted decision records under `docs/adr` when the decision boundary
   should outlive an implementation branch.
+- Put maintained non-page records that are not ADRs or operator runbooks under
+  `docs/records`; keep them listed from the `reference/design-records` pages.
 - Keep operator runbooks as standalone Markdown only when an operator still
   executes them directly.
-- Treat `docs/superpowers/plans` as temporary execution scaffolding. Once a plan
-  ships, fold durable facts into Vocs, ADRs, tests, or code comments and prune
-  the plan.
-- Keep `docs/superpowers/specs` only for active protocol/design contracts that
-  are not yet better expressed as Vocs pages or ADRs.
+- Keep `docs/superpowers` small and reviewed: active design records, approved
+  specs, and execution plans may stay there until durable facts are folded into
+  Vocs, ADRs, maintained runbooks, tests, or code comments. Do not prune a
+  document just because it lives under `docs/superpowers`; prune it only after a
+  content review identifies its replacement owner or shows it is obsolete.
 
 The Vocs reference page `reference/design-records` in each track lists the
 non-page records that are still maintained and explains the current pruning

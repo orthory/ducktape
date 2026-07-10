@@ -1,10 +1,11 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { PageBlock } from "../../../domain/pages-client";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
+import { color } from "../../theme/tokens";
 import { EDIT_BOUNDARY_MS, PagesView } from "./PagesView";
 
 const makeActions = () => {
@@ -77,6 +78,28 @@ describe("PagesView", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Open Retro" }));
     expect(spies.openPage).toHaveBeenCalledWith("p2");
+  });
+
+  it("deletes a page through an in-app dialog", () => {
+    const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { spies } = renderPagesView();
+
+    try {
+      const retro = screen.getByRole("button", { name: "Open Retro" });
+      const row = retro.closest('[role="treeitem"]');
+      expect(row).not.toBeNull();
+      fireEvent.mouseEnter(row!);
+      fireEvent.click(screen.getByRole("button", { name: /more actions for Retro/i }));
+      fireEvent.click(screen.getByRole("menuitem", { name: /^delete$/i }));
+
+      const dialog = screen.getByRole("dialog", { name: /delete Retro/i });
+      expect(nativeConfirm).not.toHaveBeenCalled();
+      fireEvent.click(within(dialog).getByRole("button", { name: /delete page/i }));
+
+      expect(spies.deletePage).toHaveBeenCalledWith("p2");
+    } finally {
+      nativeConfirm.mockRestore();
+    }
   });
 
   it("drops the block-id/count clutter — no permanent hash chip, no block counter", () => {
@@ -297,14 +320,24 @@ describe("Pages keyboard shortcuts & tab strip", () => {
     expect(spies.createChildPage).toHaveBeenNthCalledWith(2, null);
   });
 
-  it("leaves ⌘W to the window — it never closes a doc tab or creates a page", () => {
+  it("closes the active doc tab on ⌘W and Ctrl+W", () => {
     const { spies } = withTabs();
     fireEvent.keyDown(document, { code: "KeyW", metaKey: true });
-    expect(spies.closeTab).not.toHaveBeenCalled();
+    expect(spies.closeTab).toHaveBeenLastCalledWith("p1");
+    fireEvent.keyDown(document, { code: "KeyW", ctrlKey: true });
+    expect(spies.closeTab).toHaveBeenCalledTimes(2);
     expect(spies.openPage).not.toHaveBeenCalled();
-    // createChildPage is spied lazily on first access; ⌘W must never reach it,
-    // so the spy stays undefined (and if present, uncalled).
-    if (spies.createChildPage) expect(spies.createChildPage).not.toHaveBeenCalled();
+  });
+
+  it("⌘W with no open doc falls through to the window untouched", () => {
+    const { spies } = renderPagesView({
+      activePage: null,
+      activePageBlocks: [],
+      openTabs: [],
+    });
+    fireEvent.keyDown(document, { code: "KeyW", metaKey: true });
+    // closeTab is spied lazily on first access; ⌘W must never reach it.
+    if (spies.closeTab) expect(spies.closeTab).not.toHaveBeenCalled();
   });
 
   it("keeps the tab strip scrollable but hides the scrollbar chrome", () => {
@@ -316,24 +349,155 @@ describe("Pages keyboard shortcuts & tab strip", () => {
     expect(strip.className).toContain("no-scrollbar");
   });
 
-  it("writes a page comment through the panel composer (no window.prompt)", () => {
+});
+
+describe("floating comment card", () => {
+  const threadsOn = (target: string) => [
+    {
+      target,
+      threads: [
+        {
+          thread: {
+            id: "t1",
+            target,
+            opener: { user: [1] },
+            created_at: 1,
+            resolved: false,
+            resolved_by: null,
+            comment_ids: ["c1"],
+          },
+          comments: [
+            {
+              id: "c1",
+              thread_id: "t1",
+              author: { user: [1] },
+              text: "a note",
+              created_at: 1,
+              edited_at: null,
+              deleted: false,
+            },
+          ],
+        },
+      ],
+    },
+  ] as ConsoleState["pageThreads"];
+
+  it("opens a floating card on the block comment button — never the panel", () => {
+    renderPagesView({ pageThreads: threadsOn("a") });
+    fireEvent.click(screen.getByRole("button", { name: "Comment on block 1" }));
+    screen.getByRole("dialog", { name: "Comments on this block" });
+    expect(screen.queryByRole("complementary", { name: "Comments" })).toBeNull();
+  });
+
+  it("writes a page comment through the header card; Escape dismisses it", () => {
     const { spies } = renderPagesView();
 
     fireEvent.click(screen.getByRole("button", { name: "Comment on page" }));
-    // the panel opens with the composer aimed at the page.
-    screen.getByRole("form", { name: "New comment on this page" });
+    const dialog = screen.getByRole("dialog", { name: "Comments on this page" });
+    expect(screen.queryByRole("complementary", { name: "Comments" })).toBeNull();
 
-    fireEvent.change(screen.getByLabelText("New comment text"), {
+    // an uncommented page opens straight into the composer.
+    fireEvent.change(within(dialog).getByLabelText("New comment text"), {
       target: { value: "ship checklist looks thin" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Add comment" }));
-
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add comment" }));
     expect(spies.addComment).toHaveBeenCalledWith({
       target: "p1",
       text: "ship checklist looks thin",
     });
-    // submit dismisses the composer; the panel itself stays open.
-    expect(screen.queryByRole("form", { name: "New comment on this page" })).toBeNull();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Comments on this page" })).toBeNull();
+  });
+
+  it("still opens the aside panel from the header Comments toggle", () => {
+    renderPagesView();
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
     screen.getByRole("complementary", { name: "Comments" });
+    expect(screen.queryByRole("dialog", { name: /comments on/i })).toBeNull();
+  });
+
+  it("hover reveals the comment affordance but no copy-block-link", () => {
+    renderPagesView();
+    fireEvent.mouseOver(screen.getByLabelText("Edit paragraph block 1"));
+    screen.getByRole("button", { name: "Comment on block 1" });
+    expect(screen.queryByRole("button", { name: /copy link to block/i })).toBeNull();
+  });
+});
+
+describe("subpages", () => {
+  const withChild = {
+    pages: [
+      { id: "p1", title: "Launch plan", parent: null },
+      { id: "p2", title: "Retro", parent: null },
+      { id: "p3", title: "Child", parent: "p1" },
+    ],
+  };
+
+  it("lists child pages in a Subpages section and opens them", () => {
+    const { spies } = renderPagesView(withChild);
+    fireEvent.click(screen.getByRole("button", { name: "Open subpage Child" }));
+    expect(spies.openPage).toHaveBeenCalledWith("p3");
+  });
+
+  it("renders no Subpages section when the page has no children", () => {
+    renderPagesView();
+    expect(screen.queryByText("Subpages")).toBeNull();
+  });
+
+  it("creates a subpage from /page instead of converting the block", () => {
+    const { spies } = renderPagesView();
+    const area = screen.getByLabelText("Edit paragraph block 1");
+    fireEvent.focus(area);
+    fireEvent.change(area, { target: { value: "/page" } });
+    fireEvent.mouseDown(screen.getByRole("option", { name: /new subpage/i }));
+    expect(spies.createChildPage).toHaveBeenCalledWith("p1");
+    // the block itself must NOT be converted to a "page" kind.
+    if (spies.setPageBlockKind) expect(spies.setPageBlockKind).not.toHaveBeenCalled();
+  });
+});
+
+describe("endless canvas", () => {
+  const appended = expect.objectContaining({
+    parent: "p1",
+    after: "b",
+    kind: "paragraph",
+    text: "",
+  });
+
+  it("appends a block on mousedown of Add a block — before blur can commit", () => {
+    const { spies } = renderPagesView();
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Add a block" }));
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(appended);
+  });
+
+  it("appends on keyboard activation (detail-0 click) but not twice per pointer press", () => {
+    const { spies } = renderPagesView();
+    const btn = screen.getByRole("button", { name: "Add a block" });
+    // Enter/Space on the focused button synthesizes a click with detail 0
+    // and no preceding mousedown — the button must still work.
+    fireEvent.click(btn, { detail: 0 });
+    expect(spies.insertPageBlock).toHaveBeenCalledTimes(1);
+    // a real pointer press fires mousedown AND a trailing detail-1 click;
+    // that must append exactly once.
+    fireEvent.mouseDown(btn);
+    fireEvent.click(btn, { detail: 1 });
+    expect(spies.insertPageBlock).toHaveBeenCalledTimes(2);
+  });
+
+  it("appends a block when the canvas below the content is pressed", () => {
+    const { spies } = renderPagesView();
+    fireEvent.mouseDown(screen.getByTestId("page-canvas-filler"));
+    expect(spies.insertPageBlock).toHaveBeenCalledWith(appended);
+  });
+
+  it("has no canvas filler without an open page", () => {
+    renderPagesView({ activePage: null, activePageBlocks: [], openTabs: [] });
+    expect(screen.queryByTestId("page-canvas-filler")).toBeNull();
+  });
+
+  it("drops the bordered page card — the scroll surface itself is paper", () => {
+    renderPagesView();
+    expect(screen.getByTestId("doc-scroll")).toHaveStyle({ background: color.paper });
   });
 });

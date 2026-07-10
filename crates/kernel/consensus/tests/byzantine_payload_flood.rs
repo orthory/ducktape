@@ -105,9 +105,9 @@ fn sentinel_garbage() -> Vec<u8> {
 
 /// the SHARPER attack: a perfectly WELL-FORMED node frame (it would `decode_frame`
 /// + `host.submit` cleanly) that the byzantine peer NEVER submitted to consensus.
-/// its origin/key (`Z`/`zzz`) is disjoint from every honest op. content-addressing
-/// stores it under `digest_of(frame)`, which is never finalized (never proposed),
-/// so it is never delivered — isolating the defense from mere frame-validity.
+///   its origin/key (`Z`/`zzz`) is disjoint from every honest op. content-addressing
+///   stores it under `digest_of(frame)`, which is never finalized (never proposed),
+///   so it is never delivered — isolating the defense from mere frame-validity.
 fn unproposed_valid_frame() -> Vec<u8> {
     encode_frame(&op_signer(200), 0, &kv_set(b"zzz", b"999"))
 }
@@ -261,7 +261,7 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
 
     // PUMP to convergence: stop only when EVERY node has applied the whole op-set.
     let target = ops.len();
-    let mut applied = vec![0usize; N];
+    let mut applied = [0usize; N];
     loop {
         context.sleep(Duration::from_millis(50)).await;
         for (i, n) in nodes.iter_mut().enumerate() {
@@ -269,6 +269,10 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
             // store-only) reaches `decode_frame` here: random bytes Err out (this
             // `.expect` panics) and the well-formed frame would inflate `applied`
             // past `target` (asserted below). store-only is enforced, not assumed.
+            // the production drain flushes the batch window every BLOCK_TIME tick
+            // (bin/node main); enqueue-only submits never propose without it — the
+            // sim mirrors that cadence (a no-op when nothing is pending).
+            n.flush_batch().await.expect("flush");
             applied[i] += n.drain_delivered().await.expect("drain");
         }
         if applied.iter().all(|&c| c == target) {

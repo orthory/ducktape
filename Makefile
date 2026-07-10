@@ -13,7 +13,7 @@ BIN_DEST ?= $(HOME)/.cargo/bin
 
 UNAME_S := $(shell uname -s)
 
-.PHONY: all dev dogfood-forge node web app sidecar install install-node install-app test clean
+.PHONY: all dev demo-seed demo-app dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean
 
 all: node web
 
@@ -24,6 +24,21 @@ all: node web
 dev:
 	@bash ops/dev.sh
 
+## seed a local "demo" network preloaded with sample data — chat channels +
+## messages, a tasks board, pages, a registered agent (with a live @mention run),
+## jobs, an inbox note, an automation rule — plus TWO gateway web-app routes: a
+## NETWORK-hosted static site (DuckFS) and a USER-hosted loopback app. Registers a
+## "demo" workspace in ~/.ducktape and makes it active; just open the app. Builds
+## ducktape-node if needed (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
+demo-seed:
+	@bash ops/demo-seed.sh
+
+## serve the user-hosted web app behind the demo's app.<id>.duck gateway route
+## (demo-seed publishes the route; this runs the loopback server it proxies to).
+## Foreground — Ctrl-C to stop. See ops/demo-app.sh.
+demo-app:
+	@bash ops/demo-app.sh
+
 ## dogfood: host ducktape's own source in the local dev node's forge module.
 ## registers a static `ducktape-dev` git remote at the node's forge endpoint and
 ## pushes `main` (needs a running dev node — `make dev`). see ops/dogfood-forge.sh.
@@ -33,6 +48,14 @@ dogfood-forge:
 ## release build of the networked node (serves the app surface)
 node:
 	$(CARGO) build --release -p node-bin
+
+## release build of the untrusted UDP coordinator
+coordinator:
+	$(CARGO) build --release -p coordinator-bin
+
+## coordinator-only verification gate: CLI/policy tests + live UDP smoke
+coordinator-smoke:
+	$(CARGO) test -p coordinator-bin
 
 ## stage the daemon as the desktop app's sidecar (app/src-tauri/binaries)
 sidecar: app/node_modules
@@ -45,23 +68,36 @@ web: app/node_modules
 ## desktop build — stages the sidecar itself via beforeBuildCommand. on macOS
 ## a bundle (.app + .dmg under target/release/bundle); on Linux the plain
 ## binary at target/release/ducktape-desktop (--no-bundle: install-app wants
-## only the binary, and no deb/rpm/appimage packagers are needed).
+## only the binary, and no deb/rpm/appimage packagers are needed). the dmg
+## post-fix hides .VolumeIcon.icns, which macOS 26 Finder would otherwise
+## show overlapping the app icon — see ops/fix-dmg.sh.
 ifeq ($(UNAME_S),Darwin)
 app: app/node_modules
 	cd app && $(BUN) run tauri build
+	bash ops/fix-dmg.sh
 else
 app: app/node_modules
 	cd app && $(BUN) run tauri build --no-bundle
 endif
 
-app/node_modules:
+# re-run bun install whenever the manifest or lockfile changes, not just when
+# node_modules is absent; the touch keeps the dir newer than its prerequisites
+# (bun does not reliably update the dir mtime when nothing needs fetching).
+app/node_modules: app/package.json app/bun.lock
 	cd app && $(BUN) install
+	touch app/node_modules
 
 install: install-node install-app
 
 ## ducktape-node -> ~/.cargo/bin
 install-node:
 	$(CARGO) install --path bin/node --locked
+
+## coordinator -> ~/.cargo/bin/ducktape-coordinator
+install-coordinator:
+	$(CARGO) build --release -p coordinator-bin
+	mkdir -p "$(BIN_DEST)"
+	install -m 755 target/release/coordinator "$(BIN_DEST)/ducktape-coordinator"
 
 ## macOS: Ducktape.app -> $(APP_DEST); Linux: ducktape -> $(BIN_DEST),
 ## alongside install-node's ducktape-node so the app's sidecar resolution
@@ -77,7 +113,12 @@ install-app: app
 	mkdir -p "$(BIN_DEST)"
 	install -m 755 target/release/ducktape-desktop "$(BIN_DEST)/ducktape"
 	@echo "installed $(BIN_DEST)/ducktape"
+	bash ops/install-desktop-entry.sh "$(BIN_DEST)/ducktape"
 endif
+
+## regenerate app/src/domain/stream.gen.ts from the stream contract
+stream-types:
+	$(CARGO) test -p noded export_ts_bindings
 
 ## the full LOCAL verification gate (no hosted CI by design — run this before
 ## every push): the rust workspace including the process-level e2e suites
@@ -87,6 +128,8 @@ endif
 ## and the sim node staged so the provider scenario suite runs too.
 test: app/node_modules
 	$(CARGO) test --workspace
+	$(MAKE) stream-types
+	git diff --exit-code -- app/src/domain/stream.gen.ts
 	$(CARGO) build -p noded -p simnode
 	cd app && $(BUN) run typecheck
 	cd app && DUCKTAPE_NODED_BIN=$(abspath target/debug/ducktape-noded) DUCKTAPE_SIMNODE_BIN=$(abspath target/debug/ducktape-simnode) $(BUN) run test

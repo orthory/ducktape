@@ -130,14 +130,19 @@ describe("AgentView", () => {
     fireEvent.click(screen.getByRole("button", { name: /resume agent/i }));
     expect(spies.resumeAgent).toHaveBeenCalledWith("qa-agent");
 
-    // Ask-to-respond defaults to the channel's latest message (42), no anchor step.
-    fireEvent.change(screen.getByLabelText("Channel"), { target: { value: "general" } });
-    fireEvent.click(screen.getByRole("button", { name: /ask to respond/i }));
-    expect(spies.requestRun).toHaveBeenCalledWith({
-      agentId: "qa-agent",
-      channelId: "general",
-      anchorSeq: 42,
-    });
+    // Ask-to-respond moved onto the message in chat — the management page
+    // no longer hosts the form.
+    expect(screen.queryByText(/ask to respond/i)).toBeNull();
+  });
+
+  it("renders roster, detail, and the three tabs after the split", () => {
+    renderAgents();
+
+    expect(screen.getByRole("complementary", { name: /agent roster/i })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: /agent detail/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /agents/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /auto-reply/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /activity/i })).toBeInTheDocument();
   });
 
   it("adds an agent through the focused Add-agent pane", () => {
@@ -351,6 +356,141 @@ describe("AgentView", () => {
     expect(
       screen.queryByRole("button", { name: /cancel run general\/42\/summarizer/i }),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("RunsOnPicker", () => {
+  it("collapses Model and Effort to Default when only bare tags are announced", () => {
+    const { spies } = renderAgents({ capabilities: ["claude", "codex"] });
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+
+    // Bare provider tags have no variants: nothing to cascade into.
+    const model = screen.getByLabelText("Model");
+    const effort = screen.getByLabelText("Effort");
+    expect(model).toHaveValue("");
+    expect(within(model).getByRole("option", { name: "Default" })).toBeInTheDocument();
+    expect(model).toBeDisabled();
+    expect(within(effort).getByRole("option", { name: "Default" })).toBeInTheDocument();
+    expect(effort).toBeDisabled();
+
+    // The stored capability is the bare announced tag, through the
+    // unchanged register payload.
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage" },
+    });
+    fireEvent.change(screen.getByLabelText("System prompt"), { target: { value: "x" } });
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ capability: "claude" }),
+    );
+  });
+
+  it("cascades provider → model → effort across the announced matrix", () => {
+    const { spies } = renderAgents({
+      capabilities: [
+        "codex",
+        "codex_gpt-5.5_low",
+        "codex_gpt-5.5_xhigh",
+        "codex_gpt-5.4-mini_high",
+        "claude_opus_max",
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /add agent/i }));
+    const runsOn = screen.getByLabelText("Runs on");
+
+    // Defaults to the first announced tag: bare codex → Default/Default.
+    expect(runsOn).toHaveValue("codex");
+    expect(screen.getByLabelText("Model")).toHaveValue("");
+
+    // Model options = only combinations announced for the provider.
+    const model = screen.getByLabelText("Model");
+    expect(within(model).getByRole("option", { name: "Default" })).toBeInTheDocument();
+    expect(within(model).getByRole("option", { name: "gpt-5.5" })).toBeInTheDocument();
+    expect(within(model).getByRole("option", { name: "gpt-5.4-mini" })).toBeInTheDocument();
+
+    // Picking a model adopts its first announced effort; the composed tag
+    // is shown verbatim under the picker.
+    fireEvent.change(model, { target: { value: "gpt-5.5" } });
+    expect(screen.getByLabelText("Effort")).toHaveValue("low");
+    expect(screen.getByText("codex_gpt-5.5_low")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Effort"), { target: { value: "xhigh" } });
+    expect(screen.getByText("codex_gpt-5.5_xhigh")).toBeInTheDocument();
+
+    // Switching model narrows efforts to what that model announced.
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.4-mini" } });
+    expect(screen.getByLabelText("Effort")).toHaveValue("high");
+
+    // A provider with no base tag composes its first variant.
+    fireEvent.change(runsOn, { target: { value: "claude" } });
+    expect(screen.getByLabelText("Model")).toHaveValue("opus");
+    expect(screen.getByText("claude_opus_max")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Agent display name"), {
+      target: { value: "Triage" },
+    });
+    fireEvent.change(screen.getByLabelText("System prompt"), { target: { value: "x" } });
+    fireEvent.click(screen.getByRole("button", { name: /register agent/i }));
+    expect(spies.registerAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ capability: "claude_opus_max" }),
+    );
+  });
+
+  it("pins a stored tag that is no longer announced, marked offline", () => {
+    // Agent "summarizer" stores capability "alpha" — no longer announced.
+    const { spies } = renderAgents({ capabilities: ["codex"] });
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for summary agent/i }));
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+    fireEvent.click(within(detail).getByRole("button", { name: /^edit$/i }));
+
+    const runsOn = screen.getByLabelText("Runs on");
+    expect(runsOn).toHaveValue("alpha");
+    expect(within(runsOn).getByRole("option", { name: "Alpha (offline)" })).toBeInTheDocument();
+    expect(within(runsOn).getByRole("option", { name: "Codex" })).toBeInTheDocument();
+
+    // Saving without touching the field keeps the stored tag — an edit never
+    // silently rewrites which executor the agent runs on.
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    expect(spies.updateAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ capability: "alpha" }),
+    );
+  });
+
+  it("pins an offline variant tag through the whole cascade", () => {
+    renderAgents({
+      capabilities: ["codex"],
+      agents: [
+        {
+          agent_id: "researcher",
+          owner: "system" as const,
+          display_name: "Researcher",
+          capability: "claude_opus_max",
+          prompt_hash: bytes(0x11),
+          allowed_actions: ["chat.post"],
+          status: "active" as const,
+          created_at: 10,
+          updated_at: 20,
+        },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /open details for researcher/i }));
+    const detail = screen.getByRole("region", { name: /agent detail/i });
+    fireEvent.click(within(detail).getByRole("button", { name: /^edit$/i }));
+
+    const runsOn = screen.getByLabelText("Runs on");
+    expect(runsOn).toHaveValue("claude");
+    expect(
+      within(runsOn).getByRole("option", { name: "Claude (offline)" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Model")).toHaveValue("opus");
+    expect(
+      within(screen.getByLabelText("Model")).getByRole("option", { name: "opus (offline)" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Effort")).toHaveValue("max");
   });
 });
 

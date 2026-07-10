@@ -16,12 +16,12 @@ saga = { workspace = true }
 dispatch = { workspace = true }
 tagging = { workspace = true }
 tasks = { workspace = true }
-profiles = { workspace = true }
 identity = { workspace = true }
+duckdns = { workspace = true }
+gateway = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
-memory = { workspace = true }
 jobs = { workspace = true }
 valset = { workspace = true }
 sdk = { workspace = true }

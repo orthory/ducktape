@@ -1,3 +1,7 @@
+---
+showAskAi: false
+---
+
 # Node Upgrades
 
 Some changes to a Ducktape node cannot simply be rolled out one server at a
@@ -7,6 +11,12 @@ one validator runs the new logic while another runs the old, the two compute
 different app-hashes for the next block and the network forks or halts. This
 page explains the policy that lets Ducktape ship such a change to a **live**
 network with **zero network downtime**.
+
+Related: [agent Node Upgrades](/en/agent/network/node-upgrades) is the operator
+runbook, [State Sync](/en/human/architecture/state-sync) covers joining across
+activation, [Implementation Status](/en/human/reference/implementation-status)
+marks the built upgrade surface, and [What Is Left](/en/human/roadmap/what-is-left)
+tracks remaining gaps.
 
 ## Why an ordinary rolling restart forks
 
