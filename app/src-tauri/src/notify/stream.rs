@@ -20,9 +20,12 @@ use tokio_tungstenite::tungstenite::Message;
 use super::engine::{Engine, Frame, Sink};
 
 /// The notifier's fixed topic set — subscribed once per connection.
-pub const TOPICS: [&str; 4] = [
+/// `module:dispatch` carries the runs module's Dispatch ops, whose envelope
+/// names the chat thread a run answers — the run-finished deep-link's source.
+pub const TOPICS: [&str; 5] = [
     "module:chat",
     "module:runs",
+    "module:dispatch",
     "module:forge",
     "module:governance",
 ];
@@ -517,7 +520,7 @@ mod tests {
         assert_eq!(frame["op"], "subscribe");
         assert_eq!(
             frame["topics"],
-            json!(["module:chat", "module:runs", "module:forge", "module:governance"])
+            json!(["module:chat", "module:runs", "module:dispatch", "module:forge", "module:governance"])
         );
         assert!(
             frame.get("resume").is_none(),
