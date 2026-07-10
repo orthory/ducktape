@@ -19,6 +19,9 @@ BIN_DEST ?= $(HOME)/.cargo/bin
 # it to the macOS bundler for the framework/helper copy).
 CEF_CLONE ?= $(HOME)/.cache/ducktape-cef-probe/tauri-cef
 export CEF_PATH ?= $(HOME)/.local/share/cef
+# setup.sh drops a ninja binary here on Macs that lack one (cef-dll-sys
+# hardcodes the Ninja CMake generator); make sure child builds can see it.
+export PATH := $(dir $(CEF_CLONE))bin:$(PATH)
 
 UNAME_S := $(shell uname -s)
 
