@@ -3,7 +3,7 @@
 Date: 2026-07-10. Status: **Proposed**. This ADR fixes the protocol boundary
 for sub-second transaction feedback in Ducktape. Validators build up to ten
 100 ms fastblocks inside the existing one-second canonical batch window and
-issue a transferable `2f + 1` certificate before the UI calls a transaction
+issue a transferable quorum certificate before the UI calls a transaction
 preconfirmed. Simplex remains the only source of canonical order, execution,
 height, app hash, and finality.
 
@@ -19,14 +19,17 @@ window, the validator elected to propose the next Simplex view acts as a
 temporary **assembler**. It selects an append-only sequence of transaction
 frames and asks the validator set to certify each increment.
 
+For an epoch with `n` validators, v1 uses the same Commonware `N3f1` functions
+as Simplex: `f = floor((n - 1) / 3)` tolerated faults and quorum `q = n - f`.
+
 A proposal, an assembler signature, or a transport-authenticated message is
 not a preconfirmation. The externally meaningful receipt is a
 **Promise Quorum Certificate** (`PromiseQC`) containing acknowledgements from
-at least `2f + 1` validators. An honest validator sends that acknowledgement
+at least `q` validators. An honest validator sends that acknowledgement
 only after it has:
 
 1. validated and durably pinned every frame in the increment;
-2. verified a `2f + 1` availability certificate for the same proposal;
+2. verified a `q`-validator availability certificate for the same proposal;
 3. persisted a promise lock before signing; and
 4. committed to reject any canonical successor that omits or reorders the
    certified prefix.
@@ -44,8 +47,8 @@ The fixed v1 parameters are:
 | `CANONICAL_BUILD_WINDOW` | 1 s | Existing target window for one canonical batch |
 | `FASTBLOCK_PERIOD` | 100 ms | Target publication cadence and per-index deadline |
 | `FASTBLOCKS_PER_WINDOW` | 10 | Maximum certified increments before sealing |
-| `VALIDATOR_COUNT` | `n = 3f + 1` | Standard Byzantine fault model |
-| `FASTBLOCK_QUORUM` | `q = 2f + 1` | Availability and promise certificate threshold |
+| `MAX_FAULTS` | `f = floor((n - 1) / 3)` | Same `N3f1` fault function as Simplex |
+| `FASTBLOCK_QUORUM` | `q = n - f` | Same `N3f1` quorum function as Simplex; equals `2f + 1` when `n = 3f + 1` |
 | `PROMISE_SERVICE_ID` | `5` | Append-only data-plane service registry value |
 | stream / datagram ports | `45805` / `45905` | Per-use PromiseNet overlay ports |
 | user-visible guarantee | inclusion | Ordered inclusion, not successful execution |
@@ -164,7 +167,9 @@ it. If more than `f` validators are faulty, the guarantee no longer applies.
 
 The protocol assumes:
 
-- a validator set of `n = 3f + 1` derived from finalized consensus state;
+- a validator set of `n` members derived from finalized consensus state, with
+  `f = floor((n - 1) / 3)` and `q = n - f` from the same Commonware `N3f1`
+  functions used by Simplex;
 - at most `f` Byzantine validators per epoch;
 - unforgeable validator signatures and collision-resistant hashes;
 - crash-recoverable local storage for pinned bodies, votes, certificates, and
@@ -414,7 +419,7 @@ struct AvailabilityQCV1 {
     codec_version: u16,
     proposal_hash: [u8; 32],
     signer_bitmap: ValidatorBitmap,
-    signatures: Vec<Signature>,     // >= 2f + 1, canonical validator order
+    signatures: Vec<Signature>,     // >= q, canonical validator order
 }
 
 struct PromiseAckV1 {
@@ -431,7 +436,7 @@ struct PromiseQCV1 {
     codec_version: u16,
     proposal_hash: [u8; 32],
     signer_bitmap: ValidatorBitmap,
-    signatures: Vec<Signature>,     // >= 2f + 1, canonical validator order
+    signatures: Vec<Signature>,     // >= q, canonical validator order
 }
 
 struct LockNackV1 {
@@ -583,7 +588,7 @@ After installing that lock, it refuses any later incompatible availability
 vote or promise acknowledgement for the same parent. In v1 a view change
 recovers the existing session and cannot mint a second one.
 
-Only then may it sign `PromiseAck`. The assembler combines `2f + 1` such
+Only then may it sign `PromiseAck`. The assembler combines `q` such
 acknowledgements into `PromiseQC`, broadcasts the certificate to all validators
 over the control stream, and produces per-frame receipts with Merkle proofs.
 
@@ -600,16 +605,18 @@ its own `PromiseAck` as binding immediately, even if it has not yet received
 the assembled `PromiseQC`; otherwise an assembler could hide a valid receipt
 from its signers.
 
-A partial acknowledgement set can leave fewer than `f + 1` honest validators
-locked even though no `PromiseQC` was possible. Those validators still reject
-an omitting proposal and send the active proposer a signed `LockNack` carrying
-the unique availability certificate. This can delay a view, so recovery treats
-even one valid NACK as a reason to include the prepared tail. If an omitting
-canonical successor nevertheless finalizes, that finalization proves—under the
-same `f`-fault assumption—that no hidden `PromiseQC` existed, because a real
-one would have supplied at least `f + 1` honest blockers. The validator then
-records `UncommittedLockSuperseded` and may clear that partial lock. A matching
-seal clears it normally. A timer alone never deletes an unresolved lock.
+A partial acknowledgement set can leave honest validators locked even though
+no `PromiseQC` was possible. Even one can delay liveness when Byzantine nodes
+withhold their Simplex votes, and `f + 1` can block an omitting quorum. Every
+locker therefore rejects an omitting proposal and sends the active proposer a
+signed `LockNack` carrying the unique availability certificate. Recovery
+treats even one valid NACK as a reason to include the prepared tail. If an
+omitting canonical successor nevertheless finalizes, that finalization
+proves—under the same `f`-fault assumption—that no hidden `PromiseQC` existed,
+because a real one would have supplied at least `f + 1` honest blockers. The
+validator then records `UncommittedLockSuperseded` and may clear that partial
+lock. A matching seal clears it normally. A timer alone never deletes an
+unresolved lock.
 An availability vote that never advances to a promise lock may be cleared on
 an authoritative view close; it is neither a receipt nor a canonical blocker.
 
@@ -690,11 +697,11 @@ receipt.
 
 On taking leadership for a parent that did not finalize, the new Simplex
 proposer first runs recovery over PromiseNet control streams. It waits for
-`2f + 1` signed,
-monotone responses containing each validator's highest persisted availability
-certificate, promise lock, and `PromiseQC`, plus body roots. Any set of
-`2f + 1` responders intersects the `f + 1` honest lockers behind a hidden valid
-receipt, so at least one response reveals the chain that must be carried.
+`q` signed, monotone responses containing each validator's highest persisted
+availability certificate, promise lock, and `PromiseQC`, plus body roots. A
+valid hidden receipt has at least `q - f = n - 2f` honest lockers; any `q`
+responders intersect them in at least `n - 3f >= 1` validator, so one response
+reveals the chain that must be carried.
 The proposer publishes its candidate seal before entering Simplex; any holder
 whose lock is absent proactively returns `LockNack`. If a candidate races past
 that repair and fails validation, the NACK accompanies the failed view so the
@@ -709,17 +716,18 @@ converges without requiring Byzantine validators to answer recovery.
   It does not issue a conflicting session for the same parent.
 - If any responder supplies a `PromiseQC`, the new proposer carries its
   highest contiguous prefix. If a valid receipt was hidden from every signer,
-  at least `f + 1` honest `PromiseAck` locks still expose the same proposal as
+  at least `q - f` honest `PromiseAck` locks still expose the same proposal as
   a prepared tail; including those frames fulfills the receipt without needing
   to reconstruct the withheld signer set.
 - If required bodies cannot be fetched, canonical progress pauses at that
-  parent. At least `f + 1` honest promise signers MUST retain them; the
+  parent. At least `q - f` honest promise signers MUST retain them; the
   resolver queries signers named in the certificates and uses the existing
   payload-resolution backstop. Discarding the promise is not a recovery option.
 
 An assembler cannot form two conflicting availability certificates at the
-same index: two `2f + 1` signer sets intersect in at least `f + 1` validators,
-including at least one honest validator, and honest validators vote once. v1's
+same index: two `q` signer sets intersect in at least
+`2q - n = n - 2f >= f + 1` validators, including at least one honest
+validator, and honest validators vote once. v1's
 one-session-per-parent rule means every availability certificate, partial
 promise lock, and `PromiseQC` reported during recovery belongs to that unique
 append-only chain.
@@ -753,8 +761,9 @@ binding.
 
 ### Certificate uniqueness
 
-Any two quorums of size `2f + 1` in a set of `3f + 1` intersect in at least
-`f + 1` validators. At least one member of that intersection is honest. Since
+Any two quorums of size `q = n - f` intersect in at least
+`2q - n = n - 2f >= f + 1` validators. At least one member of that intersection
+is honest. Since
 an honest validator durably records at most one availability vote and one
 promise acknowledgement for a given session/index, two conflicting
 certificates cannot exist within the unique parent session. A view change
@@ -767,11 +776,11 @@ cannot fork two certified suffixes from one prefix.
 
 ### Promise fulfillment
 
-A `PromiseQC` contains `2f + 1` acknowledgements, at least `f + 1` of them from
-honest validators that installed the same durable lock. A conflicting Simplex
-finalization also needs `2f + 1` votes. Excluding those `f + 1` honest blockers
-leaves at most `2f` possible voters, so a canonical successor that omits or
-reorders the promised prefix cannot finalize.
+A `PromiseQC` contains `q` acknowledgements, at least
+`q - f = n - 2f >= f + 1` of them from honest validators that installed the
+same durable lock. A conflicting Simplex finalization also needs `q` votes.
+Excluding those honest blockers leaves at most `2f < q` possible voters, so a
+canonical successor that omits or reorders the promised prefix cannot finalize.
 
 ### Cross-protocol race
 
@@ -785,11 +794,11 @@ certificate and a conflicting `PromiseQC` cannot both win a race.
 ### Data availability
 
 Every availability signer pins and can serve the full body before voting. An
-`AvailabilityQC` therefore names at least `f + 1` honest holders. Promise
-acknowledgements additionally persist the body reference and lock. This does
-not make bytes immortal, but it gives recovery a quorum-certified holder set
-and turns premature deletion into a slashable/observable protocol fault rather
-than an unspecified cache behavior.
+`AvailabilityQC` therefore names at least `q - f >= f + 1` honest holders.
+Promise acknowledgements additionally persist the body reference and lock.
+This does not make bytes immortal, but it gives recovery a quorum-certified
+holder set and turns premature deletion into a slashable/observable protocol
+fault rather than an unspecified cache behavior.
 
 ### Clock independence
 
@@ -1127,7 +1136,7 @@ sequencer would create a weaker trust model than the rest of the chain.
 Rejected; Ducktape borrows incremental building and cumulative capacity, not
 the authority model.
 
-### One-phase `2f + 1` availability certificate
+### One-phase quorum availability certificate
 
 Quorum intersection prevents conflicting certificates, but a Byzantine
 assembler could give the assembled certificate only to a client before honest
