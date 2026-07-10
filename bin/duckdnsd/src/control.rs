@@ -317,7 +317,7 @@ mod tests {
             .request(ControlRequest::Register {
                 workspace_id: "workspace-a".into(),
                 ingress: "127.0.0.1:18080".parse().unwrap(),
-                names: vec!["docs.team-a1b2c3d4.net.ducktape.quack".into()],
+                names: vec!["docs.team-a1b2c3d4.net.duck".into()],
                 lease_seconds: 30,
             })
             .await

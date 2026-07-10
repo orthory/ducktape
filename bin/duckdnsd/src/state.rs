@@ -168,12 +168,12 @@ mod tests {
             .replace(
                 "workspace-a".into(),
                 "127.77.0.1:18080".parse().unwrap(),
-                vec!["docs.team-a1b2c3d4.net.ducktape.quack".into()],
+                vec!["docs.team-a1b2c3d4.net.duck".into()],
                 1,
             )
             .unwrap();
-        assert!(state.resolves("DOCS.TEAM-A1B2C3D4.NET.DUCKTAPE.QUACK."));
-        assert!(!state.resolves("unknown.team-a1b2c3d4.net.ducktape.quack"));
+        assert!(state.resolves("DOCS.TEAM-A1B2C3D4.NET.DUCK."));
+        assert!(!state.resolves("unknown.team-a1b2c3d4.net.duck"));
         assert!(state.ingress().is_some());
 
         state.clear("workspace-a").unwrap();
@@ -193,7 +193,7 @@ mod tests {
                 .replace(
                     "a".into(),
                     "127.0.0.1:80".parse().unwrap(),
-                    vec!["Docs.team-a1b2c3d4.net.ducktape.quack".into()],
+                    vec!["Docs.team-a1b2c3d4.net.duck".into()],
                     5,
                 )
                 .is_err()
@@ -207,13 +207,13 @@ mod tests {
             .replace(
                 "workspace-a".into(),
                 "127.0.0.1:18080".parse().unwrap(),
-                vec!["docs.team-a1b2c3d4.net.ducktape.quack".into()],
+                vec!["docs.team-a1b2c3d4.net.duck".into()],
                 1,
             )
             .unwrap();
         std::thread::sleep(Duration::from_millis(1_050));
         assert_eq!(state.status(), SnapshotStatus::Inactive);
-        assert!(!state.resolves("docs.team-a1b2c3d4.net.ducktape.quack"));
+        assert!(!state.resolves("docs.team-a1b2c3d4.net.duck"));
         assert!(state.ingress().is_none());
     }
 }

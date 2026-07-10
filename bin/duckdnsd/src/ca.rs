@@ -330,7 +330,7 @@ mod tests {
         let same = CaStore::load_or_create(directory.path()).unwrap();
         assert_eq!(first.root_der(), same.root_der());
         assert_eq!(first.installation_id(), same.installation_id());
-        first.mint("docs.team-a1b2c3d4.net.ducktape.quack").unwrap();
+        first.mint("docs.team-a1b2c3d4.net.duck").unwrap();
 
         let rotated = CaStore::rotate(directory.path()).unwrap();
         assert_ne!(first.root_der(), rotated.root_der());

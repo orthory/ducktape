@@ -160,17 +160,14 @@ mod tests {
     #[test]
     fn websocket_origin_must_match_exact_https_origin() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            HOST,
-            HeaderValue::from_static("blog.orthory.ducktape.quack"),
-        );
+        headers.insert(HOST, HeaderValue::from_static("blog.orthory.duck"));
         headers.insert(
             HeaderName::from_static("upgrade"),
             HeaderValue::from_static("websocket"),
         );
         headers.insert(
             ORIGIN,
-            HeaderValue::from_static("https://blog.orthory.ducktape.quack"),
+            HeaderValue::from_static("https://blog.orthory.duck"),
         );
         assert!(
             prepare_headers(
@@ -182,9 +179,9 @@ mod tests {
             .is_ok()
         );
         for origin in [
-            "https://evil.ducktape.quack",
-            "http://blog.orthory.ducktape.quack",
-            "https://blog.orthory.ducktape.quack:444",
+            "https://evil.duck",
+            "http://blog.orthory.duck",
+            "https://blog.orthory.duck:444",
         ] {
             let mut request_headers = headers.clone();
             request_headers.insert(ORIGIN, HeaderValue::from_str(origin).unwrap());
@@ -199,10 +196,7 @@ mod tests {
             );
         }
 
-        headers.append(
-            ORIGIN,
-            HeaderValue::from_static("https://evil.ducktape.quack"),
-        );
+        headers.append(ORIGIN, HeaderValue::from_static("https://evil.duck"));
         assert_eq!(
             prepare_headers(
                 &Method::GET,
@@ -226,8 +220,8 @@ mod tests {
             )
             .is_err()
         );
-        headers.append(HOST, HeaderValue::from_static("a.ducktape.quack"));
-        headers.append(HOST, HeaderValue::from_static("b.ducktape.quack"));
+        headers.append(HOST, HeaderValue::from_static("a.duck"));
+        headers.append(HOST, HeaderValue::from_static("b.duck"));
         assert!(
             prepare_headers(
                 &Method::GET,
@@ -242,10 +236,7 @@ mod tests {
     #[test]
     fn structured_keep_alive_policy_rechecks_and_rebuilds_forwarding_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            HOST,
-            HeaderValue::from_static("blog.orthory.ducktape.quack"),
-        );
+        headers.insert(HOST, HeaderValue::from_static("blog.orthory.duck"));
         headers.insert(
             HeaderName::from_static("sec-fetch-site"),
             HeaderValue::from_static("cross-site"),
@@ -270,11 +261,11 @@ mod tests {
         );
         let prepared =
             prepare_headers(&Method::POST, &mut headers, "::1".parse().unwrap(), false).unwrap();
-        assert_eq!(prepared.hostname, "blog.orthory.ducktape.quack");
+        assert_eq!(prepared.hostname, "blog.orthory.duck");
         assert_eq!(headers["x-forwarded-for"], "::1");
         assert_eq!(
             headers["forwarded"],
-            "for=\"[::1]\";proto=https;host=\"blog.orthory.ducktape.quack\""
+            "for=\"[::1]\";proto=https;host=\"blog.orthory.duck\""
         );
     }
 }

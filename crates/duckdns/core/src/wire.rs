@@ -2,14 +2,18 @@
 //! [`DuckDnsQuery`] -> [`DuckDnsReply`]. Local loopback targets are deliberately
 //! absent because they are node configuration, never replicated state.
 //!
-//! `.quack` is intentionally Ducktape's sole private suffix. It is not reserved
+//! `.duck` is intentionally Ducktape's sole private suffix. It is not reserved
 //! by ICANN, so a future public delegation could collide with these device-local
 //! names. The helper must use split DNS for exactly [`DUCKDNS_ZONE`] and never
 //! forward this zone publicly.
 
 use serde::{Deserialize, Serialize};
 
-pub const DUCKDNS_ZONE: &str = "ducktape.quack";
+pub const DUCKDNS_ZONE: &str = "duck";
+/// Labels directly below `.duck` that route structural namespaces instead of
+/// account handles. Keep this list explicit so future roots cannot be claimed
+/// before their grammar is introduced.
+pub const RESERVED_ROOT_LABELS: &[&str] = &["net"];
 pub const MAX_LABEL_LEN: usize = 63;
 pub const NODE_LABEL_HEX_LEN: usize = 12;
 pub const NODE_KEY_LEN: usize = 32;
@@ -21,13 +25,13 @@ pub const WEB_STREAM_INTENT: u8 = 1;
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum DuckDnsName {
-    /// `<handle>.ducktape.quack` — the handle's default homepage.
+    /// `<handle>.duck` — the handle's default homepage.
     User { handle: String },
-    /// `<service>.<handle>.ducktape.quack`.
+    /// `<service>.<handle>.duck`.
     UserService { service: String, handle: String },
-    /// `<service>.<chain>.net.ducktape.quack`.
+    /// `<service>.<chain>.net.duck`.
     NetworkService { service: String, chain: String },
-    /// `<service>.<node>.<chain>.net.ducktape.quack`.
+    /// `<service>.<node>.<chain>.net.duck`.
     NodeService {
         service: String,
         node: String,

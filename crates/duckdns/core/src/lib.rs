@@ -1,7 +1,7 @@
 //! deterministic DuckDNS core.
 //!
 //! This crate owns the reusable, SDK-free state machine and wire surface:
-//! canonical `.quack` names, handle ownership, declarative provider records,
+//! canonical `.duck` names, handle ownership, declarative provider records,
 //! query shapes, canonical state bytes, and root calculation. It contains no
 //! sockets, local target addresses, filesystem access, or host-module queries.
 //! The `duckdns` system crate maps authenticated origins plus live identity and

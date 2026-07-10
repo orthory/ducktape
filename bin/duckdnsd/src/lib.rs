@@ -1,7 +1,7 @@
 //! Device-local DuckDNS helper.
 //!
 //! `duckdnsd` owns the narrow machine boundary: authoritative split DNS for
-//! `ducktape.quack`, a token-restricted active-workspace lease, the protected
+//! `.duck`, a token-restricted active-workspace lease, the protected
 //! device CA, SNI leaf certificates, and TLS-to-node HTTP handoff. It never
 //! holds consensus state or DuckFS bytes.
 
