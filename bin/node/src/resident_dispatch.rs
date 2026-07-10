@@ -26,9 +26,15 @@
 //! pool's in-flight dedup prunes at delivery, so it alone cannot carry that
 //! guarantee), and the pool's dedup backstops any same-tick redelivery.
 //! results re-SEND (never re-run) on a deadline while the attempt stays
-//! pending, and entries retire the moment committed state stops naming them —
-//! settled, retried elsewhere, or expired. a restart re-runs at worst once;
-//! the saga module's P5 result-singularity collapses the duplicate.
+//! pending, and entries retire once committed state stops naming them —
+//! settled, retried elsewhere, or expired. retirement requires CONFIRMED
+//! absence (two consecutive reads): the latch is the exactly-once guarantee,
+//! so a single read that momentarily fails to name a live attempt — whatever
+//! its source — must not drop it and re-offer the SAME attempt as fresh work
+//! (a second child, and a computed-but-unsent result silently lost). real
+//! retirements stay absent forever, so confirmation costs one serve-window
+//! tick. a restart re-runs at worst once; the saga module's P5
+//! result-singularity collapses the duplicate.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -67,6 +73,14 @@ enum Stage {
     Settled,
 }
 
+/// one tracked attempt: its lifecycle stage plus the retire confirmation —
+/// `missed` marks a read that failed to name the attempt, and only a SECOND
+/// consecutive miss retires the entry (see the module doc).
+struct Entry {
+    stage: Stage,
+    missed: bool,
+}
+
 pub(crate) struct ResidentDispatch {
     /// the off-loop execution pool (`DispatchPool` behind the shared
     /// `Worker` seam): gate inline, spawn the provider, return immediately.
@@ -74,8 +88,8 @@ pub(crate) struct ResidentDispatch {
     /// this node's external submit key — the lease identity queried for.
     me: Vec<u8>,
     /// every attempt this pump has acted on, keyed by `(saga_id, attempt)`;
-    /// pruned against committed state each tick.
-    work: HashMap<AttemptKey, Stage>,
+    /// pruned against committed state on confirmed absence.
+    work: HashMap<AttemptKey, Entry>,
 }
 
 impl ResidentDispatch {
@@ -93,7 +107,12 @@ impl ResidentDispatch {
     /// the caller relays each due op and reports `sent` / leaves it due on
     /// failure.
     pub(crate) async fn tick(&mut self, host: &Host, now: Instant) -> Vec<(AttemptKey, Msg)> {
-        let assigned = assigned_pending(host, &self.me).await;
+        // an unreadable projection is NOT an empty one: a failed read says
+        // nothing about committed state, so the pass does nothing rather
+        // than count it toward retirement.
+        let Some(assigned) = assigned_pending(host, &self.me).await else {
+            return Vec::new();
+        };
         self.plan(assigned, now).await
     }
 
@@ -110,7 +129,10 @@ impl ResidentDispatch {
         };
         let key = (saga_id, attempt);
         match self.work.get_mut(&key) {
-            Some(stage @ Stage::Executing) => *stage = Stage::Due(msg),
+            Some(Entry {
+                stage: stage @ Stage::Executing,
+                ..
+            }) => *stage = Stage::Due(msg),
             _ => eprintln!(
                 "[resident dispatch] dropping a completed run for retired attempt {key:?}"
             ),
@@ -118,23 +140,48 @@ impl ResidentDispatch {
     }
 
     /// the pump core, separated from the host read so it is unit-testable:
-    /// retire entries committed state no longer names, offer newly assigned
-    /// attempts to the pool ONCE, and surface every due (or re-send-due) op.
+    /// retire entries committed state stopped naming (confirmed over two
+    /// consecutive reads), offer newly assigned attempts to the pool ONCE,
+    /// and surface every due (or re-send-due) op.
     async fn plan(&mut self, assigned: Vec<WorkerRequest>, now: Instant) -> Vec<(AttemptKey, Msg)> {
         // retire: an attempt absent from the committed projection settled,
         // moved on (retry under a new attempt), or expired — its entry (and
         // any un-sent result, now a guaranteed no-op) has nothing left to do.
+        // but only CONFIRMED absence retires: a first miss arms the entry and
+        // keeps it — dropping a live attempt on one flapped read would
+        // re-offer the SAME attempt as fresh work (the exactly-once break).
         // a still-running child's late result is dropped by `completed`.
         let live: std::collections::HashSet<AttemptKey> = assigned
             .iter()
             .map(|r| (r.saga_id.clone(), r.attempt))
             .collect();
-        self.work.retain(|key, _| live.contains(key));
+        self.work.retain(|key, entry| {
+            if live.contains(key) {
+                return true;
+            }
+            if !entry.missed {
+                entry.missed = true;
+                if !matches!(entry.stage, Stage::Settled) {
+                    // mid-work absence is the flap signature — worth eyes if
+                    // it recurs; a settled entry's absence is plain retirement.
+                    eprintln!(
+                        "[resident dispatch] attempt {key:?} left the committed \
+                         projection mid-work — retiring on the next absent read"
+                    );
+                }
+                return true;
+            }
+            false
+        });
 
         let mut due = Vec::new();
         for request in assigned {
             let key = (request.saga_id.clone(), request.attempt);
-            match self.work.get_mut(&key) {
+            if let Some(entry) = self.work.get_mut(&key) {
+                // named again: whatever absence was seen did not persist.
+                entry.missed = false;
+            }
+            match self.work.get_mut(&key).map(|e| &mut e.stage) {
                 None => {
                     // first sighting: offer to the pool exactly once. the
                     // gate runs inline (cheap, deterministic); an executable
@@ -166,7 +213,13 @@ impl ResidentDispatch {
                             Stage::Settled
                         }
                     };
-                    self.work.insert(key, stage);
+                    self.work.insert(
+                        key,
+                        Entry {
+                            stage,
+                            missed: false,
+                        },
+                    );
                 }
                 Some(Stage::Executing) => {} // provider running off-loop.
                 Some(Stage::Due(msg)) => {
@@ -193,10 +246,10 @@ impl ResidentDispatch {
     /// a due op left on the relay lane: latch its frame id so the entry waits
     /// for the Reply instead of re-sending every tick.
     pub(crate) fn sent(&mut self, key: &AttemptKey, frame: node::FrameId, now: Instant) {
-        if let Some(stage) = self.work.get_mut(key)
-            && let Stage::Due(msg) = stage
+        if let Some(entry) = self.work.get_mut(key)
+            && let Stage::Due(msg) = &entry.stage
         {
-            *stage = Stage::InFlight {
+            entry.stage = Stage::InFlight {
                 frame,
                 msg: msg.clone(),
                 deadline: now + RESULT_RETRY,
@@ -209,24 +262,26 @@ impl ResidentDispatch {
     /// rejected / refused re-queues the op for the next tick while committed
     /// state still names the attempt.
     pub(crate) fn on_reply(&mut self, frame: &node::FrameId, applied: bool) -> Option<AttemptKey> {
-        let key = self.work.iter().find_map(|(key, stage)| match stage {
+        let key = self.work.iter().find_map(|(key, entry)| match &entry.stage {
             Stage::InFlight { frame: f, .. } if f == frame => Some(key.clone()),
             _ => None,
         })?;
-        let stage = self.work.get_mut(&key).expect("found above");
+        let entry = self.work.get_mut(&key).expect("found above");
         if applied {
-            *stage = Stage::Settled;
-        } else if let Stage::InFlight { msg, .. } = stage {
-            *stage = Stage::Due(msg.clone());
+            entry.stage = Stage::Settled;
+        } else if let Stage::InFlight { msg, .. } = &entry.stage {
+            entry.stage = Stage::Due(msg.clone());
         }
         Some(key)
     }
 }
 
-/// the committed saga projection of this node's leased pending attempts —
-/// gracefully empty when the module is absent or the reply unreadable.
-async fn assigned_pending(host: &Host, me: &[u8]) -> Vec<WorkerRequest> {
-    let Ok(reply) = host
+/// the committed saga projection of this node's leased pending attempts.
+/// `None` when the module is absent or the reply unreadable — a failed read
+/// must never masquerade as an EMPTY projection: emptiness retires entries,
+/// and retiring a live attempt re-runs it (see `plan`).
+async fn assigned_pending(host: &Host, me: &[u8]) -> Option<Vec<WorkerRequest>> {
+    let reply = host
         .query(
             "saga",
             &saga::encode_query(&SagaQuery::AssignedPending {
@@ -234,12 +289,10 @@ async fn assigned_pending(host: &Host, me: &[u8]) -> Vec<WorkerRequest> {
             }),
         )
         .await
-    else {
-        return Vec::new();
-    };
+        .ok()?;
     match saga::decode_reply(&reply) {
-        Ok(SagaReply::AssignedPending(requests)) => requests,
-        _ => Vec::new(),
+        Ok(SagaReply::AssignedPending(requests)) => Some(requests),
+        _ => None,
     }
 }
 
@@ -451,8 +504,10 @@ format = "text"
             "applied: settled, no re-send ever"
         );
 
-        // committed state stops naming the attempt -> the entry retires; a
-        // LATER attempt of the same saga is fresh work and executes anew.
+        // committed state stops naming the attempt -> the entry retires on
+        // the CONFIRMING (second consecutive) absent read; a LATER attempt
+        // of the same saga is fresh work and executes anew.
+        assert!(pump.plan(Vec::new(), now).await.is_empty());
         assert!(pump.plan(Vec::new(), now).await.is_empty());
         assert!(pump.work.is_empty(), "retired with committed state");
         assert!(pump.plan(vec![request("job", 1)], now).await.is_empty());
@@ -485,18 +540,88 @@ format = "text"
     #[tokio::test]
     async fn a_late_result_for_a_retired_attempt_is_dropped() {
         // the lease expired (or settled elsewhere) while the provider ran:
-        // committed state stops naming the attempt, the tick retires the
-        // entry, and the late result must NOT resurrect it.
+        // committed state stops naming the attempt across two consecutive
+        // reads, the tick retires the entry, and the late result must NOT
+        // resurrect it.
         let (mut pump, mut rx, _executions) = pump_with(Duration::from_millis(50), true);
         let now = Instant::now();
 
         assert!(pump.plan(vec![request("job", 0)], now).await.is_empty());
+        assert!(pump.plan(Vec::new(), now).await.is_empty(), "first miss");
         assert!(pump.plan(Vec::new(), now).await.is_empty(), "retired");
         assert!(pump.work.is_empty());
 
         pump.completed(next_result(&mut rx).await);
         assert!(pump.work.is_empty(), "a late result does not resurrect");
         assert!(pump.plan(Vec::new(), now).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_momentary_projection_flap_never_reruns_an_executing_attempt() {
+        // one tick's read fails to name a still-pending attempt (a flap —
+        // whatever its source), and the provider's result crosses the gap:
+        // it is delivered while the entry is absent, so the pool's in-flight
+        // dedup is already pruned. without a surviving latch the next tick
+        // re-offers the SAME attempt and spawns a second child — the
+        // exactly-once break the e2e observed (two runs, one relayed
+        // result).
+        let (mut pump, mut rx, executions) = pump_with(Duration::from_millis(10), true);
+        let now = Instant::now();
+        let key = ("job".to_string(), 0u32);
+
+        assert!(pump.plan(vec![request("job", 0)], now).await.is_empty());
+        assert!(pump.plan(Vec::new(), now).await.is_empty(), "flap tick");
+        // the result lands during the gap (the park loop drains the lane
+        // before each tick).
+        pump.completed(next_result(&mut rx).await);
+        let due = pump.plan(vec![request("job", 0)], now).await;
+        assert_eq!(due.len(), 1, "the surviving result is due for relay");
+        assert_eq!(due[0].0, key);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "a flap survived by a pending attempt must not re-run it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_momentary_projection_flap_never_drops_a_computed_result() {
+        // the flap lands AFTER the provider finished but BEFORE the result
+        // was relayed: the Due entry holds the only copy of the computed
+        // answer. dropping it re-runs the attempt on re-appearance (two
+        // children, and the first answer is silently lost).
+        let (mut pump, mut rx, executions) = pump_with(Duration::from_millis(10), true);
+        let now = Instant::now();
+        let key = ("job".to_string(), 0u32);
+
+        assert!(pump.plan(vec![request("job", 0)], now).await.is_empty());
+        pump.completed(next_result(&mut rx).await);
+        assert!(pump.plan(Vec::new(), now).await.is_empty(), "flap tick");
+        let due = pump.plan(vec![request("job", 0)], now).await;
+        assert_eq!(due.len(), 1, "the computed result survives the flap");
+        assert_eq!(due[0].0, key);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "the surviving result relays; the attempt never re-runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_absence_still_retires_an_unfinished_attempt() {
+        // absence that PERSISTS is a real retirement (settled elsewhere,
+        // lease moved on): after two consecutive ticks without the attempt
+        // the entry must go, and a late result must not resurrect it.
+        let (mut pump, mut rx, _executions) = pump_with(Duration::from_millis(50), true);
+        let now = Instant::now();
+
+        assert!(pump.plan(vec![request("job", 0)], now).await.is_empty());
+        assert!(pump.plan(Vec::new(), now).await.is_empty());
+        assert!(pump.plan(Vec::new(), now).await.is_empty(), "confirmed");
+        assert!(pump.work.is_empty(), "two absent reads retire the entry");
+
+        pump.completed(next_result(&mut rx).await);
+        assert!(pump.work.is_empty(), "a late result does not resurrect");
     }
 
     #[tokio::test]
@@ -532,7 +657,10 @@ format = "text"
             "a foreign spec produces no op"
         );
         assert!(
-            matches!(pump.work.get(&("alien".into(), 0)), Some(Stage::Settled)),
+            matches!(
+                pump.work.get(&("alien".into(), 0)).map(|e| &e.stage),
+                Some(Stage::Settled)
+            ),
             "and is latched so it is not re-decoded every tick"
         );
         assert!(pump.plan(vec![foreign], now).await.is_empty());
