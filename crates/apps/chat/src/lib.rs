@@ -30,6 +30,11 @@ pub mod voice;
 // over the data plane's Service::Video / Service::Voice flows. Off-consensus
 // like `voice`, for the same reason: consensus never carries media.
 pub mod video;
+// the single-definition-site codec for the webview call socket
+// (`/v1/call/ws`) — audio + camera video framing shared by `noded` and the
+// app's TypeScript leg. See the module doc for the D1 (big-endian headers)
+// rule. Off-consensus, same reasoning as `voice`/`video`.
+pub mod call_wire;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};

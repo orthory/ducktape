@@ -74,6 +74,21 @@ pub fn seq_newer(a: u16, b: u16) -> bool {
 mod tests {
     use super::*;
 
+    /// pins the exact wire bytes (D1: header fields big-endian) — locks this
+    /// already-BE datagram codec alongside the call-socket codec
+    /// (`chat::call_wire`) as part of the wire-standardization sweep.
+    #[test]
+    fn golden_header_be() {
+        let header = MediaHeader {
+            seq: 0x0102,
+            timestamp: 0x0A0B_0C0D,
+        };
+        assert_eq!(
+            encode_frame(header, &[0x5A]).unwrap(),
+            vec![0x01, 0x00, 0x01, 0x02, 0x0A, 0x0B, 0x0C, 0x0D, 0x5A]
+        );
+    }
+
     #[test]
     fn frame_round_trip() {
         let header = MediaHeader {
