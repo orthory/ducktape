@@ -1,0 +1,1144 @@
+# ADR: Ducktape Fastblocks — 100 ms Quorum-Certified Preconfirmations
+
+Date: 2026-07-10. Status: **Proposed**. This ADR fixes the protocol boundary
+for sub-second transaction feedback in Ducktape. Validators build up to ten
+100 ms fastblocks inside the existing one-second canonical batch window and
+issue a transferable `2f + 1` certificate before the UI calls a transaction
+preconfirmed. Simplex remains the only source of canonical order, execution,
+height, app hash, and finality.
+
+Merging this ADR ratifies the protocol direction, not an assertion that the
+latency target has already been achieved. Activation is separately gated by a
+coordinated validator upgrade, adversarial simulation, and measured latency.
+
+## Decision
+
+Ducktape will add a validator-only protocol named **PromiseNet** over a
+dedicated per-use data-plane instance. During each canonical block build
+window, the validator elected to propose the next Simplex view acts as a
+temporary **assembler**. It selects an append-only sequence of transaction
+frames and asks the validator set to certify each increment.
+
+A proposal, an assembler signature, or a transport-authenticated message is
+not a preconfirmation. The externally meaningful receipt is a
+**Promise Quorum Certificate** (`PromiseQC`) containing acknowledgements from
+at least `2f + 1` validators. An honest validator sends that acknowledgement
+only after it has:
+
+1. validated and durably pinned every frame in the increment;
+2. verified a `2f + 1` availability certificate for the same proposal;
+3. persisted a promise lock before signing; and
+4. committed to reject any canonical successor that omits or reorders the
+   certified prefix.
+
+The initial protocol is an **inclusion preconfirmation**. It promises that the
+frame will occur in the first finalized canonical successor of the receipt's
+parent boundary. It does not promise that application execution will succeed,
+does not expose speculative state, and does not make external side effects
+safe before finality.
+
+The fixed v1 parameters are:
+
+| Parameter | v1 value | Meaning |
+|---|---:|---|
+| `CANONICAL_BUILD_WINDOW` | 1 s | Existing target window for one canonical batch |
+| `FASTBLOCK_PERIOD` | 100 ms | Target publication cadence and per-index deadline |
+| `FASTBLOCKS_PER_WINDOW` | 10 | Maximum certified increments before sealing |
+| `VALIDATOR_COUNT` | `n = 3f + 1` | Standard Byzantine fault model |
+| `FASTBLOCK_QUORUM` | `q = 2f + 1` | Availability and promise certificate threshold |
+| `PROMISE_SERVICE_ID` | `5` | Append-only data-plane service registry value |
+| stream / datagram ports | `45805` / `45905` | Per-use PromiseNet overlay ports |
+| user-visible guarantee | inclusion | Ordered inclusion, not successful execution |
+| fallback | ordinary Simplex | No certificate means no preconfirmation |
+
+The period is a target, not a safety assumption. If a certificate is late,
+Ducktape emits fewer fastblocks or no fastblocks for that window. It never
+lowers the quorum, treats an assembler acknowledgement as equivalent, or
+changes the signed contents to hit a timer.
+
+## Context
+
+Ducktape already has a fast *local* feeling but not a network promise. The app
+projects a submitted action optimistically, while its transaction ledger has
+only `pending`, `finalized`, and `failed`. The node accepts custody of a signed
+frame under its stable `FrameId`, but the HTTP submit path normally waits for
+the frame's finalized disposition. A caller timeout is ambiguous: the frame
+can still finalize later.
+
+The canonical path currently has these relevant properties:
+
+- `consensus::BLOCK_TIME` is one second. The node aggregates frames during
+  that window and flushes a batch, rather than creating one block per frame.
+- The node loop polls at `DRAIN_TICK = 100 ms`, but that is an implementation
+  poll interval, not a consensus or receipt guarantee.
+- `MAX_BATCH_BYTES` is currently `MAX_FRAME_BYTES`, approximately one MiB.
+  The packer preserves enqueue order and may create multiple canonical batches
+  when a window contains more than one batch's capacity.
+- `ConsensusAutomaton::propose` peeks a FIFO until finalization, so a
+  nullified view can repropose the same payload.
+- `ConsensusAutomaton::verify` currently checks only that the proposed payload
+  bytes are locally available. It has no promise-lock validation yet.
+- Simplex uses a round-robin elected proposer. Its configured leader timeout
+  is one second and certification timeout is two seconds.
+
+The data plane is intentionally off-consensus. It carries opaque bytes, derives
+admission from finalized state, and obtains pairwise peer identity from the
+WireGuard overlay. Its datagram class is unreliable and unordered; its stream
+class is reliable and backpressured. Pairwise transport authentication tells a
+receiver which peer sent bytes, but it is not evidence that can be shown to a
+third party. A preconfirmation therefore requires signed application messages
+and a durable validator state machine above the data plane.
+
+Base Flashblocks is useful product inspiration, not a protocol template. Base
+streams approximately 200 ms partial block updates from its active sequencer
+and exposes pending state through Flashblocks-aware RPC. Ducktape has no single
+sequencer whose word should become a BFT guarantee. Its equivalent receipt
+must survive an assembler crash or view change and must be enforceable by the
+validator quorum that later finalizes the block.
+
+## Goals
+
+- Publish a new certified fastblock on a 100 ms target cadence when network,
+  storage, and validator load permit.
+- Give clients a compact, independently verifiable receipt for a specific
+  `FrameId`.
+- Make a valid receipt survive assembler failure, Simplex view change, node
+  restart, and ordinary message loss.
+- Preserve a single canonical consensus and execution path.
+- Fail closed to ordinary Simplex when PromiseNet is slow, partitioned,
+  overloaded, incompatible, or disabled.
+- Bound promised work so every promise can fit in one canonical successor.
+- Tell the truth in the UI about custody, preconfirmation, rejection, and
+  finality.
+- Leave a clean protocol seam for a later speculative-execution overlay.
+
+## Non-goals
+
+- Reducing canonical BFT finality to 100 ms.
+- Guaranteeing that every transaction is preconfirmed or lands in fastblock
+  index zero.
+- Guaranteeing successful module execution, fees, business outcome, or a
+  particular wall-clock finalization deadline.
+- Treating a single validator, current assembler, RPC server, WireGuard peer,
+  or local optimistic projection as authoritative.
+- Sending irreversible external effects from speculative state.
+- Replacing Simplex with a second chain, DAG, or independent micro-consensus.
+- Matching Base's pending-state RPC in v1.
+- Increasing canonical batch throughput. Fastblocks subdivide the existing
+  block budget; they do not mint more capacity.
+
+## Terminology and Guarantee
+
+**Parent boundary** is the finalized tuple
+`(network_id, epoch, app_height, app_hash)` from which the next canonical state
+transition will execute.
+
+**Assembler** is the validator elected as proposer for the active Simplex
+view. It proposes transaction increments for one parent boundary. It has
+selection and fan-out responsibility, not unilateral authority.
+
+**Fastblock** is one append-only increment plus its `PromiseQC`. A proposal
+without that certificate is merely a candidate.
+
+**Certified prefix** is the ordered concatenation of all increments from index
+zero through the highest contiguous `PromiseQC`.
+
+**Promise lock** is a validator's durable obligation to reject a canonical
+successor that does not preserve a certified proposal.
+
+**Canonical successor** is the first finalized application block whose parent
+is the receipt's parent boundary. Nullified Simplex views do not count.
+
+For a structurally valid frame `F`, a valid receipt means:
+
+> Assuming at most `f` Byzantine validators in the receipt's epoch, any
+> canonical successor of the named parent boundary that finalizes must contain
+> `F` in the certified prefix. Execution may still deterministically reject
+> `F`.
+
+This is a safety promise, not a liveness promise. During a partition, the
+network may stop producing fastblocks or canonical blocks rather than violate
+it. If more than `f` validators are faulty, the guarantee no longer applies.
+
+## Fault and Network Model
+
+The protocol assumes:
+
+- a validator set of `n = 3f + 1` derived from finalized consensus state;
+- at most `f` Byzantine validators per epoch;
+- unforgeable validator signatures and collision-resistant hashes;
+- crash-recoverable local storage for pinned bodies, votes, certificates, and
+  promise locks;
+- eventual synchrony for liveness, but no message-delay or clock bound for
+  safety; and
+- the same deterministic frame decoder and canonical batch packer on all
+  activated validators.
+
+Messages may be delayed, duplicated, dropped, reordered, or replayed. A peer
+may equivocate, withhold bodies or certificates, crash between any two writes,
+or restart from its last durable record. Local clocks schedule work but never
+decide whether a signature or promise is valid.
+
+PromiseNet admission is the finalized validator set for exactly one epoch.
+Residents and ordinary members submit frames through the existing ingress
+path; they do not vote. Validator-set and binary cutovers freeze new sessions
+and drain or abandon unpromised candidates before the boundary changes.
+
+## Architecture
+
+```text
+client / resident
+       |
+       | signed frame (stable FrameId)
+       v
+validator ingress ---- custody / relay ----> active assembler
+                                              |
+                           PromiseNet body    | proposal
+                         + control streams    v
+                                    all validators
+                                      |      |
+                              availability  PromiseAck
+                                  votes      after WAL lock
+                                      \      /
+                                       assembler
+                                           |
+                         PromiseQC + membership proof
+                                           v
+                                         client
+
+certified prefix --sealed batch--> Simplex proposal --> final execution
+```
+
+There is one temporary assembler because one component must choose a candidate
+ordering and cut each 100 ms window. BFT does not remove that coordination
+role. BFT removes the assembler's ability to make the choice authoritative by
+itself: a fastblock exists only after the validator quorum signs, and the
+canonical block still exists only after Simplex finalizes it.
+
+The assembler for a session MUST be derived from the same epoch, view, and
+round-robin election that Simplex uses. PromiseNet MUST consume authoritative
+Simplex view lifecycle events; it MUST NOT infer leadership from elapsed wall
+time. On nullification, finalization, or epoch freeze, validators stop signing
+messages from the former assembler.
+
+## PromiseNet Data Plane
+
+PromiseNet is a new per-use `DataPlane` instance over `OverlaySockets`:
+
+- append `Service::Promise = 5` to the wire-stable service registry;
+- reserve stream port `45805` and datagram port `45905` on each validator's
+  overlay `/128`;
+- inject an epoch-scoped `AddressBook` and default-deny `AdmissionPolicy`
+  backed by the finalized validator set; and
+- bring the plane up only after overlay reachability is ready.
+
+The service uses separate bounded flows:
+
+| Flow | Transport | Contents | Rule |
+|---|---|---|---|
+| control | persistent stream | proposals, votes, certificates, recovery summaries | Safety-bearing source of truth |
+| vote hint | datagram | duplicate availability vote or promise acknowledgement | Latency optimization only; stream retry remains authoritative |
+| body | stream | full frames, batch fragments, body fetch | Reliable, backpressured, independently bounded |
+| head hint | datagram | latest session/index/certificate hash | May be dropped without semantic effect |
+
+Datagrams can reduce tail latency but are never the sole copy of a message
+needed for safety or recovery. Control traffic MUST NOT queue behind body
+transfer. Queue overflow drops hints and marks the fast path unhealthy; it does
+not allocate without bound. When another stream-class consumer makes uplink
+competition material, PromiseNet participates in the shared pacing
+coordinator required by the per-use data-plane ADR.
+
+WireGuard authentication is defense in depth and admission input. Every
+protocol object still carries an Ed25519 validator or assembler signature so a
+certificate is transferable, journalable, and independently verifiable.
+
+## Session and Timing Model
+
+A session is bound to one candidate canonical successor:
+
+```text
+session_id = H(
+  "ducktape/fastblocks/session/v1",
+  network_id,
+  epoch,
+  parent_height,
+  parent_app_hash,
+  assembler_view,
+  assembler_public_key
+)
+```
+
+The session starts only after the parent boundary is finalized and the
+Simplex view identifies its elected assembler. It closes on the earliest of:
+
+- ten certified increments;
+- the one-second build deadline;
+- assembler view loss or nullification;
+- a canonical proposal vote for the successor;
+- parent finalization changing the boundary;
+- epoch/validator-set freeze; or
+- an operator or automatic fast-path circuit breaker.
+
+v1 permits exactly one PromiseNet session per parent boundary. If its assembler
+loses the view, the next Simplex proposer recovers and seals that session—or
+uses the ordinary canonical path when it left no availability certificate—but
+does not open another fastblock session on the same parent. This deliberately
+trades fast-path liveness after a faulty assembler for a small, unambiguous
+lock space. A later protocol may add a PBFT-style safe-session transfer, but it
+must not be inferred from v1.
+
+v1 never opens a promise session on top of an unfinalized canonical proposal:
+its app hash is not yet a parent boundary. While the macro batch is in Simplex,
+new frames remain in custody for the next finalized parent. The 100 ms cadence
+therefore applies inside each eligible one-second build window; it may have a
+gap while the macro block finalizes. Pipelining promises across an unfinalized
+parent would require the speculative execution and parent-reconciliation work
+deferred to v2.
+
+The nominal healthy schedule is:
+
+| Time | Event |
+|---:|---|
+| `0 ms` | Cut and propose increment 0 |
+| `0–100 ms` | Pin, availability vote, `AvailabilityQC`, promise lock, `PromiseQC` |
+| `100 ms` | Publish fastblock 0; cut and propose increment 1 |
+| `200 ms` | Publish fastblock 1; cut and propose increment 2 |
+| `...` | Repeat without changing the certified prefix |
+| `900 ms` | Publish fastblock 8; cut and propose increment 9 |
+| `1000 ms` | Publish fastblock 9 if ready; seal canonical batch |
+
+The deadline contains two validator round trips: proposal/body to availability
+votes, then `AvailabilityQC` to durable promise acknowledgements. A deployment
+cannot beat the latency between a quorum of its validators or the storage
+latency of their required durable writes. A 100 ms target is therefore a
+measured operating envelope, not a claim about a geographically arbitrary
+validator set.
+
+“100 ms fastblocks” describes healthy publication cadence. A transaction that
+arrives immediately after a cut waits almost 100 ms for the next proposal and
+then up to another 100 ms for certification. The honest strong-preconfirmation
+latency bound inside the target envelope is therefore just under 200 ms, not
+10 ms or universally 100 ms. Queueing, large-frame capacity, loss, or quorum
+distance can make it longer or result in no preconfirmation.
+
+A missed index deadline does not invalidate a certificate that safely finishes
+before session close. It records a missed-cadence event and reduces the number
+of increments that can fit in the window. Validators never backdate a receipt
+or accept late messages after their session boundary lock closes.
+
+## Transaction Selection and Capacity
+
+Frames retain their existing stable `FrameId = H(encoded_frame)`. Ingress
+verifies the frame before custody, relays it to validators, and makes it
+eligible for the assembler's next cut. Duplicate frame bytes are idempotent.
+
+The assembler chooses from frames whose complete bytes are available. v1 does
+not fix a fee market; selection MUST be deterministic given the assembler's
+chosen list, preserve per-origin sequence constraints where they are known,
+and never reorder an already certified frame. Arrival order is an acceptable
+initial policy. A later fee policy can choose *new* frames but cannot rewrite
+the prefix.
+
+Fastblocks subdivide exactly one canonical batch budget. They do not use ten
+times the existing capacity. The cumulative limit after index `i` is:
+
+```text
+allowed(i) = floor(PROMISE_BATCH_BUDGET * (i + 1) / 10)
+```
+
+The capacity calculation MUST call the same shared encoded-size and packing
+helper used by the canonical batch builder, including varint overhead and the
+current single-frame edge case. Duplicating an approximate byte formula in
+PromiseNet is forbidden because disagreement could create an unfulfillable
+promise. `PROMISE_BATCH_BUDGET` also reserves the fixed `CanonicalBatchV2`
+wrapper and seal-reference overhead beneath the consensus payload/message cap.
+The full certificate seal is a separately bounded, content-addressed sidecar;
+it is not repeated inline beside one-MiB-class member bytes.
+
+A frame larger than the current index's remaining cumulative allowance waits
+for a later index. It remains eligible for the ordinary canonical batch even
+if it never receives a fast receipt. The final certified prefix MUST fit as the
+first and only promised batch after its parent. Unpromised frames can fill only
+the verified remaining space and are appended after the certified prefix;
+overflow carries to a later canonical block without a promise.
+
+Each proposal contains only the delta since the previous certificate, but its
+header commits to cumulative frame count, encoded bytes, and a cumulative
+Merkle root. Validators reconstruct and validate the whole prefix before
+voting. The canonical batch preserves the certified order. The v1 client
+guarantee is deliberately narrower—ordered inclusion, not execution result—so
+applications cannot mistake a structurally valid but state-invalid operation
+for a successful one.
+
+## Wire Protocol
+
+The structures below are semantic schemas. The implementation MUST choose one
+canonical, length-delimited binary encoding and include its codec version in
+every signed object. Unknown versions are rejected, never guessed.
+
+```rust
+struct ParentBoundary {
+    network_id: [u8; 32],
+    epoch: u64,
+    app_height: u64,
+    app_hash: [u8; 32],
+}
+
+struct FastblockProposalV1 {
+    codec_version: u16,             // 1
+    parent: ParentBoundary,
+    session_id: [u8; 32],
+    assembler_view: u64,
+    assembler: ValidatorId,
+    index: u8,                      // 0..=9
+    previous_promise_qc_hash: Option<[u8; 32]>,
+    delta_frame_ids: Vec<FrameId>,
+    delta_body_root: [u8; 32],
+    cumulative_frame_count: u32,
+    cumulative_encoded_bytes: u32,
+    cumulative_frame_root: [u8; 32],
+    assembler_signature: Signature,
+}
+
+struct AvailabilityVoteV1 {
+    parent: ParentBoundary,
+    session_id: [u8; 32],
+    index: u8,
+    proposal_hash: [u8; 32],
+    validator: ValidatorId,
+    signature: Signature,
+}
+
+struct AvailabilityQCV1 {
+    proposal_hash: [u8; 32],
+    signer_bitmap: ValidatorBitmap,
+    signatures: Vec<Signature>,     // >= 2f + 1, canonical validator order
+}
+
+struct PromiseAckV1 {
+    parent: ParentBoundary,
+    session_id: [u8; 32],
+    index: u8,
+    proposal_hash: [u8; 32],
+    availability_qc_hash: [u8; 32],
+    validator: ValidatorId,
+    signature: Signature,
+}
+
+struct PromiseQCV1 {
+    proposal_hash: [u8; 32],
+    availability_qc_hash: [u8; 32],
+    signer_bitmap: ValidatorBitmap,
+    signatures: Vec<Signature>,     // >= 2f + 1, canonical validator order
+}
+
+struct CertifiedIncrementV1 {
+    proposal: FastblockProposalV1,
+    availability_qc: AvailabilityQCV1,
+    promise_qc: PromiseQCV1,
+}
+
+struct PreparedIncrementV1 {
+    proposal: FastblockProposalV1,
+    availability_qc: AvailabilityQCV1,
+}
+
+struct FastblockReceiptV1 {
+    parent: ParentBoundary,
+    session_id: [u8; 32],
+    index: u8,
+    certified_chain: Vec<CertifiedIncrementV1>, // index 0..=index
+    frame_id: FrameId,
+    frame_position: u32,
+    frame_membership_proof: MerkleProof,
+}
+```
+
+Certificates use an explicit signer bitmap plus ordinary Ed25519 signatures
+in v1. Threshold or aggregate signatures are an optimization that requires a
+separate cryptographic decision; they are not needed for correctness.
+
+Signed hashes use separate domains:
+
+```text
+ducktape/fastblocks/proposal/v1
+ducktape/fastblocks/availability-vote/v1
+ducktape/fastblocks/promise-ack/v1
+ducktape/fastblocks/canonical-seal/v1
+```
+
+Every signed preimage binds the network, epoch, parent boundary, session,
+index, proposal hash, and role-specific fields. An object's hash covers its
+canonical payload without its own signature field; certificate hashes cover
+the canonical signer bitmap and ordered signatures. Validation uses the
+validator set at the bound epoch, rejects duplicate signers, checks
+bitmap/signature agreement, and counts voting power according to the consensus
+validator model. The initial implementation requires equal validator weight;
+weighted sets need an explicit quorum-function update in both Simplex and
+PromiseNet.
+
+## Validator State Machine
+
+Each validator keeps one durable `PromiseState` per unresolved parent. The
+boundary lifecycle and the current index are separate so a certified index can
+return to `Open` for the next increment without losing its prefix:
+
+```rust
+struct PromiseStateV1 {
+    parent: ParentBoundary,
+    phase: BoundaryPhaseV1,
+    session_id: SessionId,
+    assembler_view: u64,
+    certified: Vec<CertifiedIncrementV1>,
+    in_flight: Option<IndexStateV1>,
+}
+
+enum BoundaryPhaseV1 {
+    Open,
+    Sealing { certified_prefix: PrefixId },
+    Finalized { canonical_batch: FrameId },
+    Abandoned,
+}
+
+enum IndexStateV1 {
+    AvailabilityVoted {
+        proposal_hash: Hash,
+        pinned_body: BodyId,
+    },
+    PromiseLocked {
+        proposal_hash: Hash,
+        availability_qc: AvailabilityQCV1,
+        pinned_body: BodyId,
+    },
+}
+```
+
+Before an availability vote, a validator MUST:
+
+- confirm the epoch, parent boundary, current view, elected assembler, session
+  id, and index;
+- verify the assembler signature and exact previous `PromiseQC` link;
+- possess every full frame and verify each frame's size, signature, decoding,
+  `FrameId`, and absence from the already certified prefix;
+- reconstruct the cumulative roots and encoded size using the canonical packer;
+- confirm the proposal fits the cumulative capacity and local resource limits;
+- durably pin the delta body; and
+- persist that it has voted at most once for the tuple
+  `(parent, session, index)` before releasing the signature.
+
+The availability vote means “I have validated and can serve these bytes.” It
+is not yet a user promise.
+
+Before a promise acknowledgement, a validator MUST:
+
+- verify a complete `AvailabilityQC` for the exact proposal;
+- verify that the certificate extends its current contiguous prefix;
+- write and fsync the `PromiseLocked` record, availability certificate, body
+  reference, and anti-equivocation key; and
+- install the lock in the same boundary consulted by Simplex payload
+  verification.
+
+After installing that lock, it refuses any later incompatible availability
+vote or promise acknowledgement for the same parent. In v1 a view change
+recovers the existing session and cannot mint a second one.
+
+Only then may it sign `PromiseAck`. The assembler combines `2f + 1` such
+acknowledgements into `PromiseQC`, broadcasts the certificate to all validators
+over the control stream, and produces per-frame receipts with Merkle proofs.
+
+The two certificate phases are deliberate. If the user accepted the first set
+of availability votes, a Byzantine assembler could show their signatures only
+to the user and disappear before honest validators learned that a quorum
+existed. `PromiseQC` proves that a quorum acknowledged the same availability
+certificate *after* durably installing the enforcement lock.
+
+All writes are idempotent. After restart, a validator reconstructs its highest
+lock before joining Simplex or signing PromiseNet messages. A validator treats
+its own `PromiseAck` as binding immediately, even if it has not yet received
+the assembled `PromiseQC`; otherwise an assembler could hide a valid receipt
+from its signers.
+
+A partial acknowledgement set can leave fewer than `f + 1` honest validators
+locked even though no `PromiseQC` was possible. Those validators refuse an
+omitting proposal, but cannot prevent a valid Simplex quorum. If an omitting
+canonical successor nevertheless finalizes, that finalization proves—under the
+same `f`-fault assumption—that no hidden `PromiseQC` existed, because a real
+one would have supplied at least `f + 1` honest blockers. The validator then
+records `UncommittedLockSuperseded` and may clear that partial lock. A matching
+seal clears it normally. A timer alone never deletes an unresolved lock.
+An availability vote that never advances to a promise lock may be cleared on
+an authoritative view close; it is neither a receipt nor a canonical blocker.
+
+## Sealing into Simplex
+
+PromiseNet does not finalize a parallel microchain. At session close, the
+assembler builds one versioned canonical payload:
+
+```rust
+struct CanonicalBatchV2 {
+    codec_version: u16,
+    parent: ParentBoundary,
+    fastblock_seal: Option<ContentRef>, // H(canonical FastblockSealV1 bytes)
+    members: Vec<Vec<u8>>,
+}
+
+struct FastblockSealV1 {
+    codec_version: u16,
+    parent: ParentBoundary,
+    session_id: SessionId,
+    certified: Vec<CertifiedIncrementV1>,
+    prepared_tail: Option<PreparedIncrementV1>,
+    locked_frame_root: Hash,
+    locked_frame_count: u32,
+    locked_encoded_bytes: u32,
+}
+```
+
+The `PromiseQC`-certified prefix appears first in `members` and in exactly the
+committed order. Recovery may append one prepared tail: an
+`AvailabilityQC`-backed proposal for which some validators installed a lock but
+the assembler did not finish a user-visible `PromiseQC`. There can be at most
+one such tail because the next index requires the missing `PromiseQC` link.
+Unpromised members may follow the complete locked prefix. The assembler
+canonical-encodes and pins the bounded seal sidecar before proposing its hash;
+a validator possesses and verifies that sidecar before its Simplex vote. A
+block with no availability certificate or promise lock may use an empty seal
+and follows the ordinary batching path.
+
+Simplex payload validation MUST be extended beyond local byte availability.
+Before voting for a successor, a validator verifies:
+
+- the payload parent equals its finalized parent boundary;
+- the seal and all nested certificates are valid;
+- the members reproduce the certified roots and order;
+- every locally persisted promise lock for this parent is represented; and
+- the complete batch obeys the canonical size and frame rules.
+
+The PromiseNet state machine and `ConsensusAutomaton::verify` MUST consult one
+shared `BoundaryLock`; two independently cached views of the lock are unsafe.
+Once a validator begins voting on a canonical successor, the boundary closes
+to new promise acknowledgements. Late fastblock messages are rejected.
+
+The current one-second Simplex leader timeout races a builder that seals at the
+end of a one-second window. Activation therefore also changes the timing
+relationship:
+
+```text
+SIMPLEX_LEADER_TIMEOUT >= CANONICAL_BUILD_WINDOW + FASTBLOCK_SEAL_GRACE
+FASTBLOCK_SEAL_GRACE = 250 ms initially
+```
+
+The exact timeout remains an operational parameter, but it cannot be less than
+1.25 seconds in v1. This does not promise 1.25-second finality; Simplex
+certification still follows the macro proposal and may take longer.
+
+## View Change and Recovery
+
+The promise target is the first finalized successor of the parent boundary,
+not one temporary Simplex view. A view change therefore cannot erase a valid
+receipt.
+
+On taking leadership for a parent that did not finalize, a new assembler first
+runs recovery over PromiseNet control streams. It waits for `2f + 1` signed,
+monotone responses containing each validator's highest persisted availability
+certificate, promise lock, and `PromiseQC`, plus body roots. Any set of
+`2f + 1` responders intersects the `f + 1` honest lockers behind a hidden valid
+receipt, so at least one response reveals the chain that must be carried.
+
+- If no validator reports an `AvailabilityQC` or promise lock, the previous
+  unpromised candidates may be abandoned and the successor uses the ordinary
+  canonical path. No second PromiseNet session starts for that parent.
+- If any valid `AvailabilityQC` or promise lock exists, the new assembler
+  fetches its bodies and certificates and seals that unique chain immediately.
+  It does not issue a conflicting session for the same parent.
+- If a `PromiseQC` exists, the new assembler carries its highest contiguous
+  prefix even if the former assembler never broadcast the certificate.
+- If required bodies cannot be fetched, canonical progress pauses at that
+  parent. At least `f + 1` honest promise signers MUST retain them; the
+  resolver queries signers named in the certificates and uses the existing
+  payload-resolution backstop. Discarding the promise is not a recovery option.
+
+An assembler cannot form two conflicting availability certificates at the
+same index: two `2f + 1` signer sets intersect in at least `f + 1` validators,
+including at least one honest validator, and honest validators vote once. v1's
+one-session-per-parent rule means every availability certificate, partial
+promise lock, and `PromiseQC` reported during recovery belongs to that unique
+append-only chain.
+
+## Failure Behavior
+
+| Failure | Fast path | Canonical path |
+|---|---|---|
+| PromiseNet unavailable before any lock | No receipt; mark fast path unavailable | Ordinary Simplex continues |
+| Assembler crashes before `AvailabilityQC` | Candidate abandoned after view close | Next proposer may build normally |
+| Assembler crashes after `AvailabilityQC`, before `PromiseQC` | No user receipt, but any installed locks are recovered and included | Next proposer seals recovered proposal |
+| Assembler crashes after `PromiseQC` | Receipt remains valid | Next proposer carries certified prefix |
+| Datagram loss/reordering | Stream copy/retry; cadence may be missed | No effect on safety |
+| Body unavailable to a validator | Validator does not availability-vote | Quorum may proceed without it or fall back |
+| Quorum cannot pin or fsync in 100 ms | Fewer/no fastblocks | Simplex remains available unless a lock already exists |
+| Byzantine assembler equivocates | At most one certificate; fast path may stall | View change/recovery or normal proposal |
+| Validator restarts | Reload lock before signing | Reject omission after recovery |
+| Network partition with no quorum | No new receipt | BFT liveness may pause; no unsafe promise |
+| Late certificate after boundary close | Reject and count | Already selected successor is unchanged |
+| Epoch or binary cutover | Freeze new sessions; drain or recover locks | Height-gated cutover proceeds after closure |
+| More than `f` Byzantine validators | Guarantee outside model | Existing BFT guarantee also outside model |
+
+A circuit breaker disables creation of new sessions when certificate latency,
+storage errors, body-unavailable votes, equivocation, incompatible peers, or
+recovery backlog crosses configured thresholds. It cannot delete existing
+locks. “Fallback” always means no *new* promises; already issued promises remain
+binding.
+
+## Safety Argument
+
+### Certificate uniqueness
+
+Any two quorums of size `2f + 1` in a set of `3f + 1` intersect in at least
+`f + 1` validators. At least one member of that intersection is honest. Since
+an honest validator durably records at most one availability vote and one
+promise acknowledgement for a given session/index, two conflicting
+certificates cannot exist within the unique parent session. A view change
+recovers or seals that session; it cannot mint a competing one.
+
+The previous-certificate hash makes indices an append-only chain. A validator
+does not vote for index `i + 1` without validating the exact `PromiseQC` at
+index `i`, so two certified suffixes cannot fork from one prefix.
+
+### Promise fulfillment
+
+A `PromiseQC` contains `2f + 1` acknowledgements, at least `f + 1` of them from
+honest validators that installed the same durable lock. A conflicting Simplex
+finalization also needs `2f + 1` votes. Excluding those `f + 1` honest blockers
+leaves at most `2f` possible voters, so a canonical successor that omits or
+reorders the promised prefix cannot finalize.
+
+### Data availability
+
+Every availability signer pins and can serve the full body before voting. An
+`AvailabilityQC` therefore names at least `f + 1` honest holders. Promise
+acknowledgements additionally persist the body reference and lock. This does
+not make bytes immortal, but it gives recovery a quorum-certified holder set
+and turns premature deletion into a slashable/observable protocol fault rather
+than an unspecified cache behavior.
+
+### Clock independence
+
+No safety check compares wall-clock timestamps. Timers only decide whether a
+node continues attempting the fast path. A slow network can miss every 100 ms
+target and remain safe.
+
+### Deterministic execution
+
+Only the finalized `CanonicalBatchV2` enters `OrderedNode::drain_delivered` and
+`host.submit_block`. Validators never apply a fastblock to canonical state.
+The existing one-height, one-app-hash batch semantics remain intact.
+
+## Liveness and Performance Envelope
+
+PromiseNet adds work to the critical path: body fan-out, frame validation,
+durable pinning, two quorum signature rounds, one promise-lock fsync, and
+receipt fan-out. The target is credible only when a quorum is physically and
+operationally close enough.
+
+The initial per-fastblock engineering budget is:
+
+| Stage | Target budget |
+|---|---:|
+| proposal header and body fan-out to quorum | 25 ms |
+| frame validation and durable pin | 20 ms |
+| availability votes and certificate assembly | 15 ms |
+| certificate verification and promise-lock fsync | 20 ms |
+| acknowledgements, `PromiseQC`, and publication | 15 ms |
+| scheduler/queue slack | 5 ms |
+| total | 100 ms |
+
+These are acceptance budgets to measure, not observed production numbers. A
+validator topology whose quorum RTT alone consumes the budget cannot offer the
+100 ms SLO. Operators then increase the period, change validator placement, or
+leave the feature disabled; they do not weaken durability or quorum rules.
+
+The release gate is sustained operation at canonical capacity with:
+
+- at least 99.9% of eligible windows producing a valid fastblock in the target
+  deployment envelope;
+- p95 certificate formation at or below 100 ms and p99 at or below 150 ms;
+- zero conflicting certificates and zero unfulfilled receipts under all fault
+  tests within the stated fault model;
+- no statistically significant regression in canonical finalization liveness
+  when PromiseNet is disabled or falling back to the slow path; and
+- bounded memory, disk, stream queues, and recovery time under adversarial
+  submissions.
+
+The 99.9% and percentile targets are launch criteria, not consensus constants.
+They may be revised from measurements without a wire-version change. Quorum,
+lock, and receipt semantics may not.
+
+## Client API and UX
+
+Submission state becomes explicit and monotone where the network has evidence:
+
+| State | Evidence | UI wording |
+|---|---|---|
+| `received` | local node accepted custody of `FrameId` | **Queued** |
+| `preconfirmed` | valid `FastblockReceiptV1` for this frame | **Preconfirmed** |
+| `finalized.applied` | canonical drained outcome and app hash | **Finalized** |
+| `finalized.rejected` | canonical inclusion with deterministic rejection | **Finalized — rejected** |
+| `finalized.discarded` | existing cutover disposition; frame remains eligible for carry | **Carried to next epoch** |
+| `preconfirmation_missed` | window closed without a receipt | Keep **Queued**; optional “fast confirmation unavailable” detail |
+| `unknown_after_timeout` | caller lost contact before an outcome | **Status unknown**; continue polling by `FrameId` |
+
+`preconfirmation_missed` is not a transaction failure and is not terminal. A
+frame may proceed directly from `received` to a finalized state. The UI MUST
+not use “confirmed,” a green success check, or an execution result for a local
+optimistic projection or bare assembler proposal.
+
+The proposed node surface is transport-neutral:
+
+- submit returns the stable `FrameId` as soon as custody is accepted;
+- a status query by `FrameId` returns custody, optional preconfirmation
+  receipt, and eventual finalized disposition;
+- a subscription emits `preconfirmed` and `finalized` transitions; and
+- callers may choose `wait=received`, `wait=preconfirmed`, or `wait=finalized`,
+  each with a client-side timeout that does not cancel custody.
+
+A receipt-verification library MUST be shared by the node, desktop, and SDK.
+It checks the epoch validator set, signature quorum, proposal and certificate
+hashes, frame membership proof, parent boundary, and protocol version. A thin
+client may trust its local node for presentation, but the portable receipt is
+the protocol's actual evidence.
+
+Recommended user copy is: “Validators promised inclusion in the next finalized
+block.” The detail view can say that execution is pending and may still be
+rejected. Product analytics must measure time from custody to receipt and time
+from receipt to finality separately.
+
+## Speculative Execution: Deferred v2
+
+Base-like pending state, receipts, logs, and balance changes require executing
+the certified prefix against the parent state. That is deliberately outside v1.
+When added, it must be a disposable overlay keyed by
+`(parent_app_hash, session_id, index, proposal_hash)` and must satisfy:
+
+- deterministic execution of the exact certified order;
+- no mutation of canonical qmdb or module state;
+- no irreversible I/O, notifications, agent dispatch, payments, or other
+  external effects before finality;
+- explicit speculative identifiers on logs, reads, and receipts;
+- atomic discard on parent mismatch or invalidation; and
+- reconciliation against the finalized batch, with a measurable mismatch rate.
+
+The v1 receipt format commits the cumulative order and roots needed for this
+future overlay, but v1 APIs expose no speculative execution result.
+
+## Observability
+
+Every metric is labeled by network, epoch, validator role, session outcome,
+and protocol version, while avoiding transaction contents and high-cardinality
+raw `FrameId` labels.
+
+Required metrics include:
+
+- session starts, closes, view changes, and circuit-breaker state;
+- eligible, proposed, availability-certified, promise-certified, and missed
+  increments;
+- custody-to-cut, proposal-to-availability-QC, availability-QC-to-PromiseQC,
+  custody-to-receipt, and receipt-to-finality latency histograms;
+- per-peer control RTT, body throughput, retransmits, queue depth, and dropped
+  datagram hints;
+- frame validation, pin, WAL fsync, signature verification, and certificate
+  assembly time;
+- rejected votes by reason, duplicate/equivocating messages, and invalid
+  membership proofs;
+- promised/canonical bytes, unused budget, large-frame deferrals, and overflow
+  carry;
+- recovery attempts, recovered locks, missing bodies, and time to seal;
+- preconfirmation receipts fulfilled, rejected-at-execution, and any
+  receipt/canonical mismatch; and
+- canonical finalization latency with PromiseNet enabled, disabled, and
+  circuit-broken.
+
+Any valid receipt omitted from a finalized successor is a page-level invariant
+violation, not a latency alert. The node retains the receipt, canonical batch,
+validator set, and relevant signed recovery records for forensic export.
+
+## Security and Abuse Resistance
+
+| Threat | Required defense |
+|---|---|
+| forged receipt | Domain-separated validator signatures, epoch valset, quorum verification |
+| assembler equivocation | One durable vote per session/index, quorum intersection, evidence counter |
+| body withholding | Pin-before-vote, availability certificate, signer-directed fetch |
+| certificate withholding | Two-phase `PromiseQC`, control-stream broadcast, recovery summaries |
+| replay across network/epoch/parent | Bind all three in every signed preimage |
+| resident pretending to vote | Validator-only admission plus signature/valset check |
+| datagram spoof/loss | WireGuard identity, signed payload, authoritative stream retry |
+| oversized or malformed frame flood | Existing frame cap, decode-before-pin, bounded queues, peer accounting |
+| disk exhaustion | Per-session/per-peer budgets, canonical capacity, reserved WAL space, circuit breaker |
+| signature CPU exhaustion | Admission before crypto, bounded batch verification, duplicate cache |
+| stale assembler | Authoritative Simplex view events and boundary-close lock |
+| lock deletion after restart | WAL replay before networking or consensus votes |
+| unupgraded validator accepting omission | Height-gated all-validator activation |
+| misleading UI | Receipt-gated status and explicit inclusion-only language |
+
+Equivocation evidence is useful for operator policy and future slashing, but
+v1 does not add an on-chain slashing rule. Safety must not depend on punishment
+after the fact.
+
+## Compatibility and Activation
+
+This is a consensus-sensitive wire and validation change. An old validator
+would not understand `CanonicalBatchV2` or enforce promise locks and could vote
+for omission. Mixed-version activation is therefore unsafe.
+
+The feature ships dark and activates through Ducktape's height-gated upgrade
+mechanism with **`R = n` readiness**:
+
+1. every current validator runs a binary that can decode v1 PromiseNet objects,
+   replay the WAL, validate `CanonicalBatchV2`, and expose capability metadata;
+2. governance schedules an activation height only after all validators signal
+   readiness;
+3. nodes pre-open the Promise data-plane ports but emit no votes before the
+   activation boundary;
+4. the pre-cutover epoch freezes new sessions and resolves existing custody;
+5. activation atomically enables PromiseNet voting, canonical v2 payloads, and
+   receipt APIs for the new epoch; and
+6. rollback before activation is ordinary binary rollback; rollback after a
+   promise-capable epoch begins requires another coordinated upgrade that still
+   understands and honors unresolved locks.
+
+Protocol capability is advertised on the control mesh for diagnostics, but
+advertisement does not authorize early activation. Residents and clients can
+remain old: they simply see no preconfirmation state and continue waiting for
+finality. Receipt-aware APIs are additive and versioned.
+
+## Verification Strategy
+
+### Pure protocol and property tests
+
+- canonical encoding, hashing, domain separation, signer bitmap, Merkle proof,
+  and malformed-certificate vectors;
+- quorum arithmetic across supported validator counts;
+- no two conflicting `AvailabilityQC`s or `PromiseQC`s under generated vote
+  schedules;
+- append-only prefix, capacity monotonicity, deduplication, and canonical
+  packer equivalence;
+- state-machine transition generation, crash at every write boundary, and WAL
+  replay idempotence; and
+- receipt verification against wrong network, epoch, parent, frame, index, or
+  validator set.
+
+### Deterministic BFT simulation
+
+- one, four, and seven validator topologies at ten fastblock opportunities per
+  canonical window;
+- reorder, duplicate, drop, delay, and partition every PromiseNet message
+  class;
+- Byzantine assembler equivocation and certificate/body withholding;
+- up to `f` Byzantine validators double-signing, going silent, or serving
+  corrupt bodies;
+- assembler death before vote, after availability QC, after individual locks,
+  after PromiseQC, and during canonical seal;
+- Simplex nullification and multiple view changes while carrying a promise;
+- no canonical omission/reordering can finalize after a valid receipt;
+- PromiseNet total failure leaves ordinary Simplex live when no lock exists;
+- epoch freeze/restart/cutover with custody and unresolved-lock recovery; and
+- model-check the shared boundary so no interleaving signs a late promise after
+  a canonical vote.
+
+### Integration and performance
+
+- real `OverlaySockets` with persistent control/body flows and forced datagram
+  loss;
+- slow disk, full disk, corrupted WAL tail, process kill, and restart;
+- client submit through a non-validator resident and receipt propagation back;
+- one-MiB-class frames, many tiny frames, duplicate floods, and window overflow;
+- network emulation across the intended validator geography at p50/p95/p99
+  RTT, jitter, loss, and bandwidth limits;
+- sustained canonical capacity for at least 24 hours with latency and resource
+  gates above; and
+- desktop/SDK state-machine tests proving optimistic, preconfirmed, finalized,
+  rejected, carried, and unknown-after-timeout copy.
+
+No production enablement occurs until the simulator can continuously assert
+“every emitted receipt is fulfilled or canonical progress safely stops.”
+
+## Rollout
+
+### Phase 0 — protocol core
+
+Land canonical types, verifier, quorum math, WAL state machine, shared batch
+size helper, and deterministic simulator. No network or user-visible behavior
+changes.
+
+### Phase 1 — dark PromiseNet
+
+Add `Service::Promise`, per-use plane wiring, body/control flows, metrics, and
+fault injection. Validators exchange candidates in shadow mode but do not sign
+binding promise acknowledgements and clients receive nothing. Compare shadow
+prefixes with finalized batches.
+
+### Phase 2 — binding certificates behind activation
+
+Add availability voting, durable promise locks, `PromiseQC`, recovery, the
+shared `BoundaryLock`, and `CanonicalBatchV2`. Exercise height-gated `R = n`
+activation on disposable networks. The API remains operator-only.
+
+### Phase 3 — inclusion preconfirmation
+
+Expose receipt verification, status query/subscription, and desktop states to a
+canary network. Enable automatic circuit breaking and publish measured SLOs.
+Expand only after the safety, latency, and canonical-regression gates pass.
+
+### Phase 4 — default fast UX
+
+Enable inclusion preconfirmation by default for compatible networks. Keep
+ordinary finalized APIs and user-selectable finality waits. Continue treating
+receipt fulfillment as a release-blocking invariant.
+
+### Phase 5 — speculative state, separate ADR
+
+Design and review the disposable execution overlay, pending reads, receipts,
+logs, and effect quarantine. It is not implicitly authorized by this ADR.
+
+## Consequences
+
+### Benefits
+
+- Users receive validator-backed feedback in roughly 100–200 ms under the
+  target deployment envelope instead of waiting through full BFT finality.
+- The receipt is stronger than a sequencer or RPC acknowledgement and survives
+  ordinary assembler failure.
+- The protocol reuses the existing elected proposer, validator identities,
+  overlay, custody model, canonical batch, and Simplex finality.
+- Safety is independent of timer accuracy, and the fast path can disappear
+  without inventing a weaker confirmation class.
+- The cumulative prefix and roots prepare a later Base-like pending-state UX
+  without coupling that larger feature to v1.
+
+### Costs and trade-offs
+
+- Two quorum rounds and durable storage per fastblock are expensive; ten
+  increments imply up to twenty quorum signature phases per second.
+- The 100 ms SLO constrains validator geography and storage performance.
+- Promise locks couple the off-consensus data plane to consensus validation at
+  one carefully audited boundary.
+- A real promise can intentionally halt canonical progress until its data is
+  recovered; that is the cost of making the promise meaningful.
+- Large frames may not be eligible until a late index, and overload yields no
+  fast receipt rather than more throughput.
+- Canonical leader timeout and payload versioning change at activation.
+- Operations gain new WAL, disk-reservation, networking, alerting, and forensic
+  responsibilities.
+
+## Alternatives Considered
+
+### Keep only local optimistic UI
+
+Useful for responsiveness but not evidence of network custody, ordering, or
+future inclusion. It also makes timeouts ambiguous. Retained as a presentation
+technique, rejected as preconfirmation.
+
+### Accept the ingress validator's acknowledgement
+
+A single validator can crash, equivocate, or fail to become proposer. Its
+signature cannot bind a future BFT quorum. Rejected.
+
+### Copy Base's single-sequencer Flashblocks directly
+
+Base's sequencer stream is an appropriate design for its rollup architecture,
+but Ducktape validators collectively own finality. Treating an assembler as a
+sequencer would create a weaker trust model than the rest of the chain.
+Rejected; Ducktape borrows incremental building and cumulative capacity, not
+the authority model.
+
+### One-phase `2f + 1` availability certificate
+
+Quorum intersection prevents conflicting certificates, but a Byzantine
+assembler could give the assembled certificate only to a client before honest
+signers durably learn and enforce it. Immediate per-vote locking complicates
+recovery from minority equivocation. Rejected in favor of availability QC plus
+post-lock promise acknowledgements.
+
+### Independent leaderless validator lanes
+
+Per-validator lanes remove an assembler bottleneck but leave the canonical
+merge, global capacity, duplicate removal, cross-lane conflicts, and client
+proof semantics unsolved. Solving them recreates a DAG/mempool consensus
+protocol. Deferred as a possible future dissemination optimization, rejected
+for v1 ordering and certification.
+
+### Run a second BFT consensus every 100 ms
+
+This would create a second replicated log whose view changes, recovery, and
+state must reconcile with Simplex. It increases proof and operational surface
+far beyond what an inclusion receipt requires. Rejected.
+
+### Shorten canonical block time to 100 ms
+
+Ten times as many Simplex rounds, durable app-state commits, and height changes
+would amplify consensus, storage, checkpoint, and module overhead. It also
+cannot beat quorum physics and provides no graceful fast-path fallback.
+Rejected.
+
+### Treat pairwise WireGuard identity as a receipt
+
+Transport identity is not third-party-provable and says nothing about durable
+storage or quorum intent. Rejected.
+
+### Preconfirm successful execution in v1
+
+That requires deterministic speculative state, conflict handling, receipt/log
+versioning, and strict effect quarantine. Inclusion delivers the primary UX
+win with a smaller safety boundary. Deferred to a separate ADR.
+
+## Implementation Boundaries
+
+The protocol core belongs in a kernel crate with no socket or host dependency,
+so the state machine and verifier run under deterministic simulation. The
+system data-plane crate owns only `Service::Promise` and byte transport. The
+node host owns plane construction, view lifecycle wiring, persistence,
+metrics, and client gateways. Consensus owns the shared boundary check and
+canonical seal validation. `OrderedNode` owns the single canonical packer and
+continues to be the only application execution entry point. The desktop and
+SDK consume receipts but never manufacture status.
+
+Likely code seams are:
+
+- `crates/kernel/fastblocks` — types, codec, hashes, certificates, verifier,
+  capacity/state machine, recovery model, sim tests;
+- `crates/system/data-plane` — append-only service/port registration only;
+- `bin/node` — PromiseNet per-use plane, assembler, validator workers, WAL,
+  ingress/status/subscription, circuit breaker, and observability;
+- `crates/kernel/consensus` — authoritative view events, leader timeout, and
+  shared `BoundaryLock` enforcement;
+- `crates/kernel/node` — shared batch-fit helper, `CanonicalBatchV2`, seal and
+  finalization reconciliation; and
+- `app` plus SDK surfaces — receipt verification and truthful status states.
+
+These are ownership boundaries, not permission to land the protocol as one
+large change. Each rollout phase must preserve ordinary Simplex behavior and
+carry its own fault tests.
+
+## Deferred Decisions
+
+The following do not block v1's safety decision and require measurement or a
+separate ADR:
+
+- threshold/aggregate signatures versus the v1 signer bitmap;
+- fee or priority selection among never-certified frames;
+- exact queue sizes, retry intervals, disk reservation, and circuit-breaker
+  thresholds;
+- changing the 100 ms period for validator sets outside the target geography;
+- weighted validator voting;
+- economic slashing for signed equivocation or unavailable promised data; and
+- speculative execution and pending-state RPC.
+
+## References
+
+- Ducktape per-use transport contract:
+  [`docs/adr/2026-07-07-per-use-data-plane.mdx`](./2026-07-07-per-use-data-plane.mdx)
+- Ducktape userspace overlay boundary:
+  [`docs/adr/2026-07-07-userspace-overlay-net.mdx`](./2026-07-07-userspace-overlay-net.mdx)
+- [Base Flashblocks API overview](https://docs.base.org/base-chain/api-reference/flashblocks-api/flashblocks-api-overview)
+- [Base Flashblocks reference](https://docs.base.org/base-chain/flashblocks/faq)
+- [Flashbots rollup-boost Flashblocks specification](https://github.com/flashbots/rollup-boost/blob/main/specs/flashblocks.md)
