@@ -195,7 +195,7 @@ impl ValidatorRuntime<'_> {
                         block_app_hash = Some(d.app_hash);
                     }
                     block_ops.push(explorer_root_op(
-                        &blobs,
+                        blobs,
                         &op.origin,
                         &op.target,
                         &op.payload,
@@ -405,8 +405,8 @@ impl ValidatorRuntime<'_> {
                 Some(f.height),
                 orchestrator.epoch(),
                 orchestrator.epoch_base(),
-                participant_bytes(&orchestrator),
-                resident_bytes(&orchestrator),
+                participant_bytes(orchestrator),
+                resident_bytes(orchestrator),
                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
                 cv,
                 pu,
@@ -549,7 +549,7 @@ impl ValidatorRuntime<'_> {
                 // cutovers.
                 mesh_oracle.track(
                     plan.epoch(),
-                    super::super::wiring::mesh_at(&peers, plan.valset().transport_members()),
+                    super::super::wiring::mesh_at(peers, plan.valset().transport_members()),
                 );
                 // the statesync plane serves (and admits) exactly
                 // who the mesh tracks — follow the re-track.
@@ -665,8 +665,8 @@ impl ValidatorRuntime<'_> {
                     node.finalized().map(|f| f.height),
                     orchestrator.epoch(),
                     orchestrator.epoch_base(),
-                    participant_bytes(&orchestrator),
-                    resident_bytes(&orchestrator),
+                    participant_bytes(orchestrator),
+                    resident_bytes(orchestrator),
                     None,
                     cv,
                     pu,
@@ -726,7 +726,7 @@ impl ValidatorRuntime<'_> {
                 *next_seq += 1;
                 if let Err(e) = node
                     .submit(
-                        &signer,
+                        signer,
                         seq,
                         Msg {
                             target: NOP_TARGET.into(),
@@ -757,7 +757,7 @@ impl ValidatorRuntime<'_> {
         {
             let seq = *next_seq;
             *next_seq += 1;
-            match node.submit(&signer, seq, msg).await {
+            match node.submit(signer, seq, msg).await {
                 Ok(_) => {
                     println!("[node {label}] signaled ready name={name} to_version={to_version}")
                 }
@@ -787,7 +787,7 @@ impl ValidatorRuntime<'_> {
         {
             let seq = *next_seq;
             *next_seq += 1;
-            match node.submit(&signer, seq, msg).await {
+            match node.submit(signer, seq, msg).await {
                 Ok(_) => println!(
                     "[node {label}] announced capabilities {:?}",
                     announcer.capabilities
@@ -819,7 +819,7 @@ impl ValidatorRuntime<'_> {
             *next_seq += 1;
             if let Err(e) = node
                 .submit(
-                    &signer,
+                    signer,
                     seq,
                     Msg {
                         target: "saga".into(),
@@ -854,7 +854,7 @@ impl ValidatorRuntime<'_> {
             *next_seq += 1;
             if let Err(e) = node
                 .submit(
-                    &signer,
+                    signer,
                     seq,
                     Msg {
                         target: "dispatch".into(),
@@ -910,7 +910,7 @@ impl ValidatorRuntime<'_> {
                     Ok(reactor::WorkOutcome::Handled(Some(follow))) => {
                         let seq = *next_seq;
                         *next_seq += 1;
-                        if let Err(e) = node.submit(&signer, seq, follow).await {
+                        if let Err(e) = node.submit(signer, seq, follow).await {
                             eprintln!("[node {label}] worker follow-up submit failed: {e}");
                         }
                         claimed = true;

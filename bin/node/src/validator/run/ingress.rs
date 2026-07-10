@@ -37,7 +37,7 @@ impl ValidatorRuntime<'_> {
                 Ok(payload) => {
                     let seq = *next_seq;
                     *next_seq += 1;
-                    match node.submit(&signer, seq, Msg { target, payload }).await {
+                    match node.submit(signer, seq, Msg { target, payload }).await {
                         Ok(_) => RpcReply::ok(),
                         Err(e) => RpcReply::err(format!("submit failed: {e}")),
                     }
@@ -122,7 +122,7 @@ impl ValidatorRuntime<'_> {
         // provider ran moved.
         let seq = *next_seq;
         *next_seq += 1;
-        if let Err(e) = node.submit(&signer, seq, msg).await {
+        if let Err(e) = node.submit(signer, seq, msg).await {
             eprintln!("[node {label}] oracle result submit failed: {e}");
         }
     }
@@ -163,7 +163,7 @@ impl ValidatorRuntime<'_> {
         };
         // crypto first (pure, cheap): the token must verify for
         // THIS network and the announced key must prove itself.
-        let verified = match lobby::verify_join_request(&msg, &namespace) {
+        let verified = match lobby::verify_join_request(&msg, namespace) {
             Ok(v) => v,
             Err(e) => {
                 send_reply(false, e, None, false);
@@ -265,7 +265,7 @@ impl ValidatorRuntime<'_> {
             let mut subj = [0u8; 32];
             subj.copy_from_slice(verified.joiner.as_ref());
             let cap = nat_traversal::mint_coord_cap(
-                &signer,
+                signer,
                 nat_traversal::NodeKey(subj),
                 nat_traversal::now_secs() + nat_traversal::COORD_CAP_TTL_SECS,
             );
@@ -301,7 +301,7 @@ impl ValidatorRuntime<'_> {
         *next_seq += 1;
         match node
             .submit(
-                &signer,
+                signer,
                 seq,
                 Msg {
                     target: "governance".into(),
@@ -426,7 +426,7 @@ impl ValidatorRuntime<'_> {
             } => {
                 let seq = *next_seq;
                 *next_seq += 1;
-                let frame = node::encode_frame(&signer, seq, &Msg { target, payload });
+                let frame = node::encode_frame(signer, seq, &Msg { target, payload });
                 let peers: Vec<ed25519::PublicKey> =
                     if relay::required_blob_digest(&frame).is_some() {
                         read_valset_members(node.host())

@@ -35,8 +35,8 @@ impl ValidatorRuntime<'_> {
                 let coords = statesync::BoundaryCoords {
                     epoch: orchestrator.epoch(),
                     view_base: orchestrator.epoch_base(),
-                    participants: participant_bytes(&orchestrator),
-                    residents: resident_bytes(&orchestrator),
+                    participants: participant_bytes(orchestrator),
+                    residents: resident_bytes(orchestrator),
                     current_version: bc_current,
                     pending_upgrade: bc_pending,
                     floor_cert: latest_floor
@@ -112,7 +112,7 @@ impl ValidatorRuntime<'_> {
                 let _ = reply.send(read);
             }
             SyncStateRequest::IndexCut { reply } => {
-                let _ = reply.send(ship_index_blobs(&index, &label));
+                let _ = reply.send(ship_index_blobs(index, label));
             }
             SyncStateRequest::TipCoords { reply } => {
                 // the detection lane: everything here is already
@@ -131,8 +131,8 @@ impl ValidatorRuntime<'_> {
                         app_hash: f.app_hash,
                         epoch: orchestrator.epoch(),
                         view_base: orchestrator.epoch_base(),
-                        participants: participant_bytes(&orchestrator),
-                        residents: resident_bytes(&orchestrator),
+                        participants: participant_bytes(orchestrator),
+                        residents: resident_bytes(orchestrator),
                         has_floor: latest_floor
                             .as_ref()
                             .filter(|fc| fc.epoch == orchestrator.epoch())
