@@ -199,9 +199,31 @@ fn providers(cluster: &Cluster, idx: usize, tag: &str) -> Option<Vec<Vec<u8>>> {
     }
 }
 
+/// stage the agent's prompt in node `idx`'s blob store ONLY and return the
+/// 32-byte digest the registry pins. the executing node is deliberately a
+/// DIFFERENT validator: resolving this pin exercises the mesh fetch-on-miss
+/// lane (the #298 cross-node gap) end-to-end — a prompt saved via one node's
+/// app must run anywhere the workspace executes.
+fn upload_prompt(cluster: &Cluster, idx: usize) -> Vec<u8> {
+    let (status, body) = cluster.http(
+        idx,
+        "POST",
+        "/v1/files/blob",
+        Some(&serde_json::json!("You are the dispatch e2e duck.")),
+    );
+    assert_eq!(status, 200, "blob upload failed: {body}");
+    let hex = body["digest"].as_str().expect("digest in blob receipt");
+    assert_eq!(hex.len(), 64, "a 32-byte digest in hex");
+    (0..64)
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex digest"))
+        .collect()
+}
+
 /// register `agent_id` on `tag`, watch `channel` under Mention, and post the
 /// mention that engages it — the whole client-side trigger, submitted through
-/// node `idx` (whose key becomes the owner/author). returns the mention's
+/// node `idx` (whose key becomes the owner/author). the agent's prompt pin is
+/// staged on `idx` alone (see [`upload_prompt`]). returns the mention's
 /// message id.
 fn register_and_mention(
     cluster: &Cluster,
@@ -211,6 +233,7 @@ fn register_and_mention(
     tag: &str,
     message_id: &str,
 ) {
+    let prompt_hash = upload_prompt(cluster, idx);
     cluster.submit(
         idx,
         "agent",
@@ -218,7 +241,7 @@ fn register_and_mention(
             agent_id: agent_id.into(),
             display_name: agent_id.into(),
             capability: tag.into(),
-            prompt_hash: vec![7u8; 32],
+            prompt_hash,
             allowed_actions: vec![ACTION_CHAT_POST.into()],
             recipe_hash: None,
             caps: None,
@@ -423,17 +446,21 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // the never-pop-stack rule, observed: the agent's reply post (the
     // delivery block's follow-up) landed STRICTLY ABOVE the oracle result
     // that committed the outcome — at least one full block between a result
-    // and its consumption.
-    let saga_ops = index_ops(&cluster, 0, "saga");
-    let chat_ops = index_ops(&cluster, 0, "chat");
-    let result_height = op_height(&saga_ops, |p| p.get("oracle_result").is_some())
-        .expect("an OracleResult op is indexed");
-    let reply_height = op_height(&chat_ops, |p| {
-        p.get("post_message")
-            .and_then(|m| m["message_id"].as_str())
-            .is_some_and(|id| id == format!("agent/{run_text}"))
-    })
-    .expect("the agent reply post is indexed");
+    // and its consumption. the derived op index applies block-by-block
+    // BEHIND finalized state (the reply was already read from chat state
+    // above), so both lookups poll instead of racing the indexer.
+    let result_height = poll_until("the OracleResult op to index", FINALIZE, || {
+        op_height(&index_ops(&cluster, 0, "saga"), |p| {
+            p.get("oracle_result").is_some()
+        })
+    });
+    let reply_height = poll_until("the agent reply post to index", FINALIZE, || {
+        op_height(&index_ops(&cluster, 0, "chat"), |p| {
+            p.get("post_message")
+                .and_then(|m| m["message_id"].as_str())
+                .is_some_and(|id| id == format!("agent/{run_text}"))
+        })
+    });
     assert!(
         reply_height > result_height,
         "next-block delivery: reply at {reply_height} must sit above the result at {result_height}"
