@@ -1,5 +1,9 @@
 use super::*;
-use directory::Directory;
+use crate::sync::catchup::write_post_reboot_catchup_checkpoint;
+use commonware_cryptography::ed25519;
+use directory::{DirMsg, Directory, encode_msg};
+use host::Host;
+use recovery::Manifest;
 use sdk::{Ctx, Error, Module, StateSyncHandle};
 use std::sync::{Arc, Mutex};
 use upgrade::{ScheduledUpgrade, UpgradeStatus};
