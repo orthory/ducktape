@@ -6053,10 +6053,12 @@ dependencies = [
  "capability",
  "futures",
  "host",
+ "indexer",
  "sdk",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "valset",
 ]
 
