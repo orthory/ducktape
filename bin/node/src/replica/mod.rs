@@ -31,6 +31,30 @@ use commonware_codec::{Decode as _, Encode as _};
 use commonware_consensus::simplex::types::Certificate;
 use consensus::Digest;
 
+pub(crate) mod promotion;
+
+/// replace this process with a fresh invocation of itself (same argv): the
+/// clean way to re-enter boot with a different network topology — discovery
+/// channels can only be registered before `network.start()`, so a promoted
+/// joiner cannot grow a consensus engine in-process.
+pub(crate) fn reboot_self() -> ! {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let exe = std::env::current_exe().expect("current exe path");
+        let err = std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        eprintln!("FATAL: validator reboot exec failed: {err}");
+        std::process::exit(1);
+    }
+    #[cfg(not(unix))]
+    {
+        println!("promoted — restart this node to run as a validator");
+        std::process::exit(0);
+    }
+}
+
 /// one finalization observed on the cert lane, shape-decoded (NOT yet
 /// verified — verification is the follower gate's job) with the coordinates
 /// the fold planner needs.

@@ -90,6 +90,7 @@ mod sync;
 mod userkey;
 mod userkey_cli;
 mod util;
+mod validator;
 mod voice;
 mod voice_plane;
 use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
@@ -107,6 +108,13 @@ use host_state::{
     NetworkBindings, SyncSubstrates, genesis_host, restore_host, run_output_sink, sync_all_modules,
 };
 use reachability_plane::wire_reachability_plane;
+use replica::{
+    reboot_self,
+    promotion::{
+        PromotionBoundary, PromotionBoundarySource, choose_promotion_boundary,
+        joiner_manifest_fetch_retry,
+    },
+};
 use rpc::{spawn_rpc_listener, JoinRequestRecord, JoinRequestView, RpcJob, RpcReply, RpcRequest, RpcStatus};
 use sync::catchup::{
     advance_next_seq_from_frames, apply_post_reboot_catchup_frames, apply_verified_suffix_frame,
@@ -119,6 +127,9 @@ use sync::serve::{
     replica_verifier, verify_manifest_floor, write_boundary_checkpoint,
 };
 use util::{diag_log, epoch_floor, hex, participant_bytes, resident_bytes, unix_ms};
+use validator::announce::{
+    CapabilityAnnouncer, ReadinessSignaller, dispatch_pending_deliveries, saga_next_expiry,
+};
 
 use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use duckfs_disk::SyncScratch;
@@ -128,290 +139,6 @@ use recovery::{Manifest, Recovery};
 use sdk::{Msg, StateRoot};
 use statesync::p2p::P2pSyncClient;
 use statesync::{SyncServer, fetch_manifest, fetch_tip_coords};
-
-/// the node-local worker that self-emits a validator-origin `SignalReady` op
-/// ONCE per pending upgrade this binary can execute. deliberately NOT a
-/// `reactor::Worker`: readiness must survive restart/late-join, so it polls the
-/// COMMITTED upgrade state each pump tick and re-derives its decision idempotently
-/// rather than reacting to a one-shot block effect. "ready" is a truthful machine
-/// statement about the running binary — it signals iff `MAX_PROTOCOL_VERSION >=
-/// to_version` (never a version it cannot execute).
-struct ReadinessSignaller {
-    /// the highest protocol version this binary can execute (`MAX_PROTOCOL_VERSION`).
-    max_version: u32,
-    /// this node's own validator pubkey bytes — the readiness identity.
-    me: Vec<u8>,
-    /// the `(name, to_version)` we have already emitted a signal for, latched so a
-    /// signal in flight (not yet committed into the module's `ready` set, several
-    /// ticks out) is not re-emitted every pump tick (risk R10 — local dedupe atop
-    /// module idempotence).
-    signaled: Option<(String, u32)>,
-}
-
-impl ReadinessSignaller {
-    fn new(max_version: u32, me: Vec<u8>) -> Self {
-        Self {
-            max_version,
-            me,
-            signaled: None,
-        }
-    }
-
-    /// the PURE decision core: given the committed status, decide whether to emit a
-    /// `SignalReady` and latch it. returns the `(name, to_version)` to signal, or
-    /// `None`. truthful (binary can execute `to_version`), member-gated (self is a
-    /// current boundary member), and idempotent (module already holds our signal, or
-    /// one is already in flight).
-    fn decide(&mut self, status: &upgrade::UpgradeStatus) -> Option<(String, u32)> {
-        let pending = status.pending.as_ref()?;
-        // never lie: a binary that cannot execute the target version stays silent so
-        // the boundary cleanly aborts rather than arming onto an under-versioned node.
-        if pending.to_version > self.max_version {
-            return None;
-        }
-        // only a CURRENT boundary member is in the readiness denominator (R = n).
-        if !status.members.iter().any(|m| m == &self.me) {
-            return None;
-        }
-        // the module already recorded our (committed) signal — nothing to do.
-        if status.ready.iter().any(|k| k == &self.me) {
-            return None;
-        }
-        // a signal for this exact upgrade is already in flight (submitted, awaiting
-        // finalization) — do not re-submit every tick.
-        if self.signaled.as_ref() == Some(&(pending.name.clone(), pending.to_version)) {
-            return None;
-        }
-        self.signaled = Some((pending.name.clone(), pending.to_version));
-        Some((pending.name.clone(), pending.to_version))
-    }
-
-    /// query committed upgrade state and, when a signal is due, build the
-    /// validator-origin `SignalReady` op. gracefully `None` when the module is
-    /// absent (pre-retrofit) or the reply is unreadable — no panic on a baseline net.
-    async fn maybe_signal(&mut self, host: &Host) -> Option<(Msg, String, u32)> {
-        use upgrade::{
-            UpgradeMsg, UpgradeQuery, UpgradeReply, decode_reply, encode_msg, encode_query,
-        };
-        let reply = host
-            .query("upgrade", &encode_query(&UpgradeQuery::Status))
-            .await
-            .ok()?;
-        let UpgradeReply::Status(status) = decode_reply(&reply).ok()?;
-        let (name, to_version) = self.decide(&status)?;
-        let msg = Msg {
-            target: "upgrade".into(),
-            payload: encode_msg(&UpgradeMsg::SignalReady {
-                name: name.clone(),
-                to_version,
-                commitment: None,
-            }),
-        };
-        Some((msg, name, to_version))
-    }
-}
-
-/// the capability self-announcer: the state-driven twin of
-/// [`ReadinessSignaller`] for the capability registry. it polls the committed
-/// registry each pump tick and, when this node's announced set differs from
-/// what discovery found locally, self-submits ONE declarative
-/// [`CapabilityMsg::Announce`]. state-driven (survives restart/late-join) and
-/// idempotent: once the committed set matches, it stays quiet. a node with no
-/// providers announces nothing.
-struct CapabilityAnnouncer {
-    /// this node's own validator pubkey bytes — the registry identity.
-    me: Vec<u8>,
-    /// the capability tags discovery found on this host, sorted — the truthful
-    /// set to announce. empty means this node provides nothing.
-    capabilities: Vec<String>,
-    /// the set we last SUBMITTED (not yet observed committed), latched so an
-    /// in-flight announce is not re-sent every tick.
-    announced: Option<Vec<String>>,
-}
-
-impl CapabilityAnnouncer {
-    fn new(me: Vec<u8>, capabilities: Vec<String>) -> Self {
-        Self {
-            me,
-            capabilities,
-            announced: None,
-        }
-    }
-
-    /// the PURE decision core: given this node's committed announced set,
-    /// decide whether to (re)announce. `None` when the registry already matches
-    /// what we'd announce, or an identical announce is already in flight.
-    fn decide(&mut self, committed: &[String]) -> Option<Vec<String>> {
-        // nothing to provide and nothing recorded: stay silent (genesis state).
-        if self.capabilities.is_empty() && committed.is_empty() {
-            return None;
-        }
-        // the registry already reflects our providers — nothing to do.
-        if committed == self.capabilities.as_slice() {
-            self.announced = None;
-            return None;
-        }
-        // an announce for this exact set is already in flight.
-        if self.announced.as_deref() == Some(self.capabilities.as_slice()) {
-            return None;
-        }
-        self.announced = Some(self.capabilities.clone());
-        Some(self.capabilities.clone())
-    }
-
-    /// query this node's committed capability set and, when an announce is due,
-    /// build the external-origin `Announce` op. gracefully `None` when the
-    /// module is absent (pre-retrofit net) or the reply is unreadable.
-    async fn maybe_announce(&mut self, host: &Host) -> Option<Msg> {
-        use capability::{
-            CapabilityMsg, CapabilityQuery, CapabilityReply, decode_reply, encode_msg, encode_query,
-        };
-        let reply = host
-            .query(
-                "capability",
-                &encode_query(&CapabilityQuery::Node {
-                    node: self.me.clone(),
-                }),
-            )
-            .await
-            .ok()?;
-        let CapabilityReply::Node(committed) = decode_reply(&reply).ok()? else {
-            return None;
-        };
-        let capabilities = self.decide(&committed)?;
-        Some(Msg {
-            target: "capability".into(),
-            payload: encode_msg(&CapabilityMsg::Announce { capabilities }),
-        })
-    }
-}
-
-/// the committed dispatch mailbox's undelivered-result count — the nudge
-/// pump's read. `0` when the module is absent or the mailbox is empty.
-async fn dispatch_pending_deliveries(host: &Host) -> u64 {
-    use dispatch::{DispatchQuery, DispatchReply, decode_reply, encode_query};
-    let Ok(reply) = host
-        .query("dispatch", &encode_query(&DispatchQuery::PendingDeliveries))
-        .await
-    else {
-        return 0;
-    };
-    match decode_reply(&reply) {
-        Ok(DispatchReply::PendingDeliveries(n)) => n,
-        _ => 0,
-    }
-}
-
-/// the committed saga ledger's earliest pending lease-expiry/deadline — the
-/// crank pump's read. `None` when the module is absent or nothing pending
-/// carries one.
-async fn saga_next_expiry(host: &Host) -> Option<u64> {
-    use saga::{SagaQuery, SagaReply, decode_reply, encode_query};
-    let reply = host
-        .query("saga", &encode_query(&SagaQuery::NextExpiry))
-        .await
-        .ok()?;
-    match decode_reply(&reply).ok()? {
-        SagaReply::NextExpiry(v) => v,
-        _ => None,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PromotionBoundarySource {
-    Latest,
-}
-
-impl PromotionBoundarySource {
-    fn as_str(self) -> &'static str {
-        match self {
-            PromotionBoundarySource::Latest => "latest",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PromotionBoundary<'a> {
-    Promote {
-        boundary: &'a statesync::Manifest,
-        source: PromotionBoundarySource,
-    },
-    Retry,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ManifestFetchRetry {
-    log_line: String,
-    announce: bool,
-}
-
-fn joiner_manifest_fetch_retry(
-    label: &str,
-    resident_standing: bool,
-    error: impl std::fmt::Display,
-) -> ManifestFetchRetry {
-    if resident_standing {
-        return ManifestFetchRetry {
-            log_line: format!("[node {label}] resident: boundary fetch retrying ({error})"),
-            announce: false,
-        };
-    }
-    ManifestFetchRetry {
-        log_line: format!(
-            "[node {label}] joining: redemption not landed yet (or the mesh is unreachable) — \
-             the announce keeps retrying and a member node redeems it automatically. retrying \
-             ({error})"
-        ),
-        announce: true,
-    }
-}
-
-fn latest_boundary_has_floor(latest: &statesync::Manifest) -> bool {
-    latest.height <= latest.view_base || latest.floor_cert.is_some()
-}
-
-fn choose_promotion_boundary<'a>(
-    synced_host_hash: StateRoot,
-    latest: &'a statesync::Manifest,
-    self_public_key: &[u8],
-) -> PromotionBoundary<'a> {
-    if !latest.participants.iter().any(|key| key == self_public_key) {
-        return PromotionBoundary::Retry;
-    }
-    if latest.app_hash == synced_host_hash {
-        return if latest_boundary_has_floor(latest) {
-            PromotionBoundary::Promote {
-                boundary: latest,
-                source: PromotionBoundarySource::Latest,
-            }
-        } else {
-            PromotionBoundary::Retry
-        };
-    }
-    PromotionBoundary::Retry
-}
-
-/// replace this process with a fresh invocation of itself (same argv): the
-/// clean way to re-enter boot with a different network topology — discovery
-/// channels can only be registered before `network.start()`, so a promoted
-/// joiner cannot grow a consensus engine in-process.
-fn reboot_self() -> ! {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        let exe = std::env::current_exe().expect("current exe path");
-        let err = std::process::Command::new(exe)
-            .args(std::env::args_os().skip(1))
-            .exec();
-        eprintln!("FATAL: validator reboot exec failed: {err}");
-        std::process::exit(1);
-    }
-    #[cfg(not(unix))]
-    {
-        println!("promoted — restart this node to run as a validator");
-        std::process::exit(0);
-    }
-}
 
 fn main() {
     resource_limits::raise_open_file_limit();
