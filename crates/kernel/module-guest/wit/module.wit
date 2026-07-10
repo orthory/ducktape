@@ -1,0 +1,66 @@
+package ducktape:module@0.1.0;
+
+/// the deterministic host surface a wasm module may touch during dispatch.
+/// this is the wasm-boundary twin of `sdk::Ctx`: own-state read/write is
+/// host-owned and staged until block commit; cross-module reads are
+/// host-routed; writes leave as emitted intents, never reentrant calls.
+/// deliberately NO clock / rng / net / direct blob — determinism by omission.
+interface host {
+  /// the deterministic environment for this dispatch (block-constant fields
+  /// are identical on every validator; NOT wall clock, NOT per-node).
+  record env {
+    height: u64,
+    consensus-time: u64,
+    protocol-version: u32,
+    me: string,
+    origin: origin,
+  }
+
+  /// who triggered THIS dispatch.
+  variant origin {
+    external(list<u8>),
+    from-module(string),
+    system,
+  }
+
+  /// the deterministic error a module may surface. `rejected` is a clean,
+  /// deterministic no-op-on-every-honest-validator failure.
+  variant error {
+    rejected(string),
+    not-found,
+    unsupported,
+  }
+
+  /// deterministic environment for this dispatch.
+  get-env: func() -> env;
+
+  /// own authenticated state. the host owns the store and computes this
+  /// module's root() from it; writes are staged and only published at the
+  /// block-commit boundary (discarded on abort).
+  state-get: func(key: list<u8>) -> option<list<u8>>;
+  state-set: func(key: list<u8>, value: list<u8>);
+  state-delete: func(key: list<u8>);
+
+  /// snapshot root of a sibling module as of the START of this dispatch.
+  module-root: func(target: string) -> option<list<u8>>;
+  /// live, read-only, host-routed read of a sibling module.
+  query-module: func(target: string, req: list<u8>) -> result<list<u8>, error>;
+
+  /// emit a write intent — re-dispatched as a follow-up op, never reentrant.
+  emit-msg: func(target: string, payload: list<u8>);
+  /// emit an observability event — leaves the state machine.
+  emit-event: func(source: string, payload: list<u8>);
+}
+
+/// the contract every wasm module implements. the guest is PURE logic over
+/// the host surface; it owns no durable memory across dispatches (the host
+/// re-instantiates per call), so state lives entirely behind `host.state-*`.
+world module {
+  use host.{error};
+  import host;
+
+  /// dispatch entry: apply an incoming op payload addressed to this module.
+  export execute: func(payload: list<u8>) -> result<_, error>;
+  /// read-only projection of this module's state.
+  export query: func(req: list<u8>) -> result<list<u8>, error>;
+}

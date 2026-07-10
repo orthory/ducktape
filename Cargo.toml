@@ -19,6 +19,7 @@ members = [
     "crates/kernel/node", "crates/kernel/consensus", "crates/kernel/reactor",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
     "crates/kernel/capability-host",
+    "crates/kernel/wasm-host",
     # system — consensus infrastructure modules
     "crates/system/kv", 
     "crates/system/valset", 
@@ -142,6 +143,12 @@ zeroize = "1"
 # default-features = false drops the in-database WASM layer (wasmtime).
 fluent31 = { git = "https://github.com/orthory/fluent31", default-features = false }
 
+# wasmtime — the frozen-substrate wasm runtime that executes hot-swappable
+# modules inside the host. pinned EXACTLY: the runtime IS the module execution
+# semantics, so it is consensus-affecting and every validator must run the
+# identical build; changing it is a binary upgrade, never a live module swap.
+wasmtime = "=46.0.1"
+
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
 state = { path = "crates/kernel/state" }
@@ -153,6 +160,7 @@ statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }
 capability-host = { path = "crates/kernel/capability-host" }
+wasm-host = { path = "crates/kernel/wasm-host" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 # internal — module impl crates
