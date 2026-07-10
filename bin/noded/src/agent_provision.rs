@@ -27,7 +27,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use dispatch_oracle::{ProvisionedWorkspace, WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec};
+use dispatch_oracle::{
+    ProvisionedWorkspace, WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec,
+};
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 use duckfs_client::commit::{CommitError, commit};
 
@@ -139,10 +141,25 @@ impl WorkspaceProvisioner for NodedProvisioner {
         &self,
         spec: &WorkspaceSpec,
     ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
+        // this provisioner materializes DUCKFS sources; the forge variant
+        // (agent-dogfood M1, wire contract §4) is a distinct git-worktree
+        // engine that lands with task 3 — until then a forge run fails its
+        // attempt LOUDLY here (the saga settles it; never a wrong-source
+        // checkout).
+        let (prefix, snapshot) = match &spec.source {
+            WorkspaceSource::Duckfs {
+                source_prefix,
+                source_snapshot,
+            } => (source_prefix.clone(), source_snapshot.clone()),
+            WorkspaceSource::Forge { repo, .. } => {
+                return Err(format!(
+                    "forge workspace provisioning for repo {repo:?} is not implemented \
+                     by this node yet"
+                ));
+            }
+        };
         let dir = self.root.join(run_slug(&spec.run_id));
         let api = ActorNodeApi::new(self.handle.clone());
-        let prefix = spec.source_prefix.clone();
-        let snapshot = spec.source_snapshot.clone();
         let checkout_dir = dir.clone();
         // the engine call is blocking std::fs + block_on(actor) — MUST be
         // spawn_blocking (never an async worker), exactly like
@@ -185,20 +202,18 @@ impl WorkspaceProvisioner for NodedProvisioner {
         Ok(Box::new(NodedWorkspace {
             handle: self.handle.clone(),
             dir,
-            source_prefix: spec.source_prefix.clone(),
-            source_snapshot: spec.source_snapshot.clone(),
+            source: spec.source.clone(),
             env,
         }))
     }
 }
 
-/// one live materialized workspace: its on-disk dir, the source coords the
-/// receipt echoes, and the actor handle its commit rides.
+/// one live materialized workspace: its on-disk dir, the source the receipt
+/// echoes, and the actor handle its commit rides.
 struct NodedWorkspace {
     handle: NodeHandle,
     dir: PathBuf,
-    source_prefix: String,
-    source_snapshot: Option<String>,
+    source: WorkspaceSource,
     env: BTreeMap<String, String>,
 }
 
@@ -209,8 +224,7 @@ impl NodedWorkspace {
         WorkspaceSpec {
             run_id: String::new(),
             agent_id: None,
-            source_prefix: self.source_prefix.clone(),
-            source_snapshot: self.source_snapshot.clone(),
+            source: self.source.clone(),
             mount_path: String::new(),
             base_tools: Vec::new(),
             ro_mounts: Vec::new(),
