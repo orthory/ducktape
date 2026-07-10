@@ -13,7 +13,7 @@ BIN_DEST ?= $(HOME)/.cargo/bin
 
 UNAME_S := $(shell uname -s)
 
-.PHONY: all dev dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean
+.PHONY: all dev demo-seed dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean
 
 all: node web
 
@@ -23,6 +23,15 @@ all: node web
 ## see ops/dev.sh. (stop any already-running `tauri dev` first — it owns :1430.)
 dev:
 	@bash ops/dev.sh
+
+## seed a local "demo" network preloaded with sample data — chat channels +
+## messages, a tasks board, pages, a registered agent (with a live @mention run),
+## jobs, an inbox note, an automation rule — plus TWO gateway web-app routes: a
+## NETWORK-hosted static site (DuckFS) and a USER-hosted loopback app. Registers a
+## "demo" workspace in ~/.ducktape and makes it active; just open the app. Builds
+## ducktape-node if needed (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
+demo-seed:
+	@bash ops/demo-seed.sh
 
 ## dogfood: host ducktape's own source in the local dev node's forge module.
 ## registers a static `ducktape-dev` git remote at the node's forge endpoint and
