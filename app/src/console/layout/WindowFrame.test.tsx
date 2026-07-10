@@ -71,6 +71,8 @@ describe("window frame search affordance", () => {
     );
 
     await waitFor(() => expect(screen.getByLabelText("Search")).toBeTruthy());
+    // Non-mac environments (this test env included) must advertise Ctrl, not ⌘.
+    expect(screen.getByText("Ctrl K")).toBeTruthy();
   });
 });
 
