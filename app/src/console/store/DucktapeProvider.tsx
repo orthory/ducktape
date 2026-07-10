@@ -736,6 +736,12 @@ export function DucktapeProvider({
     document.documentElement.style.setProperty("--accent", state.accent);
   }, [state.accent]);
 
+  // 3b. Reflect the light/dark choice onto <html data-theme>; the --c-* palette
+  //     in global.css keys off it, re-skinning every token-driven surface.
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", state.theme);
+  }, [state.theme]);
+
   // 4. Drop any open page (doc) when the node url resolves or changes — a
   //    different node has different docs. The page enumeration is re-queried
   //    from the new node's index by `refresh`, so it isn't seeded here.

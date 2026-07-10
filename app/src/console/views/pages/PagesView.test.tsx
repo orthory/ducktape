@@ -5,6 +5,7 @@ import type { PageBlock } from "../../../domain/pages-client";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
+import { color } from "../../theme/tokens";
 import { EDIT_BOUNDARY_MS, PagesView } from "./PagesView";
 
 const makeActions = () => {
@@ -497,6 +498,6 @@ describe("endless canvas", () => {
 
   it("drops the bordered page card — the scroll surface itself is paper", () => {
     renderPagesView();
-    expect(screen.getByTestId("doc-scroll")).toHaveStyle({ background: "#ffffff" });
+    expect(screen.getByTestId("doc-scroll")).toHaveStyle({ background: color.paper });
   });
 });

@@ -129,6 +129,8 @@ export interface ConsoleState {
    *  Kept in sync with `screen`: navigating to a surface adopts its section. */
   viewMode: ViewMode;
   accent: string;
+  /** Light/dark color theme. Reflected onto <html data-theme> by the provider. */
+  theme: ThemeMode;
   notifyPrefs: NotifyPrefs;
   author: string;
   /** The node answered the last status query. */
@@ -381,6 +383,39 @@ export const saveAccent = (accent: string): void => {
   }
 };
 
+// ── Theme (light/dark) persistence ─────────────────────
+//
+// The chosen theme survives restarts. First run (no stored choice) follows the
+// OS `prefers-color-scheme`; anything else falls back to light.
+export type ThemeMode = "light" | "dark";
+export const DEFAULT_THEME: ThemeMode = "light";
+const THEME_KEY = "ducktape.theme";
+
+export const loadTheme = (): ThemeMode => {
+  try {
+    const raw = localStorage.getItem(THEME_KEY);
+    if (raw === "light" || raw === "dark") return raw;
+  } catch {
+    return DEFAULT_THEME; // storage unavailable (private mode / quota)
+  }
+  try {
+    if (typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches) {
+      return "dark";
+    }
+  } catch {
+    // matchMedia unavailable (non-browser env) — fall through to the default.
+  }
+  return DEFAULT_THEME;
+};
+
+export const saveTheme = (theme: ThemeMode): void => {
+  try {
+    localStorage.setItem(THEME_KEY, theme);
+  } catch {
+    // best-effort; a failed write just doesn't survive restart.
+  }
+};
+
 // ── Notification prefs persistence ─────────────────────
 //
 // Desktop notification preferences survive restarts. Each field is validated
@@ -607,6 +642,7 @@ export const createInitialState = (): ConsoleState => {
     screen: viewMode === "operator" ? DEFAULT_OPERATOR_SCREEN : DEFAULT_USER_SCREEN,
     viewMode,
     accent: loadAccent(),
+    theme: loadTheme(),
     notifyPrefs: loadNotifyPrefs(),
     author: DEFAULT_AUTHOR,
     connected: false,

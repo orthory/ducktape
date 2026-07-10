@@ -69,6 +69,7 @@ import {
   loadPendingDisplayName,
   removeTab,
   saveAccent,
+  saveTheme,
   saveDocTabs,
   saveNotifyPrefs,
   saveRemoteUrl,
@@ -114,6 +115,8 @@ export interface ConsoleActions {
    *  to the other rail, so the body always matches the rail. */
   setViewMode(mode: ViewMode): void;
   setAccent(accent: string): void;
+  /** Flip the light/dark color theme and persist the choice. */
+  toggleTheme(): void;
   setNotifyPrefs(prefs: NotifyPrefs): void;
   toggleChannelMute(channelId: string): void;
   setAuthor(author: string): void;
@@ -1266,6 +1269,12 @@ export function createActions({
     setAccent: (accent) => {
       saveAccent(accent);
       patch({ accent });
+    },
+
+    toggleTheme: () => {
+      const next = getState().theme === "dark" ? "light" : "dark";
+      saveTheme(next);
+      patch({ theme: next });
     },
     setNotifyPrefs,
     toggleChannelMute: (channelId) => {
