@@ -58,6 +58,7 @@ mod cli;
 mod cli_flags;
 mod config;
 mod constants;
+mod drain_actions;
 mod explorer;
 mod first_contact_join;
 mod host_reads;

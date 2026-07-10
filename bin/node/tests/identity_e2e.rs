@@ -147,13 +147,23 @@ fn identity_two_nodes_one_user() {
 
     // both binds must be visible from EITHER node's rpc: UserOf(A) and
     // UserOf(B) resolve to the same user, with both nodes in its set.
+    let sees_both = |view: &AccountView| {
+        view.account_id == user_pub
+            && view.nodes.len() == 2
+            && view.nodes.contains(&a_pub)
+            && view.nodes.contains(&b_pub)
+    };
     for reader in [0usize, 1] {
-        let a_view = poll_until(&format!("OfNode(A) to resolve on node {reader}"), FINALIZE, || {
-            account_of_node(&cluster, reader, &a_pub)
-        });
-        let b_view = poll_until(&format!("OfNode(B) to resolve on node {reader}"), FINALIZE, || {
-            account_of_node(&cluster, reader, &b_pub)
-        });
+        let a_view = poll_until(
+            &format!("OfNode(A) to show both bindings on node {reader}"),
+            FINALIZE,
+            || account_of_node(&cluster, reader, &a_pub).filter(&sees_both),
+        );
+        let b_view = poll_until(
+            &format!("OfNode(B) to show both bindings on node {reader}"),
+            FINALIZE,
+            || account_of_node(&cluster, reader, &b_pub).filter(&sees_both),
+        );
         assert_eq!(a_view.account_id, user_pub, "node {reader}: OfNode(A) wrong account");
         assert_eq!(b_view.account_id, user_pub, "node {reader}: OfNode(B) wrong account");
         assert_eq!(a_view.nodes.len(), 2, "node {reader}: expected both nodes bound (via A)");
