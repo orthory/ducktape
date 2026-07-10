@@ -371,8 +371,8 @@ async fn run_session<T: DataPlaneTransport>(
     ctl: DatagramFlow<T>,
     mut pcm_in: mpsc::Receiver<Vec<i16>>,
     mixed_out: mpsc::Sender<Vec<i16>>,
-    mut video_in: mpsc::Receiver<noded::CapturedVideo>,
-    video_out: mpsc::Sender<noded::PeerVideo>,
+    mut video_in: mpsc::Receiver<chat::call_wire::CapturedFrame>,
+    video_out: mpsc::Sender<chat::call_wire::PeerFrame>,
     mut control_in: mpsc::Receiver<noded::CallControlIn>,
     control_out: mpsc::Sender<noded::CallControlOut>,
     recipients: watch::Receiver<Vec<[u8; 32]>>,
@@ -452,7 +452,7 @@ async fn run_session<T: DataPlaneTransport>(
                         // full lane = the webview is behind; a dropped frame
                         // is recovered by the next keyframe request from the
                         // browser decoder, so shed rather than backpressure.
-                        let _ = video_out.try_send(noded::PeerVideo {
+                        let _ = video_out.try_send(chat::call_wire::PeerFrame {
                             peer: peer.0,
                             keyframe: done.keyframe,
                             ts_ms: done.ts_ms,
@@ -889,7 +889,7 @@ mod tests {
         // a 5000-byte keyframe fragments across ≥4 datagrams.
         session_a
             .video_in
-            .send(noded::CapturedVideo {
+            .send(chat::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 7,
                 data: keyframe_data.clone(),
@@ -908,7 +908,7 @@ mod tests {
         // a second (delta) frame with a different fill crosses intact too.
         session_a
             .video_in
-            .send(noded::CapturedVideo {
+            .send(chat::call_wire::CapturedFrame {
                 keyframe: false,
                 ts_ms: 40,
                 data: delta_data.clone(),
@@ -966,7 +966,7 @@ mod tests {
         // frame 0 loses a fragment (incomplete); frame 1 completes.
         session_a
             .video_in
-            .send(noded::CapturedVideo {
+            .send(chat::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 1,
                 data: vec![0xA0; 5000],
@@ -975,7 +975,7 @@ mod tests {
             .expect("session a alive");
         session_a
             .video_in
-            .send(noded::CapturedVideo {
+            .send(chat::call_wire::CapturedFrame {
                 keyframe: false,
                 ts_ms: 2,
                 data: vec![0xB1; 5000],
@@ -1079,7 +1079,7 @@ mod tests {
         let first: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
         session_a
             .video_in
-            .send(noded::CapturedVideo {
+            .send(chat::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 1,
                 data: first.clone(),
@@ -1110,7 +1110,7 @@ mod tests {
         let rejoined: Vec<u8> = (0..5000).map(|i| ((i * 3 + 1) % 251) as u8).collect();
         session_a2
             .video_in
-            .send(noded::CapturedVideo {
+            .send(chat::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 2,
                 data: rejoined.clone(),
