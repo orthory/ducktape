@@ -20,13 +20,30 @@ if [ -f "$A/node.toml" ] && [ -f "$B/node.toml" ]; then
 fi
 mkdir -p "$SH"
 
+# Containers have no /dev/net/tun and no NET_ADMIN, so the WireGuard effect
+# must be the TUN-less in-process socket backend. Rendezvous goes through the
+# compose-local coordinator service — the PUBLIC default would observe both
+# nodes at the host's reflexive address and the punch would need NAT
+# hairpinning, which never lands (#331).
+WG="--wireguard-effect socket"
+# NOTE the asymmetry (#331 product tier): only the FOUNDER's init can name a
+# coordinator — invites deliberately strip coordinated hints and `join` has
+# no --primary-coordinator flag, so node1 never registers with it. Today the
+# local coordinator exercises the coordinator-auth private-mode lane (node0's
+# registration + reflexive observation); the tunnels themselves come up from
+# the concrete-IP endpoints node-entry.sh puts in the gossiped
+# EndpointRecords. TODO(#331): a LIVE joiner (the README's app profile)
+# would fall back to the compiled-in PUBLIC coordinator and re-hit the NAT
+# hairpin — needs a product-side ambient-coordinator override.
+COORD="--primary-coordinator coordinator:3478"
+
 echo "[bootstrap] node0 (founder): init"
-"$BIN" init --name callbed --dir "$A" \
+"$BIN" init --name callbed --dir "$A" $WG $COORD \
   --listen 0.0.0.0:$P2P --advertised node0:$P2P --http 0.0.0.0:$HTTP --rpc 0.0.0.0:$RPC >/dev/null
 inv=$("$BIN" invite --config "$A/node.toml")
 
 echo "[bootstrap] node1 (friend): join (identity pass)"
-fk=$("$BIN" join "$inv" --dir "$B" \
+fk=$("$BIN" join "$inv" --dir "$B" $WG \
   --listen 0.0.0.0:$P2P --advertised node1:$P2P --http 0.0.0.0:$HTTP --rpc 0.0.0.0:$RPC)
 echo "[bootstrap]   node1 key: $fk"
 
@@ -35,7 +52,7 @@ echo "[bootstrap] node0 admits node1 + refreshes invite"
 inv2=$("$BIN" invite --config "$A/node.toml")
 
 echo "[bootstrap] node1: join (member pass)"
-"$BIN" join "$inv2" --dir "$B" \
+"$BIN" join "$inv2" --dir "$B" $WG \
   --listen 0.0.0.0:$P2P --advertised node1:$P2P --http 0.0.0.0:$HTTP --rpc 0.0.0.0:$RPC >/dev/null
 
 echo "[bootstrap] done — configs at $A and $B"
