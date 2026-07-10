@@ -235,12 +235,16 @@ pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
 const EFFECT_TASKS_CREATE: &str = "tasks.create";
 /// the wire name a [`RunEffect`] carries for a task status move.
 const EFFECT_TASKS_UPDATE_STATUS: &str = "tasks.update_status";
+/// the wire name a [`RunEffect`] carries for a page comment (M2).
+const EFFECT_PAGES_COMMENT: &str = "pages.comment";
+/// the wire name a [`RunEffect`] carries for a todo check flip (M2).
+const EFFECT_PAGES_SET_CHECKED: &str = "pages.set_checked";
 
 /// one declarative, host-assembled effect the model's answer requested. lifted
 /// out of `response_text` by [`effects_from_response_text`] so at v4 runs applies
 /// the HOST's observation (R1) rather than re-parsing prose. idempotent by
 /// run_id (applied once at the delivery boundary).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct RunEffect {
     pub kind: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -249,6 +253,17 @@ pub struct RunEffect {
     pub title: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub status: String,
+    /// `pages.comment` (M2): the page/block anchor and the comment text.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub target: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    /// `pages.set_checked` (M2): the todo block and the desired state. a
+    /// skipped `checked` decodes false on the runs side — same value.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub block: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub checked: bool,
 }
 
 /// the O1/O2 output sink: `Chain` (default — the next run reads this run's
@@ -351,13 +366,17 @@ pub fn assemble_runner_result(
     .expect("runner result serializes")
 }
 
-/// LIFT the model's `tasks.create` / `tasks.update_status` actions out of its
+/// LIFT the model's `tasks.create` / `tasks.update_status` /
+/// `pages.comment` / `pages.set_checked` actions out of its
 /// strict-response prose into declarative [`RunEffect`]s (R1, activation
 /// correctness — critic #4). at v4 runs applies these host-assembled effects
 /// rather than re-parsing the prose; an empty result lets runs fall back to the
-/// response-parsed actions so nothing is silently dropped. the parse mirrors
-/// `runs::parse_strict_response`: bare JSON, then a `` ```json `` fence, then the
-/// outermost `{…}` span. the action shape is `AgentAction`'s snake_case tags.
+/// response-parsed actions so nothing is silently dropped — which is also why
+/// EVERY known action kind must lift: a partial lift would make the effects
+/// facet override the prose actions and drop the unlifted ones. the parse
+/// mirrors `runs::parse_strict_response`: bare JSON, then a `` ```json ``
+/// fence, then the outermost `{…}` span. the action shape is `AgentAction`'s
+/// snake_case tags.
 pub fn effects_from_response_text(text: &str) -> Vec<RunEffect> {
     let Some(value) = parse_response_value(text) else {
         return Vec::new();
@@ -380,16 +399,32 @@ pub fn effects_from_response_text(text: &str) -> Vec<RunEffect> {
                     kind: EFFECT_TASKS_CREATE.to_string(),
                     task_id: str_field(create, "task_id"),
                     title: str_field(create, "title"),
-                    status: String::new(),
+                    ..RunEffect::default()
                 });
             }
-            obj.get("update_task_status")
-                .and_then(|v| v.as_object())
-                .map(|update| RunEffect {
+            if let Some(update) = obj.get("update_task_status").and_then(|v| v.as_object()) {
+                return Some(RunEffect {
                     kind: EFFECT_TASKS_UPDATE_STATUS.to_string(),
                     task_id: str_field(update, "task_id"),
-                    title: String::new(),
                     status: str_field(update, "status"),
+                    ..RunEffect::default()
+                });
+            }
+            if let Some(comment) = obj.get("add_page_comment").and_then(|v| v.as_object()) {
+                return Some(RunEffect {
+                    kind: EFFECT_PAGES_COMMENT.to_string(),
+                    target: str_field(comment, "target"),
+                    body: str_field(comment, "body"),
+                    ..RunEffect::default()
+                });
+            }
+            obj.get("set_page_checked")
+                .and_then(|v| v.as_object())
+                .map(|flip| RunEffect {
+                    kind: EFFECT_PAGES_SET_CHECKED.to_string(),
+                    block: str_field(flip, "block"),
+                    checked: flip.get("checked").and_then(|v| v.as_bool()).unwrap_or(false),
+                    ..RunEffect::default()
                 })
         })
         .collect()
@@ -624,18 +659,50 @@ mod tests {
                     kind: "tasks.create".into(),
                     task_id: "t1".into(),
                     title: "ship it".into(),
-                    status: String::new(),
+                    ..RunEffect::default()
                 },
                 RunEffect {
                     kind: "tasks.update_status".into(),
                     task_id: "t1".into(),
-                    title: String::new(),
                     status: "done".into(),
+                    ..RunEffect::default()
                 },
             ]
         );
         // prose with no actions lifts nothing (runs then falls back cleanly).
         assert!(effects_from_response_text("just prose, no json").is_empty());
         assert!(effects_from_response_text("").is_empty());
+    }
+
+    #[test]
+    fn effects_from_response_text_lifts_the_pages_actions() {
+        // M2: the pages verbs must lift alongside the task verbs — a partial
+        // lift would override the prose actions and silently drop these.
+        let text = "{\"actions\":[\
+            {\"add_page_comment\":{\"target\":\"b1\",\"body\":\"nice\"}},\
+            {\"set_page_checked\":{\"block\":\"b2\",\"checked\":true}}]}";
+        let effects = effects_from_response_text(text);
+        assert_eq!(
+            effects,
+            vec![
+                RunEffect {
+                    kind: "pages.comment".into(),
+                    target: "b1".into(),
+                    body: "nice".into(),
+                    ..RunEffect::default()
+                },
+                RunEffect {
+                    kind: "pages.set_checked".into(),
+                    block: "b2".into(),
+                    checked: true,
+                    ..RunEffect::default()
+                },
+            ]
+        );
+        // the wire keys skip-serialize: a set_checked carries no task keys.
+        let json = serde_json::to_value(&effects[1]).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("task_id"));
+        assert!(!obj.contains_key("target"));
     }
 }

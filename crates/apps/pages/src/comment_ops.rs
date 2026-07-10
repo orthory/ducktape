@@ -47,7 +47,7 @@ where
         }
     }
 
-    async fn load_comment(&self, id: &str) -> Result<Option<Comment>, PageError> {
+    pub(super) async fn load_comment(&self, id: &str) -> Result<Option<Comment>, PageError> {
         match self.get(comment_key(id).as_bytes()).await {
             Some(b) => Ok(Some(
                 serde_json::from_slice(&b).map_err(|_| PageError::Corrupt)?,
@@ -147,11 +147,28 @@ where
                 comment_id,
                 target,
                 text,
+                as_agent,
             } => {
                 if text.len() > MAX_COMMENT_TEXT_BYTES {
                     return Err(PageError::TextTooLarge);
                 }
-                let author = author_from_origin(origin)?;
+                // `as_agent` refines a MODULE origin into an individual agent
+                // author (chat's refine pattern): modules are genesis-trusted
+                // code, so the module half stays origin-derived and
+                // spoof-proof; an external or system submitter claiming an
+                // agent identity is rejected outright.
+                let author = match as_agent {
+                    None => author_from_origin(origin)?,
+                    Some(agent_id) => {
+                        if agent_id.is_empty() {
+                            return Err(PageError::EmptyAgent);
+                        }
+                        match author_from_origin(origin)? {
+                            AuthorRef::Module(module) => AuthorRef::Agent { module, agent_id },
+                            _ => return Err(PageError::AgentNeedsModuleOrigin),
+                        }
+                    }
+                };
                 if self.load_comment(&comment_id).await?.is_some() {
                     return Err(PageError::DuplicateComment);
                 }

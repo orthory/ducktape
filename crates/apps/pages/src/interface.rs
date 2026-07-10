@@ -143,12 +143,18 @@ pub enum PageMsg {
     // (mirrors the chat module). ids are client-minted like block ids.
     /// open a thread (when `thread_id` is new) anchored to `target` with this
     /// first comment, or append `comment_id` to an existing thread (whose
-    /// target must match). author = origin.
+    /// target must match). author = origin — except `as_agent`, which refines
+    /// a MODULE origin into `AuthorRef::Agent { module, agent_id }` (the
+    /// module half stays origin-derived and spoof-proof; mirrors chat's
+    /// `as_agent`). `as_agent` with a non-module origin is rejected.
     AddComment {
         thread_id: String,
         comment_id: String,
         target: String,
         text: String,
+        /// `default` so a pre-M2 payload without the key still decodes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        as_agent: Option<String>,
     },
     /// replace a comment's text; stored-author-only. rejected on a tombstone.
     EditComment { comment_id: String, text: String },
@@ -245,6 +251,11 @@ pub enum PageQuery {
     ThreadsForTargets { targets: Vec<String> },
     /// one thread with its live comments.
     CommentThread { thread_id: String },
+    /// one comment by id, tombstones included — the existence probe a module
+    /// emitting `AddComment` follow-ups uses (comment ids are client-minted,
+    /// so a squatted id would otherwise reject the follow-up and abort its
+    /// block). `None` == no comment record at that id.
+    GetComment { comment_id: String },
 }
 
 /// one entry of [`PageReply::PageList`]: a page id and its current title.
@@ -265,6 +276,7 @@ pub enum PageReply {
     PageList(Vec<PageMeta>),
     CommentThreads(Vec<TargetThreads>),
     CommentThread(Option<ThreadView>),
+    Comment(Option<Comment>),
 }
 
 pub fn encode_query(q: &PageQuery) -> Vec<u8> {

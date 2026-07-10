@@ -44,6 +44,11 @@ pub(super) enum PageError {
     // ── comments ──
     /// a comment op arrived with an empty (pre-consensus) origin.
     EmptyOrigin,
+    /// an AddComment carried an empty `as_agent` id.
+    EmptyAgent,
+    /// an AddComment carried `as_agent` under a non-module origin — only
+    /// genesis-trusted module code may attribute a comment to an agent.
+    AgentNeedsModuleOrigin,
     /// resolve/append named a thread id not in the store.
     ThreadNotFound,
     /// edit/delete named a comment id not in the store (or a tombstone).
@@ -83,6 +88,8 @@ impl core::fmt::Display for PageError {
             PageError::NotAPage => "not a page",
             PageError::PageCycle => "page cycle",
             PageError::EmptyOrigin => "empty origin",
+            PageError::EmptyAgent => "empty as_agent",
+            PageError::AgentNeedsModuleOrigin => "as_agent requires a module origin",
             PageError::ThreadNotFound => "thread not found",
             PageError::CommentNotFound => "comment not found",
             PageError::DuplicateComment => "duplicate comment id",

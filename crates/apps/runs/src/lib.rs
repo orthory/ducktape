@@ -118,11 +118,11 @@ pub use envelope::RUN_ENVELOPE_VERSION;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use agent::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent,
-    AgentQuery, AgentRecord, AgentReply, AgentResponse, AgentStatus, MAX_ACTIONS_BYTES,
-    MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
-    decode_event as agent_decode_event, decode_reply as agent_decode_reply,
-    encode_query as agent_encode_query,
+    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
+    ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent, AgentQuery, AgentRecord, AgentReply,
+    AgentResponse, AgentStatus, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES,
+    RESERVED_ID_SEPARATOR, ReplyBlock, decode_event as agent_decode_event,
+    decode_reply as agent_decode_reply, encode_query as agent_encode_query,
 };
 use chat::{
     Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
@@ -234,6 +234,9 @@ mod forge_source;
 mod inject;
 mod jobs_intake;
 mod module_impl;
+// the pages effects lane (M2): pages.comment / pages.set_checked applied at
+// the run boundary — probe-guarded, cap-gated, per-action degrade.
+mod pages_effects;
 mod response;
 // the delivery sink (O1/O2): the forge PR sink applied at the result intake —
 // gates, duplicate-PR guard, and message-facet title/body derivation.

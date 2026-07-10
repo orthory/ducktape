@@ -254,7 +254,11 @@ fn run_node(
         // the forge module the composer resolves forge:<repo>:<n> channels
         // against and the PR sink queries; unwired, forge-channel mentions
         // skip at compose.
-        .with_sink_forge("forge");
+        .with_sink_forge("forge")
+        // the pages module the composer renders [[page:<id>]] refs from and
+        // the pages effects lane (pages.comment / pages.set_checked) writes
+        // to; unwired, both degrade to breadcrumbs.
+        .with_pages_module("pages");
         let pages = Pages::init(context.child("pages"), "pages").await;
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the

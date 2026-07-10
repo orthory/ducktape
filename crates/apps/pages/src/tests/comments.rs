@@ -8,7 +8,82 @@ fn add(thread: &str, comment: &str, target: &str, text: &str) -> PageMsg {
         comment_id: comment.into(),
         target: target.into(),
         text: text.into(),
+        as_agent: None,
     }
+}
+
+fn add_as_agent(thread: &str, comment: &str, target: &str, agent: &str) -> PageMsg {
+    PageMsg::AddComment {
+        thread_id: thread.into(),
+        comment_id: comment.into(),
+        target: target.into(),
+        text: "agent says".into(),
+        as_agent: Some(agent.into()),
+    }
+}
+
+#[test]
+fn as_agent_refines_a_module_origin_into_an_agent_author() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        apply_commit_as(
+            &mut p,
+            &add_as_agent("t1", "m1", "b1", "bot"),
+            sdk::Origin::Module("runs".into()),
+        )
+        .await;
+        let view = query_thread(&p, "t1").await.unwrap();
+        let agent = AuthorRef::Agent {
+            module: "runs".into(),
+            agent_id: "bot".into(),
+        };
+        assert_eq!(view.thread.opener, agent, "the opener is the agent");
+        assert_eq!(view.comments[0].author, agent, "the comment author too");
+    });
+}
+
+#[test]
+fn as_agent_requires_a_module_origin_and_a_non_empty_id() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        apply_err_as(
+            &mut p,
+            &add_as_agent("t1", "m1", "b1", "bot"),
+            user("alice"),
+            "as_agent requires a module origin",
+        )
+        .await;
+        apply_err_as(
+            &mut p,
+            &add_as_agent("t1", "m1", "b1", ""),
+            sdk::Origin::Module("runs".into()),
+            "empty as_agent",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn get_comment_serves_the_record_tombstones_included() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        assert_eq!(query_comment(&p, "m1").await, None, "absent id is None");
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "x"), user("alice")).await;
+        assert!(query_comment(&p, "m1").await.is_some());
+        // a tombstoned comment KEEPS its record — the probe must still see it
+        // (AddComment rejects the id even when deleted).
+        apply_commit_as(&mut p, &add("t1", "m2", "b1", "y"), user("alice")).await;
+        apply_commit_as(
+            &mut p,
+            &PageMsg::DeleteComment {
+                comment_id: "m1".into(),
+            },
+            user("alice"),
+        )
+        .await;
+        let m1 = query_comment(&p, "m1").await.unwrap();
+        assert!(m1.deleted, "the tombstone is served, not hidden");
+    });
 }
 
 #[test]

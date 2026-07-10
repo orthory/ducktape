@@ -1630,7 +1630,7 @@ format = "text"
                 kind: "tasks.create".into(),
                 task_id: "t1".into(),
                 title: "ship".into(),
-                status: String::new(),
+                ..RunEffect::default()
             }],
             Sink::Pr {
                 repo: "app".into(),

@@ -176,6 +176,18 @@ async fn query_thread<E: Context + BufferPooler>(
         _ => panic!("expected CommentThread"),
     }
 }
+async fn query_comment<E: Context + BufferPooler>(
+    p: &Pages<E>,
+    comment_id: &str,
+) -> Option<Comment> {
+    let q = PageQuery::GetComment {
+        comment_id: comment_id.into(),
+    };
+    match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
+        PageReply::Comment(c) => c,
+        _ => panic!("expected Comment"),
+    }
+}
 
 // seed one page with three top-level paragraphs b1, b2, b3.
 async fn seed_page<E: Context + BufferPooler>(p: &mut Pages<E>, page: &str) {
