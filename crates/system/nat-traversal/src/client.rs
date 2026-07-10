@@ -543,14 +543,15 @@ pub async fn run_coordinator_with(sock: UdpSocket, mut coord: Coordinator) {
         // Tag 11 -> authenticated envelope; anything else -> legacy Msg. The two
         // are mutually exclusive by tag, so try the envelope first and fall back.
         let out = match AuthRequest::decode(&buf[..n]) {
-            Ok(req) => coord.handle_auth(from, req, now),
+            Ok(req) => coord.handle_auth_replies(from, req, now),
             Err(_) => match Msg::decode(&buf[..n]) {
-                Ok(m) => coord.handle_legacy(from, m, now),
+                Ok(m) => coord.handle_legacy_replies(from, m, now),
                 Err(_) => continue,
             },
         };
         for (dst, reply) in out {
-            let _ = sock.send_to(&reply.encode(), dst).await;
+            let reply = reply.encode_inline();
+            let _ = sock.send_to(&reply, dst).await;
         }
     }
 }

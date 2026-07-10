@@ -25,7 +25,7 @@ pub use auth::{
 pub use client::{
     ClientEvent, NatClient, NatSocket, SocketEvent, run_coordinator, run_coordinator_with,
 };
-pub use coordinator::Coordinator;
+pub use coordinator::{Coordinator, CoordinatorReplies, CoordinatorReply};
 #[cfg(any(test, feature = "simnat"))]
 pub use punch::{PunchError, PunchPlan, RebindProof, drive_rebind_reconnect, drive_simulated};
 #[cfg(any(test, feature = "simnat"))]
