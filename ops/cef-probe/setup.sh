@@ -29,23 +29,27 @@ ROOT="$(git rev-parse --show-toplevel)"
 # macOS: cef-dll-sys builds CEF's sandbox wrapper through CMake with the Ninja
 # generator HARDCODED (its build.rs calls `.generator("Ninja")`) — without
 # cmake+ninja the build dies deep inside tauri-bundler's helper step with
-# "CMake was unable to find a build program corresponding to Ninja". Preflight
-# here where the error is actionable; auto-install via Homebrew when present.
-# Linux never enters that path (no sandbox wrapper build).
+# "CMake was unable to find a build program corresponding to Ninja".
+# Deliberately NOT via Homebrew: brew install is hostage to the machine's tap
+# trust/auto-update state (seen failing on an unrelated untrusted tap). ninja
+# is a single static universal binary — fetch the official release into the
+# probe's bin dir (the Makefile prepends it to PATH). cmake has no static
+# single-binary story; it must already be installed.
 if [ "$(uname -s)" = "Darwin" ]; then
-  missing=""
-  command -v cmake >/dev/null || missing="cmake"
-  command -v ninja >/dev/null || missing="$missing ninja"
-  if [ -n "$missing" ]; then
-    if command -v brew >/dev/null; then
-      echo "[cef-probe] installing required build tools:$missing"
-      # shellcheck disable=SC2086
-      brew install $missing
-    else
-      echo "[cef-probe] missing build tools:$missing" >&2
-      echo "[cef-probe] install them first: brew install cmake ninja" >&2
-      exit 1
-    fi
+  if ! command -v cmake >/dev/null; then
+    echo "[cef-probe] cmake is required (cef sandbox wrapper build): brew install cmake" >&2
+    exit 1
+  fi
+  PROBE_BIN="$(dirname "$CLONE")/bin"
+  if ! command -v ninja >/dev/null && [ ! -x "$PROBE_BIN/ninja" ]; then
+    NINJA_VERSION="v1.12.1"
+    echo "[cef-probe] fetching ninja $NINJA_VERSION (official static binary) -> $PROBE_BIN/ninja"
+    mkdir -p "$PROBE_BIN"
+    curl -fsSL -o "$PROBE_BIN/ninja-mac.zip" \
+      "https://github.com/ninja-build/ninja/releases/download/$NINJA_VERSION/ninja-mac.zip"
+    unzip -o -q "$PROBE_BIN/ninja-mac.zip" -d "$PROBE_BIN"
+    rm -f "$PROBE_BIN/ninja-mac.zip"
+    chmod 755 "$PROBE_BIN/ninja"
   fi
 fi
 
