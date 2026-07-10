@@ -31,13 +31,15 @@ pub enum WorkspaceSource {
     Forge {
         repo: String,
         /// the pinned base commit (40-hex sha1) — COMMITTED refs at compose
-        /// height, the fork point AND the push-CAS base when `branch_born`.
+        /// height, the checkout/fork point.
         commit: String,
         /// the work branch (`agent/item-<n>`, or a PR's own source branch).
         branch: String,
-        /// whether `branch` existed in COMMITTED forge refs at compose height
-        /// — false ⇒ the provisioner creates it at `commit` and the push is a
-        /// zero-oid create (contract §4).
+        /// advisory compose-time metadata: whether `branch` existed in
+        /// COMMITTED forge refs at compose height. the provisioner derives
+        /// its push CAS base from the FETCHED remote advertisement (a fetch
+        /// miss ⇒ zero-oid create), not this flag — kept as a pinned wire
+        /// surface and an audit/M2 signal.
         branch_born: bool,
     },
 }

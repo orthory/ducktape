@@ -76,9 +76,11 @@ struct RunEnvelope<'a> {
     // `context`, which additionally skips on plain duckfs runs, keeping the
     // pre-M1 duckfs v3 bytes free of the key.
     /// the deterministic forge item-context instructions section (M1),
-    /// rendered by `inject` from committed tracker state. the envelope JSON is
-    /// itself the provider prompt, so this reaches the model with no oracle
-    /// change. `None` for every non-forge run.
+    /// rendered by `inject` from committed tracker state. the oracle's
+    /// `prepare()` assembles the provider input as instructions → context →
+    /// contract → conversation, so this reaches the model as its own section;
+    /// a context-less envelope assembles byte-identically to the pre-context
+    /// worker. `None` for every non-forge run.
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,9 +118,11 @@ pub(crate) enum WorkspaceSource {
         /// the work branch — per ITEM, not per run (`agent/item-<n>`, or the
         /// PR's own source branch: session identity).
         branch: String,
-        /// whether `branch` existed in committed forge refs at compose height
-        /// — the CAS base signal for the provisioner's push (branch_born ⇒
-        /// prev_oid = `commit`; unborn ⇒ zero-oid create).
+        /// advisory compose-time metadata: whether `branch` existed in
+        /// committed forge refs at compose height. the provisioner derives
+        /// its push CAS base from the FETCHED remote advertisement (a fetch
+        /// miss ⇒ zero-oid create), not this flag — kept as a pinned wire
+        /// surface and an audit/M2 signal.
         branch_born: bool,
     },
 }

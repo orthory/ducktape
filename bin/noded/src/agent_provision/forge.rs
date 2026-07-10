@@ -100,14 +100,19 @@ impl ForgeLane {
 }
 
 /// derive the forge push base URL from the node's http listen address:
-/// `http://<host>:<port>/forge`, with a wildcard bind (`0.0.0.0`/`[::]`)
-/// rewritten to `127.0.0.1` — the push must dial a CONNECTABLE host, and the
-/// lane is loopback by design (the node pushes to ITSELF; the bridge submits
-/// the ref move to consensus). `None` in = no http surface = no push lane.
+/// `http://<host>:<port>/forge`, with a wildcard bind rewritten to the SAME
+/// family's loopback (`0.0.0.0` → `127.0.0.1`, `[::]` → `[::1]` — a
+/// bindv6only `[::]` listener refuses v4 loopback dials) — the push must dial
+/// a CONNECTABLE host, and the lane is loopback by design (the node pushes to
+/// ITSELF; the bridge submits the ref move to consensus). `None` in = no http
+/// surface = no push lane.
 pub fn forge_push_base(http_listen: Option<&str>) -> Option<String> {
     let listen = http_listen?;
     let base = match listen.parse::<std::net::SocketAddr>() {
-        Ok(addr) if addr.ip().is_unspecified() => format!("127.0.0.1:{}", addr.port()),
+        Ok(addr) if addr.ip().is_unspecified() => {
+            let loopback = if addr.is_ipv6() { "[::1]" } else { "127.0.0.1" };
+            format!("{loopback}:{}", addr.port())
+        }
         Ok(addr) => addr.to_string(),
         // not a socket address (hostname:port) — trust the operator's string.
         Err(_) => listen.to_string(),

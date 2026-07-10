@@ -232,9 +232,11 @@ fn the_push_base_rewrites_wildcard_binds_to_loopback() {
         forge_push_base(Some("0.0.0.0:8844")).as_deref(),
         Some("http://127.0.0.1:8844/forge")
     );
+    // a v6 wildcard rewrites to the v6 loopback: a bindv6only [::] listener
+    // refuses 127.0.0.1, which broke every push AND the mid-loop fetch dial.
     assert_eq!(
         forge_push_base(Some("[::]:9001")).as_deref(),
-        Some("http://127.0.0.1:9001/forge")
+        Some("http://[::1]:9001/forge")
     );
     assert_eq!(
         forge_push_base(Some("127.0.0.1:8844")).as_deref(),
