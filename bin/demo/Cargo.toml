@@ -18,6 +18,7 @@ tagging = { workspace = true }
 tasks = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
+gateway = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }

@@ -75,12 +75,16 @@ pub(super) async fn park(
     status_public_key: String,
     rpc_listener: Option<std::net::TcpListener>,
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
+    gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
+    gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     blobs: noded::blobs::BlobHandle,
     agent_provisioner: &Option<dispatch_oracle::SharedProvisioner>,
     agent_dirs: &capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
+    bulk_pacer: data_plane::BulkPacer,
+    workspace: std::path::PathBuf,
     storage_for_sync: std::path::PathBuf,
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
@@ -99,6 +103,25 @@ pub(super) async fn park(
         relay_rx,
         mut lobby_tx,
     } = channels;
+    let gateway_book = gateway_requests.map(|requests| {
+        let book = crate::gateway_plane::OverlayBook::new(
+            String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+        );
+        book.set_peers(peers.iter());
+        crate::gateway_plane::spawn(
+            crate::gateway_plane::SpawnConfig {
+                label: label.clone(),
+                book: std::sync::Arc::clone(&book),
+                me: signer.public_key(),
+                factory: statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                pacer: bulk_pacer.clone(),
+                commands: gateway_commands,
+                workspace,
+            },
+            requests,
+        );
+        book
+    });
     let Some(server_peer) = sync_source else {
         eprintln!(
             "[node {label}] no statesync source: no validator other than this node \
@@ -156,6 +179,7 @@ pub(super) async fn park(
                 signer.public_key(),
                 std::sync::Arc::clone(&plane_slot),
                 statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                bulk_pacer.clone(),
                 None,
             );
         }
@@ -970,6 +994,9 @@ pub(super) async fn park(
                     *blob_peers.write().expect("blob peers lock") =
                         mesh.iter().cloned().collect();
                     oracle.track(plan.epoch(), mesh);
+                    if let Some(book) = &gateway_book {
+                        book.set_peers(plan.valset().transport_members().iter());
+                    }
                     last_tracked = plan.epoch();
                     // the follower swap: same OrderedNode, fresh
                     // orderer, cutover journaled — the epoch-local
@@ -1150,6 +1177,15 @@ pub(super) async fn park(
             // set — follow the re-track.
             *blob_peers.write().expect("blob peers lock") = mesh.iter().cloned().collect();
             oracle.track(tip.epoch, mesh);
+            if let Some(book) = &gateway_book {
+                let transport: Vec<ed25519::PublicKey> = tip
+                    .participants
+                    .iter()
+                    .chain(tip.residents.iter())
+                    .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
+                    .collect();
+                book.set_peers(transport.iter());
+            }
             last_tracked = tip.epoch;
         }
         // drive the reachability plane's standby role off the

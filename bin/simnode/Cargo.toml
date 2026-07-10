@@ -21,6 +21,7 @@ chat = { workspace = true }
 tasks = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
+gateway = { workspace = true }
 inbox = { workspace = true }
 automations = { workspace = true }
 jobs = { workspace = true }

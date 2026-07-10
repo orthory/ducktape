@@ -40,6 +40,7 @@ members = [
     "crates/system/tagging",
     "crates/duckdns/core",
     "crates/system/duckdns",
+    "crates/system/gateway",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
@@ -168,6 +169,7 @@ dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }
 duckdns-core = { path = "crates/duckdns/core" }
 duckdns = { path = "crates/system/duckdns" }
+gateway = { path = "crates/system/gateway" }
 forge = { path = "crates/apps/forge" }
 pages = { path = "crates/apps/pages" }
 chat = { path = "crates/apps/chat" }

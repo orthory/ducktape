@@ -33,6 +33,7 @@ impl ValidatorRuntime<'_> {
             latest_floor,
             mesh_oracle,
             sync_plane_book,
+            gateway_book,
             media_peers,
             blob_peers,
             reach_cmd,
@@ -464,6 +465,9 @@ impl ValidatorRuntime<'_> {
                 // the statesync plane serves (and admits) exactly
                 // who the mesh tracks — follow the re-track.
                 if let Some(book) = &sync_plane_book {
+                    book.set_peers(plan.valset().transport_members().iter());
+                }
+                if let Some(book) = &gateway_book {
                     book.set_peers(plan.valset().transport_members().iter());
                 }
                 // the media planes authenticate inbound by the same

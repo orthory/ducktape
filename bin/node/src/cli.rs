@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 
-use crate::{MAX_PROTOCOL_VERSION, cli_flags::parse_flags, config, userkey_cli};
+use crate::{MAX_PROTOCOL_VERSION, cli_flags::parse_flags, config, gateway_routes, userkey_cli};
 use config::{hex_bytes, unhex};
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
@@ -17,6 +17,9 @@ type CommandResult = Result<(), Box<dyn std::error::Error>>;
 /// long-running node path instead.
 pub(super) fn dispatch(command: &str, args: &[String]) -> Option<CommandResult> {
     if let Some(result) = userkey_cli::dispatch(command, args) {
+        return Some(result);
+    }
+    if let Some(result) = gateway_routes::dispatch(command, args) {
         return Some(result);
     }
     let result = match command {
@@ -123,6 +126,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("listen").map(String::as_str),
         flags.get("advertised").map(String::as_str),
         flags.get("http").map(String::as_str),
+        flags.get("gateway").map(String::as_str),
         flags.get("rpc").map(String::as_str),
         flags.get("wireguard-effect").map(String::as_str),
         flags.get("wireguard-listen").map(String::as_str),
@@ -1163,6 +1167,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("listen").map(String::as_str),
         flags.get("advertised").map(String::as_str),
         flags.get("http").map(String::as_str),
+        flags.get("gateway").map(String::as_str),
         flags.get("rpc").map(String::as_str),
         flags.get("wireguard-effect").map(String::as_str),
         flags.get("wireguard-listen").map(String::as_str),

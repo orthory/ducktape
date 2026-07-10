@@ -223,6 +223,7 @@ pub(super) async fn post_reboot_catchup<'a>(
     wireguard_listen: Option<std::net::SocketAddr>,
     wireguard_effect: crate::config::WireGuardEffectKind,
     overlay_slot: overlay_net::userspace::StackSlot,
+    bulk_pacer: data_plane::BulkPacer,
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
     blobs: noded::blobs::BlobHandle,
@@ -254,6 +255,7 @@ pub(super) async fn post_reboot_catchup<'a>(
                     signer.public_key(),
                     std::sync::Arc::clone(&plane_slot),
                     statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                    bulk_pacer.clone(),
                     None,
                 );
             }
