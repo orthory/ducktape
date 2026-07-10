@@ -34,6 +34,7 @@
 //!   traffic never queues behind it.
 
 pub mod flow;
+pub mod host;
 pub mod plane;
 pub mod real;
 #[cfg(feature = "sim")]
@@ -42,6 +43,7 @@ pub mod transport;
 pub mod wire;
 
 pub use flow::{DatagramPolicy, FlowId, StreamPolicy};
+pub use host::{StreamPlaneSpec, bind_stream_plane};
 pub use plane::{
     AdmissionPolicy, DataPlane, DatagramFlow, OpenError, PlaneConfig, RegisterError, SendError,
     StatsSnapshot, StreamService,

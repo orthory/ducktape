@@ -21,8 +21,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use commonware_cryptography::ed25519;
 use data_plane::{
-    AddressBook, AdmissionPolicy, DataPlane, FlowId, OverlaySockets, PeerId, PlaneConfig, Service,
-    StreamPolicy, StreamService,
+    AddressBook, AdmissionPolicy, FlowId, OverlaySockets, PeerId, PlaneConfig, Service,
+    StreamPlaneSpec, StreamPolicy, StreamService, bind_stream_plane,
 };
 use statesync::dataplane::{DataPlaneSyncClient, statesync_flow};
 use statesync::{SyncClient, SyncError, SyncRequest, SyncResponse};
@@ -173,34 +173,19 @@ pub fn spawn_bring_up(
 ) {
     tokio::spawn(async move {
         let own = book.own_addr(&me);
-        let datagram_bind = SocketAddr::new(own, Service::StateSync.overlay_datagram_port());
-        let stream_bind = SocketAddr::new(own, Service::StateSync.overlay_stream_port());
-        let sockets = loop {
-            match OverlaySockets::bind_with(
-                factory.clone(),
-                datagram_bind,
-                stream_bind,
-                book.clone(),
-            )
-            .await
-            {
-                Ok(sockets) => break sockets,
-                // the interface (or our /128) is not up yet — retry quietly.
-                Err(_) => tokio::time::sleep(std::time::Duration::from_secs(3)).await,
-            }
-        };
-        let admission: Arc<dyn AdmissionPolicy> = book;
-        let plane = DataPlane::new(
-            sockets,
-            admission,
-            PlaneConfig {
+        let spec = StreamPlaneSpec {
+            own_ip: own,
+            service: Service::StateSync,
+            config: PlaneConfig {
                 bulk_bytes_per_sec: BULK_BYTES_PER_SEC,
                 bulk_burst_bytes: BULK_BURST_BYTES,
             },
-        );
-        let svc = match plane.stream_service(Service::StateSync, StreamPolicy { accept_backlog: 32 })
-        {
-            Ok(svc) => Arc::new(svc),
+            policy: StreamPolicy { accept_backlog: 32 },
+            // the interface (or our /128) is not up yet — retry quietly.
+            retry: std::time::Duration::from_secs(3),
+        };
+        let (plane, svc) = match bind_stream_plane(spec, factory, book).await {
+            Ok(bound) => bound,
             Err(e) => {
                 eprintln!("[node {label}] statesync plane: register failed ({e}) — mesh only");
                 return;
