@@ -94,6 +94,15 @@ fn main() {
             let main = tauri::Manager::get_webview_window(app, "main")
                 .ok_or("main window missing (tauri.conf.json windows)")?;
             huddle::allow_user_media(&main)?;
+            // macOS overlays its native traffic lights on the in-app title
+            // bar (titleBarStyle Overlay). Other desktops get the same
+            // single-bar chrome by dropping native decorations; the title bar
+            // hosts in-app window controls and the frame edges drive resize
+            // (see WindowChrome.tsx).
+            // ponytail: set at setup = one decorated first paint on launch;
+            // move to per-platform tauri conf files if the flash matters.
+            #[cfg(not(target_os = "macos"))]
+            main.set_decorations(false)?;
             Ok(())
         });
 

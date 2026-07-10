@@ -12,6 +12,7 @@ import { useDucktape } from "../store/use-ducktape";
 import { isMacDesktop } from "../../domain/node-bootstrap";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { ConnectionBanner } from "./ConnectionBanner";
+import { ResizeEdges, WindowControls } from "./WindowChrome";
 
 // Left inset that clears the macOS traffic lights. Only the macOS desktop build
 // overlays them on the content (see isMacDesktop); on Linux/Windows desktop and
@@ -230,6 +231,9 @@ function TitleBar() {
           <span style={{ width: 6, height: 6, borderRadius: "50%", background: dot }} />
           {"h " + (state.status?.height ?? 0).toLocaleString()}
         </span>
+        {/* Undecorated Linux/Windows window controls; renders nothing on
+            macOS (native traffic lights) and on web. */}
+        <WindowControls />
       </div>
     </div>
   );
@@ -256,6 +260,8 @@ export function WindowFrame({ children }: { children: ReactNode }) {
           the content below, never the whole window (which had no boundary and
           went blank white on any render throw). */}
       <ErrorBoundary>{children}</ErrorBoundary>
+      {/* Edge resize handles for the undecorated non-mac desktop window. */}
+      <ResizeEdges />
     </div>
   );
 }
