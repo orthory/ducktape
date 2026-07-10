@@ -67,11 +67,8 @@ export function NodeFactsCard() {
     : "not available";
   const nodeKey = workspace?.pubkey ?? "";
   const owner = nodeKey ? state.nodeUsers[normalizeKey(nodeKey)] : undefined;
-  // Prefer the account's display name, then the profiles overlay (a name set
-  // before the bind landed) — never render the account id twice.
-  const ownerName = owner
-    ? (owner.name ?? state.authorNames[normalizeKey(nodeKey)] ?? null)
-    : null;
+  // Identity is the sole replicated account-name authority.
+  const ownerName = owner?.name ?? null;
   const ownerLine = owner
     ? ownerName
       ? `${ownerName} · ${shortKey(owner.accountId)}`

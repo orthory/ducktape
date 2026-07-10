@@ -7,9 +7,8 @@
 // the AddMemberKey/RemoveMemberKey ops carry a MemberAuth minted by the tauri
 // shell over a chain-and-nonce-scoped preimage — this client never signs, it
 // only forwards the ready-to-submit msg JSON via `submitRawMsg`. SetAccountName
-// is origin-gated (a bound node is user-trusted hardware), same contract as
-// profiles' SetName. Pure functions over an injected NodeTransport, camelCase
-// params in, verbatim serde wire out.
+// is origin-gated (a bound node is user-trusted hardware). Pure functions over
+// an injected NodeTransport, camelCase params in, verbatim serde wire out.
 
 import { hexToBytes } from "./agent-client";
 import type { BlockEvent, NodeTransport } from "./transport";

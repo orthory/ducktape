@@ -22,10 +22,16 @@ DuckDNS is an internal, typed control-plane resolver. `.duck` is presentation
 syntax understood by Ducktape; it is not installed into the OS resolver and it
 does not return IP addresses.
 
+Identity exists independently of DNS. `identity` is the canonical account,
+member-key, node-binding, and display-name registry. An account may optionally
+register one DuckDNS handle; not registering one changes no identity,
+membership, workspace, or transport behavior. Workspace create/join and the
+initial identity bind never register a handle implicitly.
+
 The supported names are:
 
-- `<account>.duck` → the stable AccountId and its currently eligible NodeIds;
-- `<service>.<account>.duck` → NodeIds of that account which declared the
+- `<handle>.duck` → the stable AccountId and its currently eligible NodeIds;
+- `<service>.<handle>.duck` → NodeIds of that account which declared the
   logical service;
 - `<service>.<chain>.net.duck` → an eligible network-wide provider pool;
 - `<service>.<node>.<chain>.net.duck` → one pinned provider.
@@ -33,11 +39,23 @@ The supported names are:
 `net` is reserved directly below `.duck`; it can never be claimed as an
 account handle.
 
-Consensus owns durable authority only: handle ownership, logical service
-declarations, provider NodeIds, account binding, and membership eligibility.
-It stores no endpoint, port, health, protocol configuration, filesystem path,
-or local target. Resolution returns full NodeIds; short node labels are display
-and routing syntax, never authentication identities.
+DuckDNS owns two orthogonal indexes: the optional handle → AccountId alias and
+each NodeId's logical service declarations. Handle replacement is declarative
+and atomic, one handle per account. Clearing or changing a handle does not
+delete service declarations; a handle only projects its current AccountId at
+query time.
+
+An account-scoped service declaration contains only `scope = "account"` and a
+service label. The system adapter derives its AccountId from the authenticated
+submitting node and captures that authority with the declaration. It therefore
+cannot advertise beneath a caller-supplied account name. Network-scoped
+declarations capture no account.
+
+Consensus owns durable authority only: aliases, logical service declarations,
+provider NodeIds, account binding, and membership eligibility. It stores no
+endpoint, port, health, protocol configuration, filesystem path, or local
+target. Resolution returns full NodeIds; short node labels are display and
+routing syntax, never authentication identities.
 
 The connection sequence is deliberately layered:
 
@@ -58,8 +76,13 @@ peer set do not use DuckDNS.
   removed.
 - The desktop has no DuckDNS installation setting, helper sidecar, privileged
   operation, or per-workspace ingress port.
-- Node configuration can declare only `scope`, `handle` (for account scope),
-  and `service`. Retired HTTP fields are rejected rather than ignored.
+- The former `profiles` module is removed. `identity` is the single display-name
+  authority; DuckDNS handles are optional aliases, not another profile record.
+- Node configuration can declare only `scope` and `service`. Retired `handle`
+  and HTTP fields are rejected rather than ignored.
+- DuckDNS state itself still participates in ordinary authenticated module state
+  sync. State-sync peer selection remains valset/mesh-derived and does not use
+  DuckDNS resolution.
 - Provider liveness is not consensus truth. A resolved provider can be offline;
   reachability and the calling feature decide freshness, selection, and retry.
 - A future public-DNS or browser adapter may project these records, but it must

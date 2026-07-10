@@ -247,6 +247,7 @@ export function DucktapeProvider({
                 authorNames: people.authorNames,
                 nodeUsers: people.nodeUsers,
                 accountKeys: people.accountKeys,
+                accountHandles: people.accountHandles,
                 pages: holdPages ? stateRef.current.pages : pagesSlices.pages,
                 activePageBlocks: holdPages
                   ? stateRef.current.activePageBlocks
@@ -618,7 +619,7 @@ export function DucktapeProvider({
   //      boot placeholder — a returning user must read as themselves (Account
   //      avatar initials, composer identity), not as "operator". A name the
   //      user typed this session (≠ placeholder) always wins; the resolved
-  //      name folds identity's account display name over profiles already.
+  //      name is identity's canonical account display name.
   useEffect(() => {
     if (state.author !== DEFAULT_AUTHOR) return;
     const self = state.status?.publicKey;

@@ -31,6 +31,10 @@ lists what is checked in and tested.
 - `crates/system/valset`: validator membership state.
 - `crates/system/saga`: deterministic continuation state.
 - `crates/system/governance`: validator-set governance over valset.
+- `crates/system/identity`: canonical accounts, member keys, display names, and
+  node bindings.
+- `crates/duckdns/core`, `crates/system/duckdns`, and `crates/duckdns/node`:
+  optional `.duck` aliases, typed discovery state, and node announcements.
 - `crates/system/upgrade`, `capability`, `dispatch`, and `tagging`: protocol
   upgrade state, capability registry, capability-routed dispatch, and engagement
   routing.
@@ -47,7 +51,6 @@ lists what is checked in and tested.
 - `crates/apps/agent`: agent registry, watches, run records.
 - `crates/apps/tasks`: small canonical task state.
 - `crates/apps/vaults`: replicated opaque secret ciphertext.
-- `crates/apps/profiles`: origin-gated display-name registry.
 - `crates/apps/runs`: agent run composition, dispatch, response, and watch state.
 - `crates/apps/inbox`: per-member notification queues.
 - `crates/apps/automations`: operator rules over the chat hook seam.

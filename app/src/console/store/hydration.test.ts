@@ -4,12 +4,13 @@
 // tracks the highest receipted height so a lagging snapshot never un-renders
 // a confirmed write.
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { NodeStatus } from "../../domain/transport";
+import { makeTransportStub } from "../../test/transport-stub";
 import { receiptFloor } from "./finalization";
 import type { OpLedger } from "./finalization";
-import { changedModules, scopeFor } from "./hydration";
+import { changedModules, fetchPeopleSlices, scopeFor } from "./hydration";
 
 // ── Fixtures ────────────────────────────────────────────
 
@@ -59,8 +60,8 @@ describe("scopeFor", () => {
     expect(scopeFor(new Set(["dispatch", "saga"]))).toEqual(new Set(["runs"]));
   });
 
-  it("groups profiles and identity together — authorNames overlays them", () => {
-    expect(scopeFor(new Set(["profiles", "identity"]))).toEqual(
+  it("groups identity and DuckDNS together as account projections", () => {
+    expect(scopeFor(new Set(["identity", "duckdns"]))).toEqual(
       new Set(["people"]),
     );
   });
@@ -69,6 +70,41 @@ describe("scopeFor", () => {
     expect(scopeFor(new Set(["kv", "blobstore", "tagging", "upgrade"]))).toEqual(
       new Set(),
     );
+  });
+});
+
+describe("fetchPeopleSlices", () => {
+  it("projects Identity names and optional DuckDNS aliases from two authoritative modules", async () => {
+    const query = vi.fn((target: string) => {
+      if (target === "identity") {
+        return Promise.resolve({
+          accounts: [
+            {
+              account_id: [10],
+              display_name: "Rae",
+              nonce: 0,
+              member_keys: [],
+              nodes: [[11]],
+              updated_at: 1,
+            },
+          ],
+        });
+      }
+      if (target === "duckdns") {
+        return Promise.resolve({
+          registrations: [{ handle: "rae", account_id: [10] }],
+        });
+      }
+      throw new Error(`unexpected query target ${target}`);
+    });
+    const slices = await fetchPeopleSlices(makeTransportStub({ query }));
+
+    expect(slices.authorNames).toEqual({ "0b": "Rae" });
+    expect(slices.nodeUsers).toEqual({
+      "0b": { accountId: "0a", name: "Rae" },
+    });
+    expect(slices.accountHandles).toEqual({ "0a": "rae" });
+    expect(query.mock.calls.map(([target]) => target)).toEqual(["identity", "duckdns"]);
   });
 });
 

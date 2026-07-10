@@ -52,15 +52,18 @@ impl Announcer {
         let reply = host
             .query(
                 "duckdns",
-                &encode_query(&DuckDnsQuery::NodeAnnouncements {
+                &encode_query(&DuckDnsQuery::NodeRegistration {
                     node: self.me.clone(),
                 }),
             )
             .await
             .ok()?;
-        let DuckDnsReply::NodeAnnouncements(committed) = decode_reply(&reply).ok()? else {
+        let DuckDnsReply::NodeRegistration(committed) = decode_reply(&reply).ok()? else {
             return None;
         };
+        let committed = committed
+            .map(|registration| registration.announcements)
+            .unwrap_or_default();
         let announcements = self.decide(&committed)?;
         Some(Msg {
             target: "duckdns".into(),

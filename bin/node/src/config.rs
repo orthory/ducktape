@@ -1598,8 +1598,6 @@ pub struct DuckDnsToml {
 pub struct DuckDnsServiceToml {
     /// `account` or `network`.
     pub scope: String,
-    /// Required for `account`, forbidden for `network`.
-    pub handle: Option<String>,
     pub service: String,
 }
 
@@ -1609,23 +1607,8 @@ fn resolve_duckdns_services(
     let mut announcements = Vec::with_capacity(raw.services.len());
     for service in &raw.services {
         let scope = match service.scope.as_str() {
-            "account" => duckdns::ServiceScope::Account {
-                handle: service.handle.clone().ok_or_else(|| {
-                    format!(
-                        "duckdns account service {:?} requires a handle",
-                        service.service
-                    )
-                })?,
-            },
-            "network" => {
-                if service.handle.is_some() {
-                    return Err(format!(
-                        "duckdns network service {:?} must not set a user handle",
-                        service.service
-                    ));
-                }
-                duckdns::ServiceScope::Network
-            }
+            "account" => duckdns::ServiceScope::Account,
+            "network" => duckdns::ServiceScope::Network,
             other => {
                 return Err(format!(
                     "duckdns service scope must be \"account\" or \"network\", got {other:?}"
@@ -3538,7 +3521,6 @@ mod tests {
 
                 [[duckdns.services]]
                 scope = "account"
-                handle = "orthory"
                 service = "huddle"
 
                 [[duckdns.services]]
@@ -3551,10 +3533,7 @@ mod tests {
         assert_eq!(services.len(), 2);
         assert!(services.iter().any(|announcement| {
             announcement.service == "huddle"
-                && matches!(
-                    announcement.scope,
-                    duckdns::ServiceScope::Account { ref handle } if handle == "orthory"
-                )
+                && announcement.scope == duckdns::ServiceScope::Account
         }));
         assert!(services.iter().any(|announcement| {
             announcement.service == "search"
@@ -3567,7 +3546,14 @@ mod tests {
             },
         ))
         .unwrap();
-        for transport_field in ["target", "duckfs", "port", "endpoint", "homepage"] {
+        for transport_field in [
+            "handle",
+            "target",
+            "duckfs",
+            "port",
+            "endpoint",
+            "homepage",
+        ] {
             assert!(
                 !wire.contains(transport_field),
                 "{transport_field} leaked into discovery"
@@ -3579,20 +3565,8 @@ mod tests {
     fn duckdns_services_reject_ambiguous_or_legacy_web_config() {
         for (case, service) in [
             (
-                "network handle",
-                r#"scope="network"
-                    handle="orthory"
-                    service="search""#,
-            ),
-            (
-                "missing account handle",
-                r#"scope="account"
-                    service="huddle""#,
-            ),
-            (
                 "legacy user scope",
                 r#"scope="user"
-                    handle="orthory"
                     service="huddle""#,
             ),
             (
@@ -3634,6 +3608,12 @@ mod tests {
                 [[duckdns.services]]
                 scope="account"
                 handle="orthory"
+                service="huddle"
+            "#,
+            r#"
+                listen="127.0.0.1:1"
+                [[duckdns.services]]
+                scope="account"
                 service="huddle"
                 target="127.0.0.1:3000"
             "#,

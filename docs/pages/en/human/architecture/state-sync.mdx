@@ -36,7 +36,7 @@ path therefore runs a full-closure connectivity walk before moving the ref.
 ## Snapshot Modules
 
 Valset, governance, saga, and the state-based product modules (tasks, vaults,
-agent, runs, profiles, identity, inbox, automations, files/duckfs, jobs, upgrade)
+agent, runs, identity, DuckDNS, inbox, automations, files/duckfs, jobs, upgrade)
 use canonical-byte snapshot/install paths where appropriate. duckfs also owns the
 workspace surface that the old memory module covered: generations are snapshots,
 and citable workspace evidence uses `duck://files/...`. The installer must

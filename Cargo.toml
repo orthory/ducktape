@@ -52,7 +52,6 @@ members = [
     "crates/apps/runs", 
     "crates/apps/tasks", 
     "crates/apps/vaults", 
-    "crates/apps/profiles", 
     "crates/apps/automations", 
     "crates/apps/inbox", 
     "crates/apps/files",
@@ -171,7 +170,6 @@ agent = { path = "crates/apps/agent" }
 runs = { path = "crates/apps/runs" }
 tasks = { path = "crates/apps/tasks" }
 vaults = { path = "crates/apps/vaults" }
-profiles = { path = "crates/apps/profiles" }
 automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }

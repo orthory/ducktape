@@ -236,10 +236,10 @@ observer여야 하므로, 아무 standing도 없는 node는 스스로에게 user
 user의 nonce를 bump해서 evict된 node를 위해 잡혀 있던 bind certificate를
 영원히 죽인다. user의 마지막 node를 unbind해도 user record는 남는다 — name과
 nonce가 zero node로 persist하므로, 나중의 bind는 같은 identity로 resolve된다.
-`SetUserName`은 origin-gated일 뿐이다(bound node는 신뢰된
-hardware이므로 user signature가 필요 없다): submit하는 node가 bound된 user의
-display name을 profiles와 같은 64바이트 한도로 설정하며, nonce는 bump하지
-않는다 — user signature를 소비하지 않기 때문이다.
+`SetAccountName`은 origin-gated일 뿐이다(bound node는 신뢰된
+hardware이므로 member-key signature가 필요 없다): submit하는 node가 bound된
+account의 display name을 64바이트 한도로 설정하며, nonce는 bump하지 않는다 —
+member-key signature를 소비하지 않기 때문이다.
 
 bind는 per-node로 남는 것들을 바꾸지 않는다: mesh tracking, valset seat,
 quorum arithmetic은 이 module의 영향을 받지 않는다. validator 셋을 굴리는

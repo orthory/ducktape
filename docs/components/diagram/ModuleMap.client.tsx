@@ -23,7 +23,8 @@ const nodes: SemanticNode[] = [
   { id: 'tagging', label: 'tagging', sub: 'engagement router', category: 'system' },
   { id: 'pages', label: 'pages', sub: 'block tree · self-contained', category: 'app' },
   { id: 'files', label: 'files', sub: 'duckfs adapter · self-contained', category: 'app' },
-  { id: 'profiles', label: 'profiles', sub: 'display names · self-contained', category: 'app' },
+  { id: 'identity', label: 'identity', sub: 'accounts + node binding', category: 'system' },
+  { id: 'duckdns', label: 'duckdns', sub: 'optional aliases + discovery', category: 'system' },
   { id: 'vaults', label: 'vaults', sub: 'encrypted · self-contained', category: 'app' },
 ]
 
@@ -41,6 +42,7 @@ const edges: SemanticEdge[] = [
   { from: 'automations', to: 'tasks', label: 'creates', kind: 'message' },
   { from: 'automations', to: 'inbox', label: 'delivers', kind: 'message' },
   { from: 'forge', to: 'chat', label: 'posts tracker', kind: 'message' },
+  { from: 'duckdns', to: 'identity', label: 'reads account authority', kind: 'read' },
 ]
 
 const legend = [
@@ -53,7 +55,7 @@ export function ModuleMap({ height = 560, direction = 'TB' }: { height?: number;
   return (
     <GraphFlow
       title="Product module interaction map"
-      description="Edges are the only legal crossings: a host-drained follow-up message or a host-routed read through a types-only interface crate. pages, files, profiles, and vaults are fully self-contained; the agent collaboration loop clusters around runs, dispatch, and tagging."
+      description="Edges are the only legal crossings: a host-drained follow-up message or a host-routed read through a typed interface. pages, files, identity, and vaults own their state; DuckDNS reads identity authority without copying it."
       nodes={nodes}
       edges={edges}
       legend={legend}

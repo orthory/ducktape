@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use duckdns_core::{
     DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply, NODE_KEY_LEN, Registry, ResolvedAccount,
     ResolvedName, ResolvedNode, ResolvedService, ServiceAuthority, ServiceScope, decode_msg,
-    decode_query, encode_reply, node_label, validate_handle,
+    decode_query, encode_reply, node_label,
 };
 use identity::{
     AccountView, IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
@@ -242,14 +242,15 @@ impl DuckDns {
             DuckDnsQuery::Resolve { .. } => Err(Error::Module(
                 "duckdns: resolution requires a host query context".into(),
             )),
-            DuckDnsQuery::HandleOwner { handle } => {
-                validate_handle(&handle).map_err(Error::Module)?;
-                Ok(encode_reply(&DuckDnsReply::HandleOwner(
-                    self.registry.handle_owner(&handle).map(<[u8]>::to_vec),
+            DuckDnsQuery::Registrations { from, limit } => {
+                Ok(encode_reply(&DuckDnsReply::Registrations(
+                    self.registry
+                        .registrations(from, limit)
+                        .map_err(Error::Module)?,
                 )))
             }
-            DuckDnsQuery::NodeAnnouncements { node } => Ok(encode_reply(
-                &DuckDnsReply::NodeAnnouncements(self.registry.node_announcements(&node)),
+            DuckDnsQuery::NodeRegistration { .. } => Err(Error::Module(
+                "duckdns: node registration requires a host query context".into(),
             )),
         }
     }
@@ -273,22 +274,16 @@ impl Module for DuckDns {
         let node = Self::origin_node(ctx)?;
         self.require_standing(ctx, &node).await?;
         match decode_msg(&msg.payload).map_err(Error::Module)? {
-            DuckDnsMsg::ClaimHandle { handle } => {
+            DuckDnsMsg::SetHandle { handle } => {
                 let account = self.require_account(ctx, &node).await?;
                 self.registry
-                    .claim_handle(&account, handle)
-                    .map_err(Error::Module)
-            }
-            DuckDnsMsg::ReleaseHandle { handle } => {
-                let account = self.require_account(ctx, &node).await?;
-                self.registry
-                    .release_handle(&account, &handle)
+                    .set_handle(&account, handle)
                     .map_err(Error::Module)
             }
             DuckDnsMsg::ReplaceAnnouncements { announcements } => {
                 let needs_account = announcements
                     .iter()
-                    .any(|announcement| matches!(announcement.scope, ServiceScope::Account { .. }));
+                    .any(|announcement| announcement.scope == ServiceScope::Account);
                 let account = if needs_account {
                     Some(self.require_account(ctx, &node).await?)
                 } else {
@@ -327,6 +322,25 @@ impl Module for DuckDns {
                     },
                 };
                 Ok(encode_reply(&DuckDnsReply::Resolved(resolved)))
+            }
+            DuckDnsQuery::NodeRegistration { node } => {
+                if node.len() != NODE_KEY_LEN {
+                    return Err(Error::Module(format!(
+                        "duckdns: node key must be {NODE_KEY_LEN} bytes, got {}",
+                        node.len()
+                    )));
+                }
+                let mut registration = self.registry.node_registration(&node);
+                if let Some(stored) = &registration
+                    && let Some(account_id) = &stored.account_id
+                    && self.account_of_node(ctx, &node).await?.as_ref() != Some(account_id)
+                {
+                    // A rebinding invalidates the captured account authority.
+                    // Presenting no committed registration makes the declarative
+                    // announcer refresh it under the node's current AccountId.
+                    registration = None;
+                }
+                Ok(encode_reply(&DuckDnsReply::NodeRegistration(registration)))
             }
             query => self.query_state(query),
         }

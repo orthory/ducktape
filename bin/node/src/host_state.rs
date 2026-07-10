@@ -23,7 +23,6 @@ use inbox::Inbox;
 use jobs::Jobs;
 use kv::Kv;
 use pages::Pages;
-use profiles::Profiles;
 use recovery::Manifest;
 use runs::RunsModule;
 use saga::{LeasePolicy, SagaModule};
@@ -134,11 +133,9 @@ pub(super) async fn genesis_host(
         Box::new(TaggingModule::new("tagging")),
         Box::new(Tasks::new("tasks")),
         Box::new(Vaults::new("vaults")),
-        // the origin-gated display-name registry: each verified submit origin
-        // may set its own name, so the ui can resolve authors to names.
-        Box::new(Profiles::new("profiles")),
         // the deterministic user->nodes binding registry: certificates are
-        // chain-scoped (this network's chain id), member-gated binds via valset.
+        // chain-scoped (this network's chain id), member-gated binds via valset,
+        // and account display names have this single canonical owner.
         Box::new(Identity::new(
             "identity",
             Some("valset".into()),
@@ -279,12 +276,6 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("vaults install: {e}"))?;
 
-    let mut profiles = Profiles::new("profiles");
-    let (bytes, root) = snapshot_of("profiles")?;
-    profiles
-        .install(bytes, root)
-        .map_err(|e| format!("profiles install: {e}"))?;
-
     let mut identity = Identity::new(
         "identity",
         Some("valset".into()),
@@ -374,7 +365,6 @@ pub(super) async fn restore_host(
         Box::new(tagging),
         Box::new(tasks),
         Box::new(vaults),
-        Box::new(profiles),
         Box::new(identity),
         Box::new(duckdns),
         Box::new(inbox),
@@ -597,12 +587,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("vaults install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("profiles").await?;
-    let mut profiles = Profiles::new("profiles");
-    profiles
-        .install(&bytes, root)
-        .map_err(|e| format!("profiles install: {e}"))?;
-
     let (bytes, root) = snapshot_of("identity").await?;
     let mut identity = Identity::new(
         "identity",
@@ -722,7 +706,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(tagging),
         Box::new(tasks),
         Box::new(vaults),
-        Box::new(profiles),
         Box::new(identity),
         Box::new(duckdns),
         Box::new(inbox),

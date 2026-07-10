@@ -81,7 +81,6 @@ use noded::{
     payload_preview,
 };
 use pages::Pages;
-use profiles::Profiles;
 use reactor::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
 use sdk::{Effect, Msg, Origin};
@@ -90,7 +89,7 @@ use tasks::Tasks;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 16] = [
+const MODULE_IDS: [&str; 15] = [
     "chat",
     "saga",
     "dispatch",
@@ -104,7 +103,6 @@ const MODULE_IDS: [&str; 16] = [
     "pages",
     "forge",
     "files",
-    "profiles",
     "identity",
     "duckdns",
 ];
@@ -397,9 +395,9 @@ fn run_sim(
             .expect("forge init")
             .with_chat("chat");
         let files = Files::open("files", duckfs_dir).expect("duckfs open");
-        let profiles = Profiles::new("profiles");
         // the deterministic user->nodes binding registry — no valset, no chain
-        // (the simulator has neither), matching noded's daemon wiring.
+        // (the simulator has neither), matching noded's daemon wiring. It is
+        // also the canonical account display-name registry.
         let identity = Identity::new("identity", None, String::new());
         let duckdns = DuckDns::new("duckdns", "identity", None, "local#00000000")
             .expect("fixed local DuckDNS chain id");
@@ -417,7 +415,6 @@ fn run_sim(
             Box::new(pages),
             Box::new(forge),
             Box::new(files),
-            Box::new(profiles),
             Box::new(identity),
             Box::new(duckdns),
         ])

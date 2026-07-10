@@ -36,8 +36,10 @@ agent-facing gaps.
 - `files` is duckfs: a consensus-replicated, copy-on-write, content-addressed
   filesystem — every node holds every byte, and bytes survive restart.
 - `jobs` is a consensus-native work board with first-claim-wins claims.
-- `identity` binds node keys to user keys — a replicated registry so a person
-  running several nodes still resolves to one identity above mesh/valset.
+- `identity` is the canonical account registry: member keys, display name, and
+  bound node keys let a person running several nodes resolve to one identity.
+- `duckdns` adds optional `<handle>.duck` account aliases and identity-only
+  service discovery. Workspace identity and membership do not require an alias.
 - `kv`, `valset`, `saga`, `governance`, `directory`, and `greeter` support
   infrastructure, examples, and tests.
 
@@ -251,10 +253,10 @@ from ANY external origin — a surviving device can evict a lost one — and it
 bumps the user's nonce so a captured bind certificate for the evicted node is
 dead forever; unbinding a user's last node keeps the user record — name and
 nonce persist with zero nodes, so a later bind resolves the same identity.
-`SetUserName` is origin-gated only (a bound node is trusted
-hardware, no user signature required): it sets the display name of the user
-the submitting node is bound to, under the same 64-byte limit as profiles,
-and it does not bump the nonce — no user signature is consumed.
+`SetAccountName` is origin-gated only (a bound node is trusted hardware, no
+member-key signature required): it sets the display name of the account the
+submitting node is bound to, under a 64-byte limit, and it does not bump the
+nonce — no member-key signature is consumed.
 
 Binding does not change what stays per node: mesh tracking, valset seats, and
 quorum arithmetic are untouched by this module. A user running three

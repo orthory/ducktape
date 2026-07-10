@@ -98,7 +98,7 @@ export function KindGlyph({
 }
 
 /** Resolve an item/review author to a display name via the same registry the
- *  chat surface uses (profiles + identity overlay in state.authorNames). */
+ *  chat surface uses (identity projection in state.authorNames). */
 export function useAuthorName(author: AuthorRef): string {
   const { state } = useDucktape();
   return authorName(author, state.authorNames);
