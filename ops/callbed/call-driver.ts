@@ -6,7 +6,7 @@
 //   - video: the node treats encoded frames as OPAQUE fragmentable bytes (it
 //     never decodes VP8 — that's browser-side WebCodecs), so we send a
 //     synthetic multi-fragment "camera frame" and assert it fragments across
-//     Service::Video / CHANNEL_VIDEO, crosses the mesh, and reassembles
+//     Service::Video (overlay data plane), crosses to the peer, and reassembles
 //     BYTE-EXACT on the far node. This tests the video TRANSPORT (the part the
 //     in-process hub tests never route over the real mesh); it does NOT test
 //     VP8 encode/decode, which is out of scope for a headless bed.
