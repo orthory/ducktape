@@ -22,6 +22,7 @@ const markTauri = () => {
 
 afterEach(() => {
   delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  vi.unstubAllGlobals();
   vi.clearAllMocks();
 });
 
@@ -29,6 +30,21 @@ describe("window controls", () => {
   it("render nothing on the web build", () => {
     render(<WindowControls />);
     expect(screen.queryByLabelText("Close window")).toBeNull();
+  });
+
+  it("render nothing on a mac desktop (native traffic lights own the chrome)", () => {
+    markTauri();
+    vi.stubGlobal("navigator", {
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+    });
+    const { container } = render(
+      <>
+        <WindowControls />
+        <ResizeEdges />
+      </>,
+    );
+    expect(screen.queryByLabelText("Close window")).toBeNull();
+    expect(container.querySelector("[data-resize-dir]")).toBeNull();
   });
 
   it("drive the native window on a non-mac desktop", () => {
