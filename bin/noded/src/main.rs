@@ -261,8 +261,7 @@ fn run_node(
         // chain-unscoped certs are an acceptable surface here). It also owns
         // the canonical account display name.
         let identity = Identity::new("identity", None, String::new());
-        let duckdns = DuckDns::new("duckdns", "identity", None, "local#00000000")
-            .expect("fixed local DuckDNS chain id");
+        let duckdns = DuckDns::new("duckdns", "identity", None);
         let mut host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),

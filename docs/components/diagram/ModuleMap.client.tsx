@@ -24,7 +24,7 @@ const nodes: SemanticNode[] = [
   { id: 'pages', label: 'pages', sub: 'block tree · self-contained', category: 'app' },
   { id: 'files', label: 'files', sub: 'duckfs adapter · self-contained', category: 'app' },
   { id: 'identity', label: 'identity', sub: 'accounts + node binding', category: 'system' },
-  { id: 'duckdns', label: 'duckdns', sub: 'optional aliases + discovery', category: 'system' },
+  { id: 'duckdns', label: 'duckdns', sub: 'optional account names', category: 'system' },
   { id: 'vaults', label: 'vaults', sub: 'encrypted · self-contained', category: 'app' },
 ]
 

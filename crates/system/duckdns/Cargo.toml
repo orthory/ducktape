@@ -3,9 +3,9 @@ name = "duckdns"
 edition.workspace = true
 version.workspace = true
 
-# Ducktape module adapter for duckdns-core. The pure state machine and wire
-# surface live in duckdns-core; this crate maps SDK origins and live sibling
-# module queries into it.
+# Ducktape module adapter for duckdns-core's account-name registry. The pure
+# state machine and wire surface live in duckdns-core; this crate derives the
+# authenticated AccountId through Identity.
 [dependencies]
 duckdns-core = { workspace = true }
 sdk = { workspace = true }

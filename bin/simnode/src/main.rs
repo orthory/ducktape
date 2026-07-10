@@ -399,8 +399,7 @@ fn run_sim(
         // (the simulator has neither), matching noded's daemon wiring. It is
         // also the canonical account display-name registry.
         let identity = Identity::new("identity", None, String::new());
-        let duckdns = DuckDns::new("duckdns", "identity", None, "local#00000000")
-            .expect("fixed local DuckDNS chain id");
+        let duckdns = DuckDns::new("duckdns", "identity", None);
         let host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),

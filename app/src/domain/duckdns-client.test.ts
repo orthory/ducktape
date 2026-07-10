@@ -48,24 +48,16 @@ describe("DuckDNS handle registration", () => {
     });
   });
 
-  it("resolves a logical account service to stable identities only", async () => {
-    const resolved = {
-      service: {
-        identity: { scope: "account" as const, service: "huddle" },
-        authority: { account: { account_id: [1, 2, 3] } },
-        providers: [{ node: [4, 5, 6], node_label: "n-040506040506" }],
-      },
-    };
+  it("resolves an account name to AccountId and nothing transport-related", async () => {
+    const resolved = { account_id: [1, 2, 3] };
     const transport = stubTransport({ resolved });
-    const name = {
-      account_service: { service: "huddle", handle: "rae" },
-    } as const;
+    const name = { handle: "rae" };
 
     await expect(resolve(transport, name)).resolves.toEqual(resolved);
     expect(transport.query).toHaveBeenCalledWith("duckdns", {
       resolve: { name },
     });
-    expect(JSON.stringify(resolved)).not.toMatch(/endpoint|port|target/);
+    expect(JSON.stringify(resolved)).not.toMatch(/node|service|endpoint|route|port/);
   });
 });
 

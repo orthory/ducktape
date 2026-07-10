@@ -1,131 +1,47 @@
-//! DuckDNS wire surface — verified names and provider identities only.
+//! DuckDNS wire surface: one optional human name for one Identity account.
 //!
-//! `.duck` is Ducktape's internal presentation syntax. It is deliberately not
-//! installed into the host DNS stack and never resolves to an IP address here;
-//! callers resolve a name to stable account/service identities and eligible
-//! node keys, then use reachability and a purpose-specific data plane.
+//! `.duck` is Ducktape presentation syntax. It is not installed into the host
+//! DNS stack and it never returns nodes, routes, endpoints, or transports.
+//! Resolution stops at the stable AccountId; Identity and the existing peer /
+//! reachability planes own every later step.
 
 use serde::{Deserialize, Serialize};
 
 pub const DUCKDNS_ZONE: &str = "duck";
-/// Labels directly below `.duck` that route structural namespaces instead of
-/// account handles. Future structural roots must be reserved before use.
+/// Structural labels reserved directly below `.duck`. They are intentionally
+/// non-functional until a real consumer justifies a namespace beneath them.
 pub const RESERVED_ROOT_LABELS: &[&str] = &["net"];
 pub const MAX_LABEL_LEN: usize = 63;
-pub const NODE_LABEL_HEX_LEN: usize = 12;
-pub const NODE_KEY_LEN: usize = 32;
-pub const MAX_ANNOUNCEMENTS_PER_NODE: usize = 128;
 pub const MAX_QUERY_LIMIT: u64 = 256;
 
-/// One parsed name in the active Ducktape workspace.
+/// One parsed account name in Ducktape's internal `.duck` namespace.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum DuckDnsName {
-    /// `<handle>.duck` — a human name for one stable account.
-    Account { handle: String },
-    /// `<service>.<handle>.duck` — account-authorized service discovery.
-    AccountService { service: String, handle: String },
-    /// `<service>.<chain>.net.duck` — a network-wide provider pool.
-    NetworkService { service: String, chain: String },
-    /// `<service>.<node>.<chain>.net.duck` — one pinned provider.
-    NodeService {
-        service: String,
-        node: String,
-        chain: String,
-    },
+pub struct DuckDnsName {
+    /// `<handle>.duck` — an optional human alias for one stable AccountId.
+    pub handle: String,
 }
 
-/// Consensus-visible authority scope of a service declaration.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceScope {
-    /// The authenticated submitting node's current account owns the service.
-    /// A `.duck` handle is an optional lookup alias, not declaration authority.
-    Account,
-    /// Any validator or admitted resident may join this provider pool.
-    Network,
-}
-
-/// One node's replicated discovery declaration. Endpoints, ports, health, and
-/// transport configuration are intentionally absent.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ServiceAnnouncement {
-    pub scope: ServiceScope,
-    pub service: String,
-}
-
-/// Stable logical service identity. A connection protocol binds its own intent
-/// to this identity; DuckDNS does not prescribe a transport.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ServiceIdentity {
-    pub scope: ServiceScope,
-    pub service: String,
-}
-
-/// One eligible node identity, in deterministic full-key order. `node_label`
-/// is display/routing syntax only; callers authenticate the full `node` key.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedNode {
-    pub node: Vec<u8>,
-    pub node_label: String,
-}
-
-/// A human name resolved to its stable account plus currently eligible nodes.
+/// The stable result of resolving one account name. Node selection is
+/// deliberately absent and must go through Identity plus peer management.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAccount {
     pub account_id: Vec<u8>,
-    pub nodes: Vec<ResolvedNode>,
 }
 
-/// One optional human-readable alias for an identity account. The account id
-/// remains the stable authority; `handle` is only a mutable presentation key.
+/// One optional human-readable alias for an Identity account. AccountId is
+/// authority; `handle` is only a mutable presentation key.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct HandleRegistration {
     pub handle: String,
     pub account_id: Vec<u8>,
 }
 
-/// One node's committed service declaration plus the account authority captured
-/// for account-scoped entries. `account_id` is absent for network-only entries.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct NodeRegistration {
-    pub account_id: Option<Vec<u8>>,
-    pub announcements: Vec<ServiceAnnouncement>,
-}
-
-/// Stable authority behind a logical service name. Account-scoped resolution
-/// carries the AccountId so a mutable handle is never used as authentication.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceAuthority {
-    Account { account_id: Vec<u8> },
-    Network,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedService {
-    pub identity: ServiceIdentity,
-    pub authority: ServiceAuthority,
-    pub providers: Vec<ResolvedNode>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ResolvedName {
-    Account(ResolvedAccount),
-    Service(ResolvedService),
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DuckDnsMsg {
-    /// Declaratively replace the authenticated account's optional `.duck`
-    /// handle. `None` unregisters it without touching service declarations.
+    /// Declaratively replace the authenticated account's optional handle.
+    /// `None` unregisters it without changing Identity.
     SetHandle { handle: Option<String> },
-    /// Full declarative replacement for the authenticated submitting node.
-    ReplaceAnnouncements {
-        announcements: Vec<ServiceAnnouncement>,
-    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -133,21 +49,13 @@ pub enum DuckDnsMsg {
 pub enum DuckDnsQuery {
     Resolve { name: DuckDnsName },
     Registrations { from: u64, limit: u64 },
-    NodeRegistration { node: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DuckDnsReply {
-    Resolved(Option<ResolvedName>),
+    Resolved(Option<ResolvedAccount>),
     Registrations(Vec<HandleRegistration>),
-    NodeRegistration {
-        registration: Option<NodeRegistration>,
-        /// Whether a captured account authority still matches Identity.
-        /// `false` forces the declarative announcer to replace even an
-        /// otherwise identical (or newly empty) declaration set.
-        authority_current: bool,
-    },
 }
 
 pub fn encode_msg(message: &DuckDnsMsg) -> Vec<u8> {

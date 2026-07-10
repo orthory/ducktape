@@ -1524,6 +1524,7 @@ impl<'a> InviteReader<'a> {
 // ============================================================================
 
 #[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeToml {
     // --- the network shape ---
     /// path to the network descriptor; PRESENT means the network shape.
@@ -1580,53 +1581,6 @@ pub struct NodeToml {
     /// capable node. announcing stays truthful either way: this can hide a
     /// real provider, never fabricate one.
     pub announce_capabilities: Option<bool>,
-    /// Explicit identity-only service discovery declarations. Consensus sees
-    /// the service name and provider NodeId, never endpoints or transports.
-    #[serde(default)]
-    pub duckdns: DuckDnsToml,
-}
-
-#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DuckDnsToml {
-    #[serde(default)]
-    pub services: Vec<DuckDnsServiceToml>,
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DuckDnsServiceToml {
-    /// `account` or `network`.
-    pub scope: String,
-    pub service: String,
-}
-
-fn resolve_duckdns_services(
-    raw: &DuckDnsToml,
-) -> Result<Vec<duckdns::ServiceAnnouncement>, String> {
-    let mut announcements = Vec::with_capacity(raw.services.len());
-    for service in &raw.services {
-        let scope = match service.scope.as_str() {
-            "account" => duckdns::ServiceScope::Account,
-            "network" => duckdns::ServiceScope::Network,
-            other => {
-                return Err(format!(
-                    "duckdns service scope must be \"account\" or \"network\", got {other:?}"
-                ));
-            }
-        };
-        let announcement = duckdns::ServiceAnnouncement {
-            scope,
-            service: service.service.clone(),
-        };
-        announcement.validate()?;
-        announcements.push(announcement);
-    }
-    announcements.sort();
-    if announcements.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err("duckdns service declarations must be unique".into());
-    }
-    Ok(announcements)
 }
 
 /// read a raw node.toml plus its base directory (which relative paths inside
@@ -1665,9 +1619,6 @@ pub struct Plumbing {
     /// passes "socket" here (overlay-net ADR phase 4) while the parse
     /// default for a file without the key stays `tun`.
     pub wireguard_effect: Option<String>,
-    /// Node-local DuckDNS discovery declarations. Existing
-    /// services survive init/join plumbing rewrites unchanged.
-    pub duckdns: DuckDnsToml,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1717,7 +1668,6 @@ pub fn merged_plumbing(
         wireguard_effect: wireguard_effect
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.wireguard_effect.clone())),
-        duckdns: e.map(|raw| raw.duckdns.clone()).unwrap_or_default(),
     })
 }
 
@@ -1749,19 +1699,6 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     }
     if let Some(w) = &p.wireguard_effect {
         s += &format!("wireguard_effect = \"{w}\"\n");
-    }
-    if !p.duckdns.services.is_empty() {
-        #[derive(serde::Serialize)]
-        struct DuckDnsSection<'a> {
-            duckdns: &'a DuckDnsToml,
-        }
-        s.push('\n');
-        s.push_str(
-            &toml::to_string(&DuckDnsSection {
-                duckdns: &p.duckdns,
-            })
-            .map_err(|error| format!("serialize DuckDNS node config: {error}"))?,
-        );
     }
     let path = dir.join("node.toml");
     std::fs::write(&path, s).map_err(|e| format!("write {path:?}: {e}"))?;
@@ -1946,8 +1883,6 @@ pub struct Resolved {
     /// publish the discovered provider set into the capability registry; see
     /// `NodeToml::announce_capabilities`.
     pub announce_capabilities: bool,
-    /// Validated identity-only discovery declarations.
-    pub duckdns_announcements: Vec<duckdns::ServiceAnnouncement>,
     /// the reachability plane's coordination privacy (per-network operational
     /// policy). `Private` (the default) requires a genesis-issued `CoordCap`
     /// for a node outside the genesis validator set; `Public` accepts any
@@ -1986,7 +1921,6 @@ pub fn resolve(cfg_path: &Path) -> Result<Resolved, String> {
 }
 
 fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String> {
-    let duckdns_announcements = resolve_duckdns_services(&raw.duckdns)?;
     let descriptor_path = base.join(raw.network.as_deref().expect("checked by caller"));
     let descriptor = NetworkDescriptor::load(&descriptor_path)?;
     if descriptor.scheme != SCHEME_ED25519 {
@@ -2082,7 +2016,6 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         invite_fronts: load_invite_fronts(base)?,
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
-        duckdns_announcements,
         coordination: descriptor.coordination(),
         // the reachability plane presents this on every coordinator request; a
         // genesis validator needs none (admitted by membership), a joiner is
@@ -2219,7 +2152,6 @@ fn resolve_advertised(
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
 /// bootstraps nobody; everyone else dials peer_seeds[0] at bootstrapper_addr.
 fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
-    let duckdns_announcements = resolve_duckdns_services(&raw.duckdns)?;
     let id = raw
         .id
         .ok_or("a dev-shape config needs `id` (or add `network = ...`)")?;
@@ -2319,7 +2251,6 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         invite_fronts: Vec::new(),
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
-        duckdns_announcements,
         // the dev shape wires direct sockets only — no real coordinator, so
         // the coordination mode defaults to Private and no cap is presented.
         coordination: Coordination::Private,
@@ -3514,123 +3445,17 @@ mod tests {
     }
 
     #[test]
-    fn duckdns_services_are_identity_only_declarations() {
-        let raw: NodeToml = toml::from_str(
-            r#"
-                listen = "127.0.0.1:1"
-
-                [[duckdns.services]]
-                scope = "account"
-                service = "huddle"
-
-                [[duckdns.services]]
-                scope = "network"
-                service = "search"
-            "#,
-        )
-        .unwrap();
-        let services = resolve_duckdns_services(&raw.duckdns).unwrap();
-        assert_eq!(services.len(), 2);
-        assert!(services.iter().any(|announcement| {
-            announcement.service == "huddle"
-                && announcement.scope == duckdns::ServiceScope::Account
-        }));
-        assert!(services.iter().any(|announcement| {
-            announcement.service == "search"
-                && announcement.scope == duckdns::ServiceScope::Network
-        }));
-
-        let wire = String::from_utf8(duckdns::encode_msg(
-            &duckdns::DuckDnsMsg::ReplaceAnnouncements {
-                announcements: services,
-            },
-        ))
-        .unwrap();
-        for transport_field in [
-            "handle",
-            "target",
-            "duckfs",
-            "port",
-            "endpoint",
-            "homepage",
-        ] {
-            assert!(
-                !wire.contains(transport_field),
-                "{transport_field} leaked into discovery"
-            );
-        }
-    }
-
-    #[test]
-    fn duckdns_services_reject_ambiguous_or_legacy_web_config() {
-        for (case, service) in [
-            (
-                "legacy user scope",
-                r#"scope="user"
-                    service="huddle""#,
-            ),
-            (
-                "noncanonical label",
-                r#"scope="network"
-                    service="Search""#,
-            ),
-        ] {
-            let text = format!("listen=\"127.0.0.1:1\"\n[[duckdns.services]]\n{service}\n");
-            let raw: NodeToml = toml::from_str(&text).unwrap();
-            assert!(
-                resolve_duckdns_services(&raw.duckdns).is_err(),
-                "accepted {case}"
-            );
-        }
-
-        let duplicate: NodeToml = toml::from_str(
-            r#"
-                listen="127.0.0.1:1"
-                [[duckdns.services]]
-                scope="network"
-                service="search"
-                [[duckdns.services]]
-                scope="network"
-                service="search"
-            "#,
-        )
-        .unwrap();
-        assert!(resolve_duckdns_services(&duplicate.duckdns).is_err());
-
-        for legacy in [
-            r#"
-                listen="127.0.0.1:1"
-                [duckdns]
-                ingress_listen="127.0.0.1:45804"
-            "#,
-            r#"
-                listen="127.0.0.1:1"
-                [[duckdns.services]]
-                scope="account"
-                handle="orthory"
-                service="huddle"
-            "#,
-            r#"
-                listen="127.0.0.1:1"
-                [[duckdns.services]]
-                scope="account"
-                service="huddle"
-                target="127.0.0.1:3000"
-            "#,
-            r#"
-                listen="127.0.0.1:1"
-                [[duckdns.services]]
-                scope="network"
-                service="search"
-                [duckdns.services.duckfs]
-                prefix="/shared/site"
-            "#,
-        ] {
-            assert!(
-                toml::from_str::<NodeToml>(legacy).is_err(),
-                "accepted retired HTTP publication config"
-            );
-        }
+    fn node_config_rejects_retired_duckdns_service_sections() {
+        let retired = r#"
+            listen = "127.0.0.1:1"
+            [[duckdns.services]]
+            scope = "account"
+            service = "huddle"
+        "#;
+        assert!(
+            toml::from_str::<NodeToml>(retired).is_err(),
+            "naming-only DuckDNS must not retain service configuration"
+        );
     }
 
     #[test]
@@ -3770,9 +3595,6 @@ namespace = "ducktape-local"
 peer_seeds = [0]
 http_listen = "127.0.0.1:8844"
 storage_dir = '/data/ducktape'
-[[duckdns.services]]
-scope = "network"
-service = "search"
 "#,
         )
         .expect("write");
@@ -3792,7 +3614,6 @@ service = "search"
         assert_eq!(p.listen, "127.0.0.1:53000");
         assert_eq!(p.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(p.storage_dir, "/data/ducktape");
-        assert_eq!(p.duckdns.services.len(), 1);
         assert!(p.rpc_listen.is_none());
         // and the merged write is network-shape.
         write_node_toml(&dir, &p).expect("write");
@@ -3801,7 +3622,6 @@ service = "search"
         assert_eq!(raw.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(raw.listen, "127.0.0.1:53000");
         assert_eq!(raw.storage_dir.as_deref(), Some("/data/ducktape"));
-        assert_eq!(raw.duckdns.services[0].service, "search");
     }
 
     #[test]

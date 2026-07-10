@@ -31,8 +31,9 @@ product module은 platform이 호스팅하는 업무용 surface다. 같은 modul
 - `jobs`는 first-claim-wins claim을 쓰는 consensus-native work board다.
 - `identity`는 member key, display name, bound node를 한 AccountId 아래 두는
   canonical account registry다.
-- `duckdns`는 선택적인 `<handle>.duck` alias와 identity-only service discovery를
-  더한다. workspace identity와 membership은 alias 등록을 요구하지 않는다.
+- `duckdns`는 선택적인 `<handle>.duck` → AccountId 이름만 더한다. node,
+  service, route directory는 소유하지 않으며 workspace identity는 이름 등록을
+  요구하지 않는다.
 - `kv`, `valset`, `saga`, `governance`, `directory`, `greeter`는 infrastructure,
   example, test를 지원한다.
 

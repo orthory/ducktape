@@ -91,8 +91,7 @@ fn main() {
         // the deterministic user->nodes binding registry: no valset gating and
         // a fixed demo chain id (the demo has no real network descriptor).
         let identity = Identity::new("identity", None, "demo".into());
-        let duckdns = DuckDns::new("duckdns", "identity", None, "demo#00000000")
-            .expect("fixed demo DuckDNS chain id");
+        let duckdns = DuckDns::new("duckdns", "identity", None);
         let inbox = Inbox::new("inbox");
         let files = Files::open("files", duckfs_dir.clone()).expect("duckfs open");
         let jobs = Jobs::new("jobs");

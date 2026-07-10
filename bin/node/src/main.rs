@@ -3059,26 +3059,10 @@ fn run_node(
         invite_fronts,
         sync_index,
         announce_capabilities,
-        duckdns_announcements,
         coordination,
         coord_cap,
         workspace,
     } = resolved;
-    // Production descriptors already carry `<name>#<8-hex>`. The legacy
-    // dev-seed shape predates that format, so give only that explicit shape a
-    // deterministic zero salt without changing identity's signing domain.
-    let duckdns_chain_id = match duckdns::derive_chain_label(&identity_chain_id) {
-        Ok(_) => identity_chain_id.clone(),
-        Err(_) if dev_demo => {
-            let candidate = format!("{identity_chain_id}#00000000");
-            duckdns::derive_chain_label(&candidate)
-                .map_err(|e| format!("dev DuckDNS chain label: {e}"))?;
-            candidate
-        }
-        Err(error) => {
-            return Err(format!("network chain id is not DuckDNS-compatible: {error}").into());
-        }
-    };
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
     // (a previous run promoted this identity) boot proceeds as a validator
@@ -3612,7 +3596,6 @@ fn run_node(
                 NetworkBindings {
                     invite: &namespace,
                     identity_chain_id: &identity_chain_id,
-                    duckdns_chain_id: &duckdns_chain_id,
                 },
                 SyncSubstrates {
                     forge_repo: &forge_repo,
@@ -4200,7 +4183,6 @@ fn run_node(
                     NetworkBindings {
                         invite: &namespace,
                         identity_chain_id: &identity_chain_id,
-                        duckdns_chain_id: &duckdns_chain_id,
                     },
                     blobs.clone(),
                 )
@@ -4353,11 +4335,6 @@ fn run_node(
                 me_bytes.clone(),
                 resident_capabilities,
             );
-            let mut resident_duckdns_announcer =
-                duckdns_node::ResidentAnnouncer::new(
-                    me_bytes.clone(),
-                    duckdns_announcements.clone(),
-                );
             let (resident_pool, mut resident_oracle_results) = oracle_pool::build(
                 &context,
                 resident_provider_set,
@@ -4593,21 +4570,6 @@ fn run_node(
                                     } else {
                                         eprintln!(
                                             "[node {label}] resident: capability announce did not \
-                                             apply ({outcome:?}) - will retry"
-                                        );
-                                    }
-                                } else if let Some(ok) = resident_duckdns_announcer
-                                    .on_reply(&frame_id, applied)
-                                {
-                                    if ok {
-                                        println!(
-                                            "[node {label}] resident: announced DuckDNS services \
-                                             {:?}",
-                                            resident_duckdns_announcer.announcements()
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "[node {label}] resident: DuckDNS announce did not \
                                              apply ({outcome:?}) - will retry"
                                         );
                                     }
@@ -5253,7 +5215,6 @@ fn run_node(
                                 NetworkBindings {
                                     invite: &namespace,
                                     identity_chain_id: &identity_chain_id,
-                                    duckdns_chain_id: &duckdns_chain_id,
                                 },
                                 SyncSubstrates {
                                     forge_repo: &forge_repo,
@@ -5456,36 +5417,6 @@ fn run_node(
                                     }
                                 }
                             }
-                            // DUCKDNS ANNOUNCE (resident tier): an empty list
-                            // is meaningful and clears stale declarations.
-                            if let Some(msg) = resident_duckdns_announcer
-                                .maybe_announce(host, now)
-                                .await
-                            {
-                                match resident_relay.submit_unheld(
-                                    &signer,
-                                    &announce_targets,
-                                    &mut relay_tx,
-                                    msg.target,
-                                    msg.payload,
-                                ) {
-                                    Ok(id) => {
-                                        resident_duckdns_announcer.sent(id, now);
-                                        println!(
-                                            "[node {label}] resident: DuckDNS announce relayed \
-                                             ({:?})",
-                                            resident_duckdns_announcer.announcements()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        resident_duckdns_announcer.send_failed();
-                                        eprintln!(
-                                            "[node {label}] resident: DuckDNS announce relay \
-                                             failed: {e}"
-                                        );
-                                    }
-                                }
-                            }
                             // DISPATCH EXECUTION (resident tier): serve the
                             // saga attempts leased to this key, so an announced
                             // resident never stalls an assignment. completed
@@ -5634,7 +5565,6 @@ fn run_node(
                     NetworkBindings {
                         invite: &namespace,
                         identity_chain_id: &identity_chain_id,
-                        duckdns_chain_id: &duckdns_chain_id,
                     },
                     SyncSubstrates {
                         forge_repo: &forge_repo,
@@ -5810,7 +5740,6 @@ fn run_node(
                     NetworkBindings {
                         invite: &namespace,
                         identity_chain_id: &identity_chain_id,
-                        duckdns_chain_id: &duckdns_chain_id,
                     },
                     blobs.clone(),
                 )
@@ -5869,7 +5798,6 @@ fn run_node(
                     NetworkBindings {
                         invite: &namespace,
                         identity_chain_id: &identity_chain_id,
-                        duckdns_chain_id: &duckdns_chain_id,
                     },
                     blobs.clone(),
                 )
@@ -6358,7 +6286,6 @@ fn run_node(
                             NetworkBindings {
                                 invite: &namespace,
                                 identity_chain_id: &identity_chain_id,
-                                duckdns_chain_id: &duckdns_chain_id,
                             },
                             SyncSubstrates {
                                 forge_repo: &forge_repo,
@@ -7123,12 +7050,6 @@ fn run_node(
         // idempotent). inert when this host installed no executor CLIs.
         let mut announcer =
             CapabilityAnnouncer::new(signer.public_key().as_ref().to_vec(), my_capabilities);
-        // Local targets never enter this pump: it carries only the replicated
-        // declarations projected from the validated node config.
-        let mut duckdns_announcer = duckdns_node::Announcer::new(
-            signer.public_key().as_ref().to_vec(),
-            duckdns_announcements.clone(),
-        );
         // one-shot upgrade transition markers keyed off COMMITTED upgrade state,
         // modeled on the `converged` latch: `upgrade armed …` fires when readiness
         // first reaches R==n (every current boundary member signaled) for the
@@ -7985,28 +7906,6 @@ fn run_node(
                                 // un-latch so a transient submit failure retries.
                                 announcer.announced = None;
                                 eprintln!("[node {label}] capability announce submit failed: {e}");
-                            }
-                        }
-                    }
-
-                    // DUCKDNS ANNOUNCE: same state-driven declarative replace
-                    // discipline as capabilities, but an empty local config
-                    // deliberately clears any stale prior publication.
-                    if orchestrator
-                        .current_members()
-                        .contains(&signer.public_key())
-                        && let Some(msg) = duckdns_announcer.maybe_announce(node.host()).await
-                    {
-                        let seq = next_seq;
-                        next_seq += 1;
-                        match node.submit(&signer, seq, msg).await {
-                            Ok(_) => println!(
-                                "[node {label}] announced DuckDNS services {:?}",
-                                duckdns_announcer.announcements()
-                            ),
-                            Err(e) => {
-                                duckdns_announcer.send_failed();
-                                eprintln!("[node {label}] DuckDNS announce submit failed: {e}");
                             }
                         }
                     }

@@ -1,9 +1,8 @@
-//! Ducktape system-module adapter for DuckDNS.
+//! Ducktape system-module adapter for the `.duck` account naming service.
 //!
 //! The deterministic registry and wire grammar live in `duckdns-core`; this
-//! crate keeps the consensus module id and SDK glue. It resolves authenticated
-//! submit nodes through `identity`, gates mutations/providers through `valset`,
-//! and re-exports the core API as the module's public wire surface.
+//! crate derives AccountId from authenticated submit nodes through `identity`,
+//! gates namespace mutations through `valset`, and re-exports the core API.
 
 pub use duckdns_core::*;
 
