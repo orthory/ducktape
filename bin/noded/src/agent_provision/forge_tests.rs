@@ -271,10 +271,8 @@ async fn provisions_a_worktree_at_the_pinned_commit_from_an_odb_only_repo() {
         "hello\n"
     );
     assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD"]), bed.head);
-    assert_eq!(
-        git_stdout(&dir, &["symbolic-ref", "HEAD"]),
-        format!("refs/heads/{BRANCH}")
-    );
+    // DETACHED: no branch is checked out (no shared-repo ref to hold or move).
+    assert_eq!(git_stdout(&dir, &["branch", "--show-current"]), "");
     assert_eq!(
         ws.env().get("DUCKTAPE_RUN_WORKSPACE"),
         Some(&dir.display().to_string())
@@ -283,10 +281,11 @@ async fn provisions_a_worktree_at_the_pinned_commit_from_an_odb_only_repo() {
 }
 
 #[tokio::test]
-async fn an_unborn_branch_is_created_at_the_pinned_commit_over_local_leftovers() {
+async fn provision_never_touches_shared_repo_refs() {
     let bed = bed();
-    // a node-local leftover ref (a dead run's debris) points somewhere stale —
-    // committed state (branch_born=false ⇒ the branch does NOT exist) is truth.
+    // a node-local ref for the work branch already exists (consensus
+    // materialized it, or a dead run left it) pointing somewhere else — the
+    // detached provision must neither read nor move it: the pin is the base.
     let repo = git2::Repository::open(&bed.repo_dir).unwrap();
     let stale = odb_commit(&repo, Some(&bed.head), "junk.txt", "stale");
     set_ref(&repo, BRANCH, &stale);
@@ -299,8 +298,8 @@ async fn an_unborn_branch_is_created_at_the_pinned_commit_over_local_leftovers()
     assert_eq!(git_stdout(&ws.workdir(), &["rev-parse", "HEAD"]), bed.head);
     assert_eq!(
         ref_oid(&bed.repo_dir, BRANCH).as_deref(),
-        Some(bed.head.as_str()),
-        "the leftover ref lost to the pinned commit"
+        Some(stale.as_str()),
+        "the shared-repo ref is NOT ours to move — it stays put"
     );
     ws.cleanup().await;
 }
@@ -323,7 +322,7 @@ async fn a_born_branch_is_forced_to_the_committed_tip_and_pushes_fast_forward() 
     assert_eq!(
         git_stdout(&dir, &["rev-parse", "HEAD"]),
         tip,
-        "the committed tip wins over node-local drift"
+        "the detached checkout sits at the PIN — node-local drift is invisible"
     );
 
     // continuation run: new work fast-forwards the born branch (CAS holds:
@@ -348,28 +347,64 @@ async fn a_born_branch_is_forced_to_the_committed_tip_and_pushes_fast_forward() 
 }
 
 #[tokio::test]
-async fn a_branch_held_by_a_concurrent_attempt_refuses_with_clean_debris() {
-    // two live attempts of one item share the work branch — git refuses the
-    // second checkout (the provision-time sibling of the push CAS race).
+async fn concurrent_attempts_of_one_item_both_provision_detached() {
+    // no branch refs are held, so there is nothing to refuse — both attempts
+    // run and the push loop orders whoever finishes second.
     let bed = bed();
     let prov = bed.provisioner();
-    let first = prov
+    let a = prov
         .provision(&bed.spec("s1:0", &bed.head, false))
         .await
-        .expect("first attempt provisions");
-    let err = provision_err(prov.provision(&bed.spec("s1:1", &bed.head, false)).await);
-    assert!(err.contains(BRANCH), "the refusal names the branch: {err}");
+        .expect("first attempt");
+    let b = prov
+        .provision(&bed.spec("s1:1", &bed.head, false))
+        .await
+        .expect("second attempt provisions too — detached HEADs don't contend");
+    assert_ne!(a.workdir(), b.workdir());
+    a.cleanup().await;
+    b.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_shared_repo_ref_force_move_mid_run_cannot_reparent_the_commit() {
+    // THE hazard the detached checkout closes: consensus catch-up force-moves
+    // refs/heads/<branch> in the shared repo WHILE the run executes. a
+    // worktree holding that branch would commit onto the moved tip with its
+    // old tree — silently reverting the interloper, then fast-forwarding past
+    // the CAS. detached, the base stays the pin; the interloper is folded in
+    // by the FETCH-driven rebase and its content survives.
+    let bed = bed();
+    let bare = bed.snapshot_bare();
+    let ws = bed
+        .provisioner()
+        .provision(&bed.spec("s1:0", &bed.head, true))
+        .await
+        .expect("provision");
+    let dir = ws.workdir();
+
+    // mid-run: the interloper lands remotely AND catch-up moves the local ref.
+    let bare_repo = git2::Repository::open(&bare).unwrap();
+    let c2 = odb_commit(&bare_repo, Some(&bed.head), "rival.txt", "interloper content\n");
+    set_ref(&bare_repo, BRANCH, &c2);
+    let local = git2::Repository::open(&bed.repo_dir).unwrap();
+    let c2_local = odb_commit(&local, Some(&bed.head), "rival.txt", "interloper content\n");
+    assert_eq!(c2_local, c2, "same commit both sides (fixed identities)");
+    set_ref(&local, BRANCH, &c2);
+
+    std::fs::write(dir.join("mine.txt"), "the run's work\n").unwrap();
+    let receipt = ws.commit("agent run s1:0").await.expect("rebase-retry push");
+    assert!(receipt.rebased);
+    let oid = receipt.output_commit.expect("post-rebase oid");
+    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(oid.as_str()));
+    // the interloper stays an ANCESTOR and its content SURVIVES at the tip —
+    // never silently reverted.
+    assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD^"]), c2);
     assert_eq!(
-        std::fs::read_dir(&bed.runs_root).unwrap().count(),
-        1,
-        "the refused attempt left no run-dir debris"
+        git_stdout(&dir, &["show", "HEAD:rival.txt"]),
+        "interloper content"
     );
-    assert_eq!(
-        worktree_count(&bed.repo_dir),
-        2,
-        "primary + the FIRST attempt only — no dangling metadata"
-    );
-    first.cleanup().await;
+    assert_eq!(git_stdout(&dir, &["show", "HEAD:mine.txt"]), "the run's work");
+    ws.cleanup().await;
 }
 
 #[tokio::test]
@@ -424,6 +459,7 @@ async fn a_push_lands_and_the_receipt_is_the_forge_output_ref() {
 
     let receipt = ws.commit("agent run s1:0").await.expect("commit+push");
     assert!(!receipt.no_changes && receipt.commit_error.is_none());
+    assert!(!receipt.rebased, "an uncontended push never claims a rebase");
     assert_eq!(receipt.source_prefix, format!("forge:{REPO}"));
     assert_eq!(receipt.source_snapshot.as_deref(), Some(bed.head.as_str()));
     assert_eq!(receipt.branch.as_deref(), Some(BRANCH));
@@ -523,7 +559,9 @@ async fn an_agents_own_commits_push_even_with_a_clean_tree() {
 }
 
 #[tokio::test]
-async fn a_concurrently_advanced_branch_cas_rejects_into_a_degraded_receipt() {
+async fn a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed() {
+    // "we replicate all of git actions": a concurrent advance is an ORDERING
+    // problem — fetch, rebase, push; both commits land as linear history.
     let bed = bed();
     let bare = bed.snapshot_bare();
     // someone advanced the branch on the remote AFTER this run's base was
@@ -534,24 +572,94 @@ async fn a_concurrently_advanced_branch_cas_rejects_into_a_degraded_receipt() {
 
     let spec = bed.spec("s1:0", &bed.head, true);
     let ws = bed.provisioner().provision(&spec).await.expect("provision");
-    std::fs::write(ws.workdir().join("mine.txt"), "forked work\n").unwrap();
+    let dir = ws.workdir();
+    std::fs::write(dir.join("mine.txt"), "forked work\n").unwrap();
 
-    // the push MUST reject (never force, never re-read the fresh tip) …
+    let receipt = ws.commit("agent run s1:0").await.expect("rebase-retry push");
+    assert!(receipt.rebased, "the receipt says the base moved under the work");
+    assert!(!receipt.no_changes && receipt.commit_error.is_none());
+    assert_eq!(receipt.branch.as_deref(), Some(BRANCH));
+    let oid = receipt.output_commit.expect("post-rebase oid");
+    // linear history: the interloper is now the run commit's PARENT …
+    assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(oid.as_str()));
+    assert_eq!(git_stdout(&dir, &["rev-parse", "HEAD^"]), c2);
+    // … and the rebase preserved the agent author + node committer (D2).
+    assert_eq!(
+        git_stdout(&dir, &["log", "-1", "--format=%an|%ae|%cn|%ce"]),
+        format!("{AGENT}|{AGENT}@agents.ducktape.local|{NODE_IDENT}|node@ducktape.local")
+    );
+    ws.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_rebase_conflict_aborts_cleanly_and_degrades() {
+    let bed = bed();
+    let bare = bed.snapshot_bare();
+    // the interloper and the run edit the SAME lines of readme.md.
+    let bare_repo = git2::Repository::open(&bare).unwrap();
+    let c2 = odb_commit(&bare_repo, Some(&bed.head), "readme.md", "rival edit\n");
+    set_ref(&bare_repo, BRANCH, &c2);
+
+    let spec = bed.spec("s1:0", &bed.head, true);
+    let ws = bed.provisioner().provision(&spec).await.expect("provision");
+    let dir = ws.workdir();
+    std::fs::write(dir.join("readme.md"), "my conflicting edit\n").unwrap();
+
     let err = ws.commit("agent run s1:0").await.unwrap_err();
     assert!(
-        err.contains("rejected") || err.contains("non-fast-forward"),
-        "the CAS reject surfaces verbatim: {err}"
+        err.contains("rebase conflict") && err.contains(BRANCH),
+        "ONLY a genuine conflict degrades, naming the branch: {err}"
     );
-    // … the remote keeps the concurrent work …
+    // aborted cleanly: no mid-rebase state left behind …
+    let rebase_dir = git_stdout(&dir, &["rev-parse", "--git-path", "rebase-merge"]);
+    let rebase_path = Path::new(&rebase_dir);
+    let rebase_abs = if rebase_path.is_absolute() {
+        rebase_path.to_path_buf()
+    } else {
+        dir.join(rebase_path)
+    };
+    assert!(!rebase_abs.exists(), "no rebase-merge debris at {rebase_dir}");
+    // … the interloper's tip stays branch head …
     assert_eq!(ref_oid(&bare, BRANCH).as_deref(), Some(c2.as_str()));
-    // … and the pool maps exactly this Err to commit_failed + Degraded —
-    // whose receipt now names the ATTEMPTED branch for the audit lane.
+    // … and the pool maps exactly this Err to commit_failed + Degraded.
     let receipt = WorkspaceReceipt::commit_failed(&spec, err);
     assert_eq!(receipt.branch.as_deref(), Some(BRANCH));
-    assert_eq!(receipt.source_prefix, format!("forge:{REPO}"));
-    assert_eq!(receipt.source_snapshot.as_deref(), Some(bed.head.as_str()));
     assert!(receipt.commit_error.is_some() && !receipt.no_changes);
     assert_eq!(receipt.output_commit, None);
+    ws.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_remote_that_always_rejects_exhausts_the_bounded_retries() {
+    let bed = bed();
+    // the branch must be born on the remote so mid-loop fetch/rebase succeed
+    // and the BOUND — not a fetch error — is what ends the loop.
+    let repo = git2::Repository::open(&bed.repo_dir).unwrap();
+    set_ref(&repo, BRANCH, &bed.head);
+    let bare = bed.snapshot_bare();
+    // a pre-receive hook that logs every push attempt and declines it.
+    let hook = bare.join("hooks").join("pre-receive");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\necho x >> hook.log\nexit 1\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let ws = bed
+        .provisioner()
+        .provision(&bed.spec("s1:0", &bed.head, true))
+        .await
+        .expect("provision");
+    std::fs::write(ws.workdir().join("mine.txt"), "work\n").unwrap();
+
+    let err = ws.commit("agent run s1:0").await.unwrap_err();
+    assert!(
+        err.contains("after 3 attempts") && err.contains("pre-receive"),
+        "the bound ends the loop carrying the real reject: {err}"
+    );
+    let pushes = std::fs::read_to_string(bare.join("hook.log")).unwrap();
+    assert_eq!(pushes.lines().count(), 3, "exactly PUSH_ATTEMPTS pushes, no spin");
     ws.cleanup().await;
 }
 
@@ -598,7 +706,8 @@ async fn cleanup_after_a_successful_push_leaves_only_the_branch_ref() {
     ws.cleanup().await;
     assert!(!dir.exists());
     assert_eq!(worktree_count(&bed.repo_dir), 1, "primary only");
-    // the local branch ref survives as a plain ref (harmless leftover — the
-    // next provision force-resets it to committed truth).
-    assert_eq!(ref_oid(&bed.repo_dir, BRANCH), receipt.output_commit);
+    let _ = receipt;
+    // detached lane: the work branch lives only on the remote — the shared
+    // repo never grew a local ref for it.
+    assert_eq!(ref_oid(&bed.repo_dir, BRANCH), None);
 }

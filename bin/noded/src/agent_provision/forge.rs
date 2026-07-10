@@ -12,13 +12,24 @@
 //! only pack digests / blob addressing are sha256): never pass
 //! `--object-format` anywhere.
 //!
-//! CAS honesty: the worktree forks at the PINNED commit — for a born branch
-//! the local ref is FORCED there (committed state is truth over node-local
-//! drift), for an unborn one it is created there — and the push is a plain
-//! (never forced) ref update whose base is never re-read. a concurrently
-//! advanced branch therefore rejects at the fork base: production's
-//! receive-pack/`PushRefs` CAS, or stock git's fetch-first refusal on any
-//! other remote. the reject degrades the receipt (`commit_error` +
+//! DETACHED by construction: the worktree checks out the PINNED commit with
+//! `--detach` and the provisioner never creates or moves a shared-repo ref.
+//! this is load-bearing, not style — the consensus module's committed-ref
+//! catch-up FORCE-MOVES `refs/heads/<branch>` in the shared repo while runs
+//! execute; a worktree HOLDING that branch would silently reparent its
+//! commit onto the moved tip with the worktree's old tree (reverting the
+//! interloper's content, fast-forward push, no reject ever fired). a
+//! detached HEAD is immune: the base stays the pin, and the remote tip is
+//! read ONLY via `git fetch` (never the untrustworthy local ref).
+//!
+//! ordering over CAS-degrade: the push is a plain (never forced)
+//! `HEAD:refs/heads/<branch>` update. a concurrently advanced branch rejects
+//! at the fork base (production's receive-pack/`PushRefs` CAS, stock git's
+//! fetch-first refusal elsewhere), and the reject is an internal RETRY
+//! trigger, not a failure: fetch the new tip, rebase the run's commits onto
+//! FETCH_HEAD, push again (bounded — [`PUSH_ATTEMPTS`]). the CAS stays the
+//! consensus linearizer underneath; both commits land as linear history.
+//! ONLY a genuine rebase conflict degrades the receipt (`commit_error` +
 //! `Status::Degraded` via the pool), never the reply (R4).
 
 use std::collections::BTreeMap;
@@ -255,7 +266,6 @@ pub(super) async fn provision(
         run_dir,
         repo: repo.clone(),
         commit: commit.clone(),
-        branch: branch.clone(),
     };
     let workspace_args = tokio::task::spawn_blocking(move || provision_blocking(blocking))
         .await
@@ -283,7 +293,6 @@ struct ProvisionArgs {
     run_dir: PathBuf,
     repo: String,
     commit: String,
-    branch: String,
 }
 
 fn provision_blocking(args: ProvisionArgs) -> Result<ProvisionArgs, String> {
@@ -292,7 +301,6 @@ fn provision_blocking(args: ProvisionArgs) -> Result<ProvisionArgs, String> {
         run_dir,
         repo,
         commit,
-        branch,
     } = &args;
     if !repo_dir.join(".git").exists() {
         return Err(format!(
@@ -315,14 +323,15 @@ fn provision_blocking(args: ProvisionArgs) -> Result<ProvisionArgs, String> {
             String::from_utf8_lossy(&present.stderr).trim()
         ));
     }
-    // `-B`: create-or-force the work branch AT the pinned commit — committed
-    // state is truth, node-local leftover refs lose (branch_born=false:
-    // create; branch_born=true: force to the committed tip). a branch already
-    // checked out by another worktree makes git REFUSE — the designed
-    // provision-time sibling of the push CAS race (two live attempts of one
-    // item), surfacing as a clear attempt failure.
+    // DETACHED checkout at the pinned commit — the provisioner never creates
+    // or moves a shared-repo ref, so the consensus module's committed-ref
+    // catch-up (which force-moves refs/heads/* in this repo while runs
+    // execute) can never reparent the run's base under it. the work branch
+    // exists only remotely; the push names it explicitly. concurrent
+    // attempts of one item both provision (no branch to contend on) and the
+    // push loop orders them.
     let add = git(repo_dir)
-        .args(["worktree", "add", "-B", branch])
+        .args(["worktree", "add", "--detach"])
         .arg(run_dir.as_os_str())
         .arg(commit)
         .output()
@@ -332,7 +341,7 @@ fn provision_blocking(args: ProvisionArgs) -> Result<ProvisionArgs, String> {
         // strand a run dir or worktree metadata.
         cleanup_blocking(repo_dir, run_dir);
         return Err(format!(
-            "git worktree add for forge repo {repo:?} branch {branch:?} failed: {}",
+            "git worktree add for forge repo {repo:?} at {commit} failed: {}",
             String::from_utf8_lossy(&add.stderr).trim()
         ));
     }
@@ -381,8 +390,17 @@ enum CommitOutcome {
     /// push, a true `no_changes`.
     NoChanges,
     /// the work landed: the branch was pushed and this is its new head oid.
-    Pushed(String),
+    /// `rebased` = a concurrent advance was folded under it first (rides the
+    /// receipt's EXISTING `rebased` field — the duckfs semantic twin).
+    Pushed { oid: String, rebased: bool },
 }
+
+/// total push attempts before a rejection is a real failure. a concurrent
+/// branch advance is an ORDERING problem, not a degrade: the consensus CAS
+/// underneath stays the linearizer, a reject just triggers fetch → rebase →
+/// push like a git user would. bounded so a hot/hostile remote can't spin
+/// the commit bracket.
+const PUSH_ATTEMPTS: u32 = 3;
 
 fn commit_blocking(
     run_dir: &Path,
@@ -417,14 +435,53 @@ fn commit_blocking(
     if !staged && head == pinned_commit {
         return Ok(CommitOutcome::NoChanges);
     }
-    // plain push, NEVER --force, base never re-read: branch_born=true is
-    // fast-forward-from-<commit> or reject; branch_born=false is a plain
-    // create (a concurrently-minted branch rejects the same way). the reject
-    // rides Err → the pool's commit_failed + Degraded (reply still delivers).
-    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-    run_git(run_dir, &["push", push_url, &refspec], &[])
-        .map_err(|e| format!("push of branch {branch:?} to {push_url} was rejected: {e}"))?;
-    Ok(CommitOutcome::Pushed(head))
+    // plain push, NEVER --force. a rejection means the branch advanced while
+    // the run executed — an ordering problem, so do what a git user does:
+    // fetch the new tip, rebase the run's commits onto it (the author
+    // survives a rebase natively; the committer stays the node via the same
+    // env), push again. ONLY a genuine rebase conflict degrades (Err → the
+    // pool's commit_failed + Degraded; the reply still delivers, R4), and
+    // the interloper's tip stays branch head.
+    let refspec = format!("HEAD:refs/heads/{branch}");
+    let fetchspec = format!("refs/heads/{branch}");
+    let committer_env = [
+        ("GIT_COMMITTER_NAME", committer_name),
+        ("GIT_COMMITTER_EMAIL", NODE_COMMITTER_EMAIL),
+    ];
+    let mut rebased = false;
+    for attempt in 1..=PUSH_ATTEMPTS {
+        match run_git(run_dir, &["push", push_url, &refspec], &[]) {
+            Ok(_) => {
+                // re-read AFTER any rebase: the pushed head is the output_commit.
+                let oid = run_git(run_dir, &["rev-parse", "HEAD"], &[])?;
+                return Ok(CommitOutcome::Pushed { oid, rebased });
+            }
+            Err(e) if attempt == PUSH_ATTEMPTS => {
+                return Err(format!(
+                    "push of branch {branch:?} to {push_url} was rejected after \
+                     {PUSH_ATTEMPTS} attempts: {e}"
+                ));
+            }
+            Err(_) => {
+                // the remote tip comes ONLY from fetch — never the local
+                // shared ref, which consensus catch-up moves/leaves stale. a
+                // fetch miss means the branch is unborn remotely (a create
+                // race that resolved away, or a non-tip reject like a hook):
+                // skip the rebase and just push again.
+                if run_git(run_dir, &["fetch", push_url, &fetchspec], &[]).is_ok() {
+                    run_git(run_dir, &["rebase", "FETCH_HEAD"], &committer_env).map_err(|e| {
+                        // never leave the worktree mid-rebase; the
+                        // interloper's tip stays branch head (best-effort
+                        // abort, then degrade).
+                        let _ = git(run_dir).args(["rebase", "--abort"]).output();
+                        format!("rebase conflict on {branch:?}: {e}")
+                    })?;
+                    rebased = true;
+                }
+            }
+        }
+    }
+    unreachable!("the push loop returns on every arm of its final attempt")
 }
 
 /// whether `git add -A` staged anything (index vs HEAD) — the exit-code
@@ -498,7 +555,13 @@ impl ProvisionedWorkspace for ForgeWorkspace {
         let spec = self.receipt_spec();
         Ok(match outcome {
             CommitOutcome::NoChanges => WorkspaceReceipt::no_changes(&spec),
-            CommitOutcome::Pushed(oid) => WorkspaceReceipt::pushed(&spec, oid),
+            CommitOutcome::Pushed { oid, rebased } => {
+                let mut receipt = WorkspaceReceipt::pushed(&spec, oid);
+                // the receipt's EXISTING field, the duckfs semantic twin
+                // (work landed on a moved base) — no wire change.
+                receipt.rebased = rebased;
+                receipt
+            }
         })
     }
 
