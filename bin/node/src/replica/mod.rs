@@ -29,9 +29,149 @@
 
 use commonware_codec::{Decode as _, Encode as _};
 use commonware_consensus::simplex::types::Certificate;
+use commonware_cryptography::ed25519;
+use commonware_p2p::authenticated::discovery::{self, Network};
+use commonware_p2p::Ingress;
+use commonware_runtime::Quota;
+use commonware_utils::ordered::Set;
 use consensus::Digest;
+use recovery::{Manifest, Recovery};
 
 pub(crate) mod promotion;
+mod park;
+mod wiring;
+
+/// the overlay-net seam's runtime context type — the same wrapper
+/// `boot::mesh::build` wires `Network`/`Oracle` over. shared by `wiring`
+/// and `park` so both name the identical `Network`/channel types `run`'s
+/// caller (`boot::mesh::MeshHead`) already produced.
+pub(super) type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tokio::Context>;
+
+/// the joiner/replica role (unified-node phase 2): park on the mesh,
+/// bootstrap a boundary, fold the head, and — on staged admission —
+/// promote to a validator. entered by `run_node` exactly when this key
+/// holds neither a recovery checkpoint's participant seat nor genesis
+/// validator standing (`!checkpoint_seats_me && !validators.contains(…)`);
+/// every exit is [`reboot_self`] or `std::process::exit`, so this never
+/// returns — the validator path in `run_node` picks up only when the
+/// condition was false to begin with.
+///
+/// wiring (phase 6a: per-epoch channel bank, reachability standby, lobby)
+/// happens in [`wiring::wire`]; the resulting [`wiring::ReplicaChannels`]
+/// feed the park loop (phases 6b–6d: serve state, the loop itself,
+/// promotion) in [`park::park`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run(
+    context: commonware_runtime::tokio::Context,
+    network: Network<OverlayCtx, ed25519::PrivateKey>,
+    oracle: &mut discovery::Oracle<ed25519::PublicKey>,
+    quota: Quota,
+    mesh_participants: &Set<ed25519::PublicKey>,
+    sync_sources: Vec<ed25519::PublicKey>,
+    sync_source: Option<ed25519::PublicKey>,
+    advertised_reach: Ingress,
+    status_public_key: String,
+    signer: ed25519::PrivateKey,
+    label: String,
+    namespace: Vec<u8>,
+    identity_chain_id: String,
+    peers: Vec<ed25519::PublicKey>,
+    validators: Vec<ed25519::PublicKey>,
+    wireguard_listen: Option<std::net::SocketAddr>,
+    wireguard_effect: crate::config::WireGuardEffectKind,
+    wireguard_key_file: std::path::PathBuf,
+    invite_token: &Option<crate::config::InviteToken>,
+    invite_wireguard: &Option<crate::config::StoredInviteWireGuard>,
+    invite_fronts: Vec<crate::config::Front>,
+    coord_cap: &Option<nat_traversal::CoordCap>,
+    workspace: std::path::PathBuf,
+    chain_id: String,
+    mesh_state_file: std::path::PathBuf,
+    checkpoint_blocks: u64,
+    sync_index: bool,
+    announce_capabilities: bool,
+    rpc_listener: Option<std::net::TcpListener>,
+    http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
+    stream_hub: &noded::StreamHub,
+    index: std::sync::Arc<indexer::IndexStore>,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    blobs: noded::blobs::BlobHandle,
+    agent_provisioner: &Option<dispatch_oracle::SharedProvisioner>,
+    agent_dirs: &capability_host::AgentDirs,
+    overlay_slot: overlay_net::userspace::StackSlot,
+    storage_for_sync: std::path::PathBuf,
+    recovery: Recovery<commonware_runtime::tokio::Context>,
+    manifest: &Option<Manifest>,
+    forge_repo: std::path::PathBuf,
+    duckfs_dir: std::path::PathBuf,
+) -> ! {
+    // `wire` and `park` both read `signer`/`label`/`namespace`/`overlay_slot`
+    // — cheap plain-data (or, for `overlay_slot`, an Arc-backed handle)
+    // clones so each phase owns its copy outright (no needless
+    // double-reference at either phase's internal `&x` sites). `context`
+    // cannot follow this pattern (no `Clone`) — it rides inside
+    // `ReplicaChannels` instead, `wire` -> `park`'s one true hand-off.
+    let channels = wiring::wire(
+        context,
+        network,
+        oracle,
+        quota,
+        mesh_participants,
+        &recovery,
+        manifest,
+        signer.clone(),
+        label.clone(),
+        namespace.clone(),
+        wireguard_listen,
+        wireguard_effect,
+        wireguard_key_file,
+        chain_id,
+        mesh_state_file,
+        advertised_reach,
+        coord_cap,
+        invite_token,
+        invite_wireguard,
+        invite_fronts,
+        voice_requests,
+        workspace,
+        overlay_slot.clone(),
+    )
+    .await;
+
+    park::park(
+        channels,
+        oracle,
+        signer,
+        label,
+        namespace,
+        identity_chain_id,
+        peers,
+        validators,
+        wireguard_listen,
+        wireguard_effect,
+        invite_token,
+        checkpoint_blocks,
+        sync_index,
+        announce_capabilities,
+        sync_sources,
+        sync_source,
+        status_public_key,
+        rpc_listener,
+        http_cmds,
+        stream_hub,
+        index,
+        blobs,
+        agent_provisioner,
+        agent_dirs,
+        overlay_slot,
+        storage_for_sync,
+        forge_repo,
+        duckfs_dir,
+        manifest,
+        recovery,
+    )
+    .await
+}
 
 /// replace this process with a fresh invocation of itself (same argv): the
 /// clean way to re-enter boot with a different network topology — discovery
