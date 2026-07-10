@@ -1,6 +1,7 @@
 use super::{
-    AuthorRef, BufferPooler, Comment, Context, MAX_COMMENT_TEXT_BYTES, MAX_COMMENTS_PER_THREAD,
-    MAX_THREADS_PER_TARGET, Origin, PageError, PageMsg, Pages, Thread, ThreadView,
+    AuthorRef, BufferPooler, Comment, Context, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES,
+    MAX_COMMENT_TEXT_BYTES, MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET,
+    Origin, PageError, PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
 };
 
 /// reserved logical-key prefixes for comment records + the per-target thread
@@ -47,7 +48,7 @@ where
         }
     }
 
-    async fn load_comment(&self, id: &str) -> Result<Option<Comment>, PageError> {
+    pub(super) async fn load_comment(&self, id: &str) -> Result<Option<Comment>, PageError> {
         match self.get(comment_key(id).as_bytes()).await {
             Some(b) => Ok(Some(
                 serde_json::from_slice(&b).map_err(|_| PageError::Corrupt)?,
@@ -147,11 +148,43 @@ where
                 comment_id,
                 target,
                 text,
+                as_agent,
             } => {
+                // bound the client-minted ids BEFORE staging: they drive the
+                // size of the shared derived blocks (the target index and the
+                // thread record). the length cap alone is NOT enough — an id
+                // of escaping chars serializes to 2–6 B each, so it must ALSO
+                // be index-safe for `len()` to bound the serialized cost and
+                // the count × length margins to hold.
+                if thread_id.len() > MAX_THREAD_ID_BYTES
+                    || comment_id.len() > MAX_COMMENT_ID_BYTES
+                    || target.len() > MAX_COMMENT_TARGET_BYTES
+                    || !id_is_index_safe(&thread_id)
+                    || !id_is_index_safe(&comment_id)
+                    || !id_is_index_safe(&target)
+                {
+                    return Err(PageError::IdTooLarge);
+                }
                 if text.len() > MAX_COMMENT_TEXT_BYTES {
                     return Err(PageError::TextTooLarge);
                 }
-                let author = author_from_origin(origin)?;
+                // `as_agent` refines a MODULE origin into an individual agent
+                // author (chat's refine pattern): modules are genesis-trusted
+                // code, so the module half stays origin-derived and
+                // spoof-proof; an external or system submitter claiming an
+                // agent identity is rejected outright.
+                let author = match as_agent {
+                    None => author_from_origin(origin)?,
+                    Some(agent_id) => {
+                        if agent_id.is_empty() {
+                            return Err(PageError::EmptyAgent);
+                        }
+                        match author_from_origin(origin)? {
+                            AuthorRef::Module(module) => AuthorRef::Agent { module, agent_id },
+                            _ => return Err(PageError::AgentNeedsModuleOrigin),
+                        }
+                    }
+                };
                 if self.load_comment(&comment_id).await?.is_some() {
                     return Err(PageError::DuplicateComment);
                 }

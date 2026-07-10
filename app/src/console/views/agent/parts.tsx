@@ -17,6 +17,8 @@ export const ACTION_LABEL: Record<string, string> = {
   "chat.post": "Post to chat",
   "tasks.create": "Create tasks",
   "tasks.update_status": "Update task status",
+  "pages.comment": "Comment on pages",
+  "pages.set_checked": "Check off page todos",
 };
 
 // Permission checkboxes read as plain abilities ("what this agent can do"),
@@ -25,7 +27,14 @@ export const ACTION_HINT: Record<string, string> = {
   "chat.post": "Reply in chat",
   "tasks.create": "Create tasks",
   "tasks.update_status": "Update task status",
+  "pages.comment": "Comment on pages",
+  "pages.set_checked": "Check off page todos",
 };
+
+/** Parse the pages_write caps field: whitespace/comma-separated page ids,
+ *  the literal "*" allowed. The node canonicalizes (sort + dedup). */
+export const parsePagesWrite = (text: string): string[] =>
+  text.split(/[\s,]+/).filter(Boolean);
 
 export type Tone = { text: string; bg: string; border: string };
 

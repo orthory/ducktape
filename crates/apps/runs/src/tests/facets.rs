@@ -2,31 +2,6 @@ use super::*;
 
 // ---- faceted delivery -------------------------------------------------------
 
-/// build a faceted RunnerResult wrapper: the three core fields plus whatever
-/// facet keys `facets` carries (data / effects / sink / status, and a
-/// `workspace_receipt` override when present).
-fn runner_wrapper(response_text: &str, facets: serde_json::Value) -> Vec<u8> {
-    let mut obj = serde_json::json!({
-        "ducktape_runner_result": 1,
-        "response_text": response_text,
-        "workspace_receipt": {
-            "source_prefix": "/shared/agent-workspaces/bot",
-            "source_snapshot": null,
-            "output_snapshot": null,
-            "commit_height": null,
-            "rebased": false,
-            "no_changes": true
-        }
-    });
-    if let serde_json::Value::Object(extra) = facets {
-        let base = obj.as_object_mut().expect("object");
-        for (k, v) in extra {
-            base.insert(k, v);
-        }
-    }
-    serde_json::to_vec(&obj).expect("wrapper serializes")
-}
-
 /// a module wired with the forge sink, one watch on "general", one engaged
 /// run for agent "bot" at seq 2.
 fn awaiting_run_with_forge(registry: &Registry) -> (RunsModule, String) {

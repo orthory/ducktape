@@ -143,12 +143,18 @@ pub enum PageMsg {
     // (mirrors the chat module). ids are client-minted like block ids.
     /// open a thread (when `thread_id` is new) anchored to `target` with this
     /// first comment, or append `comment_id` to an existing thread (whose
-    /// target must match). author = origin.
+    /// target must match). author = origin — except `as_agent`, which refines
+    /// a MODULE origin into `AuthorRef::Agent { module, agent_id }` (the
+    /// module half stays origin-derived and spoof-proof; mirrors chat's
+    /// `as_agent`). `as_agent` with a non-module origin is rejected.
     AddComment {
         thread_id: String,
         comment_id: String,
         target: String,
         text: String,
+        /// `default` so a pre-M2 payload without the key still decodes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        as_agent: Option<String>,
     },
     /// replace a comment's text; stored-author-only. rejected on a tombstone.
     EditComment { comment_id: String, text: String },
@@ -164,6 +170,33 @@ pub const MAX_COMMENT_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_COMMENTS_PER_THREAD: usize = 4096;
 pub const MAX_THREADS_PER_TARGET: usize = 1024;
 pub const MAX_QUERY_TARGETS: usize = 512;
+
+// client-minted id length caps (consensus constants). the shared DERIVED
+// blocks — the per-target thread index (a `Vec<thread_id>`, up to
+// `MAX_THREADS_PER_TARGET`) and a thread record (a `Vec<comment_id>`, up to
+// `MAX_COMMENTS_PER_THREAD`) — grow with these ids. WITHOUT a length cap a
+// user (AddComment needs no capability) can pre-bloat a target's index with
+// long ids until one more append trips `MAX_BLOCK_LEN` at stage time and
+// ABORTS the block (a permanent-re-abort R4 wedge). these caps keep those
+// derived blocks safely under `MAX_BLOCK_LEN` (768 KiB) at full count (JSON
+// overhead ≈ 3 B/entry): 1024 × (512+3) ≈ 515 KiB and 4096 × (128+3) ≈ 524
+// KiB, both a comfortable ~250 KiB clear.
+pub const MAX_THREAD_ID_BYTES: usize = 512;
+pub const MAX_COMMENT_ID_BYTES: usize = 128;
+pub const MAX_COMMENT_TARGET_BYTES: usize = 512;
+
+/// whether a client-minted id serializes 1:1 (byte-for-byte) under
+/// `serde_json` — i.e. carries no escaping char. `serde_json` escapes `"`→
+/// `\"` (2 B), `\`→`\\` (2 B), and control chars `< 0x20` → `\u00XX` (6 B),
+/// so a length-capped id built from control chars could still balloon a
+/// derived block past [`MAX_BLOCK_LEN`] and abort it. every OTHER char (incl.
+/// non-ASCII UTF-8, `/`, `:`) serializes to exactly its UTF-8 byte length, so
+/// with escaping chars rejected `String::len()` bounds the serialized cost
+/// exactly and the count × length caps hold. legit ids (uuids, path/hex
+/// forms) never contain these chars.
+pub fn id_is_index_safe(s: &str) -> bool {
+    !s.chars().any(|c| c == '"' || c == '\\' || (c as u32) < 0x20)
+}
 
 /// who authored a comment — derived from `Env.origin`, never a payload. own
 /// copy of chat's shape (each module's interface is self-contained).
@@ -245,6 +278,11 @@ pub enum PageQuery {
     ThreadsForTargets { targets: Vec<String> },
     /// one thread with its live comments.
     CommentThread { thread_id: String },
+    /// one comment by id, tombstones included — the existence probe a module
+    /// emitting `AddComment` follow-ups uses (comment ids are client-minted,
+    /// so a squatted id would otherwise reject the follow-up and abort its
+    /// block). `None` == no comment record at that id.
+    GetComment { comment_id: String },
 }
 
 /// one entry of [`PageReply::PageList`]: a page id and its current title.
@@ -265,6 +303,7 @@ pub enum PageReply {
     PageList(Vec<PageMeta>),
     CommentThreads(Vec<TargetThreads>),
     CommentThread(Option<ThreadView>),
+    Comment(Option<Comment>),
 }
 
 pub fn encode_query(q: &PageQuery) -> Vec<u8> {

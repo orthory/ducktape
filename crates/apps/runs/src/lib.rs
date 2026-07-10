@@ -118,11 +118,11 @@ pub use envelope::RUN_ENVELOPE_VERSION;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use agent::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent,
-    AgentQuery, AgentRecord, AgentReply, AgentResponse, AgentStatus, MAX_ACTIONS_BYTES,
-    MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
-    decode_event as agent_decode_event, decode_reply as agent_decode_reply,
-    encode_query as agent_encode_query,
+    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
+    ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent, AgentQuery, AgentRecord, AgentReply,
+    AgentResponse, AgentStatus, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES,
+    RESERVED_ID_SEPARATOR, ReplyBlock, decode_event as agent_decode_event,
+    decode_reply as agent_decode_reply, encode_query as agent_encode_query,
 };
 use chat::{
     Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
@@ -234,6 +234,9 @@ mod forge_source;
 mod inject;
 mod jobs_intake;
 mod module_impl;
+// the pages effects lane (M2): pages.comment / pages.set_checked applied at
+// the run boundary — probe-guarded, cap-gated, per-action degrade.
+mod pages_effects;
 mod response;
 // the delivery sink (O1/O2): the forge PR sink applied at the result intake —
 // gates, duplicate-PR guard, and message-facet title/body derivation.
@@ -324,6 +327,12 @@ pub struct RunsModule {
     /// its PRESENCE is what selects the portable v3 composer: `Some` composes v3
     /// (pins the committed head), `None` composes the v2 wire.
     files: Option<ModuleId>,
+    /// the pages module id — queried for `[[page:<id>]]` refs so a run's
+    /// context can carry referenced page subtrees (M2). genesis config, NOT
+    /// committed state (never in `root()`). `None` on nodes not wired for
+    /// pages; page refs then compose no page section (a silent skip, never
+    /// a failure).
+    pages: Option<ModuleId>,
     /// committed state — what `root()` and the app-hash commit to.
     watches: BTreeMap<String, TurnPolicy>,
     /// in-flight correlation entries keyed by dispatch id — pruned on
@@ -395,6 +404,7 @@ impl RunsModule {
             jobs,
             forge: None,
             files: None,
+            pages: None,
             watches: BTreeMap::new(),
             pending: BTreeMap::new(),
             pending_watches: BTreeMap::new(),
@@ -438,6 +448,21 @@ impl RunsModule {
             "files module id must be distinct from the runs module id"
         );
         self.files = Some(files);
+        self
+    }
+
+    /// wire the pages module so `[[page:<id>]]` refs in a run's trigger
+    /// message or injected item body render referenced page subtrees into the
+    /// composed context (M2), after construction — mirrors the injected
+    /// `Option<ModuleId>` collaborators so `new` and every existing call site
+    /// stay untouched. unwired, page refs compose no page section.
+    pub fn with_pages_module(mut self, pages: impl Into<ModuleId>) -> Self {
+        let pages = pages.into();
+        assert!(
+            pages != self.id,
+            "pages module id must be distinct from the runs module id"
+        );
+        self.pages = Some(pages);
         self
     }
 

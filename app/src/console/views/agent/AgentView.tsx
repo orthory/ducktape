@@ -21,6 +21,7 @@ import { primaryButton, runIsMine, secondaryButton, statusTone } from "./parts";
 import { RegisterAgentForm } from "./RegisterAgentForm";
 import { RosterList } from "./RosterList";
 import { JobsWorkerRow, RunsTimeline } from "./RunsTimeline";
+import { UsageCard } from "./UsageCard";
 import { WatchesPanel } from "./WatchesPanel";
 
 export { runIsMine };
@@ -248,6 +249,7 @@ export function AgentView() {
               op={state.ops[opKey.jobWorker()]}
               onToggle={toggleJobWorker}
             />
+            <UsageCard />
             <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
               {(["all", "mine"] as const).map((f) => (
                 <button

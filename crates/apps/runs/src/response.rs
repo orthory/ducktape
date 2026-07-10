@@ -202,7 +202,7 @@ fn task_status(name: &str) -> Option<TaskStatus> {
 }
 
 /// whether the registry granted this agent an action name.
-fn allows(agent: &AgentRecord, action: &str) -> bool {
+pub(super) fn allows(agent: &AgentRecord, action: &str) -> bool {
     agent.allowed_actions.iter().any(|a| a == action)
 }
 
@@ -338,6 +338,11 @@ impl RunsModule {
         // the run's durable executor attribution (sink.rs's saga lookup) —
         // computed once here, shared by the PR-body breadcrumb and the ring.
         let executing_node = self.executing_node(&*ctx, run_id).await;
+        // the pages effects lane: applied here at the run boundary like every
+        // other effect, but probe-guarded and cap-gated per action — a bad
+        // pages action degrades to a breadcrumb, the run still delivers.
+        self.emit_pages_effects(ctx, run_id, entry, &response.actions)
+            .await;
         self.emit_response(ctx, run_id, entry, response);
         let pr_number = self
             .emit_sink(
@@ -426,13 +431,22 @@ impl RunsModule {
             self.probe_reply_postable(ctx, run_id, entry).await?;
         }
 
-        if !response.actions.is_empty() {
+        // the strict all-or-nothing lane covers the TASK verbs only. the two
+        // pages actions are deliberately NOT validated here: they gate and
+        // validate at apply (`emit_pages_effects`), where a bad one degrades
+        // ALONE with a breadcrumb instead of failing the whole run.
+        let task_actions: Vec<&AgentAction> = response
+            .actions
+            .iter()
+            .filter(|action| !super::pages_effects::is_pages_action(action))
+            .collect();
+        if !task_actions.is_empty() {
             let Some(tasks) = self.tasks.clone() else {
                 return Err("no tasks module is configured".into());
             };
             let existing = self.task_ids(ctx, &tasks).await?;
             let mut created: BTreeSet<&str> = BTreeSet::new();
-            for action in &response.actions {
+            for action in task_actions {
                 let name = action.vocabulary_name();
                 if !allows(&agent, name) {
                     return Err(format!("agent {} is not allowed to {name}", entry.agent_id));
@@ -455,6 +469,9 @@ impl RunsModule {
                         if !existing.contains(task_id) && !created.contains(task_id.as_str()) {
                             return Err(format!("unknown task: {task_id}"));
                         }
+                    }
+                    AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. } => {
+                        unreachable!("pages actions are filtered out above")
                     }
                 }
             }
@@ -619,10 +636,6 @@ impl RunsModule {
             });
         }
         for action in response.actions {
-            let target = self
-                .tasks
-                .clone()
-                .expect("actions were validated against a configured tasks module");
             let payload = match action {
                 AgentAction::CreateTask { task_id, title } => {
                     tasks_encode_msg(&TaskMsg::CreateTask { task_id, title })
@@ -633,7 +646,14 @@ impl RunsModule {
                         status: task_status(&status).expect("status was validated"),
                     })
                 }
+                // pages actions were already applied by `emit_pages_effects`
+                // (its own lane: probes, cap gate, per-action degrade).
+                AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. } => continue,
             };
+            let target = self
+                .tasks
+                .clone()
+                .expect("task actions were validated against a configured tasks module");
             ctx.emit_msg(Msg { target, payload });
         }
     }

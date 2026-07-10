@@ -53,6 +53,16 @@ struct CaptureCtx {
     /// saga_id -> the winning attempt's lease holder, served by the "saga"
     /// Get arm as a Done saga (the sink's executing-node attribution).
     saga_assignees: BTreeMap<String, Vec<u8>>,
+    /// page_id -> the whole page in preorder, served by the "pages" GetPage
+    /// arm (the M2 `[[page:<id>]]` injection lane); the GetBlock arm scans
+    /// these pages by block id (the pages-effects target resolution).
+    pages: BTreeMap<String, Vec<pages::Block>>,
+    /// thread/comment ids the pages module already holds — the squat
+    /// simulation the CommentThread/GetComment freshness probes hit.
+    taken_page_ids: BTreeSet<String>,
+    /// target -> committed thread count served by the ThreadsForTargets arm
+    /// (the capacity probe); absent targets serve zero threads.
+    page_target_threads: BTreeMap<String, usize>,
     /// the committed duckfs head served by the "files" Refs arm — the v3
     /// composer's `source_snapshot` pin. `None` = a fresh network (null pin).
     files_head: Option<String>,
@@ -79,6 +89,9 @@ impl CaptureCtx {
             forge_refs: BTreeMap::new(),
             forge_items: BTreeMap::new(),
             saga_assignees: BTreeMap::new(),
+            pages: BTreeMap::new(),
+            taken_page_ids: BTreeSet::new(),
+            page_target_threads: BTreeMap::new(),
             files_head: None,
             msgs: Vec::new(),
             effects: Vec::new(),
@@ -115,6 +128,27 @@ impl CaptureCtx {
     /// the "saga" Get arm (the sink's executing-node attribution).
     fn with_saga_assignee(mut self, saga_id: &str, key: &[u8]) -> Self {
         self.saga_assignees.insert(saga_id.into(), key.to_vec());
+        self
+    }
+    /// register a committed page (whole preorder Vec, root first) served by
+    /// the "pages" GetPage arm.
+    fn with_page(mut self, page_id: &str, blocks: Vec<pages::Block>) -> Self {
+        self.pages.insert(page_id.into(), blocks);
+        self
+    }
+    /// mark a thread/comment id as already minted in the pages module (the
+    /// freshness probes then see it taken).
+    fn with_taken_page_id(mut self, id: &str) -> Self {
+        self.taken_page_ids.insert(id.into());
+        self
+    }
+    /// mark a target as already holding the thread cap.
+    fn with_crowded_page_target(self, target: &str) -> Self {
+        self.with_page_target_threads(target, pages::MAX_THREADS_PER_TARGET)
+    }
+    /// serve `count` committed threads for `target` (the capacity probe).
+    fn with_page_target_threads(mut self, target: &str, count: usize) -> Self {
+        self.page_target_threads.insert(target.into(), count);
         self
     }
     /// set the committed duckfs head the "files" Refs arm serves (the v3
@@ -223,6 +257,52 @@ impl CaptureCtx {
             .filter(|m| m.target == "tagging")
             .map(|m| tagging::decode_msg(&m.payload).expect("tagging msg"))
             .collect()
+    }
+    /// decoded pages msgs emitted this dispatch.
+    fn page_msgs(&self) -> Vec<pages::PageMsg> {
+        self.msgs
+            .iter()
+            .filter(|m| m.target == "pages")
+            .map(|m| pages::decode_msg(&m.payload).expect("pages msg"))
+            .collect()
+    }
+    /// the breadcrumb notes emitted this dispatch, as strings.
+    fn notes(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect()
+    }
+}
+
+/// a minimal committed thread view, as the "pages" CommentThread arm serves a
+/// taken thread id.
+fn dummy_thread_view(id: &str) -> pages::ThreadView {
+    pages::ThreadView {
+        thread: pages::Thread {
+            id: id.into(),
+            target: "elsewhere".into(),
+            opener: pages::AuthorRef::System,
+            created_at: 0,
+            resolved: false,
+            resolved_by: None,
+            comment_ids: Vec::new(),
+        },
+        comments: Vec::new(),
+    }
+}
+
+/// a minimal committed comment, as the "pages" GetComment arm serves a taken
+/// comment id.
+fn dummy_comment(id: &str) -> pages::Comment {
+    pages::Comment {
+        id: id.into(),
+        thread_id: "elsewhere".into(),
+        author: pages::AuthorRef::System,
+        text: String::new(),
+        created_at: 0,
+        edited_at: None,
+        deleted: false,
     }
 }
 #[async_trait::async_trait(?Send)]
@@ -337,6 +417,50 @@ impl Ctx for CaptureCtx {
                         .collect();
                     Ok(forge::encode_reply(&forge::ForgeReply::Items(items)))
                 }
+                _ => Err(Error::QueryUnsupported),
+            },
+            "pages" => match pages::decode_query(req).map_err(Error::Module)? {
+                pages::PageQuery::GetPage { page_id } => Ok(pages::encode_reply(
+                    &pages::PageReply::Page(self.pages.get(&page_id).cloned()),
+                )),
+                pages::PageQuery::GetBlock { block_id } => Ok(pages::encode_reply(
+                    &pages::PageReply::Block(
+                        self.pages
+                            .values()
+                            .flatten()
+                            .find(|b| b.id == block_id)
+                            .cloned(),
+                    ),
+                )),
+                pages::PageQuery::CommentThread { thread_id } => Ok(pages::encode_reply(
+                    &pages::PageReply::CommentThread(
+                        self.taken_page_ids
+                            .contains(&thread_id)
+                            .then(|| dummy_thread_view(&thread_id)),
+                    ),
+                )),
+                pages::PageQuery::GetComment { comment_id } => Ok(pages::encode_reply(
+                    &pages::PageReply::Comment(
+                        self.taken_page_ids
+                            .contains(&comment_id)
+                            .then(|| dummy_comment(&comment_id)),
+                    ),
+                )),
+                pages::PageQuery::ThreadsForTargets { targets } => Ok(pages::encode_reply(
+                    &pages::PageReply::CommentThreads(
+                        targets
+                            .into_iter()
+                            .map(|target| {
+                                let count =
+                                    self.page_target_threads.get(&target).copied().unwrap_or(0);
+                                let threads = (0..count)
+                                    .map(|i| dummy_thread_view(&format!("t{i}")))
+                                    .collect();
+                                pages::TargetThreads { target, threads }
+                            })
+                            .collect(),
+                    ),
+                )),
                 _ => Err(Error::QueryUnsupported),
             },
             "saga" => match saga::decode_query(req).map_err(Error::Module)? {
@@ -604,9 +728,37 @@ fn forge_read_registry() -> Registry {
     r
 }
 
-/// the forge-lane module: forge + files wired (the production wiring).
+/// the forge-lane module: forge + files + pages wired (the production wiring).
 fn forge_module() -> RunsModule {
-    module().with_sink_forge("forge").with_files_module("files")
+    module()
+        .with_sink_forge("forge")
+        .with_files_module("files")
+        .with_pages_module("pages")
+}
+
+/// a committed page in preorder as the "pages" GetPage arm serves it: the
+/// root (title), a paragraph, and one unchecked todo — enough surface for
+/// the injection assertions. the root names itself as `page`.
+fn page_blocks(page_id: &str, title: &str) -> Vec<pages::Block> {
+    let block = |id: &str, parent: Option<&str>, kind, text: &str| pages::Block {
+        id: id.into(),
+        parent: parent.map(str::to_string),
+        page: page_id.into(),
+        kind,
+        text: text.into(),
+        checked: false,
+        children: Vec::new(),
+    };
+    vec![
+        block(page_id, None, pages::BlockKind::Page, title),
+        block(
+            "b-p",
+            Some(page_id),
+            pages::BlockKind::Paragraph,
+            "spec paragraph",
+        ),
+        block("b-t", Some(page_id), pages::BlockKind::Todo, "do the thing"),
+    ]
 }
 
 /// a committed module with one watch on "general" under `policy`. the
@@ -646,6 +798,31 @@ fn engage_post(
     ctx
 }
 
+/// build a faceted RunnerResult wrapper: the three core fields plus whatever
+/// facet keys `facets` carries (data / effects / sink / status, and a
+/// `workspace_receipt` override when present).
+fn runner_wrapper(response_text: &str, facets: serde_json::Value) -> Vec<u8> {
+    let mut obj = serde_json::json!({
+        "ducktape_runner_result": 1,
+        "response_text": response_text,
+        "workspace_receipt": {
+            "source_prefix": "/shared/agent-workspaces/bot",
+            "source_snapshot": null,
+            "output_snapshot": null,
+            "commit_height": null,
+            "rebased": false,
+            "no_changes": true
+        }
+    });
+    if let serde_json::Value::Object(extra) = facets {
+        let base = obj.as_object_mut().expect("object");
+        for (k, v) in extra {
+            base.insert(k, v);
+        }
+    }
+    serde_json::to_vec(&obj).expect("wrapper serializes")
+}
+
 fn response(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
     agent::encode_response(&AgentResponse {
         reply_blocks: reply
@@ -679,6 +856,7 @@ mod delivery;
 mod engagement;
 mod facets;
 mod job_runs;
+mod pages_actions;
 mod registry;
 mod state;
 mod validation;

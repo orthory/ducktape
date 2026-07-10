@@ -182,7 +182,10 @@ pub(super) async fn genesis_host(
             // the forge module the composer resolves forge:<repo>:<n> channels
             // against and the PR sink queries; unwired, forge-channel mentions
             // skip at compose.
-            .with_sink_forge("forge"),
+            .with_sink_forge("forge")
+            // the pages module the composer renders [[page:<id>]] refs from
+            // and the pages effects lane writes to; unwired, both degrade.
+            .with_pages_module("pages"),
         ),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
@@ -348,7 +351,8 @@ pub(super) async fn restore_host(
         Some("jobs".into()),
     )
     .with_files_module("files")
-    .with_sink_forge("forge");
+    .with_sink_forge("forge")
+    .with_pages_module("pages");
     let (bytes, root) = snapshot_of("runs")?;
     runs.install(bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
@@ -684,7 +688,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         Some("jobs".into()),
     )
     .with_files_module("files")
-    .with_sink_forge("forge");
+    .with_sink_forge("forge")
+    .with_pages_module("pages");
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 

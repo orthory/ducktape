@@ -391,7 +391,10 @@ fn run_sim(
             "agent",
             Some("tasks".into()),
             Some("jobs".into()),
-        );
+        )
+        // the pages module the composer renders [[page:<id>]] refs from and
+        // the pages effects lane writes to; unwired, both degrade.
+        .with_pages_module("pages");
         let pages = Pages::init(context.child("pages"), "pages").await;
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
             .expect("forge init")

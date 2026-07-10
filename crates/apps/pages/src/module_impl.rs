@@ -114,6 +114,13 @@ where
                     .map_err(|e| Error::Module(e.to_string()))?;
                 Ok(encode_reply(&PageReply::CommentThread(view)))
             }
+            PageQuery::GetComment { comment_id } => {
+                let comment = self
+                    .load_comment(&comment_id)
+                    .await
+                    .map_err(|e| Error::Module(e.to_string()))?;
+                Ok(encode_reply(&PageReply::Comment(comment)))
+            }
         }
     }
 
