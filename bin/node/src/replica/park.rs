@@ -17,6 +17,7 @@ use commonware_runtime::{Clock, IoBuf, Metrics, Spawner, Supervisor};
 use futures::{FutureExt as _, StreamExt as _};
 use recovery::{Manifest, Recovery};
 
+use crate::blob_fetch;
 use crate::config::{self, hex_bytes, unhex};
 use crate::constants::*;
 use crate::explorer::{boundary_block_row, explorer_root_op, heal_index, stage_shipped_index};
@@ -104,6 +105,24 @@ pub(super) async fn park(
         );
         std::process::exit(1);
     };
+    // the resident's mesh blob fetch-on-miss lane (the #298 cross-node
+    // gap, resident side): the oracle pool's resolver asks current peers
+    // for a digest its own store lacks, over this same statesync channel.
+    // the park loop's sync client owns the channel receiver, so OUR fetch
+    // answers route back through its unmatched-frame hook below — blob
+    // rpc ids are top-bit-set random, disjoint from the client's small
+    // sequential ids by construction. residents deliberately run no serve
+    // loop (only validators answer this channel): fetch/client side only.
+    let blob_pending: blob_fetch::PendingMap = Default::default();
+    let blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(peers.clone()));
+    let blob_fetcher = blob_fetch::MeshBlobFetcher::new(
+        sync_tx.clone(),
+        blob_pending.clone(),
+        std::sync::Arc::clone(&blob_peers),
+        signer.public_key(),
+    )
+    .into_fetch_fn();
     // the joiner's sync client: the mesh path always works and
     // ROTATES across every validator that can serve; with the
     // statesync plane enabled, requests PREFER an overlay stream to
@@ -115,6 +134,12 @@ pub(super) async fn park(
         sync_tx,
         sync_rx,
         sync_sources.clone(),
+        // classify_mesh_frame consumes OUR blob answers into their
+        // oneshot waiters; anything else (a stray, junk) drops — a
+        // resident serves nothing.
+        Some(std::sync::Arc::new(move |id, body: &[u8]| {
+            let _ = blob_fetch::classify_mesh_frame(&blob_pending, id, body);
+        })),
     );
     let client = {
         let plane_slot: statesync_plane::PlaneSlot =
@@ -443,10 +468,9 @@ pub(super) async fn park(
         me_bytes.clone(),
         blobs.clone(),
         agent_provisioner.clone(),
-        // the resident path keeps local-only resolution for now: its
-        // statesync channel is owned by the park loop's client, so
-        // the mesh fetch lane needs its own demux there (#298).
-        None,
+        // the mesh fetch-on-miss lane (#298, resident side): demuxed
+        // through the park loop's sync client's unmatched-frame hook.
+        Some(blob_fetcher),
     );
     let mut resident_dispatch =
         resident_dispatch::ResidentDispatch::new(resident_pool, me_bytes.clone());
@@ -1006,10 +1030,14 @@ pub(super) async fn park(
                         .collect();
                     // transport first, exactly like the validator:
                     // the new epoch's mesh must admit its members.
-                    oracle.track(
-                        plan.epoch(),
-                        joiner_epoch_mesh(&peers, &member_bytes, &plan_resident_bytes),
-                    );
+                    let mesh =
+                        joiner_epoch_mesh(&peers, &member_bytes, &plan_resident_bytes);
+                    // the blob fetch-on-miss lane fans out to the same
+                    // tracked set — follow the re-track (the validator
+                    // drain's exact discipline).
+                    *blob_peers.write().expect("blob peers lock") =
+                        mesh.iter().cloned().collect();
+                    oracle.track(plan.epoch(), mesh);
                     last_tracked = plan.epoch();
                     // the follower swap: same OrderedNode, fresh
                     // orderer, cutover journaled — the epoch-local
@@ -1185,10 +1213,11 @@ pub(super) async fn park(
                     tip.epoch
                 );
             }
-            oracle.track(
-                tip.epoch,
-                joiner_epoch_mesh(&peers, &tip.participants, &tip.residents),
-            );
+            let mesh = joiner_epoch_mesh(&peers, &tip.participants, &tip.residents);
+            // the blob fetch-on-miss lane fans out to the same tracked
+            // set — follow the re-track.
+            *blob_peers.write().expect("blob peers lock") = mesh.iter().cloned().collect();
+            oracle.track(tip.epoch, mesh);
             last_tracked = tip.epoch;
         }
         // drive the reachability plane's standby role off the

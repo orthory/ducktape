@@ -109,6 +109,7 @@ pub(crate) async fn run(
         sync_tx,
         sync_rx,
         sync_sources.clone(),
+        None,
     );
 
     // the mesh takes a moment to connect, and the server only serves

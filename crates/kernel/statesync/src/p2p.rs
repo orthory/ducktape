@@ -42,6 +42,13 @@ use crate::{
 /// effective request timeout is between one and two intervals (3–6s).
 pub const REAP_INTERVAL: Duration = Duration::from_secs(3);
 
+/// sink for inbound frames whose rpc id matches no pending request: another
+/// owner may multiplex its own id space over the same channel (id spaces are
+/// disjoint by construction — this client's ids are small and sequential, a
+/// co-owner picks a range that can't collide). the hook gets the raw
+/// `(id, body)`; the kernel stays payload-agnostic.
+pub type UnmatchedFrameHook = Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
+
 /// a pending request: the reply slot plus the reaper tick it was filed under.
 struct PendingEntry {
     reply: oneshot::Sender<Vec<u8>>,
@@ -109,18 +116,21 @@ where
         E: Spawner + Clock + Send + 'static,
         R: Receiver<PublicKey = S::PublicKey> + Send + 'static,
     {
-        Self::with_sources(context, sender, receiver, vec![server])
+        Self::with_sources(context, sender, receiver, vec![server], None)
     }
 
     /// bind a client to a non-empty ordered candidate set over a registered
     /// channel pair, spawning the dispatch + reaper task on `context`
     /// (consumed — contexts are move-only). requests go to the cursor's
-    /// candidate; a transport failure advances the cursor.
+    /// candidate; a transport failure advances the cursor. `unmatched`
+    /// receives frames whose id belongs to no pending request here (see
+    /// [`UnmatchedFrameHook`]); `None` keeps the old drop-on-miss behavior.
     pub fn with_sources<E, R>(
         context: E,
         sender: S,
         mut receiver: R,
         candidates: Vec<S::PublicKey>,
+        unmatched: Option<UnmatchedFrameHook>,
     ) -> Self
     where
         E: Spawner + Clock + Send + 'static,
@@ -174,6 +184,8 @@ where
                     .remove(&id);
                 if let Some(entry) = waiter {
                     let _ = entry.reply.send(body.to_vec());
+                } else if let Some(hook) = &unmatched {
+                    hook(id, body);
                 }
             }
             // channel closed: drop every waiter so requests fail instead of
