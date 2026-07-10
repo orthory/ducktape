@@ -32,13 +32,16 @@ if [ ! -d "$CLONE" ]; then
     https://github.com/tauri-apps/tauri.git "$CLONE"
 fi
 
-# 1. default runtime -> Cef (tauri crate sources only; macro def untouched)
-grep -rl "default_runtime(crate::Wry, wry)" "$CLONE/crates/tauri/src" \
-  | xargs -r sed -i 's/default_runtime(crate::Wry, wry)/default_runtime(crate::Cef, cef)/g'
+# 1. default runtime -> Cef (tauri crate sources only; macro def untouched).
+# perl, not sed: GNU `sed -i` / `0,/re/` don't exist on BSD/macOS sed.
+for f in $(grep -rl "default_runtime(crate::Wry, wry)" "$CLONE/crates/tauri/src"); do
+  perl -pi -e 's/default_runtime\(crate::Wry, wry\)/default_runtime(crate::Cef, cef)/g' "$f"
+done
 
 # 2. version-bump the patched crates above any registry release
 for c in tauri tauri-build tauri-runtime tauri-utils tauri-macros tauri-codegen tauri-plugin; do
-  sed -i '0,/^version = ".*"/s//version = "2.90.0"/' "$CLONE/crates/$c/Cargo.toml"
+  perl -pi -e 's/^version = ".*"$/version = "2.90.0"/ if !$done && /^version = /; $done = 1 if /^version = "2\.90\.0"$/' \
+    "$CLONE/crates/$c/Cargo.toml"
 done
 
 # 3. point this workspace at the clone (idempotent), then adopt the patch
