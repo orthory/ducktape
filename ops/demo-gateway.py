@@ -21,23 +21,40 @@ URL, NODE_BIN, WORKDIR, CHAIN = sys.argv[1:5]
 HANDLE = sys.argv[5] if len(sys.argv) > 5 else "demo"
 USER_KEY = f"{WORKDIR}/user.key"
 
+# A self-contained bouncing-"DVD"-logo screensaver. Pure HTML+CSS (no JS, no
+# external assets) so it renders under any CSP, and it's obviously ALIVE — proof
+# the DuckFS route is really serving. The box travels at constant velocity and
+# reflects off all four walls (two `alternate` keyframes at coprime periods),
+# hue-cycling as it goes, just like the classic.
 INDEX_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ducktape Demo Site</title><link rel="stylesheet" href="style.css"></head>
-<body><main>
-<h1>\U0001F986 Network-hosted web app</h1>
-<p>This page is static content stored in the node's <strong>DuckFS</strong> and
-served straight from consensus state — every byte is hash-verified against a
-signed route. No server process, no origin host.</p>
-<p>Published by <code>make demo-seed</code>.</p>
-</main></body></html>
+<title>Ducktape DVD</title><style>
+  :root{color-scheme:dark}
+  html,body{margin:0;height:100%;background:#05070a;overflow:hidden}
+  .stage{position:fixed;inset:0}
+  .dvd{position:absolute;top:0;left:0;box-sizing:border-box;width:210px;height:70px;
+       display:flex;align-items:center;justify-content:center;gap:.45rem;border-radius:16px;
+       font:800 28px/1 system-ui,sans-serif;color:#fff;white-space:nowrap;user-select:none;
+       background:radial-gradient(130% 150% at 28% 18%,#7c5cff,#00d4ff);
+       box-shadow:0 0 26px rgba(120,150,255,.75),inset 0 0 0 2px rgba(255,255,255,.28);
+       animation:mx 6.1s linear infinite alternate, my 8.3s linear infinite alternate, hue 5s linear infinite;
+       will-change:left,top,filter}
+  .dvd .duck{font-size:34px}
+  .dvd small{font-weight:700;font-size:15px;opacity:.9;letter-spacing:.18em}
+  @keyframes mx{from{left:0}to{left:calc(100vw - 210px)}}
+  @keyframes my{from{top:0}to{top:calc(100vh - 70px)}}
+  @keyframes hue{from{filter:hue-rotate(0deg)}to{filter:hue-rotate(360deg)}}
+  .tag{position:fixed;left:0;right:0;bottom:16px;text-align:center;
+       font:12px/1 system-ui,sans-serif;color:#59616f;letter-spacing:.09em}
+  @media (prefers-reduced-motion:reduce){
+    .dvd{animation:hue 5s linear infinite;left:calc(50vw - 105px);top:calc(50vh - 35px)}}
+</style></head>
+<body>
+  <div class="stage"><div class="dvd"><span class="duck">\U0001F986</span>DUCK<small>DVD</small></div></div>
+  <div class="tag">network-hosted &middot; served from DuckFS by consensus &middot; make demo-seed</div>
+</body></html>
 """
-
-STYLE_CSS = ("body{font:16px/1.6 system-ui,sans-serif;margin:0;min-height:100vh;"
-             "display:grid;place-items:center;background:#0e1116;color:#e6edf3}"
-             "main{max-width:34rem;padding:2rem}h1{margin:0 0 1rem;font-size:1.6rem}"
-             "code{background:#1b2029;padding:.1em .35em;border-radius:4px}\n")
 
 
 def _post(path, body):
@@ -85,7 +102,7 @@ else:
 
 # 3. stage the static site into the node's DuckFS gateway root for route "site":
 #    /home/ext:<node>/.duck/gateway/<route>/<file> — where serve_duckfs reads it.
-site = {"index.html": ("text/html", INDEX_HTML), "style.css": ("text/css", STYLE_CSS)}
+site = {"index.html": ("text/html", INDEX_HTML)}
 changes, content_files = [], []
 for path in sorted(site):                     # DuckFS content must be path-sorted
     mime, text = site[path]
