@@ -1021,6 +1021,15 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// [`OrderedNode::take_drained`]. like `effects`, long-lived callers take
     /// these every drain tick; the queue accumulates until taken.
     drained: Vec<DrainedFrame>,
+    /// per-BLOCK once-per-block System-injection dispatch traces (upgrade
+    /// `Advance`, mailbox `DeliverPending` and its follow-ups), keyed by
+    /// height — they belong to no member frame, so [`DrainedFrame`] cannot
+    /// carry them (its shape is journaled). the replay paths merge these
+    /// after the members' dispatches when they re-execute a block; a live
+    /// node must surface the SAME rows or its derived op index diverges
+    /// from every replayed peer's. taken via
+    /// [`OrderedNode::take_system_dispatches`], beside `take_drained`.
+    system_dispatches: Vec<(u64, Vec<host::DispatchRecord>)>,
     /// the deterministic CUTOVER CEILING: frames finalized at or past this
     /// ENGINE view are DISCARDED, not applied. every honest node discards by
     /// the same agreed rule, so a straggler op that finalizes on only some
@@ -1086,6 +1095,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             orderer,
             effects: Vec::new(),
             drained: Vec::new(),
+            system_dispatches: Vec::new(),
             finalized: None,
             view_base: 0,
             last_engine_view: None,
@@ -1116,6 +1126,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             orderer,
             effects: Vec::new(),
             drained: Vec::new(),
+            system_dispatches: Vec::new(),
             finalized,
             view_base,
             last_engine_view: None,
@@ -1544,6 +1555,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // the already-durable mover, so its app-hash cannot be trusted). exactly
             // one seal per batch, below.
             let has_system = !outcome.system_dispatches.is_empty();
+            // surface the injections' dispatch traces beside the member
+            // records: the replay paths (recovery, suffix catch-up) merge
+            // these AFTER the members' dispatches when re-executing this
+            // block, so a live node must hand its index consumer the same
+            // rows or live and replayed op indexes diverge.
+            if has_system {
+                self.system_dispatches
+                    .push((height, outcome.system_dispatches));
+            }
             let mut any_applied = false;
             // one record per applying member, in member (input/FIFO) order; the
             // host guarantees `members` is 1:1 with `ops` in input order. custody
@@ -1669,6 +1689,16 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// own submitted [`FrameId`]s.
     pub fn take_drained(&mut self) -> Vec<DrainedFrame> {
         std::mem::take(&mut self.drained)
+    }
+
+    /// take the once-per-block System-injection dispatch traces recorded
+    /// since the last call, `(height, dispatches)` in drain order — the
+    /// index consumer appends each block's entry AFTER that block's member
+    /// dispatches, exactly where the replay paths put them. these belong to
+    /// no member frame, so they ride beside [`OrderedNode::take_drained`],
+    /// never inside it.
+    pub fn take_system_dispatches(&mut self) -> Vec<(u64, Vec<host::DispatchRecord>)> {
+        std::mem::take(&mut self.system_dispatches)
     }
 
     /// borrow the recovery sink mutably — the pump drives checkpointing and

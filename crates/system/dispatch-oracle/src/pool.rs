@@ -19,6 +19,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use capability_host::ProviderSet;
 use futures::future::BoxFuture;
@@ -215,6 +216,21 @@ impl DispatchPool {
 /// `Err` with the dir cleaned up and no `output_ref`); cleanup always runs
 /// (W5). a commit-mechanism failure degrades to a `no_changes` receipt (R4) —
 /// the run's answer is never lost to a receipt-plumbing error.
+/// the workspace bracket's host-side bound (#298): provision and commit both
+/// block on the daemon actor lane, and a stalled lane must not pin one of
+/// the pool's `DUCKTAPE_MAX_CONCURRENT_RUNS` permits until the saga deadline
+/// re-leases elsewhere — the step fails, the attempt settles, the lease
+/// moves on. the model call itself is bounded separately (X3, in
+/// capability-host). tests shrink the window so a hung step is observable
+/// without a wall-clock minute.
+fn workspace_step_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(250)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
 async fn execute(
     job: &ExecJob,
     prepared: crate::envelope::Prepared,
@@ -241,44 +257,84 @@ async fn execute(
         base_tools: plan.base_tools,
         ro_mounts: plan.skills, // C4 skill ro mounts (phase 5)
     };
-    let ws = prov.provision(&spec).await?; // (a)+(b) materialize OUTSIDE storage
+    // (a)+(b) materialize OUTSIDE storage — bounded: a stalled actor lane
+    // fails this attempt instead of pinning a pool permit to the saga
+    // deadline. nothing exists yet, so there is nothing to clean up.
+    let ws = tokio::time::timeout(workspace_step_timeout(), prov.provision(&spec))
+        .await
+        .map_err(|_| {
+            format!(
+                "workspace provision for {} timed out after {:?}",
+                spec.run_id,
+                workspace_step_timeout()
+            )
+        })??;
     bind_workspace(ws.as_ref(), &mut ctx); // set workdir_override/env/path_entries
-    let outcome = match provider.run(&input, &ctx).await {
-        Ok(text) => {
-            // (d) capture output_ref. a commit-MECHANISM failure (conflict,
-            // transport, rejection) must never masquerade as a clean tree: the
-            // receipt records the error and the status degrades, while the
-            // run's answer still delivers (R4 — never lost to receipt
-            // plumbing). only `CommitError::Nothing` is a true `no_changes`,
-            // and the workspace impl already maps that to Ok.
-            let (receipt, status) = match ws.commit(&format!("agent run {}", spec.run_id)).await {
-                Ok(receipt) => (receipt, crate::provision::Status::Ok),
-                Err(e) => {
-                    eprintln!("[oracle] commit failed for {}: {e}", spec.run_id);
-                    (
-                        crate::provision::WorkspaceReceipt::commit_failed(&spec, e),
-                        crate::provision::Status::Degraded,
-                    )
-                }
-            };
-            // LIFT the model's task actions into the effects facet: runs
-            // applies the host-assembled effects; an empty result lets runs
-            // fall back to the response-parsed actions. the other facets
-            // (data/sink) are host-observed later — Chain here.
-            let effects = crate::provision::effects_from_response_text(&text);
-            Ok(assemble_runner_result(
-                &text,
-                &receipt,
-                None,
-                effects,
-                crate::provision::Sink::Chain,
-                status,
-            ))
+    // run → commit → assemble, unwind-guarded: a panicking provider (or
+    // receipt path) must not skip the cleanup below and leak the per-run
+    // dir. the panic surfaces as this attempt's Err — the saga settles a
+    // failed attempt instead of a silent task death.
+    let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+        match provider.run(&input, &ctx).await {
+            Ok(text) => {
+                // (d) capture output_ref. a commit-MECHANISM failure (conflict,
+                // transport, rejection, a hung actor lane) must never
+                // masquerade as a clean tree: the receipt records the error
+                // and the status degrades, while the run's answer still
+                // delivers (R4 — never lost to receipt plumbing). only
+                // `CommitError::Nothing` is a true `no_changes`, and the
+                // workspace impl already maps that to Ok.
+                let commit = tokio::time::timeout(
+                    workspace_step_timeout(),
+                    ws.commit(&format!("agent run {}", spec.run_id)),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(format!(
+                        "commit timed out after {:?}",
+                        workspace_step_timeout()
+                    ))
+                });
+                let (receipt, status) = match commit {
+                    Ok(receipt) => (receipt, crate::provision::Status::Ok),
+                    Err(e) => {
+                        eprintln!("[oracle] commit failed for {}: {e}", spec.run_id);
+                        (
+                            crate::provision::WorkspaceReceipt::commit_failed(&spec, e),
+                            crate::provision::Status::Degraded,
+                        )
+                    }
+                };
+                // LIFT the model's task actions into the effects facet: runs
+                // applies the host-assembled effects; an empty result lets runs
+                // fall back to the response-parsed actions. the other facets
+                // (data/sink) are host-observed later — Chain here.
+                let effects = crate::provision::effects_from_response_text(&text);
+                Ok(assemble_runner_result(
+                    &text,
+                    &receipt,
+                    None,
+                    effects,
+                    crate::provision::Sink::Chain,
+                    status,
+                ))
+            }
+            Err(e) => Err(e), // failed run: no commit, no output_ref
         }
-        Err(e) => Err(e), // failed run: no commit, no output_ref
-    };
-    ws.cleanup().await; // (e) W5 always
-    outcome
+    }))
+    .await;
+    ws.cleanup().await; // (e) W5 always — even past a panicking provider
+    match outcome {
+        Ok(result) => result,
+        Err(panic) => Err(format!(
+            "provider panicked mid-run: {}",
+            panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".into())
+        )),
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1027,6 +1083,132 @@ format = "text"
         );
         assert!(v["workspace_receipt"]["output_snapshot"].is_null());
         assert!(cleaned.load(Ordering::SeqCst), "cleanup still runs (W5)");
+    }
+
+    /// a workspace whose commit never resolves — the hung-actor-lane probe
+    /// for the #298 bracket timeout.
+    struct HungCommitProvisioner {
+        cleaned: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provision::WorkspaceProvisioner for HungCommitProvisioner {
+        async fn provision(
+            &self,
+            _spec: &WorkspaceSpec,
+        ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
+            Ok(Box::new(HungCommitWs {
+                cleaned: self.cleaned.clone(),
+            }))
+        }
+    }
+
+    struct HungCommitWs {
+        cleaned: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProvisionedWorkspace for HungCommitWs {
+        fn workdir(&self) -> PathBuf {
+            std::env::temp_dir()
+        }
+        fn env(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+        fn path_entries(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+        async fn commit(&self, _message: &str) -> Result<WorkspaceReceipt, String> {
+            std::future::pending::<()>().await;
+            unreachable!("a pending future never resolves")
+        }
+        async fn cleanup(&self) {
+            self.cleaned.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hung_commit_times_out_into_a_degraded_receipt_not_a_pinned_permit() {
+        // the #298 bracket bound: commit blocks on the daemon actor lane, and
+        // a stalled lane must not pin a pool permit until the saga deadline.
+        // the step times out, the answer still delivers (R4), the receipt
+        // records the timeout, cleanup runs.
+        let (providers, _probes) = slow_providers(Duration::from_millis(5), false);
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let provisioner: SharedProvisioner = Arc::new(HungCommitProvisioner {
+            cleaned: cleaned.clone(),
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        pool.run(&eff).await.unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+
+        let bytes = outcome.expect("the run's answer still delivers (R4)");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "degraded", "a timed-out capture degrades the run");
+        assert!(
+            v["workspace_receipt"]["commit_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("timed out")),
+            "the receipt records the timeout: {v}"
+        );
+        assert!(cleaned.load(Ordering::SeqCst), "cleanup still runs (W5)");
+    }
+
+    /// a provider that panics mid-run — the unwind probe for the cleanup
+    /// guard (a leaked per-run dir was #298's second bracket finding).
+    struct PanicProvider {
+        tag: String,
+    }
+
+    #[async_trait::async_trait]
+    impl capability_host::Provider for PanicProvider {
+        fn capability(&self) -> &str {
+            &self.tag
+        }
+        async fn run(
+            &self,
+            _prompt: &str,
+            _ctx: &capability_host::RunContext,
+        ) -> Result<String, String> {
+            panic!("provider crashed hard")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_provider_still_cleans_up_and_fails_the_attempt() {
+        let providers = Arc::new(ProviderSet::assemble(
+            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            vec![Box::new(PanicProvider { tag: "alpha".into() })],
+        ));
+        let (provisioned, committed, cleaned) = flags();
+        let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
+            provisioned: provisioned.clone(),
+            committed: committed.clone(),
+            cleaned: cleaned.clone(),
+            fail_commit: None,
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        pool.run(&eff).await.unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+
+        let err = outcome.expect_err("a panic settles the attempt as a failure");
+        assert!(
+            err.contains("panicked") && err.contains("provider crashed hard"),
+            "the panic payload surfaces in the saga error: {err}"
+        );
+        assert!(provisioned.load(Ordering::SeqCst), "the mount was materialized");
+        assert!(
+            !committed.load(Ordering::SeqCst),
+            "a panicked run commits NOTHING"
+        );
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "cleanup runs even past a panicking provider — no leaked per-run dir"
+        );
     }
 
     #[tokio::test]

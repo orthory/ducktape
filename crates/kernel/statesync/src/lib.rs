@@ -354,6 +354,15 @@ pub enum SyncRequest {
     /// read the tip's consensus coordinates (membership, epoch, height) —
     /// the DETECTION lane; see [`TipCoords`].
     TipCoords,
+    /// fetch one node-local content-addressed blob by its sha256 digest —
+    /// the fetch-on-miss lane for host-staged bytes that consensus pins by
+    /// hash but never carries (an agent's registered prompt above all). the
+    /// HOST layer answers this from its blob store, not [`SyncServer`]:
+    /// blobs are node-local staging, no capture or boundary is involved.
+    /// content addressing makes the answer self-verifying — the requester
+    /// re-hashes the bytes and drops a mismatch, so no trust attaches to
+    /// which peer answered.
+    Blob { digest: [u8; 32] },
 }
 
 /// the tip's consensus coordinates without a captured boundary — the
@@ -402,6 +411,11 @@ pub enum SyncResponse {
     /// the tip's consensus coordinates — the [`SyncRequest::TipCoords`] answer.
     TipCoords(TipCoords),
     Error(String),
+    /// the [`SyncRequest::Blob`] answer: the digest's bytes when this node
+    /// holds them, `None` when it does not — an honest miss, never an error
+    /// (the requester's fan-out treats a miss and an old peer's `Error`
+    /// identically: try the next peer).
+    Blob { bytes: Option<Vec<u8>> },
 }
 
 impl SyncResponse {
@@ -414,6 +428,7 @@ impl SyncResponse {
             Self::RangePruned { .. } => "RangePruned",
             Self::IndexModules { .. } => "IndexModules",
             Self::TipCoords(_) => "TipCoords",
+            Self::Blob { .. } => "Blob",
             Self::Error(_) => "Error",
         }
     }
@@ -472,6 +487,13 @@ pub fn encode_request(req: &SyncRequest) -> Vec<u8> {
             out.extend_from_slice(&offset.to_le_bytes());
         }
         SyncRequest::TipCoords => out.push(6u8),
+        // tag 7, appended after TipCoords: an old server answers with its
+        // decoder's BadTag turned into an Error, which the fetch fan-out
+        // treats as a miss — a mixed-version mesh degrades, never wedges.
+        SyncRequest::Blob { digest } => {
+            out.push(7u8);
+            out.extend_from_slice(digest);
+        }
     }
     out
 }
@@ -516,6 +538,9 @@ pub fn decode_request(bytes: &[u8]) -> Result<SyncRequest, WireError> {
             offset: wire::take_u64(&mut buf)?,
         },
         6 => SyncRequest::TipCoords,
+        7 => SyncRequest::Blob {
+            digest: wire::take_array::<32>(&mut buf)?,
+        },
         other => return Err(WireError::BadTag("SyncRequest", other)),
     };
     wire::expect_empty(buf)?;
@@ -629,6 +654,18 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
             for (db, len) in entries {
                 wire::put_str(&mut out, db);
                 out.extend_from_slice(&len.to_le_bytes());
+            }
+        }
+        // tag 8, appended after TipCoords (the IndexModules precedent): an
+        // old requester never asks, so it never has to decode this.
+        SyncResponse::Blob { bytes } => {
+            out.push(8u8);
+            match bytes {
+                Some(b) => {
+                    out.push(1);
+                    wire::put_bytes(&mut out, b);
+                }
+                None => out.push(0),
             }
         }
         SyncResponse::TipCoords(c) => {
@@ -862,6 +899,13 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 has_floor,
             })
         }
+        8 => SyncResponse::Blob {
+            bytes: match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_bytes(&mut buf)?.to_vec()),
+                t => return Err(WireError::BadTag("blob presence", t)),
+            },
+        },
         other => return Err(WireError::BadTag("SyncResponse", other)),
     };
     wire::expect_empty(buf)?;
@@ -1203,6 +1247,12 @@ impl SyncServer {
         Ok(match req {
             SyncRequest::Manifest => ServeStep::NeedBoundary,
             SyncRequest::TipCoords => ServeStep::NeedCoords,
+            // the HOST layer answers blob fetches from its node-local store
+            // BEFORE requests reach this server; one arriving here means the
+            // host did not intercept — answer honestly instead of wedging.
+            SyncRequest::Blob { .. } => {
+                return Err("blob requests are answered by the host layer".into());
+            }
             SyncRequest::Frames {
                 after_height,
                 up_to_height,
@@ -1967,10 +2017,28 @@ mod tests {
                 db: "_blocks".into(),
                 offset: 1 << 18,
             },
+            SyncRequest::Blob { digest: [7u8; 32] },
         ] {
             let bytes = encode_request(&req);
             assert_eq!(decode_request(&bytes).unwrap(), req);
         }
+    }
+
+    #[test]
+    fn blob_response_round_trips_hit_and_miss() {
+        for resp in [
+            SyncResponse::Blob {
+                bytes: Some(b"You are quack.".to_vec()),
+            },
+            SyncResponse::Blob { bytes: None },
+        ] {
+            let bytes = encode_response(&resp);
+            assert_eq!(decode_response(&bytes).unwrap(), resp);
+        }
+        // a truncated presence flag rejects instead of decoding garbage.
+        let mut framed = encode_response(&SyncResponse::Blob { bytes: None });
+        framed.truncate(1);
+        assert!(decode_response(&framed).is_err());
     }
 
     #[test]

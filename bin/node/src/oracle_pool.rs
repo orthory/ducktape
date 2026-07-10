@@ -30,12 +30,19 @@ const ORACLE_RESULT_LANE: usize = 64;
 /// `blobs` is the node-local content-addressed store the app surface's
 /// putBlob lane feeds — the read path run-envelope prompt pins resolve
 /// through (an agent's registered prompt lives there under its sha256).
+///
+/// `blob_fetch` is the mesh fetch-on-miss lane (the #298 cross-node gap): a
+/// pin whose bytes were staged on ANOTHER node's store resolves by asking
+/// current peers, verifying by content hash, and writing the copy through
+/// this node's own store. `None` (a resident, an embedder without a mesh)
+/// keeps strict local-only resolution.
 pub(crate) fn build<C>(
     context: &C,
     providers: capability_host::ProviderSet,
     node_key: Vec<u8>,
     blobs: blobstore::BlobHandle,
     provisioner: Option<SharedProvisioner>,
+    blob_fetch: Option<crate::blob_fetch::BlobFetchFn>,
 ) -> (
     Box<dyn reactor::Worker>,
     futures::channel::mpsc::Receiver<Msg>,
@@ -64,13 +71,26 @@ where
         })
     });
 
-    // prompt resolution: a synchronous in-memory read behind the pool's
-    // async seam. `None` (blob absent on this node) fails the run loudly in
-    // the worker — never a silent fallback to the generic instructions.
+    // prompt resolution: the local store first, then (when a mesh lane is
+    // wired) fetch-on-miss from current peers. a verified fetch writes
+    // through the local store, so the mesh round-trip happens once — not
+    // per run — and survives a restart. a miss everywhere still fails the
+    // run loudly in the worker — never a silent fallback to the generic
+    // instructions.
     let resolver: BlobResolver = Arc::new(move |digest: &[u8; 32]| {
         let blobs = blobs.clone();
+        let blob_fetch = blob_fetch.clone();
         let digest = *digest;
-        Box::pin(async move { blobs.get_chunk(&digest) })
+        Box::pin(async move {
+            if let Some(bytes) = blobs.get_chunk(&digest) {
+                return Some(bytes);
+            }
+            let fetched = blob_fetch.as_ref()?(digest).await?;
+            // the fetcher verified the content hash; put_chunk re-keys by
+            // sha256 anyway, so the store can never learn a wrong mapping.
+            blobs.put_chunk(fetched.clone());
+            Some(fetched)
+        })
     });
 
     let mut pool =

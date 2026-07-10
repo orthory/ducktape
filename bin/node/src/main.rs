@@ -62,6 +62,7 @@ use tracing_subscriber::prelude::*;
 
 use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
 
+mod blob_fetch;
 mod cli;
 mod cli_flags;
 mod config;
@@ -4359,6 +4360,10 @@ fn run_node(
                 me_bytes.clone(),
                 blobs.clone(),
                 agent_provisioner.clone(),
+                // the resident path keeps local-only resolution for now: its
+                // statesync channel is owned by the park loop's client, so
+                // the mesh fetch lane needs its own demux there (#298).
+                None,
             );
             let mut resident_dispatch =
                 resident_dispatch::ResidentDispatch::new(resident_pool, me_bytes.clone());
@@ -4741,6 +4746,13 @@ fn run_node(
                         std::process::exit(1);
                     }
                     let drained = node_r.take_drained();
+                    // System-injection traces, merged per height after the
+                    // members' dispatches — the same row order the validator
+                    // drain and every replay path derive.
+                    let mut system_dispatches: std::collections::BTreeMap<
+                        u64,
+                        Vec<host::DispatchRecord>,
+                    > = node_r.take_system_dispatches().into_iter().collect();
                     let mut gi = 0;
                     while gi < drained.len() {
                         let height = drained[gi].height;
@@ -4786,6 +4798,11 @@ fn run_node(
                                     disposition,
                                 ));
                             }
+                        }
+                        // System-injection dispatches index after the
+                        // members' — see the validator drain's twin merge.
+                        if let Some(sys) = system_dispatches.remove(&height) {
+                            block_dispatches.extend(sys);
                         }
                         // a BACKFILLED height's trust is the served seal:
                         // what our fold produced must match it exactly, or
@@ -6565,6 +6582,28 @@ fn run_node(
         // request streams — so one serve task answers both.
         let (bridge_tx, sync_ingress) =
             futures::channel::mpsc::channel::<statesync_plane::SyncJob>(64);
+        // the blob fetch-on-miss lane (the #298 prompt-blob cross-node gap):
+        // the oracle pool's resolver asks current peers for a digest its own
+        // store lacks, over this same statesync channel. the pending map is
+        // the serve loop's demux — frames answering OUR fetches never enter
+        // the request path — and the peer set follows every cutover re-track
+        // beside the other planes' books.
+        let blob_pending: blob_fetch::PendingMap = Default::default();
+        let blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
+            std::sync::Arc::new(std::sync::RwLock::new(
+                initial_member_keys
+                    .iter()
+                    .chain(initial_resident_keys.iter())
+                    .cloned()
+                    .collect(),
+            ));
+        let blob_fetcher = blob_fetch::MeshBlobFetcher::new(
+            sync_tx.clone(),
+            blob_pending.clone(),
+            std::sync::Arc::clone(&blob_peers),
+            signer.public_key(),
+        )
+        .into_fetch_fn();
         {
             let mut bridge_tx = bridge_tx.clone();
             context.child("sync_ingress").spawn(move |_ctx| {
@@ -6616,6 +6655,8 @@ fn run_node(
             let state_tx = sync_state_tx;
             let mut sync_tx = sync_tx;
             let mut ingress = sync_ingress;
+            let blob_pending = blob_pending.clone();
+            let sync_blobs = blobs.clone();
             context
                 .child("statesync_serve")
                 .spawn(move |_ctx| async move {
@@ -6624,23 +6665,49 @@ fn run_node(
                         // both carriers land here: mesh frames ride an rpc
                         // envelope (multiplexed channel — the id correlates);
                         // a plane stream IS its own correlation and reply path.
-                        let (reply_to, rpc_id, body) = match job {
+                        let (reply_to, rpc_id, request) = match job {
                             statesync_plane::SyncJob::Mesh(peer, bytes) => {
                                 let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
                                     continue; // malformed rpc envelope: drop, never crash.
                                 };
-                                (
-                                    statesync_plane::SyncReplyTo::Mesh(peer),
+                                // the mesh demux: OUR fetch answers are consumed,
+                                // stray responses (a blob answer landing after its
+                                // fan-out's sweep) and unparseable frames are
+                                // DROPPED — answering either is how two serve
+                                // loops bounce Error frames forever. only a real
+                                // request proceeds; the reply-on-bad-frame lane is
+                                // stream-only below.
+                                match blob_fetch::classify_mesh_frame(
+                                    &blob_pending,
                                     rpc_id,
-                                    body.to_vec(),
-                                )
+                                    body,
+                                ) {
+                                    blob_fetch::MeshFrame::OurResponse
+                                    | blob_fetch::MeshFrame::StrayResponse
+                                    | blob_fetch::MeshFrame::Junk => continue,
+                                    blob_fetch::MeshFrame::Request(req) => (
+                                        statesync_plane::SyncReplyTo::Mesh(peer),
+                                        rpc_id,
+                                        Ok(req),
+                                    ),
+                                }
                             }
-                            statesync_plane::SyncJob::Plane(stream, req) => {
-                                (statesync_plane::SyncReplyTo::Plane(stream), 0, req)
-                            }
+                            statesync_plane::SyncJob::Plane(stream, req) => (
+                                statesync_plane::SyncReplyTo::Plane(stream),
+                                0,
+                                statesync::decode_request(&req),
+                            ),
                         };
-                        let resp = match statesync::decode_request(&body) {
+                        let resp = match request {
+                            // blob fetches are host state — answered from the
+                            // node-local store, never routed into SyncServer.
+                            Ok(statesync::SyncRequest::Blob { digest }) => {
+                                blob_fetch::serve_blob(&sync_blobs, &digest)
+                            }
                             Ok(req) => drive_sync_request(&mut server, &state_tx, req).await,
+                            // stream-only by construction: a plane stream is a
+                            // one-shot request/response, so an Error reply here
+                            // can never re-enter a serve loop and oscillate.
                             Err(e) => statesync::SyncResponse::Error(format!(
                                 "bad request frame: {e}"
                             )),
@@ -7031,6 +7098,9 @@ fn run_node(
             signer.public_key().as_ref().to_vec(),
             blobs.clone(),
             agent_provisioner.clone(),
+            // fetch-on-miss over the mesh: a prompt pin staged on another
+            // node's blob store resolves here instead of failing the run.
+            Some(blob_fetcher),
         );
         let workers: Vec<Box<dyn reactor::Worker>> = vec![oracle_worker];
         // the readiness self-signaller: polls COMMITTED upgrade state between drains
@@ -7208,6 +7278,15 @@ fn run_node(
                     // drain finished with; every disposition is deterministic,
                     // so the reply faithfully reports the op's consensus fate.
                     let drained = node.take_drained();
+                    // the once-per-block System-injection traces (upgrade
+                    // Advance, mailbox DeliverPending follow-ups) ride beside
+                    // the member frames; each height's entry indexes AFTER
+                    // that height's member dispatches, matching the replay
+                    // paths' row order exactly.
+                    let mut system_dispatches: std::collections::BTreeMap<
+                        u64,
+                        Vec<host::DispatchRecord>,
+                    > = node.take_system_dispatches().into_iter().collect();
                     // sealed = journaled: one seal per BLOCK (height), whatever a
                     // batch's member count. count DISTINCT sealed heights so the
                     // checkpoint cadence stays per-block; applied and rejected
@@ -7292,6 +7371,13 @@ fn run_node(
                                     disposition,
                                 ));
                             }
+                        }
+                        // the block's System-injection dispatches index AFTER
+                        // every member's (the replay paths' merge order) — an
+                        // agent reply delivered via the mailbox injection is
+                        // an op row here like anywhere else.
+                        if let Some(sys) = system_dispatches.remove(&height) {
+                            block_dispatches.extend(sys);
                         }
                         // one block per height: an APPLIED block records fully
                         // (count, this node's summed apply latency, per-module
@@ -7652,6 +7738,10 @@ fn run_node(
                             if let Some(peers) = &media_peers {
                                 peers.set_peers(plan.valset().transport_members().iter());
                             }
+                            // the blob fetch-on-miss lane fans out to the same
+                            // tracked set — follow the re-track.
+                            *blob_peers.write().expect("blob peers lock") =
+                                plan.valset().transport_members().iter().cloned().collect();
                             // the reachability plane retunnels for the new
                             // member set the moment transport admits it —
                             // with the epoch's resident tier as the pre-warm
