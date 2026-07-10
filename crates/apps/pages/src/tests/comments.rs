@@ -1,0 +1,286 @@
+use super::*;
+
+// ── comments (folded into the pages module) ──
+
+fn add(thread: &str, comment: &str, target: &str, text: &str) -> PageMsg {
+    PageMsg::AddComment {
+        thread_id: thread.into(),
+        comment_id: comment.into(),
+        target: target.into(),
+        text: text.into(),
+    }
+}
+
+#[test]
+fn comment_add_opens_then_appends_and_batches_by_target() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "first"), user("alice")).await;
+        apply_commit_as(&mut p, &add("t1", "m2", "b1", "second"), user("bob")).await;
+        apply_commit_as(&mut p, &add("t2", "m3", "b1", "other"), user("alice")).await;
+        apply_commit_as(&mut p, &add("t3", "m4", "b2", "elsewhere"), user("alice")).await;
+
+        let groups = query_threads(&p, &["b1", "b2"]).await;
+        let b1 = groups.iter().find(|g| g.target == "b1").unwrap();
+        assert_eq!(b1.threads.len(), 2);
+        let t1 = b1.threads.iter().find(|v| v.thread.id == "t1").unwrap();
+        assert_eq!(
+            t1.comments
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(t1.thread.opener, AuthorRef::User(b"alice".to_vec()));
+        assert_eq!(t1.comments[1].author, AuthorRef::User(b"bob".to_vec()));
+        assert_eq!(
+            groups
+                .iter()
+                .find(|g| g.target == "b2")
+                .unwrap()
+                .threads
+                .len(),
+            1
+        );
+    });
+}
+
+#[test]
+fn comment_append_rejects_target_mismatch_duplicate_and_empty_origin() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "x"), user("alice")).await;
+        apply_err_as(
+            &mut p,
+            &add("t1", "m2", "b2", "y"),
+            user("alice"),
+            "target mismatch",
+        )
+        .await;
+        apply_err_as(
+            &mut p,
+            &add("t1", "m1", "b1", "z"),
+            user("alice"),
+            "duplicate comment id",
+        )
+        .await;
+        apply_err_as(
+            &mut p,
+            &add("t9", "m9", "b1", "z"),
+            sdk::Origin::External(vec![]),
+            "empty origin",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn comment_edit_and_delete_are_author_only() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "orig"), user("alice")).await;
+        apply_err_as(
+            &mut p,
+            &PageMsg::EditComment {
+                comment_id: "m1".into(),
+                text: "hax".into(),
+            },
+            user("bob"),
+            "not the comment author",
+        )
+        .await;
+        apply_err_as(
+            &mut p,
+            &PageMsg::DeleteComment {
+                comment_id: "m1".into(),
+            },
+            user("bob"),
+            "not the comment author",
+        )
+        .await;
+        apply_commit_as(
+            &mut p,
+            &PageMsg::EditComment {
+                comment_id: "m1".into(),
+                text: "edited".into(),
+            },
+            user("alice"),
+        )
+        .await;
+        let v = query_thread(&p, "t1").await.unwrap();
+        assert_eq!(v.comments[0].text, "edited");
+        assert_eq!(v.comments[0].edited_at, Some(7));
+    });
+}
+
+#[test]
+fn comment_deleting_last_live_removes_the_thread() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
+        apply_commit_as(&mut p, &add("t1", "m2", "b1", "b"), user("alice")).await;
+        apply_commit_as(
+            &mut p,
+            &PageMsg::DeleteComment {
+                comment_id: "m1".into(),
+            },
+            user("alice"),
+        )
+        .await;
+        let v = query_thread(&p, "t1").await.unwrap();
+        assert_eq!(
+            v.comments
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            ["b"]
+        );
+        apply_commit_as(
+            &mut p,
+            &PageMsg::DeleteComment {
+                comment_id: "m2".into(),
+            },
+            user("alice"),
+        )
+        .await;
+        assert!(query_thread(&p, "t1").await.is_none());
+        assert!(query_threads(&p, &["b1"]).await[0].threads.is_empty());
+    });
+}
+
+#[test]
+fn comment_resolve_toggles_and_records_resolver() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
+        apply_commit_as(
+            &mut p,
+            &PageMsg::ResolveThread {
+                thread_id: "t1".into(),
+                resolved: true,
+            },
+            user("bob"),
+        )
+        .await;
+        let v = query_thread(&p, "t1").await.unwrap();
+        assert!(v.thread.resolved);
+        assert_eq!(v.thread.resolved_by, Some(AuthorRef::User(b"bob".to_vec())));
+        apply_commit_as(
+            &mut p,
+            &PageMsg::ResolveThread {
+                thread_id: "t1".into(),
+                resolved: false,
+            },
+            user("alice"),
+        )
+        .await;
+        assert_eq!(
+            query_thread(&p, "t1").await.unwrap().thread.resolved_by,
+            None
+        );
+        apply_err_as(
+            &mut p,
+            &PageMsg::ResolveThread {
+                thread_id: "ghost".into(),
+                resolved: true,
+            },
+            user("alice"),
+            "thread not found",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn comment_caps_and_reserved_ids_reject() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        let huge = "x".repeat(MAX_COMMENT_TEXT_BYTES + 1);
+        apply_err_as(
+            &mut p,
+            &add("t1", "m1", "b1", &huge),
+            user("alice"),
+            "comment text too large",
+        )
+        .await;
+        assert!(p.pending.is_empty(), "a rejected comment op stages nothing");
+        // a NUL-prefixed id lands in the reserved keyspace — rejected.
+        apply_err_as(
+            &mut p,
+            &add("\u{0}evil", "m1", "b1", "x"),
+            user("alice"),
+            "reserved block id",
+        )
+        .await;
+        // over-cap query rejected.
+        let targets: Vec<String> = (0..=MAX_QUERY_TARGETS).map(|i| format!("t{i}")).collect();
+        assert!(
+            p.query(&encode_query(&PageQuery::ThreadsForTargets { targets }))
+                .await
+                .is_err()
+        );
+    });
+}
+
+// comments ride the same qmdb as blocks (reserved NUL-prefixed keys), so a
+// block edit and a comment op never collide, and both compose into root.
+#[test]
+fn comments_and_blocks_coexist_and_move_the_root() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        seed_page(&mut p, "p1").await;
+        let before = p.root();
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "note on b1"), user("alice")).await;
+        assert_ne!(p.root(), before, "a comment write moves the root");
+        // the block tree is untouched by the comment.
+        assert_eq!(
+            ids(&get_page(&p, "p1").await.unwrap()),
+            ["p1", "b1", "b2", "b3"]
+        );
+        assert_eq!(query_threads(&p, &["b1"]).await[0].threads.len(), 1);
+    });
+}
+
+// deleting a block (or page) must purge the comment threads anchored to it,
+// so no comment records dangle in the reserved keyspace forever.
+#[test]
+fn deleting_a_block_purges_its_comment_threads() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        seed_page(&mut p, "p1").await; // p1 + b1,b2,b3
+        apply_commit_as(&mut p, &add("t1", "m1", "b1", "on b1"), user("alice")).await;
+        apply_commit_as(&mut p, &add("t2", "m2", "p1", "on the page"), user("alice")).await;
+        assert_eq!(query_threads(&p, &["b1"]).await[0].threads.len(), 1);
+
+        // remove b1 → its thread t1 (+ comment m1 + target index) is gone.
+        apply_commit(
+            &mut p,
+            &PageMsg::RemoveBlock {
+                block_id: "b1".into(),
+            },
+        )
+        .await;
+        assert!(query_threads(&p, &["b1"]).await[0].threads.is_empty());
+        assert!(query_thread(&p, "t1").await.is_none());
+
+        // delete the page → the page-anchored thread t2 is purged too.
+        apply_commit(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "p2".into(),
+                title: "keep".into(),
+                parent: None,
+            },
+        )
+        .await;
+        apply_commit(
+            &mut p,
+            &PageMsg::DeletePage {
+                page_id: "p1".into(),
+            },
+        )
+        .await;
+        assert!(query_thread(&p, "t2").await.is_none());
+        assert!(query_threads(&p, &["p1"]).await[0].threads.is_empty());
+    });
+}
