@@ -35,6 +35,10 @@ pub(crate) fn wire_reachability_plane<S, R>(
     wireguard_effect: WireGuardEffectKind,
     overlay_slot: overlay_net::userspace::StackSlot,
     advertised: Ingress,
+    // an explicit WireGuard advertise override (node.toml
+    // `wireguard_advertised`); `None` keeps today's derivation from
+    // `wireguard_listen` (see `reachability_plane`'s body).
+    wireguard_advertised: Option<Ingress>,
     coordinators: Vec<Ingress>,
     intro_listen: Option<std::net::SocketAddr>,
     // the genesis-issued admission capability presented on every coordinator
@@ -75,6 +79,7 @@ where
                     wireguard_effect,
                     overlay_slot,
                     advertised,
+                    wireguard_advertised,
                     coordinators,
                     intro_listen,
                     reach_coord_cap,
@@ -203,6 +208,8 @@ async fn reachability_plane(
     // the socket-mode effect publishes/clears the live stack through it.
     overlay_slot: overlay_net::userspace::StackSlot,
     advertised: Ingress,
+    // an explicit WireGuard advertise override; see `wire_reachability_plane`.
+    wireguard_advertised_override: Option<Ingress>,
     coordinators: Vec<Ingress>,
     // the invite intro listener: where a fresh joiner announces its keys
     // (token-authenticated) so its tunnel exists before any p2p.
@@ -262,10 +269,39 @@ async fn reachability_plane(
         );
         return;
     }
-    let wireguard_advertised = if wireguard_listen.ip().is_unspecified() {
-        None
-    } else {
-        match wireguard_upgrade::Endpoint::new(
+    let wireguard_advertised = match &wireguard_advertised_override {
+        // an explicit `wireguard_advertised` wins outright — the bind/
+        // advertise split (change 3): resolved ONCE here, same discipline as
+        // `advertised` above, independent of whether `wireguard_listen` is
+        // itself unspecified.
+        Some(ingress) => match resolve_ingress(ingress) {
+            Some(addr) => match wireguard_upgrade::Endpoint::new(
+                addr.ip(),
+                addr.port(),
+                wireguard_upgrade::Transport::Udp,
+                &policy,
+            ) {
+                Ok(endpoint) => Some(endpoint),
+                Err(err) => {
+                    eprintln!(
+                        "[node {label}] reachability: wireguard_advertised rejected ({err:?}) — \
+                         plane not started"
+                    );
+                    return;
+                }
+            },
+            None => {
+                eprintln!(
+                    "[node {label}] reachability: wireguard_advertised {ingress:?} did not \
+                     resolve — plane not started"
+                );
+                return;
+            }
+        },
+        // no override: derive from the bind address exactly like today —
+        // unspecified means endpoint-less/roaming, concrete advertises itself.
+        None if wireguard_listen.ip().is_unspecified() => None,
+        None => match wireguard_upgrade::Endpoint::new(
             wireguard_listen.ip(),
             wireguard_listen.port(),
             wireguard_upgrade::Transport::Udp,
@@ -279,7 +315,7 @@ async fn reachability_plane(
                 );
                 return;
             }
-        }
+        },
     };
     let mut coords: Vec<std::net::SocketAddr> = Vec::new();
     for ingress in &coordinators {

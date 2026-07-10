@@ -50,13 +50,14 @@ docker compose -f ops/callbed/docker-compose.yml run --rm driver
 `bootstrap` runs the offline ceremony (`init → invite → join → admit → invite →
 join`) and writes `node0`/`node1` configs to a shared volume; the two nodes
 boot, reach a live 2-of-2 quorum, and bring their overlay tunnels up from the
-concrete WireGuard endpoints `node-entry.sh` bakes into each node's gossiped
-`EndpointRecord`; `driver` then synthesizes tones + camera frames on each
-node's call session and asserts they arrive on the other. A compose-local
-`coordinator` (private mode, pinned to the ceremony's genesis set) exercises
-the coordinator-auth registration lane — the founder registers and learns its
-reflexive address through it (only the founder: invites strip coordinated
-hints and `join` has no coordinator flag — see #331's product tier).
+`--wireguard-advertised` endpoints (compose DNS names, resolved at plane
+start) each node advertises in its gossiped `EndpointRecord`; `driver` then
+synthesizes tones + camera frames on each node's call session and asserts
+they arrive on the other. A compose-local `coordinator` (private mode, pinned
+to the ceremony's genesis set) is BOTH nodes' ambient coordinator via the
+`primary_coordinator` node.toml key (#331 product tier) — with the advertised
+endpoints stripped, tunnels still come up through its by-identity rendezvous
+fallback, which is exactly how the bed live-verifies that lane.
 
 Why a LOCAL coordinator: media is overlay-only, and both containers sit behind
 the same host NAT — the public coordinator would observe both at the host's
@@ -88,7 +89,7 @@ Teardown: `docker compose -f ops/callbed/docker-compose.yml down -v`.
 | File | Role |
 |------|------|
 | `Dockerfile.node` | builds `ducktape-node` + `coordinator`, ships them + the scripts + curl |
-| `bootstrap.sh` | offline peering ceremony → `node0`/`node1` configs in `/shared` (socket WG effect, compose-local coordinator) |
+| `bootstrap.sh` | offline peering ceremony → `node0`/`node1` configs in `/shared` (socket WG effect, ambient coordinator on both nodes, advertised WG endpoints) |
 | `node-entry.sh` | waits for its config, runs the validator |
 | `docker-compose.yml` | `bootstrap` (one-shot) → `coordinator` → `node0` + `node1` → `driver` |
 | `call-driver.ts` | bun ws client: synth tone + camera frame; assert audio RMS + byte-exact video reassembly; verdict |
