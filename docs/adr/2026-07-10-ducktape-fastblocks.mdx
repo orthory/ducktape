@@ -664,6 +664,12 @@ A validator treats its own Promise acknowledgement as binding immediately;
 the assembler may hide a completed certificate from its signers or reveal it
 only to a client.
 
+A node exposes `preconfirmed` to a client only after it has verified and
+durably recorded the assembled PromiseQC and receipt chain. This evidence
+write is for restart-safe status and forensics; promise safety already follows
+from the signers' locks. A node that cannot persist the evidence keeps the
+operation queued even though another client may hold a valid portable receipt.
+
 The two phases are deliberate. Accepting the availability quorum directly
 would let a Byzantine assembler collect signatures, reveal them only to a
 client, and disappear before honest validators durably learned that they must
@@ -684,6 +690,7 @@ The journal gains append-only record tags:
 |---|---|---|
 | `PromisePrepared` | parent/session/index, proposal hash, anti-equivocation key, exact new frame bytes | append + sync before availability attestation |
 | `PromiseLocked` | proposal hash, cumulative ordered FrameIds, bounded AvailabilityQC bytes | append + sync before Promise acknowledgement |
+| `PromiseCertified` | proposal, AvailabilityQC, PromiseQC, and receipt-proof inputs | append + sync before this node publishes `preconfirmed` |
 | `PromiseReleased` | parent/session/proposal key, canonical digest and matching/omission reason | append + sync before deleting prepared or locked in-memory state |
 
 `PromisePrepared` is also a durable content pin. Recovery exposes its frame
@@ -712,6 +719,11 @@ A timer, circuit breaker, checkpoint, or process restart never erases a lock.
 A matching canonical finalization releases it. An omitting canonical
 finalization may release only a partial lock for which no `PromiseQC` could
 have existed, as described below.
+
+Release permits safety-state compaction but does not immediately discard
+`PromiseCertified`. The existing recovery retention/pruning policy keeps the
+receipt evidence through a configured forensic window and never prunes it
+before the matching canonical outcome is durable.
 
 ## The Cross-Protocol `PromiseGuard`
 
@@ -884,8 +896,9 @@ transition, height, app hash, or commit order.
 ## Liveness and Performance Envelope
 
 PromiseNet adds two validator message phases, body fan-out, frame validation,
-certificate verification, two durable record barriers, and client
-publication. A deployment cannot beat quorum RTT or storage latency.
+certificate verification, two voter safety barriers, a receipt-evidence
+barrier before local publication, and client fan-out. A deployment cannot beat
+quorum RTT or storage latency.
 
 The initial engineering budget per increment is:
 
@@ -895,7 +908,7 @@ The initial engineering budget per increment is:
 | existing frame validation + durable prepare | 20 ms |
 | availability attestations and certificate assembly | 15 ms |
 | AvailabilityQC verification + durable lock | 20 ms |
-| Promise acknowledgements, assembly, and publication | 15 ms |
+| Promise acknowledgements, assembly, durable evidence, and publication | 15 ms |
 | scheduler and queue slack | 5 ms |
 | total | 100 ms |
 
@@ -951,13 +964,15 @@ struct SubmissionUpdateV1 {
 }
 ```
 
-The app extends its existing `OpLedger` with one phase. Optimistic projection
-remains a separate reversible presentation technique:
+The app extends its existing `OpLedger` with one phase. `received` enriches the
+existing `pending` entry with custody evidence; it is not another ledger
+phase. Optimistic projection remains a separate reversible presentation
+technique:
 
 | State | Evidence | UI copy |
 |---|---|---|
-| `optimistic/pending` | local client projected an intent | **Sending…** |
-| `received` | node accepted custody of the stable FrameId | **Queued** |
+| `pending` before custody | local client projected an intent | **Sending…** |
+| `pending` + `received` | node accepted custody of the stable FrameId | **Queued** |
 | `preconfirmed` | local node verified a portable `FastblockReceiptV1` | **Preconfirmed** |
 | `finalized.applied` | canonical block and app hash | **Finalized** |
 | `finalized.rejected` | canonical inclusion with deterministic rejection | **Finalized — rejected** |
@@ -1214,7 +1229,8 @@ are not implied by this rollout.
 
 ### Costs and trade-offs
 
-- Two quorum phases and two durable barriers per increment are expensive.
+- Two quorum phases, two safety barriers per voter, and a local durable receipt
+  record before publication are expensive.
 - The 100 ms target constrains validator placement, disk latency, and control
   queue scheduling.
 - Binding locks intentionally couple an off-consensus protocol to the existing
@@ -1314,7 +1330,7 @@ planned for v1.
 |---|---|
 | `crates/kernel/node` | extract `BatchBuilder`; add idempotent FrameId reservation; define the canonical-prefix `PromiseGuard` and `PromiseSafetySink` interface |
 | `crates/kernel/consensus` | add `fastblocks` subject/certificate/state-machine module; extend automaton/reporter with authoritative lifecycle and guard checks; reuse `ContentStore`, scheme construction, and `N3f1` |
-| `crates/kernel/recovery` | implement `PromiseSafetySink` in the existing journal; add tolerant record/manifest tails and recovered lock/body output |
+| `crates/kernel/recovery` | implement `PromiseSafetySink` in the existing journal; add tolerant record/manifest tails and recovered lock/body/receipt output |
 | `crates/system/data-plane` | append `Service::Promise = 5` and ports only; reuse all plane/flow/stats machinery |
 | `bin/node` | wire the per-use plane, generic epoch peer book, node-actor coordinator, forwarding, cut/seal cadence, cutover barrier, circuit breaker, and metrics |
 | `bin/noded` | extend existing command/status and stream surfaces; preserve default finalized submit behavior |
