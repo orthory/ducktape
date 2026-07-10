@@ -34,7 +34,7 @@ use upgrade::Upgrade;
 use valset::Valset;
 use vaults::Vaults;
 
-use crate::hex;
+use crate::util::hex;
 
 /// Consensus-visible network names shared by genesis, restore, and state sync.
 #[derive(Clone, Copy)]

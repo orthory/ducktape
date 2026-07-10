@@ -1,30 +1,31 @@
-use commonware_cryptography::{ed25519, Signer};
-use commonware_p2p::authenticated::discovery;
-use commonware_runtime::Clock;
-use recovery::{Manifest, Recovery};
+//! Validator recovery and promoted-node catch-up.
+//!
+//! The first phase restores or creates the application boundary. The second
+//! reconciles a promoted replica with its source before engine resume.
+
 use std::time::Duration;
 
-use crate::config::WireGuardEffectKind;
-use crate::constants::*;
-use crate::explorer::{heal_index, IndexFold};
+use commonware_cryptography::{Signer, ed25519};
+use commonware_runtime::Clock;
+
+use host::Host;
+use recovery::{Manifest, Recovery};
+
+use crate::constants::MAX_PROTOCOL_VERSION;
+use crate::constants::{POST_REBOOT_CATCHUP_MAX_ATTEMPTS, POST_REBOOT_CATCHUP_MAX_ITERS};
+use crate::explorer::{IndexFold, heal_index};
 use crate::host_reads::read_upgrade_version_fields;
-use crate::host_state::{
-    genesis_host, restore_host, sync_all_modules, NetworkBindings, SyncSubstrates,
-};
+use crate::host_state::{NetworkBindings, genesis_host, restore_host};
+use crate::host_state::{SyncSubstrates, sync_all_modules};
+use crate::statesync_plane;
 use crate::sync::catchup::{
-    advance_next_seq_from_frames, catch_up_post_reboot_frames, write_post_reboot_catchup_checkpoint,
-    BootP2pSyncClient, PostRebootCatchupError,
+    BootP2pSyncClient, PostRebootCatchupError, advance_next_seq_from_frames,
+    catch_up_post_reboot_frames, write_post_reboot_catchup_checkpoint,
 };
 use crate::sync::serve::verify_manifest_floor;
 use crate::util::hex;
-use crate::statesync_plane;
-use host::Host;
 
-/// `run_node`'s boot outcome: the live [`Host`], the recovery replay record
-/// (`None` on a fresh genesis boot), the next local submit sequence, the
-/// last checkpoint (height, oplog position) for the pump's prune
-/// bookkeeping, and the manifest that recovery used as its replay baseline.
-pub(crate) type BootState = (
+pub(super) type BootState = (
     Host,
     Option<recovery::Recovered>,
     u64,
@@ -32,39 +33,31 @@ pub(crate) type BootState = (
     Option<Manifest>,
 );
 
-/// `run_node`'s recovery-aware boot: a bare journal (no checkpoint) composes
-/// the genesis registry and captures the seq-0 checkpoint; a checkpointed
-/// journal preflights the binary's protocol version against the recovered
-/// boundary, restores every module from its snapshot, heals the derived
-/// index against the checkpoint boundary BEFORE replay, and replays the
-/// journal suffix through `recovery` (folding into `boot_fold` as it goes —
-/// the caller's fold spans this AND the later post-reboot catch-up, so its
-/// construction stays with the caller).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn boot(
+pub(super) async fn restore(
     context: &commonware_runtime::tokio::Context,
-    label: &str,
+    index: &indexer::IndexStore,
+    blobs: noded::blobs::BlobHandle,
     recovery: &mut Recovery<commonware_runtime::tokio::Context>,
-    manifest: &Option<Manifest>,
+    manifest: Option<Manifest>,
     forge_repo: &std::path::Path,
     duckfs_dir: &std::path::Path,
     validators: &[ed25519::PublicKey],
     namespace: &[u8],
     identity_chain_id: &str,
-    blobs: &noded::blobs::BlobHandle,
     signer: &ed25519::PrivateKey,
-    index: &indexer::IndexStore,
+    label: &str,
     boot_fold: &mut IndexFold<'_>,
 ) -> BootState {
-    match manifest.clone() {
+    match manifest {
         None => {
             // a journal without a checkpoint is damage, not a fresh dir —
             // booting genesis over it would silently fork this node.
             if !recovery.journal_is_empty().await {
                 eprintln!(
                     "[node {label}] FATAL: recovery journal exists but the checkpoint is \
-                     missing — wipe the app state and re-sync (KEEP the consensus journal \
-                     partitions: they are what prevents this key from double-voting)"
+                 missing — wipe the app state and re-sync (KEEP the consensus journal \
+                 partitions: they are what prevents this key from double-voting)"
                 );
                 std::process::exit(1);
             }
@@ -85,27 +78,25 @@ pub(crate) async fn boot(
                 validators.iter().map(|k| k.as_ref().to_vec()).collect();
             // seq 0 is the dev demo op's; real submits start at 1.
             let (cv, pu) = read_upgrade_version_fields(&host).await;
-            let genesis_manifest =
-                match Manifest::capture(
-                    &host,
-                    None,
-                    0,
-                    0,
-                    genesis_participants,
-                    Vec::new(),
-                    None,
-                    cv,
-                    pu,
-                    pos,
-                    1,
-                )
-                {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("[node {label}] FATAL: genesis checkpoint capture: {e}");
-                        std::process::exit(1);
-                    }
-                };
+            let genesis_manifest = match Manifest::capture(
+                &host,
+                None,
+                0,
+                0,
+                genesis_participants,
+                Vec::new(),
+                None,
+                cv,
+                pu,
+                pos,
+                1,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[node {label}] FATAL: genesis checkpoint capture: {e}");
+                    std::process::exit(1);
+                }
+            };
             if let Err(e) = recovery.write_manifest(&genesis_manifest).await {
                 eprintln!("[node {label}] FATAL: genesis checkpoint write: {e}");
                 std::process::exit(1);
@@ -121,7 +112,7 @@ pub(crate) async fn boot(
             if let Err(e) = manifest.preflight(MAX_PROTOCOL_VERSION) {
                 eprintln!(
                     "[node {label}] FATAL: cannot recover — {e} (recovered boundary needs \
-                     protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
+                 protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
                     manifest.required_min_version()
                 );
                 std::process::exit(1);
@@ -154,17 +145,17 @@ pub(crate) async fn boot(
                 heal_index(index, &host, ckpt_height, label).await;
             }
             let rec = match recovery
-                .recover_with_sink(&mut host, &manifest, Some(&mut *boot_fold))
+                .recover_with_sink(&mut host, &manifest, Some(boot_fold))
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!(
                         "[node {label}] FATAL: {e}\n\
-                         [node {label}] app state cannot be locally recovered. wipe the \
-                         app-state partitions and re-sync from a peer — but ALWAYS keep \
-                         the consensus journal partitions (\"<pubkey>-e<epoch>\"): they \
-                         are the anti-equivocation record for this key."
+                     [node {label}] app state cannot be locally recovered. wipe the \
+                     app-state partitions and re-sync from a peer — but ALWAYS keep \
+                     the consensus journal partitions (\"<pubkey>-e<epoch>\"): they \
+                     are the anti-equivocation record for this key."
                     );
                     std::process::exit(1);
                 }
@@ -177,13 +168,19 @@ pub(crate) async fn boot(
             advance_next_seq_from_frames(&mut next_seq, &rec.frames, &me_bytes);
             println!(
                 "[node {label}] recovered app_hash={} height={} epoch={} (replayed {}, \
-                 already-on-disk {}{})",
+             already-on-disk {}{})",
                 hex(&rec.app_hash),
-                rec.height.map(|h| h.to_string()).unwrap_or_else(|| "genesis".into()),
+                rec.height
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| "genesis".into()),
                 rec.epoch,
                 rec.applied,
                 rec.skipped,
-                if rec.rolled_forward { ", rolled 1 forward" } else { "" },
+                if rec.rolled_forward {
+                    ", rolled 1 forward"
+                } else {
+                    ""
+                },
             );
             let prev = (manifest.height, manifest.oplog_pos);
             (host, Some(rec), next_seq, prev, Some(manifest))
@@ -191,52 +188,46 @@ pub(crate) async fn boot(
     }
 }
 
-/// `run_node`'s post-reboot catch-up (entered only when this key was just
-/// promoted and is rebooting for the first time as a validator): replay the
-/// frames finalized since the recovered height from the statesync source —
-/// preferring the overlay plane, falling back to the mesh path on transport
-/// failure — retrying on a transient source and falling back to a full
-/// module resync when the source has pruned past the recovered height.
-/// mutates and returns `host`/`resumed`/`next_seq`/`prev_ckpt`/
-/// `recovery_manifest_for_resume`/`sync_tx`/`sync_rx` verbatim (a no-op that
-/// hands its inputs straight back when this boot was not a promotion).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn post_reboot_catchup(
-    promoted_validator_boot: bool,
-    context: &commonware_runtime::tokio::Context,
-    label: &str,
-    signer: &ed25519::PrivateKey,
-    namespace: &[u8],
-    identity_chain_id: &str,
-    peers: &[ed25519::PublicKey],
-    forge_repo: &std::path::Path,
-    duckfs_dir: &std::path::Path,
-    blobs: &noded::blobs::BlobHandle,
-    wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: WireGuardEffectKind,
-    overlay_slot: &overlay_net::userspace::StackSlot,
-    recovery: &mut Recovery<commonware_runtime::tokio::Context>,
-    boot_fold: &mut IndexFold<'_>,
-    sync_source: Option<ed25519::PublicKey>,
-    mut host: Host,
-    mut resumed: Option<recovery::Recovered>,
-    mut next_seq: u64,
-    mut prev_ckpt: (Option<u64>, u64),
-    mut recovery_manifest_for_resume: Option<Manifest>,
-    mut sync_tx: discovery::Sender<
-        ed25519::PublicKey,
-        overlay_net::OverlayContext<commonware_runtime::tokio::Context>,
-    >,
-    mut sync_rx: discovery::Receiver<ed25519::PublicKey>,
-) -> (
+pub(super) type PostCatchupState<'a> = (
+    super::MeshSender,
+    super::MeshReceiver,
+    Recovery<commonware_runtime::tokio::Context>,
     Host,
     Option<recovery::Recovered>,
     u64,
     (Option<u64>, u64),
     Option<Manifest>,
-    discovery::Sender<ed25519::PublicKey, overlay_net::OverlayContext<commonware_runtime::tokio::Context>>,
-    discovery::Receiver<ed25519::PublicKey>,
-) {
+    IndexFold<'a>,
+);
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn post_reboot_catchup<'a>(
+    context: &commonware_runtime::tokio::Context,
+    promoted: bool,
+    sync_source: Option<ed25519::PublicKey>,
+    mut sync_tx: super::MeshSender,
+    mut sync_rx: super::MeshReceiver,
+    mut recovery: Recovery<commonware_runtime::tokio::Context>,
+    mut host: Host,
+    mut resumed: Option<recovery::Recovered>,
+    mut next_seq: u64,
+    mut prev_ckpt: (Option<u64>, u64),
+    mut recovery_manifest_for_resume: Option<Manifest>,
+    mut boot_fold: IndexFold<'a>,
+    signer: ed25519::PrivateKey,
+    label: String,
+    namespace: Vec<u8>,
+    identity_chain_id: String,
+    peers: Vec<ed25519::PublicKey>,
+    validators: Vec<ed25519::PublicKey>,
+    wireguard_listen: Option<std::net::SocketAddr>,
+    wireguard_effect: crate::config::WireGuardEffectKind,
+    overlay_slot: overlay_net::userspace::StackSlot,
+    forge_repo: std::path::PathBuf,
+    duckfs_dir: std::path::PathBuf,
+    blobs: noded::blobs::BlobHandle,
+) -> PostCatchupState<'a> {
+    let promoted_validator_boot = promoted && !validators.contains(&signer.public_key());
     if promoted_validator_boot {
         let Some(server_peer) = sync_source else {
             eprintln!(
@@ -254,15 +245,15 @@ pub(crate) async fn post_reboot_catchup(
                 std::sync::Arc::new(std::sync::OnceLock::new());
             if statesync_plane::enabled() && wireguard_listen.is_some() {
                 let book = statesync_plane::OverlayBook::new(
-                    String::from_utf8(namespace.to_vec()).expect("namespace is utf-8"),
+                    String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
                 );
                 book.set_peers(peers.iter());
                 statesync_plane::spawn_bring_up(
-                    label.to_string(),
+                    label.clone(),
                     book,
                     signer.public_key(),
                     std::sync::Arc::clone(&plane_slot),
-                    statesync_plane::socket_factory(wireguard_effect, overlay_slot),
+                    statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
                     None,
                 );
             }
@@ -270,7 +261,7 @@ pub(crate) async fn post_reboot_catchup(
                 plane_slot,
                 &server_peer,
                 mesh_client,
-                label.to_string(),
+                label.clone(),
             )
         };
         let mut attempts = 0usize;
@@ -279,9 +270,9 @@ pub(crate) async fn post_reboot_catchup(
             let recovered_height = resumed.as_ref().and_then(|rec| rec.height).unwrap_or(0);
             match catch_up_post_reboot_frames(
                 &client,
-                &mut *recovery,
+                &mut recovery,
                 &mut host,
-                Some(&mut *boot_fold),
+                Some(&mut boot_fold),
                 recovered_height,
                 POST_REBOOT_CATCHUP_MAX_ITERS,
             )
@@ -325,18 +316,16 @@ pub(crate) async fn post_reboot_catchup(
                         );
                         std::process::exit(1);
                     }
-                    let floor = match verify_manifest_floor(namespace, target) {
+                    let floor = match verify_manifest_floor(&namespace, target) {
                         Ok(floor) => floor,
                         Err(e) => {
-                            eprintln!(
-                                "[node {label}] FATAL: catch-up target floor verify: {e}"
-                            );
+                            eprintln!("[node {label}] FATAL: catch-up target floor verify: {e}");
                             std::process::exit(1);
                         }
                     };
                     if target.epoch > resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0)
                         && let Err(e) = node::BlockSink::cutover(
-                            &mut *recovery,
+                            &mut recovery,
                             target.epoch,
                             target.view_base,
                             &target.participants,
@@ -344,19 +333,13 @@ pub(crate) async fn post_reboot_catchup(
                         )
                         .await
                     {
-                            eprintln!(
-                                "[node {label}] FATAL: catch-up cutover journal write: {e}"
-                            );
-                            std::process::exit(1);
+                        eprintln!("[node {label}] FATAL: catch-up cutover journal write: {e}");
+                        std::process::exit(1);
                     }
                     let me_bytes = signer.public_key().as_ref().to_vec();
-                    advance_next_seq_from_frames(
-                        &mut next_seq,
-                        &summary.frame_bytes,
-                        &me_bytes,
-                    );
+                    advance_next_seq_from_frames(&mut next_seq, &summary.frame_bytes, &me_bytes);
                     let ckpt = match write_post_reboot_catchup_checkpoint(
-                        &mut *recovery,
+                        &mut recovery,
                         &host,
                         recovery_manifest_for_resume.as_ref(),
                         target,
@@ -384,7 +367,7 @@ pub(crate) async fn post_reboot_catchup(
                     }
                     prev_ckpt = (ckpt.height, ckpt.oplog_pos);
                     let refreshed = match recovery
-                        .recover_with_sink(&mut host, &ckpt, Some(&mut *boot_fold))
+                        .recover_with_sink(&mut host, &ckpt, Some(&mut boot_fold))
                         .await
                     {
                         Ok(rec) => rec,
@@ -423,12 +406,10 @@ pub(crate) async fn post_reboot_catchup(
                         );
                         std::process::exit(1);
                     }
-                    let floor = match verify_manifest_floor(namespace, &target) {
+                    let floor = match verify_manifest_floor(&namespace, &target) {
                         Ok(floor) => floor,
                         Err(e) => {
-                            eprintln!(
-                                "[node {label}] FATAL: full-sync target floor verify: {e}"
-                            );
+                            eprintln!("[node {label}] FATAL: full-sync target floor verify: {e}");
                             std::process::exit(1);
                         }
                     };
@@ -437,12 +418,12 @@ pub(crate) async fn post_reboot_catchup(
                         &client,
                         &target,
                         NetworkBindings {
-                            invite: namespace,
-                            identity_chain_id,
+                            invite: &namespace,
+                            identity_chain_id: &identity_chain_id,
                         },
                         SyncSubstrates {
-                            forge_repo,
-                            duckfs_dir,
+                            forge_repo: &forge_repo,
+                            duckfs_dir: &duckfs_dir,
                             blobs: blobs.clone(),
                         },
                         10_000 + attempts,
@@ -462,7 +443,7 @@ pub(crate) async fn post_reboot_catchup(
                     host = synced;
                     if target.epoch > resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0)
                         && let Err(e) = node::BlockSink::cutover(
-                            &mut *recovery,
+                            &mut recovery,
                             target.epoch,
                             target.view_base,
                             &target.participants,
@@ -470,10 +451,8 @@ pub(crate) async fn post_reboot_catchup(
                         )
                         .await
                     {
-                            eprintln!(
-                                "[node {label}] FATAL: full-sync cutover journal write: {e}"
-                            );
-                            std::process::exit(1);
+                        eprintln!("[node {label}] FATAL: full-sync cutover journal write: {e}");
+                        std::process::exit(1);
                     }
                     let pos = recovery.oplog_pos().await;
                     let ckpt = match Manifest::capture(
@@ -491,16 +470,12 @@ pub(crate) async fn post_reboot_catchup(
                     ) {
                         Ok(m) => m,
                         Err(e) => {
-                            eprintln!(
-                                "[node {label}] FATAL: full-sync checkpoint capture: {e}"
-                            );
+                            eprintln!("[node {label}] FATAL: full-sync checkpoint capture: {e}");
                             std::process::exit(1);
                         }
                     };
                     if let Err(e) = recovery.write_manifest(&ckpt).await {
-                        eprintln!(
-                            "[node {label}] FATAL: full-sync checkpoint write: {e}"
-                        );
+                        eprintln!("[node {label}] FATAL: full-sync checkpoint write: {e}");
                         std::process::exit(1);
                     }
                     if let Some(cert) = floor {
@@ -510,22 +485,18 @@ pub(crate) async fn post_reboot_catchup(
                             cert,
                         };
                         if let Err(e) = recovery.write_floor_cert(&floor).await {
-                            eprintln!(
-                                "[node {label}] FATAL: full-sync floor-cert write: {e}"
-                            );
+                            eprintln!("[node {label}] FATAL: full-sync floor-cert write: {e}");
                             std::process::exit(1);
                         }
                     }
                     prev_ckpt = (ckpt.height, ckpt.oplog_pos);
                     let refreshed = match recovery
-                        .recover_with_sink(&mut host, &ckpt, Some(&mut *boot_fold))
+                        .recover_with_sink(&mut host, &ckpt, Some(&mut boot_fold))
                         .await
                     {
                         Ok(rec) => rec,
                         Err(e) => {
-                            eprintln!(
-                                "[node {label}] FATAL: full-sync recovery refresh: {e}"
-                            );
+                            eprintln!("[node {label}] FATAL: full-sync recovery refresh: {e}");
                             std::process::exit(1);
                         }
                     };
@@ -579,12 +550,14 @@ pub(crate) async fn post_reboot_catchup(
         }
     }
     (
+        sync_tx,
+        sync_rx,
+        recovery,
         host,
         resumed,
         next_seq,
         prev_ckpt,
         recovery_manifest_for_resume,
-        sync_tx,
-        sync_rx,
+        boot_fold,
     )
 }

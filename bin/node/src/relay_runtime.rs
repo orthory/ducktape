@@ -16,7 +16,9 @@ use commonware_runtime::IoBuf;
 use futures::channel::oneshot;
 use sdk::Msg;
 
-use super::{RpcReply, SUBMIT_HOLD, relay};
+use crate::constants::SUBMIT_HOLD;
+use crate::relay;
+use crate::rpc::RpcReply;
 
 const MAX_INCOMING_BLOBS: usize = 4;
 

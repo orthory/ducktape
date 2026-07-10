@@ -52,7 +52,6 @@ use commonware_cryptography::Signer;
 use commonware_runtime::{Runner, Supervisor};
 use tracing_subscriber::prelude::*;
 
-
 mod blob_fetch;
 mod boot;
 mod cli;
@@ -86,37 +85,29 @@ mod validator;
 mod voice;
 mod voice_plane;
 use config::Resolved;
-
 use constants::*;
 #[cfg(test)]
-use explorer::{explorer_root_op, sealed_frame_block_row};
+use explorer::explorer_root_op;
+#[cfg(test)]
+use explorer::sealed_frame_block_row;
 #[cfg(test)]
 use replica::promotion::{
-    choose_promotion_boundary, joiner_manifest_fetch_retry, PromotionBoundary,
-    PromotionBoundarySource,
+    PromotionBoundary, PromotionBoundarySource, choose_promotion_boundary,
+    joiner_manifest_fetch_retry,
 };
-use rpc::RpcReply;
 #[cfg(test)]
-use sync::catchup::{
-    apply_post_reboot_catchup_frames, apply_verified_suffix_frame,
-    write_post_reboot_catchup_checkpoint,
-};
+use sync::catchup::{apply_post_reboot_catchup_frames, apply_verified_suffix_frame};
 #[cfg(test)]
 use sync::serve::assert_floor_binds_view;
+#[cfg(test)]
 use util::hex;
 #[cfg(test)]
 use validator::announce::ReadinessSignaller;
 
 #[cfg(test)]
-use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use directory::{DirQuery, DirReply, decode_reply, encode_query};
 use duckfs_disk::SyncScratch;
-#[cfg(test)]
-use host::Host;
 use recovery::Recovery;
-#[cfg(test)]
-use commonware_cryptography::ed25519;
-#[cfg(test)]
-use recovery::Manifest;
 #[cfg(test)]
 use sdk::{Msg, StateRoot};
 
@@ -406,8 +397,8 @@ fn run_node(
                 wireguard_listen,
                 wireguard_effect,
                 wireguard_key_file,
-                primary_coordinator.clone(),
-                wireguard_advertised.clone(),
+                primary_coordinator,
+                wireguard_advertised,
                 &invite_token,
                 &invite_wireguard,
                 invite_fronts,
@@ -435,15 +426,15 @@ fn run_node(
             )
             .await;
         }
-        validator::run::run_validator(
+        validator::run_validator(
             context,
             network,
             oracle,
             quota,
             metrics,
-            status_public_key,
             sync_source,
             advertised_reach,
+            status_public_key,
             signer,
             label,
             namespace,
@@ -462,9 +453,9 @@ fn run_node(
             chain_id,
             mesh_state_file,
             checkpoint_blocks,
+            promoted,
             dev_demo,
             announce_capabilities,
-            promoted,
             rpc_listener,
             http_cmds,
             stream_hub,
