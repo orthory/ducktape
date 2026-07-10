@@ -26,6 +26,29 @@ set -euo pipefail
 CLONE="${1:-$HOME/.cache/ducktape-cef-probe/tauri-cef}"
 ROOT="$(git rev-parse --show-toplevel)"
 
+# macOS: cef-dll-sys builds CEF's sandbox wrapper through CMake with the Ninja
+# generator HARDCODED (its build.rs calls `.generator("Ninja")`) — without
+# cmake+ninja the build dies deep inside tauri-bundler's helper step with
+# "CMake was unable to find a build program corresponding to Ninja". Preflight
+# here where the error is actionable; auto-install via Homebrew when present.
+# Linux never enters that path (no sandbox wrapper build).
+if [ "$(uname -s)" = "Darwin" ]; then
+  missing=""
+  command -v cmake >/dev/null || missing="cmake"
+  command -v ninja >/dev/null || missing="$missing ninja"
+  if [ -n "$missing" ]; then
+    if command -v brew >/dev/null; then
+      echo "[cef-probe] installing required build tools:$missing"
+      # shellcheck disable=SC2086
+      brew install $missing
+    else
+      echo "[cef-probe] missing build tools:$missing" >&2
+      echo "[cef-probe] install them first: brew install cmake ninja" >&2
+      exit 1
+    fi
+  fi
+fi
+
 if [ ! -d "$CLONE" ]; then
   mkdir -p "$(dirname "$CLONE")"
   git clone --depth 1 --branch feat/cef --single-branch \
