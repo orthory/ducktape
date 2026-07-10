@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
 import * as browser from "../../../domain/duck-browser";
@@ -72,6 +72,43 @@ export function BrowserView() {
   const [loading, setLoading] = useState(false);
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
+  // CEF shells embed the gateway session in the pane; wry opens the window.
+  const [inline, setInline] = useState(false);
+  const paneRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void gateway.inlineSupported().then((ok) => {
+      if (!cancelled) setInline(ok);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Mount/track/unmount the inline gateway webview over the pane. The child
+  // webview lives in window coordinates, so the pane's viewport rect (the main
+  // webview fills the window) is its bounds; ResizeObserver keeps it placed.
+  // ponytail: console overlays (search modal) render under the native child
+  // inside this rect; hide-on-modal if it ever matters.
+  useEffect(() => {
+    const el = paneRef.current;
+    const srcUrl = page?.hosting === "gateway" ? page.srcUrl : undefined;
+    if (!inline || !el || !srcUrl || error) return;
+    const rectOf = (): gateway.InlineRect => {
+      const r = el.getBoundingClientRect();
+      return { x: r.x, y: r.y, width: r.width, height: r.height };
+    };
+    gateway.openInline(srcUrl, rectOf()).catch((reason: unknown) => {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    });
+    const observer = new ResizeObserver(() => void gateway.placeInline(rectOf()));
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      void gateway.closeInline();
+    };
+  }, [inline, page, error]);
 
   const open = useCallback(async (raw: string, addHistory = true) => {
     if (!transport) {
@@ -84,7 +121,11 @@ export function BrowserView() {
       const loaded = await browser.loadDuckPage(transport, raw);
       if (loaded.hosting === "gateway") {
         if (!loaded.srcUrl) throw new Error("Gateway did not return a browser session URL.");
-        await gateway.openWindow(loaded.srcUrl, loaded.address.hostname);
+        // Inline shells mount the session in the pane (the effect above);
+        // window shells open the separate isolated window here.
+        if (!(await gateway.inlineSupported())) {
+          await gateway.openWindow(loaded.srcUrl, loaded.address.hostname);
+        }
       }
       setPage(loaded);
       setInput(loaded.address.canonical);
@@ -133,7 +174,9 @@ export function BrowserView() {
           {page?.hosting === "network" && !error && (
             <iframe title={page.title} data-testid="duck-browser-frame" sandbox="" allow="" referrerPolicy="no-referrer" srcDoc={page.srcDoc} style={{ width: "100%", height: "100%", display: "block", border: 0, background: color.paper }} />
           )}
-          {page?.hosting === "gateway" && !error && (
+          {page?.hosting === "gateway" && !error && (inline ? (
+            <div ref={paneRef} data-testid="gateway-inline-pane" style={{ position: "absolute", inset: 0 }} />
+          ) : (
             <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", padding: 30 }}>
               <div style={{ maxWidth: 430, padding: 20, borderRadius: radius.lg, border: `1px solid ${color.border}`, background: color.paper, textAlign: "center" }}>
                 <div style={{ color: color.dark, font: `650 13px ${font.sans}` }}>Opened in an isolated gateway window</div>
@@ -141,7 +184,7 @@ export function BrowserView() {
                 <button style={{ ...buttonStyle(), marginTop: 13 }} onClick={() => page.srcUrl && void gateway.openWindow(page.srcUrl, page.address.hostname)}>Reopen {page.address.hostname}</button>
               </div>
             </div>
-          )}
+          ))}
           {!page && !error && !loading && <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: color.muted, font: `500 11px ${font.sans}` }}><div>Enter <span style={{ fontFamily: font.mono }}>net.duck</span>, <span style={{ fontFamily: font.mono }}>&lt;account&gt;.duck</span>, or <span style={{ fontFamily: font.mono }}>&lt;label&gt;.&lt;account&gt;.duck</span>.</div></div>}
         </div>
       </div>
