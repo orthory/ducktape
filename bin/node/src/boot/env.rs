@@ -35,6 +35,13 @@ pub(crate) struct BootEnv {
     pub(crate) coordination: config::Coordination,
     pub(crate) coord_cap: Option<nat_traversal::CoordCap>,
     pub(crate) workspace: PathBuf,
+    /// the AMBIENT coordinator override (`node.toml primary_coordinator`),
+    /// raw — resolved via `config::coordinator_ingress` at each plane-wiring
+    /// site so a bad value degrades there instead of aborting boot.
+    pub(crate) primary_coordinator: Option<String>,
+    /// the WireGuard bind/advertise split (`node.toml wireguard_advertised`),
+    /// threaded into `wire_reachability_plane` at both plane-wiring sites.
+    pub(crate) wireguard_advertised: Option<Ingress>,
     pub(crate) sync_candidates: Vec<(ed25519::PublicKey, Ingress)>,
     pub(crate) chain_id: String,
     pub(crate) mesh_state_file: PathBuf,
@@ -80,6 +87,8 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         coordination,
         coord_cap,
         workspace,
+        primary_coordinator,
+        wireguard_advertised,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
@@ -281,6 +290,8 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         coordination,
         coord_cap,
         workspace,
+        primary_coordinator,
+        wireguard_advertised,
         sync_candidates,
         chain_id,
         mesh_state_file,

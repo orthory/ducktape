@@ -259,6 +259,8 @@ fn run_node(
         coordination,
         coord_cap,
         workspace,
+        primary_coordinator,
+        wireguard_advertised,
         sync_candidates,
         chain_id,
         mesh_state_file,
@@ -419,6 +421,8 @@ fn run_node(
                 wireguard_listen,
                 wireguard_effect,
                 wireguard_key_file,
+                primary_coordinator,
+                wireguard_advertised,
                 &invite_token,
                 &invite_wireguard,
                 invite_fronts,
@@ -761,9 +765,24 @@ fn run_node(
             match wireguard_listen {
                 Some(wg_addr) => {
                     // rendezvous coordinators = every coordinated-reach hint's
-                    // coordinator ingress; hostnames resolve once at plane start.
-                    let coordinators: Vec<Ingress> =
+                    // coordinator ingress, PLUS the ambient override/default
+                    // (deduped) — without it an invite-joined member (whose
+                    // descriptor carries no `coordinated:` hints, stripped at
+                    // mint time) binds zero coordinators and never registers.
+                    let mut coordinators: Vec<Ingress> =
                         coordinated.iter().map(|(_, c, _)| c.clone()).collect();
+                    match config::coordinator_ingress(primary_coordinator.as_deref()) {
+                        Ok(Some(ambient)) => {
+                            if !coordinators.contains(&ambient) {
+                                coordinators.push(ambient);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!(
+                            "[node {label}] reachability: ambient coordinator unusable ({e}) — \
+                             registering with descriptor-hinted coordinators only"
+                        ),
+                    }
                     Some(wire_reachability_plane(
                         &context,
                         &label,
@@ -775,6 +794,7 @@ fn run_node(
                         wireguard_effect,
                         overlay_slot.clone(),
                         advertised_reach,
+                        wireguard_advertised.clone(),
                         coordinators,
                         // members serve the invite intro: a fresh joiner's
                         // tunnel comes up against this listener before any p2p.
