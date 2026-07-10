@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 nat-traversal = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["net", "rt", "macros"] }
 # reading the PUBLIC genesis valset out of network.toml (--genesis-set). No
 # secret, no node-crate dependency: a local GenesisPin struct + hex decode.
 commonware-cryptography = { workspace = true }

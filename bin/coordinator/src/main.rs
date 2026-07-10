@@ -67,7 +67,10 @@ fn parse_addr(flag: &str, raw: &str) -> std::io::Result<SocketAddr> {
     })
 }
 
-#[tokio::main]
+// One socket and one sequential state machine do not benefit from Tokio's
+// CPU-count worker pool. A current-thread runtime avoids dozens of idle worker
+// threads and their reserved stacks while preserving the same async I/O path.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
     if wants_help() {
         print!("{USAGE}");
