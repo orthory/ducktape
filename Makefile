@@ -13,7 +13,7 @@ BIN_DEST ?= $(HOME)/.cargo/bin
 
 UNAME_S := $(shell uname -s)
 
-.PHONY: all dev demo-seed dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean
+.PHONY: all dev demo-seed demo-app dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean
 
 all: node web
 
@@ -32,6 +32,12 @@ dev:
 ## ducktape-node if needed (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
 demo-seed:
 	@bash ops/demo-seed.sh
+
+## serve the user-hosted web app behind the demo's app.<id>.duck gateway route
+## (demo-seed publishes the route; this runs the loopback server it proxies to).
+## Foreground — Ctrl-C to stop. See ops/demo-app.sh.
+demo-app:
+	@bash ops/demo-app.sh
 
 ## dogfood: host ducktape's own source in the local dev node's forge module.
 ## registers a static `ducktape-dev` git remote at the node's forge endpoint and
