@@ -81,6 +81,11 @@ pub(crate) async fn run(
     wireguard_listen: Option<std::net::SocketAddr>,
     wireguard_effect: crate::config::WireGuardEffectKind,
     wireguard_key_file: std::path::PathBuf,
+    // the AMBIENT coordinator override + WireGuard bind/advertise split
+    // (node.toml `primary_coordinator` / `wireguard_advertised`), consumed
+    // by `wiring::wire`'s reachability-plane bring-up.
+    primary_coordinator: Option<String>,
+    wireguard_advertised: Option<Ingress>,
     invite_token: &Option<crate::config::InviteToken>,
     invite_wireguard: &Option<crate::config::StoredInviteWireGuard>,
     invite_fronts: Vec<crate::config::Front>,
@@ -129,6 +134,8 @@ pub(crate) async fn run(
         chain_id,
         mesh_state_file,
         advertised_reach,
+        primary_coordinator,
+        wireguard_advertised,
         coord_cap,
         invite_token,
         invite_wireguard,

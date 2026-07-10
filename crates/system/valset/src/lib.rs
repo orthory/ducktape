@@ -40,7 +40,7 @@
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
-// the (not-yet-consumed) valset mesh wire surface, kept as its own namespace.
+// the validator mesh wire surface, kept as its own namespace.
 pub mod mesh;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,6 +52,7 @@ use sha2::{Digest, Sha256};
 
 /// a 32-byte ed25519 public key encoding.
 const KEY_LEN: usize = 32;
+type SnapshotMembership = (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>);
 
 pub struct Valset {
     id: ModuleId,
@@ -215,8 +216,7 @@ impl Valset {
     /// BEFORE any allocation, truncation and trailing bytes both reject, and
     /// keys must arrive strictly increasing per section — a peer cannot mint
     /// alternative byte streams for one state.
-    #[allow(clippy::type_complexity)]
-    fn decode_snapshot(bytes: &[u8]) -> Result<(BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>), Error> {
+    fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotMembership, Error> {
         fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
             let Some((head, rest)) = (*buf).split_first_chunk::<8>() else {
                 return Err(Error::Module("snapshot truncated".into()));

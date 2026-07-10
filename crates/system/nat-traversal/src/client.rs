@@ -1,11 +1,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::thread;
 
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::AuthRequest;
 use crate::auth::{AuthPolicy, CoordCap, now_secs, sign_authenticator};
+use crate::coordinator::{AuthVerifier, VerifiedRequest};
 use crate::{Coordinator, Msg, NodeKey};
 use commonware_cryptography::ed25519;
 
@@ -528,6 +530,245 @@ pub async fn run_coordinator(sock: UdpSocket, policy: AuthPolicy) {
     run_coordinator_with(sock, Coordinator::with_policy(policy)).await
 }
 
+const AUTH_QUEUE_DEPTH: usize = 64;
+const AUTH_WORKER_STACK_BYTES: usize = 512 * 1024;
+
+struct AuthJob {
+    sequence: u64,
+    from: SocketAddr,
+    now: u64,
+    request: AuthRequest,
+}
+
+struct AuthResult {
+    sequence: u64,
+    from: SocketAddr,
+    now: u64,
+    verified: Option<VerifiedRequest>,
+}
+
+enum AuthEvent {
+    Complete(AuthResult),
+    Failed(usize),
+}
+
+struct AuthWorkers {
+    jobs: Box<[mpsc::Sender<AuthJob>]>,
+    next: usize,
+    _threads: Box<[thread::JoinHandle<()>]>,
+}
+
+impl AuthWorkers {
+    fn spawn(policy: Arc<AuthPolicy>, count: usize, results: mpsc::Sender<AuthEvent>) -> Self {
+        let mut jobs = Vec::with_capacity(count);
+        let mut threads = Vec::with_capacity(count);
+        for index in 0..count {
+            let (job_tx, mut job_rx) = mpsc::channel::<AuthJob>(AUTH_QUEUE_DEPTH);
+            let result_tx = results.clone();
+            let mut verifier = AuthVerifier::with_shared_policy(policy.clone());
+            let handle = thread::Builder::new()
+                .name(format!("coordinator-auth-{index}"))
+                .stack_size(AUTH_WORKER_STACK_BYTES)
+                .spawn(move || {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        while let Some(job) = job_rx.blocking_recv() {
+                            let verified = verifier.verify(job.request, job.now);
+                            if result_tx
+                                .blocking_send(AuthEvent::Complete(AuthResult {
+                                    sequence: job.sequence,
+                                    from: job.from,
+                                    now: job.now,
+                                    verified,
+                                }))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }));
+                    if outcome.is_err() {
+                        let _ = result_tx.blocking_send(AuthEvent::Failed(index));
+                    }
+                })
+                .unwrap_or_else(|error| panic!("failed to start auth worker {index}: {error}"));
+            jobs.push(job_tx);
+            threads.push(handle);
+        }
+        Self {
+            jobs: jobs.into_boxed_slice(),
+            next: 0,
+            _threads: threads.into_boxed_slice(),
+        }
+    }
+
+    async fn dispatch(&mut self, job: AuthJob) {
+        let index = self.next;
+        self.next = (self.next + 1) % self.jobs.len();
+        if self.jobs[index].send(job).await.is_err() {
+            panic!("coordinator auth worker {index} exited");
+        }
+    }
+}
+
+enum CompletedRequest {
+    Auth(AuthResult),
+    Legacy {
+        from: SocketAddr,
+        now: u64,
+        message: Msg,
+    },
+    Malformed,
+}
+
+/// Fixed-capacity reorder ring. Verification may finish out of order; state
+/// changes never do.
+struct OrderedRequests {
+    slots: Box<[Option<CompletedRequest>]>,
+    received: u64,
+    applying: u64,
+    outstanding: usize,
+}
+
+impl OrderedRequests {
+    fn new(capacity: usize) -> Self {
+        let slots = std::iter::repeat_with(|| None)
+            .take(capacity)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            slots,
+            received: 0,
+            applying: 0,
+            outstanding: 0,
+        }
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.outstanding < self.slots.len()
+    }
+
+    fn reserve(&mut self) -> u64 {
+        assert!(self.has_capacity(), "coordinator auth window is full");
+        let sequence = self.received;
+        self.received = self
+            .received
+            .checked_add(1)
+            .expect("sequence space exhausted");
+        self.outstanding += 1;
+        sequence
+    }
+
+    fn insert(&mut self, sequence: u64, request: CompletedRequest) {
+        let distance = sequence
+            .checked_sub(self.applying)
+            .expect("stale auth result");
+        assert!(
+            distance < self.slots.len() as u64,
+            "auth result is outside the reorder window"
+        );
+        let index = (sequence % self.slots.len() as u64) as usize;
+        let slot = &mut self.slots[index];
+        assert!(slot.is_none(), "duplicate auth result");
+        *slot = Some(request);
+    }
+
+    fn pop_ready(&mut self) -> Option<CompletedRequest> {
+        let index = (self.applying % self.slots.len() as u64) as usize;
+        let request = self.slots[index].take()?;
+        self.applying = self
+            .applying
+            .checked_add(1)
+            .expect("sequence space exhausted");
+        self.outstanding -= 1;
+        Some(request)
+    }
+
+    fn insert_auth(&mut self, event: AuthEvent) {
+        match event {
+            AuthEvent::Complete(result) => {
+                self.insert(result.sequence, CompletedRequest::Auth(result));
+            }
+            AuthEvent::Failed(index) => panic!("coordinator auth worker {index} panicked"),
+        }
+    }
+}
+
+/// Run the coordinator with either the allocation-free inline verifier (`1`)
+/// or four fixed authentication workers (`4`). The latter keeps UDP I/O and
+/// rendezvous state on the current-thread runtime, bounds all queues, and
+/// applies verified requests in receive order.
+pub async fn run_coordinator_workers(sock: UdpSocket, policy: AuthPolicy, workers: usize) {
+    assert!(matches!(workers, 1 | 4), "workers must be 1 or 4");
+    if workers == 1 {
+        return run_coordinator_with(sock, Coordinator::with_policy(policy)).await;
+    }
+
+    let policy = Arc::new(policy);
+    let mut coord = Coordinator::with_shared_policy(policy.clone());
+    let capacity = workers * (AUTH_QUEUE_DEPTH + 1);
+    let (result_tx, mut results) = mpsc::channel(capacity);
+    let mut auth = AuthWorkers::spawn(policy, workers, result_tx);
+    let mut ordered = OrderedRequests::new(capacity);
+    let mut buf = [0u8; 512];
+
+    loop {
+        if ordered.has_capacity() {
+            tokio::select! {
+                result = results.recv() => {
+                    let result = result.expect("coordinator auth worker pool exited");
+                    ordered.insert_auth(result);
+                }
+                received = sock.recv_from(&mut buf) => {
+                    let Ok((n, from)) = received else { continue };
+                    let now = now_secs();
+                    let sequence = ordered.reserve();
+                    match AuthRequest::decode(&buf[..n]) {
+                        Ok(request) => {
+                            auth.dispatch(AuthJob { sequence, from, now, request }).await;
+                        }
+                        Err(_) => {
+                            let completed = match Msg::decode(&buf[..n]) {
+                                Ok(message) => CompletedRequest::Legacy { from, now, message },
+                                Err(_) => CompletedRequest::Malformed,
+                            };
+                            ordered.insert(sequence, completed);
+                        }
+                    }
+                }
+            }
+        } else {
+            let result = results
+                .recv()
+                .await
+                .expect("coordinator auth worker pool exited");
+            ordered.insert_auth(result);
+        }
+
+        while let Some(request) = ordered.pop_ready() {
+            let replies = match request {
+                CompletedRequest::Auth(AuthResult {
+                    from,
+                    now,
+                    verified: Some(request),
+                    ..
+                }) => coord.handle_verified_replies(from, request, now),
+                CompletedRequest::Auth(_) => {
+                    coord.record_reject();
+                    continue;
+                }
+                CompletedRequest::Legacy { from, now, message } => {
+                    coord.handle_legacy_replies(from, message, now)
+                }
+                CompletedRequest::Malformed => continue,
+            };
+            for (dst, reply) in replies {
+                let reply = reply.encode_inline();
+                let _ = sock.send_to(&reply, dst).await;
+            }
+        }
+    }
+}
+
 /// [`run_coordinator`] with a caller-built [`Coordinator`] — the seam for a
 /// custom registration TTL or a pre-seeded book (tests, short-lived rigs).
 pub async fn run_coordinator_with(sock: UdpSocket, mut coord: Coordinator) {
@@ -543,14 +784,15 @@ pub async fn run_coordinator_with(sock: UdpSocket, mut coord: Coordinator) {
         // Tag 11 -> authenticated envelope; anything else -> legacy Msg. The two
         // are mutually exclusive by tag, so try the envelope first and fall back.
         let out = match AuthRequest::decode(&buf[..n]) {
-            Ok(req) => coord.handle_auth(from, req, now),
+            Ok(req) => coord.handle_auth_replies(from, req, now),
             Err(_) => match Msg::decode(&buf[..n]) {
-                Ok(m) => coord.handle_legacy(from, m, now),
+                Ok(m) => coord.handle_legacy_replies(from, m, now),
                 Err(_) => continue,
             },
         };
         for (dst, reply) in out {
-            let _ = sock.send_to(&reply.encode(), dst).await;
+            let reply = reply.encode_inline();
+            let _ = sock.send_to(&reply, dst).await;
         }
     }
 }
@@ -562,6 +804,65 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use tokio::net::UdpSocket;
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn completed_requests_are_applied_in_receive_order() {
+        let mut ordered = OrderedRequests::new(4);
+        let first = ordered.reserve();
+        let second = ordered.reserve();
+        let completed = |byte| CompletedRequest::Legacy {
+            from: "127.0.0.1:1".parse().unwrap(),
+            now: 0,
+            message: Msg::Register {
+                key: NodeKey([byte; 32]),
+            },
+        };
+        ordered.insert(second, completed(2));
+        assert!(ordered.pop_ready().is_none());
+        ordered.insert(first, completed(1));
+        for expected in [1, 2] {
+            let Some(CompletedRequest::Legacy {
+                message: Msg::Register { key },
+                ..
+            }) = ordered.pop_ready()
+            else {
+                panic!("missing ordered completion");
+            };
+            assert_eq!(key, NodeKey([expected; 32]));
+        }
+        assert!(ordered.pop_ready().is_none());
+    }
+
+    #[tokio::test]
+    async fn four_auth_workers_preserve_register_before_lookup() {
+        use commonware_cryptography::{Signer as _, ed25519};
+
+        let signer = ed25519::PrivateKey::from_seed(909);
+        let mut key = [0; 32];
+        key.copy_from_slice(signer.public_key().as_ref());
+        let key = NodeKey(key);
+
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        let coordinator = tokio::spawn(run_coordinator_workers(
+            coord_sock,
+            AuthPolicy::Open { require_pop: true },
+            4,
+        ));
+
+        let client = NatClient::bind_multi_auth(key, vec![coord_addr], signer, None)
+            .await
+            .unwrap();
+        client.register().await.unwrap();
+        let reflexive = timeout(Duration::from_secs(2), client.lookup(key))
+            .await
+            .expect("four-worker lookup timed out")
+            .expect("registered mapping");
+        assert_eq!(reflexive.port(), client.local_addr().await.unwrap().port());
+
+        coordinator.abort();
+        let _ = coordinator.await;
+    }
 
     #[tokio::test]
     async fn authorized_client_rendezvous_under_private_policy_but_unauthorized_is_dropped() {

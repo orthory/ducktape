@@ -1,9 +1,107 @@
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+use arrayvec::ArrayVec;
+use commonware_codec::DecodeExt as _;
+use commonware_cryptography::ed25519;
+use lru::LruCache;
 
 use crate::AuthRequest;
 use crate::advert::{AdvertBook, AdvertOutcome};
-use crate::auth::{AuthPolicy, DEFAULT_FRESHNESS_WINDOW_SECS, verify_request};
+use crate::auth::{AuthPolicy, DEFAULT_FRESHNESS_WINDOW_SECS, verify_request_using};
 use crate::{Msg, NodeKey};
+
+const AUTH_KEY_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(64).unwrap();
+type AuthKeyCache = Option<LruCache<NodeKey, ed25519::PublicKey>>;
+
+/// Small LRU for parsed ed25519 caller keys. Parsing a valid key is roughly a
+/// tenth of request verification cost. It allocates lazily, so the fully-open
+/// legacy coordinator pays nothing, and the library-enforced capacity keeps
+/// attacker-selected callers from growing memory without bound.
+fn resolve_auth_key(cache: &mut AuthKeyCache, key: NodeKey) -> Option<ed25519::PublicKey> {
+    if let Some(cached) = cache.as_mut().and_then(|entries| entries.get(&key)) {
+        return Some(cached.clone());
+    }
+
+    let parsed = ed25519::PublicKey::decode(key.0.as_slice()).ok()?;
+    cache
+        .get_or_insert_with(|| LruCache::new(AUTH_KEY_CACHE_SIZE))
+        .put(key, parsed.clone());
+    Some(parsed)
+}
+
+pub type CoordinatorReply = (SocketAddr, Msg);
+
+/// Allocation-free output from the coordinator's bounded request handler.
+/// One request can produce at most three datagrams: the lookup response and a
+/// `PunchSync` for each peer. The compatibility handlers still return `Vec`s;
+/// the live UDP loop consumes this fixed-capacity form directly.
+pub type CoordinatorReplies = ArrayVec<CoordinatorReply, 3>;
+
+/// An authenticated request ready for the ordered rendezvous state machine.
+/// Authentication workers produce this value; it contains public identity and
+/// protocol data only.
+pub(crate) struct VerifiedRequest {
+    caller: NodeKey,
+    inner: Msg,
+}
+
+/// Stateful verifier owned by either the inline coordinator or one fixed auth
+/// worker. Its only state is policy plus a bounded cache of parsed PUBLIC keys.
+pub(crate) struct AuthVerifier {
+    policy: Arc<AuthPolicy>,
+    auth_keys: AuthKeyCache,
+    window: u64,
+}
+
+impl AuthVerifier {
+    fn new(policy: AuthPolicy) -> Self {
+        Self::with_shared_policy(Arc::new(policy))
+    }
+
+    pub(crate) fn with_shared_policy(policy: Arc<AuthPolicy>) -> Self {
+        Self {
+            policy,
+            auth_keys: None,
+            window: DEFAULT_FRESHNESS_WINDOW_SECS,
+        }
+    }
+
+    pub(crate) fn verify(&mut self, req: AuthRequest, now: u64) -> Option<VerifiedRequest> {
+        let inner_subject = req.inner.subject_key()?;
+        // Self-ops may mutate only the authenticated caller's own advert;
+        // Lookup intentionally names a different peer.
+        let is_self_op = !matches!(req.inner, Msg::Lookup { .. });
+        if is_self_op && inner_subject != req.caller {
+            return None;
+        }
+
+        let inner_bytes = req.inner.encode_inline();
+        // Authenticate the caller, never the peer named by Lookup.
+        verify_request_using(
+            &self.policy,
+            now,
+            self.window,
+            req.caller,
+            &inner_bytes,
+            &req.auth,
+            |caller| resolve_auth_key(&mut self.auth_keys, caller),
+        )
+        .ok()?;
+        Some(VerifiedRequest {
+            caller: req.caller,
+            inner: req.inner,
+        })
+    }
+
+    fn allows_legacy(&self) -> bool {
+        matches!(
+            self.policy.as_ref(),
+            AuthPolicy::Open { require_pop: false }
+        )
+    }
+}
 
 /// The untrusted entry helper. Maps a node key to the reflexive address the
 /// coordinator observed for it, and brokers a simultaneous-open. Holds no key
@@ -11,8 +109,7 @@ use crate::{Msg, NodeKey};
 /// rendezvous only, no relay.
 pub struct Coordinator {
     adverts: AdvertBook,
-    policy: AuthPolicy,
-    window: u64,
+    auth: AuthVerifier,
     rejects: u64,
 }
 
@@ -20,8 +117,7 @@ impl Default for Coordinator {
     fn default() -> Self {
         Self {
             adverts: AdvertBook::default(),
-            policy: AuthPolicy::default(), // fully-open
-            window: DEFAULT_FRESHNESS_WINDOW_SECS,
+            auth: AuthVerifier::new(AuthPolicy::default()), // fully-open
             rejects: 0,
         }
     }
@@ -34,9 +130,14 @@ impl Coordinator {
 
     /// Construct with an explicit authorization policy.
     pub fn with_policy(policy: AuthPolicy) -> Self {
+        Self::with_shared_policy(Arc::new(policy))
+    }
+
+    pub(crate) fn with_shared_policy(policy: Arc<AuthPolicy>) -> Self {
         Self {
-            policy,
-            ..Self::default()
+            adverts: AdvertBook::default(),
+            auth: AuthVerifier::with_shared_policy(policy),
+            rejects: 0,
         }
     }
 
@@ -63,34 +164,23 @@ impl Coordinator {
         req: AuthRequest,
         now: u64,
     ) -> Vec<(SocketAddr, Msg)> {
-        // Only request shapes are wrappable; a non-request inner is malformed.
-        let Some(inner_subject) = req.inner.subject_key() else {
-            self.rejects += 1;
-            return Vec::new();
-        };
-        // Anti-poisoning: for the SELF-ops (BindRequest/Register/Readvertise) the
-        // inner key IS the acting node, so it must equal the authenticated
-        // caller — otherwise an admitted member could register or re-advertise
-        // ANOTHER node's key. A `Lookup` has no such constraint: a member looks
-        // up a DIFFERENT peer, so its inner key is expected to differ.
-        let is_self_op = !matches!(req.inner, Msg::Lookup { .. });
-        if is_self_op && inner_subject != req.caller {
-            self.rejects += 1;
-            return Vec::new();
-        }
-        // Authenticate the CALLER (the PoP-signing identity), not the inner key.
-        match verify_request(
-            &self.policy,
-            now,
-            self.window,
-            req.caller,
-            &req.inner.encode(),
-            &req.auth,
-        ) {
-            Ok(()) => self.handle_with_caller(from, req.inner, Some(req.caller), now),
-            Err(_) => {
+        self.handle_auth_replies(from, req, now)
+            .into_iter()
+            .collect()
+    }
+
+    /// Allocation-free authenticated handler used by the live UDP loop.
+    pub fn handle_auth_replies(
+        &mut self,
+        from: SocketAddr,
+        req: AuthRequest,
+        now: u64,
+    ) -> CoordinatorReplies {
+        match self.auth.verify(req, now) {
+            Some(req) => self.handle_verified_replies(from, req, now),
+            None => {
                 self.rejects += 1;
-                Vec::new()
+                CoordinatorReplies::new()
             }
         }
     }
@@ -104,12 +194,37 @@ impl Coordinator {
         msg: Msg,
         now: u64,
     ) -> Vec<(SocketAddr, Msg)> {
-        if matches!(self.policy, AuthPolicy::Open { require_pop: false }) {
-            self.handle_at(from, msg, now)
+        self.handle_legacy_replies(from, msg, now)
+            .into_iter()
+            .collect()
+    }
+
+    /// Allocation-free legacy handler used by the live UDP loop.
+    pub fn handle_legacy_replies(
+        &mut self,
+        from: SocketAddr,
+        msg: Msg,
+        now: u64,
+    ) -> CoordinatorReplies {
+        if self.auth.allows_legacy() {
+            self.handle_with_caller_replies(from, msg, None, now)
         } else {
             self.rejects += 1;
-            Vec::new()
+            CoordinatorReplies::new()
         }
+    }
+
+    pub(crate) fn handle_verified_replies(
+        &mut self,
+        from: SocketAddr,
+        req: VerifiedRequest,
+        now: u64,
+    ) -> CoordinatorReplies {
+        self.handle_with_caller_replies(from, req.inner, Some(req.caller), now)
+    }
+
+    pub(crate) fn record_reject(&mut self) {
+        self.rejects += 1;
     }
 
     /// Handle one datagram observed from `from` at wall-clock `now` (seconds);
@@ -117,15 +232,20 @@ impl Coordinator {
     /// EXPIRE: a mapping older than the TTL resolves to `None` and never
     /// receives a `PunchSync` fan-out (its NAT pinhole is long dead). The
     /// caller identity is unknown on this path, so a `Lookup`'s PunchSync
-    /// fan-out reverse-maps the source (see [`Self::handle_with_caller`]).
+    /// fan-out reverse-maps the source (through the private
+    /// `handle_with_caller_replies` helper).
     pub fn handle_at(&mut self, from: SocketAddr, msg: Msg, now: u64) -> Vec<(SocketAddr, Msg)> {
-        self.handle_with_caller(from, msg, None, now)
+        self.handle_with_caller_replies(from, msg, None, now)
+            .into_iter()
+            .collect()
     }
 
     /// Time-frozen convenience (`now = 0`) for the deterministic sims/tests,
     /// where no wall time passes between registration and lookup.
     pub fn handle(&mut self, from: SocketAddr, msg: Msg) -> Vec<(SocketAddr, Msg)> {
-        self.handle_with_caller(from, msg, None, 0)
+        self.handle_with_caller_replies(from, msg, None, 0)
+            .into_iter()
+            .collect()
     }
 
     /// The pure handler. `caller`, when `Some`, is the AUTHENTICATED requesting
@@ -133,22 +253,22 @@ impl Coordinator {
     /// side learns the caller's real key even before the caller has registered.
     /// When `None` (legacy path) the caller key is reverse-mapped from the
     /// datagram source, falling back to a zero key.
-    fn handle_with_caller(
+    fn handle_with_caller_replies(
         &mut self,
         from: SocketAddr,
         msg: Msg,
         caller: Option<NodeKey>,
         now: u64,
-    ) -> Vec<(SocketAddr, Msg)> {
+    ) -> CoordinatorReplies {
         match msg {
             Msg::BindRequest { .. } => {
-                vec![(from, Msg::BindResponse { reflexive: from })]
+                CoordinatorReplies::from_iter([(from, Msg::BindResponse { reflexive: from })])
             }
             Msg::Register { key } => {
                 // The registered reflexive address IS the observed source: the
                 // coordinator never trusts a self-reported address.
                 self.adverts.observe(key, from, now);
-                Vec::new()
+                CoordinatorReplies::new()
             }
             Msg::Readvertise { key, nonce } => {
                 // The wire-level rebind path AND the keepalive: a node re-runs
@@ -158,17 +278,17 @@ impl Coordinator {
                 // a replayed/reordered datagram cannot supersede a fresh mapping
                 // — nor extend its life.
                 self.adverts.readvertise(key, from, nonce, now);
-                Vec::new()
+                CoordinatorReplies::new()
             }
             Msg::Lookup { key } => {
                 let target = self.adverts.current(key, now);
-                let mut out = vec![(
+                let response = (
                     from,
                     Msg::LookupResponse {
                         key,
                         reflexive: target,
                     },
-                )];
+                );
                 if let Some(peer_addr) = target {
                     // The caller's key for the peer-directed PunchSync: the
                     // AUTHENTICATED caller when we have one, else reverse-map the
@@ -178,22 +298,26 @@ impl Coordinator {
                     let caller_key = caller
                         .or_else(|| self.adverts.key_for_src(from, now))
                         .unwrap_or(NodeKey([0u8; 32]));
-                    out.push((
-                        from,
-                        Msg::PunchSync {
-                            peer: key,
-                            peer_reflexive: peer_addr,
-                        },
-                    ));
-                    out.push((
-                        peer_addr,
-                        Msg::PunchSync {
-                            peer: caller_key,
-                            peer_reflexive: from,
-                        },
-                    ));
+                    CoordinatorReplies::from([
+                        response,
+                        (
+                            from,
+                            Msg::PunchSync {
+                                peer: key,
+                                peer_reflexive: peer_addr,
+                            },
+                        ),
+                        (
+                            peer_addr,
+                            Msg::PunchSync {
+                                peer: caller_key,
+                                peer_reflexive: from,
+                            },
+                        ),
+                    ])
+                } else {
+                    CoordinatorReplies::from_iter([response])
                 }
-                out
             }
             // The coordinator never routes these through `handle`:
             // BindResponse/LookupResponse/PunchSync/Punch are node-directed.
@@ -201,7 +325,7 @@ impl Coordinator {
             Msg::BindResponse { .. }
             | Msg::LookupResponse { .. }
             | Msg::PunchSync { .. }
-            | Msg::Punch { .. } => Vec::new(),
+            | Msg::Punch { .. } => CoordinatorReplies::new(),
         }
     }
 
@@ -508,6 +632,48 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn parsed_key_cache_is_lazy_and_never_skips_signature_verification() {
+        use crate::AuthRequest;
+        use crate::auth::{AuthPolicy, sign_authenticator};
+        use commonware_cryptography::{Signer as _, ed25519};
+
+        let node = ed25519::PrivateKey::from_seed(250);
+        let attacker = ed25519::PrivateKey::from_seed(251);
+        let mut key = [0; 32];
+        key.copy_from_slice(node.public_key().as_ref());
+        let caller = NodeKey(key);
+        let source = addr(1, 1111);
+        let now = 1_000_000;
+        let inner = Msg::BindRequest { from: caller };
+        let mut coordinator = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
+
+        assert!(coordinator.auth.auth_keys.is_none(), "cache starts lazy");
+        let good = AuthRequest {
+            caller,
+            inner: inner.clone(),
+            auth: sign_authenticator(&node, &inner.encode(), now, None),
+        };
+        assert_eq!(coordinator.handle_auth_replies(source, good, now).len(), 1);
+        assert!(coordinator.auth.auth_keys.is_some(), "valid key was cached");
+
+        // This hits the cached parsed public key but carries a signature from a
+        // different private key. The cache saves only key parsing; it must not
+        // cache or bypass the per-request proof-of-possession decision.
+        let forged = AuthRequest {
+            caller,
+            inner: inner.clone(),
+            auth: sign_authenticator(&attacker, &inner.encode(), now, None),
+        };
+        let before = coordinator.rejects();
+        assert!(
+            coordinator
+                .handle_auth_replies(source, forged, now)
+                .is_empty()
+        );
+        assert_eq!(coordinator.rejects(), before + 1);
     }
 
     #[test]

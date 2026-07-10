@@ -24,4 +24,4 @@ commonware-codec = { workspace = true }
 
 [dev-dependencies]
 host = { workspace = true }
-futures = "0.3"
+futures = { workspace = true }

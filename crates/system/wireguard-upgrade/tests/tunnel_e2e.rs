@@ -112,7 +112,10 @@ struct Handshake {
 
 /// the full signed a->b conversation: request (initiator), response
 /// (responder, optionally with relay fallback), ack (initiator).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixture keeps both peers, keys, and validation context explicit"
+)]
 fn handshake(
     initiator: &PrivateKey,
     responder: &PrivateKey,

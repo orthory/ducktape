@@ -4,9 +4,12 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-commonware-cryptography.workspace = true
-commonware-codec.workspace = true
-thiserror.workspace = true
+arrayvec = { workspace = true }
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
+lru = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "time"] }
 
 [dev-dependencies]
@@ -14,3 +17,7 @@ tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros", "
 
 [features]
 simnat = []
+
+[[bench]]
+name = "coordinator_hot_path"
+harness = false

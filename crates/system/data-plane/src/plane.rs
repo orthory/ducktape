@@ -608,7 +608,3 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PacedStream<S> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
-
-// `Future` is used via `std::task::ready!` polling `Sleep`.
-#[allow(unused_imports)]
-use std::future::Future as _;

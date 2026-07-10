@@ -8,13 +8,13 @@ sdk = { workspace = true }
 serde = { workspace = true }
 # kernel state-sync platform surface: the shared qmdb serve/wire helpers.
 statesync = { workspace = true }
-async-trait = "0.1"
-serde_json = "1"
+async-trait = { workspace = true }
+serde_json = { workspace = true }
 commonware-storage = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
-commonware-parallel = "2026.5.0"
-commonware-codec = "2026.5.0"
+commonware-parallel = { workspace = true }
+commonware-codec = { workspace = true }
 commonware-utils = { workspace = true }
 
 [dev-dependencies]

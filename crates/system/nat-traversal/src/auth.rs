@@ -7,6 +7,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonware_cryptography::{Signer as _, Verifier as _, ed25519};
+use smallvec::SmallVec;
 
 use crate::NodeKey;
 
@@ -79,18 +80,20 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn cap_msg(subject: NodeKey, not_after: u64) -> Vec<u8> {
-    let mut m = Vec::with_capacity(40);
-    m.extend_from_slice(&subject.0);
-    m.extend_from_slice(&not_after.to_be_bytes());
+fn cap_msg(subject: NodeKey, not_after: u64) -> [u8; 40] {
+    let mut m = [0; 40];
+    m[..32].copy_from_slice(&subject.0);
+    m[32..].copy_from_slice(&not_after.to_be_bytes());
     m
 }
 
-fn pop_msg(inner_bytes: &[u8], timestamp: u64) -> Vec<u8> {
-    let mut m = Vec::with_capacity(inner_bytes.len() + 8);
-    m.extend_from_slice(inner_bytes);
-    m.extend_from_slice(&timestamp.to_be_bytes());
-    m
+fn pop_msg(inner_bytes: &[u8], timestamp: u64) -> SmallVec<[u8; 64]> {
+    // Every real wire message fits inline (Msg::MAX_ENCODED_LEN + timestamp
+    // is 61 bytes); SmallVec transparently spills for oversized API callers.
+    let mut message = SmallVec::with_capacity(inner_bytes.len() + 8);
+    message.extend_from_slice(inner_bytes);
+    message.extend_from_slice(&timestamp.to_be_bytes());
+    message
 }
 
 fn subject_pubkey(subject: NodeKey) -> Option<ed25519::PublicKey> {
@@ -153,6 +156,29 @@ pub fn verify_request(
     inner_bytes: &[u8],
     auth: &Authenticator,
 ) -> Result<(), AuthError> {
+    verify_request_using(
+        policy,
+        now,
+        window,
+        subject,
+        inner_bytes,
+        auth,
+        subject_pubkey,
+    )
+}
+
+/// Shared verifier with a caller-supplied public-key resolver. The coordinator
+/// uses a tiny bounded cache here; standalone callers retain the exact public
+/// API above and decode directly.
+pub(crate) fn verify_request_using(
+    policy: &AuthPolicy,
+    now: u64,
+    window: u64,
+    subject: NodeKey,
+    inner_bytes: &[u8],
+    auth: &Authenticator,
+    resolve_subject: impl FnOnce(NodeKey) -> Option<ed25519::PublicKey>,
+) -> Result<(), AuthError> {
     // Legacy fully-open: no checks at all.
     if let AuthPolicy::Open { require_pop: false } = policy {
         return Ok(());
@@ -164,7 +190,7 @@ pub fn verify_request(
     }
 
     // 2. Proof-of-possession.
-    let subj_pk = subject_pubkey(subject).ok_or(AuthError::BadSubjectKey)?;
+    let subj_pk = resolve_subject(subject).ok_or(AuthError::BadSubjectKey)?;
     if !subj_pk.verify(
         COORD_REQ_NS,
         &pop_msg(inner_bytes, auth.timestamp),

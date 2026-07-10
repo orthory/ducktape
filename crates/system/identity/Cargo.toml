@@ -30,9 +30,9 @@ async-trait = { workspace = true }
 # already compiled into the tree transitively via commonware-cryptography; this
 # only promotes them to direct deps. deterministic (pure-Rust verify on every
 # arch), so consensus-safe.
-p256 = "0.13"
+p256 = { workspace = true }
 # base64url-decoding the WebAuthn challenge out of clientDataJSON.
-base64 = "0.22"
+base64 = { workspace = true }
 
 [dev-dependencies]
-futures = "0.3"
+futures = { workspace = true }

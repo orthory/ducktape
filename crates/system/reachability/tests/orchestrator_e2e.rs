@@ -111,13 +111,19 @@ fn spawn_mesh_filtered(
     resolvers: Vec<StaticResolver>,
     filter: DeliveryFilter,
 ) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
-    spawn_mesh_transported(local, dir, seeds, resolvers, filter, vec![], None)
+    spawn_mesh_transported(local, dir, seeds, resolvers, filter, vec![], None, &[], &[])
 }
 
 /// The full-parameter core: `transport_pks[i]`, when set, is the identity
 /// node i's deliveries arrive UNDER (and are routed back to) — the parked
 /// standby's lobby shape, where the transport key and the record identity
 /// differ. `gossip_ingress` lands in every node's `ReachabilityConfig`.
+/// `endpointless[i]` drops node i's `wireguard_advertised` to `None`
+/// (change 2 / issue #331's endpoint-less shape); `coordinators_configured[i]`
+/// gives node i a non-empty `ReachabilityConfig.coordinators` (the gate the
+/// rendezvous fallback checks) — independent knobs so a test can cover
+/// "endpoint-less WITHOUT a coordinator" too.
+#[allow(clippy::too_many_arguments)]
 fn spawn_mesh_transported(
     local: &LocalSet,
     dir: &std::path::Path,
@@ -126,6 +132,8 @@ fn spawn_mesh_transported(
     filter: DeliveryFilter,
     transport_pks: Vec<Option<commonware_cryptography::ed25519::PublicKey>>,
     gossip_ingress: Option<commonware_cryptography::ed25519::PublicKey>,
+    endpointless: &[usize],
+    coordinators_configured: &[usize],
 ) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
     let policy = PortPolicy::production();
     let signers: Vec<PrivateKey> = seeds.iter().map(|s| PrivateKey::from_seed(*s)).collect();
@@ -161,9 +169,17 @@ fn spawn_mesh_transported(
             signer: signer.clone(),
             wireguard_key_file: dir.join(format!("wg-{i}.key")),
             wireguard_port: 51820,
-            wireguard_advertised: Some(endpoint(&policy, octet, 51820, Transport::Udp)),
+            wireguard_advertised: if endpointless.contains(&i) {
+                None
+            } else {
+                Some(endpoint(&policy, octet, 51820, Transport::Udp))
+            },
             control_endpoint: endpoint(&policy, octet, 443, Transport::Tcp),
-            coordinators: vec![],
+            coordinators: if coordinators_configured.contains(&i) {
+                vec!["203.0.113.53:3478".parse().unwrap()]
+            } else {
+                vec![]
+            },
             port_policy: policy.clone(),
             // every node persists into the shared test dir — respawning
             // from the same dir IS the cold-restart scenario.
@@ -1591,6 +1607,8 @@ async fn standby_gossip_rides_the_lobby_ingress_identity() {
                 deliver_all,
                 vec![None, None, Some(lobby.clone())],
                 Some(lobby),
+                &[],
+                &[],
             );
             retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
             spawn_nudgers(&local, &nodes);
@@ -1858,6 +1876,124 @@ async fn bootstrap_coordinated_invite_resolves_installs_and_acks() {
                 .send(ReachabilityCommand::Shutdown)
                 .await
                 .expect("shutdown accepted");
+        })
+        .await;
+}
+
+// ============================================================================
+// change 2 / issue #331: coordinated rendezvous fallback for endpoint-less
+// admitted members. Two members who each advertise NO WireGuard endpoint (the
+// product default for every invite-joined node — `wireguard_advertised:
+// None`) can never initiate a handshake on their own; WITH a coordinator
+// configured, `resolve_peer` now falls back to by-identity rendezvous
+// (`resolve_rendezvous_endpoint`, the same machinery `BootstrapCoordinated-
+// InvitePeer` already uses) instead of installing the peer endpoint-less and
+// waiting forever.
+// ============================================================================
+
+/// RED-first proof of the fallback: two endpoint-less members, each with a
+/// coordinator configured, whose `StaticResolver`s are rigged to punch each
+/// other. Before change 2, `resolve_peer` returned immediately for an
+/// endpoint-less record (ORCH:2251-2256, pre-change) and the resolver was
+/// NEVER consulted — both sides would apply with `peer.endpoint == None`.
+/// After change 2, the fallback resolves and installs the punched addr.
+#[tokio::test]
+async fn endpoint_less_members_resolve_via_coordinator_rendezvous_fallback() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let identity_of_seed =
+                |seed: u64| binding::identity_of(&PrivateKey::from_seed(seed).public_key());
+            let punched_by_0: SocketAddr = "198.51.100.10:41001".parse().unwrap();
+            let punched_by_1: SocketAddr = "198.51.100.20:41002".parse().unwrap();
+
+            let mut r0 = StaticResolver::default();
+            r0.0.insert(
+                binding::node_key(identity_of_seed(2)),
+                Resolution::Punched(punched_by_0),
+            );
+            let mut r1 = StaticResolver::default();
+            r1.0.insert(
+                binding::node_key(identity_of_seed(1)),
+                Resolution::Punched(punched_by_1),
+            );
+
+            let (nodes, mut collected) = spawn_mesh_transported(
+                &local,
+                dir.path(),
+                &[1, 2],
+                vec![r0, r1],
+                Rc::new(|_, _, _| 1),
+                vec![],
+                None,
+                // both nodes endpoint-less...
+                &[0, 1],
+                // ...and both have a coordinator configured.
+                &[0, 1],
+            );
+
+            retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            // await_applied panics on any PeerFailed — a healthy fallback
+            // resolve never emits one.
+            await_applied(&mut collected, &[0, 1], 1).await;
+
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                let config = fake.applied.last().expect("node applied");
+                let peer = config.peers.first().expect("the one peer entry");
+                let expected = if i == 0 { punched_by_0 } else { punched_by_1 };
+                assert_eq!(
+                    peer.endpoint,
+                    Some(expected),
+                    "node {i}: the fallback-resolved punched endpoint must be installed, not None"
+                );
+            }
+        })
+        .await;
+}
+
+/// Regression / "no resolver -> today's behavior": two endpoint-less members
+/// with NO coordinator configured. The fallback must never even touch the
+/// resolver (both `StaticResolver`s are empty maps — any query would default
+/// to `Resolution::Advertised`, which `resolve_rendezvous_endpoint` turns
+/// into an `Err`, which would emit a `PeerFailed` and fail this test via
+/// `await_applied`'s panic). Both peers stay installed endpoint-less, exactly
+/// like before change 2 — the peer's own initiation is still what completes
+/// the tunnel.
+#[tokio::test]
+async fn endpoint_less_members_without_a_coordinator_stay_endpoint_less() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh_transported(
+                &local,
+                dir.path(),
+                &[1, 2],
+                vec![StaticResolver::default(), StaticResolver::default()],
+                Rc::new(|_, _, _| 1),
+                vec![],
+                None,
+                &[0, 1], // endpoint-less...
+                &[],     // ...but no coordinator configured for either.
+            );
+
+            retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            await_applied(&mut collected, &[0, 1], 1).await;
+
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                let config = fake.applied.last().expect("node applied");
+                let peer = config.peers.first().expect("the one peer entry");
+                assert_eq!(
+                    peer.endpoint, None,
+                    "node {i}: no coordinator configured — must stay endpoint-less exactly like \
+                     before change 2"
+                );
+            }
         })
         .await;
 }

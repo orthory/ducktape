@@ -22,8 +22,8 @@ use std::sync::Arc;
 use capability_host::RunContext;
 use serde::Serialize;
 
-/// the pinned portable plan [`crate::envelope::prepare`] surfaces out of a v3
-/// envelope. `Some` only for a v3 run; the pool turns it into a
+/// the pinned portable plan carried by [`crate::Prepared`] for a v3 envelope.
+/// `Some` only for a v3 run; the pool turns it into a
 /// [`WorkspaceSpec`] iff a provisioner is wired, else it is inert (dormant).
 ///
 /// carries NO `mount_path`: the phase-5 composer emits SOURCE coordinates only

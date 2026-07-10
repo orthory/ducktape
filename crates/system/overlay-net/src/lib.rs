@@ -12,7 +12,7 @@
 //!
 //! two backends live behind the boundary ([`OverlayBackend`]):
 //!
-//! - the TUN pass-through ([`tun`]): the kernel routes overlay ULAs through
+//! - the TUN pass-through (`tun`): the kernel routes overlay ULAs through
 //!   the WireGuard interface, so the backend's answer IS the OS socket and
 //!   behavior is bit-identical to routing nothing at all.
 //! - the userspace backend (ADR phases 1–2, [`userspace`]): overlay
