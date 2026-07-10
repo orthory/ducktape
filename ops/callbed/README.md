@@ -9,10 +9,12 @@ surface and proved call media flows between them.
 ## Why this exists
 
 The huddle call path is: app webview → `/v1/call/ws` → node call hub
-(`bin/node/src/voice.rs`) → data-plane datagrams over the authenticated TCP mesh
-(`CHANNEL_VOICE`/`CHANNEL_VIDEO`) → remote hub → playout. The node's own tests
-wire two hubs through *in-process channels* — they never exercise the **real
-mesh**. This bed does, on two separate `ducktape-node` processes/containers.
+(`bin/node/src/voice.rs`) → data-plane datagrams over the WireGuard overlay
+(`Service::Voice`/`Service::Video`, one per-use plane each — see
+`docs/adr/2026-07-07-per-use-data-plane.mdx`) → remote hub → playout. The
+node's own tests wire two hubs through *in-process channels* — they never
+exercise the **real mesh**. This bed does, on two separate
+`ducktape-node` processes/containers.
 
 **A single node cannot host a real call**: the hub fans media out by *node key*
 and excludes self, so two webviews on one node produce an empty recipient set.
@@ -27,7 +29,7 @@ host). The `driver` exits `0` only when all of these cross the real mesh:
 - **audio**, both directions — a synthesized tone plays out at **RMS ≈ 5490**
   vs **0** for silence;
 - **video**, both directions — a synthetic multi-fragment frame fragments across
-  `Service::Video`/`CHANNEL_VIDEO` and reassembles **byte-exact** on the far node;
+  `Service::Video` and reassembles **byte-exact** on the far node;
 - **control** — `peerBeacon` presence frames cross both ways.
 
 The nodes reach a live 2-of-2 quorum (`height ≥ 1`) before the driver runs, so

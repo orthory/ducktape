@@ -124,3 +124,13 @@ Wiring: `bin/node/src/voice_plane.rs` (the media `AddressBook` + per-service
 plane bring-up) and `bin/node/src/voice.rs` (the hub over the two planes). The
 isolation invariant is guarded by the test
 `voice::tests::per_service_isolation_keeps_a_video_flood_from_starving_audio`.
+
+## Update (2026-07-10): mesh channels 7/8 removed outright
+
+2026-07-10: mesh channels 7/8 removed outright (flag day); wire compat with
+pre-overlay-media binaries dropped by decision. `CHANNEL_VOICE` /
+`CHANNEL_VIDEO` no longer exist anywhere in the tree — the wire-compatibility
+black-hole this ADR's 2026-07-09 update described was a deliberate bridge, not
+a permanent fixture, and its bridge period is now over. See
+[`docs/adr/2026-07-10-wire-standardization.mdx`](./2026-07-10-wire-standardization.mdx)
+for the decision record and the unified wire-architecture that motivated it.
