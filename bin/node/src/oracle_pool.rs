@@ -34,8 +34,8 @@ const ORACLE_RESULT_LANE: usize = 64;
 /// `blob_fetch` is the mesh fetch-on-miss lane (the #298 cross-node gap): a
 /// pin whose bytes were staged on ANOTHER node's store resolves by asking
 /// current peers, verifying by content hash, and writing the copy through
-/// this node's own store. `None` (a resident, an embedder without a mesh)
-/// keeps strict local-only resolution.
+/// this node's own store. Validators and residents both wire it; `None`
+/// (an embedder without a mesh) keeps strict local-only resolution.
 pub(crate) fn build<C>(
     context: &C,
     providers: capability_host::ProviderSet,
