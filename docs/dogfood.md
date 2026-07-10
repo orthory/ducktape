@@ -182,6 +182,7 @@ breadcrumbs before suspecting the model.
   wall-clock week.
 
 ## Known limits (set expectations honestly)
+- **No page read-authorization:** `[[page:<id>]]` injection renders any referenced page's subtree into the run context with no read-cap gate — pages read caps are out of scope for M2 (pages are workspace-visible to members). A member can surface any page they can already see.
 
 - **Concurrent branch advance is absorbed, not lost**: on a push reject the
   provisioner fetch+rebases+re-pushes (bounded 3, `rebased: true` in the
