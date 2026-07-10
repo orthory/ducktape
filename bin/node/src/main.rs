@@ -83,6 +83,7 @@ mod replica;
 mod resident_announce;
 mod resident_dispatch;
 mod resource_limits;
+mod rpc;
 mod statesync_plane;
 mod sync;
 mod userkey;
@@ -104,6 +105,7 @@ use host_reads::{
 use host_state::{
     NetworkBindings, SyncSubstrates, genesis_host, restore_host, run_output_sink, sync_all_modules,
 };
+use rpc::{spawn_rpc_listener, JoinRequestRecord, JoinRequestView, RpcJob, RpcReply, RpcRequest, RpcStatus};
 use sync::catchup::{
     advance_next_seq_from_frames, apply_post_reboot_catchup_frames, apply_verified_suffix_frame,
     catch_up_post_reboot_frames, derive_pending_boot, write_post_reboot_catchup_checkpoint,
@@ -407,137 +409,6 @@ fn reboot_self() -> ! {
         println!("promoted — restart this node to run as a validator");
         std::process::exit(0);
     }
-}
-
-// ============================================================================
-// the local rpc: json-lines over tcp, bridged from blocking threads.
-// ============================================================================
-
-/// one rpc request, parsed from a json line.
-#[derive(serde::Deserialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
-enum RpcRequest {
-    /// submit an op into the ordered lane (accepted != finalized — poll status).
-    Submit { target: String, payload_hex: String },
-    /// read-only query against a module's committed+staged projection.
-    Query { target: String, req_hex: String },
-    /// node status: latest applied boundary + every module root.
-    Status,
-    /// the verified join requests parked joiners announced to THIS member —
-    /// the queue the approve button (or `invite-accept`) settles.
-    JoinRequests,
-    /// graceful stop: replies ok, then exits 0 after the current pump turn.
-    Shutdown,
-}
-
-/// one verified, unapproved join announce (node-local, in-memory; the parked
-/// joiner re-announces every few seconds, so nothing here is durable state).
-struct JoinRequestRecord {
-    issuer: Vec<u8>,
-    first_seen_ms: u64,
-    last_seen_ms: u64,
-}
-
-/// the rpc/console projection of one [`JoinRequestRecord`].
-#[derive(serde::Serialize)]
-struct JoinRequestView {
-    /// the key asking to join, hex.
-    joiner: String,
-    /// the member whose invite token authorized the announce, hex.
-    issuer: String,
-    first_seen_ms: u64,
-    last_seen_ms: u64,
-}
-
-#[derive(serde::Serialize)]
-struct RpcReply {
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_hex: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<RpcStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    join_requests: Option<Vec<JoinRequestView>>,
-}
-
-#[derive(serde::Serialize)]
-struct RpcStatus {
-    height: Option<u64>,
-    app_hash: String,
-    modules: std::collections::BTreeMap<String, String>,
-}
-
-impl RpcReply {
-    fn ok() -> Self {
-        Self {
-            ok: true,
-            error: None,
-            reply_hex: None,
-            status: None,
-            join_requests: None,
-        }
-    }
-    fn err(msg: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            error: Some(msg.into()),
-            reply_hex: None,
-            status: None,
-            join_requests: None,
-        }
-    }
-}
-
-/// a parsed request plus the blocking thread's reply slot.
-type RpcJob = (RpcRequest, std::sync::mpsc::Sender<RpcReply>);
-
-/// serve json-lines rpc on `listener`, one OS thread per connection (local,
-/// low-volume — an operator console, a script). each line becomes an [`RpcJob`]
-/// pushed into the pump's bounded queue; the pump answers between drains, so
-/// every reply reflects a block boundary. this runs on PLAIN OS THREADS: it
-/// must never touch the async runtime, only the mpsc bridge.
-fn spawn_rpc_listener(
-    listener: std::net::TcpListener,
-    bridge: futures::channel::mpsc::Sender<RpcJob>,
-) {
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(conn) = conn else { continue };
-            let mut bridge = bridge.clone();
-            std::thread::spawn(move || {
-                use std::io::{BufRead as _, BufReader, Write as _};
-                let reader = BufReader::new(conn.try_clone().expect("clone rpc conn"));
-                let mut conn = conn;
-                for line in reader.lines() {
-                    let Ok(line) = line else { break };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let reply = match serde_json::from_str::<RpcRequest>(&line) {
-                        Ok(req) => {
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            if bridge.try_send((req, tx)).is_err() {
-                                RpcReply::err("node busy (rpc queue full)")
-                            } else {
-                                // the pump answers within a tick; a stuck node
-                                // must not park the operator's console forever.
-                                rx.recv_timeout(std::time::Duration::from_secs(10))
-                                    .unwrap_or_else(|_| RpcReply::err("node unresponsive"))
-                            }
-                        }
-                        Err(e) => RpcReply::err(format!("bad request: {e}")),
-                    };
-                    let mut out = serde_json::to_string(&reply).expect("reply serializes");
-                    out.push('\n');
-                    if conn.write_all(out.as_bytes()).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-    });
 }
 
 fn main() {
