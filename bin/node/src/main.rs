@@ -60,7 +60,7 @@ use commonware_utils::{NZU32, ordered::Set};
 use futures::{FutureExt as _, StreamExt as _};
 use tracing_subscriber::prelude::*;
 
-use consensus::{ConsensusScheme, ContentStore, Digest, SimplexOrderer, digest_of};
+use consensus::{ConsensusScheme, ContentStore, SimplexOrderer};
 
 mod blob_fetch;
 mod cli;
@@ -83,12 +83,14 @@ mod resource_limits;
 mod statesync_plane;
 mod userkey;
 mod userkey_cli;
+mod util;
 mod voice;
 mod voice_plane;
 use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
 use host_state::{
     NetworkBindings, SyncSubstrates, genesis_host, restore_host, run_output_sink, sync_all_modules,
 };
+use util::{diag_log, epoch_floor, hex, participant_bytes, resident_bytes, unix_ms};
 
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
@@ -271,43 +273,6 @@ const SUBMIT_HOLD: Duration = Duration::from_secs(10);
 fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
     let base = 9 + epoch * 5;
     (base, base + 1, base + 2, base + 3, base + 4)
-}
-
-/// the per-epoch genesis floor: domain-separated by namespace AND epoch, so a
-/// respawned engine can never confuse an old epoch's certificates with its own
-/// (an old-epoch floor fails `Floor::assert` against the new epoch).
-fn epoch_floor(namespace: &[u8], epoch: u64) -> Digest {
-    digest_of(
-        &[
-            b"ducktape:consensus:genesis:v1:".as_ref(),
-            namespace,
-            b":epoch:",
-            &epoch.to_le_bytes(),
-        ]
-        .concat(),
-    )
-}
-
-/// the orchestrator's current epoch participant set as raw key bytes — what
-/// checkpoints, cutover records, and the statesync manifest carry.
-fn participant_bytes(
-    orchestrator: &consensus::ValsetOrchestrator<ed25519::PublicKey>,
-) -> Vec<Vec<u8>> {
-    orchestrator
-        .current_members()
-        .iter()
-        .map(|k| k.as_ref().to_vec())
-        .collect()
-}
-
-fn resident_bytes(
-    orchestrator: &consensus::ValsetOrchestrator<ed25519::PublicKey>,
-) -> Vec<Vec<u8>> {
-    orchestrator
-        .current_residents()
-        .iter()
-        .map(|k| k.as_ref().to_vec())
-        .collect()
 }
 
 /// read the valset module's current membership projection (committed state —
@@ -679,11 +644,6 @@ async fn saga_next_expiry(host: &Host) -> Option<u64> {
     }
 }
 
-/// hex-encode a state root for a stable, greppable log line.
-fn hex(root: &StateRoot) -> String {
-    hex_bytes(&root.0)
-}
-
 fn assert_floor_binds_view(
     view_base: u64,
     boundary_height: u64,
@@ -772,27 +732,6 @@ fn choose_promotion_boundary<'a>(
         };
     }
     PromotionBoundary::Retry
-}
-
-fn diag_log(line: impl AsRef<str>) {
-    let Ok(path) = std::env::var("DUCKTAPE_DIAG_LOG") else {
-        return;
-    };
-    let line = line.as_ref();
-    println!("{line}");
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            if let Err(e) = writeln!(file, "{line}") {
-                eprintln!("DUCKTAPE_DIAG_LOG append failed for {path}: {e}");
-            }
-        }
-        Err(e) => eprintln!("DUCKTAPE_DIAG_LOG open failed for {path}: {e}"),
-    }
 }
 
 fn reopen_preflight_synced_host(host: &Host, expected: StateRoot) -> Result<(), String> {
@@ -2173,13 +2112,6 @@ struct JoinRequestView {
     issuer: String,
     first_seen_ms: u64,
     last_seen_ms: u64,
-}
-
-fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[derive(serde::Serialize)]
