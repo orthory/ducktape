@@ -59,11 +59,14 @@ pub(crate) fn parse_forge_channel(channel_id: &str) -> Option<ForgeItemRef<'_>> 
 // conformance tests below (the ListRefs sink-probe mirror in lib.rs is the
 // established pattern).
 
-/// the `ForgeQuery::GetItem` mirror the compose lane encodes.
+/// the committed tracker queries mirrored here: `GetItem` (the compose lane's
+/// item lookup, also the sink guard's per-PR read) and `ListItems` (the sink's
+/// duplicate-PR guard sweep).
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ForgeTrackerQuery<'a> {
     GetItem { repo: &'a str, number: u64 },
+    ListItems { repo: &'a str },
 }
 
 /// mirror of `forge::ItemKind`.
@@ -131,6 +134,31 @@ fn decode_item_reply(bytes: &[u8]) -> Result<Option<ForgeItem>, String> {
     let ItemReplyMirror::Item(item) = serde_json::from_slice(bytes)
         .map_err(|e| format!("undecodable forge item reply: {e}"))?;
     Ok(item)
+}
+
+/// the slice of `forge::ItemSummary` the duplicate-PR guard reads from a
+/// `ListItems` reply (unknown fields — title, author, timestamps — are
+/// ignored on decode).
+#[derive(Deserialize, Debug)]
+pub(crate) struct ForgeItemSummary {
+    pub number: u64,
+    pub kind: ForgeItemKind,
+    pub state: ForgeItemState,
+}
+
+/// mirror of `forge::ForgeReply::Items(Vec<ItemSummary>)`.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ItemsReplyMirror {
+    Items(Vec<ForgeItemSummary>),
+}
+
+/// decode a `ListItems` reply into item summaries (ascending by number — the
+/// tracker's listing order).
+fn decode_items_reply(bytes: &[u8]) -> Result<Vec<ForgeItemSummary>, String> {
+    let ItemsReplyMirror::Items(items) = serde_json::from_slice(bytes)
+        .map_err(|e| format!("undecodable forge items reply: {e}"))?;
+    Ok(items)
 }
 
 /// one born branch in a `ListRefs` reply — mirror of `forge::RefHead`.
@@ -270,7 +298,7 @@ impl RunsModule {
     }
 
     /// one committed tracker item, or `None` when it does not exist.
-    async fn forge_item(
+    pub(crate) async fn forge_item(
         &self,
         ctx: &dyn Ctx,
         forge: &str,
@@ -286,6 +314,25 @@ impl RunsModule {
             .await
             .map_err(|e| format!("forge item lookup failed: {e}"))?;
         decode_item_reply(&reply)
+    }
+
+    /// a repo's committed tracker items as summaries, ascending by number
+    /// (a committed-only read — validator-uniform, like the refs listing).
+    pub(crate) async fn forge_item_summaries(
+        &self,
+        ctx: &dyn Ctx,
+        forge: &str,
+        repo: &str,
+    ) -> Result<Vec<ForgeItemSummary>, String> {
+        let reply = ctx
+            .query(
+                forge,
+                &serde_json::to_vec(&ForgeTrackerQuery::ListItems { repo })
+                    .expect("query serializes"),
+            )
+            .await
+            .map_err(|e| format!("forge items lookup failed: {e}"))?;
+        decode_items_reply(&reply)
     }
 
     /// a repo's committed born branches with their tips (`ListRefs` is a
@@ -380,6 +427,42 @@ mod tests {
             forge::decode_query(&bytes).unwrap(),
             forge::ForgeQuery::ListRefs { repo: "app".into() }
         );
+    }
+
+    #[test]
+    fn list_items_query_mirror_matches_forge_decode_query() {
+        let bytes = serde_json::to_vec(&ForgeTrackerQuery::ListItems { repo: "app" }).unwrap();
+        assert_eq!(
+            forge::decode_query(&bytes).unwrap(),
+            forge::ForgeQuery::ListItems { repo: "app".into() }
+        );
+    }
+
+    #[test]
+    fn items_reply_mirror_decodes_the_real_forge_reply() {
+        let summary = |number, kind, state| forge::ItemSummary {
+            number,
+            kind,
+            title: "t".into(),
+            state,
+            author: chat::AuthorRef::User(vec![1; 32]),
+            created_at: 1,
+            updated_at: 2,
+        };
+        let bytes = forge::encode_reply(&forge::ForgeReply::Items(vec![
+            summary(3, forge::ItemKind::Issue, forge::ItemState::Open),
+            summary(4, forge::ItemKind::Pr, forge::ItemState::Merged),
+            summary(5, forge::ItemKind::Pr, forge::ItemState::Closed),
+        ]));
+        let items = decode_items_reply(&bytes).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].number, 3);
+        assert_eq!(items[0].kind, ForgeItemKind::Issue);
+        assert_eq!(items[0].state, ForgeItemState::Open);
+        assert_eq!(items[1].number, 4);
+        assert_eq!(items[1].kind, ForgeItemKind::Pr);
+        assert_eq!(items[1].state, ForgeItemState::Merged);
+        assert_eq!(items[2].state, ForgeItemState::Closed);
     }
 
     fn detail(kind: forge::ItemKind, branches: Option<(&str, &str)>) -> forge::ItemDetail {

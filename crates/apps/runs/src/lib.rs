@@ -121,12 +121,16 @@ mod forge_source;
 // deterministic forge item-context injection (M1): the byte-capped
 // instructions section a forge run's envelope carries.
 mod inject;
+// the delivery sink (O1/O2): the forge PR sink applied at the result intake —
+// gates, duplicate-PR guard, and message-facet title/body derivation.
+mod sink;
+pub(crate) use sink::ForgeSinkQuery;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent,
-    AgentQuery, AgentRecord, AgentReply, AgentResponse, AgentStatus, CapRequest,
+    AgentQuery, AgentRecord, AgentReply, AgentResponse, AgentStatus,
     MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR,
     ReplyBlock,
     decode_event as agent_decode_event, decode_reply as agent_decode_reply,
@@ -285,8 +289,16 @@ struct WorkspaceReceipt {
     /// captured (paired with a `degraded` status by the wrapper). additive:
     /// absent on healthy receipts.
     #[serde(default)]
-    #[allow(dead_code, reason = "audit metadata retained in dispatch history")]
     commit_error: Option<String>,
+    /// forge (§5, additive): the pushed work branch — `Some` on a pushed
+    /// receipt, and the ATTEMPTED branch on a commit-failed one; absent on
+    /// every duckfs receipt.
+    #[serde(default)]
+    branch: Option<String>,
+    /// forge (§5, additive): the new commit oid — the forge output_ref is
+    /// `branch@output_commit`. `Some` only when a push landed.
+    #[serde(default)]
+    output_commit: Option<String>,
 }
 
 /// one host-assembled declarative effect (R2). `kind` is a run-effect wire name
@@ -446,14 +458,21 @@ struct DeliveryReceipt<'a> {
 }
 
 /// the artifact facet distilled to a chainable reference (O1): a downstream run
-/// can set `workspace.source = prior.output_snapshot`.
+/// can set `workspace.source = prior.output_snapshot`; a forge run's output is
+/// the git coordinates `branch@output_commit` instead (the snapshot key stays a
+/// stated `null`, the forge keys skip-serialize on duckfs receipts — pre-forge
+/// bytes are unchanged).
 #[derive(Serialize, Clone)]
 struct OutputRef<'a> {
     source_prefix: &'a str,
-    output_snapshot: &'a str,
+    output_snapshot: Option<&'a str>,
     commit_height: Option<u64>,
     rebased: bool,
     no_changes: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_commit: Option<&'a str>,
 }
 
 fn encode_delivery_receipt(
@@ -462,13 +481,18 @@ fn encode_delivery_receipt(
     receipt: &WorkspaceReceipt,
     status: WireStatus,
 ) -> String {
-    let output_ref = receipt.output_snapshot.as_deref().map(|snap| OutputRef {
-        source_prefix: &receipt.source_prefix,
-        output_snapshot: snap,
-        commit_height: receipt.commit_height,
-        rebased: receipt.rebased,
-        no_changes: receipt.no_changes,
-    });
+    // an output exists when the run produced a duckfs snapshot OR pushed a
+    // forge commit; both distill into the one output_ref shape.
+    let output_ref = (receipt.output_snapshot.is_some() || receipt.output_commit.is_some())
+        .then(|| OutputRef {
+            source_prefix: &receipt.source_prefix,
+            output_snapshot: receipt.output_snapshot.as_deref(),
+            commit_height: receipt.commit_height,
+            rebased: receipt.rebased,
+            no_changes: receipt.no_changes,
+            branch: receipt.branch.as_deref(),
+            output_commit: receipt.output_commit.as_deref(),
+        });
     let status = match status {
         WireStatus::Ok => "ok",
         WireStatus::Degraded => "degraded",
@@ -511,44 +535,6 @@ fn encode_delivery_receipt(
         status: "degraded",
     })
     .expect("delivery receipt serializes")
-}
-
-// ---- forge sink wire (local mirrors) -----------------------------------------
-// runs does NOT take a production dependency on the heavy `forge` crate (it
-// pulls vendored libgit2). instead it mirrors the exact JSON shape forge decodes
-// for the sink op it emits, and a dev-only conformance test pins the mirror
-// against `forge::decode_msg` so the wire can't silently drift.
-
-/// the exact `ForgeMsg::OpenPr` JSON the forge module decodes. only the PR sink
-/// is emitted in v1 (the merge sink is inert), so only `OpenPr` is mirrored.
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ForgeSinkMsg<'a> {
-    OpenPr {
-        repo: &'a str,
-        title: &'a str,
-        body: &'a str,
-        source_branch: &'a str,
-        target_branch: &'a str,
-    },
-}
-
-fn forge_open_pr_bytes(repo: &str, title: &str, body: &str, src: &str, tgt: &str) -> Vec<u8> {
-    serde_json::to_vec(&ForgeSinkMsg::OpenPr {
-        repo,
-        title,
-        body,
-        source_branch: src,
-        target_branch: tgt,
-    })
-    .expect("forge sink msg serializes")
-}
-
-/// the `ForgeQuery::ListRefs` mirror the branch-born probe encodes.
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ForgeSinkQuery<'a> {
-    ListRefs { repo: &'a str },
 }
 
 /// the model's raw answer as a NORMALIZED [`AgentResponse`]: the wire shape
@@ -1950,114 +1936,17 @@ impl RunsModule {
             Ok(r) => r,
             Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
         };
-        // build the faceted finalize payload BEFORE moving `response` into
-        // emit_response; emission order is response → sink → finalize.
+        // build the faceted finalize payload — and render the message facet
+        // the PR sink derives its title/body from — BEFORE moving `response`
+        // into emit_response; emission order is response → sink → finalize.
         let payload =
             encode_delivery_receipt(&response, valid_data(&result.data), &result.workspace_receipt, result.status);
+        let message = sink::message_facet_text(&response.reply_blocks);
         self.emit_response(ctx, run_id, entry, response);
-        self.emit_sink(ctx, run_id, entry, &result.sink).await;
+        self.emit_sink(ctx, run_id, entry, &result.sink, &message, &result.workspace_receipt)
+            .await;
         self.emit_job_finalize_if_current_claimant(ctx, entry, true, payload)
             .await;
-    }
-
-    /// apply the O1/O2 sink. Chain is a breadcrumb/no-op in v1 (durable
-    /// output_ref chaining is future work — the receipt already carries the
-    /// output_ref for a downstream consumer). Pr emits a forge `OpenPr` gated on
-    /// the agent's D3 `ForgePush` cap (Phase 4's `permits`, NOT a KNOWN_ACTIONS
-    /// grant) and a committed-state branch-born probe (the no-fail rule: an
-    /// OpenPr for an unborn branch would abort the block). Merge is inert in v1.
-    /// any missing precondition degrades to a breadcrumb — the sink NEVER aborts
-    /// the delivery block.
-    async fn emit_sink(&self, ctx: &mut dyn Ctx, run_id: &str, entry: &PendingState, sink: &WireSink) {
-        match sink {
-            WireSink::Chain => {}
-            WireSink::Pr {
-                repo,
-                source_branch,
-                target_branch,
-                title,
-                body,
-            } => {
-                // malformed pr sinks degrade to a breadcrumb.
-                if repo.is_empty() || source_branch.is_empty() || target_branch.is_empty() {
-                    return self.note(
-                        ctx,
-                        format!(
-                            "run {run_id} pr sink skipped: incomplete pr sink (repo/source_branch/target_branch required)"
-                        ),
-                    );
-                }
-                let Some(forge) = self.forge.clone() else {
-                    return self.note(ctx, format!("run {run_id} pr sink skipped: no forge module wired"));
-                };
-                let agent = match self.agent_record(&*ctx, &entry.agent_id).await {
-                    Ok(Some(a)) => a,
-                    _ => {
-                        return self
-                            .note(ctx, format!("run {run_id} pr sink skipped: agent not registered"));
-                    }
-                };
-                if !agent.permits(&CapRequest::ForgePush(repo.as_str())) {
-                    return self.note(
-                        ctx,
-                        format!("run {run_id} pr sink skipped: agent lacks forge_push for {repo}"),
-                    );
-                }
-                match self.forge_branch_born(&*ctx, &forge, repo, source_branch).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return self.note(
-                            ctx,
-                            format!("run {run_id} pr sink skipped: source branch not present"),
-                        );
-                    }
-                    Err(why) => {
-                        return self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
-                    }
-                }
-                ctx.emit_msg(Msg {
-                    target: forge,
-                    payload: forge_open_pr_bytes(repo, title, body, source_branch, target_branch),
-                });
-            }
-            WireSink::Merge { repo, number, .. } => {
-                // v1: the merge sink needs a host-computed merge pack (a phase-2
-                // wrapper responsibility). validate the wire, breadcrumb, and
-                // fall through like Chain — never emit a MergePr yet.
-                self.note(
-                    ctx,
-                    format!("run {run_id} merge sink for {repo}#{number} is inert in v1 (treated as chain)"),
-                );
-            }
-        }
-    }
-
-    /// deterministic committed-state probe: is `branch` a born ref of `repo`?
-    /// reads COMMITTED forge state via a query (never node-local pending), so it
-    /// is uniform across validators. decoded via `serde_json::Value` to avoid a
-    /// production dependency on the forge crate.
-    async fn forge_branch_born(
-        &self,
-        ctx: &dyn Ctx,
-        forge: &str,
-        repo: &str,
-        branch: &str,
-    ) -> Result<bool, String> {
-        let reply = ctx
-            .query(
-                forge,
-                &serde_json::to_vec(&ForgeSinkQuery::ListRefs { repo }).expect("query serializes"),
-            )
-            .await
-            .map_err(|e| format!("forge refs lookup failed: {e}"))?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&reply).map_err(|e| format!("undecodable forge reply: {e}"))?;
-        let Some(refs) = value.get("refs").and_then(|r| r.as_array()) else {
-            return Err("unexpected forge reply for a refs listing".into());
-        };
-        Ok(refs
-            .iter()
-            .any(|r| r.get("name").and_then(|n| n.as_str()) == Some(branch)))
     }
 
     /// deterministic response validation — THE safety boundary (design §5).
@@ -2771,8 +2660,12 @@ mod tests {
         /// commit pinning).
         forge_refs: BTreeMap<String, Vec<(String, String)>>,
         /// (repo, number) -> tracker item, served by the "forge" GetItem arm
-        /// (the compose lane's committed item lookup).
+        /// (the compose lane's committed item lookup) and, as summaries, by the
+        /// ListItems arm (the sink's duplicate-PR guard).
         forge_items: BTreeMap<(String, u64), forge::ItemDetail>,
+        /// saga_id -> the winning attempt's lease holder, served by the "saga"
+        /// Get arm as a Done saga (the sink's executing-node attribution).
+        saga_assignees: BTreeMap<String, Vec<u8>>,
         /// the committed duckfs head served by the "files" Refs arm — the v3
         /// composer's `source_snapshot` pin. `None` = a fresh network (null pin).
         files_head: Option<String>,
@@ -2798,6 +2691,7 @@ mod tests {
                 jobs: BTreeMap::new(),
                 forge_refs: BTreeMap::new(),
                 forge_items: BTreeMap::new(),
+                saga_assignees: BTreeMap::new(),
                 files_head: None,
                 msgs: Vec::new(),
                 effects: Vec::new(),
@@ -2828,6 +2722,12 @@ mod tests {
         fn with_forge_item(mut self, repo: &str, item: forge::ItemDetail) -> Self {
             self.forge_items
                 .insert((repo.into(), item.summary.number), item);
+            self
+        }
+        /// register the node key holding `saga_id`'s winning lease, served by
+        /// the "saga" Get arm (the sink's executing-node attribution).
+        fn with_saga_assignee(mut self, saga_id: &str, key: &[u8]) -> Self {
+            self.saga_assignees.insert(saga_id.into(), key.to_vec());
             self
         }
         /// set the committed duckfs head the "files" Refs arm serves (the v3
@@ -3038,6 +2938,44 @@ mod tests {
                         Ok(forge::encode_reply(&forge::ForgeReply::Item(
                             self.forge_items.get(&(repo, number)).cloned().map(Box::new),
                         )))
+                    }
+                    forge::ForgeQuery::ListItems { repo } => {
+                        // ascending by number — the BTreeMap key order, exactly
+                        // like the real tracker's listing.
+                        let items = self
+                            .forge_items
+                            .iter()
+                            .filter(|((r, _), _)| *r == repo)
+                            .map(|(_, d)| d.summary.clone())
+                            .collect();
+                        Ok(forge::encode_reply(&forge::ForgeReply::Items(items)))
+                    }
+                    _ => Err(Error::QueryUnsupported),
+                },
+                "saga" => match saga::decode_query(req).map_err(Error::Module)? {
+                    saga::SagaQuery::Get { saga_id } => {
+                        // a Done saga still carrying its winning attempt's
+                        // lease holder — exactly what the saga module commits.
+                        let view = self.saga_assignees.get(&saga_id).map(|key| saga::SagaView {
+                            origin: SagaOrigin::Module("dispatch".into()),
+                            reply_to: Some("dispatch".into()),
+                            reply_payload: Vec::new(),
+                            spec: Vec::new(),
+                            capability: Some("model-1".into()),
+                            status: saga::SagaStatus::Done,
+                            attempt: 0,
+                            max_attempts: RUN_MAX_ATTEMPTS,
+                            assignee: Some(key.clone()),
+                            pinned_assignee: None,
+                            lease_views: None,
+                            lease_expires_at: None,
+                            deadline: None,
+                            result: Some(Vec::new()),
+                            error: None,
+                            created_at: 0,
+                            updated_at: 0,
+                        });
+                        Ok(saga::encode_reply(&saga::SagaReply::Saga(view)))
                     }
                     _ => Err(Error::QueryUnsupported),
                 },
@@ -3955,6 +3893,8 @@ mod tests {
 
     #[test]
     fn pr_sink_emits_open_pr_only_with_the_forge_push_cap() {
+        // the wire sink echoes title/body — delivery IGNORES them and derives
+        // both from the message facet (asserted exactly below).
         let sink = serde_json::json!({
             "sink": {"mode":"pr","repo":"app","source_branch":"agent/x","target_branch":"main","title":"My PR","body":"details"}
         });
@@ -3976,12 +3916,18 @@ mod tests {
         .unwrap();
         let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
         assert_eq!(forge_ops.len(), 1, "one OpenPr emitted");
+        // title = first line of the message facet; body = the full message +
+        // the receipt breadcrumb block (run id, output_ref, executing node).
+        // the default wrapper receipt is a no-changes duckfs receipt and no
+        // saga record is seeded, so output/node degrade honestly.
         assert_eq!(
             forge::decode_msg(&forge_ops[0].payload).unwrap(),
             forge::ForgeMsg::OpenPr {
                 repo: "app".into(),
-                title: "My PR".into(),
-                body: "details".into(),
+                title: "done".into(),
+                body: format!(
+                    "done\n\n---\nrun: {run_id}\noutput: none (no changes this run)\nnode: unknown"
+                ),
                 source_branch: "agent/x".into(),
                 target_branch: "main".into(),
             }
@@ -4089,6 +4035,313 @@ mod tests {
         );
     }
 
+    /// a registry whose one agent "bot" may chat and push to "app", plus an
+    /// awaiting run — the PR-sink happy-path scaffold.
+    fn forge_push_run() -> (RunsModule, Registry, String) {
+        let mut granted = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        granted.get_mut("bot").unwrap().caps.forge_push = vec!["app".into()];
+        let (m, run_id) = awaiting_run_with_forge(&granted);
+        (m, granted, run_id)
+    }
+
+    /// a faceted wrapper whose receipt is a forge receipt (§5 shape).
+    fn forge_wrapper(
+        response_text: &str,
+        branch: Option<&str>,
+        output_commit: Option<&str>,
+        no_changes: bool,
+        commit_error: Option<&str>,
+    ) -> Vec<u8> {
+        let mut receipt = serde_json::json!({
+            "source_prefix": "forge:app",
+            "source_snapshot": "2b".repeat(20),
+            "output_snapshot": null,
+            "commit_height": null,
+            "rebased": false,
+            "no_changes": no_changes,
+        });
+        let map = receipt.as_object_mut().unwrap();
+        if let Some(b) = branch {
+            map.insert("branch".into(), b.into());
+        }
+        if let Some(oid) = output_commit {
+            map.insert("output_commit".into(), oid.into());
+        }
+        if let Some(e) = commit_error {
+            map.insert("commit_error".into(), e.into());
+        }
+        runner_wrapper(
+            response_text,
+            serde_json::json!({
+                "workspace_receipt": receipt,
+                "sink": {"mode":"pr","repo":"app","source_branch":"agent/x","target_branch":"main","title":"","body":""},
+                "status": if commit_error.is_some() { "degraded" } else { "ok" },
+            }),
+        )
+    }
+
+    fn breadcrumbs(ctx: &CaptureCtx) -> Vec<String> {
+        ctx.events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn pr_sink_derives_title_and_body_from_the_message_facet_and_forge_receipt() {
+        // the full derivation: title = first line of the message facet, body =
+        // the whole facet + the receipt breadcrumb (run id, branch@oid, the
+        // executing node from the run's Done saga record).
+        let (mut m, granted, run_id) = forge_push_run();
+        let oid = "1a".repeat(20);
+        let saga_id = sink::saga_id_for_dispatch("runs", &dispatch_id_for(&run_id));
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&granted)
+            .with_transcript("general", transcript(2))
+            .with_forge_ref("app", "agent/x")
+            .with_saga_assignee(&saga_id, &[0xab; 32]);
+        let message = "Fix the flaky gate: retry twice\n\nDetails in the diff.";
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(
+                &run_id,
+                Ok(forge_wrapper(message, Some("agent/x"), Some(&oid), false, None)),
+            ),
+        )
+        .unwrap();
+        let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
+        assert_eq!(forge_ops.len(), 1, "one OpenPr emitted");
+        assert_eq!(
+            forge::decode_msg(&forge_ops[0].payload).unwrap(),
+            forge::ForgeMsg::OpenPr {
+                repo: "app".into(),
+                title: "Fix the flaky gate: retry twice".into(),
+                body: format!(
+                    "{message}\n\n---\nrun: {run_id}\noutput: agent/x@{oid}\nnode: {}",
+                    "ab".repeat(32)
+                ),
+                source_branch: "agent/x".into(),
+                target_branch: "main".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn pr_sink_skips_an_open_pr_with_the_same_source_and_notes_the_update() {
+        // the duplicate-PR guard: an OPEN PR whose source branch matches the
+        // sink's ⇒ no OpenPr — the branch update WAS the feedback.
+        let (mut m, granted, run_id) = forge_push_run();
+        let oid = "1a".repeat(20);
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&granted)
+            .with_transcript("general", transcript(2))
+            .with_forge_ref("app", "agent/x")
+            .with_forge_item("app", forge_pr(4, "existing", "", "agent/x", "main"));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(
+                &run_id,
+                Ok(forge_wrapper("done", Some("agent/x"), Some(&oid), false, None)),
+            ),
+        )
+        .unwrap();
+        assert!(
+            ctx.msgs.iter().all(|m| m.target != "forge"),
+            "an open PR with the same source must not be re-opened"
+        );
+        assert!(
+            breadcrumbs(&ctx).contains(&format!("run {run_id} pr sink: updated PR #4")),
+            "the breadcrumb names the updated PR: {:?}",
+            breadcrumbs(&ctx)
+        );
+    }
+
+    #[test]
+    fn pr_sink_guard_wording_is_honest_when_nothing_was_pushed() {
+        // guard hit + a no_changes receipt: nothing was pushed — say so.
+        let (mut m, granted, run_id) = forge_push_run();
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&granted)
+            .with_transcript("general", transcript(2))
+            .with_forge_ref("app", "agent/x")
+            .with_forge_item("app", forge_pr(4, "existing", "", "agent/x", "main"));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(forge_wrapper("done", None, None, true, None))),
+        )
+        .unwrap();
+        assert!(ctx.msgs.iter().all(|m| m.target != "forge"));
+        assert!(
+            breadcrumbs(&ctx)
+                .contains(&format!("run {run_id} pr sink: PR #4 already open, no changes pushed")),
+            "honest no-changes wording: {:?}",
+            breadcrumbs(&ctx)
+        );
+
+        // guard hit + a commit_error receipt: the workspace commit failed.
+        let (mut m2, granted2, run_id2) = forge_push_run();
+        let mut ctx2 = CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&granted2)
+            .with_transcript("general", transcript(2))
+            .with_forge_ref("app", "agent/x")
+            .with_forge_item("app", forge_pr(4, "existing", "", "agent/x", "main"));
+        exec(
+            &mut m2,
+            &mut ctx2,
+            &result_event(
+                &run_id2,
+                Ok(forge_wrapper("done", Some("agent/x"), None, false, Some("push CAS reject"))),
+            ),
+        )
+        .unwrap();
+        assert!(ctx2.msgs.iter().all(|m| m.target != "forge"));
+        assert!(
+            breadcrumbs(&ctx2).contains(&format!(
+                "run {run_id2} pr sink: PR #4 already open, nothing pushed (workspace commit failed)"
+            )),
+            "honest commit-error wording: {:?}",
+            breadcrumbs(&ctx2)
+        );
+    }
+
+    #[test]
+    fn pr_sink_guard_ignores_closed_prs_issues_and_other_sources() {
+        // a CLOSED PR on the same source, an open PR on another source, and an
+        // open issue are all non-hits: OpenPr fires (re-proposing existing work
+        // after a PR was closed is intended).
+        let (mut m, granted, run_id) = forge_push_run();
+        let mut closed = forge_pr(3, "closed", "", "agent/x", "main");
+        closed.summary.state = forge::ItemState::Closed;
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&granted)
+            .with_transcript("general", transcript(2))
+            .with_forge_ref("app", "agent/x")
+            .with_forge_item("app", closed)
+            .with_forge_item("app", forge_pr(5, "other", "", "other/y", "main"))
+            .with_forge_item("app", forge_issue(6, "an issue", ""));
+        let oid = "1a".repeat(20);
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(
+                &run_id,
+                Ok(forge_wrapper("done", Some("agent/x"), Some(&oid), false, None)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.msgs.iter().filter(|m| m.target == "forge").count(),
+            1,
+            "no open PR matches the source — OpenPr fires"
+        );
+    }
+
+    #[test]
+    fn a_no_changes_run_with_a_born_branch_and_no_open_pr_still_opens_the_pr() {
+        // plan-literal: the branch is born (earlier session work) and no PR is
+        // open for it — OpenPr fires even though THIS run pushed nothing.
+        let (mut m, granted, run_id) = forge_push_run();
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&granted)
+            .with_transcript("general", transcript(2))
+            .with_forge_ref("app", "agent/x");
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(forge_wrapper("re-proposing", None, None, true, None))),
+        )
+        .unwrap();
+        let forge_ops: Vec<_> = ctx.msgs.iter().filter(|m| m.target == "forge").collect();
+        assert_eq!(forge_ops.len(), 1, "OpenPr fires for a born branch with no open PR");
+        let forge::ForgeMsg::OpenPr { body, .. } = forge::decode_msg(&forge_ops[0].payload).unwrap()
+        else {
+            panic!("expected an OpenPr");
+        };
+        assert!(
+            body.contains("output: none (no changes this run)"),
+            "the body is honest about the empty push: {body:?}"
+        );
+    }
+
+    #[test]
+    fn saga_id_mirror_matches_the_dispatch_modules_derivation() {
+        // pin the executing-node lookup's saga-id mirror against the REAL
+        // dispatch module: register a recipe, dispatch, and read the saga id
+        // off the emitted trigger — the mirror must derive the same id.
+        let mut d = dispatch::DispatchModule::new("dispatch", "saga");
+        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("runs".into()));
+        block_on(d.execute(
+            &mut ctx,
+            &Msg {
+                target: "dispatch".into(),
+                payload: dispatch_encode_msg(&DispatchMsg::RegisterRecipe {
+                    recipe_id: "agent/bot".into(),
+                    description: "runs for agent bot".into(),
+                    capability: "model-1".into(),
+                    routing: Routing::Rendezvous,
+                    output_contract: OutputContract::Text,
+                    max_attempts: 1,
+                    deadline_views: None,
+                    lease_views: None,
+                }),
+            },
+        ))
+        .unwrap();
+        block_on(d.execute(
+            &mut ctx,
+            &Msg {
+                target: "dispatch".into(),
+                payload: dispatch_encode_msg(&DispatchMsg::Dispatch {
+                    dispatch_id: "d1".into(),
+                    recipe_id: "agent/bot".into(),
+                    payload: b"in".to_vec(),
+                }),
+            },
+        ))
+        .unwrap();
+        let trigger = ctx
+            .msgs
+            .iter()
+            .find(|m| m.target == "saga")
+            .expect("the dispatch emits a saga trigger");
+        let saga::SagaMsg::Trigger { saga_id, .. } = saga::decode_msg(&trigger.payload).unwrap()
+        else {
+            panic!("expected a saga trigger");
+        };
+        assert_eq!(saga_id, sink::saga_id_for_dispatch("runs", "d1"));
+    }
+
+    #[test]
+    fn workspace_receipt_mirror_decodes_the_forge_fields() {
+        // present: the §5 additive fields land on the mirror.
+        let wrapper = forge_wrapper("done", Some("agent/item-7"), Some(&"1a".repeat(20)), false, None);
+        let receipt = decode_run_result_v1(&wrapper).unwrap().workspace_receipt;
+        assert_eq!(receipt.branch.as_deref(), Some("agent/item-7"));
+        assert_eq!(receipt.output_commit.as_deref(), Some(&*"1a".repeat(20)));
+
+        // absent (every pre-forge receipt): serde defaults, not an error.
+        let receipt = decode_run_result_v1(&runner_wrapper("done", serde_json::json!({})))
+            .unwrap()
+            .workspace_receipt;
+        assert_eq!(receipt.branch, None);
+        assert_eq!(receipt.output_commit, None);
+    }
+
     #[test]
     fn malformed_facet_fails_the_run_without_aborting() {
         // effects is not an array → decode_run_result_v1 fails → the run fails
@@ -4194,6 +4447,60 @@ mod tests {
         assert_eq!(v["output_ref"]["output_snapshot"], "deadbeef");
         assert_eq!(v["output_ref"]["commit_height"], 7);
         assert_eq!(v["output_ref"]["source_prefix"], "/ws/duck");
+        // a duckfs output_ref carries NO forge keys — the additive fields
+        // skip-serialize, so pre-forge consumers see byte-identical shapes.
+        let output_ref = v["output_ref"].as_object().unwrap();
+        assert!(!output_ref.contains_key("branch"));
+        assert!(!output_ref.contains_key("output_commit"));
+    }
+
+    #[test]
+    fn job_finalize_output_ref_carries_forge_coordinates() {
+        // §5 distillation: a forge receipt (no snapshot, branch + output
+        // commit) distills into an output_ref stating branch@oid, so the
+        // app/jobs surface can render the forge coordinates.
+        let registry = job_registry(); // agent "duck" with tasks.create
+        let mut m = module();
+        let mut ctx = CaptureCtx::new().at(3).with_jobs_origin().with_registry(&registry);
+        exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
+        commit(&mut m);
+        let run_id = job_run_id_for("job-1", "duck", 3);
+
+        let oid = "1a".repeat(20);
+        let facets = serde_json::json!({
+            "workspace_receipt": {
+                "source_prefix": "forge:app",
+                "source_snapshot": "2b".repeat(20),
+                "output_snapshot": null,
+                "commit_height": null,
+                "rebased": false,
+                "no_changes": false,
+                "branch": "agent/item-7",
+                "output_commit": oid,
+            },
+            "effects": [{"kind":"tasks.create","task_id":"t1","title":"todo"}],
+        });
+        let mut ctx = CaptureCtx::new()
+            .at(10)
+            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_claimed_job("job-1", 3);
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(&run_id, Ok(runner_wrapper("done", facets))),
+        )
+        .unwrap();
+        let finalize = ctx.job_msgs();
+        assert_eq!(finalize.len(), 1);
+        let JobsMsg::Finalize { payload, .. } = &finalize[0] else {
+            panic!("expected a finalize");
+        };
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(v["output_ref"]["source_prefix"], "forge:app");
+        assert!(v["output_ref"]["output_snapshot"].is_null());
+        assert_eq!(v["output_ref"]["branch"], "agent/item-7");
+        assert_eq!(v["output_ref"]["output_commit"], serde_json::json!(oid));
     }
 
     #[test]
@@ -4220,23 +4527,6 @@ mod tests {
             "workspace_receipt": {"source_prefix":"p","source_snapshot":null,"output_snapshot":null,"commit_height":null,"rebased":false,"no_changes":false}
         });
         assert!(decode_run_result_v1(&serde_json::to_vec(&badv).unwrap()).is_err());
-    }
-
-    #[test]
-    fn forge_sink_mirror_matches_forge_decode_msg() {
-        // pin the local ForgeSinkMsg mirror against the real forge decoder so the
-        // wire cannot silently drift (the reason forge is a dev-dependency).
-        let bytes = forge_open_pr_bytes("app", "T", "B", "agent/x", "main");
-        assert_eq!(
-            forge::decode_msg(&bytes).unwrap(),
-            forge::ForgeMsg::OpenPr {
-                repo: "app".into(),
-                title: "T".into(),
-                body: "B".into(),
-                source_branch: "agent/x".into(),
-                target_branch: "main".into(),
-            }
-        );
     }
 
     // ---- the registry hook ------------------------------------------------------
