@@ -398,46 +398,16 @@ pub struct QueryRequest {
 // lane below; a daemon without a hub answers 503, and every refusal path says
 // WHY as one text frame before closing.
 //
-// binary frames are tagged by their first byte (`WS_TAG_*`):
-//   audio `[0x01][1920 B pcm]` — both directions; one 20 ms mono 48 kHz frame
-//     (960 × i16 LE, exactly `PCM_FRAME_BYTES` after the tag — see
-//     `chat::voice::FRAME_SAMPLES`). client→server is a captured mic frame,
-//     server→client a mixed playout frame.
-//   video — client→server `[0x02][flags u8][ts_ms u32 LE][vp8 chunk]` captured
-//     camera; server→client `[0x03][flags u8][ts_ms u32 LE][peer 32 raw]
-//     [vp8 chunk]` a reassembled peer frame. `flags` bit 0 (`WS_FLAG_KEYFRAME`)
-//     marks a decoder sync point. little-endian on THIS leg (browser
-//     `DataView`-friendly); the mesh leg stays big-endian.
-// text frames are json control: client→server `CallClientControl` (recipients /
-// beacon / keyframeRequest), server→client `CallServerControl` (keyframeRequest
-// / peerBeacon / rateHint).
+// the binary frame layout (tag byte, header fields, BE headers/LE pcm payload
+// per D1) and its encode/decode functions live in `chat::call_wire` — the
+// single definition site this handler ports onto below. text frames are json
+// control: client→server `CallClientControl` (recipients / beacon /
+// keyframeRequest), server→client `CallServerControl` (keyframeRequest /
+// peerBeacon / rateHint).
 //
 // the hub side lives with the mesh (only the p2p validator runs one): it
 // fragments/reassembles the video ends over `Service::Video` and routes control
 // (keyframe kicks, presence beacons, rate hints — see `chat::video`).
-
-/// one captured, encoded camera frame handed webview → hub for fan-out. the
-/// hub fragments `data` across `Service::Video` datagrams; `frame_no` is the
-/// hub's own monotone counter, so only the frame's own fields ride here.
-pub struct CapturedVideo {
-    /// this frame is a decoder sync point (a full keyframe, not a delta).
-    pub keyframe: bool,
-    /// capture timestamp in ms (opaque to the hub; echoed to the far webview).
-    pub ts_ms: u32,
-    /// the encoded (VP8) frame bytes.
-    pub data: Vec<u8>,
-}
-
-/// one reassembled camera frame handed hub → webview, tagged with the mesh-
-/// authenticated sender so the webview routes it to the right tile.
-pub struct PeerVideo {
-    /// the sending peer's raw ed25519 node key.
-    pub peer: [u8; 32],
-    pub keyframe: bool,
-    pub ts_ms: u32,
-    /// the reassembled encoded (VP8) frame bytes.
-    pub data: Vec<u8>,
-}
 
 /// call-control the WEBVIEW asks the hub to act on (webview → hub).
 pub enum CallControlIn {
@@ -481,9 +451,9 @@ pub struct CallSession {
     /// (raw ed25519 bytes), steered by the client as consensus state changes.
     pub recipients: tokio::sync::watch::Sender<Vec<[u8; 32]>>,
     /// captured camera frames webview → hub (fragmented onto `Service::Video`).
-    pub video_in: tokio::sync::mpsc::Sender<CapturedVideo>,
+    pub video_in: tokio::sync::mpsc::Sender<chat::call_wire::CapturedFrame>,
     /// reassembled peer camera frames hub → webview.
-    pub video_out: tokio::sync::mpsc::Receiver<PeerVideo>,
+    pub video_out: tokio::sync::mpsc::Receiver<chat::call_wire::PeerFrame>,
     /// call-control webview → hub (local beacon, keyframe asks).
     pub control_in: tokio::sync::mpsc::Sender<CallControlIn>,
     /// call-control hub → webview (peer beacons, keyframe kicks, rate hints).
@@ -500,16 +470,9 @@ pub struct CallSessionRequest {
 /// the request lane into the call hub.
 pub type CallLane = tokio::sync::mpsc::Sender<CallSessionRequest>;
 
-/// binary ws frame tags on /v1/call/ws (first byte).
-const WS_TAG_AUDIO: u8 = 0x01;
-const WS_TAG_VIDEO_CAPTURED: u8 = 0x02; // client → server
-const WS_TAG_VIDEO_PEER: u8 = 0x03; // server → client
-const WS_VIDEO_CAPTURED_HEADER: usize = 6; // tag + flags + ts_ms
-const WS_VIDEO_PEER_HEADER: usize = 38; // tag + flags + ts_ms + peer key
-const WS_FLAG_KEYFRAME: u8 = 0b0000_0001;
-
 /// client → server control messages on the call socket (text frames).
 #[derive(Debug, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -533,6 +496,7 @@ pub enum CallClientControl {
 
 /// server → client control messages on the call socket (text frames).
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -549,7 +513,10 @@ pub enum CallServerControl {
         sharing: bool,
     },
     /// send at no more than this (min across peers' loss reports).
-    RateHint { max_kbps: u32 },
+    RateHint {
+        #[cfg_attr(test, ts(type = "number"))]
+        max_kbps: u32,
+    },
 }
 
 /// a request to the actor that owns the host. replies cross the channel as
@@ -2011,9 +1978,6 @@ pub struct CallParams {
     channel: String,
 }
 
-/// one pcm sample is an i16 — two wire bytes, little endian.
-const PCM_FRAME_BYTES: usize = chat::voice::FRAME_SAMPLES * 2;
-
 async fn call_ws(
     State(handle): State<NodeHandle>,
     Query(params): Query<CallParams>,
@@ -2032,12 +1996,12 @@ async fn call_ws(
 }
 
 /// pump one huddle's audio, camera video, and call control between the webview
-/// websocket and the hub session. binary client frames are tag-dispatched:
-/// `0x01` audio → `pcm_in`, `0x02` captured video → `video_in`; the hub's
-/// `mixed_out`/`video_out`/`control_out` ends flow back as tagged binary + json
-/// text. text client frames steer fan-out and carry beacons/keyframe asks.
-/// either side closing ends the session — dropping the ends is the teardown
-/// signal the hub watches.
+/// websocket and the hub session. binary client frames are decoded via
+/// `chat::call_wire` and tag-dispatched: audio → `pcm_in`, captured video →
+/// `video_in`; the hub's `mixed_out`/`video_out`/`control_out` ends flow back
+/// as `chat::call_wire`-encoded binary + json text. text client frames steer
+/// fan-out and carry beacons/keyframe asks. either side closing ends the
+/// session — dropping the ends is the teardown signal the hub watches.
 async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String) {
     let (reply, opened) = tokio::sync::oneshot::channel();
     let request = CallSessionRequest { channel_id, reply };
@@ -2076,29 +2040,15 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
     loop {
         tokio::select! {
             inbound = socket.recv() => match inbound {
-                Some(Ok(Message::Binary(bytes))) => match bytes.first() {
-                    Some(&WS_TAG_AUDIO) if bytes.len() == 1 + PCM_FRAME_BYTES => {
-                        let frame: Vec<i16> = bytes[1..]
-                            .chunks_exact(2)
-                            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
-                            .collect();
+                Some(Ok(Message::Binary(bytes))) => {
+                    if let Some(frame) = chat::call_wire::decode_audio(&bytes) {
                         // full lane = the hub is behind; late audio is dead
                         // audio, so drop the frame rather than backpressure.
                         let _ = pcm_in.try_send(frame);
-                    }
-                    Some(&WS_TAG_VIDEO_CAPTURED)
-                        if bytes.len() > WS_VIDEO_CAPTURED_HEADER =>
-                    {
-                        let _ = video_in.try_send(CapturedVideo {
-                            keyframe: bytes[1] & WS_FLAG_KEYFRAME != 0,
-                            ts_ms: u32::from_le_bytes(
-                                bytes[2..6].try_into().expect("4 bytes"),
-                            ),
-                            data: bytes[WS_VIDEO_CAPTURED_HEADER..].to_vec(),
-                        });
-                    }
-                    _ => {} // unknown/short frame — drop, stay alive
-                },
+                    } else if let Some(frame) = chat::call_wire::decode_captured(&bytes) {
+                        let _ = video_in.try_send(frame);
+                    } // unknown/short frame — drop, stay alive
+                }
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<CallClientControl>(&text) {
                         Ok(CallClientControl::Recipients { peers }) => {
@@ -2133,11 +2083,7 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
             },
             mixed = mixed_out.recv() => match mixed {
                 Some(frame) => {
-                    let mut bytes = Vec::with_capacity(1 + frame.len() * 2);
-                    bytes.push(WS_TAG_AUDIO);
-                    for sample in frame {
-                        bytes.extend_from_slice(&sample.to_le_bytes());
-                    }
+                    let bytes = chat::call_wire::encode_audio(&frame);
                     if socket.send(Message::Binary(bytes.into())).await.is_err() {
                         break;
                     }
@@ -2146,13 +2092,7 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
             },
             video = video_out.recv() => match video {
                 Some(frame) => {
-                    let mut bytes =
-                        Vec::with_capacity(WS_VIDEO_PEER_HEADER + frame.data.len());
-                    bytes.push(WS_TAG_VIDEO_PEER);
-                    bytes.push(if frame.keyframe { WS_FLAG_KEYFRAME } else { 0 });
-                    bytes.extend_from_slice(&frame.ts_ms.to_le_bytes());
-                    bytes.extend_from_slice(&frame.peer);
-                    bytes.extend_from_slice(&frame.data);
+                    let bytes = chat::call_wire::encode_peer(&frame);
                     if socket.send(Message::Binary(bytes.into())).await.is_err() {
                         break;
                     }

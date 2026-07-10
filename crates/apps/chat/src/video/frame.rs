@@ -123,6 +123,27 @@ pub fn frame_newer(a: u32, b: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// pins the exact wire bytes (D1: header fields big-endian) — locks this
+    /// already-BE datagram codec alongside the call-socket codec
+    /// (`chat::call_wire`) as part of the wire-standardization sweep.
+    #[test]
+    fn golden_header_be() {
+        let header = VideoHeader {
+            keyframe: true,
+            frame_no: 0x0102_0304,
+            frag_index: 0x0506,
+            frag_count: 0x0708,
+            ts_ms: 0x090A_0B0C,
+        };
+        assert_eq!(
+            encode_fragment(header, &[0xAA]),
+            vec![
+                0x01, 0x01, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+                0x00, 0x00, 0xAA,
+            ]
+        );
+    }
+
     #[test]
     fn fragments_round_trip() {
         // 2 full fragments + a partial third.
