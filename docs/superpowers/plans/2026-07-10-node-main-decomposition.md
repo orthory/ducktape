@@ -293,6 +293,7 @@ The full destructure means the remaining ~5,400 lines compile unchanged. (If P0 
 - Modify: `bin/node/src/replica/mod.rs`, `bin/node/src/main.rs`
 
 **Interfaces:**
+- NOTE (from PR 1): `replica/mod.rs` already hosts the pre-existing fold helpers (`CertAnchor`/`FoldStep`/`plan_fold`, ~220 lines — the old `replica.rs`, git-mv'd there in Task A9) plus `reboot_self` and `mod promotion;`. If adding the role entry crowds it, split the fold helpers to `replica/fold.rs` first (pure move, own commit).
 - `replica/mod.rs` adds: `pub(crate) async fn run(…) -> !` — the whole `if !checkpoint_seats_me && !validators.contains(…) { … }` block (original 3680–5749). Every exit is `reboot_self()` or `std::process::exit`, so the return type is `!`; `run_node` calls it and the validator path below stays untouched.
 - `wiring.rs`: `pub(super) struct ReplicaChannels { replica_store, head_wake, cert_bridge, sync_tx, sync_rx, reach_cmd, relay_tx, relay_rx, lobby_tx, lobby_rx }` + `pub(super) async fn wire(…) -> ReplicaChannels` (P6a: epoch bank registration, first-contact spawn, lobby, `network.start()` — the start call stays INSIDE wiring; all registration for this role completes before it, hazard 2).
 - `park.rs`: `pub(super) async fn park(channels: ReplicaChannels, …) -> !` — P6b (serve-state build) + P6c (the park loop) + P6d (promotion checkpoint + `reboot_self()`), verbatim as one unit (~1.7k lines — the natural boundary is the loop; accepted, decision 2). The `send_announce`/`not_serving` closures stay closures — they never leave this fn.
