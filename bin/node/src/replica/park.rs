@@ -17,9 +17,11 @@ use commonware_runtime::{Clock, IoBuf, Metrics, Spawner, Supervisor};
 use futures::{FutureExt as _, StreamExt as _};
 use recovery::{Manifest, Recovery};
 
+use crate::blob_fetch;
 use crate::config::{self, hex_bytes, unhex};
 use crate::constants::*;
-use crate::explorer::{boundary_block_row, explorer_root_op, heal_index, stage_shipped_index};
+use crate::drain_actions::{BlockAction, CutoverTrigger, EpochActions, block_actions};
+use crate::explorer::{boundary_block_row, heal_index, stage_shipped_index};
 use crate::host_reads::{
     joiner_epoch_mesh, read_upgrade_state, read_upgrade_version_fields, read_valset_members,
     read_valset_residents,
@@ -73,12 +75,16 @@ pub(super) async fn park(
     status_public_key: String,
     rpc_listener: Option<std::net::TcpListener>,
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
+    gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
+    gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     blobs: noded::blobs::BlobHandle,
     agent_provisioner: &Option<dispatch_oracle::SharedProvisioner>,
     agent_dirs: &capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
+    bulk_pacer: data_plane::BulkPacer,
+    workspace: std::path::PathBuf,
     storage_for_sync: std::path::PathBuf,
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
@@ -97,6 +103,25 @@ pub(super) async fn park(
         relay_rx,
         mut lobby_tx,
     } = channels;
+    let gateway_book = gateway_requests.map(|requests| {
+        let book = crate::gateway_plane::OverlayBook::new(
+            String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+        );
+        book.set_peers(peers.iter());
+        crate::gateway_plane::spawn(
+            crate::gateway_plane::SpawnConfig {
+                label: label.clone(),
+                book: std::sync::Arc::clone(&book),
+                me: signer.public_key(),
+                factory: statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                pacer: bulk_pacer.clone(),
+                commands: gateway_commands,
+                workspace,
+            },
+            requests,
+        );
+        book
+    });
     let Some(server_peer) = sync_source else {
         eprintln!(
             "[node {label}] no statesync source: no validator other than this node \
@@ -104,6 +129,24 @@ pub(super) async fn park(
         );
         std::process::exit(1);
     };
+    // the resident's mesh blob fetch-on-miss lane (the #298 cross-node
+    // gap, resident side): the oracle pool's resolver asks current peers
+    // for a digest its own store lacks, over this same statesync channel.
+    // the park loop's sync client owns the channel receiver, so OUR fetch
+    // answers route back through its unmatched-frame hook below — blob
+    // rpc ids are top-bit-set random, disjoint from the client's small
+    // sequential ids by construction. residents deliberately run no serve
+    // loop (only validators answer this channel): fetch/client side only.
+    let blob_pending: blob_fetch::PendingMap = Default::default();
+    let blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(peers.clone()));
+    let blob_fetcher = blob_fetch::MeshBlobFetcher::new(
+        sync_tx.clone(),
+        blob_pending.clone(),
+        std::sync::Arc::clone(&blob_peers),
+        signer.public_key(),
+    )
+    .into_fetch_fn();
     // the joiner's sync client: the mesh path always works and
     // ROTATES across every validator that can serve; with the
     // statesync plane enabled, requests PREFER an overlay stream to
@@ -115,6 +158,12 @@ pub(super) async fn park(
         sync_tx,
         sync_rx,
         sync_sources.clone(),
+        // classify_mesh_frame consumes OUR blob answers into their
+        // oneshot waiters; anything else (a stray, junk) drops — a
+        // resident serves nothing.
+        Some(std::sync::Arc::new(move |id, body: &[u8]| {
+            let _ = blob_fetch::classify_mesh_frame(&blob_pending, id, body);
+        })),
     );
     let client = {
         let plane_slot: statesync_plane::PlaneSlot =
@@ -130,6 +179,7 @@ pub(super) async fn park(
                 signer.public_key(),
                 std::sync::Arc::clone(&plane_slot),
                 statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                bulk_pacer.clone(),
                 None,
             );
         }
@@ -443,10 +493,9 @@ pub(super) async fn park(
         me_bytes.clone(),
         blobs.clone(),
         agent_provisioner.clone(),
-        // the resident path keeps local-only resolution for now: its
-        // statesync channel is owned by the park loop's client, so
-        // the mesh fetch lane needs its own demux there (#298).
-        None,
+        // the mesh fetch-on-miss lane (#298, resident side): demuxed
+        // through the park loop's sync client's unmatched-frame hook.
+        Some(blob_fetcher),
     );
     let mut resident_dispatch =
         resident_dispatch::ResidentDispatch::new(resident_pool, me_bytes.clone());
@@ -814,64 +863,16 @@ pub(super) async fn park(
                 std::process::exit(1);
             }
             let drained = node_r.take_drained();
-            // System-injection traces, merged per height after the
-            // members' dispatches — the same row order the validator
-            // drain and every replay path derive.
-            let mut system_dispatches: std::collections::BTreeMap<
-                u64,
-                Vec<host::DispatchRecord>,
-            > = node_r.take_system_dispatches().into_iter().collect();
-            let mut gi = 0;
-            while gi < drained.len() {
-                let height = drained[gi].height;
-                let mut block_dispatches: Vec<host::DispatchRecord> = Vec::new();
-                let mut block_ops: Vec<noded::RootOp> = Vec::new();
-                let mut block_hash: Option<node::FrameId> = None;
-                let mut block_app_hash: Option<StateRoot> = None;
-                let mut sealed_hash: Option<StateRoot> = None;
-                while gi < drained.len() && drained[gi].height == height {
-                    let d = &drained[gi];
-                    gi += 1;
-                    if d.disposition == node::Disposition::Discarded {
-                        continue;
-                    }
-                    sealed_hash = Some(d.app_hash);
-                    if let (node::Disposition::Applied, Some(op)) =
-                        (&d.disposition, &d.op)
-                    {
-                        block_dispatches.extend(op.dispatches.iter().cloned());
-                    }
-                    if let Some(op) = &d.op
-                        && op.target != NOP_TARGET
-                    {
-                        let disposition = match d.disposition {
-                            node::Disposition::Applied => {
-                                noded::BlockDisposition::Applied
-                            }
-                            node::Disposition::Rejected => {
-                                noded::BlockDisposition::Rejected
-                            }
-                            node::Disposition::Discarded => continue,
-                        };
-                        if block_hash.is_none() {
-                            block_hash = Some(d.id);
-                            block_app_hash = Some(d.app_hash);
-                        }
-                        block_ops.push(explorer_root_op(
-                            &blobs,
-                            &op.origin,
-                            &op.target,
-                            &op.payload,
-                            &op.dispatches,
-                            disposition,
-                        ));
-                    }
-                }
-                // System-injection dispatches index after the
-                // members' — see the validator drain's twin merge.
-                if let Some(sys) = system_dispatches.remove(&height) {
-                    block_dispatches.extend(sys);
-                }
+            // The same projection the validator consumes; this loop retains
+            // replica-only seal verification, streaming, and checkpoints.
+            for action in block_actions(&drained, node_r.take_system_dispatches(), &blobs) {
+                let BlockAction {
+                    height,
+                    dispatches,
+                    record,
+                    sealed_hash,
+                    ..
+                } = action;
                 // a BACKFILLED height's trust is the served seal:
                 // what our fold produced must match it exactly, or
                 // this replica has diverged from the quorum's fold.
@@ -900,21 +901,9 @@ pub(super) async fn park(
                     );
                     std::process::exit(1);
                 }
-                let record = (!block_ops.is_empty()).then(|| {
-                    noded::block_row(&noded::BlockRecord {
-                        height,
-                        hash: block_hash
-                            .map(|h| noded::hex_bytes(&h))
-                            .unwrap_or_default(),
-                        commit_hash: block_app_hash
-                            .map(|h| hex(&h))
-                            .unwrap_or_default(),
-                        ops: block_ops,
-                    })
-                });
                 let ops = indexer::BlockOps {
                     record,
-                    ..noded::index_block_ops(height, height, &block_dispatches)
+                    ..noded::index_block_ops(height, height, &dispatches)
                 };
                 if let Err(err) = index.apply_block(&ops) {
                     eprintln!(
@@ -954,13 +943,9 @@ pub(super) async fn park(
                     .iter()
                     .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
                     .collect();
-                if let consensus::ObservationOutcome::Scheduled(cutover) = orch
-                    .observe_members(
-                        folded_view,
-                        observed.iter().cloned(),
-                        observed_residents.iter().cloned(),
-                    )
-                {
+                let mut actions =
+                    EpochActions::new(orch, folded_view, observed, observed_residents);
+                if let Some(CutoverTrigger::Membership(cutover)) = actions.observe_members() {
                     println!(
                         "[node {label}] replica: membership change observed at view {} \
                          — cutover to epoch {} at view {}",
@@ -971,26 +956,21 @@ pub(super) async fn park(
                     node_r.set_view_ceiling(cutover.cutover_view());
                 }
                 let boundary_upgrade = read_upgrade_state(node_r.host()).await;
-                if let Some(pending) = &boundary_upgrade.pending
-                    && let consensus::ObservationOutcome::Scheduled(cutover) =
-                        orch.observe_upgrade(folded_view, pending.activation_height)
+                if let Some(CutoverTrigger::Upgrade {
+                    cutover,
+                    name,
+                    activation_height,
+                }) = actions.observe_upgrade(&boundary_upgrade)
                 {
                     println!(
-                        "[node {label}] replica: upgrade '{}' armed — cutover to epoch \
-                         {} at view {} (activation height {})",
-                        pending.name,
+                        "[node {label}] replica: upgrade '{name}' armed — cutover to epoch \
+                         {} at view {} (activation height {activation_height})",
                         cutover.next_epoch(),
-                        cutover.cutover_view(),
-                        pending.activation_height
+                        cutover.cutover_view()
                     );
                     node_r.set_view_ceiling(cutover.cutover_view());
                 }
-                if let Some(plan) = orch.respawn_if_due(
-                    folded_view,
-                    observed,
-                    observed_residents,
-                    boundary_upgrade,
-                ) {
+                if let Some(plan) = actions.respawn(boundary_upgrade) {
                     let members = plan.valset().consensus_members();
                     let member_bytes: Vec<Vec<u8>> =
                         members.iter().map(|k| k.as_ref().to_vec()).collect();
@@ -1006,10 +986,17 @@ pub(super) async fn park(
                         .collect();
                     // transport first, exactly like the validator:
                     // the new epoch's mesh must admit its members.
-                    oracle.track(
-                        plan.epoch(),
-                        joiner_epoch_mesh(&peers, &member_bytes, &plan_resident_bytes),
-                    );
+                    let mesh =
+                        joiner_epoch_mesh(&peers, &member_bytes, &plan_resident_bytes);
+                    // the blob fetch-on-miss lane fans out to the same
+                    // tracked set — follow the re-track (the validator
+                    // drain's exact discipline).
+                    *blob_peers.write().expect("blob peers lock") =
+                        mesh.iter().cloned().collect();
+                    oracle.track(plan.epoch(), mesh);
+                    if let Some(book) = &gateway_book {
+                        book.set_peers(plan.valset().transport_members().iter());
+                    }
                     last_tracked = plan.epoch();
                     // the follower swap: same OrderedNode, fresh
                     // orderer, cutover journaled — the epoch-local
@@ -1185,10 +1172,20 @@ pub(super) async fn park(
                     tip.epoch
                 );
             }
-            oracle.track(
-                tip.epoch,
-                joiner_epoch_mesh(&peers, &tip.participants, &tip.residents),
-            );
+            let mesh = joiner_epoch_mesh(&peers, &tip.participants, &tip.residents);
+            // the blob fetch-on-miss lane fans out to the same tracked
+            // set — follow the re-track.
+            *blob_peers.write().expect("blob peers lock") = mesh.iter().cloned().collect();
+            oracle.track(tip.epoch, mesh);
+            if let Some(book) = &gateway_book {
+                let transport: Vec<ed25519::PublicKey> = tip
+                    .participants
+                    .iter()
+                    .chain(tip.residents.iter())
+                    .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
+                    .collect();
+                book.set_peers(transport.iter());
+            }
             last_tracked = tip.epoch;
         }
         // drive the reachability plane's standby role off the

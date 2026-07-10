@@ -77,6 +77,11 @@ export interface RuntimeFacts {
   logPath: string;
 }
 
+export interface GatewayLocalRoute {
+  name: { label: string | null };
+  port: number;
+}
+
 /** One pending join request a parked joiner delivered over the lobby channel.
  *  Snake_case: these rows pass through verbatim from the NODE's
  *  `join-requests` JSON (not the registry's camelCase structs). */
@@ -213,3 +218,17 @@ export const forgetWorkspace = (
  *  url to dial. Idempotent — adopts an already-listening node. */
 export const selectWorkspace = (id: string): Promise<WorkspaceSelection> =>
   invoke<WorkspaceSelection>("workspace_select", { id });
+
+/** Node-local half of a loopback-backed gateway route. A null label means the
+ * account apex; the globally signed record never contains this port. */
+export const bindGatewayRoute = (
+  id: string,
+  label: string | null,
+  port: number,
+): Promise<void> => invoke<void>("gateway_route_bind", { id, label, port });
+
+export const unbindGatewayRoute = (id: string, label: string | null): Promise<void> =>
+  invoke<void>("gateway_route_unbind", { id, label });
+
+export const listGatewayRoutes = (id: string): Promise<GatewayLocalRoute[]> =>
+  invoke<GatewayLocalRoute[]>("gateway_route_list", { id });

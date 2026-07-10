@@ -4,7 +4,8 @@
 //!
 //!   mention -> v3 envelope (files module wired) -> lease on the providing
 //!   node -> duckfs checkout of the agent's pinned source at a per-run dir
-//!   OUTSIDE storage (D7) -> the provider executes INSIDE the mount and
+//!   OUTSIDE storage (D7), the agent's skill tree checked out read-only
+//!   BESIDE it (W6) -> the provider executes INSIDE the mount and
 //!   writes a file -> commit mints the output_ref -> RunnerResult delivery
 //!   posts the reply -> the committed files state carries the artifact on
 //!   EVERY node -> the NEXT run's checkout materializes it (W2 chaining).
@@ -15,16 +16,19 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent::{ACTION_CHAT_POST, AgentMsg};
+use agent::{ACTION_CHAT_POST, AgentMsg, SkillRef};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
 use common::{Cluster, poll_until, serial};
 use duckfs_core::{
-    FilesQuery, FilesReply, decode_reply as files_decode_reply,
-    encode_query as files_encode_query,
+    Change, Content, FilesMsg, FilesQuery, FilesReply, decode_reply as files_decode_reply,
+    encode_msg as files_encode_msg, encode_query as files_encode_query,
 };
 use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 
@@ -36,6 +40,12 @@ const AGENT_ID: &str = "quacker-portable";
 const CHANNEL: &str = "portable";
 const ARTIFACT: &str = "agent-artifact.txt";
 const ARTIFACT_BODY: &str = "portable evidence";
+// the W6 skill: a committed duckfs subtree the agent pins, materialized by
+// the provisioner as a READ-ONLY mount beside (never inside) the rw mount.
+const SKILL_NAME: &str = "quackskill";
+const SKILL_FILE: &str = "SKILL.md";
+const SKILL_BODY: &str = "the way of the quack";
+const SKILL_PREFIX: &str = "/shared/skills/quackskill";
 
 /// one script-backed provider that behaves like a coding agent: it records
 /// its cwd (the provisioned mount), proves whether the PREVIOUS run's
@@ -48,6 +58,7 @@ struct PortableProvider {
     script: PathBuf,
     cwd_log: PathBuf,
     chain_log: PathBuf,
+    skills_log: PathBuf,
 }
 
 impl PortableProvider {
@@ -57,6 +68,7 @@ impl PortableProvider {
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
         let cwd_log = dir.join("cwd.log");
         let chain_log = dir.join("chain.log");
+        let skills_log = dir.join("skills.log");
         let script = dir.join("provider.sh");
         std::fs::write(
             &script,
@@ -64,18 +76,27 @@ impl PortableProvider {
                 "#!/bin/sh\n\
                  # a stand-in coding agent: drain the prompt, record the\n\
                  # provisioned cwd, prove the prior run's artifact chained in\n\
-                 # (content-checked), write this run's artifact, answer.\n\
+                 # (content-checked), prove the skill ro mount materialized\n\
+                 # (content-checked, logging the advertised ro root), write\n\
+                 # this run's artifact, answer.\n\
                  cat > /dev/null\n\
                  pwd >> {cwd}\n\
                  if [ -f {artifact} ] && [ \"$(cat {artifact})\" = '{body}' ]; then\n\
                  \techo chained >> {chain}\n\
                  fi\n\
+                 if [ \"$(cat \"$DUCKTAPE_RUN_SKILLS/{skill_name}/{skill_file}\" 2>/dev/null)\" = '{skill_body}' ]; then\n\
+                 \tprintf '%s\\n' \"$DUCKTAPE_RUN_SKILLS\" >> {skills}\n\
+                 fi\n\
                  printf '%s' '{body}' > {artifact}\n\
                  printf '%s\\n' 'portable run done'\n",
                 cwd = cwd_log.display(),
                 chain = chain_log.display(),
+                skills = skills_log.display(),
                 artifact = ARTIFACT,
                 body = ARTIFACT_BODY,
+                skill_name = SKILL_NAME,
+                skill_file = SKILL_FILE,
+                skill_body = SKILL_BODY,
             ),
         )
         .expect("write provider script");
@@ -112,6 +133,7 @@ impl PortableProvider {
             script,
             cwd_log,
             chain_log,
+            skills_log,
         }
     }
 
@@ -137,6 +159,14 @@ impl PortableProvider {
         std::fs::read_to_string(&self.chain_log)
             .map(|s| s.lines().count())
             .unwrap_or(0)
+    }
+
+    /// every `DUCKTAPE_RUN_SKILLS` root whose skill mount content-checked
+    /// inside the run, one per run (W6 evidence).
+    fn skill_roots(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.skills_log)
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -260,15 +290,14 @@ fn wait_for_reply(cluster: &Cluster, idx: usize, run_id: &str) -> String {
     })
 }
 
-/// the committed files-module view of the artifact on `idx` — `Some(size)`
-/// when the committed head carries it.
-fn artifact_stat(cluster: &Cluster, idx: usize) -> Option<u64> {
-    let path = format!("/shared/agent-workspaces/{AGENT_ID}/{ARTIFACT}");
+/// the committed files-module view of `path` on `idx` — `Some(size)` when the
+/// committed head carries it.
+fn stat_size(cluster: &Cluster, idx: usize, path: &str) -> Option<u64> {
     let reply = cluster.query(
         idx,
         "files",
         &files_encode_query(&FilesQuery::Stat {
-            path,
+            path: path.into(),
             snapshot: None,
         }),
     )?;
@@ -276,6 +305,14 @@ fn artifact_stat(cluster: &Cluster, idx: usize) -> Option<u64> {
         Ok(FilesReply::Stat(Some(info))) => Some(info.size),
         _ => None,
     }
+}
+
+fn artifact_stat(cluster: &Cluster, idx: usize) -> Option<u64> {
+    stat_size(
+        cluster,
+        idx,
+        &format!("/shared/agent-workspaces/{AGENT_ID}/{ARTIFACT}"),
+    )
 }
 
 #[test]
@@ -310,6 +347,31 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // the strict prompt path: pin a real blob on the executing node.
     let prompt_hash = upload_prompt(&cluster, 1);
 
+    // W6: seed the skill subtree in COMMITTED files state before any run
+    // composes — the agent pins it below and every portable run must
+    // materialize it as a read-only mount beside the rw workspace.
+    cluster.submit(
+        0,
+        "files",
+        &files_encode_msg(&FilesMsg::Commit {
+            base_snapshot: None,
+            message: "seed skill".into(),
+            changes: vec![Change::Put {
+                path: format!("{SKILL_PREFIX}/{SKILL_FILE}"),
+                exec: false,
+                meta: BTreeMap::new(),
+                content: Content::Inline {
+                    b64: STANDARD.encode(SKILL_BODY),
+                },
+            }],
+        }),
+    );
+    poll_until("the skill seed to commit", FINALIZE, || {
+        (stat_size(&cluster, 0, &format!("{SKILL_PREFIX}/{SKILL_FILE}"))?
+            == SKILL_BODY.len() as u64)
+            .then_some(())
+    });
+
     cluster.submit(
         0,
         "chat",
@@ -330,7 +392,13 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
             allowed_actions: vec![ACTION_CHAT_POST.into()],
             recipe_hash: None,
             caps: None,
-            skills: None,
+            // a TRACKING skill (no pin): the composer resolves it to the
+            // committed head, the provisioner mounts it read-only (W6).
+            skills: Some(vec![SkillRef {
+                name: SKILL_NAME.into(),
+                source_prefix: SKILL_PREFIX.into(),
+                source_snapshot: None,
+            }]),
         }),
     );
     cluster.submit(
@@ -349,12 +417,18 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
         }
     });
 
-    // ---- run 1: fresh network, head None -> an EMPTY checkout (the
-    // cold-start case), the script writes the artifact, commit mints the
-    // output_ref, the reply delivers.
+    // ---- run 1: the agent's workspace prefix has no content yet -> an EMPTY
+    // rw checkout (the cold-start case) beside the materialized skill mount;
+    // the script writes the artifact, commit mints the output_ref, the reply
+    // delivers.
     mention(&cluster, 0, "m1");
     let run_1 = runs::run_id_for(CHANNEL, 1, AGENT_ID);
     assert_eq!(wait_for_reply(&cluster, 0, &run_1), "portable run done");
+
+    // W6 evidence: the script content-checked the skill file under the
+    // advertised DUCKTAPE_RUN_SKILLS root before answering.
+    let roots = provider.skill_roots();
+    assert_eq!(roots.len(), 1, "run 1 saw its skill ro mount: {roots:?}");
 
     // the artifact is COMMITTED duckfs state, readable on a node that never
     // executed anything (the whole point of the portable workspace).
@@ -366,6 +440,20 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
         Some(ARTIFACT_BODY.len() as u64),
         "the artifact is present on every validator"
     );
+
+    // the W6 no-leak property: the skill ro root is a SIBLING of the commit
+    // root, so the run's output snapshot must NOT capture the skill content —
+    // neither as a subtree named after the mount nor spilled at the root.
+    for leak in [
+        format!("/shared/agent-workspaces/{AGENT_ID}/{SKILL_NAME}/{SKILL_FILE}"),
+        format!("/shared/agent-workspaces/{AGENT_ID}/{SKILL_FILE}"),
+    ] {
+        assert_eq!(
+            stat_size(&cluster, 0, &leak),
+            None,
+            "skill content leaked into the output snapshot at {leak}"
+        );
+    }
 
     // ---- run 2: the composer pins the ADVANCED head, so the checkout must
     // materialize run 1's committed artifact (W2 chaining) — content-checked
@@ -392,6 +480,27 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
             "the mount honors DUCKTAPE_AGENT_RUNS_ROOT: {cwd}"
         );
         poll_until("the run dir to be cleaned up (W5)", FINALIZE, || {
+            (!dir.exists()).then_some(())
+        });
+    }
+
+    // ---- the skill ro mounts: one content-checked root per run, each under
+    // the operator root, each a SIBLING of its run's rw mount (never inside
+    // it — that is the no-leak mechanism), and each cleaned up (W5).
+    let roots = provider.skill_roots();
+    assert_eq!(roots.len(), 2, "both runs saw the skill ro mount: {roots:?}");
+    assert_ne!(roots[0], roots[1], "per-run skill roots never collide");
+    for (root, cwd) in roots.iter().zip(&cwds) {
+        let dir = PathBuf::from(root);
+        assert!(
+            dir.starts_with(&runs_root),
+            "the skill root lives under the runs root: {root}"
+        );
+        assert!(
+            !dir.starts_with(cwd),
+            "the skill root is a sibling of the rw mount, never inside it: {root} vs {cwd}"
+        );
+        poll_until("the skill ro root to be cleaned up (W5)", FINALIZE, || {
             (!dir.exists()).then_some(())
         });
     }

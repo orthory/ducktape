@@ -29,6 +29,9 @@ const MODULE_INFO: Record<string, { label: string; desc: string }> = {
   jobs: { label: "Jobs", desc: "A consensus-native job / claim board." },
   files: { label: "Files", desc: "A copy-on-write, content-addressed filesystem (duckfs)." },
   saga: { label: "Saga", desc: "The deterministic async-RPC ledger behind agents." },
+  identity: { label: "Identity", desc: "Accounts, member keys, and node bindings." },
+  duckdns: { label: "DuckDNS", desc: "Optional global .duck handles resolved to accounts." },
+  gateway: { label: "Gateway", desc: "Signed account routes to DuckFS or local HTTP." },
   kv: { label: "KV", desc: "A key-value store (internal scaffold)." },
   directory: { label: "Directory", desc: "An example / demo module (internal)." },
 };

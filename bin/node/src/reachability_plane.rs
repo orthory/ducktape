@@ -8,6 +8,87 @@ use crate::config::{self, WireGuardEffectKind, hex_bytes};
 use crate::constants::NUDGE_INTERVAL;
 use crate::lobby;
 
+/// Which doorbell an intro arrived on: the DIRECT UDP listener or the
+/// COORDINATED (rendezvous-punched, resolver-socket) receiver.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum IntroPath {
+    Direct,
+    Coordinated,
+}
+
+/// One inviter-side intro datagram, shared by BOTH doorbells: decode →
+/// verify → install → ack, in that order — the ack is only emitted after the
+/// `InstallInvitePeer` reply settles, so "acked" can never outrun
+/// "installed". `ack` abstracts the reply transport (the direct listener
+/// answers on its own socket, the coordinated receiver via
+/// `SendResolverDatagram`). Returns `false` once the plane's command channel
+/// is gone, telling the caller to exit its receive loop.
+pub(crate) async fn handle_intro<F, Fut>(
+    bytes: &[u8],
+    src: std::net::SocketAddr,
+    binding: &[u8],
+    label: &str,
+    path: IntroPath,
+    cmds: &tokio::sync::mpsc::WeakSender<reachability::ReachabilityCommand>,
+    ack: F,
+) -> bool
+where
+    F: FnOnce(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let Ok(msg) = lobby::decode_intro(bytes) else {
+        return true; // junk on the doorbell — drop.
+    };
+    let ack_bytes = |installed: bool, detail: String| {
+        lobby::encode_intro_ack(&lobby::IntroAck {
+            nonce: msg.nonce.clone(),
+            installed,
+            detail,
+        })
+    };
+    let verified = match lobby::verify_intro(&msg, binding) {
+        Ok(v) => v,
+        Err(e) => {
+            // the direct doorbell answers a failed verification; the
+            // coordinated path drops it silently (preserved pre-extraction
+            // behavior — an unverified src has earned no resolver datagram).
+            if path == IntroPath::Direct {
+                ack(ack_bytes(false, e)).await;
+            }
+            return true;
+        }
+    };
+    let Some(cmds) = cmds.upgrade() else {
+        return false;
+    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let install = reachability::ReachabilityCommand::InstallInvitePeer {
+        peer: verified.joiner.clone(),
+        wireguard_public_key: wireguard_upgrade::X25519PublicKey(verified.wg_public_key),
+        endpoint: src,
+        reply: reachability::InstallReply(reply_tx),
+    };
+    if cmds.send(install).await.is_err() {
+        return false;
+    }
+    match reply_rx.await {
+        Ok(Ok(())) => {
+            let flavor = match path {
+                IntroPath::Direct => "",
+                IntroPath::Coordinated => "coordinated ",
+            };
+            println!(
+                "[node {label}] invite intro: {flavor}tunnel peer installed for {}",
+                config::hex_bytes(&verified.joiner.as_ref()[..4])
+            );
+            ack(ack_bytes(true, "tunnel installed".into())).await;
+        }
+        Ok(Err(e)) => ack(ack_bytes(false, e)).await,
+        Err(_) => ack(ack_bytes(false, "plane exited".into())).await,
+    }
+    true
+}
+
 /// the reachability plane's thread body: derive the plane's endpoints, bind
 /// the nat client against the coordinated-reach coordinators, and drive
 /// `reachability::run` with the configured WireGuard effect — real (an
@@ -488,53 +569,24 @@ async fn reachability_plane(
                 let Ok((n, src)) = socket.recv_from(&mut buf).await else {
                     continue;
                 };
-                let Ok(msg) = lobby::decode_intro(&buf[..n]) else {
-                    continue; // junk on the doorbell — drop.
-                };
-                let ack = |installed: bool, detail: String| {
-                    let ack = lobby::IntroAck {
-                        nonce: msg.nonce.clone(),
-                        installed,
-                        detail,
-                    };
-                    let bytes = lobby::encode_intro_ack(&ack);
+                let ack = |bytes: Vec<u8>| {
                     let socket = &socket;
                     async move {
                         let _ = socket.send_to(&bytes, src).await;
                     }
                 };
-                let verified = match lobby::verify_intro(&msg, &binding) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        ack(false, e).await;
-                        continue;
-                    }
-                };
-                let Some(cmds) = intro_cmds.upgrade() else {
+                if !handle_intro(
+                    &buf[..n],
+                    src,
+                    &binding,
+                    &intro_label,
+                    IntroPath::Direct,
+                    &intro_cmds,
+                    ack,
+                )
+                .await
+                {
                     break;
-                };
-                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                let install = reachability::ReachabilityCommand::InstallInvitePeer {
-                    peer: verified.joiner.clone(),
-                    wireguard_public_key: wireguard_upgrade::X25519PublicKey(
-                        verified.wg_public_key,
-                    ),
-                    endpoint: src,
-                    reply: reachability::InstallReply(reply_tx),
-                };
-                if cmds.send(install).await.is_err() {
-                    break;
-                }
-                match reply_rx.await {
-                    Ok(Ok(())) => {
-                        println!(
-                            "[node {intro_label}] invite intro: tunnel peer installed for {}",
-                            config::hex_bytes(&verified.joiner.as_ref()[..4])
-                        );
-                        ack(true, "tunnel installed".into()).await;
-                    }
-                    Ok(Err(e)) => ack(false, e).await,
-                    Err(_) => ack(false, "plane exited".into()).await,
                 }
             }
         });
@@ -545,59 +597,32 @@ async fn reachability_plane(
         let binding = config.chain_id.clone().into_bytes();
         tokio::spawn(async move {
             while let Some((src, bytes)) = invite_intro_rx.recv().await {
-                let Ok(msg) = lobby::decode_intro(&bytes) else {
-                    continue;
-                };
-                let verified = match lobby::verify_intro(&msg, &binding) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let Some(cmds) = intro_cmds.upgrade() else {
-                    break;
-                };
-                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                let install = reachability::ReachabilityCommand::InstallInvitePeer {
-                    peer: verified.joiner.clone(),
-                    wireguard_public_key: wireguard_upgrade::X25519PublicKey(
-                        verified.wg_public_key,
-                    ),
-                    endpoint: src,
-                    reply: reachability::InstallReply(reply_tx),
-                };
-                if cmds.send(install).await.is_err() {
-                    break;
-                }
-                let ack = match reply_rx.await {
-                    Ok(Ok(())) => {
-                        println!(
-                            "[node {intro_label}] invite intro: coordinated tunnel peer \
-                             installed for {}",
-                            config::hex_bytes(&verified.joiner.as_ref()[..4])
-                        );
-                        lobby::IntroAck {
-                            nonce: msg.nonce.clone(),
-                            installed: true,
-                            detail: "tunnel installed".into(),
+                let ack = |ack_bytes: Vec<u8>| {
+                    let cmds = intro_cmds.clone();
+                    async move {
+                        if let Some(cmds) = cmds.upgrade() {
+                            let _ = cmds
+                                .send(reachability::ReachabilityCommand::SendResolverDatagram {
+                                    endpoint: src,
+                                    bytes: ack_bytes,
+                                })
+                                .await;
                         }
                     }
-                    Ok(Err(e)) => lobby::IntroAck {
-                        nonce: msg.nonce.clone(),
-                        installed: false,
-                        detail: e,
-                    },
-                    Err(_) => lobby::IntroAck {
-                        nonce: msg.nonce.clone(),
-                        installed: false,
-                        detail: "plane exited".into(),
-                    },
                 };
-                let bytes = lobby::encode_intro_ack(&ack);
-                let _ = cmds
-                    .send(reachability::ReachabilityCommand::SendResolverDatagram {
-                        endpoint: src,
-                        bytes,
-                    })
-                    .await;
+                if !handle_intro(
+                    &bytes,
+                    src,
+                    &binding,
+                    &intro_label,
+                    IntroPath::Coordinated,
+                    &intro_cmds,
+                    ack,
+                )
+                .await
+                {
+                    break;
+                }
             }
         });
     }

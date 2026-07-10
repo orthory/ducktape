@@ -123,6 +123,49 @@ describe("remoteTransport", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("http://node.example:8844/v1/status");
   });
 
+  it("mints a gateway session with only the finalized account route identity", async () => {
+    const reply = { url: "http://0123456789abcdef0123456789abcdef.localhost:49152/" };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, reply));
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = remoteTransport("http://node.example:8844");
+    await expect(transport.gatewaySession!({
+      accountId: [1, 2],
+      name: { label: "api" },
+      revision: 4,
+    })).resolves.toEqual(reply);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://node.example:8844/v1/gateway/session");
+    expect(JSON.parse(String(init.body))).toEqual({
+      accountId: [1, 2],
+      name: { label: "api" },
+      revision: 4,
+    });
+  });
+
+  it("moves a bounded gateway proxy body as base64 JSON", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, {
+      head: { status: 201, headers: [{ name: "content-type", value: "text/plain" }] },
+      bodyB64: btoa("ok"),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = remoteTransport("http://node.example:8844");
+    const body = new Uint8Array([1, 2, 3]);
+    const head = {
+      account_id: [1, 2],
+      name: { label: null },
+      revision: 1,
+      method: "post" as const,
+      path_and_query: "/items",
+      headers: [{ name: "content-type", value: "application/octet-stream" }],
+      body_len: body.length,
+    };
+    const reply = await transport.gatewayProxy!({ head, body });
+    expect(new TextDecoder().decode(reply.body)).toBe("ok");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("http://node.example:8844/v1/gateway/proxy");
+    expect(JSON.parse(String(init.body))).toEqual({ head, bodyB64: "AQID" });
+  });
+
   it("sends one union subscribe frame on open", () => {
     const transport = remoteTransport("http://node.example:8844");
     const unsubscribe = transport.subscribe(["module:chat", "logs"], {});

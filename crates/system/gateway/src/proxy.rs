@@ -1,0 +1,406 @@
+//! Bounded request contract for the gateway reverse proxy.
+//!
+//! The stream hello carries only [`ProxyRequestHead`]. A caller writes exactly
+//! `body_len` bytes after the authenticated stream opens, then receives one
+//! bounded response. The publisher re-resolves the route and caller account
+//! before touching DuckFS or loopback, so this is not a raw filesystem, socket,
+//! or reverse-proxy primitive.
+
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    MAX_REQUEST_BODY_BYTES, RouteAudience, RouteMethod, RouteName, RouteRecord, RouteTarget,
+    validate_account_id, validate_content_path,
+};
+
+pub const PROXY_FLOW_DOMAIN: &[u8] = b"ducktape-gateway-proxy-v1";
+pub const PROXY_INTENT: u8 = 1;
+pub const MAX_PROXY_HEAD_BYTES: usize = 1024;
+pub const MAX_PATH_AND_QUERY_BYTES: usize = 2048;
+pub const MAX_HEADERS: usize = 8;
+pub const MAX_HEADER_NAME_BYTES: usize = 64;
+pub const MAX_HEADER_VALUE_BYTES: usize = 1024;
+pub const MAX_HEADER_BYTES: usize = 4096;
+pub const MAX_RESPONSE_HEAD_BYTES: usize = 4096;
+
+pub const ALLOWED_REQUEST_HEADERS: &[&str] = &[
+    "accept",
+    "authorization",
+    "content-type",
+    "idempotency-key",
+    "if-match",
+    "if-none-match",
+];
+
+pub const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "etag",
+    "last-modified",
+    "location",
+    "retry-after",
+];
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyHeader {
+    /// Canonical lowercase ASCII. Cookie, Set-Cookie, forwarding headers, CORS,
+    /// and security headers are absent from the allowlists by construction.
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyRequestHead {
+    pub account_id: Vec<u8>,
+    pub name: RouteName,
+    pub revision: u64,
+    pub method: RouteMethod,
+    /// Strict HTTP origin-form (`/path?query`), never an absolute URI.
+    pub path_and_query: String,
+    /// Strictly name-sorted, unique, allowlisted request headers.
+    pub headers: Vec<ProxyHeader>,
+    pub body_len: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyResponseHead {
+    pub status: u16,
+    /// Strictly name-sorted, unique, allowlisted response headers.
+    pub headers: Vec<ProxyHeader>,
+}
+
+pub fn encode_proxy_request_head(head: &ProxyRequestHead) -> Result<Vec<u8>, String> {
+    validate_proxy_request_head(head)?;
+    let bytes = serde_json::to_vec(head).map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_PROXY_HEAD_BYTES {
+        return Err(format!(
+            "gateway proxy: head exceeds {MAX_PROXY_HEAD_BYTES} bytes"
+        ));
+    }
+    Ok(bytes)
+}
+
+pub fn decode_proxy_request_head(bytes: &[u8]) -> Result<ProxyRequestHead, String> {
+    if bytes.len() > MAX_PROXY_HEAD_BYTES {
+        return Err(format!(
+            "gateway proxy: head exceeds {MAX_PROXY_HEAD_BYTES} bytes"
+        ));
+    }
+    let head: ProxyRequestHead =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    validate_proxy_request_head(&head)?;
+    Ok(head)
+}
+
+pub fn validate_proxy_request_head(head: &ProxyRequestHead) -> Result<(), String> {
+    validate_account_id(&head.account_id)?;
+    head.name.validate()?;
+    if head.revision == 0 {
+        return Err("gateway proxy: revision starts at 1".into());
+    }
+    validate_origin_form(&head.path_and_query)?;
+    validate_headers(&head.headers, ALLOWED_REQUEST_HEADERS, "request")?;
+    if head.body_len > MAX_REQUEST_BODY_BYTES {
+        return Err(format!(
+            "gateway proxy: body exceeds {MAX_REQUEST_BODY_BYTES} bytes"
+        ));
+    }
+    if !head.method.permits_body() && head.body_len != 0 {
+        return Err("gateway proxy: GET/HEAD requests cannot carry a body".into());
+    }
+    Ok(())
+}
+
+pub fn validate_response_head(head: &ProxyResponseHead) -> Result<(), String> {
+    if !(200..=599).contains(&head.status) {
+        return Err("gateway proxy: invalid upstream status".into());
+    }
+    validate_headers(&head.headers, ALLOWED_RESPONSE_HEADERS, "response")?;
+    if let Some(location) = header_value(&head.headers, "location") {
+        validate_safe_location(location)?;
+    }
+    Ok(())
+}
+
+pub fn validate_origin_form(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || !value.starts_with('/')
+        || value.starts_with("//")
+        || value.len() > MAX_PATH_AND_QUERY_BYTES
+        || value.contains(['\r', '\n', '\\', '#'])
+        || !value.bytes().all(|byte| (b'!'..=b'~').contains(&byte))
+    {
+        return Err("gateway proxy: invalid origin-form path/query".into());
+    }
+    Ok(())
+}
+
+pub fn validate_safe_location(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || !value.starts_with('/')
+        || value.starts_with("//")
+        || value.len() > MAX_PATH_AND_QUERY_BYTES
+        || value.contains(['\r', '\n', '\\'])
+        || !value.bytes().all(|byte| (b'!'..=b'~').contains(&byte))
+    {
+        return Err("gateway proxy: unsafe redirect location".into());
+    }
+    Ok(())
+}
+
+pub fn validate_headers(
+    headers: &[ProxyHeader],
+    allowed: &[&str],
+    kind: &str,
+) -> Result<(), String> {
+    if headers.len() > MAX_HEADERS {
+        return Err(format!(
+            "gateway proxy: too many {kind} headers (max {MAX_HEADERS})"
+        ));
+    }
+    let mut previous: Option<&str> = None;
+    let mut total = 0usize;
+    for header in headers {
+        if header.name.is_empty()
+            || header.name.len() > MAX_HEADER_NAME_BYTES
+            || !header
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+            || !allowed.contains(&header.name.as_str())
+        {
+            return Err(format!(
+                "gateway proxy: disallowed {kind} header {:?}",
+                header.name
+            ));
+        }
+        if previous.is_some_and(|old| old >= header.name.as_str()) {
+            return Err(format!(
+                "gateway proxy: {kind} headers must be strictly sorted and unique"
+            ));
+        }
+        previous = Some(&header.name);
+        if header.value.is_empty()
+            || header.value.len() > MAX_HEADER_VALUE_BYTES
+            || !header.value.is_ascii()
+            || header.value.bytes().any(|byte| byte < b' ' || byte == 0x7f)
+        {
+            return Err(format!(
+                "gateway proxy: invalid value for {kind} header {:?}",
+                header.name
+            ));
+        }
+        total = total
+            .checked_add(header.name.len() + header.value.len())
+            .ok_or_else(|| "gateway proxy: header size overflow".to_string())?;
+    }
+    if total > MAX_HEADER_BYTES {
+        return Err(format!(
+            "gateway proxy: {kind} headers exceed {MAX_HEADER_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+pub fn header_value<'a>(headers: &'a [ProxyHeader], name: &str) -> Option<&'a str> {
+    headers
+        .binary_search_by(|header| header.name.as_str().cmp(name))
+        .ok()
+        .map(|index| headers[index].value.as_str())
+}
+
+pub fn audience_allows(
+    audience: &RouteAudience,
+    owner_account: &[u8],
+    caller_account: &[u8],
+) -> bool {
+    match audience {
+        RouteAudience::Owner => caller_account == owner_account,
+        RouteAudience::Network => !caller_account.is_empty(),
+        RouteAudience::Accounts { account_ids } => account_ids
+            .binary_search_by(|account| account.as_slice().cmp(caller_account))
+            .is_ok(),
+    }
+}
+
+/// Validate invocation policy against the current route. This is run at the
+/// consumer before opening a stream and again at the publisher after resolving
+/// its own finalized state.
+pub fn request_matches_record(head: &ProxyRequestHead, record: &RouteRecord) -> bool {
+    let statement = &record.statement;
+    let Some(route) = &statement.route else {
+        return false;
+    };
+    statement.account_id == head.account_id
+        && statement.name == head.name
+        && statement.revision == head.revision
+        && route.policy.methods.binary_search(&head.method).is_ok()
+        && head.body_len <= route.policy.max_request_bytes
+        && (route.policy.allow_authorization
+            || header_value(&head.headers, "authorization").is_none())
+}
+
+/// Resolve a strict content request to the signed manifest entry. Query
+/// strings and percent-decoding are deliberately absent for immutable content.
+pub fn content_file_for_request<'a>(
+    head: &ProxyRequestHead,
+    record: &'a RouteRecord,
+) -> Result<&'a crate::ContentFile, String> {
+    if !matches!(head.method, RouteMethod::Get | RouteMethod::Head) || head.body_len != 0 {
+        return Err("gateway content: only bodyless GET/HEAD are supported".into());
+    }
+    let Some(route) = &record.statement.route else {
+        return Err("gateway content: route is unpublished".into());
+    };
+    let RouteTarget::DuckFs { content } = &route.target else {
+        return Err("gateway content: route is not content-backed".into());
+    };
+    if head.path_and_query.contains('?') {
+        return Err("gateway content: query strings are not supported".into());
+    }
+    let path = match head.path_and_query.as_str() {
+        "/" => content
+            .default_path
+            .as_deref()
+            .ok_or_else(|| "gateway content: no default path".to_string())?,
+        path => path
+            .strip_prefix('/')
+            .ok_or_else(|| "gateway content: path is not origin-form".to_string())?,
+    };
+    validate_content_path(path)?;
+    content
+        .files
+        .binary_search_by(|file| file.path.as_str().cmp(path))
+        .ok()
+        .map(|index| &content.files[index])
+        .ok_or_else(|| "gateway content: file is not declared".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        MemberAuthorization, ROUTE_FORMAT_VERSION, RouteDefinition, RoutePolicy, RouteStatement,
+    };
+
+    fn record() -> RouteRecord {
+        RouteRecord {
+            statement: RouteStatement {
+                version: ROUTE_FORMAT_VERSION,
+                chain_id: "test".into(),
+                account_id: vec![1; 32],
+                name: RouteName::named("api"),
+                publisher_node: vec![2; 32],
+                revision: 7,
+                route: Some(RouteDefinition {
+                    target: RouteTarget::LoopbackHttp,
+                    policy: RoutePolicy {
+                        audience: RouteAudience::Network,
+                        methods: vec![RouteMethod::Get, RouteMethod::Post],
+                        max_request_bytes: 1024,
+                        max_response_bytes: 4096,
+                        allow_authorization: false,
+                    },
+                }),
+            },
+            authorization: MemberAuthorization {
+                signer: vec![3; 32],
+                signature: vec![4; 64],
+            },
+        }
+    }
+
+    #[test]
+    fn invocation_is_record_method_revision_and_header_scoped() {
+        let head = ProxyRequestHead {
+            account_id: vec![1; 32],
+            name: RouteName::named("api"),
+            revision: 7,
+            method: RouteMethod::Post,
+            path_and_query: "/v1/items".into(),
+            headers: vec![ProxyHeader {
+                name: "content-type".into(),
+                value: "application/json".into(),
+            }],
+            body_len: 12,
+        };
+        let encoded = encode_proxy_request_head(&head).unwrap();
+        assert_eq!(decode_proxy_request_head(&encoded).unwrap(), head);
+        assert!(request_matches_record(&head, &record()));
+
+        let mut stale = head.clone();
+        stale.revision -= 1;
+        assert!(!request_matches_record(&stale, &record()));
+        let mut forbidden = head.clone();
+        forbidden.method = RouteMethod::Delete;
+        assert!(!request_matches_record(&forbidden, &record()));
+        let mut ambient = head;
+        ambient.headers = vec![ProxyHeader {
+            name: "authorization".into(),
+            value: "Bearer secret".into(),
+        }];
+        assert!(!request_matches_record(&ambient, &record()));
+    }
+
+    #[test]
+    fn absolute_urls_smuggling_and_ambient_headers_fail_closed() {
+        for path in [
+            "https://evil.test",
+            "//evil.test/x",
+            "/x\r\nHost: evil",
+            "/x#fragment",
+            "/\\evil.test",
+        ] {
+            assert!(validate_origin_form(path).is_err(), "accepted {path:?}");
+        }
+        for name in ["cookie", "host", "origin", "x-forwarded-for"] {
+            assert!(
+                validate_headers(
+                    &[ProxyHeader {
+                        name: name.into(),
+                        value: "x".into(),
+                    }],
+                    ALLOWED_REQUEST_HEADERS,
+                    "request",
+                )
+                .is_err(),
+                "accepted {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn audience_is_separate_from_global_name_resolution() {
+        let owner = vec![1; 32];
+        let bob = vec![2; 32];
+        assert!(audience_allows(&RouteAudience::Owner, &owner, &owner));
+        assert!(!audience_allows(&RouteAudience::Owner, &owner, &bob));
+        assert!(audience_allows(&RouteAudience::Network, &owner, &bob));
+        assert!(audience_allows(
+            &RouteAudience::Accounts {
+                account_ids: vec![bob.clone()]
+            },
+            &owner,
+            &bob
+        ));
+    }
+
+    #[test]
+    fn caller_cannot_forge_a_huge_body_len() {
+        let head = ProxyRequestHead {
+            account_id: vec![1],
+            name: RouteName::apex(),
+            revision: 1,
+            method: RouteMethod::Post,
+            path_and_query: "/".into(),
+            headers: vec![],
+            body_len: MAX_REQUEST_BODY_BYTES + 1,
+        };
+        assert!(validate_proxy_request_head(&head).is_err());
+        let mut json = serde_json::to_value(&head).unwrap();
+        json["account_id"] = serde_json::json!(vec![1; crate::MAX_ACCOUNT_ID_BYTES + 1]);
+        assert!(decode_proxy_request_head(&serde_json::to_vec(&json).unwrap()).is_err());
+    }
+}

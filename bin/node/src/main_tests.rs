@@ -8,6 +8,43 @@ use sdk::{Ctx, Error, Module, StateSyncHandle};
 use std::sync::{Arc, Mutex};
 use upgrade::{ScheduledUpgrade, UpgradeStatus};
 
+#[test]
+fn gateway_requires_a_loopback_node_api_and_real_overlay() {
+    let wireguard = Some("127.0.0.1:51820".parse().unwrap());
+    assert!(gateway_can_start(
+        false,
+        Some("127.0.0.1:0"),
+        Some("127.0.0.1:8844"),
+        wireguard,
+        config::WireGuardEffectKind::Socket,
+    ));
+    for allowed in [
+        gateway_can_start(
+            false,
+            Some("127.0.0.1:0"),
+            Some("0.0.0.0:8844"),
+            wireguard,
+            config::WireGuardEffectKind::Socket,
+        ),
+        gateway_can_start(
+            true,
+            Some("127.0.0.1:0"),
+            Some("127.0.0.1:8844"),
+            wireguard,
+            config::WireGuardEffectKind::Socket,
+        ),
+        gateway_can_start(
+            false,
+            Some("127.0.0.1:0"),
+            Some("127.0.0.1:8844"),
+            wireguard,
+            config::WireGuardEffectKind::Fake,
+        ),
+    ] {
+        assert!(!allowed);
+    }
+}
+
 fn test_root(byte: u8) -> StateRoot {
     StateRoot([byte; sdk::ROOT_LEN])
 }

@@ -125,7 +125,7 @@ pub(crate) const EPOCH_CHANNEL_BANK: u64 = 16;
 pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-pub(crate) const MODULE_IDS: [&str; 22] = [
+pub(crate) const MODULE_IDS: [&str; 23] = [
     "kv",
     "pages",
     "chat",
@@ -141,6 +141,7 @@ pub(crate) const MODULE_IDS: [&str; 22] = [
     "vaults",
     "identity",
     "duckdns",
+    "gateway",
     "inbox",
     "directory",
     "automations",
