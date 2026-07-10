@@ -63,6 +63,7 @@ use tracing_subscriber::prelude::*;
 use consensus::{ConsensusScheme, ContentStore, SimplexOrderer};
 
 mod blob_fetch;
+mod boot;
 mod cli;
 mod cli_flags;
 mod config;
@@ -240,215 +241,40 @@ fn run_node(
     sync_only: bool,
     log_ring: noded::LogRing,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Resolved {
+    let boot::env::BootEnv {
         signer,
         label,
         namespace,
-        // the descriptor's own chain-id (network shape) or the raw dev-shape
-        // namespace — NOT `namespace` below, which is `genesis_namespace()`
-        // (chain_id@fingerprint) on the network shape. this is the string the
-        // desktop app records as `Workspace.chain_id`; threaded into
-        // `identity`'s certificate domain separation.
-        chain_id: identity_chain_id,
-        mesh: peers,
+        identity_chain_id,
+        peers,
         validators,
         bootstrappers,
         coordinated,
         listen,
         advertised,
-        storage_dir: storage,
+        storage,
         rpc_listen,
         http_listen,
         wireguard_listen,
         wireguard_effect,
         wireguard_key_file,
         invite_listen,
-        dev_demo,
-        checkpoint_blocks,
         invite_token,
         invite_wireguard,
         invite_fronts,
-        sync_index,
-        announce_capabilities,
         coordination,
         coord_cap,
         workspace,
-    } = resolved;
-    // a key outside the GENESIS validator set is not an error: post-genesis
-    // members are admitted via governance. with a recovery checkpoint on disk
-    // (a previous run promoted this identity) boot proceeds as a validator
-    // off the recovery record; with a fresh storage dir the node enters
-    // JOINER mode — park on the mesh, sync a boundary whose participant set
-    // includes this key, fabricate the equivalent recovery checkpoint, and
-    // reboot through the normal restore path. this filesystem probe mirrors
-    // the recovery store's layout (storage_dir/<partition>/) and only gates
-    // which listeners bind — the runtime re-decides joiner-vs-validator from
-    // the real store.
-    let promoted = storage
-        .join("recovery-manifest")
-        .read_dir()
-        .map(|mut entries| entries.next().is_some())
-        .unwrap_or(false);
-    let joiner = !sync_only && !validators.contains(&signer.public_key()) && !promoted;
-    if joiner {
-        if invite_token.is_some() {
-            println!(
-                "[node {label}] identity {} is not in the genesis validator set — joiner \
-                 mode: announcing this key with the invite token; a member node redeems it \
-                 automatically (the mint was the approval) and full-node standing lands at \
-                 the next block",
-                hex_bytes(signer.public_key().as_ref())
-            );
-        } else {
-            println!(
-                "[node {label}] identity {} is not in the genesis validator set — joiner \
-                 mode: no invite token on disk, so a member must grant standing manually \
-                 (`ducktape-node invite-accept {}`)",
-                hex_bytes(signer.public_key().as_ref()),
-                hex_bytes(signer.public_key().as_ref())
-            );
-        }
-    }
-
-    // keep the raw (key, addr) pairs for statesync source selection before
-    // discovery's bootstrapper list converts to its own ingress address type.
-    let sync_candidates = bootstrappers.clone();
-    // cold-restart dial seeding: the persisted mesh's control endpoints (the
-    // chain-derived ULAs for overlay-advertised members) join the dial
-    // hints, so a member restarting with every configured ingress gone
-    // still dials its peers over the tunnels the reachability plane
-    // re-applies at boot. Config hints win: a peer that already has a
-    // configured entry gets no seed, in case discovery keeps one ingress
-    // per key — a possibly-dead persisted address must never displace a
-    // live operator-provided one. Load refusals (tamper, format, chain) are
-    // the plane's to surface at its restore; here they just mean no seeds.
-    let chain_id = String::from_utf8_lossy(&namespace).to_string();
-    let mesh_state_file = storage.join("mesh-state.json");
-    // fail-closed check for private coordination: a node that is neither a
-    // genesis validator (admitted by membership) nor holding a `coord.cap`
-    // will have every rendezvous request silently dropped by a private
-    // coordinator. Surface that loudly instead of pretending the plane is
-    // healthy — the tunnels never come up, and the operator needs to know it
-    // is a missing credential, not a network fault.
-    if wireguard_listen.is_some()
-        && !coordinated.is_empty()
-        && coordination == config::Coordination::Private
-        && coord_cap.is_none()
-        && !validators.contains(&signer.public_key())
-    {
-        eprintln!(
-            "[node {label}] reachability: private coordination but no coord.cap and not a \
-             genesis validator — rendezvous will be denied; provide coord.cap or use a \
-             fronted/direct reach hint"
-        );
-    }
-    let mesh_dial_seeds: Vec<(ed25519::PublicKey, Ingress)> =
-        match reachability::store::load(&mesh_state_file, &chain_id) {
-            Ok(Some(mesh)) => {
-                let me = reachability::identity_of(&signer.public_key());
-                let seeds: Vec<(ed25519::PublicKey, Ingress)> = mesh
-                    .adverts
-                    .iter()
-                    .map(|advert| &advert.record)
-                    .filter(|record| record.validator_identity != me)
-                    .filter_map(|record| {
-                        let pk =
-                            ed25519::PublicKey::decode(&record.validator_identity.0[..]).ok()?;
-                        if bootstrappers.iter().any(|(hinted, _)| *hinted == pk) {
-                            return None;
-                        }
-                        Some((pk, Ingress::Socket(record.control_endpoint.socket_addr())))
-                    })
-                    .collect();
-                if !seeds.is_empty() {
-                    println!(
-                        "[node {label}] {} mesh dial seed(s) from the persisted mesh (epoch {})",
-                        seeds.len(),
-                        mesh.epoch
-                    );
-                }
-                seeds
-            }
-            _ => Vec::new(),
-        };
-    let bootstrappers: Vec<(ed25519::PublicKey, _)> =
-        bootstrappers.into_iter().chain(mesh_dial_seeds).collect();
-
-    for (i, pk) in peers.iter().enumerate() {
-        println!(
-            "[node {label}] peer[{i}] identity={}",
-            hex_bytes(pk.as_ref())
-        );
-    }
-    println!(
-        "[node {label}] starting on {listen} ({} mesh peers, {} validators{}), namespace {}, storage {}",
-        peers.len(),
-        validators.len(),
-        if sync_only { ", sync-only" } else { "" },
-        String::from_utf8_lossy(&namespace),
-        storage.display()
-    );
-    // coordinated reach targets are split OUT of the TCP mesh dialer (a
-    // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
-    // there was a silent no-op). reaching them is the reachability plane's
-    // job: gossip relays through whatever mesh links exist, the nat client
-    // rendezvouses via the coordinator and hole-punches the WireGuard path, and
-    // once tunnels apply the mesh dials the target's advertised overlay
-    // address over the tunnel (the target sets `advertised = "overlay"`).
-    // what still needs a TCP foothold is the gossip itself: with ZERO
-    // bootstrap links nothing carries this node's records anywhere. a
-    // RESTART has one without config: the persisted mesh re-applies at boot
-    // and its ULA seeds joined `bootstrappers` above. what remains uncovered
-    // is the FIRST join (nothing persisted yet) on a coordinated-only
-    // config — surface that loudly rather than park silently.
-    if !coordinated.is_empty() {
-        if bootstrappers.is_empty() {
-            println!(
-                "[node {label}] WARNING: {} coordinated reach target(s) but NO direct/fronted \
-                 bootstrap link and no persisted mesh — tunnel bring-up gossip has no path to \
-                 ride, so these peers stay unreachable. add at least one direct/fronted hint \
-                 (an ephemeral ingress is enough) for the join window; after the first \
-                 converged mesh, restarts ride the persisted state.",
-                coordinated.len()
-            );
-        } else {
-            println!(
-                "[node {label}] {} coordinated reach target(s): mesh traffic flows over the \
-                 WireGuard tunnel once the reachability plane converges.",
-                coordinated.len()
-            );
-        }
-        for (target, coord, _coord_key) in &coordinated {
-            println!(
-                "[node {label}]   coordinated target {} via coordinator {coord:?}",
-                hex_bytes(&target.as_ref()[..4])
-            );
-        }
-    }
-    if let Some(wg) = &wireguard_listen {
-        let advertise = if wg.ip().is_unspecified() {
-            format!(
-                "endpoint-less on udp port {} (roaming: peers learn this node's address from its own initiations)",
-                wg.port()
-            )
-        } else {
-            format!("advertising WireGuard endpoint udp/{wg}")
-        };
-        match wireguard_effect {
-            WireGuardEffectKind::Tun => {
-                println!("[node {label}] reachability plane: {advertise}")
-            }
-            WireGuardEffectKind::Socket => println!(
-                "[node {label}] reachability plane: {advertise}; userspace socket backend \
-                 (TUN-less — overlay reachability lives inside this process)"
-            ),
-            WireGuardEffectKind::Fake => println!(
-                "[node {label}] reachability plane: {advertise}; \
-                 records, advertisements, and tunnel handshakes run for real, the interface \
-                 effect is the in-memory fake (no real tunnel)."
-            ),
-        }
-    }
+        sync_candidates,
+        chain_id,
+        mesh_state_file,
+        checkpoint_blocks,
+        dev_demo,
+        sync_index,
+        announce_capabilities,
+        promoted,
+        joiner,
+    } = boot::env::derive(resolved, sync_only);
 
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise. a
