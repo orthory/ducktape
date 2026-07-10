@@ -54,7 +54,12 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 # CLI / tauri-agent MCP server drive (semantic tree / input / DOM-SVG shot / logs).
 # registration is cfg-gated to debug + desktop in main.rs so a release runtime
 # registers nothing.
-tauri-plugin-agent = "0.0.1"
+# Git-pinned past the 0.0.1 release for the multiwebview fix (plugin#39/PR#40):
+# tauri's webview_windows() evicts a window once add_child gives it a second
+# webview, which killed the bridge whenever the inline gateway tab opened. The
+# JS guest (@byeongsu-hong/tauri-plugin-agent) is unchanged — npm stays 0.0.1.
+# Move the pin to a release once PR#40 merges and ships.
+tauri-plugin-agent = { git = "https://github.com/byeongsu-hong/tauri-agent-plugin", rev = "c1f65f1df2bc039ac24546d198d73eade426523a" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
