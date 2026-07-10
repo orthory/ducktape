@@ -1,7 +1,7 @@
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 
-use super::joiner_epoch_mesh;
+use crate::host_reads::joiner_epoch_mesh;
 
 fn pubkey_bytes(seed: &[u8; 32]) -> Vec<u8> {
     ed25519::PrivateKey::decode(seed.as_slice())
