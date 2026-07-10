@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 triple=$(rustc -vV | sed -n 's/^host: //p')
-cargo build --release -p node-bin -p duckdnsd --manifest-path ../Cargo.toml
+cargo build --release -p node-bin --manifest-path ../Cargo.toml
 mkdir -p src-tauri/binaries
 suffix=
 case "$triple" in
@@ -17,6 +17,4 @@ esac
 # placeholder's non-executable mode
 rm -f "src-tauri/binaries/ducktape-node-${triple}${suffix}"
 cp "../target/release/ducktape-node${suffix}" "src-tauri/binaries/ducktape-node-${triple}${suffix}"
-rm -f "src-tauri/binaries/duckdnsd-${triple}${suffix}"
-cp "../target/release/duckdnsd${suffix}" "src-tauri/binaries/duckdnsd-${triple}${suffix}"
-echo "staged src-tauri/binaries/ducktape-node-${triple}${suffix} and duckdnsd-${triple}${suffix}"
+echo "staged src-tauri/binaries/ducktape-node-${triple}${suffix}"

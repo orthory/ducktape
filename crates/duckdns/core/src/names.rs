@@ -10,7 +10,7 @@ use crate::{
     RESERVED_ROOT_LABELS, ServiceAnnouncement, ServiceScope,
 };
 
-/// The one validator for user, service, and derived chain labels: lowercase
+/// The one validator for account, service, and derived chain labels: lowercase
 /// ASCII `[a-z0-9-]`, no leading/trailing hyphen, maximum 63 bytes.
 pub fn validate_label(label: &str) -> Result<(), String> {
     if label.is_empty() {
@@ -125,8 +125,8 @@ impl DuckDnsName {
     /// Validate a value decoded directly from the wire.
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::User { handle } => validate_handle(handle),
-            Self::UserService { service, handle } => {
+            Self::Account { handle } => validate_handle(handle),
+            Self::AccountService { service, handle } => {
                 validate_label(service)?;
                 validate_handle(handle)
             }
@@ -148,8 +148,8 @@ impl DuckDnsName {
 
     pub fn hostname(&self) -> String {
         match self {
-            Self::User { handle } => format!("{handle}.{DUCKDNS_ZONE}"),
-            Self::UserService { service, handle } => {
+            Self::Account { handle } => format!("{handle}.{DUCKDNS_ZONE}"),
+            Self::AccountService { service, handle } => {
                 format!("{service}.{handle}.{DUCKDNS_ZONE}")
             }
             Self::NetworkService { service, chain } => {
@@ -187,10 +187,10 @@ pub fn parse_hostname(hostname: &str) -> Result<DuckDnsName, String> {
     }
 
     let name = match labels.as_slice() {
-        [handle] => DuckDnsName::User {
+        [handle] => DuckDnsName::Account {
             handle: (*handle).to_owned(),
         },
-        [service, handle] => DuckDnsName::UserService {
+        [service, handle] => DuckDnsName::AccountService {
             service: (*service).to_owned(),
             handle: (*handle).to_owned(),
         },
@@ -217,10 +217,7 @@ impl ServiceAnnouncement {
     pub fn validate(&self) -> Result<(), String> {
         validate_label(&self.service)?;
         match &self.scope {
-            ServiceScope::User { handle } => validate_handle(handle),
-            ServiceScope::Network if self.default_homepage => {
-                Err("duckdns: network service cannot be a default user homepage".into())
-            }
+            ServiceScope::Account { handle } => validate_handle(handle),
             ServiceScope::Network => Ok(()),
         }
     }
@@ -230,7 +227,7 @@ impl crate::ServiceIdentity {
     pub fn validate(&self) -> Result<(), String> {
         validate_label(&self.service)?;
         match &self.scope {
-            ServiceScope::User { handle } => validate_handle(handle),
+            ServiceScope::Account { handle } => validate_handle(handle),
             ServiceScope::Network => Ok(()),
         }
     }

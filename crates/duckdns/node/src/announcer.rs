@@ -1,5 +1,5 @@
-//! State-driven local DuckDNS publication announcer. Configuration supplies
-//! the desired declarations (without targets); this pump compares them with
+//! State-driven DuckDNS service announcer. Configuration supplies the desired
+//! identity-only declarations; this pump compares them with
 //! the committed registry and emits one full declarative replacement only
 //! when they differ.
 
@@ -140,8 +140,6 @@ mod tests {
         ServiceAnnouncement {
             scope: ServiceScope::Network,
             service: "docs".into(),
-            default_homepage: false,
-            allow_cross_site: false,
         }
     }
 

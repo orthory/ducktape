@@ -1,5 +1,5 @@
 //! Pure replicated registry. Authorization facts are supplied by the adapter:
-//! account ids for user operations and the authenticated provider node key.
+//! account ids for account operations and the authenticated provider node key.
 //! Membership/identity lookups and final eligible-provider filtering stay out
 //! of this SDK-free core.
 
@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 
 use crate::codec::{Reader, push_bytes, push_string, push_u64};
 use crate::{
-    DuckDnsName, MAX_ANNOUNCEMENTS_PER_NODE, MAX_LABEL_LEN, NODE_KEY_LEN, ResolvedService,
-    ServiceAnnouncement, ServiceIdentity, ServiceProvider, ServiceScope, derive_chain_label,
-    node_label, validate_handle,
+    DuckDnsName, MAX_ANNOUNCEMENTS_PER_NODE, MAX_LABEL_LEN, NODE_KEY_LEN, ResolvedNode,
+    ResolvedService, ServiceAnnouncement, ServiceAuthority, ServiceIdentity, ServiceScope,
+    derive_chain_label, node_label, validate_handle,
 };
 
 const MAX_ACCOUNT_ID_LEN: usize = 1024;
@@ -58,42 +58,6 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    /// Every canonical name implied by replicated declarations, before the
-    /// system adapter removes providers that lost standing/identity binding.
-    pub fn namespace_names(&self) -> Vec<DuckDnsName> {
-        let mut names = BTreeSet::new();
-        for (node, announcements) in &self.effective().announcements {
-            let node = node_label(node).expect("validated registry node key");
-            for announcement in announcements {
-                match &announcement.scope {
-                    ServiceScope::User { handle } => {
-                        names.insert(DuckDnsName::UserService {
-                            service: announcement.service.clone(),
-                            handle: handle.clone(),
-                        });
-                        if announcement.default_homepage {
-                            names.insert(DuckDnsName::User {
-                                handle: handle.clone(),
-                            });
-                        }
-                    }
-                    ServiceScope::Network => {
-                        names.insert(DuckDnsName::NetworkService {
-                            service: announcement.service.clone(),
-                            chain: self.chain_label.clone(),
-                        });
-                        names.insert(DuckDnsName::NodeService {
-                            service: announcement.service.clone(),
-                            node: node.clone(),
-                            chain: self.chain_label.clone(),
-                        });
-                    }
-                }
-            }
-        }
-        names.into_iter().collect()
-    }
-
     pub fn claim_handle(&mut self, account: &[u8], handle: String) -> Result<(), String> {
         validate_account(account)?;
         validate_handle(&handle)?;
@@ -134,7 +98,7 @@ impl Registry {
             announcements.retain(|announcement| {
                 !matches!(
                     &announcement.scope,
-                    ServiceScope::User { handle: announced } if announced == handle
+                    ServiceScope::Account { handle: announced } if announced == handle
                 )
             });
             !announcements.is_empty()
@@ -145,7 +109,7 @@ impl Registry {
     }
 
     /// Replace one authenticated node's full declaration set. `account` is
-    /// required only when the replacement contains user-scoped services.
+    /// required only when the replacement contains account-scoped services.
     pub fn replace_announcements(
         &mut self,
         node: &[u8],
@@ -164,18 +128,19 @@ impl Registry {
         }
         let replacement: BTreeSet<_> = announcements.into_iter().collect();
 
-        let user_handles: BTreeSet<&str> = replacement
+        let account_handles: BTreeSet<&str> = replacement
             .iter()
             .filter_map(|announcement| match &announcement.scope {
-                ServiceScope::User { handle } => Some(handle.as_str()),
+                ServiceScope::Account { handle } => Some(handle.as_str()),
                 ServiceScope::Network => None,
             })
             .collect();
-        if !user_handles.is_empty() {
-            let account = account
-                .ok_or_else(|| "duckdns: user announcements require a bound account".to_string())?;
+        if !account_handles.is_empty() {
+            let account = account.ok_or_else(|| {
+                "duckdns: account announcements require a bound account".to_string()
+            })?;
             validate_account(account)?;
-            for handle in user_handles {
+            for handle in account_handles {
                 match self.effective().handles.get(handle) {
                     Some(owner) if owner == account => {}
                     Some(_) => {
@@ -198,11 +163,11 @@ impl Registry {
     }
 
     /// Resolve against replicated declarations only. The system adapter must
-    /// remove providers lacking current standing and, for user services, nodes
+    /// remove providers lacking current standing and, for account services, nodes
     /// no longer bound to the owning account.
-    pub fn resolve(&self, name: &DuckDnsName) -> Result<Option<ResolvedService>, String> {
+    pub fn resolve_service(&self, name: &DuckDnsName) -> Result<Option<ResolvedService>, String> {
         name.validate()?;
-        let Some(identity) = self.identity_for_name(name) else {
+        let Some((identity, authority)) = self.binding_for_name(name) else {
             return Ok(None);
         };
         let requested_node = match name {
@@ -210,19 +175,17 @@ impl Registry {
             _ => None,
         };
         let mut providers = Vec::new();
-        let mut allow_cross_site = None;
         for (node, announcements) in &self.effective().announcements {
-            let Some(announcement) = announcements.iter().find(|announcement| {
+            if !announcements.iter().any(|announcement| {
                 announcement.scope == identity.scope && announcement.service == identity.service
-            }) else {
+            }) {
                 continue;
-            };
+            }
             let label = node_label(node)?;
             if requested_node.is_some_and(|requested| requested != &label) {
                 continue;
             }
-            allow_cross_site.get_or_insert(announcement.allow_cross_site);
-            providers.push(ServiceProvider {
+            providers.push(ResolvedNode {
                 node: node.clone(),
                 node_label: label,
             });
@@ -232,52 +195,37 @@ impl Registry {
         }
         Ok(Some(ResolvedService {
             identity,
+            authority,
             providers,
-            allow_cross_site: allow_cross_site.unwrap_or(false),
         }))
     }
 
-    fn identity_for_name(&self, name: &DuckDnsName) -> Option<ServiceIdentity> {
+    fn binding_for_name(&self, name: &DuckDnsName) -> Option<(ServiceIdentity, ServiceAuthority)> {
         match name {
-            DuckDnsName::User { handle } => {
-                self.effective().handles.get(handle)?;
-                let service = self
-                    .effective()
-                    .announcements
-                    .values()
-                    .flat_map(BTreeSet::iter)
-                    .find_map(|announcement| match &announcement.scope {
-                        ServiceScope::User { handle: announced }
-                            if announced == handle && announcement.default_homepage =>
-                        {
-                            Some(announcement.service.clone())
-                        }
-                        _ => None,
-                    })?;
-                Some(ServiceIdentity {
-                    scope: ServiceScope::User {
-                        handle: handle.clone(),
+            DuckDnsName::Account { .. } => None,
+            DuckDnsName::AccountService { service, handle } => {
+                let account_id = self.effective().handles.get(handle)?.clone();
+                Some((
+                    ServiceIdentity {
+                        scope: ServiceScope::Account {
+                            handle: handle.clone(),
+                        },
+                        service: service.clone(),
                     },
-                    service,
-                })
-            }
-            DuckDnsName::UserService { service, handle } => {
-                self.effective().handles.get(handle)?;
-                Some(ServiceIdentity {
-                    scope: ServiceScope::User {
-                        handle: handle.clone(),
-                    },
-                    service: service.clone(),
-                })
+                    ServiceAuthority::Account { account_id },
+                ))
             }
             DuckDnsName::NetworkService { service, chain }
             | DuckDnsName::NodeService { service, chain, .. }
                 if chain == &self.chain_label =>
             {
-                Some(ServiceIdentity {
-                    scope: ServiceScope::Network,
-                    service: service.clone(),
-                })
+                Some((
+                    ServiceIdentity {
+                        scope: ServiceScope::Network,
+                        service: service.clone(),
+                    },
+                    ServiceAuthority::Network,
+                ))
             }
             DuckDnsName::NetworkService { .. } | DuckDnsName::NodeService { .. } => None,
         }
@@ -342,8 +290,6 @@ fn validate_state(state: &State) -> Result<(), String> {
         validate_handle(handle)?;
         validate_account(owner)?;
     }
-    let mut policies: BTreeMap<ServiceIdentity, (bool, bool)> = BTreeMap::new();
-    let mut homepages: BTreeMap<String, String> = BTreeMap::new();
     for (node, announcements) in &state.announcements {
         validate_node(node)?;
         if announcements.is_empty() {
@@ -356,34 +302,11 @@ fn validate_state(state: &State) -> Result<(), String> {
         }
         for announcement in announcements {
             announcement.validate()?;
-            if let ServiceScope::User { handle } = &announcement.scope
+            if let ServiceScope::Account { handle } = &announcement.scope
                 && !state.handles.contains_key(handle)
             {
                 return Err(format!(
-                    "duckdns: user announcement refers to unclaimed handle {handle:?}"
-                ));
-            }
-            let identity = ServiceIdentity {
-                scope: announcement.scope.clone(),
-                service: announcement.service.clone(),
-            };
-            let policy = (announcement.default_homepage, announcement.allow_cross_site);
-            if policies
-                .insert(identity.clone(), policy)
-                .is_some_and(|old| old != policy)
-            {
-                return Err(format!(
-                    "duckdns: providers disagree on policy for {identity:?}"
-                ));
-            }
-            if announcement.default_homepage
-                && let ServiceScope::User { handle } = &announcement.scope
-                && homepages
-                    .insert(handle.clone(), announcement.service.clone())
-                    .is_some_and(|old| old != announcement.service)
-            {
-                return Err(format!(
-                    "duckdns: handle {handle:?} has more than one default homepage"
+                    "duckdns: account announcement refers to unclaimed handle {handle:?}"
                 ));
             }
         }
@@ -404,15 +327,13 @@ fn encode_state(state: &State) -> Vec<u8> {
         push_u64(&mut out, announcements.len());
         for announcement in announcements {
             match &announcement.scope {
-                ServiceScope::User { handle } => {
+                ServiceScope::Account { handle } => {
                     out.push(0);
                     push_string(&mut out, handle);
                 }
                 ServiceScope::Network => out.push(1),
             }
             push_string(&mut out, &announcement.service);
-            out.push(u8::from(announcement.default_homepage));
-            out.push(u8::from(announcement.allow_cross_site));
         }
     }
     out
@@ -452,7 +373,7 @@ fn decode_state(bytes: &[u8]) -> Result<State, String> {
         let mut previous: Option<ServiceAnnouncement> = None;
         for _ in 0..count {
             let scope = match reader.u8()? {
-                0 => ServiceScope::User {
+                0 => ServiceScope::Account {
                     handle: reader.string(MAX_LABEL_LEN, "handle")?,
                 },
                 1 => ServiceScope::Network,
@@ -465,8 +386,6 @@ fn decode_state(bytes: &[u8]) -> Result<State, String> {
             let announcement = ServiceAnnouncement {
                 scope,
                 service: reader.string(MAX_LABEL_LEN, "service")?,
-                default_homepage: reader.boolean()?,
-                allow_cross_site: reader.boolean()?,
             };
             if previous.as_ref().is_some_and(|old| old >= &announcement) {
                 return Err(

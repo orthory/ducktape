@@ -538,13 +538,6 @@ fn resolve_node_bin() -> Result<PathBuf, String> {
     resolve_external_bin("DUCKTAPE_NODE_BIN", "ducktape-node")
 }
 
-/// Resolve the bundled system helper through the same ownership, ancestor, and
-/// executable checks as the node sidecar. This is intentionally the only
-/// desktop path that turns a DuckDNS helper name into an executable path.
-pub(crate) fn resolve_duckdnsd_bin() -> Result<PathBuf, String> {
-    resolve_external_bin("DUCKTAPE_DUCKDNSD_BIN", "duckdnsd")
-}
-
 /// A sidecar override is either absent, a trusted executable, or an actionable
 /// error. Never silently fall back when an explicitly pinned path is broken.
 fn env_external_bin(variable: &str, binary: &str) -> Result<Option<PathBuf>, String> {

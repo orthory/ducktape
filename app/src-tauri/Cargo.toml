@@ -25,9 +25,7 @@ getrandom = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
-duckdnsd = { workspace = true }
 toml = "0.8"
-toml_edit = "0.22"
 # notify/stream.rs: the async ws client of the node's typed /v1/ws stream.
 # tokio-tungstenite deliberately builds without TLS features — the stream dials
 # the local workspace node over plain localhost http.

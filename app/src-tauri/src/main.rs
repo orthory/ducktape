@@ -13,8 +13,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
-mod duckdns;
-mod duckdns_install;
 mod enroll;
 mod forge_git;
 mod huddle;
@@ -28,12 +26,7 @@ fn main() {
     let node_control = daemon::NodeControl::new().expect("start desktop node-control actor");
     let mut builder = tauri::Builder::default()
         .manage(node_control)
-        .manage(duckdns::Registration::default())
         .invoke_handler(tauri::generate_handler![
-            duckdns::duckdns_status,
-            duckdns_install::duckdns_install,
-            duckdns_install::duckdns_repair,
-            duckdns_install::duckdns_remove,
             workspaces::workspace_list,
             workspaces::workspace_active,
             workspaces::workspace_create,
@@ -125,10 +118,6 @@ fn main() {
             // one place that asks its loop to exit.
             if let Some(notify) = tauri::Manager::try_state::<notify::NotifyHandles>(app) {
                 notify.stream.shutdown();
-            }
-            let registration = tauri::Manager::state::<duckdns::Registration>(app);
-            if let Err(err) = duckdns::deactivate(&registration) {
-                eprintln!("app exit: could not clear DuckDNS registration: {err}");
             }
             if let Err(err) = workspaces::stop_active_workspace_node(app) {
                 eprintln!("app exit: could not stop active workspace node: {err}");

@@ -91,10 +91,6 @@ pub struct Cluster {
     /// would not survive a respawn). set before the first spawn; empty by
     /// default so existing tests are byte-for-byte unchanged.
     pub extra_toml: Vec<String>,
-    /// Per-node config tails for integration tests whose local effects must
-    /// differ by process (for example DuckDNS ingress/target sockets). The
-    /// outer vector stays index-aligned with `peer_ids`.
-    pub extra_toml_by_node: Vec<Vec<String>>,
     /// extra environment variables for node `idx`'s process, index-aligned
     /// with `peer_ids` (what gives each node its own capability-provider
     /// surface: `DUCKTAPE_CAPABILITY_DIR`, spec `detect.env` overrides).
@@ -436,7 +432,6 @@ impl Cluster {
             bootstrap_addr_override: None,
             wireguard: false,
             extra_toml: Vec::new(),
-            extra_toml_by_node: peer_ids.iter().map(|_| Vec::new()).collect(),
             env: peer_ids.iter().map(|_| Vec::new()).collect(),
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
@@ -490,10 +485,6 @@ impl Cluster {
             cfg.push_str("wireguard_effect = \"fake\"\n");
         }
         for line in &self.extra_toml {
-            cfg.push_str(line);
-            cfg.push('\n');
-        }
-        for line in &self.extra_toml_by_node[idx] {
             cfg.push_str(line);
             cfg.push('\n');
         }
@@ -615,7 +606,6 @@ impl Cluster {
         // keep `advertised`/`env` index-aligned with the extended index space
         // so a later `config_path(joiner_idx)` / `spawn` never panics.
         self.advertised.push(None);
-        self.extra_toml_by_node.push(Vec::new());
         self.env.push(Vec::new());
         self.nodes.push(Some(NodeProc { id, child, log }));
         self.peer_ids.len() - 1
@@ -958,7 +948,7 @@ pub fn poll_until<T>(what: &str, timeout: Duration, mut probe: impl FnMut() -> O
 
 /// allocate `n` distinct free localhost ports by holding all the listeners at
 /// once (sequential bind-drop could hand the same port back twice).
-pub fn alloc_ports(n: usize) -> Vec<u16> {
+fn alloc_ports(n: usize) -> Vec<u16> {
     let listeners: Vec<TcpListener> = (0..n)
         .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind port-0 probe"))
         .collect();

@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use duckdns::{
-    DuckDns, DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply, ServiceAnnouncement,
-    ServiceScope, decode_reply, encode_msg, encode_query,
+    DuckDns, DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply, ResolvedName,
+    ServiceAnnouncement, ServiceAuthority, ServiceScope, decode_reply, encode_msg, encode_query,
 };
 use futures::executor::block_on;
 use identity::{AccountView, IdentityQuery, IdentityReply, decode_query as identity_decode_query};
@@ -17,19 +17,15 @@ fn network(service: &str) -> ServiceAnnouncement {
     ServiceAnnouncement {
         scope: ServiceScope::Network,
         service: service.into(),
-        default_homepage: false,
-        allow_cross_site: false,
     }
 }
 
-fn user(handle: &str, service: &str, default_homepage: bool) -> ServiceAnnouncement {
+fn account(handle: &str, service: &str) -> ServiceAnnouncement {
     ServiceAnnouncement {
-        scope: ServiceScope::User {
+        scope: ServiceScope::Account {
             handle: handle.into(),
         },
         service: service.into(),
-        default_homepage,
-        allow_cross_site: false,
     }
 }
 
@@ -63,6 +59,26 @@ impl TestCtx {
     fn bind(&mut self, node: Vec<u8>, account: &[u8]) {
         self.accounts.insert(node, account.to_vec());
     }
+
+    fn account_view(&self, account_id: &[u8]) -> Option<AccountView> {
+        let nodes: Vec<_> = self
+            .accounts
+            .iter()
+            .filter(|(_, account)| account.as_slice() == account_id)
+            .map(|(node, _)| node.clone())
+            .collect();
+        if nodes.is_empty() {
+            return None;
+        }
+        Some(AccountView {
+            account_id: account_id.to_vec(),
+            display_name: None,
+            nonce: 0,
+            member_keys: vec![],
+            nodes,
+            updated_at: 0,
+        })
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -87,16 +103,15 @@ impl Ctx for TestCtx {
             },
             "identity" => match identity_decode_query(req).map_err(Error::Module)? {
                 IdentityQuery::OfNode { node_key } => {
-                    let account = self.accounts.get(&node_key).map(|account_id| AccountView {
-                        account_id: account_id.clone(),
-                        display_name: None,
-                        nonce: 0,
-                        member_keys: vec![],
-                        nodes: vec![node_key],
-                        updated_at: 0,
-                    });
+                    let account = self
+                        .accounts
+                        .get(&node_key)
+                        .and_then(|account| self.account_view(account));
                     Ok(identity::encode_reply(&IdentityReply::Account(account)))
                 }
+                IdentityQuery::Get { account_id } => Ok(identity::encode_reply(
+                    &IdentityReply::Account(self.account_view(&account_id)),
+                )),
                 _ => Err(Error::QueryUnsupported),
             },
             _ => Err(Error::UnknownModule(target.into())),
@@ -123,14 +138,6 @@ fn resolve(module: &DuckDns, ctx: &TestCtx, name: DuckDnsName) -> DuckDnsReply {
     let bytes =
         block_on(module.query_with(ctx, &encode_query(&DuckDnsQuery::Resolve { name }))).unwrap();
     decode_reply(&bytes).unwrap()
-}
-
-fn namespace(module: &DuckDns, ctx: &TestCtx) -> Vec<String> {
-    let bytes = block_on(module.query_with(ctx, &encode_query(&DuckDnsQuery::Namespace))).unwrap();
-    let DuckDnsReply::Namespace(names) = decode_reply(&bytes).unwrap() else {
-        panic!("namespace query returned another reply shape");
-    };
-    names
 }
 
 #[test]
@@ -172,7 +179,7 @@ fn resident_can_claim_but_outsider_and_unbound_node_cannot() {
         .contains("not a validator or admitted resident")
     );
 
-    ctx.residents.push(outsider.clone());
+    ctx.residents.push(outsider);
     assert!(
         execute(
             &mut module,
@@ -188,59 +195,7 @@ fn resident_can_claim_but_outsider_and_unbound_node_cannot() {
 }
 
 #[test]
-fn user_scope_uses_identity_owner_while_network_scope_needs_only_standing() {
-    let owner_node = node(1);
-    let other_node = node(2);
-    let network_only = node(3);
-    let mut ctx = TestCtx::new(owner_node.clone());
-    ctx.validators = vec![owner_node.clone(), other_node.clone(), network_only.clone()];
-    ctx.bind(owner_node.clone(), b"owner");
-    ctx.bind(other_node.clone(), b"other");
-    let mut module = DuckDns::new(
-        "duckdns",
-        "identity",
-        Some("valset".into()),
-        "team#a1b2c3d4",
-    )
-    .unwrap();
-
-    execute(
-        &mut module,
-        &mut ctx,
-        DuckDnsMsg::ClaimHandle {
-            handle: "orthory".into(),
-        },
-    )
-    .unwrap();
-    block_on(module.commit_block()).unwrap();
-
-    ctx.origin(other_node.clone());
-    assert!(
-        execute(
-            &mut module,
-            &mut ctx,
-            DuckDnsMsg::ReplaceAnnouncements {
-                announcements: vec![user("orthory", "home", true)],
-            },
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("does not own")
-    );
-
-    ctx.origin(network_only);
-    execute(
-        &mut module,
-        &mut ctx,
-        DuckDnsMsg::ReplaceAnnouncements {
-            announcements: vec![network("docs")],
-        },
-    )
-    .unwrap();
-}
-
-#[test]
-fn resolution_rechecks_standing_and_identity_binding() {
+fn bare_account_name_resolves_identity_and_current_nodes() {
     let first = node(1);
     let second = node(2);
     let mut ctx = TestCtx::new(first.clone());
@@ -254,7 +209,6 @@ fn resolution_rechecks_standing_and_identity_binding() {
         "team#a1b2c3d4",
     )
     .unwrap();
-
     execute(
         &mut module,
         &mut ctx,
@@ -263,72 +217,42 @@ fn resolution_rechecks_standing_and_identity_binding() {
         },
     )
     .unwrap();
-    execute(
-        &mut module,
-        &mut ctx,
-        DuckDnsMsg::ReplaceAnnouncements {
-            announcements: vec![network("docs"), user("orthory", "home", true)],
-        },
-    )
-    .unwrap();
-    ctx.origin(second.clone());
-    execute(
-        &mut module,
-        &mut ctx,
-        DuckDnsMsg::ReplaceAnnouncements {
-            announcements: vec![network("docs"), user("orthory", "home", true)],
-        },
-    )
-    .unwrap();
     block_on(module.commit_block()).unwrap();
 
-    let DuckDnsReply::Resolved(Some(network_resolution)) = resolve(
+    let DuckDnsReply::Resolved(Some(ResolvedName::Account(resolved))) = resolve(
         &module,
         &ctx,
-        DuckDnsName::NetworkService {
-            service: "docs".into(),
-            chain: "team-a1b2c3d4".into(),
+        DuckDnsName::Account {
+            handle: "orthory".into(),
         },
     ) else {
-        panic!("network service did not resolve");
+        panic!("account name did not resolve");
     };
-    assert_eq!(network_resolution.providers.len(), 2);
+    assert_eq!(resolved.account_id, b"owner");
+    assert_eq!(resolved.nodes.len(), 2);
 
-    ctx.validators = vec![first.clone()];
-    let DuckDnsReply::Resolved(Some(filtered)) = resolve(
+    ctx.validators.retain(|candidate| candidate != &second);
+    let DuckDnsReply::Resolved(Some(ResolvedName::Account(filtered))) = resolve(
         &module,
         &ctx,
-        DuckDnsName::NetworkService {
-            service: "docs".into(),
-            chain: "team-a1b2c3d4".into(),
+        DuckDnsName::Account {
+            handle: "orthory".into(),
         },
     ) else {
-        panic!("standing provider did not resolve");
+        panic!("account name did not resolve after standing changed");
     };
-    assert_eq!(filtered.providers.len(), 1);
-    assert_eq!(filtered.providers[0].node, first);
-
-    ctx.accounts.remove(&first);
-    assert_eq!(
-        resolve(
-            &module,
-            &ctx,
-            DuckDnsName::User {
-                handle: "orthory".into(),
-            },
-        ),
-        DuckDnsReply::Resolved(None)
-    );
+    assert_eq!(filtered.nodes.len(), 1);
+    assert_eq!(filtered.nodes[0].node, first);
 }
 
 #[test]
-fn namespace_snapshot_rechecks_live_standing_and_user_binding() {
-    let provider = node(1);
-    let stale = node(2);
-    let mut ctx = TestCtx::new(provider.clone());
-    ctx.validators = vec![provider.clone(), stale.clone()];
-    ctx.bind(provider.clone(), b"owner");
-    ctx.bind(stale.clone(), b"owner");
+fn account_service_declaration_requires_owner_and_filters_rebinding() {
+    let owner_node = node(1);
+    let other_node = node(2);
+    let mut ctx = TestCtx::new(owner_node.clone());
+    ctx.validators = vec![owner_node.clone(), other_node.clone()];
+    ctx.bind(owner_node.clone(), b"owner");
+    ctx.bind(other_node.clone(), b"other");
     let mut module = DuckDns::new(
         "duckdns",
         "identity",
@@ -344,41 +268,67 @@ fn namespace_snapshot_rechecks_live_standing_and_user_binding() {
         },
     )
     .unwrap();
+
+    ctx.origin(other_node.clone());
+    assert!(
+        execute(
+            &mut module,
+            &mut ctx,
+            DuckDnsMsg::ReplaceAnnouncements {
+                announcements: vec![account("orthory", "huddle")],
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("does not own")
+    );
+
+    ctx.origin(owner_node.clone());
     execute(
         &mut module,
         &mut ctx,
         DuckDnsMsg::ReplaceAnnouncements {
-            announcements: vec![network("docs"), user("orthory", "home", true)],
-        },
-    )
-    .unwrap();
-    ctx.origin(stale.clone());
-    execute(
-        &mut module,
-        &mut ctx,
-        DuckDnsMsg::ReplaceAnnouncements {
-            announcements: vec![network("status")],
+            announcements: vec![account("orthory", "huddle")],
         },
     )
     .unwrap();
     block_on(module.commit_block()).unwrap();
 
-    let names = namespace(&module, &ctx);
-    assert!(names.contains(&"orthory.duck".into()));
-    assert!(names.contains(&"docs.team-a1b2c3d4.net.duck".into()));
-    assert!(names.contains(&"status.team-a1b2c3d4.net.duck".into()));
+    let DuckDnsReply::Resolved(Some(ResolvedName::Service(resolved))) = resolve(
+        &module,
+        &ctx,
+        DuckDnsName::AccountService {
+            service: "huddle".into(),
+            handle: "orthory".into(),
+        },
+    ) else {
+        panic!("account service did not resolve");
+    };
+    assert_eq!(resolved.providers.len(), 1);
+    assert_eq!(
+        resolved.authority,
+        ServiceAuthority::Account {
+            account_id: b"owner".to_vec(),
+        }
+    );
+    assert_eq!(resolved.providers[0].node, owner_node);
 
-    ctx.validators.retain(|node| node != &stale);
-    let names = namespace(&module, &ctx);
-    assert!(!names.iter().any(|name| name.starts_with("status.")));
-    ctx.accounts.remove(&provider);
-    let names = namespace(&module, &ctx);
-    assert!(!names.iter().any(|name| name.contains("orthory")));
-    assert!(names.contains(&"docs.team-a1b2c3d4.net.duck".into()));
+    ctx.bind(node(1), b"other");
+    assert_eq!(
+        resolve(
+            &module,
+            &ctx,
+            DuckDnsName::AccountService {
+                service: "huddle".into(),
+                handle: "orthory".into(),
+            },
+        ),
+        DuckDnsReply::Resolved(None)
+    );
 }
 
 #[test]
-fn node_qualified_name_never_fails_over() {
+fn network_and_node_scoped_discovery_recheck_standing() {
     let provider = node(1);
     let mut ctx = TestCtx::new(provider.clone());
     ctx.residents = vec![provider.clone()];
@@ -393,20 +343,32 @@ fn node_qualified_name_never_fails_over() {
         &mut module,
         &mut ctx,
         DuckDnsMsg::ReplaceAnnouncements {
-            announcements: vec![network("docs")],
+            announcements: vec![network("search")],
         },
     )
     .unwrap();
     block_on(module.commit_block()).unwrap();
+
+    let DuckDnsReply::Resolved(Some(ResolvedName::Service(resolved))) = resolve(
+        &module,
+        &ctx,
+        DuckDnsName::NodeService {
+            service: "search".into(),
+            node: "n-010101010101".into(),
+            chain: "team-a1b2c3d4".into(),
+        },
+    ) else {
+        panic!("node-scoped service did not resolve");
+    };
+    assert_eq!(resolved.providers.len(), 1);
 
     ctx.residents.clear();
     assert_eq!(
         resolve(
             &module,
             &ctx,
-            DuckDnsName::NodeService {
-                service: "docs".into(),
-                node: "n-010101010101".into(),
+            DuckDnsName::NetworkService {
+                service: "search".into(),
                 chain: "team-a1b2c3d4".into(),
             },
         ),

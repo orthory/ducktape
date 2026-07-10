@@ -18,7 +18,6 @@ export interface WorkspacePorts {
   rpc: number;
   wireguard?: number | null;
   invite?: number | null;
-  duckdns?: number | null;
 }
 
 export interface Workspace {

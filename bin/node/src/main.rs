@@ -3059,8 +3059,7 @@ fn run_node(
         invite_fronts,
         sync_index,
         announce_capabilities,
-        duckdns_services,
-        duckdns_ingress_listen,
+        duckdns_announcements,
         coordination,
         coord_cap,
         workspace,
@@ -3080,11 +3079,6 @@ fn run_node(
             return Err(format!("network chain id is not DuckDNS-compatible: {error}").into());
         }
     };
-    let duckdns_announcements: Vec<_> = duckdns_services
-        .iter()
-        .map(|service| service.announcement.clone())
-        .collect();
-    let duckdns_publications = std::sync::Arc::new(duckdns_services);
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
     // (a previous run promoted this identity) boot proceeds as a validator
@@ -3270,21 +3264,6 @@ fn run_node(
         Some(addr) if !sync_only => Some(std::net::TcpListener::bind(addr)?),
         _ => None,
     };
-    let duckdns_plane_slot: duckdns_node::plane::PlaneSlot =
-        std::sync::Arc::new(std::sync::OnceLock::new());
-    let duckdns_ingress_listener = match duckdns_ingress_listen {
-        Some(address) if !sync_only => {
-            let listener = std::net::TcpListener::bind(address)?;
-            listener.set_nonblocking(true)?;
-            println!(
-                "[node {label}] DuckDNS HTTP ingress listening on http://{}",
-                listener.local_addr()?
-            );
-            Some(listener)
-        }
-        _ => None,
-    };
-
     // the http/ws app surface: same bind-early rule. the server itself runs on
     // its OWN plain-tokio OS thread (noded's exact split — the host never
     // leaves the commonware runner thread; http handlers only send
@@ -3336,43 +3315,6 @@ fn run_node(
                 .unwrap_or_else(|e| panic!("agent runs root failed D7 validation: {e}")),
         ),
     ));
-    // Reuse noded's established no-self-dial files adapter for DuckFS-backed
-    // DuckDNS sites. It holds only a clone of the actor command lane.
-    let duckdns_files = noded::ActorNodeApi::new(http_handle.clone());
-    if let Some(listener) = duckdns_ingress_listener {
-        let commands = http_handle.command_sender();
-        let plane = std::sync::Arc::clone(&duckdns_plane_slot);
-        let publications = std::sync::Arc::clone(&duckdns_publications);
-        let files = duckdns_files.clone();
-        let me: [u8; 32] = signer
-            .public_key()
-            .as_ref()
-            .try_into()
-            .expect("ed25519 keys are 32 bytes");
-        let thread_label = label.clone();
-        std::thread::Builder::new()
-            .name("duckdns-ingress".into())
-            .spawn(move || {
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("DuckDNS ingress tokio runtime")
-                    .block_on(async move {
-                        if let Err(error) = duckdns_node::ingress::serve(
-                            listener,
-                            commands,
-                            plane,
-                            me,
-                            publications,
-                            files,
-                        )
-                        .await
-                        {
-                            eprintln!("[node {thread_label}] DuckDNS ingress failed: {error}");
-                        }
-                    });
-            })?;
-    }
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
     match http_listen.as_deref() {
@@ -4130,9 +4072,6 @@ fn run_node(
             // (awaiting a deliberate promote) — the not-admitted bail below
             // must never fire.
             let mut resident_standing = false;
-            let mut resident_duckdns_plane_book: Option<
-                std::sync::Arc<duckdns_node::plane::WebPeers>,
-            > = None;
             let mut send_announce = |targets: &[ed25519::PublicKey], attempt: usize| {
                 let Some(frame) = &announce_frame else { return };
                 if attempt % LOBBY_ANNOUNCE_EVERY != 1 || targets.is_empty() {
@@ -5166,35 +5105,6 @@ fn run_node(
                         joiner_epoch_mesh(&peers, &tip.participants, &tip.residents),
                     );
                     last_tracked = tip.epoch;
-                }
-                // A resident is a real DuckDNS requester/provider. Bring its
-                // web plane up once standing appears, and refresh admission on
-                // every later tip snapshot so revocation cuts inbound streams.
-                let duckdns_transport_keys: Vec<ed25519::PublicKey> = tip
-                    .participants
-                    .iter()
-                    .chain(tip.residents.iter())
-                    .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
-                    .collect();
-                if let Some(book) = &resident_duckdns_plane_book {
-                    book.set_peers(duckdns_transport_keys.iter());
-                } else if wireguard_listen.is_some()
-                    && tip.residents.iter().any(|key| key == &me_bytes)
-                {
-                    let book = duckdns_node::plane::WebPeers::new(
-                        String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
-                    );
-                    book.set_peers(duckdns_transport_keys.iter());
-                    duckdns_node::plane::spawn_bring_up(
-                        label.clone(),
-                        std::sync::Arc::clone(&book),
-                        signer.public_key(),
-                        std::sync::Arc::clone(&duckdns_plane_slot),
-                        statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
-                        std::sync::Arc::clone(&duckdns_publications),
-                        duckdns_files.clone(),
-                    );
-                    resident_duckdns_plane_book = Some(book);
                 }
                 // drive the reachability plane's standby role off the
                 // manifest: membership and resident standing come from the
@@ -6693,26 +6603,6 @@ fn run_node(
             );
             book
         });
-        // DuckDNS's per-use stream plane. Unlike statesync this is not env
-        // gated: a configured overlay is the web transport. The slot is kept
-        // for the requester-side local ingress; the accept loop always runs so
-        // this node can provide its explicit local publications.
-        let duckdns_plane_book = wireguard_listen.map(|_| {
-            let book = duckdns_node::plane::WebPeers::new(
-                String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
-            );
-            book.set_peers(initial_member_keys.iter().chain(initial_resident_keys.iter()));
-            duckdns_node::plane::spawn_bring_up(
-                label.clone(),
-                std::sync::Arc::clone(&book),
-                signer.public_key(),
-                std::sync::Arc::clone(&duckdns_plane_slot),
-                statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
-                std::sync::Arc::clone(&duckdns_publications),
-                duckdns_files.clone(),
-            );
-            book
-        });
         drop(bridge_tx);
         // the statesync SERVE task (the [`SyncStateRequest`] seam): owns the
         // capture cache and both statesync carriers end-to-end — decode,
@@ -7754,9 +7644,6 @@ fn run_node(
                             // the statesync plane serves (and admits) exactly
                             // who the mesh tracks — follow the re-track.
                             if let Some(book) = &sync_plane_book {
-                                book.set_peers(plan.valset().transport_members().iter());
-                            }
-                            if let Some(book) = &duckdns_plane_book {
                                 book.set_peers(plan.valset().transport_members().iter());
                             }
                             // the media planes authenticate inbound by the same

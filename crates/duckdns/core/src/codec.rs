@@ -1,5 +1,5 @@
 //! Shared strict codec for the DuckDNS registry root preimage and snapshot.
-//! Every read is bounds-checked before allocation; booleans are exactly 0/1;
+//! Every read is bounds-checked before allocation;
 //! callers finish the whole input so trailing bytes reject.
 
 pub(crate) fn push_u64(out: &mut Vec<u8>, value: usize) {
@@ -43,14 +43,6 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.array::<8>()?))
-    }
-
-    pub(crate) fn boolean(&mut self) -> Result<bool, String> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err("duckdns: registry snapshot boolean is not 0/1".into()),
-        }
     }
 
     pub(crate) fn count(&mut self, what: &str, minimum_bytes: usize) -> Result<usize, String> {
@@ -110,9 +102,6 @@ mod tests {
     fn strict_cursor_rejects_noncanonical_frames() {
         let mut truncated = Reader::new(&[0; 7]);
         assert!(truncated.u64().unwrap_err().contains("truncated"));
-
-        let mut boolean = Reader::new(&[2]);
-        assert!(boolean.boolean().unwrap_err().contains("not 0/1"));
 
         let mut trailing = Reader::new(&[0, 1]);
         trailing.u8().unwrap();
