@@ -7,6 +7,7 @@ are driving and QAing each branch.
 ```
 ops/
   fleet.sh          fleet manager (userspace, no root)
+  fleet.mjs         metadata + HTTP/WebSocket/TCP runtime
   fleet-console/    the dashboard (Vite + React + @novnc/novnc, @xyflow/react)
 ```
 
@@ -29,15 +30,15 @@ open a full-size **interactive** session plus that worktree's commit trail.
 ## How it works
 
 ```
-browser ──http/ws :6090 (ONLY exposed port)──▶ one websockify
-                                               ├─ --web fleet-console/dist  (UI + fleet.json)
+browser ──http/ws :6090 (ONLY exposed port)──▶ one Bun server
+                                               ├─ fleet-console/dist  (UI + fleet.json)
                                                └─ ?token=<worktree> ─▶ 127.0.0.1:<vncPort>
 per worktree:  Xvfb :11x → tauri dev (isolated $HOME) → x11vnc 127.0.0.1:591x
                                              └─ tauri-agent endpoint in $STATE/<id>
 ```
 
 - **One exposed port** (`:6090`). Every worktree's x11vnc binds `127.0.0.1`; the
-  browser reaches them only through websockify's token router.
+  browser reaches them only through the fleet server's token router.
 - **Human screen vs agent stream**: people watch the VNC/noVNC tile. Agents use
   the per-worktree tauri-agent endpoint. `fleet.json` includes an `agent`
   object with `runtimeDir`, `endpointPath`, `endpointReady`, and an
@@ -56,8 +57,8 @@ per worktree:  Xvfb :11x → tauri dev (isolated $HOME) → x11vnc 127.0.0.1:591
 - **Port bases** are offset from the single-instance `remote-tauri.sh`
   (`:99/5900/6080`) so both can run at once. Override with `FLEET_DISP_BASE`,
   `FLEET_VITE_BASE`, `FLEET_VNC_BASE`, `FLEET_WEB_PORT`, `FLEET_SCREEN`.
-- Reuses the x11vnc / xdotool / noVNC / websockify already staged under
-  `~/.local/opt/remote-tauri/` by the `tauri-debug` / remote-tauri setup.
+- Reuses x11vnc / xdotool staged under `~/.local/opt/remote-tauri/` by the
+  `tauri-debug` / remote-tauri setup; the dashboard supplies its noVNC client.
 
 ## Notes
 
