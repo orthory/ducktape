@@ -288,7 +288,10 @@ mod tests {
     /// signed handshake exactly like `wireguard-upgrade`'s own e2e tests do.
     /// `req_nonce`/`ack_nonce` keep an initiator's REPEATED handshakes fresh
     /// in a shared `ReplayCache` (replay state is keyed by identity+nonce).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the signed-handshake fixture keeps both peers and nonces explicit"
+    )]
     fn plan_between(
         initiator: &PrivateKey,
         responder: &PrivateKey,

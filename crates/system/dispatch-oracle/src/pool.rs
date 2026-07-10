@@ -1322,7 +1322,6 @@ format = "text"
         // fail THIS test. facet fields carry serde defaults so the minimal shape
         // still decodes (non-deny_unknown_fields, as runs keeps it).
         #[derive(serde::Deserialize)]
-        #[allow(dead_code)]
         struct RunsRunnerResult {
             ducktape_runner_result: u32,
             response_text: String,
@@ -1337,7 +1336,6 @@ format = "text"
             status: RunsStatus,
         }
         #[derive(serde::Deserialize)]
-        #[allow(dead_code)]
         struct RunsWorkspaceReceipt {
             source_prefix: String,
             source_snapshot: Option<String>,
@@ -1349,7 +1347,6 @@ format = "text"
             commit_error: Option<String>,
         }
         #[derive(serde::Deserialize)]
-        #[allow(dead_code)]
         struct RunsEffect {
             kind: String,
             #[serde(default)]
@@ -1411,6 +1408,18 @@ format = "text"
             parsed.workspace_receipt.output_snapshot,
             Some("cc".repeat(32))
         );
+        assert_eq!(
+            parsed.workspace_receipt.source_prefix,
+            "/shared/agent-workspaces/bot"
+        );
+        assert_eq!(
+            parsed.workspace_receipt.source_snapshot,
+            Some("aa".repeat(32))
+        );
+        assert_eq!(parsed.workspace_receipt.commit_height, Some(9));
+        assert!(parsed.workspace_receipt.rebased);
+        assert!(!parsed.workspace_receipt.no_changes);
+        assert_eq!(parsed.workspace_receipt.commit_error, None);
         assert!(parsed.effects.is_empty());
         assert_eq!(parsed.sink, RunsSink::Chain);
         assert_eq!(parsed.status, RunsStatus::Ok);
@@ -1442,6 +1451,8 @@ format = "text"
         assert_eq!(parsed.effects.len(), 1);
         assert_eq!(parsed.effects[0].kind, "tasks.create");
         assert_eq!(parsed.effects[0].task_id, "t1");
+        assert_eq!(parsed.effects[0].title, "ship");
+        assert_eq!(parsed.effects[0].status, "");
         assert_eq!(parsed.status, RunsStatus::Degraded);
         assert_eq!(
             parsed.sink,

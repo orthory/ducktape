@@ -2,7 +2,7 @@
 //!
 //! an ACCOUNT is keyed by its FOUNDING key (`account_id` = the first member
 //! key). it collects many MEMBER KEYS of different schemes (an ed25519 seed
-//! key, a WebAuthn passkey, a native P-256 key -- see [`scheme`]), shares one
+//! key, a WebAuthn passkey, a native P-256 key -- see [`KeyKind`]), shares one
 //! display name across them, and owns many NODES (each a workspace's
 //! mesh/valset identity). every state-changing op is authorized by a MEMBER
 //! KEY, captured as a [`MemberAuth`]: the account it speaks for is resolved

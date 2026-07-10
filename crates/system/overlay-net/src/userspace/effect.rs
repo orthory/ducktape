@@ -1,6 +1,6 @@
 //! the userspace backend behind the orchestration boundary: a
 //! [`WireGuardEffect`] whose "interface" is the in-process
-//! [`WgDevice`](super::device::WgDevice) + [`VirtualStack`](super::stack::VirtualStack)
+//! [`WgDevice`] + [`VirtualStack`]
 //! pair instead of a TUN.
 //!
 //! the ADR's rule is that the orchestration boundary does not move: the

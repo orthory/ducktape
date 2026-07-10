@@ -55,7 +55,7 @@ use sdk::{Ctx, Error, Module, ModuleId, Msg, ResolverSyncTarget, StateRoot, Stat
 /// pending overlay and every message that carries it), not a storage-layout limit.
 pub const MAX_KEY_LEN: usize = 4 * 1024;
 
-/// write-time cap on a value. [`kv_config`]'s codec [`RangeCfg`] bounds a stored
+/// write-time cap on a value. `kv_config`'s codec [`RangeCfg`] bounds a stored
 /// value at 1 MiB AT DECODE TIME — an oversized value would COMMIT fine and then
 /// panic every later read (and any log replay / sync batch decode) on every
 /// validator: a poison pill. rejecting here keeps it out of the log entirely.
@@ -262,7 +262,7 @@ where
     /// `target.root`, by pulling `target`'s op range from `resolver`. commonware's
     /// sync engine merkle-verifies every fetched batch against `target.root`, so a
     /// byzantine source cannot produce a store with a matching root but forged
-    /// contents — the root is the trust anchor. reuses [`kv_config`] so the synced
+    /// contents — the root is the trust anchor. reuses `kv_config` so the synced
     /// store's storage layout matches a freshly-opened one.
     pub async fn sync_from<R>(
         context: E,

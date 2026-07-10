@@ -6,7 +6,7 @@
 //! (whichever executor CLI the operator brought), feeds the payload to it,
 //! and submits the raw answer as a saga `OracleResult` op.
 //!
-//! the payload comes in two shapes (see [`envelope`]): a legacy flat string
+//! the payload comes in two shapes (see the envelope parser): a legacy flat string
 //! is fed to the provider VERBATIM, and a run ENVELOPE (marker
 //! `ducktape_run`) is assembled host-side — the agent's registered prompt
 //! resolved from the node's blob store by its committed content hash, plus
@@ -22,7 +22,7 @@
 //!
 //! - [`DispatchWorker`] awaits the provider INLINE — the simple embedding for
 //!   tests and in-process reactors.
-//! - [`DispatchPool`] (see [`pool`]) hands execution to a spawned background
+//! - [`DispatchPool`] hands execution to a spawned background
 //!   task and returns immediately — what real hosts run, so a minutes-long
 //!   CLI call never stalls the host's event loop.
 

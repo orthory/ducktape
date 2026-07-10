@@ -287,7 +287,10 @@ pub enum Resolution {
 /// Per-peer endpoint resolution, pluggable so the orchestrator's protocol
 /// logic tests deterministically without UDP. The real implementation is
 /// [`NatResolver`]; tests use [`StaticResolver`].
-#[allow(async_fn_in_trait)] // consumed on a single-thread block_on root; no Send bound wanted
+#[allow(
+    async_fn_in_trait,
+    reason = "the resolver is consumed on a single-thread block_on root; no Send bound is wanted"
+)]
 pub trait EndpointResolver {
     /// Resolve `peer`'s dialable UDP address given its advertised WireGuard
     /// endpoint. Errors mean the peer stays on its advertised endpoint and a
@@ -801,7 +804,10 @@ impl From<UpgradeError> for ReachabilityError {
 /// nonce, and a triple whose parts disagree can never validate on both
 /// sides (the ack pins request and response by hash).
 // a handful of entries per epoch — variant size imbalance is irrelevant.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "each epoch holds only a handful of handshakes; boxing would complicate the retry state"
+)]
 enum PeerHandshake {
     /// We initiated and sent the request; the peer's response is due.
     AwaitingResponse { request: TunnelUpgradeRequest },
@@ -838,6 +844,17 @@ struct RelaySlot {
     signer: ValidatorIdentity,
     msg: ReachabilityMsg,
     expires_at_view: u64,
+}
+
+/// A verified candidate to store and fan out through the relay mesh.
+/// Grouping the signed-message metadata keeps the relay boundary explicit.
+struct RelayedHandshake {
+    pair: (ValidatorIdentity, ValidatorIdentity),
+    stage: u8,
+    signer: ValidatorIdentity,
+    expires_at_view: u64,
+    verified: bool,
+    msg: ReachabilityMsg,
 }
 
 /// Which side of the plane this node runs for the epoch.
@@ -1569,12 +1586,14 @@ where
                 let verified = request.verify_signature().is_ok();
                 self.relay(
                     via,
-                    (initiator, responder),
-                    0,
-                    initiator,
-                    expires,
-                    verified,
-                    ReachabilityMsg::Request(request),
+                    RelayedHandshake {
+                        pair: (initiator, responder),
+                        stage: 0,
+                        signer: initiator,
+                        expires_at_view: expires,
+                        verified,
+                        msg: ReachabilityMsg::Request(request),
+                    },
                 )
                 .await
             }
@@ -1591,12 +1610,14 @@ where
                 let verified = response.verify_signature().is_ok();
                 self.relay(
                     via,
-                    (initiator, responder),
-                    1,
-                    responder,
-                    expires,
-                    verified,
-                    ReachabilityMsg::Response(response),
+                    RelayedHandshake {
+                        pair: (initiator, responder),
+                        stage: 1,
+                        signer: responder,
+                        expires_at_view: expires,
+                        verified,
+                        msg: ReachabilityMsg::Response(response),
+                    },
                 )
                 .await
             }
@@ -1613,12 +1634,14 @@ where
                 let verified = ack.verify_signature().is_ok();
                 self.relay(
                     via,
-                    (initiator, responder),
-                    2,
-                    initiator,
-                    expires,
-                    verified,
-                    ReachabilityMsg::Ack(ack),
+                    RelayedHandshake {
+                        pair: (initiator, responder),
+                        stage: 2,
+                        signer: initiator,
+                        expires_at_view: expires,
+                        verified,
+                        msg: ReachabilityMsg::Ack(ack),
+                    },
                 )
                 .await
             }
@@ -1629,17 +1652,19 @@ where
     /// `(initiator, responder)` with stage supersession, and fan out to every
     /// peer except the delivering one and the message's signer — this node
     /// cannot know which peer holds the working link to the addressee.
-    #[allow(clippy::too_many_arguments)]
     async fn relay(
         &mut self,
         via: ValidatorIdentity,
-        pair: (ValidatorIdentity, ValidatorIdentity),
-        stage: u8,
-        signer: ValidatorIdentity,
-        expires_at_view: u64,
-        verified: bool,
-        msg: ReachabilityMsg,
+        relayed: RelayedHandshake,
     ) -> Result<(), ReachabilityError> {
+        let RelayedHandshake {
+            pair,
+            stage,
+            signer,
+            expires_at_view,
+            verified,
+            msg,
+        } = relayed;
         if !verified {
             return self
                 .fail_peer(via, "relayed an unverifiable handshake message")

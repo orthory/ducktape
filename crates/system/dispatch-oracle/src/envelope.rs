@@ -48,13 +48,10 @@ pub type BlobResolver = Arc<dyn Fn(&[u8; 32]) -> BoxFuture<'static, Option<Vec<u
 /// business (committed bytes); decoding here is by name. unknown fields are
 /// tolerated on purpose — an ADDITIVE field under the same version must not
 /// kill in-flight runs mid-upgrade; semantic changes bump the marker instead.
+/// `ducktape_run` is validated before this body is deserialized, so the marker
+/// is intentionally absent here.
 #[derive(Deserialize)]
 struct WireEnvelope {
-    #[allow(
-        dead_code,
-        reason = "the version routed decoding; carried for completeness"
-    )]
-    ducktape_run: u64,
     agent_id: String,
     /// lowercase 64-hex of the agent's prompt pin, or null when the record
     /// carries none (the generic `instructions` apply).

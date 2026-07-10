@@ -4,9 +4,9 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-commonware-cryptography.workspace = true
-commonware-codec.workspace = true
-thiserror.workspace = true
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync", "time"] }
 
 [dev-dependencies]
