@@ -23,6 +23,7 @@ use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -1449,6 +1450,7 @@ fn node_uptime_secs(_pid: u32) -> Option<u64> {
 /// parse a `ps -o etime` field ("[[dd-]hh:]mm:ss") into whole seconds. returns
 /// `None` for any shape it doesn't recognize (blank, out-of-range, too many
 /// colon groups) rather than guessing.
+#[cfg(any(unix, test))]
 fn parse_etime(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     if raw.is_empty() {

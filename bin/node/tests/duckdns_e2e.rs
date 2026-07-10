@@ -105,8 +105,19 @@ fn request(
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
         .expect("DuckDNS ingress read timeout");
+    request_on(&mut stream, method, path, host, headers, "close")
+}
+
+fn request_on(
+    stream: &mut TcpStream,
+    method: &str,
+    path: &str,
+    host: &str,
+    headers: &[(&str, &str)],
+    connection: &str,
+) -> HttpResponse {
     let mut request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: {connection}\r\n"
     );
     for (name, value) in headers {
         request.push_str(name);
@@ -273,6 +284,12 @@ fn remote_duckfs_site_streams_and_fails_over_across_real_nodes() {
              scope = \"network\"\n\
              service = \"docs\"\n\
              [duckdns.services.duckfs]\n\
+             prefix = \"/shared/sites/docs\"\n\
+             [[duckdns.services]]\n\
+             scope = \"network\"\n\
+             service = \"corsdocs\"\n\
+             allow_cross_site = true\n\
+             [duckdns.services.duckfs]\n\
              prefix = \"/shared/sites/docs\"{}",
             wireguard_port, websocket
         ));
@@ -374,10 +391,76 @@ fn remote_duckfs_site_streams_and_fails_over_across_real_nodes() {
         &[("Sec-Fetch-Site", "cross-site")],
     );
     assert_eq!(cross_site.status, 403);
-    let admin = request(ingress[0], "GET", "/v1/status", &hostname, &[]);
+
+    // Policy is evaluated for every request on one persistent downstream
+    // connection, not just its first safe request.
+    let mut keep_alive =
+        TcpStream::connect(("127.0.0.1", ingress[0])).expect("DuckDNS keep-alive ingress");
+    keep_alive
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("DuckDNS keep-alive read timeout");
     assert_eq!(
-        admin.status, 404,
-        "the node administration router is unreachable"
+        request_on(&mut keep_alive, "GET", "/", &hostname, &[], "keep-alive").status,
+        200
+    );
+    assert_eq!(
+        request_on(
+            &mut keep_alive,
+            "POST",
+            "/",
+            &hostname,
+            &[("Sec-Fetch-Site", "cross-site")],
+            "close",
+        )
+        .status,
+        403,
+        "a safe first request must not launder an unsafe second request"
+    );
+
+    let cors_name = DuckDnsName::NetworkService {
+        service: "corsdocs".into(),
+        chain: chain.clone(),
+    };
+    poll_until("cross-site opt-in announcement", FINALIZE, || {
+        resolve(&cluster, cors_name.clone()).filter(|service| service.providers.len() == 2)
+    });
+    let allowed = request(
+        ingress[0],
+        "POST",
+        "/",
+        &cors_name.hostname(),
+        &[("Sec-Fetch-Site", "cross-site")],
+    );
+    assert_eq!(
+        allowed.status, 405,
+        "opted-in cross-site POST reached the read-only DuckFS service"
+    );
+
+    for (method, path, expected) in [
+        ("GET", "/v1/status", 404),
+        ("POST", "/v1/shutdown", 405),
+        ("POST", "/v1/query", 405),
+        ("GET", "/metrics", 404),
+    ] {
+        let admin = request(ingress[0], method, path, &hostname, &[]);
+        assert_eq!(
+            admin.status, expected,
+            "the node administration route {method} {path} is unreachable"
+        );
+    }
+    assert!(
+        cluster.status(0).get("app_hash").is_some(),
+        "the shutdown administration route did not reach the node router"
+    );
+    let unpublished = DuckDnsName::NetworkService {
+        service: "admin".into(),
+        chain: chain.clone(),
+    }
+    .hostname();
+    assert_eq!(
+        request(ingress[0], "GET", "/", &unpublished, &[]).status,
+        404,
+        "an undeclared service identity cannot select an arbitrary local port"
     );
 
     let echo_name = DuckDnsName::NetworkService {
@@ -592,4 +675,9 @@ fn validator_and_resident_serve_each_other_then_revocation_cuts_publication() {
         removed.status, 404,
         "revoked provider is no longer published"
     );
+    let refused = poll_until("revoked resident requester to be refused", READY, || {
+        let response = request(ports[3], "GET", "/", &member_name.hostname(), &[]);
+        (response.status == 403).then_some(response)
+    });
+    assert_eq!(refused.status, 403, "an outsider cannot request DuckDNS");
 }

@@ -172,19 +172,19 @@ pub fn read_token(path: &Path) -> Result<String, String> {
     Ok(token)
 }
 
-fn ensure_private_mode(path: &Path) -> Result<(), String> {
+fn ensure_private_mode(_path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(path)
-            .map_err(|error| format!("stat DuckDNS control token {}: {error}", path.display()))?
+        let mode = std::fs::metadata(_path)
+            .map_err(|error| format!("stat DuckDNS control token {}: {error}", _path.display()))?
             .permissions()
             .mode()
             & 0o777;
         if mode & 0o077 != 0 {
             return Err(format!(
                 "DuckDNS control token {} has unsafe mode {mode:o}; want 600",
-                path.display()
+                _path.display()
             ));
         }
     }

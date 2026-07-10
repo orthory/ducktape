@@ -252,6 +252,11 @@ mod tests {
     use super::*;
     use duckdns::ServiceScope;
 
+    fn key(seed: u64) -> ed25519::PublicKey {
+        use commonware_cryptography::Signer as _;
+        ed25519::PrivateKey::from_seed(seed).public_key()
+    }
+
     #[test]
     fn service_identity_moves_the_flow_id() {
         let docs = ServiceIdentity {
@@ -264,5 +269,26 @@ mod tests {
         };
         assert_eq!(web_flow(&docs).unwrap(), web_flow(&docs).unwrap());
         assert_ne!(web_flow(&docs).unwrap(), web_flow(&status).unwrap());
+    }
+
+    #[test]
+    fn web_admission_tracks_only_current_standing_members() {
+        let member = key(1);
+        let outsider = key(2);
+        let peers = WebPeers::new("team-a1b2c3d4".into());
+        peers.set_peers([&member].into_iter());
+        let member = PeerId(member.as_ref().try_into().unwrap());
+        let outsider = PeerId(outsider.as_ref().try_into().unwrap());
+        let flow = FlowId::derive(b"duckdns-admission-test");
+
+        assert!(peers.permits(member, Service::Web, flow));
+        assert!(!peers.permits(outsider, Service::Web, flow));
+        assert!(!peers.permits(member, Service::StateSync, flow));
+
+        peers.set_peers(std::iter::empty());
+        assert!(
+            !peers.permits(member, Service::Web, flow),
+            "standing revocation immediately closes new Web admissions"
+        );
     }
 }

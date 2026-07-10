@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
-use crate::{CaStore, SharedState};
+use crate::{CaStore, IngressRoute, SharedState};
 
 const LEAF_CACHE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_CACHED_LEAVES: usize = 4096;
@@ -131,14 +131,22 @@ async fn handle_https(
             ));
         }
     };
-    let Some(ingress) = state.ingress() else {
-        return write_http_error(
-            &mut tls,
-            503,
-            "Service Unavailable",
-            "active workspace unavailable",
-        )
-        .await;
+    let hostname = tls.get_ref().1.server_name().unwrap_or_default();
+    let ingress = match state.route(hostname) {
+        IngressRoute::Published(ingress) => ingress,
+        IngressRoute::Unpublished => {
+            return write_http_error(&mut tls, 404, "Not Found", "unpublished DuckDNS service")
+                .await;
+        }
+        IngressRoute::Inactive => {
+            return write_http_error(
+                &mut tls,
+                503,
+                "Service Unavailable",
+                "active workspace unavailable",
+            )
+            .await;
+        }
     };
     let mut upstream =
         match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(ingress)).await {

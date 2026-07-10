@@ -4,10 +4,13 @@
 //! The app creates the control credential as the current user before elevation;
 //! the system helper reads it and stores its own protected copy.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::process::Command;
 
 use serde::Serialize;
+#[cfg(target_os = "linux")]
 use tauri::Manager as _;
 
 use crate::daemon::require_main_window;

@@ -60,13 +60,30 @@ pub(super) fn stop_owned(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) fn prepare_state(state_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(state_dir)
+        .map_err(|error| format!("create {}: {error}", state_dir.display()))?;
+    protect_unix_state(state_dir)
+}
+
 pub(super) fn protect_state(state_dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("chmod {}: {error}", state_dir.display()))
+    protect_unix_state(state_dir)
 }
 
 pub(super) fn apply(id: &str, root_cert: &Path) -> Result<(), String> {
+    for directory in [
+        Path::new("/usr/local/libexec"),
+        Path::new(BINARY)
+            .parent()
+            .expect("Linux helper binary has a parent directory"),
+        Path::new("/etc/systemd/resolved.conf.d"),
+        Path::new("/usr/lib/mozilla"),
+        Path::new("/usr/lib/mozilla/certificates"),
+        Path::new("/etc/firefox"),
+        Path::new("/etc/firefox/policies"),
+    ] {
+        ensure_public_directory(directory)?;
+    }
     let service = format!(
         "# {}\n[Unit]\nDescription=Ducktape DuckDNS device helper\nAfter=network.target systemd-resolved.service\nWants=systemd-resolved.service\n\n[Service]\nType=simple\nExecStart={BINARY} serve\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nPrivateDevices=true\nProtectSystem=strict\nProtectHome=true\nReadWritePaths={}\nRestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE\n\n[Install]\nWantedBy=multi-user.target\n",
         marker(id),
@@ -95,6 +112,13 @@ pub(super) fn apply(id: &str, root_cert: &Path) -> Result<(), String> {
         "systemctl",
         &["enable", "--now", "ducktape-duckdnsd.service"],
     )
+}
+
+fn ensure_public_directory(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(path).map_err(|error| format!("create {}: {error}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|error| format!("chmod {}: {error}", path.display()))
 }
 
 fn resolver_path(id: &str) -> PathBuf {
@@ -230,8 +254,14 @@ fn write_unmarked_owned(
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent", path.display()))?;
+    let parent_existed = parent.exists();
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    if !parent_existed {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("chmod {}: {error}", parent.display()))?;
+    }
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     let _ = std::fs::remove_file(&temporary);
     std::fs::write(&temporary, bytes)
@@ -617,8 +647,14 @@ fn write_shared_json(path: &Path, value: &serde_json::Value) -> Result<(), Strin
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent", path.display()))?;
+    let parent_existed = parent.exists();
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    if !parent_existed {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("chmod {}: {error}", parent.display()))?;
+    }
     let mut bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("encode Firefox policy: {error}"))?;
     bytes.push(b'\n');

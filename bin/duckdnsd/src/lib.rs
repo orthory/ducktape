@@ -33,7 +33,7 @@ pub use install::{InstallationStatus, install, installation_status, uninstall};
 pub use paths::{
     DEFAULT_CONTROL_ADDRESS, configured_control_address, configured_state_dir, default_state_dir,
 };
-pub use state::{ActiveWorkspace, SharedState, SnapshotStatus};
+pub use state::{ActiveWorkspace, IngressRoute, SharedState, SnapshotStatus};
 
 pub const ROOT_CERT_FILE: &str = "root-ca.pem";
 pub const ROOT_KEY_FILE: &str = "root-ca-key.der";

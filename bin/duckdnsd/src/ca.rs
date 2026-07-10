@@ -14,7 +14,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::{ROOT_CERT_FILE, ROOT_KEY_FILE};
 
-const ROOT_DER_FILE: &str = "root-ca.der";
+pub(crate) const ROOT_DER_FILE: &str = "root-ca.der";
 pub(crate) const INSTALLATION_ID_FILE: &str = "installation.id";
 
 #[derive(Clone)]
@@ -292,17 +292,27 @@ fn random_hex(bytes: usize) -> String {
     random.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn write_new(path: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
+fn write_new(path: &Path, bytes: &[u8], _private: bool) -> Result<(), String> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(if private { 0o600 } else { 0o644 });
+        options.mode(if _private { 0o600 } else { 0o644 });
     }
     let mut file = options
         .open(path)
         .map_err(|error| format!("create {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(if _private {
+            0o600
+        } else {
+            0o644
+        }))
+        .map_err(|error| format!("chmod {}: {error}", path.display()))?;
+    }
     use std::io::Write as _;
     file.write_all(bytes)
         .and_then(|_| file.sync_all())

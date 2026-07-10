@@ -55,6 +55,10 @@ pub fn install(client_token: &Path, repair: bool) -> Result<InstallationStatus, 
         }
     }
 
+    // Establish the system-only creation boundary before generating the root
+    // key. This matters on Windows, where a fresh ProgramData child otherwise
+    // inherits readable ACLs until the later per-file protection pass.
+    platform::prepare_state(&state_dir)?;
     let ca = CaStore::load_or_create(&state_dir)?;
     let id = ca.installation_id().to_owned();
     let result = (|| {
@@ -269,14 +273,25 @@ fn write_owned(path: &Path, bytes: &[u8], id: &str) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent", path.display()))?;
+    #[cfg(unix)]
+    let parent_existed = parent.exists();
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    #[cfg(unix)]
+    if !parent_existed {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("chmod {}: {error}", parent.display()))?;
+    }
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     let _ = std::fs::remove_file(&temporary);
     std::fs::write(&temporary, bytes)
         .map_err(|error| format!("write {}: {error}", temporary.display()))?;
     #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o644))
+            .map_err(|error| format!("chmod {}: {error}", temporary.display()))?;
         std::fs::rename(&temporary, path)
             .map_err(|error| format!("install {}: {error}", path.display()))
     }
@@ -289,6 +304,41 @@ fn write_owned(path: &Path, bytes: &[u8], id: &str) -> Result<(), String> {
         std::fs::rename(&temporary, path)
             .map_err(|error| format!("install {}: {error}", path.display()))
     }
+}
+
+#[cfg(unix)]
+fn protect_unix_state(state_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // Fixed install-status is intentionally unprivileged: traverse to public
+    // id/certificate material without allowing a directory listing. Secret
+    // bytes remain root-only regardless of the invoking user's umask.
+    if let Some(ducktape_state) = state_dir.parent() {
+        std::fs::set_permissions(ducktape_state, std::fs::Permissions::from_mode(0o711))
+            .map_err(|error| format!("chmod {}: {error}", ducktape_state.display()))?;
+    }
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o711))
+        .map_err(|error| format!("chmod {}: {error}", state_dir.display()))?;
+    for private in [
+        state_dir.join(crate::ROOT_KEY_FILE),
+        control_token_path(state_dir),
+    ] {
+        if private.exists() {
+            std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("chmod {}: {error}", private.display()))?;
+        }
+    }
+    for public in [
+        state_dir.join(ROOT_CERT_FILE),
+        state_dir.join(crate::ca::ROOT_DER_FILE),
+        state_dir.join(INSTALLATION_ID_FILE),
+    ] {
+        if public.exists() {
+            std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o644))
+                .map_err(|error| format!("chmod {}: {error}", public.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_owned_or_absent(path: &Path, id: &str) -> Result<(), String> {
@@ -323,6 +373,7 @@ fn artifact_owned(path: &Path, id: &str) -> Result<bool, String> {
     }
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn remove_owned(path: &Path, id: &str) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
@@ -375,6 +426,10 @@ mod platform {
     const PLIST: &str = "/Library/LaunchDaemons/com.ducktape.duckdnsd.plist";
     const RESOLVER: &str = "/etc/resolver/ducktape.quack";
 
+    fn trust_marker_path() -> PathBuf {
+        default_state_dir().join("macos-trust.installation-id")
+    }
+
     pub(super) fn binary_path() -> PathBuf {
         BINARY.into()
     }
@@ -391,10 +446,14 @@ mod platform {
         Ok(())
     }
 
+    pub(super) fn prepare_state(state_dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(state_dir)
+            .map_err(|error| format!("create {}: {error}", state_dir.display()))?;
+        protect_unix_state(state_dir)
+    }
+
     pub(super) fn protect_state(state_dir: &Path) -> Result<(), String> {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("chmod {}: {error}", state_dir.display()))
+        protect_unix_state(state_dir)
     }
 
     pub(super) fn apply(id: &str, root_cert: &Path) -> Result<(), String> {
@@ -409,15 +468,35 @@ mod platform {
         );
         write_owned(Path::new(RESOLVER), resolver.as_bytes(), id)?;
         let fingerprint = certificate_fingerprint(root_cert)?;
-        run_allow_failure(
-            "security",
-            &[
-                "delete-certificate",
-                "-Z",
-                &fingerprint,
-                "/Library/Keychains/System.keychain",
-            ],
-        );
+        let marker_path = trust_marker_path();
+        ensure_owned_or_absent(&marker_path, id)?;
+        let mut prior = if marker_path.exists() {
+            read_macos_trust_fingerprints(&marker_path, id)?
+        } else {
+            Vec::new()
+        };
+        prior.push(fingerprint.clone());
+        prior.sort();
+        prior.dedup();
+        for installed in prior {
+            run_allow_failure(
+                "security",
+                &[
+                    "delete-certificate",
+                    "-Z",
+                    &installed,
+                    "/Library/Keychains/System.keychain",
+                ],
+            );
+        }
+        // Persist the exact installed certificate before adding it. Initial
+        // install rollback and later rotation repair can then remove only the
+        // roots this installation introduced, even across a crash.
+        write_owned(
+            &marker_path,
+            format!("{}\nFingerprint={fingerprint}\n", marker(id)).as_bytes(),
+            id,
+        )?;
         run(
             "security",
             &[
@@ -438,6 +517,34 @@ mod platform {
     pub(super) fn inspect(id: &str, problems: &mut Vec<String>) {
         inspect_owned(Path::new(PLIST), id, problems);
         inspect_owned(Path::new(RESOLVER), id, problems);
+        let trust_marker = trust_marker_path();
+        inspect_owned(&trust_marker, id, problems);
+        let root = default_state_dir().join(ROOT_CERT_FILE);
+        match certificate_fingerprint(&root) {
+            Ok(expected) => {
+                match read_macos_trust_fingerprints(&trust_marker, id) {
+                    Ok(installed) if installed == [expected.clone()] => {}
+                    Ok(_) => problems.push("macOS trust marker has a stale DuckDNS root".into()),
+                    Err(error) => problems.push(error),
+                }
+                if !matches!(
+                    Command::new("security")
+                        .args([
+                            "find-certificate",
+                            "-a",
+                            "-Z",
+                            "/Library/Keychains/System.keychain",
+                        ])
+                        .output(),
+                    Ok(output)
+                        if output.status.success()
+                            && String::from_utf8_lossy(&output.stdout).contains(&expected)
+                ) {
+                    problems.push("missing current DuckDNS root in the System Keychain".into());
+                }
+            }
+            Err(error) => problems.push(error),
+        }
         if !matches!(
             Command::new("launchctl")
                 .args(["print", "system/com.ducktape.duckdnsd"])
@@ -452,10 +559,21 @@ mod platform {
         stop_owned(id)?;
         remove_owned(Path::new(PLIST), id)?;
         remove_owned(Path::new(RESOLVER), id)?;
+        let trust_marker = trust_marker_path();
+        let mut fingerprints = if trust_marker.exists() {
+            read_macos_trust_fingerprints(&trust_marker, id)?
+        } else {
+            Vec::new()
+        };
         let root = default_state_dir().join(ROOT_CERT_FILE);
         if root.exists()
             && let Ok(fingerprint) = certificate_fingerprint(&root)
         {
+            fingerprints.push(fingerprint);
+        }
+        fingerprints.sort();
+        fingerprints.dedup();
+        for fingerprint in fingerprints {
             run_allow_failure(
                 "security",
                 &[
@@ -466,7 +584,37 @@ mod platform {
                 ],
             );
         }
+        remove_owned(&trust_marker, id)?;
         Ok(())
+    }
+
+    fn read_macos_trust_fingerprints(path: &Path, id: &str) -> Result<Vec<String>, String> {
+        ensure_owned(path, id)?;
+        let contents = std::fs::read_to_string(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        let mut fingerprints = Vec::new();
+        for line in contents.lines() {
+            let Some(fingerprint) = line.strip_prefix("Fingerprint=") else {
+                continue;
+            };
+            if fingerprint.len() != 40 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "duckdnsd: invalid macOS trust fingerprint in {}",
+                    path.display()
+                ));
+            }
+            fingerprints.push(fingerprint.to_ascii_uppercase());
+        }
+        if fingerprints.is_empty() {
+            return Err(format!(
+                "duckdnsd: no macOS trust fingerprint in {}",
+                path.display()
+            ));
+        }
+        fingerprints.sort();
+        fingerprints.dedup();
+        Ok(fingerprints)
     }
 
     fn certificate_fingerprint(certificate: &Path) -> Result<String, String> {
@@ -517,29 +665,86 @@ mod platform {
 
     pub(super) fn stop_owned(id: &str) -> Result<(), String> {
         ensure_owned_or_absent(&binary_marker_path(), id)?;
-        run_allow_failure("sc.exe", &["stop", SERVICE]);
+        if service_owned(id)? {
+            run_allow_failure("sc.exe", &["stop", SERVICE]);
+        }
         Ok(())
     }
 
-    pub(super) fn protect_state(state_dir: &Path) -> Result<(), String> {
+    fn protect_state_directory(state_dir: &Path) -> Result<(), String> {
         let path = state_dir
             .to_str()
             .ok_or("duckdnsd: state path is not UTF-8")?;
+        // Well-known SIDs avoid localized group names. Users may traverse the
+        // directory and read only public CA/id material. On the key/token they
+        // receive READ_ATTRIBUTES so install-status can verify presence, but
+        // never READ_DATA.
         run(
             "icacls.exe",
             &[
                 path,
                 "/inheritance:r",
                 "/grant:r",
-                "SYSTEM:(OI)(CI)F",
-                "Administrators:(OI)(CI)F",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-32-545:(RX)",
             ],
         )
     }
 
+    pub(super) fn prepare_state(state_dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(state_dir)
+            .map_err(|error| format!("create {}: {error}", state_dir.display()))?;
+        protect_state_directory(state_dir)
+    }
+
+    pub(super) fn protect_state(state_dir: &Path) -> Result<(), String> {
+        protect_state_directory(state_dir)?;
+        for private in [
+            state_dir.join(crate::ROOT_KEY_FILE),
+            control_token_path(state_dir),
+        ] {
+            run(
+                "icacls.exe",
+                &[
+                    private
+                        .to_str()
+                        .ok_or("duckdnsd: private state path is not UTF-8")?,
+                    "/inheritance:r",
+                    "/grant:r",
+                    "*S-1-5-18:F",
+                    "*S-1-5-32-544:F",
+                    "*S-1-5-32-545:(RA)",
+                ],
+            )?;
+        }
+        for public in [
+            state_dir.join(ROOT_CERT_FILE),
+            state_dir.join(crate::ca::ROOT_DER_FILE),
+            state_dir.join(INSTALLATION_ID_FILE),
+        ] {
+            run(
+                "icacls.exe",
+                &[
+                    public
+                        .to_str()
+                        .ok_or("duckdnsd: public state path is not UTF-8")?,
+                    "/inheritance:r",
+                    "/grant:r",
+                    "*S-1-5-18:F",
+                    "*S-1-5-32-544:F",
+                    "*S-1-5-32-545:R",
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn apply(id: &str, root_cert: &Path) -> Result<(), String> {
         let binary = binary_path().display().to_string();
-        run_allow_failure("sc.exe", &["delete", SERVICE]);
+        if service_owned(id)? {
+            run_allow_failure("sc.exe", &["delete", SERVICE]);
+        }
         let bin_path = format!("\"{binary}\" serve");
         run(
             "sc.exe",
@@ -554,11 +759,26 @@ mod platform {
                 "Ducktape DuckDNS",
             ],
         )?;
+        let description = marker(id);
+        if let Err(error) = run("sc.exe", &["description", SERVICE, &description]) {
+            // Until the description lands, the fixed-name service has no
+            // ownership marker and the generic rollback must refuse it. This
+            // call created that exact service, so remove it here before
+            // returning the installation failure.
+            run_allow_failure("sc.exe", &["delete", SERVICE]);
+            return Err(error);
+        }
         let root = ps_quote(&root_cert.display().to_string());
+        let root_der = ps_quote(
+            &default_state_dir()
+                .join(crate::ca::ROOT_DER_FILE)
+                .display()
+                .to_string(),
+        );
         let comment = ps_quote(&marker(id));
         let id = ps_quote(id);
         let script = format!(
-            "$owned={comment}; $foreign=Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {{$_.Namespace -contains '.ducktape.quack' -and $_.Comment -ne $owned}}; if($foreign){{throw 'unowned NRPT rule for ducktape.quack'}}; Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {{$_.Comment -eq $owned}} | Remove-DnsClientNrptRule -Force; Add-DnsClientNrptRule -Namespace '.ducktape.quack' -NameServers '127.77.0.1' -Comment $owned; Import-Certificate -FilePath {root} -CertStoreLocation 'Cert:\\LocalMachine\\Root' | Out-Null; $cert=Get-ChildItem 'Cert:\\LocalMachine\\Root' | Where-Object {{$_.Subject -like ('*OU=duckdnsd:' + {id} + '*')}}; if(-not $cert){{throw 'DuckDNS root certificate did not install'}}"
+            "$owned={comment}; $foreign=Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {{$_.Namespace -contains '.ducktape.quack' -and $_.Comment -ne $owned}}; if($foreign){{throw 'unowned NRPT rule for ducktape.quack'}}; Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {{$_.Comment -eq $owned}} | Remove-DnsClientNrptRule -Force; Add-DnsClientNrptRule -Namespace '.ducktape.quack' -NameServers '127.77.0.1' -Comment $owned; Get-ChildItem 'Cert:\\LocalMachine\\Root' | Where-Object {{$_.Subject -like ('*OU=duckdnsd:' + {id} + '*')}} | Remove-Item -Force; $cert=Import-Certificate -FilePath {root} -CertStoreLocation 'Cert:\\LocalMachine\\Root'; $expected=(Get-FileHash -LiteralPath {root_der} -Algorithm SHA256).Hash; $sha=[Security.Cryptography.SHA256]::Create(); $actual=([BitConverter]::ToString($sha.ComputeHash($cert.RawData))).Replace('-',''); if($actual -ne $expected){{throw 'DuckDNS root certificate did not install byte-exact'}}"
         );
         run(
             "powershell.exe",
@@ -569,15 +789,30 @@ mod platform {
 
     pub(super) fn inspect(id: &str, problems: &mut Vec<String>) {
         inspect_owned(&binary_marker_path(), id, problems);
-        if !matches!(
-            Command::new("sc.exe").args(["query", SERVICE]).output(),
-            Ok(output) if output.status.success()
-        ) {
-            problems.push("DuckDNS Windows service is not installed".into());
+        match service_owned(id) {
+            Ok(true) => {
+                if !matches!(
+                    Command::new("sc.exe").args(["query", SERVICE]).output(),
+                    Ok(output)
+                        if output.status.success()
+                            && String::from_utf8_lossy(&output.stdout).contains("RUNNING")
+                ) {
+                    problems.push("DuckDNS Windows service is not running".into());
+                }
+            }
+            Ok(false) => problems.push("DuckDNS Windows service is not installed".into()),
+            Err(error) => problems.push(error),
         }
         let comment = ps_quote(&marker(id));
+        let id = ps_quote(id);
+        let root_der = ps_quote(
+            &default_state_dir()
+                .join(crate::ca::ROOT_DER_FILE)
+                .display()
+                .to_string(),
+        );
         let script = format!(
-            "if(-not (Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {{$_.Comment -eq {comment}}})){{exit 1}}"
+            "$rules=@(Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {{$_.Namespace -contains '.ducktape.quack'}}); if(@($rules | Where-Object {{$_.Comment -eq {comment}}}).Count -ne 1 -or @($rules | Where-Object {{$_.Comment -ne {comment}}}).Count -ne 0){{exit 1}}; $certs=@(Get-ChildItem 'Cert:\\LocalMachine\\Root' | Where-Object {{$_.Subject -like ('*OU=duckdnsd:' + {id} + '*')}}); if($certs.Count -ne 1){{exit 2}}; $expected=(Get-FileHash -LiteralPath {root_der} -Algorithm SHA256).Hash; $sha=[Security.Cryptography.SHA256]::Create(); $actual=([BitConverter]::ToString($sha.ComputeHash($certs[0].RawData))).Replace('-',''); if($actual -ne $expected){{exit 3}}"
         );
         if !matches!(
             Command::new("powershell.exe")
@@ -585,13 +820,15 @@ mod platform {
                 .output(),
             Ok(output) if output.status.success()
         ) {
-            problems.push("missing owned Windows NRPT rule".into());
+            problems.push("Windows NRPT or root trust is missing, foreign, or stale".into());
         }
     }
 
     pub(super) fn remove(id: &str) -> Result<(), String> {
         stop_owned(id)?;
-        run_allow_failure("sc.exe", &["delete", SERVICE]);
+        if service_owned(id)? {
+            run_allow_failure("sc.exe", &["delete", SERVICE]);
+        }
         let comment = ps_quote(&marker(id));
         let id = ps_quote(id);
         let script = format!(
@@ -601,6 +838,32 @@ mod platform {
             "powershell.exe",
             &["-NoProfile", "-NonInteractive", "-Command", &script],
         )
+    }
+
+    fn service_owned(id: &str) -> Result<bool, String> {
+        let description = Command::new("sc.exe")
+            .args(["qdescription", SERVICE])
+            .output()
+            .map_err(|error| format!("query DuckDNS Windows service description: {error}"))?;
+        if description.status.success() {
+            if String::from_utf8_lossy(&description.stdout).contains(&marker(id)) {
+                return Ok(true);
+            }
+            return Err(format!(
+                "duckdnsd: refusing to replace unowned Windows service {SERVICE}"
+            ));
+        }
+        let query = Command::new("sc.exe")
+            .args(["query", SERVICE])
+            .output()
+            .map_err(|error| format!("query DuckDNS Windows service: {error}"))?;
+        if query.status.success() {
+            Err(format!(
+                "duckdnsd: Windows service {SERVICE} exists but its ownership marker is unreadable"
+            ))
+        } else {
+            Ok(false)
+        }
     }
 
     fn ps_quote(value: &str) -> String {
@@ -619,6 +882,9 @@ mod platform {
         None
     }
     pub(super) fn stop_owned(_id: &str) -> Result<(), String> {
+        Err("duckdnsd: installation is unsupported on this OS".into())
+    }
+    pub(super) fn prepare_state(_state_dir: &Path) -> Result<(), String> {
         Err("duckdnsd: installation is unsupported on this OS".into())
     }
     pub(super) fn protect_state(_state_dir: &Path) -> Result<(), String> {
@@ -658,5 +924,49 @@ mod tests {
         assert!(artifact_owned(&path, &first).unwrap());
         assert!(!artifact_owned(&path, &second).unwrap());
         assert!(ensure_owned(&path, &second).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_state_permissions_keep_public_status_readable_and_secrets_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let ducktape_state = directory.path().join("ducktape");
+        let state_dir = ducktape_state.join("duckdnsd");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let private = [
+            state_dir.join(crate::ROOT_KEY_FILE),
+            control_token_path(&state_dir),
+        ];
+        let public = [
+            state_dir.join(ROOT_CERT_FILE),
+            state_dir.join(crate::ca::ROOT_DER_FILE),
+            state_dir.join(INSTALLATION_ID_FILE),
+        ];
+        for path in private.iter().chain(&public) {
+            std::fs::write(path, b"test").unwrap();
+        }
+        std::fs::set_permissions(&ducktape_state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for path in &private {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+        for path in &public {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        protect_unix_state(&state_dir).unwrap();
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&ducktape_state), 0o711);
+        assert_eq!(mode(&state_dir), 0o711);
+        for path in &private {
+            assert_eq!(mode(path), 0o600, "{}", path.display());
+        }
+        for path in &public {
+            assert_eq!(mode(path), 0o644, "{}", path.display());
+        }
     }
 }

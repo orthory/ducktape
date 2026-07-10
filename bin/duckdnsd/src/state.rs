@@ -27,6 +27,13 @@ pub enum SnapshotStatus {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngressRoute {
+    Inactive,
+    Unpublished,
+    Published(SocketAddr),
+}
+
 #[derive(Clone, Default)]
 pub struct SharedState {
     inner: Arc<RwLock<Option<ActiveWorkspace>>>,
@@ -88,24 +95,35 @@ impl SharedState {
     }
 
     pub fn resolves(&self, hostname: &str) -> bool {
+        matches!(self.route(hostname), IngressRoute::Published(_))
+    }
+
+    /// Resolve one TLS SNI name and its ingress from the same leased snapshot.
+    /// Keeping the name check and address lookup atomic prevents a workspace
+    /// switch or lease expiry from pairing one workspace's authorization with
+    /// another workspace's node ingress.
+    pub fn route(&self, hostname: &str) -> IngressRoute {
         let Ok(parsed) = duckdns_core::parse_hostname(hostname) else {
-            return false;
+            return IngressRoute::Unpublished;
         };
         let canonical = parsed.hostname();
-        self.active()
-            .is_some_and(|active| active.names.contains(&canonical))
+        self.with_active(|active| {
+            if active.names.contains(&canonical) {
+                IngressRoute::Published(active.ingress)
+            } else {
+                IngressRoute::Unpublished
+            }
+        })
+        .unwrap_or(IngressRoute::Inactive)
     }
 
     pub fn ingress(&self) -> Option<SocketAddr> {
-        self.active().map(|active| active.ingress)
+        self.with_active(|active| active.ingress)
     }
 
     pub fn status(&self) -> SnapshotStatus {
-        let Some(active) = self.active() else {
-            return SnapshotStatus::Inactive;
-        };
-        SnapshotStatus::Active {
-            workspace_id: active.workspace_id,
+        self.with_active(|active| SnapshotStatus::Active {
+            workspace_id: active.workspace_id.clone(),
             ingress: active.ingress,
             names: active.names.len(),
             lease_millis: active
@@ -114,15 +132,16 @@ impl SharedState {
                 .as_millis()
                 .try_into()
                 .unwrap_or(u64::MAX),
-        }
+        })
+        .unwrap_or(SnapshotStatus::Inactive)
     }
 
-    fn active(&self) -> Option<ActiveWorkspace> {
+    fn with_active<T>(&self, read: impl FnOnce(&ActiveWorkspace) -> T) -> Option<T> {
         let active = self.inner.read().expect("duckdnsd state lock");
         active
             .as_ref()
             .filter(|active| active.expires_at > Instant::now())
-            .cloned()
+            .map(read)
     }
 }
 
