@@ -535,35 +535,20 @@ pub(crate) fn node_binary_display() -> Option<String> {
 /// frontend cannot select a program, and workspaces always run the bundled
 /// network-shape node (real identity, real descriptor).
 fn resolve_node_bin() -> Result<PathBuf, String> {
-    if let Some(explicit) = env_node_bin()? {
-        return Ok(explicit);
-    }
-    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| "app executable has no parent dir".to_string())?;
-    let sibling = dir.join(format!("ducktape-node{}", std::env::consts::EXE_SUFFIX));
-    if let Ok(validated) = validate_node_bin(&sibling) {
-        return Ok(validated);
-    }
-    Err(format!(
-        "no trusted, executable ducktape-node at {} — stage it with `bun run sidecar` \
-         (or `make sidecar` at the repo root), or set DUCKTAPE_NODE_BIN",
-        sibling.display()
-    ))
+    resolve_external_bin("DUCKTAPE_NODE_BIN", "ducktape-node")
 }
 
-/// the `DUCKTAPE_NODE_BIN` override, trimmed and validated: `Ok(None)` when
-/// unset or empty (fall through to the sibling), `Ok(Some(path))` when it names
-/// a usable binary, and an actionable `Err` when it is set but points at a
-/// missing / empty / non-executable file. that last case is the dev trap the
-/// old code walked straight into: `tauri dev`'s build.rs can leave a 0-byte
-/// placeholder at the pinned path, and spawning it fails with a baffling
-/// `Exec format error` / `Permission denied` far from the cause. reject it here
-/// with a message that names the fix, and never silently substitute the sibling
-/// for an explicitly-pinned (if broken) path.
-fn env_node_bin() -> Result<Option<PathBuf>, String> {
-    let raw = match std::env::var("DUCKTAPE_NODE_BIN") {
+/// Resolve the bundled system helper through the same ownership, ancestor, and
+/// executable checks as the node sidecar. This is intentionally the only
+/// desktop path that turns a DuckDNS helper name into an executable path.
+pub(crate) fn resolve_duckdnsd_bin() -> Result<PathBuf, String> {
+    resolve_external_bin("DUCKTAPE_DUCKDNSD_BIN", "duckdnsd")
+}
+
+/// A sidecar override is either absent, a trusted executable, or an actionable
+/// error. Never silently fall back when an explicitly pinned path is broken.
+fn env_external_bin(variable: &str, binary: &str) -> Result<Option<PathBuf>, String> {
+    let raw = match std::env::var(variable) {
         Ok(v) => v,
         Err(_) => return Ok(None),
     };
@@ -572,12 +557,31 @@ fn env_node_bin() -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
     let path = PathBuf::from(trimmed);
-    validate_node_bin(&path).map(Some).map_err(|reason| {
+    validate_external_bin(&path).map(Some).map_err(|reason| {
         format!(
-            "DUCKTAPE_NODE_BIN={trimmed} is not a trusted executable ({reason}) — \
-             run `cargo build -p node-bin`, wait for the rebuild to finish, or unset it"
+            "{variable}={trimmed} is not a trusted executable ({reason}) — \
+             run `bun run sidecar`, wait for the {binary} rebuild to finish, or unset it"
         )
     })
+}
+
+fn resolve_external_bin(variable: &str, binary: &str) -> Result<PathBuf, String> {
+    if let Some(explicit) = env_external_bin(variable, binary)? {
+        return Ok(explicit);
+    }
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "app executable has no parent dir".to_string())?;
+    let sibling = dir.join(format!("{binary}{}", std::env::consts::EXE_SUFFIX));
+    if let Ok(validated) = validate_external_bin(&sibling) {
+        return Ok(validated);
+    }
+    Err(format!(
+        "no trusted, executable {binary} at {} — stage sidecars with `bun run sidecar` \
+         (or `make sidecar` at the repo root), or set {variable}",
+        sibling.display()
+    ))
 }
 
 /// Resolve symlinks once and validate the target before execution. In addition
@@ -587,7 +591,7 @@ fn env_node_bin() -> Result<Option<PathBuf>, String> {
 /// because their ownership rule prevents another user replacing our entry.
 /// Same-user replacement is outside this boundary (that user can already
 /// modify `~/.ducktape` and the running app).
-fn validate_node_bin(path: &Path) -> Result<PathBuf, String> {
+fn validate_external_bin(path: &Path) -> Result<PathBuf, String> {
     let canonical =
         fs::canonicalize(path).map_err(|err| format!("resolve {}: {err}", path.display()))?;
     let meta = fs::metadata(&canonical)
@@ -1048,12 +1052,12 @@ mod tests {
         fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o775)).unwrap();
         assert_eq!(
-            validate_node_bin(&path).expect("owner-controlled executable"),
+            validate_external_bin(&path).expect("owner-controlled executable"),
             fs::canonicalize(&path).unwrap()
         );
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o757)).unwrap();
-        let err = validate_node_bin(&path).expect_err("world-writable executable");
+        let err = validate_external_bin(&path).expect_err("world-writable executable");
         assert!(err.contains("untrusted group or other"), "{err}");
     }
 
@@ -1067,7 +1071,7 @@ mod tests {
         let path = parent.join("ducktape-node");
         fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        let err = validate_node_bin(&path).expect_err("replaceable parent");
+        let err = validate_external_bin(&path).expect_err("replaceable parent");
         assert!(err.contains("ancestor directory"), "{err}");
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -1075,13 +1079,13 @@ mod tests {
     #[test]
     fn validation_rejects_empty_and_zero_byte() {
         assert!(
-            validate_node_bin(&PathBuf::from("")).is_err(),
+            validate_external_bin(&PathBuf::from("")).is_err(),
             "empty path is not usable"
         );
         let zero = scratch("zero").join("node");
         fs::write(&zero, b"").unwrap();
         assert!(
-            validate_node_bin(&zero).is_err(),
+            validate_external_bin(&zero).is_err(),
             "a 0-byte file is not usable"
         );
     }

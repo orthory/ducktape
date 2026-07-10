@@ -15,7 +15,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { keyHex } from "../../domain/chat-client";
 import type { CallEvent, CallSession } from "../../domain/call-session";
-import type { BlockEvent, NodeTransport } from "../../domain/transport";
+import type {
+  NodeTransport,
+  StreamSignal,
+  TopicHandlers,
+} from "../../domain/transport";
+import type { EventFrame } from "../../domain/stream";
 import { DucktapeProvider } from "./DucktapeProvider";
 import { useDucktape } from "./use-ducktape";
 import type { ConsoleActions } from "./DucktapeProvider";
@@ -81,10 +86,11 @@ const member = (user: string, node: number[]) => ({
 });
 
 const makeFakeNode = () => {
-  const blockListeners = new Set<(block: BlockEvent) => void>();
+  const topicHandlers = new Set<TopicHandlers>();
+  const streamListeners = new Set<(signal: StreamSignal) => void>();
   // The channel's huddle roster — tests mutate this, then finalize a block so
   // the provider re-queries and the store reconciles against it. The scoped
-  // block hydration diffs module roots between statuses, so each finalize must
+  // stream hydration diffs module roots between statuses, so each finalize must
   // move the chat root (and the height) or nothing re-queries.
   const state = { huddle: [] as ReturnType<typeof member>[], height: 1 };
   const transport: NodeTransport = {
@@ -153,16 +159,41 @@ const makeFakeNode = () => {
       }),
     ),
     metrics: vi.fn().mockResolvedValue(""),
-    onBlock: vi.fn((listener: (block: BlockEvent) => void) => {
-      blockListeners.add(listener);
-      return () => blockListeners.delete(listener);
+    subscribe: vi.fn((_topics: string[], handlers: TopicHandlers) => {
+      topicHandlers.add(handlers);
+      return () => topicHandlers.delete(handlers);
+    }),
+    onStream: vi.fn((listener: (signal: StreamSignal) => void) => {
+      streamListeners.add(listener);
+      return () => streamListeners.delete(listener);
     }),
     blocks: vi.fn().mockResolvedValue([]),
   };
   const finalize = () => {
     state.height += 1;
-    blockListeners.forEach((notify) =>
-      notify({ height: state.height, appHash: "cc".repeat(32) } as BlockEvent),
+    const frame: EventFrame = {
+      type: "event",
+      topic: "module:chat",
+      cursor: String(state.height),
+      op: {
+        height: state.height,
+        seq: 0,
+        time: Date.now(),
+        origin: { kind: "system" },
+      },
+    };
+    topicHandlers.forEach((handlers) => handlers.onEvent?.(frame));
+    streamListeners.forEach((notify) =>
+      notify({
+        kind: "heartbeat",
+        frame: {
+          type: "heartbeat",
+          height: state.height,
+          appHash: "cc".repeat(32),
+          timeMs: Date.now(),
+          intervalMs: 3_000,
+        },
+      }),
     );
   };
   return { transport, finalize, state };

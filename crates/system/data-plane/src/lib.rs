@@ -65,6 +65,9 @@ pub enum Service {
     /// Real-time camera video (chat module): encoded frames fragmented
     /// across datagrams — see `chat::video` for the frame layer.
     Video = 3,
+    /// DuckDNS HTTP/WebSocket byte streams. TLS terminates on the requesting
+    /// device; the provider connects only to its declared loopback target.
+    Web = 4,
 }
 
 impl Service {
@@ -79,6 +82,7 @@ impl Service {
             Service::StateSync => 45801,
             Service::Voice => 45802,
             Service::Video => 45803,
+            Service::Web => 45804,
         }
     }
 
@@ -89,6 +93,7 @@ impl Service {
             Service::StateSync => 45901,
             Service::Voice => 45902,
             Service::Video => 45903,
+            Service::Web => 45904,
         }
     }
 }
@@ -101,6 +106,7 @@ impl TryFrom<u8> for Service {
             1 => Ok(Service::StateSync),
             2 => Ok(Service::Voice),
             3 => Ok(Service::Video),
+            4 => Ok(Service::Web),
             other => Err(other),
         }
     }

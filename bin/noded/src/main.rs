@@ -30,6 +30,7 @@ use automations::Automations;
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
+use duckdns::DuckDns;
 use tagging::TaggingModule;
 use files::Files;
 use forge::Forge;
@@ -55,7 +56,7 @@ use tracing_subscriber::prelude::*;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 15] = [
+const MODULE_IDS: [&str; 16] = [
     "chat",
     "saga",
     "dispatch",
@@ -71,6 +72,7 @@ const MODULE_IDS: [&str; 15] = [
     "files",
     "profiles",
     "identity",
+    "duckdns",
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 
@@ -263,6 +265,8 @@ fn run_node(
         // daemon carries no valset (ungated binds) and no chain (dev-only,
         // chain-unscoped certs are an acceptable surface here).
         let identity = Identity::new("identity", None, String::new());
+        let duckdns = DuckDns::new("duckdns", "identity", None, "local#00000000")
+            .expect("fixed local DuckDNS chain id");
         let mut host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),
@@ -279,6 +283,7 @@ fn run_node(
             Box::new(files),
             Box::new(profiles),
             Box::new(identity),
+            Box::new(duckdns),
         ])
         .expect("genesis");
 

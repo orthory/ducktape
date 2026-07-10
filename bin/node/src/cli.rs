@@ -84,6 +84,7 @@ fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// `init --name <human name> [--dir .] [--listen a] [--advertised a] [--http a]
 /// [--rpc a] [--primary-coordinator host:port|none]
 /// [--wireguard-listen a] [--invite-listen a]
+/// [--duckdns-ingress a]
 /// [--wireguard-effect socket|tun|fake]` — found a network: mint the
 /// chain-id, write the descriptor + node config, seed the genesis validator
 /// set with this identity.
@@ -121,6 +122,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("wireguard-effect").map(String::as_str),
         flags.get("wireguard-listen").map(String::as_str),
         flags.get("invite-listen").map(String::as_str),
+        flags.get("duckdns-ingress").map(String::as_str),
     )?;
     if primary_coordinator.is_some() {
         if plumbing.wireguard_listen.is_none() {
@@ -1111,6 +1113,7 @@ fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 
 /// `join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a]
 /// [--rpc a] [--wireguard-listen a] [--invite-listen a]
+/// [--duckdns-ingress a]
 /// [--wireguard-effect socket|tun|fake]` — materialize a workspace
 /// from an invite: descriptor + identity (kept across re-joins) + node
 /// config. prints this identity for the inviter's pre-genesis `admit`.
@@ -1139,6 +1142,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("wireguard-effect").map(String::as_str),
         flags.get("wireguard-listen").map(String::as_str),
         flags.get("invite-listen").map(String::as_str),
+        flags.get("duckdns-ingress").map(String::as_str),
     )?;
     if config::invite_requires_reachability_defaults(&invite) {
         // a WireGuard or Coordinated invite makes the reachability plane the

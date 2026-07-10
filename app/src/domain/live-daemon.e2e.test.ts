@@ -136,6 +136,7 @@ describe.skipIf(!bin)("app domain layer against a live daemon", () => {
       "files",
       "profiles",
       "identity",
+      "duckdns",
     ]);
   });
 

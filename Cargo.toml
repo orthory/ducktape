@@ -38,6 +38,10 @@ members = [
     "crates/system/dispatch",
     "crates/system/dispatch-oracle",
     "crates/system/tagging",
+    "crates/duckdns/core",
+    "crates/duckdns/client",
+    "crates/duckdns/node",
+    "crates/system/duckdns",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
@@ -58,6 +62,7 @@ members = [
     "crates/examples/directory", "crates/examples/greeter",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
+    "bin/duckdnsd",
     "bin/fs",
     # app — the desktop shell of the react client (web twin ships from app/)
     "app/src-tauri",
@@ -158,6 +163,11 @@ blobstore = { path = "crates/system/blobstore" }
 dispatch = { path = "crates/system/dispatch" }
 dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }
+duckdns-core = { path = "crates/duckdns/core" }
+duckdns-client = { path = "crates/duckdns/client" }
+duckdns-node = { path = "crates/duckdns/node" }
+duckdns = { path = "crates/system/duckdns" }
+duckdnsd = { path = "bin/duckdnsd", default-features = false }
 forge = { path = "crates/apps/forge" }
 pages = { path = "crates/apps/pages" }
 chat = { path = "crates/apps/chat" }

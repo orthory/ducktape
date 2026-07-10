@@ -85,7 +85,9 @@ mod userkey_cli;
 mod voice;
 mod voice_plane;
 use config::{Resolved, WireGuardEffectKind, hex_bytes, unhex};
-use host_state::{genesis_host, restore_host, run_output_sink, sync_all_modules};
+use host_state::{
+    NetworkBindings, SyncSubstrates, genesis_host, restore_host, run_output_sink, sync_all_modules,
+};
 
 /// the consensus signature scheme this build runs — a genesis-wide constant. today only
 /// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
@@ -229,7 +231,7 @@ const EPOCH_CHANNEL_BANK: u64 = 16;
 const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. keep in
 /// sync with [`genesis_host`] — status endpoints report exactly these roots.
-const MODULE_IDS: [&str; 22] = [
+const MODULE_IDS: [&str; 23] = [
     "kv",
     "pages",
     "chat",
@@ -245,6 +247,7 @@ const MODULE_IDS: [&str; 22] = [
     "vaults",
     "profiles",
     "identity",
+    "duckdns",
     "inbox",
     "directory",
     "automations",
@@ -877,7 +880,11 @@ async fn reopen_recovery(
 
 /// a backfilled height's served seal, held for the post-fold cross-check:
 /// `(disposition, app_hash, per-module roots)` as the quorum sealed them.
-type ServedSeal = (node::Disposition, StateRoot, Vec<(sdk::ModuleId, StateRoot)>);
+type ServedSeal = (
+    node::Disposition,
+    StateRoot,
+    Vec<(sdk::ModuleId, StateRoot)>,
+);
 
 /// fold the committed views in `(after_view, up_to_view]` that never reached
 /// this replica as certificates — lost gossip, or ancestors committed by
@@ -914,7 +921,11 @@ where
         let view = f.height.saturating_sub(view_base);
         seal_checks.insert(
             f.height,
-            (to_node_disposition(f.disposition), f.app_hash, f.roots.clone()),
+            (
+                to_node_disposition(f.disposition),
+                f.app_hash,
+                f.roots.clone(),
+            ),
         );
         if node_r.orderer_mut().admit_backfilled(view, f.frame.clone()) {
             *watermark = Some(view);
@@ -1227,9 +1238,7 @@ async fn drive_sync_request(
                     requested_after: after_height,
                     retained_from: retained_start,
                 },
-                Ok(Err(e)) => {
-                    statesync::SyncResponse::Error(format!("recovery frame range: {e}"))
-                }
+                Ok(Err(e)) => statesync::SyncResponse::Error(format!("recovery frame range: {e}")),
                 Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
             }
         }
@@ -1250,9 +1259,9 @@ async fn drive_sync_request(
             }
             match server.serve(statesync::SyncRequest::IndexModules { boundary }) {
                 statesync::ServeStep::Reply(resp) => resp,
-                _ => statesync::SyncResponse::Error(
-                    "index attach did not settle the request".into(),
-                ),
+                _ => {
+                    statesync::SyncResponse::Error("index attach did not settle the request".into())
+                }
             }
         }
         statesync::ServeStep::NeedCoords => {
@@ -2431,15 +2440,17 @@ where
     // pump in: mesh datagrams -> orchestrator commands.
     {
         let cmd = cmd_tx.clone();
-        context.child("reachability_in").spawn(move |_ctx| async move {
-            while let Ok((peer, msg)) = reach_p2p_rx.recv().await {
-                let bytes: Vec<u8> = msg.into();
-                let deliver = reachability::ReachabilityCommand::Deliver { from: peer, bytes };
-                if cmd.send(deliver).await.is_err() {
-                    break;
+        context
+            .child("reachability_in")
+            .spawn(move |_ctx| async move {
+                while let Ok((peer, msg)) = reach_p2p_rx.recv().await {
+                    let bytes: Vec<u8> = msg.into();
+                    let deliver = reachability::ReachabilityCommand::Deliver { from: peer, bytes };
+                    if cmd.send(deliver).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            });
     }
     // pump out: orchestrator sends -> mesh; everything else is
     // operator-visible progress.
@@ -2815,7 +2826,9 @@ async fn reachability_plane(
                         continue;
                     }
                 };
-                let Some(cmds) = intro_cmds.upgrade() else { break };
+                let Some(cmds) = intro_cmds.upgrade() else {
+                    break;
+                };
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let install = reachability::ReachabilityCommand::InstallInvitePeer {
                     peer: verified.joiner.clone(),
@@ -2855,7 +2868,9 @@ async fn reachability_plane(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let Some(cmds) = intro_cmds.upgrade() else { break };
+                let Some(cmds) = intro_cmds.upgrade() else {
+                    break;
+                };
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let install = reachability::ReachabilityCommand::InstallInvitePeer {
                     peer: verified.joiner.clone(),
@@ -3044,10 +3059,32 @@ fn run_node(
         invite_fronts,
         sync_index,
         announce_capabilities,
+        duckdns_services,
+        duckdns_ingress_listen,
         coordination,
         coord_cap,
         workspace,
     } = resolved;
+    // Production descriptors already carry `<name>#<8-hex>`. The legacy
+    // dev-seed shape predates that format, so give only that explicit shape a
+    // deterministic zero salt without changing identity's signing domain.
+    let duckdns_chain_id = match duckdns::derive_chain_label(&identity_chain_id) {
+        Ok(_) => identity_chain_id.clone(),
+        Err(_) if dev_demo => {
+            let candidate = format!("{identity_chain_id}#00000000");
+            duckdns::derive_chain_label(&candidate)
+                .map_err(|e| format!("dev DuckDNS chain label: {e}"))?;
+            candidate
+        }
+        Err(error) => {
+            return Err(format!("network chain id is not DuckDNS-compatible: {error}").into());
+        }
+    };
+    let duckdns_announcements: Vec<_> = duckdns_services
+        .iter()
+        .map(|service| service.announcement.clone())
+        .collect();
+    let duckdns_publications = std::sync::Arc::new(duckdns_services);
     // a key outside the GENESIS validator set is not an error: post-genesis
     // members are admitted via governance. with a recovery checkpoint on disk
     // (a previous run promoted this identity) boot proceeds as a validator
@@ -3126,15 +3163,12 @@ fn run_node(
                     .map(|advert| &advert.record)
                     .filter(|record| record.validator_identity != me)
                     .filter_map(|record| {
-                        let pk = ed25519::PublicKey::decode(&record.validator_identity.0[..])
-                            .ok()?;
+                        let pk =
+                            ed25519::PublicKey::decode(&record.validator_identity.0[..]).ok()?;
                         if bootstrappers.iter().any(|(hinted, _)| *hinted == pk) {
                             return None;
                         }
-                        Some((
-                            pk,
-                            Ingress::Socket(record.control_endpoint.socket_addr()),
-                        ))
+                        Some((pk, Ingress::Socket(record.control_endpoint.socket_addr())))
                     })
                     .collect();
                 if !seeds.is_empty() {
@@ -3148,10 +3182,8 @@ fn run_node(
             }
             _ => Vec::new(),
         };
-    let bootstrappers: Vec<(ed25519::PublicKey, _)> = bootstrappers
-        .into_iter()
-        .chain(mesh_dial_seeds)
-        .collect();
+    let bootstrappers: Vec<(ed25519::PublicKey, _)> =
+        bootstrappers.into_iter().chain(mesh_dial_seeds).collect();
 
     for (i, pk) in peers.iter().enumerate() {
         println!(
@@ -3206,7 +3238,10 @@ fn run_node(
     }
     if let Some(wg) = &wireguard_listen {
         let advertise = if wg.ip().is_unspecified() {
-            format!("endpoint-less on udp port {} (roaming: peers learn this node's address from its own initiations)", wg.port())
+            format!(
+                "endpoint-less on udp port {} (roaming: peers learn this node's address from its own initiations)",
+                wg.port()
+            )
         } else {
             format!("advertising WireGuard endpoint udp/{wg}")
         };
@@ -3233,6 +3268,20 @@ fn run_node(
     // answers with a clear not-admitted error instead of a dead port.
     let rpc_listener = match rpc_listen.as_deref() {
         Some(addr) if !sync_only => Some(std::net::TcpListener::bind(addr)?),
+        _ => None,
+    };
+    let duckdns_plane_slot: duckdns_node::plane::PlaneSlot =
+        std::sync::Arc::new(std::sync::OnceLock::new());
+    let duckdns_ingress_listener = match duckdns_ingress_listen {
+        Some(address) if !sync_only => {
+            let listener = std::net::TcpListener::bind(address)?;
+            listener.set_nonblocking(true)?;
+            println!(
+                "[node {label}] DuckDNS HTTP ingress listening on http://{}",
+                listener.local_addr()?
+            );
+            Some(listener)
+        }
         _ => None,
     };
 
@@ -3280,12 +3329,50 @@ fn run_node(
     // unconditionally, so the runs composer emits v3 (the de-versioned
     // activation — no flag day, pre-production re-genesis). a misconfigured
     // root (inside <storage>) is a boot error, never a silent D7 hole.
-    let agent_provisioner: Option<dispatch_oracle::SharedProvisioner> =
-        Some(std::sync::Arc::new(noded::agent_provision::NodedProvisioner::new(
+    let agent_provisioner: Option<dispatch_oracle::SharedProvisioner> = Some(std::sync::Arc::new(
+        noded::agent_provision::NodedProvisioner::new(
             http_handle.clone(),
             noded::agent_provision::agent_runs_root(&storage)
                 .unwrap_or_else(|e| panic!("agent runs root failed D7 validation: {e}")),
-        )));
+        ),
+    ));
+    // Reuse noded's established no-self-dial files adapter for DuckFS-backed
+    // DuckDNS sites. It holds only a clone of the actor command lane.
+    let duckdns_files = noded::ActorNodeApi::new(http_handle.clone());
+    if let Some(listener) = duckdns_ingress_listener {
+        let commands = http_handle.command_sender();
+        let plane = std::sync::Arc::clone(&duckdns_plane_slot);
+        let publications = std::sync::Arc::clone(&duckdns_publications);
+        let files = duckdns_files.clone();
+        let me: [u8; 32] = signer
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("ed25519 keys are 32 bytes");
+        let thread_label = label.clone();
+        std::thread::Builder::new()
+            .name("duckdns-ingress".into())
+            .spawn(move || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("DuckDNS ingress tokio runtime")
+                    .block_on(async move {
+                        if let Err(error) = duckdns_node::ingress::serve(
+                            listener,
+                            commands,
+                            plane,
+                            me,
+                            publications,
+                            files,
+                        )
+                        .await
+                        {
+                            eprintln!("[node {thread_label}] DuckDNS ingress failed: {error}");
+                        }
+                    });
+            })?;
+    }
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
     match http_listen.as_deref() {
@@ -3580,12 +3667,17 @@ fn run_node(
                 &context,
                 &client,
                 &manifest,
-                &forge_repo,
-                &duckfs_dir,
-                &namespace,
-                blobs.clone(),
+                NetworkBindings {
+                    invite: &namespace,
+                    identity_chain_id: &identity_chain_id,
+                    duckdns_chain_id: &duckdns_chain_id,
+                },
+                SyncSubstrates {
+                    forge_repo: &forge_repo,
+                    duckfs_dir: &duckfs_dir,
+                    blobs: blobs.clone(),
+                },
                 0,
-                &identity_chain_id,
             )
             .await
             {
@@ -4038,6 +4130,9 @@ fn run_node(
             // (awaiting a deliberate promote) — the not-admitted bail below
             // must never fire.
             let mut resident_standing = false;
+            let mut resident_duckdns_plane_book: Option<
+                std::sync::Arc<duckdns_node::plane::WebPeers>,
+            > = None;
             let mut send_announce = |targets: &[ed25519::PublicKey], attempt: usize| {
                 let Some(frame) = &announce_frame else { return };
                 if attempt % LOBBY_ANNOUNCE_EVERY != 1 || targets.is_empty() {
@@ -4158,9 +4253,12 @@ fn run_node(
                     &forge_repo,
                     &duckfs_dir,
                     ckpt,
-                    &namespace,
+                    NetworkBindings {
+                        invite: &namespace,
+                        identity_chain_id: &identity_chain_id,
+                        duckdns_chain_id: &duckdns_chain_id,
+                    },
                     blobs.clone(),
-                    &identity_chain_id,
                 )
                 .await;
                 let mut host = match restored {
@@ -4311,6 +4409,11 @@ fn run_node(
                 me_bytes.clone(),
                 resident_capabilities,
             );
+            let mut resident_duckdns_announcer =
+                duckdns_node::ResidentAnnouncer::new(
+                    me_bytes.clone(),
+                    duckdns_announcements.clone(),
+                );
             let (resident_pool, mut resident_oracle_results) = oracle_pool::build(
                 &context,
                 resident_provider_set,
@@ -4542,6 +4645,21 @@ fn run_node(
                                     } else {
                                         eprintln!(
                                             "[node {label}] resident: capability announce did not \
+                                             apply ({outcome:?}) - will retry"
+                                        );
+                                    }
+                                } else if let Some(ok) = resident_duckdns_announcer
+                                    .on_reply(&frame_id, applied)
+                                {
+                                    if ok {
+                                        println!(
+                                            "[node {label}] resident: announced DuckDNS services \
+                                             {:?}",
+                                            resident_duckdns_announcer.announcements()
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[node {label}] resident: DuckDNS announce did not \
                                              apply ({outcome:?}) - will retry"
                                         );
                                     }
@@ -5049,6 +5167,35 @@ fn run_node(
                     );
                     last_tracked = tip.epoch;
                 }
+                // A resident is a real DuckDNS requester/provider. Bring its
+                // web plane up once standing appears, and refresh admission on
+                // every later tip snapshot so revocation cuts inbound streams.
+                let duckdns_transport_keys: Vec<ed25519::PublicKey> = tip
+                    .participants
+                    .iter()
+                    .chain(tip.residents.iter())
+                    .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
+                    .collect();
+                if let Some(book) = &resident_duckdns_plane_book {
+                    book.set_peers(duckdns_transport_keys.iter());
+                } else if wireguard_listen.is_some()
+                    && tip.residents.iter().any(|key| key == &me_bytes)
+                {
+                    let book = duckdns_node::plane::WebPeers::new(
+                        String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+                    );
+                    book.set_peers(duckdns_transport_keys.iter());
+                    duckdns_node::plane::spawn_bring_up(
+                        label.clone(),
+                        std::sync::Arc::clone(&book),
+                        signer.public_key(),
+                        std::sync::Arc::clone(&duckdns_plane_slot),
+                        statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                        std::sync::Arc::clone(&duckdns_publications),
+                        duckdns_files.clone(),
+                    );
+                    resident_duckdns_plane_book = Some(book);
+                }
                 // drive the reachability plane's standby role off the
                 // manifest: membership and resident standing come from the
                 // synced boundary, whose height doubles as the plane's
@@ -5172,12 +5319,17 @@ fn run_node(
                                 &context,
                                 &client,
                                 &m,
-                                &forge_repo,
-                                &duckfs_dir,
-                                &namespace,
-                                blobs.clone(),
+                                NetworkBindings {
+                                    invite: &namespace,
+                                    identity_chain_id: &identity_chain_id,
+                                    duckdns_chain_id: &duckdns_chain_id,
+                                },
+                                SyncSubstrates {
+                                    forge_repo: &forge_repo,
+                                    duckfs_dir: &duckfs_dir,
+                                    blobs: blobs.clone(),
+                                },
                                 attempt,
-                                &identity_chain_id,
                             )
                             .await
                             {
@@ -5373,6 +5525,36 @@ fn run_node(
                                     }
                                 }
                             }
+                            // DUCKDNS ANNOUNCE (resident tier): an empty list
+                            // is meaningful and clears stale declarations.
+                            if let Some(msg) = resident_duckdns_announcer
+                                .maybe_announce(host, now)
+                                .await
+                            {
+                                match resident_relay.submit_unheld(
+                                    &signer,
+                                    &announce_targets,
+                                    &mut relay_tx,
+                                    msg.target,
+                                    msg.payload,
+                                ) {
+                                    Ok(id) => {
+                                        resident_duckdns_announcer.sent(id, now);
+                                        println!(
+                                            "[node {label}] resident: DuckDNS announce relayed \
+                                             ({:?})",
+                                            resident_duckdns_announcer.announcements()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        resident_duckdns_announcer.send_failed();
+                                        eprintln!(
+                                            "[node {label}] resident: DuckDNS announce relay \
+                                             failed: {e}"
+                                        );
+                                    }
+                                }
+                            }
                             // DISPATCH EXECUTION (resident tier): serve the
                             // saga attempts leased to this key, so an announced
                             // resident never stalls an assignment. completed
@@ -5518,12 +5700,17 @@ fn run_node(
                     &context,
                     &client,
                     &m,
-                    &forge_repo,
-                    &duckfs_dir,
-                    &namespace,
-                    blobs.clone(),
+                    NetworkBindings {
+                        invite: &namespace,
+                        identity_chain_id: &identity_chain_id,
+                        duckdns_chain_id: &duckdns_chain_id,
+                    },
+                    SyncSubstrates {
+                        forge_repo: &forge_repo,
+                        duckfs_dir: &duckfs_dir,
+                        blobs: blobs.clone(),
+                    },
                     attempt,
-                    &identity_chain_id,
                 )
                 .await
                 {
@@ -5689,9 +5876,12 @@ fn run_node(
                     &forge_repo,
                     &duckfs_dir,
                     &validators,
-                    &namespace,
+                    NetworkBindings {
+                        invite: &namespace,
+                        identity_chain_id: &identity_chain_id,
+                        duckdns_chain_id: &duckdns_chain_id,
+                    },
                     blobs.clone(),
-                    &identity_chain_id,
                 )
                 .await;
                 let pos = recovery.oplog_pos().await;
@@ -5745,9 +5935,12 @@ fn run_node(
                     &forge_repo,
                     &duckfs_dir,
                     &manifest,
-                    &namespace,
+                    NetworkBindings {
+                        invite: &namespace,
+                        identity_chain_id: &identity_chain_id,
+                        duckdns_chain_id: &duckdns_chain_id,
+                    },
                     blobs.clone(),
-                    &identity_chain_id,
                 )
                 .await;
                 let mut host = match restored {
@@ -6226,12 +6419,17 @@ fn run_node(
                             &context,
                             &client,
                             &target,
-                            &forge_repo,
-                            &duckfs_dir,
-                            &namespace,
-                            blobs.clone(),
+                            NetworkBindings {
+                                invite: &namespace,
+                                identity_chain_id: &identity_chain_id,
+                                duckdns_chain_id: &duckdns_chain_id,
+                            },
+                            SyncSubstrates {
+                                forge_repo: &forge_repo,
+                                duckfs_dir: &duckfs_dir,
+                                blobs: blobs.clone(),
+                            },
                             10_000 + attempts,
-                            &identity_chain_id,
                         )
                         .await
                         {
@@ -6492,6 +6690,26 @@ fn run_node(
                 std::sync::Arc::new(std::sync::OnceLock::new()),
                 statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
                 Some(bridge_tx.clone()),
+            );
+            book
+        });
+        // DuckDNS's per-use stream plane. Unlike statesync this is not env
+        // gated: a configured overlay is the web transport. The slot is kept
+        // for the requester-side local ingress; the accept loop always runs so
+        // this node can provide its explicit local publications.
+        let duckdns_plane_book = wireguard_listen.map(|_| {
+            let book = duckdns_node::plane::WebPeers::new(
+                String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+            );
+            book.set_peers(initial_member_keys.iter().chain(initial_resident_keys.iter()));
+            duckdns_node::plane::spawn_bring_up(
+                label.clone(),
+                std::sync::Arc::clone(&book),
+                signer.public_key(),
+                std::sync::Arc::clone(&duckdns_plane_slot),
+                statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                std::sync::Arc::clone(&duckdns_publications),
+                duckdns_files.clone(),
             );
             book
         });
@@ -6936,6 +7154,12 @@ fn run_node(
         // idempotent). inert when this host installed no executor CLIs.
         let mut announcer =
             CapabilityAnnouncer::new(signer.public_key().as_ref().to_vec(), my_capabilities);
+        // Local targets never enter this pump: it carries only the replicated
+        // declarations projected from the validated node config.
+        let mut duckdns_announcer = duckdns_node::Announcer::new(
+            signer.public_key().as_ref().to_vec(),
+            duckdns_announcements.clone(),
+        );
         // one-shot upgrade transition markers keyed off COMMITTED upgrade state,
         // modeled on the `converged` latch: `upgrade armed …` fires when readiness
         // first reaches R==n (every current boundary member signaled) for the
@@ -7532,6 +7756,9 @@ fn run_node(
                             if let Some(book) = &sync_plane_book {
                                 book.set_peers(plan.valset().transport_members().iter());
                             }
+                            if let Some(book) = &duckdns_plane_book {
+                                book.set_peers(plan.valset().transport_members().iter());
+                            }
                             // the media planes authenticate inbound by the same
                             // tracked set — follow the re-track too, so a
                             // just-added member's huddle media is admitted.
@@ -7772,6 +7999,28 @@ fn run_node(
                                 // un-latch so a transient submit failure retries.
                                 announcer.announced = None;
                                 eprintln!("[node {label}] capability announce submit failed: {e}");
+                            }
+                        }
+                    }
+
+                    // DUCKDNS ANNOUNCE: same state-driven declarative replace
+                    // discipline as capabilities, but an empty local config
+                    // deliberately clears any stale prior publication.
+                    if orchestrator
+                        .current_members()
+                        .contains(&signer.public_key())
+                        && let Some(msg) = duckdns_announcer.maybe_announce(node.host()).await
+                    {
+                        let seq = next_seq;
+                        next_seq += 1;
+                        match node.submit(&signer, seq, msg).await {
+                            Ok(_) => println!(
+                                "[node {label}] announced DuckDNS services {:?}",
+                                duckdns_announcer.announcements()
+                            ),
+                            Err(e) => {
+                                duckdns_announcer.send_failed();
+                                eprintln!("[node {label}] DuckDNS announce submit failed: {e}");
                             }
                         }
                     }

@@ -12,6 +12,7 @@ use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use directory::Directory;
 use dispatch::DispatchModule;
+use duckdns::DuckDns;
 use duckfs_disk::SyncScratch;
 use files::Files;
 use forge::Forge;
@@ -36,6 +37,21 @@ use vaults::Vaults;
 
 use crate::hex;
 
+/// Consensus-visible network names shared by genesis, restore, and state sync.
+#[derive(Clone, Copy)]
+pub(super) struct NetworkBindings<'a> {
+    pub(super) invite: &'a [u8],
+    pub(super) identity_chain_id: &'a str,
+    pub(super) duckdns_chain_id: &'a str,
+}
+
+/// Node-local substrates used only while reconstructing a host from state sync.
+pub(super) struct SyncSubstrates<'a> {
+    pub(super) forge_repo: &'a std::path::Path,
+    pub(super) duckfs_dir: &'a std::path::Path,
+    pub(super) blobs: blobstore::BlobHandle,
+}
+
 pub(super) fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
     std::sync::Arc::new(move |ctx, line| {
         let Some(run_key) = ctx.run_key.as_deref() else {
@@ -59,12 +75,8 @@ pub(super) async fn genesis_host(
     forge_repo: &std::path::Path,
     duckfs_dir: &std::path::Path,
     genesis_validators: &[ed25519::PublicKey],
-    // the network binding invite tokens verify against (the genesis
-    // namespace) — wired into governance identically on every node, or
-    // `Redeem` settles differently across validators and the app-hash forks.
-    invite_binding: &[u8],
+    bindings: NetworkBindings<'_>,
     blobs: blobstore::BlobHandle,
-    chain_id: &str,
 ) -> Host {
     let kv = Kv::init(context.child("kv"), "kv").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
@@ -92,7 +104,7 @@ pub(super) async fn genesis_host(
         // governance is the SOLE authorized author of valset changes: member
         // proposals + ballots, deterministic tally, follow-up membership ops.
         Box::new(
-            Governance::new("governance", "valset", "upgrade").with_invite_binding(invite_binding),
+            Governance::new("governance", "valset", "upgrade").with_invite_binding(bindings.invite),
         ),
         // the no-downtime upgrade coordinator: holds the at-most-one pending
         // upgrade + per-validator readiness set (valset-gated). its mere
@@ -130,8 +142,17 @@ pub(super) async fn genesis_host(
         Box::new(Identity::new(
             "identity",
             Some("valset".into()),
-            chain_id.to_string(),
+            bindings.identity_chain_id.to_string(),
         )),
+        Box::new(
+            DuckDns::new(
+                "duckdns",
+                "identity",
+                Some("valset".into()),
+                bindings.duckdns_chain_id,
+            )
+            .expect("descriptor chain id has a DuckDNS label"),
+        ),
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
         Box::new(Inbox::new("inbox")),
@@ -175,10 +196,8 @@ pub(super) async fn restore_host(
     forge_repo: &std::path::Path,
     duckfs_dir: &std::path::Path,
     manifest: &Manifest,
-    // see `genesis_host` — the same binding must reach every rebuild path.
-    invite_binding: &[u8],
+    bindings: NetworkBindings<'_>,
     blobs: blobstore::BlobHandle,
-    chain_id: &str,
 ) -> Result<Host, String> {
     let kv = Kv::init(context.child("kv"), "kv").await;
     let pages = Pages::init(context.child("pages"), "pages").await;
@@ -213,7 +232,7 @@ pub(super) async fn restore_host(
         .map_err(|e| format!("valset install: {e}"))?;
 
     let mut governance =
-        Governance::new("governance", "valset", "upgrade").with_invite_binding(invite_binding);
+        Governance::new("governance", "valset", "upgrade").with_invite_binding(bindings.invite);
     let (bytes, root) = snapshot_of("governance")?;
     governance
         .install(bytes, root)
@@ -266,11 +285,27 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("profiles install: {e}"))?;
 
-    let mut identity = Identity::new("identity", Some("valset".into()), chain_id.to_string());
+    let mut identity = Identity::new(
+        "identity",
+        Some("valset".into()),
+        bindings.identity_chain_id.to_string(),
+    );
     let (bytes, root) = snapshot_of("identity")?;
     identity
         .install(bytes, root)
         .map_err(|e| format!("identity install: {e}"))?;
+
+    let mut duckdns = DuckDns::new(
+        "duckdns",
+        "identity",
+        Some("valset".into()),
+        bindings.duckdns_chain_id,
+    )
+    .map_err(|e| format!("duckdns init: {e}"))?;
+    let (bytes, root) = snapshot_of("duckdns")?;
+    duckdns
+        .install(bytes, root)
+        .map_err(|e| format!("duckdns install: {e}"))?;
 
     let mut inbox = Inbox::new("inbox");
     let (bytes, root) = snapshot_of("inbox")?;
@@ -341,6 +376,7 @@ pub(super) async fn restore_host(
         Box::new(vaults),
         Box::new(profiles),
         Box::new(identity),
+        Box::new(duckdns),
         Box::new(inbox),
         Box::new(files),
         Box::new(jobs),
@@ -406,19 +442,19 @@ impl statesync::ObjectFetch for FilesOdb<'_> {
 /// retries (a busy source moves its qmdb targets past the captured boundary;
 /// the caller refetches the manifest and tries again, and metrics labels
 /// must not collide).
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     context: &commonware_runtime::tokio::Context,
     client: &C,
     manifest: &statesync::Manifest,
-    forge_repo: &std::path::Path,
-    duckfs_dir: &std::path::Path,
-    // see `genesis_host` — the same binding must reach every rebuild path.
-    invite_binding: &[u8],
-    blobs: blobstore::BlobHandle,
+    bindings: NetworkBindings<'_>,
+    substrates: SyncSubstrates<'_>,
     attempt: usize,
-    chain_id: &str,
 ) -> Result<Host, String> {
+    let SyncSubstrates {
+        forge_repo,
+        duckfs_dir,
+        blobs,
+    } = substrates;
     let entry_root = |module: &str| -> Result<StateRoot, String> {
         Ok(manifest
             .entry(module)
@@ -538,7 +574,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
 
     let (bytes, root) = snapshot_of("governance").await?;
     let mut governance =
-        Governance::new("governance", "valset", "upgrade").with_invite_binding(invite_binding);
+        Governance::new("governance", "valset", "upgrade").with_invite_binding(bindings.invite);
     governance
         .install(&bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
@@ -568,10 +604,26 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("profiles install: {e}"))?;
 
     let (bytes, root) = snapshot_of("identity").await?;
-    let mut identity = Identity::new("identity", Some("valset".into()), chain_id.to_string());
+    let mut identity = Identity::new(
+        "identity",
+        Some("valset".into()),
+        bindings.identity_chain_id.to_string(),
+    );
     identity
         .install(&bytes, root)
         .map_err(|e| format!("identity install: {e}"))?;
+
+    let (bytes, root) = snapshot_of("duckdns").await?;
+    let mut duckdns = DuckDns::new(
+        "duckdns",
+        "identity",
+        Some("valset".into()),
+        bindings.duckdns_chain_id,
+    )
+    .map_err(|e| format!("duckdns init: {e}"))?;
+    duckdns
+        .install(&bytes, root)
+        .map_err(|e| format!("duckdns install: {e}"))?;
 
     let (bytes, root) = snapshot_of("inbox").await?;
     let mut inbox = Inbox::new("inbox");
@@ -672,6 +724,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(vaults),
         Box::new(profiles),
         Box::new(identity),
+        Box::new(duckdns),
         Box::new(inbox),
         Box::new(files),
         Box::new(jobs),
