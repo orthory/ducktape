@@ -115,6 +115,13 @@ pub use interface::*;
 mod envelope;
 pub use envelope::RUN_ENVELOPE_VERSION;
 
+// the forge compose lane (M1): forge:<repo>:<n> channel detection, committed
+// tracker/refs mirrors, and the item-session workspace/sink composition.
+mod forge_source;
+// deterministic forge item-context injection (M1): the byte-capped
+// instructions section a forge run's envelope carries.
+mod inject;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use agent::{
@@ -301,7 +308,13 @@ struct WireEffect {
 /// defaults to `Chain` via the `#[serde(default)]` on [`RunnerResult::sink`], and
 /// a present `{"mode":"pr",...}` decodes to `Pr`. `Merge` is DEFINED-BUT-INERT in
 /// v1 (validated on the wire, treated like `Chain` with a breadcrumb).
-#[derive(Deserialize, Default, Debug)]
+///
+/// ONE shape, both directions (M1): the same type also SERIALIZES as the v3
+/// envelope's REQUESTED sink (`result_contract.sink`). a requested `Pr`
+/// carries empty title/body — the keys skip-serialize, and delivery derives
+/// them from the message facet — and `Chain` composes as an absent field
+/// (see [`WireSink::is_chain`]), matching the oracle's own skip.
+#[derive(Serialize, Deserialize, Default, Debug)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum WireSink {
     #[default]
@@ -312,8 +325,9 @@ enum WireSink {
         source_branch: String,
         #[serde(default)]
         target_branch: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
         title: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         body: String,
     },
     Merge {
@@ -329,6 +343,14 @@ enum WireSink {
         #[allow(dead_code, reason = "merge sink wire is forward-compatible but inert in v1")]
         pack_digest: String,
     },
+}
+
+impl WireSink {
+    /// the composed `result_contract` omits the sink key entirely for `Chain`
+    /// — the serde skip mirroring dispatch-oracle's `is_chain`.
+    fn is_chain(&self) -> bool {
+        matches!(self, WireSink::Chain)
+    }
 }
 
 /// the host's terminal observation of a run. `Failed` fails the run even with a
@@ -1397,21 +1419,15 @@ impl RunsModule {
             return Ok(None);
         };
         let source_snapshot = self.duckfs_head(ctx, &files).await?;
-        let skills = agent
-            .skills
-            .iter()
-            .map(|s| envelope::SkillEnvelope {
-                name: s.name.clone(),
-                source_prefix: s.source_prefix.clone(),
-                // a pinned skill passes its snapshot through; a tracking skill
-                // (no pin) resolves to the SAME committed head this run pins its
-                // workspace to (W2) — deterministic across validators.
-                source_snapshot: s.source_snapshot.clone().or_else(|| source_snapshot.clone()),
-            })
-            .collect();
+        // a pinned skill passes its snapshot through; a tracking skill (no
+        // pin) resolves to the SAME committed head this run pins its workspace
+        // to (W2) — deterministic across validators.
+        let skills = envelope::resolve_skills(agent, &source_snapshot);
         Ok(Some(envelope::PortableInputs {
-            source_snapshot,
+            workspace: envelope::duckfs_workspace(agent, source_snapshot),
             skills,
+            sink: WireSink::Chain,
+            context: None,
         }))
     }
 
@@ -1440,6 +1456,11 @@ impl RunsModule {
     /// context (P4) and the fully composed payload. any failure here is a
     /// clean skip for the no-fail engagement intake and a clean error for an
     /// explicit `RequestRun`.
+    ///
+    /// a `forge:<repo>:<n>` trigger channel selects the forge compose lane
+    /// (M1): the item-session workspace source, the requested PR sink, and
+    /// the injected item context — see [`forge_source`]. any other channel
+    /// composes the duckfs lane exactly as before.
     async fn prepare_dispatch(
         &self,
         ctx: &dyn Ctx,
@@ -1448,7 +1469,10 @@ impl RunsModule {
         anchor_seq: u64,
     ) -> Result<PreparedDispatch, String> {
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
-        let portable = self.portable_inputs(ctx, agent).await?;
+        let portable = match forge_source::parse_forge_channel(channel_id) {
+            Some(item_ref) => Some(self.forge_portable_inputs(ctx, agent, &item_ref).await?),
+            None => self.portable_inputs(ctx, agent).await?,
+        };
         let payload = envelope::render_payload(
             &self.id,
             agent,
@@ -2742,9 +2766,13 @@ mod tests {
         taken_dispatches: BTreeSet<String>,
         /// job_id -> board record served by the jobs arm (finalize guard).
         jobs: BTreeMap<String, Job>,
-        /// repo -> born branch names, served by the "forge" ListRefs arm (the
-        /// sink's committed-state branch-born probe).
-        forge_refs: BTreeMap<String, Vec<String>>,
+        /// repo -> born (branch, tip-hex) pairs, served by the "forge"
+        /// ListRefs arm (the sink's branch-born probe and the compose lane's
+        /// commit pinning).
+        forge_refs: BTreeMap<String, Vec<(String, String)>>,
+        /// (repo, number) -> tracker item, served by the "forge" GetItem arm
+        /// (the compose lane's committed item lookup).
+        forge_items: BTreeMap<(String, u64), forge::ItemDetail>,
         /// the committed duckfs head served by the "files" Refs arm — the v3
         /// composer's `source_snapshot` pin. `None` = a fresh network (null pin).
         files_head: Option<String>,
@@ -2769,6 +2797,7 @@ mod tests {
                 taken_dispatches: BTreeSet::new(),
                 jobs: BTreeMap::new(),
                 forge_refs: BTreeMap::new(),
+                forge_items: BTreeMap::new(),
                 files_head: None,
                 msgs: Vec::new(),
                 effects: Vec::new(),
@@ -2780,9 +2809,25 @@ mod tests {
             self.env.consensus_time = view;
             self
         }
-        /// register a born branch under `repo` (the sink's branch-born probe).
-        fn with_forge_ref(mut self, repo: &str, branch: &str) -> Self {
-            self.forge_refs.entry(repo.into()).or_default().push(branch.into());
+        /// register a born branch under `repo` (the sink's branch-born probe;
+        /// tip = a fixed zero oid where the tip does not matter).
+        fn with_forge_ref(self, repo: &str, branch: &str) -> Self {
+            let tip = "00".repeat(20);
+            self.with_forge_tip(repo, branch, &tip)
+        }
+        /// register a born branch with an explicit tip (the compose lane's
+        /// commit pinning).
+        fn with_forge_tip(mut self, repo: &str, branch: &str, tip: &str) -> Self {
+            self.forge_refs
+                .entry(repo.into())
+                .or_default()
+                .push((branch.into(), tip.into()));
+            self
+        }
+        /// register a tracker item served by the "forge" GetItem arm.
+        fn with_forge_item(mut self, repo: &str, item: forge::ItemDetail) -> Self {
+            self.forge_items
+                .insert((repo.into(), item.summary.number), item);
             self
         }
         /// set the committed duckfs head the "files" Refs arm serves (the v3
@@ -2982,12 +3027,17 @@ mod tests {
                             .get(&repo)
                             .into_iter()
                             .flatten()
-                            .map(|name| forge::RefHead {
+                            .map(|(name, tip)| forge::RefHead {
                                 name: name.clone(),
-                                head: "00".repeat(20),
+                                head: tip.clone(),
                             })
                             .collect();
                         Ok(forge::encode_reply(&forge::ForgeReply::Refs(refs)))
+                    }
+                    forge::ForgeQuery::GetItem { repo, number } => {
+                        Ok(forge::encode_reply(&forge::ForgeReply::Item(
+                            self.forge_items.get(&(repo, number)).cloned().map(Box::new),
+                        )))
                     }
                     _ => Err(Error::QueryUnsupported),
                 },
@@ -3294,10 +3344,22 @@ mod tests {
 
         let m = module().with_files_module("files");
 
+        // the duckfs snapshot pin, from the tagged workspace source.
+        fn duckfs_pin(inputs: &envelope::PortableInputs) -> Option<String> {
+            match &inputs.workspace {
+                envelope::WorkspaceSource::Duckfs {
+                    source_snapshot, ..
+                } => source_snapshot.clone(),
+                other => panic!("expected a duckfs workspace source, got {other:?}"),
+            }
+        }
+
         // files wired + a committed head: Some, head pinned, skills resolved.
         let ctx4 = CaptureCtx::new().with_files_head(&head);
         let inputs = block_on(m.portable_inputs(&ctx4, &agent)).unwrap().unwrap();
-        assert_eq!(inputs.source_snapshot.as_deref(), Some(head.as_str()));
+        assert_eq!(duckfs_pin(&inputs).as_deref(), Some(head.as_str()));
+        assert!(inputs.sink.is_chain(), "the duckfs lane requests no sink");
+        assert!(inputs.context.is_none(), "the duckfs lane injects no context");
         // pinned skill passes its snapshot through; tracking resolves to the head.
         assert_eq!(inputs.skills[0].source_snapshot.as_deref(), Some("bb".repeat(32).as_str()));
         assert_eq!(
@@ -3310,8 +3372,337 @@ mod tests {
         let ctx_empty = CaptureCtx::new();
         let inputs = block_on(m.portable_inputs(&ctx_empty, &agent)).unwrap().unwrap();
         assert!(
-            inputs.source_snapshot.is_none(),
+            duckfs_pin(&inputs).is_none(),
             "an unresolved head is a legitimate null pin, still Some"
+        );
+    }
+
+    // ---- the forge compose lane (M1) --------------------------------------------
+
+    /// a committed tracker item as the "forge" GetItem arm serves it.
+    fn forge_item_detail(
+        number: u64,
+        kind: forge::ItemKind,
+        title: &str,
+        body: &str,
+        branches: Option<(&str, &str)>,
+    ) -> forge::ItemDetail {
+        forge::ItemDetail {
+            summary: forge::ItemSummary {
+                number,
+                kind,
+                title: title.into(),
+                state: forge::ItemState::Open,
+                author: AuthorRef::User(vec![1; 32]),
+                created_at: 0,
+                updated_at: 0,
+            },
+            body: body.into(),
+            channel_id: format!("forge:app:{number}"),
+            source_branch: branches.map(|(s, _)| s.to_string()),
+            target_branch: branches.map(|(_, t)| t.to_string()),
+            merge_oid: None,
+            reviews: Vec::new(),
+        }
+    }
+
+    fn forge_issue(number: u64, title: &str, body: &str) -> forge::ItemDetail {
+        forge_item_detail(number, forge::ItemKind::Issue, title, body, None)
+    }
+
+    fn forge_pr(number: u64, title: &str, body: &str, src: &str, tgt: &str) -> forge::ItemDetail {
+        forge_item_detail(number, forge::ItemKind::Pr, title, body, Some((src, tgt)))
+    }
+
+    /// a registry whose one agent "bot" holds the forge_read cap on "app".
+    fn forge_read_registry() -> Registry {
+        let mut r = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        r.get_mut("bot").unwrap().caps.forge_read = vec!["app".into()];
+        r
+    }
+
+    /// the forge-lane module: forge + files wired (the production wiring).
+    fn forge_module() -> RunsModule {
+        module().with_sink_forge("forge").with_files_module("files")
+    }
+
+    fn compose_forge(
+        m: &RunsModule,
+        ctx: &CaptureCtx,
+        registry: &Registry,
+        channel: &str,
+    ) -> Result<serde_json::Value, String> {
+        let agent = registry.get("bot").expect("bot registered");
+        let prepared = block_on(m.prepare_dispatch(ctx, agent, channel, 2))?;
+        Ok(serde_json::from_slice(&prepared.payload).expect("payload is JSON"))
+    }
+
+    #[test]
+    fn an_issue_run_forks_main_with_an_unborn_item_branch_and_requests_a_pr() {
+        let registry = forge_read_registry();
+        let main_tip = "cd".repeat(20);
+        let m = forge_module();
+        let ctx = CaptureCtx::new()
+            .with_registry(&registry)
+            .with_transcript("forge:app:7", transcript(2))
+            .with_forge_item("app", forge_issue(7, "Fix the gate", "repro inside"))
+            .with_forge_tip("app", "main", &main_tip)
+            .with_files_head(&"aa".repeat(32));
+        let v = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap();
+
+        assert_eq!(v["ducktape_run"], 3);
+        assert_eq!(v["workspace"]["kind"], "forge");
+        assert_eq!(v["workspace"]["repo"], "app");
+        assert_eq!(
+            v["workspace"]["commit"], main_tip,
+            "an issue with an unborn work branch forks the committed main tip"
+        );
+        assert_eq!(v["workspace"]["branch"], "agent/item-7");
+        assert_eq!(v["workspace"]["branch_born"], false);
+        // the requested sink: a PR of the work branch onto main, no title/body.
+        assert_eq!(v["result_contract"]["sink"]["mode"], "pr");
+        assert_eq!(v["result_contract"]["sink"]["repo"], "app");
+        assert_eq!(v["result_contract"]["sink"]["source_branch"], "agent/item-7");
+        assert_eq!(v["result_contract"]["sink"]["target_branch"], "main");
+        assert!(v["result_contract"]["sink"].get("title").is_none());
+        assert!(v["result_contract"]["sink"].get("body").is_none());
+        // the deterministic item context rides the envelope.
+        let context = v["context"].as_str().expect("a forge run carries context");
+        assert!(context.contains("repo: app"), "{context}");
+        assert!(context.contains("issue #7"), "{context}");
+        assert!(context.contains("title: Fix the gate"), "{context}");
+        assert!(context.contains("repro inside"), "{context}");
+        assert!(context.contains("work branch: agent/item-7"), "{context}");
+        // thread continuity: unchanged — replies land in the item discussion.
+        assert_eq!(v["thread_key"], "forge:app:7#2");
+        // skills machinery is the duckfs lane's: the duckfs head still pins.
+        assert_eq!(v["skills"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_forge_session_continues_from_the_born_work_branch_tip() {
+        let registry = forge_read_registry();
+        let main_tip = "cd".repeat(20);
+        let item_tip = "ef".repeat(20);
+        let m = forge_module();
+        let ctx = CaptureCtx::new()
+            .with_registry(&registry)
+            .with_transcript("forge:app:7", transcript(2))
+            .with_forge_item("app", forge_issue(7, "Fix the gate", "body"))
+            .with_forge_tip("app", "main", &main_tip)
+            .with_forge_tip("app", "agent/item-7", &item_tip);
+        let v = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap();
+        assert_eq!(
+            v["workspace"]["commit"], item_tip,
+            "a born work branch is the session: later runs fork ITS tip, not main"
+        );
+        assert_eq!(v["workspace"]["branch"], "agent/item-7");
+        assert_eq!(v["workspace"]["branch_born"], true);
+    }
+
+    #[test]
+    fn a_pr_item_run_works_the_prs_own_source_branch() {
+        let registry = forge_read_registry();
+        let src_tip = "12".repeat(20);
+        let m = forge_module();
+        let ctx = CaptureCtx::new()
+            .with_registry(&registry)
+            .with_transcript("forge:app:8", transcript(2))
+            .with_forge_item("app", forge_pr(8, "Wire it", "please", "feature/x", "dev"))
+            .with_forge_tip("app", "main", &"cd".repeat(20))
+            .with_forge_tip("app", "feature/x", &src_tip);
+        let v = compose_forge(&m, &ctx, &registry, "forge:app:8").unwrap();
+        // THE pr-item rule: the session pushes the PR's own branch, so the
+        // open PR updates in place.
+        assert_eq!(v["workspace"]["branch"], "feature/x");
+        assert_eq!(v["workspace"]["commit"], src_tip);
+        assert_eq!(v["workspace"]["branch_born"], true);
+        assert_eq!(v["result_contract"]["sink"]["source_branch"], "feature/x");
+        assert_eq!(
+            v["result_contract"]["sink"]["target_branch"], "dev",
+            "a PR item's requested sink targets the PR's own target branch"
+        );
+        let context = v["context"].as_str().unwrap();
+        assert!(context.contains("pr #8"), "{context}");
+        assert!(context.contains("pr source branch: feature/x"), "{context}");
+        assert!(context.contains("pr target branch: dev"), "{context}");
+    }
+
+    #[test]
+    fn a_forge_run_without_the_forge_read_cap_fails_compose_deterministically() {
+        // no forge_read grant → compose Err naming the cap gate, BEFORE any
+        // tracker lookup (the fixtures deliberately hold no item).
+        let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        let m = forge_module();
+        let ctx = CaptureCtx::new()
+            .with_registry(&registry)
+            .with_transcript("forge:app:7", transcript(2));
+        let reason = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap_err();
+        assert!(
+            reason.contains("forge_read"),
+            "the reason names the missing cap: {reason}"
+        );
+    }
+
+    #[test]
+    fn forge_compose_failures_have_deterministic_reasons() {
+        let registry = forge_read_registry();
+        let m = forge_module();
+
+        // item missing.
+        let ctx = CaptureCtx::new()
+            .with_registry(&registry)
+            .with_transcript("forge:app:7", transcript(2))
+            .with_forge_tip("app", "main", &"cd".repeat(20));
+        let reason = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap_err();
+        assert!(reason.contains("no forge item"), "{reason}");
+
+        // issue with no main branch to fork.
+        let ctx = CaptureCtx::new()
+            .with_registry(&registry)
+            .with_transcript("forge:app:7", transcript(2))
+            .with_forge_item("app", forge_issue(7, "t", "b"));
+        let reason = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap_err();
+        assert!(reason.contains("main"), "{reason}");
+
+        // PR whose source branch is not born.
+        let ctx = CaptureCtx::new()
+            .with_registry(&registry)
+            .with_transcript("forge:app:8", transcript(2))
+            .with_forge_item("app", forge_pr(8, "t", "b", "feature/x", "main"))
+            .with_forge_tip("app", "main", &"cd".repeat(20));
+        let reason = compose_forge(&m, &ctx, &registry, "forge:app:8").unwrap_err();
+        assert!(reason.contains("feature/x"), "{reason}");
+
+        // forge channel, but no forge module wired.
+        let unwired = module().with_files_module("files");
+        let ctx = CaptureCtx::new()
+            .with_registry(&registry)
+            .with_transcript("forge:app:7", transcript(2))
+            .with_forge_item("app", forge_issue(7, "t", "b"))
+            .with_forge_tip("app", "main", &"cd".repeat(20));
+        let reason = compose_forge(&unwired, &ctx, &registry, "forge:app:7").unwrap_err();
+        assert!(reason.contains("forge module"), "{reason}");
+    }
+
+    #[test]
+    fn a_malformed_forge_channel_composes_the_duckfs_lane_as_today() {
+        // "forge:app" (no number) is NOT a forge channel — the duckfs lane
+        // composes exactly as for any other channel id.
+        let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        let m = forge_module();
+        let ctx = CaptureCtx::new()
+            .with_registry(&registry)
+            .with_transcript("forge:app", transcript(2))
+            .with_files_head(&"aa".repeat(32));
+        let v = compose_forge(&m, &ctx, &registry, "forge:app").unwrap();
+        assert_eq!(v["workspace"]["kind"], "duckfs");
+        assert!(v.get("context").is_none());
+        assert!(v["result_contract"].get("sink").is_none());
+    }
+
+    #[test]
+    fn an_engagement_on_a_forge_channel_without_the_cap_skips_with_a_breadcrumb() {
+        // the engagement arm is NO-FAIL: a compose failure is a skip + note,
+        // never a dispatch and never a block abort.
+        let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        let mut m = forge_module();
+        let mut watch_ctx = CaptureCtx::new().with_origin(user(9)).with_registry(&registry);
+        exec(
+            &mut m,
+            &mut watch_ctx,
+            &admin(&RunsMsg::WatchChannel {
+                channel_id: "forge:app:7".into(),
+                policy: TurnPolicy::All,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        let mut ctx = CaptureCtx::new()
+            .at(2)
+            .with_tagging_origin()
+            .with_registry(&registry)
+            .with_transcript("forge:app:7", transcript(2))
+            .with_forge_item("app", forge_issue(7, "t", "b"))
+            .with_forge_tip("app", "main", &"cd".repeat(20));
+        exec(&mut m, &mut ctx, &engagement("forge:app:7", 2, vec![])).unwrap();
+
+        assert!(
+            ctx.dispatch_msgs().is_empty(),
+            "a compose failure stages no dispatch"
+        );
+        assert!(
+            ctx.events.iter().any(|e| {
+                let s = String::from_utf8_lossy(&e.payload);
+                s.contains("run skipped") && s.contains("forge_read")
+            }),
+            "the skip breadcrumb names the compose reason"
+        );
+    }
+
+    #[test]
+    fn a_request_run_on_a_forge_channel_without_the_cap_rejects_with_the_reason() {
+        let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        let mut m = forge_module();
+        let mut ctx = CaptureCtx::new()
+            .with_origin(user(9))
+            .with_registry(&registry)
+            .with_transcript("forge:app:7", transcript(2));
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &admin(&RunsMsg::RequestRun {
+                agent_id: "bot".into(),
+                channel_id: "forge:app:7".into(),
+                anchor_seq: 2,
+            }),
+        )
+        .unwrap_err();
+        let Error::Module(reason) = err else {
+            panic!("expected a module rejection");
+        };
+        assert!(reason.contains("forge_read"), "{reason}");
+    }
+
+    #[test]
+    fn a_forge_engagement_with_the_cap_stages_the_dispatch() {
+        // the happy path END TO END through the engagement arm: watch the item
+        // channel, mention-free All engagement, forge workspace composed.
+        let registry = forge_read_registry();
+        let mut m = forge_module();
+        let mut watch_ctx = CaptureCtx::new().with_origin(user(9)).with_registry(&registry);
+        exec(
+            &mut m,
+            &mut watch_ctx,
+            &admin(&RunsMsg::WatchChannel {
+                channel_id: "forge:app:7".into(),
+                policy: TurnPolicy::All,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+
+        let mut ctx = CaptureCtx::new()
+            .at(2)
+            .with_tagging_origin()
+            .with_registry(&registry)
+            .with_transcript("forge:app:7", transcript(2))
+            .with_forge_item("app", forge_issue(7, "Fix the gate", "body"))
+            .with_forge_tip("app", "main", &"cd".repeat(20));
+        exec(&mut m, &mut ctx, &engagement("forge:app:7", 2, vec![])).unwrap();
+
+        let dispatches = ctx.dispatch_msgs();
+        assert_eq!(dispatches.len(), 1, "one run staged");
+        let DispatchMsg::Dispatch { payload, .. } = &dispatches[0] else {
+            panic!("expected a dispatch");
+        };
+        let v: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(v["workspace"]["kind"], "forge");
+        assert_eq!(v["workspace"]["branch"], "agent/item-7");
+        assert!(
+            get_pending(&m, &run_id_for("forge:app:7", 2, "bot")).is_some(),
+            "the pending entry is staged"
         );
     }
 
