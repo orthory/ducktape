@@ -2,8 +2,7 @@
 //!
 //! a synced resident (joined → admitted → boundary-following, not yet
 //! promoted) provides real executors, but it never runs the validator loop —
-//! so the validator-tier [`crate::validator::announce::CapabilityAnnouncer`]
-//! pump never fires for
+//! so the validator-tier [`crate::validator::announce::CapabilityAnnouncer`] pump never fires for
 //! it. this wrapper reuses that announcer's state-driven decision core
 //! (compare discovery against the COMMITTED registry, announce once, stay
 //! quiet when matched) and adapts its delivery to the resident's only write
