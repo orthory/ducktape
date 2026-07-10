@@ -237,6 +237,12 @@ PromiseNet is a new per-use `DataPlane` instance over `OverlaySockets`:
   backed by the finalized validator set; and
 - bring the plane up only after overlay reachability is ready.
 
+Service/port suffix `4` is intentionally not reused. It belonged to the
+removed DuckDNS Web plane; treating it as a tombstone preserves the registry's
+append-only wire contract for any older binary that observed that assignment.
+PromiseNet therefore uses suffix `5` even though the current enum has no live
+variant numbered four.
+
 The service uses separate bounded flows:
 
 | Flow | Transport | Contents | Rule |
@@ -617,6 +623,7 @@ because a real one would have supplied at least `f + 1` honest blockers. The
 validator then records `UncommittedLockSuperseded` and may clear that partial
 lock. A matching seal clears it normally. A timer alone never deletes an
 unresolved lock.
+
 An availability vote that never advances to a promise lock may be cleared on
 an authoritative view close; it is neither a receipt nor a canonical blocker.
 
@@ -702,6 +709,7 @@ availability certificate, promise lock, and `PromiseQC`, plus body roots. A
 valid hidden receipt has at least `q - f = n - 2f` honest lockers; any `q`
 responders intersect them in at least `n - 3f >= 1` validator, so one response
 reveals the chain that must be carried.
+
 The proposer publishes its candidate seal before entering Simplex; any holder
 whose lock is absent proactively returns `LockNack`. If a candidate races past
 that repair and fails validation, the NACK accompanies the failed view so the
@@ -763,9 +771,8 @@ binding.
 
 Any two quorums of size `q = n - f` intersect in at least
 `2q - n = n - 2f >= f + 1` validators. At least one member of that intersection
-is honest. Since
-an honest validator durably records at most one availability vote and one
-promise acknowledgement for a given session/index, two conflicting
+is honest. Since an honest validator durably records at most one availability
+vote and one promise acknowledgement for a given session/index, two conflicting
 certificates cannot exist within the unique parent session. A view change
 recovers or seals that session; it cannot mint a competing one.
 
