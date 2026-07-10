@@ -4231,6 +4231,7 @@ dependencies = [
  "arrayvec",
  "commonware-codec",
  "commonware-cryptography",
+ "crossbeam-channel",
  "lru",
  "smallvec",
  "thiserror 2.0.18",

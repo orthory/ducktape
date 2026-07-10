@@ -108,20 +108,91 @@ The coordinator is keyless in every mode:
 - **Legacy development mode** — `--allow-anonymous`. This disables proof of
   possession and is for local smoke testing only.
 
-Malformed `--listen`, `--workers`, and malformed/value-less `--genesis-set` are
-hard errors, not silent fallbacks to a weaker policy.
+Malformed `--listen`, `--workers`, `--metrics-interval`, and malformed/value-less
+`--genesis-set` are hard errors, not silent fallbacks to a weaker policy.
 
 ## Authentication workers
 
 `--workers 1` verifies inline with no worker threads. `--workers 4` runs only
 the Ed25519 checks on four fixed 512 KiB-stack threads; UDP I/O and the single
-rendezvous state machine remain ordered on the current-thread runtime. Work and
-result queues are bounded, so overload falls back to the kernel's bounded UDP
-queue/drop behavior instead of growing process memory.
+rendezvous state machine remain ordered on the current-thread runtime. The
+workers pull from one shared bounded queue, so an idle verifier can take the
+next job instead of waiting behind a busy worker's round-robin queue. The work
+queue, result queue, and ordered completion window are bounded, so overload
+falls back to the kernel's bounded UDP queue/drop behavior instead of growing
+process memory.
 
 The systemd and container recipes select `--workers 4` and set
 `MALLOC_ARENA_MAX=1` to avoid glibc reserving a large virtual arena per worker.
 Use `--workers 1` on a single-vCPU or minimum-footprint host.
+
+## Metrics, cross-host load, flood, and soak
+
+The server emits one parseable `coordinator_metrics` line every
+`--metrics-interval` seconds (default 10; `0` disables it). Counters are
+cumulative. `cpu_pct` is process CPU across all coordinator threads, so four
+fully busy auth workers can approach 400%. `rss_mib` and the
+`inflight`/`inflight_max`/`saturated` fields make bounded overload and recovery
+visible without opening a metrics socket.
+
+Build both executables, put `coordinator` on the server host and
+`coordinator-load` on a different host, then run the baseline:
+
+```sh
+cargo build --release -p coordinator-bin --bins
+
+# Server host. With systemd, set the same arguments in COORDINATOR_ARGS and use
+# journalctl -fu ducktape-coordinator for the metrics rows.
+MALLOC_ARENA_MAX=1 ./coordinator --listen 0.0.0.0:3478 --workers 4 \
+  --metrics-interval 1
+
+# Load host (a distinct machine/VM): client-local RTT needs no clock sync.
+# Sweep concurrency until coordinator CPU or drop rate reaches the desired load.
+for clients in 16 64 256; do
+  ./coordinator-load --target SERVER_IP:3478 --duration 60 \
+    --clients "$clients" --report-interval 0
+done
+```
+
+The default output is a compact comparison table with end-to-end p99, drops,
+request/flood rates, and load-host CPU; use `--output log` for stable
+`key=value` ingestion. The matching grouped server metrics rows supply
+coordinator CPU/RSS and show whether the 260-request bounded window saturated.
+Each valid client reuses one signed, response-correlated request, refreshes its
+timestamp every 20 seconds, and rotates the correlation key after a timeout.
+That keeps late replies out of later latency samples without making load-host
+signing throughput the benchmark's ceiling.
+Latency uses fixed 0.1 ms buckets up to the configured timeout, so a 24-hour
+run keeps constant memory instead of retaining every sample.
+
+Run a real invalid-signature flood while retaining a valid probe, followed by a
+valid-only recovery phase:
+
+```sh
+./coordinator-load --target SERVER_IP:3478 --duration 60 --clients 1 \
+  --invalid-clients 16 --timeout-ms 1000 --recovery 10 --report-interval 10
+```
+
+Invalid packets use a fresh claimed public key but a different signing key and
+refresh their timestamp every 10 seconds, so they exercise Ed25519 rejection
+rather than the cheaper stale-request check. Recovery passes only if at least
+one valid response arrives after the flood stops; on the server,
+`rejected` rises during the flood and `inflight` returns to zero afterward.
+
+The same bounded-memory probe is the 24-hour soak; interval rows keep the run
+observable without retaining every latency sample:
+
+```sh
+./coordinator-load --target SERVER_IP:3478 --duration 86400 --clients 16 \
+  --rate 1000 --timeout-ms 1000 --report-interval 60 | tee coordinator-soak.log
+```
+
+Keep the corresponding server metrics log. A useful soak artifact therefore
+contains minute p99/drop rows plus CPU, RSS, saturation, send-error, and recovery
+evidence from the server. Omit `--rate` only when the soak host can sustain an
+unlimited run without disturbing colocated services. Do not add `NodeKey`
+sharding unless this cross-host profile shows the ordered state actor—not
+signature verification or UDP drops—has become the measured bottleneck.
 
 ## Deploy A — systemd (bare VPS)
 
@@ -139,7 +210,7 @@ sudo cp ops/coordinator/ducktape-coordinator.service /etc/systemd/system/
 # Optional: edit /etc/ducktape/coordinator.env to choose a bind address and auth
 # mode. The supplied file selects four auth workers and default public
 # proof-of-possession. For private mode use:
-# COORDINATOR_ARGS=--workers 4 --genesis-set /etc/ducktape/network.toml
+# COORDINATOR_ARGS=--workers 4 --metrics-interval 10 --genesis-set /etc/ducktape/network.toml
 
 # 4. Start it.
 sudo systemctl daemon-reload
