@@ -56,6 +56,7 @@ export interface HuddleContext {
   selfNodeHex: string;
   canEncode: boolean;
   canDecode: boolean;
+  canScreenShare: boolean;
   authorNames: Record<string, string>;
   roster: HuddleMember[];
   /** Main's mute at handoff — the window seeds its session from this. */
@@ -89,6 +90,7 @@ export const buildHuddleContext = (
     selfNodeHex: selfNodeHex.toLowerCase(),
     canEncode: cap.canEncode,
     canDecode: cap.canDecode,
+    canScreenShare: cap.canScreenShare,
     authorNames,
     roster: channel?.huddle ?? [],
     seedMuted: voice.muted,

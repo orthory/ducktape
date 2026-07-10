@@ -1,11 +1,13 @@
-// The popped-out huddle window (`index.html?view=huddle`). In PR-B it is a real
-// video surface: it runs its OWN media session (useHuddleWindowSession), seeded
-// by the context the main window pushes (ducktape://huddle-context), and renders
-// the same CallTiles + HuddleControls the dock/stage use. Consensus stays in the
-// main window — only leave/sweep cross back over ducktape://huddle-cmd. If the
-// session dies (or the user closes the window), the window closes and Rust's
-// Destroyed hook tells main to re-take the session, so the call is never
-// stranded in a dead float. Protocol: store/huddle-window.ts.
+// The popped-out huddle window (`index.html?view=huddle`). A real video
+// surface: it runs its OWN media session (useHuddleWindowSession), seeded by
+// the context the main window pushes (ducktape://huddle-context), and renders
+// the same CallTiles + HuddleControls + roster/notice pieces the dock/stage
+// use — an audio-only huddle shows the member roster (with per-member mute and
+// stale-sweep), a video one the tiles. Consensus stays in the main window —
+// only leave/sweep cross back over ducktape://huddle-cmd. If the session dies
+// (or the user closes the window), the window closes and Rust's Destroyed hook
+// tells main to re-take the session, so the call is never stranded in a dead
+// float. Protocol: store/huddle-window.ts.
 
 import { useCallback, useEffect, useState } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -16,6 +18,7 @@ import { HUDDLE_CMD_EVENT, HUDDLE_CONTEXT_EVENT } from "../../store/huddle-windo
 import type { HuddleContext, HuddleWindowCmd } from "../../store/huddle-window";
 import { color, font, radius } from "../../theme/tokens";
 import { HoverButton } from "../chat/HoverButton";
+import { CardNotices, Roster } from "../chat/HuddleCard";
 import { CallTiles } from "./CallTiles";
 import { HuddleControls } from "./HuddleControls";
 import { useHuddleWindowSession } from "./useHuddleWindowSession";
@@ -63,6 +66,15 @@ export function HuddleWindow() {
 
   const view = useHuddleWindowSession(ctx, onMediaEnded);
   const overCap = view ? view.participants.length > MAX_VIDEO_PARTICIPANTS : false;
+  // Tiles are up while OUR video lane runs, or a peer beacons video we can
+  // decode; otherwise the audio-style roster is the body (mute + sweep stay
+  // reachable in an audio-only huddle — same rule as the dock).
+  const showTiles =
+    !!view &&
+    (view.cameraOn ||
+      view.sharing ||
+      (view.canDecode && Object.values(view.peers).some((b) => b.cameraOn || b.sharing)));
+  const mutedWhileTalking = view ? view.participants.some((p) => p.isSelf && p.muted && p.speaking) : false;
 
   return (
     <div
@@ -96,13 +108,20 @@ export function HuddleWindow() {
             </HoverButton>
           </div>
 
-          {/* tiles */}
-          <div style={{ flex: 1, minHeight: 0, padding: 10, overflow: "auto" }}>
-            {view.participants.length === 0 ? (
-              <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: color.muted2, font: `500 12px ${font.sans}` }}>
-                connecting…
-              </div>
-            ) : (
+          {/* body — tiles when video runs, the roster otherwise */}
+          <div
+            style={{
+              flex: 1,
+              minHeight: 0,
+              padding: 10,
+              overflow: "auto",
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <CardNotices failure={null} mutedWhileTalking={mutedWhileTalking} mediaNote={view.mediaNote} />
+            {showTiles ? (
               <CallTiles
                 layout="gallery"
                 participants={view.participants}
@@ -111,32 +130,45 @@ export function HuddleWindow() {
                 canEncode={view.canEncode}
                 canDecode={view.canDecode}
                 selfCameraOn={view.cameraOn}
+                selfSharing={view.sharing}
                 bindPreview={view.bindPreview}
                 bindTile={view.bindTile}
+              />
+            ) : (
+              <Roster
+                participants={view.participants}
+                ring={color.paper}
+                maxRows={6}
+                onSweep={(user) => send({ op: "sweep", user })}
               />
             )}
           </div>
 
           {/* control bar */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "8px 10px", borderTop: `1px solid ${color.borderSoft}` }}>
-            <HuddleControls
-              size="comfortable"
-              status={view.status}
-              muted={view.muted}
-              cameraOn={view.cameraOn}
-              canEncode={view.canEncode}
-              cameraDisabledReason={overCap ? "Video is capped at 8 participants" : undefined}
-              onToggleMute={() => {
-                const next = !view.muted;
-                view.setMuted(next);
-                send({ op: "mute", muted: next }); // let main re-take with the same mute
-              }}
-              onToggleCamera={() => view.setCamera(!view.cameraOn)}
-              onLeave={() => send({ op: "leave" })}
-              // No in-window retry — a dead session closes the float and the dock
-              // re-takes (see useHuddleWindowSession); the error state never shows.
-              onRetry={() => {}}
-            />
+            <div style={{ flex: 1, maxWidth: 420 }}>
+              <HuddleControls
+                size="comfortable"
+                status={view.status}
+                muted={view.muted}
+                cameraOn={view.cameraOn}
+                canEncode={view.canEncode}
+                cameraDisabledReason={overCap ? "Video is capped at 8 participants" : undefined}
+                sharing={view.sharing}
+                canScreenShare={view.canScreenShare && !overCap}
+                onToggleScreen={() => view.setScreenShare(!view.sharing)}
+                onToggleMute={() => {
+                  const next = !view.muted;
+                  view.setMuted(next);
+                  send({ op: "mute", muted: next }); // let main re-take with the same mute
+                }}
+                onToggleCamera={() => view.setCamera(!view.cameraOn)}
+                onLeave={() => send({ op: "leave" })}
+                // No in-window retry — a dead session closes the float and the dock
+                // re-takes (see useHuddleWindowSession); the error state never shows.
+                onRetry={() => {}}
+              />
+            </div>
           </div>
         </>
       ) : (

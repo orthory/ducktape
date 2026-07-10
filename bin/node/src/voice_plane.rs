@@ -174,13 +174,26 @@ async fn bind_service(
     });
     let datagram_bind = SocketAddr::new(own, service.overlay_datagram_port());
     let stream_bind = SocketAddr::new(own, service.overlay_stream_port());
+    // Say ONCE why the plane is not up yet: an interface that never arrives
+    // (an unprivileged tun, an epoch that never applies) otherwise reads as a
+    // huddle that hangs in "connecting" with an empty log.
+    let mut logged = false;
     loop {
         match OverlaySockets::bind_with(factory.clone(), datagram_bind, stream_bind, book.clone())
             .await
         {
             Ok(sockets) => return sockets,
             // The interface (or our `/128`) is not up yet — retry quietly.
-            Err(_) => tokio::time::sleep(BIND_RETRY).await,
+            Err(err) => {
+                if !logged {
+                    logged = true;
+                    eprintln!(
+                        "[voice-plane] {service:?} bind on {datagram_bind} waiting on the \
+                         overlay interface ({err}) — retrying until it is up"
+                    );
+                }
+                tokio::time::sleep(BIND_RETRY).await;
+            }
         }
     }
 }

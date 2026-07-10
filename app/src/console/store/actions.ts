@@ -37,7 +37,11 @@ import * as valsetClient from "../../domain/valset-client";
 import * as ws from "../../domain/workspace-client";
 import type { Workspace } from "../../domain/workspace-client";
 import { parseMessageInput } from "../views/chat/chat-input";
-import { hasAgentMention, mentionResolverOf } from "../views/chat/mention";
+import {
+  hasAgentMention,
+  mentionableUsers,
+  mentionResolverOf,
+} from "../views/chat/mention";
 import {
   defaultScreenForSection,
   sectionForScreen,
@@ -66,11 +70,12 @@ import {
   removeTab,
   saveAccent,
   saveDocTabs,
+  saveNotifyPrefs,
   saveRemoteUrl,
   saveViewMode,
   selfAuthorBytes,
 } from "./state";
-import type { ConsoleState, ViewMode } from "./state";
+import type { ConsoleState, NotifyPrefs, ViewMode } from "./state";
 
 /** How often a parked joiner's phase is polled while it promotes. */
 const JOIN_POLL_MS = 1500;
@@ -109,6 +114,8 @@ export interface ConsoleActions {
    *  to the other rail, so the body always matches the rail. */
   setViewMode(mode: ViewMode): void;
   setAccent(accent: string): void;
+  setNotifyPrefs(prefs: NotifyPrefs): void;
+  toggleChannelMute(channelId: string): void;
   setAuthor(author: string): void;
   /** Set our own display name in the `profiles` module (origin-gated SetName)
    *  and keep it as the local author identity, so it propagates to everyone. */
@@ -185,9 +192,6 @@ export interface ConsoleActions {
   /** Choose input/output devices: persist, apply to the live session, and store
    *  on `devicePrefs`. A leave/rejoin keeps the selection. */
   setDevicePrefs(prefs: DevicePrefs): void;
-  /** Whether this runtime can do video calls — WebKitGTK can't (no WebCodecs),
-   *  its Chromium companion window can. Drives the camera control's enablement. */
-  videoSupported(): boolean;
   /** Evict a stale huddle member (one whose beacons went silent) from the
    *  channel roster on consensus — the cleanup for a client that died without
    *  leaving. Keyed by the target's submitter identity bytes, not its node. */
@@ -536,10 +540,27 @@ export function createActions({
    *  that can't do voice. */
   const selfNodeHex = (): string => getState().status?.publicKey ?? "";
 
+  const setNotifyPrefs = (prefs: NotifyPrefs): void => {
+    saveNotifyPrefs(prefs);
+    patch({ notifyPrefs: prefs });
+  };
+
   // The last fan-out set pushed into the live session — refresh() lands a new
   // channels array every block, so pushes are deduped by value here rather
   // than by effect identity upstream.
   let lastRecipients: string | null = null;
+  // Membership reconciliation bookkeeping: whether the FINALIZED roster has
+  // carried our node at least once this membership — only then does a roster
+  // without us mean "we were removed" rather than "the join hasn't landed yet".
+  let huddleSelfSeen = false;
+  // Auto-reconnect damping: one re-establish per window. A second unexpected
+  // close inside the window (flapping network, or another client of this node
+  // taking the session — a fight we must not enter) fails honestly instead.
+  const RECONNECT_DAMP_MS = 30_000;
+  let lastReconnectAtMs = 0;
+  // The transient media-failure note auto-clears; keep the timer so a newer
+  // note supersedes an older one cleanly.
+  let mediaNoteTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Recompute + push the fan-out set for `channelId` (default: the active
    *  huddle) into the live session. No-op when not huddling or unchanged. */
@@ -560,16 +581,97 @@ export function createActions({
     lastRecipients = null;
   };
 
+  /** Reconcile our session against the FINALIZED roster: once the roster has
+   *  carried our node and then drops it while the session runs (a sweep by
+   *  another member, or another client of this identity leaving), end the media
+   *  and say so — the server keeps mixing audio for any authenticated member
+   *  regardless of roster, so without this a removed participant keeps hearing
+   *  the huddle behind a card that shows nobody in it. Runs on every channel
+   *  refresh (beside the recipients push). */
+  const reconcileHuddleMembership = (): void => {
+    const state = getState();
+    const { channelId, status } = state.voice;
+    const active = status === "live" || status === "connecting" || status === "reconnecting";
+    if (!channelId || !active) {
+      huddleSelfSeen = false;
+      return;
+    }
+    const channel = state.channels.find((c) => c.id === channelId);
+    if (!channel) return; // channel list mid-refresh — never treat as removal.
+    const self = selfNodeHex();
+    const inRoster = (channel.huddle ?? []).some((m) => keyHex(m.node) === self);
+    if (inRoster) {
+      huddleSelfSeen = true;
+      return;
+    }
+    // Not in the roster: before the join lands that's expected (the optimistic
+    // projection usually covers even that); after we've been seen, it's removal.
+    if (!huddleSelfSeen) return;
+    huddleSelfSeen = false;
+    stopVoice();
+    closeHuddleWindow();
+    update((prev) => ({
+      voice: {
+        ...prev.voice,
+        popped: false,
+        status: "error",
+        error: "removed",
+        mediaNote: null,
+        cameraOn: false,
+        sharing: false,
+        peers: {},
+        speaking: false,
+      },
+    }));
+  };
+
+  /** Build + start a fresh media session for `channelId` (consensus membership
+   *  untouched) and put the slice in `status`. The shared core of the pop-in
+   *  retake and the auto-reconnect — a CallSession can never restart, so any
+   *  re-establish is a new instance. Camera resets off (a stream cannot survive
+   *  its session); mute is carried for call continuity. */
+  const startHuddleMedia = (
+    channelId: string,
+    seedMuted: boolean,
+    status: "connecting" | "reconnecting",
+  ): void => {
+    const nodeUrl = getState().nodeUrl;
+    if (voice || !nodeUrl) return;
+    voice = createCallSession(onCallEvent);
+    voice.setMuted(seedMuted);
+    voice.setDevices(getState().devicePrefs); // start() reads these at acquire
+    update((prev) => ({
+      voice: {
+        ...prev.voice,
+        popped: false,
+        muted: seedMuted,
+        status,
+        error: null,
+        mediaNote: null,
+        cameraOn: false,
+        sharing: false,
+        peers: {},
+        sessionStartMs: Date.now(),
+        speaking: false,
+      },
+    }));
+    voice.start(callSocketUrl(nodeUrl, channelId));
+    pushRecipients(channelId);
+  };
+
   // Session events → the voice slice. A `peerBeacon` merges that peer's latest
   // ephemeral call state (keyed by its already-lowercase node hex) into the
-  // slice. A `status` event drives lifecycle: any terminal end reconciles the
-  // consensus roster (submit leave) so peers never keep showing a dead
-  // participant, and clears local camera/peer state (the session is gone) —
-  // 'closed' (the session was replaced) clears the slice entirely (and closes
-  // the popped-out window); 'error' (hub refusal, socket failure, mic denial)
-  // keeps the dock up in its error state so the failure is visible — the status
-  // event carries WHY (error), which the slice mirrors for the dock's message.
-  // Leave dismisses it.
+  // slice. A `status` event drives lifecycle:
+  //   - 'closed' on a LIVE session (socket drop, node restart, session replaced)
+  //     gets ONE automatic media re-establish — membership is kept, the slice
+  //     shows "reconnecting". Damped by RECONNECT_DAMP_MS so a flapping link (or
+  //     another client of this node repeatedly taking the session) converges on
+  //     a visible failure instead of a silent steal loop.
+  //   - any other terminal end ('error', or 'closed' when not live / inside the
+  //     damp window) reconciles the consensus roster (submit leave) so peers
+  //     never keep showing a dead participant, and keeps the dock up in its
+  //     error state — a huddle must end visibly, never vanish.
+  // Leave dismisses the error card.
   const onCallEvent = (event: CallEvent): void => {
     if (event.kind === "peerBeacon") {
       update((prev) => ({
@@ -593,43 +695,60 @@ export function createActions({
       update((prev) => ({ voice: { ...prev.voice, speaking: event.speaking } }));
       return;
     }
+    if (event.kind === "mediaNote") {
+      if (mediaNoteTimer !== null) clearTimeout(mediaNoteTimer);
+      update((prev) => ({ voice: { ...prev.voice, mediaNote: event.note } }));
+      mediaNoteTimer = setTimeout(() => {
+        mediaNoteTimer = null;
+        update((prev) => ({ voice: { ...prev.voice, mediaNote: null } }));
+      }, 5_000);
+      return;
+    }
     const status = event.status;
     const error = event.error;
     if (status === "closed" || status === "error") {
-      const channelId = getState().voice.channelId;
+      const prevVoice = getState().voice;
+      const channelId = prevVoice.channelId;
       stopVoice();
-      if (channelId) submitLeaveHuddle(channelId);
-      if (status === "closed") {
-        closeHuddleWindow();
-        patch({
-          voice: {
-            channelId: null,
-            muted: false,
-            status: "idle",
-            error: null,
-            popped: false,
-            cameraOn: false,
-            sharing: false,
-            peers: {},
-            sessionStartMs: null,
-            speaking: false,
-          },
-        });
-      } else {
-        update((prev) => ({
-          voice: {
-            ...prev.voice,
-            status: "error",
-            error: error ?? "connection",
-            cameraOn: false,
-            sharing: false,
-            peers: {},
-          },
-        }));
+      if (
+        status === "closed" &&
+        channelId &&
+        prevVoice.status === "live" &&
+        Date.now() - lastReconnectAtMs > RECONNECT_DAMP_MS
+      ) {
+        lastReconnectAtMs = Date.now();
+        startHuddleMedia(channelId, prevVoice.muted, "reconnecting");
+        return;
       }
+      if (channelId) submitLeaveHuddle(channelId);
+      closeHuddleWindow();
+      update((prev) => ({
+        voice: {
+          ...prev.voice,
+          popped: false,
+          status: "error",
+          error: error ?? "connection",
+          mediaNote: null,
+          cameraOn: false,
+          sharing: false,
+          peers: {},
+          speaking: false,
+        },
+      }));
       return;
     }
-    update((prev) => ({ voice: { ...prev.voice, status, error: null } }));
+    update((prev) => ({
+      voice: {
+        ...prev.voice,
+        // A re-establish's own session reports 'connecting' — keep the visible
+        // "reconnecting" until it actually lands ('live' promotes both).
+        status:
+          prev.voice.status === "reconnecting" && status === "connecting"
+            ? "reconnecting"
+            : status,
+        error: null,
+      },
+    }));
   };
 
   /** Submit a leave_huddle for `channelId` with the optimistic roster prune. */
@@ -650,29 +769,11 @@ export function createActions({
   const retakeHuddleMedia = (): void => {
     const state = getState();
     const channelId = state.voice.channelId;
-    const nodeUrl = state.nodeUrl;
-    if (voice || !channelId || !nodeUrl) {
+    if (voice || !channelId || !state.nodeUrl) {
       update((prev) => ({ voice: { ...prev.voice, popped: false } }));
       return;
     }
-    const seedMuted = state.voice.muted;
-    voice = createCallSession(onCallEvent);
-    voice.setMuted(seedMuted);
-    update((prev) => ({
-      voice: {
-        ...prev.voice,
-        popped: false,
-        muted: seedMuted,
-        status: "connecting",
-        error: null,
-        cameraOn: false,
-        peers: {},
-        sessionStartMs: Date.now(),
-        speaking: false,
-      },
-    }));
-    voice.start(callSocketUrl(nodeUrl, channelId));
-    pushRecipients(channelId);
+    startHuddleMedia(channelId, state.voice.muted, "connecting");
   };
 
   // The one write path: apply the op's PRECONFIRMED render immediately (the
@@ -744,6 +845,14 @@ export function createActions({
           origin: getState().author,
         }),
       (prev) => optimistic.watchSet(prev, { channelId, policy: "mention" }),
+    );
+  };
+
+  const mentionResolver = () => {
+    const state = getState();
+    return mentionResolverOf(
+      state.agents,
+      mentionableUsers(state.nodeUsers, state.agents),
     );
   };
 
@@ -1116,6 +1225,16 @@ export function createActions({
       saveAccent(accent);
       patch({ accent });
     },
+    setNotifyPrefs,
+    toggleChannelMute: (channelId) => {
+      const prefs = getState().notifyPrefs;
+      setNotifyPrefs({
+        ...prefs,
+        mutedChannels: prefs.mutedChannels.includes(channelId)
+          ? prefs.mutedChannels.filter((id) => id !== channelId)
+          : [...prefs.mutedChannels, channelId],
+      });
+    },
     setAuthor: (author) => patch({ author }),
 
     // ── Account writes (see account-ops.ts) ──
@@ -1221,7 +1340,7 @@ export function createActions({
       const channelId = getState().activeChannel;
       if (!channelId || !body.trim()) return;
       const messageId = crypto.randomUUID();
-      const blocks = parseMessageInput(body, mentionResolverOf(getState().agents));
+      const blocks = parseMessageInput(body, mentionResolver());
       const author = getState().author;
       void ensureMentionWatch(channelId, blocks).then(() =>
         submitTracked(
@@ -1263,7 +1382,7 @@ export function createActions({
       const root = getState().activeThread?.root;
       if (!channelId || !root || !body.trim()) return;
       const messageId = crypto.randomUUID();
-      const blocks = parseMessageInput(body, mentionResolverOf(getState().agents));
+      const blocks = parseMessageInput(body, mentionResolver());
       const author = getState().author;
       void ensureMentionWatch(channelId, blocks)
         .then(() =>
@@ -1315,7 +1434,7 @@ export function createActions({
       // seeded the editor with "@agent_id", so re-parsing must resolve it
       // back or the edit silently strips the mention. No auto-watch here —
       // engagement is a post-time concern.
-      const blocks = parseMessageInput(body, mentionResolverOf(getState().agents));
+      const blocks = parseMessageInput(body, mentionResolver());
       submitTracked(
         opKey.messageSeq(channelId, seq),
         (live) =>
@@ -1431,7 +1550,14 @@ export function createActions({
       // start the audio session and reflect "connecting"; push whatever roster
       // we already know (others may be huddling), self excluded. joins start
       // MUTED — joining a room must never be a hot-mic moment; unmuting is the
-      // deliberate act.
+      // deliberate act. Deliberately NOT startHuddleMedia: a join differs from
+      // a media re-establish (it sets channelId, forces muted, and must keep
+      // `popped` for a retry from the popped window) — folding them would break
+      // one or the other.
+      // A fresh membership: reset the reconcile + reconnect bookkeeping so an
+      // old session's history never bleeds into this one.
+      huddleSelfSeen = false;
+      lastReconnectAtMs = 0;
       voice = createCallSession(onCallEvent);
       voice.setMuted(true);
       voice.setDevices(getState().devicePrefs); // start() reads these at acquire
@@ -1444,8 +1570,9 @@ export function createActions({
           muted: true,
           status: "connecting",
           error: null,
+          mediaNote: null,
           cameraOn: false,
-            sharing: false,
+          sharing: false,
           peers: {},
           // Fresh session → fresh staleness baseline (a retry replaces the session).
           sessionStartMs: Date.now(),
@@ -1458,6 +1585,7 @@ export function createActions({
 
     leaveHuddle: () => {
       const channelId = getState().voice.channelId;
+      huddleSelfSeen = false;
       stopVoice();
       closeHuddleWindow();
       patch({
@@ -1466,9 +1594,10 @@ export function createActions({
           muted: false,
           status: "idle",
           error: null,
+          mediaNote: null,
           popped: false,
           cameraOn: false,
-            sharing: false,
+          sharing: false,
           peers: {},
           sessionStartMs: null,
           speaking: false,
@@ -1482,7 +1611,10 @@ export function createActions({
       update((prev) => ({ voice: { ...prev.voice, muted } }));
     },
 
-    syncHuddleRecipients: () => pushRecipients(),
+    syncHuddleRecipients: () => {
+      reconcileHuddleMembership();
+      pushRecipients();
+    },
 
     setCamera: (on) => {
       if (!voice) return;
@@ -1517,8 +1649,6 @@ export function createActions({
       voice?.setDevices(prefs);
       patch({ devicePrefs: prefs });
     },
-
-    videoSupported: () => getState().videoCapability.canEncode,
 
     sweepHuddle: (channelId, user) => {
       submitTracked(

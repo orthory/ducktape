@@ -43,9 +43,14 @@ export type ViewMode = "user" | "operator";
 export interface VoiceSlice {
   channelId: string | null;
   muted: boolean;
-  status: "idle" | "connecting" | "live" | "error";
+  /** "reconnecting" = the live session dropped unexpectedly and ONE automatic
+   *  media re-establish is in flight — consensus membership is kept. */
+  status: "idle" | "connecting" | "reconnecting" | "live" | "error";
   /** Why `status` is "error" — picks the dock's message. Null otherwise. */
   error: VoiceError | null;
+  /** A transient media failure note (camera/screen acquire failed) — shown for a
+   *  few seconds by the card surfaces, then auto-cleared. Never fatal. */
+  mediaNote: "camera-failed" | "screen-failed" | null;
   /** The huddle lives in its own desktop window right now — the in-app card
    *  yields to it (desktop only; see store/huddle-window.ts). */
   popped: boolean;
@@ -124,6 +129,7 @@ export interface ConsoleState {
    *  Kept in sync with `screen`: navigating to a surface adopts its section. */
   viewMode: ViewMode;
   accent: string;
+  notifyPrefs: NotifyPrefs;
   author: string;
   /** The node answered the last status query. */
   connected: boolean;
@@ -274,6 +280,13 @@ export interface ConsoleState {
    *  once `blocks` has data and clears it). Null when nothing is pending. */
   explorerFocus: number | null;
 
+  /** The forge item the forge view should open on next render — a clicked
+   *  desktop notification's hand-off (the explorerFocus idiom: the provider's
+   *  navigate listener sets it, ForgeView consumes it, and the provider
+   *  retires it when the user leaves the forge screen). `number` null means
+   *  a repo-only focus. Null when nothing is pending. */
+  forgeFocus: { repo: string; number: number | null } | null;
+
   /** Per-operation finalization ledger (entity key → newest op touching that
    *  row): pending while a write is in flight, then finalized with the
    *  inclusion height + addressable op hash from the submit receipt. Client
@@ -316,6 +329,28 @@ export interface ConsoleState {
 
 export const DEFAULT_ACCENT = "#a05a3c";
 
+export interface NotifyPrefs {
+  enabled: boolean;
+  mentions: boolean;
+  replies: boolean;
+  huddles: boolean;
+  runs: boolean;
+  forge: boolean;
+  governance: boolean;
+  mutedChannels: string[];
+}
+
+export const DEFAULT_NOTIFY_PREFS: NotifyPrefs = {
+  enabled: true,
+  mentions: true,
+  replies: true,
+  huddles: true,
+  runs: true,
+  forge: true,
+  governance: true,
+  mutedChannels: [],
+};
+
 /** The boot placeholder author. The provider replaces it with the chain's
  *  resolved name for our own node as soon as one hydrates — only a name the
  *  USER typed (≠ this placeholder) is ever kept over the chain's. */
@@ -339,6 +374,62 @@ export const loadAccent = (): string => {
 export const saveAccent = (accent: string): void => {
   try {
     localStorage.setItem(ACCENT_KEY, accent);
+  } catch {
+    // persistence is best-effort; a failed write just doesn't survive restart.
+  }
+};
+
+// ── Notification prefs persistence ─────────────────────
+//
+// Desktop notification preferences survive restarts. Each field is validated
+// independently so a partial or corrupt blob falls back only where needed.
+const NOTIFY_PREFS_KEY = "ducktape.notifyPrefs";
+
+const defaultNotifyPrefs = (): NotifyPrefs => ({
+  ...DEFAULT_NOTIFY_PREFS,
+  mutedChannels: [...DEFAULT_NOTIFY_PREFS.mutedChannels],
+});
+
+const loadNotifyPrefsFrom = (value: unknown): NotifyPrefs => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return defaultNotifyPrefs();
+  }
+  const prefs = value as Record<string, unknown>;
+  return {
+    enabled:
+      typeof prefs.enabled === "boolean" ? prefs.enabled : DEFAULT_NOTIFY_PREFS.enabled,
+    mentions:
+      typeof prefs.mentions === "boolean" ? prefs.mentions : DEFAULT_NOTIFY_PREFS.mentions,
+    replies:
+      typeof prefs.replies === "boolean" ? prefs.replies : DEFAULT_NOTIFY_PREFS.replies,
+    huddles:
+      typeof prefs.huddles === "boolean" ? prefs.huddles : DEFAULT_NOTIFY_PREFS.huddles,
+    runs: typeof prefs.runs === "boolean" ? prefs.runs : DEFAULT_NOTIFY_PREFS.runs,
+    forge: typeof prefs.forge === "boolean" ? prefs.forge : DEFAULT_NOTIFY_PREFS.forge,
+    governance:
+      typeof prefs.governance === "boolean"
+        ? prefs.governance
+        : DEFAULT_NOTIFY_PREFS.governance,
+    mutedChannels:
+      Array.isArray(prefs.mutedChannels) &&
+      prefs.mutedChannels.every((channel): channel is string => typeof channel === "string")
+        ? [...prefs.mutedChannels]
+        : [...DEFAULT_NOTIFY_PREFS.mutedChannels],
+  };
+};
+
+export const loadNotifyPrefs = (): NotifyPrefs => {
+  try {
+    const raw = localStorage.getItem(NOTIFY_PREFS_KEY);
+    return loadNotifyPrefsFrom(raw ? JSON.parse(raw) : null);
+  } catch {
+    return defaultNotifyPrefs();
+  }
+};
+
+export const saveNotifyPrefs = (prefs: NotifyPrefs): void => {
+  try {
+    localStorage.setItem(NOTIFY_PREFS_KEY, JSON.stringify(prefs));
   } catch {
     // persistence is best-effort; a failed write just doesn't survive restart.
   }
@@ -514,6 +605,7 @@ export const createInitialState = (): ConsoleState => {
     screen: viewMode === "operator" ? DEFAULT_OPERATOR_SCREEN : DEFAULT_USER_SCREEN,
     viewMode,
     accent: loadAccent(),
+    notifyPrefs: loadNotifyPrefs(),
     author: DEFAULT_AUTHOR,
     connected: false,
     nodeUrl: null,
@@ -535,6 +627,7 @@ export const createInitialState = (): ConsoleState => {
       muted: false,
       status: "idle",
       error: null,
+      mediaNote: null,
       popped: false,
       cameraOn: false,
       sharing: false,
@@ -570,6 +663,7 @@ export const createInitialState = (): ConsoleState => {
     lastBlock: null,
     blocks: [],
     explorerFocus: null,
+    forgeFocus: null,
     ops: {},
     error: null,
     bootError: null,
@@ -672,4 +766,3 @@ export const channelIdOf = (name: string): string =>
     .trim()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
-

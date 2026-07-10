@@ -51,6 +51,7 @@ const ctx = (): HuddleContext => ({
   selfNodeHex: keyHex([9]),
   canEncode: true,
   canDecode: true,
+  canScreenShare: true,
   authorNames: {},
   roster: [
     { user: bytes("alice"), node: [9], joined_at: 0 }, // co-located → self

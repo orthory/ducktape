@@ -254,6 +254,7 @@ function HuddleDockCard() {
             channelName={channel?.name ?? channelId}
             status={voice.status}
             error={voice.error}
+            mediaNote={voice.mediaNote}
             participants={participants}
             ring={color.paper}
             maxRows={4}
@@ -264,7 +265,9 @@ function HuddleDockCard() {
           <HeaderIconButton title="Expand to full stage" onClick={() => setExpanded(true)}>
             <ExpandGlyph size={14} />
           </HeaderIconButton>
-          {isTauri() && (
+          {/* Pop-out hands the MEDIA session to the window — there is nothing to
+              hand off from an errored session, so the control hides with it. */}
+          {isTauri() && voice.status !== "error" && (
             <HeaderIconButton title="Open in window" onClick={() => actions.popOutHuddle()}>
               <PopGlyph size={13} />
             </HeaderIconButton>
@@ -308,7 +311,9 @@ function HuddleDockCard() {
       />
 
       {devicesOpen && (
-        <div style={{ position: "absolute", left: 10, right: 10, bottom: 46, zIndex: 5 }}>
+        // Anchored ABOVE the card, not over it — the roster, tiles and mute
+        // state stay visible while devices are being switched.
+        <div style={{ position: "absolute", left: 0, right: 0, bottom: "calc(100% + 6px)", zIndex: 5 }}>
           <DevicesMenu onClose={() => setDevicesOpen(false)} />
         </div>
       )}

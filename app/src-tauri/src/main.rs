@@ -2,12 +2,13 @@
 //!
 //! the node no longer lives in this process. the shell's jobs beyond the
 //! webview are the `~/.ducktape` WORKSPACE REGISTRY (see [`workspaces`]) — found
-//! or join networks, allocate ports, drive the node's onboarding verbs, and
-//! spawn the selected workspace's node DETACHED (its own process group, stdio
-//! to `daemon.log`) so closing the console window only hides to the menu-bar
-//! app instead of killing the network. a real app quit (tray Quit / Cmd-Q /
-//! OS exit) stops the active managed node through the workspace pidfile before
-//! the shell exits.
+//! or join networks and allocate ports. A bounded, dedicated node-control actor
+//! drives onboarding/custody verbs and spawns the selected workspace's node
+//! DETACHED (its own process group, stdio to `daemon.log`), so Tauri runtime
+//! workers never execute or wait on the node binary. Closing the console window
+//! only hides to the menu-bar app instead of killing the network. A real app
+//! quit (tray Quit / Cmd-Q / OS exit) stops the active managed node through the
+//! workspace pidfile before the shell exits.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -16,14 +17,16 @@ mod enroll;
 mod forge_git;
 mod huddle;
 mod menu;
+mod notify;
 mod tray;
 mod user_identity;
 mod workspaces;
 
 fn main() {
+    let node_control = daemon::NodeControl::new().expect("start desktop node-control actor");
     let mut builder = tauri::Builder::default()
+        .manage(node_control)
         .invoke_handler(tauri::generate_handler![
-            daemon::daemon_spawn,
             workspaces::workspace_list,
             workspaces::workspace_active,
             workspaces::workspace_create,
@@ -71,11 +74,17 @@ fn main() {
             tray::tray_quit,
             huddle::huddle_pop_out,
             huddle::huddle_pop_in,
-        ])
+            notify::notify_configure,
+            notify::notify_mark_seen,
+        ]);
+    builder = builder.plugin(tauri_plugin_notification::init());
+    builder = builder
         // Menu-bar icon + popover, and an app menu with no Cmd+W Close
         // Window so the webview owns the key (macOS only; no-ops elsewhere).
         .setup(|app| {
             tray::init(app.handle())?;
+            // After tray::init: both stack window-event handlers on "main".
+            notify::init(app.handle())?;
             menu::install(app)?;
             // The in-app huddle dock captures from THIS window, so the main
             // webview needs the same mic/camera grant as the pop-out
@@ -104,10 +113,15 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
     app.run(|app, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event
-            && let Err(err) = workspaces::stop_active_workspace_node(app)
-        {
-            eprintln!("app exit: could not stop active workspace node: {err}");
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            // The notify stream task is detach-on-drop; a real quit is the
+            // one place that asks its loop to exit.
+            if let Some(notify) = tauri::Manager::try_state::<notify::NotifyHandles>(app) {
+                notify.stream.shutdown();
+            }
+            if let Err(err) = workspaces::stop_active_workspace_node(app) {
+                eprintln!("app exit: could not stop active workspace node: {err}");
+            }
         }
     });
 }
