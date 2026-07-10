@@ -248,7 +248,11 @@ fn run_node(
         // the duckfs/files module the portable (v3) composer pins its source
         // head from (W2). its presence is what selects the v3 composer; unwired,
         // the composer emits the v2 wire.
-        .with_files_module("files");
+        .with_files_module("files")
+        // the forge module the composer resolves forge:<repo>:<n> channels
+        // against and the PR sink queries; unwired, forge-channel mentions
+        // skip at compose.
+        .with_sink_forge("forge");
         let pages = Pages::init(context.child("pages"), "pages").await;
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the

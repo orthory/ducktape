@@ -169,7 +169,11 @@ pub(super) async fn genesis_host(
             // the duckfs/files module the portable (v3) composer pins its source
             // head from (W2). its presence is what selects the v3 composer;
             // unwired, the composer emits the v2 wire.
-            .with_files_module("files"),
+            .with_files_module("files")
+            // the forge module the composer resolves forge:<repo>:<n> channels
+            // against and the PR sink queries; unwired, forge-channel mentions
+            // skip at compose.
+            .with_sink_forge("forge"),
         ),
         Box::new(Directory::new("directory")),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
@@ -323,7 +327,8 @@ pub(super) async fn restore_host(
         Some("tasks".into()),
         Some("jobs".into()),
     )
-    .with_files_module("files");
+    .with_files_module("files")
+    .with_sink_forge("forge");
     let (bytes, root) = snapshot_of("runs")?;
     runs.install(bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
@@ -646,7 +651,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         Some("tasks".into()),
         Some("jobs".into()),
     )
-    .with_files_module("files");
+    .with_files_module("files")
+    .with_sink_forge("forge");
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 
