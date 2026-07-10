@@ -1,5 +1,5 @@
 // Build the token-routed VNC WebSocket URL. The console is served by the same
-// websockify that proxies VNC, so we derive host + scheme from where the browser
+// fleet server that proxies VNC, so we derive host + scheme from where the browser
 // actually reached us — that transparently handles the tailscale IP, a MagicDNS
 // name, and a future TLS front, without threading host/port through the app.
 
