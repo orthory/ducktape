@@ -243,6 +243,41 @@ fn squatted_ids_and_a_crowded_target_degrade_the_comment() {
 }
 
 #[test]
+fn same_block_thread_cap_degrades_the_overflow_comment_without_aborting() {
+    // the target holds (cap - 1) COMMITTED threads; the run emits two
+    // comments to it. the committed-only probe is blind to the first
+    // comment's staged thread, so without same-run accounting BOTH would
+    // emit and the second AddComment would abort the delivery block
+    // (TooManyThreads). the accounting makes the second DEGRADE instead.
+    let cap = pages::MAX_THREADS_PER_TARGET;
+    let (mut m, registry, run_id) =
+        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_COMMENT], &["*"]);
+    let mut ctx = delivery_ctx(&registry).with_page_target_threads("b-p", cap - 1);
+    deliver(
+        &mut m,
+        &mut ctx,
+        &run_id,
+        serde_json::json!({
+            "effects": [
+                {"kind": ACTION_PAGES_COMMENT, "target": "b-p", "body": "first"},
+                {"kind": ACTION_PAGES_COMMENT, "target": "b-p", "body": "second"},
+            ]
+        }),
+    );
+
+    let msgs = ctx.page_msgs();
+    assert_eq!(msgs.len(), 1, "only the first comment fits: {msgs:?}");
+    assert!(matches!(&msgs[0], PageMsg::AddComment { text, .. } if text == "first"));
+    assert!(
+        ctx.notes().iter().any(|n| n.contains("already holds")),
+        "the overflow comment leaves a cap breadcrumb: {:?}",
+        ctx.notes()
+    );
+    assert_eq!(ctx.chat_msgs().len(), 1, "the reply still posts (no abort)");
+    assert_delivered(&mut m, &run_id);
+}
+
+#[test]
 fn an_unwired_pages_module_degrades_to_a_breadcrumb() {
     // the same run on a module WITHOUT with_pages_module: the forge-unwired
     // pattern — breadcrumb, no pages msg, delivery proceeds.

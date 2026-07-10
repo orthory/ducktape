@@ -21,6 +21,8 @@
 //! `SetChecked` stores no author — a `Block` has no author field — so it is
 //! origin-gated only.
 
+use std::collections::BTreeMap;
+
 use agent::CapRequest;
 
 use super::response::allows;
@@ -75,15 +77,35 @@ impl RunsModule {
                 return;
             }
         };
+        // threads THIS run has already staged, per target: pages reads its
+        // pending overlay first, so the committed-only thread-cap probe is
+        // blind to threads staged earlier in this same delivery block. a run
+        // emitting several comments to a near-full target would pass every
+        // committed probe, then abort the block on the sibling pages rejects
+        // (TooManyThreads) — the permanent-abort R4 hole. account for them.
+        let mut staged_threads: BTreeMap<String, usize> = BTreeMap::new();
         for (index, action) in actions.iter().enumerate() {
             if !is_pages_action(action) {
                 continue;
             }
+            let already_staged = match action {
+                AgentAction::AddPageComment { target, .. } => {
+                    staged_threads.get(target).copied().unwrap_or(0)
+                }
+                _ => 0,
+            };
             match self
-                .pages_action_msg(&*ctx, &pages, &agent, run_id, index, action)
+                .pages_action_msg(&*ctx, &pages, &agent, run_id, index, action, already_staged)
                 .await
             {
-                Ok(msg) => ctx.emit_msg(msg),
+                Ok(msg) => {
+                    // a landed comment opens one new thread on its target;
+                    // the next sibling to that target must count it.
+                    if let AgentAction::AddPageComment { target, .. } = action {
+                        *staged_threads.entry(target.clone()).or_default() += 1;
+                    }
+                    ctx.emit_msg(msg)
+                }
                 Err(why) => self.note(
                     ctx,
                     format!("run {run_id} pages action {index} skipped: {why}"),
@@ -94,7 +116,9 @@ impl RunsModule {
 
     /// one pages action as an emit-ready follow-up, or the reason it degrades.
     /// gate order: grant → target resolution → cap → payload → freshness
-    /// probes.
+    /// probes. `already_staged` is how many threads this run has staged to
+    /// this comment's target already (the same-block thread-cap accounting).
+    #[allow(clippy::too_many_arguments, reason = "run_id + index derive the deterministic ids; already_staged is the same-block cap counter")]
     async fn pages_action_msg(
         &self,
         ctx: &dyn Ctx,
@@ -103,6 +127,7 @@ impl RunsModule {
         run_id: &str,
         index: usize,
         action: &AgentAction,
+        already_staged: usize,
     ) -> Result<Msg, String> {
         let name = action.vocabulary_name();
         if !allows(agent, name) {
@@ -125,7 +150,7 @@ impl RunsModule {
                 // nowhere — unresolvable, degrade.
                 let block = self.page_block(ctx, pages, target).await?;
                 self.check_pages_write(agent, &block.page)?;
-                self.probe_comment_lands(ctx, pages, run_id, index, target)
+                self.probe_comment_lands(ctx, pages, run_id, index, target, already_staged)
                     .await?;
                 Ok(Msg {
                     target: pages.to_string(),
@@ -207,6 +232,7 @@ impl RunsModule {
         run_id: &str,
         index: usize,
         target: &str,
+        already_staged: usize,
     ) -> Result<(), String> {
         let thread_id = page_thread_id(run_id, index);
         let reply = ctx
@@ -242,7 +268,9 @@ impl RunsModule {
             }
             _ => return Err("unexpected pages reply for a comment lookup".into()),
         }
-        // a fresh thread still needs a slot in the target's thread list.
+        // a fresh thread still needs a slot in the target's thread list —
+        // counting both committed threads and the ones this run already
+        // staged to this target (else the sibling AddComment aborts).
         let reply = ctx
             .query(
                 pages,
@@ -254,7 +282,7 @@ impl RunsModule {
             .map_err(|e| format!("pages target lookup failed: {e}"))?;
         match pages::decode_reply(&reply) {
             Ok(PageReply::CommentThreads(groups)) => {
-                let taken = groups.first().map(|g| g.threads.len()).unwrap_or(0);
+                let taken = groups.first().map(|g| g.threads.len()).unwrap_or(0) + already_staged;
                 if taken >= MAX_THREADS_PER_TARGET {
                     return Err(format!("target {target} already holds {taken} threads"));
                 }

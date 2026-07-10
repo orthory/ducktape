@@ -60,9 +60,9 @@ struct CaptureCtx {
     /// thread/comment ids the pages module already holds — the squat
     /// simulation the CommentThread/GetComment freshness probes hit.
     taken_page_ids: BTreeSet<String>,
-    /// targets already holding MAX_THREADS_PER_TARGET threads, served by the
-    /// ThreadsForTargets arm (the capacity probe).
-    crowded_page_targets: BTreeSet<String>,
+    /// target -> committed thread count served by the ThreadsForTargets arm
+    /// (the capacity probe); absent targets serve zero threads.
+    page_target_threads: BTreeMap<String, usize>,
     /// the committed duckfs head served by the "files" Refs arm — the v3
     /// composer's `source_snapshot` pin. `None` = a fresh network (null pin).
     files_head: Option<String>,
@@ -91,7 +91,7 @@ impl CaptureCtx {
             saga_assignees: BTreeMap::new(),
             pages: BTreeMap::new(),
             taken_page_ids: BTreeSet::new(),
-            crowded_page_targets: BTreeSet::new(),
+            page_target_threads: BTreeMap::new(),
             files_head: None,
             msgs: Vec::new(),
             effects: Vec::new(),
@@ -143,8 +143,12 @@ impl CaptureCtx {
         self
     }
     /// mark a target as already holding the thread cap.
-    fn with_crowded_page_target(mut self, target: &str) -> Self {
-        self.crowded_page_targets.insert(target.into());
+    fn with_crowded_page_target(self, target: &str) -> Self {
+        self.with_page_target_threads(target, pages::MAX_THREADS_PER_TARGET)
+    }
+    /// serve `count` committed threads for `target` (the capacity probe).
+    fn with_page_target_threads(mut self, target: &str, count: usize) -> Self {
+        self.page_target_threads.insert(target.into(), count);
         self
     }
     /// set the committed duckfs head the "files" Refs arm serves (the v3
@@ -447,13 +451,11 @@ impl Ctx for CaptureCtx {
                         targets
                             .into_iter()
                             .map(|target| {
-                                let threads = if self.crowded_page_targets.contains(&target) {
-                                    (0..pages::MAX_THREADS_PER_TARGET)
-                                        .map(|i| dummy_thread_view(&format!("t{i}")))
-                                        .collect()
-                                } else {
-                                    Vec::new()
-                                };
+                                let count =
+                                    self.page_target_threads.get(&target).copied().unwrap_or(0);
+                                let threads = (0..count)
+                                    .map(|i| dummy_thread_view(&format!("t{i}")))
+                                    .collect();
                                 pages::TargetThreads { target, threads }
                             })
                             .collect(),
