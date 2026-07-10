@@ -185,6 +185,19 @@ pub const MAX_THREAD_ID_BYTES: usize = 512;
 pub const MAX_COMMENT_ID_BYTES: usize = 128;
 pub const MAX_COMMENT_TARGET_BYTES: usize = 512;
 
+/// whether a client-minted id serializes 1:1 (byte-for-byte) under
+/// `serde_json` — i.e. carries no escaping char. `serde_json` escapes `"`→
+/// `\"` (2 B), `\`→`\\` (2 B), and control chars `< 0x20` → `\u00XX` (6 B),
+/// so a length-capped id built from control chars could still balloon a
+/// derived block past [`MAX_BLOCK_LEN`] and abort it. every OTHER char (incl.
+/// non-ASCII UTF-8, `/`, `:`) serializes to exactly its UTF-8 byte length, so
+/// with escaping chars rejected `String::len()` bounds the serialized cost
+/// exactly and the count × length caps hold. legit ids (uuids, path/hex
+/// forms) never contain these chars.
+pub fn id_is_index_safe(s: &str) -> bool {
+    !s.chars().any(|c| c == '"' || c == '\\' || (c as u32) < 0x20)
+}
+
 /// who authored a comment — derived from `Env.origin`, never a payload. own
 /// copy of chat's shape (each module's interface is self-contained).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

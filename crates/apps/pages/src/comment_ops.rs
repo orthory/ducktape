@@ -1,7 +1,7 @@
 use super::{
     AuthorRef, BufferPooler, Comment, Context, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES,
     MAX_COMMENT_TEXT_BYTES, MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET,
-    Origin, PageError, PageMsg, Pages, Thread, ThreadView,
+    Origin, PageError, PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
 };
 
 /// reserved logical-key prefixes for comment records + the per-target thread
@@ -152,11 +152,16 @@ where
             } => {
                 // bound the client-minted ids BEFORE staging: they drive the
                 // size of the shared derived blocks (the target index and the
-                // thread record), and an unbounded id could grow one past
-                // MAX_BLOCK_LEN on a later append and abort the block.
+                // thread record). the length cap alone is NOT enough — an id
+                // of escaping chars serializes to 2–6 B each, so it must ALSO
+                // be index-safe for `len()` to bound the serialized cost and
+                // the count × length margins to hold.
                 if thread_id.len() > MAX_THREAD_ID_BYTES
                     || comment_id.len() > MAX_COMMENT_ID_BYTES
                     || target.len() > MAX_COMMENT_TARGET_BYTES
+                    || !id_is_index_safe(&thread_id)
+                    || !id_is_index_safe(&comment_id)
+                    || !id_is_index_safe(&target)
                 {
                     return Err(PageError::IdTooLarge);
                 }

@@ -31,7 +31,7 @@ fn add_comment_rejects_over_length_ids_before_staging() {
             &mut p,
             &add(&long_thread, "m1", "b1", "hi"),
             user("alice"),
-            "too large",
+            "id or target too large",
         )
         .await;
         let long_comment = "m".repeat(MAX_COMMENT_ID_BYTES + 1);
@@ -39,7 +39,7 @@ fn add_comment_rejects_over_length_ids_before_staging() {
             &mut p,
             &add("t1", &long_comment, "b1", "hi"),
             user("alice"),
-            "too large",
+            "id or target too large",
         )
         .await;
         let long_target = "b".repeat(MAX_COMMENT_TARGET_BYTES + 1);
@@ -47,7 +47,7 @@ fn add_comment_rejects_over_length_ids_before_staging() {
             &mut p,
             &add("t1", "m1", &long_target, "hi"),
             user("alice"),
-            "too large",
+            "id or target too large",
         )
         .await;
         // nothing staged — an id at exactly the cap still lands.
@@ -60,9 +60,37 @@ fn add_comment_rejects_over_length_ids_before_staging() {
     });
 }
 
+/// pin the ESCAPE vector: an id carrying a serde_json-escaping char (`"`,
+/// `\`, or a control char < 0x20) is rejected at admission even under the
+/// length cap — otherwise its escaped serialization (2–6 B/char) could still
+/// overflow a derived block and abort it. covers thread_id, comment_id, and
+/// target.
+#[test]
+fn add_comment_rejects_escaping_char_ids() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = Pages::init(context, "pages").await;
+        for (t, c, tg) in [
+            ("th\u{1}read", "m1", "b1"), // control char in thread_id
+            ("t1", "com\"ment", "b1"),   // quote in comment_id
+            ("t1", "m1", "tar\\get"),    // backslash in target
+        ] {
+            apply_err_as(
+                &mut p,
+                &add(t, c, tg, "hi"),
+                user("alice"),
+                "id or target too large",
+            )
+            .await;
+        }
+    });
+}
+
 /// the R4 invariant: at the count caps, ids bounded to their length caps keep
 /// the DERIVED shared blocks under MAX_BLOCK_LEN, so an AddComment append can
-/// never abort a block on size. proven by serializing the worst case.
+/// never abort a block on size. because admission ALSO rejects escaping chars
+/// (see `add_comment_rejects_escaping_char_ids`), every admitted id
+/// serializes 1:1, so a max-BYTE-length ASCII id is the true worst case — a
+/// non-ASCII UTF-8 id of the same `len()` serializes to the same byte count.
 #[test]
 fn bounded_ids_keep_the_derived_blocks_under_max_block_len() {
     // the per-target thread index is a Vec<thread_id> of up to

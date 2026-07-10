@@ -30,7 +30,7 @@ use super::{AgentAction, AgentRecord, Ctx, Msg, PendingState, RunsModule};
 use pages::{
     MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES, MAX_THREAD_ID_BYTES,
     MAX_THREADS_PER_TARGET, PageMsg, PageQuery, PageReply, encode_msg as pages_encode_msg,
-    encode_query as pages_encode_query,
+    encode_query as pages_encode_query, id_is_index_safe,
 };
 
 /// whether an action belongs to this lane (and is therefore skipped by the
@@ -45,11 +45,18 @@ pub(super) fn is_pages_action(action: &AgentAction) -> bool {
 /// deterministic ids for an agent comment: derived from the run id and the
 /// action's index in the validated response, so every replaying node mints
 /// the identical thread/comment (never randomness — X2 replay-identity).
+///
+/// the run id is HASHED (hex sha256, via `dispatch_id_for`) rather than
+/// inlined: a raw run id embeds the reserved `\x1f` run-key separator (a
+/// control char) AND a loosely-bounded channel id, so the inline form would
+/// be neither index-safe nor length-bounded — pages would reject it and the
+/// emitted op would abort the delivery block. the 64-char hex hash is short,
+/// escape-free, and still fully replay-deterministic.
 fn page_thread_id(run_id: &str, index: usize) -> String {
-    format!("agent/{run_id}/thread/{index}")
+    format!("agent/{}/thread/{index}", crate::dispatch_id_for(run_id))
 }
 fn page_comment_id(run_id: &str, index: usize) -> String {
-    format!("agent/{run_id}/comment/{index}")
+    format!("agent/{}/comment/{index}", crate::dispatch_id_for(run_id))
 }
 
 impl RunsModule {
@@ -145,20 +152,22 @@ impl RunsModule {
                         body.len()
                     ));
                 }
-                // the target and our own minted ids must clear pages' length
-                // caps — an over-length id makes pages reject the AddComment
-                // (IdTooLarge) and abort the delivery block, so degrade here.
-                // run_id embeds a loosely-bounded channel/agent id, so this
-                // guard is load-bearing, not just belt.
-                if target.len() > MAX_COMMENT_TARGET_BYTES {
-                    return Err(format!(
-                        "target exceeds pages' {MAX_COMMENT_TARGET_BYTES}-byte cap"
-                    ));
+                // never emit an id pages would reject (length OR escaping
+                // char) — that rejection aborts the delivery block. the
+                // TARGET is external (from model output / injected context),
+                // so this is live for it; the minted ids are hash-derived
+                // (short, hex, escape-free) so their check is belt against a
+                // future scheme change. one shared `id_is_index_safe`
+                // predicate, no drift with pages admission.
+                if target.len() > MAX_COMMENT_TARGET_BYTES || !id_is_index_safe(target) {
+                    return Err("target exceeds pages' id length/charset cap".into());
                 }
                 if page_thread_id(run_id, index).len() > MAX_THREAD_ID_BYTES
                     || page_comment_id(run_id, index).len() > MAX_COMMENT_ID_BYTES
+                    || !id_is_index_safe(&page_thread_id(run_id, index))
+                    || !id_is_index_safe(&page_comment_id(run_id, index))
                 {
-                    return Err("run id yields a comment id over pages' length cap".into());
+                    return Err("run id yields a comment id pages would reject".into());
                 }
                 // target → owning page (the cap is PAGE-scoped). a page root
                 // is itself a block that names itself as `page`, so GetBlock

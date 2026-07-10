@@ -70,9 +70,12 @@ fn a_pages_comment_effect_lands_agent_authored_with_deterministic_ids() {
     else {
         panic!("expected AddComment, got {:?}", msgs[0]);
     };
-    // ids derive from run_id + action index — replay-identical, never random.
-    assert_eq!(*thread_id, format!("agent/{run_id}/thread/0"));
-    assert_eq!(*comment_id, format!("agent/{run_id}/comment/0"));
+    // ids derive from hash(run_id) + action index — replay-identical, never
+    // random, and index-safe (hex, no reserved separators) by construction.
+    let rid = dispatch_id_for(&run_id);
+    assert_eq!(*thread_id, format!("agent/{rid}/thread/0"));
+    assert_eq!(*comment_id, format!("agent/{rid}/comment/0"));
+    assert!(pages::id_is_index_safe(thread_id) && pages::id_is_index_safe(comment_id));
     assert_eq!(target, "b-p");
     assert_eq!(text, "looks good");
     assert_eq!(
@@ -212,13 +215,14 @@ fn squatted_ids_and_a_crowded_target_degrade_the_comment() {
     // squattable and the target's thread list is cappable — each probe must
     // catch its case (an emitted op pages rejects would abort the block).
     let (_, registry, run_id) = awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_COMMENT], &["*"]);
+    let rid = dispatch_id_for(&run_id);
     for (ctx, needle) in [
         (
-            delivery_ctx(&registry).with_taken_page_id(&format!("agent/{run_id}/thread/0")),
+            delivery_ctx(&registry).with_taken_page_id(&format!("agent/{rid}/thread/0")),
             "thread id already taken",
         ),
         (
-            delivery_ctx(&registry).with_taken_page_id(&format!("agent/{run_id}/comment/0")),
+            delivery_ctx(&registry).with_taken_page_id(&format!("agent/{rid}/comment/0")),
             "comment id already taken",
         ),
         (
@@ -278,13 +282,14 @@ fn same_block_thread_cap_degrades_the_overflow_comment_without_aborting() {
 }
 
 #[test]
-fn an_agent_minted_id_over_the_pages_cap_degrades_not_emits() {
-    // a pathologically long channel id pushes the agent's own minted
-    // comment_id (agent/{run_id}/comment/{index}) past pages'
-    // MAX_COMMENT_ID_BYTES. emitting it would make pages reject the
-    // AddComment (IdTooLarge) and abort the delivery block — the agent lane
-    // must degrade instead (run_id embeds a loosely-bounded channel id).
-    let channel = "c".repeat(120);
+fn a_pathological_channel_still_yields_a_safe_hashed_comment_id() {
+    // the run id ALWAYS carries the reserved \x1f separator AND a channel id
+    // of any length. an inline-run-id scheme would make the minted comment id
+    // both escape-laden (\x1f -> , 6 B) and, for a long channel,
+    // over-length — pages would reject it (IdTooLarge) and abort the block.
+    // hashing the run id keeps the minted id short, hex, escape-free, so the
+    // comment LANDS regardless of the channel — the structural immunization.
+    let channel = "c".repeat(400);
     let mut registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_PAGES_COMMENT])]);
     registry.get_mut("bot").unwrap().caps.pages_write = vec!["*".into()];
     let mut m = module().with_pages_module("pages");
@@ -316,11 +321,23 @@ fn an_agent_minted_id_over_the_pages_cap_degrades_not_emits() {
         .with_page("p1", page_blocks("p1", "Spec"));
     deliver(&mut m, &mut ctx, &run_id, comment_effect("b-p"));
 
-    assert!(ctx.page_msgs().is_empty(), "the over-length id is not emitted");
+    let msgs = ctx.page_msgs();
+    assert_eq!(msgs.len(), 1, "the comment lands despite the channel: {msgs:?}");
+    let PageMsg::AddComment {
+        thread_id,
+        comment_id,
+        ..
+    } = &msgs[0]
+    else {
+        panic!("expected AddComment, got {:?}", msgs[0]);
+    };
     assert!(
-        ctx.notes().iter().any(|n| n.contains("length cap")),
-        "the over-length id leaves a breadcrumb: {:?}",
-        ctx.notes()
+        pages::id_is_index_safe(thread_id) && thread_id.len() <= pages::MAX_THREAD_ID_BYTES,
+        "minted thread id must clear pages' caps: {thread_id}"
+    );
+    assert!(
+        pages::id_is_index_safe(comment_id) && comment_id.len() <= pages::MAX_COMMENT_ID_BYTES,
+        "minted comment id must clear pages' caps: {comment_id}"
     );
     assert_eq!(ctx.chat_msgs().len(), 1, "the reply still posts (no abort)");
     assert_delivered(&mut m, &run_id);
