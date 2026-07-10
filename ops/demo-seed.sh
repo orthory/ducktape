@@ -49,9 +49,16 @@ s=[socket.socket() for _ in range(3)]
 [x.bind(('127.0.0.1',0)) for x in s]
 print(*[x.getsockname()[1] for x in s])
 [x.close() for x in s]")
+# Gateway serving needs two things the app's workspace_create also sets:
+#   --gateway         binds the isolated browser plane that serves the routes
+#   --wireguard-effect the userspace (TUN-less) overlay — the browser session
+#                      requires an active overlay, and the default "tun" effect
+#                      can't start without /dev/net/tun + privilege.
+# Without both, site/app.<id>.duck render blank. 127.0.0.1:0 = OS-assigned ports.
 CHAIN="$("$NODE_BIN" init --name "$ID" --dir "$WSDIR" \
   --listen 127.0.0.1:$P1 --advertised 127.0.0.1:$P1 \
-  --http 127.0.0.1:$P2 --rpc 127.0.0.1:$P3 2>/dev/null | tail -1)"
+  --http 127.0.0.1:$P2 --rpc 127.0.0.1:$P3 --gateway 127.0.0.1:0 \
+  --wireguard-effect socket --wireguard-listen 127.0.0.1:0 2>/dev/null | tail -1)"
 [ -n "$CHAIN" ] || die "init produced no chain-id"
 PUB="$("$NODE_BIN" keygen --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
 
@@ -159,7 +166,8 @@ $(printf '\033[32m[demo-seed] done.\033[0m')
 Open the Ducktape app and it boots into the "$ID" workspace, preloaded.
 
 Gateway web apps published on this node (open in the app's browser):
-  • site.$ID.duck — network-hosted static web app, served from DuckFS. Works now.
+  • site.$ID.duck — a bouncing-DVD web app, served static from DuckFS by
+                    consensus. Works now (the gateway browser plane is live).
   • app.$ID.duck  — user-hosted web app. The route is published, but a
                     user-hosted app is just that: run \`make demo-app\` to serve it
                     on the node's loopback, then it's live.
