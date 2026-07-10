@@ -424,7 +424,8 @@ mod platform {
 
     const BINARY: &str = "/Library/PrivilegedHelperTools/com.ducktape.duckdnsd";
     const PLIST: &str = "/Library/LaunchDaemons/com.ducktape.duckdnsd.plist";
-    const RESOLVER: &str = "/etc/resolver/ducktape.quack";
+    const RESOLVER: &str = "/etc/resolver/duck";
+    const LEGACY_RESOLVER: &str = "/etc/resolver/ducktape.quack";
 
     fn trust_marker_path() -> PathBuf {
         default_state_dir().join("macos-trust.installation-id")
@@ -467,6 +468,7 @@ mod platform {
             marker(id)
         );
         write_owned(Path::new(RESOLVER), resolver.as_bytes(), id)?;
+        remove_legacy_resolver_if_owned(id)?;
         let fingerprint = certificate_fingerprint(root_cert)?;
         let marker_path = trust_marker_path();
         ensure_owned_or_absent(&marker_path, id)?;
@@ -559,6 +561,7 @@ mod platform {
         stop_owned(id)?;
         remove_owned(Path::new(PLIST), id)?;
         remove_owned(Path::new(RESOLVER), id)?;
+        remove_legacy_resolver_if_owned(id)?;
         let trust_marker = trust_marker_path();
         let mut fingerprints = if trust_marker.exists() {
             read_macos_trust_fingerprints(&trust_marker, id)?
@@ -585,6 +588,14 @@ mod platform {
             );
         }
         remove_owned(&trust_marker, id)?;
+        Ok(())
+    }
+
+    fn remove_legacy_resolver_if_owned(id: &str) -> Result<(), String> {
+        let path = Path::new(LEGACY_RESOLVER);
+        if path.exists() && artifact_owned(path, id)? {
+            remove_file_if_present(path)?;
+        }
         Ok(())
     }
 
@@ -776,9 +787,10 @@ mod platform {
                 .to_string(),
         );
         let comment = ps_quote(&marker(id));
+        let namespace = ps_quote(&format!(".{}", duckdns_core::DUCKDNS_ZONE));
         let id = ps_quote(id);
         let script = format!(
-            "$owned={comment}; $foreign=Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {{$_.Namespace -contains '.ducktape.quack' -and $_.Comment -ne $owned}}; if($foreign){{throw 'unowned NRPT rule for ducktape.quack'}}; Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {{$_.Comment -eq $owned}} | Remove-DnsClientNrptRule -Force; Add-DnsClientNrptRule -Namespace '.ducktape.quack' -NameServers '127.77.0.1' -Comment $owned; Get-ChildItem 'Cert:\\LocalMachine\\Root' | Where-Object {{$_.Subject -like ('*OU=duckdnsd:' + {id} + '*')}} | Remove-Item -Force; $cert=Import-Certificate -FilePath {root} -CertStoreLocation 'Cert:\\LocalMachine\\Root'; $expected=(Get-FileHash -LiteralPath {root_der} -Algorithm SHA256).Hash; $sha=[Security.Cryptography.SHA256]::Create(); $actual=([BitConverter]::ToString($sha.ComputeHash($cert.RawData))).Replace('-',''); if($actual -ne $expected){{throw 'DuckDNS root certificate did not install byte-exact'}}"
+            "$owned={comment}; $zone={namespace}; $foreign=Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {{$_.Namespace -contains $zone -and $_.Comment -ne $owned}}; if($foreign){{throw 'unowned NRPT rule for DuckDNS zone'}}; Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {{$_.Comment -eq $owned}} | Remove-DnsClientNrptRule -Force; Add-DnsClientNrptRule -Namespace $zone -NameServers '127.77.0.1' -Comment $owned; Get-ChildItem 'Cert:\\LocalMachine\\Root' | Where-Object {{$_.Subject -like ('*OU=duckdnsd:' + {id} + '*')}} | Remove-Item -Force; $cert=Import-Certificate -FilePath {root} -CertStoreLocation 'Cert:\\LocalMachine\\Root'; $expected=(Get-FileHash -LiteralPath {root_der} -Algorithm SHA256).Hash; $sha=[Security.Cryptography.SHA256]::Create(); $actual=([BitConverter]::ToString($sha.ComputeHash($cert.RawData))).Replace('-',''); if($actual -ne $expected){{throw 'DuckDNS root certificate did not install byte-exact'}}"
         );
         run(
             "powershell.exe",
@@ -804,6 +816,7 @@ mod platform {
             Err(error) => problems.push(error),
         }
         let comment = ps_quote(&marker(id));
+        let namespace = ps_quote(&format!(".{}", duckdns_core::DUCKDNS_ZONE));
         let id = ps_quote(id);
         let root_der = ps_quote(
             &default_state_dir()
@@ -812,7 +825,7 @@ mod platform {
                 .to_string(),
         );
         let script = format!(
-            "$rules=@(Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {{$_.Namespace -contains '.ducktape.quack'}}); if(@($rules | Where-Object {{$_.Comment -eq {comment}}}).Count -ne 1 -or @($rules | Where-Object {{$_.Comment -ne {comment}}}).Count -ne 0){{exit 1}}; $certs=@(Get-ChildItem 'Cert:\\LocalMachine\\Root' | Where-Object {{$_.Subject -like ('*OU=duckdnsd:' + {id} + '*')}}); if($certs.Count -ne 1){{exit 2}}; $expected=(Get-FileHash -LiteralPath {root_der} -Algorithm SHA256).Hash; $sha=[Security.Cryptography.SHA256]::Create(); $actual=([BitConverter]::ToString($sha.ComputeHash($certs[0].RawData))).Replace('-',''); if($actual -ne $expected){{exit 3}}"
+            "$zone={namespace}; $rules=@(Get-DnsClientNrptRule -ErrorAction SilentlyContinue | Where-Object {{$_.Namespace -contains $zone}}); if(@($rules | Where-Object {{$_.Comment -eq {comment}}}).Count -ne 1 -or @($rules | Where-Object {{$_.Comment -ne {comment}}}).Count -ne 0){{exit 1}}; $certs=@(Get-ChildItem 'Cert:\\LocalMachine\\Root' | Where-Object {{$_.Subject -like ('*OU=duckdnsd:' + {id} + '*')}}); if($certs.Count -ne 1){{exit 2}}; $expected=(Get-FileHash -LiteralPath {root_der} -Algorithm SHA256).Hash; $sha=[Security.Cryptography.SHA256]::Create(); $actual=([BitConverter]::ToString($sha.ComputeHash($certs[0].RawData))).Replace('-',''); if($actual -ne $expected){{exit 3}}"
         );
         if !matches!(
             Command::new("powershell.exe")

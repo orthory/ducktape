@@ -145,10 +145,10 @@ describe("SettingsView", () => {
     });
 
     renderSettings();
-    expect(await screen.findByText(/\.quack access — Not installed/i)).toBeInTheDocument();
+    expect(await screen.findByText(/\.duck access — Not installed/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /install duckdns/i }));
     await waitFor(() =>
-      expect(screen.getByText(/\.quack access — Installed/i)).toBeInTheDocument(),
+      expect(screen.getByText(/\.duck access — Installed/i)).toBeInTheDocument(),
     );
     expect(invokeMock).toHaveBeenCalledWith("duckdns_install");
   });

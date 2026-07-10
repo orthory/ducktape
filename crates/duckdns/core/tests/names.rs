@@ -1,32 +1,33 @@
 use duckdns_core::{
-    DuckDnsName, derive_chain_label, node_label, parse_hostname, validate_handle, validate_label,
+    DuckDnsName, RESERVED_ROOT_LABELS, derive_chain_label, node_label, parse_hostname,
+    validate_handle, validate_label,
 };
 
 #[test]
 fn parses_every_hostname_form_and_renders_canonically() {
     let cases = [
         (
-            "orthory.ducktape.quack",
+            "orthory.duck",
             DuckDnsName::User {
                 handle: "orthory".into(),
             },
         ),
         (
-            "blog.orthory.ducktape.quack",
+            "blog.orthory.duck",
             DuckDnsName::UserService {
                 service: "blog".into(),
                 handle: "orthory".into(),
             },
         ),
         (
-            "docs.team-a1b2c3d4.net.ducktape.quack",
+            "docs.team-a1b2c3d4.net.duck",
             DuckDnsName::NetworkService {
                 service: "docs".into(),
                 chain: "team-a1b2c3d4".into(),
             },
         ),
         (
-            "docs.n-ab12cd34ef56.team-a1b2c3d4.net.ducktape.quack",
+            "docs.n-ab12cd34ef56.team-a1b2c3d4.net.duck",
             DuckDnsName::NodeService {
                 service: "docs".into(),
                 node: "n-ab12cd34ef56".into(),
@@ -43,7 +44,7 @@ fn parses_every_hostname_form_and_renders_canonically() {
 
 #[test]
 fn lookup_normalizes_dns_case_and_one_trailing_dot() {
-    let parsed = parse_hostname("BLOG.Orthory.DuckTape.Quack.").unwrap();
+    let parsed = parse_hostname("BLOG.Orthory.Duck.").unwrap();
     assert_eq!(
         parsed,
         DuckDnsName::UserService {
@@ -51,7 +52,7 @@ fn lookup_normalizes_dns_case_and_one_trailing_dot() {
             handle: "orthory".into(),
         }
     );
-    assert_eq!(parsed.hostname(), "blog.orthory.ducktape.quack");
+    assert_eq!(parsed.hostname(), "blog.orthory.duck");
 }
 
 #[test]
@@ -83,6 +84,7 @@ fn one_strict_label_rule_and_reserved_handle_are_enforced() {
         assert!(validate_label(invalid).is_err(), "accepted {invalid:?}");
     }
     assert!(validate_label(&"z".repeat(64)).is_err());
+    assert!(RESERVED_ROOT_LABELS.contains(&"net"));
     assert!(validate_handle("net").unwrap_err().contains("reserved"));
 }
 
@@ -90,13 +92,13 @@ fn one_strict_label_rule_and_reserved_handle_are_enforced() {
 fn malformed_or_ambiguous_hostnames_reject() {
     for hostname in [
         "orthory.example",
-        "net.ducktape.quack",
-        "docs..orthory.ducktape.quack",
-        "docs.orthory.ducktape.quack..",
-        "docs.n-xyz.team-a1b2c3d4.net.ducktape.quack",
-        "too.many.labels.for.user.ducktape.quack",
-        " docs.orthory.ducktape.quack",
-        "döcs.orthory.ducktape.quack",
+        "net.duck",
+        "docs..orthory.duck",
+        "docs.orthory.duck..",
+        "docs.n-xyz.team-a1b2c3d4.net.duck",
+        "too.many.labels.for.user.duck",
+        " docs.orthory.duck",
+        "döcs.orthory.duck",
     ] {
         assert!(parse_hostname(hostname).is_err(), "accepted {hostname:?}");
     }

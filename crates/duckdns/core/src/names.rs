@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 
 use crate::{
     DUCKDNS_ZONE, DuckDnsName, MAX_LABEL_LEN, NODE_KEY_LEN, NODE_LABEL_HEX_LEN,
-    ServiceAnnouncement, ServiceScope,
+    RESERVED_ROOT_LABELS, ServiceAnnouncement, ServiceScope,
 };
 
 /// The one validator for user, service, and derived chain labels: lowercase
@@ -40,8 +40,10 @@ pub fn validate_label(label: &str) -> Result<(), String> {
 
 pub fn validate_handle(handle: &str) -> Result<(), String> {
     validate_label(handle)?;
-    if handle == "net" {
-        return Err("duckdns: user handle \"net\" is reserved for network services".into());
+    if RESERVED_ROOT_LABELS.contains(&handle) {
+        return Err(format!(
+            "duckdns: account handle {handle:?} is reserved for a root namespace"
+        ));
     }
     Ok(())
 }

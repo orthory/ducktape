@@ -18,8 +18,8 @@ use tokio::io::{
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
 
-const FIRST: &str = "docs.team-a1b2c3d4.net.ducktape.quack";
-const SECOND: &str = "status.team-a1b2c3d4.net.ducktape.quack";
+const FIRST: &str = "docs.team-a1b2c3d4.net.duck";
+const SECOND: &str = "status.team-a1b2c3d4.net.duck";
 
 fn dns_request(name: &str, kind: RecordType) -> Vec<u8> {
     let mut message = Message::new(17, MessageType::Query, OpCode::Query);

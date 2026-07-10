@@ -217,13 +217,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let resolver = LeafResolver::new(CaStore::load_or_create(directory.path()).unwrap());
         let first = resolver
-            .certificate_for("docs.team-a1b2c3d4.net.ducktape.quack")
+            .certificate_for("docs.team-a1b2c3d4.net.duck")
             .unwrap();
         let same = resolver
-            .certificate_for("DOCS.TEAM-A1B2C3D4.NET.DUCKTAPE.QUACK.")
+            .certificate_for("DOCS.TEAM-A1B2C3D4.NET.DUCK.")
             .unwrap();
         let other = resolver
-            .certificate_for("status.team-a1b2c3d4.net.ducktape.quack")
+            .certificate_for("status.team-a1b2c3d4.net.duck")
             .unwrap();
         assert!(Arc::ptr_eq(&first, &same));
         assert!(!Arc::ptr_eq(&first, &other));

@@ -364,9 +364,9 @@ fn namespace_snapshot_rechecks_live_standing_and_user_binding() {
     block_on(module.commit_block()).unwrap();
 
     let names = namespace(&module, &ctx);
-    assert!(names.contains(&"orthory.ducktape.quack".into()));
-    assert!(names.contains(&"docs.team-a1b2c3d4.net.ducktape.quack".into()));
-    assert!(names.contains(&"status.team-a1b2c3d4.net.ducktape.quack".into()));
+    assert!(names.contains(&"orthory.duck".into()));
+    assert!(names.contains(&"docs.team-a1b2c3d4.net.duck".into()));
+    assert!(names.contains(&"status.team-a1b2c3d4.net.duck".into()));
 
     ctx.validators.retain(|node| node != &stale);
     let names = namespace(&module, &ctx);
@@ -374,7 +374,7 @@ fn namespace_snapshot_rechecks_live_standing_and_user_binding() {
     ctx.accounts.remove(&provider);
     let names = namespace(&module, &ctx);
     assert!(!names.iter().any(|name| name.contains("orthory")));
-    assert!(names.contains(&"docs.team-a1b2c3d4.net.ducktape.quack".into()));
+    assert!(names.contains(&"docs.team-a1b2c3d4.net.duck".into()));
 }
 
 #[test]

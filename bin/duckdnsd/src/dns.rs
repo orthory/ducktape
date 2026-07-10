@@ -179,7 +179,7 @@ mod tests {
             .replace(
                 "workspace-a".into(),
                 "127.0.0.1:18080".parse().unwrap(),
-                vec!["docs.team-a1b2c3d4.net.ducktape.quack".into()],
+                vec!["docs.team-a1b2c3d4.net.duck".into()],
                 30,
             )
             .unwrap();
@@ -197,60 +197,30 @@ mod tests {
             .unwrap(),
         ));
 
-        let answer = query(
-            address,
-            "docs.team-a1b2c3d4.net.ducktape.quack.",
-            RecordType::A,
-        )
-        .await;
+        let answer = query(address, "docs.team-a1b2c3d4.net.duck.", RecordType::A).await;
         assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
         assert!(answer.metadata.authoritative);
         assert_eq!(answer.answers.len(), 1);
         assert_eq!(answer.answers[0].ttl, DNS_TTL);
 
-        let ipv6 = query(
-            address,
-            "docs.team-a1b2c3d4.net.ducktape.quack.",
-            RecordType::AAAA,
-        )
-        .await;
+        let ipv6 = query(address, "docs.team-a1b2c3d4.net.duck.", RecordType::AAAA).await;
         assert_eq!(ipv6.metadata.response_code, ResponseCode::NoError);
         assert_eq!(ipv6.answers.len(), 1);
         assert!(matches!(ipv6.answers[0].data, RData::AAAA(_)));
 
-        let any = query(
-            address,
-            "docs.team-a1b2c3d4.net.ducktape.quack.",
-            RecordType::ANY,
-        )
-        .await;
+        let any = query(address, "docs.team-a1b2c3d4.net.duck.", RecordType::ANY).await;
         assert_eq!(any.answers.len(), 2);
         assert!(any.answers.iter().all(|record| record.ttl == DNS_TTL));
 
-        let tcp_answer = query_tcp(
-            address,
-            "docs.team-a1b2c3d4.net.ducktape.quack.",
-            RecordType::A,
-        )
-        .await;
+        let tcp_answer = query_tcp(address, "docs.team-a1b2c3d4.net.duck.", RecordType::A).await;
         assert_eq!(tcp_answer.metadata.response_code, ResponseCode::NoError);
         assert_eq!(tcp_answer.answers.len(), 1);
 
-        let unknown = query(
-            address,
-            "unknown.team-a1b2c3d4.net.ducktape.quack.",
-            RecordType::A,
-        )
-        .await;
+        let unknown = query(address, "unknown.team-a1b2c3d4.net.duck.", RecordType::A).await;
         assert_eq!(unknown.metadata.response_code, ResponseCode::NXDomain);
 
         state.clear("workspace-a").unwrap();
-        let inactive = query(
-            address,
-            "docs.team-a1b2c3d4.net.ducktape.quack.",
-            RecordType::A,
-        )
-        .await;
+        let inactive = query(address, "docs.team-a1b2c3d4.net.duck.", RecordType::A).await;
         assert_eq!(inactive.metadata.response_code, ResponseCode::NXDomain);
         task.abort();
     }

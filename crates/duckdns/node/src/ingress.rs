@@ -363,8 +363,8 @@ mod tests {
                 .collect(),
             allow_cross_site: false,
         };
-        let first = ordered_providers(&resolved, "docs.team-deadbeef.net.ducktape.quack");
-        let second = ordered_providers(&resolved, "docs.team-deadbeef.net.ducktape.quack");
+        let first = ordered_providers(&resolved, "docs.team-deadbeef.net.duck");
+        let second = ordered_providers(&resolved, "docs.team-deadbeef.net.duck");
         assert_eq!(first, second);
         assert_ne!(
             first, resolved.providers,

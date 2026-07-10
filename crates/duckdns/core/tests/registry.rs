@@ -208,11 +208,11 @@ fn namespace_enumerates_every_canonical_published_name_once() {
     assert_eq!(
         hostnames,
         vec![
-            "orthory.ducktape.quack",
-            "home.orthory.ducktape.quack",
-            "docs.team-a1b2c3d4.net.ducktape.quack",
-            "docs.n-010101010101.team-a1b2c3d4.net.ducktape.quack",
-            "docs.n-020202020202.team-a1b2c3d4.net.ducktape.quack",
+            "orthory.duck",
+            "home.orthory.duck",
+            "docs.team-a1b2c3d4.net.duck",
+            "docs.n-010101010101.team-a1b2c3d4.net.duck",
+            "docs.n-020202020202.team-a1b2c3d4.net.duck",
         ]
     );
 }

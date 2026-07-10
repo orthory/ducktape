@@ -10,6 +10,7 @@ use super::*;
 const BINARY: &str = "/usr/local/libexec/ducktape/duckdnsd";
 const SERVICE: &str = "/etc/systemd/system/ducktape-duckdnsd.service";
 const FIREFOX_POLICY: &str = "/etc/firefox/policies/policies.json";
+const LEGACY_DUCKDNS_ZONE: &str = "ducktape.quack";
 
 pub(super) fn binary_path() -> PathBuf {
     BINARY.into()
@@ -90,10 +91,7 @@ pub(super) fn apply(id: &str, root_cert: &Path) -> Result<(), String> {
         default_state_dir().display(),
     );
     write_owned(Path::new(SERVICE), service.as_bytes(), id)?;
-    let resolver = format!(
-        "# {}\n[Resolve]\nDNS=127.77.0.1\nDomains=~ducktape.quack\n",
-        marker(id)
-    );
+    let resolver = resolver_config(id);
     write_owned(&resolver_path(id), resolver.as_bytes(), id)?;
 
     let anchor = trust_anchor(id)?;
@@ -125,9 +123,21 @@ fn resolver_path(id: &str) -> PathBuf {
     resolver(id)
 }
 
+fn resolver_config(id: &str) -> String {
+    format!(
+        "# {}\n[Resolve]\nDNS=127.77.0.1\nDomains=~{}\n",
+        marker(id),
+        duckdns_core::DUCKDNS_ZONE,
+    )
+}
+
 pub(super) fn inspect(id: &str, problems: &mut Vec<String>) {
     inspect_owned(Path::new(SERVICE), id, problems);
-    inspect_owned(&resolver_path(id), id, problems);
+    let resolver = resolver_path(id);
+    inspect_owned(&resolver, id, problems);
+    if std::fs::read_to_string(&resolver).is_ok_and(|installed| installed != resolver_config(id)) {
+        problems.push("systemd-resolved has a stale DuckDNS split-DNS zone".into());
+    }
     let anchor = match trust_anchor(id) {
         Ok(path) => {
             inspect_owned(&path, id, problems);
@@ -281,6 +291,7 @@ struct FirefoxPolicyOwnership {
     created_dns_over_https: bool,
     created_excluded_domains: bool,
     added_dns_exclusion: bool,
+    legacy_dns_exclusion: bool,
 }
 
 impl FirefoxPolicyOwnership {
@@ -299,23 +310,32 @@ impl FirefoxPolicyOwnership {
             created_dns_over_https: dns.is_none(),
             created_excluded_domains: dns.and_then(|value| value.get("ExcludedDomains")).is_none(),
             added_dns_exclusion: false,
+            legacy_dns_exclusion: false,
         }
     }
 
     fn from_marker(contents: &str) -> Self {
+        let added_dns_exclusion = marker_flag(contents, "AddedDnsExclusion");
+        let recorded_zone = marker_value(contents, "DnsZone");
         Self {
             created_policy: marker_flag(contents, "CreatedPolicy"),
             created_certificates: marker_flag(contents, "CreatedCertificates"),
             created_certificate_install: marker_flag(contents, "CreatedCertificateInstall"),
             created_dns_over_https: marker_flag(contents, "CreatedDnsOverHttps"),
             created_excluded_domains: marker_flag(contents, "CreatedExcludedDomains"),
-            added_dns_exclusion: marker_flag(contents, "AddedDnsExclusion"),
+            added_dns_exclusion: added_dns_exclusion
+                && recorded_zone == Some(duckdns_core::DUCKDNS_ZONE),
+            // Installers predating the `.duck` migration did not record a
+            // zone, so their AddedDnsExclusion marker owns `.quack`.
+            legacy_dns_exclusion: marker_flag(contents, "LegacyDnsExclusion")
+                || (added_dns_exclusion
+                    && recorded_zone.is_none_or(|zone| zone == LEGACY_DUCKDNS_ZONE)),
         }
     }
 
     fn encode(self, id: &str) -> String {
         format!(
-            "{}\nCreatedPolicy={}\nCreatedCertificates={}\nCreatedCertificateInstall={}\nCreatedDnsOverHttps={}\nCreatedExcludedDomains={}\nAddedDnsExclusion={}\n",
+            "{}\nCreatedPolicy={}\nCreatedCertificates={}\nCreatedCertificateInstall={}\nCreatedDnsOverHttps={}\nCreatedExcludedDomains={}\nAddedDnsExclusion={}\nLegacyDnsExclusion={}\nDnsZone={}\n",
             marker(id),
             self.created_policy,
             self.created_certificates,
@@ -323,12 +343,19 @@ impl FirefoxPolicyOwnership {
             self.created_dns_over_https,
             self.created_excluded_domains,
             self.added_dns_exclusion,
+            self.legacy_dns_exclusion,
+            duckdns_core::DUCKDNS_ZONE,
         )
     }
 }
 
 fn marker_flag(contents: &str, name: &str) -> bool {
     contents.lines().any(|line| line == format!("{name}=true"))
+}
+
+fn marker_value<'a>(contents: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}=");
+    contents.lines().find_map(|line| line.strip_prefix(&prefix))
 }
 
 fn install_firefox_policy(id: &str, certificate: &Path) -> Result<(), String> {
@@ -351,19 +378,35 @@ fn install_firefox_policy(id: &str, certificate: &Path) -> Result<(), String> {
     if legacy_certificate != certificate {
         remove_firefox_certificate(&mut policy, &legacy_certificate)?;
     }
-    let added_exclusion = add_firefox_dns_exclusion(&mut policy)?;
+    let added_exclusion =
+        migrate_firefox_dns_exclusion(&mut policy, ownership.legacy_dns_exclusion)?;
     ownership.added_dns_exclusion |= added_exclusion;
     // Record exactly what this installation added before replacing the shared
     // policy. If the policy write fails, first-install rollback can still
     // remove only our intended fields; if it succeeds, uninstall has the same
     // ownership record even across a crash between these two writes.
     write_owned(&marker_path, ownership.encode(id).as_bytes(), id)?;
-    write_shared_json(policy_path, &policy)
+    write_shared_json(policy_path, &policy)?;
+    if ownership.legacy_dns_exclusion {
+        // Clearing legacy ownership is the commit marker for the migration.
+        // Until this second write lands, either the old or new policy can be
+        // recovered without mistaking a foreign exclusion for ours.
+        ownership.legacy_dns_exclusion = false;
+        write_owned(&marker_path, ownership.encode(id).as_bytes(), id)?;
+    }
+    Ok(())
 }
 
 fn inspect_firefox_policy(id: &str, problems: &mut Vec<String>) {
     let marker_path = firefox_policy_marker(id);
     inspect_owned(&marker_path, id, problems);
+    if std::fs::read_to_string(&marker_path)
+        .ok()
+        .map(|contents| FirefoxPolicyOwnership::from_marker(&contents))
+        .is_some_and(|ownership| ownership.legacy_dns_exclusion)
+    {
+        problems.push("Firefox policy still owns the legacy .quack DNS exclusion".into());
+    }
     let certificate = firefox_certificate(id);
     match read_firefox_policy(Path::new(FIREFOX_POLICY)) {
         Ok(policy)
@@ -391,8 +434,11 @@ fn remove_firefox_policy(id: &str) -> Result<(), String> {
         let removed_certificate = remove_firefox_certificate(&mut policy, &certificate)?;
         let removed_legacy_certificate =
             remove_firefox_certificate(&mut policy, &trust_anchor(id)?)?;
-        let removed_exclusion =
+        let removed_current_exclusion =
             ownership.added_dns_exclusion && remove_firefox_dns_exclusion(&mut policy)?;
+        let removed_legacy_exclusion = ownership.legacy_dns_exclusion
+            && remove_firefox_dns_exclusion_for(&mut policy, LEGACY_DUCKDNS_ZONE)?;
+        let removed_exclusion = removed_current_exclusion || removed_legacy_exclusion;
         let removed_created_fields = remove_created_firefox_fields(&mut policy, ownership)?;
         if removed_certificate
             || removed_legacy_certificate
@@ -484,7 +530,25 @@ fn add_firefox_dns_exclusion(policy: &mut serde_json::Value) -> Result<bool, Str
     }
 }
 
+fn migrate_firefox_dns_exclusion(
+    policy: &mut serde_json::Value,
+    owned_legacy_exclusion: bool,
+) -> Result<bool, String> {
+    let added_current = add_firefox_dns_exclusion(policy)?;
+    if owned_legacy_exclusion {
+        remove_firefox_dns_exclusion_for(policy, LEGACY_DUCKDNS_ZONE)?;
+    }
+    Ok(added_current)
+}
+
 fn remove_firefox_dns_exclusion(policy: &mut serde_json::Value) -> Result<bool, String> {
+    remove_firefox_dns_exclusion_for(policy, duckdns_core::DUCKDNS_ZONE)
+}
+
+fn remove_firefox_dns_exclusion_for(
+    policy: &mut serde_json::Value,
+    zone: &str,
+) -> Result<bool, String> {
     let policies = policy
         .get_mut("policies")
         .and_then(serde_json::Value::as_object_mut)
@@ -498,7 +562,7 @@ fn remove_firefox_dns_exclusion(policy: &mut serde_json::Value) -> Result<bool, 
         return Ok(false);
     };
     let before = excluded.len();
-    excluded.retain(|entry| entry.as_str() != Some(duckdns_core::DUCKDNS_ZONE));
+    excluded.retain(|entry| entry.as_str() != Some(zone));
     Ok(excluded.len() != before)
 }
 
@@ -674,6 +738,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resolved_config_routes_only_the_duck_root() {
+        let id = "ab".repeat(16);
+        let config = resolver_config(&id);
+        assert!(config.contains("Domains=~duck\n"));
+        assert!(!config.contains(LEGACY_DUCKDNS_ZONE));
+    }
+
+    #[test]
     fn firefox_policy_merge_preserves_foreign_settings() {
         let certificate = Path::new("/tmp/ducktape-root.pem");
         let mut policy = serde_json::json!({
@@ -696,7 +768,7 @@ mod tests {
         );
         assert_eq!(
             policy["policies"]["DNSOverHTTPS"]["ExcludedDomains"],
-            serde_json::json!(["corp.example", "ducktape.quack"])
+            serde_json::json!(["corp.example", "duck"])
         );
         assert_eq!(policy["policies"]["DisableTelemetry"], true);
 
@@ -728,6 +800,60 @@ mod tests {
         remove_firefox_dns_exclusion(&mut policy).unwrap();
         remove_created_firefox_fields(&mut policy, ownership).unwrap();
         assert!(firefox_policy_is_empty(&policy));
+    }
+
+    #[test]
+    fn owned_legacy_firefox_exclusion_migrates_to_duck() {
+        let mut policy = serde_json::json!({
+            "policies": {
+                "DNSOverHTTPS": { "ExcludedDomains": [LEGACY_DUCKDNS_ZONE] }
+            }
+        });
+
+        assert!(migrate_firefox_dns_exclusion(&mut policy, true).unwrap());
+        assert_eq!(
+            policy["policies"]["DNSOverHTTPS"]["ExcludedDomains"],
+            serde_json::json!(["duck"])
+        );
+    }
+
+    #[test]
+    fn foreign_legacy_firefox_exclusion_is_preserved() {
+        let mut policy = serde_json::json!({
+            "policies": {
+                "DNSOverHTTPS": { "ExcludedDomains": [LEGACY_DUCKDNS_ZONE] }
+            }
+        });
+
+        assert!(migrate_firefox_dns_exclusion(&mut policy, false).unwrap());
+        assert_eq!(
+            policy["policies"]["DNSOverHTTPS"]["ExcludedDomains"],
+            serde_json::json!(["ducktape.quack", "duck"])
+        );
+    }
+
+    #[test]
+    fn firefox_ownership_marker_distinguishes_legacy_and_current_zones() {
+        let legacy = FirefoxPolicyOwnership::from_marker("AddedDnsExclusion=true\n");
+        assert!(legacy.legacy_dns_exclusion);
+        assert!(!legacy.added_dns_exclusion);
+
+        let current = FirefoxPolicyOwnership {
+            added_dns_exclusion: true,
+            ..FirefoxPolicyOwnership::default()
+        };
+        let decoded = FirefoxPolicyOwnership::from_marker(&current.encode(&"ab".repeat(16)));
+        assert!(decoded.added_dns_exclusion);
+        assert!(!decoded.legacy_dns_exclusion);
+
+        let in_flight = FirefoxPolicyOwnership {
+            added_dns_exclusion: true,
+            legacy_dns_exclusion: true,
+            ..FirefoxPolicyOwnership::default()
+        };
+        let decoded = FirefoxPolicyOwnership::from_marker(&in_flight.encode(&"cd".repeat(16)));
+        assert!(decoded.added_dns_exclusion);
+        assert!(decoded.legacy_dns_exclusion);
     }
 
     #[test]

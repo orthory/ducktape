@@ -61,7 +61,7 @@ export function DuckDnsSection() {
     if (
       operation === "remove" &&
       !window.confirm(
-        "Remove DuckDNS split DNS and its device root certificate? Published .quack names will stop opening on this device.",
+        "Remove DuckDNS split DNS and its device root certificate? Published .duck names will stop opening on this device.",
       )
     ) {
       return;
@@ -88,7 +88,7 @@ export function DuckDnsSection() {
       <SectionLabel>DUCKDNS</SectionLabel>
       <GroupCard>
         <ControlRow
-          title={`.quack access — ${state}`}
+          title={`.duck access — ${state}`}
           desc={description}
           control={
             desktop ? (
@@ -130,7 +130,7 @@ export function DuckDnsSection() {
           }}
         >
           {detail ?? status?.error ??
-            ".quack is a private suffix, not an ICANN-reserved TLD; a future public delegation could collide with these local names."}
+            ".duck is a private suffix, not an ICANN-reserved TLD; a future public delegation could collide with these local names."}
         </div>
       </GroupCard>
     </>
