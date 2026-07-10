@@ -69,6 +69,8 @@ mod lobby;
 mod main_tests;
 mod oracle_pool;
 mod reachability_plane;
+#[cfg(test)]
+mod reachability_plane_tests;
 mod relay;
 mod relay_runtime;
 mod replica;
