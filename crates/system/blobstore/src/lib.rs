@@ -204,7 +204,10 @@ mod tests {
         let digest = store.put_chunk(b"payload".to_vec());
         std::fs::write(root.path().join(hex(&digest)), b"garbage").unwrap();
         // the live process still holds the true bytes in memory.
-        assert_eq!(store.get_chunk(&digest).as_deref(), Some(b"payload".as_ref()));
+        assert_eq!(
+            store.get_chunk(&digest).as_deref(),
+            Some(b"payload".as_ref())
+        );
     }
 
     #[test]
@@ -215,10 +218,16 @@ mod tests {
             .put_chunk(b"warm me".to_vec());
 
         let fresh = BlobHandle::persistent(root.path()).unwrap();
-        assert_eq!(fresh.get_chunk(&digest).as_deref(), Some(b"warm me".as_ref()));
+        assert_eq!(
+            fresh.get_chunk(&digest).as_deref(),
+            Some(b"warm me".as_ref())
+        );
         // deleting the file after the first get: the cached copy still serves.
         std::fs::remove_file(root.path().join(hex(&digest))).unwrap();
-        assert_eq!(fresh.get_chunk(&digest).as_deref(), Some(b"warm me".as_ref()));
+        assert_eq!(
+            fresh.get_chunk(&digest).as_deref(),
+            Some(b"warm me".as_ref())
+        );
     }
 
     #[test]

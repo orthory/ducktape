@@ -350,9 +350,9 @@ where
     /// block observe this block's staged writes.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match crate::decode_query(req).map_err(Error::Module)? {
-            crate::KvQuery::Get { key } => Ok(crate::encode_reply(
-                &crate::KvReply::Value(self.get(&key).await),
-            )),
+            crate::KvQuery::Get { key } => Ok(crate::encode_reply(&crate::KvReply::Value(
+                self.get(&key).await,
+            ))),
         }
     }
 
@@ -485,7 +485,8 @@ mod tests {
     impl TestCtx {
         fn new() -> Self {
             Self {
-                env: sdk::Env { protocol_version: 0,
+                env: sdk::Env {
+                    protocol_version: 0,
                     height: 0,
                     consensus_time: 0,
                     origin: sdk::Origin::System,

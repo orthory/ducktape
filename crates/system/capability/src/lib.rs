@@ -332,8 +332,7 @@ impl Module for CapabilityRegistry {
             // peers — including a joined node that has not been promoted yet.
             if !self.members(ctx, &valset_id).await?.contains(&node) {
                 return Err(Error::Module(
-                    "capability announcer holds no current standing (validator or resident)"
-                        .into(),
+                    "capability announcer holds no current standing (validator or resident)".into(),
                 ));
             }
         }
@@ -516,7 +515,11 @@ mod tests {
         futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex", "claude"]))).unwrap();
         // staged, not committed: root still ZERO, but read-your-writes sees it.
         assert_eq!(c.root(), StateRoot::ZERO, "root reflects committed only");
-        assert_eq!(node_tags(&c, &me), vec!["claude", "codex"], "ryw sees stage");
+        assert_eq!(
+            node_tags(&c, &me),
+            vec!["claude", "codex"],
+            "ryw sees stage"
+        );
 
         futures::executor::block_on(c.commit_block()).unwrap();
         assert_ne!(c.root(), StateRoot::ZERO, "a committed announce moves root");
@@ -616,11 +619,7 @@ mod tests {
 
         // a key with NEITHER standing is still rejected, even alongside a
         // populated resident set.
-        let mut ctx = TestCtx::gated(
-            &outsider,
-            vec![validator.clone()],
-            vec![resident.clone()],
-        );
+        let mut ctx = TestCtx::gated(&outsider, vec![validator.clone()], vec![resident.clone()]);
         let err =
             futures::executor::block_on(c.execute(&mut ctx, &announce(&["claude"]))).unwrap_err();
         assert!(
@@ -656,7 +655,11 @@ mod tests {
             assert!(matches!(err, Error::Module(_)), "got {err:?} for {bad:?}");
         }
         futures::executor::block_on(c.commit_block()).unwrap();
-        assert_eq!(c.root(), StateRoot::ZERO, "rejected announces staged nothing");
+        assert_eq!(
+            c.root(),
+            StateRoot::ZERO,
+            "rejected announces staged nothing"
+        );
     }
 
     #[test]
@@ -700,7 +703,10 @@ mod tests {
         // ... a later dispatch in the same block errors, so the host aborts:
         futures::executor::block_on(c.abort_block()).unwrap();
 
-        assert!(node_tags(&c, &me).is_empty(), "aborted announce left nothing");
+        assert!(
+            node_tags(&c, &me).is_empty(),
+            "aborted announce left nothing"
+        );
         assert_eq!(c.root(), before, "root unchanged after a rolled-back block");
     }
 
@@ -738,17 +744,18 @@ mod tests {
         dst.install(&bytes, src_root).unwrap();
         assert_eq!(dst.root(), src_root, "installed root equals source root");
         assert_eq!(providers(&dst, "codex"), providers(&src, "codex"));
-        assert!(node_tags(&dst, &[13u8; 32]).is_empty(), "stale stage dropped");
+        assert!(
+            node_tags(&dst, &[13u8; 32]).is_empty(),
+            "stale stage dropped"
+        );
     }
 
     #[test]
     fn tampered_snapshot_is_rejected_and_the_target_is_untouched() {
         let mut src = ungated();
         let a = vec![14u8; 32];
-        futures::executor::block_on(
-            src.execute(&mut TestCtx::external(&a), &announce(&["codex"])),
-        )
-        .unwrap();
+        futures::executor::block_on(src.execute(&mut TestCtx::external(&a), &announce(&["codex"])))
+            .unwrap();
         futures::executor::block_on(src.commit_block()).unwrap();
         let src_root = src.root();
 

@@ -515,7 +515,10 @@ mod tests {
         // provisioner is wired) — surfacing it is not activating it.
         let plan = workspace.expect("a v3 envelope surfaces its portable plan");
         assert_eq!(plan.source_prefix, "/shared/agent-workspaces/bot");
-        assert_eq!(plan.source_snapshot.as_deref(), Some("aa".repeat(32).as_str()));
+        assert_eq!(
+            plan.source_snapshot.as_deref(),
+            Some("aa".repeat(32).as_str())
+        );
         assert_eq!(plan.base_tools.len(), 3);
         // the C4 skills are surfaced as ro mounts (name -> mount_subpath).
         assert_eq!(plan.skills.len(), 1);
@@ -535,9 +538,7 @@ mod tests {
         let mut old_shape: serde_json::Value =
             serde_json::from_str(&v3_envelope_json(None)).unwrap();
         old_shape["workspace"]["mount_path"] = serde_json::json!("/tmp/ducktape-workspace");
-        let Prepared {
-            ctx, workspace, ..
-        } = prepare(&old_shape.to_string(), None).await.unwrap();
+        let Prepared { ctx, workspace, .. } = prepare(&old_shape.to_string(), None).await.unwrap();
         assert!(ctx.portable, "an old-shape v3 is still accepted + portable");
         let plan = workspace.expect("an old-shape v3 still surfaces its plan");
         assert_eq!(plan.source_prefix, "/shared/agent-workspaces/bot");
@@ -557,7 +558,10 @@ mod tests {
         let mut empty_prefix = base.clone();
         empty_prefix["workspace"]["source_prefix"] = serde_json::json!("");
         let err = prepare(&empty_prefix.to_string(), None).await.unwrap_err();
-        assert!(err.contains("source_prefix must not be empty"), "got {err:?}");
+        assert!(
+            err.contains("source_prefix must not be empty"),
+            "got {err:?}"
+        );
 
         let mut empty_tools = base.clone();
         empty_tools["base_tools"] = serde_json::json!([]);
@@ -581,9 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn v2_envelopes_remain_non_portable_for_legacy_in_flight_runs() {
-        let Prepared {
-            ctx, workspace, ..
-        } = prepare(&envelope_json(None), None).await.unwrap();
+        let Prepared { ctx, workspace, .. } = prepare(&envelope_json(None), None).await.unwrap();
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
         assert!(!ctx.portable);
         assert!(ctx.workdir_override.is_none());

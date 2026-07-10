@@ -431,8 +431,7 @@ impl Module for TaggingModule {
                     .subscriptions
                     .iter()
                     .map(|(key, subscribers)| {
-                        let (source, container) =
-                            key.split_once(SEP).unwrap_or((key.as_str(), ""));
+                        let (source, container) = key.split_once(SEP).unwrap_or((key.as_str(), ""));
                         SubscriptionView {
                             source: source.to_string(),
                             container: container.to_string(),
@@ -474,9 +473,9 @@ impl Module for TaggingModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Author, EntityRef, decode_event, encode_msg};
     use futures::executor::block_on;
     use sdk::Env;
-    use crate::{Author, EntityRef, decode_event, encode_msg};
 
     struct CaptureCtx {
         env: Env,
@@ -508,9 +507,7 @@ mod tests {
             &self.env
         }
         fn module_root(&self, target: &str) -> Option<StateRoot> {
-            self.registered
-                .contains(&target)
-                .then_some(StateRoot::ZERO)
+            self.registered.contains(&target).then_some(StateRoot::ZERO)
         }
         async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
             Err(Error::QueryUnsupported)
@@ -525,7 +522,11 @@ mod tests {
     fn module() -> TaggingModule {
         TaggingModule::new("tagging")
     }
-    fn exec(m: &mut TaggingModule, ctx: &mut CaptureCtx, payload: &TaggingMsg) -> Result<(), Error> {
+    fn exec(
+        m: &mut TaggingModule,
+        ctx: &mut CaptureCtx,
+        payload: &TaggingMsg,
+    ) -> Result<(), Error> {
         let msg = Msg {
             target: "tagging".into(),
             payload: encode_msg(payload),

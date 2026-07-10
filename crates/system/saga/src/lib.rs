@@ -1070,10 +1070,8 @@ impl Module for SagaModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{decode_callback, decode_reply, decode_worker_request, encode_msg, encode_query};
     use futures::executor::block_on;
-    use crate::{
-        decode_callback, decode_reply, decode_worker_request, encode_msg, encode_query,
-    };
     use sdk::{Env, Event};
 
     /// a minimal `Ctx` that captures emitted msgs/effects and serves a canned
@@ -1154,15 +1152,13 @@ mod tests {
         async fn query(&self, target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
             match target {
                 "valset" => match &self.validators {
-                    Some(v) => Ok(valset::encode_reply(&ValsetReply::Validators(
-                        v.clone(),
-                    ))),
+                    Some(v) => Ok(valset::encode_reply(&ValsetReply::Validators(v.clone()))),
                     None => Err(Error::QueryUnsupported),
                 },
                 "capability" => match &self.providers {
-                    Some(p) => Ok(capability::encode_reply(
-                        &CapabilityReply::Providers(p.clone()),
-                    )),
+                    Some(p) => Ok(capability::encode_reply(&CapabilityReply::Providers(
+                        p.clone(),
+                    ))),
                     None => Err(Error::QueryUnsupported),
                 },
                 _ => Err(Error::QueryUnsupported),
@@ -2573,12 +2569,8 @@ mod tests {
         // other keys see nothing, and a landed result retires it.
         let me = b"resident-key".to_vec();
         let other = b"someone-else".to_vec();
-        let mut m = SagaModule::with_assignment(
-            "saga",
-            "valset",
-            "capability",
-            LeasePolicy::Strict,
-        );
+        let mut m =
+            SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict);
         assert!(
             assigned_pending(&m, &me).is_empty(),
             "an empty ledger assigns nothing"

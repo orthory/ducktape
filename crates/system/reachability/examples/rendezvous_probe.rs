@@ -94,7 +94,9 @@ async fn main() {
 
     match mode.as_str() {
         "idle" => {
-            println!("registered; idling — pump answers PunchSync, keepalive readvertises every 25s. Ctrl-C to stop.");
+            println!(
+                "registered; idling — pump answers PunchSync, keepalive readvertises every 25s. Ctrl-C to stop."
+            );
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
@@ -117,7 +119,9 @@ async fn main() {
                     );
                 }
                 Ok(Resolution::Advertised) => {
-                    println!("ADVERTISED:  resolver fell through without a punch (unexpected for the probe)");
+                    println!(
+                        "ADVERTISED:  resolver fell through without a punch (unexpected for the probe)"
+                    );
                     std::process::exit(1);
                 }
                 Err(e) => {

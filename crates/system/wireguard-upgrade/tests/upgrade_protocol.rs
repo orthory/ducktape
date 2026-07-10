@@ -441,7 +441,10 @@ fn valid_plan_builds_defguard_peer_config() {
     .unwrap();
 
     let peer = DefguardPeerConfig::from_plan(&plan);
-    assert_eq!(peer.peer.endpoint, plan.peer_endpoint().map(|e| e.socket_addr()));
+    assert_eq!(
+        peer.peer.endpoint,
+        plan.peer_endpoint().map(|e| e.socket_addr())
+    );
     assert_eq!(peer.allowed_ips, plan.allowed_ips());
 
     let interface = DefguardInterfaceConfig::from_plan(
@@ -657,7 +660,8 @@ fn record_check_mirrors_the_per_record_view_rules() {
     let set = active_set(id(&a), id(&PrivateKey::from_seed(2)));
     let good = record_for(&a, &set, [8, 8, 8, 10], xkey(1), 1);
 
-    good.check(&policy, 10).expect("a fresh, policy-clean record checks");
+    good.check(&policy, 10)
+        .expect("a fresh, policy-clean record checks");
 
     // expired: current view past `expires_at_view` (50 in the fixture).
     assert_eq!(good.check(&policy, 51).unwrap_err(), UpgradeError::Expired);
@@ -755,7 +759,11 @@ fn duplicate_requested_allowed_ips_is_rejected_even_though_the_signature_verifie
     let overlay = OverlayPolicy::default_v4();
 
     let canonical = overlay.allowed_ips_for(&view, id(&b)).unwrap();
-    assert_eq!(canonical.len(), 1, "canonical overlay routes are a singleton");
+    assert_eq!(
+        canonical.len(),
+        1,
+        "canonical overlay routes are a singleton"
+    );
 
     let request = TunnelUpgradeRequest::sign(
         TunnelUpgradeRequestFields {

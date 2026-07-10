@@ -51,12 +51,12 @@ impl Ctx for TestCtx {
         }
         let q = valset::decode_query(r).map_err(Error::Module)?;
         match (q, &self.members, &self.residents) {
-            (valset::ValsetQuery::Validators, Some(m), _) => {
-                Ok(valset::encode_reply(&valset::ValsetReply::Validators(m.clone())))
-            }
-            (valset::ValsetQuery::Residents, _, Some(o)) => {
-                Ok(valset::encode_reply(&valset::ValsetReply::Residents(o.clone())))
-            }
+            (valset::ValsetQuery::Validators, Some(m), _) => Ok(valset::encode_reply(
+                &valset::ValsetReply::Validators(m.clone()),
+            )),
+            (valset::ValsetQuery::Residents, _, Some(o)) => Ok(valset::encode_reply(
+                &valset::ValsetReply::Residents(o.clone()),
+            )),
             _ => Err(Error::QueryUnsupported),
         }
     }
@@ -210,7 +210,9 @@ fn bind_creates_a_single_member_account() {
     // resolvable by node and by member.
     assert_eq!(account_of_node(&id, node).unwrap().account_id, account_id);
     assert_eq!(
-        account_of_member(&id, &ed_pub(&founder)).unwrap().account_id,
+        account_of_member(&id, &ed_pub(&founder))
+            .unwrap()
+            .account_id,
         account_id
     );
 }
@@ -225,7 +227,13 @@ fn a_second_ed25519_key_joins_and_can_bind_its_own_node() {
     // founder admits a second key; the new key proves possession, founder consents.
     let joiner = ed(2);
     let nonce = get_account(&id, &account_id).unwrap().nonce; // 1
-    let preimage = add_member_preimage(CHAIN, &account_id, &ed_pub(&joiner), KeyKind::Ed25519, nonce);
+    let preimage = add_member_preimage(
+        CHAIN,
+        &account_id,
+        &ed_pub(&joiner),
+        KeyKind::Ed25519,
+        nonce,
+    );
     apply(
         &mut id,
         node1,
@@ -251,7 +259,11 @@ fn a_second_ed25519_key_joins_and_can_bind_its_own_node() {
         &mut id,
         node2,
         IdentityMsg::BindNode {
-            authorizer: ed_auth(&joiner, IDENTITY_BIND_NS, &bind_preimage(CHAIN, node2, nonce)),
+            authorizer: ed_auth(
+                &joiner,
+                IDENTITY_BIND_NS,
+                &bind_preimage(CHAIN, node2, nonce),
+            ),
         },
     )
     .expect("joiner binds node2");
@@ -270,7 +282,13 @@ fn any_surviving_member_can_evict_a_lost_key_but_not_the_last() {
     // add a second key.
     let joiner = ed(2);
     let nonce = get_account(&id, &account_id).unwrap().nonce;
-    let preimage = add_member_preimage(CHAIN, &account_id, &ed_pub(&joiner), KeyKind::Ed25519, nonce);
+    let preimage = add_member_preimage(
+        CHAIN,
+        &account_id,
+        &ed_pub(&joiner),
+        KeyKind::Ed25519,
+        nonce,
+    );
     apply(
         &mut id,
         node,
@@ -330,8 +348,13 @@ fn a_passkey_joins_and_then_authorizes_an_unbind() {
     // assertion; founder's ed25519 signature consents.
     let passkey = wa_key(0x42);
     let nonce = get_account(&id, &account_id).unwrap().nonce;
-    let preimage =
-        add_member_preimage(CHAIN, &account_id, &wa_pub(&passkey), KeyKind::WebauthnP256, nonce);
+    let preimage = add_member_preimage(
+        CHAIN,
+        &account_id,
+        &wa_pub(&passkey),
+        KeyKind::WebauthnP256,
+        nonce,
+    );
     apply(
         &mut id,
         node,
@@ -407,13 +430,34 @@ fn a_stale_certificate_is_rejected_after_the_nonce_advances() {
     let account_id = found_account(&mut id, &founder, node1);
     // account nonce is now 1. a cert minted at nonce 0 (the founding preimage)
     // can't be replayed to bind another node.
-    let stale = ed_auth(&founder, IDENTITY_BIND_NS, &bind_preimage(CHAIN, b"node-2", 0));
-    let err = apply(&mut id, b"node-2", IdentityMsg::BindNode { authorizer: stale }).unwrap_err();
-    assert!(format!("{err:?}").contains("does not verify"), "got {err:?}");
+    let stale = ed_auth(
+        &founder,
+        IDENTITY_BIND_NS,
+        &bind_preimage(CHAIN, b"node-2", 0),
+    );
+    let err = apply(
+        &mut id,
+        b"node-2",
+        IdentityMsg::BindNode { authorizer: stale },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("does not verify"),
+        "got {err:?}"
+    );
     // signing the CURRENT nonce works.
     let nonce = get_account(&id, &account_id).unwrap().nonce;
-    let fresh = ed_auth(&founder, IDENTITY_BIND_NS, &bind_preimage(CHAIN, b"node-2", nonce));
-    apply(&mut id, b"node-2", IdentityMsg::BindNode { authorizer: fresh }).expect("fresh cert");
+    let fresh = ed_auth(
+        &founder,
+        IDENTITY_BIND_NS,
+        &bind_preimage(CHAIN, b"node-2", nonce),
+    );
+    apply(
+        &mut id,
+        b"node-2",
+        IdentityMsg::BindNode { authorizer: fresh },
+    )
+    .expect("fresh cert");
 }
 
 #[test]
@@ -426,10 +470,22 @@ fn a_forged_authorizer_kind_is_rejected() {
 
     // claim the founder is a P256 member while presenting its real ed25519 sig:
     // the registered kind (Ed25519) does not match the asserted kind (P256).
-    let mut auth = ed_auth(&founder, IDENTITY_BIND_NS, &bind_preimage(CHAIN, b"node-2", nonce));
+    let mut auth = ed_auth(
+        &founder,
+        IDENTITY_BIND_NS,
+        &bind_preimage(CHAIN, b"node-2", nonce),
+    );
     auth.kind = KeyKind::P256;
-    let err = apply(&mut id, b"node-2", IdentityMsg::BindNode { authorizer: auth }).unwrap_err();
-    assert!(format!("{err:?}").contains("kind does not match"), "got {err:?}");
+    let err = apply(
+        &mut id,
+        b"node-2",
+        IdentityMsg::BindNode { authorizer: auth },
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("kind does not match"),
+        "got {err:?}"
+    );
 }
 
 #[test]
@@ -448,7 +504,10 @@ fn set_account_name_is_origin_gated_to_a_bound_node() {
     )
     .expect("bound node names its account");
     assert_eq!(
-        get_account(&id, &account_id).unwrap().display_name.as_deref(),
+        get_account(&id, &account_id)
+            .unwrap()
+            .display_name
+            .as_deref(),
         Some("Kim")
     );
 
@@ -456,7 +515,9 @@ fn set_account_name_is_origin_gated_to_a_bound_node() {
     let err = apply(
         &mut id,
         b"stranger",
-        IdentityMsg::SetAccountName { display_name: "x".into() },
+        IdentityMsg::SetAccountName {
+            display_name: "x".into(),
+        },
     )
     .unwrap_err();
     assert!(format!("{err:?}").contains("not bound"), "got {err:?}");
@@ -479,7 +540,10 @@ fn bind_is_valset_gated_when_configured() {
         payload: encode_msg(&msg),
     };
     let err = block_on(id.execute(&mut ctx, &m)).unwrap_err();
-    assert!(format!("{err:?}").contains("not a network member"), "got {err:?}");
+    assert!(
+        format!("{err:?}").contains("not a network member"),
+        "got {err:?}"
+    );
 
     // origin present as a resident -> admitted.
     let mut ctx = TestCtx::gated(node, vec![], vec![node.to_vec()]);
@@ -495,8 +559,13 @@ fn snapshot_install_roundtrips_mixed_scheme_membership() {
     let account_id = found_account(&mut id, &founder, node);
     let passkey = wa_key(0x51);
     let nonce = get_account(&id, &account_id).unwrap().nonce;
-    let preimage =
-        add_member_preimage(CHAIN, &account_id, &wa_pub(&passkey), KeyKind::WebauthnP256, nonce);
+    let preimage = add_member_preimage(
+        CHAIN,
+        &account_id,
+        &wa_pub(&passkey),
+        KeyKind::WebauthnP256,
+        nonce,
+    );
     apply(
         &mut id,
         node,
@@ -514,7 +583,9 @@ fn snapshot_install_roundtrips_mixed_scheme_membership() {
     let bytes = id.snapshot();
     let root = id.root();
     let mut joiner = new_identity();
-    joiner.install(&bytes, root).expect("install verifies + adopts");
+    joiner
+        .install(&bytes, root)
+        .expect("install verifies + adopts");
 
     // ... and now answers queries identically, including the passkey member.
     assert_eq!(joiner.root(), root);
@@ -523,7 +594,9 @@ fn snapshot_install_roundtrips_mixed_scheme_membership() {
         get_account(&id, &account_id)
     );
     assert_eq!(
-        account_of_member(&joiner, &wa_pub(&passkey)).unwrap().account_id,
+        account_of_member(&joiner, &wa_pub(&passkey))
+            .unwrap()
+            .account_id,
         account_id
     );
 

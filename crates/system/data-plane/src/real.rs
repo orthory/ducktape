@@ -69,10 +69,8 @@ pub type PlaneStream = Box<dyn Duplex>;
 /// an unconnected datagram socket bound to the node's overlay `/128`.
 pub trait DatagramSocket: Send + Sync {
     fn send_to<'a>(&'a self, buf: &'a [u8], dest: SocketAddr) -> BoxFuture<'a, io::Result<usize>>;
-    fn recv_from<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>>;
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8])
+    -> BoxFuture<'a, io::Result<(usize, SocketAddr)>>;
     fn local_addr(&self) -> io::Result<SocketAddr>;
 }
 
@@ -132,18 +130,18 @@ impl StreamListener for TcpListener {
 
 impl SocketFactory for OsSocketFactory {
     fn bind_udp(&self, addr: SocketAddr) -> BoxFuture<'_, io::Result<Box<dyn DatagramSocket>>> {
-        Box::pin(async move {
-            Ok(Box::new(UdpSocket::bind(addr).await?) as Box<dyn DatagramSocket>)
-        })
+        Box::pin(
+            async move { Ok(Box::new(UdpSocket::bind(addr).await?) as Box<dyn DatagramSocket>) },
+        )
     }
 
     fn bind_listener(
         &self,
         addr: SocketAddr,
     ) -> BoxFuture<'_, io::Result<Box<dyn StreamListener>>> {
-        Box::pin(async move {
-            Ok(Box::new(TcpListener::bind(addr).await?) as Box<dyn StreamListener>)
-        })
+        Box::pin(
+            async move { Ok(Box::new(TcpListener::bind(addr).await?) as Box<dyn StreamListener>) },
+        )
     }
 
     fn dial_from<'a>(
@@ -206,7 +204,13 @@ impl OverlaySockets {
         stream_bind: SocketAddr,
         addresses: Arc<dyn AddressBook>,
     ) -> io::Result<Self> {
-        Self::bind_with(Arc::new(OsSocketFactory), datagram_bind, stream_bind, addresses).await
+        Self::bind_with(
+            Arc::new(OsSocketFactory),
+            datagram_bind,
+            stream_bind,
+            addresses,
+        )
+        .await
     }
 
     /// Bind the datagram and stream sockets to the given overlay addresses and

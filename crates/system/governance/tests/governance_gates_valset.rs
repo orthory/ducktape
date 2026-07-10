@@ -54,7 +54,8 @@ async fn submit_as(
     payload: Vec<u8>,
 ) -> Result<(), SubmitError> {
     host.submit_at(
-        BlockContext { protocol_version: 0,
+        BlockContext {
+            protocol_version: 0,
             height: at,
             consensus_time: at,
             origin: Origin::External(who.to_vec()),
@@ -334,7 +335,10 @@ fn a_passing_proposal_removes_the_validator_and_emits_leave() {
         let members = validators(&host).await;
         assert_eq!(members.len(), 1, "the removed validator is gone");
         assert!(members.contains(&m1), "the remaining member stays");
-        assert!(!members.contains(&m2), "the removed key is dropped from the set");
+        assert!(
+            !members.contains(&m2),
+            "the removed key is dropped from the set"
+        );
     });
 }
 
@@ -435,7 +439,10 @@ fn a_member_leaves_by_removing_itself_pending_the_remaining_majority() {
         let members = validators(&host).await;
         assert_eq!(members.len(), 1, "the leaver is gone");
         assert!(members.contains(&m1), "the remaining member stays");
-        assert!(!members.contains(&m2), "the leaver's key is dropped from the set");
+        assert!(
+            !members.contains(&m2),
+            "the leaver's key is dropped from the set"
+        );
     });
 }
 
@@ -634,7 +641,11 @@ fn a_direct_module_origin_leave_of_the_last_validator_is_refused() {
             matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("last validator")),
             "got {err:?}"
         );
-        assert_eq!(validators(&host).await, vec![founder], "the set is untouched");
+        assert_eq!(
+            validators(&host).await,
+            vec![founder],
+            "the set is untouched"
+        );
     });
 }
 
