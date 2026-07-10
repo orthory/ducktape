@@ -48,9 +48,22 @@ docker compose -f ops/callbed/docker-compose.yml run --rm driver
 ```
 
 `bootstrap` runs the offline ceremony (`init → invite → join → admit → invite →
-join`) and writes `node0`/`node1` configs to a shared volume; the two nodes boot
-and reach a live 2-of-2 quorum; `driver` then synthesizes tones + camera frames
-on each node's call session and asserts they arrive on the other.
+join`) and writes `node0`/`node1` configs to a shared volume; the two nodes
+boot, reach a live 2-of-2 quorum, and bring their overlay tunnels up from the
+concrete WireGuard endpoints `node-entry.sh` bakes into each node's gossiped
+`EndpointRecord`; `driver` then synthesizes tones + camera frames on each
+node's call session and asserts they arrive on the other. A compose-local
+`coordinator` (private mode, pinned to the ceremony's genesis set) exercises
+the coordinator-auth registration lane — the founder registers and learns its
+reflexive address through it (only the founder: invites strip coordinated
+hints and `join` has no coordinator flag — see #331's product tier).
+
+Why a LOCAL coordinator: media is overlay-only, and both containers sit behind
+the same host NAT — the public coordinator would observe both at the host's
+reflexive address, and the punch would need NAT hairpinning, which never lands
+(issue #331). In-network, rendezvous hands out the real container addresses.
+The nodes use the TUN-less `socket` WireGuard effect (no `/dev/net/tun`, no
+`NET_ADMIN` needed).
 
 Do **not** use `up --abort-on-container-exit`: the one-shot `bootstrap` exits
 first and would tear the whole stack down before the nodes start.
@@ -74,10 +87,10 @@ Teardown: `docker compose -f ops/callbed/docker-compose.yml down -v`.
 
 | File | Role |
 |------|------|
-| `Dockerfile.node` | builds `ducktape-node`, ships it + the scripts + curl |
-| `bootstrap.sh` | offline peering ceremony → `node0`/`node1` configs in `/shared` |
+| `Dockerfile.node` | builds `ducktape-node` + `coordinator`, ships them + the scripts + curl |
+| `bootstrap.sh` | offline peering ceremony → `node0`/`node1` configs in `/shared` (socket WG effect, compose-local coordinator) |
 | `node-entry.sh` | waits for its config, runs the validator |
-| `docker-compose.yml` | `bootstrap` (one-shot) → `node0` + `node1` → `driver` |
+| `docker-compose.yml` | `bootstrap` (one-shot) → `coordinator` → `node0` + `node1` → `driver` |
 | `call-driver.ts` | bun ws client: synth tone + camera frame; assert audio RMS + byte-exact video reassembly; verdict |
 | `virtual-mic.sh` | PulseAudio null-sink → a capture source (for the app profile) |
 
