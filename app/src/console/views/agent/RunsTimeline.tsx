@@ -45,10 +45,14 @@ import {
 // isWallClock rule); only wall-clock stamps get absolute labels, and
 // durations always come from the created→delivered DIFF.
 
+/** 2001-01-01 in unix MILLIS — chat-helpers' isWallClock threshold shifted
+ *  three decimal places, telling the millis lane from the seconds lane. */
+const WALL_CLOCK_MILLIS_FLOOR = 978_307_200_000;
+
 /** The counter as unix seconds when it is a real wall-clock stamp, else null
  *  (a height counter — not renderable as time). */
 const wallClockSecs = (counter: number): number | null => {
-  if (counter > 978_307_200_000) return counter / 1000; // millis lane
+  if (counter > WALL_CLOCK_MILLIS_FLOOR) return counter / 1000; // millis lane
   if (isWallClock(counter)) return counter; // seconds lane
   return null;
 };
@@ -62,11 +66,13 @@ const formatSeconds = (secs: number): string => {
 };
 
 /** created→delivered as an honest duration: seconds for wall-clock lanes
- *  (millis normalized first), a block count for height lanes. */
+ *  (both endpoints normalized via wallClockSecs), a block count for height
+ *  lanes. */
 const runDuration = (rec: RunRecord): string => {
+  const start = wallClockSecs(rec.created_at);
+  const end = wallClockSecs(rec.delivered_at);
+  if (start !== null && end !== null) return formatSeconds(Math.max(0, end - start));
   const diff = Math.max(0, rec.delivered_at - rec.created_at);
-  if (rec.created_at > 978_307_200_000) return formatSeconds(diff / 1000);
-  if (isWallClock(rec.created_at)) return formatSeconds(diff);
   return diff === 1 ? "1 block" : `${diff} blocks`;
 };
 

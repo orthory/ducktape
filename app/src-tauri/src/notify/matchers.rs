@@ -633,6 +633,18 @@ mod tests {
     }
 
     #[test]
+    fn run_thread_tracker_hard_caps_at_256_entries() {
+        let mut tracker = RunThreadTracker::default();
+        for i in 0..300u64 {
+            tracker.insert(format!("d{i:03}"), "general".to_string(), i);
+        }
+        assert_eq!(tracker.0.len(), 256, "the cap holds under overflow");
+        // pop_first evicted the smallest keys; the newest entries survive.
+        assert!(tracker.remove("d299").is_some());
+        assert!(tracker.remove("d000").is_none());
+    }
+
+    #[test]
     fn matches_merged_pull_requests_and_normalizes_default_repo() {
         let ctx = ctx(&no_root);
         let merged = op(
