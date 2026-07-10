@@ -65,9 +65,9 @@ wrong.
 
 ## What it is
 
-`coordinator --listen <addr>` (default `0.0.0.0:3478`). One **UDP** *control*
-socket — genuinely the only socket the process ever holds. Stateless. It
-provides two services on that one socket:
+`coordinator --listen <addr> --workers <1|4>` (defaults: `0.0.0.0:3478`, one
+worker). One **UDP** *control* socket — genuinely the only socket the process
+ever holds. Stateless. It provides two services on that one socket:
 
 - **Rendezvous** — peers `register` their key and `lookup` each other; a
   `Lookup` fans a `PunchSync` to both sides so they simultaneous-open.
@@ -108,8 +108,20 @@ The coordinator is keyless in every mode:
 - **Legacy development mode** — `--allow-anonymous`. This disables proof of
   possession and is for local smoke testing only.
 
-Malformed `--listen` and malformed/value-less `--genesis-set` are hard errors,
-not silent fallbacks to a weaker policy.
+Malformed `--listen`, `--workers`, and malformed/value-less `--genesis-set` are
+hard errors, not silent fallbacks to a weaker policy.
+
+## Authentication workers
+
+`--workers 1` verifies inline with no worker threads. `--workers 4` runs only
+the Ed25519 checks on four fixed 512 KiB-stack threads; UDP I/O and the single
+rendezvous state machine remain ordered on the current-thread runtime. Work and
+result queues are bounded, so overload falls back to the kernel's bounded UDP
+queue/drop behavior instead of growing process memory.
+
+The systemd and container recipes select `--workers 4` and set
+`MALLOC_ARENA_MAX=1` to avoid glibc reserving a large virtual arena per worker.
+Use `--workers 1` on a single-vCPU or minimum-footprint host.
 
 ## Deploy A — systemd (bare VPS)
 
@@ -125,8 +137,9 @@ sudo install -D -m 0644 ops/coordinator/coordinator.env.example /etc/ducktape/co
 sudo cp ops/coordinator/ducktape-coordinator.service /etc/systemd/system/
 
 # Optional: edit /etc/ducktape/coordinator.env to choose a bind address and auth
-# mode. Leave COORDINATOR_ARGS empty for default public proof-of-possession, or
-# use: COORDINATOR_ARGS=--genesis-set /etc/ducktape/network.toml
+# mode. The supplied file selects four auth workers and default public
+# proof-of-possession. For private mode use:
+# COORDINATOR_ARGS=--workers 4 --genesis-set /etc/ducktape/network.toml
 
 # 4. Start it.
 sudo systemctl daemon-reload
@@ -169,7 +182,8 @@ For private mode in Docker, append the auth args after the image name:
 docker run --cap-drop=ALL --security-opt no-new-privileges --read-only \
   -p 3478:3478/udp \
   -v /etc/ducktape/network.toml:/etc/ducktape/network.toml:ro \
-  ducktape-coordinator --listen 0.0.0.0:3478 --genesis-set /etc/ducktape/network.toml
+  ducktape-coordinator --listen 0.0.0.0:3478 --workers 4 \
+    --genesis-set /etc/ducktape/network.toml
 ```
 
 The image is multi-stage: a `rust:1.96-bookworm` build stage compiles exactly
