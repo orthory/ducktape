@@ -34,7 +34,6 @@ function MicGlyph({ size = 15, muted = false }: { size?: number; muted?: boolean
 }
 
 export interface SelfCheckProps {
-  channelName?: string;
   status: HuddleStatus;
   cameraOn: boolean;
   sharing: boolean;
@@ -46,8 +45,6 @@ export interface SelfCheckProps {
   bindPreview: (el: HTMLVideoElement | null) => void;
   /** Turn the camera on/off. Works before the session is `live` (local media). */
   onToggleCamera: () => void;
-  /** Omit → no in-panel mute toggle (the control bar owns it). */
-  onToggleMute?: () => void;
 }
 
 /** The mic meter: a track with a level fill and the speaking threshold marked, so
@@ -101,7 +98,6 @@ export function SelfCheck({
   speaking,
   bindPreview,
   onToggleCamera,
-  onToggleMute,
 }: SelfCheckProps) {
   const showVideo = (cameraOn || sharing) && canEncode;
   const subtitle =
@@ -177,29 +173,6 @@ export function SelfCheck({
         </div>
 
         <MicMeter level={level} muted={muted} speaking={speaking} />
-
-        {onToggleMute && (
-          <div style={{ display: "flex", justifyContent: "center" }}>
-            <HoverButton
-              onClick={onToggleMute}
-              title={muted ? "Unmute" : "Mute"}
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 7,
-                padding: "6px 14px",
-                borderRadius: radius.md,
-                border: `1px solid ${muted ? color.dangerBorder : color.borderSoft}`,
-                background: muted ? color.dangerSoft : color.sunken,
-                color: muted ? color.danger : color.inkSoft,
-                font: `600 12px ${font.sans}`,
-              }}
-              hoverStyle={{ filter: "brightness(1.03)" }}
-            >
-              <MicGlyph size={15} muted={muted} /> {muted ? "Unmute" : "Mute"}
-            </HoverButton>
-          </div>
-        )}
       </div>
     </div>
   );
