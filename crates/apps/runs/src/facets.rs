@@ -1,8 +1,7 @@
 use super::response::RUNNER_RESULT_VERSION;
 use super::{
-    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentResponse, CapRequest, Ctx,
-    Deserialize, JOB_FINALIZE_PAYLOAD_BYTES, MAX_ACTIONS_PER_RUN, Msg, PendingState, RunsModule,
-    Serialize,
+    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentResponse, Deserialize,
+    JOB_FINALIZE_PAYLOAD_BYTES, MAX_ACTIONS_PER_RUN, Serialize,
 };
 
 /// the R5 typed-data facet ceiling — data larger than this degrades to null.
@@ -40,20 +39,38 @@ pub(super) struct RunnerResult {
 }
 
 #[derive(Deserialize, Default, Debug)]
-pub(super) struct WorkspaceReceipt {
-    source_prefix: String,
+pub(crate) struct WorkspaceReceipt {
+    pub(crate) source_prefix: String,
     #[allow(dead_code, reason = "audit metadata retained in dispatch history")]
-    source_snapshot: Option<String>,
-    output_snapshot: Option<String>,
-    commit_height: Option<u64>,
-    rebased: bool,
-    no_changes: bool,
+    pub(crate) source_snapshot: Option<String>,
+    pub(crate) output_snapshot: Option<String>,
+    pub(crate) commit_height: Option<u64>,
+    pub(crate) rebased: bool,
+    pub(crate) no_changes: bool,
     /// `Some` iff the executor's workspace commit failed — the writes were not
     /// captured (paired with a `degraded` status by the wrapper). additive:
     /// absent on healthy receipts.
     #[serde(default)]
-    #[allow(dead_code, reason = "audit metadata retained in dispatch history")]
-    commit_error: Option<String>,
+    pub(crate) commit_error: Option<String>,
+    /// forge (§5, additive): the pushed work branch — `Some` on a pushed
+    /// receipt, and the ATTEMPTED branch on a commit-failed one; absent on
+    /// every duckfs receipt.
+    #[serde(default)]
+    pub(crate) branch: Option<String>,
+    /// forge (§5, additive): the new commit oid — the forge output_ref is
+    /// `branch@output_commit`. `Some` only when a push landed.
+    #[serde(default)]
+    pub(crate) output_commit: Option<String>,
+}
+
+/// the receipt's durable output reference for the delivered-runs ring: the
+/// forge `branch@output_commit` when a push landed, else the duckfs output
+/// snapshot, else `None` (nothing moved this run).
+pub(super) fn output_ref_of(receipt: &WorkspaceReceipt) -> Option<String> {
+    match (&receipt.branch, &receipt.output_commit) {
+        (Some(branch), Some(oid)) => Some(format!("{branch}@{oid}")),
+        _ => receipt.output_snapshot.clone(),
+    }
 }
 
 /// one host-assembled declarative effect (R2). `kind` is a run-effect wire name
@@ -75,9 +92,15 @@ pub(super) struct WireEffect {
 /// defaults to `Chain` via the `#[serde(default)]` on [`RunnerResult::sink`], and
 /// a present `{"mode":"pr",...}` decodes to `Pr`. `Merge` is DEFINED-BUT-INERT in
 /// v1 (validated on the wire, treated like `Chain` with a breadcrumb).
-#[derive(Deserialize, Default, Debug)]
+///
+/// ONE shape, both directions (M1): the same type also SERIALIZES as the v3
+/// envelope's REQUESTED sink (`result_contract.sink`). a requested `Pr`
+/// carries empty title/body — the keys skip-serialize, and delivery derives
+/// them from the message facet — and `Chain` composes as an absent field
+/// (see [`WireSink::is_chain`]), matching the oracle's own skip.
+#[derive(Serialize, Deserialize, Default, Debug)]
 #[serde(tag = "mode", rename_all = "snake_case")]
-pub(super) enum WireSink {
+pub(crate) enum WireSink {
     #[default]
     Chain,
     Pr {
@@ -86,8 +109,9 @@ pub(super) enum WireSink {
         source_branch: String,
         #[serde(default)]
         target_branch: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
         title: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         body: String,
     },
     Merge {
@@ -115,6 +139,14 @@ pub(super) enum WireSink {
         )]
         pack_digest: String,
     },
+}
+
+impl WireSink {
+    /// the composed `result_contract` omits the sink key entirely for `Chain`
+    /// — the serde skip mirroring dispatch-oracle's `is_chain`.
+    pub(crate) fn is_chain(&self) -> bool {
+        matches!(self, WireSink::Chain)
+    }
 }
 
 /// the host's terminal observation of a run. `Failed` fails the run even with a
@@ -211,14 +243,21 @@ struct DeliveryReceipt<'a> {
 }
 
 /// the artifact facet distilled to a chainable reference (O1): a downstream run
-/// can set `workspace.source = prior.output_snapshot`.
+/// can set `workspace.source = prior.output_snapshot`; a forge run's output is
+/// the git coordinates `branch@output_commit` instead (the snapshot key stays a
+/// stated `null`, the forge keys skip-serialize on duckfs receipts — pre-forge
+/// bytes are unchanged).
 #[derive(Serialize, Clone)]
 struct OutputRef<'a> {
     source_prefix: &'a str,
-    output_snapshot: &'a str,
+    output_snapshot: Option<&'a str>,
     commit_height: Option<u64>,
     rebased: bool,
     no_changes: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_commit: Option<&'a str>,
 }
 
 pub(super) fn encode_delivery_receipt(
@@ -227,13 +266,18 @@ pub(super) fn encode_delivery_receipt(
     receipt: &WorkspaceReceipt,
     status: WireStatus,
 ) -> String {
-    let output_ref = receipt.output_snapshot.as_deref().map(|snap| OutputRef {
-        source_prefix: &receipt.source_prefix,
-        output_snapshot: snap,
-        commit_height: receipt.commit_height,
-        rebased: receipt.rebased,
-        no_changes: receipt.no_changes,
-    });
+    // an output exists when the run produced a duckfs snapshot OR pushed a
+    // forge commit; both distill into the one output_ref shape.
+    let output_ref = (receipt.output_snapshot.is_some() || receipt.output_commit.is_some())
+        .then(|| OutputRef {
+            source_prefix: &receipt.source_prefix,
+            output_snapshot: receipt.output_snapshot.as_deref(),
+            commit_height: receipt.commit_height,
+            rebased: receipt.rebased,
+            no_changes: receipt.no_changes,
+            branch: receipt.branch.as_deref(),
+            output_commit: receipt.output_commit.as_deref(),
+        });
     let status = match status {
         WireStatus::Ok => "ok",
         WireStatus::Degraded => "degraded",
@@ -276,164 +320,4 @@ pub(super) fn encode_delivery_receipt(
         status: "degraded",
     })
     .expect("delivery receipt serializes")
-}
-
-// ---- forge sink wire (local mirrors) -----------------------------------------
-// runs does NOT take a production dependency on the heavy `forge` crate (it
-// pulls vendored libgit2). instead it mirrors the exact JSON shape forge decodes
-// for the sink op it emits, and a dev-only conformance test pins the mirror
-// against `forge::decode_msg` so the wire can't silently drift.
-
-/// the exact `ForgeMsg::OpenPr` JSON the forge module decodes. only the PR sink
-/// is emitted in v1 (the merge sink is inert), so only `OpenPr` is mirrored.
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ForgeSinkMsg<'a> {
-    OpenPr {
-        repo: &'a str,
-        title: &'a str,
-        body: &'a str,
-        source_branch: &'a str,
-        target_branch: &'a str,
-    },
-}
-
-pub(super) fn forge_open_pr_bytes(
-    repo: &str,
-    title: &str,
-    body: &str,
-    src: &str,
-    tgt: &str,
-) -> Vec<u8> {
-    serde_json::to_vec(&ForgeSinkMsg::OpenPr {
-        repo,
-        title,
-        body,
-        source_branch: src,
-        target_branch: tgt,
-    })
-    .expect("forge sink msg serializes")
-}
-
-/// the `ForgeQuery::ListRefs` mirror the branch-born probe encodes.
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ForgeSinkQuery<'a> {
-    ListRefs { repo: &'a str },
-}
-
-impl RunsModule {
-    /// apply the O1/O2 sink. Chain is a breadcrumb/no-op in v1 (durable
-    /// output_ref chaining is future work — the receipt already carries the
-    /// output_ref for a downstream consumer). Pr emits a forge `OpenPr` gated on
-    /// the agent's D3 `ForgePush` cap (Phase 4's `permits`, NOT a KNOWN_ACTIONS
-    /// grant) and a committed-state branch-born probe (the no-fail rule: an
-    /// OpenPr for an unborn branch would abort the block). Merge is inert in v1.
-    /// any missing precondition degrades to a breadcrumb — the sink NEVER aborts
-    /// the delivery block.
-    pub(super) async fn emit_sink(
-        &self,
-        ctx: &mut dyn Ctx,
-        run_id: &str,
-        entry: &PendingState,
-        sink: &WireSink,
-    ) {
-        match sink {
-            WireSink::Chain => {}
-            WireSink::Pr {
-                repo,
-                source_branch,
-                target_branch,
-                title,
-                body,
-            } => {
-                // malformed pr sinks degrade to a breadcrumb.
-                if repo.is_empty() || source_branch.is_empty() || target_branch.is_empty() {
-                    return self.note(
-                        ctx,
-                        format!(
-                            "run {run_id} pr sink skipped: incomplete pr sink (repo/source_branch/target_branch required)"
-                        ),
-                    );
-                }
-                let Some(forge) = self.forge.clone() else {
-                    return self.note(
-                        ctx,
-                        format!("run {run_id} pr sink skipped: no forge module wired"),
-                    );
-                };
-                let agent = match self.agent_record(&*ctx, &entry.agent_id).await {
-                    Ok(Some(a)) => a,
-                    _ => {
-                        return self.note(
-                            ctx,
-                            format!("run {run_id} pr sink skipped: agent not registered"),
-                        );
-                    }
-                };
-                if !agent.permits(&CapRequest::ForgePush(repo.as_str())) {
-                    return self.note(
-                        ctx,
-                        format!("run {run_id} pr sink skipped: agent lacks forge_push for {repo}"),
-                    );
-                }
-                match self
-                    .forge_branch_born(&*ctx, &forge, repo, source_branch)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return self.note(
-                            ctx,
-                            format!("run {run_id} pr sink skipped: source branch not present"),
-                        );
-                    }
-                    Err(why) => {
-                        return self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
-                    }
-                }
-                ctx.emit_msg(Msg {
-                    target: forge,
-                    payload: forge_open_pr_bytes(repo, title, body, source_branch, target_branch),
-                });
-            }
-            WireSink::Merge { repo, number, .. } => {
-                // v1: the merge sink needs a host-computed merge pack (a phase-2
-                // wrapper responsibility). validate the wire, breadcrumb, and
-                // fall through like Chain — never emit a MergePr yet.
-                self.note(
-                    ctx,
-                    format!("run {run_id} merge sink for {repo}#{number} is inert in v1 (treated as chain)"),
-                );
-            }
-        }
-    }
-
-    /// deterministic committed-state probe: is `branch` a born ref of `repo`?
-    /// reads COMMITTED forge state via a query (never node-local pending), so it
-    /// is uniform across validators. decoded via `serde_json::Value` to avoid a
-    /// production dependency on the forge crate.
-    async fn forge_branch_born(
-        &self,
-        ctx: &dyn Ctx,
-        forge: &str,
-        repo: &str,
-        branch: &str,
-    ) -> Result<bool, String> {
-        let reply = ctx
-            .query(
-                forge,
-                &serde_json::to_vec(&ForgeSinkQuery::ListRefs { repo }).expect("query serializes"),
-            )
-            .await
-            .map_err(|e| format!("forge refs lookup failed: {e}"))?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&reply).map_err(|e| format!("undecodable forge reply: {e}"))?;
-        let Some(refs) = value.get("refs").and_then(|r| r.as_array()) else {
-            return Err("unexpected forge reply for a refs listing".into());
-        };
-        Ok(refs
-            .iter()
-            .any(|r| r.get("name").and_then(|n| n.as_str()) == Some(branch)))
-    }
 }

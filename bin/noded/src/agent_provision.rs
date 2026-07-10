@@ -1,38 +1,41 @@
-//! the REAL [`WorkspaceProvisioner`]: materialize / commit / clean a per-run
-//! duckfs workspace over the in-daemon actor lane, for portable (v3) agent
-//! runs.
+//! the REAL [`WorkspaceProvisioner`] for portable (v3) agent runs: one
+//! per-run workspace under a D7-validated root, materialized from whichever
+//! source the run's envelope pinned.
+//!
+//! two lanes, dispatched on [`WorkspaceSource`]:
+//! - **duckfs** ([`duckfs`]): checkout / commit a duckfs subtree over the
+//!   in-daemon actor lane — the original lane, moved verbatim.
+//! - **forge** ([`forge`]): a git WORKTREE of a node-local forge repo at the
+//!   run's pinned commit, committed with agent authorship and pushed back
+//!   through this node's own loopback smart-HTTP lane so the branch move
+//!   settles through consensus (wire contract §4). configured per binary via
+//!   [`NodedProvisioner::with_forge`]; unconfigured or unusable (no repo
+//!   base, no http surface, no worktree-capable host `git`) the lane fails
+//!   each forge attempt LOUDLY while duckfs runs are untouched.
 //!
 //! this lives in the noded LIB crate — the only place `duckfs-client` (the
-//! checkout/commit engine) and [`ActorNodeApi`] (the actor-lane `NodeApi`,
-//! `pub(crate)`) are both reachable, the reachability wall dispatch-oracle
-//! cannot cross. it runs the exact `checkout_with`/`commit` primitives the
-//! `/v1/fs/workspaces` RPC does ([`crate::workspaces`]), on `spawn_blocking`
-//! (the engine is sync std::fs + `block_on` of the actor — NEVER an axum/tokio
-//! worker), and drives them through [`ActorNodeApi`] so there is no self-dial.
+//! checkout/commit engine), the actor-lane `NodeApi`, and the node handle's
+//! forge repo base are all reachable, the reachability wall dispatch-oracle
+//! cannot cross.
 //!
 //! D7 (isolation floor): the per-run dir is minted under [`agent_runs_root`],
 //! a root VALIDATED at boot to be OUTSIDE `<storage>` — so a `..` from a
 //! checkout can NOT reach `user.key`, the node keys, qmdb, the blobstore, or
 //! forge's git substrate. the managed `/v1/fs/workspaces` root stays under
 //! `<storage>`; this is a distinct, relocated root for live agent runs.
-//!
-//! LIVE, not dormant: this branch de-versioned the ADR's phased rollout
-//! (pre-production — no committed history, no mixed-binary set). both binaries
-//! wire the files module unconditionally, so the runs composer emits v3 for
-//! every agent run and the pool takes the full provision → bind → run →
-//! commit → cleanup bracket through this provisioner. the v2/scratch path
-//! survives only for embedders that never wire a files module (dev tools,
-//! tests).
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use dispatch_oracle::{ProvisionedWorkspace, WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec};
-use duckfs_client::checkout::{CheckoutOptions, checkout_with};
-use duckfs_client::commit::{CommitError, commit};
+use dispatch_oracle::{
+    ProvisionedWorkspace, WorkspaceProvisioner, WorkspaceSource, WorkspaceSpec,
+};
 
 use crate::NodeHandle;
-use crate::actor_api::ActorNodeApi;
+
+mod duckfs;
+mod forge;
+
+pub use forge::forge_push_base;
 
 /// the D7 relocation lever: the root per-run agent workspaces are minted
 /// under. MUST be outside `<storage>` — VALIDATED here at boot, never trusted.
@@ -139,11 +142,16 @@ fn mount_dir_name(subpath: &str) -> Result<(), String> {
     }
 }
 
-/// the real provisioner: mints per-run checkouts under `root`, driving the
-/// duckfs engine over `handle`'s actor lane.
+/// the real provisioner: mints per-run workspaces under `root`, driving the
+/// duckfs engine over `handle`'s actor lane and (when [`Self::with_forge`]
+/// configured a usable lane) the forge worktree engine over host `git`.
 pub struct NodedProvisioner {
     handle: NodeHandle,
     root: PathBuf,
+    /// the forge lane: `Ok` when this node can provision forge worktrees,
+    /// `Err(reason)` — decided ONCE at construction, permanent and loud —
+    /// when it can't. the duckfs lane is unaffected either way.
+    forge: Result<forge::ForgeLane, String>,
 }
 
 impl NodedProvisioner {
@@ -151,7 +159,42 @@ impl NodedProvisioner {
         Self {
             handle,
             root: root.into(),
+            forge: Err("this provisioner was built without a forge lane \
+                        (with_forge was never called)"
+                .into()),
         }
+    }
+
+    /// configure the forge worktree lane: `push_base` is the loopback
+    /// smart-HTTP base URL ([`forge_push_base`] derives it from the node's
+    /// http listen address; `None` = this node serves no http surface) and
+    /// `committer_name` is this node's stable identity — the COMMITTER on
+    /// every run commit (D2: author is the agent, committer is the node).
+    /// the repo base is read off the handle's forge repo (the same base the
+    /// forge module materializes into). host `git` is probed ONCE here —
+    /// a probe failure makes the lane permanently unavailable, loudly.
+    pub fn with_forge(
+        self,
+        push_base: Option<String>,
+        committer_name: impl Into<String>,
+    ) -> Self {
+        self.with_forge_probed(push_base, committer_name, forge::probe_host_git)
+    }
+
+    /// [`Self::with_forge`] with the construction-time probe injected — the
+    /// seam that lets tests exercise a probe failure without uninstalling git.
+    fn with_forge_probed(
+        mut self,
+        push_base: Option<String>,
+        committer_name: impl Into<String>,
+        probe: impl FnOnce() -> Result<(), String>,
+    ) -> Self {
+        self.forge =
+            forge::ForgeLane::configure(&self.handle, push_base, committer_name.into(), probe);
+        if let Err(reason) = &self.forge {
+            eprintln!("[oracle] forge workspace provisioning unavailable on this node: {reason}");
+        }
+        self
     }
 }
 
@@ -162,11 +205,11 @@ impl WorkspaceProvisioner for NodedProvisioner {
         spec: &WorkspaceSpec,
     ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
         let slug = run_slug(&spec.run_id);
-        let dir = self.root.join(&slug);
-        // validate every skill mount name BEFORE materializing anything: a
-        // bad name fails the provision with ZERO debris on disk. duplicates
-        // are refused too — two mounts sharing a name would silently merge
-        // into one checkout dir.
+        let run_dir = self.root.join(&slug);
+        // validate every skill mount name BEFORE dispatching to a lane: a bad
+        // name fails the provision with ZERO debris on disk, whichever lane
+        // would have materialized. duplicates are refused too — two mounts
+        // sharing a name would silently merge into one checkout dir.
         let mut names = std::collections::HashSet::new();
         for m in &spec.ro_mounts {
             mount_dir_name(&m.mount_subpath)?;
@@ -177,166 +220,31 @@ impl WorkspaceProvisioner for NodedProvisioner {
                 ));
             }
         }
-        let api = ActorNodeApi::new(self.handle.clone());
-        let prefix = spec.source_prefix.clone();
-        let snapshot = spec.source_snapshot.clone();
-        let checkout_dir = dir.clone();
-        // the engine call is blocking std::fs + block_on(actor) — MUST be
-        // spawn_blocking (never an async worker), exactly like
-        // workspaces.rs::create_workspace. a managed checkout records no node
-        // url (its commits ride the actor lane).
-        tokio::task::spawn_blocking(move || {
-            checkout_with(
-                &api,
-                &checkout_dir,
-                &prefix,
-                snapshot.as_deref(),
-                &CheckoutOptions::default(),
-            )
-            .inspect_err(|_| {
-                // a checkout can fail PARTWAY (transport mid-read, verify
-                // mismatch) after materializing some of the tree — the run
-                // never gets a workspace handle to clean up, so the error
-                // path must remove its own debris (W5 applies here too).
-                let _ = std::fs::remove_dir_all(&checkout_dir);
-            })
-        })
-        .await
-        .map_err(|_| "workspace checkout task panicked".to_string())?
-        .map_err(|e| e.to_string())?;
-        // W6 skill ro mounts land at a SUFFIXED SIBLING of the rw checkout
-        // root (`<slug>-ro/<name>`): `commit` scans only under `dir`, so a
-        // skill tree beside it can never leak into the output snapshot.
-        let ro_dir = if spec.ro_mounts.is_empty() {
-            None
-        } else {
-            let ro_root = self.root.join(format!("{slug}-ro"));
-            let api = ActorNodeApi::new(self.handle.clone());
-            let mounts = spec.ro_mounts.clone();
-            let checkout_ro = ro_root.clone();
-            let checkout_rw = dir.clone();
-            tokio::task::spawn_blocking(move || {
-                mounts
-                    .iter()
-                    .try_for_each(|m| {
-                        checkout_with(
-                            &api,
-                            &checkout_ro.join(&m.mount_subpath),
-                            &m.source_prefix,
-                            m.source_snapshot.as_deref(),
-                            &CheckoutOptions::default(),
-                        )
-                        .map(|_| ())
-                    })
-                    .inspect_err(|_| {
-                        // W5 again: the run never gets a workspace handle on a
-                        // failed provision, so BOTH trees (the partial ro root
-                        // and the already-materialized rw checkout) must go.
-                        let _ = std::fs::remove_dir_all(&checkout_ro);
-                        let _ = std::fs::remove_dir_all(&checkout_rw);
-                    })
-            })
-            .await
-            .map_err(|_| "skill mount checkout task panicked".to_string())?
-            .map_err(|e| e.to_string())?;
-            Some(ro_root)
-        };
-        let mut env = BTreeMap::new();
-        env.insert("DUCKTAPE_RUN_WORKSPACE".into(), dir.display().to_string());
-        if let Some(ro) = &ro_dir {
-            // the consumer hook: skill trees live under this root, one dir
-            // per mount name. nothing reads it yet.
-            env.insert("DUCKTAPE_RUN_SKILLS".into(), ro.display().to_string());
-        }
-        Ok(Box::new(NodedWorkspace {
-            handle: self.handle.clone(),
-            dir,
-            ro_dir,
-            source_prefix: spec.source_prefix.clone(),
-            source_snapshot: spec.source_snapshot.clone(),
-            env,
-        }))
-    }
-}
-
-/// one live materialized workspace: its on-disk dir, the source coords the
-/// receipt echoes, and the actor handle its commit rides.
-struct NodedWorkspace {
-    handle: NodeHandle,
-    dir: PathBuf,
-    /// the W6 skill ro root (`<slug>-ro`), `Some` iff the run had mounts —
-    /// tracked ONLY so cleanup can remove it; commit never looks at it.
-    ro_dir: Option<PathBuf>,
-    source_prefix: String,
-    source_snapshot: Option<String>,
-    env: BTreeMap<String, String>,
-}
-
-impl NodedWorkspace {
-    /// a receipt-only spec: `commit`/`no_changes` read only the source coords,
-    /// so the run_id/tools/mount are irrelevant here.
-    fn receipt_spec(&self) -> WorkspaceSpec {
-        WorkspaceSpec {
-            run_id: String::new(),
-            agent_id: None,
-            source_prefix: self.source_prefix.clone(),
-            source_snapshot: self.source_snapshot.clone(),
-            mount_path: String::new(),
-            base_tools: Vec::new(),
-            ro_mounts: Vec::new(),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ProvisionedWorkspace for NodedWorkspace {
-    fn workdir(&self) -> PathBuf {
-        self.dir.clone()
-    }
-
-    fn env(&self) -> BTreeMap<String, String> {
-        self.env.clone()
-    }
-
-    fn path_entries(&self) -> Vec<PathBuf> {
-        Vec::new()
-    }
-
-    async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String> {
-        let api = ActorNodeApi::new(self.handle.clone());
-        let dir = self.dir.clone();
-        let message = message.to_string();
-        let result = tokio::task::spawn_blocking(move || commit(&api, &dir, &message))
-            .await
-            .map_err(|_| "workspace commit task panicked".to_string())?;
-        let spec = self.receipt_spec();
-        match result {
-            Ok(summary) => Ok(WorkspaceReceipt::committed(
-                &spec,
-                summary.snapshot,
-                summary.height,
-                summary.rebased,
-            )),
-            // the agent wrote nothing — a clean working copy (R2 empty facet).
-            Err(CommitError::Nothing) => Ok(WorkspaceReceipt::no_changes(&spec)),
-            // a conflict / rejection / transport failure is loud.
-            Err(e) => Err(e.to_string()),
-        }
-    }
-
-    async fn cleanup(&self) {
-        // W5: idempotent, best-effort. an already-gone dir is success; any
-        // other error is swallowed — cleanup must never fail the run. the
-        // skill ro root is the run's debris too.
-        let dir = self.dir.clone();
-        let ro_dir = self.ro_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = std::fs::remove_dir_all(&dir);
-            if let Some(ro) = &ro_dir {
-                let _ = std::fs::remove_dir_all(ro);
+        match &spec.source {
+            WorkspaceSource::Duckfs {
+                source_prefix,
+                source_snapshot,
+            } => {
+                duckfs::provision(
+                    self.handle.clone(),
+                    run_dir,
+                    self.root.join(format!("{slug}-ro")),
+                    source_prefix.clone(),
+                    source_snapshot.clone(),
+                    spec,
+                )
+                .await
             }
-        })
-        .await;
+            WorkspaceSource::Forge { repo, .. } => match &self.forge {
+                Ok(lane) => forge::provision(lane, run_dir, spec).await,
+                // a loud attempt failure BEFORE any on-disk debris — the saga
+                // settles the attempt (liveness is its job, not ours).
+                Err(reason) => Err(format!(
+                    "forge workspace provisioning for repo {repo:?} is unavailable on this \
+                     node: {reason}"
+                )),
+            },
+        }
     }
 }
 

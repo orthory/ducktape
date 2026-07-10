@@ -25,6 +25,9 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) gateway_listen: Option<String>,
     pub(crate) gateway_enabled: bool,
     pub(crate) log_ring: noded::LogRing,
+    /// this node's signer identity — the COMMITTER on every forge run commit
+    /// (D2: author is the agent, committer is the node).
+    pub(crate) forge_committer: String,
 }
 
 pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
@@ -37,6 +40,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         gateway_listen,
         gateway_enabled,
         log_ring,
+        forge_committer,
     } = config;
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise. a
@@ -124,6 +128,19 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             http_handle.clone(),
             noded::agent_provision::agent_runs_root(storage)
                 .unwrap_or_else(|e| panic!("agent runs root failed D7 validation: {e}")),
+        )
+        // the forge worktree lane (agent-dogfood M1): repos come off the
+        // handle's forge base (the same <storage>/forge-repo the host
+        // materializes into); pushes dial THIS node's own http surface at
+        // loopback (mirroring the serve condition below — no surface, no push
+        // lane, and forge runs fail loudly at provision); the committer on
+        // every run commit is this node's signer identity (D2 — the author is
+        // the agent).
+        .with_forge(
+            noded::agent_provision::forge_push_base(
+                http_listen.as_deref().filter(|_| !sync_only),
+            ),
+            forge_committer,
         ),
     ));
     // (like the rpc surface above, a joiner binds and the park loop pumps —

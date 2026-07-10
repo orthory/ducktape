@@ -8,12 +8,13 @@ import {
   cancelRun,
   enableJobWorker,
   pendingRuns,
+  recentRuns,
   requestRun,
   unwatchChannel,
   watchChannel,
   watches,
 } from "./runs-client";
-import type { PendingRun, WatchView } from "./runs-client";
+import type { PendingRun, RunRecord, WatchView } from "./runs-client";
 import { makeTransportStub } from "../test/transport-stub";
 
 const stubTransport = (reply?: unknown) =>
@@ -111,5 +112,32 @@ describe("runs queries", () => {
     const transport = stubTransport({ watches: [watch] });
     await expect(watches(transport)).resolves.toEqual([watch]);
     expect(transport.query).toHaveBeenCalledWith("runs", "watches");
+  });
+
+  it("sends the bare string RecentRuns and decodes the delivered-runs ring", async () => {
+    const record: RunRecord = {
+      run_id: "run-1",
+      agent_id: "helper",
+      channel_id: "forge:app:12",
+      anchor_seq: 4,
+      outcome: "delivered",
+      degraded: false,
+      created_at: 2,
+      delivered_at: 9,
+      executing_node: "ab".repeat(32),
+      output_ref: "agent/x@1a2b3c4d5e6f",
+      pr_number: 7,
+    };
+    const failed: RunRecord = {
+      ...record,
+      run_id: "run-2",
+      outcome: "failed",
+      executing_node: "unknown",
+      output_ref: null,
+      pr_number: null,
+    };
+    const transport = stubTransport({ recent_runs: [record, failed] });
+    await expect(recentRuns(transport)).resolves.toEqual([record, failed]);
+    expect(transport.query).toHaveBeenCalledWith("runs", "recent_runs");
   });
 });

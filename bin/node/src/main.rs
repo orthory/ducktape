@@ -300,6 +300,10 @@ fn run_node(
         gateway_listen,
         gateway_enabled,
         log_ring,
+        // the forge worktree lane's committer identity (agent-dogfood M1):
+        // every run commit is authored by this node's signer (D2 — the author
+        // is the agent).
+        forge_committer: config::hex_bytes(signer.public_key().as_ref()),
     })?;
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.

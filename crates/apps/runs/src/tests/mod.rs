@@ -1,5 +1,5 @@
 use super::*;
-use crate::facets::{WireSink, WireStatus, decode_run_result_v1, forge_open_pr_bytes};
+use crate::facets::{WireSink, WireStatus, decode_run_result_v1};
 use crate::response::{
     FAILURE_EXCERPT_BYTES, agent_response_from_text, failure_excerpt, parse_strict_response,
 };
@@ -42,9 +42,17 @@ struct CaptureCtx {
     taken_dispatches: BTreeSet<String>,
     /// job_id -> board record served by the jobs arm (finalize guard).
     jobs: BTreeMap<String, Job>,
-    /// repo -> born branch names, served by the "forge" ListRefs arm (the
-    /// sink's committed-state branch-born probe).
-    forge_refs: BTreeMap<String, Vec<String>>,
+    /// repo -> born (branch, tip-hex) pairs, served by the "forge"
+    /// ListRefs arm (the sink's branch-born probe and the compose lane's
+    /// commit pinning).
+    forge_refs: BTreeMap<String, Vec<(String, String)>>,
+    /// (repo, number) -> tracker item, served by the "forge" GetItem arm
+    /// (the compose lane's committed item lookup) and, as summaries, by the
+    /// ListItems arm (the sink's duplicate-PR guard).
+    forge_items: BTreeMap<(String, u64), forge::ItemDetail>,
+    /// saga_id -> the winning attempt's lease holder, served by the "saga"
+    /// Get arm as a Done saga (the sink's executing-node attribution).
+    saga_assignees: BTreeMap<String, Vec<u8>>,
     /// the committed duckfs head served by the "files" Refs arm — the v3
     /// composer's `source_snapshot` pin. `None` = a fresh network (null pin).
     files_head: Option<String>,
@@ -69,6 +77,8 @@ impl CaptureCtx {
             taken_dispatches: BTreeSet::new(),
             jobs: BTreeMap::new(),
             forge_refs: BTreeMap::new(),
+            forge_items: BTreeMap::new(),
+            saga_assignees: BTreeMap::new(),
             files_head: None,
             msgs: Vec::new(),
             effects: Vec::new(),
@@ -80,12 +90,31 @@ impl CaptureCtx {
         self.env.consensus_time = view;
         self
     }
-    /// register a born branch under `repo` (the sink's branch-born probe).
-    fn with_forge_ref(mut self, repo: &str, branch: &str) -> Self {
+    /// register a born branch under `repo` (the sink's branch-born probe;
+    /// tip = a fixed zero oid where the tip does not matter).
+    fn with_forge_ref(self, repo: &str, branch: &str) -> Self {
+        let tip = "00".repeat(20);
+        self.with_forge_tip(repo, branch, &tip)
+    }
+    /// register a born branch with an explicit tip (the compose lane's
+    /// commit pinning).
+    fn with_forge_tip(mut self, repo: &str, branch: &str, tip: &str) -> Self {
         self.forge_refs
             .entry(repo.into())
             .or_default()
-            .push(branch.into());
+            .push((branch.into(), tip.into()));
+        self
+    }
+    /// register a tracker item served by the "forge" GetItem arm.
+    fn with_forge_item(mut self, repo: &str, item: forge::ItemDetail) -> Self {
+        self.forge_items
+            .insert((repo.into(), item.summary.number), item);
+        self
+    }
+    /// register the node key holding `saga_id`'s winning lease, served by
+    /// the "saga" Get arm (the sink's executing-node attribution).
+    fn with_saga_assignee(mut self, saga_id: &str, key: &[u8]) -> Self {
+        self.saga_assignees.insert(saga_id.into(), key.to_vec());
         self
     }
     /// set the committed duckfs head the "files" Refs arm serves (the v3
@@ -285,12 +314,55 @@ impl Ctx for CaptureCtx {
                         .get(&repo)
                         .into_iter()
                         .flatten()
-                        .map(|name| forge::RefHead {
+                        .map(|(name, tip)| forge::RefHead {
                             name: name.clone(),
-                            head: "00".repeat(20),
+                            head: tip.clone(),
                         })
                         .collect();
                     Ok(forge::encode_reply(&forge::ForgeReply::Refs(refs)))
+                }
+                forge::ForgeQuery::GetItem { repo, number } => {
+                    Ok(forge::encode_reply(&forge::ForgeReply::Item(
+                        self.forge_items.get(&(repo, number)).cloned().map(Box::new),
+                    )))
+                }
+                forge::ForgeQuery::ListItems { repo } => {
+                    // ascending by number — the BTreeMap key order, exactly
+                    // like the real tracker's listing.
+                    let items = self
+                        .forge_items
+                        .iter()
+                        .filter(|((r, _), _)| *r == repo)
+                        .map(|(_, d)| d.summary.clone())
+                        .collect();
+                    Ok(forge::encode_reply(&forge::ForgeReply::Items(items)))
+                }
+                _ => Err(Error::QueryUnsupported),
+            },
+            "saga" => match saga::decode_query(req).map_err(Error::Module)? {
+                saga::SagaQuery::Get { saga_id } => {
+                    // a Done saga still carrying its winning attempt's
+                    // lease holder — exactly what the saga module commits.
+                    let view = self.saga_assignees.get(&saga_id).map(|key| saga::SagaView {
+                        origin: SagaOrigin::Module("dispatch".into()),
+                        reply_to: Some("dispatch".into()),
+                        reply_payload: Vec::new(),
+                        spec: Vec::new(),
+                        capability: Some("model-1".into()),
+                        status: saga::SagaStatus::Done,
+                        attempt: 0,
+                        max_attempts: RUN_MAX_ATTEMPTS,
+                        assignee: Some(key.clone()),
+                        pinned_assignee: None,
+                        lease_views: None,
+                        lease_expires_at: None,
+                        deadline: None,
+                        result: Some(Vec::new()),
+                        error: None,
+                        created_at: 0,
+                        updated_at: 0,
+                    });
+                    Ok(saga::encode_reply(&saga::SagaReply::Saga(view)))
                 }
                 _ => Err(Error::QueryUnsupported),
             },
@@ -478,6 +550,63 @@ fn pending_runs(m: &RunsModule) -> Vec<PendingRun> {
 
 fn get_pending(m: &RunsModule, run_id: &str) -> Option<PendingRun> {
     pending_runs(m).into_iter().find(|p| p.run_id == run_id)
+}
+
+fn recent_runs(m: &RunsModule) -> Vec<RunRecord> {
+    let reply = block_on(m.query(&encode_query(&RunsQuery::RecentRuns))).unwrap();
+    match runs_decode_reply(&reply).unwrap() {
+        RunsReply::RecentRuns(runs) => runs,
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
+
+// ---- shared forge fixtures (the compose lane + the PR sink) -------------------
+
+/// a committed tracker item as the "forge" GetItem arm serves it.
+fn forge_item_detail(
+    number: u64,
+    kind: forge::ItemKind,
+    title: &str,
+    body: &str,
+    branches: Option<(&str, &str)>,
+) -> forge::ItemDetail {
+    forge::ItemDetail {
+        summary: forge::ItemSummary {
+            number,
+            kind,
+            title: title.into(),
+            state: forge::ItemState::Open,
+            author: AuthorRef::User(vec![1; 32]),
+            created_at: 0,
+            updated_at: 0,
+        },
+        body: body.into(),
+        channel_id: format!("forge:app:{number}"),
+        source_branch: branches.map(|(s, _)| s.to_string()),
+        target_branch: branches.map(|(_, t)| t.to_string()),
+        merge_oid: None,
+        reviews: Vec::new(),
+    }
+}
+
+fn forge_issue(number: u64, title: &str, body: &str) -> forge::ItemDetail {
+    forge_item_detail(number, forge::ItemKind::Issue, title, body, None)
+}
+
+fn forge_pr(number: u64, title: &str, body: &str, src: &str, tgt: &str) -> forge::ItemDetail {
+    forge_item_detail(number, forge::ItemKind::Pr, title, body, Some((src, tgt)))
+}
+
+/// a registry whose one agent "bot" holds the forge_read cap on "app".
+fn forge_read_registry() -> Registry {
+    let mut r = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    r.get_mut("bot").unwrap().caps.forge_read = vec!["app".into()];
+    r
+}
+
+/// the forge-lane module: forge + files wired (the production wiring).
+fn forge_module() -> RunsModule {
+    module().with_sink_forge("forge").with_files_module("files")
 }
 
 /// a committed module with one watch on "general" under `policy`. the

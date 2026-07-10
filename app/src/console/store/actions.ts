@@ -148,6 +148,11 @@ export interface ConsoleActions {
   selectChannel(channelId: string): void;
   createChannel(name: string, postPolicy: PostPolicy): void;
   sendMessage(body: string): void;
+  /** Post `body` into ANY channel (not just the active one) with the same
+   *  mention parsing + first-agent-mention watch arming as `sendMessage` —
+   *  the forge item Discussion's post path into its hidden channel. Resolves
+   *  when the tracked submit settles (errors surface via the ops ledger). */
+  postInChannel(channelId: string, body: string): Promise<void>;
   openThread(rootSeq: number): void;
   closeThread(): void;
   replyInThread(body: string): void;
@@ -857,6 +862,44 @@ export function createActions({
     );
   };
 
+  // THE channel-parameterized post every composer shares: parse mentions with
+  // the live resolver, arm the first-mention watch, then submit the tracked
+  // post. `sendMessage`/`replyInThread` route the ACTIVE channel through it;
+  // the forge item Discussion posts into its hidden channel via
+  // `postInChannel`. The optimistic patch self-guards on the active channel
+  // (`optimistic.postedMessage` returns {} for a background channel).
+  const postToChannel = (
+    channelId: string,
+    body: string,
+    thread: number | null,
+  ): Promise<unknown> => {
+    const messageId = crypto.randomUUID();
+    const blocks = parseMessageInput(body, mentionResolver());
+    const author = getState().author;
+    return ensureMentionWatch(channelId, blocks).then(() =>
+      submitTracked(
+        opKey.message(channelId, messageId),
+        (live) =>
+          chatClient.postMessage(live, {
+            channelId,
+            messageId,
+            blocks,
+            origin: author,
+            ...(thread !== null ? { thread } : {}),
+          }),
+        (prev) =>
+          optimistic.postedMessage(prev, {
+            channelId,
+            messageId,
+            blocks,
+            authorBytes: selfAuthorBytes(prev.status, prev.author),
+            at: Date.now(),
+            thread,
+          }),
+      ),
+    );
+  };
+
   // Re-pull the open thread's own ChatThread snapshot after a write that may
   // have touched the root or a reply. `submitTracked` already refreshed the
   // flat `state.messages` (every sequence, replies included), but the thread
@@ -1348,25 +1391,12 @@ export function createActions({
     sendMessage: (body) => {
       const channelId = getState().activeChannel;
       if (!channelId || !body.trim()) return;
-      const messageId = crypto.randomUUID();
-      const blocks = parseMessageInput(body, mentionResolver());
-      const author = getState().author;
-      void ensureMentionWatch(channelId, blocks).then(() =>
-        submitTracked(
-          opKey.message(channelId, messageId),
-          (live) =>
-            chatClient.postMessage(live, { channelId, messageId, blocks, origin: author }),
-          (prev) =>
-            optimistic.postedMessage(prev, {
-              channelId,
-              messageId,
-              blocks,
-              authorBytes: selfAuthorBytes(prev.status, prev.author),
-              at: Date.now(),
-              thread: null,
-            }),
-        ),
-      );
+      void postToChannel(channelId, body, null);
+    },
+
+    postInChannel: (channelId, body) => {
+      if (!channelId || !body.trim()) return Promise.resolve();
+      return postToChannel(channelId, body, null).then(() => undefined);
     },
 
     openThread: (rootSeq) => {
@@ -1390,44 +1420,7 @@ export function createActions({
       const channelId = getState().activeChannel;
       const root = getState().activeThread?.root;
       if (!channelId || !root || !body.trim()) return;
-      const messageId = crypto.randomUUID();
-      const blocks = parseMessageInput(body, mentionResolver());
-      const author = getState().author;
-      void ensureMentionWatch(channelId, blocks)
-        .then(() =>
-          submitTracked(
-            opKey.message(channelId, messageId),
-            (live) =>
-              chatClient.postMessage(live, {
-                channelId,
-                messageId,
-                blocks,
-                origin: author,
-                thread: root.seq,
-              }),
-            (prev) =>
-              optimistic.postedMessage(prev, {
-                channelId,
-                messageId,
-                blocks,
-                authorBytes: selfAuthorBytes(prev.status, prev.author),
-                at: Date.now(),
-                thread: root.seq,
-              }),
-          ),
-        )
-        .then(() => {
-          const live = getNode();
-          if (!live) return;
-          return chatClient
-            .thread(live, { channelId, rootSeq: root.seq })
-            .then((activeThread) =>
-              update((prev) =>
-                prev.activeThread?.root.seq === root.seq ? { activeThread } : {},
-              ),
-            )
-            .catch(fail);
-        });
+      void postToChannel(channelId, body, root.seq).then(() => resyncOpenThread());
     },
 
     editMessage: (seq, body) => {

@@ -246,11 +246,15 @@ async fn execute(
         // accept-only / legacy: unchanged behavior, raw text bytes.
         return provider.run(&input, &ctx).await.map(String::into_bytes);
     };
+    // the REQUESTED sink (Chain when the envelope carried none) — echoed on
+    // the assembled RunnerResult below so runs' delivery can route it.
+    let sink = plan.sink;
     let spec = WorkspaceSpec {
         run_id: format!("{}:{}", job.saga_id, job.attempt),
         agent_id: ctx.agent_id.clone(),
-        source_prefix: plan.source_prefix,
-        source_snapshot: plan.source_snapshot,
+        // the tagged source (duckfs subtree or forge repo@commit) crosses to
+        // the provisioner verbatim — the pool never interprets it.
+        source: plan.source,
         // the composer emits SOURCE coords only (D7); the provisioner mints its
         // own writable cwd, so mount_path is advisory-empty here.
         mount_path: String::new(),
@@ -307,15 +311,17 @@ async fn execute(
                 };
                 // LIFT the model's task actions into the effects facet: runs
                 // applies the host-assembled effects; an empty result lets runs
-                // fall back to the response-parsed actions. the other facets
-                // (data/sink) are host-observed later — Chain here.
+                // fall back to the response-parsed actions. the sink is the
+                // plan's REQUESTED sink (Chain unless the composer named one) —
+                // echoed so runs' delivery routes the output without re-deriving
+                // intent; the data facet stays host-observed later.
                 let effects = crate::provision::effects_from_response_text(&text);
                 Ok(assemble_runner_result(
                     &text,
                     &receipt,
                     None,
                     effects,
-                    crate::provision::Sink::Chain,
+                    sink,
                     status,
                 ))
             }
@@ -790,6 +796,7 @@ format = "text"
             "contract": "CONTRACT",
             "conversation": "CONVERSATION",
             "workspace": {
+                "kind": "duckfs",
                 "source_prefix": "/shared/agent-workspaces/bot",
                 "source_snapshot": "aa".repeat(32)
             },
@@ -800,6 +807,39 @@ format = "text"
                 {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32)}
             ],
             "result_contract": {"ducktape_runner_result": 1}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// a forge-sourced v3 run envelope — the EXACT byte shapes task 1's
+    /// composer emits (task-1 report §"Exact final serde shapes"): tagged
+    /// forge workspace, `context`, requested-Pr sink WITHOUT title/body keys.
+    fn forge_envelope_payload() -> Vec<u8> {
+        serde_json::json!({
+            "ducktape_run": 3,
+            "agent_id": "bot",
+            "prompt_hash": null,
+            "thread_key": "forge:app:7#2",
+            "instructions": "GENERIC",
+            "contract": "CONTRACT",
+            "conversation": "CONVERSATION",
+            "context": "Forge item context — you are working this item as a session.\nrepo: app\nitem: issue #7 (open)",
+            "workspace": {
+                "kind": "forge",
+                "repo": "app",
+                "commit": "d0".repeat(20),
+                "branch": "agent/item-7",
+                "branch_born": false
+            },
+            "base_tools": [
+                {"name":"ducktape-files","version":"1","exposure":"cli"}
+            ],
+            "skills": [],
+            "result_contract": {
+                "ducktape_runner_result": 1,
+                "sink": {"mode":"pr","repo":"app","source_branch":"agent/item-7","target_branch":"main"}
+            }
         })
         .to_string()
         .into_bytes()
@@ -827,10 +867,13 @@ format = "text"
                 std::env::temp_dir().join(format!("mock-ws-{}", spec.run_id.replace(':', "_")));
             let mut env = BTreeMap::new();
             env.insert("DUCKTAPE_RUN_WORKSPACE".into(), dir.display().to_string());
+            // kind-agnostic: echo whatever source the spec carries, exactly
+            // like a real receipt would (duckfs prefix/pin or forge:<repo>).
+            let (src, snap) = spec.source.receipt_coords();
             Ok(Box::new(MockWs {
                 dir,
-                src: spec.source_prefix.clone(),
-                snap: spec.source_snapshot.clone(),
+                src,
+                snap,
                 env,
                 committed: self.committed.clone(),
                 cleaned: self.cleaned.clone(),
@@ -875,6 +918,8 @@ format = "text"
                 rebased: false,
                 no_changes: false,
                 commit_error: None,
+                branch: None,
+                output_commit: None,
             })
         }
         async fn cleanup(&self) {
@@ -943,6 +988,10 @@ format = "text"
             "/shared/agent-workspaces/bot"
         );
         assert_eq!(v["workspace_receipt"]["no_changes"], false);
+        assert!(
+            !v.as_object().unwrap().contains_key("sink"),
+            "a chain-sink run keeps the sink key skip-serialized"
+        );
 
         // the full lifecycle fired, and the provider ran INSIDE the mount.
         assert!(provisioned.load(Ordering::SeqCst), "provision was called");
@@ -1003,6 +1052,8 @@ format = "text"
                 rebased: false,
                 no_changes: true,
                 commit_error: None,
+                branch: None,
+                output_commit: None,
             })
         }
         async fn cleanup(&self) {}
@@ -1029,6 +1080,149 @@ format = "text"
             mounts[0].source_snapshot.as_deref(),
             Some("bb".repeat(32).as_str())
         );
+    }
+
+    /// a probe provisioner that captures the WHOLE [`WorkspaceSpec`] — how the
+    /// forge tests observe that the tagged source crossed envelope →
+    /// PortablePlan → WorkspaceSpec intact.
+    struct SpecProbe {
+        captured: Arc<Mutex<Option<WorkspaceSpec>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::provision::WorkspaceProvisioner for SpecProbe {
+        async fn provision(
+            &self,
+            spec: &WorkspaceSpec,
+        ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
+            *self.captured.lock().unwrap() = Some(spec.clone());
+            Ok(Box::new(ProbeWs))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forge_runs_pinned_source_reaches_the_provisioners_spec() {
+        // the forge half of the skills-reach-the-spec pattern: the tagged
+        // source survives envelope → PortablePlan → WorkspaceSpec verbatim,
+        // so task 3's provisioner sees exactly the committed pin.
+        let (providers, _probes) = slow_providers(Duration::from_millis(5), false);
+        let captured: Arc<Mutex<Option<WorkspaceSpec>>> = Arc::new(Mutex::new(None));
+        let provisioner: SharedProvisioner = Arc::new(SpecProbe {
+            captured: captured.clone(),
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &forge_envelope_payload());
+        pool.run(&eff).await.unwrap();
+        let _ = next_result(&mut rx).await;
+
+        let spec = captured.lock().unwrap().clone().expect("the spec was captured");
+        assert_eq!(spec.run_id, "s1:0");
+        assert_eq!(
+            spec.source,
+            crate::workspace_source::WorkspaceSource::Forge {
+                repo: "app".into(),
+                commit: "d0".repeat(20),
+                branch: "agent/item-7".into(),
+                branch_born: false,
+            }
+        );
+        assert_eq!(
+            spec.mount_path, "",
+            "the dead-advisory mount_path is NOT propagated for forge"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_requested_sink_is_echoed_on_the_runner_result() {
+        // O1/O2 threading: the plan's requested Pr sink rides the assembled
+        // RunnerResult — with title/body as PRESENT empty keys (runs' decode
+        // keeps title required; delivery derives the real text, contract §3).
+        let (providers, _probes) = slow_providers(Duration::from_millis(5), false);
+        let (provisioned, committed, cleaned) = flags();
+        let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
+            provisioned: provisioned.clone(),
+            committed: committed.clone(),
+            cleaned: cleaned.clone(),
+            fail_commit: None,
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &forge_envelope_payload());
+        pool.run(&eff).await.unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+
+        let bytes = outcome.unwrap();
+        let raw = String::from_utf8(bytes.clone()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["sink"]["mode"], "pr", "the requested sink is echoed: {v}");
+        assert_eq!(v["sink"]["repo"], "app");
+        assert_eq!(v["sink"]["source_branch"], "agent/item-7");
+        assert_eq!(v["sink"]["target_branch"], "main");
+        // the interop obligation: empty title/body are PRESENT keys, never
+        // skipped — runs' WireSink keeps title required on decode.
+        assert!(
+            raw.contains(r#""title":"""#) && raw.contains(r#""body":"""#),
+            "empty title/body must be present keys: {raw}"
+        );
+        // and the forge receipt coords rode along (§5).
+        assert_eq!(v["workspace_receipt"]["source_prefix"], "forge:app");
+        assert_eq!(v["workspace_receipt"]["source_snapshot"], "d0".repeat(20));
+    }
+
+    #[tokio::test]
+    async fn a_hung_commit_on_the_forge_path_times_out_into_a_degraded_receipt() {
+        // the #298 timeout bracket covers the forge path exactly as duckfs:
+        // a stalled commit step fails the capture, the answer still delivers.
+        let (providers, _probes) = slow_providers(Duration::from_millis(5), false);
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let provisioner: SharedProvisioner = Arc::new(HungCommitProvisioner {
+            cleaned: cleaned.clone(),
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &forge_envelope_payload());
+        pool.run(&eff).await.unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+
+        let bytes = outcome.expect("the run's answer still delivers (R4)");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "degraded");
+        assert!(
+            v["workspace_receipt"]["commit_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("timed out")),
+            "the receipt records the timeout: {v}"
+        );
+        assert!(cleaned.load(Ordering::SeqCst), "cleanup still runs (W5)");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_provider_on_the_forge_path_still_cleans_up() {
+        // the unwind guard covers the forge path exactly as duckfs: no commit,
+        // no leaked per-run dir, the attempt settles as a failure.
+        let providers = Arc::new(ProviderSet::assemble(
+            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            vec![Box::new(PanicProvider { tag: "alpha".into() })],
+        ));
+        let (provisioned, committed, cleaned) = flags();
+        let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
+            provisioned: provisioned.clone(),
+            committed: committed.clone(),
+            cleaned: cleaned.clone(),
+            fail_commit: None,
+        });
+        let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
+
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &forge_envelope_payload());
+        pool.run(&eff).await.unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+
+        let err = outcome.expect_err("a panic settles the attempt as a failure");
+        assert!(err.contains("panicked"), "got {err}");
+        assert!(provisioned.load(Ordering::SeqCst));
+        assert!(!committed.load(Ordering::SeqCst), "a panicked run commits NOTHING");
+        assert!(cleaned.load(Ordering::SeqCst), "cleanup runs past the panic (W5)");
     }
 
     #[tokio::test]
@@ -1386,6 +1580,8 @@ format = "text"
             rebased: true,
             no_changes: false,
             commit_error: None,
+            branch: None,
+            output_commit: None,
         };
 
         use crate::provision::{RunEffect, Sink, Status};
@@ -1464,6 +1660,56 @@ format = "text"
                 body: "body".into(),
             }
         );
+
+        // (3) the REQUESTED-sink echo (contract §3): a Pr sink whose
+        //     title/body are empty must still serialize them as PRESENT keys
+        //     (runs keeps title REQUIRED on decode — the mirror has no serde
+        //     default on it), and a forge receipt carrying the additive §5
+        //     fields must still decode into runs' CURRENT mirror (unknown
+        //     fields tolerated) — the two halves of the flag-day interop.
+        let forge_receipt = WorkspaceReceipt {
+            source_prefix: "forge:app".into(),
+            source_snapshot: Some("d0".repeat(20)),
+            output_snapshot: None,
+            commit_height: None,
+            rebased: false,
+            no_changes: false,
+            commit_error: None,
+            branch: Some("agent/item-7".into()),
+            output_commit: Some("e1".repeat(20)),
+        };
+        let echoed = assemble_runner_result(
+            "prose",
+            &forge_receipt,
+            None,
+            Vec::new(),
+            Sink::Pr {
+                repo: "app".into(),
+                source_branch: "agent/item-7".into(),
+                target_branch: "main".into(),
+                title: String::new(),
+                body: String::new(),
+            },
+            Status::Ok,
+        );
+        let raw = String::from_utf8(echoed.clone()).unwrap();
+        assert!(
+            raw.contains(r#""title":"""#) && raw.contains(r#""body":"""#),
+            "empty title/body stay PRESENT keys on the wire: {raw}"
+        );
+        let parsed: RunsRunnerResult = serde_json::from_slice(&echoed)
+            .expect("a requested-sink echo deserializes into the runs contract");
+        assert_eq!(
+            parsed.sink,
+            RunsSink::Pr {
+                repo: "app".into(),
+                source_branch: "agent/item-7".into(),
+                target_branch: "main".into(),
+                title: String::new(),
+                body: String::new(),
+            }
+        );
+        assert_eq!(parsed.workspace_receipt.source_prefix, "forge:app");
     }
 
     /// the pool's gate is the shared one: announcements claim (Accept) or

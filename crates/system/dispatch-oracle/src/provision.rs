@@ -20,35 +20,39 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use capability_host::RunContext;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+use crate::workspace_source::WorkspaceSource;
 
 /// the pinned portable plan carried by [`crate::Prepared`] for a v3 envelope.
 /// `Some` only for a v3 run; the pool turns it into a
 /// [`WorkspaceSpec`] iff a provisioner is wired, else it is inert (dormant).
 ///
-/// carries NO `mount_path`: the phase-5 composer emits SOURCE coordinates only
-/// (D7), and the provisioner mints its own writable host cwd. `skills` are the
-/// C4 read-only mounts, surfaced straight into [`WorkspaceSpec::ro_mounts`].
+/// carries NO `mount_path`: the composer emits SOURCE coordinates only (D7),
+/// and the provisioner mints its own writable host cwd. `skills` are the C4
+/// read-only mounts, surfaced straight into [`WorkspaceSpec::ro_mounts`];
+/// `sink` is the REQUESTED output sink (`result_contract.sink`, absent ⇒
+/// [`Sink::Chain`]) the pool echoes onto the assembled `RunnerResult`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortablePlan {
-    pub source_prefix: String,
-    pub source_snapshot: Option<String>,
+    pub source: WorkspaceSource,
+    pub sink: Sink,
     pub base_tools: Vec<BaseTool>,
     pub skills: Vec<RoMount>,
 }
 
 /// what the pool hands the provisioner for one run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSpec {
     /// `"{saga_id}:{attempt}"` — idempotency key + per-run dir naming.
     pub run_id: String,
     pub agent_id: Option<String>,
-    /// the rw source duckfs subtree (envelope `workspace.source_prefix`).
-    pub source_prefix: String,
-    /// the pinned source snapshot id (W2); `None` = committed head.
-    pub source_snapshot: Option<String>,
+    /// the pinned source the provisioner materializes — a duckfs subtree or a
+    /// forge repo@commit on a work branch, verbatim from the plan.
+    pub source: WorkspaceSource,
     /// advisory only — NEVER used as a real host path (W1); the provisioner
-    /// mints its own writable mount OUTSIDE storage.
+    /// mints its own writable mount OUTSIDE storage. duckfs-era debt: always
+    /// empty from the pool, and deliberately NOT part of [`WorkspaceSource`].
     pub mount_path: String,
     pub base_tools: Vec<BaseTool>,
     /// W6 skill/instruction ro subtrees — EMPTY in phase 2, carried so phase 4
@@ -92,49 +96,87 @@ pub struct WorkspaceReceipt {
     /// healthy wire shape is unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_error: Option<String>,
+    /// forge only (contract §5, additive): the work branch — `Some` when a
+    /// push landed, and on a forge FAILURE receipt (`commit_failed`), where
+    /// the ATTEMPTED branch is known and rides the audit lane (task-2 review
+    /// call). skip-serialized so duckfs receipt bytes are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub branch: Option<String>,
+    /// forge only (contract §5, additive): the new commit oid — the forge
+    /// `output_ref` is `branch@output_commit`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub output_commit: Option<String>,
 }
 
 impl WorkspaceReceipt {
-    /// the agent committed a new snapshot (the `output_ref`).
+    /// the base every constructor extends: source coordinates from the spec
+    /// (duckfs prefix/pin verbatim; forge `forge:<repo>` + pinned commit, §5),
+    /// everything else empty.
+    fn base(spec: &WorkspaceSpec) -> Self {
+        let (source_prefix, source_snapshot) = spec.source.receipt_coords();
+        Self {
+            source_prefix,
+            source_snapshot,
+            output_snapshot: None,
+            commit_height: None,
+            rebased: false,
+            no_changes: false,
+            commit_error: None,
+            branch: None,
+            output_commit: None,
+        }
+    }
+
+    /// the agent committed a new duckfs snapshot (the `output_ref`).
     pub fn committed(spec: &WorkspaceSpec, snapshot: String, height: u64, rebased: bool) -> Self {
         Self {
-            source_prefix: spec.source_prefix.clone(),
-            source_snapshot: spec.source_snapshot.clone(),
             output_snapshot: Some(snapshot),
             commit_height: Some(height),
             rebased,
-            no_changes: false,
-            commit_error: None,
+            ..Self::base(spec)
+        }
+    }
+
+    /// forge: the agent's commit was PUSHED to the work branch — the forge
+    /// `output_ref` is `<branch>@<output_commit>` (§5). duckfs's
+    /// snapshot/height stay `None`: the artifact lives in the git substrate,
+    /// not a duckfs snapshot. forge-ONLY: a duckfs success is `committed()`.
+    pub fn pushed(spec: &WorkspaceSpec, output_commit: String) -> Self {
+        // loud in debug so a mixed-up caller can never mint a branchless
+        // "pushed" receipt for a duckfs spec (flagged in the task-2 review).
+        debug_assert!(
+            matches!(spec.source, WorkspaceSource::Forge { .. }),
+            "WorkspaceReceipt::pushed is forge-only (duckfs success is committed())"
+        );
+        Self {
+            branch: spec.source.forge_branch(),
+            output_commit: Some(output_commit),
+            ..Self::base(spec)
         }
     }
 
     /// the agent wrote nothing — a clean working copy (R2: any facet may be
-    /// empty). no `output_ref` is produced.
+    /// empty). no `output_ref` is produced (and for forge, no push happens).
     pub fn no_changes(spec: &WorkspaceSpec) -> Self {
         Self {
-            source_prefix: spec.source_prefix.clone(),
-            source_snapshot: spec.source_snapshot.clone(),
-            output_snapshot: None,
-            commit_height: None,
-            rebased: false,
             no_changes: true,
-            commit_error: None,
+            ..Self::base(spec)
         }
     }
 
     /// the commit MECHANISM failed — the agent's writes were not captured. the
     /// truth is "capture failed", never "clean tree": `no_changes` stays false
     /// and the error rides the receipt into the audit lane (I4), while the
-    /// run's answer still delivers (R4) under a `Degraded` status.
+    /// run's answer still delivers (R4) under a `Degraded` status. the forge
+    /// push-CAS reject rides THIS lane too (§5).
     pub fn commit_failed(spec: &WorkspaceSpec, error: String) -> Self {
         Self {
-            source_prefix: spec.source_prefix.clone(),
-            source_snapshot: spec.source_snapshot.clone(),
-            output_snapshot: None,
-            commit_height: None,
-            rebased: false,
-            no_changes: false,
             commit_error: Some(error),
+            // forge: the ATTEMPTED work branch is known at failure time and
+            // rides the audit lane too (task-2 review call). duckfs specs
+            // carry no branch, so their receipt bytes are unchanged.
+            branch: spec.source.forge_branch(),
+            ..Self::base(spec)
         }
     }
 }
@@ -212,7 +254,13 @@ pub struct RunEffect {
 /// the O1/O2 output sink: `Chain` (default — the next run reads this run's
 /// output_ref) / `Pr` (open a forge PR) / `Merge` (merge a forge PR). the
 /// concrete routing is runs' concern; the wrapper only names the intent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+///
+/// Deserialize decodes the composer's REQUESTED sink
+/// (`result_contract.sink`, contract §1): the requested-Pr shape carries NO
+/// title/body keys, so those default EMPTY on decode. Serialize keeps them
+/// PRESENT (no skip) — runs' decode keeps `title` required, so the echoed
+/// `RunnerResult` must always state them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum Sink {
     #[default]
@@ -221,7 +269,9 @@ pub enum Sink {
         repo: String,
         source_branch: String,
         target_branch: String,
+        #[serde(default)]
         title: String,
+        #[serde(default)]
         body: String,
     },
     Merge {
@@ -388,8 +438,10 @@ mod tests {
         WorkspaceSpec {
             run_id: "s1:0".into(),
             agent_id: Some("bot".into()),
-            source_prefix: "/shared/agent-workspaces/bot".into(),
-            source_snapshot: Some("aa".repeat(32)),
+            source: WorkspaceSource::Duckfs {
+                source_prefix: "/shared/agent-workspaces/bot".into(),
+                source_snapshot: Some("aa".repeat(32)),
+            },
             mount_path: "/tmp/ducktape-workspace".into(),
             base_tools: vec![BaseTool {
                 name: "ducktape-files".into(),
@@ -398,6 +450,111 @@ mod tests {
             }],
             ro_mounts: Vec::new(),
         }
+    }
+
+    fn forge_spec() -> WorkspaceSpec {
+        WorkspaceSpec {
+            run_id: "s1:0".into(),
+            agent_id: Some("bot".into()),
+            source: WorkspaceSource::Forge {
+                repo: "app".into(),
+                commit: "d0".repeat(20),
+                branch: "agent/item-7".into(),
+                branch_born: false,
+            },
+            mount_path: String::new(),
+            base_tools: Vec::new(),
+            ro_mounts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn forge_receipts_carry_repo_coords_and_the_pinned_commit() {
+        // contract §5: source_prefix = "forge:<repo>", source_snapshot =
+        // Some(pinned commit) — on EVERY constructor, success or not.
+        let r = WorkspaceReceipt::no_changes(&forge_spec());
+        assert_eq!(r.source_prefix, "forge:app");
+        assert_eq!(r.source_snapshot.as_deref(), Some("d0".repeat(20).as_str()));
+        assert_eq!(r.branch, None, "no push landed — no pushed branch");
+        assert_eq!(r.output_commit, None);
+
+        // a FAILURE receipt still names the ATTEMPTED branch (the audit lane
+        // knows where the push aimed; task-2 review call) — but never mints
+        // an output_commit.
+        let r = WorkspaceReceipt::commit_failed(&forge_spec(), "push CAS-rejected".into());
+        assert_eq!(r.source_prefix, "forge:app");
+        assert_eq!(r.source_snapshot.as_deref(), Some("d0".repeat(20).as_str()));
+        assert_eq!(r.branch.as_deref(), Some("agent/item-7"));
+        assert_eq!(r.output_commit, None);
+        assert_eq!(r.commit_error.as_deref(), Some("push CAS-rejected"));
+    }
+
+    #[test]
+    fn a_pushed_receipt_is_the_forge_output_ref() {
+        // the forge success shape task 3's provisioner emits: the output_ref
+        // is `branch@output_commit`; duckfs's snapshot/height stay None (the
+        // artifact lives in the git substrate, not a duckfs snapshot).
+        let r = WorkspaceReceipt::pushed(&forge_spec(), "e1".repeat(20));
+        assert_eq!(r.source_prefix, "forge:app");
+        assert_eq!(r.source_snapshot.as_deref(), Some("d0".repeat(20).as_str()));
+        assert_eq!(r.branch.as_deref(), Some("agent/item-7"));
+        assert_eq!(r.output_commit.as_deref(), Some("e1".repeat(20).as_str()));
+        assert_eq!(r.output_snapshot, None);
+        assert_eq!(r.commit_height, None);
+        assert!(!r.no_changes && !r.rebased && r.commit_error.is_none());
+    }
+
+    #[test]
+    fn the_new_receipt_fields_are_additive_on_the_wire() {
+        // None ⇒ ABSENT keys: a duckfs receipt's bytes are unchanged by the
+        // forge fields (the additive half of contract §5).
+        let duckfs = WorkspaceReceipt::committed(&spec(), "cc".repeat(32), 9, false);
+        let v = serde_json::to_value(&duckfs).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("branch"), "None branch must skip-serialize");
+        assert!(
+            !obj.contains_key("output_commit"),
+            "None output_commit must skip-serialize"
+        );
+        // Some ⇒ PRESENT keys with the §5 values.
+        let pushed = WorkspaceReceipt::pushed(&forge_spec(), "e1".repeat(20));
+        let v = serde_json::to_value(&pushed).unwrap();
+        assert_eq!(v["branch"], "agent/item-7");
+        assert_eq!(v["output_commit"], "e1".repeat(20));
+        assert_eq!(v["source_prefix"], "forge:app");
+        assert_eq!(v["source_snapshot"], "d0".repeat(20));
+    }
+
+    #[test]
+    fn a_requested_pr_sink_without_title_or_body_decodes_default_empty() {
+        // the composer's requested-sink bytes (contract §1) carry NO
+        // title/body keys — delivery derives them later; this worker decodes
+        // them default-empty into the existing enum.
+        let sink: Sink = serde_json::from_str(
+            r#"{"mode":"pr","repo":"app","source_branch":"agent/item-7","target_branch":"main"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            sink,
+            Sink::Pr {
+                repo: "app".into(),
+                source_branch: "agent/item-7".into(),
+                target_branch: "main".into(),
+                title: String::new(),
+                body: String::new(),
+            }
+        );
+        // present title/body keys still decode verbatim.
+        let sink: Sink = serde_json::from_str(
+            r#"{"mode":"pr","repo":"app","source_branch":"b","target_branch":"main","title":"T","body":"B"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&sink, Sink::Pr { title, body, .. } if title == "T" && body == "B"),
+            "got {sink:?}"
+        );
+        // an unknown mode is a loud decode failure, never a guessed sink.
+        assert!(serde_json::from_str::<Sink>(r#"{"mode":"carrier_pigeon"}"#).is_err());
     }
 
     #[test]

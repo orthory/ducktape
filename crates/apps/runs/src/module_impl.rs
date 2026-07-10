@@ -84,6 +84,10 @@ impl Module for RunsModule {
                     .collect();
                 Ok(encode_reply(&RunsReply::Watches(watches)))
             }
+            RunsQuery::RecentRuns => Ok(encode_reply(&RunsReply::RecentRuns(
+                // newest first: the ring appends at the back.
+                self.history.iter().rev().cloned().collect(),
+            ))),
         }
     }
 
@@ -108,12 +112,19 @@ impl Module for RunsModule {
                 }
             }
         }
+        for record in std::mem::take(&mut self.pending_history) {
+            self.history.push_back(record);
+            if self.history.len() > super::RUN_HISTORY_CAP {
+                self.history.pop_front();
+            }
+        }
         Ok(())
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.pending_watches.clear();
         self.pending_overlay.clear();
+        self.pending_history.clear();
         Ok(())
     }
 }

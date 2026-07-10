@@ -115,11 +115,11 @@ pub use interface::*;
 mod envelope;
 pub use envelope::RUN_ENVELOPE_VERSION;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentEvent,
-    AgentQuery, AgentRecord, AgentReply, AgentResponse, AgentStatus, CapRequest, MAX_ACTIONS_BYTES,
+    AgentQuery, AgentRecord, AgentReply, AgentResponse, AgentStatus, MAX_ACTIONS_BYTES,
     MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
     decode_event as agent_decode_event, decode_reply as agent_decode_reply,
     encode_query as agent_encode_query,
@@ -171,6 +171,10 @@ pub const JOB_RUN_LEASE_VIEWS: u64 = 1000;
 
 /// jobs finalization payloads must fit the jobs module's 64 KiB cap.
 const JOB_FINALIZE_PAYLOAD_BYTES: usize = 64 * 1024;
+
+/// the delivered-runs ring keeps this many terminal runs (newest evicts
+/// oldest). derived observability state — never part of `root()`/snapshot.
+const RUN_HISTORY_CAP: usize = 100;
 /// reserved delimiter separating run-key fields — the registry rejects agent
 /// ids carrying it ([`RESERVED_ID_SEPARATOR`]), so run keys stay unambiguous.
 const RUN_KEY_SEPARATOR: char = RESERVED_ID_SEPARATOR;
@@ -222,10 +226,26 @@ mod agent_intake;
 mod dispatch_flow;
 mod engagement;
 mod facets;
+// the forge compose lane (M1): forge:<repo>:<n> channel detection, committed
+// tracker/refs mirrors, and the item-session workspace/sink composition.
+mod forge_source;
+// deterministic forge item-context injection (M1): the byte-capped
+// instructions section a forge run's envelope carries.
+mod inject;
 mod jobs_intake;
 mod module_impl;
 mod response;
+// the delivery sink (O1/O2): the forge PR sink applied at the result intake —
+// gates, duplicate-PR guard, and message-facet title/body derivation.
+mod sink;
 mod state;
+
+// crate-root aliases for the pre-split names the forge modules were written
+// against (they cross module boundaries: the wire mirrors live in facets, the
+// reply rendering in response, the ListRefs mirror in sink).
+pub(crate) use facets::{WireSink, WorkspaceReceipt};
+pub(crate) use response::{REPLY_KIND_CODE, truncate_utf8};
+pub(crate) use sink::ForgeSinkQuery;
 
 use response::canonical_origin;
 use state::{
@@ -315,6 +335,14 @@ pub struct RunsModule {
     /// entry stages `None` for its prune.
     pending_watches: BTreeMap<String, Option<TurnPolicy>>,
     pending_overlay: BTreeMap<String, Option<PendingState>>,
+    /// the delivered-runs ring (last [`RUN_HISTORY_CAP`], oldest first —
+    /// queries serve it reversed). DERIVED state: recorded at delivery,
+    /// rebuilt by replay, never in `root()`/snapshot, empty after a
+    /// snapshot join.
+    history: VecDeque<RunRecord>,
+    /// this block's staged history records — merged into the ring only at
+    /// `commit_block` (an aborted block must leave no ghost record).
+    pending_history: Vec<RunRecord>,
 }
 
 impl RunsModule {
@@ -371,6 +399,8 @@ impl RunsModule {
             pending: BTreeMap::new(),
             pending_watches: BTreeMap::new(),
             pending_overlay: BTreeMap::new(),
+            history: VecDeque::new(),
+            pending_history: Vec::new(),
         }
     }
 
@@ -519,6 +549,10 @@ impl RunsModule {
         self.pending = pending;
         self.pending_watches.clear();
         self.pending_overlay.clear();
+        // the ring is derived per-node state: a snapshot describes a block
+        // boundary this node never executed, so its history starts empty.
+        self.history.clear();
+        self.pending_history.clear();
         Ok(())
     }
 }

@@ -13,6 +13,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 
+import { parseItemChannelId } from "../../domain/forge-client";
 import {
   isTauri,
   resolveNode,
@@ -776,8 +777,17 @@ export function DucktapeProvider({
             if (payload) dispatch({ type: "patch", patch: { screen: payload } });
             return;
           }
-          const target = parseNavigateTarget(payload);
+          let target = parseNavigateTarget(payload);
           if (!target) return;
+          // A chat target into a forge item's HIDDEN discussion channel
+          // (`forge:<repo>:<n>`) is unroutable on the chat surface (those
+          // channels are filtered out) — the reply landed in the item's
+          // Discussion, so route to the forge item view instead.
+          const forgeItem =
+            target.screen === "chat" && target.channelId
+              ? parseItemChannelId(target.channelId)
+              : null;
+          if (forgeItem) target = { screen: "forge", ...forgeItem };
           const { channelId, threadRoot } = target;
           // Every structured navigate owns the parked-thread slot: a stale
           // hand-off from an earlier navigate (channel never entered, or a

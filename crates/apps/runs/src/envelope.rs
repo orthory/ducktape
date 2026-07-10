@@ -16,7 +16,7 @@ use agent::{AgentRecord, PROMPT_HASH_LEN};
 use chat::{AuthorRef, Block, MessageView};
 use serde::Serialize;
 
-use crate::hex;
+use crate::{WireSink, hex};
 
 /// the envelope marker the host worker routes on. bumping it is a payload
 /// flag day for the worker, not for consensus state.
@@ -69,12 +69,22 @@ struct RunEnvelope<'a> {
     contract: &'a str,
     conversation: String,
     // --- v3 (portable) additive fields ------------------------------------
-    // EVERY one is `Option` with `skip_serializing_if`, and all four are
-    // `None` on the v2 path, so a non-portable run emits ZERO extra keys and
-    // its bytes are byte-for-byte the v2 wire. they appear together only when
-    // the caller passes [`PortableInputs`] (the files module is wired).
+    // EVERY one is `Option` with `skip_serializing_if`, and all are `None` on
+    // the v2 path, so a non-portable run emits ZERO extra keys and its bytes
+    // are byte-for-byte the v2 wire. they appear together only when the
+    // caller passes [`PortableInputs`] (the files module is wired) — except
+    // `context`, which additionally skips on plain duckfs runs, keeping the
+    // pre-M1 duckfs v3 bytes free of the key.
+    /// the deterministic forge item-context instructions section (M1),
+    /// rendered by `inject` from committed tracker state. the oracle's
+    /// `prepare()` assembles the provider input as instructions → context →
+    /// contract → conversation, so this reaches the model as its own section;
+    /// a context-less envelope assembles byte-identically to the pre-context
+    /// worker. `None` for every non-forge run.
     #[serde(skip_serializing_if = "Option::is_none")]
-    workspace: Option<WorkspaceEnvelope>,
+    context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<WorkspaceSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     base_tools: Option<Vec<BaseToolEnvelope>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,16 +93,38 @@ struct RunEnvelope<'a> {
     result_contract: Option<ResultContractEnvelope>,
 }
 
-/// the portable workspace block: the duckfs SOURCE coordinates only. carries
-/// NO `mount_path` (D7): the envelope states which committed subtree + snapshot
-/// to check out, and the phase-2 host wrapper picks the per-run writable cwd —
-/// never a consensus-supplied host path.
-#[derive(Serialize)]
-struct WorkspaceEnvelope {
-    source_prefix: String,
-    /// the W2 consensus pin of the duckfs head. ALWAYS emitted (null when the
-    /// files head is unresolved) so the envelope states its pin decision.
-    source_snapshot: Option<String>,
+/// the portable workspace source — WHERE the run's rw workspace is checked out
+/// from, tagged by kind. carries NO `mount_path` (D7): the envelope states
+/// committed source coordinates only, and the host wrapper picks the per-run
+/// writable cwd — never a consensus-supplied host path.
+#[derive(Serialize, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum WorkspaceSource {
+    /// a duckfs subtree checkout — exactly the flat era's two fields.
+    Duckfs {
+        source_prefix: String,
+        /// the W2 consensus pin of the duckfs head. ALWAYS emitted (null when
+        /// the files head is unresolved) so the envelope states its pin
+        /// decision.
+        source_snapshot: Option<String>,
+    },
+    /// a forge repo checkout (M1) — the git-native workspace lane.
+    Forge {
+        repo: String,
+        /// the pinned base: a 40-hex sha1 tip resolved from COMMITTED forge
+        /// refs at compose height (I1) — the work-branch tip when born, else
+        /// the main tip an issue run forks from.
+        commit: String,
+        /// the work branch — per ITEM, not per run (`agent/item-<n>`, or the
+        /// PR's own source branch: session identity).
+        branch: String,
+        /// advisory compose-time metadata: whether `branch` existed in
+        /// committed forge refs at compose height. the provisioner derives
+        /// its push CAS base from the FETCHED remote advertisement (a fetch
+        /// miss ⇒ zero-oid create), not this flag — kept as a pinned wire
+        /// surface and an audit/M2 signal.
+        branch_born: bool,
+    },
 }
 
 /// one base-tool manifest entry the worker exposes to a portable run.
@@ -107,6 +139,11 @@ struct BaseToolEnvelope {
 #[derive(Serialize)]
 struct ResultContractEnvelope {
     ducktape_runner_result: u32,
+    /// the REQUESTED output sink, composed from the trigger context (a forge
+    /// item channel requests `Pr`). `Chain` is an ABSENT key — mirroring the
+    /// oracle's own is_chain skip — so pre-M1 duckfs v3 bytes are unchanged.
+    #[serde(skip_serializing_if = "WireSink::is_chain")]
+    sink: WireSink,
 }
 
 /// a C4 skill ref: a duckfs read-only source subtree the host mounts for the
@@ -125,13 +162,48 @@ pub(crate) struct SkillEnvelope {
 /// composer path (byte-identical to today).
 #[derive(Debug)]
 pub(crate) struct PortableInputs {
-    pub source_snapshot: Option<String>,
+    /// the tagged workspace source (duckfs or forge).
+    pub workspace: WorkspaceSource,
     pub skills: Vec<SkillEnvelope>,
+    /// the requested output sink; [`WireSink::Chain`] (the default) composes
+    /// as an absent key.
+    pub sink: WireSink,
+    /// the deterministic item-context section (forge runs only).
+    pub context: Option<String>,
 }
 
 /// the duckfs subtree a portable run's rw workspace is checked out from.
 fn workspace_source_prefix(agent: &AgentRecord) -> String {
     format!("/shared/agent-workspaces/{}", agent.agent_id)
+}
+
+/// the duckfs workspace source for `agent`, pinned at `source_snapshot` — the
+/// non-forge composer lane's workspace.
+pub(crate) fn duckfs_workspace(
+    agent: &AgentRecord,
+    source_snapshot: Option<String>,
+) -> WorkspaceSource {
+    WorkspaceSource::Duckfs {
+        source_prefix: workspace_source_prefix(agent),
+        source_snapshot,
+    }
+}
+
+/// resolve an agent's C4 skill refs against the committed duckfs head: a
+/// pinned skill passes its snapshot through; a tracking skill (no pin)
+/// resolves to the SAME committed head (W2) — deterministic across
+/// validators. shared by the duckfs and forge compose lanes (skills are
+/// duckfs subtrees either way).
+pub(crate) fn resolve_skills(agent: &AgentRecord, head: &Option<String>) -> Vec<SkillEnvelope> {
+    agent
+        .skills
+        .iter()
+        .map(|s| SkillEnvelope {
+            name: s.name.clone(),
+            source_prefix: s.source_prefix.clone(),
+            source_snapshot: s.source_snapshot.clone().or_else(|| head.clone()),
+        })
+        .collect()
 }
 
 /// the base-tool manifest every portable run is granted (v1).
@@ -167,18 +239,17 @@ fn envelope(
     conversation: String,
     portable: Option<PortableInputs>,
 ) -> String {
-    let (ducktape_run, workspace, base_tools, skills, result_contract) = match portable {
-        None => (RUN_ENVELOPE_VERSION, None, None, None, None),
+    let (ducktape_run, context, workspace, base_tools, skills, result_contract) = match portable {
+        None => (RUN_ENVELOPE_VERSION, None, None, None, None, None),
         Some(p) => (
             RUN_ENVELOPE_VERSION_PORTABLE,
-            Some(WorkspaceEnvelope {
-                source_prefix: workspace_source_prefix(agent),
-                source_snapshot: p.source_snapshot,
-            }),
+            p.context,
+            Some(p.workspace),
             Some(base_tools()),
             Some(p.skills),
             Some(ResultContractEnvelope {
                 ducktape_runner_result: RUNNER_RESULT_VERSION,
+                sink: p.sink,
             }),
         ),
     };
@@ -190,6 +261,7 @@ fn envelope(
         instructions: DEFAULT_PROMPT,
         contract: STRICT_OUTPUT_INSTRUCTION,
         conversation,
+        context,
         workspace,
         base_tools,
         skills,
@@ -486,8 +558,13 @@ mod tests {
 
     fn portable(snapshot: Option<&str>, skills: Vec<SkillEnvelope>) -> PortableInputs {
         PortableInputs {
-            source_snapshot: snapshot.map(str::to_string),
+            workspace: duckfs_workspace(
+                &agent_with_hash(vec![7u8; PROMPT_HASH_LEN]),
+                snapshot.map(str::to_string),
+            ),
             skills,
+            sink: crate::WireSink::Chain,
+            context: None,
         }
     }
 
@@ -506,6 +583,7 @@ mod tests {
         );
         let v = parse(&payload);
         assert_eq!(v["ducktape_run"], 2);
+        assert!(v.get("context").is_none(), "no context key at v2");
         assert!(v.get("workspace").is_none(), "no v3 workspace key at v2");
         assert!(v.get("base_tools").is_none(), "no v3 base_tools key at v2");
         assert!(v.get("skills").is_none(), "no v3 skills key at v2");
@@ -541,6 +619,7 @@ mod tests {
         );
         let v = parse(&payload);
         assert_eq!(v["ducktape_run"], 3);
+        assert_eq!(v["workspace"]["kind"], "duckfs", "the workspace source is tagged");
         assert_eq!(v["workspace"]["source_prefix"], "/shared/agent-workspaces/bot");
         assert_eq!(v["workspace"]["source_snapshot"], "aa".repeat(32));
         // D7: the envelope carries SOURCE coords only — never a host mount path.
@@ -548,6 +627,10 @@ mod tests {
             v["workspace"].get("mount_path").is_none(),
             "the v3 workspace must NOT carry a mount_path (D7): {}",
             v["workspace"]
+        );
+        assert!(
+            v.get("context").is_none(),
+            "a duckfs run composes no context key"
         );
         // the 3-tool base manifest, in order.
         let tools = v["base_tools"].as_array().unwrap();
@@ -558,6 +641,10 @@ mod tests {
         assert_eq!(tools[0]["version"], "1");
         assert_eq!(tools[0]["exposure"], "cli");
         assert_eq!(v["result_contract"]["ducktape_runner_result"], 1);
+        assert!(
+            v["result_contract"].get("sink").is_none(),
+            "a chain sink is an ABSENT key, mirroring the oracle's is_chain skip"
+        );
         let skills = v["skills"].as_array().unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0]["name"], "release");
@@ -589,5 +676,101 @@ mod tests {
             "the pin decision is stated as null, not omitted"
         );
         assert_eq!(v["skills"].as_array().unwrap().len(), 0, "no skills is []");
+    }
+
+    // ---- the forge workspace source (M1) --------------------------------------
+
+    #[test]
+    fn a_forge_run_composes_tagged_source_item_context_and_requested_pr_sink() {
+        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
+        let commit = "ab".repeat(20);
+        let inputs = PortableInputs {
+            workspace: WorkspaceSource::Forge {
+                repo: "app".into(),
+                commit: commit.clone(),
+                branch: "agent/item-7".into(),
+                branch_born: false,
+            },
+            skills: Vec::new(),
+            sink: crate::WireSink::Pr {
+                repo: "app".into(),
+                source_branch: "agent/item-7".into(),
+                target_branch: "main".into(),
+                title: String::new(),
+                body: String::new(),
+            },
+            context: Some("Forge item context:\nrepo: app".into()),
+        };
+        let payload = render_payload(
+            "runs",
+            &agent,
+            "forge:app:7",
+            1,
+            None,
+            &transcript,
+            Some(inputs),
+        );
+        let v = parse(&payload);
+        assert_eq!(v["ducktape_run"], 3);
+        assert_eq!(
+            v["thread_key"], "forge:app:7#1",
+            "thread continuity keys are unchanged — replies land in the item discussion"
+        );
+        // context rides IMMEDIATELY after conversation — field order is the bytes.
+        assert!(
+            payload.contains(r#"Reply as the agent.","context":"Forge item context:"#),
+            "context follows conversation byte-adjacent: {payload}"
+        );
+        // the tagged forge source, with its committed field order.
+        assert_eq!(v["workspace"]["kind"], "forge");
+        assert_eq!(v["workspace"]["repo"], "app");
+        assert_eq!(v["workspace"]["commit"], commit);
+        assert_eq!(v["workspace"]["branch"], "agent/item-7");
+        assert_eq!(v["workspace"]["branch_born"], false);
+        assert!(
+            payload.contains(&format!(
+                r#""workspace":{{"kind":"forge","repo":"app","commit":"{commit}","branch":"agent/item-7","branch_born":false}}"#
+            )),
+            "the forge workspace field order is part of the committed bytes: {payload}"
+        );
+        // the requested sink carries mode/repo/source/target and NO title/body
+        // keys — delivery derives them from the message facet (Task 4).
+        assert_eq!(v["result_contract"]["ducktape_runner_result"], 1);
+        assert_eq!(v["result_contract"]["sink"]["mode"], "pr");
+        assert!(v["result_contract"]["sink"].get("title").is_none());
+        assert!(v["result_contract"]["sink"].get("body").is_none());
+        assert!(
+            payload.contains(
+                r#""result_contract":{"ducktape_runner_result":1,"sink":{"mode":"pr","repo":"app","source_branch":"agent/item-7","target_branch":"main"}}"#
+            ),
+            "the requested-sink field order is part of the committed bytes: {payload}"
+        );
+    }
+
+    #[test]
+    fn forge_envelope_bytes_are_deterministic() {
+        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "go")];
+        let inputs = || PortableInputs {
+            workspace: WorkspaceSource::Forge {
+                repo: "app".into(),
+                commit: "cd".repeat(20),
+                branch: "feature/x".into(),
+                branch_born: true,
+            },
+            skills: Vec::new(),
+            sink: crate::WireSink::Pr {
+                repo: "app".into(),
+                source_branch: "feature/x".into(),
+                target_branch: "dev".into(),
+                title: String::new(),
+                body: String::new(),
+            },
+            context: Some("ctx".into()),
+        };
+        let a = render_payload("runs", &agent, "forge:app:9", 1, None, &transcript, Some(inputs()));
+        let b = render_payload("runs", &agent, "forge:app:9", 1, None, &transcript, Some(inputs()));
+        assert_eq!(a.as_bytes(), b.as_bytes(), "forge composition is byte-deterministic");
     }
 }

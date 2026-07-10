@@ -54,6 +54,35 @@ export interface PendingRun {
   created_at: number;
 }
 
+/** How a run ended: delivered (possibly degraded) or failed. */
+export type RunOutcome = "delivered" | "failed";
+
+/** One terminal run in the node's delivered-runs ring (last 100, newest
+ *  first) — derived observability state recorded at delivery, never part of
+ *  consensus roots; empty on a snapshot-joined node. */
+export interface RunRecord {
+  run_id: string;
+  agent_id: string;
+  /** Empty for job-backed runs. */
+  channel_id: string;
+  /** The anchor message seq; 0 for job-backed runs. */
+  anchor_seq: number;
+  outcome: RunOutcome;
+  /** The host observed the run as degraded but still delivered it. */
+  degraded: boolean;
+  /** Consensus counters (creation/delivery block) — only their DIFF is
+   *  meaningful as a duration; never render the raw values as clock time. */
+  created_at: number;
+  delivered_at: number;
+  /** Lowercase key hex of the node that executed the run, or "unknown". */
+  executing_node: string;
+  /** forge `branch@output_commit` or a duckfs snapshot id; null when the run
+   *  moved nothing. */
+  output_ref: string | null;
+  /** The forge PR this run opened or updated, when the PR sink applied. */
+  pr_number: number | null;
+}
+
 const TARGET = "runs";
 
 // ── Msgs (writes — one submit = one block; requester from origin) ──
@@ -125,3 +154,10 @@ export const watches = (transport: NodeTransport): Promise<WatchView[]> =>
   Promise.resolve()
     .then(() => transport.query(TARGET, "watches"))
     .then((reply) => replyVariant<WatchView[]>(reply, "watches"));
+
+/** The delivered-runs ring, newest first (last 100). `RecentRuns` is a
+ *  unit-variant query — the bare string. */
+export const recentRuns = (transport: NodeTransport): Promise<RunRecord[]> =>
+  Promise.resolve()
+    .then(() => transport.query(TARGET, "recent_runs"))
+    .then((reply) => replyVariant<RunRecord[]>(reply, "recent_runs"));

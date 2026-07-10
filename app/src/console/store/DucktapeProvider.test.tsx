@@ -1234,6 +1234,32 @@ describe("ducktape://navigate deep-link", () => {
     await waitFor(() => expect(capturedState!.forgeFocus).toBeNull());
   });
 
+  it("reroutes a chat target into a hidden forge item channel to the forge view", async () => {
+    // the run-finished deep-link for a forge-item mention targets screen
+    // "chat" with the item's hidden `forge:<repo>:<n>` channel — unroutable
+    // on the chat surface, so it must land on the item's forge view instead.
+    markTauri();
+    const { transport } = makeFakeNode();
+    renderConsole(transport);
+    await waitFor(() =>
+      expect(screen.getByTestId("channel").textContent).toBe("general"),
+    );
+
+    await act(async () => {
+      tauriEvent.emitTo("ducktape://navigate", {
+        screen: "chat",
+        channelId: "forge:app:12",
+        threadRoot: 7,
+      });
+    });
+    await waitFor(() => {
+      expect(capturedState!.screen).toBe("forge");
+      expect(capturedState!.forgeFocus).toEqual({ repo: "app", number: 12 });
+    });
+    // no chat-side effects: the hidden channel is never entered.
+    expect(capturedState!.activeChannel).toBe("general");
+  });
+
   it("ignores malformed structured payloads", async () => {
     markTauri();
     const { transport } = makeFakeNode();

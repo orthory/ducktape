@@ -72,6 +72,20 @@ export interface ForgeItemDetail extends ForgeItemSummary {
   reviews: ForgeReview[];
 }
 
+/** Parse a forge item's hidden discussion channel id (`forge:<repo>:<number>`)
+ *  into its repo/number; null for any other channel id. The number sits after
+ *  the LAST ':' — repo names may carry colons. */
+export const parseItemChannelId = (
+  channelId: string,
+): { repo: string; number: number } | null => {
+  if (!channelId.startsWith("forge:")) return null;
+  const sep = channelId.lastIndexOf(":");
+  const repo = channelId.slice("forge:".length, sep);
+  const number = Number(channelId.slice(sep + 1));
+  if (!repo || !Number.isInteger(number) || number <= 0) return null;
+  return { repo, number };
+};
+
 // ── Msgs (writes — one commit per submit) ───────────────
 
 export const commit = (

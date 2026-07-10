@@ -1,6 +1,8 @@
 use super::facets::{
-    WireStatus, decode_run_result_v1, effects_to_actions, encode_delivery_receipt, valid_data,
+    WireStatus, decode_run_result_v1, effects_to_actions, encode_delivery_receipt, output_ref_of,
+    valid_data,
 };
+use super::{RunOutcome, RunRecord, sink};
 use super::{
     ACTION_CHAT_POST, AgentAction, AgentRecord, AgentResponse, BTreeSet, Block, ChatMsg, ChatQuery,
     ChatReply, Ctx, Error, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES,
@@ -19,7 +21,7 @@ use super::{
 /// strict-output instruction names.
 const REPLY_KIND_PARAGRAPH: &str = "paragraph";
 const REPLY_KIND_HEADING: &str = "heading";
-const REPLY_KIND_CODE: &str = "code";
+pub(crate) const REPLY_KIND_CODE: &str = "code";
 pub(super) const RUNNER_RESULT_VERSION: u32 = envelope::RUNNER_RESULT_VERSION;
 
 /// the model's raw answer as a NORMALIZED [`AgentResponse`]: the wire shape
@@ -155,7 +157,7 @@ fn non_empty_text(text: &str) -> String {
     }
 }
 
-fn truncate_utf8(text: &str, max: usize) -> String {
+pub(crate) fn truncate_utf8(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
@@ -251,7 +253,9 @@ impl RunsModule {
     }
 
     /// the failure triple (breadcrumb note + threaded failure reply + job
-    /// finalize false) — unchanged behavior, was inlined three times.
+    /// finalize false) — unchanged behavior, was inlined three times. also
+    /// records the terminal run into the delivered-runs ring (derived state,
+    /// observation only: nothing emitted changes).
     async fn fail_run(
         &mut self,
         ctx: &mut dyn Ctx,
@@ -261,6 +265,20 @@ impl RunsModule {
     ) {
         self.note(ctx, format!("run {run_id} failed: {reason}"));
         self.emit_failure_reply(ctx, run_id, entry, &reason).await;
+        let executing_node = self.executing_node(&*ctx, run_id).await;
+        self.pending_history.push(RunRecord {
+            run_id: run_id.to_string(),
+            agent_id: entry.agent_id.clone(),
+            channel_id: entry.channel_id.clone(),
+            anchor_seq: entry.anchor_seq,
+            outcome: RunOutcome::Failed,
+            degraded: false,
+            created_at: entry.created_at,
+            delivered_at: ctx.env().consensus_time,
+            executing_node,
+            output_ref: None,
+            pr_number: None,
+        });
         self.emit_job_finalize_if_current_claimant(ctx, entry, false, reason)
             .await;
     }
@@ -307,16 +325,47 @@ impl RunsModule {
             Ok(r) => r,
             Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
         };
-        // build the faceted finalize payload BEFORE moving `response` into
-        // emit_response; emission order is response → sink → finalize.
+        // build the faceted finalize payload — and render the message facet
+        // the PR sink derives its title/body from — BEFORE moving `response`
+        // into emit_response; emission order is response → sink → finalize.
         let payload = encode_delivery_receipt(
             &response,
             valid_data(&result.data),
             &result.workspace_receipt,
             result.status,
         );
+        let message = sink::message_facet_text(&response.reply_blocks);
+        // the run's durable executor attribution (sink.rs's saga lookup) —
+        // computed once here, shared by the PR-body breadcrumb and the ring.
+        let executing_node = self.executing_node(&*ctx, run_id).await;
         self.emit_response(ctx, run_id, entry, response);
-        self.emit_sink(ctx, run_id, entry, &result.sink).await;
+        let pr_number = self
+            .emit_sink(
+                ctx,
+                run_id,
+                entry,
+                &result.sink,
+                &message,
+                &result.workspace_receipt,
+                &executing_node,
+            )
+            .await;
+        // record the delivery into the ring AFTER the sink so the record can
+        // carry the PR number the sink opened/updated. observation only —
+        // every emitted op above is byte-identical with or without it.
+        self.pending_history.push(RunRecord {
+            run_id: run_id.to_string(),
+            agent_id: entry.agent_id.clone(),
+            channel_id: entry.channel_id.clone(),
+            anchor_seq: entry.anchor_seq,
+            outcome: RunOutcome::Delivered,
+            degraded: result.status == WireStatus::Degraded,
+            created_at: entry.created_at,
+            delivered_at: ctx.env().consensus_time,
+            executing_node,
+            output_ref: output_ref_of(&result.workspace_receipt),
+            pr_number,
+        });
         self.emit_job_finalize_if_current_claimant(ctx, entry, true, payload)
             .await;
     }

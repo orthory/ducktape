@@ -1,7 +1,7 @@
 use super::{
     AgentQuery, AgentRecord, AgentReply, AgentStatus, CONTEXT_WINDOW, ChatQuery, ChatReply, Ctx,
     DispatchMsg, DispatchQuery, DispatchReply, FilesQuery, FilesReply, MAX_PAYLOAD_BYTES,
-    MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule, SagaOrigin,
+    MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule, SagaOrigin, WireSink,
     agent_decode_reply, agent_encode_query, chat_decode_reply, chat_encode_query,
     dispatch_decode_reply, dispatch_encode_msg, dispatch_encode_query, dispatch_id_for, envelope,
     files_decode_reply, files_encode_query, recipe_id_for,
@@ -159,24 +159,15 @@ impl RunsModule {
             return Ok(None);
         };
         let source_snapshot = self.duckfs_head(ctx, &files).await?;
-        let skills = agent
-            .skills
-            .iter()
-            .map(|s| envelope::SkillEnvelope {
-                name: s.name.clone(),
-                source_prefix: s.source_prefix.clone(),
-                // a pinned skill passes its snapshot through; a tracking skill
-                // (no pin) resolves to the SAME committed head this run pins its
-                // workspace to (W2) — deterministic across validators.
-                source_snapshot: s
-                    .source_snapshot
-                    .clone()
-                    .or_else(|| source_snapshot.clone()),
-            })
-            .collect();
+        // a pinned skill passes its snapshot through; a tracking skill (no
+        // pin) resolves to the SAME committed head this run pins its workspace
+        // to (W2) — deterministic across validators.
+        let skills = envelope::resolve_skills(agent, &source_snapshot);
         Ok(Some(envelope::PortableInputs {
-            source_snapshot,
+            workspace: envelope::duckfs_workspace(agent, source_snapshot),
             skills,
+            sink: WireSink::Chain,
+            context: None,
         }))
     }
 
@@ -205,6 +196,11 @@ impl RunsModule {
     /// context (P4) and the fully composed payload. any failure here is a
     /// clean skip for the no-fail engagement intake and a clean error for an
     /// explicit `RequestRun`.
+    ///
+    /// a `forge:<repo>:<n>` trigger channel selects the forge compose lane
+    /// (M1): the item-session workspace source, the requested PR sink, and
+    /// the injected item context — see [`super::forge_source`]. any other
+    /// channel composes the duckfs lane exactly as before.
     pub(super) async fn prepare_dispatch(
         &self,
         ctx: &dyn Ctx,
@@ -213,7 +209,10 @@ impl RunsModule {
         anchor_seq: u64,
     ) -> Result<PreparedDispatch, String> {
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
-        let portable = self.portable_inputs(ctx, agent).await?;
+        let portable = match super::forge_source::parse_forge_channel(channel_id) {
+            Some(item_ref) => Some(self.forge_portable_inputs(ctx, agent, &item_ref).await?),
+            None => self.portable_inputs(ctx, agent).await?,
+        };
         let payload = envelope::render_payload(
             &self.id,
             agent,

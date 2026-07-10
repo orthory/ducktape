@@ -35,6 +35,7 @@ use sdk::{Effect, Msg};
 mod envelope;
 mod pool;
 mod provision;
+mod workspace_source;
 pub use envelope::{BlobResolver, Prepared, RUN_ENVELOPE_VERSION, RUNNER_RESULT_VERSION};
 pub use pool::{
     DEFAULT_MAX_CONCURRENT_RUNS, DeliverFn, DispatchPool, SpawnFn, max_concurrent_runs_from_env,
@@ -44,6 +45,7 @@ pub use provision::{
     Status, WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec, assemble_runner_result,
     bind_workspace, effects_from_response_text,
 };
+pub use workspace_source::WorkspaceSource;
 
 /// everything a provider execution needs, extracted by the gate so the
 /// expensive run can happen away from the effect-offer callsite (on a spawned

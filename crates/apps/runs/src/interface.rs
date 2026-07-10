@@ -79,6 +79,48 @@ pub struct PendingRun {
     pub created_at: u64,
 }
 
+// ---- delivered-run history --------------------------------------------------
+
+/// how a run ended: the result delivered, or it failed (worker error,
+/// timeout, cancellation, failed validation). a degraded-but-delivered run is
+/// `Delivered` with [`RunRecord::degraded`] set.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    Delivered,
+    Failed,
+}
+
+/// one terminal run in the delivered-runs ring — DERIVED observability state,
+/// recorded at delivery (the moment the pending entry prunes). never part of
+/// `root()`/snapshot: replay rebuilds it deterministically, and a
+/// snapshot-joined node starts with an empty ring.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RunRecord {
+    pub run_id: String,
+    pub agent_id: String,
+    /// empty for job-backed runs.
+    pub channel_id: String,
+    /// the anchor message seq; 0 for job-backed runs. the envelope's
+    /// thread key is `"{channel_id}#{seq}"`.
+    pub anchor_seq: u64,
+    pub outcome: RunOutcome,
+    /// the host observed the run as degraded but still delivered it.
+    pub degraded: bool,
+    /// consensus counters (creation block / delivery block) — counter DIFFS
+    /// are meaningful, the raw values are whatever the lane stamps.
+    pub created_at: u64,
+    pub delivered_at: u64,
+    /// lowercase key hex of the node whose attempt settled the run (the DONE
+    /// saga's assignee), or `"unknown"`.
+    pub executing_node: String,
+    /// what the run produced: forge `branch@output_commit` when a push
+    /// landed, else the duckfs output snapshot, else `None`.
+    pub output_ref: Option<String>,
+    /// the forge PR this run opened or updated, when the PR sink applied.
+    pub pr_number: Option<u64>,
+}
+
 // ---- ops ----------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -119,6 +161,9 @@ pub enum RunsQuery {
     /// entries prune on delivery, and every dispatch has a deadline.
     PendingRuns,
     Watches,
+    /// the delivered-runs ring, newest first (last 100). derived state — see
+    /// [`RunRecord`].
+    RecentRuns,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -126,6 +171,7 @@ pub enum RunsQuery {
 pub enum RunsReply {
     PendingRuns(Vec<PendingRun>),
     Watches(Vec<WatchView>),
+    RecentRuns(Vec<RunRecord>),
 }
 
 // ---- codecs -------------------------------------------------------------------

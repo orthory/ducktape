@@ -98,6 +98,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // http git upload-pack (clone) lane must agree on it, so both are handed the
     // same path — the actor to materialize into, the http handle to serve from.
     let forge_repo = storage.join("forge-git");
+    // the forge worktree lane's push rendezvous: agent run pushes dial THIS
+    // daemon's own http surface at loopback (a wildcard bind is rewritten to
+    // 127.0.0.1), where receive-pack submits the ref move to the actor.
+    let forge_push_base = noded::agent_provision::forge_push_base(Some(&listen.to_string()));
 
     // the per-module derived index: one fluent31 database per module under
     // <storage>/index/<module>/, with each module's view mapper registered.
@@ -140,6 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_node(
                 actor_storage,
                 actor_forge_repo,
+                forge_push_base,
                 actor_index,
                 blobs,
                 oracle_cmds,
@@ -189,6 +194,7 @@ fn init_tracing(log_ring: noded::LogRing) {
 fn run_node(
     storage: PathBuf,
     forge_repo: PathBuf,
+    forge_push_base: Option<String>,
     index: Arc<IndexStore>,
     blobs: noded::blobs::BlobHandle,
     oracle_cmds: mpsc::Sender<NodeCommand>,
@@ -244,7 +250,11 @@ fn run_node(
         // the duckfs/files module the portable (v3) composer pins its source
         // head from (W2). its presence is what selects the v3 composer; unwired,
         // the composer emits the v2 wire.
-        .with_files_module("files");
+        .with_files_module("files")
+        // the forge module the composer resolves forge:<repo>:<n> channels
+        // against and the PR sink queries; unwired, forge-channel mentions
+        // skip at compose.
+        .with_sink_forge("forge");
         let pages = Pages::init(context.child("pages"), "pages").await;
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the
@@ -304,6 +314,7 @@ fn run_node(
             blobs.clone(),
             agent_dirs,
             &storage_for_runs,
+            forge_push_base,
         );
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would
