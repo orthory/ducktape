@@ -41,7 +41,6 @@ use crate::hex;
 pub(super) struct NetworkBindings<'a> {
     pub(super) invite: &'a [u8],
     pub(super) identity_chain_id: &'a str,
-    pub(super) duckdns_chain_id: &'a str,
 }
 
 /// Node-local substrates used only while reconstructing a host from state sync.
@@ -141,15 +140,11 @@ pub(super) async fn genesis_host(
             Some("valset".into()),
             bindings.identity_chain_id.to_string(),
         )),
-        Box::new(
-            DuckDns::new(
-                "duckdns",
-                "identity",
-                Some("valset".into()),
-                bindings.duckdns_chain_id,
-            )
-            .expect("descriptor chain id has a DuckDNS label"),
-        ),
+        Box::new(DuckDns::new(
+            "duckdns",
+            "identity",
+            Some("valset".into()),
+        )),
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
         Box::new(Inbox::new("inbox")),
@@ -286,13 +281,7 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("identity install: {e}"))?;
 
-    let mut duckdns = DuckDns::new(
-        "duckdns",
-        "identity",
-        Some("valset".into()),
-        bindings.duckdns_chain_id,
-    )
-    .map_err(|e| format!("duckdns init: {e}"))?;
+    let mut duckdns = DuckDns::new("duckdns", "identity", Some("valset".into()));
     let (bytes, root) = snapshot_of("duckdns")?;
     duckdns
         .install(bytes, root)
@@ -598,13 +587,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("identity install: {e}"))?;
 
     let (bytes, root) = snapshot_of("duckdns").await?;
-    let mut duckdns = DuckDns::new(
-        "duckdns",
-        "identity",
-        Some("valset".into()),
-        bindings.duckdns_chain_id,
-    )
-    .map_err(|e| format!("duckdns init: {e}"))?;
+    let mut duckdns = DuckDns::new("duckdns", "identity", Some("valset".into()));
     duckdns
         .install(&bytes, root)
         .map_err(|e| format!("duckdns install: {e}"))?;

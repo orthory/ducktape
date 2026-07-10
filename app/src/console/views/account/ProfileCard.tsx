@@ -1,6 +1,6 @@
 // The identity account at the top of the Account view. Identity owns the
 // canonical display name and AccountId; DuckDNS contributes only an optional
-// `<handle>.duck` discovery alias. Workspace membership and account identity do
+// `<handle>.duck` account name. Workspace membership and account identity do
 // not depend on registering that alias.
 
 import { useEffect, useState, type FormEvent } from "react";
@@ -125,7 +125,7 @@ export function ProfileCard({ accountId }: { accountId: string | undefined }) {
         <div style={{ display: "flex", alignItems: "baseline", gap: 7, flexWrap: "wrap" }}>
           <span style={{ font: `600 12px ${font.sans}`, color: color.ink }}>Duck name</span>
           <span style={{ font: `400 11px ${font.sans}`, color: color.muted }}>
-            Optional discovery alias — your identity works without one.
+            Optional account name — your identity works without one.
           </span>
           <FinalizationMark op={state.ops[opKey.duckHandle()]} />
         </div>

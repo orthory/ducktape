@@ -38,8 +38,8 @@ agent-facing gaps.
 - `jobs` is a consensus-native work board with first-claim-wins claims.
 - `identity` is the canonical account registry: member keys, display name, and
   bound node keys let a person running several nodes resolve to one identity.
-- `duckdns` adds optional `<handle>.duck` account aliases and identity-only
-  service discovery. Workspace identity and membership do not require an alias.
+- `duckdns` adds an optional `<handle>.duck` → AccountId name. It owns no node,
+  service, or route directory; workspace identity does not require a name.
 - `kv`, `valset`, `saga`, `governance`, `directory`, and `greeter` support
   infrastructure, examples, and tests.
 

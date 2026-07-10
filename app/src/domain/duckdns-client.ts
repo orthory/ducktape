@@ -1,7 +1,7 @@
 // Typed client for the consensus `duckdns` module. Identity owns accounts and
-// display names; DuckDNS owns only an optional human handle -> AccountId alias
-// and identity-only service discovery. Registering a handle is never required
-// to create/join a workspace or to use an account.
+// display names; DuckDNS owns only an optional human handle -> AccountId alias.
+// Registering a handle is never required to create/join a workspace or use an
+// account, and resolution never returns nodes or routes.
 
 import type { BlockEvent, NodeTransport } from "./transport";
 import { replyVariant } from "./wire";
@@ -16,26 +16,13 @@ export interface HandleRegistration {
   account_id: number[];
 }
 
-export type DuckDnsName =
-  | { account: { handle: string } }
-  | { account_service: { service: string; handle: string } }
-  | { network_service: { service: string; chain: string } }
-  | { node_service: { service: string; node: string; chain: string } };
-
-export interface ResolvedNode {
-  node: number[];
-  node_label: string;
+export interface DuckDnsName {
+  handle: string;
 }
 
-export type ResolvedName =
-  | { account: { account_id: number[]; nodes: ResolvedNode[] } }
-  | {
-      service: {
-        identity: { scope: "account" | "network"; service: string };
-        authority: { account: { account_id: number[] } } | "network";
-        providers: ResolvedNode[];
-      };
-    };
+export interface ResolvedAccount {
+  account_id: number[];
+}
 
 /** Canonical form accepted by consensus. Registration is strict, while DNS
  * lookup itself remains case-insensitive. */
@@ -72,12 +59,12 @@ export const registrations = (
     .then(() => transport.query(TARGET, { registrations: { from, limit } }))
     .then((reply) => replyVariant<HandleRegistration[]>(reply, "registrations"));
 
-/** Resolve a typed `.duck` name to stable AccountId/NodeId identities. No IP,
- * endpoint, port, or transport metadata crosses this boundary. */
+/** Resolve a typed `.duck` account name to its stable AccountId. Identity and
+ * peer management own node lookup and connectivity after this boundary. */
 export const resolve = (
   transport: NodeTransport,
   name: DuckDnsName,
-): Promise<ResolvedName | null> =>
+): Promise<ResolvedAccount | null> =>
   Promise.resolve()
     .then(() => transport.query(TARGET, { resolve: { name } }))
-    .then((reply) => replyVariant<ResolvedName | null>(reply, "resolved"));
+    .then((reply) => replyVariant<ResolvedAccount | null>(reply, "resolved"));

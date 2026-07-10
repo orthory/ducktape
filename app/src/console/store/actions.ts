@@ -119,7 +119,7 @@ export interface ConsoleActions {
   setAuthor(author: string): void;
   /** Set this node's bound identity account display name. */
   setDisplayName(name: string): void;
-  /** Declaratively set or clear the bound account's optional `.duck` handle. */
+  /** Declaratively set or clear the bound account's optional `.duck` name. */
   setDuckHandle(handle: string | null): void;
 
   // ── Account (the person: member keys, bound nodes) ──

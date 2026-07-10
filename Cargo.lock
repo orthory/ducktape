@@ -2303,16 +2303,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "duckdns-node"
-version = "0.1.0"
-dependencies = [
- "duckdns",
- "host",
- "node",
- "sdk",
-]
-
-[[package]]
 name = "duckfs-client"
 version = "0.1.0"
 dependencies = [
@@ -4400,7 +4390,6 @@ dependencies = [
  "dispatch",
  "dispatch-oracle",
  "duckdns",
- "duckdns-node",
  "duckfs-client",
  "duckfs-core",
  "duckfs-disk",
