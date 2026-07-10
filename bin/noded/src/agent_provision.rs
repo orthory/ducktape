@@ -117,6 +117,28 @@ fn run_slug(run_id: &str) -> String {
     format!("{prefix}{hash}")
 }
 
+/// a W6 skill mount subpath is consensus-supplied data used as ONE host
+/// directory name — never a path. the envelope validates only non-emptiness
+/// (a `..` or `a/b` name would otherwise escape the ro root), so the trust
+/// boundary is HERE: a bounded charset, with `.`/`..` refused outright (both
+/// pass the charset alone).
+fn mount_dir_name(subpath: &str) -> Result<(), String> {
+    let safe = !subpath.is_empty()
+        && subpath != "."
+        && subpath != ".."
+        && subpath
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if safe {
+        Ok(())
+    } else {
+        Err(format!(
+            "skill mount subpath {subpath:?} is not a safe directory name \
+             (want [a-zA-Z0-9._-]+, not `.` or `..`)"
+        ))
+    }
+}
+
 /// the real provisioner: mints per-run checkouts under `root`, driving the
 /// duckfs engine over `handle`'s actor lane.
 pub struct NodedProvisioner {
@@ -139,7 +161,13 @@ impl WorkspaceProvisioner for NodedProvisioner {
         &self,
         spec: &WorkspaceSpec,
     ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
-        let dir = self.root.join(run_slug(&spec.run_id));
+        let slug = run_slug(&spec.run_id);
+        let dir = self.root.join(&slug);
+        // validate every skill mount name BEFORE materializing anything: a
+        // bad name fails the provision with ZERO debris on disk.
+        for m in &spec.ro_mounts {
+            mount_dir_name(&m.mount_subpath)?;
+        }
         let api = ActorNodeApi::new(self.handle.clone());
         let prefix = spec.source_prefix.clone();
         let snapshot = spec.source_snapshot.clone();
@@ -167,24 +195,54 @@ impl WorkspaceProvisioner for NodedProvisioner {
         .await
         .map_err(|_| "workspace checkout task panicked".to_string())?
         .map_err(|e| e.to_string())?;
-        // this provisioner wires the rw source only: W6 skill/instruction ro
-        // mounts are NOT materialized yet. an agent with skills still runs —
-        // minus its skill trees — and the gap is LOUD, never silent: the
-        // envelope pinned those refs on consensus, so dropping them without a
-        // trace would break the composer's contract invisibly.
-        if !spec.ro_mounts.is_empty() {
-            eprintln!(
-                "[oracle] run {} requests {} skill mount(s) this provisioner \
-                 does not materialize yet — running without them",
-                spec.run_id,
-                spec.ro_mounts.len()
-            );
-        }
+        // W6 skill ro mounts land at a SUFFIXED SIBLING of the rw checkout
+        // root (`<slug>-ro/<name>`): `commit` scans only under `dir`, so a
+        // skill tree beside it can never leak into the output snapshot.
+        let ro_dir = if spec.ro_mounts.is_empty() {
+            None
+        } else {
+            let ro_root = self.root.join(format!("{slug}-ro"));
+            let api = ActorNodeApi::new(self.handle.clone());
+            let mounts = spec.ro_mounts.clone();
+            let checkout_ro = ro_root.clone();
+            let checkout_rw = dir.clone();
+            tokio::task::spawn_blocking(move || {
+                mounts
+                    .iter()
+                    .try_for_each(|m| {
+                        checkout_with(
+                            &api,
+                            &checkout_ro.join(&m.mount_subpath),
+                            &m.source_prefix,
+                            m.source_snapshot.as_deref(),
+                            &CheckoutOptions::default(),
+                        )
+                        .map(|_| ())
+                    })
+                    .inspect_err(|_| {
+                        // W5 again: the run never gets a workspace handle on a
+                        // failed provision, so BOTH trees (the partial ro root
+                        // and the already-materialized rw checkout) must go.
+                        let _ = std::fs::remove_dir_all(&checkout_ro);
+                        let _ = std::fs::remove_dir_all(&checkout_rw);
+                    })
+            })
+            .await
+            .map_err(|_| "skill mount checkout task panicked".to_string())?
+            .map_err(|e| e.to_string())?;
+            Some(ro_root)
+        };
         let mut env = BTreeMap::new();
         env.insert("DUCKTAPE_RUN_WORKSPACE".into(), dir.display().to_string());
+        if let Some(ro) = &ro_dir {
+            // the consumer hook: skill trees live under this root, one dir
+            // per mount name. nothing reads it yet.
+            env.insert("DUCKTAPE_RUN_SKILLS".into(), ro.display().to_string());
+        }
         Ok(Box::new(NodedWorkspace {
             handle: self.handle.clone(),
             dir,
+            ro_dir,
             source_prefix: spec.source_prefix.clone(),
             source_snapshot: spec.source_snapshot.clone(),
             env,
@@ -197,6 +255,9 @@ impl WorkspaceProvisioner for NodedProvisioner {
 struct NodedWorkspace {
     handle: NodeHandle,
     dir: PathBuf,
+    /// the W6 skill ro root (`<slug>-ro`), `Some` iff the run had mounts —
+    /// tracked ONLY so cleanup can remove it; commit never looks at it.
+    ro_dir: Option<PathBuf>,
     source_prefix: String,
     source_snapshot: Option<String>,
     env: BTreeMap<String, String>,
@@ -256,12 +317,15 @@ impl ProvisionedWorkspace for NodedWorkspace {
 
     async fn cleanup(&self) {
         // W5: idempotent, best-effort. an already-gone dir is success; any
-        // other error is swallowed — cleanup must never fail the run.
+        // other error is swallowed — cleanup must never fail the run. the
+        // skill ro root is the run's debris too.
         let dir = self.dir.clone();
-        let _ = tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
+        let ro_dir = self.ro_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = std::fs::remove_dir_all(&dir);
+            if let Some(ro) = &ro_dir {
+                let _ = std::fs::remove_dir_all(ro);
+            }
         })
         .await;
     }
@@ -318,5 +382,28 @@ mod tests {
         assert_ne!(a0, a1, "attempt 0 and 1 get distinct dirs");
         // deterministic per run_id (idempotent provision + cleanup).
         assert_eq!(run_slug("saga:2"), run_slug("saga:2"));
+    }
+
+    #[test]
+    fn mount_dir_name_refuses_traversal_and_admits_plain_names() {
+        // the trust boundary for consensus-supplied skill names: `provision`
+        // runs this over EVERY mount before materializing anything, so a
+        // rejection here is a loud provision failure with zero disk debris.
+        for bad in [
+            "..",
+            ".",
+            "",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "name with space",
+            "name\0nul",
+        ] {
+            assert!(mount_dir_name(bad).is_err(), "{bad:?} must be refused");
+        }
+        for good in ["skill", "my-skill_v2", "..dots.ok..", "A.B"] {
+            assert!(mount_dir_name(good).is_ok(), "{good:?} must be admitted");
+        }
     }
 }
