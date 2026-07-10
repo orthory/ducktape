@@ -27,16 +27,12 @@ bad() {
 echo "port_probe:"
 FREE=54999
 if port_probe "$FREE"; then bad "a free port reads as up"; else ok "a free port reads as down"; fi
-if command -v python3 >/dev/null 2>&1; then
-  python3 -c "import socket,time;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',$FREE));s.listen(1);open('$TMP/ready','w').close();time.sleep(5)" &
-  LISTENER=$!
-  for _ in $(seq 1 40); do [ -f "$TMP/ready" ] && break; sleep 0.05; done
-  if port_probe "$FREE"; then ok "a bound port reads as up"; else bad "misses a bound port"; fi
-  kill "$LISTENER" 2>/dev/null
-  LISTENER=""
-else
-  echo "  skip (no python3) — bound-port probe"
-fi
+bun -e 'Bun.listen({hostname:"127.0.0.1",port:Number(process.argv[1]),socket:{data(){}}})' "$FREE" &
+LISTENER=$!
+for _ in $(seq 1 40); do port_probe "$FREE" && break; sleep 0.05; done
+if port_probe "$FREE"; then ok "a bound port reads as up"; else bad "misses a bound port"; fi
+kill "$LISTENER" 2>/dev/null
+LISTENER=""
 
 echo "restart_node honesty:"
 # Layout: a pinned NODE_BIN (staged copy the app dials) + a NODE_SRC (cargo's
