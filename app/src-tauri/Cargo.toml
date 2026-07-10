@@ -48,7 +48,9 @@ tauri-plugin-agent = "0.0.1"
 [features]
 # CEF runtime probe: run the shell on tauri-runtime-cef instead of wry.
 # Gates out the WebKitGTK getUserMedia hook (CEF has its own permission path).
-cef = ["tauri/cef"]
+# `unstable` unlocks tauri's multiwebview API (Window::add_child) — the inline
+# gateway view is a child webview positioned over the Browser pane.
+cef = ["tauri/cef", "tauri/unstable"]
 
 # webkit2gtk's only use (huddle::allow_user_media) is #[cfg]-gated off under
 # `cef`; the crate stays compiled-but-unused, which is harmless.

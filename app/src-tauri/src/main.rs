@@ -44,6 +44,10 @@ fn main() {
             workspaces::gateway_route_unbind,
             workspaces::gateway_route_list,
             gateway_window::gateway_open_window,
+            gateway_window::gateway_inline_supported,
+            gateway_window::gateway_open_inline,
+            gateway_window::gateway_inline_place,
+            gateway_window::gateway_inline_close,
             workspaces::workspace_create,
             workspaces::workspace_join,
             workspaces::workspace_invite_blob,
@@ -129,9 +133,7 @@ fn main() {
     // in tauri.conf.json under `plugins.agent`. The endpoint publishes to
     // ${XDG_RUNTIME_DIR|TMPDIR|TMP}/tauri-agent/com.ducktape.app/endpoint.json;
     // set XDG_RUNTIME_DIR per instance to isolate parallel worktree apps.
-    // tauri-plugin-agent drives the wry webview; skip it on the CEF probe until
-    // its runtime compat is verified separately.
-    #[cfg(all(debug_assertions, desktop, not(feature = "cef")))]
+    #[cfg(all(debug_assertions, desktop))]
     {
         builder = builder.plugin(tauri_plugin_agent::init());
     }

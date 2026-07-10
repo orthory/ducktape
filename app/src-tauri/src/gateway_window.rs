@@ -95,6 +95,156 @@ pub fn gateway_open_window(
     Ok(())
 }
 
+/// Browser-pane rect in main-window logical px, reported by the UI.
+#[derive(serde::Deserialize)]
+pub struct InlineRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+const INLINE_LABEL: &str = "gateway-inline";
+
+/// Whether this shell embeds gateway content inline in the Browser pane.
+/// CEF: every gateway session runs in its own renderer process and the
+/// `gateway-inline` label matches no capability, so an embedded child webview
+/// is exactly as isolated as the separate window. wry/WebKitGTK keeps the
+/// separate window — it cannot distinguish child/iframe IPC from the main
+/// frame on Linux (see the module doc).
+#[tauri::command]
+pub fn gateway_inline_supported() -> bool {
+    cfg!(feature = "cef")
+}
+
+/// Open (or re-navigate) the inline gateway child webview at `rect`.
+/// Same validation and guards as `gateway_open_window`, same single-surface
+/// rule: opening inline closes any separate gateway window, and vice versa.
+#[cfg(feature = "cef")]
+#[tauri::command]
+pub fn gateway_open_inline(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    url: String,
+    rect: InlineRect,
+) -> Result<(), String> {
+    use tauri::{LogicalPosition, LogicalSize, Manager as _};
+
+    crate::daemon::require_main_window(&window)?;
+    let (url, _token) = validate_session_url(&url)?;
+
+    // One executable publisher surface at a time (mirrors gateway_open_window).
+    for (label, existing) in app.webview_windows() {
+        if label.starts_with(WINDOW_PREFIX) {
+            existing
+                .close()
+                .map_err(|error| format!("close old gateway window: {error}"))?;
+        }
+    }
+
+    let position = LogicalPosition::new(rect.x, rect.y);
+    let size = LogicalSize::new(rect.width, rect.height);
+    if let Some(existing) = app.get_webview(INLINE_LABEL) {
+        existing
+            .navigate(url)
+            .map_err(|error| format!("navigate inline gateway view: {error}"))?;
+        return place_inline_webview(&existing, position, size);
+    }
+
+    let allowed_host = url.host_str().expect("validated host").to_string();
+    let allowed_port = url.port().expect("validated port");
+    let builder = tauri::webview::WebviewBuilder::new(INLINE_LABEL, WebviewUrl::External(url))
+        .incognito(true)
+        .devtools(false)
+        .on_navigation(move |candidate| {
+            candidate.scheme() == "http"
+                && candidate.host_str() == Some(allowed_host.as_str())
+                && candidate.port() == Some(allowed_port)
+                && candidate.username().is_empty()
+                && candidate.password().is_none()
+        })
+        .on_new_window(|_, _| NewWindowResponse::Deny)
+        .on_download(|_, _| false);
+    window
+        .as_ref()
+        .window()
+        .add_child(builder, position, size)
+        .map_err(|error| format!("open inline gateway view: {error}"))?;
+    Ok(())
+}
+
+/// Track the Browser pane as it resizes (ResizeObserver on the UI side).
+#[cfg(feature = "cef")]
+#[tauri::command]
+pub fn gateway_inline_place(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    rect: InlineRect,
+) -> Result<(), String> {
+    use tauri::{LogicalPosition, LogicalSize, Manager as _};
+
+    crate::daemon::require_main_window(&window)?;
+    let Some(existing) = app.get_webview(INLINE_LABEL) else {
+        return Ok(()); // already closed — a late resize is not an error
+    };
+    place_inline_webview(
+        &existing,
+        LogicalPosition::new(rect.x, rect.y),
+        LogicalSize::new(rect.width, rect.height),
+    )
+}
+
+/// Close the inline gateway view (idempotent) — navigation away, view switch,
+/// or the pop-out-to-window control.
+#[cfg(feature = "cef")]
+#[tauri::command]
+pub fn gateway_inline_close(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager as _;
+    if let Some(existing) = app.get_webview(INLINE_LABEL) {
+        existing
+            .close()
+            .map_err(|error| format!("close inline gateway view: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cef")]
+fn place_inline_webview(
+    webview: &tauri::Webview,
+    position: tauri::LogicalPosition<f64>,
+    size: tauri::LogicalSize<f64>,
+) -> Result<(), String> {
+    webview
+        .set_bounds(tauri::Rect {
+            position: position.into(),
+            size: size.into(),
+        })
+        .map_err(|error| format!("place inline gateway view: {error}"))
+}
+
+// wry: the inline surface does not exist; the UI never calls these because
+// gateway_inline_supported() is false, but the commands stay registered so
+// the invoke surface is identical across shells.
+#[cfg(not(feature = "cef"))]
+#[tauri::command]
+pub fn gateway_open_inline(url: String, rect: InlineRect) -> Result<(), String> {
+    let _ = (url, rect);
+    Err("inline gateway views require the cef shell".into())
+}
+
+#[cfg(not(feature = "cef"))]
+#[tauri::command]
+pub fn gateway_inline_place(rect: InlineRect) -> Result<(), String> {
+    let _ = rect;
+    Err("inline gateway views require the cef shell".into())
+}
+
+#[cfg(not(feature = "cef"))]
+#[tauri::command]
+pub fn gateway_inline_close() -> Result<(), String> {
+    Err("inline gateway views require the cef shell".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
