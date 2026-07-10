@@ -14,9 +14,9 @@
 //   bun call-driver.ts <HOST:PORT_A> <HOST:PORT_B>
 //   (env SETTLE_MS: warmup after recipients before measuring; default 400)
 //
-// wire (bin/noded/src/lib.rs):
-//   in  0x01|960*i16le PCM,  0x02|flags|ts_ms(4le)|vp8-bytes,  text {type:"recipients",peers}
-//   out 0x01|960*i16le mixed PCM (20ms),  0x03|flags|ts_ms(4le)|peer(32)|vp8-bytes,  text control
+// wire (chat::call_wire — the single definition site; headers BE per D1, PCM payload stays LE):
+//   in  0x01|960*i16le PCM,  0x02|flags|ts_ms(4be)|vp8-bytes,  text {type:"recipients",peers}
+//   out 0x01|960*i16le mixed PCM (20ms),  0x03|flags|ts_ms(4be)|peer(32)|vp8-bytes,  text control
 
 const [httpA, httpB] = process.argv.slice(2);
 if (!httpA || !httpB) {
@@ -68,7 +68,7 @@ function capturedVideo(keyframe: boolean, tsMs: number, data: Uint8Array): Uint8
   const buf = new Uint8Array(6 + data.length); // tag | flags | ts_ms(4) | data
   buf[0] = TAG_VIDEO_CAPTURED;
   buf[1] = keyframe ? FLAG_KEYFRAME : 0;
-  new DataView(buf.buffer).setUint32(2, tsMs, true);
+  new DataView(buf.buffer).setUint32(2, tsMs); // big-endian (D1)
   buf.set(data, 6);
   return buf;
 }
@@ -78,7 +78,7 @@ function parsePeerVideo(ab: ArrayBuffer): PeerVideo | null {
   if (u[0] !== TAG_VIDEO_PEER || u.byteLength < PEER_HDR) return null;
   const dv = new DataView(ab);
   const peer = [...u.slice(6, 38)].map((b) => b.toString(16).padStart(2, "0")).join("");
-  return { peer, keyframe: (u[1] & FLAG_KEYFRAME) !== 0, tsMs: dv.getUint32(2, true), data: u.slice(PEER_HDR) };
+  return { peer, keyframe: (u[1] & FLAG_KEYFRAME) !== 0, tsMs: dv.getUint32(2), data: u.slice(PEER_HDR) };
 }
 const bytesEqual = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((v, i) => v === b[i]);
 

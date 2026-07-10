@@ -233,7 +233,7 @@ describe("MembersView", () => {
 
     fireEvent.change(input, { target: { value: "  Rae the Founder  " } });
     fireEvent.click(screen.getByRole("button", { name: /save display name/i }));
-    // trimmed and written through the origin-gated profiles action.
+    // trimmed and written through the origin-gated identity action.
     expect(spies.setDisplayName).toHaveBeenCalledWith("Rae the Founder");
   });
 
@@ -274,7 +274,7 @@ describe("MembersView", () => {
     renderMembers({
       members: [deviceAKey, deviceBKey, soloBoundKey, unboundKey],
       // Mirror the provider overlay: a bound node's authorNames entry IS the
-      // user's display name (identity overlays profiles at each bound key).
+      // account's display name (identity projects it at each bound node key).
       authorNames: {
         [deviceAKey]: "Casey",
         [deviceBKey]: "Casey",

@@ -37,6 +37,10 @@ import {
 } from "./call-frames";
 import { SAMPLE_RATE, floatToPcm16, nextSpeaking, pcm16ToFloat, rms, voiceErrorOf } from "./voice-session";
 import type { VoiceStatus, VoiceError } from "./voice-session";
+// The control-frame shapes are generated from the node's `CallClientControl`/
+// `CallServerControl` serde enums (`make stream-types`) — a hand-rolled
+// mirror here would drift the moment either side adds a variant.
+import type { CallClientControl, CallServerControl } from "./stream.gen";
 
 export type { VoiceStatus, VoiceError };
 
@@ -115,17 +119,6 @@ export interface CallSession {
 // Runtime video capability now lives in domain/video-capability.ts (a REAL codec
 // probe via isConfigSupported — WebKitGTK exposes the WebCodecs API but may not
 // register a vp8 encoder, and encode/decode capability can diverge).
-
-/** A hub → webview control frame — camelCase tags and fields, mirroring the
- *  node's `CallServerControl` serde attributes. */
-interface ServerControl {
-  type?: string;
-  peer?: string;
-  muted?: boolean;
-  cameraOn?: boolean;
-  sharing?: boolean;
-  maxKbps?: number;
-}
 
 /** Create a call session. `onEvent` receives status transitions and peer
  *  beacons; the caller maps status into the ephemeral voice slice (and treats
@@ -316,7 +309,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
 
   const sendBeacon = () => {
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "beacon", muted, cameraOn, sharing }));
+      socket.send(
+        JSON.stringify({ type: "beacon", muted, cameraOn, sharing } satisfies CallClientControl),
+      );
     }
     // Mirror the settled lane state to the store — authoritative for paths the
     // store can't see (failed acquire, encoder death, native "Stop sharing").
@@ -407,7 +402,9 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
     if (now - pipe.lastRequestMs < 1000) return; // ≥1 s, mirroring the hub
     pipe.lastRequestMs = now;
     if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "keyframeRequest", peer: peerHex }));
+      socket.send(
+        JSON.stringify({ type: "keyframeRequest", peer: peerHex } satisfies CallClientControl),
+      );
     }
   };
 
@@ -468,7 +465,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   };
 
   // ── control ─────────────────────────────────────────────
-  const parseControl = (text: string): ServerControl | null => {
+  const parseControl = (text: string): CallServerControl | null => {
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -476,14 +473,14 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
       return null;
     }
     if (!parsed || typeof parsed !== "object") return null;
-    const msg = parsed as ServerControl;
+    const msg = parsed as CallServerControl;
     if (msg.type === "keyframeRequest" || msg.type === "peerBeacon" || msg.type === "rateHint") {
       return msg;
     }
     return null;
   };
 
-  const applyControl = (msg: ServerControl) => {
+  const applyControl = (msg: CallServerControl) => {
     switch (msg.type) {
       case "keyframeRequest":
         // a peer lost sync with US — the next encoded frame must be a key.
@@ -529,7 +526,7 @@ export const createCallSession = (onEvent: (event: CallEvent) => void): CallSess
   // ── socket ──────────────────────────────────────────────
   const sendRecipients = (peers: string[]) => {
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "recipients", peers }));
+      socket.send(JSON.stringify({ type: "recipients", peers } satisfies CallClientControl));
     } else {
       pendingRecipients = peers;
     }

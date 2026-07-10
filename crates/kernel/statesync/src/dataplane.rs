@@ -46,11 +46,16 @@ pub const INTENT_RPC: u8 = 1;
 /// or corrupt length prefix cannot make the reader allocate unboundedly.
 pub const MAX_FRAME_LEN: u64 = 64 * 1024 * 1024;
 
-/// write one length-prefixed frame: `u64-le len || bytes`, then flush. shared
+/// write one length-prefixed frame: `u64-be len || bytes`, then flush. shared
 /// by the client (request out) and the inline serve loop (response out).
+///
+/// network byte order (BE), not the wire crate's LE convention: this frame
+/// prefix lives on the raw stream body, outside `wire.rs`'s length-prefixed
+/// helpers, so it has no compatibility obligation to their encoding — see the
+/// module doc's flag-day note.
 pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
     writer
-        .write_all(&(bytes.len() as u64).to_le_bytes())
+        .write_all(&(bytes.len() as u64).to_be_bytes())
         .await?;
     writer.write_all(bytes).await?;
     writer.flush().await?;
@@ -62,7 +67,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) ->
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut len_bytes = [0u8; 8];
     reader.read_exact(&mut len_bytes).await?;
-    let len = u64::from_le_bytes(len_bytes);
+    let len = u64::from_be_bytes(len_bytes);
     if len > MAX_FRAME_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -138,6 +143,17 @@ mod tests {
         write_frame(&mut a, &payload).await.unwrap();
         let read = read_frame(&mut b).await.unwrap();
         assert_eq!(read, payload);
+    }
+
+    #[tokio::test]
+    async fn frame_length_prefix_is_big_endian() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        write_frame(&mut a, b"abc").await.unwrap();
+        let mut buf = [0u8; 11];
+        tokio::io::AsyncReadExt::read_exact(&mut b, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, [0, 0, 0, 0, 0, 0, 0, 3, b'a', b'b', b'c']);
     }
 
     #[tokio::test]

@@ -30,7 +30,7 @@ export const isBeaconStale = (
 export interface HuddleParticipant {
   /** The member's user key as hex — React key + identity. */
   key: string;
-  /** Resolved display name (profiles registry, else the readable fallback). */
+  /** Resolved account display name (identity, else the readable fallback). */
   name: string;
   /** Known-muted: a peer whose beacon says muted, or ourselves when muted. A
    *  member we have no beacon from yet is NOT shown muted (unknown != muted). */

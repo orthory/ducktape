@@ -24,7 +24,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Icon } from "../../components/Icon";
 import { MODULES } from "../../modules/registry";
 import { accentVar, font } from "../../theme/tokens";
-import * as profilesClient from "../../../domain/profiles-client";
+import * as identityClient from "../../../domain/identity-client";
 import { remoteTransport, type NodeStatus } from "../../../domain/transport";
 import { activeWorkspace, type Workspace } from "../../../domain/workspace-client";
 
@@ -53,11 +53,11 @@ async function loadSnap(): Promise<Snap> {
   if (!workspace) return EMPTY;
   const live = remoteTransport(`http://127.0.0.1:${workspace.ports.http}`);
   try {
-    const [status, profiles] = await Promise.all([
+    const [status, accounts] = await Promise.all([
       live.status(),
-      profilesClient.allProfiles(live, { from: 0, limit: 256 }).catch(() => []),
+      identityClient.allAccounts(live, { from: 0, limit: 256 }).catch(() => []),
     ]);
-    return { workspace, status, memberCount: profiles.length };
+    return { workspace, status, memberCount: accounts.length };
   } catch {
     return { workspace, status: null, memberCount: 0 };
   }

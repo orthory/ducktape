@@ -36,8 +36,10 @@ agent-facing gaps.
 - `files` is duckfs: a consensus-replicated, copy-on-write, content-addressed
   filesystem — every node holds every byte, and bytes survive restart.
 - `jobs` is a consensus-native work board with first-claim-wins claims.
-- `identity` binds node keys to user keys — a replicated registry so a person
-  running several nodes still resolves to one identity above mesh/valset.
+- `identity` is the canonical account registry: member keys, display name, and
+  bound node keys let a person running several nodes resolve to one identity.
+- `duckdns` adds optional `<handle>.duck` account aliases and identity-only
+  service discovery. Workspace identity and membership do not require an alias.
 - `kv`, `valset`, `saga`, `governance`, `directory`, and `greeter` support
   infrastructure, examples, and tests.
 
@@ -233,33 +235,34 @@ strategies, not for multiple in-cascade claimants of the same kind.
 
 ## Identity
 
-Identity is the user/node binding registry (`crates/system/identity`): a user
-is an ed25519 keypair held by the person in the app; a node is a workspace's
-mesh/valset identity. The module stores, per user, a display name, a
-replay-guard nonce, and the set of bound node keys — one person can bind
-several nodes to the same user.
+Identity is the canonical account registry (`crates/system/identity`). An
+account has a stable AccountId (its founding member key as an identifier), one
+or more member keys of supported schemes, a shared display name and replay
+nonce, and any number of bound node keys. A node remains a workspace's
+mesh/valset identity; several nodes and devices can belong to one account
+without collapsing their network identities.
 
 `BindNode` binds the SUBMITTING node (the verified origin, never a payload
-field) to a user, consented to by a user-key signature over a
-chain-id ‖ node-key ‖ nonce preimage — a certificate can never replay onto a
-different network, a cert minted for node A can never bind node B, and a
-stale nonce (from a prior bind/unbind) rejects. On
-the networked node, `BindNode` is additionally gated to current members: the
-origin must be a validator or an observer, so a node with no standing at all
-cannot mint itself a user. `UnbindNode` carries no such gate and is accepted
-from ANY external origin — a surviving device can evict a lost one — and it
-bumps the user's nonce so a captured bind certificate for the evicted node is
-dead forever; unbinding a user's last node keeps the user record — name and
-nonce persist with zero nodes, so a later bind resolves the same identity.
-`SetUserName` is origin-gated only (a bound node is trusted
-hardware, no user signature required): it sets the display name of the user
-the submitting node is bound to, under the same 64-byte limit as profiles,
-and it does not bump the nonce — no user signature is consumed.
+field) to the authorizing member key's account. The member proof covers a
+chain-id ‖ node-key ‖ nonce preimage, so it cannot replay across networks,
+nodes, or nonce changes. A brand-new member key founds an account on its first
+bind. On a networked node, the submitting node must also be a current validator
+or resident. `UnbindNode` is authorized by any surviving member key in the
+account; `AddMemberKey` requires both an existing member's consent and proof of
+possession by the new key; `RemoveMemberKey` preserves at least one live member.
+Each accepted member-signed change advances the shared nonce. Unbinding the
+last node leaves the account, member keys, name, and nonce intact, so a later
+bind resolves the same identity.
+
+`SetAccountName` is origin-gated only (a bound node is trusted hardware, no
+member-key signature required): it sets the display name of the account the
+submitting node is bound to, under a 64-byte limit, and it does not bump the
+nonce — no member-key signature is consumed.
 
 Binding does not change what stays per node: mesh tracking, valset seats, and
-quorum arithmetic are untouched by this module. A user running three
-validators still holds three seats and casts three votes — identity maps keys
-to a person for display and authorship resolution, it does not collapse
+quorum arithmetic are untouched by this module. An account running three
+validators still holds three seats and casts three votes — Identity resolves
+nodes to an account for authority, display, and authorship without collapsing
 consensus weight.
 
 Adding identity to a network that predates it is a module-set change like any
@@ -267,9 +270,10 @@ other: the genesis app-hash moves, so an already-running network needs a
 coordinated rebuild — a lockstep upgrade across every validator, not a rolling
 one — to adopt it.
 
-The module stores keys; custody of the user key itself is a desktop-app
-concern layered on top through `bin/node`'s `user-key` verbs. The
-24-word mnemonic is an entropy-preserving, identity-preserving encoding of the
+The module stores public membership and binding state; custody of private
+member keys is a desktop-app concern layered on top through `bin/node`'s
+`user-key` verbs. The primary native member's 24-word mnemonic is an
+entropy-preserving, identity-preserving encoding of the
 raw ed25519 seed, so it recovers the identity exactly rather than deriving a
 new one. The password is local-encryption only — argon2id wraps a key that
 encrypts the seed at rest with XChaCha20-Poly1305 — and never enters key

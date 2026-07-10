@@ -1,19 +1,23 @@
-// The binary framing of /v1/call/ws — mirrors bin/noded/src/lib.rs (WS_TAG_*).
-// Little-endian on THIS (browser ↔ node) leg, so a DataView reads it directly;
-// the mesh leg between nodes stays big-endian and never reaches here.
+// The binary framing of /v1/call/ws — mirrors chat::call_wire (the single
+// definition site; bin/noded/src/lib.rs ports its handler onto the same
+// codec). Structural header fields (ts_ms) are big-endian (D1), matching the
+// mesh leg's already-BE datagram codecs. The pcm audio PAYLOAD stays
+// little-endian: it's loopback-only (never relayed to another node) and a
+// JS Int16Array is platform little-endian, so flipping it would just add a
+// conversion with no interop benefit.
 //
 // Tag byte layouts (first byte selects the frame kind):
 //   audio    [0x01][pcm i16 LE …]                    — both directions
-//   captured [0x02][flags u8][ts_ms u32 LE][vp8 …]   — client → server only
-//   peer     [0x03][flags u8][ts_ms u32 LE][key 32][vp8 …] — server → client
+//   captured [0x02][flags u8][ts_ms u32 BE][vp8 …]   — client → server only
+//   peer     [0x03][flags u8][ts_ms u32 BE][key 32][vp8 …] — server → client
 // `flags` bit 0 (WS_FLAG_KEYFRAME) marks a decoder sync point.
 
 export const WS_TAG_AUDIO = 0x01;
 export const WS_TAG_VIDEO_CAPTURED = 0x02;
 export const WS_TAG_VIDEO_PEER = 0x03;
 const WS_FLAG_KEYFRAME = 0x01;
-const CAPTURED_HEADER = 6; // tag + flags + ts_ms(u32 LE)
-const PEER_HEADER = 38; // tag + flags + ts_ms(u32 LE) + peer key(32 raw)
+const CAPTURED_HEADER = 6; // tag + flags + ts_ms(u32 BE)
+const PEER_HEADER = 38; // tag + flags + ts_ms(u32 BE) + peer key(32 raw)
 
 /** Prefix a captured 20 ms pcm frame with the audio tag. The pcm's own
  *  byteOffset/byteLength are honoured, so a subarray view ships only its own
@@ -25,7 +29,7 @@ export const encodeAudioFrame = (pcm: Int16Array): ArrayBuffer => {
   return out.buffer;
 };
 
-/** Encode one captured (VP8) camera frame: `[0x02][flags][ts_ms u32 LE][data]`.
+/** Encode one captured (VP8) camera frame: `[0x02][flags][ts_ms u32 BE][data]`.
  *  `tsMs` is coerced to a u32 (the wire width) before write. */
 export const encodeCapturedVideo = (
   keyframe: boolean,
@@ -36,7 +40,7 @@ export const encodeCapturedVideo = (
   const view = new DataView(out.buffer);
   out[0] = WS_TAG_VIDEO_CAPTURED;
   out[1] = keyframe ? WS_FLAG_KEYFRAME : 0;
-  view.setUint32(2, tsMs >>> 0, true);
+  view.setUint32(2, tsMs >>> 0);
   out.set(data, CAPTURED_HEADER);
   return out.buffer;
 };
@@ -66,7 +70,7 @@ export const decodeServerFrame = (buf: ArrayBuffer): ServerBinaryFrame | null =>
     return {
       kind: "video",
       keyframe: (bytes[1] & WS_FLAG_KEYFRAME) !== 0,
-      tsMs: view.getUint32(2, true),
+      tsMs: view.getUint32(2),
       peer: toHex(bytes.subarray(6, 38)),
       data: bytes.slice(PEER_HEADER),
     };

@@ -45,8 +45,10 @@ export const OP_STALE_MS = 10_000;
 // overwrite each other's record, so a row always shows its latest write.
 
 export const opKey = {
-  /** The local member's own profile (the Settings display-name row). */
-  profile: () => "profile/self",
+  /** The local identity account's canonical display-name row. */
+  accountName: () => "account/name/self",
+  /** The local identity account's optional DuckDNS handle row. */
+  duckHandle: () => "account/duck-handle/self",
   channel: (channelId: string) => `chat/channel/${channelId}`,
   /** A NEW message — keyed by the client-minted message id (the committed row
    *  carries it in `head.message_id`, so the row matches after refresh too). */

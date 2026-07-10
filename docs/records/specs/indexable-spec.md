@@ -128,8 +128,8 @@ Not every module earns a mapper. Skip one when:
 - **the substrate is already a read model.** forge's state *is* a git repo —
   cloneable, greppable, log-walkable over the existing smart-HTTP lane. An
   index would be a worse second copy.
-- **canonical queries already fit the read shape.** profiles is a small
-  origin→name map; `query` answers it point-wise. Listing modules with
+- **canonical queries already fit the read shape.** identity is a bounded
+  account→name/keys/nodes registry with direct typed queries. Listing modules with
   nothing to scan or search gains nothing from the derived tier.
 - **the data never leaves the node-local plane.** files' chunk bytes bypass
   consensus entirely; there is no op stream to fold.

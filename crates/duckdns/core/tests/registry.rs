@@ -4,11 +4,9 @@ use duckdns_core::{
     decode_reply, encode_msg, encode_query, encode_reply,
 };
 
-fn account(handle: &str, service: &str) -> ServiceAnnouncement {
+fn account(service: &str) -> ServiceAnnouncement {
     ServiceAnnouncement {
-        scope: ServiceScope::Account {
-            handle: handle.into(),
-        },
+        scope: ServiceScope::Account,
         service: service.into(),
     }
 }
@@ -23,7 +21,7 @@ fn network(service: &str) -> ServiceAnnouncement {
 #[test]
 fn wire_types_round_trip_without_transport_metadata() {
     let message = DuckDnsMsg::ReplaceAnnouncements {
-        announcements: vec![account("orthory", "huddle")],
+        announcements: vec![account("huddle")],
     };
     assert_eq!(decode_msg(&encode_msg(&message)).unwrap(), message);
 
@@ -42,52 +40,106 @@ fn wire_types_round_trip_without_transport_metadata() {
         }],
     })));
     assert_eq!(decode_reply(&encode_reply(&reply)).unwrap(), reply);
+
+    let register = DuckDnsMsg::SetHandle {
+        handle: Some("orthory".into()),
+    };
+    assert_eq!(
+        String::from_utf8(encode_msg(&register)).unwrap(),
+        r#"{"set_handle":{"handle":"orthory"}}"#
+    );
+    assert_eq!(decode_msg(&encode_msg(&register)).unwrap(), register);
+    assert_eq!(
+        String::from_utf8(encode_query(&DuckDnsQuery::Registrations {
+            from: 0,
+            limit: 256,
+        }))
+        .unwrap(),
+        r#"{"registrations":{"from":0,"limit":256}}"#
+    );
 }
 
 #[test]
-fn handle_claims_are_idempotent_owned_and_release_cleans_services() {
+fn handle_registration_is_declarative_unique_per_account_and_service_independent() {
     let mut registry = Registry::new("team#A1B2C3D4").unwrap();
     let owner = vec![7; 32];
     let other = vec![8; 32];
     let node = vec![1; 32];
 
-    registry.claim_handle(&owner, "orthory".into()).unwrap();
-    registry.claim_handle(&owner, "orthory".into()).unwrap();
-    assert!(registry.claim_handle(&other, "orthory".into()).is_err());
+    registry.set_handle(&owner, Some("orthory".into())).unwrap();
+    registry.set_handle(&owner, Some("orthory".into())).unwrap();
+    assert!(registry.set_handle(&other, Some("orthory".into())).is_err());
     registry
-        .replace_announcements(&node, Some(&owner), vec![account("orthory", "huddle")])
+        .replace_announcements(&node, Some(&owner), vec![account("huddle")])
         .unwrap();
     registry.commit();
 
-    assert!(registry.release_handle(&other, "orthory").is_err());
-    registry.release_handle(&owner, "orthory").unwrap();
+    registry.set_handle(&owner, Some("renamed".into())).unwrap();
     registry.commit();
     assert_eq!(registry.handle_owner("orthory"), None);
-    assert!(registry.node_announcements(&node).is_empty());
+    assert_eq!(registry.handle_owner("renamed"), Some(owner.as_slice()));
+
+    registry.set_handle(&owner, None).unwrap();
+    registry.commit();
+    assert_eq!(registry.handle_owner("renamed"), None);
+    assert_eq!(
+        registry.node_registration(&node).unwrap().announcements,
+        vec![account("huddle")]
+    );
+
+    registry.set_handle(&owner, Some("final".into())).unwrap();
+    registry.commit();
+    assert_eq!(registry.registrations(0, 256).unwrap().len(), 1);
+    assert_eq!(registry.registrations(0, 256).unwrap()[0].handle, "final");
+    assert!(registry.registrations(0, 257).is_err());
 }
 
 #[test]
-fn account_services_require_the_submitting_nodes_account() {
+fn account_services_require_and_capture_the_submitting_nodes_account() {
     let mut registry = Registry::new("team#A1B2C3D4").unwrap();
     let owner = vec![7; 32];
-    let other = vec![8; 32];
-    registry.claim_handle(&owner, "orthory".into()).unwrap();
-    registry.commit();
 
-    let declaration = account("orthory", "huddle");
+    let declaration = account("huddle");
     assert!(
         registry
             .replace_announcements(&[1; 32], None, vec![declaration.clone()])
             .is_err()
     );
-    assert!(
-        registry
-            .replace_announcements(&[1; 32], Some(&other), vec![declaration.clone()])
-            .is_err()
-    );
     registry
         .replace_announcements(&[1; 32], Some(&owner), vec![declaration])
         .unwrap();
+    assert_eq!(
+        registry.node_registration(&[1; 32]).unwrap().account_id,
+        Some(owner)
+    );
+}
+
+#[test]
+fn account_alias_gates_lookup_not_service_registration() {
+    let mut registry = Registry::new("team#A1B2C3D4").unwrap();
+    let owner = vec![7; 32];
+    registry
+        .replace_announcements(&[1; 32], Some(&owner), vec![account("huddle")])
+        .unwrap();
+    registry.commit();
+
+    let name = DuckDnsName::AccountService {
+        service: "huddle".into(),
+        handle: "orthory".into(),
+    };
+    assert!(registry.resolve_service(&name).unwrap().is_none());
+
+    registry.set_handle(&owner, Some("orthory".into())).unwrap();
+    registry.commit();
+    assert_eq!(
+        registry.resolve_service(&name).unwrap().unwrap().providers[0].node,
+        vec![1; 32]
+    );
+
+    registry.set_handle(&owner, None).unwrap();
+    registry.commit();
+    assert!(registry.resolve_service(&name).unwrap().is_none());
+    assert!(registry.node_registration(&[1; 32]).is_some());
 }
 
 #[test]
@@ -139,18 +191,17 @@ fn service_resolution_returns_node_identities_not_endpoints() {
 fn declarative_replacement_removes_stale_services() {
     let mut registry = Registry::new("team#00000000").unwrap();
     registry
-        .replace_announcements(
-            &[1; 32],
-            None,
-            vec![network("search"), network("status")],
-        )
+        .replace_announcements(&[1; 32], None, vec![network("search"), network("status")])
         .unwrap();
     registry
         .replace_announcements(&[1; 32], None, vec![network("search")])
         .unwrap();
     registry.commit();
 
-    assert_eq!(registry.node_announcements(&[1; 32]), vec![network("search")]);
+    assert_eq!(
+        registry.node_registration(&[1; 32]).unwrap().announcements,
+        vec![network("search")]
+    );
     assert!(
         registry
             .resolve_service(&DuckDnsName::NetworkService {
@@ -166,12 +217,12 @@ fn declarative_replacement_removes_stale_services() {
 fn pending_changes_abort_or_commit_atomically() {
     let mut registry = Registry::new("team#00000000").unwrap();
     let owner = vec![7; 32];
-    registry.claim_handle(&owner, "orthory".into()).unwrap();
+    registry.set_handle(&owner, Some("orthory".into())).unwrap();
     assert_eq!(registry.root_bytes(), [0; 32]);
     registry.abort();
     assert_eq!(registry.handle_owner("orthory"), None);
 
-    registry.claim_handle(&owner, "orthory".into()).unwrap();
+    registry.set_handle(&owner, Some("orthory".into())).unwrap();
     registry.commit();
     assert_eq!(registry.handle_owner("orthory"), Some(owner.as_slice()));
     assert_ne!(registry.root_bytes(), [0; 32]);
@@ -180,9 +231,9 @@ fn pending_changes_abort_or_commit_atomically() {
 #[test]
 fn snapshot_round_trip_is_canonical_and_root_checked() {
     let mut first = Registry::new("team#00000000").unwrap();
-    first.claim_handle(&[7; 32], "orthory".into()).unwrap();
+    first.set_handle(&[7; 32], Some("orthory".into())).unwrap();
     first
-        .replace_announcements(&[1; 32], Some(&[7; 32]), vec![account("orthory", "huddle")])
+        .replace_announcements(&[1; 32], Some(&[7; 32]), vec![account("huddle")])
         .unwrap();
     first.commit();
 
@@ -196,6 +247,9 @@ fn snapshot_round_trip_is_canonical_and_root_checked() {
     let mut corrupt = snapshot.clone();
     corrupt.push(0);
     assert!(restored.install(&corrupt, root).is_err());
+    let mut future = snapshot.clone();
+    future[0] = 2;
+    assert!(restored.install(&future, root).is_err());
     assert!(restored.install(&snapshot, [9; 32]).is_err());
     assert_eq!(restored.root_bytes(), root);
 }
@@ -205,21 +259,23 @@ fn insertion_order_does_not_change_snapshot_or_root() {
     let mut first = Registry::new("team#00000000").unwrap();
     let mut second = Registry::new("team#00000000").unwrap();
     for registry in [&mut first, &mut second] {
-        registry.claim_handle(&[7; 32], "orthory".into()).unwrap();
+        registry
+            .set_handle(&[7; 32], Some("orthory".into()))
+            .unwrap();
         registry.commit();
     }
     first
         .replace_announcements(
             &[1; 32],
             Some(&[7; 32]),
-            vec![network("search"), account("orthory", "huddle")],
+            vec![network("search"), account("huddle")],
         )
         .unwrap();
     second
         .replace_announcements(
             &[1; 32],
             Some(&[7; 32]),
-            vec![account("orthory", "huddle"), network("search")],
+            vec![account("huddle"), network("search")],
         )
         .unwrap();
     first.commit();

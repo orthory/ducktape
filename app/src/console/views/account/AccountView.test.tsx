@@ -147,6 +147,31 @@ describe("AccountView — profile", () => {
     expect(screen.getByText("not linked to an account yet")).toBeInTheDocument();
   });
 
+  it("registers, validates, and removes an optional .duck alias", () => {
+    const { spies } = renderAccount(linkedState());
+    expect(screen.getByText(/identity works without one/i)).toBeInTheDocument();
+
+    const input = screen.getByRole("textbox", { name: "Duck name" });
+    fireEvent.change(input, { target: { value: " Rae-Team " } });
+    fireEvent.click(screen.getByRole("button", { name: "Register Duck name" }));
+    expect(spies.setDuckHandle).toHaveBeenCalledWith("rae-team");
+
+    fireEvent.change(input, { target: { value: "net" } });
+    fireEvent.click(screen.getByRole("button", { name: "Register Duck name" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("net.duck is reserved");
+    expect(spies.setDuckHandle).toHaveBeenCalledTimes(1);
+
+  });
+
+  it("removes an existing .duck alias without touching identity", () => {
+    const registered = renderAccount({
+      ...linkedState(),
+      accountHandles: { [ACCOUNT_ID]: "rae" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Remove Duck name" }));
+    expect(registered.spies.setDuckHandle).toHaveBeenCalledWith(null);
+  });
+
   it("shows the honest chain-scope banner when nothing is connected", () => {
     renderAccount({ workspace: null, nodeUrl: null, connected: false });
     expect(screen.getByText(/Account data lives on each network/)).toBeInTheDocument();

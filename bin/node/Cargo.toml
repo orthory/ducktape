@@ -43,7 +43,6 @@ pages = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
 vaults = { workspace = true }
-profiles = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
 duckdns-node = { workspace = true }

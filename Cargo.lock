@@ -2053,7 +2053,6 @@ dependencies = [
  "inbox",
  "jobs",
  "kv",
- "profiles",
  "runs",
  "saga",
  "sdk",
@@ -4421,7 +4420,6 @@ dependencies = [
  "noded",
  "overlay-net",
  "pages",
- "profiles",
  "rand 0.8.6",
  "reachability",
  "reactor",
@@ -4478,7 +4476,6 @@ dependencies = [
  "indexer",
  "jobs",
  "pages",
- "profiles",
  "reactor",
  "runs",
  "saga",
@@ -5400,19 +5397,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "profiles"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "host",
- "sdk",
- "serde",
- "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -6451,7 +6435,6 @@ dependencies = [
  "jobs",
  "noded",
  "pages",
- "profiles",
  "reactor",
  "runs",
  "saga",

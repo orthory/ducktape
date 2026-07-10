@@ -2,6 +2,7 @@ import type { Dispatch } from "react";
 
 import * as agentClient from "../../domain/agent-client";
 import * as chatClient from "../../domain/chat-client";
+import * as duckdnsClient from "../../domain/duckdns-client";
 import type { ChatBlock, PostPolicy } from "../../domain/chat-client";
 import * as forgeClient from "../../domain/forge-client";
 import type {
@@ -14,7 +15,6 @@ import * as identityClient from "../../domain/identity-client";
 import { normalizeKey } from "../../domain/names";
 import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
-import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
 import type { TurnPolicy } from "../../domain/runs-client";
 import { parseMetrics, type NodeMetrics } from "../../domain/metrics";
@@ -117,9 +117,10 @@ export interface ConsoleActions {
   setNotifyPrefs(prefs: NotifyPrefs): void;
   toggleChannelMute(channelId: string): void;
   setAuthor(author: string): void;
-  /** Set our own display name in the `profiles` module (origin-gated SetName)
-   *  and keep it as the local author identity, so it propagates to everyone. */
+  /** Set this node's bound identity account display name. */
   setDisplayName(name: string): void;
+  /** Declaratively set or clear the bound account's optional `.duck` handle. */
+  setDuckHandle(handle: string | null): void;
 
   // ── Account (the person: member keys, bound nodes) ──
   /** Mint a fresh device-link challenge for this node's account — the Account
@@ -1069,21 +1070,19 @@ export function createActions({
           // parks in localStorage (names are chain-scoped) and lands here, on
           // the first adopted node. When the bind landed, the name belongs on
           // the ACCOUNT (identity SetAccountName) so it travels with the
-          // person across devices; otherwise fall back to the per-node
-          // profiles name, same as setDisplayName's routing. Fire-and-forget
-          // like the bind itself: a failure keeps the parked name for the
-          // next connect and never surfaces as an error.
+          // person across devices. An unbound outcome leaves it parked for the
+          // next connect; there is no second per-node name registry.
           const pending = loadPendingDisplayName();
           if (!pending) return;
           patch({ author: pending });
-          const write =
-            outcome === "bound" || outcome === "already"
-              ? identityClient.setAccountName(transport, {
-                  displayName: pending,
-                  origin: pending,
-                })
-              : profilesClient.setName(transport, { displayName: pending, origin: pending });
-          return write.then(() => clearPendingDisplayName()).catch(() => {});
+          if (outcome !== "bound" && outcome !== "already") return;
+          return identityClient
+            .setAccountName(transport, {
+              displayName: pending,
+              origin: pending,
+            })
+            .then(() => clearPendingDisplayName())
+            .catch(() => {});
         })
         .catch(() => {});
     };
@@ -1288,27 +1287,37 @@ export function createActions({
       return ws.workspaceRuntimeFacts(workspace.id).catch(() => null);
     },
 
-    // Keep the local author identity (still the web-origin string) AND submit
-    // a name write so the chosen name propagates: it's origin-gated, so
-    // passing our origin only ever writes OUR OWN name. Once this node is
-    // bound to a user (state.nodeUsers has it), the durable identity is the
-    // USER, not the node — so the write goes through identity's SetAccountName
-    // instead of profiles' SetName, the same way MembersView's inline
-    // self-rename (canRename row, also wired to this action) picks up the
-    // bound-vs-unbound distinction for free. An unbound node keeps the
-    // original profiles path unchanged. Refresh re-reads authorNames/nodeUsers.
+    // Identity is the only durable display-name authority. The module derives
+    // the account from the authenticated node and rejects an unbound origin.
     setDisplayName: (name) => {
       const current = getState();
       const origin = current.author;
-      const nodeKeyNorm = normalizeKey(current.workspace?.pubkey);
-      const bound = nodeKeyNorm ? current.nodeUsers[nodeKeyNorm] : undefined;
       submitTracked(
-        opKey.profile(),
-        (live) =>
-          bound
-            ? identityClient.setAccountName(live, { displayName: name, origin })
-            : profilesClient.setName(live, { displayName: name, origin }),
+        opKey.accountName(),
+        (live) => identityClient.setAccountName(live, { displayName: name, origin }),
         () => ({ author: name }),
+      );
+    },
+
+    setDuckHandle: (handle) => {
+      const current = getState();
+      const nodeKey = normalizeKey(current.status?.publicKey || current.workspace?.pubkey);
+      const accountId = nodeKey
+        ? current.nodeUsers[nodeKey]?.accountId
+        : undefined;
+      if (!accountId) {
+        fail("bind this node to an identity account before registering a .duck name");
+        return;
+      }
+      submitTracked(
+        opKey.duckHandle(),
+        (live) => duckdnsClient.setHandle(live, { handle, origin: current.author }),
+        (prev) => {
+          const accountHandles = { ...prev.accountHandles };
+          if (handle) accountHandles[accountId] = handle;
+          else delete accountHandles[accountId];
+          return { accountHandles };
+        },
       );
     },
 
@@ -2258,6 +2267,9 @@ export function createActions({
           activeChannel: null,
           activeThread: null,
           authorNames: {},
+          nodeUsers: {},
+          accountKeys: {},
+          accountHandles: {},
           pages: [],
           activePage: null,
           activePageBlocks: [],
@@ -2323,6 +2335,9 @@ export function createActions({
         activeChannel: null,
         activeThread: null,
         authorNames: {},
+        nodeUsers: {},
+        accountKeys: {},
+        accountHandles: {},
         members: [],
         proposals: [],
         forgeHead: null,
@@ -2431,6 +2446,9 @@ export function createActions({
             activeChannel: null,
             activeThread: null,
             authorNames: {},
+            nodeUsers: {},
+            accountKeys: {},
+            accountHandles: {},
             pages: [],
             activePage: null,
             activePageBlocks: [],
@@ -2496,6 +2514,9 @@ export function createActions({
             activeChannel: null,
             activeThread: null,
             authorNames: {},
+            nodeUsers: {},
+            accountKeys: {},
+            accountHandles: {},
             pages: [],
             activePage: null,
             activePageBlocks: [],

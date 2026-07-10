@@ -118,7 +118,7 @@ const sectionLabel: CSSProperties = {
   color: color.muted2,
 };
 
-// mirrors `profiles::MAX_NAME_LEN` — the module rejects a longer display name.
+// mirrors identity's MAX_DISPLAY_NAME_LEN — consensus rejects a longer name.
 const MAX_NAME_LEN = 64;
 
 function makeMembers(
@@ -461,7 +461,7 @@ function MemberRow({
   onPromote: () => void;
   onRevoke: () => void;
   /** Show the rename control for this row — the local node's own entry, the
-   *  only profile an origin-gated `SetName` may write. */
+   *  only account name an origin-gated `SetAccountName` may write. */
   canRename: boolean;
   onRename: (name: string) => void;
 }) {
@@ -469,7 +469,7 @@ function MemberRow({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
 
-  // Inline self-rename: the same origin-gated profiles write Settings uses,
+  // Inline self-rename: the same origin-gated identity write Account uses,
   // surfaced on your own row. Enter/Save commits, Escape/Cancel discards; an
   // empty name is treated as no change (Settings owns clearing).
   if (canRename && editing) {

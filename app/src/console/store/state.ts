@@ -155,10 +155,9 @@ export interface ConsoleState {
   /** The active channel's tag catalog (count-ordered), loaded on demand for
    *  the header's tag dropdown. Cleared on channel switch. */
   channelTags: ChatTagRow[];
-  /** hex(user key bytes) → display name, from the `profiles` module; threaded
-   *  into author rendering so messages show chosen names, not hex handles.
-   *  OVERLAID by `identity`'s per-user display name for every node it binds —
-   *  see DucktapeProvider's snapshot build. */
+  /** hex(node key bytes) → canonical account display name, projected from
+   *  `identity` for author rendering. Unbound nodes deliberately have no
+   *  replicated display-name record. */
   authorNames: Record<string, string>;
   /** hex(node key bytes) → its owning user, from the `identity` module — the
    *  node/user split's resolver: `name` is that user's chosen display name
@@ -168,6 +167,9 @@ export interface ConsoleState {
    *  from the `identity` module. `nodeUsers`/`authorNames` carry the shared
    *  display name; this is the key list the account settings surface renders. */
   accountKeys: Record<string, MemberKeyView[]>;
+  /** hex(account id) → its optional DuckDNS handle (without `.duck`). Identity
+   *  exists independently when no entry is registered. */
+  accountHandles: Record<string, string>;
   /** This client's live voice-huddle session — ephemeral, never in the
    *  committed snapshot (see VoiceSlice). */
   voice: VoiceSlice;
@@ -622,6 +624,7 @@ export const createInitialState = (): ConsoleState => {
     authorNames: {},
     nodeUsers: {},
     accountKeys: {},
+    accountHandles: {},
     voice: {
       channelId: null,
       muted: false,
@@ -692,6 +695,7 @@ export interface ConsoleSnapshot {
   authorNames: Record<string, string>;
   nodeUsers: Record<string, { accountId: string; name: string | null }>;
   accountKeys: Record<string, MemberKeyView[]>;
+  accountHandles: Record<string, string>;
   pages: PageMeta[];
   activePageBlocks: PageBlock[];
   agents: AgentRecord[];
@@ -719,6 +723,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   authorNames: snapshot.authorNames,
   nodeUsers: snapshot.nodeUsers,
   accountKeys: snapshot.accountKeys,
+  accountHandles: snapshot.accountHandles,
   pages: snapshot.pages,
   activePageBlocks: snapshot.activePageBlocks,
   agents: snapshot.agents,

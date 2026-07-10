@@ -59,7 +59,7 @@ describe("identity queries", () => {
   });
 
   it("throws on a mismatched reply variant", async () => {
-    const transport = stubTransport({ profiles: [] });
+    const transport = stubTransport({ tasks: [] });
     await expect(allAccounts(transport)).rejects.toThrow(
       "unexpected module reply: wanted accounts",
     );

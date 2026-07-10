@@ -206,9 +206,6 @@ const makeFakeNode = ({
         if (query === "watches") return Promise.resolve({ watches: [] });
         return Promise.resolve({ pending_runs: [] });
       }
-      if (target === "profiles") {
-        return Promise.resolve({ profiles: [] });
-      }
       if (target === "identity") {
         return Promise.resolve({ accounts: users });
       }
