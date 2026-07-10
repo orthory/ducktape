@@ -18,4 +18,4 @@ commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
 
 [dev-dependencies]
-futures = "0.3"
+futures = { workspace = true }

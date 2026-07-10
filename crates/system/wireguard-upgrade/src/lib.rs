@@ -1015,7 +1015,10 @@ pub enum Perspective {
     Responder,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the public validation boundary keeps every signed transcript and context input explicit"
+)]
 pub fn validate_upgrade(
     view: &MeshView,
     policy: &PortPolicy,
@@ -1047,7 +1050,10 @@ pub fn validate_upgrade(
 /// the responder-side counterpart the `tunnel_e2e` "PINNED GAP" test
 /// documents: before this function existed, only the initiator's plan was
 /// derivable.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the public validation boundary keeps every signed transcript and context input explicit"
+)]
 pub fn validate_upgrade_as(
     perspective: Perspective,
     view: &MeshView,

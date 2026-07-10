@@ -244,7 +244,10 @@ pub enum SagaQuery {
 #[serde(rename_all = "snake_case")]
 // Query replies are the public serde wire surface; keep the ergonomic variant
 // payloads instead of boxing only to shrink this in-memory enum.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "this public serde wire enum keeps ergonomic unboxed payload variants"
+)]
 pub enum SagaReply {
     Saga(Option<SagaView>),
     NextExpiry(Option<u64>),

@@ -210,9 +210,11 @@ pub fn verify_authority(
             rp_id_hash,
             namespace,
             preimage,
-            authenticator_data,
-            client_data_json,
-            signature,
+            WebauthnAssertion {
+                authenticator_data,
+                client_data_json,
+                signature,
+            },
         ),
         // any (kind, proof-shape) mismatch is a categorical no: a native key
         // must present a `Signature`, a passkey a `Webauthn` envelope.
@@ -262,18 +264,27 @@ fn verify_p256_native(pubkey: &[u8], namespace: &[u8], preimage: &[u8], sig: &[u
     pk.verify(namespace, preimage, &sig)
 }
 
-/// the WebAuthn assertion envelope (see the module docs).
-#[allow(clippy::too_many_arguments)]
+/// the borrowed WebAuthn assertion envelope (see the module docs).
+struct WebauthnAssertion<'a> {
+    authenticator_data: &'a [u8],
+    client_data_json: &'a [u8],
+    signature: &'a [u8],
+}
+
 fn verify_webauthn_p256(
     pubkey: &[u8],
     rp_id_hash: Option<&[u8; 32]>,
     namespace: &[u8],
     preimage: &[u8],
-    authenticator_data: &[u8],
-    client_data_json: &[u8],
-    signature: &[u8],
+    assertion: WebauthnAssertion<'_>,
 ) -> bool {
     use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
+
+    let WebauthnAssertion {
+        authenticator_data,
+        client_data_json,
+        signature,
+    } = assertion;
 
     // 1. authenticatorData shape + user-presence. (signCount replay is not
     //    tracked: our preimage carries the account nonce, so a replayed

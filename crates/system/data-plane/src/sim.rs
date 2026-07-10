@@ -1,7 +1,7 @@
 //! The deterministic in-memory transport arm (`sim` feature): a virtual
 //! network of point-to-point links with latency, serialization (bandwidth),
 //! and optional datagram loss — the test/simulation counterpart of the
-//! future overlay-socket arm.
+//! real overlay-socket arm.
 //!
 //! The link model is what makes the isolation proofs honest: BOTH classes'
 //! bytes are serialized through the same directed link (a shared
@@ -87,7 +87,6 @@ pub struct SimNet {
 }
 
 impl SimNet {
-    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         SimNet {
             inner: Arc::new(NetInner {
@@ -132,6 +131,12 @@ impl SimNet {
                 datagrams: 0,
             })),
         );
+    }
+}
+
+impl Default for SimNet {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

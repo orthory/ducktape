@@ -117,7 +117,8 @@ impl Coordinator {
     /// EXPIRE: a mapping older than the TTL resolves to `None` and never
     /// receives a `PunchSync` fan-out (its NAT pinhole is long dead). The
     /// caller identity is unknown on this path, so a `Lookup`'s PunchSync
-    /// fan-out reverse-maps the source (see [`Self::handle_with_caller`]).
+    /// fan-out reverse-maps the source (through the private
+    /// `handle_with_caller` helper).
     pub fn handle_at(&mut self, from: SocketAddr, msg: Msg, now: u64) -> Vec<(SocketAddr, Msg)> {
         self.handle_with_caller(from, msg, None, now)
     }

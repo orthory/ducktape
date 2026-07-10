@@ -15,4 +15,4 @@ sha2 = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-futures = "0.3"
+futures = { workspace = true }
