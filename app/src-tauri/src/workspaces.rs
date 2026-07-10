@@ -33,6 +33,16 @@ use tauri::Manager as _;
 use crate::daemon::{NodeControl, last_line, require_main_window, run_verb};
 
 const DEFAULT_PRIMARY_COORDINATOR: &str = "p2p.ducktape.byeongsu.dev:3478";
+
+/// the coordinator handed to every spawned node: the deployed public
+/// rendezvous by default, overridable via `DUCKTAPE_PRIMARY_COORDINATOR`
+/// (passed verbatim — the node CLI accepts `none` to opt out). the no-UI
+/// escape hatch for self-hosted coordinators; deliberately not a setting.
+fn primary_coordinator() -> String {
+    std::env::var("DUCKTAPE_PRIMARY_COORDINATOR")
+        .unwrap_or_else(|_| DEFAULT_PRIMARY_COORDINATOR.into())
+}
+
 const MAX_WORKSPACE_NAME_BYTES: usize = 128;
 const MAX_INVITE_BLOB_BYTES: usize = 256 * 1024;
 
@@ -273,6 +283,22 @@ fn free_port(used: &[u16]) -> Result<u16, String> {
     Err("could not find a free localhost port".into())
 }
 
+/// [`free_port`]'s UDP twin — the wireguard/invite listeners are UDP, and a
+/// free TCP port says nothing about the same UDP port (a collision silently
+/// disables the reachability plane). same TOCTOU window, same dedup.
+fn free_udp_port(used: &[u16]) -> Result<u16, String> {
+    for _ in 0..64 {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+            .map_err(|err| format!("probe free udp port: {err}"))?;
+        let port = socket.local_addr().map_err(|err| err.to_string())?.port();
+        drop(socket);
+        if !used.contains(&port) {
+            return Ok(port);
+        }
+    }
+    Err("could not find a free localhost udp port".into())
+}
+
 /// distinct free ports, avoiding every port already recorded in the
 /// registry — a stopped workspace's ports are still ITS ports; handing them to
 /// a new workspace would collide the moment both run.
@@ -284,9 +310,9 @@ fn allocate_ports(reserved: &[u16]) -> Result<Ports, String> {
     used.push(http);
     let rpc = free_port(&used)?;
     used.push(rpc);
-    let wireguard = free_port(&used)?;
+    let wireguard = free_udp_port(&used)?;
     used.push(wireguard);
-    let invite = free_port(&used)?;
+    let invite = free_udp_port(&used)?;
     Ok(Ports {
         listen,
         http,
@@ -410,6 +436,7 @@ fn workspace_create_blocking(app: tauri::AppHandle, name: String) -> Result<Work
             .ok_or("workspace allocator did not assign an invite port")?
     );
     let dir_s = dir.to_string_lossy().to_string();
+    let coordinator = primary_coordinator();
     // desktop-spawned nodes run the TUN-less userspace WireGuard backend
     // (overlay-net ADR phase 4): no /dev/net/tun, no setcap, no host
     // mutation. self-managed configs keep the parse default (`tun`).
@@ -426,7 +453,7 @@ fn workspace_create_blocking(app: tauri::AppHandle, name: String) -> Result<Work
         "--rpc",
         &rpc,
         "--primary-coordinator",
-        DEFAULT_PRIMARY_COORDINATOR,
+        &coordinator,
         "--wireguard-listen",
         &wireguard,
         "--invite-listen",
@@ -1630,6 +1657,16 @@ mod tests {
         }];
         assert_eq!(unique_id("My Team", &taken), "my-team-2");
         assert_eq!(unique_id("***", &taken), "workspace");
+    }
+
+    #[test]
+    fn primary_coordinator_reads_the_env_override() {
+        // one test owns the var end-to-end — process env is shared across
+        // parallel tests, so set + assert + remove stay in a single test.
+        unsafe { std::env::set_var("DUCKTAPE_PRIMARY_COORDINATOR", "127.0.0.1:9999") };
+        assert_eq!(primary_coordinator(), "127.0.0.1:9999");
+        unsafe { std::env::remove_var("DUCKTAPE_PRIMARY_COORDINATOR") };
+        assert_eq!(primary_coordinator(), DEFAULT_PRIMARY_COORDINATOR);
     }
 
     #[test]
