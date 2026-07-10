@@ -109,7 +109,7 @@ describe("autoBindUserIdentity", () => {
     expect(transport.submit).not.toHaveBeenCalled();
   });
 
-  it("walks a fresh bind with nonce 0 when no account is bound anywhere yet", async () => {
+  it("binds identity with nonce 0 without implicitly registering DuckDNS", async () => {
     markTauri();
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_state")
@@ -148,6 +148,12 @@ describe("autoBindUserIdentity", () => {
         authorizer: { key: [1, 2, 3], kind: "ed25519", proof: { signature: { sig: [9, 9, 9] } } },
       },
     });
+    expect(transport.submit).toHaveBeenCalledTimes(1);
+    expect(transport.submit).not.toHaveBeenCalledWith(
+      "duckdns",
+      expect.anything(),
+      expect.anything(),
+    );
   });
 
   it("signs with the existing account's nonce (3), not 0", async () => {

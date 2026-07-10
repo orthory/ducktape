@@ -1,6 +1,6 @@
 // Key display helpers shared by console views. Keys are hex ed25519 public
 // keys as the node emits them; a names map is hex(key bytes) → profile display
-// name, built from the `profiles` module (see `ConsoleState.authorNames`).
+// name, projected from `identity` (see `ConsoleState.authorNames`).
 
 /** Canonical lookup form of a hex key: trimmed, no `0x` prefix, lowercase. */
 export const normalizeKey = (key: string | null | undefined): string =>

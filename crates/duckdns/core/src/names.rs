@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 
 use crate::{
     DUCKDNS_ZONE, DuckDnsName, MAX_LABEL_LEN, NODE_KEY_LEN, NODE_LABEL_HEX_LEN,
-    RESERVED_ROOT_LABELS, ServiceAnnouncement, ServiceScope,
+    RESERVED_ROOT_LABELS, ServiceAnnouncement,
 };
 
 /// The one validator for account, service, and derived chain labels: lowercase
@@ -215,20 +215,12 @@ pub fn parse_hostname(hostname: &str) -> Result<DuckDnsName, String> {
 
 impl ServiceAnnouncement {
     pub fn validate(&self) -> Result<(), String> {
-        validate_label(&self.service)?;
-        match &self.scope {
-            ServiceScope::Account { handle } => validate_handle(handle),
-            ServiceScope::Network => Ok(()),
-        }
+        validate_label(&self.service)
     }
 }
 
 impl crate::ServiceIdentity {
     pub fn validate(&self) -> Result<(), String> {
-        validate_label(&self.service)?;
-        match &self.scope {
-            ServiceScope::Account { handle } => validate_handle(handle),
-            ServiceScope::Network => Ok(()),
-        }
+        validate_label(&self.service)
     }
 }

@@ -24,7 +24,8 @@ What already holds and any future build leans on:
   One workspace = one node = one member identity.
 - **Membership = network membership.** valset
   (`crates/system/valset/src/lib.rs`) is the consensus roster; the WireGuard
-  peer set derives from it; profiles maps keys to display names.
+  peer set derives from it; identity maps node keys to canonical account
+  display names.
 - **Ordering, durability, late-join.** Consensus total order, per-channel
   gap-free sequences, revisions, statesync of full history.
 - **Trust-model precedent.** vaults
@@ -69,9 +70,9 @@ unauthenticated origin — privacy claims only ever hold on the signed-frame
    get all epochs wrapped — Slack history semantics); message bodies gain a
    `sealed {epoch, nonce, ct}` arm (XChaCha20-Poly1305, AAD =
    `(channel_id, message_id, epoch, author_key)`), stored opaquely, no
-   crypto in `execute`; members publish a messaging X25519 pubkey via an
-   origin-gated profiles write (consensus authorship is the ed25519↔X25519
-   binding, same trick as WireGuard tunnel keys); crypto runs in the
+   crypto in `execute`; members publish a messaging X25519 pubkey through a
+   future origin-gated identity extension (consensus authorship binds the
+   account to X25519, the same trick as WireGuard tunnel keys); crypto runs in the
    member's **node** behind `/v1/crypto/{pubkey,seal,open}` routes (keys
    never in the webview; also finally serves vaults); DMs are two-member
    private channels with deterministic id `dm:<min>:<max>`, created

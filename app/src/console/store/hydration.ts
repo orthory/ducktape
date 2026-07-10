@@ -15,15 +15,16 @@
 // boundary-reinstall model residents jumped N heights at a time; the diff
 // was still sound then, just coarser.
 //
-// Group boundaries follow the DERIVED maps, not just the queries: profiles
-// and identity fetch together because `authorNames` overlays one on the
-// other; runs/dispatch/saga share a group because the runs timeline reads
-// dispatch assignments per pending run.
+// Group boundaries follow the DERIVED maps, not just the queries: identity and
+// DuckDNS fetch together because the account surface projects optional handles
+// alongside canonical account names; runs/dispatch/saga share a group because
+// the runs timeline reads dispatch assignments per pending run.
 
 import * as agentClient from "../../domain/agent-client";
 import * as capabilityClient from "../../domain/capability-client";
 import * as chatClient from "../../domain/chat-client";
 import * as dispatchClient from "../../domain/dispatch-client";
+import * as duckdnsClient from "../../domain/duckdns-client";
 import * as filesClient from "../../domain/files-client";
 import type { FileEntry } from "../../domain/files-client";
 import * as forgeClient from "../../domain/forge-client";
@@ -32,7 +33,6 @@ import type { ProposalView } from "../../domain/governance-client";
 import * as identityClient from "../../domain/identity-client";
 import * as pagesClient from "../../domain/pages-client";
 import type { PageBlock, PageMeta } from "../../domain/pages-client";
-import * as profilesClient from "../../domain/profiles-client";
 import * as runsClient from "../../domain/runs-client";
 import * as valsetClient from "../../domain/valset-client";
 import type { NodeStatus, NodeTransport } from "../../domain/transport";
@@ -83,8 +83,8 @@ const GROUPS_BY_MODULE: Record<string, readonly SliceGroup[]> = {
   runs: ["runs"],
   dispatch: ["runs"],
   saga: ["runs"],
-  profiles: ["people"],
   identity: ["people"],
+  duckdns: ["people"],
   files: ["files"],
 };
 
@@ -250,27 +250,33 @@ export interface PeopleSlices {
   authorNames: Record<string, string>;
   nodeUsers: Record<string, { accountId: string; name: string | null }>;
   accountKeys: Record<string, identityClient.MemberKeyView[]>;
+  accountHandles: Record<string, string>;
 }
 
-/** Profiles + identity accounts, derived together: identity's per-user
- *  display name OVERLAYS profiles for every node that user binds — the user
- *  is the durable identity, the node just its hardware. */
+/** Identity is the sole account/name authority. DuckDNS contributes only an
+ * optional handle projection keyed by AccountId. */
 export const fetchPeopleSlices = (live: NodeTransport): Promise<PeopleSlices> =>
   Promise.resolve()
     .then(() =>
       Promise.all([
-        profilesClient.allProfiles(live, { from: 0, limit: 256 }),
         identityClient
           .allAccounts(live, { from: 0, limit: 256 })
           .catch((): identityClient.AccountView[] => []),
+        duckdnsClient
+          .registrations(live)
+          .catch((): duckdnsClient.HandleRegistration[] => []),
       ]),
     )
-    .then(([profiles, users]) => {
-      const authorNames: Record<string, string> = Object.fromEntries(
-        profiles.map((p) => [chatClient.keyHex(p.key), p.display_name]),
-      );
+    .then(([users, registrations]) => {
+      const authorNames: Record<string, string> = {};
       const nodeUsers: Record<string, { accountId: string; name: string | null }> = {};
       const accountKeys: Record<string, identityClient.MemberKeyView[]> = {};
+      const accountHandles: Record<string, string> = Object.fromEntries(
+        registrations.map((registration) => [
+          chatClient.keyHex(registration.account_id),
+          registration.handle,
+        ]),
+      );
       for (const u of users) {
         const accountId = chatClient.keyHex(u.account_id);
         accountKeys[accountId] = u.member_keys;
@@ -280,7 +286,7 @@ export const fetchPeopleSlices = (live: NodeTransport): Promise<PeopleSlices> =>
           if (u.display_name) authorNames[nodeHex] = u.display_name;
         }
       }
-      return { authorNames, nodeUsers, accountKeys };
+      return { authorNames, nodeUsers, accountKeys, accountHandles };
     });
 
 export const fetchFilesSlices = (

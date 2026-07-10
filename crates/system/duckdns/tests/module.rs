@@ -20,11 +20,9 @@ fn network(service: &str) -> ServiceAnnouncement {
     }
 }
 
-fn account(handle: &str, service: &str) -> ServiceAnnouncement {
+fn account(service: &str) -> ServiceAnnouncement {
     ServiceAnnouncement {
-        scope: ServiceScope::Account {
-            handle: handle.into(),
-        },
+        scope: ServiceScope::Account,
         service: service.into(),
     }
 }
@@ -141,7 +139,7 @@ fn resolve(module: &DuckDns, ctx: &TestCtx, name: DuckDnsName) -> DuckDnsReply {
 }
 
 #[test]
-fn resident_can_claim_but_outsider_and_unbound_node_cannot() {
+fn resident_can_register_but_outsider_and_unbound_node_cannot() {
     let resident = node(1);
     let outsider = node(2);
     let mut ctx = TestCtx::new(resident.clone());
@@ -158,8 +156,8 @@ fn resident_can_claim_but_outsider_and_unbound_node_cannot() {
     execute(
         &mut module,
         &mut ctx,
-        DuckDnsMsg::ClaimHandle {
-            handle: "orthory".into(),
+        DuckDnsMsg::SetHandle {
+            handle: Some("orthory".into()),
         },
     )
     .unwrap();
@@ -170,8 +168,8 @@ fn resident_can_claim_but_outsider_and_unbound_node_cannot() {
         execute(
             &mut module,
             &mut ctx,
-            DuckDnsMsg::ClaimHandle {
-                handle: "outsider".into(),
+            DuckDnsMsg::SetHandle {
+                handle: Some("outsider".into()),
             },
         )
         .unwrap_err()
@@ -184,8 +182,8 @@ fn resident_can_claim_but_outsider_and_unbound_node_cannot() {
         execute(
             &mut module,
             &mut ctx,
-            DuckDnsMsg::ClaimHandle {
-                handle: "unbound".into(),
+            DuckDnsMsg::SetHandle {
+                handle: Some("unbound".into()),
             },
         )
         .unwrap_err()
@@ -212,12 +210,24 @@ fn bare_account_name_resolves_identity_and_current_nodes() {
     execute(
         &mut module,
         &mut ctx,
-        DuckDnsMsg::ClaimHandle {
-            handle: "orthory".into(),
+        DuckDnsMsg::SetHandle {
+            handle: Some("orthory".into()),
         },
     )
     .unwrap();
     block_on(module.commit_block()).unwrap();
+
+    let registrations = block_on(module.query(&encode_query(&DuckDnsQuery::Registrations {
+        from: 0,
+        limit: 256,
+    })))
+    .expect("registration query");
+    let DuckDnsReply::Registrations(registrations) = decode_reply(&registrations).unwrap() else {
+        panic!("registration query returned the wrong variant");
+    };
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(registrations[0].handle, "orthory");
+    assert_eq!(registrations[0].account_id, b"owner");
 
     let DuckDnsReply::Resolved(Some(ResolvedName::Account(resolved))) = resolve(
         &module,
@@ -246,7 +256,7 @@ fn bare_account_name_resolves_identity_and_current_nodes() {
 }
 
 #[test]
-fn account_service_declaration_requires_owner_and_filters_rebinding() {
+fn account_service_authority_is_derived_from_origin_and_filters_rebinding() {
     let owner_node = node(1);
     let other_node = node(2);
     let mut ctx = TestCtx::new(owner_node.clone());
@@ -263,24 +273,33 @@ fn account_service_declaration_requires_owner_and_filters_rebinding() {
     execute(
         &mut module,
         &mut ctx,
-        DuckDnsMsg::ClaimHandle {
-            handle: "orthory".into(),
+        DuckDnsMsg::SetHandle {
+            handle: Some("orthory".into()),
         },
     )
     .unwrap();
 
     ctx.origin(other_node.clone());
-    assert!(
-        execute(
-            &mut module,
-            &mut ctx,
-            DuckDnsMsg::ReplaceAnnouncements {
-                announcements: vec![account("orthory", "huddle")],
+    execute(
+        &mut module,
+        &mut ctx,
+        DuckDnsMsg::ReplaceAnnouncements {
+            announcements: vec![account("huddle")],
+        },
+    )
+    .unwrap();
+    block_on(module.commit_block()).unwrap();
+    assert_eq!(
+        resolve(
+            &module,
+            &ctx,
+            DuckDnsName::AccountService {
+                service: "huddle".into(),
+                handle: "orthory".into(),
             },
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("does not own")
+        ),
+        DuckDnsReply::Resolved(None),
+        "another account's declaration is not projected beneath this alias"
     );
 
     ctx.origin(owner_node.clone());
@@ -288,7 +307,7 @@ fn account_service_declaration_requires_owner_and_filters_rebinding() {
         &mut module,
         &mut ctx,
         DuckDnsMsg::ReplaceAnnouncements {
-            announcements: vec![account("orthory", "huddle")],
+            announcements: vec![account("huddle")],
         },
     )
     .unwrap();
@@ -324,6 +343,23 @@ fn account_service_declaration_requires_owner_and_filters_rebinding() {
             },
         ),
         DuckDnsReply::Resolved(None)
+    );
+
+    let registration = block_on(module.query_with(
+        &ctx,
+        &encode_query(&DuckDnsQuery::NodeRegistration { node: node(1) }),
+    ))
+    .unwrap();
+    assert_eq!(
+        decode_reply(&registration).unwrap(),
+        DuckDnsReply::NodeRegistration {
+            registration: Some(duckdns::NodeRegistration {
+                account_id: Some(b"owner".to_vec()),
+                announcements: vec![account("huddle")],
+            }),
+            authority_current: false,
+        },
+        "the announcer must observe and replace a stale account binding"
     );
 }
 

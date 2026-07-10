@@ -109,12 +109,11 @@ export const isModuleChannel = (id: string): boolean => id.includes(":");
 
 // ── Rendering helpers (wire → display) ──────────────────
 
-/** hex(User key bytes) → display name — the resolved `profiles` registry, keyed
- *  so `authorName` can look a User author up by its origin bytes. */
+/** hex(node key bytes) → display name — projected from the node's bound
+ * identity account so `authorName` can resolve a User author. */
 export type AuthorNames = Record<string, string>;
 
-/** Lowercase hex of a User author's key bytes — the map key into AuthorNames
- *  (and the `profiles` Profile.key, which IS these same origin bytes). */
+/** Lowercase hex of a User author's key bytes — the map key into AuthorNames. */
 export const keyHex = (bytes: number[]): string =>
   bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
 
@@ -124,9 +123,9 @@ export const keyHex = (bytes: number[]): string =>
  *  agent-client's `hexToBytes` under the roster's vocabulary. */
 export { hexToBytes as keyBytes } from "./agent-client";
 
-/** A display name for an author. A User author's bytes are the submitter
- *  identity the daemon stamped; when the `profiles` registry (`names`) resolves
- *  those bytes it wins, else we fall back to the utf-8/hex handle. */
+/** A display name for an author. A User author's bytes are the submitter node
+ * identity the daemon stamped; the bound account's Identity name wins, else we
+ * fall back to the utf-8/hex handle. */
 export const authorName = (author: AuthorRef, names?: AuthorNames): string => {
   if (author === "system") return "system";
   if ("user" in author)
@@ -138,7 +137,7 @@ export const authorName = (author: AuthorRef, names?: AuthorNames): string => {
 /** User author bytes are a claimed display name on the embedded daemon but a
  * raw ed25519 pubkey on the networked node (the signed frame origin). Render
  * printable UTF-8 as-is and anything else as a short hex handle until the
- * name registry resolves keys to display names. */
+ * identity projection resolves keys to display names. */
 const displayUserBytes = (bytes: number[]): string => {
   try {
     const text = new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));

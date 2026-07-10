@@ -24,7 +24,6 @@ const MODULE_INFO: Record<string, { label: string; desc: string }> = {
   governance: { label: "Governance", desc: "Validator-set proposals and quorum voting." },
   vaults: { label: "Vaults", desc: "Encrypted team secrets with an owner/reader ACL." },
   valset: { label: "Validator set", desc: "The active validator set backing consensus." },
-  profiles: { label: "Profiles", desc: "Display names bound to member public keys." },
   inbox: { label: "Inbox", desc: "Per-member notification queues." },
   automations: { label: "Automations", desc: "Event-triggered rules over module events." },
   jobs: { label: "Jobs", desc: "A consensus-native job / claim board." },

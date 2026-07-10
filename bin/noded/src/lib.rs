@@ -354,7 +354,7 @@ pub enum ModuleCategory {
 
 impl ModuleCategory {
     /// The category a module id belongs to. Ids not listed here —
-    /// infrastructure and internal modules (files, saga, profiles, kv,
+    /// infrastructure and internal modules (files, saga, identity, kv,
     /// valset, governance, vaults, directory, …) — fall to `System`, so a new
     /// or unknown module always groups sensibly rather than breaking the view.
     pub fn of(id: &str) -> Self {
@@ -2259,7 +2259,6 @@ mod tests {
         for id in [
             "files",
             "saga",
-            "profiles",
             "identity",
             "duckdns",
             "kv",

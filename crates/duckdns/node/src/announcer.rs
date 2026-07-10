@@ -36,8 +36,12 @@ impl Announcer {
         &self.announcements
     }
 
-    fn decide(&mut self, committed: &[ServiceAnnouncement]) -> Option<Vec<ServiceAnnouncement>> {
-        if committed == self.announcements.as_slice() {
+    fn decide(
+        &mut self,
+        committed: &[ServiceAnnouncement],
+        authority_current: bool,
+    ) -> Option<Vec<ServiceAnnouncement>> {
+        if authority_current && committed == self.announcements.as_slice() {
             self.announced = None;
             return None;
         }
@@ -52,16 +56,23 @@ impl Announcer {
         let reply = host
             .query(
                 "duckdns",
-                &encode_query(&DuckDnsQuery::NodeAnnouncements {
+                &encode_query(&DuckDnsQuery::NodeRegistration {
                     node: self.me.clone(),
                 }),
             )
             .await
             .ok()?;
-        let DuckDnsReply::NodeAnnouncements(committed) = decode_reply(&reply).ok()? else {
+        let DuckDnsReply::NodeRegistration {
+            registration,
+            authority_current,
+        } = decode_reply(&reply).ok()?
+        else {
             return None;
         };
-        let announcements = self.decide(&committed)?;
+        let committed = registration
+            .map(|registration| registration.announcements)
+            .unwrap_or_default();
+        let announcements = self.decide(&committed, authority_current)?;
         Some(Msg {
             target: "duckdns".into(),
             payload: encode_msg(&DuckDnsMsg::ReplaceAnnouncements { announcements }),
@@ -146,23 +157,35 @@ mod tests {
     #[test]
     fn decision_is_declarative_latched_and_clears_stale_state() {
         let mut with_docs = Announcer::new(vec![1; 32], vec![docs()]);
-        assert_eq!(with_docs.decide(&[]), Some(vec![docs()]));
+        assert_eq!(with_docs.decide(&[], true), Some(vec![docs()]));
         assert_eq!(
-            with_docs.decide(&[]),
+            with_docs.decide(&[], true),
             None,
             "identical replacement is in flight"
         );
         assert_eq!(
-            with_docs.decide(&[docs()]),
+            with_docs.decide(&[docs()], true),
             None,
             "committed match is quiet"
         );
 
         let mut empty = Announcer::new(vec![1; 32], vec![]);
         assert_eq!(
-            empty.decide(&[docs()]),
+            empty.decide(&[docs()], true),
             Some(vec![]),
             "removing config clears stale replicated declarations"
+        );
+
+        let mut rebound_empty = Announcer::new(vec![1; 32], vec![]);
+        assert_eq!(
+            rebound_empty.decide(&[], false),
+            Some(vec![]),
+            "stale account authority is explicitly cleared even when config is empty"
+        );
+        assert_eq!(
+            rebound_empty.decide(&[], false),
+            None,
+            "the stale-authority replacement remains in-flight latched"
         );
     }
 

@@ -21,7 +21,7 @@
 //!   except the last -- an account always keeps at least one live key).
 //! - [`IdentityMsg::SetAccountName`] renames, origin-gated to a bound node.
 //!
-//! state model mirrors profiles/capability's host-lent staging seam: `execute`
+//! state model mirrors capability's host-lent staging seam: `execute`
 //! STAGES into a `pending` overlay (committed state untouched); `query` reads
 //! pending-over-committed (read-your-writes) via the `merged_*` helpers;
 //! `commit_block` folds pending into committed state AND rebuilds the derived

@@ -19,7 +19,6 @@ host = { workspace = true }
 sdk = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
-profiles = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
 inbox = { workspace = true }

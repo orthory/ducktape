@@ -132,7 +132,6 @@ const makeFakeNode = () => {
       if (target === "runs") return Promise.resolve({ pending_runs: [] });
       if (target === "agent") return Promise.resolve({ agents: [] });
       if (target === "forge") return Promise.resolve({ head: null });
-      if (target === "profiles") return Promise.resolve({ profiles: [] });
       if (target === "identity") return Promise.resolve({ users: [] });
       if (target === "valset") {
         if (query === "residents") return Promise.resolve({ residents: [] });
