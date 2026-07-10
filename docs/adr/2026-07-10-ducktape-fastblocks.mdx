@@ -1,12 +1,21 @@
-# ADR: Ducktape Fastblocks — 100 ms Quorum-Certified Preconfirmations
+# ADR: Ducktape Interactive Fastblocks — 100 ms Quorum-Certified Preconfirmations
 
 Date: 2026-07-10. Status: **Proposed**.
 
-This ADR defines sub-second transaction feedback for Ducktape. Validators may
-publish up to ten quorum-certified, append-only increments during the existing
-one-second batch window. A client may call a transaction **preconfirmed** only
-after receiving a transferable quorum certificate. Simplex remains the only
-source of canonical order, execution, height, app hash, and finality.
+This ADR defines sub-second feedback for Ducktape's **interactive durable
+lane**: small, bounded human-facing mutations such as posting a chat message,
+reacting, editing page text, or adding a comment. Validators may publish up to
+ten quorum-certified, append-only interactive increments during the existing
+one-second batch window. A client may call an eligible operation
+**preconfirmed** only after receiving a transferable quorum certificate.
+Simplex remains the only source of canonical order, execution, height, app
+hash, and finality.
+
+Fastblocks are deliberately **not** a general transaction accelerator. Files,
+forge pushes, agent runs, governance, membership, bulk writes, destructive
+tree operations, and every module that has not explicitly opted in remain on
+ordinary finality. Voice, video, presence, and similar ephemeral interaction
+remain on their existing data planes and never enter Fastblocks.
 
 This revision adopts a strict **reuse-first** constraint: Fastblocks extends
 the component that already owns an invariant instead of building a parallel
@@ -24,9 +33,17 @@ intended validator topology.
 Ducktape will add a validator-only protocol named **PromiseNet** over one
 dedicated per-use `DataPlane` instance. During an eligible canonical build
 window, the validator that Simplex already elected for the active view acts as
-the temporary **assembler**. It reserves an append-only prefix from the
-existing `OrderedNode` custody queue and asks the epoch validator set to
-certify each increment.
+the temporary **assembler**. It reserves an append-only prefix of operations
+that every validator independently classifies as interactive, then asks the
+epoch validator set to certify each increment.
+
+Eligibility is derived from the signed frame's existing `(target, payload)`.
+The client supplies no priority bit. `sdk::Module` gains a pure,
+state-independent `submission_class(protocol_version, payload)` method whose
+default is `Ordinary`; `Host` routes classification to the target module.
+Chat and Pages opt specific bounded message variants into `InteractiveV1`.
+Changing a classifier or its limits is consensus-sensitive and activates
+through the same height-gated `R = n` upgrade as PromiseNet.
 
 For `n` validators, Fastblocks uses the same Commonware `N3f1` quorum rule as
 Simplex:
@@ -48,11 +65,12 @@ such an acknowledgement, it must:
 4. make the existing Simplex proposal verifier reject any canonical successor
    that omits or reorders the locked prefix.
 
-The v1 guarantee is **ordered inclusion**, not successful execution. A valid
-receipt says that its frame must occur in the first finalized canonical
-successor of the named parent boundary. Normal deterministic execution may
-still reject the operation. No pending state, speculative receipt, or external
-side effect becomes final before Simplex finality.
+The v1 guarantee is **ordered inclusion of an eligible interactive frame**,
+not successful execution. A valid receipt says that its frame must occur in
+the first finalized canonical successor of the named parent boundary. Normal
+deterministic execution may still reject the operation. No pending state,
+speculative receipt, or external side effect becomes final before Simplex
+finality.
 
 The protocol uses these fixed or derived parameters:
 
@@ -64,15 +82,23 @@ The protocol uses these fixed or derived parameters:
 | tolerated faults | `f = floor((n - 1) / 3)` | Commonware `N3f1` |
 | certificate quorum | `q = n - f` | Commonware `N3f1` |
 | canonical payload | existing `encode_batch` bytes | `crates/kernel/node` |
-| maximum promised capacity | one existing canonical batch | the shared batch builder and `MAX_BATCH_BYTES` |
+| lane / policy | `interactive/v1` | module-owned classifier under the active protocol version |
+| maximum interactive frame | 16 KiB encoded | validator-enforced before a Fastblock vote |
+| maximum interactive window | 256 KiB / 256 frames | one bounded prefix inside the existing batch |
+| per-origin interactive window | 32 KiB / 32 frames | fairness bound derived from authenticated frame origin |
+| per-module interactive window | 128 KiB | prevents one opted-in module from consuming the lane |
+| maximum ordinary bypass | 4 canonical windows | honest-assembler aging guard in the shared batch scheduler; not receipt validity |
 | certificate scheme | epoch's active `ConsensusScheme` | existing Ed25519/BLS selection and epoch key material |
 | data-plane service | `Service::Promise = 5` | append-only service registry |
 | stream / datagram ports | `45805` / `45905` | existing per-use port derivation convention |
 | fallback | ordinary Simplex | existing flush and proposal path |
 
-The 100 ms period is a scheduling and service-level target, never a safety
-input. A late certificate produces a missed increment, not a smaller quorum,
-weaker receipt, or altered signed subject.
+The 16/256 KiB limits are what make a 100 ms engineering target plausible:
+PromiseNet never has to disseminate a one-MiB file or validate an arbitrary
+module workload during the fast path. They are v1 protocol constants, not
+client preferences. The 100 ms period remains a scheduling and service-level
+target, never a safety input. A late certificate produces a missed increment,
+not a smaller quorum, weaker receipt, or altered signed subject.
 
 ## Reuse and Integrity Rule
 
@@ -96,14 +122,15 @@ instance—is intentional integrity, not duplication.
 | validator membership | epoch respawn / valset orchestrator | reuse | PromiseNet receives the same finalized validator snapshot |
 | keys and quorum certificates | `ConsensusScheme`, Commonware certificate `Scheme`, `N3f1` | extend | a Fastblock subject adapter and separate signature namespace |
 | frame identity and validation | `FrameId`, `frame_id`, `decode_frame` | reuse | none |
-| custody and FIFO order | `OrderedNode::outstanding` and `pending_batch` | extend | reservation, deduplication, and leader forwarding; no second mempool |
-| capacity and encoding | `encode_batch`, `decode_batch`, `MAX_BATCH_BYTES`, current packer | refactor then reuse | extract one `BatchBuilder` used by ordinary and fast paths |
+| operation semantics | `sdk::Module` and target module decoder | extend | pure default-ordinary `submission_class`; validators re-derive eligibility |
+| custody and ordering | `OrderedNode::outstanding` and `pending_batch` | extend | one custody set with interactive/ordinary scheduling indexes; no second mempool |
+| capacity, fairness, and encoding | `encode_batch`, `decode_batch`, `MAX_BATCH_BYTES`, current packer | refactor then reuse | one `BatchBuilder` enforces lane quotas, origin order, aging, and final encoding |
 | canonical proposal and execution | `Orderer`, `ContentStore`, Simplex, `OrderedNode::drain_delivered` | reuse unchanged | locked-prefix check before a Simplex vote |
 | payload availability | consensus `ContentStore`, eager relay, resolver | reuse | Promise body streams populate the same content-addressed store |
 | durable safety state | `BlockSink`, `Recovery`, `recovery-oplog`, `Manifest` | extend | namespaced promise records and unresolved-lock checkpoint state |
 | network transport | `DataPlane`, `OverlaySockets`, flow policies and stats | instantiate existing abstraction | one isolated `Service::Promise` plane |
-| API actor and stream | `NodeCommand`, `/v1/submit`, `StreamHub` | extend | FrameId progress and receipt events on existing surfaces |
-| desktop operation state | `OpLedger` and optimistic projection | extend | one evidence-gated `preconfirmed` phase |
+| API actor and stream | `NodeCommand`, `/v1/submit`, `StreamHub` | extend | FrameId progress plus interactive previews on existing surfaces |
+| desktop operation state | `OpLedger` and optimistic reducers | extend | evidence-gated `preconfirmed` and reversible remote previews |
 | activation and cutover | height-gated upgrade, `R = n`, epoch respawn | reuse | Fastblocks is another coordinated protocol-version capability |
 
 The only genuinely new safety mechanism is a small, shared
@@ -127,6 +154,22 @@ or fails. The node gives a signed frame a stable content address, `FrameId`,
 and keeps accepted frames in `OrderedNode` custody. A submit timeout is
 ambiguous because the frame may still finalize later.
 
+The useful latency problem is narrower than “all transactions are slow.”
+Chat, Pages, comments, reactions, and similar collaborative edits need rapid
+shared feedback to feel interactive. Bulk and control-plane work does not need
+ten quorum promises per second, and allowing it into the fast path makes the
+100 ms target physically and operationally implausible. A one-MiB file frame,
+an agent workflow, or an unbounded subtree mutation should not compete with a
+short message or checkbox toggle for PromiseNet fsync and bandwidth.
+
+The app already contains pure optimistic reducers for chat and page mutations.
+They are currently applied only to the submitting client and are mislabeled in
+one comment as a “preconfirmed render.” The interactive lane turns those
+reducers into an appropriate presentation seam: local intent remains
+optimistic, while a network-delivered operation is rendered to collaborators
+as provisional only after its PromiseQC is verified. Finalized module streams
+still replace the preview with committed truth.
+
 The current canonical path already provides most of the machinery needed:
 
 - `consensus::BLOCK_TIME` is one second.
@@ -134,6 +177,8 @@ The current canonical path already provides most of the machinery needed:
   block window.
 - `OrderedNode` owns accepted-frame custody, cutover carry, FIFO batching,
   exact frame decoding, and the canonical `encode_batch` format.
+- `sdk::Module` already owns the semantic decoder for its payload, and its
+  trait can default every existing module to the ordinary lane.
 - `ConsensusAutomaton::propose(Context)` is called in the elected Simplex
   proposer context and waits for the canonical pending FIFO.
 - `ConsensusAutomaton::verify` already gates a vote on local payload
@@ -150,6 +195,8 @@ The current canonical path already provides most of the machinery needed:
   and tears down and respawns epoch-scoped engines.
 - `NodeCommand`, `StreamHub`, and the app's `OpLedger` already own submission
   and user-visible finalization progress.
+- `app/src/console/store/optimistic.ts` already has pure reversible projections
+  for the initial Chat and Pages operations.
 
 Base Flashblocks is product inspiration, not a trust model to copy. Base's
 active sequencer emits cumulative partial block updates approximately every
@@ -160,16 +207,26 @@ temporary assembler—must own the promise.
 
 ## Goals
 
-- Target one new certified increment every 100 ms when quorum network and
-  storage latency permit.
-- Return independently verifiable evidence for a specific existing `FrameId`.
+- Target one new certified interactive increment every 100 ms when quorum
+  network and storage latency permit.
+- Return independently verifiable evidence for an eligible existing
+  `FrameId`, and distribute its provisional operation to relevant
+  collaborators over the existing stream.
+- Keep fast-path bytes and work bounded enough that the latency target is
+  credible under ordinary human-interaction load.
+- Let a module own semantic eligibility while making `Ordinary` the safe
+  default and requiring validators to re-derive the classification.
 - Preserve a receipt across assembler failure, view change, process restart,
   ordinary packet loss, and certificate withholding.
 - Keep exactly one canonical consensus, payload format, execution path, and
   app-state commit path.
 - Reuse existing custody, packing, availability, recovery, membership,
   upgrade, API, and UX owners.
-- Bound promised work to what the next ordinary canonical batch can contain.
+- Bound promised work to a 256 KiB interactive prefix inside what the next
+  ordinary canonical batch can contain.
+- Preserve the per-origin order observed by a custodian and prevent
+  interactive priority from starving ordinary/bulk custody on an honest
+  assembler/custody path.
 - Degrade to the current Simplex path when no binding promise exists.
 - Tell the truth about optimism, custody, preconfirmation, rejection, and
   finality.
@@ -178,7 +235,9 @@ temporary assembler—must own the promise.
 ## Non-goals
 
 - Reducing canonical Simplex finality to 100 ms.
-- Guaranteeing that every accepted transaction gets a preconfirmation.
+- Giving every accepted transaction, module, or payload a preconfirmation.
+- Letting a client, RPC server, or assembler declare its own operation
+  interactive.
 - Increasing canonical throughput; Fastblocks divide existing capacity.
 - Guaranteeing successful module execution, fees, effects, or a wall-clock
   finalization deadline.
@@ -188,6 +247,11 @@ temporary assembler—must own the promise.
 - Creating a second mempool, canonical batch codec, recovery database,
   validator-set watcher, or client transport.
 - Exposing Base-like pending state in v1.
+- Accelerating files, forge, agents, runs, jobs, governance, membership,
+  identity, upgrade, state sync, or module operations whose work is not
+  explicitly bounded by the active policy.
+- Replacing voice, video, typing indicators, presence, cursor motion, or other
+  ephemeral data-plane traffic with consensus messages.
 - Allowing a binding promise to cross a validator-set or protocol-version
   cutover.
 
@@ -199,6 +263,32 @@ application block executes.
 
 **Assembler** is the validator Simplex elected to propose the active view. It
 chooses candidate order and performs fan-out; it has no unilateral authority.
+
+**Interactive durable lane** is a bounded scheduling class for module writes
+that benefit from provisional collaborative rendering but still require
+canonical inclusion. It is neither a second consensus lane nor an ephemeral
+data plane.
+
+**Ordinary lane** is the default scheduling class for every frame not
+classified `InteractiveV1`.
+
+**Ordinary disposition** is the scheduler outcome in which a frame receives no
+promise in the current window. Frames above the 16 KiB cap enter this path
+without module classification. An interactive candidate may also receive this
+disposition when it is over quota, aged behind an earlier same-origin frame, or
+admitted after the promise window; its module classification does not change.
+It may enter the ordinary tail without a receipt or remain in custody for a
+later window.
+
+**Eligibility policy** is the active protocol version plus each module's pure
+`submission_class` implementation and the global, per-origin, and per-module
+byte/frame caps. It contains only facts derivable from the signed frames and
+certified prefix and is independently evaluated by every Fastblock voter.
+
+**Scheduler fairness policy** is the local same-origin barrier and ordinary
+aging rule applied to the assembler's custody. It is an honest-node liveness
+contract, not a fact that a portable receipt can prove about frames a validator
+never saw.
 
 **Candidate increment** is an append-only delta proposed at one fastblock
 index. It becomes a **fastblock** only when accompanied by a valid `PromiseQC`.
@@ -213,7 +303,7 @@ successor that does not begin with its locked prefix.
 receipt's parent boundary. Nullified views and cutover-discarded deliveries do
 not count.
 
-For a structurally valid frame `F`, a valid receipt means:
+For a structurally valid, policy-eligible frame `F`, a valid receipt means:
 
 > Assuming at most `f` Byzantine validators in the named epoch, any canonical
 > successor of the named parent boundary that finalizes must contain `F` at the
@@ -232,7 +322,9 @@ The protocol assumes:
 - at most `f` Byzantine validators in the epoch;
 - unforgeable signatures and collision-resistant hashes;
 - crash-recoverable storage for prepared votes, bodies, and locks;
-- deterministic existing frame decoding and batch encoding; and
+- deterministic existing frame decoding and batch encoding;
+- identical, state-independent module classification and interactive quota
+  rules under the active protocol version; and
 - eventual synchrony for liveness, with no clock or delay bound required for
   safety.
 
@@ -255,12 +347,17 @@ existing client / resident submission
        NodeCommand + relay lane
                  |
                  v
-       OrderedNode custody FIFO  <---- forwarded FrameId/body from validators
+ decode signed frame -> Host -> target Module::submission_class
                  |
-      shared BatchBuilder preview/reservation
-                 |
-                 v
-     elected Simplex proposer = PromiseNet assembler
+        OrderedNode single custody set
+           /                    \
+ interactive index          ordinary index
+ (bounded + eligible)       (default + aged)
+           \                    /
+          shared BatchBuilder scheduler
+                    |
+                    v
+       elected Simplex proposer = PromiseNet assembler
                  |
       +----------+-----------+
       |                      |
@@ -273,9 +370,9 @@ existing client / resident submission
         lock    -> PromiseQC
                  |
                  v
-       verified receipt event
+ verified receipt + interactive preview
 
-certified reservation + optional ordinary tail
+interactive certified prefix + ordinary tail
                  |
                  v
        existing encode_batch bytes
@@ -285,11 +382,13 @@ certified reservation + optional ordinary tail
 ```
 
 PromiseNet is an adjunct to the existing orderer, not a second ordering
-system. All safety-bearing transitions re-enter the node actor that owns
-custody, recovery, and the `PromiseGuard`. Network receive, body hashing, and
-signature verification may happen off-loop, but the actor serializes queue
-reservation, durable prepare, durable lock, canonical authorization, release,
-and cutover.
+system. `OrderedNode::outstanding` remains the sole custody authority; the two
+indexes are scheduler views over the same frames, not separate mempools. All
+safety-bearing transitions re-enter the node actor that owns custody,
+classification routing, recovery, and the `PromiseGuard`. Network receive,
+body hashing, and signature verification may happen off-loop, but the actor
+serializes classification, queue reservation, durable prepare, durable lock,
+canonical authorization, release, and cutover.
 
 There is one assembler because one component must select an order and cut a
 window. BFT does not eliminate this coordination role; it prevents that role
@@ -315,6 +414,10 @@ A window is eligible only when all of the following are true:
 - the current validator is the Simplex proposer for the callback's view;
 - the consensus pending FIFO has no older canonical payload ahead of this
   window;
+- at least one policy-eligible interactive frame is ready without overtaking
+  an older unresolved frame from the same origin in the assembler's custody;
+- no ordinary frame in the assembler's custody has reached the four-window
+  bypass limit;
 - no binding promise or canonical authorization exists for the parent;
 - no armed membership or binary cutover can consume the successor;
 - a durable `PromiseSafetySink` is available; and
@@ -354,11 +457,11 @@ The healthy schedule is:
 
 | Offset | Existing/new action |
 |---:|---|
-| `0 ms` | Simplex proposer callback opens the window; shared builder previews increment 0 |
+| `0 ms` | Simplex proposer callback opens the window; shared builder previews eligible interactive increment 0 |
 | `0–100 ms` | body validation, durable prepare, `AvailabilityQC`, durable lock, `PromiseQC` |
 | `100 ms` | publish receipt for index 0 and preview the next delta |
-| `200–900 ms` | repeat while the cumulative ordinary batch still fits |
-| `1000 ms` | atomically close the guard, encode one ordinary batch, pin, and submit to the existing orderer |
+| `200–900 ms` | repeat within cumulative interactive, origin, and module quotas |
+| `1000 ms` | close the guard; append an ordinary tail; encode, pin, and submit one existing batch |
 
 `BLOCK_TIME`, the 100 ms node beat, and the automaton's proposal wait become
 fields of one `BlockCadence` value so the host and automaton cannot drift onto
@@ -369,7 +472,8 @@ the canonical target remains one second.
 A transaction arriving immediately after a cut can wait almost one period for
 the next candidate and another period for two quorum phases. The honest user
 expectation is therefore approximately 100–200 ms in the target topology, not
-a universal 100 ms upper bound.
+a universal 100 ms upper bound. An ineligible or quota-deferred operation gets
+no PromiseQC and follows ordinary finality without being rejected.
 
 ## PromiseNet Data Plane
 
@@ -412,6 +516,10 @@ in the epoch's existing consensus `ContentStore`. A durable promise prepare
 causes those same bytes to be restored into `Recovered.frames`, which the boot
 path already pins into `ContentStore`. The existing canonical eager relay and
 resolver remain the correctness backstop for the final `encode_batch` payload.
+Promise body flows accept only already-classified frames at or below 16 KiB
+and stop after the 256 KiB window cap. Bulk module data therefore never enters
+the latency-critical plane even though the eventual canonical payload uses the
+same store and resolver.
 
 ## Intake, Selection, and Shared Batching
 
@@ -419,19 +527,73 @@ Ingress retains the current contract:
 
 1. validate size, signature, and `decode_frame`;
 2. calculate the existing stable `FrameId`;
-3. enter `OrderedNode::outstanding` custody and `pending_batch` FIFO; and
-4. carry unresolved custody across an epoch cutover under the same FrameId.
+3. if the complete encoded frame is at most 16 KiB, decode the root `sdk::Msg`
+   and ask `Host` to route `submission_class(active_version, payload)` to its
+   target module; larger frames take the ordinary path without invoking a
+   fast-path classifier;
+4. enter the one `OrderedNode::outstanding` custody set plus the appropriate
+   scheduler index; and
+5. carry unresolved custody across an epoch cutover under the same FrameId.
+
+Classification has a fail-closed contract:
+
+```rust
+enum SubmissionClass {
+    Ordinary,
+    InteractiveV1,
+}
+
+trait Module {
+    fn submission_class(&self, protocol_version: u32, payload: &[u8])
+        -> SubmissionClass
+    {
+        SubmissionClass::Ordinary
+    }
+}
+```
+
+The method must be pure, deterministic, state-independent, and bounded by the
+16 KiB frame cap plus explicit decoder limits. A decode failure is not
+interactive. Although the object-safe trait method receives `&self`, an opted-in
+implementation may inspect only the protocol version and payload; it delegates
+to a pure message-enum classifier and must return the same result across
+different module states. The returned class is a hint to the shared scheduler
+until a Fastblock validator independently repeats the same classification;
+neither a stored queue bit nor a client request is proof of eligibility.
+
+The initial `interactive/v1` policy is deliberately small:
+
+| Module | Interactive variants | Ordinary variants |
+|---|---|---|
+| Chat | `PostMessage`, `EditMessage`, `DeleteMessage`, `AddReaction`, `RemoveReaction` | channel creation, hooks, membership, and huddle roster administration |
+| Pages | `CreatePage`, `InsertBlock`, `UpdateText`, `SetKind`, `SetChecked`, `AddComment`, `EditComment`, `DeleteComment`, `ResolveThread` | subtree move/remove, page reparent/delete, and all unknown future variants |
+| every other module | none | all variants |
+
+An otherwise interactive variant receives ordinary disposition for a window
+when its complete encoded frame exceeds 16 KiB or a window/origin/module quota
+is exhausted. This is a loss of the current fast-path opportunity, not a
+permanent reclassification or transaction rejection. The frame may be packed
+in the ordinary tail or reconsidered in a later window if it remains in
+custody. Adding a module or variant requires measured bounded cost,
+preview/reconciliation support, and a coordinated policy-version upgrade.
 
 When Fastblocks is active, a validator forwards newly accepted byte-identical
-frames to the authoritative assembler. The assembler admits them through the
-same `submit_frame` function. `submit_frame` is extended to make duplicate
-`FrameId` insertion idempotent; forwarded data does not enter a PromiseNet-only
-mempool.
+**interactive candidates** to the authoritative assembler. The assembler
+admits them through the same `submit_frame` function and reclassifies them.
+`submit_frame` is extended to make duplicate `FrameId` insertion idempotent;
+forwarded data does not enter a PromiseNet-only mempool. Ordinary frames keep
+their existing custody and proposal flow.
 
 Before protocol work, the existing greedy logic in `flush_batch` is extracted
 as one `BatchBuilder`/`BatchPlan` abstraction. It owns:
 
-- FIFO member order;
+- the one custody set and two scheduling indexes;
+- FIFO order within a class;
+- a local per-origin head-of-line rule: an interactive frame may not overtake
+  any older unresolved frame from the same authenticated origin in this
+  custody set;
+- global, per-origin, and per-module interactive counters;
+- ordinary-frame age and the four-window priority-bypass ceiling;
 - exact `varint(count) || varint(len) || bytes` size accounting;
 - `MAX_BATCH_BYTES` and the current single-member edge case;
 - previewing a prefix without removing custody;
@@ -442,33 +604,61 @@ Both the disabled path and Fastblocks call this helper. A golden regression
 test must prove that ordinary `flush_batch` produces byte-identical batches
 before and after extraction.
 
-Fastblocks subdivide one existing batch budget. At index `i`, the assembler
-asks `BatchBuilder` for the longest additional FIFO prefix whose cumulative
-ordinary encoded length is within the proportional target:
+The origin barrier preserves the order a normal submitter presented to its
+custodian; it is not a claim about an unknowable global mempool. A receipt
+proves the certified order shown in its chain. Applications that require a
+stronger causal dependency must wait for the earlier frame's finalization or
+include that dependency in module state.
+
+Fastblocks subdivide a 256 KiB slice of one existing batch budget. At index
+`i`, the assembler asks `BatchBuilder` for the longest additional eligible
+interactive prefix whose cumulative encoded length is within:
 
 ```text
-target(i) = floor(existing_one_batch_target * (i + 1) / 10)
+interactive_target(i) = floor(256 KiB * (i + 1) / 10)
 ```
 
-The builder—not PromiseNet—decides whether a frame fits, including the existing
-single-member rule. There is no separately maintained promise byte formula and
-no wrapper overhead to reserve. A large frame waits for a later index or the
-ordinary path. Overload yields fewer preconfirmations, not extra canonical
-capacity.
+The builder—not PromiseNet—decides whether a frame fits both the interactive
+limits and the existing canonical batch. It admits at most 256 interactive
+frames, 32 frames / 32 KiB per origin, and 128 KiB per module in the window.
+There is no separately maintained canonical byte formula and no wrapper
+overhead to reserve. Overload yields fewer preconfirmations, not extra
+canonical capacity.
+
+Interactive priority is bounded. If ordinary custody is ready, no more than
+four consecutive canonical windows may begin with a newly certified
+interactive prefix. The next eligible proposer window disables new promises
+and gives the aged ordinary head an ordinary batch opportunity. This escape
+rule is essential for a one-MiB-class frame that cannot share a batch with even
+a small prefix. Interactive traffic may add bounded latency; it may not starve
+bulk work forever on an honest assembler/custody path.
+
+The bypass counter is not part of PromiseQC validity: remote voters cannot
+prove which ordinary frames the assembler has seen. A Byzantine proposer can
+censor an ordinary frame just as it can without Fastblocks; base Simplex view
+change and liveness assumptions remain the remedy. PromiseNet adds no new
+censorship-resistance claim.
 
 Each candidate carries only new frame bodies but commits to the cumulative
-ordered FrameId root, count, and ordinary encoded length. An existing
-certified reservation can only grow. At seal:
+ordered FrameId root, lane/policy version, count, and encoded length. Every
+validator reclassifies every delta and recomputes all fast-path quotas before
+voting. Empty deltas are never certified. An existing certified reservation
+can only grow. At seal:
 
-1. the certified prefix is taken first, byte-identical and in order;
-2. unpromised frames from the same FIFO may fill the remaining capacity;
+1. the certified interactive prefix is taken first, byte-identical and in
+   certified order;
+2. unpromised interactive and ordinary frames may fill the remaining capacity
+   without violating per-origin order;
 3. overflow stays in custody for a later canonical batch; and
 4. the resulting ordinary `encode_batch(members)` bytes follow the existing
    `sink.pin -> orderer.submit` path.
 
-If no promise lock exists, the reservation can be released and the existing
-ordinary `flush_batch` behavior is the fallback. If a lock exists, the prefix
-cannot be released by a timeout or circuit breaker.
+An assembler whose local guard remains unlocked may release its scheduling
+reservation and try the existing ordinary `flush_batch` fallback. That local
+release never clears another validator's prepare or lock: a hidden partial lock
+still rejects an omission and enters the NACK/supersession flow below. Any
+locally installed lock keeps the prefix reserved and cannot be cleared by a
+timeout or circuit breaker.
 
 ## Cryptography and Wire Protocol
 
@@ -495,6 +685,10 @@ length-delimited wire helpers and Commonware certificate codec. Every top-level
 object starts with a protocol version and rejects unknown versions.
 
 ```rust
+enum LaneId {
+    InteractiveV1,
+}
+
 struct ParentBoundaryV1 {
     network_id: [u8; 32],
     epoch: u64,
@@ -507,6 +701,8 @@ struct ProposalCoreV1 {
     session_id: [u8; 32],
     assembler_view: u64,
     assembler: ValidatorId,
+    lane: LaneId,                      // must be InteractiveV1
+    policy_version: u32,
     index: u8,                         // 0..=9
     previous_promise_subject: Option<[u8; 32]>,
     delta_frame_ids: Vec<FrameId>,
@@ -531,13 +727,13 @@ struct SignedProposalV1 {
 
 struct AvailabilityQCV1 {
     codec_version: u16,
-    subject: FastblockSubjectV1::Availability,
+    subject: FastblockSubjectV1,       // must be Availability
     certificate: SchemeCertificate,
 }
 
 struct PromiseQCV1 {
     codec_version: u16,
-    subject: FastblockSubjectV1::Promise,
+    subject: FastblockSubjectV1,       // must be Promise
     certificate: SchemeCertificate,
 }
 
@@ -557,6 +753,8 @@ struct CertifiedIncrementV1 {
 struct FastblockReceiptV1 {
     codec_version: u16,
     parent: ParentBoundaryV1,
+    lane: LaneId,                      // must be InteractiveV1
+    policy_version: u32,
     frame_id: FrameId,
     frame_position: u32,
     certified_chain: Vec<CertifiedIncrementV1>,
@@ -565,8 +763,9 @@ struct FastblockReceiptV1 {
 ```
 
 Every signed subject transitively binds network, epoch, parent, session,
-assembler view, index, proposal hash, and role. Domain namespaces are distinct
-for proposal, availability, promise, and NACK attestations.
+assembler view, lane, policy version, index, proposal hash, and role. Domain
+namespaces are distinct for proposal, availability, promise, and NACK
+attestations.
 
 Certificate serialization is proof material, not chain identity. Different
 valid signer subsets may produce different certificate bytes for the same
@@ -603,6 +802,8 @@ Each validator owns at most one unresolved boundary state:
 ```rust
 struct PromiseStateV1 {
     parent: ParentBoundaryV1,
+    lane: LaneId,                      // must be InteractiveV1
+    policy_version: u32,
     phase: BoundaryPhaseV1,
     session: Option<SessionStateV1>,
     certified_prefix: Vec<FrameId>,
@@ -634,10 +835,16 @@ struct LockedV1 {
 Before releasing an availability attestation, a validator must:
 
 - validate epoch, parent, authoritative view, assembler, session, index, and
-  exact previous promise-subject link;
+  exact previous promise-subject link, and require the proposal's lane and
+  policy version to equal the active values;
 - verify the assembler attestation and previous certified chain;
-- possess every full delta frame and run the existing size, signature,
-  `decode_frame`, and `FrameId` checks;
+- possess every full delta frame, reject any frame above 16 KiB before module
+  decoding, and run the existing size, signature, `decode_frame`, and
+  `FrameId` checks;
+- route every decoded root message through the target module and require
+  `InteractiveV1` under the proposal's active policy version;
+- enforce the 16 KiB frame, 256 KiB / 256 frame window, 32 KiB / 32 frame
+  origin, and 128 KiB module bounds over the complete prefix;
 - reject duplicates and any rewrite of the prior prefix;
 - recompute roots and exact encoded capacity through `BatchBuilder`;
 - pass local disk and queue limits; and
@@ -688,8 +895,8 @@ The journal gains append-only record tags:
 
 | Record | Contents | Durability point |
 |---|---|---|
-| `PromisePrepared` | parent/session/index, proposal hash, anti-equivocation key, exact new frame bytes | append + sync before availability attestation |
-| `PromiseLocked` | proposal hash, cumulative ordered FrameIds, bounded AvailabilityQC bytes | append + sync before Promise acknowledgement |
+| `PromisePrepared` | parent/session/lane/policy/index, proposal hash, parent-wide anti-equivocation key, exact new frame bytes | append + sync before availability attestation |
+| `PromiseLocked` | lane/policy, proposal hash, parent-wide Promise anti-equivocation key, cumulative ordered FrameIds, bounded AvailabilityQC bytes | append + sync before Promise acknowledgement |
 | `PromiseCertified` | proposal, AvailabilityQC, PromiseQC, and receipt-proof inputs | append + sync before this node publishes `preconfirmed` |
 | `PromiseReleased` | parent/session/proposal key, canonical digest and matching/omission reason | append + sync before deleting prepared or locked in-memory state |
 
@@ -700,6 +907,12 @@ existing `ContentStore::pin` path. There is no PromiseNet blob store.
 An acknowledger that did not participate in availability first performs an
 idempotent prepare for every missing prefix body, then writes the lock. A
 Promise acknowledgement is never backed only by another signer's body pin.
+
+The durable signing key is `(network, epoch, parent, lane, policy, phase,
+index)`, not `(session, index)`. Its stored value binds the one accepted
+session and proposal. Consequently, an honest validator cannot sign a
+conflicting proposal at the same parent/index even if lifecycle bugs or a view
+change present a second session identifier.
 
 `Manifest` receives a tolerant additive tail containing the complete
 unresolved promise snapshot, including every body still required by a lock,
@@ -826,6 +1039,10 @@ custody.
 
 | Failure | Receipt behavior | Canonical behavior |
 |---|---|---|
+| target module/variant is ordinary | no receipt; report `fastPathEligible = false` | normal custody and finality |
+| frame exceeds 16 KiB or interactive candidate is over quota | no receipt in that window; remain queued or enter ordinary tail | normal custody; not rejected; a candidate is not permanently reclassified |
+| validators disagree on policy version/classification | no certificate can form; page policy-drift alert | ordinary Simplex remains available before any lock |
+| ordinary head reaches four bypasses | no new interactive receipts for the escape window | aged ordinary batch gets priority |
 | PromiseNet unavailable before any lock | no receipt | existing Simplex flush continues |
 | candidate misses 100 ms target | no on-time receipt; metric records miss | later increment or ordinary flush |
 | assembler equivocation | conflicting quorum certificates cannot both form | evidence retained; view may nullify |
@@ -841,9 +1058,10 @@ custody.
 | epoch cutover becomes pending | no new session | existing cutover barrier and custody carry remain authoritative |
 | more than `f` Byzantine validators | guarantee outside fault model | fail-stop evidence where detectable |
 
-Fallback is intentionally asymmetric. Before a promise lock, Fastblocks may
-disappear without affecting finality. After a lock, preserving the receipt is
-more important than canonical liveness.
+Fallback is intentionally asymmetric. Ineligibility is routine and never a
+transaction failure. Before a promise lock, Fastblocks may disappear without
+affecting finality. After a lock, preserving the receipt is more important than
+canonical liveness.
 
 ## Safety Argument
 
@@ -851,9 +1069,10 @@ more important than canonical liveness.
 
 Two quorums have an intersection of at least `2q - n = n - 2f`, which is
 greater than `f` for the supported `N3f1` sets. Therefore their intersection
-contains an honest validator. Durable anti-equivocation permits that validator
-to attest to only one proposal for `(parent, session, index)`, so conflicting
-AvailabilityQCs or PromiseQCs cannot both be valid.
+contains an honest validator. Parent-wide durable anti-equivocation permits
+that validator to attest to only one proposal for
+`(network, epoch, parent, lane, policy, phase, index)`, so conflicting
+AvailabilityQCs or PromiseQCs cannot both be valid even across session IDs.
 
 Signer-set-independent proposal subjects ensure that two encodings of the same
 valid certificate cannot create two prefix branches.
@@ -881,6 +1100,15 @@ just a digest. A PromiseQC therefore leaves at least `n - 2f` honest body
 holders. The new proposer can fetch by existing FrameId from lock holders; the
 ordinary canonical payload then uses the existing content relay and resolver.
 
+### Eligibility integrity
+
+The client and assembler cannot grant fast-path status. Every quorum signer
+decodes the signed frame, routes the payload to the same target-module
+classifier under the signed policy version, and recomputes the cumulative
+quotas. A Byzantine assembler can omit an eligible operation or reduce
+liveness, but it cannot form a PromiseQC for an ordinary, oversized, or
+over-quota frame without an honest validator violating the protocol.
+
 ### Clock independence
 
 Deadlines start and stop attempts but do not validate messages, clear locks,
@@ -891,14 +1119,17 @@ the number of fastblocks, not violate a receipt.
 
 The final payload is the existing canonical batch encoding and enters the
 existing single execution path. Fastblocks introduce no alternate app-state
-transition, height, app hash, or commit order.
+transition, height, app hash, or commit order. Interactive priority affects
+which frames the elected assembler proposes, not how validators execute the
+agreed order.
 
 ## Liveness and Performance Envelope
 
 PromiseNet adds two validator message phases, body fan-out, frame validation,
 certificate verification, two voter safety barriers, a receipt-evidence
 barrier before local publication, and client fan-out. A deployment cannot beat
-quorum RTT or storage latency.
+quorum RTT or storage latency. The lane limits remove bulk bytes and arbitrary
+module work from this path; they do not remove those physical costs.
 
 The initial engineering budget per increment is:
 
@@ -916,7 +1147,8 @@ These are acceptance budgets, not consensus constants or observed production
 numbers. If quorum RTT or fsync consumes the envelope, operators increase the
 period or leave Fastblocks disabled; they do not weaken the promise.
 
-The launch gate is sustained operation at canonical capacity with:
+The launch gate is sustained operation at the 256 KiB / 256-frame interactive
+window cap, alongside ordinary canonical load, with:
 
 - at least 99.9% of eligible windows producing a valid increment in the target
   deployment envelope;
@@ -924,7 +1156,11 @@ The launch gate is sustained operation at canonical capacity with:
 - zero conflicting certificates, omitted receipts, or recovered-lock loss
   under the stated fault model;
 - no material canonical-finality regression when PromiseNet is disabled or
-  fails before a lock; and
+  fails before a lock;
+- no ordinary frame exceeding the four-window priority-bypass bound in a
+  healthy proposer/custody path;
+- zero classifier disagreement across validators running the same active
+  policy version; and
 - bounded memory, journal growth, queues, CPU, and boot recovery time under
   adversarial submissions.
 
@@ -941,10 +1177,20 @@ The current client surfaces are extended instead of replaced:
 - An additive wait preference may return after `received` or `preconfirmed`;
   every early response includes the stable `FrameId` and does not cancel
   custody when the caller times out.
+- The custody response reports validator-derived `fastPathEligibility` as
+  `Ordinary`, `InteractiveCandidate`, or `InteractiveDeferred`. Candidate is
+  semantic classification, not a promise. Deferred is a non-final per-window
+  disposition with a bounded reason such as `quota`, `originHead`,
+  `ordinaryEscape`, or `windowClosed`; an oversized frame is `Ordinary` with
+  reason `frameTooLarge` because its module classifier is not invoked.
+- Asking to wait for preconfirmation on an ordinary or currently deferred
+  operation returns `received` plus that status; it does not wait forever,
+  cancel custody, or reject the transaction.
 - A `SubmissionStatus(FrameId)` actor command reads custody, an optional
   verified receipt, and final disposition.
-- `StreamHub` adds a submission topic/update on the existing `/v1/stream`
-  WebSocket. No second websocket or notification server is created.
+- `StreamHub` adds `interactive:<module-id>` topics on the existing
+  `/v1/stream` WebSocket. No second websocket or notification server is
+  created.
 - The existing `pending_submits` correlation map is keyed by the same
   `FrameId`; it publishes a preconfirmation update without consuming the
   holder that later resolves the existing final response.
@@ -957,33 +1203,59 @@ The transport-neutral progress object is:
 ```rust
 struct SubmissionUpdateV1 {
     frame_id: FrameId,
+    fast_path_eligibility: FastPathEligibilityV1,
     phase: SubmissionPhaseV1,
     receipt: Option<FastblockReceiptV1>,
     finalized: Option<SubmitReceipt>,
     rejection: Option<String>,
 }
+
+struct InteractivePreviewV1 {
+    encoded_frame: Vec<u8>,
+    receipt: FastblockReceiptV1,
+}
 ```
+
+The node emits an interactive preview only after verifying and durably storing
+the receipt. Subscribers receive the exact signed frame and portable evidence,
+not an asserted execution result. A consumer decodes the frame, derives its
+authenticated origin, target, and payload, recomputes its `FrameId`, and
+requires that ID in the receipt. `PromiseCertified` provides bounded replay
+for a reconnect during the current parent; the normal finalized module stream
+remains the durable history.
 
 The app extends its existing `OpLedger` with one phase. `received` enriches the
 existing `pending` entry with custody evidence; it is not another ledger
-phase. Optimistic projection remains a separate reversible presentation
-technique:
+phase. The existing pure chat/pages optimistic helpers are split into reusable
+projection functions for local intent and verified remote previews:
 
 | State | Evidence | UI copy |
 |---|---|---|
 | `pending` before custody | local client projected an intent | **Sending…** |
 | `pending` + `received` | node accepted custody of the stable FrameId | **Queued** |
-| `preconfirmed` | local node verified a portable `FastblockReceiptV1` | **Preconfirmed** |
+| `preconfirmed` | local node verified a portable receipt for this eligible frame | **Preconfirmed** |
+| remote interactive preview | verified receipt plus exact chat/pages operation | Render provisionally with a **Preconfirmed** marker |
 | `finalized.applied` | canonical block and app hash | **Finalized** |
 | `finalized.rejected` | canonical inclusion with deterministic rejection | **Finalized — rejected** |
 | `carried` | existing cutover custody remains unresolved | **Carried to next epoch** |
 | `preconfirmation_missed` | window ended without a receipt | stay **Queued**; optional fast-path detail |
 | `unknown_after_timeout` | connection ended before an outcome | **Status unknown**; continue by FrameId |
 
-The UI must never call the optimistic projection “preconfirmed,” show an
-execution result from an inclusion receipt, or raise the existing finality /
-read-your-writes floor on preconfirmation. Finalized refresh and app-hash
-logic remain final-only.
+The submitting client deduplicates its local optimistic row and the network
+preview by FrameId. Other clients apply only the target module's explicitly
+supported reversible preview reducer to a separate provisional overlay. An
+additive chat/page operation may appear as a ghost row; an edit, deletion,
+reaction, checkbox, or kind change appears as a marked pending diff and must
+not overwrite or hide committed truth. The finalized stream rekeys
+module-assigned fields, removes the marker, and replaces every preview with
+committed truth. Deterministic rejection removes the overlay or marks it
+rejected.
+
+The UI must never call the pre-custody optimistic projection “preconfirmed,”
+show an execution result from an inclusion receipt, or raise the existing
+finality / read-your-writes floor on preconfirmation. A preview must not send
+notifications, launch agents, start effects, or become queryable committed
+state. Finalized refresh and app-hash logic remain final-only.
 
 The node verifies receipts using the same epoch certificate suite and exposes
 only verified progress to the desktop. Portable SDK consumers may call the
@@ -991,7 +1263,9 @@ pure verifier API and shared golden vectors; the desktop does not need a
 second cryptographic implementation for its local-node path.
 
 Recommended copy is: “Validators promised inclusion in the next finalized
-block.” Detail text states that execution is pending and may still reject.
+block.” Detail text states that the chat/page change is provisional, execution
+is pending, and it may still reject. Ordinary operations use the current
+queued/finalized language and never show a missing fast receipt as an error.
 
 ## Speculative Execution: Deferred
 
@@ -1004,6 +1278,11 @@ quarantine irreversible effects, and must reconcile against final execution.
 The v1 ordered prefix and receipt can support that later work, but this ADR
 does not authorize speculative execution or pending-state RPC.
 
+Interactive previews do not contradict this deferral. They are reversible UI
+projections of a small allowlisted operation, backed by an inclusion receipt.
+They do not run `Module::execute`, compute a root, answer a query, or assert
+that the operation will succeed.
+
 ## Observability Reuse
 
 New counters and histograms register in the existing node metrics registry.
@@ -1013,18 +1292,22 @@ bounded outcome; raw FrameIds and transaction contents are not labels.
 
 Required observations include:
 
+- classified interactive/ordinary frames by bounded module/variant class and
+  ordinary-reason code;
 - eligible/opened/closed windows and close reason;
 - proposed, prepared, availability-certified, locked, promise-certified, and
   missed increments;
 - custody-to-cut, proposal-to-AvailabilityQC, AvailabilityQC-to-lock,
   lock-to-PromiseQC, custody-to-receipt, and receipt-to-finality latency;
-- existing batch bytes, promised bytes, unused capacity, deferred large
-  frames, and overflow carry;
+- interactive bytes/frames by global, origin, and module quota; ordinary tail
+  bytes; bypass age/escape windows; and overflow carry;
 - control/body queue depth, per-peer RTT, throughput, retransmit, and dropped
   hints;
 - frame validation, journal sync, certificate verification, and assembly time;
 - rejected messages by bounded reason, equivocation, replay, and bad proofs;
 - recovery summaries, NACKs, restored locks, missing bodies, and repair time;
+- preview publication, deduplication, final reconciliation, rejection rollback,
+  and preview-to-final latency;
 - circuit-breaker state and disk reservation; and
 - canonical finalization latency with Fastblocks active, inactive, and failed
   before/after a lock.
@@ -1042,6 +1325,11 @@ participant set, recovered promise records, and ordinary canonical batch.
 | assembler equivocation | durable one-vote key, quorum intersection, evidence counter |
 | body withholding | prepare-before-attest, Promise acknowledger retention, FrameId fetch |
 | certificate withholding | post-lock PromiseQC semantics, broadcast, recovery summaries |
+| client marks bulk work interactive | no client priority field; module classifier is authoritative |
+| Byzantine assembler inserts ordinary work | every voter re-decodes, reclassifies, and recomputes quotas |
+| one user or module monopolizes the lane | authenticated-origin, module, global byte, and frame limits |
+| honest scheduler starves a large ordinary frame | four-window bypass ceiling and ordinary escape window; Byzantine proposer censorship remains a base-consensus liveness concern |
+| classifier changes on one validator | signed policy version, `R = n` activation, disagreement metrics |
 | resident pretending to vote | validator-only epoch admission plus certificate participant check |
 | datagram spoof/loss | WireGuard attribution, signed subjects, stream retry |
 | malformed or oversized frame flood | existing cap and decoder before durability; bounded queues |
@@ -1055,6 +1343,7 @@ participant set, recovered promise records, and ordinary canonical batch.
 | cutover drops a promise | existing epoch barrier extended with unresolved-lock assertion |
 | old validator votes for omission | height-gated `R = n` activation |
 | misleading UX | receipt-gated `preconfirmed`; final-only execution/result language |
+| provisional preview triggers effects | allowlisted pure reducers; no module execution, query state, or effects before finality |
 
 Equivocation evidence may inform operator policy or future slashing. v1 does
 not add an on-chain slashing rule, and safety never depends on punishment.
@@ -1066,13 +1355,13 @@ state-sync consumers, explorers, module execution, and old clients continue to
 consume ordinary batches. Receipt-aware API changes are additive.
 
 Validator behavior is still consensus-sensitive: an old validator does not
-restore Promise locks or reject an omitting batch. Binding mode therefore
-activates only through the existing height-gated upgrade mechanism with
-**`R = n` readiness**:
+restore Promise locks, apply the interactive policy, enforce quotas, or reject
+an omitting batch. Binding mode therefore activates only through the existing
+height-gated upgrade mechanism with **`R = n` readiness**:
 
 1. every current validator runs a binary that understands Promise wire
-   objects, the epoch certificate scheme, new recovery record tags, and the
-   guard;
+   objects, the epoch certificate scheme, the exact module classifier policy
+   and limits, new recovery record tags, and the guard;
 2. the existing upgrade module collects readiness from the live boundary
    validator set and arms one activation height;
 3. nodes may pre-open `Service::Promise` in dark mode but emit no binding
@@ -1081,11 +1370,16 @@ activates only through the existing height-gated upgrade mechanism with
    boundary;
 5. epoch respawn constructs Simplex, PromiseNet, the participant book, and the
    certificate suite from one agreed snapshot; and
-6. the active protocol version enables promise signing and canonical guard
-   enforcement together.
+6. the active protocol version enables module classification, promise signing,
+   quota enforcement, and canonical guard enforcement together.
 
 No new feature-negotiation consensus is added. Diagnostic capability fields
 may expose support, but the committed upgrade state is authoritative.
+
+Old clients remain compatible: they do not subscribe to interactive topics,
+continue waiting for the existing finalized response, and render only
+committed module streams. Enabling another module or variant is a new policy
+version even when the Promise wire codec is unchanged.
 
 Rollback before activation is ordinary binary rollback. A binary used after
 activation must continue to decode and honor unresolved promise records even
@@ -1103,6 +1397,8 @@ upgrade/migration.
 - With Fastblocks disabled, canonical digests, drained member order, app hashes,
   recovery replay, cutover carry, HTTP final receipts, and OpLedger transitions
   remain unchanged.
+- Every pre-existing module inherits `Ordinary`; Chat and Pages golden vectors
+  cover every current and unknown message variant under each policy version.
 - Promise body intake and restart seed the same `ContentStore` keys as
   `frame_id` / `digest_of`.
 - The generic epoch overlay book preserves statesync behavior while enforcing
@@ -1120,6 +1416,12 @@ upgrade/migration.
 - certificate signer-subset variation never changes proposal-chain identity;
 - prefix append-only, reservation order, deduplication, capacity monotonicity,
   and ordinary-batch equivalence;
+- 16 KiB frame, 256 KiB / 256 frame global, 32 KiB / 32 frame origin, and
+  128 KiB module boundary vectors;
+- quota overflow gives ordinary disposition for that window without changing
+  the module class or dropping custody;
+- no same-custodian origin overtake and no ordinary frame exceeds four
+  interactive-priority windows in scheduler model tests;
 - generated interleavings of `install_lock` and `authorize_canonical` admit no
   double authorization;
 - crash at every prepare/lock/release append and sync boundary;
@@ -1131,6 +1433,8 @@ upgrade/migration.
 
 - one, four, seven, and non-`3f + 1` validator counts supported by `N3f1`;
 - ten attempted increments per one-second window;
+- mixed Chat, Pages, files, agents, governance, unknown variants, and forged
+  client-priority inputs; only active-policy operations certify;
 - reorder, duplicate, drop, delay, and partition every Promise message class;
 - Byzantine assembler equivocation, withholding, and death before/after each
   durable boundary;
@@ -1152,12 +1456,15 @@ upgrade/migration.
 - slow/full disk, corrupt journal tail, process kill, and restart;
 - submit through validator and resident paths, including forwarding to an
   elected assembler and progress propagation back;
-- one-MiB-class frames, many small frames, duplicate floods, and overflow;
+- one-MiB-class files remain off PromiseNet while many small chat/page frames,
+  duplicate floods, per-origin abuse, quota overflow, and ordinary escape
+  windows run concurrently;
 - intended validator geography under p50/p95/p99 RTT, jitter, loss, bandwidth,
   and fsync distributions;
 - 24-hour canonical-capacity soak against latency and resource gates; and
-- desktop tests for optimistic, queued, preconfirmed, finalized, rejected,
-  carried, missed, and unknown states.
+- desktop tests for local optimism, remote interactive preview, FrameId
+  deduplication, finalized reconciliation, rejected rollback, ordinary
+  ineligibility, carried, missed, and unknown states.
 
 Production enablement requires the simulator to continuously assert: every
 emitted valid receipt is fulfilled, or canonical progress safely stops.
@@ -1167,23 +1474,26 @@ emitted valid receipt is fulfilled, or canonical progress safely stops.
 ### Phase 0 — extract reusable seams
 
 Extract `BatchBuilder`, `BlockCadence`, the service-parameterized epoch peer
-book, and scheme factory without enabling Fastblocks. Land byte-for-byte and
-behavioral regression tests first.
+book, scheme factory, default-ordinary `Module::submission_class`, and pure
+preview reducers without enabling Fastblocks. Land byte-for-byte, classifier,
+and behavioral regression tests first.
 
 ### Phase 1 — dark PromiseNet
 
 Append `Service::Promise`, construct the isolated plane from the existing
 epoch lifecycle, and exercise bounded control/body flows, admission, stats,
-and fault injection. Shadow assemblers preview the existing FIFO but create no
-durable lock or client state.
+and fault injection. Shadow assemblers preview the interactive scheduler index
+over existing custody but create no durable lock or client state. Only the
+bounded Chat/Pages policy enters the shadow plane; files and arbitrary modules
+are negative controls.
 
 ### Phase 2 — shadow certificates and recovery
 
 Add Fastblock subjects, both epoch scheme variants, prepare records, receipt
 verification, simulator, and recovery replay. Validators may assemble
 non-binding shadow AvailabilityQCs and compare the predicted prefix with the
-ordinary finalized batch. No Promise acknowledgement or `preconfirmed` UI is
-enabled.
+ordinary finalized batch. Measure quota pressure and ordinary bypass aging. No
+Promise acknowledgement or `preconfirmed` UI is enabled.
 
 ### Phase 3 — binding protocol behind activation
 
@@ -1192,16 +1502,20 @@ cutover barrier. Exercise the existing `R = n` height-gated activation on
 disposable and canary networks. Keep receipt access operator-only until safety
 and latency gates pass.
 
-### Phase 4 — inclusion-preconfirmation UX
+### Phase 4 — interactive preconfirmation UX
 
 Extend existing submit/status/stream surfaces and `OpLedger`, enable verified
-receipts for canary users, and measure custody-to-receipt separately from
-receipt-to-finality. Expand only after invariant and SLO gates remain green.
+receipts plus remote Chat/Pages previews for canary users, and measure
+custody-to-receipt separately from receipt-to-finality. Expand only after
+preview reconciliation, ordinary fairness, invariant, and SLO gates remain
+green.
 
 ### Phase 5 — default fast UX
 
-Enable inclusion preconfirmation by default for compatible networks while
-preserving the existing final-only API default and circuit breaker.
+Enable the interactive lane by default for compatible networks while
+preserving the existing final-only API default, ordinary classification for
+all other modules, and circuit breaker. New module variants do not opt in
+without a later policy upgrade.
 
 ### Separate ADR — speculative state
 
@@ -1212,8 +1526,17 @@ are not implied by this rollout.
 
 ### Benefits
 
-- Users receive quorum-backed inclusion feedback in roughly 100–200 ms in the
-  target deployment envelope.
+- Chat and Pages users receive quorum-backed inclusion feedback—and
+  collaborators receive reversible provisional updates—in roughly 100–200 ms
+  in the target deployment envelope.
+- Small frame and window limits make that target materially more credible than
+  a general-purpose transaction fast path.
+- Module-owned, default-ordinary classification lets future interactive
+  products opt in without client-controlled priority or a central payload
+  parser.
+- Files, agents, governance, and bulk work cannot consume PromiseNet resources,
+  while the ordinary escape window prevents priority starvation on honest
+  assembler/custody paths.
 - The promise survives ordinary assembler failure and is stronger than a
   sequencer, ingress-node, or RPC acknowledgement.
 - The final block remains byte-for-byte compatible with Ducktape's current
@@ -1241,10 +1564,17 @@ are not implied by this rollout.
   disk and forensic-retention pressure.
 - The `OrderedNode` batch helper and automaton/reporter acquire new extension
   seams even though their disabled behavior stays unchanged.
+- The scheduler is no longer a single FIFO: it must maintain one custody set,
+  two indexes, local origin barriers, quotas, and ordinary aging correctly.
+- Interactive priority can delay ordinary work by up to four proposer windows,
+  and the forced ordinary escape window can temporarily remove fast UX under
+  sustained bulk load.
+- Module classifiers and preview reducers are protocol/product commitments;
+  opting in a poorly bounded operation can damage latency or mislead users.
 - v1 permits only one promise session per parent; a failed assembler can remove
   fast UX for that boundary.
-- v1 promises inclusion only. It does not provide Base-like pending state or
-  successful execution receipts.
+- v1 previews allowlisted operation intent only. They do not provide Base-like
+  pending state or successful execution receipts.
 
 ## Alternatives Considered
 
@@ -1257,6 +1587,27 @@ future inclusion. Rejected as the meaning of preconfirmation.
 
 A single signer may fail, equivocate, or lose proposer authority. Its
 statement cannot constrain a later BFT quorum. Rejected.
+
+### Preconfirm every transaction type
+
+This lets one-MiB files, bulk forge work, agent/control operations, and
+semantically unbounded mutations consume the same two quorum rounds and fsync
+budget as a short chat message. It makes the 100 ms target dishonest and adds
+no meaningful UX benefit for most modules. Rejected in favor of the bounded
+interactive durable lane.
+
+### Let the client request high priority
+
+Any user could relabel bulk or adversarial work and exhaust the lane. A client
+preference also cannot prove that module execution cost is bounded. Rejected;
+the target module classifies its own payload and every validator rechecks it.
+
+### Give Chat and Pages separate PromiseNet protocols
+
+Separate networks would duplicate certificates, locks, recovery, quotas, and
+canonical reconciliation. Rejected. Modules own semantic eligibility and
+preview rendering, while one validator protocol certifies the shared bounded
+interactive prefix.
 
 ### Copy Base's sequencer Flashblocks directly
 
@@ -1328,13 +1679,15 @@ planned for v1.
 
 | Existing location | Change |
 |---|---|
-| `crates/kernel/node` | extract `BatchBuilder`; add idempotent FrameId reservation; define the canonical-prefix `PromiseGuard` and `PromiseSafetySink` interface |
+| `crates/kernel/sdk` / `crates/kernel/host` | add default-ordinary `SubmissionClass`, pure versioned `Module::submission_class`, and target routing; no client priority field |
+| `crates/apps/chat` / `crates/apps/pages` | decode and classify the exact v1 variant allowlist; keep every unknown/future variant ordinary |
+| `crates/kernel/node` | extract `BatchBuilder`; keep one custody set with interactive/ordinary indexes, quotas, origin barriers, aging, idempotent FrameId reservation; define `PromiseGuard` and `PromiseSafetySink` |
 | `crates/kernel/consensus` | add `fastblocks` subject/certificate/state-machine module; extend automaton/reporter with authoritative lifecycle and guard checks; reuse `ContentStore`, scheme construction, and `N3f1` |
 | `crates/kernel/recovery` | implement `PromiseSafetySink` in the existing journal; add tolerant record/manifest tails and recovered lock/body/receipt output |
 | `crates/system/data-plane` | append `Service::Promise = 5` and ports only; reuse all plane/flow/stats machinery |
-| `bin/node` | wire the per-use plane, generic epoch peer book, node-actor coordinator, forwarding, cut/seal cadence, cutover barrier, circuit breaker, and metrics |
-| `bin/noded` | extend existing command/status and stream surfaces; preserve default finalized submit behavior |
-| `app` | add evidence-gated `preconfirmed` to `OpLedger`; keep optimistic projection and finality floor separate |
+| `bin/node` | wire the per-use plane, generic epoch peer book, node-actor classifier/scheduler coordinator, interactive-only forwarding, cut/seal cadence, cutover barrier, circuit breaker, and metrics |
+| `bin/noded` | extend existing command/status and stream surfaces with eligibility and `interactive:<module>` previews; preserve default finalized submit behavior |
+| `app` | add evidence-gated `preconfirmed`; reuse/refactor Chat/Pages optimistic reducers for remote previews, FrameId dedupe, rollback, and final reconciliation |
 
 Dependency direction remains intact: `node` owns frame/batch invariants;
 `consensus` may depend on them; `recovery` implements node's persistence
@@ -1354,6 +1707,10 @@ These require measurement or separate ADRs and do not change v1 safety:
 - exact bounded queue sizes, retry intervals, body chunk size, and disk reserve;
 - whether datagram hints improve p99 enough to retain;
 - fee/priority selection among frames not yet reserved;
+- which additional modules or variants can prove bounded classification and
+  safe reversible preview behavior;
+- changes to the 16/256 KiB, origin/module quota, or four-window aging
+  constants, each requiring a policy-version activation;
 - changing the 100 ms target for wider validator geography;
 - weighted validator sets, coordinated with the Simplex quorum model;
 - economic slashing for signed equivocation or unavailable promised data;
