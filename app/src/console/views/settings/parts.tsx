@@ -40,7 +40,7 @@ export function SectionLabel({
       style={{
         font: `600 9px ${font.mono}`,
         letterSpacing: ".11em",
-        color: danger ? "#c79a8a" : color.muted2,
+        color: danger ? color.danger : color.muted2,
         marginTop,
       }}
     >

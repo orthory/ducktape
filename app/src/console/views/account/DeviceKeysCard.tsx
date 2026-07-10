@@ -340,7 +340,7 @@ export function DeviceKeysCard({
                         setRemoveError(null);
                         setPendingRemove(member);
                       }}
-                      hoverBg="#fbeeec"
+                      hoverBg={color.dangerSoft}
                       style={{ ...outlineButton, color: color.red }}
                     >
                       Remove

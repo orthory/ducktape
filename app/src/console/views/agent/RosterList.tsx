@@ -36,7 +36,7 @@ function AgentListButton({
         alignItems: "center",
         gap: 12,
         padding: "12px 14px",
-        background: selected ? "#faf4ef" : "transparent",
+        background: selected ? color.sunken : "transparent",
         cursor: "pointer",
         textAlign: "left",
         boxShadow: selected ? `inset 3px 0 0 ${accentVar}` : undefined,

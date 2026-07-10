@@ -6,7 +6,7 @@ import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 
 import { forgeDiff, type CommitInfo, type FileDiff } from "../../../domain/forge-git-client";
 import { Icon } from "../../components/Icon";
-import { color, font, radius } from "../../theme/tokens";
+import { color, font, radius, tint } from "../../theme/tokens";
 
 export const panelLabel: CSSProperties = {
   font: `700 9px ${font.mono}`,
@@ -15,11 +15,11 @@ export const panelLabel: CSSProperties = {
 };
 
 export const statusTone = {
-  success: { text: color.green, bg: "#eef5f0", border: "#cfe3d7" },
-  warning: { text: color.amber, bg: "#fbf4e6", border: "#ecdcae" },
-  neutral: { text: color.purple, bg: "#f1edf5", border: "#ddd2e6" },
-  info: { text: color.blue, bg: "#f1f4f8", border: "#d7e0eb" },
-  danger: { text: color.red, bg: "#fbeeec", border: "#eccfc9" },
+  success: tint(color.green),
+  warning: tint(color.amber),
+  neutral: tint(color.purple),
+  info: tint(color.blue),
+  danger: tint(color.red),
 } as const;
 
 export const inputStyle: CSSProperties = {
