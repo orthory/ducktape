@@ -2154,6 +2154,29 @@ pub fn endpoint_host(
     }
 }
 
+/// the FULL `host:port` a minted invite's WireGuard `endpoint` carries: an
+/// explicit `wireguard_advertised` is used VERBATIM — host AND port — because
+/// in the port-forwarded setup the key exists for, the externally reachable
+/// port can differ from the local bind port (`wireguard_listen`); baking the
+/// advertised host with the bind port would mint an invite whose endpoint is
+/// silently wrong. Absent, the endpoint is today's derivation exactly:
+/// [`endpoint_host`]'s host at the bind port.
+pub fn invite_wireguard_endpoint(
+    advertised: Option<&str>,
+    listen: &str,
+    wireguard_listen: SocketAddr,
+    wireguard_advertised: Option<&str>,
+) -> Result<String, String> {
+    if let Some(ingress) = parse_wireguard_advertised(wireguard_advertised)? {
+        return Ok(match ingress {
+            Ingress::Socket(addr) => addr.to_string(),
+            Ingress::Dns { host, port } => format!("{host}:{port}"),
+        });
+    }
+    let host = endpoint_host(advertised, listen, wireguard_listen, None)?;
+    Ok(format!("{host}:{}", wireguard_listen.port()))
+}
+
 /// which `WireGuardEffect` implementation the reachability plane drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireGuardEffectKind {
@@ -3680,6 +3703,48 @@ mod tests {
             endpoint_host(Some("203.0.113.1:443"), "127.0.0.1:0", unspecified, None).unwrap(),
             "203.0.113.1",
             "absent + unspecified listen: falls back to `advertised`/`listen`, unchanged"
+        );
+    }
+
+    /// The invite-mint endpoint (review fix, change 3): with
+    /// `wireguard_advertised` set the minted `endpoint` is the advertised
+    /// value VERBATIM — host AND port. The port-forwarded scenario the key
+    /// exists for: external 41820 forwarded to bind 51820 — baking the
+    /// advertised host with the BIND port would silently mint a wrong
+    /// endpoint. Absent, the derivation is bit-identical to before: the
+    /// `endpoint_host` host at the bind port.
+    #[test]
+    fn invite_endpoint_uses_the_advertised_value_verbatim_including_its_port() {
+        let unspecified: SocketAddr = "0.0.0.0:51820".parse().unwrap();
+        let concrete: SocketAddr = "10.0.0.5:51820".parse().unwrap();
+
+        assert_eq!(
+            invite_wireguard_endpoint(None, "127.0.0.1:0", unspecified, Some("203.0.113.9:41820"))
+                .unwrap(),
+            "203.0.113.9:41820",
+            "the advertised endpoint rides verbatim — 41820, never the bind port 51820"
+        );
+        assert_eq!(
+            invite_wireguard_endpoint(
+                None,
+                "127.0.0.1:0",
+                concrete,
+                Some("tunnel.example.com:41820")
+            )
+            .unwrap(),
+            "tunnel.example.com:41820",
+            "a hostname override stays a hostname, with ITS port — even over a concrete bind IP"
+        );
+        assert_eq!(
+            invite_wireguard_endpoint(None, "127.0.0.1:0", concrete, None).unwrap(),
+            "10.0.0.5:51820",
+            "absent: today's derivation exactly — the wireguard_listen IP at the bind port"
+        );
+        assert_eq!(
+            invite_wireguard_endpoint(Some("203.0.113.1:443"), "127.0.0.1:0", unspecified, None)
+                .unwrap(),
+            "203.0.113.1:51820",
+            "absent + unspecified listen: the advertised HOST at the WG bind port, unchanged"
         );
     }
 

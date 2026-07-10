@@ -273,9 +273,21 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     let intro_port =
                         config::resolved_invite_listen(raw.invite_listen.as_deref(), wg_listen)?
                             .port();
+                    // the tunnel endpoint carries the FULL advertised
+                    // host:port when `wireguard_advertised` is configured —
+                    // the external port can differ from the bind port in the
+                    // port-forwarded setup the key exists for. The intro
+                    // stays host + intro port (no advertise override exists
+                    // for the intro lane).
+                    let endpoint = config::invite_wireguard_endpoint(
+                        raw.advertised.as_deref(),
+                        &raw.listen,
+                        wg_listen,
+                        raw.wireguard_advertised.as_deref(),
+                    )?;
                     Some(config::InviteWireGuard {
                         public_key: wg_keypair.public_key().0,
-                        endpoint: Some(format!("{host}:{}", wg_listen.port())),
+                        endpoint: Some(endpoint),
                         intro: Some(format!("{host}:{intro_port}")),
                         mesh_port,
                     })
