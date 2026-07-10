@@ -1,11 +1,37 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   ROUTE_FORMAT_VERSION,
   bytesToHex,
+  listRoutes,
+  probeRouteHealth,
   routeSigningPreimage,
   validateStatement,
 } from "./gateway-client";
+import { makeTransportStub } from "../test/transport-stub";
+import type { RouteRecord } from "./gateway-client";
+
+const loopbackRecord = (methods: Array<"get" | "head" | "post"> = ["get", "head"]): RouteRecord => ({
+  statement: {
+    version: ROUTE_FORMAT_VERSION,
+    chain_id: "test",
+    account_id: [1],
+    name: { label: "api" },
+    publisher_node: new Array(32).fill(3),
+    revision: 7,
+    route: {
+      target: { kind: "loopback_http" },
+      policy: {
+        audience: { kind: "network" },
+        methods,
+        max_request_bytes: methods.includes("post") ? 1024 : 0,
+        max_response_bytes: 4096,
+        allow_authorization: false,
+      },
+    },
+  },
+  authorization: { signer: new Array(32).fill(4), signature: new Array(64).fill(5) },
+});
 
 describe("gateway wire contract", () => {
   it("matches the Rust signing-preimage fixed vector", () => {
@@ -61,5 +87,49 @@ describe("gateway wire contract", () => {
         },
       },
     })).toThrow(/DuckFS routes require GET\+HEAD/);
+  });
+
+  it("lists live account routes through one bounded management query", async () => {
+    const summary = {
+      name: { label: "api" },
+      publisher_node: new Array(32).fill(3),
+      revision: 7,
+      target: "loopback_http" as const,
+    };
+    const query = vi.fn().mockResolvedValue({ routes: [summary] });
+    await expect(listRoutes(makeTransportStub({ query }), [1])).resolves.toEqual([summary]);
+    expect(query).toHaveBeenCalledWith("gateway", { list: { account_id: [1] } });
+  });
+
+  it("health-checks the real route path with a credential-free HEAD", async () => {
+    const record = loopbackRecord();
+    const gatewayProxy = vi.fn().mockResolvedValue({
+      head: { status: 204, headers: [] },
+      body: new Uint8Array(0),
+    });
+    await expect(probeRouteHealth(makeTransportStub({ gatewayProxy }), record)).resolves.toEqual({
+      path: "/",
+      status: 204,
+    });
+    expect(gatewayProxy).toHaveBeenCalledWith({
+      head: {
+        account_id: [1],
+        name: { label: "api" },
+        revision: 7,
+        method: "head",
+        path_and_query: "/",
+        headers: [],
+        body_len: 0,
+      },
+      body: new Uint8Array(0),
+    });
+  });
+
+  it("does not probe a route whose signed policy omits HEAD", async () => {
+    const gatewayProxy = vi.fn();
+    await expect(
+      probeRouteHealth(makeTransportStub({ gatewayProxy }), loopbackRecord(["post"])),
+    ).rejects.toThrow(/requires HEAD/);
+    expect(gatewayProxy).not.toHaveBeenCalled();
   });
 });

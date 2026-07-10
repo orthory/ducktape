@@ -54,6 +54,13 @@ signature namespace, validation, query, proxy, and browser paths; each
 `(account, name)` has its own revision stream. There are no separate page,
 application, or API record types.
 
+The management query lists bounded summaries (name, publisher, revision, and
+target kind) for every live route of one account in canonical apex-then-label
+order. DuckFS manifests, policies, signatures, and tombstones remain behind the
+exact-name query, so a list cannot multiply the largest route payload by the
+account route limit. Tombstones stay queryable for revision continuity but
+never appear as live management entries.
+
 ### Consensus authority
 
 The gateway module accepts a mutation only when all of these hold:
@@ -156,6 +163,27 @@ disabled. It has no account, signature, peer hop, or gateway session.
 No local CA, hosts-file change, OS DNS interception, public ingress, or
 ambient browser trust is installed.
 
+### Routes management and health
+
+The product surface is **Routes**, not separate DNS, reverse-proxy, and gateway
+forms. An account claims its optional DuckDNS handle once. A route editor then
+derives `<label>.<account>.duck` and saves the signed route together with its
+node-local loopback binding, rolling the binding back when publication fails.
+The local port never enters DuckDNS or consensus.
+
+Publication and availability remain distinct. For a selected live route, the
+trusted console may send a bodyless, credential-free `HEAD` through the normal
+node API and authenticated gateway plane. The probe therefore exercises the
+finalized record, current publisher and Identity authority, audience policy,
+overlay stream, and the real DuckFS or loopback source. It follows no redirect
+and receives the ordinary route byte caps and header filtering. DuckFS probes
+the declared default (or first) file; loopback probes `/`. A response below 400
+is healthy, a 4xx proves the route is reachable, and a 5xx is reported as
+failing.
+Routes that did not explicitly sign `HEAD` are never probed. Results are
+short-lived UI diagnostics only: they are neither consensus state nor an
+admission or failover signal.
+
 ## Consequences
 
 - Identity exists whether or not an account publishes a route or registers a
@@ -164,6 +192,8 @@ ambient browser trust is installed.
   authenticated network and Identity layers.
 - Static content and HTTP servers share one standardizable route/policy/proxy
   contract without erasing their target-specific byte boundary.
+- Operators configure one derived address and source in Routes; the UI keeps
+  published state separate from its end-to-end health result.
 - Backend methods are possible but must be explicitly signed. Cookie-based
   ambient authority is impossible, and Authorization is opt-in.
 - A loopback service can stay private to its node while network peers use its

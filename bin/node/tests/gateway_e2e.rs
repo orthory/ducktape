@@ -128,8 +128,11 @@ fn route_revision(cluster: &Cluster, reader: usize) -> Option<u64> {
         }),
     )?;
     match gateway::decode_reply(&bytes).ok()? {
-        GatewayReply::Route(Some(record)) => Some(record.statement.revision),
-        GatewayReply::Route(None) => None,
+        GatewayReply::Route(record) => record
+            .as_ref()
+            .as_ref()
+            .map(|record| record.statement.revision),
+        GatewayReply::Routes(_) => None,
     }
 }
 

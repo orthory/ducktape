@@ -371,11 +371,14 @@ async fn resolve_route(
     )
     .await?;
     match gateway::decode_reply(&reply) {
-        Ok(gateway::GatewayReply::Route(Some(record))) if record.statement.route.is_some() => {
-            Ok(record)
-        }
-        Ok(gateway::GatewayReply::Route(_)) => Err(GatewayFailure::NotFound(
-            "gateway route is not published".into(),
+        Ok(gateway::GatewayReply::Route(route)) => match *route {
+            Some(record) if record.statement.route.is_some() => Ok(record),
+            _ => Err(GatewayFailure::NotFound(
+                "gateway route is not published".into(),
+            )),
+        },
+        Ok(gateway::GatewayReply::Routes(_)) => Err(GatewayFailure::Unavailable(
+            "gateway returned an unexpected route-list reply".into(),
         )),
         Err(error) => Err(GatewayFailure::Unavailable(error)),
     }
@@ -1019,7 +1022,7 @@ mod tests {
             };
             assert_eq!(target, "gateway");
             let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
-                Some(route.clone()),
+                Box::new(Some(route.clone())),
             ))));
 
             let NodeCommand::Query { target, reply, .. } = requests.next().await.unwrap() else {
@@ -1089,7 +1092,7 @@ mod tests {
                 panic!()
             };
             let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
-                Some(route),
+                Box::new(Some(route)),
             ))));
             let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
                 panic!()
@@ -1187,7 +1190,7 @@ mod tests {
                 panic!("route query")
             };
             let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
-                Some(route),
+                Box::new(Some(route)),
             ))));
             for _ in 0..2 {
                 let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {

@@ -362,7 +362,7 @@ fn spawn_gateway_actor(mut cmds: mpsc::Receiver<NodeCommand>, replies: usize) {
                 }
             );
             let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
-                Some(gateway_route()),
+                Box::new(Some(gateway_route())),
             ))));
         }
     });

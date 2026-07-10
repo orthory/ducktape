@@ -165,7 +165,7 @@ fn route_requires_standing_bound_origin_current_member_and_valid_signature() {
     .unwrap();
     assert!(matches!(
         decode_reply(&reply).unwrap(),
-        GatewayReply::Route(Some(_))
+        GatewayReply::Route(route) if route.is_some()
     ));
 
     context.env.origin = Origin::External(outsider.clone());
@@ -220,9 +220,21 @@ fn apex_and_named_routes_share_one_authority_model_but_independent_revisions() {
         .unwrap();
         assert!(matches!(
             decode_reply(&reply).unwrap(),
-            GatewayReply::Route(Some(_))
+            GatewayReply::Route(route) if route.is_some()
         ));
     }
+
+    let reply = block_on(module.query(&encode_query(&GatewayQuery::List {
+        account_id: account.account_id,
+    })))
+    .unwrap();
+    let GatewayReply::Routes(routes) = decode_reply(&reply).unwrap() else {
+        panic!("list must return routes");
+    };
+    assert_eq!(routes.len(), 2);
+    assert_eq!(routes[0].name, RouteName::apex());
+    assert_eq!(routes[1].name, RouteName::named("api"));
+    assert_eq!(routes[0].revision, 1);
 }
 
 #[test]

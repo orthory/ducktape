@@ -311,7 +311,7 @@ const loadAccountRoute = async (
     gateway.getRoute(transport, resolved.account_id, address.name),
   ]);
   if (!account) throw new Error("The resolved account no longer exists.");
-  if (!record?.statement.route) throw new Error(`${address.hostname} has no published gateway route.`);
+  if (!record?.statement.route) throw new Error(`${address.hostname} has no published route.`);
   gateway.verifyRecord(record, account);
 
   const session = await transport.gatewaySession({
@@ -342,7 +342,7 @@ const loadAccountRoute = async (
     gateway.bytesToHex(latestRecord.statement.publisher_node) !==
       gateway.bytesToHex(record.statement.publisher_node)
   ) {
-    throw new Error("Gateway route changed while the session was opening. Reload it.");
+    throw new Error("The route changed while the session was opening. Reload it.");
   }
 
   return {

@@ -151,6 +151,13 @@ pub enum RouteTarget {
     LoopbackHttp,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteTargetKind {
+    DuckFs,
+    LoopbackHttp,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteDefinition {
@@ -186,6 +193,17 @@ pub struct RouteRecord {
     pub authorization: MemberAuthorization,
 }
 
+/// Bounded management projection of one live route. In particular, DuckFS
+/// manifests and signatures remain behind the exact-name `Get` query.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSummary {
+    pub name: RouteName,
+    pub publisher_node: Vec<u8>,
+    pub revision: u64,
+    pub target: RouteTargetKind,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayMsg {
@@ -202,12 +220,20 @@ pub enum GatewayQuery {
         account_id: Vec<u8>,
         name: RouteName,
     },
+    /// Every currently published route owned by one account, in canonical
+    /// [`RouteName`] order. Tombstones remain queryable through `Get` so a
+    /// publisher can continue the revision stream, but are not management
+    /// surface entries.
+    List { account_id: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayReply {
-    Route(Option<RouteRecord>),
+    /// Boxed only to keep the Rust reply enum bounded after adding the compact
+    /// list variant; `Box` is transparent in the JSON wire representation.
+    Route(Box<Option<RouteRecord>>),
+    Routes(Vec<RouteSummary>),
 }
 
 pub fn encode_msg(message: &GatewayMsg) -> Vec<u8> {

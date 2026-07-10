@@ -4,8 +4,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     MAX_ACCOUNT_ID_BYTES, MAX_ROUTE_LABEL_BYTES, MAX_ROUTE_STATEMENT_JSON_BYTES,
-    MAX_ROUTES_PER_ACCOUNT, RouteName, RouteRecord, validate_account_id, validate_authorization,
-    validate_route_statement,
+    MAX_ROUTES_PER_ACCOUNT, RouteName, RouteRecord, RouteSummary, RouteTarget, RouteTargetKind,
+    validate_account_id, validate_authorization, validate_route_statement,
 };
 
 const STATE_FORMAT_VERSION: u8 = 1;
@@ -63,6 +63,28 @@ impl Registry {
             .routes
             .get(&(account_id.to_vec(), name.clone()))
             .cloned())
+    }
+
+    pub fn routes(&self, account_id: &[u8]) -> Result<Vec<RouteSummary>, String> {
+        validate_account_id(account_id)?;
+        Ok(self
+            .effective()
+            .routes
+            .range((account_id.to_vec(), RouteName::apex())..)
+            .take_while(|((owner, _), _)| owner.as_slice() == account_id)
+            .filter_map(|(_, record)| {
+                let route = record.statement.route.as_ref()?;
+                Some(RouteSummary {
+                    name: record.statement.name.clone(),
+                    publisher_node: record.statement.publisher_node.clone(),
+                    revision: record.statement.revision,
+                    target: match &route.target {
+                        RouteTarget::DuckFs { .. } => RouteTargetKind::DuckFs,
+                        RouteTarget::LoopbackHttp => RouteTargetKind::LoopbackHttp,
+                    },
+                })
+            })
+            .collect())
     }
 
     pub fn set_route(&mut self, record: RouteRecord) -> Result<(), String> {
@@ -358,6 +380,10 @@ mod tests {
                 .route
                 .is_none()
         );
+        let live = registry.routes(&[1; 32]).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].name, RouteName::named("api"));
+        assert_eq!(live[0].target, RouteTargetKind::LoopbackHttp);
     }
 
     #[test]

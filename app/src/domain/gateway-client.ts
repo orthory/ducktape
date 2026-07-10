@@ -97,6 +97,18 @@ export interface RouteRecord {
   authorization: MemberAuthorization;
 }
 
+export interface RouteSummary {
+  name: RouteName;
+  publisher_node: number[];
+  revision: number;
+  target: "duck_fs" | "loopback_http";
+}
+
+export interface RouteHealthProbe {
+  path: string;
+  status: number;
+}
+
 interface SetRouteMessage {
   set_route: {
     statement: RouteStatement;
@@ -422,6 +434,53 @@ export const getRoute = (
   return Promise.resolve()
     .then(() => transport.query(TARGET, { get: { account_id: accountId, name } }))
     .then((reply) => replyVariant<RouteRecord | null>(reply, "route"));
+};
+
+/** Bounded summaries for every live route of one account, in canonical
+ * apex-then-label order. Manifests, policies, signatures, and signed
+ * tombstones stay behind getRoute. */
+export const listRoutes = (
+  transport: NodeTransport,
+  accountId: number[],
+): Promise<RouteSummary[]> => {
+  validateAccountId(accountId);
+  return Promise.resolve()
+    .then(() => transport.query(TARGET, { list: { account_id: accountId } }))
+    .then((reply) => replyVariant<RouteSummary[]>(reply, "routes"));
+};
+
+/** Exercise the finalized route through the same authenticated gateway plane
+ * as a real caller. The probe is deliberately credential-free and bodyless;
+ * routes that did not explicitly sign HEAD are never probed implicitly. */
+export const probeRouteHealth = async (
+  transport: NodeTransport,
+  record: RouteRecord,
+): Promise<RouteHealthProbe> => {
+  validateStatement(record.statement);
+  const route = record.statement.route;
+  if (!route) throw new Error("gateway: cannot probe an unpublished route");
+  if (!route.policy.methods.includes("head")) {
+    throw new Error("gateway: route health requires HEAD in the signed policy");
+  }
+  if (!transport.gatewayProxy) {
+    throw new Error("gateway: this node has no active gateway plane");
+  }
+  const path = route.target.kind === "duck_fs"
+    ? `/${route.target.content.default_path ?? route.target.content.files[0].path}`
+    : "/";
+  const reply = await transport.gatewayProxy({
+    head: {
+      account_id: record.statement.account_id,
+      name: record.statement.name,
+      revision: record.statement.revision,
+      method: "head",
+      path_and_query: path,
+      headers: [],
+      body_len: 0,
+    },
+    body: new Uint8Array(0),
+  });
+  return { path, status: reply.head.status };
 };
 
 export const signStatement = async (statement: RouteStatement): Promise<SetRouteMessage> => {

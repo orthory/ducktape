@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
 import * as browser from "../../../domain/duck-browser";
@@ -9,12 +9,21 @@ import { normalizeKey } from "../../../domain/names";
 import { isTauri } from "../../../domain/node-bootstrap";
 import * as workspaces from "../../../domain/workspace-client";
 import type { LoadedDuckPage } from "../../../domain/duck-browser";
-import type { RouteMethod, RouteRecord, RouteStatement } from "../../../domain/gateway-client";
+import type { RouteMethod, RouteRecord, RouteStatement, RouteSummary } from "../../../domain/gateway-client";
 import { Icon } from "../../components/Icon";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font, radius } from "../../theme/tokens";
 
 const METHOD_ORDER: RouteMethod[] = ["get", "head", "post", "put", "patch", "delete"];
+
+type RouteHealth =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "serving"; status: number; path: string }
+  | { kind: "reachable"; status: number; path: string }
+  | { kind: "failing"; status: number; path: string }
+  | { kind: "disabled" }
+  | { kind: "unavailable" };
 
 const short = (value?: string, width = 8): string =>
   value ? `${value.slice(0, width)}…${value.slice(-4)}` : "—";
@@ -44,6 +53,11 @@ const fieldStyle: CSSProperties = {
   color: color.ink,
   font: `500 11px ${font.mono}`,
 };
+
+const routeKey = (name: gateway.RouteName): string => name.label ?? "_apex";
+
+const routeTargetLabel = (route: RouteSummary): string =>
+  route.target === "duck_fs" ? "DuckFS" : "Local HTTP";
 
 function SecurityBar({ page }: { page: LoadedDuckPage }) {
   const routed = page.hosting === "gateway";
@@ -84,12 +98,12 @@ function SecurityBar({ page }: { page: LoadedDuckPage }) {
   );
 }
 
-function PublishPanel({
+function RoutesPanel({
   onClose,
-  onPublished,
+  onSaved,
 }: {
   onClose: () => void;
-  onPublished: (address: string) => void;
+  onSaved: (address: string) => void;
 }) {
   const { state, transport } = useDucktape();
   const publisherNode = normalizeKey(state.status?.publicKey ?? state.workspace?.pubkey ?? "");
@@ -102,13 +116,17 @@ function PublishPanel({
   const [target, setTarget] = useState<"duck_fs" | "loopback_http">("duck_fs");
   const [port, setPort] = useState("3000");
   const [defaultPath, setDefaultPath] = useState("index.html");
-  const [audience, setAudience] = useState<"network" | "owner">("network");
+  const [audience, setAudience] = useState<"network" | "owner" | "accounts">("network");
   const [methods, setMethods] = useState<RouteMethod[]>(["get", "head"]);
   const [requestKiB, setRequestKiB] = useState("256");
   const [responseKiB, setResponseKiB] = useState("4096");
   const [allowAuthorization, setAllowAuthorization] = useState(false);
   const [record, setRecord] = useState<RouteRecord | null>(null);
+  const [records, setRecords] = useState<RouteSummary[]>([]);
   const [localRoutes, setLocalRoutes] = useState<workspaces.GatewayLocalRoute[]>([]);
+  const [health, setHealth] = useState<RouteHealth>({ kind: "idle" });
+  const refreshRun = useRef(0);
+  const healthRun = useRef(0);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
 
@@ -118,26 +136,109 @@ function PublishPanel({
     : null;
   const local = localRoutes.find((route) => route.name.label === name.label);
 
+  const resetEditor = useCallback(() => {
+    setTarget("duck_fs");
+    setPort("3000");
+    setDefaultPath("index.html");
+    setAudience("network");
+    setMethods(["get", "head"]);
+    setRequestKiB("256");
+    setResponseKiB("4096");
+    setAllowAuthorization(false);
+  }, []);
+
+  const hydrateEditor = useCallback((next: RouteRecord | null, routes: workspaces.GatewayLocalRoute[]) => {
+    const definition = next?.statement.route;
+    if (!definition) {
+      resetEditor();
+      return;
+    }
+    setTarget(definition.target.kind);
+    setAudience(definition.policy.audience.kind);
+    setMethods(definition.policy.methods);
+    setRequestKiB(String(definition.policy.max_request_bytes / 1024));
+    setResponseKiB(String(definition.policy.max_response_bytes / 1024));
+    setAllowAuthorization(definition.policy.allow_authorization);
+    if (definition.target.kind === "duck_fs") {
+      setDefaultPath(definition.target.content.default_path ?? "index.html");
+    } else {
+      const bound = routes.find((route) => route.name.label === next.statement.name.label);
+      setPort(String(bound?.port ?? 3000));
+    }
+  }, [resetEditor]);
+
   const refresh = useCallback(async () => {
+    const run = ++refreshRun.current;
     if (!transport || !accountId) {
       setRecord(null);
+      setRecords([]);
       setLocalRoutes([]);
+      resetEditor();
       return;
     }
     gateway.validateRouteName(name);
-    const [next, routes] = await Promise.all([
-      gateway.getRoute(transport, identity.hexToBytes(accountId), name),
+    const accountBytes = identity.hexToBytes(accountId);
+    const result = await Promise.all([
+      gateway.getRoute(transport, accountBytes, name),
+      gateway.listRoutes(transport, accountBytes),
       workspaceId && isTauri()
         ? workspaces.listGatewayRoutes(workspaceId)
         : Promise.resolve([]),
-    ]);
+    ]).catch((error: unknown) => {
+      if (refreshRun.current !== run) return null;
+      throw error;
+    });
+    if (!result || refreshRun.current !== run) return;
+    const [next, published, routes] = result;
     setRecord(next);
+    setRecords(published);
     setLocalRoutes(routes);
-  }, [transport, accountId, name, workspaceId]);
+    hydrateEditor(next, routes);
+  }, [transport, accountId, name, workspaceId, hydrateEditor, resetEditor]);
 
   useEffect(() => {
+    setRecord(null);
+    setHealth({ kind: "idle" });
     refresh().catch((error: unknown) => setNote(String(error)));
+    return () => {
+      refreshRun.current += 1;
+    };
   }, [refresh]);
+
+  const checkHealth = useCallback(async (): Promise<void> => {
+    const run = ++healthRun.current;
+    const definition = record?.statement.route;
+    if (!transport || !record || !definition) {
+      setHealth({ kind: "idle" });
+      return;
+    }
+    if (!definition.policy.methods.includes("head")) {
+      setHealth({ kind: "disabled" });
+      return;
+    }
+    setHealth({ kind: "checking" });
+    try {
+      const result = await gateway.probeRouteHealth(transport, record);
+      if (healthRun.current !== run) return;
+      setHealth(result.status >= 500
+        ? { kind: "failing", ...result }
+        : result.status >= 400
+          ? { kind: "reachable", ...result }
+          : { kind: "serving", ...result });
+    } catch {
+      if (healthRun.current === run) setHealth({ kind: "unavailable" });
+    }
+  }, [transport, record]);
+
+  useEffect(() => {
+    void checkHealth();
+    if (!record?.statement.route?.policy.methods.includes("head")) return;
+    const timer = window.setInterval(() => void checkHealth(), 30_000);
+    return () => {
+      window.clearInterval(timer);
+      healthRun.current += 1;
+    };
+  }, [checkHealth, record]);
 
   const statement = (route: gateway.RouteDefinition | null): RouteStatement => ({
     version: gateway.ROUTE_FORMAT_VERSION,
@@ -160,6 +261,9 @@ function PublishPanel({
 
   const publish = async (): Promise<void> => {
     if (!transport || !workspaceId) throw new Error("Connect a managed workspace first.");
+    if (audience === "accounts") {
+      throw new Error("Explicit account audiences are read-only in this Routes editor.");
+    }
     gateway.validateRouteName(name);
     const maxResponse = numericCap(
       responseKiB,
@@ -225,8 +329,8 @@ function PublishPanel({
       throw error;
     }
     await refresh();
-    setNote(address ? `Published ${address}.` : "Published; DuckDNS registration remains optional.");
-    if (address) onPublished(address);
+    setNote(address ? `Saved ${address}.` : "Route saved. Register a Duck name to make it browsable.");
+    if (address) onSaved(address);
   };
 
   const unpublish = async (): Promise<void> => {
@@ -246,7 +350,7 @@ function PublishPanel({
       throw error;
     }
     await refresh();
-    setNote("Route removed; its revision tombstone prevents replay.");
+    setNote("Route removed. Its signed revision tombstone prevents replay.");
   };
 
   const createStarter = async (): Promise<void> => {
@@ -260,7 +364,7 @@ function PublishPanel({
     });
     setDefaultPath("index.html");
     setTarget("duck_fs");
-    setNote("Starter created in the route's DuckFS root. Publish when ready.");
+    setNote("Starter created in the route's DuckFS root. Save when ready.");
   };
 
   const run = (operation: () => Promise<void>): void => {
@@ -271,13 +375,29 @@ function PublishPanel({
       .finally(() => setBusy(false));
   };
 
-  const canPublish = Boolean(
+  const canMutate = Boolean(
     transport && isTauri() && workspaceId && accountId && publisherNode && chainId && !busy,
   );
+  const canPublish = canMutate && audience !== "accounts";
+
+  const healthText = health.kind === "checking" ? "Checking end to end…"
+    : health.kind === "serving" ? `Healthy · HTTP ${health.status}`
+      : health.kind === "reachable" ? `Reachable · HTTP ${health.status}`
+        : health.kind === "failing" ? `Unhealthy · HTTP ${health.status}`
+          : health.kind === "disabled" ? "Not checked · HEAD is not allowed"
+            : health.kind === "unavailable" ? "Unavailable"
+              : "Not checked";
+  const healthColor = health.kind === "serving" ? "#397047"
+    : health.kind === "failing" || health.kind === "unavailable" ? color.danger
+      : color.muted3;
+  const displayAddress = (item: RouteSummary): string => {
+    const prefix = item.name.label ? `${item.name.label}.` : "";
+    return handle ? `${prefix}${handle}.duck` : item.name.label ?? "Account apex";
+  };
 
   return (
-    <aside aria-label="Gateway publishing" style={{
-      width: 326,
+    <aside aria-label="Routes" style={{
+      width: 356,
       flexShrink: 0,
       borderLeft: `1px solid ${color.borderSoft}`,
       background: color.sidebar,
@@ -285,20 +405,77 @@ function PublishPanel({
       overflowY: "auto",
     }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <span style={{ font: `650 13px ${font.sans}`, color: color.dark }}>Gateway route</span>
-        <button onClick={onClose} aria-label="Close publishing panel" style={{ ...buttonStyle(), width: 28, padding: 0, textAlign: "center" }}>×</button>
+        <span style={{ font: `650 13px ${font.sans}`, color: color.dark }}>Routes</span>
+        <button onClick={onClose} aria-label="Close routes" style={{ ...buttonStyle(), width: 28, padding: 0, textAlign: "center" }}>×</button>
       </div>
       <p style={{ font: `400 11px/1.55 ${font.sans}`, color: color.muted3, margin: "12px 0 14px" }}>
-        One signed route can serve exact DuckFS files or reverse-proxy one local HTTP server.
-        DuckDNS is only the optional account name.
+        Connect one account address to exact DuckFS content or a local HTTP service.
+        The address, reverse proxy, and signed access policy are saved together.
       </p>
 
-      <dl style={{ margin: 0, display: "grid", gridTemplateColumns: "72px 1fr", gap: "7px 8px", font: `500 10.5px ${font.mono}` }}>
-        <dt style={{ color: color.muted }}>Account</dt><dd style={{ margin: 0, color: color.inkSoft }}>{short(accountId, 10)}</dd>
-        <dt style={{ color: color.muted }}>Node</dt><dd style={{ margin: 0, color: color.inkSoft }}>{short(publisherNode, 10)}</dd>
-        <dt style={{ color: color.muted }}>Address</dt><dd style={{ margin: 0, color: color.inkSoft }}>{address ?? "DNS optional"}</dd>
-        <dt style={{ color: color.muted }}>Revision</dt><dd style={{ margin: 0, color: color.inkSoft }}>{record?.statement.revision ?? "—"}</dd>
-      </dl>
+      {!handle && accountId && (
+        <div style={{ padding: "9px 10px", border: `1px solid ${color.border}`, borderRadius: radius.sm, background: color.paper, color: color.muted3, font: `500 10.5px/1.45 ${font.sans}` }}>
+          Routes can exist by Account ID. Register a Duck name in Account to make them browsable as <span style={{ fontFamily: font.mono }}>.duck</span> addresses.
+        </div>
+      )}
+
+      <section aria-label="Published routes" style={{ marginTop: 14 }}>
+        <div style={{ color: color.muted3, font: `650 10px ${font.sans}`, marginBottom: 6 }}>Published routes</div>
+        {records.length === 0 ? (
+          <div style={{ padding: "10px 0", color: color.muted, font: `500 10px ${font.sans}` }}>No routes published.</div>
+        ) : (
+          <div style={{ display: "grid", gap: 5 }}>
+            {records.map((item) => {
+              const selected = routeKey(item.name) === routeKey(name);
+              const routePublisher = gateway.bytesToHex(item.publisher_node);
+              return (
+                <button
+                  key={routeKey(item.name)}
+                  aria-label={`Edit ${displayAddress(item)}`}
+                  onClick={() => {
+                    setLabel(item.name.label ?? "");
+                    setNote(null);
+                  }}
+                  style={{
+                    all: "unset",
+                    cursor: "pointer",
+                    display: "grid",
+                    gridTemplateColumns: "1fr auto",
+                    gap: "3px 8px",
+                    padding: "8px 9px",
+                    borderRadius: radius.sm,
+                    border: `1px solid ${selected ? color.borderStrong : color.border}`,
+                    background: selected ? color.paper : "transparent",
+                  }}
+                >
+                  <span style={{ color: color.ink, font: `600 10.5px ${font.mono}`, overflowWrap: "anywhere" }}>{displayAddress(item)}</span>
+                  <span style={{ color: color.muted3, font: `600 9px ${font.sans}` }}>
+                    {routeTargetLabel(item)} · {routePublisher === publisherNode ? "this node" : short(routePublisher, 6)}
+                  </span>
+                  <span style={{ color: selected ? healthColor : color.muted, font: `500 9px ${font.sans}` }}>
+                    {selected ? healthText : "Published"}
+                  </span>
+                  <span style={{ color: color.muted, font: `500 9px ${font.mono}` }}>r{item.revision}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      <div style={{ marginTop: 15, paddingTop: 14, borderTop: `1px solid ${color.border}` }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+          <span style={{ color: color.dark, font: `650 11px ${font.sans}` }}>{record?.statement.route ? "Edit route" : "New route"}</span>
+          <span style={{ color: color.muted, font: `500 9px ${font.mono}` }}>revision {record?.statement.revision ?? "—"}</span>
+        </div>
+        <div style={{ marginTop: 5, color: color.inkSoft, font: `500 10.5px ${font.mono}`, overflowWrap: "anywhere" }}>{address ?? "Account ID route"}</div>
+        {record?.statement.route && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 7 }}>
+            <span role="status" style={{ color: healthColor, font: `600 10px ${font.sans}` }}>{healthText}</span>
+            <button disabled={health.kind === "checking"} onClick={() => void checkHealth()} aria-label="Check route health" style={{ ...buttonStyle(health.kind === "checking"), height: 24, padding: "0 8px", fontSize: 9 }}>Check</button>
+          </div>
+        )}
+      </div>
 
       <div style={{ display: "grid", gap: 8, marginTop: 16 }}>
         <label style={{ font: `600 10px ${font.sans}`, color: color.muted3 }}>
@@ -306,10 +483,10 @@ function PublishPanel({
           <input aria-label="Route label" value={label} onChange={(event) => setLabel(event.target.value.toLowerCase())} placeholder="api" spellCheck={false} style={{ ...fieldStyle, display: "block", width: "100%", marginTop: 5 }} />
         </label>
         <label style={{ font: `600 10px ${font.sans}`, color: color.muted3 }}>
-          Target
+          Source
           <select aria-label="Route target" value={target} onChange={(event) => setTarget(event.target.value as typeof target)} style={{ ...fieldStyle, display: "block", width: "100%", marginTop: 5 }}>
             <option value="duck_fs">DuckFS content</option>
-            <option value="loopback_http">Loopback HTTP</option>
+            <option value="loopback_http">Local HTTP service</option>
           </select>
         </label>
         <label style={{ font: `600 10px ${font.sans}`, color: color.muted3 }}>
@@ -317,6 +494,7 @@ function PublishPanel({
           <select aria-label="Route audience" value={audience} onChange={(event) => setAudience(event.target.value as typeof audience)} style={{ ...fieldStyle, display: "block", width: "100%", marginTop: 5 }}>
             <option value="network">All identified network members</option>
             <option value="owner">Owning account only</option>
+            {audience === "accounts" && <option value="accounts">Explicit accounts (read only)</option>}
           </select>
         </label>
       </div>
@@ -330,7 +508,7 @@ function PublishPanel({
           <div style={{ marginTop: 7, color: color.muted, font: `500 9.5px/1.45 ${font.mono}`, overflowWrap: "anywhere" }}>
             {publisherNode ? gateway.contentRoot(publisherNode, name) : "—"}
           </div>
-          <button disabled={!canPublish} onClick={() => run(createStarter)} style={{ ...buttonStyle(!canPublish), marginTop: 9, width: "100%", textAlign: "center" }}>Create starter file</button>
+          <button disabled={!canMutate} onClick={() => run(createStarter)} style={{ ...buttonStyle(!canMutate), marginTop: 9, width: "100%", textAlign: "center" }}>Create starter file</button>
         </div>
       ) : (
         <div style={{ marginTop: 13 }}>
@@ -369,13 +547,14 @@ function PublishPanel({
       </div>
 
       <div style={{ display: "grid", gap: 7, marginTop: 14 }}>
-        <button disabled={!canPublish} onClick={() => run(publish)} style={{ ...buttonStyle(!canPublish), textAlign: "center" }}>Publish signed route</button>
+        <button disabled={!canPublish} onClick={() => run(publish)} style={{ ...buttonStyle(!canPublish), textAlign: "center" }}>Save route</button>
         {record?.statement.route && (
-          <button disabled={!canPublish} onClick={() => run(unpublish)} style={{ ...buttonStyle(!canPublish), textAlign: "center", color: color.danger }}>Unpublish route</button>
+          <button disabled={!canMutate} onClick={() => run(unpublish)} style={{ ...buttonStyle(!canMutate), textAlign: "center", color: color.danger }}>Remove route</button>
         )}
       </div>
-      {!isTauri() && <p style={{ color: color.muted, font: `500 10px/1.5 ${font.sans}` }}>Publishing requires the desktop user-key signer.</p>}
-      {isTauri() && !accountId && <p style={{ color: color.muted, font: `500 10px/1.5 ${font.sans}` }}>Bind this node to your Identity account before publishing.</p>}
+      {!isTauri() && <p style={{ color: color.muted, font: `500 10px/1.5 ${font.sans}` }}>Saving routes requires the desktop user-key signer.</p>}
+      {isTauri() && !accountId && <p style={{ color: color.muted, font: `500 10px/1.5 ${font.sans}` }}>Bind this node to your Identity account before saving routes.</p>}
+      {audience === "accounts" && <p style={{ color: color.muted, font: `500 10px/1.5 ${font.sans}` }}>This explicit-account policy remains active but cannot be changed in this compact editor.</p>}
       {note && <div role="status" style={{ marginTop: 12, padding: 10, borderRadius: radius.sm, background: color.paper, border: `1px solid ${color.border}`, color: color.muted3, font: `500 10.5px/1.45 ${font.sans}` }}>{note}</div>}
     </aside>
   );
@@ -389,7 +568,7 @@ export function BrowserView() {
   const [loading, setLoading] = useState(false);
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
-  const [publishOpen, setPublishOpen] = useState(false);
+  const [routesOpen, setRoutesOpen] = useState(false);
 
   const open = useCallback(async (raw: string, addHistory = true) => {
     if (!transport) {
@@ -441,7 +620,7 @@ export function BrowserView() {
             <input aria-label="Duck address" value={input} onChange={(event) => setInput(event.target.value)} spellCheck={false} autoCapitalize="none" autoCorrect="off" style={{ flex: 1, minWidth: 0, border: 0, outline: 0, padding: "0 9px 0 2px", background: "transparent", color: color.ink, font: `500 11.5px ${font.mono}` }} />
           </div>
         </form>
-        <button onClick={() => setPublishOpen((openPanel) => !openPanel)} style={buttonStyle()}>Publish</button>
+        <button onClick={() => setRoutesOpen((openPanel) => !openPanel)} style={buttonStyle()}>Routes</button>
       </div>
 
       {page && <SecurityBar page={page} />}
@@ -463,7 +642,7 @@ export function BrowserView() {
           )}
           {!page && !error && !loading && <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: color.muted, font: `500 11px ${font.sans}` }}><div>Enter <span style={{ fontFamily: font.mono }}>net.duck</span>, <span style={{ fontFamily: font.mono }}>&lt;account&gt;.duck</span>, or <span style={{ fontFamily: font.mono }}>&lt;label&gt;.&lt;account&gt;.duck</span>.</div></div>}
         </div>
-        {publishOpen && <PublishPanel onClose={() => setPublishOpen(false)} onPublished={(next) => { setPublishOpen(false); void open(next); }} />}
+        {routesOpen && <RoutesPanel onClose={() => setRoutesOpen(false)} onSaved={setInput} />}
       </div>
     </div>
   );

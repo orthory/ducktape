@@ -210,10 +210,15 @@ impl Module for Gateway {
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            GatewayQuery::Get { account_id, name } => Ok(encode_reply(&GatewayReply::Route(
-                self.registry
-                    .route(&account_id, &name)
-                    .map_err(Error::Module)?,
+            GatewayQuery::Get { account_id, name } => {
+                Ok(encode_reply(&GatewayReply::Route(Box::new(
+                    self.registry
+                        .route(&account_id, &name)
+                        .map_err(Error::Module)?,
+                ))))
+            }
+            GatewayQuery::List { account_id } => Ok(encode_reply(&GatewayReply::Routes(
+                self.registry.routes(&account_id).map_err(Error::Module)?,
             ))),
         }
     }

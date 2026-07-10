@@ -961,11 +961,14 @@ async fn current_route(
         .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
         .map_err(GatewayFailure::Unavailable)?;
     match gateway::decode_reply(&bytes) {
-        Ok(gateway::GatewayReply::Route(Some(record))) if record.statement.route.is_some() => {
-            Ok(record)
-        }
-        Ok(gateway::GatewayReply::Route(_)) => Err(GatewayFailure::NotFound(
-            "gateway route is not published".into(),
+        Ok(gateway::GatewayReply::Route(route)) => match *route {
+            Some(record) if record.statement.route.is_some() => Ok(record),
+            _ => Err(GatewayFailure::NotFound(
+                "gateway route is not published".into(),
+            )),
+        },
+        Ok(gateway::GatewayReply::Routes(_)) => Err(GatewayFailure::Unavailable(
+            "gateway returned an unexpected route-list reply".into(),
         )),
         Err(error) => Err(GatewayFailure::Unavailable(error)),
     }
