@@ -20,36 +20,20 @@ const HEIGHT: f64 = 300.0;
 const MIN_WIDTH: f64 = 300.0;
 const MIN_HEIGHT: f64 = 220.0;
 
-/// Grant the webview's mic/camera permission requests (Linux; no-op elsewhere).
+/// Media-permission seam for huddle-capable webviews (currently a no-op).
 ///
-/// WebKitGTK has no OS permission prompt: `getUserMedia` raises a
-/// `permission-request` signal for the EMBEDDER to decide, and an unhandled
-/// request is denied — so without this hook every huddle fails `NotAllowedError`
-/// ("mic-denied") no matter what the user does. User-media requests only ever
-/// originate from our own bundled console, where joining a huddle / enabling the
-/// camera is itself the consent, so they are allowed; every other request kind
-/// (geolocation, notifications, …) is left to WebKit's default deny. macOS and
-/// Windows are untouched: WKWebView and WebView2 already run a real OS prompt.
+/// Under wry/WebKitGTK this installed the embedder-side `permission-request`
+/// grant, without which every Linux huddle failed `NotAllowedError`. The CEF
+/// runtime replaced that engine, and the seam stays so the grant has one home
+/// once tauri-runtime-cef exposes a media-permission handler.
 pub fn allow_user_media<R: Runtime>(window: &WebviewWindow<R>) -> tauri::Result<()> {
-    #[cfg(target_os = "linux")]
-    return window.with_webview(|webview| {
-        use webkit2gtk::glib::Cast;
-        use webkit2gtk::{PermissionRequestExt, UserMediaPermissionRequest, WebViewExt};
-        webview.inner().connect_permission_request(|_, request| {
-            match request.downcast_ref::<UserMediaPermissionRequest>() {
-                Some(media) => {
-                    media.allow();
-                    true
-                }
-                None => false,
-            }
-        });
-    });
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = window;
-        Ok(())
-    }
+    // CEF runs its own permission flow, so the WebKitGTK embedder hook this
+    // used to install is gone with wry. tauri-runtime-cef does not answer
+    // OnRequestMediaAccessPermission yet — until that lands upstream, live
+    // mic/camera relies on Chromium's default flow (QA passes
+    // --use-fake-device/-ui-for-media-stream switches through app argv).
+    let _ = window;
+    Ok(())
 }
 
 /// Create (or re-show) the huddle window.

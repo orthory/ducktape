@@ -25,9 +25,12 @@ mod tray;
 mod user_identity;
 mod workspaces;
 
+// CEF non-browser processes (renderer/GPU/plugin) re-exec this same binary;
+// the entry-point macro dispatches them to run_cef_helper_process and returns.
+#[tauri::cef_entry_point]
 fn main() {
     let node_control = daemon::NodeControl::new().expect("start desktop node-control actor");
-    let mut builder = tauri::Builder::default()
+    let mut builder = tauri::Builder::<tauri::Cef>::default()
         .manage(node_control)
         .invoke_handler(tauri::generate_handler![
             workspaces::workspace_list,
@@ -36,6 +39,10 @@ fn main() {
             workspaces::gateway_route_unbind,
             workspaces::gateway_route_list,
             gateway_window::gateway_open_window,
+            gateway_window::gateway_inline_supported,
+            gateway_window::gateway_open_inline,
+            gateway_window::gateway_inline_place,
+            gateway_window::gateway_inline_close,
             workspaces::workspace_create,
             workspaces::workspace_join,
             workspaces::workspace_invite_blob,

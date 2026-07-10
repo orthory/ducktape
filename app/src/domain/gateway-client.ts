@@ -507,6 +507,38 @@ export const openWindow = async (url: string, title: string): Promise<void> => {
   await invoke<void>("gateway_open_window", { url, title });
 };
 
+// ── Inline gateway view (CEF shells only) ───────────────
+// On the CEF runtime every gateway session is its own renderer process and the
+// inline child webview's label matches no capability, so embedding in the
+// Browser pane is as isolated as the separate window. wry shells report
+// unsupported and keep the window path.
+
+export interface InlineRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+let inlineSupport: Promise<boolean> | null = null;
+export const inlineSupported = (): Promise<boolean> => {
+  if (!isTauri()) return Promise.resolve(false);
+  inlineSupport ??= invoke<boolean>("gateway_inline_supported").catch(() => false);
+  return inlineSupport;
+};
+
+export const openInline = async (url: string, rect: InlineRect): Promise<void> => {
+  await invoke<void>("gateway_open_inline", { url, rect });
+};
+
+export const placeInline = async (rect: InlineRect): Promise<void> => {
+  await invoke<void>("gateway_inline_place", { rect });
+};
+
+export const closeInline = async (): Promise<void> => {
+  await invoke<void>("gateway_inline_close").catch(() => undefined);
+};
+
 export const contentRoot = (
   publisherNode: ArrayLike<number> | string,
   name: RouteName,
