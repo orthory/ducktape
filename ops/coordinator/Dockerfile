@@ -3,7 +3,7 @@ FROM rust:1.96-bookworm AS build
 WORKDIR /src
 COPY . .
 # Only the coordinator crate and its (workspace) deps are compiled.
-RUN cargo build --release -p coordinator-bin
+RUN cargo build --release -p coordinator-bin --bin coordinator
 
 # Distroless cc runtime: glibc + libgcc for the dynamically-linked binary, no
 # shell, no package manager, runs as the built-in non-root uid 65532 (nonroot).

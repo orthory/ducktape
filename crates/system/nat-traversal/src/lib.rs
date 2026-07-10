@@ -23,8 +23,9 @@ pub use auth::{
     DEFAULT_FRESHNESS_WINDOW_SECS, mint_coord_cap, now_secs, sign_authenticator, verify_request,
 };
 pub use client::{
-    ClientEvent, NatClient, NatSocket, SocketEvent, run_coordinator, run_coordinator_with,
-    run_coordinator_workers,
+    ClientEvent, CoordinatorMetrics, CoordinatorMetricsSnapshot, NatClient, NatSocket, SocketEvent,
+    run_coordinator, run_coordinator_with, run_coordinator_workers,
+    run_coordinator_workers_with_metrics,
 };
 pub use coordinator::{Coordinator, CoordinatorReplies, CoordinatorReply};
 #[cfg(any(test, feature = "simnat"))]

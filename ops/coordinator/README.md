@@ -33,9 +33,13 @@ docker run --rm -p 3478:3478/udp ducktape-coordinator
 
 Auth modes:
 
-- default: public proof-of-possession (`COORDINATOR_ARGS=`).
-- private: `COORDINATOR_ARGS=--genesis-set /etc/ducktape/network.toml`.
-- local/dev legacy: `COORDINATOR_ARGS=--allow-anonymous`.
+- default: public proof-of-possession (`COORDINATOR_ARGS=--workers 4 --metrics-interval 10`).
+- private: append `--genesis-set /etc/ducktape/network.toml`.
+- local/dev legacy: append `--allow-anonymous`.
+
+`coordinator_metrics` lines report request counters, bounded-window saturation,
+in-flight work, process CPU, and RSS. The cross-host/flood/24-hour probe commands
+are in `docs/deploy/coordinator.md`.
 
 A `--listen 0.0.0.0:3478` wildcard bind is fully functional on a single-IP
 host: every answer derives from the datagram's observed source. On a
