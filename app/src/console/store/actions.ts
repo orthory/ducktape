@@ -12,6 +12,7 @@ import type {
 } from "../../domain/forge-client";
 import * as governanceClient from "../../domain/governance-client";
 import * as identityClient from "../../domain/identity-client";
+import { normalizeKey } from "../../domain/names";
 import * as pagesClient from "../../domain/pages-client";
 import type { BlockKind as PageBlockKind, PageBlock } from "../../domain/pages-client";
 import * as runsClient from "../../domain/runs-client";
@@ -1300,9 +1301,9 @@ export function createActions({
 
     setDuckHandle: (handle) => {
       const current = getState();
-      const nodeKey = current.status?.publicKey || current.workspace?.pubkey;
+      const nodeKey = normalizeKey(current.status?.publicKey || current.workspace?.pubkey);
       const accountId = nodeKey
-        ? current.nodeUsers[nodeKey.toLowerCase()]?.accountId
+        ? current.nodeUsers[nodeKey]?.accountId
         : undefined;
       if (!accountId) {
         fail("bind this node to an identity account before registering a .duck name");

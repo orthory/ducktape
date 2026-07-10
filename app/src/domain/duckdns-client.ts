@@ -63,7 +63,7 @@ export const setHandle = (
     params.origin,
   );
 
-/** Every registered handle, ascending by handle. */
+/** One deterministic page of registered handles, ascending by handle. */
 export const registrations = (
   transport: NodeTransport,
   { from = 0, limit = MAX_QUERY_LIMIT }: { from?: number; limit?: number } = {},

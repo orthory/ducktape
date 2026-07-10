@@ -352,8 +352,14 @@ fn account_service_authority_is_derived_from_origin_and_filters_rebinding() {
     .unwrap();
     assert_eq!(
         decode_reply(&registration).unwrap(),
-        DuckDnsReply::NodeRegistration(None),
-        "the announcer must observe a stale account binding as absent"
+        DuckDnsReply::NodeRegistration {
+            registration: Some(duckdns::NodeRegistration {
+                account_id: Some(b"owner".to_vec()),
+                announcements: vec![account("huddle")],
+            }),
+            authority_current: false,
+        },
+        "the announcer must observe and replace a stale account binding"
     );
 }
 

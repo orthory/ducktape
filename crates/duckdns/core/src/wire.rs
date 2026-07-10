@@ -141,7 +141,13 @@ pub enum DuckDnsQuery {
 pub enum DuckDnsReply {
     Resolved(Option<ResolvedName>),
     Registrations(Vec<HandleRegistration>),
-    NodeRegistration(Option<NodeRegistration>),
+    NodeRegistration {
+        registration: Option<NodeRegistration>,
+        /// Whether a captured account authority still matches Identity.
+        /// `false` forces the declarative announcer to replace even an
+        /// otherwise identical (or newly empty) declaration set.
+        authority_current: bool,
+    },
 }
 
 pub fn encode_msg(message: &DuckDnsMsg) -> Vec<u8> {

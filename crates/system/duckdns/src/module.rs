@@ -330,17 +330,21 @@ impl Module for DuckDns {
                         node.len()
                     )));
                 }
-                let mut registration = self.registry.node_registration(&node);
+                let registration = self.registry.node_registration(&node);
+                let mut authority_current = true;
                 if let Some(stored) = &registration
                     && let Some(account_id) = &stored.account_id
                     && self.account_of_node(ctx, &node).await?.as_ref() != Some(account_id)
                 {
                     // A rebinding invalidates the captured account authority.
-                    // Presenting no committed registration makes the declarative
-                    // announcer refresh it under the node's current AccountId.
-                    registration = None;
+                    // Keep the old declaration visible but flag it stale so the
+                    // announcer also submits an empty replacement when desired.
+                    authority_current = false;
                 }
-                Ok(encode_reply(&DuckDnsReply::NodeRegistration(registration)))
+                Ok(encode_reply(&DuckDnsReply::NodeRegistration {
+                    registration,
+                    authority_current,
+                }))
             }
             query => self.query_state(query),
         }
