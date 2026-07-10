@@ -134,3 +134,14 @@ black-hole this ADR's 2026-07-09 update described was a deliberate bridge, not
 a permanent fixture, and its bridge period is now over. See
 [`docs/adr/2026-07-10-wire-standardization.mdx`](./2026-07-10-wire-standardization.mdx)
 for the decision record and the unified wire-architecture that motivated it.
+
+## Update (2026-07-10): the shared bulk coordinator is live
+
+Gateway responses are the second stream-class consumer. The deferred
+coordinator shape above is therefore implemented as `data_plane::BulkPacer`:
+the node constructs one process-wide token bucket and injects clones into the
+separate state-sync and gateway planes. They retain distinct sockets, queues,
+flows, admission, and stats, but their writes draw from one aggregate link
+budget. Datagram media never touches this budget. Each signed gateway policy
+also caps a response at 4 MiB, so an invocation cannot become unbounded bulk
+transfer.

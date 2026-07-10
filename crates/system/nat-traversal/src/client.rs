@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use tokio::net::UdpSocket;
@@ -530,6 +531,67 @@ pub async fn run_coordinator(sock: UdpSocket, policy: AuthPolicy) {
     run_coordinator_with(sock, Coordinator::with_policy(policy)).await
 }
 
+#[derive(Default)]
+struct CoordinatorMetricsInner {
+    received: AtomicU64,
+    authenticated: AtomicU64,
+    rejected: AtomicU64,
+    legacy: AtomicU64,
+    malformed: AtomicU64,
+    replies: AtomicU64,
+    send_errors: AtomicU64,
+    saturated: AtomicU64,
+    inflight: AtomicU64,
+    inflight_max: AtomicU64,
+}
+
+/// Cheap live counters for the coordinator's UDP loop. A cloned handle can be
+/// sampled by an operator task without adding another listening socket.
+#[derive(Clone, Default)]
+pub struct CoordinatorMetrics(Arc<CoordinatorMetricsInner>);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoordinatorMetricsSnapshot {
+    pub received: u64,
+    pub authenticated: u64,
+    pub rejected: u64,
+    pub legacy: u64,
+    pub malformed: u64,
+    pub replies: u64,
+    pub send_errors: u64,
+    pub saturated: u64,
+    pub inflight: u64,
+    pub inflight_max: u64,
+}
+
+impl CoordinatorMetrics {
+    pub fn snapshot(&self) -> CoordinatorMetricsSnapshot {
+        let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
+        CoordinatorMetricsSnapshot {
+            received: load(&self.0.received),
+            authenticated: load(&self.0.authenticated),
+            rejected: load(&self.0.rejected),
+            legacy: load(&self.0.legacy),
+            malformed: load(&self.0.malformed),
+            replies: load(&self.0.replies),
+            send_errors: load(&self.0.send_errors),
+            saturated: load(&self.0.saturated),
+            inflight: load(&self.0.inflight),
+            inflight_max: load(&self.0.inflight_max),
+        }
+    }
+
+    fn increment(value: &AtomicU64) {
+        value.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn set_inflight(&self, value: usize) {
+        let value = value as u64;
+        self.0.inflight.store(value, Ordering::Relaxed);
+        self.0.inflight_max.fetch_max(value, Ordering::Relaxed);
+    }
+}
+
 const AUTH_QUEUE_DEPTH: usize = 64;
 const AUTH_WORKER_STACK_BYTES: usize = 512 * 1024;
 
@@ -553,17 +615,24 @@ enum AuthEvent {
 }
 
 struct AuthWorkers {
-    jobs: Box<[mpsc::Sender<AuthJob>]>,
-    next: usize,
+    jobs: crossbeam_channel::Sender<AuthJob>,
     _threads: Box<[thread::JoinHandle<()>]>,
 }
 
 impl AuthWorkers {
-    fn spawn(policy: Arc<AuthPolicy>, count: usize, results: mpsc::Sender<AuthEvent>) -> Self {
-        let mut jobs = Vec::with_capacity(count);
+    fn spawn(
+        policy: Arc<AuthPolicy>,
+        count: usize,
+        capacity: usize,
+        results: mpsc::Sender<AuthEvent>,
+    ) -> Self {
+        // A single bounded queue lets whichever verifier is idle take the next
+        // job. Per-worker round-robin queues can block behind one busy worker
+        // while another worker's queue is empty.
+        let (jobs, job_rx) = crossbeam_channel::bounded::<AuthJob>(capacity);
         let mut threads = Vec::with_capacity(count);
         for index in 0..count {
-            let (job_tx, mut job_rx) = mpsc::channel::<AuthJob>(AUTH_QUEUE_DEPTH);
+            let jobs = job_rx.clone();
             let result_tx = results.clone();
             let mut verifier = AuthVerifier::with_shared_policy(policy.clone());
             let handle = thread::Builder::new()
@@ -571,7 +640,7 @@ impl AuthWorkers {
                 .stack_size(AUTH_WORKER_STACK_BYTES)
                 .spawn(move || {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        while let Some(job) = job_rx.blocking_recv() {
+                        while let Ok(job) = jobs.recv() {
                             let verified = verifier.verify(job.request, job.now);
                             if result_tx
                                 .blocking_send(AuthEvent::Complete(AuthResult {
@@ -591,21 +660,23 @@ impl AuthWorkers {
                     }
                 })
                 .unwrap_or_else(|error| panic!("failed to start auth worker {index}: {error}"));
-            jobs.push(job_tx);
             threads.push(handle);
         }
         Self {
-            jobs: jobs.into_boxed_slice(),
-            next: 0,
+            jobs,
             _threads: threads.into_boxed_slice(),
         }
     }
 
-    async fn dispatch(&mut self, job: AuthJob) {
-        let index = self.next;
-        self.next = (self.next + 1) % self.jobs.len();
-        if self.jobs[index].send(job).await.is_err() {
-            panic!("coordinator auth worker {index} exited");
+    fn dispatch(&self, job: AuthJob) {
+        match self.jobs.try_send(job) {
+            Ok(()) => {}
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                panic!("coordinator auth worker pool exited")
+            }
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                panic!("coordinator auth queue exceeded its ordered window")
+            }
         }
     }
 }
@@ -698,16 +769,27 @@ impl OrderedRequests {
 /// rendezvous state on the current-thread runtime, bounds all queues, and
 /// applies verified requests in receive order.
 pub async fn run_coordinator_workers(sock: UdpSocket, policy: AuthPolicy, workers: usize) {
+    run_coordinator_workers_with_metrics(sock, policy, workers, CoordinatorMetrics::default()).await
+}
+
+pub async fn run_coordinator_workers_with_metrics(
+    sock: UdpSocket,
+    policy: AuthPolicy,
+    workers: usize,
+    metrics: CoordinatorMetrics,
+) {
     assert!(matches!(workers, 1 | 4), "workers must be 1 or 4");
     if workers == 1 {
-        return run_coordinator_with(sock, Coordinator::with_policy(policy)).await;
+        return run_coordinator_with_metrics(sock, Coordinator::with_policy(policy), metrics).await;
     }
 
     let policy = Arc::new(policy);
+    // ponytail: keep one ordered state actor; shard by NodeKey only if profiles
+    // show it saturating before the auth workers.
     let mut coord = Coordinator::with_shared_policy(policy.clone());
     let capacity = workers * (AUTH_QUEUE_DEPTH + 1);
     let (result_tx, mut results) = mpsc::channel(capacity);
-    let mut auth = AuthWorkers::spawn(policy, workers, result_tx);
+    let auth = AuthWorkers::spawn(policy, workers, capacity, result_tx);
     let mut ordered = OrderedRequests::new(capacity);
     let mut buf = [0u8; 512];
 
@@ -720,16 +802,21 @@ pub async fn run_coordinator_workers(sock: UdpSocket, policy: AuthPolicy, worker
                 }
                 received = sock.recv_from(&mut buf) => {
                     let Ok((n, from)) = received else { continue };
+                    CoordinatorMetrics::increment(&metrics.0.received);
                     let now = now_secs();
                     let sequence = ordered.reserve();
+                    metrics.set_inflight(ordered.outstanding);
                     match AuthRequest::decode(&buf[..n]) {
                         Ok(request) => {
-                            auth.dispatch(AuthJob { sequence, from, now, request }).await;
+                            auth.dispatch(AuthJob { sequence, from, now, request });
                         }
                         Err(_) => {
                             let completed = match Msg::decode(&buf[..n]) {
                                 Ok(message) => CompletedRequest::Legacy { from, now, message },
-                                Err(_) => CompletedRequest::Malformed,
+                                Err(_) => {
+                                    CoordinatorMetrics::increment(&metrics.0.malformed);
+                                    CompletedRequest::Malformed
+                                }
                             };
                             ordered.insert(sequence, completed);
                         }
@@ -737,6 +824,7 @@ pub async fn run_coordinator_workers(sock: UdpSocket, policy: AuthPolicy, worker
                 }
             }
         } else {
+            CoordinatorMetrics::increment(&metrics.0.saturated);
             let result = results
                 .recv()
                 .await
@@ -751,27 +839,51 @@ pub async fn run_coordinator_workers(sock: UdpSocket, policy: AuthPolicy, worker
                     now,
                     verified: Some(request),
                     ..
-                }) => coord.handle_verified_replies(from, request, now),
+                }) => {
+                    CoordinatorMetrics::increment(&metrics.0.authenticated);
+                    coord.handle_verified_replies(from, request, now)
+                }
                 CompletedRequest::Auth(_) => {
+                    CoordinatorMetrics::increment(&metrics.0.rejected);
                     coord.record_reject();
                     continue;
                 }
                 CompletedRequest::Legacy { from, now, message } => {
-                    coord.handle_legacy_replies(from, message, now)
+                    let rejected = coord.rejects();
+                    let replies = coord.handle_legacy_replies(from, message, now);
+                    if coord.rejects() == rejected {
+                        CoordinatorMetrics::increment(&metrics.0.legacy);
+                    } else {
+                        CoordinatorMetrics::increment(&metrics.0.rejected);
+                    }
+                    replies
                 }
                 CompletedRequest::Malformed => continue,
             };
             for (dst, reply) in replies {
                 let reply = reply.encode_inline();
-                let _ = sock.send_to(&reply, dst).await;
+                if sock.send_to(&reply, dst).await.is_ok() {
+                    CoordinatorMetrics::increment(&metrics.0.replies);
+                } else {
+                    CoordinatorMetrics::increment(&metrics.0.send_errors);
+                }
             }
         }
+        metrics.set_inflight(ordered.outstanding);
     }
 }
 
 /// [`run_coordinator`] with a caller-built [`Coordinator`] — the seam for a
 /// custom registration TTL or a pre-seeded book (tests, short-lived rigs).
-pub async fn run_coordinator_with(sock: UdpSocket, mut coord: Coordinator) {
+pub async fn run_coordinator_with(sock: UdpSocket, coord: Coordinator) {
+    run_coordinator_with_metrics(sock, coord, CoordinatorMetrics::default()).await
+}
+
+async fn run_coordinator_with_metrics(
+    sock: UdpSocket,
+    mut coord: Coordinator,
+    metrics: CoordinatorMetrics,
+) {
     // Big enough for an AuthRequest with a cap (~251 bytes worst case: the
     // 32-byte caller field plus the inner request, authenticator, and cap).
     let mut buf = [0u8; 512];
@@ -780,19 +892,45 @@ pub async fn run_coordinator_with(sock: UdpSocket, mut coord: Coordinator) {
             Ok(v) => v,
             Err(_) => continue,
         };
+        CoordinatorMetrics::increment(&metrics.0.received);
         let now = now_secs();
         // Tag 11 -> authenticated envelope; anything else -> legacy Msg. The two
         // are mutually exclusive by tag, so try the envelope first and fall back.
         let out = match AuthRequest::decode(&buf[..n]) {
-            Ok(req) => coord.handle_auth_replies(from, req, now),
+            Ok(req) => {
+                let rejected = coord.rejects();
+                let replies = coord.handle_auth_replies(from, req, now);
+                if coord.rejects() == rejected {
+                    CoordinatorMetrics::increment(&metrics.0.authenticated);
+                } else {
+                    CoordinatorMetrics::increment(&metrics.0.rejected);
+                }
+                replies
+            }
             Err(_) => match Msg::decode(&buf[..n]) {
-                Ok(m) => coord.handle_legacy_replies(from, m, now),
-                Err(_) => continue,
+                Ok(m) => {
+                    let rejected = coord.rejects();
+                    let replies = coord.handle_legacy_replies(from, m, now);
+                    if coord.rejects() == rejected {
+                        CoordinatorMetrics::increment(&metrics.0.legacy);
+                    } else {
+                        CoordinatorMetrics::increment(&metrics.0.rejected);
+                    }
+                    replies
+                }
+                Err(_) => {
+                    CoordinatorMetrics::increment(&metrics.0.malformed);
+                    continue;
+                }
             },
         };
         for (dst, reply) in out {
             let reply = reply.encode_inline();
-            let _ = sock.send_to(&reply, dst).await;
+            if sock.send_to(&reply, dst).await.is_ok() {
+                CoordinatorMetrics::increment(&metrics.0.replies);
+            } else {
+                CoordinatorMetrics::increment(&metrics.0.send_errors);
+            }
         }
     }
 }
@@ -859,6 +997,82 @@ mod tests {
             .expect("four-worker lookup timed out")
             .expect("registered mapping");
         assert_eq!(reflexive.port(), client.local_addr().await.unwrap().port());
+
+        coordinator.abort();
+        let _ = coordinator.await;
+    }
+
+    #[tokio::test]
+    async fn invalid_signature_overload_is_counted_and_valid_traffic_recovers() {
+        use commonware_cryptography::{Signer as _, ed25519};
+
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        let metrics = CoordinatorMetrics::default();
+        let coordinator = tokio::spawn(run_coordinator_workers_with_metrics(
+            coord_sock,
+            AuthPolicy::Open { require_pop: true },
+            4,
+            metrics.clone(),
+        ));
+
+        let claimed = ed25519::PrivateKey::from_seed(910);
+        let forger = ed25519::PrivateKey::from_seed(911);
+        let caller = {
+            let mut key = [0; 32];
+            key.copy_from_slice(claimed.public_key().as_ref());
+            NodeKey(key)
+        };
+        let inner = Msg::BindRequest { from: caller };
+        let forged = AuthRequest {
+            caller,
+            auth: sign_authenticator(&forger, &inner.encode_inline(), now_secs(), None),
+            inner,
+        }
+        .encode_inline();
+        let flood = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for _ in 0..5_000 {
+            flood.send_to(&forged, coord_addr).await.unwrap();
+        }
+
+        let valid_signer = ed25519::PrivateKey::from_seed(912);
+        let valid_key = {
+            let mut key = [0; 32];
+            key.copy_from_slice(valid_signer.public_key().as_ref());
+            NodeKey(key)
+        };
+        let valid = NatClient::bind_multi_auth(valid_key, vec![coord_addr], valid_signer, None)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if timeout(Duration::from_millis(100), valid.discover_reflexive())
+                    .await
+                    .is_ok_and(|result| result.is_ok())
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("valid requests recover after the flood");
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = metrics.snapshot();
+                if snapshot.rejected != 0 && snapshot.inflight == 0 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map(|snapshot| {
+            assert!(snapshot.authenticated != 0);
+            assert!(snapshot.replies != 0);
+            assert!(snapshot.saturated != 0, "flood reached the bounded window");
+        })
+        .expect("coordinator drains its bounded queue after overload");
 
         coordinator.abort();
         let _ = coordinator.await;

@@ -41,8 +41,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use commonware_cryptography::ed25519;
 use data_plane::{
-    AddressBook, AdmissionPolicy, FlowId, OverlaySockets, PeerId, PlaneConfig, Service,
-    StreamPlaneSpec, StreamPolicy, StreamService, bind_stream_plane,
+    AddressBook, AdmissionPolicy, BulkPacer, FlowId, OverlaySockets, PeerId, Service,
+    StreamPacing, StreamPlaneSpec, StreamPolicy, StreamService, bind_stream_plane,
 };
 use statesync::dataplane::{DataPlaneSyncClient, statesync_flow};
 use statesync::{SyncClient, SyncError, SyncRequest, SyncResponse};
@@ -71,12 +71,17 @@ pub fn socket_factory(
 }
 
 /// bulk ceiling for the statesync plane instance: a static compromise between
-/// sync time (~24 MB/s ≈ 42 s/GB) and real-time headroom — on uplinks faster
-/// than 192 Mbit/s other planes keep headroom, on slower ones bulk can still
-/// crowd them (adaptive cross-plane coordination arrives with the second bulk
-/// consumer).
+/// sync time (~24 MB/s ≈ 42 s/GB) and real-time headroom. State sync and
+/// gateway now share this one process ceiling; adaptive per-link shaping is a
+/// separate concern.
 const BULK_BYTES_PER_SEC: u64 = 24_000_000;
 const BULK_BURST_BYTES: u64 = 512 * 1024;
+
+/// One link-headroom budget shared by every stream-class per-use plane in this
+/// process (state sync and gateway responses today).
+pub fn shared_bulk_pacer() -> BulkPacer {
+    BulkPacer::new(BULK_BYTES_PER_SEC, BULK_BURST_BYTES)
+}
 
 /// derive a peer's overlay ULA from its raw ed25519 key bytes — the same
 /// `(namespace, identity)` function the reachability plane routes by.
@@ -189,6 +194,7 @@ pub fn spawn_bring_up(
     // in-process stack). either way its bind errors while the overlay is
     // down are absorbed by the retry loop below.
     factory: Arc<dyn data_plane::SocketFactory>,
+    pacer: BulkPacer,
     serve: Option<futures::channel::mpsc::Sender<SyncJob>>,
 ) {
     tokio::spawn(async move {
@@ -196,10 +202,7 @@ pub fn spawn_bring_up(
         let spec = StreamPlaneSpec {
             own_ip: own,
             service: Service::StateSync,
-            config: PlaneConfig {
-                bulk_bytes_per_sec: BULK_BYTES_PER_SEC,
-                bulk_burst_bytes: BULK_BURST_BYTES,
-            },
+            pacing: StreamPacing::Shared(pacer),
             policy: StreamPolicy { accept_backlog: 32 },
             // the interface (or our /128) is not up yet — retry quietly.
             retry: std::time::Duration::from_secs(3),

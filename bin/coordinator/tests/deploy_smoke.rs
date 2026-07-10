@@ -32,6 +32,7 @@ async fn help_prints_usage_without_binding() {
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("--listen <addr>"));
     assert!(stdout.contains("--workers <1|4>"));
+    assert!(stdout.contains("--metrics-interval <secs>"));
     assert!(stdout.contains("--genesis-set <network.toml>"));
     assert!(stdout.contains("--allow-anonymous"));
     assert!(
@@ -49,6 +50,8 @@ async fn cli_rejects_missing_and_unknown_flags() {
         vec!["--workers", "0"],
         vec!["--workers", "2"],
         vec!["--workers", "many"],
+        vec!["--metrics-interval"],
+        vec!["--metrics-interval", "often"],
         vec!["--wat"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_coordinator"))

@@ -120,6 +120,28 @@ fn run_slug(run_id: &str) -> String {
     format!("{prefix}{hash}")
 }
 
+/// a W6 skill mount subpath is consensus-supplied data used as ONE host
+/// directory name — never a path. the envelope validates only non-emptiness
+/// (a `..` or `a/b` name would otherwise escape the ro root), so the trust
+/// boundary is HERE: a bounded charset, with `.`/`..` refused outright (both
+/// pass the charset alone).
+fn mount_dir_name(subpath: &str) -> Result<(), String> {
+    let safe = !subpath.is_empty()
+        && subpath != "."
+        && subpath != ".."
+        && subpath
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if safe {
+        Ok(())
+    } else {
+        Err(format!(
+            "skill mount subpath {subpath:?} is not a safe directory name \
+             (want [a-zA-Z0-9._-]+, not `.` or `..`)"
+        ))
+    }
+}
+
 /// the real provisioner: mints per-run workspaces under `root`, driving the
 /// duckfs engine over `handle`'s actor lane and (when [`Self::with_forge`]
 /// configured a usable lane) the forge worktree engine over host `git`.
@@ -182,7 +204,22 @@ impl WorkspaceProvisioner for NodedProvisioner {
         &self,
         spec: &WorkspaceSpec,
     ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
-        let run_dir = self.root.join(run_slug(&spec.run_id));
+        let slug = run_slug(&spec.run_id);
+        let run_dir = self.root.join(&slug);
+        // validate every skill mount name BEFORE dispatching to a lane: a bad
+        // name fails the provision with ZERO debris on disk, whichever lane
+        // would have materialized. duplicates are refused too — two mounts
+        // sharing a name would silently merge into one checkout dir.
+        let mut names = std::collections::HashSet::new();
+        for m in &spec.ro_mounts {
+            mount_dir_name(&m.mount_subpath)?;
+            if !names.insert(m.mount_subpath.as_str()) {
+                return Err(format!(
+                    "duplicate skill mount subpath {:?}",
+                    m.mount_subpath
+                ));
+            }
+        }
         match &spec.source {
             WorkspaceSource::Duckfs {
                 source_prefix,
@@ -191,6 +228,7 @@ impl WorkspaceProvisioner for NodedProvisioner {
                 duckfs::provision(
                     self.handle.clone(),
                     run_dir,
+                    self.root.join(format!("{slug}-ro")),
                     source_prefix.clone(),
                     source_snapshot.clone(),
                     spec,
@@ -261,5 +299,28 @@ mod tests {
         assert_ne!(a0, a1, "attempt 0 and 1 get distinct dirs");
         // deterministic per run_id (idempotent provision + cleanup).
         assert_eq!(run_slug("saga:2"), run_slug("saga:2"));
+    }
+
+    #[test]
+    fn mount_dir_name_refuses_traversal_and_admits_plain_names() {
+        // the trust boundary for consensus-supplied skill names: `provision`
+        // runs this over EVERY mount before materializing anything, so a
+        // rejection here is a loud provision failure with zero disk debris.
+        for bad in [
+            "..",
+            ".",
+            "",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "name with space",
+            "name\0nul",
+        ] {
+            assert!(mount_dir_name(bad).is_err(), "{bad:?} must be refused");
+        }
+        for good in ["skill", "my-skill_v2", "..dots.ok..", "A.B"] {
+            assert!(mount_dir_name(good).is_ok(), "{good:?} must be admitted");
+        }
     }
 }

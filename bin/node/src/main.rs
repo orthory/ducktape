@@ -52,15 +52,17 @@ use commonware_cryptography::Signer;
 use commonware_runtime::{Runner, Supervisor};
 use tracing_subscriber::prelude::*;
 
-
 mod blob_fetch;
 mod boot;
 mod cli;
 mod cli_flags;
 mod config;
 mod constants;
+mod drain_actions;
 mod explorer;
 mod first_contact_join;
+mod gateway_plane;
+mod gateway_routes;
 mod host_reads;
 mod host_state;
 #[cfg(test)]
@@ -70,6 +72,8 @@ mod lobby;
 mod main_tests;
 mod oracle_pool;
 mod reachability_plane;
+#[cfg(test)]
+mod reachability_plane_tests;
 mod relay;
 mod relay_runtime;
 mod replica;
@@ -86,37 +90,29 @@ mod validator;
 mod voice;
 mod voice_plane;
 use config::Resolved;
-
 use constants::*;
 #[cfg(test)]
-use explorer::{explorer_root_op, sealed_frame_block_row};
+use explorer::explorer_root_op;
+#[cfg(test)]
+use explorer::sealed_frame_block_row;
 #[cfg(test)]
 use replica::promotion::{
-    choose_promotion_boundary, joiner_manifest_fetch_retry, PromotionBoundary,
-    PromotionBoundarySource,
+    PromotionBoundary, PromotionBoundarySource, choose_promotion_boundary,
+    joiner_manifest_fetch_retry,
 };
-use rpc::RpcReply;
 #[cfg(test)]
-use sync::catchup::{
-    apply_post_reboot_catchup_frames, apply_verified_suffix_frame,
-    write_post_reboot_catchup_checkpoint,
-};
+use sync::catchup::{apply_post_reboot_catchup_frames, apply_verified_suffix_frame};
 #[cfg(test)]
 use sync::serve::assert_floor_binds_view;
+#[cfg(test)]
 use util::hex;
 #[cfg(test)]
 use validator::announce::ReadinessSignaller;
 
 #[cfg(test)]
-use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use directory::{DirQuery, DirReply, decode_reply, encode_query};
 use duckfs_disk::SyncScratch;
-#[cfg(test)]
-use host::Host;
 use recovery::Recovery;
-#[cfg(test)]
-use commonware_cryptography::ed25519;
-#[cfg(test)]
-use recovery::Manifest;
 #[cfg(test)]
 use sdk::{Msg, StateRoot};
 
@@ -158,6 +154,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "unexpected arg {other:?} (want a subcommand — \
                      keygen|user-key|user-sign-bind|user-sign-unbind|\
                      user-sign-possession|user-sign-add-member|user-sign-remove-member|\
+                     user-sign-gateway-route|gateway-route-bind|gateway-route-unbind|\
+                     gateway-route-list|\
                      user-webauthn-challenge|user-p256-payload|\
                      init|invite|admit|\
                      invite-accept|promote|resident-remove|\
@@ -215,6 +213,23 @@ fn init_tracing(log_ring: noded::LogRing) {
 /// and you cannot start a runtime from inside one. so `main` is sync and hands
 /// off to `Runner::start`, which drives everything (including the engine's spawned
 /// tasks) on the runtime it owns.
+fn gateway_can_start(
+    sync_only: bool,
+    gateway_listen: Option<&str>,
+    http_listen: Option<&str>,
+    wireguard_listen: Option<std::net::SocketAddr>,
+    wireguard_effect: config::WireGuardEffectKind,
+) -> bool {
+    let api_is_loopback = http_listen
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|address| address.ip().is_loopback());
+    !sync_only
+        && gateway_listen.is_some()
+        && api_is_loopback
+        && wireguard_listen.is_some()
+        && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake)
+}
+
 fn run_node(
     resolved: Resolved,
     sync_only: bool,
@@ -234,6 +249,7 @@ fn run_node(
         storage,
         rpc_listen,
         http_listen,
+        gateway_listen,
         wireguard_listen,
         wireguard_effect,
         wireguard_key_file,
@@ -257,6 +273,14 @@ fn run_node(
         joiner,
     } = boot::env::derive(resolved, sync_only);
 
+    let gateway_enabled = gateway_can_start(
+        sync_only,
+        gateway_listen.as_deref(),
+        http_listen.as_deref(),
+        wireguard_listen,
+        wireguard_effect,
+    );
+
     let boot::surfaces::Surfaces {
         rpc_listener,
         http_cmds,
@@ -265,18 +289,22 @@ fn run_node(
         voice_requests,
         blobs,
         agent_provisioner,
-    } = boot::surfaces::bind(
+        gateway_requests,
+        gateway_commands,
+    } = boot::surfaces::bind(boot::surfaces::BindConfig {
         sync_only,
-        &label,
-        &storage,
+        label: &label,
+        storage: &storage,
         rpc_listen,
         http_listen,
+        gateway_listen,
+        gateway_enabled,
         log_ring,
         // the forge worktree lane's committer identity (agent-dogfood M1):
         // every run commit is authored by this node's signer (D2 — the author
         // is the agent).
-        config::hex_bytes(signer.public_key().as_ref()),
-    )?;
+        forge_committer: config::hex_bytes(signer.public_key().as_ref()),
+    })?;
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
     let storage_for_sync = storage.clone();
@@ -327,6 +355,10 @@ fn run_node(
             wireguard_effect,
             overlay_slot.clone(),
         );
+        // One process-wide bulk budget: state sync and Gateway retain separate
+        // protocols, queues, sockets, and admission but cannot independently
+        // saturate the same WireGuard link.
+        let bulk_pacer = statesync_plane::shared_bulk_pacer();
 
         if sync_only {
             boot::sync_only::run(
@@ -410,8 +442,8 @@ fn run_node(
                 wireguard_listen,
                 wireguard_effect,
                 wireguard_key_file,
-                primary_coordinator.clone(),
-                wireguard_advertised.clone(),
+                primary_coordinator,
+                wireguard_advertised,
                 &invite_token,
                 &invite_wireguard,
                 invite_fronts,
@@ -424,6 +456,8 @@ fn run_node(
                 announce_capabilities,
                 rpc_listener,
                 http_cmds,
+                gateway_requests,
+                gateway_commands.clone(),
                 &stream_hub,
                 index,
                 voice_requests,
@@ -431,6 +465,7 @@ fn run_node(
                 &agent_provisioner,
                 &agent_dirs,
                 overlay_slot,
+                bulk_pacer.clone(),
                 storage_for_sync,
                 recovery,
                 &manifest,
@@ -439,15 +474,15 @@ fn run_node(
             )
             .await;
         }
-        validator::run::run_validator(
+        validator::run_validator(
             context,
             network,
             oracle,
             quota,
             metrics,
-            status_public_key,
             sync_source,
             advertised_reach,
+            status_public_key,
             signer,
             label,
             namespace,
@@ -466,11 +501,13 @@ fn run_node(
             chain_id,
             mesh_state_file,
             checkpoint_blocks,
+            promoted,
             dev_demo,
             announce_capabilities,
-            promoted,
             rpc_listener,
             http_cmds,
+            gateway_requests,
+            gateway_commands,
             stream_hub,
             index,
             voice_requests,
@@ -478,6 +515,8 @@ fn run_node(
             agent_provisioner,
             agent_dirs,
             overlay_slot,
+            bulk_pacer,
+            workspace,
             recovery,
             manifest,
             forge_repo,

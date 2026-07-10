@@ -12,17 +12,36 @@ pub(crate) struct Surfaces {
     pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
     pub(crate) blobs: noded::blobs::BlobHandle,
     pub(crate) agent_provisioner: Option<dispatch_oracle::SharedProvisioner>,
+    pub(crate) gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
+    pub(crate) gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
 }
 
-pub(crate) fn bind(
-    sync_only: bool,
-    label: &str,
-    storage: &std::path::Path,
-    rpc_listen: Option<String>,
-    http_listen: Option<String>,
-    log_ring: noded::LogRing,
-    forge_committer: String,
-) -> Result<Surfaces, Box<dyn std::error::Error>> {
+pub(crate) struct BindConfig<'a> {
+    pub(crate) sync_only: bool,
+    pub(crate) label: &'a str,
+    pub(crate) storage: &'a std::path::Path,
+    pub(crate) rpc_listen: Option<String>,
+    pub(crate) http_listen: Option<String>,
+    pub(crate) gateway_listen: Option<String>,
+    pub(crate) gateway_enabled: bool,
+    pub(crate) log_ring: noded::LogRing,
+    /// this node's signer identity — the COMMITTER on every forge run commit
+    /// (D2: author is the agent, committer is the node).
+    pub(crate) forge_committer: String,
+}
+
+pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
+    let BindConfig {
+        sync_only,
+        label,
+        storage,
+        rpc_listen,
+        http_listen,
+        gateway_listen,
+        gateway_enabled,
+        log_ring,
+        forge_committer,
+    } = config;
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise. a
     // JOINER binds too: the park loop pumps the same surface — a resident
@@ -37,6 +56,23 @@ pub(crate) fn bind(
     // leaves the commonware runner thread; http handlers only send
     // NodeCommands over the lane), so the pump below is its single consumer.
     let (http_handle, http_cmds, stream_hub) = noded::NodeHandle::channel_with_log_ring(log_ring);
+    let gateway_listener = match (gateway_listen.as_deref(), http_listen.as_deref()) {
+        (Some(addr), Some(_)) if !sync_only && gateway_enabled => {
+            let address: std::net::SocketAddr = addr
+                .parse()
+                .map_err(|error| format!("invalid gateway_listen {addr:?}: {error}"))?;
+            if address.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+                return Err("gateway_listen must bind exactly 127.0.0.1".into());
+            }
+            let listener = std::net::TcpListener::bind(address)?;
+            listener.set_nonblocking(true)?;
+            let actual = listener.local_addr()?;
+            println!("[node {label}] gateway browser listening on http://{actual}");
+            Some((listener, actual))
+        }
+        _ => None,
+    };
+    let (gateway_lane, gateway_requests) = tokio::sync::mpsc::channel::<noded::GatewayJob>(32);
     // the derived per-module index (noded's exact store, <storage>/index),
     // plus the blocks database the explorer reads: the pump folds sealed
     // blocks into it, boot heals it from verified state at sync/recovery
@@ -66,7 +102,18 @@ pub(crate) fn bind(
         // the duckfs workspace RPC's managed-checkout root (disk state, separate
         // from the module's own `<storage>/duckfs` dir).
         .with_duckfs_workspaces(storage.join("duckfs-workspaces"));
+    let http_handle = if gateway_enabled {
+        http_handle.with_gateway(gateway_lane)
+    } else {
+        drop(gateway_lane);
+        http_handle
+    };
+    let http_handle = match gateway_listener.as_ref() {
+        Some((_, address)) => http_handle.with_browser_gateway(*address),
+        None => http_handle,
+    };
     let blobs = http_handle.blob_handle();
+    let gateway_commands = http_handle.command_sender();
     // the REAL portable-agent-run provisioner, built from a clone of the http
     // handle BEFORE the serve/drop match consumes it. portable (v3) runs
     // materialize a per-run duckfs checkout under a root VALIDATED to be
@@ -110,6 +157,8 @@ pub(crate) fn bind(
                     .unwrap_or_default()
             );
             let thread_label = label.to_string();
+            let gateway_listener = gateway_listener.map(|(listener, _)| listener);
+            let gateway_handle = http_handle.clone();
             std::thread::Builder::new()
                 .name("app-surface".into())
                 .spawn(move || {
@@ -118,6 +167,17 @@ pub(crate) fn bind(
                         .build()
                         .expect("app-surface tokio runtime")
                         .block_on(async move {
+                            if let Some(listener) = gateway_listener {
+                                let listener = tokio::net::TcpListener::from_std(listener)
+                                    .expect("adopt gateway browser listener");
+                                tokio::spawn(async move {
+                                    if let Err(error) =
+                                        noded::serve_browser_gateway(listener, gateway_handle).await
+                                    {
+                                        eprintln!("gateway browser server error: {error}");
+                                    }
+                                });
+                            }
                             let listener = tokio::net::TcpListener::from_std(listener)
                                 .expect("adopt app-surface listener");
                             if let Err(e) = noded::serve(listener, http_handle).await {
@@ -143,5 +203,7 @@ pub(crate) fn bind(
         voice_requests,
         blobs,
         agent_provisioner,
+        gateway_requests: gateway_enabled.then_some(gateway_requests),
+        gateway_commands,
     })
 }

@@ -1545,6 +1545,10 @@ pub struct NodeToml {
     pub storage_dir: Option<String>,
     pub rpc_listen: Option<String>,
     pub http_listen: Option<String>,
+    /// Dedicated, least-privilege browser gateway. It exposes no node API and
+    /// is normally loopback-only; route windows use per-session
+    /// `<token>.localhost` origins on this listener.
+    pub gateway_listen: Option<String>,
     /// sealed blocks between recovery checkpoints (node-local operator
     /// policy — never part of the network descriptor). default 32.
     pub checkpoint_blocks: Option<u64>,
@@ -1620,6 +1624,7 @@ pub struct Plumbing {
     pub listen: String,
     pub advertised: Option<String>,
     pub http_listen: Option<String>,
+    pub gateway_listen: Option<String>,
     pub rpc_listen: Option<String>,
     /// merged like the rest — a hand-edited storage_dir survives rewrites.
     pub storage_dir: String,
@@ -1647,6 +1652,7 @@ pub fn merged_plumbing(
     listen: Option<&str>,
     advertised: Option<&str>,
     http_listen: Option<&str>,
+    gateway_listen: Option<&str>,
     rpc_listen: Option<&str>,
     wireguard_effect: Option<&str>,
     wireguard_listen: Option<&str>,
@@ -1675,6 +1681,9 @@ pub fn merged_plumbing(
         http_listen: http_listen
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.http_listen.clone())),
+        gateway_listen: gateway_listen
+            .map(str::to_string)
+            .or_else(|| e.and_then(|r| r.gateway_listen.clone())),
         rpc_listen: rpc_listen
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.rpc_listen.clone())),
@@ -1715,6 +1724,9 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     s += &format!("storage_dir = '{}'\n", p.storage_dir);
     if let Some(h) = &p.http_listen {
         s += &format!("http_listen = \"{h}\"\n");
+    }
+    if let Some(d) = &p.gateway_listen {
+        s += &format!("gateway_listen = \"{d}\"\n");
     }
     if let Some(r) = &p.rpc_listen {
         s += &format!("rpc_listen = \"{r}\"\n");
@@ -1884,6 +1896,7 @@ pub struct Resolved {
     pub storage_dir: PathBuf,
     pub rpc_listen: Option<String>,
     pub http_listen: Option<String>,
+    pub gateway_listen: Option<String>,
     /// the staged WireGuard reachability plane's advertised UDP endpoint;
     /// None = plane off.
     pub wireguard_listen: Option<SocketAddr>,
@@ -2035,6 +2048,13 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         .map(|wg| resolved_invite_listen(raw.invite_listen.as_deref(), wg))
         .transpose()?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
+    // Existing workspaces predate `gateway_listen`. Any node already exposing
+    // the app surface gets the safe loopback/ephemeral gateway automatically;
+    // no registry or node.toml migration (and no stale port) is required.
+    let gateway_listen = raw
+        .gateway_listen
+        .clone()
+        .or_else(|| raw.http_listen.as_ref().map(|_| "127.0.0.1:0".to_string()));
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -2050,6 +2070,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         storage_dir: base.join(raw.storage_dir.as_deref().unwrap_or("storage")),
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
+        gateway_listen,
         wireguard_listen,
         wireguard_effect,
         wireguard_key_file: base.join("wireguard.key"),
@@ -2310,6 +2331,10 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
+    let gateway_listen = raw
+        .gateway_listen
+        .clone()
+        .or_else(|| raw.http_listen.as_ref().map(|_| "127.0.0.1:0".to_string()));
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
@@ -2333,6 +2358,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         storage_dir,
         rpc_listen: raw.rpc_listen,
         http_listen: raw.http_listen,
+        gateway_listen,
         wireguard_listen,
         wireguard_effect,
         invite_listen: wireguard_listen
@@ -3915,6 +3941,7 @@ storage_dir = '/data/ducktape'
             None,
             None,
             None,
+            None,
         )
         .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
@@ -3940,6 +3967,7 @@ storage_dir = '/data/ducktape'
             None,
             None,
             None,
+            None,
             Some("socket"),
             None,
             None,
@@ -3951,13 +3979,14 @@ storage_dir = '/data/ducktape'
         write_node_toml(&dir, &p).expect("write");
 
         // no flag: the hand-settable value on disk survives a re-merge.
-        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None)
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None, None)
             .expect("re-merge");
         assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
 
         // the flag wins over the file (merged_plumbing's standing precedence).
         let p = merged_plumbing(
             &dir,
+            None,
             None,
             None,
             None,
@@ -3974,6 +4003,7 @@ storage_dir = '/data/ducktape'
         // a typo aborts the verb before anything is written.
         let err = merged_plumbing(
             &dir,
+            None,
             None,
             None,
             None,
@@ -4007,6 +4037,7 @@ storage_dir = '/data/ducktape'
             None,
             None,
             None,
+            None,
             Some("203.0.113.9:3478"),
             Some("198.51.100.5:41820"),
         )
@@ -4016,7 +4047,7 @@ storage_dir = '/data/ducktape'
         write_node_toml(&dir, &p).expect("write");
 
         // no flags: the hand-settable values on disk survive a re-merge.
-        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None)
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None, None)
             .expect("re-merge");
         assert_eq!(p.primary_coordinator.as_deref(), Some("203.0.113.9:3478"));
         assert_eq!(p.wireguard_advertised.as_deref(), Some("198.51.100.5:41820"));
@@ -4024,6 +4055,7 @@ storage_dir = '/data/ducktape'
         // the flags win over the file (merged_plumbing's standing precedence).
         let p = merged_plumbing(
             &dir,
+            None,
             None,
             None,
             None,

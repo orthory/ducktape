@@ -12,6 +12,7 @@ import { useDucktape } from "../store/use-ducktape";
 import { isMacDesktop } from "../../domain/node-bootstrap";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { ConnectionBanner } from "./ConnectionBanner";
+import { ResizeEdges, WindowControls } from "./WindowChrome";
 
 // Left inset that clears the macOS traffic lights. Only the macOS desktop build
 // overlays them on the content (see isMacDesktop); on Linux/Windows desktop and
@@ -20,6 +21,11 @@ import { ConnectionBanner } from "./ConnectionBanner";
 // resolved once at module load rather than per TitleBar render (which re-renders
 // on every finalized block).
 const TRAFFIC_LIGHT_INSET = isMacDesktop() ? 69 : 0;
+
+// The palette shortcut as the local platform types it (the handler accepts
+// both meta and ctrl — see ConsoleShell). Same module-load resolution as the
+// inset above.
+const SEARCH_KEY_LABEL = isMacDesktop() ? "⌘K" : "Ctrl K";
 
 // The centered search affordance in the title bar: a compact field that opens
 // the ⌘K palette (see ConsoleShell / SearchModal). It sits in the middle cell
@@ -43,7 +49,7 @@ function SearchBar() {
     >
       <button
         onClick={actions.openSearch}
-        title="Search (⌘K)"
+        title={`Search (${SEARCH_KEY_LABEL})`}
         aria-label="Search"
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
@@ -90,7 +96,7 @@ function SearchBar() {
             background: color.paper,
           }}
         >
-          ⌘K
+          {SEARCH_KEY_LABEL}
         </span>
       </button>
     </div>
@@ -225,6 +231,9 @@ function TitleBar() {
           <span style={{ width: 6, height: 6, borderRadius: "50%", background: dot }} />
           {"h " + (state.status?.height ?? 0).toLocaleString()}
         </span>
+        {/* Undecorated Linux/Windows window controls; renders nothing on
+            macOS (native traffic lights) and on web. */}
+        <WindowControls />
       </div>
     </div>
   );
@@ -251,6 +260,8 @@ export function WindowFrame({ children }: { children: ReactNode }) {
           the content below, never the whole window (which had no boundary and
           went blank white on any render throw). */}
       <ErrorBoundary>{children}</ErrorBoundary>
+      {/* Edge resize handles for the undecorated non-mac desktop window. */}
+      <ResizeEdges />
     </div>
   );
 }

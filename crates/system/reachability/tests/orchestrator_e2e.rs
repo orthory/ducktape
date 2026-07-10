@@ -548,6 +548,60 @@ async fn nat_resolver_punches_over_loopback() {
     }
 }
 
+/// The REAL `send_datagram_and_recv` over loopback UDP: the addressed peer's
+/// reply is returned (matched by src) while a STRANGER's datagram arriving
+/// mid-wait is forwarded to the datagram sink instead of being swallowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolver_datagram_roundtrip_over_loopback() {
+    let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let coord_addr = coord_sock.local_addr().unwrap();
+    tokio::spawn(nat_traversal::client::run_coordinator(
+        coord_sock,
+        nat_traversal::AuthPolicy::Open { require_pop: false },
+    ));
+
+    let client = nat_traversal::NatClient::bind_multi(NodeKey([0xcc; 32]), vec![coord_addr])
+        .await
+        .unwrap();
+    let (sink_tx, mut sink_rx) = mpsc::channel(8);
+    let mut resolver = reachability::NatResolver::from_client_with_datagram_sink(
+        client,
+        reachability::RENDEZVOUS_KEEPALIVE,
+        Some(sink_tx),
+    )
+    .await
+    .unwrap();
+
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stranger_addr = stranger.local_addr().unwrap();
+
+    // the peer echoes an ack — but only after the stranger's datagram has hit
+    // the resolver socket mid-wait, the one that must be sinked, not eaten.
+    tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        let (n, resolver_addr) = peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"intro");
+        stranger.send_to(b"unrelated", resolver_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        peer.send_to(b"intro-ack", resolver_addr).await.unwrap();
+    });
+
+    let reply = resolver
+        .send_datagram_and_recv(peer_addr, b"intro".to_vec(), Duration::from_secs(5))
+        .await
+        .expect("the peer's reply is returned");
+    assert_eq!(reply, b"intro-ack");
+
+    let (src, bytes) = tokio::time::timeout(Duration::from_secs(2), sink_rx.recv())
+        .await
+        .expect("bounded")
+        .expect("sink stays open");
+    assert_eq!(src, stranger_addr, "the sinked datagram is the stranger's");
+    assert_eq!(bytes, b"unrelated");
+}
+
 /// A `NodeKey` whose bytes ARE the ed25519 public key — the subject a signed
 /// coordinator request proves possession of.
 fn node_key_of(pk: &commonware_cryptography::ed25519::PublicKey) -> NodeKey {

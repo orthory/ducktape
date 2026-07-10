@@ -40,6 +40,7 @@ members = [
     "crates/system/tagging",
     "crates/duckdns/core",
     "crates/system/duckdns",
+    "crates/system/gateway",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
@@ -70,6 +71,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 arrayvec = "0.7"
+crossbeam-channel = "0.5"
 lru = "0.18"
 smallvec = "1"
 sha2 = "0.10"
@@ -167,6 +169,7 @@ dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }
 duckdns-core = { path = "crates/duckdns/core" }
 duckdns = { path = "crates/system/duckdns" }
+gateway = { path = "crates/system/gateway" }
 forge = { path = "crates/apps/forge" }
 pages = { path = "crates/apps/pages" }
 chat = { path = "crates/apps/chat" }

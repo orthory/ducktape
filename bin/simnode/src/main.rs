@@ -64,6 +64,7 @@ use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
 use duckdns::DuckDns;
+use gateway::Gateway;
 use tagging::TaggingModule;
 use files::Files;
 use forge::Forge;
@@ -89,7 +90,7 @@ use tasks::Tasks;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 15] = [
+const MODULE_IDS: [&str; 16] = [
     "chat",
     "saga",
     "dispatch",
@@ -105,6 +106,7 @@ const MODULE_IDS: [&str; 15] = [
     "files",
     "identity",
     "duckdns",
+    "gateway",
 ];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 const PEER_ORIGIN: &[u8] = b"peer";
@@ -400,6 +402,7 @@ fn run_sim(
         // also the canonical account display-name registry.
         let identity = Identity::new("identity", None, String::new());
         let duckdns = DuckDns::new("duckdns", "identity", None);
+        let gateway = Gateway::new("gateway", "identity", None, "local");
         let host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),
@@ -416,6 +419,7 @@ fn run_sim(
             Box::new(files),
             Box::new(identity),
             Box::new(duckdns),
+            Box::new(gateway),
         ])
         .expect("genesis");
 

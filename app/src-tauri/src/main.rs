@@ -5,14 +5,17 @@
 //! or join networks and allocate ports. A bounded, dedicated node-control actor
 //! drives onboarding/custody verbs and spawns the selected workspace's node
 //! DETACHED (its own process group, stdio to `daemon.log`), so Tauri runtime
-//! workers never execute or wait on the node binary. Closing the console window
-//! only hides to the menu-bar app instead of killing the network. A real app
-//! quit (tray Quit / Cmd-Q / OS exit) stops the active managed node through the
-//! workspace pidfile before the shell exits.
+//! workers never execute or wait on the node binary. On macOS, closing the
+//! console window only hides to the menu-bar app instead of killing the
+//! network (close-to-hide is wired in the mac-gated tray init); on
+//! Linux/Windows there is no tray to hide into, so close quits. A real app
+//! quit (tray Quit / Cmd-Q / OS exit / non-mac window close) stops the active
+//! managed node through the workspace pidfile before the shell exits.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
+mod gateway_window;
 mod enroll;
 mod forge_git;
 mod huddle;
@@ -29,6 +32,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             workspaces::workspace_list,
             workspaces::workspace_active,
+            workspaces::gateway_route_bind,
+            workspaces::gateway_route_unbind,
+            workspaces::gateway_route_list,
+            gateway_window::gateway_open_window,
             workspaces::workspace_create,
             workspaces::workspace_join,
             workspaces::workspace_invite_blob,
@@ -54,6 +61,7 @@ fn main() {
             user_identity::user_identity_lock,
             user_identity::user_sign_bind,
             user_identity::user_sign_unbind,
+            user_identity::user_sign_gateway_route,
             user_identity::user_sign_possession,
             user_identity::user_sign_add_member,
             user_identity::user_sign_remove_member,
@@ -92,6 +100,15 @@ fn main() {
             let main = tauri::Manager::get_webview_window(app, "main")
                 .ok_or("main window missing (tauri.conf.json windows)")?;
             huddle::allow_user_media(&main)?;
+            // macOS overlays its native traffic lights on the in-app title
+            // bar (titleBarStyle Overlay). Other desktops get the same
+            // single-bar chrome by dropping native decorations; the title bar
+            // hosts in-app window controls and the frame edges drive resize
+            // (see WindowChrome.tsx).
+            // ponytail: set at setup = one decorated first paint on launch;
+            // move to per-platform tauri conf files if the flash matters.
+            #[cfg(not(target_os = "macos"))]
+            main.set_decorations(false)?;
             Ok(())
         });
 

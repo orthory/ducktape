@@ -4,6 +4,7 @@
 import { AgentView } from "../views/agent/AgentView";
 import { ChatView } from "../views/chat/ChatView";
 import { ExplorerView } from "../views/explorer/ExplorerView";
+import { BrowserView } from "../views/browser/BrowserView";
 import { FilesView } from "../views/files/FilesView";
 import { ForgeView } from "../views/forge/ForgeView";
 import { GovernanceView } from "../views/governance/GovernanceView";
@@ -26,8 +27,9 @@ export const MODULES: AppModule[] = [
   { id: "chat", nav: { icon: "chat", label: "Chat", order: 0, section: "user" }, Screen: ChatView },
   { id: "pages", nav: { icon: "pages", label: "Pages", order: 1, section: "user" }, Screen: PagesView },
   { id: "files", nav: { icon: "files", label: "Files", order: 2, section: "user" }, Screen: FilesView },
-  { id: "forge", nav: { icon: "forge", label: "Forge", order: 3, section: "user" }, Screen: ForgeView },
-  { id: "agent", nav: { icon: "agent", label: "Agents", order: 4, section: "user" }, Screen: AgentView },
+  { id: "browser", nav: { icon: "browser", label: "Browser", order: 3, section: "user" }, Screen: BrowserView },
+  { id: "forge", nav: { icon: "forge", label: "Forge", order: 4, section: "user" }, Screen: ForgeView },
+  { id: "agent", nav: { icon: "agent", label: "Agents", order: 5, section: "user" }, Screen: AgentView },
   // ── Node operator surfaces ──
   { id: "members", nav: { icon: "members", label: "Members", order: 0, section: "operator" }, Screen: MembersView },
   { id: "governance", nav: { icon: "governance", label: "Governance", order: 1, section: "operator" }, Screen: GovernanceView },

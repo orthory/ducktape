@@ -45,6 +45,7 @@ tasks = { workspace = true }
 vaults = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
+gateway = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
@@ -104,6 +105,7 @@ commonware-utils = { workspace = true }
 commonware-codec = { workspace = true }
 
 serde = { workspace = true }
+reqwest = { workspace = true }
 sha2 = { workspace = true }
 toml = "0.8"
 # identity keygen entropy (`Signer::random`).

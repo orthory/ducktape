@@ -10,6 +10,51 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use serde::Deserialize;
 
+/// Linux process CPU time across every thread, in nanoseconds.
+#[cfg(target_os = "linux")]
+pub fn process_cpu_ns() -> Option<u64> {
+    let mut total = 0u64;
+    let mut found = false;
+    for entry in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("schedstat")) else {
+            continue;
+        };
+        let Some(runtime) = text
+            .split_whitespace()
+            .next()
+            .and_then(|raw| raw.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        total = total.saturating_add(runtime);
+        found = true;
+    }
+    found.then_some(total)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_cpu_ns() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    kib.checked_mul(1024)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_rss_bytes() -> Option<u64> {
+    None
+}
+
 /// The one field of `network.toml` the coordinator cares about: the genesis
 /// validators, as hex ed25519 public keys. Every other key (chain_id, scheme,
 /// bootstrap, reach, coordination, …) is ignored — serde drops unknown fields —

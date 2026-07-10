@@ -209,6 +209,53 @@ export interface FileReadRange {
   eof: boolean;
 }
 
+export interface GatewayRouteName {
+  label: string | null;
+}
+
+export type GatewayMethod = "get" | "head" | "post" | "put" | "patch" | "delete";
+
+export interface GatewayHeader {
+  name: string;
+  value: string;
+}
+
+/** Snake-case fields mirror `gateway::ProxyRequestHead` exactly. */
+export interface GatewayProxyHead {
+  account_id: number[];
+  name: GatewayRouteName;
+  revision: number;
+  method: GatewayMethod;
+  path_and_query: string;
+  headers: GatewayHeader[];
+  body_len: number;
+}
+
+export interface GatewayResponseHead {
+  status: number;
+  headers: GatewayHeader[];
+}
+
+export interface GatewayProxyRequest {
+  head: GatewayProxyHead;
+  body: Uint8Array<ArrayBuffer>;
+}
+
+export interface GatewayProxyReply {
+  head: GatewayResponseHead;
+  body: Uint8Array<ArrayBuffer>;
+}
+
+export interface GatewaySessionRequest {
+  accountId: number[];
+  name: GatewayRouteName;
+  revision: number;
+}
+
+export interface GatewaySessionReply {
+  url: string;
+}
+
 export interface NodeTransport {
   /**
    * Submit one module msg — one block. Resolves once the block is committed.
@@ -296,6 +343,13 @@ export interface NodeTransport {
   }): Promise<FileReadRange>;
   /** The bounded commit history, newest-first (GET /v1/files/history). */
   filesHistory(params?: { limit?: number }): Promise<FileSnapshot[]>;
+
+  /** Invoke one finalized, policy-bounded route over the authenticated
+   * gateway plane. Optional because the embedded daemon has no mesh. */
+  gatewayProxy?(request: GatewayProxyRequest): Promise<GatewayProxyReply>;
+  /** Mint a short-lived, route-scoped origin on the dedicated browser
+   * listener. That listener exposes no node API or cross-route primitive. */
+  gatewaySession?(request: GatewaySessionRequest): Promise<GatewaySessionReply>;
 
   status(): Promise<NodeStatus>;
   /**
@@ -717,6 +771,27 @@ export const remoteTransport = (baseUrl: string): NodeTransport => {
       );
       return body.snapshots;
     },
+    gatewayProxy: async (request) => {
+      const encode = (bytes: Uint8Array): string => {
+        let binary = "";
+        for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+          binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+        }
+        return btoa(binary);
+      };
+      const wire = await postJson<{ head: GatewayResponseHead; bodyB64: string }>(
+        `${base}/v1/gateway/proxy`,
+        { head: request.head, bodyB64: encode(request.body) },
+      );
+      const binary = atob(wire.bodyB64);
+      const body = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        body[index] = binary.charCodeAt(index);
+      }
+      return { head: wire.head, body };
+    },
+    gatewaySession: (request) =>
+      postJson<GatewaySessionReply>(`${base}/v1/gateway/session`, request),
     status: async () => {
       const res = await fetchDeadline(`${base}/v1/status`, undefined, STATUS_TIMEOUT_MS);
       if (!res.ok) throw new NodeError("httpError", `node replied ${res.status}`, res.status);

@@ -33,6 +33,16 @@ use tauri::Manager as _;
 use crate::daemon::{NodeControl, last_line, require_main_window, run_verb};
 
 const DEFAULT_PRIMARY_COORDINATOR: &str = "p2p.ducktape.byeongsu.dev:3478";
+
+/// the coordinator handed to every spawned node: the deployed public
+/// rendezvous by default, overridable via `DUCKTAPE_PRIMARY_COORDINATOR`
+/// (passed verbatim — the node CLI accepts `none` to opt out). the no-UI
+/// escape hatch for self-hosted coordinators; deliberately not a setting.
+fn primary_coordinator() -> String {
+    std::env::var("DUCKTAPE_PRIMARY_COORDINATOR")
+        .unwrap_or_else(|_| DEFAULT_PRIMARY_COORDINATOR.into())
+}
+
 const MAX_WORKSPACE_NAME_BYTES: usize = 128;
 const MAX_INVITE_BLOB_BYTES: usize = 256 * 1024;
 
@@ -273,6 +283,22 @@ fn free_port(used: &[u16]) -> Result<u16, String> {
     Err("could not find a free localhost port".into())
 }
 
+/// [`free_port`]'s UDP twin — the wireguard/invite listeners are UDP, and a
+/// free TCP port says nothing about the same UDP port (a collision silently
+/// disables the reachability plane). same TOCTOU window, same dedup.
+fn free_udp_port(used: &[u16]) -> Result<u16, String> {
+    for _ in 0..64 {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+            .map_err(|err| format!("probe free udp port: {err}"))?;
+        let port = socket.local_addr().map_err(|err| err.to_string())?.port();
+        drop(socket);
+        if !used.contains(&port) {
+            return Ok(port);
+        }
+    }
+    Err("could not find a free localhost udp port".into())
+}
+
 /// distinct free ports, avoiding every port already recorded in the
 /// registry — a stopped workspace's ports are still ITS ports; handing them to
 /// a new workspace would collide the moment both run.
@@ -284,9 +310,9 @@ fn allocate_ports(reserved: &[u16]) -> Result<Ports, String> {
     used.push(http);
     let rpc = free_port(&used)?;
     used.push(rpc);
-    let wireguard = free_port(&used)?;
+    let wireguard = free_udp_port(&used)?;
     used.push(wireguard);
-    let invite = free_port(&used)?;
+    let invite = free_udp_port(&used)?;
     Ok(Ports {
         listen,
         http,
@@ -364,6 +390,125 @@ pub fn workspace_active(
         .and_then(|id| reg.workspaces.iter().find(|w| &w.id == id).cloned()))
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayRouteName {
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayLocalRoute {
+    pub name: GatewayRouteName,
+    pub port: u16,
+}
+
+/// Bind one globally published gateway route (apex when `label` is null) to an
+/// exact loopback port. The port remains node-local and the sidecar persists no
+/// URL, host, or executable command.
+#[tauri::command]
+pub async fn gateway_route_bind(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+    label: Option<String>,
+    port: u16,
+) -> Result<(), String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || gateway_route_bind_blocking(app, id, label, port))
+        .await
+}
+
+fn gateway_route_bind_blocking(
+    app: tauri::AppHandle,
+    id: String,
+    label: Option<String>,
+    port: u16,
+) -> Result<(), String> {
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
+    let dir = workspaces_dir(&app)?.join(&ws.id);
+    let mut args = vec![
+        "gateway-route-bind".to_string(),
+        "--workspace".to_string(),
+        dir.to_string_lossy().into_owned(),
+    ];
+    if let Some(label) = label {
+        args.extend(["--label".to_string(), label]);
+    }
+    args.extend(["--port".to_string(), port.to_string()]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_verb(&refs).map(|_| ())
+}
+
+#[tauri::command]
+pub async fn gateway_route_unbind(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+    label: Option<String>,
+) -> Result<(), String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || gateway_route_unbind_blocking(app, id, label))
+        .await
+}
+
+fn gateway_route_unbind_blocking(
+    app: tauri::AppHandle,
+    id: String,
+    label: Option<String>,
+) -> Result<(), String> {
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
+    let dir = workspaces_dir(&app)?.join(&ws.id);
+    let mut args = vec![
+        "gateway-route-unbind".to_string(),
+        "--workspace".to_string(),
+        dir.to_string_lossy().into_owned(),
+    ];
+    if let Some(label) = label {
+        args.extend(["--label".to_string(), label]);
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_verb(&refs).map(|_| ())
+}
+
+#[tauri::command]
+pub async fn gateway_route_list(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    control: tauri::State<'_, NodeControl>,
+    id: String,
+) -> Result<Vec<GatewayLocalRoute>, String> {
+    require_main_window(&window)?;
+    let control = control.inner().clone();
+    control
+        .run(move || gateway_route_list_blocking(app, id))
+        .await
+}
+
+fn gateway_route_list_blocking(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<Vec<GatewayLocalRoute>, String> {
+    let reg = load_registry(&app)?;
+    let ws = find(&reg, &id)?;
+    let dir = workspaces_dir(&app)?.join(&ws.id);
+    let out = run_verb(&[
+        "gateway-route-list",
+        "--workspace",
+        &dir.to_string_lossy(),
+    ])?;
+    serde_json::from_str(last_line(&out).trim())
+        .map_err(|error| format!("gateway-route-list output is not json: {error}"))
+}
+
 /// found a NEW network: mint a fresh chain-id + this workspace's identity, seed
 /// the genesis validator set with it (a solo 1-validator network usable at
 /// once), and record it active. does not spawn — the ui calls
@@ -410,6 +555,7 @@ fn workspace_create_blocking(app: tauri::AppHandle, name: String) -> Result<Work
             .ok_or("workspace allocator did not assign an invite port")?
     );
     let dir_s = dir.to_string_lossy().to_string();
+    let coordinator = primary_coordinator();
     // desktop-spawned nodes run the TUN-less userspace WireGuard backend
     // (overlay-net ADR phase 4): no /dev/net/tun, no setcap, no host
     // mutation. self-managed configs keep the parse default (`tun`).
@@ -423,10 +569,12 @@ fn workspace_create_blocking(app: tauri::AppHandle, name: String) -> Result<Work
         &listen,
         "--http",
         &http,
+        "--gateway",
+        "127.0.0.1:0",
         "--rpc",
         &rpc,
         "--primary-coordinator",
-        DEFAULT_PRIMARY_COORDINATOR,
+        &coordinator,
         "--wireguard-listen",
         &wireguard,
         "--invite-listen",
@@ -536,6 +684,8 @@ fn workspace_join_blocking(
         &listen,
         "--http",
         &http,
+        "--gateway",
+        "127.0.0.1:0",
         "--rpc",
         &rpc,
         "--wireguard-listen",
@@ -1630,6 +1780,16 @@ mod tests {
         }];
         assert_eq!(unique_id("My Team", &taken), "my-team-2");
         assert_eq!(unique_id("***", &taken), "workspace");
+    }
+
+    #[test]
+    fn primary_coordinator_reads_the_env_override() {
+        // one test owns the var end-to-end — process env is shared across
+        // parallel tests, so set + assert + remove stay in a single test.
+        unsafe { std::env::set_var("DUCKTAPE_PRIMARY_COORDINATOR", "127.0.0.1:9999") };
+        assert_eq!(primary_coordinator(), "127.0.0.1:9999");
+        unsafe { std::env::remove_var("DUCKTAPE_PRIMARY_COORDINATOR") };
+        assert_eq!(primary_coordinator(), DEFAULT_PRIMARY_COORDINATOR);
     }
 
     #[test]
