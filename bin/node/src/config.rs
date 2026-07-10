@@ -1580,61 +1580,39 @@ pub struct NodeToml {
     /// capable node. announcing stays truthful either way: this can hide a
     /// real provider, never fabricate one.
     pub announce_capabilities: Option<bool>,
-    /// Explicit local HTTP publications. Names/policy are announced through
-    /// the replicated DuckDNS module; `target` never leaves this node.
+    /// Explicit identity-only service discovery declarations. Consensus sees
+    /// the service name and provider NodeId, never endpoints or transports.
     #[serde(default)]
     pub duckdns: DuckDnsToml,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DuckDnsToml {
-    /// Dedicated loopback HTTP ingress fed by `duckdnsd` after local TLS
-    /// termination. Absent keeps device ingress disabled.
-    pub ingress_listen: Option<String>,
     #[serde(default)]
     pub services: Vec<DuckDnsServiceToml>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DuckDnsServiceToml {
-    /// `user` or `network`.
+    /// `account` or `network`.
     pub scope: String,
-    /// Required for `user`, forbidden for `network`.
+    /// Required for `account`, forbidden for `network`.
     pub handle: Option<String>,
     pub service: String,
-    /// Numeric loopback socket only (`127.0.0.0/8` or `::1`). Hostnames and
-    /// non-loopback addresses reject at config load.
-    /// Secondary dynamic-app backend: a numeric loopback HTTP socket.
-    pub target: Option<String>,
-    /// Primary static-site backend: a DuckFS subtree served directly through
-    /// the files module actor lane.
-    pub duckfs: Option<DuckDnsDuckFsToml>,
-    #[serde(default)]
-    pub default_homepage: bool,
-    #[serde(default)]
-    pub allow_cross_site: bool,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct DuckDnsDuckFsToml {
-    pub prefix: String,
-    pub snapshot: Option<String>,
-    #[serde(default = "duckdns_default_index")]
-    pub index: String,
-}
-
-fn duckdns_default_index() -> String {
-    "index.html".into()
-}
-
-fn resolve_duckdns_services(raw: &DuckDnsToml) -> Result<duckdns_client::Publications, String> {
-    let mut publications = Vec::with_capacity(raw.services.len());
+fn resolve_duckdns_services(
+    raw: &DuckDnsToml,
+) -> Result<Vec<duckdns::ServiceAnnouncement>, String> {
+    let mut announcements = Vec::with_capacity(raw.services.len());
     for service in &raw.services {
         let scope = match service.scope.as_str() {
-            "user" => duckdns::ServiceScope::User {
+            "account" => duckdns::ServiceScope::Account {
                 handle: service.handle.clone().ok_or_else(|| {
                     format!(
-                        "duckdns user service {:?} requires a handle",
+                        "duckdns account service {:?} requires a handle",
                         service.service
                     )
                 })?,
@@ -1650,97 +1628,22 @@ fn resolve_duckdns_services(raw: &DuckDnsToml) -> Result<duckdns_client::Publica
             }
             other => {
                 return Err(format!(
-                    "duckdns service scope must be \"user\" or \"network\", got {other:?}"
+                    "duckdns service scope must be \"account\" or \"network\", got {other:?}"
                 ));
             }
         };
         let announcement = duckdns::ServiceAnnouncement {
             scope,
             service: service.service.clone(),
-            default_homepage: service.default_homepage,
-            allow_cross_site: service.allow_cross_site,
         };
-        let target = match (&service.target, &service.duckfs) {
-            (Some(value), None) => duckdns_client::PublicationTarget::Loopback(
-                value
-                    .parse()
-                    .map_err(|e| format!("duckdns target {value:?}: {e}"))?,
-            ),
-            (None, Some(site)) => {
-                duckdns_client::PublicationTarget::DuckFs(duckdns_client::DuckFsSite {
-                    prefix: site.prefix.clone(),
-                    snapshot: site.snapshot.clone(),
-                    index: site.index.clone(),
-                })
-            }
-            (Some(_), Some(_)) => {
-                return Err(format!(
-                    "duckdns service {:?} must set exactly one of target or duckfs",
-                    service.service
-                ));
-            }
-            (None, None) => {
-                return Err(format!(
-                    "duckdns service {:?} requires target or duckfs",
-                    service.service
-                ));
-            }
-        };
-        publications.push(duckdns_client::Publication {
-            announcement,
-            target,
-        });
+        announcement.validate()?;
+        announcements.push(announcement);
     }
-    duckdns_client::Publications::new(publications)
-}
-
-fn resolve_duckdns_ingress(raw: &DuckDnsToml) -> Result<Option<SocketAddr>, String> {
-    let Some(value) = &raw.ingress_listen else {
-        return Ok(None);
-    };
-    let address: SocketAddr = value
-        .parse()
-        .map_err(|e| format!("duckdns.ingress_listen {value:?}: {e}"))?;
-    if !address.ip().is_loopback() {
-        return Err(format!(
-            "duckdns.ingress_listen {address} is not loopback"
-        ));
+    announcements.sort();
+    if announcements.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("duckdns service declarations must be unique".into());
     }
-    Ok(Some(address))
-}
-
-fn reject_duckdns_admin_targets(
-    publications: &duckdns_client::Publications,
-    ingress: Option<SocketAddr>,
-    http_listen: Option<&str>,
-    rpc_listen: Option<&str>,
-) -> Result<(), String> {
-    let reserved = [
-        ("DuckDNS ingress", ingress.map(|address| address.port())),
-        ("node HTTP administration surface", configured_port(http_listen)),
-        ("node RPC administration surface", configured_port(rpc_listen)),
-    ];
-    for publication in publications.iter() {
-        let duckdns_client::PublicationTarget::Loopback(target) = &publication.target else {
-            continue;
-        };
-        for (name, port) in reserved {
-            if port.is_some_and(|port| port != 0 && port == target.port()) {
-                return Err(format!(
-                    "duckdns target {} collides with the {name}; node administration routes \
-                     can never be published",
-                    target
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn configured_port(value: Option<&str>) -> Option<u16> {
-    value?
-        .rsplit_once(':')
-        .and_then(|(_, port)| port.parse().ok())
+    Ok(announcements)
 }
 
 /// read a raw node.toml plus its base directory (which relative paths inside
@@ -1779,7 +1682,7 @@ pub struct Plumbing {
     /// passes "socket" here (overlay-net ADR phase 4) while the parse
     /// default for a file without the key stays `tun`.
     pub wireguard_effect: Option<String>,
-    /// Node-local DuckDNS ingress and publication declarations. Existing
+    /// Node-local DuckDNS discovery declarations. Existing
     /// services survive init/join plumbing rewrites unchanged.
     pub duckdns: DuckDnsToml,
 }
@@ -1794,7 +1697,6 @@ pub fn merged_plumbing(
     wireguard_effect: Option<&str>,
     wireguard_listen: Option<&str>,
     invite_listen: Option<&str>,
-    duckdns_ingress: Option<&str>,
 ) -> Result<Plumbing, String> {
     let path = dir.join("node.toml");
     let existing: Option<NodeToml> = if path.exists() {
@@ -1806,10 +1708,6 @@ pub fn merged_plumbing(
     // reject a typo'd effect value at the verb, before anything lands on disk
     // — resolve() would only catch it on the node's NEXT boot.
     parse_wireguard_effect(wireguard_effect)?;
-    let mut duckdns = e.map(|raw| raw.duckdns.clone()).unwrap_or_default();
-    if let Some(ingress) = duckdns_ingress {
-        duckdns.ingress_listen = Some(ingress.to_owned());
-    }
     Ok(Plumbing {
         listen: listen
             .map(str::to_string)
@@ -1836,7 +1734,7 @@ pub fn merged_plumbing(
         wireguard_effect: wireguard_effect
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.wireguard_effect.clone())),
-        duckdns,
+        duckdns: e.map(|raw| raw.duckdns.clone()).unwrap_or_default(),
     })
 }
 
@@ -1869,7 +1767,7 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     if let Some(w) = &p.wireguard_effect {
         s += &format!("wireguard_effect = \"{w}\"\n");
     }
-    if p.duckdns.ingress_listen.is_some() || !p.duckdns.services.is_empty() {
+    if !p.duckdns.services.is_empty() {
         #[derive(serde::Serialize)]
         struct DuckDnsSection<'a> {
             duckdns: &'a DuckDnsToml,
@@ -2065,10 +1963,8 @@ pub struct Resolved {
     /// publish the discovered provider set into the capability registry; see
     /// `NodeToml::announce_capabilities`.
     pub announce_capabilities: bool,
-    /// Validated loopback-only web publications. Targets are node-local and
-    /// never serialized into DuckDNS consensus messages.
-    pub duckdns_services: duckdns_client::Publications,
-    pub duckdns_ingress_listen: Option<SocketAddr>,
+    /// Validated identity-only discovery declarations.
+    pub duckdns_announcements: Vec<duckdns::ServiceAnnouncement>,
     /// the reachability plane's coordination privacy (per-network operational
     /// policy). `Private` (the default) requires a genesis-issued `CoordCap`
     /// for a node outside the genesis validator set; `Public` accepts any
@@ -2107,14 +2003,7 @@ pub fn resolve(cfg_path: &Path) -> Result<Resolved, String> {
 }
 
 fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String> {
-    let duckdns_services = resolve_duckdns_services(&raw.duckdns)?;
-    let duckdns_ingress_listen = resolve_duckdns_ingress(&raw.duckdns)?;
-    reject_duckdns_admin_targets(
-        &duckdns_services,
-        duckdns_ingress_listen,
-        raw.http_listen.as_deref(),
-        raw.rpc_listen.as_deref(),
-    )?;
+    let duckdns_announcements = resolve_duckdns_services(&raw.duckdns)?;
     let descriptor_path = base.join(raw.network.as_deref().expect("checked by caller"));
     let descriptor = NetworkDescriptor::load(&descriptor_path)?;
     if descriptor.scheme != SCHEME_ED25519 {
@@ -2210,8 +2099,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         invite_fronts: load_invite_fronts(base)?,
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
-        duckdns_services,
-        duckdns_ingress_listen,
+        duckdns_announcements,
         coordination: descriptor.coordination(),
         // the reachability plane presents this on every coordinator request; a
         // genesis validator needs none (admitted by membership), a joiner is
@@ -2348,14 +2236,7 @@ fn resolve_advertised(
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
 /// bootstraps nobody; everyone else dials peer_seeds[0] at bootstrapper_addr.
 fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
-    let duckdns_services = resolve_duckdns_services(&raw.duckdns)?;
-    let duckdns_ingress_listen = resolve_duckdns_ingress(&raw.duckdns)?;
-    reject_duckdns_admin_targets(
-        &duckdns_services,
-        duckdns_ingress_listen,
-        raw.http_listen.as_deref(),
-        raw.rpc_listen.as_deref(),
-    )?;
+    let duckdns_announcements = resolve_duckdns_services(&raw.duckdns)?;
     let id = raw
         .id
         .ok_or("a dev-shape config needs `id` (or add `network = ...`)")?;
@@ -2455,8 +2336,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         invite_fronts: Vec::new(),
         sync_index: raw.sync_index.unwrap_or(false),
         announce_capabilities: raw.announce_capabilities.unwrap_or(true),
-        duckdns_services,
-        duckdns_ingress_listen,
+        duckdns_announcements,
         // the dev shape wires direct sockets only — no real coordinator, so
         // the coordination mode defaults to Private and no cap is presented.
         coordination: Coordination::Private,
@@ -3651,128 +3531,77 @@ mod tests {
     }
 
     #[test]
-    fn duckdns_services_parse_to_loopback_targets_without_consensus_addresses() {
+    fn duckdns_services_are_identity_only_declarations() {
         let raw: NodeToml = toml::from_str(
             r#"
                 listen = "127.0.0.1:1"
 
-                [duckdns]
-                ingress_listen = "127.77.0.1:0"
-
                 [[duckdns.services]]
-                scope = "user"
+                scope = "account"
                 handle = "orthory"
-                service = "blog"
-                target = "127.42.0.1:3000"
-                default_homepage = true
-                allow_cross_site = true
+                service = "huddle"
 
                 [[duckdns.services]]
                 scope = "network"
-                service = "docs"
-                [duckdns.services.duckfs]
-                prefix = "/shared/sites/docs"
-                snapshot = "abababababababababababababababababababababababababababababababab"
+                service = "search"
             "#,
         )
         .unwrap();
-        assert_eq!(
-            resolve_duckdns_ingress(&raw.duckdns).unwrap(),
-            Some("127.77.0.1:0".parse().unwrap())
-        );
         let services = resolve_duckdns_services(&raw.duckdns).unwrap();
         assert_eq!(services.len(), 2);
-        let blog = services
-            .iter()
-            .find(|service| service.announcement.service == "blog")
-            .unwrap();
-        assert_eq!(
-            blog.target,
-            duckdns_client::PublicationTarget::Loopback("127.42.0.1:3000".parse().unwrap())
-        );
-        assert!(blog.announcement.default_homepage);
-        assert!(blog.announcement.allow_cross_site);
-        assert!(matches!(
-            blog.announcement.scope,
-            duckdns::ServiceScope::User { ref handle } if handle == "orthory"
-        ));
-        let docs = services
-            .iter()
-            .find(|service| service.announcement.service == "docs")
-            .unwrap();
-        assert!(matches!(
-            &docs.target,
-            duckdns_client::PublicationTarget::DuckFs(site)
-                if site.prefix == "/shared/sites/docs"
-                    && site.index == "index.html"
-                    && site.snapshot.as_deref()
-                        == Some("abababababababababababababababababababababababababababababababab")
-        ));
-        let encoded = duckdns::encode_msg(&duckdns::DuckDnsMsg::ReplaceAnnouncements {
-            announcements: services
-                .iter()
-                .map(|service| service.announcement.clone())
-                .collect(),
-        });
-        let wire = String::from_utf8(encoded).unwrap();
-        assert!(!wire.contains("3000"));
-        assert!(!wire.contains("8080"));
-        assert!(!wire.contains("127.42.0.1"));
-        assert!(!wire.contains("/shared/sites/docs"));
+        assert!(services.iter().any(|announcement| {
+            announcement.service == "huddle"
+                && matches!(
+                    announcement.scope,
+                    duckdns::ServiceScope::Account { ref handle } if handle == "orthory"
+                )
+        }));
+        assert!(services.iter().any(|announcement| {
+            announcement.service == "search"
+                && announcement.scope == duckdns::ServiceScope::Network
+        }));
+
+        let wire = String::from_utf8(duckdns::encode_msg(
+            &duckdns::DuckDnsMsg::ReplaceAnnouncements {
+                announcements: services,
+            },
+        ))
+        .unwrap();
+        for transport_field in ["target", "duckfs", "port", "endpoint", "homepage"] {
+            assert!(
+                !wire.contains(transport_field),
+                "{transport_field} leaked into discovery"
+            );
+        }
     }
 
     #[test]
-    fn duckdns_services_fail_closed_on_unsafe_or_ambiguous_config() {
-        let invalid = [
-            (
-                "non-loopback",
-                r#"scope="network"
-                    service="docs"
-                    target="10.0.0.2:80""#,
-            ),
-            (
-                "hostname target",
-                r#"scope="network"
-                    service="docs"
-                    target="localhost:80""#,
-            ),
-            (
-                "port zero",
-                r#"scope="network"
-                    service="docs"
-                    target="127.0.0.1:0""#,
-            ),
+    fn duckdns_services_reject_ambiguous_or_legacy_web_config() {
+        for (case, service) in [
             (
                 "network handle",
                 r#"scope="network"
                     handle="orthory"
-                    service="docs"
-                    target="127.0.0.1:80""#,
+                    service="search""#,
             ),
             (
-                "missing user handle",
+                "missing account handle",
+                r#"scope="account"
+                    service="huddle""#,
+            ),
+            (
+                "legacy user scope",
                 r#"scope="user"
-                    service="docs"
-                    target="127.0.0.1:80""#,
+                    handle="orthory"
+                    service="huddle""#,
             ),
             (
                 "noncanonical label",
                 r#"scope="network"
-                    service="Docs"
-                    target="127.0.0.1:80""#,
+                    service="Search""#,
             ),
-            (
-                "network homepage",
-                r#"scope="network"
-                    service="docs"
-                    target="127.0.0.1:80"
-                    default_homepage=true"#,
-            ),
-        ];
-        for (case, service) in invalid {
-            let text = format!(
-                "listen=\"127.0.0.1:1\"\n[[duckdns.services]]\n{service}\n"
-            );
+        ] {
+            let text = format!("listen=\"127.0.0.1:1\"\n[[duckdns.services]]\n{service}\n");
             let raw: NodeToml = toml::from_str(&text).unwrap();
             assert!(
                 resolve_duckdns_services(&raw.duckdns).is_err(),
@@ -3785,66 +3614,41 @@ mod tests {
                 listen="127.0.0.1:1"
                 [[duckdns.services]]
                 scope="network"
-                service="docs"
-                target="127.0.0.1:80"
+                service="search"
                 [[duckdns.services]]
                 scope="network"
-                service="docs"
-                target="127.0.0.1:81"
+                service="search"
             "#,
         )
         .unwrap();
         assert!(resolve_duckdns_services(&duplicate.duckdns).is_err());
 
-        let two_homes: NodeToml = toml::from_str(
-            r#"
-                listen="127.0.0.1:1"
-                [[duckdns.services]]
-                scope="user"
-                handle="orthory"
-                service="one"
-                target="127.0.0.1:80"
-                default_homepage=true
-                [[duckdns.services]]
-                scope="user"
-                handle="orthory"
-                service="two"
-                target="127.0.0.1:81"
-                default_homepage=true
-            "#,
-        )
-        .unwrap();
-        assert!(resolve_duckdns_services(&two_homes.duckdns).is_err());
-
-        let unsafe_ingress: NodeToml = toml::from_str(
+        for legacy in [
             r#"
                 listen="127.0.0.1:1"
                 [duckdns]
-                ingress_listen="0.0.0.0:45804"
+                ingress_listen="127.0.0.1:45804"
             "#,
-        )
-        .unwrap();
-        assert!(resolve_duckdns_ingress(&unsafe_ingress.duckdns).is_err());
-
-        let admin_target: NodeToml = toml::from_str(
+            r#"
+                listen="127.0.0.1:1"
+                [[duckdns.services]]
+                scope="account"
+                handle="orthory"
+                service="huddle"
+                target="127.0.0.1:3000"
+            "#,
             r#"
                 listen="127.0.0.1:1"
                 [[duckdns.services]]
                 scope="network"
-                service="admin"
-                target="127.42.0.1:8844"
+                service="search"
+                [duckdns.services.duckfs]
+                prefix="/shared/site"
             "#,
-        )
-        .unwrap();
-        let publications = resolve_duckdns_services(&admin_target.duckdns).unwrap();
-        for (ingress, http, rpc) in [
-            (Some("127.77.0.1:8844".parse().unwrap()), None, None),
-            (None, Some("0.0.0.0:8844"), None),
-            (None, None, Some("[::1]:8844")),
         ] {
             assert!(
-                reject_duckdns_admin_targets(&publications, ingress, http, rpc).is_err(),
-                "accepted a Ducktape-owned administration port"
+                toml::from_str::<NodeToml>(legacy).is_err(),
+                "accepted retired HTTP publication config"
             );
         }
     }
@@ -3978,13 +3782,18 @@ mod tests {
     #[test]
     fn plumbing_merges_flags_over_existing_file_over_defaults() {
         let dir = tmp("plumbing");
-        // an existing DEV-shape file (the desktop app's solo config).
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:0\"\nnamespace = \"ducktape-local\"\npeer_seeds = [0]\nhttp_listen = \"127.0.0.1:8844\"\nstorage_dir = '/data/ducktape'\n\
-             [duckdns]\ningress_listen = \"127.0.0.1:8855\"\n\
-             [[duckdns.services]]\nscope = \"network\"\nservice = \"docs\"\n\
-             [duckdns.services.duckfs]\nprefix = \"/shared/sites/docs\"\n",
+            r#"id = 0
+listen = "127.0.0.1:0"
+namespace = "ducktape-local"
+peer_seeds = [0]
+http_listen = "127.0.0.1:8844"
+storage_dir = '/data/ducktape'
+[[duckdns.services]]
+scope = "network"
+service = "search"
+"#,
         )
         .expect("write");
         // one flag overrides ONLY its field; the http port AND a hand-edited
@@ -3998,13 +3807,11 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
         assert_eq!(p.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(p.storage_dir, "/data/ducktape");
-        assert_eq!(p.duckdns.ingress_listen.as_deref(), Some("127.0.0.1:8855"));
         assert_eq!(p.duckdns.services.len(), 1);
         assert!(p.rpc_listen.is_none());
         // and the merged write is network-shape.
@@ -4014,18 +3821,7 @@ mod tests {
         assert_eq!(raw.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(raw.listen, "127.0.0.1:53000");
         assert_eq!(raw.storage_dir.as_deref(), Some("/data/ducktape"));
-        assert_eq!(
-            raw.duckdns.ingress_listen.as_deref(),
-            Some("127.0.0.1:8855")
-        );
-        assert_eq!(raw.duckdns.services[0].service, "docs");
-        assert_eq!(
-            raw.duckdns.services[0]
-                .duckfs
-                .as_ref()
-                .map(|site| site.prefix.as_str()),
-            Some("/shared/sites/docs")
-        );
+        assert_eq!(raw.duckdns.services[0].service, "search");
     }
 
     #[test]
@@ -4041,14 +3837,13 @@ mod tests {
             Some("socket"),
             None,
             None,
-            None,
         )
         .expect("merge");
         assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
         write_node_toml(&dir, &p).expect("write");
 
         // no flag: the hand-settable value on disk survives a re-merge.
-        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None)
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None)
             .expect("re-merge");
         assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
 
@@ -4060,7 +3855,6 @@ mod tests {
             None,
             None,
             Some("tun"),
-            None,
             None,
             None,
         )
@@ -4075,7 +3869,6 @@ mod tests {
             None,
             None,
             Some("sokcet"),
-            None,
             None,
             None,
         )

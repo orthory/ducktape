@@ -1,0 +1,67 @@
+# ADR: DuckDNS Is Identity and Service Discovery
+
+Date: 2026-07-10. Status: **Accepted**.
+
+## Context
+
+The first DuckDNS implementation projected published HTTP services into the
+host DNS stack, returned loopback A/AAAA answers, installed a device root CA,
+terminated TLS, and proxied requests over an extra data-plane service. That
+made browser compatibility, privileged OS mutation, and local certificate-key
+custody part of the naming system itself.
+
+The durable capability Ducktape needs first is smaller: turn a human name into
+a stable account or logical service, then discover the eligible full NodeIds.
+Huddle counterparty discovery is the motivating example. State sync is not:
+it already derives its canonical peer set from the finalized valset/mesh view,
+and routing it through a second directory would create competing authority.
+
+## Decision
+
+DuckDNS is an internal, typed control-plane resolver. `.duck` is presentation
+syntax understood by Ducktape; it is not installed into the OS resolver and it
+does not return IP addresses.
+
+The supported names are:
+
+- `<account>.duck` → the stable AccountId and its currently eligible NodeIds;
+- `<service>.<account>.duck` → NodeIds of that account which declared the
+  logical service;
+- `<service>.<chain>.net.duck` → an eligible network-wide provider pool;
+- `<service>.<node>.<chain>.net.duck` → one pinned provider.
+
+`net` is reserved directly below `.duck`; it can never be claimed as an
+account handle.
+
+Consensus owns durable authority only: handle ownership, logical service
+declarations, provider NodeIds, account binding, and membership eligibility.
+It stores no endpoint, port, health, protocol configuration, filesystem path,
+or local target. Resolution returns full NodeIds; short node labels are display
+and routing syntax, never authentication identities.
+
+The connection sequence is deliberately layered:
+
+1. DuckDNS resolves a name to AccountId/service identity and eligible NodeIds.
+2. Reachability resolves a selected NodeId to a fresh, signed locator.
+3. The consumer opens its existing purpose-specific data plane and applies its
+   own admission policy.
+
+For Huddle, `huddle.alice.duck` is therefore a convenient counterparty lookup,
+not a media endpoint. Voice/video continue to use their existing data-plane
+services. Protocols such as state sync which already know their authoritative
+peer set do not use DuckDNS.
+
+## Consequences
+
+- `duckdnsd`, split-DNS installers, the local CA, TLS termination, browser
+  proxying, DuckFS web publication, and the DuckDNS Web data-plane service are
+  removed.
+- The desktop has no DuckDNS installation setting, helper sidecar, privileged
+  operation, or per-workspace ingress port.
+- Node configuration can declare only `scope`, `handle` (for account scope),
+  and `service`. Retired HTTP fields are rejected rather than ignored.
+- Provider liveness is not consensus truth. A resolved provider can be offline;
+  reachability and the calling feature decide freshness, selection, and retry.
+- A future public-DNS or browser adapter may project these records, but it must
+  remain an adapter. It cannot become the authority or weaken the typed
+  AccountId/NodeId result.

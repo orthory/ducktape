@@ -6,7 +6,7 @@ fn main() {
     // beforeBuildCommand runs scripts/prepare-sidecar.sh, which overwrites it.
     let triple = std::env::var("TARGET").expect("cargo sets TARGET");
     let executable_suffix = if triple.contains("windows") { ".exe" } else { "" };
-    for binary in ["ducktape-node", "duckdnsd"] {
+    for binary in ["ducktape-node"] {
         let path = std::path::PathBuf::from(format!(
             "binaries/{binary}-{triple}{executable_suffix}"
         ));

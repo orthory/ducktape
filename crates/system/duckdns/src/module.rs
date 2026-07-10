@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
 
 use duckdns_core::{
-    DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply, NODE_KEY_LEN, Registry, ResolvedService,
-    ServiceScope, decode_msg, decode_query, encode_reply, validate_handle,
+    DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply, NODE_KEY_LEN, Registry, ResolvedAccount,
+    ResolvedName, ResolvedNode, ResolvedService, ServiceAuthority, ServiceScope, decode_msg,
+    decode_query, encode_reply, node_label, validate_handle,
 };
 use identity::{
-    IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
+    AccountView, IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
     encode_query as identity_encode_query,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
@@ -130,22 +131,81 @@ impl DuckDns {
         }
     }
 
+    async fn account_by_id(
+        &self,
+        ctx: &dyn Ctx,
+        account_id: &[u8],
+    ) -> Result<Option<AccountView>, Error> {
+        match identity_decode_reply(
+            &ctx.query(
+                &self.identity_id,
+                &identity_encode_query(&IdentityQuery::Get {
+                    account_id: account_id.to_vec(),
+                }),
+            )
+            .await?,
+        )
+        .map_err(Error::Module)?
+        {
+            IdentityReply::Account(account) => Ok(account),
+            other => Err(Error::Module(format!(
+                "duckdns: identity answered Get with {other:?}"
+            ))),
+        }
+    }
+
     async fn require_account(&self, ctx: &dyn Ctx, node: &[u8]) -> Result<Vec<u8>, Error> {
         self.account_of_node(ctx, node).await?.ok_or_else(|| {
             Error::Module("duckdns: origin is not bound to an identity account".into())
         })
     }
 
-    async fn filter_resolution(
+    async fn resolve_account(
+        &self,
+        ctx: &dyn Ctx,
+        handle: &str,
+    ) -> Result<Option<ResolvedAccount>, Error> {
+        let Some(account_id) = self.registry.handle_owner(handle).map(<[u8]>::to_vec) else {
+            return Ok(None);
+        };
+        let Some(account) = self.account_by_id(ctx, &account_id).await? else {
+            return Ok(None);
+        };
+        if account.account_id != account_id {
+            return Err(Error::Module(
+                "duckdns: identity returned a mismatched account id".into(),
+            ));
+        }
+        let standing = self.members(ctx).await?;
+        let mut nodes = Vec::with_capacity(account.nodes.len());
+        for node in account.nodes {
+            if standing
+                .as_ref()
+                .is_some_and(|members| !members.contains(&node))
+            {
+                continue;
+            }
+            let label = node_label(&node).map_err(Error::Module)?;
+            nodes.push(ResolvedNode {
+                node,
+                node_label: label,
+            });
+        }
+        nodes.sort_by(|a, b| a.node.cmp(&b.node));
+        nodes.dedup_by(|a, b| a.node == b.node);
+        Ok(Some(ResolvedAccount { account_id, nodes }))
+    }
+
+    async fn filter_service_resolution(
         &self,
         ctx: &dyn Ctx,
         name: &DuckDnsName,
         mut resolved: ResolvedService,
     ) -> Result<Option<ResolvedService>, Error> {
         let standing = self.members(ctx).await?;
-        let owner = match &resolved.identity.scope {
-            ServiceScope::User { handle } => self.registry.handle_owner(handle).map(<[u8]>::to_vec),
-            ServiceScope::Network => None,
+        let owner = match &resolved.authority {
+            ServiceAuthority::Account { account_id } => Some(account_id),
+            ServiceAuthority::Network => None,
         };
 
         let mut providers = Vec::with_capacity(resolved.providers.len());
@@ -156,7 +216,7 @@ impl DuckDns {
             {
                 continue;
             }
-            if let Some(owner) = &owner
+            if let Some(owner) = owner
                 && self.account_of_node(ctx, &provider.node).await?.as_ref() != Some(owner)
             {
                 continue;
@@ -179,7 +239,7 @@ impl DuckDns {
 
     fn query_state(&self, query: DuckDnsQuery) -> Result<Vec<u8>, Error> {
         match query {
-            DuckDnsQuery::Resolve { .. } | DuckDnsQuery::Namespace => Err(Error::Module(
+            DuckDnsQuery::Resolve { .. } => Err(Error::Module(
                 "duckdns: resolution requires a host query context".into(),
             )),
             DuckDnsQuery::HandleOwner { handle } => {
@@ -228,7 +288,7 @@ impl Module for DuckDns {
             DuckDnsMsg::ReplaceAnnouncements { announcements } => {
                 let needs_account = announcements
                     .iter()
-                    .any(|announcement| matches!(announcement.scope, ServiceScope::User { .. }));
+                    .any(|announcement| matches!(announcement.scope, ServiceScope::Account { .. }));
                 let account = if needs_account {
                     Some(self.require_account(ctx, &node).await?)
                 } else {
@@ -248,26 +308,25 @@ impl Module for DuckDns {
     async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             DuckDnsQuery::Resolve { name } => {
-                let resolved = match self.registry.resolve(&name).map_err(Error::Module)? {
-                    Some(resolved) => self.filter_resolution(ctx, &name, resolved).await?,
-                    None => None,
+                name.validate().map_err(Error::Module)?;
+                let resolved = match &name {
+                    DuckDnsName::Account { handle } => self
+                        .resolve_account(ctx, handle)
+                        .await?
+                        .map(ResolvedName::Account),
+                    _ => match self
+                        .registry
+                        .resolve_service(&name)
+                        .map_err(Error::Module)?
+                    {
+                        Some(resolved) => self
+                            .filter_service_resolution(ctx, &name, resolved)
+                            .await?
+                            .map(ResolvedName::Service),
+                        None => None,
+                    },
                 };
                 Ok(encode_reply(&DuckDnsReply::Resolved(resolved)))
-            }
-            DuckDnsQuery::Namespace => {
-                let mut names = Vec::new();
-                for name in self.registry.namespace_names() {
-                    let resolved = match self.registry.resolve(&name).map_err(Error::Module)? {
-                        Some(resolved) => self.filter_resolution(ctx, &name, resolved).await?,
-                        None => None,
-                    };
-                    if resolved.is_some() {
-                        names.push(name.hostname());
-                    }
-                }
-                names.sort();
-                names.dedup();
-                Ok(encode_reply(&DuckDnsReply::Namespace(names)))
             }
             query => self.query_state(query),
         }

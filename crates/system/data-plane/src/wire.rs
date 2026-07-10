@@ -204,12 +204,10 @@ mod tests {
             (Service::StateSync, 1u8),
             (Service::Voice, 2u8),
             (Service::Video, 3u8),
-            (Service::Web, 4u8),
         ] {
             assert_eq!(service as u8, id);
             assert_eq!(Service::try_from(id), Ok(service));
         }
-        assert_eq!(Service::Web.overlay_stream_port(), 45804);
-        assert_eq!(Service::try_from(5u8), Err(5u8));
+        assert_eq!(Service::try_from(4u8), Err(4u8));
     }
 }

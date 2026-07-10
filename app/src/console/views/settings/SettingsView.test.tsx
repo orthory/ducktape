@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 
@@ -110,47 +110,6 @@ describe("SettingsView", () => {
     renderSettings();
     await Promise.resolve();
     expect(invokeMock).not.toHaveBeenCalled();
-  });
-
-  it("offers explicit native DuckDNS install and reports the resulting state", async () => {
-    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
-    let installed = false;
-    invokeMock.mockImplementation((command: string) => {
-      if (command === "duckdns_status") {
-        return Promise.resolve({
-          installed,
-          installation: {
-            installed,
-            healthy: installed,
-            installation_id: installed ? "ab".repeat(16) : null,
-            problems: [],
-          },
-          snapshot: installed ? { state: "inactive" } : null,
-          error: null,
-        });
-      }
-      if (command === "duckdns_install") {
-        installed = true;
-        return Promise.resolve({
-          installation: {
-            installed: true,
-            healthy: true,
-            installation_id: "ab".repeat(16),
-            problems: [],
-          },
-          warnings: [],
-        });
-      }
-      return Promise.reject(new Error(`unexpected command ${command}`));
-    });
-
-    renderSettings();
-    expect(await screen.findByText(/\.duck access — Not installed/i)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /install duckdns/i }));
-    await waitFor(() =>
-      expect(screen.getByText(/\.duck access — Installed/i)).toBeInTheDocument(),
-    );
-    expect(invokeMock).toHaveBeenCalledWith("duckdns_install");
   });
 
   it("links into the module views that own membership and the daemon", () => {

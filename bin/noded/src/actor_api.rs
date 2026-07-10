@@ -26,13 +26,12 @@ use crate::{BlockSummary, DEFAULT_ORIGIN, NodeCommand, NodeHandle};
 
 /// a `NodeApi` bound to one node's actor lane. cheap to clone (holds only the
 /// command-channel handle); a fresh one is made per workspace request.
-#[derive(Clone)]
-pub struct ActorNodeApi {
+pub(crate) struct ActorNodeApi {
     handle: NodeHandle,
 }
 
 impl ActorNodeApi {
-    pub fn new(handle: NodeHandle) -> Self {
+    pub(crate) fn new(handle: NodeHandle) -> Self {
         ActorNodeApi { handle }
     }
 

@@ -4,32 +4,32 @@ use duckdns_core::{
 };
 
 #[test]
-fn parses_every_hostname_form_and_renders_canonically() {
+fn parses_every_name_form_and_renders_canonically() {
     let cases = [
         (
             "orthory.duck",
-            DuckDnsName::User {
+            DuckDnsName::Account {
                 handle: "orthory".into(),
             },
         ),
         (
-            "blog.orthory.duck",
-            DuckDnsName::UserService {
-                service: "blog".into(),
+            "huddle.orthory.duck",
+            DuckDnsName::AccountService {
+                service: "huddle".into(),
                 handle: "orthory".into(),
             },
         ),
         (
-            "docs.team-a1b2c3d4.net.duck",
+            "search.team-a1b2c3d4.net.duck",
             DuckDnsName::NetworkService {
-                service: "docs".into(),
+                service: "search".into(),
                 chain: "team-a1b2c3d4".into(),
             },
         ),
         (
-            "docs.n-ab12cd34ef56.team-a1b2c3d4.net.duck",
+            "search.n-ab12cd34ef56.team-a1b2c3d4.net.duck",
             DuckDnsName::NodeService {
-                service: "docs".into(),
+                service: "search".into(),
                 node: "n-ab12cd34ef56".into(),
                 chain: "team-a1b2c3d4".into(),
             },
@@ -44,43 +44,39 @@ fn parses_every_hostname_form_and_renders_canonically() {
 
 #[test]
 fn lookup_normalizes_dns_case_and_one_trailing_dot() {
-    let parsed = parse_hostname("BLOG.Orthory.Duck.").unwrap();
+    let parsed = parse_hostname("HUDDLE.Orthory.Duck.").unwrap();
     assert_eq!(
         parsed,
-        DuckDnsName::UserService {
-            service: "blog".into(),
+        DuckDnsName::AccountService {
+            service: "huddle".into(),
             handle: "orthory".into(),
         }
     );
-    assert_eq!(parsed.hostname(), "blog.orthory.duck");
+    assert_eq!(parsed.hostname(), "huddle.orthory.duck");
 }
 
 #[test]
-fn derives_readable_chain_and_node_labels() {
+fn chain_and_node_labels_are_deterministic() {
     assert_eq!(
-        derive_chain_label("Team A#A1B2C3D4").unwrap(),
-        "team-a-a1b2c3d4"
+        derive_chain_label("Research Team#A1B2C3D4").unwrap(),
+        "research-team-a1b2c3d4"
     );
-    assert_eq!(
-        derive_chain_label("team#a1b2c3d4").unwrap(),
-        "team-a1b2c3d4"
-    );
-    let mut node = [0u8; 32];
-    node[..6].copy_from_slice(&[0xab, 0x12, 0xcd, 0x34, 0xef, 0x56]);
-    assert_eq!(node_label(&node).unwrap(), "n-ab12cd34ef56");
-
-    let long = format!("{}#deadbeef", "A".repeat(100));
+    let long = format!("{}#12345678", "a".repeat(100));
     let label = derive_chain_label(&long).unwrap();
     assert_eq!(label.len(), 63);
-    assert!(label.ends_with("-deadbeef"));
+    assert!(label.ends_with("-12345678"));
+
+    let node: Vec<u8> = (0..32).collect();
+    assert_eq!(node_label(&node).unwrap(), "n-000102030405");
+    assert!(node_label(&node[..31]).is_err());
 }
 
 #[test]
-fn one_strict_label_rule_and_reserved_handle_are_enforced() {
+fn strict_labels_and_reserved_roots_are_enforced() {
     for valid in ["a", "abc-123", &"z".repeat(63)] {
         validate_label(valid).unwrap();
     }
-    for invalid in ["", "UPPER", "under_score", "-start", "end-", "two.words"] {
+    for invalid in ["", "-a", "a-", "A", "a_b", "a.b", "döcs"] {
         assert!(validate_label(invalid).is_err(), "accepted {invalid:?}");
     }
     assert!(validate_label(&"z".repeat(64)).is_err());
@@ -89,15 +85,15 @@ fn one_strict_label_rule_and_reserved_handle_are_enforced() {
 }
 
 #[test]
-fn malformed_or_ambiguous_hostnames_reject() {
+fn malformed_or_ambiguous_names_reject() {
     for hostname in [
         "orthory.example",
         "net.duck",
-        "docs..orthory.duck",
-        "docs.orthory.duck..",
-        "docs.n-xyz.team-a1b2c3d4.net.duck",
-        "too.many.labels.for.user.duck",
-        " docs.orthory.duck",
+        "huddle..orthory.duck",
+        "huddle.orthory.duck..",
+        "search.n-xyz.team-a1b2c3d4.net.duck",
+        "too.many.labels.for.account.duck",
+        " huddle.orthory.duck",
         "döcs.orthory.duck",
     ] {
         assert!(parse_hostname(hostname).is_err(), "accepted {hostname:?}");
@@ -108,5 +104,4 @@ fn malformed_or_ambiguous_hostnames_reject() {
             "accepted {chain_id:?}"
         );
     }
-    assert!(node_label(&[0; 31]).is_err());
 }

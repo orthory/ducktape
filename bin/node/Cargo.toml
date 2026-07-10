@@ -46,7 +46,6 @@ vaults = { workspace = true }
 profiles = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
-duckdns-client = { workspace = true }
 duckdns-node = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
@@ -139,9 +138,6 @@ commonware-parallel = { workspace = true }
 # the phase-3 proof: duckfs_client_e2e drives the checkout/commit engine (as a
 # library, over each node's real http surface) across a two-validator cluster.
 duckfs-client = { workspace = true }
-# duckdns_e2e drives a real remote WebSocket publication through the HTTP
-# ingress and userspace overlay; the target/client stay test-local.
-tungstenite = "0.24"
 # coordinated_invite_cli seeds a signed mesh-state.json so `invite` bundles
 # member fronts, building the persisted adverts with the same crates the node
 # already depends on (reachability::store + wireguard-upgrade advert types +
