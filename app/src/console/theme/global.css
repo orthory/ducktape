@@ -7,6 +7,71 @@
   box-sizing: border-box;
 }
 
+/* Theme palette. Every token in theme/tokens.ts reads one of these vars, so
+   flipping `data-theme` on <html> (DucktapeProvider) re-skins the whole app.
+   Light values here MUST match the token fallbacks in tokens.ts. */
+:root {
+  --c-ink: #2c2b27;
+  --c-ink-soft: #3f3e39;
+  --c-ink-softer: #4a4843;
+  --c-muted: #878787;
+  --c-muted2: #a1a1a1;
+  --c-muted3: #676767;
+  --c-icon-idle: #c5c5c5;
+  --c-paper: #ffffff;
+  --c-sidebar: #f9f9f9;
+  --c-titlebar: #f1f1f1;
+  --c-hover: #ededed;
+  --c-sunken: #f5f5f5;
+  --c-panel: #efefef;
+  --c-window-border: #d1d1d1;
+  --c-border: #e5e5e5;
+  --c-border-soft: #ececec;
+  --c-border-strong: #d6d6d6;
+  --c-chip: #e3e3e3;
+  --c-filled: #26251f;
+  --c-on-filled: #efefef;
+  --c-green: #5cb45f;
+  --c-amber: #c08a3e;
+  --c-blue: #5f7a9e;
+  --c-red: #a35248;
+  --c-purple: #7a6f9e;
+  --c-danger: #c0483c;
+  --c-danger-soft: #faf1ef;
+  --c-danger-border: #eccbc5;
+}
+
+:root[data-theme="dark"] {
+  --c-ink: #eceae4;
+  --c-ink-soft: #d4d2cb;
+  --c-ink-softer: #bfbdb5;
+  --c-muted: #918f88;
+  --c-muted2: #726f69;
+  --c-muted3: #a7a49d;
+  --c-icon-idle: #5b5952;
+  --c-paper: #1b1a17;
+  --c-sidebar: #201f1b;
+  --c-titlebar: #24231f;
+  --c-hover: #2b2a25;
+  --c-sunken: #151410;
+  --c-panel: #26251f;
+  --c-window-border: #34332d;
+  --c-border: #2e2d27;
+  --c-border-soft: #292823;
+  --c-border-strong: #3b3a33;
+  --c-chip: #323029;
+  --c-filled: #ecebe5;
+  --c-on-filled: #1b1a17;
+  --c-green: #6cc06f;
+  --c-amber: #d3a25c;
+  --c-blue: #7f9bc4;
+  --c-red: #cf6d61;
+  --c-purple: #9a8fc4;
+  --c-danger: #d4655a;
+  --c-danger-soft: #2c1c19;
+  --c-danger-border: #4c302b;
+}
+
 html,
 body,
 #root {
@@ -16,7 +81,8 @@ body,
 
 body {
   font-family: "Geist Sans", "IBM Plex Sans KR", system-ui, -apple-system, sans-serif;
-  color: #2c2b27;
+  color: var(--c-ink);
+  background: var(--c-paper);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
@@ -63,13 +129,13 @@ button:focus-visible,
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #d7d7d7;
+  background: var(--c-border-strong);
   border-radius: 6px;
   border: 3px solid transparent;
   background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #c3c3c3;
+  background: var(--c-icon-idle);
   background-clip: content-box;
 }
 
