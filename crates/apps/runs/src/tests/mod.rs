@@ -53,6 +53,9 @@ struct CaptureCtx {
     /// saga_id -> the winning attempt's lease holder, served by the "saga"
     /// Get arm as a Done saga (the sink's executing-node attribution).
     saga_assignees: BTreeMap<String, Vec<u8>>,
+    /// page_id -> the whole page in preorder, served by the "pages" GetPage
+    /// arm (the M2 `[[page:<id>]]` injection lane).
+    pages: BTreeMap<String, Vec<pages::Block>>,
     /// the committed duckfs head served by the "files" Refs arm — the v3
     /// composer's `source_snapshot` pin. `None` = a fresh network (null pin).
     files_head: Option<String>,
@@ -79,6 +82,7 @@ impl CaptureCtx {
             forge_refs: BTreeMap::new(),
             forge_items: BTreeMap::new(),
             saga_assignees: BTreeMap::new(),
+            pages: BTreeMap::new(),
             files_head: None,
             msgs: Vec::new(),
             effects: Vec::new(),
@@ -115,6 +119,12 @@ impl CaptureCtx {
     /// the "saga" Get arm (the sink's executing-node attribution).
     fn with_saga_assignee(mut self, saga_id: &str, key: &[u8]) -> Self {
         self.saga_assignees.insert(saga_id.into(), key.to_vec());
+        self
+    }
+    /// register a committed page (whole preorder Vec, root first) served by
+    /// the "pages" GetPage arm.
+    fn with_page(mut self, page_id: &str, blocks: Vec<pages::Block>) -> Self {
+        self.pages.insert(page_id.into(), blocks);
         self
     }
     /// set the committed duckfs head the "files" Refs arm serves (the v3
@@ -337,6 +347,12 @@ impl Ctx for CaptureCtx {
                         .collect();
                     Ok(forge::encode_reply(&forge::ForgeReply::Items(items)))
                 }
+                _ => Err(Error::QueryUnsupported),
+            },
+            "pages" => match pages::decode_query(req).map_err(Error::Module)? {
+                pages::PageQuery::GetPage { page_id } => Ok(pages::encode_reply(
+                    &pages::PageReply::Page(self.pages.get(&page_id).cloned()),
+                )),
                 _ => Err(Error::QueryUnsupported),
             },
             "saga" => match saga::decode_query(req).map_err(Error::Module)? {
@@ -604,9 +620,37 @@ fn forge_read_registry() -> Registry {
     r
 }
 
-/// the forge-lane module: forge + files wired (the production wiring).
+/// the forge-lane module: forge + files + pages wired (the production wiring).
 fn forge_module() -> RunsModule {
-    module().with_sink_forge("forge").with_files_module("files")
+    module()
+        .with_sink_forge("forge")
+        .with_files_module("files")
+        .with_pages_module("pages")
+}
+
+/// a committed page in preorder as the "pages" GetPage arm serves it: the
+/// root (title), a paragraph, and one unchecked todo — enough surface for
+/// the injection assertions. the root names itself as `page`.
+fn page_blocks(page_id: &str, title: &str) -> Vec<pages::Block> {
+    let block = |id: &str, parent: Option<&str>, kind, text: &str| pages::Block {
+        id: id.into(),
+        parent: parent.map(str::to_string),
+        page: page_id.into(),
+        kind,
+        text: text.into(),
+        checked: false,
+        children: Vec::new(),
+    };
+    vec![
+        block(page_id, None, pages::BlockKind::Page, title),
+        block(
+            "b-p",
+            Some(page_id),
+            pages::BlockKind::Paragraph,
+            "spec paragraph",
+        ),
+        block("b-t", Some(page_id), pages::BlockKind::Todo, "do the thing"),
+    ]
 }
 
 /// a committed module with one watch on "general" under `policy`. the

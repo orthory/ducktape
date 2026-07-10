@@ -4,7 +4,7 @@ use super::{
     MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule, SagaOrigin, WireSink,
     agent_decode_reply, agent_encode_query, chat_decode_reply, chat_encode_query,
     dispatch_decode_reply, dispatch_encode_msg, dispatch_encode_query, dispatch_id_for, envelope,
-    files_decode_reply, files_encode_query, recipe_id_for,
+    files_decode_reply, files_encode_query, inject, recipe_id_for,
 };
 
 impl RunsModule {
@@ -209,10 +209,30 @@ impl RunsModule {
         anchor_seq: u64,
     ) -> Result<PreparedDispatch, String> {
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
-        let portable = match super::forge_source::parse_forge_channel(channel_id) {
+        let mut portable = match super::forge_source::parse_forge_channel(channel_id) {
             Some(item_ref) => Some(self.forge_portable_inputs(ctx, agent, &item_ref).await?),
             None => self.portable_inputs(ctx, agent).await?,
         };
+        // M2: `[[page:<id>]]` refs in the trigger message text or the injected
+        // item body render referenced page subtrees into the same context
+        // section — resolved from COMMITTED pages state at compose height,
+        // appended after the M1 item context (which stays untouched).
+        if let Some(inputs) = portable.as_mut() {
+            let anchor_text = transcript
+                .last()
+                .map(inject::message_text)
+                .unwrap_or_default();
+            let mut sources = vec![anchor_text.as_str()];
+            if let Some(item) = inputs.context.as_deref() {
+                sources.push(item);
+            }
+            if let Some(section) = self.page_context(ctx, &sources).await {
+                inputs.context = Some(match inputs.context.take() {
+                    Some(item) => format!("{item}\n\n{section}"),
+                    None => section,
+                });
+            }
+        }
         let payload = envelope::render_payload(
             &self.id,
             agent,
