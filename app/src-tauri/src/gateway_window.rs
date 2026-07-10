@@ -1,9 +1,10 @@
-//! Capability-free native window for executable gateway content.
+//! Capability-free surfaces for executable gateway content.
 //!
-//! Tauri cannot distinguish iframe IPC from main-frame IPC on Linux, so
-//! publisher content must never share the privileged `main` WebView. This
-//! window label matches no capability and navigation stays pinned to one
-//! random, short-lived gateway-session origin.
+//! Publisher content never shares the privileged `main` webview: it renders in
+//! its own capability-free webview — inline in the Browser pane (a multiwebview
+//! child, the default) or a separate window (pop-out). On the CEF runtime each
+//! surface is its own renderer process, and navigation stays pinned to one
+//! random, short-lived gateway-session origin either way.
 
 use tauri::webview::{NewWindowResponse, WebviewWindowBuilder};
 use tauri::{Manager as _, WebviewUrl};
@@ -93,6 +94,128 @@ pub fn gateway_open_window(
         .build()
         .map_err(|error| format!("open isolated gateway window: {error}"))?;
     Ok(())
+}
+
+/// Browser-pane rect in main-window logical px, reported by the UI.
+#[derive(serde::Deserialize)]
+pub struct InlineRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+const INLINE_LABEL: &str = "gateway-inline";
+
+/// Whether this shell embeds gateway content inline in the Browser pane.
+/// Always true on the CEF runtime: every gateway session runs in its own
+/// renderer process and the `gateway-inline` label matches no capability, so
+/// an embedded child webview is exactly as isolated as the separate window.
+/// (The command stays so the web build's client can probe and fall back.)
+#[tauri::command]
+pub fn gateway_inline_supported() -> bool {
+    true
+}
+
+/// Open (or re-navigate) the inline gateway child webview at `rect`.
+/// Same validation and guards as `gateway_open_window`, same single-surface
+/// rule: opening inline closes any separate gateway window, and vice versa.
+#[tauri::command]
+pub fn gateway_open_inline(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    url: String,
+    rect: InlineRect,
+) -> Result<(), String> {
+    use tauri::{LogicalPosition, LogicalSize, Manager as _};
+
+    crate::daemon::require_main_window(&window)?;
+    let (url, _token) = validate_session_url(&url)?;
+
+    // One executable publisher surface at a time (mirrors gateway_open_window).
+    for (label, existing) in app.webview_windows() {
+        if label.starts_with(WINDOW_PREFIX) {
+            existing
+                .close()
+                .map_err(|error| format!("close old gateway window: {error}"))?;
+        }
+    }
+
+    let position = LogicalPosition::new(rect.x, rect.y);
+    let size = LogicalSize::new(rect.width, rect.height);
+    if let Some(existing) = app.get_webview(INLINE_LABEL) {
+        existing
+            .navigate(url)
+            .map_err(|error| format!("navigate inline gateway view: {error}"))?;
+        return place_inline_webview(&existing, position, size);
+    }
+
+    let allowed_host = url.host_str().expect("validated host").to_string();
+    let allowed_port = url.port().expect("validated port");
+    let builder = tauri::webview::WebviewBuilder::new(INLINE_LABEL, WebviewUrl::External(url))
+        .incognito(true)
+        .devtools(false)
+        .on_navigation(move |candidate| {
+            candidate.scheme() == "http"
+                && candidate.host_str() == Some(allowed_host.as_str())
+                && candidate.port() == Some(allowed_port)
+                && candidate.username().is_empty()
+                && candidate.password().is_none()
+        })
+        .on_new_window(|_, _| NewWindowResponse::Deny)
+        .on_download(|_, _| false);
+    window
+        .as_ref()
+        .window()
+        .add_child(builder, position, size)
+        .map_err(|error| format!("open inline gateway view: {error}"))?;
+    Ok(())
+}
+
+/// Track the Browser pane as it resizes (ResizeObserver on the UI side).
+#[tauri::command]
+pub fn gateway_inline_place(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    rect: InlineRect,
+) -> Result<(), String> {
+    use tauri::{LogicalPosition, LogicalSize, Manager as _};
+
+    crate::daemon::require_main_window(&window)?;
+    let Some(existing) = app.get_webview(INLINE_LABEL) else {
+        return Ok(()); // already closed — a late resize is not an error
+    };
+    place_inline_webview(
+        &existing,
+        LogicalPosition::new(rect.x, rect.y),
+        LogicalSize::new(rect.width, rect.height),
+    )
+}
+
+/// Close the inline gateway view (idempotent) — navigation away, view switch,
+/// or the pop-out-to-window control.
+#[tauri::command]
+pub fn gateway_inline_close(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager as _;
+    if let Some(existing) = app.get_webview(INLINE_LABEL) {
+        existing
+            .close()
+            .map_err(|error| format!("close inline gateway view: {error}"))?;
+    }
+    Ok(())
+}
+
+fn place_inline_webview(
+    webview: &tauri::Webview,
+    position: tauri::LogicalPosition<f64>,
+    size: tauri::LogicalSize<f64>,
+) -> Result<(), String> {
+    webview
+        .set_bounds(tauri::Rect {
+            position: position.into(),
+            size: size.into(),
+        })
+        .map_err(|error| format!("place inline gateway view: {error}"))
 }
 
 #[cfg(test)]
