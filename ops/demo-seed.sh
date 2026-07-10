@@ -145,7 +145,7 @@ submit automations '{"create_rule":{"rule_id":"deploy-watch","trigger":{"message
 # this node, stages the static site into DuckFS, and signs + submits both routes:
 #   • site — a NETWORK-hosted static app, served from DuckFS by consensus
 #   • app  — a USER-hosted app the gateway proxies to a node-local server
-python3 "$SCRIPT_DIR/demo-gateway.py" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" \
+python3 "$SCRIPT_DIR/demo-gateway.py" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID" \
   || die "gateway route publish failed"
 
 log "seeded $N ops + 2 gateway web-app routes across pages, chat, tasks, agent, runs, jobs, inbox, automations, files, gateway"
@@ -158,8 +158,9 @@ cat <<EOF
 $(printf '\033[32m[demo-seed] done.\033[0m')
 Open the Ducktape app and it boots into the "$ID" workspace, preloaded.
 
-Gateway routes published on this node:
-  • site — network-hosted static web app (served from DuckFS)
-  • app  — user-hosted web app (proxied to a node-local server; run one on the
-           node's loopback to serve it)
+Gateway web apps published on this node (open in the app's browser):
+  • site.$ID.duck — network-hosted static web app, served from DuckFS. Works now.
+  • app.$ID.duck  — user-hosted web app. The route is published, but a
+                    user-hosted app is just that: run \`make demo-app\` to serve it
+                    on the node's loopback, then it's live.
 EOF

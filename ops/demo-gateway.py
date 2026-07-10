@@ -13,11 +13,12 @@ This reuses the node's OWN signing CLIs (`user-sign-bind`, `user-sign-gateway-
 route`) and the frameless /v1/submit lane, which stamps the node's validator key
 as the op origin — so the local daemon publishes as itself, exactly as the app does.
 
-Usage: demo-gateway.py <http-url> <node-bin> <workdir> <chain-id>
+Usage: demo-gateway.py <http-url> <node-bin> <workdir> <chain-id> [handle]
 """
-import base64, hashlib, json, subprocess, sys, urllib.error, urllib.request
+import base64, hashlib, json, re, subprocess, sys, urllib.error, urllib.request
 
 URL, NODE_BIN, WORKDIR, CHAIN = sys.argv[1:5]
+HANDLE = sys.argv[5] if len(sys.argv) > 5 else "demo"
 USER_KEY = f"{WORKDIR}/user.key"
 
 INDEX_HTML = """<!doctype html>
@@ -72,6 +73,16 @@ bind = json.loads(sign(["user-sign-bind", "--key", USER_KEY, "--chain-id", CHAIN
 account_id = bind["bind_node"]["authorizer"]["key"]   # list[int] — also the account id
 submit("identity", bind)
 
+# 2b. give the account a human handle so its routes get a resolvable .duck
+#     address (site.<handle>.duck / app.<handle>.duck). Origin is the bound node,
+#     so DuckDNS attaches the handle to this account. Skipped if the id isn't a
+#     legal DNS label (DuckDNS handles are lowercase [a-z0-9-], not "net").
+if re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?", HANDLE) and HANDLE != "net":
+    submit("duckdns", {"set_handle": {"handle": HANDLE}})
+else:
+    HANDLE = None
+    print(f"[gateway] skipped .duck handle (workspace id is not a legal DNS label)")
+
 # 3. stage the static site into the node's DuckFS gateway root for route "site":
 #    /home/ext:<node>/.duck/gateway/<route>/<file> — where serve_duckfs reads it.
 site = {"index.html": ("text/html", INDEX_HTML), "style.css": ("text/css", STYLE_CSS)}
@@ -116,5 +127,10 @@ publish({"version": 1, "chain_id": CHAIN, "account_id": account_id,
                               "allow_authorization": True}}})
 
 routes = query("gateway", {"list": {"account_id": account_id}})
-print(f"[gateway] account {bytes(account_id).hex()[:12]}… published "
-      f"{len(routes.get('routes', []))} routes: site (DuckFS static), app (loopback)")
+n = len(routes.get("routes", []))
+if HANDLE:
+    print(f"[gateway] published {n} routes on {HANDLE}.duck: "
+          f"site.{HANDLE}.duck (DuckFS static), app.{HANDLE}.duck (loopback)")
+else:
+    print(f"[gateway] published {n} routes on account {bytes(account_id).hex()[:12]}… "
+          f"(no .duck handle — reach them via the Gateway view)")
