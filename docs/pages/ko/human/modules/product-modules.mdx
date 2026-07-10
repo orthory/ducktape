@@ -29,8 +29,10 @@ product module은 platform이 호스팅하는 업무용 surface다. 같은 modul
 - `files`는 duckfs다: consensus-replicated, copy-on-write, content-addressed
   filesystem — 모든 node가 모든 byte를 들고 있고, byte는 restart를 견딘다.
 - `jobs`는 first-claim-wins claim을 쓰는 consensus-native work board다.
-- `identity`는 node key를 user key에 묶는다 — 여러 node를 굴리는 한 사람이
-  mesh/valset 위에서 하나의 identity로 resolve되게 하는 replicated registry다.
+- `identity`는 member key, display name, bound node를 한 AccountId 아래 두는
+  canonical account registry다.
+- `duckdns`는 선택적인 `<handle>.duck` alias와 identity-only service discovery를
+  더한다. workspace identity와 membership은 alias 등록을 요구하지 않는다.
 - `kv`, `valset`, `saga`, `governance`, `directory`, `greeter`는 infrastructure,
   example, test를 지원한다.
 
@@ -218,24 +220,24 @@ claim하면, 두 번째 `Claim`은 첫 번째 staged claim을 보고 reject하�
 
 ## Identity
 
-identity는 user/node binding registry다(`crates/system/identity`). user는
-사람이 app에서 들고 있는 ed25519 keypair이고, node는 workspace의 mesh/valset
-identity다. 이 module은 user마다 display name, replay-guard nonce, 그리고
-bound node key 집합을 저장한다 — 한 사람이 여러 node를 같은 user에 bind할 수
-있다.
+identity는 canonical account registry다(`crates/system/identity`). account는
+founding member key에서 정해진 stable AccountId, 여러 scheme의 member key,
+공유 display name과 replay nonce, 그리고 여러 bound node key를 가진다. node는
+계속 workspace의 mesh/valset identity이므로, 여러 device와 node가 한 account에
+속해도 network identity 자체가 합쳐지지는 않는다.
 
 `BindNode`는 SUBMIT하는 node(검증된 origin이며 절대 payload field가 아니다)를
-user에 bind하며, chain-id ‖ node-key ‖ nonce preimage 위의 user-key
-signature로 동의를 증명한다 — certificate는 다른 network로 절대 replay될 수
-없고, node A를 위해 mint된 cert는 node B를 절대 bind할 수 없으며, stale
-nonce(이전 bind/unbind에서 남은)는 reject된다. 네트워크에 연결된
-node에서는 `BindNode`가 추가로 현재 member에게 gate된다: origin이 validator나
-observer여야 하므로, 아무 standing도 없는 node는 스스로에게 user를 mint할 수
-없다. `UnbindNode`는 이런 gate가 없고 어떤 external origin에서든 accept된다 —
-살아남은 device가 잃어버린 device를 evict할 수 있다는 뜻이다 — 그리고
-user의 nonce를 bump해서 evict된 node를 위해 잡혀 있던 bind certificate를
-영원히 죽인다. user의 마지막 node를 unbind해도 user record는 남는다 — name과
-nonce가 zero node로 persist하므로, 나중의 bind는 같은 identity로 resolve된다.
+authorizing member key의 account에 bind한다. member proof는
+chain-id ‖ node-key ‖ nonce preimage를 덮으므로 다른 network, node, nonce로
+replay할 수 없다. 아직 어느 account에도 속하지 않은 새 member key는 첫 bind에서
+account를 만든다. networked node에서는 submit node가 현재 validator 또는
+resident여야 한다. `UnbindNode`는 account의 살아남은 아무 member key나
+authorize할 수 있고, `AddMemberKey`는 기존 member의 동의와 새 key의 possession
+proof를 모두 요구하며, `RemoveMemberKey`는 마지막 live member를 보존한다.
+member-signed 변경이 accept될 때마다 shared nonce가 증가한다. 마지막 node를
+unbind해도 account, member key, name, nonce는 남으므로 나중의 bind는 같은
+identity로 resolve된다.
+
 `SetAccountName`은 origin-gated일 뿐이다(bound node는 신뢰된
 hardware이므로 member-key signature가 필요 없다): submit하는 node가 bound된
 account의 display name을 64바이트 한도로 설정하며, nonce는 bump하지 않는다 —
@@ -243,18 +245,19 @@ member-key signature를 소비하지 않기 때문이다.
 
 bind는 per-node로 남는 것들을 바꾸지 않는다: mesh tracking, valset seat,
 quorum arithmetic은 이 module의 영향을 받지 않는다. validator 셋을 굴리는
-user는 여전히 세 자리를 차지하고 세 표를 던진다 — identity는 display와
-authorship resolution을 위해 key를 사람에게 매핑할 뿐, consensus weight를
-합치지 않는다.
+account는 여전히 세 자리를 차지하고 세 표를 던진다 — identity는 authority,
+display, authorship resolution을 위해 node를 account에 매핑할 뿐 consensus
+weight를 합치지 않는다.
 
 identity가 없던 network에 이를 추가하는 것은 다른 module-set 변경과
 마찬가지다: genesis app-hash가 옮겨가므로, 이미 돌고 있는 network가 이를
 적용하려면 coordinated rebuild — rolling이 아닌, 모든 validator에 걸친
 lockstep upgrade — 가 필요하다.
 
-이 module은 key를 저장할 뿐이고, user key 자체의 custody는 그 위에 얹힌
-desktop-app의 관심사이며 `bin/node`의 `user-key` verb를 통해 다룬다.
-24-word mnemonic은 raw ed25519 seed를 그대로 encoding한 것이라 — entropy를
+이 module은 public membership과 binding state만 저장한다. private member key의
+custody는 그 위에 얹힌 desktop-app의 관심사이며 `bin/node`의 `user-key` verb를
+통해 다룬다. primary native member의 24-word mnemonic은 raw ed25519 seed를
+그대로 encoding한 것이라 — entropy를
 보존하고 identity를 보존한다 — 새 identity를 derive하는 게 아니라 정확히 같은
 identity를 복구한다. password는 local encryption 용도일 뿐이다 — argon2id가
 key를 만들고 그 key로 XChaCha20-Poly1305가 seed를 at rest 상태로 암호화한다 —

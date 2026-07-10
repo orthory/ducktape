@@ -9,7 +9,7 @@
 # (node0 -> 127.0.0.1:8080, node1 -> 127.0.0.1:8081)
 #
 # Builds the bundle from real app source, launches two chromium on disjoint
-# debug ports, runs the CDP driver, tears chromium down.
+# debug ports + profiles, runs the CDP driver, tears chromium down.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 H="$HERE/browser-harness"

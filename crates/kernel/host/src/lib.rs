@@ -212,7 +212,7 @@ impl FinalizedSnapshot {
 }
 
 /// which block-boundary phase a module failed in. the two phases have opposite
-/// damage profile: a COMMIT failure may leave the block half-published (earlier
+/// damage profiles: a COMMIT failure may leave the block half-published (earlier
 /// modules in registry order committed, this one did not), an ABORT failure may
 /// leave staged writes that leak into a later block. either way this node's
 /// registry no longer matches what every other honest validator computed.
