@@ -601,92 +601,88 @@ async fn proxy_loopback(
     })
 }
 
+/// DuckFS reads are windowed at 1 MiB; a manifest (≤ 4 MiB) or a file
+/// (≤ 64 MiB) is assembled across windows.
+const READ_WINDOW: u64 = 1024 * 1024;
+
+fn gateway_path(own_node: &[u8; 32], label: &str, relative: &str) -> String {
+    format!(
+        "/home/ext:{}/.duck/gateway/{}/{}",
+        hex_bytes(own_node),
+        label,
+        relative
+    )
+}
+
 async fn serve_duckfs(
     commands: &mpsc::Sender<NodeCommand>,
     own_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
     record: &gateway::RouteRecord,
 ) -> Result<GatewayResponse, GatewayFailure> {
-    let file = gateway::content_file_for_request(head, record).map_err(GatewayFailure::NotFound)?;
-    let refs = files_query(commands, &FilesQuery::Refs {}).await?;
-    let snapshot = match refs {
-        FilesReply::Refs(info) => info
-            .head
-            .ok_or_else(|| GatewayFailure::NotFound("publisher DuckFS is empty".into()))?,
-        _ => {
-            return Err(GatewayFailure::Unavailable(
-                "unexpected DuckFS refs reply".into(),
-            ));
-        }
+    let route = record
+        .statement
+        .route
+        .as_ref()
+        .ok_or_else(|| GatewayFailure::NotFound("route is unpublished".into()))?;
+    let gateway::RouteTarget::DuckFs { manifest_sha256 } = &route.target else {
+        return Err(GatewayFailure::Invalid(
+            "route is not content-backed".into(),
+        ));
     };
-    let path = format!(
-        "/home/ext:{}/.duck/gateway/{}/{}",
-        hex_bytes(own_node),
-        head.name.local_key(),
-        file.path
-    );
-    let stat = files_query(
-        commands,
-        &FilesQuery::Stat {
-            path: path.clone(),
-            snapshot: Some(snapshot.clone()),
-        },
-    )
-    .await?;
-    match stat {
-        FilesReply::Stat(Some(entry))
-            if entry.kind == EntryKindWire::File && entry.size == file.size => {}
-        FilesReply::Stat(Some(_)) => {
-            return Err(GatewayFailure::Forbidden(
-                "DuckFS file type or size differs from the signed route".into(),
-            ));
-        }
-        FilesReply::Stat(None) => {
-            return Err(GatewayFailure::NotFound(
-                "published DuckFS file is missing".into(),
-            ));
-        }
-        _ => {
-            return Err(GatewayFailure::Unavailable(
-                "unexpected DuckFS stat reply".into(),
-            ));
-        }
+    if !matches!(
+        head.method,
+        gateway::RouteMethod::Get | gateway::RouteMethod::Head
+    ) || head.body_len != 0
+    {
+        return Err(GatewayFailure::Invalid(
+            "content routes serve bodyless GET/HEAD only".into(),
+        ));
     }
-    // HEAD returns no body, but it still authenticates the exact bytes before
-    // advertising the signed ETag. A same-sized local mutation must not make a
-    // stale manifest appear current merely because the caller chose HEAD.
-    let read = files_query(
+    let label = head.name.local_key();
+    // Pin one DuckFS snapshot across the manifest read and the file read so a
+    // publisher-local mutation cannot race them.
+    let snapshot = duckfs_head(commands).await?;
+
+    // The manifest is a DuckFS file addressed by the signed hash: read it,
+    // verify the exact bytes, then trust its file table.
+    let manifest_bytes = read_duckfs_file(
         commands,
-        &FilesQuery::Read {
-            path,
-            snapshot: Some(snapshot),
-            offset: 0,
-            // DuckFS accepts a positive read window. A declared empty file
-            // still returns zero bytes + EOF and is verified below.
-            len: file.size.max(1),
-        },
+        &gateway_path(own_node, label, gateway::MANIFEST_FILE),
+        &snapshot,
+        gateway::MAX_MANIFEST_BYTES,
     )
     .await?;
-    let mut bytes = match read {
-        FilesReply::Read { b64, eof: true } => {
-            STANDARD.decode(b64.as_bytes()).map_err(|error| {
-                GatewayFailure::Unavailable(format!("DuckFS returned bad base64: {error}"))
-            })?
-        }
-        FilesReply::Read { .. } => {
-            return Err(GatewayFailure::Unavailable(
-                "DuckFS returned a partial file".into(),
-            ));
-        }
-        _ => {
-            return Err(GatewayFailure::Unavailable(
-                "unexpected DuckFS read reply".into(),
-            ));
-        }
-    };
+    if hex_bytes(&Sha256::digest(&manifest_bytes)) != *manifest_sha256 {
+        return Err(GatewayFailure::Forbidden(
+            "manifest does not match the signed hash".into(),
+        ));
+    }
+    let manifest: gateway::RouteManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| GatewayFailure::Unavailable(format!("manifest is not valid json: {error}")))?;
+    gateway::validate_manifest(&manifest).map_err(GatewayFailure::Forbidden)?;
+
+    let file =
+        gateway::manifest_file_for_path(&manifest, &head.path_and_query).map_err(GatewayFailure::NotFound)?;
+    // Serve-time cap: the file table is off consensus, so the signed response
+    // cap is enforced here rather than at admission.
+    if file.size > route.policy.max_response_bytes {
+        return Err(GatewayFailure::Forbidden(
+            "file exceeds the signed response cap".into(),
+        ));
+    }
+    // HEAD still authenticates the exact bytes before advertising the ETag, so
+    // a same-sized local mutation cannot make a stale file look current.
+    let mut bytes = read_duckfs_file(
+        commands,
+        &gateway_path(own_node, label, &file.path),
+        &snapshot,
+        file.size,
+    )
+    .await?;
     if bytes.len() as u64 != file.size || hex_bytes(&Sha256::digest(&bytes)) != file.sha256 {
         return Err(GatewayFailure::Forbidden(
-            "DuckFS bytes do not match the signed route".into(),
+            "DuckFS bytes do not match the manifest".into(),
         ));
     }
     if head.method == gateway::RouteMethod::Head {
@@ -710,6 +706,96 @@ async fn serve_duckfs(
         head: response_head,
         body: bytes,
     })
+}
+
+async fn duckfs_head(
+    commands: &mpsc::Sender<NodeCommand>,
+) -> Result<duckfs_core::DigestHex, GatewayFailure> {
+    match files_query(commands, &FilesQuery::Refs {}).await? {
+        FilesReply::Refs(info) => info
+            .head
+            .ok_or_else(|| GatewayFailure::NotFound("publisher DuckFS is empty".into())),
+        _ => Err(GatewayFailure::Unavailable(
+            "unexpected DuckFS refs reply".into(),
+        )),
+    }
+}
+
+/// Stat a gateway file, bound its size to `max_len`, then read it across
+/// 1 MiB windows. The caller hash-verifies the returned bytes.
+async fn read_duckfs_file(
+    commands: &mpsc::Sender<NodeCommand>,
+    path: &str,
+    snapshot: &duckfs_core::DigestHex,
+    max_len: u64,
+) -> Result<Vec<u8>, GatewayFailure> {
+    let size = match files_query(
+        commands,
+        &FilesQuery::Stat {
+            path: path.to_string(),
+            snapshot: Some(snapshot.clone()),
+        },
+    )
+    .await?
+    {
+        FilesReply::Stat(Some(entry)) if entry.kind == EntryKindWire::File => entry.size,
+        FilesReply::Stat(Some(_)) => {
+            return Err(GatewayFailure::Forbidden(
+                "gateway path is not a file".into(),
+            ));
+        }
+        FilesReply::Stat(None) => {
+            return Err(GatewayFailure::NotFound("gateway file is missing".into()));
+        }
+        _ => {
+            return Err(GatewayFailure::Unavailable(
+                "unexpected DuckFS stat reply".into(),
+            ));
+        }
+    };
+    if size > max_len {
+        return Err(GatewayFailure::Forbidden(format!(
+            "gateway file exceeds {max_len} bytes"
+        )));
+    }
+    let mut bytes = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        // A declared empty file still issues one read to confirm EOF.
+        let len = if size == 0 {
+            1
+        } else {
+            (size - offset).min(READ_WINDOW)
+        };
+        match files_query(
+            commands,
+            &FilesQuery::Read {
+                path: path.to_string(),
+                snapshot: Some(snapshot.clone()),
+                offset,
+                len,
+            },
+        )
+        .await?
+        {
+            FilesReply::Read { b64, eof } => {
+                let chunk = STANDARD.decode(b64.as_bytes()).map_err(|error| {
+                    GatewayFailure::Unavailable(format!("DuckFS returned bad base64: {error}"))
+                })?;
+                offset += chunk.len() as u64;
+                bytes.extend_from_slice(&chunk);
+                if eof || offset >= size {
+                    break;
+                }
+            }
+            _ => {
+                return Err(GatewayFailure::Unavailable(
+                    "unexpected DuckFS read reply".into(),
+                ));
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 async fn files_query(
@@ -940,6 +1026,7 @@ mod tests {
                     max_request_bytes: 1024,
                     max_response_bytes: 4096,
                     allow_authorization: false,
+                    allow_upgrade: false,
                 },
             }),
         };
@@ -1133,13 +1220,35 @@ mod tests {
         assert!(matches!(error, GatewayFailure::Forbidden(_)));
     }
 
+    fn stat_reply(path: String, size: u64) -> Vec<u8> {
+        duckfs_core::encode_reply(&FilesReply::Stat(Some(duckfs_core::EntryInfo {
+            path,
+            kind: EntryKindWire::File,
+            size,
+            exec: false,
+            object: "bb".repeat(32),
+            meta: std::collections::BTreeMap::new(),
+        })))
+    }
+
     async fn serve_content_head(
         declared: &[u8],
         actual: &[u8],
     ) -> Result<GatewayResponse, GatewayFailure> {
         let publisher = [2u8; 32];
         let member = ed25519::PrivateKey::from_seed(77);
-        let digest = hex_bytes(&Sha256::digest(declared));
+        // The signed statement binds only the manifest hash; the manifest (a
+        // DuckFS file) lists the content file and its own hash.
+        let manifest = gateway::RouteManifest {
+            default_path: Some("index.html".into()),
+            files: vec![gateway::ContentFile {
+                path: "index.html".into(),
+                mime: "text/html".into(),
+                size: declared.len() as u64,
+                sha256: hex_bytes(&Sha256::digest(declared)),
+            }],
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let statement = gateway::RouteStatement {
             version: gateway::ROUTE_FORMAT_VERSION,
             chain_id: "test".into(),
@@ -1149,15 +1258,7 @@ mod tests {
             revision: 1,
             route: Some(gateway::RouteDefinition {
                 target: gateway::RouteTarget::DuckFs {
-                    content: gateway::DuckFsContent {
-                        default_path: Some("index.html".into()),
-                        files: vec![gateway::ContentFile {
-                            path: "index.html".into(),
-                            mime: "text/html".into(),
-                            size: declared.len() as u64,
-                            sha256: digest,
-                        }],
-                    },
+                    manifest_sha256: hex_bytes(&Sha256::digest(&manifest_bytes)),
                 },
                 policy: gateway::RoutePolicy {
                     audience: gateway::RouteAudience::Owner,
@@ -1165,6 +1266,7 @@ mod tests {
                     max_request_bytes: 0,
                     max_response_bytes: 1024,
                     allow_authorization: false,
+                    allow_upgrade: false,
                 },
             }),
         };
@@ -1182,57 +1284,42 @@ mod tests {
             statement,
         };
         let owner = account(vec![1; 32], publisher, &member);
+        let manifest_path = gateway_path(&publisher, "_apex", gateway::MANIFEST_FILE);
+        let file_path = gateway_path(&publisher, "_apex", "index.html");
+        let manifest_len = manifest_bytes.len() as u64;
+        let manifest_b64 = STANDARD.encode(&manifest_bytes);
         let actual_b64 = STANDARD.encode(actual);
         let actual_len = actual.len() as u64;
-        let (commands, mut requests) = mpsc::channel(8);
-        tokio::spawn(async move {
-            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
-                panic!("route query")
-            };
-            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
-                Box::new(Some(route)),
-            ))));
-            for _ in 0..2 {
-                let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
-                    panic!("identity query")
-                };
-                let _ = reply.send(Ok(identity::encode_reply(
-                    &identity::IdentityReply::Account(Some(owner.clone())),
-                )));
-            }
-            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
-                panic!("refs query")
-            };
-            let _ = reply.send(Ok(duckfs_core::encode_reply(&FilesReply::Refs(
-                duckfs_core::RefsInfo {
-                    head: Some("aa".repeat(32)),
-                    pins: std::collections::BTreeMap::new(),
-                    window_len: 1,
-                },
-            ))));
-            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
-                panic!("stat query")
-            };
-            let _ = reply.send(Ok(duckfs_core::encode_reply(&FilesReply::Stat(Some(
-                duckfs_core::EntryInfo {
-                    path: format!(
-                        "/home/ext:{}/.duck/gateway/_apex/index.html",
-                        hex_bytes(&publisher)
-                    ),
-                    kind: EntryKindWire::File,
-                    size: actual_len,
-                    exec: false,
-                    object: "bb".repeat(32),
-                    meta: std::collections::BTreeMap::new(),
-                },
-            )))));
-            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
-                panic!("read query")
-            };
-            let _ = reply.send(Ok(duckfs_core::encode_reply(&FilesReply::Read {
+        // Ordered replies: route → identity ×2 → refs → manifest stat/read →
+        // file stat/read.
+        let replies: Vec<Vec<u8>> = vec![
+            gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(route)))),
+            identity::encode_reply(&identity::IdentityReply::Account(Some(owner.clone()))),
+            identity::encode_reply(&identity::IdentityReply::Account(Some(owner))),
+            duckfs_core::encode_reply(&FilesReply::Refs(duckfs_core::RefsInfo {
+                head: Some("aa".repeat(32)),
+                pins: std::collections::BTreeMap::new(),
+                window_len: 1,
+            })),
+            stat_reply(manifest_path, manifest_len),
+            duckfs_core::encode_reply(&FilesReply::Read {
+                b64: manifest_b64,
+                eof: true,
+            }),
+            stat_reply(file_path, actual_len),
+            duckfs_core::encode_reply(&FilesReply::Read {
                 b64: actual_b64,
                 eof: true,
-            })));
+            }),
+        ];
+        let (commands, mut requests) = mpsc::channel(8);
+        tokio::spawn(async move {
+            for bytes in replies {
+                let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                    panic!("expected a query")
+                };
+                let _ = reply.send(Ok(bytes));
+            }
         });
         serve_current(
             &commands,
