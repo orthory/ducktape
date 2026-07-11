@@ -71,6 +71,7 @@ fn main() {
             gateway_window::gateway_open_inline,
             gateway_window::gateway_inline_place,
             gateway_window::gateway_inline_close,
+            gateway_window::gateway_inline_hide_all,
             workspaces::workspace_create,
             workspaces::workspace_join,
             workspaces::workspace_invite_blob,

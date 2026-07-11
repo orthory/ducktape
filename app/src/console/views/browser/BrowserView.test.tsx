@@ -53,7 +53,7 @@ describe("BrowserView security boundary", () => {
     expect(frame.getAttribute("sandbox")).toBe("");
     expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
     expect(frame.getAttribute("srcdoc")).toContain("script-src 'none'");
-    expect(screen.getByText("NETWORK SNAPSHOT")).toBeInTheDocument();
+    expect(screen.getByText("SNAPSHOT")).toBeInTheDocument();
   });
 
   it("embeds every account target in the capability-free inline gateway view", async () => {
@@ -95,12 +95,29 @@ describe("BrowserView security boundary", () => {
       // the .duck route, so a permission prompt can name the site rather than
       // the random loopback session origin it is served from
       "api.alice.duck",
+      "tab-1",
       expect.objectContaining({ width: expect.any(Number), height: expect.any(Number) }),
     ));
     expect(screen.queryByTestId("duck-browser-frame")).toBeNull();
-    expect(screen.getByText("SIGNED GATEWAY ROUTE")).toBeInTheDocument();
+    expect(screen.getByText("SIGNED")).toBeInTheDocument();
 
     view.unmount();
     expect(closeInline).toHaveBeenCalled();
+  });
+
+  it("keeps independent addresses across browser tabs", () => {
+    renderBrowser();
+    const first = screen.getByRole("textbox", { name: "Duck address" });
+    fireEvent.change(first, { target: { value: "site.demo.duck" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "New tab" }));
+    expect(screen.getByRole("textbox", { name: "Duck address" })).toHaveValue("net.duck");
+    fireEvent.change(screen.getByRole("textbox", { name: "Duck address" }), {
+      target: { value: "app.demo.duck" },
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "site.demo.duck" }));
+    expect(screen.getByRole("textbox", { name: "Duck address" })).toHaveValue("site.demo.duck");
+    expect(screen.getAllByRole("tab")).toHaveLength(2);
   });
 });

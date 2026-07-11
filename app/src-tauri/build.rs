@@ -33,6 +33,7 @@ fn main() {
         "gateway_open_inline",
         "gateway_inline_place",
         "gateway_inline_close",
+        "gateway_inline_hide_all",
         "workspace_create",
         "workspace_join",
         "workspace_invite_blob",
