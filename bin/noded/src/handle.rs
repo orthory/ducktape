@@ -1,0 +1,222 @@
+//! the node-actor command lane ([`NodeCommand`]) and the router's shared
+//! state ([`NodeHandle`]): every http handler talks to whichever actor owns
+//! the non-Send `host::Host` exclusively through this seam.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use axum::http::StatusCode;
+use axum::response::Response;
+use futures::SinkExt as _;
+use futures::channel::{mpsc, oneshot};
+
+use crate::call::CallLane;
+use crate::gateway_http::{BrowserGateway, GatewayLane};
+use crate::stream::{LogRing, StreamHub};
+use crate::{BlockSummary, NodeStatus, error_response};
+
+/// inbound command backlog before submit/query callers see backpressure.
+pub(crate) const COMMAND_BUFFER: usize = 64;
+/// internal block wakeups buffered per lagging websocket subscriber.
+pub(crate) const EVENT_BUFFER: usize = 64;
+
+/// a request to the actor that owns the host. replies cross the channel as
+/// wire-ready types so the http layer stays free of sdk conversions.
+pub enum NodeCommand {
+    Submit {
+        target: String,
+        payload: Vec<u8>,
+        /// `Origin::External` bytes for this block (see [`SubmitRequest::origin`]).
+        origin: Vec<u8>,
+        reply: oneshot::Sender<Result<BlockSummary, String>>,
+    },
+    Query {
+        target: String,
+        req: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    Status {
+        reply: oneshot::Sender<NodeStatus>,
+    },
+    /// encode the runtime's Prometheus registry (commonware runtime metrics plus
+    /// the daemon's own `ducktape_*` series) to the OpenMetrics text exposition.
+    /// the actor owns the commonware context that holds the registry, so this,
+    /// like every other read, crosses the command lane.
+    Metrics {
+        reply: oneshot::Sender<String>,
+    },
+}
+
+/// the router's shared state: a command lane into the node actor, the
+/// stream hub for websocket subscribers, the shutdown signal, and the
+/// node-local blob store the files module shares.
+#[derive(Clone)]
+pub struct NodeHandle {
+    pub(crate) cmds: mpsc::Sender<NodeCommand>,
+    pub(crate) hub: StreamHub,
+    pub(crate) shutdown: std::sync::Arc<tokio::sync::Notify>,
+    /// the files blob lane. NOT a command into the actor: chunk bytes stay
+    /// node-local by design (never consensus state, never an op), so the http
+    /// handlers read/write this store directly.
+    pub(crate) blobs: crate::blobs::BlobHandle,
+    /// the forge module's on-disk repo base dir (`<storage>/<forge subdir>`);
+    /// each named repo lives at `<forge_repo>/<name>` as a real libgit2 repo.
+    /// threaded in so the git upload-pack (clone/fetch) handler can open a repo
+    /// READ-ONLY and serve its objects — the ONE route that reads forge's git
+    /// substrate directly instead of over the actor lane. `None` on a handle
+    /// that never serves the git lane (the router tests' fake actor), which
+    /// makes upload-pack a clean 500 there rather than a panic.
+    pub(crate) forge_repo: Option<PathBuf>,
+    /// the per-module derived index (fluent31-backed read models). node-local
+    /// like `blobs`: the actor is the one WRITER as blocks commit;
+    /// the `/v1/index/*` handlers read it directly through MVCC snapshots, so
+    /// an index scan never crosses the actor command lane. `None` on a handle
+    /// whose embedder configured no index (the router tests' fake actor) —
+    /// index routes answer 503 there.
+    pub(crate) index: Option<Arc<indexer::IndexStore>>,
+    /// the call hub's session-request lane. `None` on daemons without a mesh
+    /// (the embedded daemon, router tests) — `/v1/call/ws` answers 503 there.
+    pub(crate) call: Option<CallLane>,
+    /// Purpose-specific gateway request lane. No raw peer, filesystem, or
+    /// arbitrary socket proxy is exposed through the client surface.
+    pub(crate) gateway: Option<GatewayLane>,
+    /// Dedicated least-privilege browser origin for gateway rendering. It is
+    /// a separate loopback listener, never the node API origin.
+    pub(crate) browser_gateway: Option<BrowserGateway>,
+    /// the root dir the duckfs workspace RPC materializes managed checkouts
+    /// under (`<storage>/duckfs-workspaces`). node-local disk state, threaded in
+    /// like `forge_repo`; `None` on a handle that never serves the seam (the
+    /// router tests' fake handle), which makes `/v1/fs/workspaces` a clean 503.
+    pub(crate) duckfs_workspaces: Option<PathBuf>,
+}
+
+impl NodeHandle {
+    /// build the handle plus the actor-side ends: the command receiver the
+    /// actor drains and the stream hub it publishes finalized blocks on.
+    /// the blob store is born here — BEFORE genesis — so the embedding daemon
+    /// can hand [`Self::blob_handle`] clones to forge and its block loop.
+    pub fn channel() -> (Self, mpsc::Receiver<NodeCommand>, StreamHub) {
+        Self::channel_with_log_ring(LogRing::default())
+    }
+
+    /// same as [`Self::channel`], but uses a caller-created log ring so a
+    /// tracing layer can feed the same ring before the handle is fully wired.
+    pub fn channel_with_log_ring(logs: LogRing) -> (Self, mpsc::Receiver<NodeCommand>, StreamHub) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
+        let hub = StreamHub::with_log_ring(EVENT_BUFFER, logs);
+        let handle = Self {
+            cmds: cmd_tx,
+            hub: hub.clone(),
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            blobs: crate::blobs::BlobHandle::default(),
+            forge_repo: None,
+            index: None,
+            call: None,
+            gateway: None,
+            browser_gateway: None,
+            duckfs_workspaces: None,
+        };
+        (handle, cmd_rx, hub)
+    }
+
+    /// swap the blob store for a persistent one rooted at `root` (write-
+    /// through to `<root>/<sha256-hex>`, disk fallback on a memory miss) so
+    /// node-local blobs — an agent's registered prompt above all — survive a
+    /// daemon restart. still never consensus state, never in any root. must
+    /// run BEFORE any [`Self::blob_handle`] clone is handed out (the daemons
+    /// chain it right after [`Self::channel`]); an unusable root is a loud
+    /// startup error, not a silently-forgetful store.
+    pub fn with_blob_root(mut self, root: impl Into<PathBuf>) -> std::io::Result<Self> {
+        self.blobs = crate::blobs::BlobHandle::persistent(root)?;
+        Ok(self)
+    }
+
+    /// point this handle at the forge module's on-disk repo base dir so the git
+    /// upload-pack (clone/fetch) handler can open `<forge_repo>/<name>` and serve
+    /// its objects. the daemon passes the SAME base it hands `Forge::with_blobs`,
+    /// so the http fetch lane reads exactly the repos consensus materializes.
+    pub fn with_forge_repo(mut self, base: impl Into<PathBuf>) -> Self {
+        self.forge_repo = Some(base.into());
+        self
+    }
+
+    /// point this handle at the per-module derived index so the `/v1/index/*`
+    /// routes can serve snapshot reads. the daemon passes the SAME store its
+    /// actor feeds block-by-block.
+    pub fn with_index_store(mut self, index: Arc<indexer::IndexStore>) -> Self {
+        self.index = Some(index);
+        self
+    }
+
+    /// point this handle at a call hub's session-request lane so
+    /// `/v1/call/ws` can open huddle sessions. only the p2p validator
+    /// wires one — it owns the mesh the audio/video rides.
+    pub fn with_call(mut self, call: CallLane) -> Self {
+        self.call = Some(call);
+        self
+    }
+
+    /// Point gateway requests at the full node's authenticated overlay
+    /// stream. `net.duck` remains a local network-content read.
+    pub fn with_gateway(mut self, lane: GatewayLane) -> Self {
+        self.gateway = Some(lane);
+        self
+    }
+
+    /// Enable gateway browsing on a separately bound loopback listener. The
+    /// caller binds first so port 0 becomes an actual session-returned port.
+    pub fn with_browser_gateway(mut self, listen: SocketAddr) -> Self {
+        self.browser_gateway = Some(BrowserGateway {
+            listen,
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        });
+        self
+    }
+
+    /// point this handle at the root dir the duckfs workspace RPC manages
+    /// checkouts under. the daemon passes `<storage>/duckfs-workspaces`; an
+    /// unset root makes `/v1/fs/workspaces` answer 503.
+    pub fn with_duckfs_workspaces(mut self, root: impl Into<PathBuf>) -> Self {
+        self.duckfs_workspaces = Some(root.into());
+        self
+    }
+
+    /// the blob store this surface serves. the daemon hands clones to forge
+    /// (push packfiles) and its block loop (op receipts) so http uploads land
+    /// exactly where those consumers read.
+    pub fn blob_handle(&self) -> crate::blobs::BlobHandle {
+        self.blobs.clone()
+    }
+
+    /// a clone of the command lane's sender, for embedder-side producers
+    /// that inject commands exactly as the http layer does — the oracle
+    /// pool's completed provider runs re-enter as `Submit` commands here.
+    pub fn command_sender(&self) -> mpsc::Sender<NodeCommand> {
+        self.cmds.clone()
+    }
+
+    /// the multiplexed stream hub backing `/v1/ws`.
+    pub fn stream_hub(&self) -> StreamHub {
+        self.hub.clone()
+    }
+
+    pub(crate) fn stream_index(&self) -> Option<Arc<indexer::IndexStore>> {
+        self.index.clone()
+    }
+
+    /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
+    /// `Notify` stores the permit, so a request that lands before anyone awaits
+    /// is not lost.
+    pub async fn shutdown_requested(&self) {
+        self.shutdown.notified().await;
+    }
+
+    pub(crate) async fn send(&self, cmd: NodeCommand) -> Result<(), Response> {
+        let mut cmds = self.cmds.clone();
+        cmds.send(cmd)
+            .await
+            .map_err(|_| error_response(StatusCode::SERVICE_UNAVAILABLE, "node actor is gone"))
+    }
+}

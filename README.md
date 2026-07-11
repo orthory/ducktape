@@ -61,7 +61,7 @@ Run the joiner state-sync proof — a fresh joiner rebuilds every module and
 lands on the source app-hash:
 
 ```sh
-cargo test -p demo --test joiner_rebuilds_global_app_hash
+cargo test -p demo --test network_joiner_full
 ```
 
 Run everything the repo can verify locally (rust workspace including the e2e

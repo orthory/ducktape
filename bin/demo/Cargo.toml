@@ -29,16 +29,10 @@ sdk = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-commonware-storage = { workspace = true }
 # the network joiner test drives the FULL statesync wire protocol (manifest,
 # chunked snapshots, remote qmdb resolver) between a source host and a joiner.
 statesync = { workspace = true }
 futures = "0.3"
-# dev-only: the joiner test reads a rebuilt repo's blobs back out through git2
-# directly — proof the pack landed real objects. same vendored build forge uses.
-git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }

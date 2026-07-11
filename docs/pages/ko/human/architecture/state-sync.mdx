@@ -37,7 +37,6 @@ advance할 수 없다.
 
 ## Capstone
 
-demo test `joiner_rebuilds_global_app_hash`는 모든 module을 재구축하고 joiner가
-정확한 source app-hash에 도달하는지 확인한다. node test인 `network_joiner_full`,
-`cluster_e2e`, `invite_e2e`는 running node의 live state-sync wire 위에서도 같은
-property를 증명한다.
+demo test `network_joiner_full`은 state-sync wire protocol만으로 모든 module을
+재구축하고 joiner가 정확한 source app-hash에 도달하는지 확인한다. node test인
+`cluster_e2e`, `invite_e2e`는 running node 위에서도 같은 property를 증명한다.

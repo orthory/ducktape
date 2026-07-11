@@ -68,10 +68,9 @@ and [What Is Left](/en/human/roadmap/what-is-left) keeps the open-work boundary.
 
 - `cargo test --workspace` exercises the Rust workspace.
 - `cargo run -p demo` runs the in-process multi-module walkthrough.
-- `cargo test -p demo --test joiner_rebuilds_global_app_hash` proves a joiner can
-  rebuild every module and match the source app-hash in-process.
 - `cargo test -p demo --test network_joiner_full` proves a joiner rebuilds every
-  module purely over the state-sync wire protocol.
+  module purely over the state-sync wire protocol and matches the source
+  app-hash.
 - `bin/node/examples/demo-invite.sh` drives a human-runnable onboarding ceremony
   over real sockets: founder `init`, invite, friend `join`, founder `admit`, a
   refreshed invite, then both nodes booting one network and converging an

@@ -163,21 +163,18 @@ pub enum RunStream {
     Stderr,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct BlockNote {
-    height: u64,
-    app_hash: String,
-}
-
 #[derive(Clone)]
 pub struct StreamHub {
-    blocks: broadcast::Sender<BlockNote>,
+    /// block wakeups: subscribers re-scan on any commit; the payload they'd
+    /// want (height/app-hash) lives in `tip`, which the heartbeat reads.
+    blocks: broadcast::Sender<()>,
     tip: Arc<RwLock<Option<(u64, String)>>>,
     logs: LogRing,
     run_output: RunOutputRegistry,
 }
 
 impl StreamHub {
+    #[cfg(test)]
     pub fn new(buffer: usize) -> Self {
         Self::with_log_ring(buffer, LogRing::default())
     }
@@ -193,9 +190,8 @@ impl StreamHub {
     }
 
     pub fn publish_block(&self, height: u64, app_hash: impl Into<String>) {
-        let app_hash = app_hash.into();
-        self.prime(height, app_hash.clone());
-        let _ = self.blocks.send(BlockNote { height, app_hash });
+        self.prime(height, app_hash);
+        let _ = self.blocks.send(());
     }
 
     pub fn prime(&self, height: u64, app_hash: impl Into<String>) {
@@ -210,7 +206,7 @@ impl StreamHub {
         self.run_output.clone()
     }
 
-    pub(crate) fn subscribe_blocks(&self) -> broadcast::Receiver<BlockNote> {
+    pub(crate) fn subscribe_blocks(&self) -> broadcast::Receiver<()> {
         self.blocks.subscribe()
     }
 
@@ -566,10 +562,7 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
             }
             note = block_rx.recv() => {
                 match note {
-                    Ok(note) => {
-                        let _ = (note.height, note.app_hash);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
                 if !catch_up(&handle, &mut socket, &mut topics, Wake::Block).await {
@@ -1218,7 +1211,7 @@ mod tests {
             "module:chat",
             &mut state,
             Some(&store),
-            &StreamHub::new(crate::EVENT_BUFFER),
+            &StreamHub::new(crate::handle::EVENT_BUFFER),
         );
         assert!(result.frames.is_empty());
     }
@@ -1334,7 +1327,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn heartbeat_frame_shape_under_paused_time() {
-        let hub = StreamHub::new(crate::EVENT_BUFFER);
+        let hub = StreamHub::new(crate::handle::EVENT_BUFFER);
         hub.prime(7, "abc");
         let mut interval = tokio::time::interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
         interval.tick().await;
