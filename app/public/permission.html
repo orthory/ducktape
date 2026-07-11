@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Permission request</title>
+    <style>
+      /* The consent window is the one surface a page must never be able to
+         imitate or influence: it renders from the app's own origin, in its own
+         OS window, and shows nothing the requesting content can set except the
+         site name it was opened for (bounded ASCII, escaped as text). */
+      :root {
+        --bg: #ffffff;
+        --fg: #16181d;
+        --muted: #6b7280;
+        --line: #e5e7eb;
+        --warn-bg: #fef3c7;
+        --warn-fg: #92400e;
+        --accent: #2563eb;
+        --accent-fg: #ffffff;
+        color-scheme: light dark;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #16181d;
+          --fg: #e8eaed;
+          --muted: #9aa1ab;
+          --line: #2c3038;
+          --warn-bg: #3a2d10;
+          --warn-fg: #f0c674;
+          --accent: #3b82f6;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 18px 20px 16px;
+        background: var(--bg);
+        color: var(--fg);
+        font: 13px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-height: 100vh;
+      }
+      h1 { font-size: 15px; font-weight: 600; margin: 0; }
+      .site { font-weight: 600; word-break: break-all; }
+      .origin {
+        color: var(--muted);
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11px;
+        word-break: break-all;
+      }
+      .badge {
+        display: inline-block;
+        background: var(--warn-bg);
+        color: var(--warn-fg);
+        border-radius: 4px;
+        padding: 1px 6px;
+        font-size: 11px;
+        font-weight: 600;
+      }
+      ul { margin: 0; padding-left: 18px; }
+      li { font-weight: 600; }
+      .why { color: var(--muted); margin: 0; }
+      .actions { display: flex; flex-direction: column; gap: 6px; margin-top: auto; }
+      button {
+        font: inherit;
+        padding: 7px 10px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: transparent;
+        color: var(--fg);
+        cursor: pointer;
+      }
+      button:hover { border-color: var(--muted); }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--accent-fg);
+      }
+      .row { display: flex; gap: 6px; }
+      .row button { flex: 1; }
+    </style>
+  </head>
+  <body>
+    <h1><span class="badge">Remote content</span></h1>
+    <div>
+      <div class="site" id="site">…</div>
+      <div class="origin" id="origin"></div>
+    </div>
+    <div>
+      <p class="why" id="why">wants to use:</p>
+      <ul id="permissions"></ul>
+    </div>
+    <p class="why">
+      This is a page published on your Ducktape network. It is not part of
+      Ducktape and it is not asking for these on Ducktape's behalf.
+    </p>
+    <div class="actions">
+      <button class="primary" id="allow-session">Allow while this page is open</button>
+      <div class="row">
+        <button id="allow-once">Allow once</button>
+        <button id="deny">Don't allow</button>
+      </div>
+    </div>
+    <script src="/permission.js"></script>
+  </body>
+</html>

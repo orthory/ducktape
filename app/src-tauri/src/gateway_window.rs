@@ -5,6 +5,11 @@
 //! child, the default) or a separate window (pop-out). On the CEF runtime each
 //! surface is its own renderer process, and navigation stays pinned to one
 //! random, short-lived gateway-session origin either way.
+//!
+//! Both surfaces record the `.duck` route they show with [`crate::permissions`]
+//! before they open: the session origin is a random loopback token, so the
+//! route is the only honest name a permission prompt can put in front of the
+//! user.
 
 use tauri::webview::{NewWindowResponse, WebviewWindowBuilder};
 use tauri::{Manager as _, WebviewUrl};
@@ -39,6 +44,15 @@ fn validate_session_url(value: &str) -> Result<(tauri::Url, String), String> {
     Ok((url, token))
 }
 
+/// The `.duck` route a surface was opened for, as the UI addressed it. It names
+/// the content in permission prompts, so it is bounded like any other input.
+fn validate_site(title: &str) -> Result<(), String> {
+    if title.is_empty() || title.len() > 128 || !title.is_ascii() {
+        return Err("gateway site name must be bounded ASCII".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn gateway_open_window(
     app: crate::rt::AppHandle,
@@ -48,10 +62,9 @@ pub fn gateway_open_window(
 ) -> Result<(), String> {
     crate::daemon::require_main_window(&window)?;
     let (url, token) = validate_session_url(&url)?;
-    if title.is_empty() || title.len() > 128 || !title.is_ascii() {
-        return Err("gateway window title must be bounded ASCII".into());
-    }
+    validate_site(&title)?;
     let label = format!("{WINDOW_PREFIX}{token}");
+    crate::permissions::note_gateway_site(&label, &title);
     if let Some(existing) = app.get_webview_window(&label) {
         existing
             .navigate(url)
@@ -65,17 +78,11 @@ pub fn gateway_open_window(
 
     // Keep at most one executable publisher window. Closing the previous view
     // drops its incognito storage and prevents stale sessions accumulating.
-    for (label, existing) in app.webview_windows() {
-        if label.starts_with(WINDOW_PREFIX) {
-            existing
-                .close()
-                .map_err(|error| format!("close old gateway window: {error}"))?;
-        }
-    }
+    close_open_gateway_surfaces(&app, &label)?;
 
     let allowed_host = url.host_str().expect("validated host").to_string();
     let allowed_port = url.port().expect("validated port");
-    WebviewWindowBuilder::new(&app, label, WebviewUrl::External(url))
+    let opened = WebviewWindowBuilder::new(&app, label.clone(), WebviewUrl::External(url))
         .title(title)
         .inner_size(1100.0, 760.0)
         .min_inner_size(720.0, 480.0)
@@ -93,6 +100,27 @@ pub fn gateway_open_window(
         .on_download(|_, _| false)
         .build()
         .map_err(|error| format!("open isolated gateway window: {error}"))?;
+    // However the user closes it, the session's permissions die with it.
+    opened.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            crate::permissions::forget_webview(&label);
+        }
+    });
+    Ok(())
+}
+
+/// Close every gateway surface except `keep` (the one being opened), and drop
+/// the permissions each of them had earned — a closed surface takes its session
+/// grants with it.
+fn close_open_gateway_surfaces(app: &crate::rt::AppHandle, keep: &str) -> Result<(), String> {
+    for (label, existing) in app.webview_windows() {
+        if label.starts_with(WINDOW_PREFIX) && label != keep {
+            existing
+                .close()
+                .map_err(|error| format!("close old gateway window: {error}"))?;
+            crate::permissions::forget_webview(&label);
+        }
+    }
     Ok(())
 }
 
@@ -125,21 +153,18 @@ pub fn gateway_open_inline(
     app: crate::rt::AppHandle,
     window: crate::rt::WebviewWindow,
     url: String,
+    title: String,
     rect: InlineRect,
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager as _};
 
     crate::daemon::require_main_window(&window)?;
     let (url, _token) = validate_session_url(&url)?;
+    validate_site(&title)?;
+    crate::permissions::note_gateway_site(INLINE_LABEL, &title);
 
     // One executable publisher surface at a time (mirrors gateway_open_window).
-    for (label, existing) in app.webview_windows() {
-        if label.starts_with(WINDOW_PREFIX) {
-            existing
-                .close()
-                .map_err(|error| format!("close old gateway window: {error}"))?;
-        }
-    }
+    close_open_gateway_surfaces(&app, INLINE_LABEL)?;
 
     let position = LogicalPosition::new(rect.x, rect.y);
     let size = LogicalSize::new(rect.width, rect.height);
@@ -202,6 +227,8 @@ pub fn gateway_inline_close(app: crate::rt::AppHandle) -> Result<(), String> {
             .close()
             .map_err(|error| format!("close inline gateway view: {error}"))?;
     }
+    // The surface is gone: so are the permissions the user granted it.
+    crate::permissions::forget_webview(INLINE_LABEL);
     Ok(())
 }
 
