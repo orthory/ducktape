@@ -77,7 +77,6 @@ fn serve(request: http::Request<Vec<u8>>, responder: StreamResponder) {
     if authority.is_empty() {
         return fail(responder, 400, "duck: missing authority");
     }
-    let origin = format!("duck://{authority}");
     let path_and_query = uri
         .path_and_query()
         .map(|value| value.as_str())
@@ -93,7 +92,22 @@ fn serve(request: http::Request<Vec<u8>>, responder: StreamResponder) {
     };
 
     if uri.path() == "/.duck/ws" {
+        // The synthetic /.duck/ws is same-origin, so the fetch's Origin is the
+        // page's own duck origin; fall back to it if a navigation omitted one.
+        let origin = request
+            .headers()
+            .get("origin")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("duck://{authority}"));
         return serve_ws_bootstrap(&base, &authority, &origin, responder);
+    }
+    // `/.duck/` is the node's control-plane namespace (the WS-token mint and
+    // door live there). A page must never reach it by proxy — only the synthetic
+    // /.duck/ws above is the page's to call — or it could mint tokens for other
+    // authorities. Everything else under /.duck/ is reserved, not app content.
+    if uri.path().starts_with("/.duck/") {
+        return fail(responder, 404, "duck: reserved path");
     }
 
     let client = match reqwest::blocking::Client::builder()
@@ -105,13 +119,27 @@ fn serve(request: http::Request<Vec<u8>>, responder: StreamResponder) {
     };
     let method = reqwest::Method::from_bytes(request.method().as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
-    let mut outbound = client
-        .request(method, format!("{base}{path_and_query}"))
-        .header("x-duck-authority", &authority)
-        .header("origin", &origin);
-    if let Some(content_type) = request.headers().get("content-type") {
-        outbound = outbound.header("content-type", content_type);
+    let mut outbound = client.request(method, format!("{base}{path_and_query}"));
+    // Forward the page's own request headers — Cookie, Origin (the REAL page
+    // origin, so the node's cross-origin guard is meaningful), Accept,
+    // Content-Type — and let the node's denylist strip the dangerous ones. The
+    // one thing a page must NOT be able to set is `x-duck-*`: the node trusts
+    // those as ours, so we drop any page-set copy before stamping our own
+    // authority. `host`/`content-length` are reqwest's to set from the target
+    // URL + body; `accept-encoding` is dropped so the backend never compresses
+    // (this hop does not decode, and content-encoding is not forwarded).
+    for (name, value) in request.headers() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if lower.starts_with("x-duck-")
+            || lower == "host"
+            || lower == "content-length"
+            || lower == "accept-encoding"
+        {
+            continue;
+        }
+        outbound = outbound.header(name, value);
     }
+    outbound = outbound.header("x-duck-authority", &authority);
     if !request.body().is_empty() {
         outbound = outbound.body(request.body().clone());
     }
