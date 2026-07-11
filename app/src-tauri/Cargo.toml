@@ -12,6 +12,14 @@ version.workspace = true
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# The feat/cef Tauri CLI discovers CEF bundling through the app's enabled
+# Cargo features. The standalone runtime no longer enables `tauri/cef`, so
+# keep the optional direct `cef` dependency below in the default feature set
+# as the packaging signal. Without it, macOS builds silently omit the CEF
+# framework/helper apps and panic in cef::library_loader at launch.
+default = ["cef"]
+
 [dependencies]
 # tray-icon: the macOS menu-bar icon + popover (src/tray.rs, gated to macOS).
 # image-png: decode the bundled tray.png for the icon.
@@ -40,6 +48,11 @@ tauri = { version = "2", default-features = false, features = [
 tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "86591aa0afb6da9afcd7f4d80c95f34555692b08", features = [
   "macos-private-api",
 ] }
+# See the default feature above. This resolves to the same package/version the
+# runtime already uses; making it a direct optional dependency gives Cargo and
+# the feat/cef bundler the `cef` feature signal without re-coupling tauri itself
+# to the unreleased runtime feature.
+cef = { version = "=148.0.0", optional = true }
 # native OS toasts for the production notification sink (src/notify/present.rs).
 tauri-plugin-notification = "2"
 # in-app LAN key-enrollment server (pure Rust, no system libs): an ephemeral,

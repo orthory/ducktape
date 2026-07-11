@@ -210,7 +210,7 @@ pub fn init<R: Runtime>(_app: &AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
-fn show_main<R: Runtime>(app: &AppHandle<R>) {
+pub(crate) fn show_main<R: Runtime>(app: &AppHandle<R>) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();

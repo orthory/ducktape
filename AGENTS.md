@@ -1,3 +1,5 @@
+<!-- LATTICE_LANE: 98cbfdac-a5d9-4ec5-bb26-75a001f3f7bf -->
+
 # Repository Instructions
 
 ## Internal Skills
