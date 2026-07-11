@@ -464,6 +464,7 @@ format = "text"
                 saga_id,
                 attempt,
                 outcome,
+                ..
             } => {
                 assert_eq!((saga_id, attempt), ("job".to_string(), 0));
                 assert_eq!(outcome.unwrap(), b"answer to: the whole input".to_vec());

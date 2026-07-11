@@ -22,7 +22,7 @@
 //! execution to a spawned background task, and returns immediately — so a
 //! minutes-long CLI call never stalls the host's event loop.
 
-use capability_host::ProviderSet;
+use capability_host::{ProviderOutput, ProviderSet};
 use dispatch::{WorkSpec, decode_work_spec};
 use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Effect, Msg};
@@ -48,6 +48,24 @@ pub(crate) struct ExecJob {
     pub capability: String,
     /// the fully rendered prompt — the WorkSpec payload, verbatim.
     pub input: String,
+}
+
+pub(crate) struct AttemptOutput {
+    pub bytes: Vec<u8>,
+    pub usage: Option<saga::TokenUsage>,
+}
+
+fn attempt_output(output: ProviderOutput, bytes: Vec<u8>) -> AttemptOutput {
+    AttemptOutput {
+        bytes,
+        usage: output.usage.map(|usage| saga::TokenUsage {
+            input_tokens: usage.input_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_write_input_tokens: usage.cache_write_input_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_output_tokens: usage.reasoning_output_tokens,
+        }),
+    }
 }
 
 /// the fast, deterministic half of the worker step: decode routing plus the
@@ -134,12 +152,32 @@ fn gate_own_lease(providers: &ProviderSet, request: &WorkerRequest, work: WorkSp
 /// normal submit path, echoing the request's `(saga_id, attempt)`
 /// idempotency key.
 fn oracle_result(saga_id: &str, attempt: u32, outcome: Result<Vec<u8>, String>) -> Msg {
+    oracle_result_with_usage(saga_id, attempt, outcome, None)
+}
+
+fn oracle_result_with_usage(
+    saga_id: &str,
+    attempt: u32,
+    outcome: Result<Vec<u8>, String>,
+    usage: Option<saga::TokenUsage>,
+) -> Msg {
     Msg {
         target: "saga".into(),
         payload: encode_msg(&SagaMsg::OracleResult {
             saga_id: saga_id.into(),
             attempt,
             outcome,
+            usage,
+        }),
+    }
+}
+
+fn renew_lease(saga_id: &str, attempt: u32) -> Msg {
+    Msg {
+        target: "saga".into(),
+        payload: encode_msg(&SagaMsg::RenewLease {
+            saga_id: saga_id.into(),
+            attempt,
         }),
     }
 }

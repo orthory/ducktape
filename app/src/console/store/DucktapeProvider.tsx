@@ -259,7 +259,7 @@ export function DucktapeProvider({
                 capabilitiesByNode: capability.capabilitiesByNode,
                 watches: runs.watches,
                 pendingRuns: runs.pendingRuns,
-                runAssignee: runs.runAssignee,
+                runLease: runs.runLease,
                 files: files.files,
                 blocks,
               }),

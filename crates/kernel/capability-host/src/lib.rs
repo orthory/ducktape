@@ -48,7 +48,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 /// host's own resources. the RUN's committed outcome is bounded by the
 /// saga's consensus deadline regardless (ADR X3) — this factor only decides
 /// how long this host keeps paying for one child.
-const HARD_TIMEOUT_FACTOR: u32 = 6;
+const HARD_TIMEOUT_FACTOR: u32 = 36;
 
 mod session;
 mod spec;
@@ -105,6 +105,23 @@ pub struct OutputLine {
     pub line: String,
 }
 
+/// provider-reported token counters. cached/reasoning values are subsets of
+/// input/output, so totals add only the two top-level fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderOutput {
+    pub text: String,
+    pub usage: Option<TokenUsage>,
+}
+
 /// optional live-tail callback for provider output. The run context is passed
 /// beside each line so embedders can key their own per-run registry with the
 /// host-local identity available to capability-host.
@@ -132,6 +149,17 @@ pub trait Provider: Send + Sync {
     /// `ctx` is host-local run identity (see [`RunContext`]) — implementations
     /// that predate workspaces/sessions may simply ignore it.
     async fn run(&self, prompt: &str, ctx: &RunContext) -> Result<String, String>;
+    /// the same run plus optional executor-reported usage. legacy/custom
+    /// providers inherit the text-only default without changing their API.
+    async fn run_with_usage(
+        &self,
+        prompt: &str,
+        ctx: &RunContext,
+    ) -> Result<ProviderOutput, String> {
+        self.run(prompt, ctx)
+            .await
+            .map(|text| ProviderOutput { text, usage: None })
+    }
 }
 
 /// the host's provider surface: every LOADED spec (for routing — an
@@ -439,6 +467,7 @@ impl CliProvider {
 /// CLI's output, not part of it).
 struct Invocation {
     text: String,
+    usage: Option<TokenUsage>,
     stdout: String,
 }
 
@@ -648,30 +677,34 @@ impl CliProvider {
             ));
         }
         let stdout = String::from_utf8_lossy(&out_bytes).into_owned();
-        let text = match self.spec.output {
-            OutputFormat::JsonlEvents => parse_jsonl_events(&stdout),
-            OutputFormat::JsonResult => parse_json_result(&stdout),
-            OutputFormat::Text => parse_text_output(&stdout),
-        }?;
-        Ok(Invocation { text, stdout })
+        let (text, usage) = match self.spec.output {
+            OutputFormat::JsonlEvents => {
+                (parse_jsonl_events(&stdout)?, parse_token_usage(&stdout))
+            }
+            OutputFormat::JsonResult => {
+                (parse_json_result(&stdout)?, parse_token_usage(&stdout))
+            }
+            // Plain stdout is model-authored answer text, not a provider
+            // telemetry envelope. Never infer usage from answer content.
+            OutputFormat::Text => (parse_text_output(&stdout)?, None),
+        };
+        Ok(Invocation {
+            text,
+            usage,
+            stdout,
+        })
     }
-}
 
-#[async_trait::async_trait]
-impl Provider for CliProvider {
-    fn capability(&self) -> &str {
-        &self.spec.tag
-    }
-
-    async fn run(&self, prompt: &str, ctx: &RunContext) -> Result<String, String> {
+    async fn run_output(&self, prompt: &str, ctx: &RunContext) -> Result<ProviderOutput, String> {
         let workdir = self.ensure_writable_workdir(ctx)?;
 
         let Some((session, store)) = self.session_store(ctx)? else {
             // no session plumbing for this run: one cold invocation.
-            return Ok(self
-                .invoke(prompt, &self.spec.args, &workdir, ctx)
-                .await?
-                .text);
+            let run = self.invoke(prompt, &self.spec.args, &workdir, ctx).await?;
+            return Ok(ProviderOutput {
+                text: run.text,
+                usage: run.usage,
+            });
         };
 
         if let Some(session_id) = store.load() {
@@ -681,7 +714,10 @@ impl Provider for CliProvider {
                     // re-capture on success: a CLI that rotates ids on
                     // resume stays resumable next time.
                     store.store_captured(&session.capture, &run.stdout);
-                    return Ok(run.text);
+                    return Ok(ProviderOutput {
+                        text: run.text,
+                        usage: run.usage,
+                    });
                 }
                 Err(e) => {
                     // a stale/expired session must degrade to a cold start,
@@ -699,7 +735,29 @@ impl Provider for CliProvider {
         }
         let run = self.invoke(prompt, &self.spec.args, &workdir, ctx).await?;
         store.store_captured(&session.capture, &run.stdout);
-        Ok(run.text)
+        Ok(ProviderOutput {
+            text: run.text,
+            usage: run.usage,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for CliProvider {
+    fn capability(&self) -> &str {
+        &self.spec.tag
+    }
+
+    async fn run(&self, prompt: &str, ctx: &RunContext) -> Result<String, String> {
+        self.run_output(prompt, ctx).await.map(|output| output.text)
+    }
+
+    async fn run_with_usage(
+        &self,
+        prompt: &str,
+        ctx: &RunContext,
+    ) -> Result<ProviderOutput, String> {
+        self.run_output(prompt, ctx).await
     }
 }
 
@@ -723,6 +781,58 @@ pub(crate) fn result_objects(stdout: &str) -> impl Iterator<Item = Value> + '_ {
         .chain(stdout.lines().rev().map(str::trim))
         .filter_map(|candidate| serde_json::from_str::<Value>(candidate).ok())
         .filter(|v| v.get("type").and_then(Value::as_str) == Some("result"))
+}
+
+fn token_usage_from(value: &Value) -> Option<TokenUsage> {
+    let usage = value.get("usage")?.as_object()?;
+    let read = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let has_tokens = [
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    ]
+    .iter()
+    .any(|key| usage.contains_key(*key));
+    if !has_tokens {
+        return None;
+    }
+
+    let raw_input = read("input_tokens");
+    let cached_input = usage
+        .get("cached_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| read("cache_read_input_tokens"));
+    let cache_write = read("cache_creation_input_tokens");
+    // Codex reports cached_input_tokens as a subset of input_tokens. Claude's
+    // cache read/write counters are additional to its input_tokens field.
+    let input_tokens = if usage.contains_key("cached_input_tokens") {
+        raw_input
+    } else {
+        raw_input
+            .saturating_add(cached_input)
+            .saturating_add(cache_write)
+    };
+    Some(TokenUsage {
+        input_tokens,
+        cached_input_tokens: cached_input,
+        cache_write_input_tokens: cache_write,
+        output_tokens: read("output_tokens"),
+        reasoning_output_tokens: read("reasoning_output_tokens"),
+    })
+}
+
+fn parse_token_usage(stdout: &str) -> Option<TokenUsage> {
+    json_lines(stdout)
+        .filter_map(|value| token_usage_from(&value))
+        .last()
+        .or_else(|| {
+            result_objects(stdout)
+                .filter_map(|value| token_usage_from(&value))
+                .next()
+        })
 }
 
 /// the LAST agent message in a JSONL event stream. tolerant of
@@ -1291,10 +1401,22 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"echo: %s
             "events",
             r#"cat > /dev/null
 printf '{"type":"item.completed","item":{"type":"agent_message","text":"first"}}\n'
-printf '{"type":"item.completed","item":{"item_type":"agent_message","text":"second"}}\n'"#,
+printf '{"type":"item.completed","item":{"item_type":"agent_message","text":"second"}}\n'
+printf '{"type":"turn.completed","usage":{"input_tokens":24763,"cached_input_tokens":24448,"output_tokens":122,"reasoning_output_tokens":7}}\n'"#,
         );
         let p = mock_provider("events", "jsonl-events", bin, "jsonl-last-wd");
-        assert_eq!(p.run("x", &RunContext::default()).await.unwrap(), "second");
+        let output = p.run_with_usage("x", &RunContext::default()).await.unwrap();
+        assert_eq!(output.text, "second");
+        assert_eq!(
+            output.usage,
+            Some(TokenUsage {
+                input_tokens: 24763,
+                cached_input_tokens: 24448,
+                cache_write_input_tokens: 0,
+                output_tokens: 122,
+                reasoning_output_tokens: 7,
+            })
+        );
     }
 
     #[tokio::test]
@@ -1304,10 +1426,15 @@ printf '{"type":"item.completed","item":{"item_type":"agent_message","text":"sec
             &dir,
             "result",
             r#"cat > /dev/null
-printf '{"type":"result","subtype":"success","is_error":false,"result":"pong"}\n'"#,
+printf '{"type":"result","subtype":"success","is_error":false,"result":"pong","usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":4}}\n'"#,
         );
         let p = mock_provider("result", "json-result", bin, "result-run-wd");
-        assert_eq!(p.run("ping", &RunContext::default()).await.unwrap(), "pong");
+        let output = p
+            .run_with_usage("ping", &RunContext::default())
+            .await
+            .unwrap();
+        assert_eq!(output.text, "pong");
+        assert_eq!(output.usage.unwrap().input_tokens, 60);
     }
 
     #[tokio::test]
@@ -1339,6 +1466,18 @@ printf '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"b
         let p = mock_provider("silent", "text", silent, "text-silent-wd");
         let err = p.run("q", &RunContext::default()).await.unwrap_err();
         assert!(err.contains("no output"), "got: {err}");
+
+        let usage_shaped = fake_cli(
+            &dir,
+            "plain-json",
+            r#"cat > /dev/null
+printf '{"usage":{"input_tokens":999},"answer":"still plain text"}\n'"#,
+        );
+        let output = mock_provider("plain-json", "text", usage_shaped, "plain-json-wd")
+            .run_with_usage("q", &RunContext::default())
+            .await
+            .unwrap();
+        assert_eq!(output.usage, None, "answer JSON is not telemetry");
     }
 
     #[tokio::test]
@@ -1450,15 +1589,15 @@ printf '{"type":"turn.completed"}\n'"#,
         let bin = fake_cli(
             &dir,
             "chatterbox",
-            "cat > /dev/null\nwhile true; do echo tick >&2; sleep 0.05; done",
+            "cat > /dev/null\nwhile true; do echo tick >&2; sleep 0.01; done",
         );
         let p = mock_provider("chatterbox", "text", bin, "chatty-wd")
-            .with_timeout(Duration::from_millis(100));
+            .with_timeout(Duration::from_millis(50));
         let start = std::time::Instant::now();
         let err = p.run("x", &RunContext::default()).await.unwrap_err();
         assert!(err.contains("hard cap"), "names the ceiling: {err}");
         assert!(
-            start.elapsed() >= Duration::from_millis(500)
+            start.elapsed() >= Duration::from_millis(1500)
                 && start.elapsed() < Duration::from_secs(5),
             "killed at ~idle × {HARD_TIMEOUT_FACTOR}, not the idle window: {:?}",
             start.elapsed()

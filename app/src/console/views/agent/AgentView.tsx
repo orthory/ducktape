@@ -249,7 +249,7 @@ export function AgentView() {
               op={state.ops[opKey.jobWorker()]}
               onToggle={toggleJobWorker}
             />
-            <UsageCard />
+            <UsageCard refreshKey={state.pendingRuns.map((run) => run.run_id).join("\n")} />
             <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
               {(["all", "mine"] as const).map((f) => (
                 <button
@@ -280,7 +280,9 @@ export function AgentView() {
               channels={state.channels}
               ops={state.ops}
               onCancel={actions.cancelRun}
-              runAssignee={state.runAssignee}
+              onReassign={actions.reassignRun}
+              runLease={state.runLease}
+              currentHeight={state.status?.height ?? state.lastBlock ?? 0}
               authorNames={state.authorNames}
               workspacePubkey={state.workspace?.pubkey ?? null}
             />

@@ -626,6 +626,35 @@ impl DispatchModule {
         Ok(())
     }
 
+    fn on_reassign(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        dispatch_id: String,
+        attempt: u32,
+    ) -> Result<(), Error> {
+        let Origin::Module(receiver) = &ctx.env().origin else {
+            return Err(Error::Module(
+                "ReassignDispatch is module-origin only (a module reassigns its own dispatch)"
+                    .into(),
+            ));
+        };
+        let key = dispatch_key(receiver, &dispatch_id);
+        let Some(dispatch) = self.dispatch(&key) else {
+            return Ok(());
+        };
+        if dispatch.status != Status::AwaitingResult {
+            return Ok(());
+        }
+        ctx.emit_msg(Msg {
+            target: self.saga.clone(),
+            payload: saga_encode_msg(&SagaMsg::Reassign {
+                saga_id: dispatch.saga_id.clone(),
+                attempt,
+            }),
+        });
+        Ok(())
+    }
+
     /// the host-injected delivery sweep: emit up to
     /// [`MAX_DELIVERIES_PER_BLOCK`] mailbox events, FIFO, each as one
     /// follow-up `Msg` to its receiver.
@@ -761,6 +790,10 @@ impl DispatchModule {
                 payload,
             } => self.on_dispatch(ctx, dispatch_id, recipe_id, payload),
             DispatchMsg::CancelDispatch { dispatch_id } => self.on_cancel(ctx, dispatch_id),
+            DispatchMsg::ReassignDispatch {
+                dispatch_id,
+                attempt,
+            } => self.on_reassign(ctx, dispatch_id, attempt),
             DispatchMsg::DeliverPending {} => self.on_deliver_pending(ctx),
             // the block's EXISTENCE is the point (it carries the host's
             // delivery injection); the op itself stages nothing.
@@ -782,6 +815,12 @@ impl DispatchModule {
             },
             outcome: d.outcome.clone(),
             assignee: None,
+            attempt: None,
+            max_attempts: None,
+            lease_expires_at: None,
+            deadline: None,
+            lease_updated_at: None,
+            reassignable: None,
             created_at: d.created_at,
             updated_at: d.updated_at,
         }
@@ -790,7 +829,11 @@ impl DispatchModule {
     /// the saga's current lease holder, read through the host-routed sibling
     /// lane — the filtered-facade pattern (cf. `upgrade::members`). read-only:
     /// this never stages, so it is safe inside `query_with`.
-    async fn saga_assignee(&self, ctx: &dyn Ctx, saga_id: &str) -> Result<Option<Vec<u8>>, Error> {
+    async fn saga_view(
+        &self,
+        ctx: &dyn Ctx,
+        saga_id: &str,
+    ) -> Result<Option<saga::SagaView>, Error> {
         let reply = ctx
             .query(
                 &self.saga,
@@ -800,7 +843,7 @@ impl DispatchModule {
             )
             .await?;
         match saga_decode_reply(&reply).map_err(Error::Module)? {
-            SagaReply::Saga(saga) => Ok(saga.and_then(|v| v.assignee)),
+            SagaReply::Saga(saga) => Ok(saga),
             other => Err(Error::Module(format!("saga answered Get with {other:?}"))),
         }
     }
@@ -898,8 +941,18 @@ impl Module for DispatchModule {
                 let mut view = Self::view(d);
                 // "running on" is only meaningful while the saga is live; a
                 // delivered run has left every node.
-                if matches!(d.status, Status::AwaitingResult) {
-                    view.assignee = self.saga_assignee(ctx, &d.saga_id).await?;
+                if matches!(d.status, Status::AwaitingResult)
+                    && let Some(saga) = self.saga_view(ctx, &d.saga_id).await?
+                {
+                    view.assignee = saga.assignee;
+                    view.attempt = Some(saga.attempt);
+                    view.max_attempts = Some(saga.max_attempts);
+                    view.lease_expires_at = saga.lease_expires_at;
+                    view.deadline = saga.deadline;
+                    view.lease_updated_at = Some(saga.updated_at);
+                    view.reassignable = Some(
+                        saga.pinned_assignee.is_none() && saga.attempt + 1 < saga.max_attempts,
+                    );
                 }
                 Ok(encode_reply(&DispatchReply::Dispatch(Some(view))))
             }
@@ -1560,6 +1613,23 @@ mod tests {
         assert_eq!(pending_deliveries(&m), 0, "the orphan seq was dropped");
     }
 
+    #[test]
+    fn reassign_is_receiver_scoped_and_carries_the_expected_attempt() {
+        let mut m = module();
+        let key = registered_and_dispatched(&mut m, OutputContract::Text);
+        let reassign = DispatchMsg::ReassignDispatch {
+            dispatch_id: "d1".into(),
+            attempt: 2,
+        };
+        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("caller".into()));
+        exec(&mut m, &mut ctx, &reassign).unwrap();
+        assert_eq!(ctx.msgs.len(), 1);
+        assert!(matches!(
+            saga_decode_msg(&ctx.msgs[0].payload).unwrap(),
+            SagaMsg::Reassign { saga_id, attempt: 2 } if saga_id == saga_id_for(&key)
+        ));
+    }
+
     /// a `saga` `Get` reply carrying a Pending saga with the given assignee.
     fn saga_reply_with_assignee(assignee: Option<Vec<u8>>) -> Vec<u8> {
         use saga::{SagaStatus, SagaView, encode_reply as saga_encode_reply};
@@ -1574,13 +1644,13 @@ mod tests {
             max_attempts: 2,
             assignee,
             pinned_assignee: None,
-            lease_views: None,
-            lease_expires_at: None,
-            deadline: None,
+            lease_views: Some(64),
+            lease_expires_at: Some(80),
+            deadline: Some(100),
             result: None,
             error: None,
             created_at: 0,
-            updated_at: 0,
+            updated_at: 40,
         })))
     }
 
@@ -1608,6 +1678,12 @@ mod tests {
             .with_saga_reply(saga_reply_with_assignee(Some(b"worker-key".to_vec())));
         let view = query_dispatch(&m, &ctx, &key).expect("a dispatch view");
         assert_eq!(view.assignee, Some(b"worker-key".to_vec()));
+        assert_eq!(view.attempt, Some(0));
+        assert_eq!(view.max_attempts, Some(2));
+        assert_eq!(view.lease_expires_at, Some(80));
+        assert_eq!(view.deadline, Some(100));
+        assert_eq!(view.lease_updated_at, Some(40));
+        assert_eq!(view.reassignable, Some(true));
     }
 
     #[test]
@@ -1623,5 +1699,7 @@ mod tests {
             .with_saga_reply(saga_reply_with_assignee(Some(b"worker-key".to_vec())));
         let view = query_dispatch(&m, &ctx, &key).expect("a dispatch view");
         assert_eq!(view.assignee, None);
+        assert_eq!(view.attempt, None);
+        assert_eq!(view.reassignable, None);
     }
 }

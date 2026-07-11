@@ -243,6 +243,27 @@ fn cancel_run_is_gated_to_the_requester_or_the_owner() {
     );
     abort(&mut m);
 
+    let mut ctx = CaptureCtx::new()
+        .with_origin(user(1))
+        .with_registry(&registry);
+    exec(
+        &mut m,
+        &mut ctx,
+        &admin(&RunsMsg::ReassignRun {
+            run_id: run_id.clone(),
+            attempt: 0,
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        ctx.dispatch_msgs(),
+        vec![DispatchMsg::ReassignDispatch {
+            dispatch_id: dispatch_id_for(&run_id),
+            attempt: 0,
+        }]
+    );
+    commit(&mut m);
+
     // the REQUESTER cancels: the dispatch plane is told; the entry STAYS
     // pending — the plane's Err("cancelled") delivery is the one result
     // path that prunes it.

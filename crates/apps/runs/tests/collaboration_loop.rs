@@ -98,6 +98,7 @@ fn oracle_op_for(effect: &Effect, raw: Vec<u8>) -> Msg {
             saga_id: request.saga_id,
             attempt: request.attempt,
             outcome: Ok(raw),
+            usage: None,
         }),
     }
 }
@@ -406,6 +407,7 @@ async fn oracle_result(host: &mut Host, run_id: &str, height: u64, outcome: Resu
                 saga_id,
                 attempt: 0,
                 outcome,
+                usage: None,
             }),
         },
     )
@@ -825,6 +827,7 @@ fn a_failed_job_run_finalizes_the_jobs_board_with_error_detail() {
                         saga_id: saga_id.clone(),
                         attempt,
                         outcome: Err("model unavailable".into()),
+                        usage: None,
                     }),
                 },
             )
@@ -870,6 +873,7 @@ fn a_failed_oracle_fails_the_run_and_surfaces_a_failure_reply() {
                         saga_id: saga_id.clone(),
                         attempt,
                         outcome: Err("model unavailable".into()),
+                        usage: None,
                     }),
                 },
             )
@@ -940,6 +944,7 @@ fn a_response_with_a_disallowed_action_fails_the_run_and_writes_nothing() {
                     saga_id: saga_id.clone(),
                     attempt: 0,
                     outcome: Ok(canned_response(&run_id)),
+                    usage: None,
                 }),
             },
         )

@@ -64,6 +64,7 @@ fn mock_worker(eff: &Effect) -> Option<Msg> {
             saga_id: wr.saga_id,
             attempt: wr.attempt,
             outcome: Ok(result),
+            usage: None,
         }),
     })
 }

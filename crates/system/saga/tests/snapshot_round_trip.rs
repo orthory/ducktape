@@ -156,6 +156,7 @@ fn source() -> SagaModule {
             saga_id: "s-done".into(),
             attempt: 0,
             outcome: Ok(b"agreed-answer".to_vec()),
+            usage: None,
         },
     );
     exec(
@@ -166,6 +167,7 @@ fn source() -> SagaModule {
             saga_id: "s-failed".into(),
             attempt: 0,
             outcome: Err("first worker crashed".into()),
+            usage: None,
         },
     );
     exec(
@@ -188,6 +190,7 @@ fn source() -> SagaModule {
             saga_id: "s-failed".into(),
             attempt: 1,
             outcome: Err("second worker crashed".into()),
+            usage: None,
         },
     );
     block_on(m.commit_block()).unwrap();

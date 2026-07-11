@@ -359,6 +359,8 @@ export interface ConsoleActions {
   requestRun(params: { agentId: string; channelId: string; anchorSeq: number }): void;
   /** Cancel an awaiting run (run-creator or owner only). */
   cancelRun(runId: string): void;
+  /** Fence one attempt and move the run to a different provider. */
+  reassignRun(runId: string, attempt: number): void;
   /** Owner-gated edit of a registered agent. A provided `prompt` is staged in
    *  the blob store and its digest committed as the new prompt_hash; every
    *  omitted field keeps its current value. */
@@ -2043,6 +2045,17 @@ export function createActions({
         opKey.run(runId),
         (live) => runsClient.cancelRun(live, { runId, origin: getState().author }),
         (prev) => optimistic.runCancelled(prev, runId),
+      );
+    },
+
+    reassignRun: (runId, attempt) => {
+      if (!runId || attempt < 0) return;
+      submitTracked(opKey.run(runId), (live) =>
+        runsClient.reassignRun(live, {
+          runId,
+          attempt,
+          origin: getState().author,
+        }),
       );
     },
 

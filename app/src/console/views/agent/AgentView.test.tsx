@@ -192,10 +192,30 @@ describe("AgentView", () => {
     expect(spies.unwatchChannel).toHaveBeenCalledWith("general");
   });
 
-  it("cancels an in-progress run and toggles the jobs worker on the Activity tab", () => {
-    const { spies } = renderAgents();
+  it("reassigns or cancels an in-progress run and toggles the jobs worker", () => {
+    const { spies } = renderAgents({
+      runLease: new Map([
+        [
+          "general/42/summarizer",
+          {
+            assigneeHex: "cd".repeat(32),
+            attempt: 0,
+            maxAttempts: 2,
+            expiresAt: 80,
+            deadline: 100,
+            updatedAt: 40,
+            reassignable: true,
+          },
+        ],
+      ]),
+    });
 
     openTab(/activity/i);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /force reassign run general\/42\/summarizer/i }),
+    );
+    expect(spies.reassignRun).toHaveBeenCalledWith("general/42/summarizer", 0);
 
     fireEvent.click(screen.getByRole("button", { name: /cancel run general\/42\/summarizer/i }));
     expect(spies.cancelRun).toHaveBeenCalledWith("general/42/summarizer");
@@ -294,7 +314,20 @@ describe("AgentView", () => {
   it("shows which node is executing an in-flight run", () => {
     const nodeKey = "cd".repeat(32);
     renderAgents({
-      runAssignee: new Map([["general/42/summarizer", nodeKey]]),
+      runLease: new Map([
+        [
+          "general/42/summarizer",
+          {
+            assigneeHex: nodeKey,
+            attempt: 0,
+            maxAttempts: 2,
+            expiresAt: 80,
+            deadline: 100,
+            updatedAt: 40,
+            reassignable: true,
+          },
+        ],
+      ]),
       authorNames: { [nodeKey]: "Node Bob" },
     });
 

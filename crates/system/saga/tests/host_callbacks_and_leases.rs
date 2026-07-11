@@ -124,6 +124,7 @@ fn oracle(id: &str, attempt: u32, outcome: Result<Vec<u8>, String>) -> Msg {
             saga_id: id.into(),
             attempt,
             outcome,
+            usage: None,
         }),
     }
 }

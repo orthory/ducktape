@@ -203,7 +203,7 @@ being silently ignored.
 |---|---|---|---|
 | `args` | string array | no (default `[]`) | passed verbatim to exec; fully literal, no placeholders |
 | `prompt` | string | yes | must be `"stdin"` in v1 |
-| `timeout_secs` | integer | no (default `300`) | 1..=3600; IDLE budget — output refreshes it; killed after this much silence, or at 6x regardless |
+| `timeout_secs` | integer | no (default `300`) | 1..=3600; IDLE budget — output refreshes it; killed after this much silence, or at 36x regardless |
 
 ### `[output]`
 
