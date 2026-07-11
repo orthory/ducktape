@@ -1273,6 +1273,7 @@ async fn gateway_browser_proxy(
             .to_string(),
         headers: forwarded,
         body_len: body.len() as u64,
+        upgrade: false,
     };
     let response = match proxy_current(&handle, head, body.to_vec()).await {
         Ok(response) => response,

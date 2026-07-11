@@ -220,14 +220,32 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
             let workspace = workspace.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let outcome = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
-                    if hello.intent != gateway::PROXY_INTENT {
-                        return Err(GatewayFailure::Invalid(
+                if hello.intent != gateway::PROXY_INTENT {
+                    let _ = write_proxy_response(
+                        &mut stream,
+                        Err(GatewayFailure::Invalid(
                             "gateway proxy: unsupported stream intent".into(),
-                        ));
+                        )),
+                    )
+                    .await;
+                    return;
+                }
+                let head = match gateway::decode_proxy_request_head(&hello.meta) {
+                    Ok(head) => head,
+                    Err(error) => {
+                        let _ =
+                            write_proxy_response(&mut stream, Err(GatewayFailure::Invalid(error)))
+                                .await;
+                        return;
                     }
-                    let head = gateway::decode_proxy_request_head(&hello.meta)
-                        .map_err(GatewayFailure::Invalid)?;
+                };
+                // A WebSocket upgrade is long-lived; it owns the stream and
+                // writes its own responses, so it bypasses the one-shot timeout.
+                if head.upgrade {
+                    serve_ws(&commands, &workspace, &own_node, &requester.0, &head, stream).await;
+                    return;
+                }
+                let outcome = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
                     let body_len = usize::try_from(head.body_len).map_err(|_| {
                         GatewayFailure::Invalid("gateway proxy: body length overflows usize".into())
                     })?;
@@ -825,6 +843,176 @@ async fn query(
         .map_err(GatewayFailure::Unavailable)
 }
 
+/// Authorize a WebSocket upgrade and resolve its loopback `ws://` target. Same
+/// checks as an HTTP request plus the signed `allow_upgrade` bit; content
+/// routes cannot upgrade.
+async fn authorize_ws(
+    commands: &mpsc::Sender<NodeCommand>,
+    workspace: &Path,
+    own_node: &[u8; 32],
+    caller_node: &[u8; 32],
+    head: &gateway::ProxyRequestHead,
+) -> Result<String, GatewayFailure> {
+    gateway::validate_proxy_request_head(head).map_err(GatewayFailure::Invalid)?;
+    if !head.upgrade {
+        return Err(GatewayFailure::Invalid("gateway proxy: not an upgrade".into()));
+    }
+    let record = resolve_route(commands, &head.account_id, &head.name).await?;
+    if record.statement.publisher_node.as_slice() != own_node {
+        return Err(GatewayFailure::Forbidden(
+            "gateway request does not name this publisher".into(),
+        ));
+    }
+    if !gateway::request_matches_record(head, &record) {
+        return Err(GatewayFailure::Conflict(
+            "gateway request does not match the current signed route".into(),
+        ));
+    }
+    revalidate_route_authority(commands, &record).await?;
+    let caller = account_of_node(commands, caller_node).await?;
+    let route = record
+        .statement
+        .route
+        .as_ref()
+        .expect("resolve_route rejects tombstones");
+    if !gateway::audience_allows(
+        &route.policy.audience,
+        &record.statement.account_id,
+        &caller.account_id,
+    ) {
+        return Err(GatewayFailure::Forbidden(
+            "caller account is outside the signed route audience".into(),
+        ));
+    }
+    if !route.policy.allow_upgrade || !matches!(route.target, gateway::RouteTarget::LoopbackHttp) {
+        return Err(GatewayFailure::Forbidden(
+            "route does not permit a WebSocket upgrade".into(),
+        ));
+    }
+    let routes = crate::gateway_routes::load(workspace).map_err(GatewayFailure::Unavailable)?;
+    let port = routes.port(&head.name).ok_or_else(|| {
+        GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
+    })?;
+    Ok(format!("ws://127.0.0.1:{port}{}", head.path_and_query))
+}
+
+/// Bridge a WebSocket upgrade to the route's loopback upstream. Owns the mesh
+/// stream: writes a `Failure` frame on any authorize/dial error, otherwise a
+/// `101` `ResponseHead` then pumps `WsFrame`/`WsClose` both ways until close.
+async fn serve_ws<S>(
+    commands: &mpsc::Sender<NodeCommand>,
+    workspace: &Path,
+    own_node: &[u8; 32],
+    caller_node: &[u8; 32],
+    head: &gateway::ProxyRequestHead,
+    mut stream: S,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let url = match authorize_ws(commands, workspace, own_node, caller_node, head).await {
+        Ok(url) => url,
+        Err(failure) => {
+            let _ = write_frame(&mut stream, &failure_frame(&failure)).await;
+            let _ = stream.flush().await;
+            return;
+        }
+    };
+    let upstream = match tokio_tungstenite::connect_async(&url).await {
+        Ok((upstream, _response)) => upstream,
+        Err(error) => {
+            let _ = write_frame(
+                &mut stream,
+                &failure_frame(&GatewayFailure::Unavailable(error.to_string())),
+            )
+            .await;
+            let _ = stream.flush().await;
+            return;
+        }
+    };
+    if write_frame(
+        &mut stream,
+        &gateway::ProxyFrame::ResponseHead(gateway::ProxyResponseHead {
+            status: 101,
+            headers: vec![],
+        }),
+    )
+    .await
+    .is_err()
+        || stream.flush().await.is_err()
+    {
+        return;
+    }
+    ws_pump(stream, upstream).await;
+}
+
+/// Two independent tasks (mesh→upstream, upstream→mesh); when either direction
+/// ends, the other is aborted so both sockets drop and each peer sees EOF.
+async fn ws_pump<S, U>(stream: S, upstream: U)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    U: futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>>
+        + futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin
+        + Send
+        + 'static,
+{
+    use tokio_tungstenite::tungstenite::Message;
+    let (mut mesh_read, mut mesh_write) = tokio::io::split(stream);
+    let (mut ws_tx, mut ws_rx) = upstream.split();
+    let mut to_upstream = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        loop {
+            match read_frame(&mut mesh_read, &mut buf).await {
+                Ok(gateway::ProxyFrame::WsFrame { binary, payload }) => {
+                    let message = if binary {
+                        Message::binary(payload)
+                    } else {
+                        Message::text(String::from_utf8_lossy(&payload).into_owned())
+                    };
+                    if ws_tx.send(message).await.is_err() {
+                        break;
+                    }
+                }
+                _ => {
+                    let _ = ws_tx.close().await;
+                    break;
+                }
+            }
+        }
+    });
+    let mut to_mesh = tokio::spawn(async move {
+        while let Some(message) = ws_rx.next().await {
+            let frame = match message {
+                Ok(Message::Text(text)) => gateway::ProxyFrame::WsFrame {
+                    binary: false,
+                    payload: text.as_bytes().to_vec(),
+                },
+                Ok(Message::Binary(bytes)) => gateway::ProxyFrame::WsFrame {
+                    binary: true,
+                    payload: bytes.to_vec(),
+                },
+                Ok(Message::Close(frame)) => gateway::ProxyFrame::WsClose {
+                    code: frame.map(|frame| u16::from(frame.code)).unwrap_or(1000),
+                },
+                Ok(_) => continue,
+                Err(_) => break,
+            };
+            let closing = matches!(frame, gateway::ProxyFrame::WsClose { .. });
+            if write_frame(&mut mesh_write, &frame).await.is_err() {
+                break;
+            }
+            let _ = mesh_write.flush().await;
+            if closing {
+                break;
+            }
+        }
+    });
+    tokio::select! {
+        _ = &mut to_upstream => to_mesh.abort(),
+        _ = &mut to_mesh => to_upstream.abort(),
+    }
+}
+
 /// Map a typed failure onto a wire frame, redacting `Unavailable` detail
 /// (which may carry a workspace path / loopback port / library diagnostic).
 fn failure_frame(failure: &GatewayFailure) -> gateway::ProxyFrame {
@@ -1064,6 +1252,107 @@ mod tests {
         assert!(matches!(capped, Err(GatewayFailure::Unavailable(_))));
     }
 
+    #[tokio::test]
+    async fn ws_upgrade_bridges_frames_over_the_mesh() {
+        use tokio_tungstenite::tungstenite::Message;
+        // A WebSocket echo upstream on loopback.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    Message::Text(_) | Message::Binary(_) => {
+                        if ws.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let publisher = [2u8; 32];
+        let caller = [3u8; 32];
+        let member = ed25519::PrivateKey::from_seed(44);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Network, true);
+        let owner = account(vec![1; 32], publisher, &member);
+        let caller_view = account(vec![9; 32], caller, &ed25519::PrivateKey::from_seed(55));
+
+        let workspace = tempfile::tempdir().unwrap();
+        let routes = crate::gateway_routes::LocalRoutes {
+            version: 1,
+            routes: vec![crate::gateway_routes::LocalRoute {
+                name: gateway::RouteName::named("api"),
+                port,
+            }],
+        };
+        std::fs::write(
+            workspace.path().join(crate::gateway_routes::FILE_NAME),
+            serde_json::to_vec_pretty(&routes).unwrap(),
+        )
+        .unwrap();
+
+        // Fake node actor: route → publisher authority → caller account.
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let replies: Vec<Vec<u8>> = vec![
+                gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(route)))),
+                identity::encode_reply(&identity::IdentityReply::Account(Some(owner))),
+                identity::encode_reply(&identity::IdentityReply::Account(Some(caller_view))),
+            ];
+            for bytes in replies {
+                let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                    panic!("expected a query")
+                };
+                let _ = reply.send(Ok(bytes));
+            }
+        });
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let head = gateway::ProxyRequestHead {
+            account_id: vec![1; 32],
+            name: gateway::RouteName::named("api"),
+            revision: 4,
+            method: gateway::RouteMethod::Get,
+            path_and_query: "/socket".into(),
+            headers: vec![],
+            body_len: 0,
+            upgrade: true,
+        };
+        let workspace_path = workspace.path().to_path_buf();
+        tokio::spawn(async move {
+            serve_ws(&commands, &workspace_path, &publisher, &caller, &head, server).await;
+        });
+
+        // The upgrade is acknowledged with a 101, then a frame round-trips
+        // through the loopback WebSocket and back.
+        let mut buf = Vec::new();
+        match read_frame(&mut client, &mut buf).await.unwrap() {
+            gateway::ProxyFrame::ResponseHead(head) => assert_eq!(head.status, 101),
+            other => panic!("expected a 101 upgrade ack, got {other:?}"),
+        }
+        write_frame(
+            &mut client,
+            &gateway::ProxyFrame::WsFrame {
+                binary: false,
+                payload: b"ping".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        client.flush().await.unwrap();
+        match read_frame(&mut client, &mut buf).await.unwrap() {
+            gateway::ProxyFrame::WsFrame { binary, payload } => {
+                assert!(!binary);
+                assert_eq!(payload, b"ping");
+            }
+            other => panic!("expected an echoed ws frame, got {other:?}"),
+        }
+    }
+
     #[test]
     fn admission_is_service_flow_and_member_scoped() {
         let signer = ed25519::PrivateKey::from_seed(99);
@@ -1080,6 +1369,7 @@ mod tests {
         signer: &ed25519::PrivateKey,
         publisher: [u8; 32],
         audience: gateway::RouteAudience,
+        allow_upgrade: bool,
     ) -> gateway::RouteRecord {
         let statement = gateway::RouteStatement {
             version: gateway::ROUTE_FORMAT_VERSION,
@@ -1096,7 +1386,7 @@ mod tests {
                     max_request_bytes: 1024,
                     max_response_bytes: 4096,
                     allow_authorization: false,
-                    allow_upgrade: false,
+                    allow_upgrade,
                 },
             }),
         };
@@ -1175,7 +1465,7 @@ mod tests {
         let publisher = [2u8; 32];
         let caller = [3u8; 32];
         let member = ed25519::PrivateKey::from_seed(44);
-        let route = signed_route(&member, publisher, gateway::RouteAudience::Network);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Network, false);
         let (commands, mut requests) = mpsc::channel(4);
         tokio::spawn(async move {
             let NodeCommand::Query { target, reply, .. } = requests.next().await.unwrap() else {
@@ -1230,6 +1520,7 @@ mod tests {
                     },
                 ],
                 body_len: body.len() as u64,
+                upgrade: false,
             },
             body,
         )
@@ -1253,7 +1544,7 @@ mod tests {
         let publisher = [2u8; 32];
         let caller = [3u8; 32];
         let member = ed25519::PrivateKey::from_seed(44);
-        let route = signed_route(&member, publisher, gateway::RouteAudience::Owner);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Owner, false);
         let (commands, mut requests) = mpsc::channel(4);
         tokio::spawn(async move {
             let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
@@ -1293,6 +1584,7 @@ mod tests {
                 path_and_query: "/".into(),
                 headers: vec![],
                 body_len: 0,
+                upgrade: false,
             },
             &[],
         )
@@ -1415,6 +1707,7 @@ mod tests {
                 path_and_query: "/".into(),
                 headers: vec![],
                 body_len: 0,
+                upgrade: false,
             },
             &[],
         )

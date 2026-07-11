@@ -100,6 +100,10 @@ pub struct ProxyRequestHead {
     /// Strictly name-sorted, unique, allowlisted request headers.
     pub headers: Vec<ProxyHeader>,
     pub body_len: u64,
+    /// Request a WebSocket upgrade (GET, no body) on a route signed
+    /// `allow_upgrade`. Defaults false so older/non-WS callers stay wire-compatible.
+    #[serde(default)]
+    pub upgrade: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -141,6 +145,9 @@ pub fn validate_proxy_request_head(head: &ProxyRequestHead) -> Result<(), String
     }
     validate_origin_form(&head.path_and_query)?;
     validate_headers(&head.headers, "request")?;
+    if head.upgrade && (head.method != RouteMethod::Get || head.body_len != 0) {
+        return Err("gateway proxy: a WebSocket upgrade must be a bodyless GET".into());
+    }
     if head.body_len > MAX_REQUEST_BODY_BYTES {
         return Err(format!(
             "gateway proxy: body exceeds {MAX_REQUEST_BODY_BYTES} bytes"
@@ -344,6 +351,7 @@ mod tests {
                 value: "application/json".into(),
             }],
             body_len: 12,
+            upgrade: false,
         };
         let encoded = encode_proxy_request_head(&head).unwrap();
         assert_eq!(decode_proxy_request_head(&encoded).unwrap(), head);
@@ -464,6 +472,7 @@ mod tests {
             path_and_query: "/".into(),
             headers: vec![],
             body_len: MAX_REQUEST_BODY_BYTES + 1,
+            upgrade: false,
         };
         assert!(validate_proxy_request_head(&head).is_err());
         let mut json = serde_json::to_value(&head).unwrap();
