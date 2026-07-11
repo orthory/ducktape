@@ -48,7 +48,7 @@ read -r P1 P2 P3 < <(bun "$SCRIPT_DIR/fleet.mjs" ports 3)
 # A free UDP port for the overlay's WireGuard socket. This MUST be concrete: the
 # reachability plane refuses to start on port 0 ("wireguard_listen needs a
 # concrete UDP port — plane not started"), which leaves the overlay down.
-WGP="$(bun -e 'const s=require("node:dgram").createSocket("udp4");s.bind(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')"
+WGP="$(bun "$SCRIPT_DIR/fleet.mjs" udp-port)"
 # Gateway serving needs the app's workspace_create posture:
 #   --gateway            binds the isolated browser plane that serves the routes
 #   --wireguard-effect   the userspace (TUN-less) overlay — no /dev/net/tun, no
@@ -60,10 +60,10 @@ WGP="$(bun -e 'const s=require("node:dgram").createSocket("udp4");s.bind(0,"127.
 #     none               public rendezvous coordinator; keeps network.toml (which
 #                        the app reboots from) fully local.
 CHAIN="$("$NODE_BIN" init --name "$ID" --dir "$WSDIR" \
-  --listen 127.0.0.1:$P1 --advertised 127.0.0.1:$P1 \
-  --http 127.0.0.1:$P2 --rpc 127.0.0.1:$P3 --gateway 127.0.0.1:0 \
+  --listen "127.0.0.1:$P1" --advertised "127.0.0.1:$P1" \
+  --http "127.0.0.1:$P2" --rpc "127.0.0.1:$P3" --gateway 127.0.0.1:0 \
   --primary-coordinator none \
-  --wireguard-effect socket --wireguard-listen 0.0.0.0:$WGP 2>/dev/null | tail -1)"
+  --wireguard-effect socket --wireguard-listen "0.0.0.0:$WGP" 2>/dev/null | tail -1)"
 [ -n "$CHAIN" ] || die "init produced no chain-id"
 PUB="$("$NODE_BIN" keygen --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
 
