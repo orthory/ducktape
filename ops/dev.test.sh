@@ -137,6 +137,34 @@ DUCKTAPE_DEV_OS=Linux
 [ "$(dev_os)" = Linux ] && ok "honors Linux platform override" || bad "missed Linux platform override"
 unset DUCKTAPE_DEV_OS
 
+if grep -q 'DUCKTAPE_DISABLE_HEARTBEAT' "$HERE/dev.sh"; then
+  bad "dev disables heartbeats and can strand writes at height zero"
+else
+  ok "keeps heartbeats enabled so dev writes finalize"
+fi
+
+echo "macOS cargo runner contract:"
+RUNNER_LOG="$TMP/runner.log"
+RUNNER_STUB="$TMP/build-with-stub"
+cat >"$RUNNER_STUB" <<'EOF'
+#!/usr/bin/env bash
+printf 'runner=%s\n' "${CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER:-}" >"$RUNNER_LOG"
+printf 'args=%s\n' "$*" >>"$RUNNER_LOG"
+EOF
+chmod +x "$RUNNER_STUB"
+export RUNNER_LOG
+BUILD_WITH="$RUNNER_STUB" CARGO="cargo-test" "$HERE/dev-macos-cargo.sh" run --target aarch64-apple-darwin
+grep -q "runner=$HERE/dev-macos-runner.sh" "$RUNNER_LOG" \
+  && ok "points explicit-target Cargo at the bundle runner" \
+  || bad "did not export the macOS target runner"
+grep -q 'args=cargo-test run --target aarch64-apple-darwin' "$RUNNER_LOG" \
+  && ok "preserves the Cargo-compatible runner arguments" \
+  || bad "changed the Cargo runner argument contract"
+grep -q -- '--features dev-cef' "$HERE/dev.sh" \
+  && grep -q -- '--no-default-features' "$HERE/dev.sh" \
+  && ok "avoids the incomplete CEF CLI dev bundler with the dependency-equivalent feature" \
+  || bad "macOS dev can still enter the incomplete CEF CLI bundler"
+
 echo "macOS bundle staging:"
 ROOT="$TMP/root"
 mkdir -p "$ROOT/ops" "$ROOT/target/debug" "$ROOT/skeleton/Contents/MacOS" \
@@ -156,7 +184,10 @@ chmod +x "$ROOT/skeleton/Contents/MacOS/ducktape-desktop"
 DEBUG_EXE="$ROOT/target/debug/ducktape-desktop"
 printf 'new-debug-binary\n' >"$DEBUG_EXE"
 chmod +x "$DEBUG_EXE"
+mkdir -p "$ROOT/invalid"
 MACOS_BUNDLE_SOURCE="$ROOT/skeleton"
+MACOS_SYSTEM_APP="$ROOT/no-system-app"
+MACOS_USER_APP="$ROOT/no-user-app"
 MACOS_DEBUG_APP="$ROOT/target/debug/Ducktape.app"
 STAGED=$(stage_macos_debug_bundle "$DEBUG_EXE")
 [ "$STAGED" = "$MACOS_DEBUG_APP" ] && ok "stages under target/debug" || bad "staged bundle in the wrong location"
@@ -166,8 +197,32 @@ while IFS= read -r helper; do
   cmp -s "$DEBUG_EXE" "$STAGED/Contents/Frameworks/$helper.app/Contents/MacOS/$helper" || helpers_ok=0
 done < <(macos_helper_names)
 [ "$helpers_ok" = 1 ] && ok "replaces all five helper executables" || bad "one or more helper executables were stale"
+MACOS_BUNDLE_SOURCE="$ROOT/invalid"
+if macos_bundle_source >/dev/null; then
+  bad "accepted a bundle directory without CEF payloads"
+else
+  ok "rejects incomplete bundle directories before launch"
+fi
 rm -rf "$ROOT"
-unset ROOT MACOS_BUNDLE_SOURCE MACOS_DEBUG_APP
+unset ROOT MACOS_BUNDLE_SOURCE MACOS_SYSTEM_APP MACOS_USER_APP MACOS_DEBUG_APP
+
+echo "stale macOS app cleanup scope:"
+sleep 30 &
+STALE_APP_PID=$!
+sleep 30 &
+OTHER_APP_PID=$!
+DUCKTAPE_DEV_APP_PIDS="$STALE_APP_PID"
+stop_stale_macos_debug_app
+wait "$STALE_APP_PID" 2>/dev/null || true
+kill -0 "$STALE_APP_PID" 2>/dev/null \
+  && bad "left the scoped stale debug app alive" \
+  || ok "stops the scoped stale debug app"
+kill -0 "$OTHER_APP_PID" 2>/dev/null \
+  && ok "leaves unrelated app processes alone" \
+  || bad "killed an unrelated app process"
+kill "$OTHER_APP_PID" 2>/dev/null || true
+wait "$OTHER_APP_PID" 2>/dev/null || true
+unset DUCKTAPE_DEV_APP_PIDS
 
 echo "cleanup scope:"
 OWNED_FILE="$TMP/cfg"

@@ -92,6 +92,17 @@ node_config_of() { # $1 = pid
   fi
 }
 
+process_running() { # $1 = pid; zombies have exited even though kill -0 succeeds
+  local stat
+  kill -0 "$1" 2>/dev/null || return 1
+  stat="$(ps -o stat= -p "$1" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$stat" ] || return 1
+  case "$stat" in
+    Z*|*Z*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # Copy the freshly-built node to the pinned out-of-target path. rm-first: a
 # running node holds the old inode, so replacing the file never ETXTBSYs and the
 # live process keeps executing until we bounce it; a fresh inode also can't
@@ -169,7 +180,7 @@ restart_node() {
   # the process is alive; on death, tail the log the node just wrote so the real
   # reason (bind conflict, bad config, panic) is right there in the terminal.
   sleep 0.4
-  if ! jobs -pr | grep -qx "${SPAWNED_PID:-0}"; then
+  if ! process_running "${SPAWNED_PID:-0}"; then
     wait "${SPAWNED_PID:-0}" 2>/dev/null || true
     log "✗ rebuilt node exited on start — last log lines:"
     tail -n 20 "$dir/daemon.log" 2>/dev/null | sed 's/^/    /'
@@ -210,15 +221,52 @@ macos_debug_app_path() {
   printf '%s\n' "${MACOS_DEBUG_APP:-$ROOT/target/debug/Ducktape.app}"
 }
 
+macos_debug_app_pids() {
+  if [ -n "${DUCKTAPE_DEV_APP_PIDS:-}" ]; then
+    printf '%s\n' $DUCKTAPE_DEV_APP_PIDS
+    return
+  fi
+  local executable
+  executable="$(macos_debug_app_path)/Contents/MacOS/ducktape-desktop"
+  ps -eo pid=,args= 2>/dev/null \
+    | awk -v m="$executable" 'index($0, m) && $0 !~ /awk/ { print $1 }'
+}
+
+stop_stale_macos_debug_app() {
+  local pids pid i
+  pids="$(macos_debug_app_pids)"
+  [ -n "$pids" ] || return 0
+  # This path is unique to the current worktree. A previous tauri-dev crash can
+  # leave it holding CEF's SingletonLock even after Vite is gone; terminate only
+  # those exact app processes, never /Applications/Ducktape.app or a sibling.
+  # shellcheck disable=SC2086
+  kill $pids 2>/dev/null || true
+  for pid in $pids; do
+    i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+  log "stopped stale macOS debug app(s): $(printf '%s ' $pids)"
+}
+
 macos_bundle_source() {
   local candidate
   for candidate in \
     "${MACOS_BUNDLE_SOURCE:-}" \
+    "${MACOS_SYSTEM_APP:-/Applications/Ducktape.app}" \
+    "${MACOS_USER_APP:-$HOME/Applications/Ducktape.app}" \
     "$ROOT/target/debug/bundle/macos/Ducktape.app" \
     "$ROOT/target/release/bundle/macos/Ducktape.app"
   do
     [ -n "$candidate" ] || continue
-    if [ -d "$candidate" ]; then
+    if [ -d "$candidate" ] \
+      && bash "$ROOT/ops/check-macos-cef-bundle.sh" "$candidate" >/dev/null 2>&1
+    then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -241,7 +289,11 @@ ensure_macos_bundle_skeleton() {
       --manifest-path "$CEF_CLONE/crates/tauri-cli/Cargo.toml" \
       --bin cargo-tauri -- build --debug --bundles app --ignore-version-mismatches \
       --config '{"build":{"beforeBuildCommand":"bun run build && ../ops/stage-debug-sidecar.sh"}}'
-  )
+  ) || return 1
+  macos_bundle_source >/dev/null || {
+    log "✗ macOS bundle build completed without the CEF framework/helpers"
+    return 1
+  }
 }
 
 stage_macos_debug_bundle() { # $1 = target/debug/ducktape-desktop
@@ -274,13 +326,22 @@ stage_macos_debug_bundle() { # $1 = target/debug/ducktape-desktop
 }
 
 run_tauri_dev() {
+  local target
   case "$(dev_os)" in
     Darwin)
       ensure_macos_bundle_skeleton || exit 1
+      stop_stale_macos_debug_app
+      target="$(rustc -vV | sed -n 's/^host: //p')"
+      [ -n "$target" ] || {
+        log "✗ could not resolve the Rust host target for the macOS runner"
+        exit 1
+      }
       log "launching tauri dev through bundled macOS runner (frontend hot-reload; Ctrl-C to stop)…"
       "$BUILD_WITH" "$CARGO" run \
         --manifest-path "$CEF_CLONE/crates/tauri-cli/Cargo.toml" \
-        --bin cargo-tauri -- dev --config "$CFG_OVERRIDE" --runner "$ROOT/ops/dev-macos-runner.sh"
+        --bin cargo-tauri -- dev --target "$target" --features dev-cef \
+        --config "$CFG_OVERRIDE" --runner "$ROOT/ops/dev-macos-cargo.sh" \
+        -- --no-default-features
       ;;
     *)
       log "launching tauri dev (frontend hot-reload; Ctrl-C to stop)…"
@@ -304,10 +365,6 @@ main() {
   tag=$(printf '%s' "$ROOT" | cksum | cut -d' ' -f1)
   NODE_BIN="${TMPDIR:-/tmp}/ducktape-dev-node-$(id -u)-$tag/ducktape-node"
   export DUCKTAPE_NODE_BIN="$NODE_BIN"
-  # Keep the idle dev chain quiet: no nop heartbeat blocks (dev is single-
-  # validator with no coordinated upgrades, so the heartbeat earns nothing).
-  export DUCKTAPE_DISABLE_HEARTBEAT=1
-
   ensure_app_deps "$ROOT/app" || {
     log "app dependency install failed"
     exit 1

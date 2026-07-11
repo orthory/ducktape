@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Runner used by `cargo-tauri dev` on macOS. Tauri still builds the debug
-# executable and owns Vite/rebuilds; this script stages that executable into a
-# valid CEF .app bundle before execing it.
+# Cargo target runner used by `cargo-tauri dev` on macOS. Tauri still builds
+# the debug executable and owns Vite/rebuilds; Cargo passes the finished binary
+# here so it can be staged into a valid CEF .app bundle before execution.
 set -euo pipefail
 
 binary="${1:?usage: dev-macos-runner.sh /path/to/ducktape-desktop [args...]}"

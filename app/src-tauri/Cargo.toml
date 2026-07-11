@@ -19,6 +19,12 @@ tauri-build = { version = "2", features = [] }
 # as the packaging signal. Without it, macOS builds silently omit the CEF
 # framework/helper apps and panic in cef::library_loader at launch.
 default = ["cef"]
+cef = ["dep:cef"]
+# `cargo-tauri dev`'s current macOS CEF branch builds an app bundle without
+# the framework/helper payloads. The dev launcher enables this alias instead:
+# it keeps the exact same direct CEF dependency while deliberately avoiding
+# the CLI's feature-name probe, then runs through our validated bundle runner.
+dev-cef = ["dep:cef"]
 
 [dependencies]
 # tray-icon: the macOS menu-bar icon + popover (src/tray.rs, gated to macOS).
