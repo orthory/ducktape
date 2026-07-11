@@ -120,9 +120,13 @@ export const parseDuckAddress = (input: string): DuckAddress => {
   };
 };
 
+// Content type is opaque in v2 (no MIME whitelist — Chromium is the sandbox).
+// Prefer the DuckFS metadata, otherwise infer from the extension, otherwise
+// serve as an opaque download.
 const mimeForPath = (entry: FileEntry, path: string): string => {
+  if (entry.meta.mime) return entry.meta.mime;
   const lower = path.toLowerCase();
-  const inferred = lower.endsWith(".html") ? "text/html"
+  return lower.endsWith(".html") ? "text/html"
     : lower.endsWith(".css") ? "text/css"
       : lower.endsWith(".js") || lower.endsWith(".mjs") ? "application/javascript"
         : lower.endsWith(".json") ? "application/json"
@@ -134,14 +138,7 @@ const mimeForPath = (entry: FileEntry, path: string): string => {
                     : lower.endsWith(".svg") ? "image/svg+xml"
                       : lower.endsWith(".webp") ? "image/webp"
                         : lower.endsWith(".txt") ? "text/plain"
-                          : null;
-  if (!inferred || !gateway.ALLOWED_CONTENT_MIME_TYPES.has(inferred)) {
-    throw new Error(`Gateway does not publish this file type: ${path}`);
-  }
-  if (entry.meta.mime && entry.meta.mime !== inferred) {
-    throw new Error(`DuckFS MIME metadata disagrees with ${path}.`);
-  }
-  return inferred;
+                          : "application/octet-stream";
 };
 
 const readExact = async (
@@ -150,7 +147,7 @@ const readExact = async (
   size: number,
   snapshot: string,
 ): Promise<Uint8Array<ArrayBuffer>> => {
-  if (size > gateway.MAX_CONTENT_FILE_BYTES) throw new Error(`${path} exceeds the file cap.`);
+  if (size > gateway.MAX_FILE_BYTES) throw new Error(`${path} exceeds the file cap.`);
   const range = await files.read(transport, {
     path,
     snapshot,
@@ -162,12 +159,15 @@ const readExact = async (
   return bytes;
 };
 
-export const buildContentDefinition = async (
+/// Scan the route's DuckFS content root, build + commit the `.manifest.json`,
+/// and return its SHA-256 (the only thing the signed route binds). The
+/// manifest file itself is excluded from the scan so a republish is idempotent.
+export const buildContentManifest = async (
   transport: NodeTransport,
   publisherNode: string,
   name: gateway.RouteName,
   defaultPath = "index.html",
-): Promise<gateway.DuckFsContent> => {
+): Promise<string> => {
   gateway.validateContentPath(defaultPath);
   const root = gateway.contentRoot(publisherNode, name);
   const snapshot = (await files.refs(transport)).head;
@@ -182,7 +182,7 @@ export const buildContentDefinition = async (
       limit: 256,
     });
     entries.push(...page.entries);
-    if (entries.length > gateway.MAX_CONTENT_FILES * 2) {
+    if (entries.length > gateway.MAX_MANIFEST_FILES * 2) {
       throw new Error("Gateway content tree is too large.");
     }
     after = page.next ?? undefined;
@@ -190,9 +190,11 @@ export const buildContentDefinition = async (
   if (entries.some((entry) => entry.kind === "symlink")) {
     throw new Error("Gateway content cannot contain symlinks.");
   }
-  const fileEntries = entries.filter((entry) => entry.kind === "file");
-  if (fileEntries.length === 0 || fileEntries.length > gateway.MAX_CONTENT_FILES) {
-    throw new Error(`Gateway content requires 1..${gateway.MAX_CONTENT_FILES} files.`);
+  const fileEntries = entries.filter(
+    (entry) => entry.kind === "file" && !entry.path.endsWith(`/${gateway.MANIFEST_FILE}`),
+  );
+  if (fileEntries.length === 0 || fileEntries.length > gateway.MAX_MANIFEST_FILES) {
+    throw new Error(`Gateway content requires 1..${gateway.MAX_MANIFEST_FILES} files.`);
   }
   let total = 0;
   const declarations: gateway.ContentFile[] = [];
@@ -202,7 +204,7 @@ export const buildContentDefinition = async (
     gateway.validateContentPath(path);
     const bytes = await readExact(transport, entry.path, entry.size, snapshot);
     total += bytes.length;
-    if (total > gateway.MAX_CONTENT_TOTAL_BYTES) throw new Error("Gateway content is too large.");
+    if (total > gateway.MAX_SITE_BYTES) throw new Error("Gateway content is too large.");
     declarations.push({
       path,
       mime: mimeForPath(entry, path),
@@ -210,13 +212,20 @@ export const buildContentDefinition = async (
       sha256: gateway.sha256Hex(bytes),
     });
   }
-  // Rust's canonical manifest uses bytewise `String` ordering. Every accepted
-  // path is ASCII, so an explicit code-unit comparison is byte-identical;
-  // locale collation is deliberately forbidden here.
+  // The node compares against bytewise `String` ordering; every path is ASCII,
+  // so code-unit comparison is byte-identical. Locale collation is forbidden.
   declarations.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
-  const content = { default_path: defaultPath, files: declarations };
-  gateway.validateContent(content);
-  return content;
+  const manifest: gateway.RouteManifest = { default_path: defaultPath, files: declarations };
+  gateway.validateManifest(manifest);
+  // Commit the manifest as a DuckFS file; the route binds its exact bytes.
+  const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
+  await files.uploadFile(transport, {
+    path: `${root}/${gateway.MANIFEST_FILE}`,
+    bytes: manifestBytes,
+    meta: { mime: "application/json" },
+    message: "gateway: publish route manifest",
+  });
+  return gateway.sha256Hex(manifestBytes);
 };
 
 const sanitizeNetworkDocument = (html: string): { srcDoc: string; title: string } => {
@@ -355,12 +364,10 @@ const loadAccountRoute = async (
     revision: record.statement.revision,
     title: address.hostname,
     srcUrl,
-    fileCount: record.statement.route.target.kind === "duck_fs"
-      ? record.statement.route.target.content.files.length
-      : 0,
-    totalBytes: record.statement.route.target.kind === "duck_fs"
-      ? record.statement.route.target.content.files.reduce((total, file) => total + file.size, 0)
-      : 0,
+    // The file table lives off consensus (in the manifest), so these are not
+    // known from the record alone.
+    fileCount: 0,
+    totalBytes: 0,
   };
 };
 

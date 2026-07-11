@@ -2,7 +2,7 @@ import { ed25519 } from "@noble/curves/ed25519.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { makeTransportStub } from "../test/transport-stub";
-import { buildContentDefinition, loadDuckPage, parseDuckAddress } from "./duck-browser";
+import { buildContentManifest, loadDuckPage, parseDuckAddress } from "./duck-browser";
 import * as gateway from "./gateway-client";
 import * as nodeBootstrap from "./node-bootstrap";
 
@@ -12,6 +12,8 @@ const b64 = (bytes: Uint8Array): string => {
   bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
   return btoa(binary);
 };
+const fromB64 = (value: string): Uint8Array =>
+  Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -74,13 +76,26 @@ describe("browser authority boundaries", () => {
         b64: b64(contents.get(path)!),
         eof: true,
       })),
+      filesCommit: vi.fn().mockResolvedValue({ height: 1, appHash: "aa".repeat(32) }),
     });
 
-    const manifest = await buildContentDefinition(transport, publisher, name, "A.html");
+    const hash = await buildContentManifest(transport, publisher, name, "A.html");
+    expect(hash).toMatch(/^[0-9a-f]{64}$/);
+
+    // The committed .manifest.json carries the canonically-ordered file table,
+    // and the returned hash is its exact byte digest.
+    const request = vi.mocked(transport.filesCommit).mock.calls.at(-1)![0] as {
+      changes: { put: { path: string; content: { inline: { b64: string } } } }[];
+    };
+    const put = request.changes[0].put;
+    expect(put.path).toBe(`${gateway.contentRoot(publisher, name)}/${gateway.MANIFEST_FILE}`);
+    const manifestBytes = fromB64(put.content.inline.b64);
+    const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as gateway.RouteManifest;
     expect(manifest.files.map((file) => file.path)).toEqual([
       "-x.html", ".x.html", "0.html", "A.html", "_x.html", "a.html",
     ]);
-    expect(() => gateway.validateContent(manifest)).not.toThrow();
+    expect(() => gateway.validateManifest(manifest)).not.toThrow();
+    expect(hash).toBe(gateway.sha256Hex(manifestBytes));
   });
 
   it("loads net.duck from one pinned local snapshot and strips executable markup", async () => {
@@ -134,6 +149,7 @@ describe("browser authority boundaries", () => {
           max_request_bytes: 1024,
           max_response_bytes: 4096,
           allow_authorization: false,
+          allow_upgrade: false,
         },
       },
     };
@@ -201,6 +217,7 @@ describe("browser authority boundaries", () => {
           max_request_bytes: 0,
           max_response_bytes: 1024,
           allow_authorization: false,
+          allow_upgrade: false,
         },
       },
     };
