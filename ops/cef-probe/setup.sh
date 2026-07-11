@@ -20,7 +20,9 @@ set -euo pipefail
 
 CLONE="${1:-$HOME/.cache/ducktape-cef-probe/tauri-cef}"
 UPSTREAM="https://github.com/tauri-apps/tauri.git"
-SHA="3b2823b91"
+# Full 40-char sha, deliberately: `git fetch <remote> <commit>` only accepts
+# unabbreviated commits, so a short pin makes fresh provisioning impossible.
+SHA="3b2823b918d5ea88fca10b472daf349c67c22d51"
 
 [ "$(uname -s)" = "Darwin" ] || { echo "cef: nothing to provision on $(uname -s)"; exit 0; }
 
@@ -42,12 +44,26 @@ fi
 
 # Shallow-fetch the pinned sha once (feat/cef can rebase, so a branch clone
 # would drift; the commit can't). cef-env runs before every make target, so
-# no per-run fetch. To move the pin: bump SHA, rm -rf the checkout, re-run.
-if [ ! -d "$CLONE" ]; then
+# no per-run fetch. Guard on a usable HEAD, not directory existence: the
+# fetch is not atomic, and a previous attempt that died mid-provision must
+# self-heal instead of satisfying the check forever. To move the pin: bump
+# SHA (full 40 chars) and re-run — the mismatch gate below forces the
+# re-clone.
+if ! git -C "$CLONE" rev-parse --quiet --verify HEAD >/dev/null 2>&1; then
+  rm -rf "$CLONE"
   mkdir -p "$CLONE"
   git -C "$CLONE" init -q
   git -C "$CLONE" fetch --depth 1 "$UPSTREAM" "$SHA"
   git -C "$CLONE" checkout -q FETCH_HEAD
+fi
+
+# A checkout at the wrong commit means the pin moved (or the cache was
+# tampered with); silently building a drifted CLI is how bugs hide behind
+# rev pins. Refuse with the remedy instead.
+HAVE="$(git -C "$CLONE" rev-parse HEAD)"
+if [ "$HAVE" != "$SHA" ]; then
+  echo "[cef] checkout is at $HAVE but the pin is $SHA — rm -rf $CLONE and re-run" >&2
+  exit 1
 fi
 
 # Repo-tracked fixes to the pinned checkout, applied idempotently on every
