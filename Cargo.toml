@@ -200,3 +200,13 @@ overlay-net = { path = "crates/system/overlay-net" }
 # would be a different trait).
 governor = "0.10.2"
 rand_core = "0.6.4"
+
+# --- CEF runtime probe (local-only; appended by ops/cef-probe/setup.sh) ---
+[patch.crates-io]
+tauri = { path = "/Users/eddy/.cache/ducktape-cef-probe/tauri-cef/crates/tauri" }
+tauri-build = { path = "/Users/eddy/.cache/ducktape-cef-probe/tauri-cef/crates/tauri-build" }
+tauri-runtime = { path = "/Users/eddy/.cache/ducktape-cef-probe/tauri-cef/crates/tauri-runtime" }
+tauri-utils = { path = "/Users/eddy/.cache/ducktape-cef-probe/tauri-cef/crates/tauri-utils" }
+tauri-macros = { path = "/Users/eddy/.cache/ducktape-cef-probe/tauri-cef/crates/tauri-macros" }
+tauri-codegen = { path = "/Users/eddy/.cache/ducktape-cef-probe/tauri-cef/crates/tauri-codegen" }
+tauri-plugin = { path = "/Users/eddy/.cache/ducktape-cef-probe/tauri-cef/crates/tauri-plugin" }
