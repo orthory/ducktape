@@ -496,7 +496,7 @@ impl Host {
     /// frozen boundary state (the orchestrator's `RespawnPlan::boundary_version`),
     /// identical on every honest node, so this is a deterministic self-transition —
     /// never a wall-clock/IO/RNG input. a no-op for modules that don't override
-    /// [`Module::set_active_version`] (only dual-path modules like forge do), and
+    /// [`Module::set_active_version`] (only dual-path modules do), and
     /// `version` is a NON-hashed branch selector — it never enters any `root()`
     /// preimage, so `app_hash()` is unmoved by this call alone (the app-hashed
     /// reconciliation of the upgrade module's own `current_version` rides the

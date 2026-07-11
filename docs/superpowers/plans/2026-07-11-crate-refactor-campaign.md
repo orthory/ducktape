@@ -75,12 +75,14 @@ into `host`; network cluster likely 6 → 3-4 crates; `examples/*` deleted if
 nothing outside them depends on them.
 
 Flagged user decisions (default = the conservative side, veto either way):
-- forge `MultiRepoV2` dual-path: NOT compat debt — it is the only real-module
-  end-to-end exercise of the live height-gated upgrade mechanism
-  (`bin/node/tests/upgrade_adversarial.rs`, `/upgrade` runbook). Batch 5 keeps
-  it and deletes only the zero-value pieces around it (`norm_repo_at`, dead
-  `active_version()` getter, legacy `ForgeMsg::Push`). Say the word and the
-  whole v2 apparatus (~150 lines, version-branching in 5 methods) goes.
+- forge `MultiRepoV2` dual-path: RESOLVED 2026-07-12 — v2 ADOPTED as the only
+  layout (flag day: every forge root moves, snapshots always carry the FGv2
+  magic) and the dual-path machinery deleted (`ForgeLayout`, `forge_layout`,
+  `active_version` field + `set_active_version` override/inherent, version
+  branches in root/snapshot/install). User call: "not on production, we can be
+  flexible; merge v1 v2". The upgrade mechanism keeps kernel-level coverage
+  (recovery tests' synthetic dual modules, `upgrade_e2e.rs`, and the surviving
+  mid-window-admission leg of `upgrade_adversarial.rs`).
 - consensus BLS/V2 scheme surface: deleted in batch 1 (production arms were
   `unimplemented!()` bails; this IS the "reserved enum space" the campaign
   licenses deleting). Re-adding is a fresh build, not a revert.

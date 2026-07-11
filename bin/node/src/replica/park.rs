@@ -37,7 +37,6 @@ use crate::replica;
 use crate::resident_announce;
 use crate::resident_dispatch;
 use crate::rpc::{RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
-use crate::statesync_plane;
 use crate::sync::catchup::{catch_up_post_reboot_frames, PostRebootCatchupError};
 use crate::sync::serve::{
     reopen_preflight_synced_host, reopen_recovery, replica_backfill, replica_orchestrator_at,
@@ -117,7 +116,7 @@ pub(super) async fn park(
             .expect("ed25519 keys are 32 bytes");
         crate::agent_plane::spawn(
             label.clone(),
-            statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
             std::sync::Arc::clone(&tracked),
             me,
             bulk_pacer.clone(),
@@ -135,7 +134,7 @@ pub(super) async fn park(
                 label: label.clone(),
                 book: std::sync::Arc::clone(&book),
                 me: signer.public_key(),
-                factory: statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+                factory: crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
                 pacer: bulk_pacer.clone(),
                 commands: gateway_commands,
                 workspace,
@@ -144,13 +143,13 @@ pub(super) async fn park(
         );
         book
     });
-    let Some(server_peer) = sync_source else {
+    if sync_source.is_none() {
         eprintln!(
             "[node {label}] no statesync source: no validator other than this node \
              is available to serve (only validators answer the statesync channel)"
         );
         std::process::exit(1);
-    };
+    }
     // the resident's mesh blob fetch-on-miss lane (the #298 cross-node
     // gap, resident side): the oracle pool's resolver asks current peers
     // for a digest its own store lacks, over this same statesync channel.
@@ -169,13 +168,9 @@ pub(super) async fn park(
         signer.public_key(),
     )
     .into_fetch_fn();
-    // the joiner's sync client: the mesh path always works and
-    // ROTATES across every validator that can serve; with the
-    // statesync plane enabled, requests PREFER an overlay stream to
-    // the primary source and fall back on transport failure — the
-    // plane binds lazily once the invite tunnel brings the interface
-    // up.
-    let mesh_client = P2pSyncClient::with_sources(
+    // the joiner's sync client: the mesh path, ROTATING across every
+    // validator that can serve.
+    let client = P2pSyncClient::with_sources(
         context.child("sync_client"),
         sync_tx,
         sync_rx,
@@ -187,31 +182,6 @@ pub(super) async fn park(
             let _ = blob_fetch::classify_mesh_frame(&blob_pending, id, body);
         })),
     );
-    let client = {
-        let plane_slot: statesync_plane::PlaneSlot =
-            std::sync::Arc::new(std::sync::OnceLock::new());
-        if statesync_plane::enabled() && wireguard_listen.is_some() {
-            let book = statesync_plane::OverlayBook::new(
-                String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
-            );
-            book.set_peers(peers.iter());
-            statesync_plane::spawn_bring_up(
-                label.clone(),
-                book,
-                signer.public_key(),
-                std::sync::Arc::clone(&plane_slot),
-                statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
-                bulk_pacer.clone(),
-                None,
-            );
-        }
-        statesync_plane::PlaneFallbackClient::new(
-            plane_slot,
-            &server_peer,
-            mesh_client,
-            label.clone(),
-        )
-    };
 
     // the announce, built once: this key + the invite token + the
     // proof-of-possession binding them. re-sent (round-robin over the
