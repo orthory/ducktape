@@ -69,7 +69,7 @@ const freshTab = (id: string): BrowserTab => ({
   historyIndex: -1,
 });
 
-export function BrowserView() {
+export function BrowserView({ visible = true }: { visible?: boolean }) {
   const { transport } = useDucktape();
   const nextTab = useRef(2);
   const [tabs, setTabs] = useState<BrowserTab[]>(() => [freshTab("tab-1")]);
@@ -99,6 +99,10 @@ export function BrowserView() {
     const el = paneRef.current;
     const gatewayPage = page?.hosting === "gateway" ? page : undefined;
     const srcUrl = gatewayPage?.srcUrl;
+    if (!visible) {
+      void gateway.hideAllInline();
+      return;
+    }
     if (!el || !gatewayPage || !srcUrl || error) return;
     const rectOf = (): gateway.InlineRect => {
       const r = el.getBoundingClientRect();
@@ -118,7 +122,7 @@ export function BrowserView() {
       observer.disconnect();
       void gateway.hideAllInline();
     };
-  }, [active.id, page, error, updateTab]);
+  }, [active.id, page, error, updateTab, visible]);
 
   const open = useCallback(async (raw: string, addHistory = true, tabId = activeId) => {
     if (!transport) {
