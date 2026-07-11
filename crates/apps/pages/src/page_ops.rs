@@ -60,15 +60,7 @@ where
                 // delete the whole block subtree, root included (depth-first).
                 // child PAGES are separate roots (folder relation is in the
                 // index, not the block children), so they are untouched.
-                let mut stack = vec![root];
-                while let Some(cur) = stack.pop() {
-                    for child in &cur.children {
-                        stack.push(self.require_block(child, PageError::Corrupt).await?);
-                    }
-                    self.purge_comments_for_target(&cur.id).await?;
-                    self.delete_block(&cur.id);
-                }
-                Ok(())
+                self.delete_subtree(root).await
             }
             PageMsg::SetPageParent { page_id, parent } => {
                 // the target must be an existing page root.

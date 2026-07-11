@@ -102,7 +102,6 @@ pub fn required_blob_digest(frame: &[u8]) -> Option<[u8; 32]> {
         return None;
     }
     match forge::decode_msg(&msg.payload).ok()? {
-        forge::ForgeMsg::Push { pack_digest, .. } => digest_bytes(&pack_digest),
         forge::ForgeMsg::PushRefs { pack_digest, .. } => {
             pack_digest.as_deref().and_then(digest_bytes)
         }

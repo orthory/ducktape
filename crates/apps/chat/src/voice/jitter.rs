@@ -1,10 +1,7 @@
 //! The receive-side jitter buffer: absorbs network jitter and reordering,
 //! decides per 20 ms playout tick what the decoder should do.
 //!
-//! [`JitterBuffer`] is the seam — the engine only speaks this interface, so
-//! a NetEQ-grade implementation (e.g. the `neteq` crate) can replace
-//! [`MinimalJitter`] without touching the engine. The minimal
-//! implementation is deliberately simple: fixed prefill that grows on
+//! [`MinimalJitter`] is deliberately simple: fixed prefill that grows on
 //! underrun (bounded), seq-driven, no time-stretching.
 
 use std::collections::BTreeMap;
@@ -36,13 +33,6 @@ pub struct JitterStats {
     pub underruns: u64,
     /// Current prefill target, frames — grows on underrun up to the max.
     pub depth_frames: usize,
-}
-
-pub trait JitterBuffer: Send {
-    fn insert(&mut self, seq: u16, payload: Vec<u8>);
-    /// Called exactly once per 20 ms playout tick.
-    fn tick(&mut self) -> PlayoutStep;
-    fn stats(&self) -> JitterStats;
 }
 
 /// Hard cap on buffered frames — a stalled playout must not accumulate
@@ -98,10 +88,8 @@ impl MinimalJitter {
             }
         }
     }
-}
 
-impl JitterBuffer for MinimalJitter {
-    fn insert(&mut self, seq: u16, payload: Vec<u8>) {
+    pub fn insert(&mut self, seq: u16, payload: Vec<u8>) {
         let pos = self.unwrap_seq(seq);
         if let Some(floor) = self.floor
             && pos < floor
@@ -116,7 +104,8 @@ impl JitterBuffer for MinimalJitter {
         }
     }
 
-    fn tick(&mut self) -> PlayoutStep {
+    /// Called exactly once per 20 ms playout tick.
+    pub fn tick(&mut self) -> PlayoutStep {
         if self.filling {
             if self.packets.len() < self.prefill {
                 return PlayoutStep::Buffering;
@@ -145,7 +134,7 @@ impl JitterBuffer for MinimalJitter {
         PlayoutStep::Gap
     }
 
-    fn stats(&self) -> JitterStats {
+    pub fn stats(&self) -> JitterStats {
         self.stats
     }
 }
