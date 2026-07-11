@@ -25,6 +25,7 @@ fn a_registered_agent_event_registers_the_dispatch_recipe() {
         output_contract,
         max_attempts,
         deadline_views,
+        lease_views,
         ..
     } = &recipes[0]
     else {
@@ -40,6 +41,7 @@ fn a_registered_agent_event_registers_the_dispatch_recipe() {
     );
     assert_eq!(*max_attempts, RUN_MAX_ATTEMPTS);
     assert_eq!(*deadline_views, Some(RUN_DEADLINE_VIEWS));
+    assert_eq!(*lease_views, Some(RUN_LEASE_VIEWS));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use super::{
-    AgentEvent, Ctx, DispatchMsg, Error, Msg, OutputContract, RUN_DEADLINE_VIEWS, RUN_MAX_ATTEMPTS,
-    Routing, RunsModule, agent_decode_event, dispatch_encode_msg, recipe_id_for,
+    AgentEvent, Ctx, DispatchMsg, Error, Msg, OutputContract, RUN_DEADLINE_VIEWS, RUN_LEASE_VIEWS,
+    RUN_MAX_ATTEMPTS, Routing, RunsModule, agent_decode_event, dispatch_encode_msg, recipe_id_for,
 };
 
 impl RunsModule {
@@ -43,7 +43,7 @@ impl RunsModule {
                         output_contract: OutputContract::Text,
                         max_attempts: RUN_MAX_ATTEMPTS,
                         deadline_views: Some(RUN_DEADLINE_VIEWS),
-                        lease_views: None,
+                        lease_views: Some(RUN_LEASE_VIEWS),
                     }),
                 });
                 Ok(())
