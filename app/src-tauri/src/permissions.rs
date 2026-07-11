@@ -15,8 +15,10 @@
 //! - [`Principal::HostUi`] — the bundled Ducktape windows (console, tray
 //!   popover, huddle, and this module's own consent window). Our code, our
 //!   origin: it gets exactly the capabilities the product declares in
-//!   [`HOST_UI_CAPABILITIES`] and nothing else — a console that starts asking
-//!   for geolocation or MIDI is denied like anyone else.
+//!   [`HOST_UI_CAPABILITIES`] and nothing else — including the local-network
+//!   permission its `tauri://localhost` origin needs to reach the node daemon
+//!   on loopback. A console that starts asking for geolocation or MIDI is
+//!   denied like anyone else.
 //! - [`Principal::Gateway`] — executable content from a `.duck` site, in a
 //!   capability-free webview. It may ASK for the huddle-class devices
 //!   ([`GATEWAY_PROMPTABLE`]); only the user, through the native consent
@@ -48,6 +50,7 @@ const HOST_UI_LABELS: &[&str] = &["main", "tray", "huddle", PROMPT_LABEL];
 /// camera and screen; notifications and clipboard reads back the console's own
 /// affordances.
 const HOST_UI_CAPABILITIES: &[PermissionKind] = &[
+    PermissionKind::LocalNetwork,
     PermissionKind::Microphone,
     PermissionKind::Camera,
     PermissionKind::ScreenCapture,
@@ -557,6 +560,16 @@ mod tests {
             Decision::PerKind(vec![Verdict::Allow, Verdict::Allow])
         );
 
+        assert_eq!(
+            decide(&request(
+                "main",
+                "tauri://localhost",
+                vec![PermissionKind::LocalNetwork]
+            )),
+            Decision::PerKind(vec![Verdict::Allow]),
+            "the packaged console needs Chromium local-network access to reach its loopback node"
+        );
+
         let mixed = decide(&request(
             "main",
             "tauri://localhost",
@@ -609,6 +622,7 @@ mod tests {
         );
 
         for forbidden in [
+            PermissionKind::LocalNetwork,
             PermissionKind::Geolocation,
             PermissionKind::ClipboardRead,
             PermissionKind::Notifications,
