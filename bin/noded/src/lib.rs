@@ -553,16 +553,27 @@ pub enum NodeCommand {
     },
 }
 
-/// One bounded invocation through a globally signed gateway route. The
-/// full node drains this lane through `Service::Gateway`; the embedded daemon
-/// leaves it unwired because it has no authenticated network transport.
-pub struct GatewayJob {
-    /// Derived from the locally finalized RouteRecord, never client input.
-    pub publisher_node: [u8; 32],
-    pub max_response_bytes: u64,
-    pub head: gateway::ProxyRequestHead,
-    pub body: Vec<u8>,
-    pub reply: oneshot::Sender<Result<GatewayResponse, GatewayFailure>>,
+/// One invocation through a globally signed gateway route. The full node drains
+/// this lane through `Service::Gateway`; the embedded daemon leaves it unwired
+/// because it has no authenticated network transport. `publisher_node` and the
+/// caps are derived from the locally finalized RouteRecord, never client input.
+pub enum GatewayJob {
+    /// A bounded HTTP exchange: one request, one buffered response.
+    Http {
+        publisher_node: [u8; 32],
+        max_response_bytes: u64,
+        head: gateway::ProxyRequestHead,
+        body: Vec<u8>,
+        reply: oneshot::Sender<Result<GatewayResponse, GatewayFailure>>,
+    },
+    /// A WebSocket upgrade: the plane bridges the browser message channels to
+    /// the publisher's socket for the life of the connection.
+    Upgrade {
+        publisher_node: [u8; 32],
+        head: gateway::ProxyRequestHead,
+        to_browser: tokio::sync::mpsc::Sender<GatewayWsMsg>,
+        from_browser: tokio::sync::mpsc::Receiver<GatewayWsMsg>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1028,7 +1039,7 @@ async fn proxy_current(
         ));
     };
     let (reply, rx) = oneshot::channel();
-    lane.send(GatewayJob {
+    lane.send(GatewayJob::Http {
         publisher_node,
         max_response_bytes,
         head,

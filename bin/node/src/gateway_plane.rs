@@ -158,30 +158,77 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                 let workspace = client_workspace.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let result = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
-                        if job.publisher_node == own_node {
-                            serve_current(
-                                &commands, &workspace, &own_node, &own_node, &job.head, &job.body,
-                            )
+                    match job {
+                        GatewayJob::Http {
+                            publisher_node,
+                            max_response_bytes,
+                            head,
+                            body,
+                            reply,
+                        } => {
+                            let result = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
+                                if publisher_node == own_node {
+                                    serve_current(
+                                        &commands, &workspace, &own_node, &own_node, &head, &body,
+                                    )
+                                    .await
+                                } else {
+                                    proxy_remote(
+                                        &slot,
+                                        publisher_node,
+                                        max_response_bytes,
+                                        &head,
+                                        &body,
+                                    )
+                                    .await
+                                }
+                            })
                             .await
-                        } else {
-                            proxy_remote(
-                                &slot,
-                                job.publisher_node,
-                                job.max_response_bytes,
-                                &job.head,
-                                &job.body,
-                            )
-                            .await
+                            .unwrap_or_else(|_| {
+                                Err(GatewayFailure::Unavailable(
+                                    "gateway proxy request timed out".into(),
+                                ))
+                            });
+                            let _ = reply.send(result);
                         }
-                    })
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(GatewayFailure::Unavailable(
-                            "gateway proxy request timed out".into(),
-                        ))
-                    });
-                    let _ = job.reply.send(result);
+                        // A WebSocket upgrade is long-lived, so it is not wrapped
+                        // in the one-shot timeout.
+                        GatewayJob::Upgrade {
+                            publisher_node,
+                            head,
+                            to_browser,
+                            from_browser,
+                        } => {
+                            if publisher_node == own_node {
+                                // Loopback: pipe our own serve_ws to the caller
+                                // pump over a local duplex.
+                                let (server_end, caller_end) = tokio::io::duplex(64 * 1024);
+                                let serve_commands = commands.clone();
+                                let serve_workspace = workspace.clone();
+                                tokio::spawn(async move {
+                                    serve_ws(
+                                        &serve_commands,
+                                        &serve_workspace,
+                                        &own_node,
+                                        &own_node,
+                                        &head,
+                                        server_end,
+                                    )
+                                    .await;
+                                });
+                                caller_ws_pump(caller_end, to_browser, from_browser).await;
+                            } else {
+                                proxy_remote_ws(
+                                    &slot,
+                                    publisher_node,
+                                    &head,
+                                    to_browser,
+                                    from_browser,
+                                )
+                                .await;
+                            }
+                        }
+                    }
                 });
             }
         });
@@ -306,6 +353,43 @@ async fn proxy_remote(
     })
     .await
     .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))?
+}
+
+/// Caller side of a remote WebSocket upgrade: open the mesh stream to the
+/// publisher, then bridge it to the browser channels. `caller_ws_pump` consumes
+/// the publisher's `101` ack. On any open failure the browser is closed.
+async fn proxy_remote_ws(
+    slot: &PlaneSlot,
+    publisher: [u8; 32],
+    head: &gateway::ProxyRequestHead,
+    to_browser: tokio::sync::mpsc::Sender<noded::GatewayWsMsg>,
+    from_browser: tokio::sync::mpsc::Receiver<noded::GatewayWsMsg>,
+) {
+    let service = match slot.get() {
+        Some(service) => service,
+        None => {
+            let _ = to_browser.send(noded::GatewayWsMsg::Close(1011)).await;
+            return;
+        }
+    };
+    let meta = match gateway::encode_proxy_request_head(head) {
+        Ok(meta) => meta,
+        Err(_) => {
+            let _ = to_browser.send(noded::GatewayWsMsg::Close(1011)).await;
+            return;
+        }
+    };
+    let stream = match service
+        .open(PeerId(publisher), proxy_flow(), gateway::PROXY_INTENT, meta)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(_) => {
+            let _ = to_browser.send(noded::GatewayWsMsg::Close(1011)).await;
+            return;
+        }
+    };
+    caller_ws_pump(stream, to_browser, from_browser).await;
 }
 
 async fn serve_current(
@@ -1013,22 +1097,31 @@ where
     }
 }
 
-/// Caller side of a WebSocket upgrade: bridge the browser's message channels to
-/// the mesh stream (already past the `101` ack). Mirrors [`ws_pump`] with the
-/// roles reversed — the noded WS door owns the browser/axum translation. Kept
-/// here so the two directions of the tunnel share one frame codec.
-#[allow(dead_code)] // consumed by the noded WS door (PR-3, browser-facing).
+/// Caller side of a WebSocket upgrade: read the publisher's `101` ack, then
+/// bridge the browser's message channels to the mesh stream. Mirrors
+/// [`ws_pump`] with the roles reversed — the noded WS door owns the
+/// browser/axum translation. Returns once either direction closes. On a
+/// non-101 first frame (a `Failure` or garbage) it closes the browser side.
 async fn caller_ws_pump<S>(
-    mesh: S,
+    mut mesh: S,
     to_browser: tokio::sync::mpsc::Sender<noded::GatewayWsMsg>,
     mut from_browser: tokio::sync::mpsc::Receiver<noded::GatewayWsMsg>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     use noded::GatewayWsMsg;
+    let mut buf = Vec::new();
+    match read_frame(&mut mesh, &mut buf).await {
+        Ok(gateway::ProxyFrame::ResponseHead(head)) if head.status == 101 => {}
+        _ => {
+            // Upgrade refused/failed; signal an abnormal close to the browser.
+            let _ = to_browser.send(GatewayWsMsg::Close(1011)).await;
+            return;
+        }
+    }
     let (mut mesh_read, mut mesh_write) = tokio::io::split(mesh);
     let mut to_browser_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
+        // Seed with any bytes already read past the 101 frame.
         loop {
             match read_frame(&mut mesh_read, &mut buf).await {
                 Ok(gateway::ProxyFrame::WsFrame { binary, payload }) => {
@@ -1420,10 +1513,20 @@ mod tests {
 
     #[tokio::test]
     async fn caller_ws_pump_bridges_browser_channel_to_mesh() {
-        // A fake publisher end of the mesh that echoes every WsFrame.
+        // A fake publisher end of the mesh: send the 101 ack, then echo frames.
         let (mesh_caller, mesh_publisher) = tokio::io::duplex(4096);
         tokio::spawn(async move {
             let mut publisher = mesh_publisher;
+            write_frame(
+                &mut publisher,
+                &gateway::ProxyFrame::ResponseHead(gateway::ProxyResponseHead {
+                    status: 101,
+                    headers: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+            publisher.flush().await.unwrap();
             let mut buf = Vec::new();
             loop {
                 match read_frame(&mut publisher, &mut buf).await {
@@ -1450,6 +1553,95 @@ mod tests {
         assert_eq!(
             to_browser_rx.recv().await,
             Some(noded::GatewayWsMsg::Text("hi".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_ws_upgrade_bridges_browser_to_loopback_upstream() {
+        use tokio_tungstenite::tungstenite::Message;
+        // WS echo upstream.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    Message::Text(_) | Message::Binary(_) => {
+                        if ws.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        // An Owner-audience upgrade route: for a loopback upgrade the caller is
+        // the publisher node itself, so the owner account admits it.
+        let publisher = [2u8; 32];
+        let member = ed25519::PrivateKey::from_seed(44);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Owner, true);
+        let owner = account(vec![1; 32], publisher, &member);
+        let workspace = tempfile::tempdir().unwrap();
+        let routes = crate::gateway_routes::LocalRoutes {
+            version: 1,
+            routes: vec![crate::gateway_routes::LocalRoute {
+                name: gateway::RouteName::named("api"),
+                port,
+            }],
+        };
+        std::fs::write(
+            workspace.path().join(crate::gateway_routes::FILE_NAME),
+            serde_json::to_vec_pretty(&routes).unwrap(),
+        )
+        .unwrap();
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let replies: Vec<Vec<u8>> = vec![
+                gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(route)))),
+                identity::encode_reply(&identity::IdentityReply::Account(Some(owner.clone()))),
+                identity::encode_reply(&identity::IdentityReply::Account(Some(owner))),
+            ];
+            for bytes in replies {
+                let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                    panic!("expected a query")
+                };
+                let _ = reply.send(Ok(bytes));
+            }
+        });
+
+        // The loopback Upgrade path the client half runs: serve_ws piped to
+        // caller_ws_pump over a local duplex.
+        let (server_end, caller_end) = tokio::io::duplex(64 * 1024);
+        let head = gateway::ProxyRequestHead {
+            account_id: vec![1; 32],
+            name: gateway::RouteName::named("api"),
+            revision: 4,
+            method: gateway::RouteMethod::Get,
+            path_and_query: "/socket".into(),
+            headers: vec![],
+            body_len: 0,
+            upgrade: true,
+        };
+        let workspace_path = workspace.path().to_path_buf();
+        tokio::spawn(async move {
+            serve_ws(&commands, &workspace_path, &publisher, &publisher, &head, server_end).await;
+        });
+        let (to_browser_tx, mut to_browser_rx) = tokio::sync::mpsc::channel(8);
+        let (from_browser_tx, from_browser_rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(caller_ws_pump(caller_end, to_browser_tx, from_browser_rx));
+
+        // A browser message crosses caller_ws_pump -> mesh -> serve_ws -> the
+        // loopback WS echo and back.
+        from_browser_tx
+            .send(noded::GatewayWsMsg::Text("ping".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            to_browser_rx.recv().await,
+            Some(noded::GatewayWsMsg::Text("ping".into()))
         );
     }
 
