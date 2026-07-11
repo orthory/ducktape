@@ -74,12 +74,12 @@ describe("providersOf", () => {
       "codex",
       "codex_gpt-5.5_low",
       "codex_gpt-5.5_xhigh",
-      "codex_gpt-5.4-mini_high",
-      "codex_gpt-5.3-codex-spark_medium",
+      "codex_gpt-5.6-terra_high",
+      "codex_gpt-5.6-sol_medium",
     ]);
     // The bare `codex` tag names no model; each model appears once, no effort.
     // Models keep their internal hyphens/dots (only the trailing _effort drops).
-    expect(groups[0].models).toEqual(["gpt-5.5", "gpt-5.4-mini", "gpt-5.3-codex-spark"]);
+    expect(groups[0].models).toEqual(["gpt-5.5", "gpt-5.6-terra", "gpt-5.6-sol"]);
   });
 
   it("preserves first-seen provider order and dedupes repeated tags", () => {
