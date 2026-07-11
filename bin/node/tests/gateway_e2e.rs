@@ -96,6 +96,7 @@ fn signed_route(
                 max_request_bytes: 1024,
                 max_response_bytes: 4096,
                 allow_authorization: false,
+                allow_upgrade: false,
             },
         }),
     };
@@ -364,12 +365,13 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
             .unwrap(),
         br#"{"ok":true}"#
     );
+    // v2 forwards Set-Cookie end to end (v1 stripped it).
     assert!(
         response["head"]["headers"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|header| header["name"] != "set-cookie")
+            .any(|header| header["name"] == "set-cookie")
     );
 
     let (status, session) = cluster.http(
@@ -402,8 +404,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     assert!(String::from_utf8_lossy(&html).contains("<title>Alice</title>"));
     assert_eq!(host.len(), 32 + ".localhost".len());
 
-    let (status, _, _) = raw_browser_request(browser_port, authority, "Cookie: ambient=yes\r\n");
-    assert_eq!(status, 400);
+    // (v2: ambient Cookie now flows to the upstream; the v1 400 was removed.)
     let mut cross = TcpStream::connect(("127.0.0.1", browser_port)).unwrap();
     let request = format!(
         "GET /page HTTP/1.1\r\nHost: {authority}\r\nOrigin: http://evil.localhost:{browser_port}\r\nConnection: close\r\n\r\n"
@@ -419,12 +420,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
 
     for (method, path, headers, expected) in [
         ("delete", "/items", serde_json::json!([]), 403),
-        (
-            "get",
-            "/items",
-            serde_json::json!([{ "name": "cookie", "value": "ambient=yes" }]),
-            400,
-        ),
+        // (v2: Cookie is no longer rejected at the proxy; it flows to upstream.)
         (
             "get",
             "/items",

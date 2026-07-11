@@ -337,6 +337,7 @@ fn gateway_route() -> gateway::RouteRecord {
                     max_request_bytes: 1024,
                     max_response_bytes: 4096,
                     allow_authorization: false,
+                    allow_upgrade: false,
                 },
             }),
         },
@@ -376,12 +377,15 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
     let (lane, mut jobs) = tokio::sync::mpsc::channel::<noded::GatewayJob>(1);
     tokio::spawn(async move {
         let job = jobs.recv().await.expect("one gateway job");
-        assert_eq!(job.publisher_node, [2; 32]);
-        assert_eq!(job.head.name, gateway::RouteName::named("app"));
-        assert_eq!(job.head.method, gateway::RouteMethod::Post);
-        assert_eq!(job.head.path_and_query, "/api/items");
-        assert_eq!(job.body, br#"{"name":"duck"}"#);
-        let _ = job.reply.send(Ok(noded::GatewayResponse {
+        let noded::GatewayJob::Http { publisher_node, head, body, reply, .. } = job else {
+            panic!("expected an http gateway job");
+        };
+        assert_eq!(publisher_node, [2; 32]);
+        assert_eq!(head.name, gateway::RouteName::named("app"));
+        assert_eq!(head.method, gateway::RouteMethod::Post);
+        assert_eq!(head.path_and_query, "/api/items");
+        assert_eq!(body, br#"{"name":"duck"}"#);
+        let _ = reply.send(Ok(noded::GatewayResponse {
             head: gateway::ProxyResponseHead {
                 status: 201,
                 headers: vec![gateway::ProxyHeader {
@@ -509,10 +513,13 @@ async fn gateway_browser_session_is_route_scoped_and_cross_origin_cookie_safe() 
 
     tokio::spawn(async move {
         let job = jobs.recv().await.unwrap();
-        assert_eq!(job.head.method, gateway::RouteMethod::Post);
-        assert_eq!(job.head.path_and_query, "/api");
-        assert_eq!(job.body, b"payload");
-        let _ = job.reply.send(Ok(noded::GatewayResponse {
+        let noded::GatewayJob::Http { head, body, reply, .. } = job else {
+            panic!("expected an http gateway job");
+        };
+        assert_eq!(head.method, gateway::RouteMethod::Post);
+        assert_eq!(head.path_and_query, "/api");
+        assert_eq!(body, b"payload");
+        let _ = reply.send(Ok(noded::GatewayResponse {
             head: gateway::ProxyResponseHead {
                 status: 201,
                 headers: vec![gateway::ProxyHeader {
@@ -563,19 +570,7 @@ async fn gateway_browser_session_is_route_scoped_and_cross_origin_cookie_safe() 
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    let response = noded::gateway_browser_router(handle.clone())
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/")
-                .header(header::HOST, &host)
-                .header(header::COOKIE, "ambient=secret")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // (v2: ambient Cookie now flows end to end; the v1 rejection was removed.)
 
     let response = noded::gateway_browser_router(handle)
         .oneshot(
