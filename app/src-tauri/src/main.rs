@@ -31,6 +31,17 @@ mod workspaces;
 fn main() {
     let node_control = daemon::NodeControl::new().expect("start desktop node-control actor");
     let mut builder = tauri::Builder::<tauri::Cef>::default()
+        // Keep Chromium's local-data encryption OFF the OS keychain: os_crypt
+        // otherwise prompts macOS for "Chromium Safe Storage" Keychain access
+        // (and would hit kwallet/gnome-keyring on Linux). The key only guards
+        // Chromium's own cookie/localStorage store — worthless here: the
+        // console is a localhost UI whose real data lives in the node, and
+        // gateway sessions are incognito. Deliberate: web-content storage is
+        // not keychain-protected.
+        .command_line_args([
+            ("use-mock-keychain", None::<&str>),
+            ("password-store", Some("basic")),
+        ])
         .manage(node_control)
         .invoke_handler(tauri::generate_handler![
             workspaces::workspace_list,
