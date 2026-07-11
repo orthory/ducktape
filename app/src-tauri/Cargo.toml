@@ -33,7 +33,7 @@ tauri = { version = "2", default-features = false, features = [
 ] }
 # Rev-pinned like the plugin above: bump deliberately (push to the repo,
 # update the rev, rebuild to refresh Cargo.lock).
-tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "cc68ac4ce72abae2ea2d5b4b355373d80fe82dd1" }
+tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "86591aa0afb6da9afcd7f4d80c95f34555692b08" }
 # native OS toasts for the production notification sink (src/notify/present.rs).
 tauri-plugin-notification = "2"
 # in-app LAN key-enrollment server (pure Rust, no system libs): an ephemeral,
