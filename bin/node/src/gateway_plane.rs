@@ -31,13 +31,6 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 const BIND_RETRY: Duration = Duration::from_secs(3);
 const PROXY_IO_TIMEOUT: Duration = Duration::from_secs(15);
-const RESPONSE_OK: u8 = 0;
-const RESPONSE_INVALID: u8 = 1;
-const RESPONSE_FORBIDDEN: u8 = 2;
-const RESPONSE_NOT_FOUND: u8 = 3;
-const RESPONSE_UNAVAILABLE: u8 = 4;
-const RESPONSE_CONFLICT: u8 = 5;
-const RESPONSE_HEADER_BYTES: usize = 5;
 const MAX_ERROR_BYTES: usize = 512;
 const MAX_PROXY_FRAME_BYTES: usize =
     gateway::MAX_RESPONSE_BODY_BYTES as usize + gateway::MAX_RESPONSE_HEAD_BYTES + 2;
@@ -832,113 +825,144 @@ async fn query(
         .map_err(GatewayFailure::Unavailable)
 }
 
+/// Map a typed failure onto a wire frame, redacting `Unavailable` detail
+/// (which may carry a workspace path / loopback port / library diagnostic).
+fn failure_frame(failure: &GatewayFailure) -> gateway::ProxyFrame {
+    use gateway::FailureKind;
+    let (kind, mut detail) = match failure {
+        GatewayFailure::Invalid(detail) => (FailureKind::Invalid, detail.clone()),
+        GatewayFailure::Forbidden(detail) => (FailureKind::Forbidden, detail.clone()),
+        GatewayFailure::NotFound(detail) => (FailureKind::NotFound, detail.clone()),
+        GatewayFailure::Conflict(detail) => (FailureKind::Conflict, detail.clone()),
+        GatewayFailure::Unavailable(_) => (
+            FailureKind::Unavailable,
+            "gateway publisher is unavailable".to_string(),
+        ),
+    };
+    detail.truncate(MAX_ERROR_BYTES);
+    gateway::ProxyFrame::Failure(gateway::ProxyFailure { kind, detail })
+}
+
+fn failure_from(failure: gateway::ProxyFailure) -> GatewayFailure {
+    use gateway::FailureKind;
+    match failure.kind {
+        FailureKind::Invalid => GatewayFailure::Invalid(failure.detail),
+        FailureKind::Forbidden => GatewayFailure::Forbidden(failure.detail),
+        FailureKind::NotFound => GatewayFailure::NotFound(failure.detail),
+        FailureKind::Conflict => GatewayFailure::Conflict(failure.detail),
+        FailureKind::Unavailable => GatewayFailure::Unavailable(failure.detail),
+    }
+}
+
+async fn write_frame<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    frame: &gateway::ProxyFrame,
+) -> std::io::Result<()> {
+    let bytes = gateway::encode_frame(frame)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    stream.write_all(&bytes).await
+}
+
+/// Read one frame, filling `buf` from the stream until a full frame is
+/// available. Leftover bytes stay in `buf` for the next call.
+async fn read_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+) -> Result<gateway::ProxyFrame, GatewayFailure> {
+    loop {
+        match gateway::decode_frame(buf) {
+            Ok((frame, consumed)) => {
+                buf.drain(..consumed);
+                return Ok(frame);
+            }
+            Err(gateway::FrameError::Incomplete) => {
+                let mut chunk = [0u8; 8192];
+                let read = stream
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
+                if read == 0 {
+                    return Err(GatewayFailure::Unavailable(
+                        "gateway stream closed mid-frame".into(),
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..read]);
+            }
+            Err(gateway::FrameError::Malformed(detail)) => {
+                return Err(GatewayFailure::Unavailable(format!(
+                    "malformed gateway frame: {detail}"
+                )));
+            }
+        }
+    }
+}
+
+/// Publisher → caller: a `ResponseHead`, the body split into `MAX_CHUNK_BYTES`
+/// `BodyChunk`s, then `End`; a failure is a single `Failure` frame instead.
 async fn write_proxy_response<S: AsyncWrite + Unpin>(
     stream: &mut S,
     outcome: Result<GatewayResponse, GatewayFailure>,
 ) -> std::io::Result<()> {
-    let encoded = outcome.and_then(|response| {
-        gateway::validate_response_head(&response.head).map_err(GatewayFailure::Unavailable)?;
-        if response.body.len() > gateway::MAX_RESPONSE_BODY_BYTES as usize {
-            return Err(GatewayFailure::Unavailable(
-                "gateway response exceeds the absolute cap".into(),
-            ));
+    match outcome {
+        Ok(response) => {
+            if let Err(error) = gateway::validate_response_head(&response.head) {
+                write_frame(stream, &failure_frame(&GatewayFailure::Unavailable(error))).await?;
+                return stream.flush().await;
+            }
+            write_frame(stream, &gateway::ProxyFrame::ResponseHead(response.head)).await?;
+            for chunk in response.body.chunks(gateway::MAX_CHUNK_BYTES) {
+                write_frame(stream, &gateway::ProxyFrame::BodyChunk(chunk.to_vec())).await?;
+            }
+            write_frame(stream, &gateway::ProxyFrame::End).await?;
         }
-        let head = serde_json::to_vec(&response.head)
-            .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-        if head.len() > gateway::MAX_RESPONSE_HEAD_BYTES {
-            return Err(GatewayFailure::Unavailable(
-                "gateway response metadata is too large".into(),
-            ));
-        }
-        let mut frame = Vec::with_capacity(2 + head.len() + response.body.len());
-        frame.extend_from_slice(&(head.len() as u16).to_be_bytes());
-        frame.extend_from_slice(&head);
-        frame.extend_from_slice(&response.body);
-        Ok(frame)
-    });
-    let (status, mut payload) = match encoded {
-        Ok(frame) => (RESPONSE_OK, frame),
-        Err(GatewayFailure::Invalid(detail)) => (RESPONSE_INVALID, detail.into_bytes()),
-        Err(GatewayFailure::Forbidden(detail)) => (RESPONSE_FORBIDDEN, detail.into_bytes()),
-        Err(GatewayFailure::NotFound(detail)) => (RESPONSE_NOT_FOUND, detail.into_bytes()),
-        Err(GatewayFailure::Conflict(detail)) => (RESPONSE_CONFLICT, detail.into_bytes()),
-        // Internal IO errors may contain a workspace path, loopback port, or
-        // library diagnostic. None is useful to a remote caller; preserve the
-        // typed failure while keeping publisher-local details off the wire.
-        Err(GatewayFailure::Unavailable(_)) => (
-            RESPONSE_UNAVAILABLE,
-            b"gateway publisher is unavailable".to_vec(),
-        ),
-    };
-    if status != RESPONSE_OK {
-        payload.truncate(MAX_ERROR_BYTES);
+        Err(failure) => write_frame(stream, &failure_frame(&failure)).await?,
     }
-    stream.write_all(&[status]).await?;
-    stream
-        .write_all(&(payload.len() as u32).to_be_bytes())
-        .await?;
-    stream.write_all(&payload).await?;
     stream.flush().await
 }
 
+/// Caller side (buffered): collect body chunks into one `GatewayResponse`,
+/// enforcing the response cap. `max_response_bytes == 0` (unbounded/SSE) is
+/// capped at the buffer ceiling on this buffered path — true streaming lands
+/// with the duck:// viewer.
 async fn read_proxy_response<S: AsyncRead + Unpin>(
     stream: &mut S,
     max_response_bytes: u64,
 ) -> Result<GatewayResponse, GatewayFailure> {
-    let mut header = [0u8; RESPONSE_HEADER_BYTES];
-    stream
-        .read_exact(&mut header)
-        .await
-        .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-    let len = u32::from_be_bytes(header[1..].try_into().expect("four response length bytes"));
-    let max = if header[0] == RESPONSE_OK {
-        usize::try_from(max_response_bytes)
-            .unwrap_or(usize::MAX)
-            .saturating_add(gateway::MAX_RESPONSE_HEAD_BYTES + 2)
-            .min(MAX_PROXY_FRAME_BYTES)
-    } else {
-        MAX_ERROR_BYTES
+    let mut buf = Vec::new();
+    let head = match read_frame(stream, &mut buf).await? {
+        gateway::ProxyFrame::ResponseHead(head) => head,
+        gateway::ProxyFrame::Failure(failure) => return Err(failure_from(failure)),
+        _ => {
+            return Err(GatewayFailure::Unavailable(
+                "publisher did not open with a response head".into(),
+            ));
+        }
     };
-    if len as usize > max {
-        return Err(GatewayFailure::Unavailable(
-            "publisher returned an oversized gateway response".into(),
-        ));
-    }
-    let mut payload = vec![0u8; len as usize];
-    stream
-        .read_exact(&mut payload)
-        .await
-        .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-    if header[0] != RESPONSE_OK {
-        let detail = String::from_utf8_lossy(&payload).into_owned();
-        return Err(match header[0] {
-            RESPONSE_INVALID => GatewayFailure::Invalid(detail),
-            RESPONSE_FORBIDDEN => GatewayFailure::Forbidden(detail),
-            RESPONSE_NOT_FOUND => GatewayFailure::NotFound(detail),
-            RESPONSE_CONFLICT => GatewayFailure::Conflict(detail),
-            RESPONSE_UNAVAILABLE => GatewayFailure::Unavailable(detail),
-            _ => GatewayFailure::Unavailable("publisher returned an unknown status".into()),
-        });
-    }
-    if payload.len() < 2 {
-        return Err(GatewayFailure::Unavailable(
-            "publisher returned a truncated gateway response".into(),
-        ));
-    }
-    let head_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-    if head_len > gateway::MAX_RESPONSE_HEAD_BYTES || payload.len() < 2 + head_len {
-        return Err(GatewayFailure::Unavailable(
-            "publisher returned invalid gateway metadata".into(),
-        ));
-    }
-    let head: gateway::ProxyResponseHead = serde_json::from_slice(&payload[2..2 + head_len])
-        .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
     gateway::validate_response_head(&head).map_err(GatewayFailure::Unavailable)?;
-    let body = payload.split_off(2 + head_len);
-    if body.len() as u64 > max_response_bytes {
-        return Err(GatewayFailure::Unavailable(
-            "publisher exceeded the signed response cap".into(),
-        ));
+    let cap = if max_response_bytes == 0 {
+        MAX_PROXY_FRAME_BYTES as u64
+    } else {
+        max_response_bytes.min(MAX_PROXY_FRAME_BYTES as u64)
+    };
+    let mut body = Vec::new();
+    loop {
+        match read_frame(stream, &mut buf).await? {
+            gateway::ProxyFrame::BodyChunk(chunk) => {
+                if body.len() as u64 + chunk.len() as u64 > cap {
+                    return Err(GatewayFailure::Unavailable(
+                        "publisher exceeded the response cap".into(),
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            gateway::ProxyFrame::End => break,
+            gateway::ProxyFrame::Failure(failure) => return Err(failure_from(failure)),
+            _ => {
+                return Err(GatewayFailure::Unavailable(
+                    "unexpected frame in gateway response body".into(),
+                ));
+            }
+        }
     }
     Ok(GatewayResponse { head, body })
 }
@@ -998,6 +1022,46 @@ mod tests {
             Err(GatewayFailure::Unavailable(detail))
                 if detail == "gateway publisher is unavailable"
         ));
+    }
+
+    #[tokio::test]
+    async fn frame_codec_chunks_large_body_and_enforces_cap() {
+        // A body larger than one chunk is split into multiple BodyChunk frames
+        // and reassembled exactly.
+        let big = vec![7u8; gateway::MAX_CHUNK_BYTES * 2 + 100];
+        let response = GatewayResponse {
+            head: gateway::ProxyResponseHead {
+                status: 200,
+                headers: vec![],
+            },
+            body: big.clone(),
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(1 << 20);
+        // The writer can outrun the bounded duplex, so drive it concurrently.
+        let pump = tokio::spawn(async move {
+            write_proxy_response(&mut writer, Ok(response)).await.unwrap();
+        });
+        let got = read_proxy_response(&mut reader, (gateway::MAX_CHUNK_BYTES * 3) as u64)
+            .await
+            .unwrap();
+        pump.await.unwrap();
+        assert_eq!(got.body, big);
+
+        // A body past the caller's cap is rejected mid-stream.
+        let over = GatewayResponse {
+            head: gateway::ProxyResponseHead {
+                status: 200,
+                headers: vec![],
+            },
+            body: vec![1u8; 5000],
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(1 << 20);
+        let pump = tokio::spawn(async move {
+            let _ = write_proxy_response(&mut writer, Ok(over)).await;
+        });
+        let capped = read_proxy_response(&mut reader, 1000).await;
+        let _ = pump.await;
+        assert!(matches!(capped, Err(GatewayFailure::Unavailable(_))));
     }
 
     #[test]
