@@ -48,6 +48,7 @@ pub use call::{
 // the gateway lane: signed-route proxying + the isolated browser-gateway
 // origin (`gateway_http` because the `gateway` crate is a dependency).
 mod gateway_http;
+pub mod origin_guard;
 pub use gateway_http::{
     GatewayFailure, GatewayJob, GatewayLane, GatewayProxyReply, GatewayProxyRequest,
     GatewayResponse, GatewaySessionRequest, gateway_browser_router, serve_browser_gateway,
@@ -80,7 +81,6 @@ use duckfs_core::CHUNK_SIZE;
 use futures::channel::oneshot;
 use sdk::StateRoot;
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
 
 use crate::call::call_ws;
 use crate::gateway_http::{gateway_proxy, gateway_session};
@@ -408,8 +408,13 @@ pub fn router(handle: NodeHandle) -> Router {
             "/forge/{repo}/git-upload-pack",
             post(git_upload_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
         )
-        // the web app is served from a different origin than the node.
-        .layer(CorsLayer::permissive())
+        // The control plane forges consensus ops, reads all state, writes the
+        // filesystem and pushes git. The trusted console is the ONLY web page
+        // allowed to reach it: the guard refuses any other browser origin, and
+        // the matching CORS allowlist stops a page reading a response even on a
+        // request that carries no Origin at all. See `origin_guard`.
+        .layer(axum::middleware::from_fn(origin_guard::guard))
+        .layer(origin_guard::cors())
         .with_state(handle)
 }
 
