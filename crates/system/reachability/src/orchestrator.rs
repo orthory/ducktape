@@ -43,10 +43,10 @@ use std::time::{Duration, Instant};
 use commonware_cryptography::{Signer as _, ed25519};
 use nat_traversal::{ClientEvent, NatClient, NodeKey, SocketEvent};
 use tokio::sync::mpsc;
-use wireguard_effect::{
+use wireguard::effect::{
     PeerTunnelConfig, WireGuardEffect, apply_peer_tunnels, plan_peer_configs, update_peer_tunnels,
 };
-use wireguard_upgrade::{
+use wireguard::{
     ActiveValidatorSet, Endpoint, EndpointAdvertisement, EndpointRecord, MeshVersion, MeshView,
     OverlayPolicy, Perspective, PortPolicy, ReplayCache, SignedEndpointRecord, TunnelInstallPlan,
     TunnelUpgradeAck, TunnelUpgradeAckFields, TunnelUpgradeRequest, TunnelUpgradeRequestFields,
@@ -167,7 +167,7 @@ pub enum ReachabilityCommand {
         /// this).
         peer: ed25519::PublicKey,
         /// The counterparty's X25519 WireGuard key.
-        wireguard_public_key: wireguard_upgrade::X25519PublicKey,
+        wireguard_public_key: wireguard::X25519PublicKey,
         /// Where to dial it: the blob's advertised endpoint on the joiner
         /// side; the intro datagram's observed source on the inviter side
         /// (WireGuard roams to the authenticated initiation either way).
@@ -181,7 +181,7 @@ pub enum ReachabilityCommand {
     /// authenticated intro datagram over the same punched underlay socket.
     BootstrapCoordinatedInvitePeer {
         peer: ed25519::PublicKey,
-        wireguard_public_key: wireguard_upgrade::X25519PublicKey,
+        wireguard_public_key: wireguard::X25519PublicKey,
         intro: Vec<u8>,
         reply: CoordinatedInviteReply,
     },
@@ -1237,7 +1237,6 @@ where
                 wireguard_public_key: self.keypair.public_key(),
                 control_endpoint: self.config.control_endpoint,
                 wireguard_endpoint: self.config.wireguard_advertised,
-                capabilities: vec![],
                 expires_at_view: self.view + ADVERT_TTL_VIEWS,
                 // the epoch's first signed nonce; the counter below starts
                 // past it.
@@ -1376,8 +1375,7 @@ where
             };
             let allowed_ips = self
                 .overlay
-                .identity_allowed_ips(record.validator_identity)
-                .expect("the plane's overlay is ula_v6, which derives view-free");
+                .identity_allowed_ips(record.validator_identity);
             peers.insert(
                 record.validator_identity,
                 PeerTunnelConfig {
@@ -1390,8 +1388,7 @@ where
         }
         let local_interface_ips = self
             .overlay
-            .identity_allowed_ips(self.me)
-            .expect("the plane's overlay is ula_v6, which derives view-free");
+            .identity_allowed_ips(self.me);
         let peer_count = peers.len();
         // the join-window invite layer rides the restore apply too (a node
         // rebooting mid-window keeps its invite tunnel), but never enters
@@ -1908,8 +1905,7 @@ where
         };
         let allowed_ips = self
             .overlay
-            .identity_allowed_ips(owner)
-            .expect("the plane's overlay is ula_v6, which derives view-free");
+            .identity_allowed_ips(owner);
         let state = self.state.as_mut().expect("still in epoch");
         state.prewarm_peers.insert(
             owner,
@@ -2121,8 +2117,7 @@ where
         };
         let allowed_ips = self
             .overlay
-            .identity_allowed_ips(owner)
-            .expect("the plane's overlay is ula_v6, which derives view-free");
+            .identity_allowed_ips(owner);
         let state = self.state.as_mut().expect("still in epoch");
         state.prewarm_peers.insert(
             owner,
@@ -2240,8 +2235,7 @@ where
                 // identity-derived /128 every validated plan carries.
                 let local_interface_ips = self
                     .overlay
-                    .identity_allowed_ips(self.me)
-                    .expect("the plane's overlay is ula_v6, which derives view-free");
+                    .identity_allowed_ips(self.me);
                 if let Err(err) = apply_peer_tunnels(
                     &mut self.effect,
                     self.interface.clone(),
@@ -2495,7 +2489,7 @@ where
     async fn install_invite_peer(
         &mut self,
         peer: ed25519::PublicKey,
-        wireguard_public_key: wireguard_upgrade::X25519PublicKey,
+        wireguard_public_key: wireguard::X25519PublicKey,
         endpoint: SocketAddr,
         reply: InstallReply,
     ) -> Result<(), ReachabilityError> {
@@ -2508,8 +2502,7 @@ where
         }
         let allowed_ips = self
             .overlay
-            .identity_allowed_ips(identity)
-            .expect("the plane's overlay is ula_v6, which derives view-free");
+            .identity_allowed_ips(identity);
         self.invite_peers.insert(
             identity,
             PeerTunnelConfig {
@@ -2530,8 +2523,7 @@ where
         let peers: Vec<PeerTunnelConfig> = merged.values().cloned().collect();
         let local_interface_ips = self
             .overlay
-            .identity_allowed_ips(self.me)
-            .expect("the plane's overlay is ula_v6, which derives view-free");
+            .identity_allowed_ips(self.me);
         let outcome = if self.interface_live {
             update_peer_tunnels(
                 &mut self.effect,
@@ -2584,7 +2576,7 @@ where
     async fn bootstrap_coordinated_invite_peer(
         &mut self,
         peer: ed25519::PublicKey,
-        wireguard_public_key: wireguard_upgrade::X25519PublicKey,
+        wireguard_public_key: wireguard::X25519PublicKey,
         intro: Vec<u8>,
         reply: CoordinatedInviteReply,
     ) -> Result<(), ReachabilityError> {
@@ -2660,8 +2652,7 @@ where
         let peers: Vec<PeerTunnelConfig> = merged.values().cloned().collect();
         let local_interface_ips = self
             .overlay
-            .identity_allowed_ips(self.me)
-            .expect("the plane's overlay is ula_v6, which derives view-free");
+            .identity_allowed_ips(self.me);
         let outcome = if self.interface_live {
             update_peer_tunnels(
                 &mut self.effect,
@@ -2782,8 +2773,6 @@ where
             responder_wireguard_public_key: self.keypair.public_key(),
             responder_wireguard_endpoint: self.config.wireguard_advertised,
             accepted_allowed_ips: self.overlay.allowed_ips_for(view, sender)?,
-            relay_candidates: vec![],
-            direct_dial_failure: None,
             keepalive_seconds: Some(KEEPALIVE_SECONDS),
             expires_at_view: self.view + HANDSHAKE_TTL_VIEWS,
             nonce,
@@ -2862,7 +2851,7 @@ where
             nonce: state.next_nonce(),
         };
         let ack = TunnelUpgradeAck::sign(fields, &self.config.signer);
-        let plan = wireguard_upgrade::validate_upgrade_as(
+        let plan = wireguard::validate_upgrade_as(
             Perspective::Initiator,
             &view,
             &self.config.port_policy,
@@ -2946,7 +2935,7 @@ where
                 .await;
         }
         let view = state.view_state.as_ref().expect("mesh verified").clone();
-        let plan = wireguard_upgrade::validate_upgrade_as(
+        let plan = wireguard::validate_upgrade_as(
             Perspective::Responder,
             &view,
             &self.config.port_policy,

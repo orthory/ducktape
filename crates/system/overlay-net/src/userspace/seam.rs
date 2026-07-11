@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, BufReader, ReadHalf, Writ
 use tokio::time::timeout;
 
 use super::sockets::{VirtualTcpListener, VirtualTcpStream};
-use super::stack::{LISTEN_BACKLOG, StackSlot};
+use super::stack::{LISTEN_BACKLOG, StackSlot, accept_via_slot};
 
 /// the tokio network arm's default read/write timeouts — mesh connections
 /// carried by the OS arm already live under exactly these, so the virtual
@@ -79,12 +79,6 @@ pub(crate) fn split(stream: VirtualTcpStream) -> (VirtualSink, VirtualStream) {
     )
 }
 
-/// how often the lazy leg re-checks the slot: for the stack to (re)appear
-/// while the tunnel is down, and for a live stack having been REPLACED under
-/// a pending accept (a rebuilt backend aborts the old stack's poll task, so
-/// a future parked on its wakers would otherwise pend forever).
-const LEG_POLL: Duration = Duration::from_secs(1);
-
 /// the virtual half of socket mode's mesh listener (ADR phase 3): a lazy
 /// TCP acceptor at the node's own ULA on a fixed port.
 ///
@@ -101,7 +95,7 @@ pub struct LazyVirtualListener {
     port: u16,
     /// the live leg, tagged with the stack it bound on so a rebuild
     /// (different `Arc`) is detected and re-bound.
-    leg: Option<(std::sync::Arc<super::stack::VirtualStack>, VirtualListener)>,
+    leg: Option<(std::sync::Arc<super::stack::VirtualStack>, VirtualTcpListener)>,
 }
 
 impl LazyVirtualListener {
@@ -117,41 +111,11 @@ impl LazyVirtualListener {
     /// a down tunnel or a mid-rebuild window is time, not an error — exactly
     /// the OS listener's posture toward a link being down.
     pub async fn accept(&mut self) -> (SocketAddr, VirtualSink, VirtualStream) {
-        loop {
-            let Some(stack) = self.slot.get() else {
-                self.leg = None;
-                tokio::time::sleep(LEG_POLL).await;
-                continue;
-            };
-            let stale = match &self.leg {
-                Some((bound_on, _)) => !std::sync::Arc::ptr_eq(bound_on, &stack),
-                None => true,
-            };
-            if stale {
-                match stack.listen_tcp(self.port, LISTEN_BACKLOG) {
-                    Ok(listener) => self.leg = Some((stack, VirtualListener(listener))),
-                    // the port is briefly still held (a replaced stack's
-                    // teardown) — retry on the poll cadence.
-                    Err(_) => {
-                        self.leg = None;
-                        tokio::time::sleep(LEG_POLL).await;
-                        continue;
-                    }
-                }
-            }
-            let Some((_, listener)) = self.leg.as_mut() else {
-                continue;
-            };
-            // bounded wait so a stack replaced UNDER this accept (whose
-            // wakers will never fire again) is re-detected on the next pass;
-            // the accept itself is poll-based over pre-armed slots, so a
-            // timed-out attempt abandons no connection state.
-            match timeout(LEG_POLL, listener.accept()).await {
-                Ok(Ok(conn)) => return conn,
-                Ok(Err(_)) => self.leg = None,
-                Err(_elapsed) => {}
-            }
-        }
+        let (stream, addr) = accept_via_slot(&self.slot, None, self.port, &mut self.leg)
+            .await
+            .expect("no required ip: the shared accept loop cannot fail");
+        let (sink, stream) = split(stream);
+        (addr, sink, stream)
     }
 }
 

@@ -26,8 +26,7 @@ members = [
     "crates/system/governance",
     "crates/system/identity",
     "crates/system/upgrade", 
-    "crates/system/wireguard-upgrade",
-    "crates/system/wireguard-effect",
+    "crates/system/wireguard",
     "crates/system/nat-traversal",
     "crates/system/reachability",
     "crates/system/data-plane",
@@ -187,8 +186,7 @@ directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 evm = { path = "crates/examples/evm" }
 # internal — types-only interface crates (the legal cross-module surface)
-wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
-wireguard-effect = { path = "crates/system/wireguard-effect" }
+wireguard = { path = "crates/system/wireguard" }
 nat-traversal = { path = "crates/system/nat-traversal" }
 reachability = { path = "crates/system/reachability" }
 data-plane = { path = "crates/system/data-plane" }

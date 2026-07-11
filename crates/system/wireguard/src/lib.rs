@@ -1,11 +1,15 @@
-//! Validator-set backed WireGuard tunnel-upgrade protocol.
+//! Validator-set backed WireGuard tunnel-upgrade protocol, plus the effect
+//! layer that applies it.
 //!
-//! This crate owns the security boundary before any node installs a WireGuard
-//! peer. It verifies the active validator set, endpoint advertisements, port
-//! policy, overlay routes, replay nonces, and the request/response/ack handshake.
-//! A successful validation yields a [`TunnelInstallPlan`] that can be converted
-//! into defguard `wireguard-rs` peer/interface configuration and handed to
-//! `WGApi::<Userspace|Kernel>::configure_interface` by the effectful node layer.
+//! The crate root owns the security boundary before any node installs a
+//! WireGuard peer. It verifies the active validator set, endpoint
+//! advertisements, port policy, overlay routes, replay nonces, and the
+//! request/response/ack handshake. A successful validation yields a
+//! [`TunnelInstallPlan`]; the [`effect`] module converts plans into defguard
+//! `wireguard-rs` peer/interface configuration and pushes them through a
+//! `WireGuardEffect` (fake in tests, `WGApi::<Userspace>` in production).
+
+pub mod effect;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
@@ -14,9 +18,6 @@ use std::str::FromStr;
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer, Verifier, ed25519};
-use defguard_wireguard_rs::{
-    InterfaceConfiguration, key::Key as DefguardKey, net::IpAddrMask, peer::Peer as DefguardPeer,
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -28,9 +29,7 @@ const ENDPOINT_RECORD_NS: &[u8] = b"ducktape:wireguard-endpoint-record:v1";
 const UPGRADE_REQUEST_NS: &[u8] = b"ducktape:wireguard-upgrade-request:v1";
 const UPGRADE_RESPONSE_NS: &[u8] = b"ducktape:wireguard-upgrade-response:v1";
 const UPGRADE_ACK_NS: &[u8] = b"ducktape:wireguard-upgrade-ack:v1";
-const DIRECT_DIAL_FAILURE_NS: &[u8] = b"ducktape:wireguard-direct-dial-failure:v1";
 const MAX_ACK_INSTALL_LAG: u64 = 8;
-const MAX_DIAL_FAILURE_LAG: u64 = 8;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UpgradeError {
@@ -68,10 +67,6 @@ pub enum UpgradeError {
     Replay,
     #[error("invalid allowed IP route")]
     InvalidAllowedIp,
-    #[error("invalid relay candidate")]
-    InvalidRelay,
-    #[error("invalid direct dial failure evidence")]
-    InvalidDialFailure,
     #[error("invalid WireGuard key")]
     InvalidWireGuardKey,
 }
@@ -212,13 +207,6 @@ impl PortPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MeshCapability {
-    Bootnode,
-    Relay,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ActiveValidatorSet {
     pub namespace: String,
@@ -291,7 +279,6 @@ pub struct EndpointRecord {
     /// to the pre-Option encoding (and old records decodable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wireguard_endpoint: Option<Endpoint>,
-    pub capabilities: Vec<MeshCapability>,
     pub expires_at_view: u64,
     pub nonce: u64,
 }
@@ -468,14 +455,6 @@ impl MeshView {
             .iter()
             .find(|r| r.validator_identity == identity)
     }
-
-    pub fn relay_candidates(&self) -> Vec<ValidatorIdentity> {
-        self.records
-            .iter()
-            .filter(|r| r.capabilities.contains(&MeshCapability::Relay))
-            .map(|r| r.validator_identity)
-            .collect()
-    }
 }
 
 /// the documented v2 preimage (docs/records/protocols/wireguard-tunnel-upgrade.md "Mesh
@@ -544,24 +523,16 @@ impl AllowedIp {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum OverlayMode {
-    /// stable-index host allocation out of a v4 block (the original scheme).
-    /// an address is a function of the validator's INDEX, so it moves when
-    /// the set reorders across epochs.
-    IndexedV4 { base: Ipv4Addr, prefix: u8 },
-    /// identity-hash /128s inside a chain-scoped IPv6 ULA /48. an address is
-    /// a function of (chain_id, identity) ONLY — every node derives every
-    /// peer's address without an allocator or index, and it never moves when
-    /// the valset reorders. fd00::/8 cannot collide with RFC1918 v4 or the
-    /// 100.64.0.0/10 CGNAT block a resident Tailscale occupies, which is what
-    /// lets a `dt-*` interface coexist with a personal tailnet.
-    UlaV6 { chain_id: String },
-}
-
+/// The overlay addressing scheme: identity-hash /128s inside a chain-scoped
+/// IPv6 ULA /48. an address is a function of (chain_id, identity) ONLY —
+/// every node derives every peer's address without an allocator or index,
+/// and it never moves when the valset reorders. fd00::/8 cannot collide with
+/// RFC1918 v4 or the 100.64.0.0/10 CGNAT block a resident Tailscale
+/// occupies, which is what lets a `dt-*` interface coexist with a personal
+/// tailnet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OverlayPolicy {
-    mode: OverlayMode,
+    chain_id: String,
 }
 
 /// The chain-scoped ULA /48 prefix: `fd` followed by the first 40 bits of
@@ -595,23 +566,12 @@ pub fn ula_v6_member_addr(chain_id: &str, identity: ValidatorIdentity) -> Ipv6Ad
 }
 
 impl OverlayPolicy {
-    pub fn default_v4() -> Self {
-        Self {
-            mode: OverlayMode::IndexedV4 {
-                base: Ipv4Addr::new(100, 64, 0, 0),
-                prefix: 16,
-            },
-        }
-    }
-
     /// The node-driven WireGuard overlay: identity-hash /128s in the chain's
     /// ULA /48 (see [`ula_v6_prefix`] / [`ula_v6_member_addr`]). `chain_id`
     /// must be the same string the mesh uses as its advertisement namespace.
     pub fn ula_v6(chain_id: impl Into<String>) -> Self {
         Self {
-            mode: OverlayMode::UlaV6 {
-                chain_id: chain_id.into(),
-            },
+            chain_id: chain_id.into(),
         }
     }
 
@@ -620,47 +580,24 @@ impl OverlayPolicy {
         view: &MeshView,
         identity: ValidatorIdentity,
     ) -> Result<Vec<AllowedIp>, UpgradeError> {
-        // membership gate for BOTH modes: an overlay address exists only for
-        // a validator of this view, even though the ULA derivation would
-        // happily hash any identity.
-        let index = view
-            .stable_index(identity)
-            .ok_or(UpgradeError::UnknownValidator)? as u32;
-        match &self.mode {
-            OverlayMode::IndexedV4 { base, prefix } => {
-                let base = u32::from(*base);
-                let host_count = 1u32 << (32 - *prefix as u32);
-                let offset = index + 1;
-                if offset >= host_count {
-                    return Err(UpgradeError::InvalidAllowedIp);
-                }
-                Ok(vec![AllowedIp {
-                    addr: IpAddr::V4(Ipv4Addr::from(base + offset)),
-                    cidr: 32,
-                }])
-            }
-            OverlayMode::UlaV6 { chain_id } => Ok(vec![AllowedIp {
-                addr: IpAddr::V6(ula_v6_member_addr(chain_id, identity)),
-                cidr: 128,
-            }]),
-        }
+        // membership gate: an overlay address exists only for a validator of
+        // this view, even though the ULA derivation would happily hash any
+        // identity.
+        view.stable_index(identity)
+            .ok_or(UpgradeError::UnknownValidator)?;
+        Ok(self.identity_allowed_ips(identity))
     }
 
-    /// View-free [`OverlayPolicy::allowed_ips_for`], available only in modes
-    /// whose addresses are pure functions of identity (`ula_v6`). Exists for
-    /// re-deriving a PREVIOUSLY validated mesh from persisted records at
-    /// boot, where no live `MeshView` can exist yet — the caller owns the
-    /// membership gate the view would otherwise supply. `IndexedV4`
-    /// addresses depend on a validator's index in a live set, so deriving
-    /// one without a view would be a guess: `None`.
-    pub fn identity_allowed_ips(&self, identity: ValidatorIdentity) -> Option<Vec<AllowedIp>> {
-        match &self.mode {
-            OverlayMode::IndexedV4 { .. } => None,
-            OverlayMode::UlaV6 { chain_id } => Some(vec![AllowedIp {
-                addr: IpAddr::V6(ula_v6_member_addr(chain_id, identity)),
-                cidr: 128,
-            }]),
-        }
+    /// View-free [`OverlayPolicy::allowed_ips_for`] — the address is a pure
+    /// function of identity. Exists for re-deriving a PREVIOUSLY validated
+    /// mesh from persisted records at boot, where no live `MeshView` can
+    /// exist yet — the caller owns the membership gate the view would
+    /// otherwise supply.
+    pub fn identity_allowed_ips(&self, identity: ValidatorIdentity) -> Vec<AllowedIp> {
+        vec![AllowedIp {
+            addr: IpAddr::V6(ula_v6_member_addr(&self.chain_id, identity)),
+            cidr: 128,
+        }]
     }
 
     fn validate_for(
@@ -754,51 +691,6 @@ impl TunnelUpgradeRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DirectDialFailureFields {
-    pub namespace: String,
-    pub epoch: u64,
-    pub valset_root: Root,
-    pub admission_root: AdmissionRoot,
-    pub mesh_version: MeshVersion,
-    pub observer_identity: ValidatorIdentity,
-    pub target_identity: ValidatorIdentity,
-    pub target_wireguard_endpoint: Endpoint,
-    pub failed_at_view: u64,
-    pub expires_at_view: u64,
-    pub error_hash: [u8; 32],
-    pub nonce: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DirectDialFailureEvidence {
-    pub fields: DirectDialFailureFields,
-    pub signature: SignatureBytes,
-}
-
-impl DirectDialFailureEvidence {
-    pub fn sign(fields: DirectDialFailureFields, signer: &ed25519::PrivateKey) -> Self {
-        let mut msg = Vec::new();
-        put_direct_dial_failure_fields(&mut msg, &fields);
-        let signature = signer.sign(DIRECT_DIAL_FAILURE_NS, &msg);
-        Self {
-            fields,
-            signature: signature_bytes(&signature),
-        }
-    }
-
-    fn verify_signature(&self) -> Result<(), UpgradeError> {
-        let mut msg = Vec::new();
-        put_direct_dial_failure_fields(&mut msg, &self.fields);
-        verify_ed25519(
-            self.fields.observer_identity,
-            DIRECT_DIAL_FAILURE_NS,
-            &msg,
-            &self.signature,
-        )
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunnelUpgradeResponseFields {
     pub request_hash: [u8; 32],
     pub namespace: String,
@@ -814,8 +706,6 @@ pub struct TunnelUpgradeResponseFields {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responder_wireguard_endpoint: Option<Endpoint>,
     pub accepted_allowed_ips: Vec<AllowedIp>,
-    pub relay_candidates: Vec<ValidatorIdentity>,
-    pub direct_dial_failure: Option<DirectDialFailureEvidence>,
     pub keepalive_seconds: Option<u16>,
     pub expires_at_view: u64,
     pub nonce: u64,
@@ -959,7 +849,6 @@ pub struct TunnelInstallPlan {
     peer_endpoint: Option<Endpoint>,
     local_interface_ips: Vec<AllowedIp>,
     allowed_ips: Vec<AllowedIp>,
-    relay_candidates: Vec<ValidatorIdentity>,
     keepalive_seconds: Option<u16>,
 }
 
@@ -996,60 +885,25 @@ impl TunnelInstallPlan {
         &self.allowed_ips
     }
 
-    pub fn relay_candidates(&self) -> &[ValidatorIdentity] {
-        &self.relay_candidates
-    }
-
     pub fn keepalive_seconds(&self) -> Option<u16> {
         self.keepalive_seconds
     }
 }
 
 /// Which side of a validated handshake a [`TunnelInstallPlan`] is built for.
-/// [`validate_upgrade`] (unchanged, kept for existing callers) always builds
-/// the initiator's plan; [`validate_upgrade_as`] lets either party derive its
-/// OWN install plan from the identical signed triple.
+/// [`validate_upgrade_as`] lets either party derive its OWN install plan
+/// from the identical signed triple.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Perspective {
     Initiator,
     Responder,
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the public validation boundary keeps every signed transcript and context input explicit"
-)]
-pub fn validate_upgrade(
-    view: &MeshView,
-    policy: &PortPolicy,
-    overlay: &OverlayPolicy,
-    current_view: u64,
-    request: &TunnelUpgradeRequest,
-    response: &TunnelUpgradeResponse,
-    ack: &TunnelUpgradeAck,
-    replay: &mut ReplayCache,
-) -> Result<TunnelInstallPlan, UpgradeError> {
-    validate_upgrade_as(
-        Perspective::Initiator,
-        view,
-        policy,
-        overlay,
-        current_view,
-        request,
-        response,
-        ack,
-        replay,
-    )
-}
-
-/// Identical validation to [`validate_upgrade`], but returns the install plan
-/// for the requested `perspective`. The initiator and responder each hold a
-/// full copy of the same signed request/response/ack triple; each calls this
-/// ONCE, from its own `MeshView` and its own `ReplayCache`, with its own
-/// perspective, to derive its own `local_*`/`peer_*` install config. This is
-/// the responder-side counterpart the `tunnel_e2e` "PINNED GAP" test
-/// documents: before this function existed, only the initiator's plan was
-/// derivable.
+/// Validate the signed request/response/ack triple and return the install
+/// plan for the requested `perspective`. The initiator and responder each
+/// hold a full copy of the same triple; each calls this ONCE, from its own
+/// `MeshView` and its own `ReplayCache`, with its own perspective, to derive
+/// its own `local_*`/`peer_*` install config.
 #[allow(
     clippy::too_many_arguments,
     reason = "the public validation boundary keeps every signed transcript and context input explicit"
@@ -1171,40 +1025,11 @@ pub fn validate_upgrade_as(
     if rq.requested_allowed_ips == rs.accepted_allowed_ips {
         return Err(UpgradeError::InvalidAllowedIp);
     }
-    if !rs.relay_candidates.is_empty() && rs.direct_dial_failure.is_none() {
-        return Err(UpgradeError::InvalidRelay);
-    }
-    if let Some(failure) = &rs.direct_dial_failure {
-        // dial-failure evidence is about a dial toward an ADVERTISED
-        // endpoint — an endpoint-less responder has nothing to fail against.
-        let Some(responder_endpoint) = responder_record.wireguard_endpoint else {
-            return Err(UpgradeError::InvalidDialFailure);
-        };
-        validate_direct_dial_failure(
-            failure,
-            view,
-            current_view,
-            rq.initiator_identity,
-            rq.responder_identity,
-            responder_endpoint,
-        )?;
-    }
-    for relay in &rs.relay_candidates {
-        let record = view.record(*relay).ok_or(UpgradeError::InvalidRelay)?;
-        if !record.capabilities.contains(&MeshCapability::Relay) {
-            return Err(UpgradeError::InvalidRelay);
-        }
-    }
-    let mut replay_keys = vec![
+    let replay_keys = replay.check_batch(&[
         (rq.initiator_identity, rq.epoch, rq.nonce),
         (rs.responder_identity, rs.epoch, rs.nonce),
         (ak.initiator_identity, ak.epoch, ak.nonce),
-    ];
-    if let Some(failure) = &rs.direct_dial_failure {
-        let f = &failure.fields;
-        replay_keys.push((f.observer_identity, f.epoch, f.nonce));
-    }
-    let replay_keys = replay.check_batch(&replay_keys)?;
+    ])?;
 
     for (identity, epoch, nonce) in replay_keys {
         replay.insert(identity, epoch, nonce);
@@ -1227,7 +1052,6 @@ pub fn validate_upgrade_as(
             peer_endpoint: rs.responder_wireguard_endpoint,
             local_interface_ips: rs.accepted_allowed_ips.clone(),
             allowed_ips: rq.requested_allowed_ips.clone(),
-            relay_candidates: rs.relay_candidates.clone(),
             keepalive_seconds: rs.keepalive_seconds,
         },
         Perspective::Responder => TunnelInstallPlan {
@@ -1239,46 +1063,9 @@ pub fn validate_upgrade_as(
             peer_endpoint: rq.initiator_wireguard_endpoint,
             local_interface_ips: rq.requested_allowed_ips.clone(),
             allowed_ips: rs.accepted_allowed_ips.clone(),
-            relay_candidates: rs.relay_candidates.clone(),
             keepalive_seconds: rs.keepalive_seconds,
         },
     })
-}
-
-fn validate_direct_dial_failure(
-    failure: &DirectDialFailureEvidence,
-    view: &MeshView,
-    current_view: u64,
-    observer_identity: ValidatorIdentity,
-    target_identity: ValidatorIdentity,
-    target_endpoint: Endpoint,
-) -> Result<(), UpgradeError> {
-    failure.verify_signature()?;
-    let f = &failure.fields;
-    if f.request_tuple()
-        != (
-            view.active_set.namespace.as_str(),
-            view.active_set.epoch,
-            view.active_set.valset_root,
-            view.active_set.admission_root,
-            view.mesh_version,
-        )
-        || f.observer_identity != observer_identity
-        || f.target_identity != target_identity
-        || f.target_wireguard_endpoint != target_endpoint
-    {
-        return Err(UpgradeError::InvalidDialFailure);
-    }
-    // symmetric freshness window, exactly as the ack's `installed_at_view`:
-    // the evidence is minted on the INITIATOR's view clock and validated on
-    // the responder's — ordinary cross-node skew must not refuse it.
-    if current_view > f.expires_at_view
-        || f.failed_at_view.saturating_sub(current_view) > MAX_DIAL_FAILURE_LAG
-        || current_view.saturating_sub(f.failed_at_view) > MAX_DIAL_FAILURE_LAG
-    {
-        return Err(UpgradeError::InvalidDialFailure);
-    }
-    Ok(())
 }
 
 trait CommonRequestFields {
@@ -1319,84 +1106,6 @@ impl CommonRequestFields for TunnelUpgradeAckFields {
             self.mesh_version,
         )
     }
-}
-
-impl CommonRequestFields for DirectDialFailureFields {
-    fn request_tuple(&self) -> (&str, u64, Root, AdmissionRoot, MeshVersion) {
-        (
-            &self.namespace,
-            self.epoch,
-            self.valset_root,
-            self.admission_root,
-            self.mesh_version,
-        )
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct DefguardPeerConfig {
-    pub peer: DefguardPeer,
-    pub allowed_ips: Vec<AllowedIp>,
-}
-
-impl DefguardPeerConfig {
-    pub fn from_plan(plan: &TunnelInstallPlan) -> Self {
-        let mut peer = DefguardPeer::new(DefguardKey::new(plan.peer_wireguard_public_key.0));
-        peer.endpoint = plan.peer_endpoint.map(|endpoint| endpoint.socket_addr());
-        peer.persistent_keepalive_interval = plan.keepalive_seconds;
-        peer.set_allowed_ips(to_defguard_allowed_ips(&plan.allowed_ips));
-        Self {
-            peer,
-            allowed_ips: plan.allowed_ips.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct DefguardInterfaceConfig {
-    pub config: InterfaceConfiguration,
-}
-
-impl DefguardInterfaceConfig {
-    pub fn from_plan(
-        name: impl Into<String>,
-        private_key_base64: impl Into<String>,
-        listen_endpoint: Endpoint,
-        plans: Vec<TunnelInstallPlan>,
-    ) -> Self {
-        let mut addresses = Vec::new();
-        let mut seen = BTreeSet::new();
-        for plan in &plans {
-            for route in &plan.local_interface_ips {
-                if seen.insert((route.addr, route.cidr)) {
-                    addresses.push(IpAddrMask::new(route.addr, route.cidr));
-                }
-            }
-        }
-        let peers = plans
-            .iter()
-            .map(DefguardPeerConfig::from_plan)
-            .map(|cfg| cfg.peer)
-            .collect();
-        Self {
-            config: InterfaceConfiguration {
-                name: name.into(),
-                prvkey: private_key_base64.into(),
-                addresses,
-                port: listen_endpoint.port,
-                peers,
-                mtu: None,
-                fwmark: None,
-            },
-        }
-    }
-}
-
-fn to_defguard_allowed_ips(routes: &[AllowedIp]) -> Vec<IpAddrMask> {
-    routes
-        .iter()
-        .map(|route| IpAddrMask::new(route.addr, route.cidr))
-        .collect()
 }
 
 fn ensure_x25519(key: X25519PublicKey) -> Result<(), UpgradeError> {
@@ -1561,7 +1270,6 @@ fn put_endpoint_record(out: &mut Vec<u8>, record: &EndpointRecord) {
     put_x25519(out, record.wireguard_public_key);
     put_endpoint(out, record.control_endpoint);
     put_opt_endpoint(out, record.wireguard_endpoint);
-    put_capabilities(out, &record.capabilities);
     put_u64(out, record.expires_at_view);
     put_u64(out, record.nonce);
 }
@@ -1591,21 +1299,6 @@ fn put_request_fields(out: &mut Vec<u8>, fields: &TunnelUpgradeRequestFields) {
     put_u64(out, fields.nonce);
 }
 
-fn put_direct_dial_failure_fields(out: &mut Vec<u8>, fields: &DirectDialFailureFields) {
-    put_str(out, &fields.namespace);
-    put_u64(out, fields.epoch);
-    put_root(out, fields.valset_root);
-    put_admission_root(out, fields.admission_root);
-    put_mesh_version(out, fields.mesh_version);
-    put_identity(out, fields.observer_identity);
-    put_identity(out, fields.target_identity);
-    put_endpoint(out, fields.target_wireguard_endpoint);
-    put_u64(out, fields.failed_at_view);
-    put_u64(out, fields.expires_at_view);
-    put_fixed(out, &fields.error_hash);
-    put_u64(out, fields.nonce);
-}
-
 fn put_response_fields(out: &mut Vec<u8>, fields: &TunnelUpgradeResponseFields) {
     put_fixed(out, &fields.request_hash);
     put_str(out, &fields.namespace);
@@ -1618,15 +1311,6 @@ fn put_response_fields(out: &mut Vec<u8>, fields: &TunnelUpgradeResponseFields) 
     put_x25519(out, fields.responder_wireguard_public_key);
     put_opt_endpoint(out, fields.responder_wireguard_endpoint);
     put_allowed_ips(out, &fields.accepted_allowed_ips);
-    put_identities(out, &fields.relay_candidates);
-    match &fields.direct_dial_failure {
-        Some(evidence) => {
-            out.push(1);
-            put_direct_dial_failure_fields(out, &evidence.fields);
-            put_signature(out, &evidence.signature);
-        }
-        None => out.push(0),
-    }
     match fields.keepalive_seconds {
         Some(v) => {
             out.push(1);
@@ -1740,19 +1424,6 @@ fn put_endpoint(out: &mut Vec<u8>, endpoint: Endpoint) {
     put_u16(out, endpoint.port);
 }
 
-fn put_capabilities(out: &mut Vec<u8>, values: &[MeshCapability]) {
-    let mut sorted = values.to_vec();
-    sorted.sort();
-    sorted.dedup();
-    put_u64(out, sorted.len() as u64);
-    for value in sorted {
-        out.push(match value {
-            MeshCapability::Bootnode => 1,
-            MeshCapability::Relay => 2,
-        });
-    }
-}
-
 fn put_allowed_ips(out: &mut Vec<u8>, routes: &[AllowedIp]) {
     let mut sorted = routes.to_vec();
     sorted.sort();
@@ -1770,15 +1441,5 @@ fn put_allowed_ips(out: &mut Vec<u8>, routes: &[AllowedIp]) {
             }
         }
         out.push(route.cidr);
-    }
-}
-
-fn put_identities(out: &mut Vec<u8>, values: &[ValidatorIdentity]) {
-    let mut sorted = values.to_vec();
-    sorted.sort();
-    sorted.dedup();
-    put_u64(out, sorted.len() as u64);
-    for value in sorted {
-        put_identity(out, value);
     }
 }

@@ -21,8 +21,8 @@ use reachability::{
 };
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
-use wireguard_effect::{FakeWireGuardEffect, FakeWireGuardEffectError, WireGuardEffect};
-use wireguard_upgrade::{Endpoint, PortPolicy, Transport, ValidatorIdentity, X25519PublicKey};
+use wireguard::effect::{FakeWireGuardEffect, FakeWireGuardEffectError, WireGuardEffect};
+use wireguard::{Endpoint, PortPolicy, Transport, ValidatorIdentity, X25519PublicKey};
 
 /// `run()` owns its effect; tests need to inspect it afterwards — a shared
 /// handle delegating to the fake underneath.
@@ -335,7 +335,7 @@ fn spawn_nudgers(local: &LocalSet, nodes: &[TestNode]) {
 
 fn ula(identity: ValidatorIdentity) -> IpAddrMask {
     IpAddrMask::new(
-        std::net::IpAddr::V6(wireguard_upgrade::ula_v6_member_addr(CHAIN, identity)),
+        std::net::IpAddr::V6(wireguard::ula_v6_member_addr(CHAIN, identity)),
         128,
     )
 }
@@ -975,21 +975,20 @@ async fn forged_relayed_record_is_refused() {
             retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
 
             let policy = PortPolicy::production();
-            let forged = wireguard_upgrade::SignedEndpointRecord {
-                record: wireguard_upgrade::EndpointRecord {
+            let forged = wireguard::SignedEndpointRecord {
+                record: wireguard::EndpointRecord {
                     namespace: CHAIN.into(),
                     epoch: 1,
-                    valset_root: wireguard_upgrade::Root([1; 32]),
-                    admission_root: wireguard_upgrade::AdmissionRoot([2; 32]),
+                    valset_root: wireguard::Root([1; 32]),
+                    admission_root: wireguard::AdmissionRoot([2; 32]),
                     validator_identity: nodes[1].identity,
-                    wireguard_public_key: wireguard_upgrade::X25519PublicKey([4; 32]),
+                    wireguard_public_key: wireguard::X25519PublicKey([4; 32]),
                     control_endpoint: endpoint(&policy, 20, 443, Transport::Tcp),
                     wireguard_endpoint: Some(endpoint(&policy, 20, 51820, Transport::Udp)),
-                    capabilities: vec![],
                     expires_at_view: 100,
                     nonce: 9,
                 },
-                signature: wireguard_upgrade::SignatureBytes(vec![0; 64]),
+                signature: wireguard::SignatureBytes(vec![0; 64]),
             };
             nodes[0]
                 .cmd
@@ -1499,8 +1498,8 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
             let (standby_keys, _) =
                 WireGuardKeypair::load_or_generate(&dir.path().join("wg-2.key")).unwrap();
             let rebind = |nonce: u64, octet: u8| {
-                wireguard_upgrade::SignedEndpointRecord::sign(
-                    wireguard_upgrade::EndpointRecord {
+                wireguard::SignedEndpointRecord::sign(
+                    wireguard::EndpointRecord {
                         namespace: CHAIN.into(),
                         epoch: 1,
                         valset_root: set.valset_root,
@@ -1517,7 +1516,6 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
                             )
                             .unwrap(),
                         ),
-                        capabilities: vec![],
                         expires_at_view: 10 + reachability::ADVERT_TTL_VIEWS,
                         nonce,
                     },
@@ -1593,17 +1591,16 @@ async fn record_from_neither_member_nor_standby_is_refused() {
             let set =
                 reachability::active_set(CHAIN, 1, vec![nodes[0].identity, nodes[1].identity])
                     .unwrap();
-            let forged = wireguard_upgrade::SignedEndpointRecord::sign(
-                wireguard_upgrade::EndpointRecord {
+            let forged = wireguard::SignedEndpointRecord::sign(
+                wireguard::EndpointRecord {
                     namespace: CHAIN.into(),
                     epoch: 1,
                     valset_root: set.valset_root,
                     admission_root: set.admission_root,
                     validator_identity: binding::identity_of(&stranger.public_key()),
-                    wireguard_public_key: wireguard_upgrade::X25519PublicKey([9; 32]),
+                    wireguard_public_key: wireguard::X25519PublicKey([9; 32]),
                     control_endpoint: endpoint(&policy, 99, 443, Transport::Tcp),
                     wireguard_endpoint: Some(endpoint(&policy, 99, 51820, Transport::Udp)),
-                    capabilities: vec![],
                     expires_at_view: 1000,
                     nonce: 1,
                 },

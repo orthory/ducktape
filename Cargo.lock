@@ -5713,8 +5713,7 @@ dependencies = [
  "upgrade",
  "valset",
  "vaults",
- "wireguard-effect",
- "wireguard-upgrade",
+ "wireguard",
  "zeroize",
 ]
 
@@ -6311,7 +6310,7 @@ dependencies = [
  "rand_core 0.6.4",
  "smoltcp",
  "tokio",
- "wireguard-effect",
+ "wireguard",
 ]
 
 [[package]]
@@ -7316,8 +7315,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "wireguard-effect",
- "wireguard-upgrade",
+ "wireguard",
  "x25519-dalek",
 ]
 
@@ -11492,12 +11490,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "wireguard-effect"
+name = "wireguard"
 version = "0.1.0"
 dependencies = [
+ "commonware-codec",
  "commonware-cryptography",
  "defguard_wireguard_rs",
- "wireguard-upgrade",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -11514,19 +11516,6 @@ dependencies = [
  "thiserror 1.0.69",
  "widestring",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "wireguard-upgrade"
-version = "0.1.0"
-dependencies = [
- "commonware-codec",
- "commonware-cryptography",
- "defguard_wireguard_rs",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
 ]
 
 [[package]]

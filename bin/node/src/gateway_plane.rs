@@ -59,7 +59,7 @@ fn proxy_flow() -> FlowId {
 }
 
 fn ula_of(namespace: &str, raw: &[u8; 32]) -> std::net::Ipv6Addr {
-    wireguard_upgrade::ula_v6_member_addr(namespace, wireguard_upgrade::ValidatorIdentity(*raw))
+    wireguard::ula_v6_member_addr(namespace, wireguard::ValidatorIdentity(*raw))
 }
 
 /// Forward/reverse identity map and default-deny admission for the gateway.

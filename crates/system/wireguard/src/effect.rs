@@ -1,11 +1,9 @@
-//! Effect adapter that takes a validated `wireguard-upgrade` `TunnelInstallPlan`
-//! and actually configures a WireGuard interface. `wireguard-upgrade` is a
-//! pure validation leaf crate — nothing in the workspace calls
-//! `WGApi::configure_interface` today. This crate is that missing consumer:
-//! a `WireGuardEffect` trait behind which tests use a deterministic
-//! `FakeWireGuardEffect` (CI has no real WireGuard userspace runtime) and
-//! real runs use `DefguardWireGuardEffect` (`defguard_wireguard_rs`
-//! `WGApi::<Userspace>`).
+//! Effect adapter that takes a validated [`TunnelInstallPlan`](crate::TunnelInstallPlan)
+//! from the crate root's pure validation layer and actually configures a
+//! WireGuard interface: a `WireGuardEffect` trait behind which tests use a
+//! deterministic `FakeWireGuardEffect` (CI has no real WireGuard userspace
+//! runtime) and real runs use `DefguardWireGuardEffect`
+//! (`defguard_wireguard_rs` `WGApi::<Userspace>`).
 
 #[cfg(unix)]
 mod defguard_effect;

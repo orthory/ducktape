@@ -39,9 +39,6 @@ pub enum TransportError {
 pub trait DataPlaneTransport: Send + Sync + 'static {
     type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
 
-    /// Largest whole datagram frame (header + payload) this medium carries.
-    fn max_datagram(&self) -> usize;
-
     /// Fire-and-forget: queue one frame toward a peer. May be silently lost
     /// in transit; must not block on the receiver.
     fn send_datagram(

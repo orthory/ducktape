@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use wireguard_upgrade::EndpointAdvertisement;
+use wireguard::EndpointAdvertisement;
 
 /// Bumped whenever the on-disk layout changes shape; `load` refuses other
 /// versions (the restore is best-effort — a stale-format file just means one
@@ -137,7 +137,7 @@ mod tests {
     use super::*;
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
     use std::net::{IpAddr, Ipv4Addr};
-    use wireguard_upgrade::{
+    use wireguard::{
         AdmissionRoot, Endpoint, EndpointRecord, MeshVersion, PortPolicy, Root, Transport,
         ValidatorIdentity, X25519PublicKey,
     };
@@ -163,7 +163,6 @@ mod tests {
             wireguard_public_key: X25519PublicKey([octet; 32]),
             control_endpoint: endpoint(443, Transport::Tcp),
             wireguard_endpoint: Some(endpoint(51820, Transport::Udp)),
-            capabilities: vec![],
             expires_at_view: 50,
             nonce: 1,
         };

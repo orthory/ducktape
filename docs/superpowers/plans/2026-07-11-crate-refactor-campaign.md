@@ -45,6 +45,14 @@ Largest: `bin/node` 28.1k, `apps/runs` 10.9k, `app/src-tauri` 10.0k,
    --no-deps` + `cargo test -p <crate>`; `cargo check -p files
    --no-default-features` when files/duckfs-core are touched;
    `cargo check --workspace` before every PR.
+7. **Feature-regression gates (every batch, user mandate 2026-07-11):**
+   (a) FULL `cargo test --workspace` on the branch, not just touched crates;
+   (b) the TS app suite (`bun run typecheck` + `bun run test` in app/) —
+   wire-shape changes only surface there; (c) a deleted-symbol cross-surface
+   sweep: every deleted pub item / enum variant / struct field / serde
+   default is grepped through app/src, docs/, ops/, skills/, Makefile and
+   dynamic string-routed wire (the `CapabilityQuery::All` near-miss class);
+   (d) clean-context PR review before merge.
 
 ## Batches (one worktree + one PR against dev each)
 

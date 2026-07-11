@@ -86,7 +86,7 @@ pub fn shared_bulk_pacer() -> BulkPacer {
 /// derive a peer's overlay ULA from its raw ed25519 key bytes — the same
 /// `(namespace, identity)` function the reachability plane routes by.
 fn ula_of(namespace: &str, raw_key: &[u8; 32]) -> std::net::Ipv6Addr {
-    wireguard_upgrade::ula_v6_member_addr(namespace, wireguard_upgrade::ValidatorIdentity(*raw_key))
+    wireguard::ula_v6_member_addr(namespace, wireguard::ValidatorIdentity(*raw_key))
 }
 
 /// the address book AND admission policy for the statesync plane, one object:

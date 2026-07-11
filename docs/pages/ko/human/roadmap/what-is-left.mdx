@@ -52,9 +52,10 @@ product depth다.
 
 ## Mesh
 
-두 parallel mesh type system(`valset::mesh`, `wireguard-upgrade`)은 하나의
-contract로 합쳐져야 하며, validated WireGuard upgrade path는 private overlay를 실제로
-올리는 runtime consumer가 필요하다.
+mesh contract는 이제 하나의 crate에 있다. `valset::mesh`는 삭제됐고
+`crates/system/wireguard`가 tunnel-upgrade protocol을 소유하며, node의
+reachability plane이 runtime에 이를 drive한다. 남은 것은 실제 WireGuard
+interface를 올리는 privileged e2e이고, 아직 deliberately descoped다.
 
 ## Deferred Deliberately
 

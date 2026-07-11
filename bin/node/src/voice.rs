@@ -667,10 +667,6 @@ mod tests {
     impl DataPlaneTransport for MemLink {
         type Stream = tokio::io::DuplexStream;
 
-        fn max_datagram(&self) -> usize {
-            data_plane::MAX_DATAGRAM
-        }
-
         async fn send_datagram(&self, to: PeerId, frame: Vec<u8>) -> Result<(), TransportError> {
             // fire-and-forget: a full lane drops the frame, exactly as an
             // overlay UDP send would on buffer pressure.
@@ -1256,7 +1252,7 @@ mod overlay_e2e {
     use commonware_cryptography::{Signer as _, ed25519};
     use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
     use overlay_net::userspace::{UserspaceWireGuardEffect, VirtualSocketFactory};
-    use wireguard_effect::WireGuardEffect;
+    use wireguard::effect::WireGuardEffect;
 
     use super::*;
 
@@ -1310,9 +1306,9 @@ mod overlay_e2e {
     fn stand_up(node_seed: u64, wg_seed: u8) -> OverlayNode {
         let node_key = ed25519::PrivateKey::from_seed(node_seed).public_key();
         let raw_key: [u8; 32] = node_key.as_ref().try_into().expect("ed25519 is 32 bytes");
-        let ula = wireguard_upgrade::ula_v6_member_addr(
+        let ula = wireguard::ula_v6_member_addr(
             NS,
-            wireguard_upgrade::ValidatorIdentity(raw_key),
+            wireguard::ValidatorIdentity(raw_key),
         );
         let mut node = OverlayNode {
             effect: UserspaceWireGuardEffect::new(tokio::runtime::Handle::current()),

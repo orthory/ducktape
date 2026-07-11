@@ -122,7 +122,7 @@ pub(crate) fn build(
     // OverlayBook and the reachability plane use, so all three agree on
     // what "overlay" means.
     let overlay_router = overlay_net::OverlayRouter::for_prefix48(
-        wireguard_upgrade::ula_v6_prefix(&String::from_utf8_lossy(&namespace)),
+        wireguard::ula_v6_prefix(&String::from_utf8_lossy(&namespace)),
     );
     // ADR phase 3: the backend follows `wireguard_effect`. socket mode
     // routes overlay dials/binds into the in-process virtual stack (and

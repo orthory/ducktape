@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use wireguard_upgrade::X25519PublicKey;
+use wireguard::X25519PublicKey;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeyError {

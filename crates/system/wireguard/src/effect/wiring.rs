@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
 use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
-use wireguard_upgrade::{AllowedIp, TunnelInstallPlan, ValidatorIdentity, X25519PublicKey};
+use crate::{AllowedIp, TunnelInstallPlan, ValidatorIdentity, X25519PublicKey};
 
-use crate::WireGuardEffect;
+use crate::effect::WireGuardEffect;
 
 /// Apply a validated `TunnelInstallPlan` through a `WireGuardEffect`,
 /// bringing up (or replacing) the local WireGuard interface for this one
@@ -13,7 +13,7 @@ use crate::WireGuardEffect;
 /// `peer_endpoint_override`, when set, replaces the plan's statically
 /// advertised `peer_endpoint` with a different address before applying —
 /// this is how a punched path gets wired in without touching
-/// `wireguard-upgrade`'s validated plan: the caller passes the hole-punch's
+/// the crate root's validated plan: the caller passes the hole-punch's
 /// resolved reflexive address
 /// (`nat_traversal::punch::PunchPlan::peer_reflexive` in the simulated rig;
 /// a real `NatClient` observation in production). `None` uses the plan's
@@ -225,7 +225,7 @@ mod tests {
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
     use defguard_wireguard_rs::net::IpAddrMask;
     use std::net::{IpAddr, Ipv4Addr};
-    use wireguard_upgrade::*;
+    use crate::*;
 
     fn id(sk: &PrivateKey) -> ValidatorIdentity {
         ValidatorIdentity::try_from(sk.public_key().as_ref()).unwrap()
@@ -267,7 +267,6 @@ mod tests {
                     51820,
                     Transport::Udp,
                 )),
-                capabilities: vec![],
                 expires_at_view: 50,
                 nonce: 1,
             })
@@ -283,9 +282,9 @@ mod tests {
 
     /// sign the full initiator->responder conversation against `view` and
     /// validate it from the initiator's perspective. `TunnelInstallPlan` has
-    /// no public constructor by design (only `validate_upgrade`/
-    /// `validate_upgrade_as` produce one), so this fixture runs the real
-    /// signed handshake exactly like `wireguard-upgrade`'s own e2e tests do.
+    /// no public constructor by design (only `validate_upgrade_as` produces
+    /// one), so this fixture runs the real signed handshake exactly like the
+    /// crate's own e2e tests do.
     /// `req_nonce`/`ack_nonce` keep an initiator's REPEATED handshakes fresh
     /// in a shared `ReplayCache` (replay state is keyed by identity+nonce).
     #[allow(
@@ -342,8 +341,6 @@ mod tests {
                     .unwrap()
                     .wireguard_endpoint,
                 accepted_allowed_ips: overlay.allowed_ips_for(view, id(initiator)).unwrap(),
-                relay_candidates: vec![],
-                direct_dial_failure: None,
                 keepalive_seconds: Some(25),
                 expires_at_view: 40,
                 nonce: 1,
@@ -367,7 +364,18 @@ mod tests {
             },
             initiator,
         );
-        validate_upgrade(view, policy, overlay, 12, &request, &response, &ack, replay).unwrap()
+        validate_upgrade_as(
+            Perspective::Initiator,
+            view,
+            policy,
+            overlay,
+            12,
+            &request,
+            &response,
+            &ack,
+            replay,
+        )
+        .unwrap()
     }
 
     /// a minimal two-validator handshake, direct (no relay), yielding the
@@ -377,7 +385,7 @@ mod tests {
         let a = PrivateKey::from_seed(1);
         let b = PrivateKey::from_seed(2);
         let policy = PortPolicy::production();
-        let overlay = OverlayPolicy::default_v4();
+        let overlay = OverlayPolicy::ula_v6("ducktape-wiring");
         let view = mesh_view(&[(&a, xkey(0x0a), 10), (&b, xkey(0x0b), 20)]);
         let mut replay = ReplayCache::default();
         let plan = plan_between(
@@ -408,7 +416,7 @@ mod tests {
         let b = PrivateKey::from_seed(2);
         let c = PrivateKey::from_seed(3);
         let policy = PortPolicy::production();
-        let overlay = OverlayPolicy::default_v4();
+        let overlay = OverlayPolicy::ula_v6("ducktape-wiring");
         let view = mesh_view(&[
             (&a, xkey(0x0a), 10),
             (&b, xkey(0x0b), 20),
@@ -451,7 +459,7 @@ mod tests {
     #[test]
     fn applies_plan_with_punch_resolved_peer_endpoint() {
         let (plan, listen) = two_party_plan();
-        let mut fake = crate::FakeWireGuardEffect::default();
+        let mut fake = crate::effect::FakeWireGuardEffect::default();
         let override_addr: SocketAddr = "203.0.113.9:51820".parse().unwrap();
 
         apply_tunnel_plan(
@@ -503,7 +511,7 @@ mod tests {
         // `InterfaceConfiguration.prvkey` failing to decode to a 32-byte
         // key. `apply_tunnel_plan` must not leave that interface behind.
         let (plan, listen) = two_party_plan();
-        let mut fake = crate::FakeWireGuardEffect {
+        let mut fake = crate::effect::FakeWireGuardEffect {
             reject_next_apply: true,
             ..Default::default()
         };
@@ -518,7 +526,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(err, crate::FakeWireGuardEffectError::Rejected);
+        assert_eq!(err, crate::effect::FakeWireGuardEffectError::Rejected);
         assert_eq!(fake.create_calls, 1);
         assert_eq!(
             fake.remove_calls, 1,
@@ -530,7 +538,7 @@ mod tests {
     #[test]
     fn falls_back_to_the_plans_own_endpoint_when_no_override_is_given() {
         let (plan, listen) = two_party_plan();
-        let mut fake = crate::FakeWireGuardEffect::default();
+        let mut fake = crate::effect::FakeWireGuardEffect::default();
 
         apply_tunnel_plan(
             &mut fake,
@@ -555,7 +563,7 @@ mod tests {
         // re-applied through `update_peer_tunnels`. One create, two applied
         // configs, no teardown in between.
         let (plan_ab, plan_ac, listen) = three_party_plans();
-        let mut fake = crate::FakeWireGuardEffect::default();
+        let mut fake = crate::effect::FakeWireGuardEffect::default();
         let base = plan_peer_configs(std::slice::from_ref(&plan_ab), &BTreeMap::new());
         let local = plan_ab.local_interface_ips().to_vec();
 
@@ -607,7 +615,7 @@ mod tests {
         // it with no interface up must fail exactly like the real UAPI
         // socket being absent, never silently record a config.
         let (plan, listen) = two_party_plan();
-        let mut fake = crate::FakeWireGuardEffect::default();
+        let mut fake = crate::effect::FakeWireGuardEffect::default();
         let peers = plan_peer_configs(std::slice::from_ref(&plan), &BTreeMap::new());
 
         let err = update_peer_tunnels(
@@ -620,7 +628,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(err, crate::FakeWireGuardEffectError::NotCreated);
+        assert_eq!(err, crate::effect::FakeWireGuardEffectError::NotCreated);
         assert!(fake.applied.is_empty());
     }
 
@@ -661,7 +669,7 @@ mod tests {
     #[test]
     fn applies_all_plans_on_one_interface_with_per_peer_overrides() {
         let (plan_ab, plan_ac, listen) = three_party_plans();
-        let mut fake = crate::FakeWireGuardEffect::default();
+        let mut fake = crate::effect::FakeWireGuardEffect::default();
         let punched: SocketAddr = "203.0.113.9:40001".parse().unwrap();
         // only c resolved through the nat client; b stays on its advert.
         let overrides = BTreeMap::from([(plan_ac.peer_identity(), punched)]);
