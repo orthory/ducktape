@@ -43,8 +43,9 @@ console.log(port);
 JS
 )"
 
-log "route app.$ID.duck -> 127.0.0.1:$PORT  (Ctrl-C to stop)"
-log "open the app on the '$ID' workspace, then browse to app.$ID.duck"
+log "route app.$ID.duck -> 127.0.0.1:$PORT"
+log "KEEP THIS RUNNING: app.$ID.duck is Unavailable whenever this process is not up."
+log "open the app on the '$ID' workspace (its node must be running), then browse to app.$ID.duck  (Ctrl-C here stops it)"
 
 # a small LIVE server — the timestamp ticks on reload, proving it's a running
 # process, not static consensus bytes.
