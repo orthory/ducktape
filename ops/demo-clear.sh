@@ -14,6 +14,9 @@
 set -uo pipefail
 
 ID="${DEMO_WORKSPACE_ID:-demo}"
+# this script kills by path match and rm -rfs the workspace dir — refuse an id
+# that could walk WSDIR out of ~/.ducktape/workspaces (e.g. "../..").
+case "$ID" in ""|*/*|*..*|.*) printf '\033[31m[demo-clear] unsafe workspace id: %s\033[0m\n' "$ID" >&2; exit 1;; esac
 DUCK="$HOME/.ducktape"
 WSDIR="$DUCK/workspaces/$ID"
 REG="$DUCK/registry.json"
