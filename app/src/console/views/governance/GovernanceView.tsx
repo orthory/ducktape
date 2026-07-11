@@ -204,7 +204,7 @@ function HoverButton({
         gap: 7,
         borderRadius: radius.sm,
         border: dark ? `1px solid ${color.dark}` : `1px solid ${accent}`,
-        background: disabled
+        background: disabled && !active
           ? color.sunken
           : dark
             ? hover
@@ -213,7 +213,7 @@ function HoverButton({
             : active || hover
               ? activeBg
               : "transparent",
-        color: disabled
+        color: disabled && !active
           ? color.muted2
           : dark
             ? color.onDark
@@ -224,7 +224,7 @@ function HoverButton({
                 : color.inkSoft,
         padding: "7px 12px",
         font: `600 11.5px ${font.sans}`,
-        opacity: disabled ? 0.58 : 1,
+        opacity: disabled && !active ? 0.58 : 1,
         cursor: disabled ? "not-allowed" : "pointer",
       }}
     >
@@ -395,7 +395,7 @@ function ProposalCard({
           <HoverButton
             variant="approve"
             active={proposal.myVote === true}
-            disabled={!canVote}
+            disabled={!canVote || proposal.myVote === true}
             ariaLabel={`Approve proposal ${proposal.title}`}
             onClick={() => onVote(true)}
           >
@@ -405,7 +405,7 @@ function ProposalCard({
           <HoverButton
             variant="reject"
             active={proposal.myVote === false}
-            disabled={!canVote}
+            disabled={!canVote || proposal.myVote === false}
             ariaLabel={`Reject proposal ${proposal.title}`}
             onClick={() => onVote(false)}
           >

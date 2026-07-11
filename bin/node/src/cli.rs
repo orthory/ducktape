@@ -668,6 +668,47 @@ fn poll_proposal(
     }
 }
 
+fn cast_yes_once(
+    addr: &str,
+    proposal_id: &str,
+    opened: governance::ProposalView,
+    principal: &[u8],
+) -> Result<governance::ProposalView, String> {
+    use governance::{GovMsg, ProposalStatus, encode_msg};
+
+    if opened.status != ProposalStatus::Open {
+        return Ok(opened);
+    }
+    if opened
+        .votes
+        .iter()
+        .any(|(voter, yes)| voter == principal && *yes)
+    {
+        eprintln!("ballot already cast as {}", hex_bytes(principal));
+        return Ok(opened);
+    }
+    rpc_submit(
+        addr,
+        "governance",
+        &encode_msg(&GovMsg::Vote {
+            proposal_id: proposal_id.into(),
+            approve: true,
+        }),
+    )?;
+    let proposal = poll_proposal(addr, proposal_id, "this ballot to finalize", |p| {
+        p.as_ref().is_some_and(|proposal| {
+            proposal.status != ProposalStatus::Open
+                || proposal
+                    .votes
+                    .iter()
+                    .any(|(voter, yes)| voter == principal && *yes)
+        })
+    })?
+    .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
+    eprintln!("ballot cast as {}", hex_bytes(principal));
+    Ok(proposal)
+}
+
 /// how a driven membership ceremony left the proposal.
 enum CeremonyOutcome {
     /// passed and executed — the set changes at the next epoch cutover.
@@ -736,24 +777,7 @@ fn drive_membership_ceremony(
     let opened = read_proposal(rpc_addr, &proposal_id)?
         .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
     let principal = proposal_principal(rpc_addr, &opened, me_bytes)?;
-    rpc_submit(
-        rpc_addr,
-        "governance",
-        &encode_msg(&GovMsg::Vote {
-            proposal_id: proposal_id.clone(),
-            approve: true,
-        }),
-    )?;
-    let after_vote = poll_proposal(rpc_addr, &proposal_id, "this ballot to finalize", |p| {
-        p.as_ref().is_some_and(|v| {
-            v.status != ProposalStatus::Open
-                || v.votes
-                    .iter()
-                    .any(|(voter, yes)| voter == &principal && *yes)
-        })
-    })?
-    .expect("the poll only accepts a present proposal");
-    eprintln!("ballot cast as {}", hex_bytes(&principal));
+    let after_vote = cast_yes_once(rpc_addr, &proposal_id, opened, &principal)?;
 
     // Execute only when the proposal's frozen rule says the yes power is
     // irreversible. A shortfall is the normal intermediate state, not an error.
@@ -1036,24 +1060,7 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     let opened = read_proposal(&rpc_addr, &proposal_id)?
         .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
     let principal = proposal_principal(&rpc_addr, &opened, &me_bytes)?;
-    rpc_submit(
-        &rpc_addr,
-        "governance",
-        &encode_msg(&GovMsg::Vote {
-            proposal_id: proposal_id.clone(),
-            approve: true,
-        }),
-    )?;
-    let after_vote = poll_proposal(&rpc_addr, &proposal_id, "this ballot to finalize", |p| {
-        p.as_ref().is_some_and(|v| {
-            v.status != ProposalStatus::Open
-                || v.votes
-                    .iter()
-                    .any(|(voter, yes)| voter == &principal && *yes)
-        })
-    })?
-    .expect("the poll only accepts a present proposal");
-    eprintln!("ballot cast as {}", hex_bytes(&principal));
+    let after_vote = cast_yes_once(&rpc_addr, &proposal_id, opened, &principal)?;
 
     // Execute only once the proposal's own frozen voting rule is satisfied.
     let members = read_members(&rpc_addr)?;
