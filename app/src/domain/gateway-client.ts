@@ -527,8 +527,11 @@ export const inlineSupported = (): Promise<boolean> => {
   return inlineSupport;
 };
 
-export const openInline = async (url: string, rect: InlineRect): Promise<void> => {
-  await invoke<void>("gateway_open_inline", { url, rect });
+// `title` is the .duck route the user navigated to. The shell needs it because
+// the session origin is a random loopback token: it is the only honest name a
+// permission prompt can put in front of the user (see src-tauri/permissions.rs).
+export const openInline = async (url: string, title: string, rect: InlineRect): Promise<void> => {
+  await invoke<void>("gateway_open_inline", { url, title, rect });
 };
 
 export const placeInline = async (rect: InlineRect): Promise<void> => {

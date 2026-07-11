@@ -24,7 +24,7 @@ fn main() {
     // unsafe once executable gateway content has its own capability-free
     // WebView. `permissions/trusted.toml` grants this exact list only to the
     // bundled main/tray/huddle capability (`trusted`).
-    const COMMANDS: &[&str] = &[
+    const TRUSTED_COMMANDS: &[&str] = &[
         "workspace_list",
         "workspace_active",
         "gateway_route_bind",
@@ -84,6 +84,20 @@ fn main() {
         "notify_configure",
         "notify_mark_seen",
     ];
+    // The native permission consent window's own commands. They answer requests
+    // made by OTHER webviews, so they live in their own capability
+    // (`permissions/prompt.toml`, window label `permission-prompt`) and are
+    // deliberately absent from the console's `trusted` surface.
+    const PROMPT_COMMANDS: &[&str] = &["permission_prompt_state", "permission_prompt_decide"];
+
+    // Leaked: the manifest borrows the list for the rest of the build script.
+    let commands: &'static [&str] = Vec::leak(
+        TRUSTED_COMMANDS
+            .iter()
+            .chain(PROMPT_COMMANDS)
+            .copied()
+            .collect::<Vec<_>>(),
+    );
     let main_source = std::fs::read_to_string("src/main.rs").expect("read Tauri command registry");
     let handler = main_source
         .split_once(".invoke_handler(tauri::generate_handler![")
@@ -97,22 +111,34 @@ fn main() {
                 .and_then(|line| line.rsplit_once("::").map(|(_, command)| command))
         })
         .collect();
-    let declared: std::collections::BTreeSet<&str> = COMMANDS.iter().copied().collect();
+    let declared: std::collections::BTreeSet<&str> = commands.iter().copied().collect();
     assert_eq!(
         registered, declared,
         "Tauri invoke handler and ACL command manifest drifted"
     );
     let trusted = std::fs::read_to_string("permissions/trusted.toml")
         .expect("read trusted application permission");
-    for command in COMMANDS {
+    for command in TRUSTED_COMMANDS {
         assert!(
             trusted.contains(&format!("\"{command}\"")),
             "trusted application permission omits {command}"
         );
     }
+    let prompt =
+        std::fs::read_to_string("permissions/prompt.toml").expect("read consent window permission");
+    for command in PROMPT_COMMANDS {
+        assert!(
+            prompt.contains(&format!("\"{command}\"")),
+            "permission-prompt permission omits {command}"
+        );
+        assert!(
+            !trusted.contains(&format!("\"{command}\"")),
+            "{command} answers another webview's permission request — it must stay out of the console's trusted surface"
+        );
+    }
     tauri_build::try_build(
         tauri_build::Attributes::new()
-            .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS)),
+            .app_manifest(tauri_build::AppManifest::new().commands(commands)),
     )
     .expect("build Tauri application manifest")
 }

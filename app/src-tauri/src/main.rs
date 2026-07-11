@@ -21,6 +21,7 @@ mod forge_git;
 mod huddle;
 mod menu;
 mod notify;
+mod permissions;
 mod rt;
 mod tray;
 mod user_identity;
@@ -46,19 +47,10 @@ fn main() {
         ..Default::default()
     });
 
-    // Chromium permission policy: gateway webviews render remote .duck
-    // content through a localhost session proxy, so the requesting origin
-    // alone cannot distinguish them from the console UI — deny device/prompt
-    // permissions by label. Everything else falls to the runtime default
-    // (app-local origins only), which is what lets the console + huddle
-    // window use real mic/camera without fake-device switches.
-    tauri_runtime_cef::set_permission_policy(|req| {
-        if req.webview_label.starts_with("gateway-") {
-            tauri_runtime_cef::PermissionDecision::Deny
-        } else {
-            tauri_runtime_cef::PermissionDecision::Default
-        }
-    });
+    // Deny-by-default Chromium permission policy (camera, microphone, screen,
+    // clipboard, geolocation, …), installed before the runtime can field a
+    // single request. The rules live in `permissions`.
+    permissions::install_policy();
 
     // CEF non-browser processes (renderer/GPU/plugin) re-exec this same
     // binary; dispatch them to the CEF helper before any app setup.
@@ -129,6 +121,8 @@ fn main() {
             huddle::huddle_pop_in,
             notify::notify_configure,
             notify::notify_mark_seen,
+            permissions::permission_prompt_state,
+            permissions::permission_prompt_decide,
         ]);
     builder = builder.plugin(tauri_plugin_notification::init());
     builder = builder
@@ -139,12 +133,12 @@ fn main() {
             // After tray::init: both stack window-event handlers on "main".
             notify::init(app.handle())?;
             menu::install(app)?;
-            // The in-app huddle dock captures from THIS window, so the main
-            // webview needs the same mic/camera grant as the pop-out
-            // (Linux only; no-ops elsewhere — see huddle::allow_user_media).
+            // The permission policy is already live; give it the handle it needs
+            // to raise the native consent window when gateway content asks for
+            // a device.
+            permissions::attach(app.handle());
             let main = tauri::Manager::get_webview_window(app, "main")
                 .ok_or("main window missing (tauri.conf.json windows)")?;
-            huddle::allow_user_media(&main)?;
             // macOS overlays its native traffic lights on the in-app title
             // bar (titleBarStyle Overlay). Other desktops get the same
             // single-bar chrome by dropping native decorations; the title bar

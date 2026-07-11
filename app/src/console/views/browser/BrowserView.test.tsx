@@ -130,6 +130,9 @@ describe("BrowserView security boundary", () => {
     await screen.findByTestId("gateway-inline-pane");
     await waitFor(() => expect(openInline).toHaveBeenCalledWith(
       "http://0123456789abcdef0123456789abcdef.localhost:49152/v1",
+      // the .duck route, so a permission prompt can name the site rather than
+      // the random loopback session origin it is served from
+      "api.alice.duck",
       expect.objectContaining({ width: expect.any(Number), height: expect.any(Number) }),
     ));
     expect(openWindow).not.toHaveBeenCalled();

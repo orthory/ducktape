@@ -99,7 +99,7 @@ export function BrowserView() {
       const r = el.getBoundingClientRect();
       return { x: r.x, y: r.y, width: r.width, height: r.height };
     };
-    gateway.openInline(srcUrl, rectOf()).catch((reason: unknown) => {
+    gateway.openInline(srcUrl, page.address.hostname, rectOf()).catch((reason: unknown) => {
       setError(reason instanceof Error ? reason.message : String(reason));
     });
     const observer = new ResizeObserver(() => void gateway.placeInline(rectOf()));
