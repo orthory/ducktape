@@ -439,14 +439,16 @@ impl Host {
                     // module's Advance arm check computes (both route through
                     // upgrade::effective_version), so dispatch and hashing
                     // can never diverge at the boundary (risk R4).
-                    let ready: std::collections::BTreeMap<Vec<u8>, ()> =
-                        s.ready.iter().map(|k| (k.clone(), ())).collect();
                     upgrade::effective_version(
                         height,
                         s.current_version,
                         s.pending.as_ref(),
                         &s.members,
-                        &ready,
+                        |member| {
+                            s.ready
+                                .binary_search_by(|ready| ready.as_slice().cmp(member))
+                                .is_ok()
+                        },
                     )
                 }
                 // module present but reply unreadable — never fork on a decode slip.

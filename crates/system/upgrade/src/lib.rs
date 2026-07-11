@@ -152,24 +152,18 @@ impl Upgrade {
     /// stamps. byte-identical to the `Advance` arm check via the ONE shared
     /// `crate::effective_version` predicate.
     pub fn effective_version(&self, height: u64, boundary_members: &[Vec<u8>]) -> u32 {
-        let ready: BTreeMap<Vec<u8>, ()> = self
-            .committed
-            .readiness
-            .keys()
-            .map(|k| (k.clone(), ()))
-            .collect();
         crate::effective_version(
             height,
             self.committed.current_version,
             self.committed.pending.as_ref(),
             boundary_members,
-            &ready,
+            |member| self.committed.readiness.contains_key(member),
         )
     }
 
     // ---- the op handlers ----------------------------------------------------
 
-    async fn handle_schedule(
+    fn handle_schedule(
         &mut self,
         ctx: &mut dyn Ctx,
         name: String,
@@ -209,7 +203,7 @@ impl Upgrade {
         Ok(())
     }
 
-    async fn handle_cancel(&mut self, ctx: &mut dyn Ctx, name: String) -> Result<(), Error> {
+    fn handle_cancel(&mut self, ctx: &mut dyn Ctx, name: String) -> Result<(), Error> {
         Self::require_module_or_system(ctx)?;
         let height = ctx.env().height;
         let mut next = self.read().clone();
@@ -295,19 +289,13 @@ impl Upgrade {
             let members = self.members(ctx).await?;
             // the shared predicate over FROZEN committed readiness (plan R4): armed
             // iff every boundary member had signaled by end-of-(H-1).
-            let ready: BTreeMap<Vec<u8>, ()> = self
-                .committed
-                .readiness
-                .keys()
-                .map(|k| (k.clone(), ()))
-                .collect();
             let armed = up.to_version
                 == crate::effective_version(
                     height,
                     self.committed.current_version,
                     Some(&up),
                     &members,
-                    &ready,
+                    |member| self.committed.readiness.contains_key(member),
                 );
             // apply the reconciliation over staged-over-committed (published at
             // commit_block): ARM flips current_version + clears the slot; ABORT
@@ -401,11 +389,8 @@ impl Module for Upgrade {
                 name,
                 activation_height,
                 to_version,
-            } => {
-                self.handle_schedule(ctx, name, activation_height, to_version)
-                    .await
-            }
-            UpgradeMsg::Cancel { name } => self.handle_cancel(ctx, name).await,
+            } => self.handle_schedule(ctx, name, activation_height, to_version),
+            UpgradeMsg::Cancel { name } => self.handle_cancel(ctx, name),
             UpgradeMsg::SignalReady {
                 name,
                 to_version,
@@ -426,8 +411,6 @@ impl Module for Upgrade {
                 let members = self.members(ctx).await?;
                 let state = self.read();
                 let ready: Vec<Vec<u8>> = state.readiness.keys().cloned().collect();
-                let ready_map: BTreeMap<Vec<u8>, ()> =
-                    state.readiness.keys().map(|k| (k.clone(), ())).collect();
                 // `armed` (readiness complete) is derived from the ONE shared
                 // predicate evaluated AT the activation height (where the height
                 // gate always passes), so it can never drift from the arm check
@@ -440,7 +423,7 @@ impl Module for Upgrade {
                                 state.current_version,
                                 Some(up),
                                 &members,
-                                &ready_map,
+                                |member| state.readiness.contains_key(member),
                             )
                     }
                     None => false,

@@ -9,8 +9,6 @@
 //! `effective_version` derivation so the module, host, and orchestrator never
 //! hand-copy the arming predicate.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 /// the coordinates of a scheduled upgrade. **at most one** is ever pending.
@@ -109,13 +107,13 @@ pub fn effective_version(
     current: u32,
     pending: Option<&ScheduledUpgrade>,
     boundary_members: &[Vec<u8>],
-    ready: &BTreeMap<Vec<u8>, ()>,
+    is_ready: impl Fn(&[u8]) -> bool,
 ) -> u32 {
     match pending {
         Some(up)
             if height >= up.activation_height
                 && !boundary_members.is_empty()
-                && boundary_members.iter().all(|m| ready.contains_key(m)) =>
+                && boundary_members.iter().all(|member| is_ready(member)) =>
         {
             up.to_version
         }
@@ -125,10 +123,16 @@ pub fn effective_version(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn rt_msg(m: UpgradeMsg) {
         assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);
+    }
+
+    fn has(keys: &BTreeMap<Vec<u8>, ()>) -> impl Fn(&[u8]) -> bool + '_ {
+        |member| keys.contains_key(member)
     }
 
     #[test]
@@ -185,23 +189,26 @@ mod tests {
 
         // no pending -> current.
         let empty: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
-        assert_eq!(effective_version(10, 1, None, &members, &empty), 1);
+        assert_eq!(effective_version(10, 1, None, &members, has(&empty)), 1);
 
         // armed & height < activation -> current.
         let mut all: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
         all.insert(m1.clone(), ());
         all.insert(m2.clone(), ());
-        assert_eq!(effective_version(9, 1, Some(&up), &members, &all), 1);
+        assert_eq!(effective_version(9, 1, Some(&up), &members, has(&all)), 1);
 
         // armed & height >= activation & all members ready -> to_version.
-        assert_eq!(effective_version(10, 1, Some(&up), &members, &all), 2);
+        assert_eq!(effective_version(10, 1, Some(&up), &members, has(&all)), 2);
 
         // a boundary member missing -> current.
         let mut partial: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
         partial.insert(m1.clone(), ());
-        assert_eq!(effective_version(10, 1, Some(&up), &members, &partial), 1);
+        assert_eq!(
+            effective_version(10, 1, Some(&up), &members, has(&partial)),
+            1
+        );
 
         // empty boundary set -> current (never arm against no members).
-        assert_eq!(effective_version(10, 1, Some(&up), &[], &all), 1);
+        assert_eq!(effective_version(10, 1, Some(&up), &[], has(&all)), 1);
     }
 }
