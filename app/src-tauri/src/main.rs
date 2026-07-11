@@ -151,7 +151,7 @@ fn main() {
             Ok(())
         });
 
-    // dev-only debug bridge (tauri-plugin-agent): registers our agent debugger
+    // dev-only debug bridge (tauri-agent-plugin): registers our agent debugger
     // so the `tauri-agent` CLI / MCP server can drive the real native UI —
     // semantic tree, input, DOM-SVG screenshots, logs — over an app-scoped
     // endpoint registry. Gated to debug + desktop; a release runtime never
@@ -162,7 +162,7 @@ fn main() {
     // set XDG_RUNTIME_DIR per instance to isolate parallel worktree apps.
     #[cfg(all(debug_assertions, desktop))]
     {
-        builder = builder.plugin(tauri_plugin_agent::init());
+        builder = builder.plugin(tauri_agent_plugin::init());
     }
 
     let app = builder

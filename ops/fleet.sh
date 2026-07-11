@@ -142,18 +142,20 @@ JSON
   # VNC (started after the app) is gone, the instance is dead — clear it.
   if [ -f "$endpoint" ] && ! port_up "$vnc"; then rm -f "$endpoint"; fi
 
-  # the app — isolated HOME, warm build caches, headless WebKit flags
+  # the app — isolated HOME/cache, warm Cargo caches, headless WebKit flags
+  # CEF needs single-process/no-sandbox in headless QA; Wry ignores those args.
   if ! [ -f "$endpoint" ]; then
     ( cd "$app" && \
       HOME="$home" \
       CARGO_HOME="$REAL_HOME/.cargo" RUSTUP_HOME="$REAL_HOME/.rustup" \
-      XDG_CACHE_HOME="$REAL_HOME/.cache" BUN_INSTALL_CACHE_DIR="$REAL_HOME/.bun/install/cache" \
+      XDG_CACHE_HOME="$home/.cache" BUN_INSTALL_CACHE_DIR="$REAL_HOME/.bun/install/cache" \
       PATH="$REAL_HOME/.local/bin:$PATH" \
       DISPLAY="$disp" WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 \
       LIBGL_ALWAYS_SOFTWARE=1 GDK_BACKEND=x11 \
       DUCKTAPE_TAURI_DEV_PORT="$vite" XDG_RUNTIME_DIR="$wsdir" \
       DUCKTAPE_NODE_BIN="$NODE_BIN" \
-      setsid dbus-run-session -- bunx tauri dev --config "$wsdir/no-before.json" --no-dev-server-wait \
+      setsid nohup dbus-run-session -- bunx tauri dev --config "$wsdir/no-before.json" --no-dev-server-wait \
+      -- -- --no-sandbox --single-process --in-process-gpu \
       >"$wsdir/tauri.log" 2>&1 < /dev/null & )
     log "[$id] app starting (compiling if cold)…"
   fi
