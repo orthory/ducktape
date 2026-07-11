@@ -712,9 +712,11 @@ impl Governance {
                 "proposal already exists: {proposal_id}"
             )));
         }
-        let action = self.normalize_share_action(ctx, action).await?;
         let submitter = Self::external_origin(ctx)?;
         let (proposer, electorate) = self.frozen_electorate(ctx, &submitter, &action).await?;
+        // Gate the submitter before resolving up to MAX_SHARE_ACCOUNTS Identity
+        // records for an adoption proposal.
+        let action = self.normalize_share_action(ctx, action).await?;
 
         let now = ctx.env().consensus_time;
         let deadline = now
