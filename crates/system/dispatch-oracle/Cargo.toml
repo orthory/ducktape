@@ -15,7 +15,7 @@ dispatch = { workspace = true }
 # the pool's spawn/deliver/resolver seams are boxed futures; the semaphore
 # caps concurrent provider runs (tokio::sync is runtime-agnostic).
 futures = { workspace = true }
-reactor = { workspace = true }
+host = { workspace = true }
 saga = { workspace = true }
 sdk = { workspace = true }
 # the run envelope is JSON (see src/envelope.rs).

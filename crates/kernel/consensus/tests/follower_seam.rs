@@ -1,5 +1,5 @@
 //! the follower seam (unified-node design, phase 1): `verify_finalization`
-//! is a REAL cryptographic gate over both certificate schemes, and
+//! is a REAL cryptographic gate over the certificate scheme, and
 //! `FollowerOrderer` admits only verified, ascending finalizations into the
 //! same ordered gate a validator's reporter drives — with no unverified
 //! admission path and a loud refusal on `submit`.
@@ -19,15 +19,10 @@ use commonware_consensus::types::{Epoch, Round, View};
 use commonware_cryptography::certificate::Scheme as _;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_parallel::Sequential;
-use commonware_utils::{
-    Faults as _, N3f1, TryCollect as _, ordered::BiMap, ordered::Set, test_rng,
-};
+use commonware_utils::{Faults as _, N3f1, ordered::Set, test_rng};
 use node::Orderer as _;
 
-use consensus::{
-    BlsScheme, ContentStore, FollowerOrderer, Observed, bls_dev_public, bls_dev_scheme,
-    digest_of, verify_finalization,
-};
+use consensus::{ContentStore, FollowerOrderer, Observed, digest_of, verify_finalization};
 
 const NAMESPACE: &[u8] = b"follower-seam";
 
@@ -116,62 +111,6 @@ fn a_v1_certificate_does_not_verify_across_a_participant_set_change() {
     assert!(
         verify_finalization(&mut test_rng(), &v1_verifier(5), &old_cert).is_err(),
         "an old epoch's certificate must not verify against the new participant set"
-    );
-}
-
-#[test]
-fn a_quorum_v2_bls_certificate_verifies_and_rejects_cross_set() {
-    let proposal = proposal_for(1, b"the bls-finalized frame");
-    let n = 4u64;
-    let seeds: Vec<u64> = (0..n).collect();
-    let schemes: Vec<BlsScheme> = seeds
-        .iter()
-        .map(|s| bls_dev_scheme(NAMESPACE, &seeds, *s).expect("dev key in the set"))
-        .collect();
-    let quorum = N3f1::quorum(n as u32) as usize;
-    let attestations: Vec<_> = schemes
-        .iter()
-        .take(quorum)
-        .map(|s| {
-            s.sign(Subject::Finalize {
-                proposal: &proposal,
-            })
-            .expect("signer signs")
-        })
-        .collect();
-    let certificate = schemes[0]
-        .assemble::<_, N3f1>(attestations, &Sequential)
-        .expect("quorum assembles");
-    let cert_bytes = Finalization::<BlsScheme, consensus::Digest> {
-        proposal: proposal.clone(),
-        certificate,
-    }
-    .encode()
-    .to_vec();
-
-    let verifier_for = |seeds: &[u64]| {
-        let participants: BiMap<ed25519::PublicKey, consensus::BlsPublicKey> = seeds
-            .iter()
-            .map(|s| {
-                (
-                    ed25519::PrivateKey::from_seed(*s).public_key(),
-                    bls_dev_public(*s),
-                )
-            })
-            .try_collect()
-            .expect("distinct dev keys");
-        BlsScheme::verifier(NAMESPACE, participants)
-    };
-
-    let ok = verify_finalization(&mut test_rng(), &verifier_for(&seeds), &cert_bytes)
-        .expect("a quorum-signed bls certificate verifies");
-    assert_eq!(ok.proposal.payload, digest_of(b"the bls-finalized frame"));
-
-    // one seat added: the old aggregate must fail the new set's verifier.
-    let grown: Vec<u64> = (0..n + 1).collect();
-    assert!(
-        verify_finalization(&mut test_rng(), &verifier_for(&grown), &cert_bytes).is_err(),
-        "an old epoch's bls aggregate must not verify against the grown set"
     );
 }
 

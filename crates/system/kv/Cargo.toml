@@ -18,4 +18,4 @@ commonware-codec = { workspace = true }
 commonware-utils = { workspace = true }
 
 [dev-dependencies]
-state = { workspace = true }
+host = { workspace = true }

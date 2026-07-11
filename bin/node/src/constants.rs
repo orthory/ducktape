@@ -1,10 +1,8 @@
 use std::time::Duration;
 
-use consensus::ConsensusScheme;
-
-/// the consensus signature scheme this build runs — a genesis-wide constant. today only
-/// V1 (ed25519); see [`ConsensusScheme`]'s rekey/respawn contract for the BLS/V2 path.
-pub(crate) const CONSENSUS_SCHEME: ConsensusScheme = ConsensusScheme::V1Ed25519;
+// the consensus signature scheme is V1 ed25519, the only wired variant — see
+// `consensus::ConsensusScheme`'s rekey/respawn contract for what a scheme
+// migration would take (an epoch teardown-respawn, not a constant flip).
 /// the highest protocol version THIS binary's dual-path modules can execute — a
 /// per-node BUILD constant, NEVER consensus state (a lying value can only
 /// refuse-to-boot or halt this one node, never fork the network). the

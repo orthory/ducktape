@@ -24,7 +24,7 @@ use kv::{KvMsg, encode as kv_encode};
 use saga::SagaModule;
 use saga::{SagaMsg, encode_msg as saga_encode_msg};
 use sdk::{Module, Msg, StateRoot};
-use state::global_root;
+use host::global_root;
 use valset::Valset;
 use valset::{ValsetMsg, encode_msg as valset_encode_msg};
 

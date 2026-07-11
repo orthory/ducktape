@@ -125,7 +125,7 @@ struct ValidatorRuntime<'a> {
     heartbeat_disabled: bool,
     last_crank: std::time::Instant,
     last_nudge: std::time::Instant,
-    workers: Vec<Box<dyn reactor::Worker>>,
+    workers: Vec<Box<dyn host::worker::Worker>>,
     signaller: ReadinessSignaller,
     announcer: CapabilityAnnouncer,
     upgrade_armed_latch: Option<(String, u32)>,
@@ -269,9 +269,9 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // announced set to nothing — never the reverse). routing and
     // default models live in the specs (docs/records/specs/capability-spec.md); a broken
     // operator spec is a boot error, not a silently dropped executor.
-    let providers = capability_host::discover_with_dirs_and_output_sink(
+    let providers = capability_host::discover(
         agent_dirs.clone(),
-        run_output_sink(stream_hub.run_output()),
+        Some(run_output_sink(stream_hub.run_output())),
     )
     .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
     let my_capabilities = providers.capabilities();
@@ -292,7 +292,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         // node's blob store resolves here instead of failing the run.
         Some(blob_fetcher),
     );
-    let workers: Vec<Box<dyn reactor::Worker>> = vec![oracle_worker];
+    let workers: Vec<Box<dyn host::worker::Worker>> = vec![oracle_worker];
     // the readiness self-signaller: polls COMMITTED upgrade state between drains
     // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
     // this binary can execute. survives restart/late-join (state-driven, not a

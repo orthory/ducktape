@@ -52,7 +52,7 @@ use saga::{
     encode_msg as saga_encode_msg, encode_query as saga_encode_query,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
-use state::global_root;
+use host::global_root;
 use valset::Valset;
 use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
@@ -124,7 +124,7 @@ async fn commit_op_as(module: &mut dyn Module, at: u64, origin: sdk::Origin, pay
 }
 
 /// the (id, root) pair a node's registry reports for a module — the exact input
-/// `state::global_root` consumes. needed because ONE deterministic runner
+/// `host::global_root` consumes. needed because ONE deterministic runner
 /// shares ONE storage-partition namespace: the joiner's qmdb stores must
 /// rebuild under distinct storage ids or they would open the source's live
 /// partitions, while the app-hash both nodes agree on is composed over the

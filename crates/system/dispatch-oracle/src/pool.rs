@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use capability_host::ProviderSet;
 use futures::future::BoxFuture;
-use reactor::{WorkOutcome, Worker};
+use host::worker::{WorkOutcome, Worker};
 use sdk::{Effect, Msg};
 use tokio::sync::Semaphore;
 
@@ -345,7 +345,7 @@ async fn execute(
 
 #[async_trait::async_trait(?Send)]
 impl Worker for DispatchPool {
-    async fn run(&self, effect: &Effect) -> Result<WorkOutcome, reactor::Error> {
+    async fn run(&self, effect: &Effect) -> Result<WorkOutcome, host::worker::Error> {
         match gate(&self.providers, &self.node_key, effect) {
             Gated::NotMine => Ok(WorkOutcome::NotMine),
             Gated::Skip => Ok(WorkOutcome::Handled(None)),

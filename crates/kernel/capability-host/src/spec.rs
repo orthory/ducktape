@@ -90,9 +90,6 @@ pub struct CapabilitySpec {
     /// injection surface. which model (if any) the executor runs is encoded
     /// here as ordinary flags — operator policy, invisible to consensus.
     pub args: Vec<String>,
-    /// how the prompt reaches the child. v1 supports stdin only: the prompt
-    /// is fed concurrently with output collection, then EOF.
-    pub prompt: PromptMode,
     /// per-job wall-clock budget; the child is killed at the deadline.
     /// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` overrides ALL specs at once.
     pub timeout_secs: u64,
@@ -104,14 +101,6 @@ pub struct CapabilitySpec {
     /// optional `[session]` thread-continuity plumbing — host-local capture
     /// and resume of the executor's own session id (see [`crate::session`]).
     pub session: Option<SessionSpec>,
-}
-
-/// how the prompt is delivered to the child process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptMode {
-    /// written to the child's stdin, then EOF. the only v1 mode: an argv
-    /// placeholder would leak prompts into `ps` output and hit ARG_MAX.
-    Stdin,
 }
 
 /// the named stdout parsers. a CLOSED set on purpose: each name is a tested
@@ -236,14 +225,15 @@ impl CapabilitySpec {
         if raw.detect.bin.is_empty() {
             return Err(format!("{origin}: detect.bin must be non-empty"));
         }
-        let prompt = match raw.invoke.prompt.as_str() {
-            "stdin" => PromptMode::Stdin,
-            other => {
-                return Err(format!(
-                    "{origin}: invoke.prompt {other:?} is not supported (v1 supports \"stdin\")"
-                ));
-            }
-        };
+        // the prompt always reaches the child via stdin (an argv placeholder
+        // would leak prompts into `ps` output and hit ARG_MAX); the field is
+        // validated but carries no choice.
+        if raw.invoke.prompt != "stdin" {
+            return Err(format!(
+                "{origin}: invoke.prompt {:?} is not supported (only \"stdin\")",
+                raw.invoke.prompt
+            ));
+        }
         if !TIMEOUT_RANGE.contains(&raw.invoke.timeout_secs) {
             return Err(format!(
                 "{origin}: invoke.timeout_secs must be within {TIMEOUT_RANGE:?}, got {}",
@@ -279,7 +269,6 @@ impl CapabilitySpec {
                 bin: raw.detect.bin,
                 env: raw.detect.env,
                 args: raw.invoke.args,
-                prompt,
                 timeout_secs: raw.invoke.timeout_secs,
                 output,
                 workspace,

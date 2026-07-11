@@ -821,7 +821,7 @@ impl ValidatorRuntime<'_> {
             let mut claimed = false;
             for w in workers.iter() {
                 match w.run(&eff).await {
-                    Ok(reactor::WorkOutcome::Handled(Some(follow))) => {
+                    Ok(host::worker::WorkOutcome::Handled(Some(follow))) => {
                         let seq = *next_seq;
                         *next_seq += 1;
                         if let Err(e) = node.submit(signer, seq, follow).await {
@@ -832,11 +832,11 @@ impl ValidatorRuntime<'_> {
                     }
                     // a deliberate skip (e.g. leased to another
                     // node): claimed, nothing to submit.
-                    Ok(reactor::WorkOutcome::Handled(None)) => {
+                    Ok(host::worker::WorkOutcome::Handled(None)) => {
                         claimed = true;
                         break;
                     }
-                    Ok(reactor::WorkOutcome::NotMine) => {}
+                    Ok(host::worker::WorkOutcome::NotMine) => {}
                     Err(e) => {
                         eprintln!("[node {label}] worker error: {e}");
                         claimed = true; // errored ≠ unclaimed; don't double-log

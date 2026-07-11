@@ -28,7 +28,7 @@
 
 use capability_host::ProviderSet;
 use dispatch::{WorkSpec, decode_work_spec};
-use reactor::{WorkOutcome, Worker};
+use host::worker::{WorkOutcome, Worker};
 use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Effect, Msg};
 
@@ -185,7 +185,7 @@ impl DispatchWorker {
 
 #[async_trait::async_trait(?Send)]
 impl Worker for DispatchWorker {
-    async fn run(&self, effect: &Effect) -> Result<WorkOutcome, reactor::Error> {
+    async fn run(&self, effect: &Effect) -> Result<WorkOutcome, host::worker::Error> {
         match gate(&self.providers, &self.node_key, effect) {
             Gated::NotMine => Ok(WorkOutcome::NotMine),
             Gated::Skip => Ok(WorkOutcome::Handled(None)),
@@ -410,7 +410,7 @@ format = "text"
         let capability = std::env::var("DUCKTAPE_LIVE_CAPABILITY")
             .expect("set DUCKTAPE_LIVE_CAPABILITY to a capability this host provides");
         let worker = DispatchWorker::new(
-            capability_host::discover().expect("capability specs load"),
+            capability_host::discover(Default::default(), None).expect("capability specs load"),
             b"live".to_vec(),
         );
         let payload = b"Reply with exactly one word: quack".to_vec();

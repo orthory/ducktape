@@ -49,7 +49,7 @@ use noded::{
     payload_preview,
 };
 use pages::Pages;
-use reactor::MAX_WORKER_ROUNDS;
+use host::worker::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
 use sdk::{Effect, Msg, Origin};
 use tasks::Tasks;
@@ -438,7 +438,7 @@ fn unix_millis() -> u64 {
 #[allow(clippy::too_many_arguments)]
 async fn submit_and_drain(
     host: &mut Host,
-    workers: &[Box<dyn reactor::Worker>],
+    workers: &[Box<dyn host::worker::Worker>],
     height: &mut u64,
     index: &IndexStore,
     blobs: &noded::blobs::BlobHandle,
@@ -622,7 +622,7 @@ fn origin_tag(origin: &Origin) -> String {
 }
 
 async fn offer_effects(
-    workers: &[Box<dyn reactor::Worker>],
+    workers: &[Box<dyn host::worker::Worker>],
     effects: Vec<Effect>,
     queue: &mut VecDeque<Msg>,
 ) {
@@ -630,12 +630,12 @@ async fn offer_effects(
         let mut claimed = false;
         for w in workers {
             match w.run(&eff).await {
-                Ok(reactor::WorkOutcome::Handled(follow)) => {
+                Ok(host::worker::WorkOutcome::Handled(follow)) => {
                     queue.extend(follow);
                     claimed = true;
                     break;
                 }
-                Ok(reactor::WorkOutcome::NotMine) => {}
+                Ok(host::worker::WorkOutcome::NotMine) => {}
                 Err(err) => {
                     eprintln!("[noded] worker error: {err}");
                     claimed = true;

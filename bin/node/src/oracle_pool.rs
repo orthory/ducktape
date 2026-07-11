@@ -44,7 +44,7 @@ pub(crate) fn build<C>(
     provisioner: Option<SharedProvisioner>,
     blob_fetch: Option<crate::blob_fetch::BlobFetchFn>,
 ) -> (
-    Box<dyn reactor::Worker>,
+    Box<dyn host::worker::Worker>,
     futures::channel::mpsc::Receiver<Msg>,
 )
 where

@@ -3,23 +3,18 @@ name = "node"
 edition.workspace = true
 version.workspace = true
 
-# the replication layer: wraps a `host::Host` with an ordering seam so N
-# validators apply a totally-ordered op stream identically. two seams live here:
-#  - `Transport` + `LoopbackHub` (gossip): a locally-originated msg is applied
-#    locally AND propagated; an inbound msg is applied but NEVER re-propagated
-#    (the wire-level local-only rule). converges only for order-INdependent roots.
-#  - `Orderer` + `SequencedHub`/`RoundOrderer` (agreed total order): a msg is NOT
-#    applied on submit; it is proposed into an agreed order and applied via
-#    host.submit ONLY when the order delivers it, identically on every validator.
-#    this is what makes an order-DEPENDENT qmdb root converge.
+# the replication layer: wraps a `host::Host` with an ordering seam
+# (`Orderer` + `RoundOrderer`, agreed total order) so N validators apply a
+# totally-ordered op stream identically. a msg is NOT applied on submit; it is
+# proposed into an agreed order and applied via host.submit ONLY when the order
+# delivers it, identically on every validator. this is what makes an
+# order-DEPENDENT qmdb root converge.
 # depends on sdk (Msg) + host (the state machine); the wire codec lives here so
 # sdk stays dep-clean. the real commonware simplex orderer is a later slice; it
 # is the drop-in behind the same `Orderer` trait.
 [dependencies]
 sdk = { workspace = true }
 host = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 # op frames are ed25519-SIGNED: encode signs, decode verifies, so the host's
 # Origin::External is authenticated authorship.
@@ -27,9 +22,8 @@ commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
 
 [dev-dependencies]
-# the gossip convergence test stands two nodes on one LoopbackHub over a pair of
-# in-memory directory modules (state-based root -> converges without a total
-# order) and drives them on a plain futures executor -- no runtime/commonware.
+# tests stand hosts over in-memory directory modules and drive the async seams
+# on a plain futures executor.
 directory = { workspace = true }
 futures = "0.3"
 # the agreed-order convergence test stands N validators, each a host with a
@@ -40,5 +34,4 @@ kv = { workspace = true }
 saga = { workspace = true }
 # a probe module (impl sdk::Module) in the env-from-view test needs async-trait.
 async-trait = { workspace = true }
-state = { workspace = true }
 commonware-runtime = { workspace = true }

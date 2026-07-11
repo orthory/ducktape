@@ -323,7 +323,7 @@ pub(super) async fn park(
             eprintln!(
                 "[node {label}] FATAL: cannot recover — {e} (recovered boundary needs \
                  protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
-                ckpt.required_min_version()
+                ckpt.required_min_version
             );
             std::process::exit(1);
         }
@@ -477,9 +477,9 @@ pub(super) async fn park(
     // drained by the park loop's pump pass, so a minutes-long run
     // never stalls the serve window, boundary follow, or promotion
     // detection.
-    let resident_provider_set = capability_host::discover_with_dirs_and_output_sink(
+    let resident_provider_set = capability_host::discover(
         agent_dirs.clone(),
-        run_output_sink(stream_hub.run_output()),
+        Some(run_output_sink(stream_hub.run_output())),
     )
     .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
     let resident_capabilities = resident_provider_set.capabilities();

@@ -166,14 +166,7 @@ pub(crate) fn capture_session_id(capture: &SessionCapture, stdout: &str) -> Opti
 /// with a top-level `session_id`, and the older `msg` envelope's
 /// `session_configured`.
 fn capture_jsonl(stdout: &str) -> Option<String> {
-    for line in stdout.lines() {
-        let line = line.trim();
-        if !line.starts_with('{') {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    for v in crate::json_lines(stdout) {
         if v.get("type").and_then(Value::as_str) == Some("thread.started")
             && let Some(id) = v.get("thread_id").and_then(Value::as_str)
         {
@@ -193,20 +186,12 @@ fn capture_jsonl(stdout: &str) -> Option<String> {
 }
 
 /// the named string field of the single result object — the same candidate
-/// scan `parse_json_result` uses (whole output first, then per-line against
-/// banner noise), minus the error posture.
+/// scan `parse_json_result` uses (via [`crate::result_objects`]), minus the
+/// error posture.
 fn capture_result_field(stdout: &str, field: &str) -> Option<String> {
-    let candidates = std::iter::once(stdout.trim()).chain(stdout.lines().rev().map(str::trim));
-    for candidate in candidates {
-        let Ok(v) = serde_json::from_str::<Value>(candidate) else {
-            continue;
-        };
-        if v.get("type").and_then(Value::as_str) != Some("result") {
-            continue;
-        }
-        return v.get(field).and_then(Value::as_str).map(str::to_string);
-    }
-    None
+    crate::result_objects(stdout)
+        .next()
+        .and_then(|v| v.get(field).and_then(Value::as_str).map(str::to_string))
 }
 
 /// a captured id lands in argv and on disk — accept only short, printable,
