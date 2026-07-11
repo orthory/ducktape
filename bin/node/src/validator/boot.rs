@@ -306,83 +306,65 @@ pub(super) async fn post_reboot_catchup<'a>(
                         );
                         std::process::exit(1);
                     };
-                    if !target
-                        .participants
-                        .iter()
-                        .any(|key| key.as_slice() == signer.public_key().as_ref())
-                    {
-                        eprintln!(
-                            "[node {label}] FATAL: catch-up target height {} no longer \
-                             includes this validator",
-                            target.height
-                        );
-                        std::process::exit(1);
-                    }
-                    let floor = match verify_manifest_floor(&namespace, target) {
-                        Ok(floor) => floor,
-                        Err(e) => {
-                            eprintln!("[node {label}] FATAL: catch-up target floor verify: {e}");
-                            std::process::exit(1);
-                        }
-                    };
-                    if target.epoch > resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0)
-                        && let Err(e) = node::BlockSink::cutover(
-                            &mut recovery,
-                            target.epoch,
-                            target.view_base,
-                            &target.participants,
-                            &target.residents,
-                        )
-                        .await
-                    {
-                        eprintln!("[node {label}] FATAL: catch-up cutover journal write: {e}");
-                        std::process::exit(1);
-                    }
-                    let me_bytes = signer.public_key().as_ref().to_vec();
-                    advance_next_seq_from_frames(&mut next_seq, &summary.frame_bytes, &me_bytes);
-                    let ckpt = match write_post_reboot_catchup_checkpoint(
+                    let resumed_epoch = resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0);
+                    finalize_catchup_boundary(
                         &mut recovery,
-                        &host,
-                        recovery_manifest_for_resume.as_ref(),
+                        &mut host,
+                        &mut next_seq,
+                        &mut prev_ckpt,
+                        &mut resumed,
+                        &mut recovery_manifest_for_resume,
+                        &mut boot_fold,
+                        &signer,
+                        &label,
+                        &namespace,
                         target,
-                        &summary.blocks,
-                        next_seq,
-                    )
-                    .await
-                    {
-                        Ok(ckpt) => ckpt,
-                        Err(e) => {
-                            eprintln!("[node {label}] FATAL: {e}");
-                            std::process::exit(1);
-                        }
-                    };
-                    if let Some(cert) = floor {
-                        let floor = recovery::FloorCert {
-                            epoch: target.epoch,
-                            height: target.height,
-                            cert,
-                        };
-                        if let Err(e) = recovery.write_floor_cert(&floor).await {
-                            eprintln!("[node {label}] FATAL: catch-up floor-cert write: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                    prev_ckpt = (ckpt.height, ckpt.oplog_pos);
-                    let refreshed = match recovery
-                        .recover_with_sink(&mut host, &ckpt, Some(&mut boot_fold))
-                        .await
-                    {
-                        Ok(rec) => rec,
-                        Err(e) => {
-                            eprintln!(
-                                "[node {label}] FATAL: post-catch-up checkpoint recovery: {e}"
+                        "catch-up",
+                        "post-catch-up checkpoint recovery",
+                        async |recovery: &mut Recovery<commonware_runtime::tokio::Context>,
+                               host: &mut Host,
+                               next_seq: &mut u64,
+                               base_manifest: Option<&Manifest>| {
+                            if target.epoch > resumed_epoch
+                                && let Err(e) = node::BlockSink::cutover(
+                                    recovery,
+                                    target.epoch,
+                                    target.view_base,
+                                    &target.participants,
+                                    &target.residents,
+                                )
+                                .await
+                            {
+                                eprintln!(
+                                    "[node {label}] FATAL: catch-up cutover journal write: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                            let me_bytes = signer.public_key().as_ref().to_vec();
+                            advance_next_seq_from_frames(
+                                next_seq,
+                                &summary.frame_bytes,
+                                &me_bytes,
                             );
-                            std::process::exit(1);
-                        }
-                    };
-                    advance_next_seq_from_frames(&mut next_seq, &refreshed.frames, &me_bytes);
-                    resumed = Some(refreshed);
-                    recovery_manifest_for_resume = Some(ckpt);
+                            match write_post_reboot_catchup_checkpoint(
+                                recovery,
+                                host,
+                                base_manifest,
+                                target,
+                                &summary.blocks,
+                                *next_seq,
+                            )
+                            .await
+                            {
+                                Ok(ckpt) => ckpt,
+                                Err(e) => {
+                                    eprintln!("[node {label}] FATAL: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        },
+                    )
+                    .await;
                     break;
                 }
                 Err(PostRebootCatchupError::RangePruned {
@@ -396,116 +378,98 @@ pub(super) async fn post_reboot_catchup<'a>(
                          boundary {}",
                         target.height
                     );
-                    if !target
-                        .participants
-                        .iter()
-                        .any(|key| key.as_slice() == signer.public_key().as_ref())
-                    {
-                        eprintln!(
-                            "[node {label}] FATAL: full-sync target height {} no longer \
-                             includes this validator",
-                            target.height
-                        );
-                        std::process::exit(1);
-                    }
-                    let floor = match verify_manifest_floor(&namespace, &target) {
-                        Ok(floor) => floor,
-                        Err(e) => {
-                            eprintln!("[node {label}] FATAL: full-sync target floor verify: {e}");
-                            std::process::exit(1);
-                        }
-                    };
-                    let synced = match sync_all_modules(
-                        context,
-                        &client,
+                    let resumed_epoch = resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0);
+                    finalize_catchup_boundary(
+                        &mut recovery,
+                        &mut host,
+                        &mut next_seq,
+                        &mut prev_ckpt,
+                        &mut resumed,
+                        &mut recovery_manifest_for_resume,
+                        &mut boot_fold,
+                        &signer,
+                        &label,
+                        &namespace,
                         &target,
-                        NetworkBindings {
-                            invite: &namespace,
-                            identity_chain_id: &identity_chain_id,
+                        "full-sync",
+                        "full-sync recovery refresh",
+                        async |recovery: &mut Recovery<commonware_runtime::tokio::Context>,
+                               host: &mut Host,
+                               next_seq: &mut u64,
+                               _base_manifest: Option<&Manifest>| {
+                            let synced = match sync_all_modules(
+                                context,
+                                &client,
+                                &target,
+                                NetworkBindings {
+                                    invite: &namespace,
+                                    identity_chain_id: &identity_chain_id,
+                                },
+                                SyncSubstrates {
+                                    forge_repo: &forge_repo,
+                                    duckfs_dir: &duckfs_dir,
+                                    blobs: blobs.clone(),
+                                },
+                                10_000 + attempts,
+                            )
+                            .await
+                            {
+                                Ok(host) => host,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[node {label}] FATAL: full state-sync fallback failed at \
+                                         boundary {}: {e}",
+                                        target.height
+                                    );
+                                    std::process::exit(1);
+                                }
+                            };
+                            *host = synced;
+                            if target.epoch > resumed_epoch
+                                && let Err(e) = node::BlockSink::cutover(
+                                    recovery,
+                                    target.epoch,
+                                    target.view_base,
+                                    &target.participants,
+                                    &target.residents,
+                                )
+                                .await
+                            {
+                                eprintln!(
+                                    "[node {label}] FATAL: full-sync cutover journal write: {e}"
+                                );
+                                std::process::exit(1);
+                            }
+                            let pos = recovery.oplog_pos().await;
+                            let ckpt = match Manifest::capture(
+                                host,
+                                Some(target.height),
+                                target.epoch,
+                                target.view_base,
+                                target.participants.clone(),
+                                target.residents.clone(),
+                                None,
+                                target.current_version,
+                                target.pending_upgrade.clone(),
+                                pos,
+                                *next_seq,
+                            ) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[node {label}] FATAL: full-sync checkpoint capture: {e}"
+                                    );
+                                    std::process::exit(1);
+                                }
+                            };
+                            if let Err(e) = recovery.write_manifest(&ckpt).await {
+                                eprintln!("[node {label}] FATAL: full-sync checkpoint write: {e}");
+                                std::process::exit(1);
+                            }
+                            ckpt
                         },
-                        SyncSubstrates {
-                            forge_repo: &forge_repo,
-                            duckfs_dir: &duckfs_dir,
-                            blobs: blobs.clone(),
-                        },
-                        10_000 + attempts,
                     )
-                    .await
-                    {
-                        Ok(host) => host,
-                        Err(e) => {
-                            eprintln!(
-                                "[node {label}] FATAL: full state-sync fallback failed at \
-                                 boundary {}: {e}",
-                                target.height
-                            );
-                            std::process::exit(1);
-                        }
-                    };
-                    host = synced;
-                    if target.epoch > resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0)
-                        && let Err(e) = node::BlockSink::cutover(
-                            &mut recovery,
-                            target.epoch,
-                            target.view_base,
-                            &target.participants,
-                            &target.residents,
-                        )
-                        .await
-                    {
-                        eprintln!("[node {label}] FATAL: full-sync cutover journal write: {e}");
-                        std::process::exit(1);
-                    }
-                    let pos = recovery.oplog_pos().await;
-                    let ckpt = match Manifest::capture(
-                        &host,
-                        Some(target.height),
-                        target.epoch,
-                        target.view_base,
-                        target.participants.clone(),
-                        target.residents.clone(),
-                        None,
-                        target.current_version,
-                        target.pending_upgrade.clone(),
-                        pos,
-                        next_seq,
-                    ) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            eprintln!("[node {label}] FATAL: full-sync checkpoint capture: {e}");
-                            std::process::exit(1);
-                        }
-                    };
-                    if let Err(e) = recovery.write_manifest(&ckpt).await {
-                        eprintln!("[node {label}] FATAL: full-sync checkpoint write: {e}");
-                        std::process::exit(1);
-                    }
-                    if let Some(cert) = floor {
-                        let floor = recovery::FloorCert {
-                            epoch: target.epoch,
-                            height: target.height,
-                            cert,
-                        };
-                        if let Err(e) = recovery.write_floor_cert(&floor).await {
-                            eprintln!("[node {label}] FATAL: full-sync floor-cert write: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                    prev_ckpt = (ckpt.height, ckpt.oplog_pos);
-                    let refreshed = match recovery
-                        .recover_with_sink(&mut host, &ckpt, Some(&mut boot_fold))
-                        .await
-                    {
-                        Ok(rec) => rec,
-                        Err(e) => {
-                            eprintln!("[node {label}] FATAL: full-sync recovery refresh: {e}");
-                            std::process::exit(1);
-                        }
-                    };
-                    let me_bytes = signer.public_key().as_ref().to_vec();
-                    advance_next_seq_from_frames(&mut next_seq, &refreshed.frames, &me_bytes);
-                    resumed = Some(refreshed);
-                    recovery_manifest_for_resume = Some(ckpt);
+                    .await;
                     break;
                 }
                 Err(PostRebootCatchupError::Retry(e))
@@ -562,4 +526,87 @@ pub(super) async fn post_reboot_catchup<'a>(
         recovery_manifest_for_resume,
         boot_fold,
     )
+}
+
+/// the shared finalize sequence both catch-up arms settle a boundary through:
+/// verify the target still seats this validator, verify the target's floor
+/// certificate, run the arm-specific middle (`make_ckpt`: frames-replay writes
+/// the catch-up checkpoint; the pruned arm full-syncs, then captures its own —
+/// both cut the cutover journal record before their checkpoint write), write
+/// the floor cert, and re-recover from the fresh checkpoint. every failure is
+/// the same FATAL exit the arms carried inline; `kind` and `recover_fatal`
+/// keep each arm's error wording byte-identical.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_catchup_boundary<F>(
+    recovery: &mut Recovery<commonware_runtime::tokio::Context>,
+    host: &mut Host,
+    next_seq: &mut u64,
+    prev_ckpt: &mut (Option<u64>, u64),
+    resumed: &mut Option<recovery::Recovered>,
+    recovery_manifest_for_resume: &mut Option<Manifest>,
+    boot_fold: &mut IndexFold<'_>,
+    signer: &ed25519::PrivateKey,
+    label: &str,
+    namespace: &[u8],
+    target: &statesync::Manifest,
+    kind: &str,
+    recover_fatal: &str,
+    make_ckpt: F,
+) where
+    F: AsyncFnOnce(
+        &mut Recovery<commonware_runtime::tokio::Context>,
+        &mut Host,
+        &mut u64,
+        Option<&Manifest>,
+    ) -> Manifest,
+{
+    if !target
+        .participants
+        .iter()
+        .any(|key| key.as_slice() == signer.public_key().as_ref())
+    {
+        eprintln!(
+            "[node {label}] FATAL: {kind} target height {} no longer \
+             includes this validator",
+            target.height
+        );
+        std::process::exit(1);
+    }
+    let floor = match verify_manifest_floor(namespace, target) {
+        Ok(floor) => floor,
+        Err(e) => {
+            eprintln!("[node {label}] FATAL: {kind} target floor verify: {e}");
+            std::process::exit(1);
+        }
+    };
+    let ckpt = make_ckpt(
+        recovery,
+        host,
+        next_seq,
+        recovery_manifest_for_resume.as_ref(),
+    )
+    .await;
+    if let Some(cert) = floor {
+        let floor = recovery::FloorCert {
+            epoch: target.epoch,
+            height: target.height,
+            cert,
+        };
+        if let Err(e) = recovery.write_floor_cert(&floor).await {
+            eprintln!("[node {label}] FATAL: {kind} floor-cert write: {e}");
+            std::process::exit(1);
+        }
+    }
+    *prev_ckpt = (ckpt.height, ckpt.oplog_pos);
+    let refreshed = match recovery.recover_with_sink(host, &ckpt, Some(boot_fold)).await {
+        Ok(rec) => rec,
+        Err(e) => {
+            eprintln!("[node {label}] FATAL: {recover_fatal}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let me_bytes = signer.public_key().as_ref().to_vec();
+    advance_next_seq_from_frames(next_seq, &refreshed.frames, &me_bytes);
+    *resumed = Some(refreshed);
+    *recovery_manifest_for_resume = Some(ckpt);
 }

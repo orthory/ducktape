@@ -10,9 +10,7 @@ use sdk::Msg;
 use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::{MODULE_IDS, SUBMIT_HOLD};
-use crate::host_reads::{
-    read_members_from_host, read_redemptions_from_host, read_valset_members, read_valset_residents,
-};
+use crate::host_reads::{read_redemptions_from_host, read_valset_members, read_valset_residents};
 use crate::rpc::{JoinRequestRecord, JoinRequestView, RpcJob, RpcReply, RpcRequest, RpcStatus};
 use crate::util::{hex, unix_ms};
 use crate::{config, lobby, relay, relay_runtime};
@@ -74,7 +72,7 @@ impl ValidatorRuntime<'_> {
                 // read-time hygiene: an approved joiner holds
                 // STANDING now (resident or already validator) —
                 // its request is settled, drop it.
-                let members = read_members_from_host(node.host()).await;
+                let members = read_valset_members(node.host()).await;
                 let residents_now = read_valset_residents(node.host()).await;
                 join_requests.retain(|joiner, _| {
                     !members.contains(joiner) && !residents_now.contains(joiner)
@@ -174,7 +172,7 @@ impl ValidatorRuntime<'_> {
         // removed member's outstanding invites die with it), and a
         // joiner that already holds standing — VALIDATOR or
         // RESIDENT — has nothing pending.
-        let members = read_members_from_host(node.host()).await;
+        let members = read_valset_members(node.host()).await;
         let residents_now = read_valset_residents(node.host()).await;
         let joiner_bytes = verified.joiner.as_ref().to_vec();
         if members.contains(&joiner_bytes) {
