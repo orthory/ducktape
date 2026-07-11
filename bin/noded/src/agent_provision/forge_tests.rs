@@ -6,8 +6,11 @@
 //! passes the loopback http URL (that lane is Task 6's e2e). stock git's
 //! fetch-first refusal on the bare remote is the CAS-reject stand-in.
 
-use super::*;
 use super::super::NodedProvisioner;
+use super::super::plane_tests::{
+    SKILL_BODY, SKILL_FILE, skill_mount, skill_tree, spawn_files_actor,
+};
+use super::*;
 use dispatch_oracle::WorkspaceProvisioner as _;
 
 const REPO: &str = "app";
@@ -128,6 +131,29 @@ impl Bed {
         let (handle, _rx, _hub) = NodeHandle::channel();
         NodedProvisioner::new(handle.with_forge_repo(&self.repo_base), &self.runs_root)
             .with_forge(Some(self.push_base()), NODE_IDENT)
+    }
+
+    /// a provisioner whose actor lane is SERVED (the plain one above drops its
+    /// receiver — fine for runs with no mounts, but a W6 checkout needs a node
+    /// on the other end). `reject_reads` fails the mount checkout mid-way. the
+    /// actor handle must outlive the provision, so it comes back with it.
+    fn skill_provisioner(
+        &self,
+        reject_reads: bool,
+    ) -> (NodedProvisioner, tokio::task::JoinHandle<()>) {
+        let (handle, rx, _hub) = NodeHandle::channel();
+        let actor = spawn_files_actor(rx, skill_tree(), reject_reads);
+        let prov = NodedProvisioner::new(handle.with_forge_repo(&self.repo_base), &self.runs_root)
+            .with_forge(Some(self.push_base()), NODE_IDENT);
+        (prov, actor)
+    }
+
+    /// [`Self::spec`] with the W6 skill mount the plane tests share.
+    fn skill_spec(&self, run_id: &str, commit: &str) -> WorkspaceSpec {
+        WorkspaceSpec {
+            ro_mounts: vec![skill_mount()],
+            ..self.spec(run_id, commit, false)
+        }
     }
 
     /// snapshot the substrate into the bare rendezvous repo (ALL refs) —
@@ -442,6 +468,66 @@ async fn a_repo_missing_on_this_node_fails_provision_loudly() {
         "{err}"
     );
     assert_eq!(std::fs::read_dir(&bed.runs_root).unwrap().count(), 0);
+}
+
+// ---- W6 skill mounts ------------------------------------------------------
+
+#[tokio::test]
+async fn skill_mounts_land_beside_the_worktree_where_git_can_never_see_them() {
+    // the forge lane used to REFUSE these (running without them); it now
+    // materializes them exactly like the duckfs lane — at the `-ro` SIBLING,
+    // never inside the worktree, where `git add -A` would commit and PUSH the
+    // skill trees onto the agent's work branch.
+    let bed = bed();
+    let (prov, _actor) = bed.skill_provisioner(false);
+    let ws = prov
+        .provision(&bed.skill_spec("s1:0", &bed.head))
+        .await
+        .expect("provision");
+    let dir = ws.workdir();
+    let ro = PathBuf::from(ws.env().get("DUCKTAPE_RUN_SKILLS").expect("skills root"));
+
+    assert_eq!(ro, PathBuf::from(format!("{}-ro", dir.display())));
+    assert_eq!(
+        std::fs::read_to_string(ro.join("qa").join(SKILL_FILE)).unwrap(),
+        SKILL_BODY
+    );
+    // the worktree is UNTOUCHED by the mounts: nothing to stage, nothing to push.
+    run_git(&dir, &["add", "-A"], &[]).unwrap();
+    assert_eq!(
+        git_stdout(&dir, &["status", "--porcelain"]),
+        "",
+        "the skill trees are invisible to git"
+    );
+
+    ws.cleanup().await;
+    assert!(!dir.exists());
+    assert!(!ro.exists(), "the skill root is the run's debris too");
+    assert_eq!(worktree_count(&bed.repo_dir), 1, "primary only");
+}
+
+#[tokio::test]
+async fn a_failed_skill_mount_checkout_leaves_no_debris() {
+    // W5: the run never gets a workspace handle on a failed provision, so the
+    // provision unwinds EVERYTHING it made — the partial ro tree AND the
+    // worktree it had already added (metadata in the shared repo included).
+    let bed = bed();
+    let (prov, _actor) = bed.skill_provisioner(true);
+    let err = provision_err(prov.provision(&bed.skill_spec("s1:0", &bed.head)).await);
+    assert!(
+        err.contains("chunk not available"),
+        "the module's rejection rides out verbatim: {err}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&bed.runs_root).unwrap().count(),
+        0,
+        "neither the worktree nor the ro root survives"
+    );
+    assert_eq!(
+        worktree_count(&bed.repo_dir),
+        1,
+        "primary only — metadata pruned"
+    );
 }
 
 // ---- commit + push --------------------------------------------------------

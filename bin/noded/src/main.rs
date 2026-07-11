@@ -102,6 +102,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // daemon's own http surface at loopback (a wildcard bind is rewritten to
     // 127.0.0.1), where receive-pack submits the ref move to the actor.
     let forge_push_base = noded::agent_provision::forge_push_base(Some(&listen.to_string()));
+    // the same surface, bare (no /forge): the base an agent run's tool plane
+    // dials back as DUCKTAPE_NODE.
+    let node_http_base = noded::agent_provision::node_http_base(Some(&listen.to_string()));
 
     // the per-module derived index: one fluent31 database per module under
     // <storage>/index/<module>/, with each module's view mapper registered.
@@ -145,6 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 actor_storage,
                 actor_forge_repo,
                 forge_push_base,
+                node_http_base,
                 actor_index,
                 blobs,
                 oracle_cmds,
@@ -195,6 +199,7 @@ fn run_node(
     storage: PathBuf,
     forge_repo: PathBuf,
     forge_push_base: Option<String>,
+    node_http_base: Option<String>,
     index: Arc<IndexStore>,
     blobs: noded::blobs::BlobHandle,
     oracle_cmds: mpsc::Sender<NodeCommand>,
@@ -321,6 +326,7 @@ fn run_node(
             agent_dirs,
             &storage_for_runs,
             forge_push_base,
+            node_http_base,
         );
         // resume the local block counter ABOVE the index watermark: the op
         // log persists under --storage, and a counter restarting at 0 would

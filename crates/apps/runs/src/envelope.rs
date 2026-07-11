@@ -4,8 +4,9 @@
 //! input, in consensus, and it rides the dispatch as committed payload data
 //! (P4). the payload is a JSON envelope carrying the agent's real prompt pin
 //! (`prompt_hash`), a thread-continuity key, the generic fallback
-//! instructions, the strict output contract, the rendered conversation, and
-//! the portable workspace plan ([`PortableInputs`]). the host-side worker
+//! instructions, the strict output contract, the rendered conversation, the
+//! runtime section (the tool plane and the run's skill mounts), and the
+//! portable workspace plan ([`PortableInputs`]). the host-side worker
 //! routes on the `ducktape_run` marker and assembles the final model input,
 //! resolving `prompt_hash` from the content-addressed blob store — so the
 //! exact prompt bytes stay verifiable against the committed hash. every run
@@ -40,6 +41,38 @@ pub(crate) const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object 
 {"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[]}
 Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Do not include markdown fences around the JSON."#;
 
+/// the tool-plane sentence every v3 run is told. deliberately SHORT: the
+/// `ducktape` MCP server carries the full tool guide in its own `initialize`
+/// instructions (versioned with the binary), so restating the surface here
+/// would only give the two something to drift apart about. this section points
+/// at the plane; the plane describes itself.
+pub(crate) const TOOL_PLANE_INSTRUCTION: &str = "A Ducktape MCP tool server named \"ducktape\" is available in this session. It is how you read and write Ducktape state — chat, tasks, pages, forge items, and duckfs files. Call its tools instead of guessing; its own instructions describe every tool it offers.";
+
+/// the deterministic runtime section: what this run's session carries. composed
+/// in consensus from the envelope's OWN fields — the skill names it lists are
+/// exactly the ones the host materializes from `skills` — so it stays a pure
+/// function of committed state, with no host input, wall clock, or ordering of
+/// its own (skills keep envelope order).
+///
+/// the skills sentence exists to close a real gap: the host checks the skill
+/// trees out read-only and exports `DUCKTAPE_RUN_SKILLS`, and until now nothing
+/// ever TOLD the model the directory was there. a run that mounts no skills
+/// gains no skills sentence — an empty mount list is not worth a line of the
+/// model's attention — but every run gets the tool-plane sentence.
+fn runtime_section(skills: &[SkillEnvelope]) -> String {
+    if skills.is_empty() {
+        return TOOL_PLANE_INSTRUCTION.to_string();
+    }
+    let names = skills
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{TOOL_PLANE_INSTRUCTION}\nYour skills are mounted read-only under the directory named by the DUCKTAPE_RUN_SKILLS environment variable, one directory per skill: {names}."
+    )
+}
+
 /// the committed payload shape. FIELD ORDER IS PART OF THE COMMITTED BYTES:
 /// serde_json serializes struct fields in declaration order, so this
 /// declaration — not any map — is the canonical layout every validator
@@ -61,12 +94,19 @@ struct RunEnvelope<'a> {
     conversation: String,
     /// the deterministic forge item-context instructions section (M1),
     /// rendered by `inject` from committed tracker state. the oracle's
-    /// `prepare()` assembles the provider input as instructions → context →
-    /// contract → conversation, so this reaches the model as its own section;
-    /// a context-less envelope assembles byte-identically to the context-less
-    /// worker. `None` (an ABSENT key) for every non-forge run.
+    /// `prepare()` assembles the provider input as instructions → runtime →
+    /// context → contract → conversation, so this reaches the model as its own
+    /// section; a context-less envelope assembles byte-identically to the
+    /// context-less worker. `None` (an ABSENT key) for every non-forge run.
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<String>,
+    /// the deterministic runtime section: the ducktape tool plane, plus the
+    /// skill mounts this envelope's own `skills` list asks the host for. every
+    /// v3 run carries it — the tool plane is unconditional — so unlike
+    /// `context` it is never an absent key. it rides AFTER `context` in the
+    /// bytes but BEFORE it in the assembled input: field order is the committed
+    /// layout, reading order is the worker's, and the worker decodes by name.
+    runtime: String,
     workspace: WorkspaceSource,
     skills: Vec<SkillEnvelope>,
     result_contract: ResultContractEnvelope,
@@ -193,6 +233,7 @@ fn envelope(
         contract: STRICT_OUTPUT_INSTRUCTION,
         conversation,
         context: portable.context,
+        runtime: runtime_section(&portable.skills),
         workspace: portable.workspace,
         skills: portable.skills,
         result_contract: ResultContractEnvelope {
@@ -402,6 +443,21 @@ mod tests {
         portable(None, Vec::new())
     }
 
+    fn skill(name: &str) -> SkillEnvelope {
+        SkillEnvelope {
+            name: name.into(),
+            source_prefix: format!("/shared/skills/{name}"),
+            source_snapshot: Some("bb".repeat(32)),
+        }
+    }
+
+    fn runtime_of(payload: &str) -> String {
+        parse(payload)["runtime"]
+            .as_str()
+            .expect("every v3 envelope carries a runtime section")
+            .to_string()
+    }
+
     #[test]
     fn a_chat_envelope_carries_the_prompt_pin_and_anchor_thread_key() {
         let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
@@ -491,6 +547,17 @@ mod tests {
         let j1 = render_job_payload(&agent, "job-1", "spec", plain());
         let j2 = render_job_payload(&agent, "job-1", "spec", plain());
         assert_eq!(j1.as_bytes(), j2.as_bytes());
+
+        // the runtime section is composed, not passed in — so it must be
+        // byte-stable across composes of the same skill list too.
+        let skilled = || portable(None, vec![skill("release"), skill("triage")]);
+        let s1 = render_payload("runs", &agent, "general", 2, None, &transcript, skilled());
+        let s2 = render_payload("runs", &agent, "general", 2, None, &transcript, skilled());
+        assert_eq!(
+            s1.as_bytes(),
+            s2.as_bytes(),
+            "the runtime section is a pure function of the envelope's own fields"
+        );
     }
 
     #[test]
@@ -594,6 +661,76 @@ mod tests {
             "the pin decision is stated as null, not omitted"
         );
         assert_eq!(v["skills"].as_array().unwrap().len(), 0, "no skills is []");
+    }
+
+    // ---- the runtime section (tool plane + skill mounts) -----------------------
+
+    #[test]
+    fn the_runtime_section_names_every_mounted_skill_in_envelope_order() {
+        // the host mounts the skills ro under DUCKTAPE_RUN_SKILLS, one dir per
+        // name — this section is the ONLY thing that tells the model they exist.
+        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let skills = vec![skill("release"), skill("triage"), skill("qa")];
+        let payload = render_payload(
+            "runs",
+            &agent,
+            "general",
+            1,
+            None,
+            &[],
+            portable(None, skills),
+        );
+        let runtime = runtime_of(&payload);
+
+        assert!(
+            runtime.starts_with(TOOL_PLANE_INSTRUCTION),
+            "the tool plane leads: {runtime}"
+        );
+        assert!(
+            runtime.contains("DUCKTAPE_RUN_SKILLS"),
+            "the section names the env var the host actually exports: {runtime}"
+        );
+        // names ride VERBATIM, in envelope order — the mount subpaths are these
+        // names, so a reordered or renamed list would point the model at
+        // directories that are not there.
+        assert!(
+            runtime.ends_with("one directory per skill: release, triage, qa."),
+            "every mounted skill, in envelope order: {runtime}"
+        );
+    }
+
+    #[test]
+    fn a_skill_less_run_composes_the_tool_plane_but_no_skills_sentence() {
+        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let payload = render_payload("runs", &agent, "general", 1, None, &[], plain());
+        let runtime = runtime_of(&payload);
+        assert_eq!(
+            runtime, TOOL_PLANE_INSTRUCTION,
+            "no mounts ⇒ no mounts sentence; the tool plane is unconditional"
+        );
+        assert!(!runtime.contains("DUCKTAPE_RUN_SKILLS"));
+    }
+
+    #[test]
+    fn the_runtime_key_rides_between_context_and_workspace() {
+        // FIELD ORDER IS THE COMMITTED BYTES: runtime sits after `context` and
+        // before `workspace`. (its READING order in the assembled model input
+        // is the worker's business — dispatch-oracle decodes by name and puts
+        // runtime BEFORE context.)
+        let agent = agent_with_hash(vec![7u8; PROMPT_HASH_LEN]);
+        let payload = render_payload("runs", &agent, "general", 1, None, &[], plain());
+        let quoted = serde_json::to_string(TOOL_PLANE_INSTRUCTION).unwrap();
+        assert!(
+            payload.contains(&format!(
+                r#""runtime":{quoted},"workspace":{{"kind":"duckfs""#
+            )),
+            "runtime precedes workspace in the committed layout: {payload}"
+        );
+        // v3 is the ONLY composed version (the v2/flat tolerances died at the
+        // flag day), so there is no legacy composer whose bytes this could
+        // move: every composed envelope is v3 and every v3 envelope carries a
+        // runtime key.
+        assert_eq!(parse(&payload)["ducktape_run"], 3);
     }
 
     // ---- the forge workspace source (M1) --------------------------------------

@@ -99,25 +99,12 @@ impl ForgeLane {
     }
 }
 
-/// derive the forge push base URL from the node's http listen address:
-/// `http://<host>:<port>/forge`, with a wildcard bind rewritten to the SAME
-/// family's loopback (`0.0.0.0` → `127.0.0.1`, `[::]` → `[::1]` — a
-/// bindv6only `[::]` listener refuses v4 loopback dials) — the push must dial
-/// a CONNECTABLE host, and the lane is loopback by design (the node pushes to
-/// ITSELF; the bridge submits the ref move to consensus). `None` in = no http
-/// surface = no push lane.
+/// the forge smart-HTTP base: this node's OWN http base ([`super::node_http_base`]
+/// — same loopback normalisation, one implementation) plus the `/forge` mount.
+/// the lane is loopback by design (the node pushes to ITSELF; the bridge submits
+/// the ref move to consensus). `None` in = no http surface = no push lane.
 pub fn forge_push_base(http_listen: Option<&str>) -> Option<String> {
-    let listen = http_listen?;
-    let base = match listen.parse::<std::net::SocketAddr>() {
-        Ok(addr) if addr.ip().is_unspecified() => {
-            let loopback = if addr.is_ipv6() { "[::1]" } else { "127.0.0.1" };
-            format!("{loopback}:{}", addr.port())
-        }
-        Ok(addr) => addr.to_string(),
-        // not a socket address (hostname:port) — trust the operator's string.
-        Err(_) => listen.to_string(),
-    };
-    Some(format!("http://{base}/forge"))
+    Some(format!("{}/forge", super::node_http_base(http_listen)?))
 }
 
 /// the construction-time probe: host `git` exists AND supports worktrees,
@@ -235,11 +222,17 @@ fn validate_coords(repo: &str, commit: &str, branch: &str) -> Result<(), String>
 }
 
 /// provision one forge run: verify the repo + pinned commit are materialized
-/// on THIS node, then `git worktree add` the work branch at the pinned commit
-/// under the (already D7-validated) run dir.
+/// on THIS node, `git worktree add` the work branch at the pinned commit under
+/// the (already D7-validated) run dir, then materialize the W6 skill mounts
+/// beside it. `handle` is the actor lane those mounts check out over (they are
+/// duckfs subtrees whatever the rw source is); `node_url` is this node's http
+/// base, handed to the run as `DUCKTAPE_NODE`.
 pub(super) async fn provision(
     lane: &ForgeLane,
+    handle: NodeHandle,
     run_dir: PathBuf,
+    ro_root: PathBuf,
+    node_url: Option<String>,
     spec: &WorkspaceSpec,
 ) -> Result<Box<dyn ProvisionedWorkspace>, String> {
     let WorkspaceSource::Forge {
@@ -255,17 +248,6 @@ pub(super) async fn provision(
     let repo_dir = lane.repo_base.join(repo);
     let push_url = format!("{}/{repo}", lane.push_base);
 
-    // W6 parity with the duckfs lane: skill ro mounts are not materialized
-    // yet — loud, never silent (the envelope pinned them on consensus).
-    if !spec.ro_mounts.is_empty() {
-        eprintln!(
-            "[oracle] run {} requests {} skill mount(s) this provisioner \
-             does not materialize yet — running without them",
-            spec.run_id,
-            spec.ro_mounts.len()
-        );
-    }
-
     let blocking = ProvisionArgs {
         repo_dir,
         run_dir,
@@ -276,14 +258,41 @@ pub(super) async fn provision(
         .await
         .map_err(|_| "forge worktree provision task panicked".to_string())??;
 
-    let mut env = BTreeMap::new();
-    env.insert(
-        "DUCKTAPE_RUN_WORKSPACE".into(),
-        workspace_args.run_dir.display().to_string(),
+    // W6 skill ro mounts land at a SUFFIXED SIBLING of the git worktree root
+    // (`<slug>-ro/<name>`), never inside it: the commit bracket's `git add -A`
+    // stages EVERYTHING under the worktree, so a skill tree in there would be
+    // committed with the run's work and PUSHED onto the work branch. beside it,
+    // git cannot see them at all.
+    let ro_dir = if spec.ro_mounts.is_empty() {
+        None
+    } else {
+        let mounts = spec.ro_mounts.clone();
+        let checkout_ro = ro_root.clone();
+        let repo_dir = workspace_args.repo_dir.clone();
+        let run_dir = workspace_args.run_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            super::checkout_ro_mounts(&handle, &checkout_ro, &mounts).inspect_err(|_| {
+                // W5: a failed provision removes ALL its own debris. the mount
+                // helper dropped its partial ro tree; the worktree — and its
+                // metadata in the shared repo — goes here.
+                cleanup_blocking(&repo_dir, &run_dir);
+            })
+        })
+        .await
+        .map_err(|_| "skill mount checkout task panicked".to_string())??;
+        Some(ro_root)
+    };
+
+    let env = super::run_env(
+        &workspace_args.run_dir,
+        ro_dir.as_deref(),
+        node_url.as_deref(),
+        spec,
     );
     Ok(Box::new(ForgeWorkspace {
         repo_dir: workspace_args.repo_dir,
         run_dir: workspace_args.run_dir,
+        ro_dir,
         push_url,
         source: spec.source.clone(),
         agent_id: spec.agent_id.clone(),
@@ -358,6 +367,10 @@ fn provision_blocking(args: ProvisionArgs) -> Result<ProvisionArgs, String> {
 struct ForgeWorkspace {
     repo_dir: PathBuf,
     run_dir: PathBuf,
+    /// the W6 skill ro root (`<slug>-ro`), `Some` iff the run had mounts —
+    /// tracked ONLY so cleanup can remove it; the commit/push never look at it
+    /// (it lives outside the worktree, so git cannot see it either).
+    ro_dir: Option<PathBuf>,
     push_url: String,
     source: WorkspaceSource,
     agent_id: Option<String>,
@@ -531,7 +544,7 @@ impl ProvisionedWorkspace for ForgeWorkspace {
     }
 
     fn path_entries(&self) -> Vec<PathBuf> {
-        Vec::new()
+        super::tool_path_entries()
     }
 
     async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String> {
@@ -571,8 +584,16 @@ impl ProvisionedWorkspace for ForgeWorkspace {
     async fn cleanup(&self) {
         let repo_dir = self.repo_dir.clone();
         let run_dir = self.run_dir.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || cleanup_blocking(&repo_dir, &run_dir)).await;
+        // the skill ro root is the run's debris too — it sits beside the
+        // worktree, so `worktree remove` never touches it.
+        let ro_dir = self.ro_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            cleanup_blocking(&repo_dir, &run_dir);
+            if let Some(ro) = &ro_dir {
+                let _ = std::fs::remove_dir_all(ro);
+            }
+        })
+        .await;
     }
 }
 
