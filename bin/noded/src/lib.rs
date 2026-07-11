@@ -29,6 +29,9 @@ pub use stream::{
 // cap); re-exported flat so the router keeps its bare handler names and the
 // public param structs stay at `noded::CommitBody` &c.
 mod files_http;
+// The WebSocket side-door token store (consumed by the duck:// WS door in the
+// viewer campaign). Public so node-bin's gateway plane can share one store.
+pub mod gateway_ws_token;
 pub use files_http::*;
 // the workspace RPC (`/v1/fs/workspaces`) and its actor-lane `NodeApi` adapter.
 // crate-internal: the router registers the handlers and the adapter is used only
