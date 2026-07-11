@@ -6,11 +6,11 @@
 //! (whichever executor CLI the operator brought), feeds the payload to it,
 //! and submits the raw answer as a saga `OracleResult` op.
 //!
-//! the payload comes in two shapes (see the envelope parser): a legacy flat string
-//! is fed to the provider VERBATIM, and a run ENVELOPE (marker
-//! `ducktape_run`) is assembled host-side — the agent's registered prompt
-//! resolved from the node's blob store by its committed content hash, plus
-//! the contract and conversation the dispatcher composed. beyond that
+//! the payload is a run ENVELOPE (marker `ducktape_run`, v3-only — legacy
+//! flat strings and v2 envelopes fail the run loudly), assembled host-side:
+//! the agent's registered prompt resolved from the node's blob store by its
+//! committed content hash, plus the contract and conversation the dispatcher
+//! composed. beyond that
 //! assembly the crate stays opinion-free: NO prompt text is authored here,
 //! NO output shape is parsed here (the dispatch module judges the recipe's
 //! output contract in consensus), and NO credentials are touched (BYO CLI

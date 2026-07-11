@@ -8,7 +8,7 @@ use super::{
     ChatReply, Ctx, Error, MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES,
     MAX_THREAD_REPLIES, Msg, Origin, PendingState, ReplyBlock, ResultEvent, RunsModule, SagaOrigin,
     TaskMsg, TaskQuery, TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg,
-    chat_encode_query, decode_result_event, envelope, reply_message_id, tasks_decode_reply,
+    chat_encode_query, decode_result_event, reply_message_id, tasks_decode_reply,
     tasks_encode_msg, tasks_encode_query,
 };
 
@@ -22,7 +22,6 @@ use super::{
 const REPLY_KIND_PARAGRAPH: &str = "paragraph";
 const REPLY_KIND_HEADING: &str = "heading";
 pub(crate) const REPLY_KIND_CODE: &str = "code";
-pub(super) const RUNNER_RESULT_VERSION: u32 = envelope::RUNNER_RESULT_VERSION;
 
 /// the model's raw answer as a NORMALIZED [`AgentResponse`]: the wire shape
 /// when it parses (unknown kinds and empty texts drop), a plain paragraph
@@ -140,9 +139,10 @@ fn normalize_response(mut response: AgentResponse, raw_text: &str, job_run: bool
     let bytes =
         serde_json::to_vec(&to_chat_blocks(&response.reply_blocks)).expect("blocks serialize");
     if bytes.len() > MAX_REPLY_BLOCKS_BYTES {
-        response.reply_blocks = vec![paragraph_block(truncate_utf8(
+        response.reply_blocks = vec![paragraph_block(crate::truncate_on_boundary(
             &non_empty_text(raw_text),
             MAX_REPLY_BLOCKS_BYTES / 4,
+            "…",
         ))];
     }
     response
@@ -157,17 +157,6 @@ fn non_empty_text(text: &str) -> String {
     }
 }
 
-pub(crate) fn truncate_utf8(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_string();
-    }
-    let mut keep = max;
-    while keep > 0 && !text.is_char_boundary(keep) {
-        keep -= 1;
-    }
-    format!("{}…", &text[..keep])
-}
-
 /// byte bound on the error excerpt a failure reply carries — same order as
 /// the host's diagnostic excerpts (capability-host bounds stderr to 400).
 pub(super) const FAILURE_EXCERPT_BYTES: usize = 400;
@@ -179,7 +168,7 @@ pub(super) fn failure_excerpt(reason: &str) -> String {
     if line.is_empty() {
         return "no error detail".into();
     }
-    truncate_utf8(&line, FAILURE_EXCERPT_BYTES)
+    crate::truncate_on_boundary(&line, FAILURE_EXCERPT_BYTES, "…")
 }
 
 /// the canonical state form of a dispatch origin (see [`SagaOrigin`]).
@@ -287,11 +276,11 @@ impl RunsModule {
     /// [`AgentResponse`] (validate/emit reused); the sink is applied (cap-gated,
     /// probe-guarded, degrades to a breadcrumb, never aborts); data (R5) +
     /// artifact (O1) + status fold into the faceted finalize payload. a plain
-    /// (message-only) result — raw text or an `AgentResponse` with no runner
-    /// marker — decodes to a facet-free [`RunnerResult`] (Chain sink, Ok status,
-    /// empty effects), so it delivers exactly the model prose + its parsed
-    /// actions. idempotent by run_id — every effect applies once, here, from the
-    /// winning attempt (X2); nothing is emitted mid-run.
+    /// (message-only) wrapper — prose, no facets — delivers exactly the model
+    /// prose + its parsed actions; marker-less bytes FAIL the run (flag day,
+    /// the flat tolerance is gone). idempotent by run_id — every effect
+    /// applies once, here, from the winning attempt (X2); nothing is emitted
+    /// mid-run.
     async fn deliver_run_result(
         &mut self,
         ctx: &mut dyn Ctx,

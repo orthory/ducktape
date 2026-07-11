@@ -136,18 +136,12 @@ impl RunsModule {
         );
         Ok(())
     }
-    fn truncate_job_payload(mut payload: String) -> String {
-        if payload.len() <= JOB_FINALIZE_PAYLOAD_BYTES {
-            return payload;
-        }
-        let marker = "\n[truncated by runs to fit jobs payload cap]";
-        let mut keep = JOB_FINALIZE_PAYLOAD_BYTES.saturating_sub(marker.len());
-        while keep > 0 && !payload.is_char_boundary(keep) {
-            keep -= 1;
-        }
-        payload.truncate(keep);
-        payload.push_str(marker);
-        payload
+    fn truncate_job_payload(payload: String) -> String {
+        crate::truncate_on_boundary(
+            &payload,
+            JOB_FINALIZE_PAYLOAD_BYTES,
+            "\n[truncated by runs to fit jobs payload cap]",
+        )
     }
 
     async fn job_claimed_by_run(

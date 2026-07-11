@@ -1,5 +1,5 @@
 use super::*;
-use crate::facets::{WireSink, WireStatus, decode_run_result_v1};
+use crate::facets::{WireSink, decode_run_result_v1};
 use crate::response::{
     FAILURE_EXCERPT_BYTES, agent_response_from_text, failure_excerpt, parse_strict_response,
 };
@@ -823,7 +823,17 @@ fn runner_wrapper(response_text: &str, facets: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&obj).expect("wrapper serializes")
 }
 
+/// the model's strict-output prose (a bare AgentResponse JSON), wrapped in
+/// the host-assembled runner result the oracle now ALWAYS delivers (the
+/// marker-less flat tolerance is gone — flag day).
 fn response(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
+    let prose = String::from_utf8(response_json(reply, actions)).expect("utf-8");
+    runner_wrapper(&prose, serde_json::json!({}))
+}
+
+/// the bare AgentResponse wire JSON — the PROSE inside [`response`], and the
+/// expected-value shape assertions compare against.
+fn response_json(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
     agent::encode_response(&AgentResponse {
         reply_blocks: reply
             .iter()

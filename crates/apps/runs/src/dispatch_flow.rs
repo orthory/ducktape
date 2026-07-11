@@ -1,11 +1,12 @@
 use super::{
     AgentQuery, AgentRecord, AgentReply, AgentStatus, CONTEXT_WINDOW, ChatQuery, ChatReply, Ctx,
     DispatchMsg, DispatchQuery, DispatchReply, FilesQuery, FilesReply, MAX_PAYLOAD_BYTES,
-    MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule, SagaOrigin, WireSink,
+    MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule, SagaOrigin,
     agent_decode_reply, agent_encode_query, chat_decode_reply, chat_encode_query,
     dispatch_decode_reply, dispatch_encode_msg, dispatch_encode_query, dispatch_id_for, envelope,
     files_decode_reply, files_encode_query, inject, recipe_id_for,
 };
+use crate::facets::WireSink;
 
 impl RunsModule {
     // ---- registry reads --------------------------------------------------------
@@ -141,34 +142,33 @@ impl RunsModule {
 
     // ---- payload preparation (the dispatch plane's composition rule) -----
 
-    /// resolve the portable (v3) inputs, or `None` when the files module is
-    /// unwired.
+    /// resolve the portable inputs every envelope composes with.
     ///
-    /// the files module's PRESENCE is the composer's v2-vs-v3 selector — it is
-    /// genesis-uniform infrastructure, not a version tag. unwired, no files query
-    /// is issued and the composer takes its byte-identical v2 path. wired, every
-    /// validator resolves the SAME committed head, so the composed v3 bytes are
-    /// consensus-uniform; a head query that FAILS becomes the run's error (a
-    /// loud skip at the callsite), never a silent unpinned source.
+    /// the files module is genesis-uniform infrastructure: every production
+    /// composer wires it, and every validator then resolves the SAME committed
+    /// head (W2), so the composed bytes are consensus-uniform; a head query
+    /// that FAILS becomes the run's error (a loud skip at the callsite), never
+    /// a silent unpinned source. unwired (dev tools/tests) the head is an
+    /// explicit null pin — the envelope still composes v3.
     pub(super) async fn portable_inputs(
         &self,
         ctx: &dyn Ctx,
         agent: &AgentRecord,
-    ) -> Result<Option<envelope::PortableInputs>, String> {
-        let Some(files) = self.files.clone() else {
-            return Ok(None);
+    ) -> Result<envelope::PortableInputs, String> {
+        let source_snapshot = match self.files.clone() {
+            Some(files) => self.duckfs_head(ctx, &files).await?,
+            None => None,
         };
-        let source_snapshot = self.duckfs_head(ctx, &files).await?;
         // a pinned skill passes its snapshot through; a tracking skill (no
         // pin) resolves to the SAME committed head this run pins its workspace
         // to (W2) — deterministic across validators.
         let skills = envelope::resolve_skills(agent, &source_snapshot);
-        Ok(Some(envelope::PortableInputs {
+        Ok(envelope::PortableInputs {
             workspace: envelope::duckfs_workspace(agent, source_snapshot),
             skills,
             sink: WireSink::Chain,
             context: None,
-        }))
+        })
     }
 
     /// the committed duckfs head — a dispatch-start committed read, so the
@@ -210,28 +210,26 @@ impl RunsModule {
     ) -> Result<PreparedDispatch, String> {
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
         let mut portable = match super::forge_source::parse_forge_channel(channel_id) {
-            Some(item_ref) => Some(self.forge_portable_inputs(ctx, agent, &item_ref).await?),
+            Some(item_ref) => self.forge_portable_inputs(ctx, agent, &item_ref).await?,
             None => self.portable_inputs(ctx, agent).await?,
         };
         // M2: `[[page:<id>]]` refs in the trigger message text or the injected
         // item body render referenced page subtrees into the same context
         // section — resolved from COMMITTED pages state at compose height,
         // appended after the M1 item context (which stays untouched).
-        if let Some(inputs) = portable.as_mut() {
-            let anchor_text = transcript
-                .last()
-                .map(inject::message_text)
-                .unwrap_or_default();
-            let mut sources = vec![anchor_text.as_str()];
-            if let Some(item) = inputs.context.as_deref() {
-                sources.push(item);
-            }
-            if let Some(section) = self.page_context(ctx, &sources).await {
-                inputs.context = Some(match inputs.context.take() {
-                    Some(item) => format!("{item}\n\n{section}"),
-                    None => section,
-                });
-            }
+        let anchor_text = transcript
+            .last()
+            .map(inject::message_text)
+            .unwrap_or_default();
+        let mut sources = vec![anchor_text.as_str()];
+        if let Some(item) = portable.context.as_deref() {
+            sources.push(item);
+        }
+        if let Some(section) = self.page_context(ctx, &sources).await {
+            portable.context = Some(match portable.context.take() {
+                Some(item) => format!("{item}\n\n{section}"),
+                None => section,
+            });
         }
         let payload = envelope::render_payload(
             &self.id,

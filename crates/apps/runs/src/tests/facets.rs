@@ -26,10 +26,10 @@ fn awaiting_run_with_forge(registry: &Registry) -> (RunsModule, String) {
 
 #[test]
 fn a_plain_result_delivers_its_prose_and_parsed_actions() {
-    // a bare response_text (no runner marker, no facets) flows through the
-    // single delivery path: the message is delivered and the prose-parsed
-    // action is applied — exactly as today's message-only delivery did.
-    let response_text = String::from_utf8(response(
+    // a facet-free wrapper (prose only, no effects/sink/data) flows through
+    // the single delivery path: the message is delivered and the PROSE-parsed
+    // action is applied (the effects-facet fallback).
+    let response_text = String::from_utf8(response_json(
         &["on it"],
         vec![AgentAction::CreateTask {
             task_id: "from_prose".into(),
@@ -46,7 +46,7 @@ fn a_plain_result_delivers_its_prose_and_parsed_actions() {
     exec(
         &mut m,
         &mut ctx,
-        &result_event(&run_id, Ok(response_text.into_bytes())),
+        &result_event(&run_id, Ok(runner_wrapper(&response_text, serde_json::json!({})))),
     )
     .unwrap();
     assert_eq!(ctx.chat_msgs().len(), 1, "the run delivers its message");
@@ -132,7 +132,7 @@ fn empty_effects_falls_back_to_response_parsed_actions() {
     // critic #4 fallback: with an EMPTY effects facet, a model that emitted
     // the action only in prose still gets it applied — never a silent drop.
     let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
-    let response_text = String::from_utf8(response(
+    let response_text = String::from_utf8(response_json(
         &["on it"],
         vec![AgentAction::CreateTask {
             task_id: "t1".into(),

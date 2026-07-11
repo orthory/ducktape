@@ -180,7 +180,22 @@ impl host::worker::Worker for EchoWorker {
             payload: saga::encode_msg(&saga::SagaMsg::OracleResult {
                 saga_id: request.saga_id,
                 attempt: request.attempt,
-                outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id).into_bytes()),
+                // the runs module accepts only ducktape_runner_result wrappers
+                // (the flat-payload tolerance is gone) — wrap the echo like a
+                // real provider result.
+                outcome: Ok(serde_json::json!({
+                    "ducktape_runner_result": 1,
+                    "response_text": format!("echo: handling dispatch {}", work.dispatch_id),
+                    "workspace_receipt": {
+                        "source_prefix": "echo",
+                        "output_snapshot": null,
+                        "commit_height": null,
+                        "rebased": false,
+                        "no_changes": true,
+                    },
+                })
+                .to_string()
+                .into_bytes()),
             }),
         })))
     }

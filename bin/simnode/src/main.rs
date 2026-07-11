@@ -394,6 +394,9 @@ fn run_sim(
             Some("tasks".into()),
             Some("jobs".into()),
         )
+        // the duckfs/files module the portable (v3) composer pins its source
+        // head from (W2) — mandatory for envelope composition.
+        .with_files_module("files")
         // the pages module the composer renders [[page:<id>]] refs from and
         // the pages effects lane writes to; unwired, both degrade.
         .with_pages_module("pages");

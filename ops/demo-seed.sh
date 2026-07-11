@@ -153,7 +153,7 @@ submit jobs '{"submit":{"job_id":"j1","kind":"demo","spec":"render the welcome d
 submit inbox '{"deliver":{"member":"demo","kind":"welcome","body":"Your demo network is ready."}}'
 
 # automations — a rule that files a task whenever someone says "deploy"
-submit automations '{"create_rule":{"rule_id":"deploy-watch","trigger":{"message_posted":{"channel_id":null,"mention":null,"text_contains":"deploy"}},"action":{"create_task":{"task_id_prefix":"deploy","title_template":"Follow up on a deploy mention"}}}}'
+submit automations '{"create_rule":{"rule_id":"deploy-watch","trigger":{"channel_id":null,"mention":null,"text_contains":"deploy"},"action":{"create_task":{"task_id_prefix":"deploy","title_template":"Follow up on a deploy mention"}}}}'
 
 # gateway — publish two web-app routes. The helper binds an Identity account to
 # this node, stages the static site into DuckFS, and signs + submits both routes:
