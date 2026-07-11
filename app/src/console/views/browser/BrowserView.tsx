@@ -93,15 +93,18 @@ export function BrowserView() {
   // inside this rect; hide-on-modal if it ever matters.
   useEffect(() => {
     const el = paneRef.current;
-    const srcUrl = page?.hosting === "gateway" ? page.srcUrl : undefined;
-    if (!inline || !el || !srcUrl || error) return;
+    const gatewayPage = page?.hosting === "gateway" ? page : undefined;
+    const srcUrl = gatewayPage?.srcUrl;
+    if (!inline || !el || !gatewayPage || !srcUrl || error) return;
     const rectOf = (): gateway.InlineRect => {
       const r = el.getBoundingClientRect();
       return { x: r.x, y: r.y, width: r.width, height: r.height };
     };
-    gateway.openInline(srcUrl, page.address.hostname, rectOf()).catch((reason: unknown) => {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    });
+    gateway
+      .openInline(srcUrl, gatewayPage.address.hostname, rectOf())
+      .catch((reason: unknown) => {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      });
     const observer = new ResizeObserver(() => void gateway.placeInline(rectOf()));
     observer.observe(el);
     return () => {
