@@ -7,6 +7,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
+import { createSocket } from "node:dgram";
 import { createConnection } from "node:net";
 
 function readJson(path, fallback) {
@@ -37,6 +38,17 @@ export function freePorts(count) {
   const ports = listeners.map(({ port }) => port);
   listeners.forEach((listener) => listener.stop());
   return ports;
+}
+
+export function freeUdpPort() {
+  return new Promise((resolvePort, reject) => {
+    const socket = createSocket("udp4");
+    socket.once("error", reject);
+    socket.bind(0, "127.0.0.1", () => {
+      const { port } = socket.address();
+      socket.close(() => resolvePort(port));
+    });
+  });
 }
 
 function sh(...args) {
@@ -285,12 +297,13 @@ async function main() {
   const [command, ...args] = Bun.argv.slice(2);
   if (command === "slot") console.log(slotFor(args[0], args[1]));
   else if (command === "ports") console.log(freePorts(Number(args[0])).join(" "));
+  else if (command === "udp-port") process.stdout.write(`${await freeUdpPort()}\n`);
   else if (command === "emit") await emitFleet();
   else if (command === "serve") {
     const server = startWeb(args[0], args[1], args[2], args[3]);
     console.log(`fleet web listening on ${server.url}`);
   } else {
-    throw new Error("usage: fleet.mjs {slot|ports|emit|serve} ...");
+    throw new Error("usage: fleet.mjs {slot|ports|udp-port|emit|serve} ...");
   }
 }
 
