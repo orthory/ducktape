@@ -23,7 +23,7 @@
         "uqr": "^0.1.3",
       },
       "devDependencies": {
-        "@byeongsu-hong/tauri-agent-fleet": "github:byeongsu-hong/tauri-agent-fleet#b8031f5",
+        "@byeongsu-hong/tauri-agent-fleet": "github:byeongsu-hong/tauri-agent-fleet#66a4647",
         "@byeongsu-hong/tauri-agent-plugin": "0.0.2",
         "@tailwindcss/vite": "^4.3.0",
         "@tauri-apps/cli": "^2.11.2",
@@ -65,7 +65,7 @@
 
     "@bramus/specificity": ["@bramus/specificity@2.4.2", "", { "dependencies": { "css-tree": "^3.0.0" }, "bin": { "specificity": "bin/cli.js" } }, "sha512-ctxtJ/eA+t+6q2++vj5j7FYX3nRu311q1wfYH3xjlLOsczhlhxAg2FWNUXhpGvAw3BWo1xBcvOV6/YLc2r5FJw=="],
 
-    "@byeongsu-hong/tauri-agent-fleet": ["@byeongsu-hong/tauri-agent-fleet@github:byeongsu-hong/tauri-agent-fleet#b8031f5", { "dependencies": { "@byeongsu-hong/tauri-agent-plugin": "^0.0.2", "@novnc/novnc": "^1.6.0", "react": "^19.1.1", "react-dom": "^19.1.1" }, "bin": { "tauri-agent-fleet": "./dist/cli.js" } }, "byeongsu-hong-tauri-agent-fleet-b8031f5", "sha512-EEbUqslSXiSX9oEYbAvv6+JGdZfuZXGnWrBFTxWesqiKHElJnZsCvYuW6nHgNUsd/l6ddsMZijbtysC7wI2zEg=="],
+    "@byeongsu-hong/tauri-agent-fleet": ["@byeongsu-hong/tauri-agent-fleet@github:byeongsu-hong/tauri-agent-fleet#66a4647", { "dependencies": { "@byeongsu-hong/tauri-agent-plugin": "^0.0.2", "@novnc/novnc": "^1.6.0", "react": "^19.1.1", "react-dom": "^19.1.1" }, "bin": { "tauri-agent-fleet": "./dist/cli.js" } }, "byeongsu-hong-tauri-agent-fleet-66a4647", "sha512-cQv2HuTJacJr7su4+sKoOV7VLFCG5b/ASKKkvPfxA3gQFlBwJtL+AqKS1lK81hcn7NXrE4IyPKe/60AHHLNt8w=="],
 
     "@byeongsu-hong/tauri-agent-plugin": ["@byeongsu-hong/tauri-agent-plugin@0.0.2", "", { "dependencies": { "@tauri-apps/api": "^2.11.1", "commander": "^14.0.0" }, "peerDependencies": { "jsdom": "^26.1.0" }, "optionalPeers": ["jsdom"], "bin": { "tauri-agent": "dist-cli/tauri-agent.js", "tauri-agent-mcp": "dist-cli/tauri-agent-mcp.js" } }, "sha512-qeOr5hHU40mG8de+6VKwRYWbuTz0nkKepYDy146bFI9yxz3c/h86MWb80I/B0OyCqb6Th54nPj6UadJcuRMKNA=="],
 
