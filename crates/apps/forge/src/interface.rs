@@ -99,7 +99,7 @@ pub enum ForgeMsg {
         open: bool,
     },
     /// merge an open PR. the merge commit is CLIENT-COMPUTED (validators may
-    /// not hold the objects — same trust model as `Push`): the merging client
+    /// not hold the objects — same trust model as `PushRefs`): the merging client
     /// builds it locally, uploads its pack, then submits this op. consensus
     /// gates on a double CAS — the target branch must still be at
     /// `prev_target_oid` AND the source at `expected_source_oid` — then moves

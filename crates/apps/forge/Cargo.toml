@@ -12,7 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # the node-local blob store forge fetches Push packfiles from by digest. the
 # same node-local receipt lane the daemon and the files module share; the
-# packfile bytes never enter consensus (see the `Push` op in lib.rs).
+# packfile bytes never enter consensus (see the `PushRefs` op in lib.rs).
 blobstore = { workspace = true }
 # sha2 rehashes the 20-byte sha1 HEAD oid into a 32-byte StateRoot (always used).
 sha2 = { workspace = true }
