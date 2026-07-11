@@ -43,14 +43,22 @@ fn route_record(publisher: [u8; 32]) -> gateway::RouteRecord {
 async fn ws_side_door_mints_consumes_and_bridges_to_the_lane() {
     let (handle, mut cmd_rx, _events) = NodeHandle::channel();
 
-    // Fake actor: answer the door's route resolution (a gateway Get).
+    // Fake actor: resolve the duck authority (duckdns) and the route (gateway).
     tokio::spawn(async move {
         while let Some(command) = cmd_rx.next().await {
             if let NodeCommand::Query { target, reply, .. } = command {
-                assert_eq!(target, "gateway");
-                let _ = reply.send(Ok(gateway::encode_reply(
-                    &gateway::GatewayReply::Route(Box::new(Some(route_record([2u8; 32])))),
-                )));
+                let bytes = match target.as_str() {
+                    "duckdns" => duckdns::encode_reply(&duckdns::DuckDnsReply::Resolved(Some(
+                        duckdns::ResolvedAccount {
+                            account_id: vec![1; 32],
+                        },
+                    ))),
+                    "gateway" => gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(
+                        Some(route_record([2u8; 32])),
+                    ))),
+                    other => panic!("unexpected query target {other}"),
+                };
+                let _ = reply.send(Ok(bytes));
             }
         }
     });
@@ -81,7 +89,7 @@ async fn ws_side_door_mints_consumes_and_bridges_to_the_lane() {
         .with_browser_gateway("127.0.0.1:0".parse().unwrap());
 
     // Mint a token through the real endpoint (shares the handle's token store).
-    let origin = "duck://app.alice.duck";
+    let origin = "duck://api.alice.duck";
     let mint = gateway_browser_router(handle.clone())
         .oneshot(
             axum::http::Request::builder()
@@ -90,8 +98,7 @@ async fn ws_side_door_mints_consumes_and_bridges_to_the_lane() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "account_id": vec![1u8; 32],
-                        "name": { "label": "api" },
+                        "authority": "api.alice.duck",
                         "origin": origin,
                     })
                     .to_string(),

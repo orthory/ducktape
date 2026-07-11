@@ -43,11 +43,10 @@ mod workspaces;
 // their DispatchPool via `with_provisioner`.
 pub mod agent_provision;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
@@ -61,7 +60,6 @@ use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Re
 use duckfs_core::CHUNK_SIZE;
 use futures::SinkExt as _;
 use futures::channel::{mpsc, oneshot};
-use rand::RngCore as _;
 use sdk::StateRoot;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
@@ -603,21 +601,9 @@ pub enum GatewayFailure {
 
 pub type GatewayLane = tokio::sync::mpsc::Sender<GatewayJob>;
 
-const GATEWAY_SESSION_IDLE: Duration = Duration::from_secs(10 * 60);
-const MAX_GATEWAY_SESSIONS: usize = 64;
-
-#[derive(Clone)]
-struct GatewaySession {
-    account_id: Vec<u8>,
-    name: gateway::RouteName,
-    revision: u64,
-    last_used: Instant,
-}
-
 #[derive(Clone)]
 struct BrowserGateway {
     listen: SocketAddr,
-    sessions: Arc<tokio::sync::Mutex<HashMap<String, GatewaySession>>>,
     /// Single-use tokens for the WebSocket side door (audit S3), shared between
     /// the `/.duck/ws-token` mint and the `/.duck/ws/{token}` upgrade.
     ws_tokens: Arc<gateway_ws_token::WsTokenStore>,
@@ -740,11 +726,10 @@ impl NodeHandle {
     }
 
     /// Enable gateway browsing on a separately bound loopback listener. The
-    /// caller binds first so port 0 becomes an actual session-returned port.
+    /// caller binds first so port 0 becomes an actual reportable port.
     pub fn with_browser_gateway(mut self, listen: SocketAddr) -> Self {
         self.browser_gateway = Some(BrowserGateway {
             listen,
-            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             ws_tokens: Arc::new(gateway_ws_token::WsTokenStore::new()),
         });
         self
@@ -843,7 +828,7 @@ pub fn router(handle: NodeHandle) -> Router {
                 gateway::MAX_REQUEST_BODY_BYTES as usize * 2 + gateway::MAX_PROXY_HEAD_BYTES,
             )),
         )
-        .route("/v1/gateway/session", post(gateway_session))
+        .route("/v1/gateway/browser", get(gateway_browser_base))
         .route(
             "/v1/files/blob",
             // one receipt per request; the json routes keep axum's (smaller)
@@ -1090,83 +1075,97 @@ async fn gateway_proxy(
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct GatewaySessionRequest {
-    pub account_id: Vec<u8>,
-    pub name: gateway::RouteName,
-    pub revision: u64,
-}
-
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GatewaySessionReply {
-    url: String,
+struct GatewayBrowserBase {
+    base: String,
 }
 
-async fn gateway_session(
-    State(handle): State<NodeHandle>,
-    headers: HeaderMap,
-    Json(request): Json<GatewaySessionRequest>,
-) -> Response {
+/// Report the dedicated browser-gateway listener's loopback base URL so the
+/// app's `duck://` scheme handler can reach it (the port is ephemeral, chosen
+/// at bind time). This is the node-API origin, so it is console/native-guarded
+/// like the other control routes; the untrusted page never sees this URL.
+async fn gateway_browser_base(State(handle): State<NodeHandle>, headers: HeaderMap) -> Response {
     if let Some(response) = gateway_api_origin_guard(&headers) {
         return response;
     }
-    let Some(gateway) = handle.browser_gateway.clone() else {
-        return error_response(
+    match &handle.browser_gateway {
+        Some(gateway) => Json(GatewayBrowserBase {
+            base: format!("http://{}", gateway.listen),
+        })
+        .into_response(),
+        None => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway browser gateway is not configured",
-        );
-    };
-    if handle.gateway.is_none() {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "gateway browsing requires an active network overlay",
-        );
+        ),
     }
-    let record = match current_route(&handle, &request.account_id, &request.name).await {
-        Ok(record) => record,
-        Err(failure) => return gateway_failure_response(failure),
-    };
-    if record.statement.revision != request.revision {
-        return error_response(
-            StatusCode::CONFLICT,
-            "gateway route changed; resolve the name again",
-        );
-    }
+}
 
-    let now = Instant::now();
-    let mut sessions = gateway.sessions.lock().await;
-    sessions.retain(|_, session| now.duration_since(session.last_used) < GATEWAY_SESSION_IDLE);
-    if sessions.len() >= MAX_GATEWAY_SESSIONS
-        && let Some(oldest) = sessions
-            .iter()
-            .min_by_key(|(_, session)| session.last_used)
-            .map(|(token, _)| token.clone())
-    {
-        sessions.remove(&oldest);
+/// Resolve a `duck://` authority (`<label>.<handle>.duck` or `<handle>.duck`)
+/// to the account it names and the route label beneath it. Node-local: one
+/// DuckDNS resolve, no session state and no round-trip to the publisher.
+/// `net.duck` and any `<x>.net.duck` are reserved and carry no gateway route.
+async fn resolve_duck_authority(
+    handle: &NodeHandle,
+    authority: &str,
+) -> Result<(Vec<u8>, gateway::RouteName), GatewayFailure> {
+    let trimmed = authority
+        .trim()
+        .strip_prefix("duck://")
+        .unwrap_or(authority.trim())
+        .to_ascii_lowercase();
+    let host = trimmed.split('/').next().unwrap_or_default();
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.last() != Some(&"duck") || (labels.len() != 2 && labels.len() != 3) {
+        return Err(GatewayFailure::Invalid(
+            "duck address must be <account>.duck or <label>.<account>.duck".into(),
+        ));
     }
-    let token = loop {
-        let mut random = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut random);
-        let candidate = hex_bytes(&random);
-        if !sessions.contains_key(&candidate) {
-            break candidate;
-        }
+    let (label, alias) = if labels.len() == 3 {
+        (Some(labels[0]), labels[1])
+    } else {
+        (None, labels[0])
     };
-    sessions.insert(
-        token.clone(),
-        GatewaySession {
-            account_id: request.account_id,
-            name: request.name,
-            revision: request.revision,
-            last_used: now,
-        },
-    );
-    Json(GatewaySessionReply {
-        url: format!("http://{token}.localhost:{}/", gateway.listen.port()),
-    })
-    .into_response()
+    if alias == "net" {
+        return Err(GatewayFailure::NotFound(
+            "net.duck is reserved and has no gateway route".into(),
+        ));
+    }
+    duckdns::validate_handle(alias).map_err(GatewayFailure::Invalid)?;
+    let name = match label {
+        Some(label) => gateway::RouteName::named(label),
+        None => gateway::RouteName::apex(),
+    };
+    name.validate().map_err(GatewayFailure::Invalid)?;
+
+    let (reply, rx) = oneshot::channel();
+    let mut commands = handle.cmds.clone();
+    commands
+        .send(NodeCommand::Query {
+            target: "duckdns".into(),
+            req: duckdns::encode_query(&duckdns::DuckDnsQuery::Resolve {
+                name: duckdns::DuckDnsName {
+                    handle: alias.to_string(),
+                },
+            }),
+            reply,
+        })
+        .await
+        .map_err(|_| GatewayFailure::Unavailable("node actor is gone".into()))?;
+    let bytes = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .map_err(|_| GatewayFailure::Unavailable("duckdns resolve timed out".into()))?
+        .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
+        .map_err(GatewayFailure::Unavailable)?;
+    match duckdns::decode_reply(&bytes) {
+        Ok(duckdns::DuckDnsReply::Resolved(Some(account))) => Ok((account.account_id, name)),
+        Ok(duckdns::DuckDnsReply::Resolved(None)) => Err(GatewayFailure::NotFound(format!(
+            "{alias}.duck is not registered"
+        ))),
+        Ok(_) => Err(GatewayFailure::Unavailable(
+            "duckdns returned an unexpected reply".into(),
+        )),
+        Err(error) => Err(GatewayFailure::Unavailable(error)),
+    }
 }
 
 /// Dedicated gateway-rendering router: no node API, no permissive CORS, and
@@ -1241,60 +1240,43 @@ async fn gateway_browser_proxy(
         )
             .into_response();
     };
-    let expected_suffix = format!(".localhost:{}", gateway.listen.port());
-    let Some(host) = headers
-        .get(header::HOST)
+    // The trusted duck:// scheme handler is the only caller; it forwards the
+    // page's stable authority (`<label>.<handle>.duck`), which the node resolves
+    // fresh each request — there is no session token and no server-side binding.
+    let Some(authority) = headers
+        .get("x-duck-authority")
         .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
     else {
         return error_response(
             StatusCode::MISDIRECTED_REQUEST,
-            "invalid gateway session origin",
+            "missing duck authority",
         );
     };
-    let Some(token) = host.strip_suffix(&expected_suffix).filter(|token| {
-        token.len() == 32
-            && token
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) else {
-        return error_response(
-            StatusCode::MISDIRECTED_REQUEST,
-            "invalid gateway session origin",
-        );
-    };
-    let session_origin = format!("http://{host}");
+    let page_origin = format!("duck://{authority}");
     if headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|origin| origin != session_origin)
+        .is_some_and(|origin| origin != page_origin)
     {
         return error_response(StatusCode::FORBIDDEN, "cross-origin gateway call denied");
     }
-    if headers
-        .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|site| site != "same-origin" && site != "none")
-    {
-        return error_response(StatusCode::FORBIDDEN, "cross-site gateway call denied");
-    }
-    let now = Instant::now();
-    let session = {
-        let mut sessions = gateway.sessions.lock().await;
-        sessions.retain(|_, session| now.duration_since(session.last_used) < GATEWAY_SESSION_IDLE);
-        let Some(session) = sessions.get_mut(token) else {
-            return error_response(StatusCode::GONE, "gateway session expired");
-        };
-        session.last_used = now;
-        session.clone()
+    let (account_id, name) = match resolve_duck_authority(&handle, &authority).await {
+        Ok(resolved) => resolved,
+        Err(failure) => return gateway_failure_response(failure),
+    };
+    let record = match current_route(&handle, &account_id, &name).await {
+        Ok(record) => record,
+        Err(failure) => return gateway_failure_response(failure),
     };
     let forwarded = match gateway_request_headers(&headers) {
         Ok(headers) => headers,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
     };
     let head = gateway::ProxyRequestHead {
-        account_id: session.account_id,
-        name: session.name,
-        revision: session.revision,
+        account_id,
+        name,
+        revision: record.statement.revision,
         method,
         path_and_query: uri
             .path_and_query()
@@ -1316,8 +1298,12 @@ async fn gateway_browser_proxy(
             "publisher returned an invalid status",
         );
     }
+    // connect-src allows the page's own duck origin plus ONLY the dedicated
+    // gateway WS-door port on loopback (audit S1 defense-in-depth: the node-API
+    // port is deliberately excluded, so page content cannot reach `/v1`).
+    let ws_door = format!("ws://127.0.0.1:{0} ws://[::1]:{0}", gateway.listen.port());
     let content_security_policy = format!(
-        "default-src 'none'; script-src 'unsafe-inline' {session_origin}; style-src 'unsafe-inline' {session_origin}; img-src {session_origin} data: blob:; connect-src {session_origin}; font-src {session_origin} data:; media-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'; object-src 'none'; form-action {session_origin}; base-uri 'none'; frame-ancestors 'none'; sandbox allow-scripts allow-same-origin allow-forms; webrtc 'block'"
+        "default-src 'none'; script-src 'unsafe-inline' {page_origin}; style-src 'unsafe-inline' {page_origin}; img-src {page_origin} data: blob:; connect-src {page_origin} {ws_door}; font-src {page_origin} data:; media-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'; object-src 'none'; form-action {page_origin}; base-uri 'none'; frame-ancestors 'none'; sandbox allow-scripts allow-same-origin allow-forms; webrtc 'block'"
     );
     let mut builder = Response::builder()
         .status(status)
@@ -1328,7 +1314,7 @@ async fn gateway_browser_proxy(
         .header("cross-origin-resource-policy", "same-origin")
         .header("cross-origin-opener-policy", "same-origin")
         .header("origin-agent-cluster", "?1")
-        .header("access-control-allow-origin", &session_origin)
+        .header("access-control-allow-origin", &page_origin)
         .header(header::VARY, "Origin")
         .header(
             "permissions-policy",
@@ -2544,8 +2530,7 @@ pub async fn serve(listener: tokio::net::TcpListener, handle: NodeHandle) -> std
 /// listener. The router contains no node API.
 #[derive(Debug, Deserialize)]
 struct WsTokenRequest {
-    account_id: Vec<u8>,
-    name: gateway::RouteName,
+    authority: String,
     origin: String,
 }
 
@@ -2555,9 +2540,10 @@ struct WsTokenReply {
 }
 
 /// Mint a single-use WS side-door token. Called by the duck:// scheme handler
-/// after it has verified the request is same-origin; the handler passes the
-/// page's origin and its resolved route. Native/console-guarded like the other
-/// browser-gateway control routes.
+/// when the page fetches its synthetic same-origin `/.duck/ws`; the handler
+/// passes the page's origin and its authority, which the node resolves to the
+/// bound route just as the content path does. Native/console-guarded like the
+/// other browser-gateway control routes.
 async fn gateway_ws_token_mint(
     State(handle): State<NodeHandle>,
     Json(request): Json<WsTokenRequest>,
@@ -2565,12 +2551,14 @@ async fn gateway_ws_token_mint(
     let Some(browser_gateway) = handle.browser_gateway.clone() else {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway browsing is disabled");
     };
-    if request.origin.is_empty() || gateway::validate_account_id(&request.account_id).is_err() {
-        return error_response(StatusCode::BAD_REQUEST, "origin and account are required");
+    if request.origin.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "origin is required");
     }
-    let token = browser_gateway
-        .ws_tokens
-        .mint(request.origin, request.account_id, request.name);
+    let (account_id, name) = match resolve_duck_authority(&handle, &request.authority).await {
+        Ok(resolved) => resolved,
+        Err(failure) => return gateway_failure_response(failure),
+    };
+    let token = browser_gateway.ws_tokens.mint(request.origin, account_id, name);
     Json(WsTokenReply { token }).into_response()
 }
 
