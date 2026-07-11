@@ -1528,16 +1528,13 @@ mod tests {
             .unwrap();
             publisher.flush().await.unwrap();
             let mut buf = Vec::new();
-            loop {
-                match read_frame(&mut publisher, &mut buf).await {
-                    Ok(frame @ gateway::ProxyFrame::WsFrame { .. }) => {
-                        if write_frame(&mut publisher, &frame).await.is_err() {
-                            break;
-                        }
-                        let _ = publisher.flush().await;
-                    }
-                    _ => break,
+            while let Ok(frame @ gateway::ProxyFrame::WsFrame { .. }) =
+                read_frame(&mut publisher, &mut buf).await
+            {
+                if write_frame(&mut publisher, &frame).await.is_err() {
+                    break;
                 }
+                let _ = publisher.flush().await;
             }
         });
 
