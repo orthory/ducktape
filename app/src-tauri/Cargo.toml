@@ -33,7 +33,13 @@ tauri = { version = "2", default-features = false, features = [
 ] }
 # Rev-pinned like the plugin above: bump deliberately (push to the repo,
 # update the rev, rebuild to refresh Cargo.lock).
-tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "86591aa0afb6da9afcd7f4d80c95f34555692b08" }
+# macos-private-api must stay in sync with the tauri feature above: tauri only
+# forwards it to tauri-runtime-wry, so an out-of-tree runtime has to be synced
+# by hand or macOS builds fail E0046 (WindowBuilder::transparent required by
+# the trait but cfg'd out of the impl).
+tauri-runtime-cef = { git = "https://github.com/byeongsu-hong/tauri-runtime-cef", rev = "86591aa0afb6da9afcd7f4d80c95f34555692b08", features = [
+  "macos-private-api",
+] }
 # native OS toasts for the production notification sink (src/notify/present.rs).
 tauri-plugin-notification = "2"
 # in-app LAN key-enrollment server (pure Rust, no system libs): an ephemeral,
