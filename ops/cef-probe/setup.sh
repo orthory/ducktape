@@ -50,4 +50,27 @@ if [ ! -d "$CLONE" ]; then
   git -C "$CLONE" checkout -q FETCH_HEAD
 fi
 
+# Repo-tracked fixes to the pinned checkout, applied idempotently on every
+# run (cef-env precedes every make target, and the clone may predate a new
+# patch). Today's only patch makes the bundler's CEF helper .apps re-exec
+# the app binary instead of a generic embedded stub: CEF requires every
+# process to register the same custom schemes, and the stub registered
+# none, so `tauri://localhost` origins failed Mojo validation in helper
+# processes and the packaged app rendered a permanently blank window.
+PATCH_DIR="$(cd "$(dirname "$0")" && pwd)/patches"
+for patch in "$PATCH_DIR"/*.patch; do
+  [ -e "$patch" ] || continue
+  if git -C "$CLONE" apply --check --reverse "$patch" 2>/dev/null; then
+    continue # already applied
+  fi
+  if git -C "$CLONE" apply --check "$patch" 2>/dev/null; then
+    echo "[cef] applying $(basename "$patch")"
+    git -C "$CLONE" apply "$patch"
+  else
+    echo "[cef] $(basename "$patch") applies neither forward nor reverse;" \
+      "the checkout has drifted — rm -rf $CLONE and re-run" >&2
+    exit 1
+  fi
+done
+
 echo "cef: ready (CLI checkout at $CLONE)"
