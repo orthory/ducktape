@@ -113,7 +113,6 @@ pub use interface::*;
 
 // dispatch payload composition: the structured run envelope.
 mod envelope;
-pub use envelope::RUN_ENVELOPE_VERSION;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -157,17 +156,17 @@ use tasks::{
 
 /// how many transcript messages (newest-first, ending at the anchor) one run
 /// embeds into its composed payload — the bounded prompt window (P4).
-pub const CONTEXT_WINDOW: u64 = 64;
+pub(crate) const CONTEXT_WINDOW: u64 = 64;
 
 /// whole-dispatch deadline granted to a run's LLM work, in views past the
 /// dispatching block.
-pub const RUN_DEADLINE_VIEWS: u64 = 1024;
+pub(crate) const RUN_DEADLINE_VIEWS: u64 = 1024;
 
 /// oracle attempts per run: one retry after a failed or expired attempt.
-pub const RUN_MAX_ATTEMPTS: u32 = 2;
+pub(crate) const RUN_MAX_ATTEMPTS: u32 = 2;
 
 /// jobs-board claims created by the runs worker use a view-denominated lease.
-pub const JOB_RUN_LEASE_VIEWS: u64 = 1000;
+pub(crate) const JOB_RUN_LEASE_VIEWS: u64 = 1000;
 
 /// jobs finalization payloads must fit the jobs module's 64 KiB cap.
 const JOB_FINALIZE_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -205,7 +204,7 @@ pub fn reply_message_id(run_id: &str) -> String {
 
 /// the dispatch-plane recipe an agent's runs execute under — registered
 /// (module-owned) by the registry hook in the same block as the agent itself.
-pub fn recipe_id_for(agent_id: &str) -> String {
+pub(crate) fn recipe_id_for(agent_id: &str) -> String {
     format!("agent/{agent_id}")
 }
 
@@ -219,6 +218,21 @@ pub fn dispatch_id_for(run_id: &str) -> String {
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// THE char-boundary truncator (one home for what was four hand-rolled
+/// loops): `s` within `budget` bytes is returned untouched; otherwise it is
+/// cut at the largest char boundary that leaves room for `suffix`, and the
+/// suffix is appended — the result never exceeds `budget` bytes.
+pub(crate) fn truncate_on_boundary(s: &str, budget: usize, suffix: &str) -> String {
+    if s.len() <= budget {
+        return s.to_string();
+    }
+    let mut keep = budget.saturating_sub(suffix.len());
+    while keep > 0 && !s.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{}{suffix}", &s[..keep])
 }
 
 mod admin;
@@ -242,13 +256,6 @@ mod response;
 // gates, duplicate-PR guard, and message-facet title/body derivation.
 mod sink;
 mod state;
-
-// crate-root aliases for the pre-split names the forge modules were written
-// against (they cross module boundaries: the wire mirrors live in facets, the
-// reply rendering in response, the ListRefs mirror in sink).
-pub(crate) use facets::{WireSink, WorkspaceReceipt};
-pub(crate) use response::{REPLY_KIND_CODE, truncate_utf8};
-pub(crate) use sink::ForgeSinkQuery;
 
 use response::canonical_origin;
 use state::{
@@ -321,11 +328,11 @@ pub struct RunsModule {
     /// surface. `None` on nodes not wired for the sink; the sink then degrades
     /// to a breadcrumb.
     forge: Option<ModuleId>,
-    /// the duckfs/files module id — queried for the committed head that a
-    /// portable (v3) envelope pins as `source_snapshot` (W2). genesis config,
-    /// NOT committed state (never in `root()`), so it adds no consensus surface.
-    /// its PRESENCE is what selects the portable v3 composer: `Some` composes v3
-    /// (pins the committed head), `None` composes the v2 wire.
+    /// the duckfs/files module id — queried for the committed head every
+    /// envelope pins as `source_snapshot` (W2). genesis config, NOT committed
+    /// state (never in `root()`), so it adds no consensus surface. every
+    /// production composer wires it; unwired (dev tools/tests) the envelope
+    /// still composes v3, with a null pin.
     files: Option<ModuleId>,
     /// the pages module id — queried for `[[page:<id>]]` refs so a run's
     /// context can carry referenced page subtrees (M2). genesis config, NOT
@@ -436,11 +443,11 @@ impl RunsModule {
         self
     }
 
-    /// wire the duckfs/files module so a portable (v3) envelope can pin the
-    /// committed head as `source_snapshot` (W2), after construction — mirrors
-    /// the injected `Option<ModuleId>` collaborators so `new` and every existing
-    /// call site stay untouched. wiring it is what makes the composer emit the
-    /// portable v3 wire; unwired, the composer emits the v2 wire.
+    /// wire the duckfs/files module so the envelope pins the committed head
+    /// as `source_snapshot` (W2), after construction — mirrors the injected
+    /// `Option<ModuleId>` collaborators so `new` and every existing call site
+    /// stay untouched. every production composer wires it; unwired, the
+    /// envelope composes with a null pin.
     pub fn with_files_module(mut self, files: impl Into<ModuleId>) -> Self {
         let files = files.into();
         assert!(

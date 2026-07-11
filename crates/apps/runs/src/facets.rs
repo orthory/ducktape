@@ -1,4 +1,4 @@
-use super::response::RUNNER_RESULT_VERSION;
+use super::envelope::RUNNER_RESULT_VERSION;
 use super::{
     ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
     ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentResponse, Deserialize,
@@ -11,22 +11,23 @@ const MAX_DATA_BYTES: usize = 32 * 1024;
 /// wrapper every run's finalize carries).
 const DELIVERY_RECEIPT_VERSION: u32 = 1;
 
-/// the wrapper a portable (`v3`) provider returns instead of the bare response
-/// text: the model prose plus the host-assembled facets — message
+/// the wrapper the oracle's provisioning path returns instead of the bare
+/// response text: the model prose plus the host-assembled facets — message
 /// (`response_text`) / data / effects / artifact (`workspace_receipt`) / sink /
-/// status. the five facet fields are ADDITIVE `#[serde(default)]`s (this struct
-/// is deliberately NOT `deny_unknown_fields`), so a minimal
-/// `{ducktape_runner_result, response_text, workspace_receipt}` wrapper still
-/// decodes and a bytes-with-no-marker result becomes a message-only result. the
-/// single delivery path ([`RunsModule::deliver_run_result`]) applies whatever
-/// facets are present; a plain (message-only) result carries none.
+/// status. `deny_unknown_fields`: the assembled shape is this crate's own
+/// contract with dispatch-oracle, and an unrecognized key is drift, not
+/// forward compat. the facet fields keep `#[serde(default)]` because the
+/// oracle SKIP-SERIALIZES empty/default facets (the minimal
+/// `{ducktape_runner_result, response_text, workspace_receipt}` shape) —
+/// load-bearing, not forward-compat. the single delivery path
+/// ([`RunsModule::deliver_run_result`]) applies whatever facets are present.
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RunnerResult {
     pub(super) ducktape_runner_result: u32,
     pub(super) response_text: String,
     pub(super) workspace_receipt: WorkspaceReceipt,
     /// R5 typed-data facet: an already-serialized JSON text or `None`.
-    #[serde(default)]
     pub(super) data: Option<String>,
     /// R2 declarative effects, host-assembled (lifted from the model's actions).
     #[serde(default)]
@@ -42,25 +43,20 @@ pub(super) struct RunnerResult {
 #[derive(Deserialize, Default, Debug)]
 pub(crate) struct WorkspaceReceipt {
     pub(crate) source_prefix: String,
-    #[allow(dead_code, reason = "audit metadata retained in dispatch history")]
-    pub(crate) source_snapshot: Option<String>,
     pub(crate) output_snapshot: Option<String>,
     pub(crate) commit_height: Option<u64>,
     pub(crate) rebased: bool,
     pub(crate) no_changes: bool,
     /// `Some` iff the executor's workspace commit failed — the writes were not
-    /// captured (paired with a `degraded` status by the wrapper). additive:
-    /// absent on healthy receipts.
-    #[serde(default)]
+    /// captured (paired with a `degraded` status by the wrapper). the oracle
+    /// skip-serializes it on healthy receipts (a missing Option key is None).
     pub(crate) commit_error: Option<String>,
-    /// forge (§5, additive): the pushed work branch — `Some` on a pushed
-    /// receipt, and the ATTEMPTED branch on a commit-failed one; absent on
-    /// every duckfs receipt.
-    #[serde(default)]
+    /// forge (§5): the pushed work branch — `Some` on a pushed receipt, and
+    /// the ATTEMPTED branch on a commit-failed one; absent on every duckfs
+    /// receipt.
     pub(crate) branch: Option<String>,
-    /// forge (§5, additive): the new commit oid — the forge output_ref is
+    /// forge (§5): the new commit oid — the forge output_ref is
     /// `branch@output_commit`. `Some` only when a push landed.
-    #[serde(default)]
     pub(crate) output_commit: Option<String>,
 }
 
@@ -103,11 +99,10 @@ pub(super) struct WireEffect {
 }
 
 /// the O1/O2 output sink. internally tagged on `mode`; a MISSING sink field
-/// defaults to `Chain` via the `#[serde(default)]` on [`RunnerResult::sink`], and
-/// a present `{"mode":"pr",...}` decodes to `Pr`. `Merge` is DEFINED-BUT-INERT in
-/// v1 (validated on the wire, treated like `Chain` with a breadcrumb).
+/// defaults to `Chain` via the `#[serde(default)]` on [`RunnerResult::sink`],
+/// and a present `{"mode":"pr",...}` decodes to `Pr`.
 ///
-/// ONE shape, both directions (M1): the same type also SERIALIZES as the v3
+/// ONE shape, both directions (M1): the same type also SERIALIZES as the
 /// envelope's REQUESTED sink (`result_contract.sink`). a requested `Pr`
 /// carries empty title/body — the keys skip-serialize, and delivery derives
 /// them from the message facet — and `Chain` composes as an absent field
@@ -127,31 +122,6 @@ pub(crate) enum WireSink {
         title: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         body: String,
-    },
-    Merge {
-        #[serde(default)]
-        repo: String,
-        number: u64,
-        #[allow(
-            dead_code,
-            reason = "merge sink wire is forward-compatible but inert in v1"
-        )]
-        prev_target_oid: String,
-        #[allow(
-            dead_code,
-            reason = "merge sink wire is forward-compatible but inert in v1"
-        )]
-        expected_source_oid: String,
-        #[allow(
-            dead_code,
-            reason = "merge sink wire is forward-compatible but inert in v1"
-        )]
-        merge_oid: String,
-        #[allow(
-            dead_code,
-            reason = "merge sink wire is forward-compatible but inert in v1"
-        )]
-        pack_digest: String,
     },
 }
 
@@ -179,32 +149,20 @@ pub(super) enum WireStatus {
 // facets it carries; a plain (message-only) result carries none.
 
 /// decode the full faceted [`RunnerResult`]. marker + version strict (R4): a
-/// wrapper that claims the marker but is malformed or an unsupported version
-/// fails the run. bytes with NO marker — every legacy raw-text result — become a
-/// message-only result (response_text = the lossy-decoded bytes, no facets).
+/// result that is not a well-formed `ducktape_runner_result` wrapper of the
+/// understood version FAILS THE RUN, deterministically — the flat-string
+/// passthrough for marker-less bytes is gone (flag day; the oracle always
+/// wraps).
 pub(super) fn decode_run_result_v1(bytes: &[u8]) -> Result<RunnerResult, String> {
-    match serde_json::from_slice::<serde_json::Value>(bytes) {
-        Ok(serde_json::Value::Object(map)) if map.contains_key("ducktape_runner_result") => {
-            let result: RunnerResult = serde_json::from_value(serde_json::Value::Object(map))
-                .map_err(|e| format!("runner result is malformed: {e}"))?;
-            if result.ducktape_runner_result != RUNNER_RESULT_VERSION {
-                return Err(format!(
-                    "runner result version {} is not supported (understands {RUNNER_RESULT_VERSION})",
-                    result.ducktape_runner_result
-                ));
-            }
-            Ok(result)
-        }
-        _ => Ok(RunnerResult {
-            ducktape_runner_result: RUNNER_RESULT_VERSION,
-            response_text: String::from_utf8_lossy(bytes).into_owned(),
-            workspace_receipt: WorkspaceReceipt::default(),
-            data: None,
-            effects: Vec::new(),
-            sink: WireSink::Chain,
-            status: WireStatus::Ok,
-        }),
+    let result: RunnerResult = serde_json::from_slice(bytes)
+        .map_err(|e| format!("runner result is malformed (no flat-payload tolerance): {e}"))?;
+    if result.ducktape_runner_result != RUNNER_RESULT_VERSION {
+        return Err(format!(
+            "runner result version {} is not supported (understands {RUNNER_RESULT_VERSION})",
+            result.ducktape_runner_result
+        ));
     }
+    Ok(result)
 }
 
 /// map host-assembled declarative effects into the validated [`AgentAction`]

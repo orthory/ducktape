@@ -1,26 +1,25 @@
 use super::*;
 
-// ---- the composer's v2-vs-v3 selection (files presence) ---------------------
+// ---- the composer always emits the portable v3 wire --------------------------
 
 #[test]
-fn a_run_composes_v2_without_files_and_v3_with_files_wired() {
+fn a_run_composes_v3_with_or_without_files_wired() {
     let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
     let agent = record("bot", &[ACTION_CHAT_POST]);
     let head = "aa".repeat(32);
 
-    // no files module: the byte-identical v2 payload, no portable fields.
+    // no files module (dev tools/tests): still the v3 wire, with a null pin.
     let m0 = module();
     let ctx0 = CaptureCtx::new()
         .with_registry(&registry)
         .with_transcript("general", transcript(2));
     let prepared = block_on(m0.prepare_dispatch(&ctx0, &agent, "general", 2)).unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
-    assert_eq!(v["ducktape_run"], 2, "no files module composes v2");
+    assert_eq!(v["ducktape_run"], 3, "every composer emits v3 (flag day)");
     assert!(
-        v.get("workspace").is_none(),
-        "no v3 workspace without files"
+        v["workspace"]["source_snapshot"].is_null(),
+        "an unwired files module composes an explicit null pin"
     );
-    assert!(v.get("skills").is_none());
 
     // files wired: the v3 payload pins the committed head.
     let m4 = module().with_files_module("files");
@@ -62,16 +61,6 @@ fn portable_inputs_gate_pin_and_skill_resolution() {
         },
     ];
 
-    // no files module: None (the composer takes its v2 path).
-    let unwired = module();
-    let ctx0 = CaptureCtx::new().with_files_head(&head);
-    assert!(
-        block_on(unwired.portable_inputs(&ctx0, &agent))
-            .unwrap()
-            .is_none(),
-        "no portable inputs without a wired files module"
-    );
-
     let m = module().with_files_module("files");
 
     // the duckfs snapshot pin, from the tagged workspace source.
@@ -84,9 +73,9 @@ fn portable_inputs_gate_pin_and_skill_resolution() {
         }
     }
 
-    // files wired + a committed head: Some, head pinned, skills resolved.
+    // files wired + a committed head: head pinned, skills resolved.
     let ctx4 = CaptureCtx::new().with_files_head(&head);
-    let inputs = block_on(m.portable_inputs(&ctx4, &agent)).unwrap().unwrap();
+    let inputs = block_on(m.portable_inputs(&ctx4, &agent)).unwrap();
     assert_eq!(duckfs_pin(&inputs).as_deref(), Some(head.as_str()));
     assert!(inputs.sink.is_chain(), "the duckfs lane requests no sink");
     assert!(inputs.context.is_none(), "the duckfs lane injects no context");
@@ -101,42 +90,50 @@ fn portable_inputs_gate_pin_and_skill_resolution() {
         "a tracking skill pins the same committed head (W2)"
     );
 
-    // files wired + an unresolved head: Some with a null pin (fresh network).
+    // files wired + an unresolved head: a null pin (fresh network).
     let ctx_empty = CaptureCtx::new();
-    let inputs = block_on(m.portable_inputs(&ctx_empty, &agent))
-        .unwrap()
-        .unwrap();
+    let inputs = block_on(m.portable_inputs(&ctx_empty, &agent)).unwrap();
     assert!(
         duckfs_pin(&inputs).is_none(),
-        "an unresolved head is a legitimate null pin, still Some"
+        "an unresolved head is a legitimate null pin"
+    );
+
+    // no files module (dev tools/tests): no query is issued, the pin is null,
+    // skills still resolve (a tracking skill then has no head to pin to).
+    let unwired = module();
+    let ctx0 = CaptureCtx::new().with_files_head(&head);
+    let inputs = block_on(unwired.portable_inputs(&ctx0, &agent)).unwrap();
+    assert!(
+        duckfs_pin(&inputs).is_none(),
+        "an unwired files module composes a null pin, never a files query"
+    );
+    assert_eq!(
+        inputs.skills[1].source_snapshot, None,
+        "a tracking skill stays unpinned without a files head"
     );
 }
 
 // ---- runner-result decode (facet-free + faceted) ----------------------------
 
 #[test]
-fn legacy_raw_text_results_decode_as_message_only() {
-    // a raw-text result (or the AgentResponse JSON the model emits) carries
-    // no runner marker, so it decodes to a facet-free message-only result:
-    // response_text = the lossy-decoded bytes, no effects, Chain sink, Ok.
+fn marker_less_results_are_loud_errors_not_message_only_delivery() {
+    // FLAG DAY: the flat-string passthrough is gone. bytes without the
+    // ducktape_runner_result marker — raw prose, bare AgentResponse JSON,
+    // invalid utf-8 — fail the decode deterministically (the run fails).
     for raw in [
-        "just a prose answer",
-        "",
-        r#"{"reply_blocks":[{"id":"x","kind":"paragraph","text":"hi"}],"actions":[]}"#,
+        "just a prose answer".as_bytes(),
+        "".as_bytes(),
+        br#"{"reply_blocks":[{"id":"x","kind":"paragraph","text":"hi"}],"actions":[]}"#.as_slice(),
         // a JSON object WITHOUT the marker is not a runner wrapper.
-        r#"{"response_text":"nope"}"#,
+        br#"{"response_text":"nope"}"#.as_slice(),
+        &[0xff, 0xfe],
     ] {
-        let result = decode_run_result_v1(raw.as_bytes()).unwrap();
-        assert_eq!(result.response_text, raw);
-        assert!(result.effects.is_empty());
-        assert!(matches!(result.sink, WireSink::Chain));
-        assert_eq!(result.status, WireStatus::Ok);
+        let err = decode_run_result_v1(raw).unwrap_err();
+        assert!(
+            err.contains("malformed"),
+            "{raw:?} must be a loud error, got {err:?}"
+        );
     }
-    // invalid utf-8 still degrades lossily rather than erroring.
-    assert_eq!(
-        decode_run_result_v1(&[0xff, 0xfe]).unwrap().response_text,
-        "\u{fffd}\u{fffd}"
-    );
 }
 
 #[test]

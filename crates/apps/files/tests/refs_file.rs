@@ -11,7 +11,8 @@ mod harness;
 use harness::open_files;
 
 use files::state::{PinEntry, Refs, Staged, root_bytes};
-use files::{DiskStore, Kind, ObjectStore as _};
+use duckfs_disk::DiskStore;
+use files::{Kind, ObjectStore as _};
 use sdk::{Module as _, StateRoot};
 
 fn a_refs() -> Refs {

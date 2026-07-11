@@ -6,14 +6,11 @@
 //! dispatch-oracle CANNOT depend on duckfs-client (the reachability wall — a
 //! kernel/system crate must never touch the OS-side checkout engine), so this
 //! module speaks only plain data: the concrete `checkout_with`/`commit` calls
-//! live in the node binary's provisioner impl. the pool brackets a portable
-//! run with provision → bind → run → commit → assemble → cleanup ONLY when
-//! both a v3 plan AND a wired provisioner exist; otherwise the run is
-//! byte-identical to the legacy path (see [`crate::pool`]). this path is LIVE
-//! in both node binaries: they wire the files module unconditionally, so the
-//! runs composer emits v3 for every agent run (the de-versioned activation —
-//! no flag day, pre-production re-genesis). only embedders without a files
-//! module (dev tools, tests) still compose v2.
+//! live in the node binary's provisioner impl. the pool brackets a run with
+//! provision → bind → run → commit → assemble → cleanup ONLY when a
+//! provisioner is wired; an embedder without one keeps the accept-only
+//! degrade (raw-text delivery, no workspace). this path is LIVE in both node
+//! binaries.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -24,9 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::workspace_source::WorkspaceSource;
 
-/// the pinned portable plan carried by [`crate::Prepared`] for a v3 envelope.
-/// `Some` only for a v3 run; the pool turns it into a
-/// [`WorkspaceSpec`] iff a provisioner is wired, else it is inert (dormant).
+/// the pinned portable plan carried by [`crate::Prepared`]. the pool turns it
+/// into a [`WorkspaceSpec`] iff a provisioner is wired, else it is inert
+/// (dormant).
 ///
 /// carries NO `mount_path`: the composer emits SOURCE coordinates only (D7),
 /// and the provisioner mints its own writable host cwd. `skills` are the C4
@@ -37,7 +34,6 @@ use crate::workspace_source::WorkspaceSource;
 pub struct PortablePlan {
     pub source: WorkspaceSource,
     pub sink: Sink,
-    pub base_tools: Vec<BaseTool>,
     pub skills: Vec<RoMount>,
 }
 
@@ -50,18 +46,9 @@ pub struct WorkspaceSpec {
     /// the pinned source the provisioner materializes — a duckfs subtree or a
     /// forge repo@commit on a work branch, verbatim from the plan.
     pub source: WorkspaceSource,
-    pub base_tools: Vec<BaseTool>,
     /// W6 skill/instruction ro subtrees — the plan's C4 skill mounts,
     /// verbatim.
     pub ro_mounts: Vec<RoMount>,
-}
-
-/// one base-tool manifest entry (validated at accept; bindings wired later).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BaseTool {
-    pub name: String,
-    pub version: String,
-    pub exposure: String,
 }
 
 /// a read-only mount the provisioner materializes beside the rw source (W6) —
@@ -337,6 +324,14 @@ struct RunnerResultWire<'a> {
 /// const; `runs` reads it back as `u32 == 1` and unwraps `response_text`
 /// deterministically on every node. empty/default facets skip-serialize, so a
 /// plain run's bytes stay byte-compatible with the pre-v4 minimal shape.
+///
+/// the assembled bytes are delivered as the saga's Ok payload, and the saga
+/// ABORTS any Ok larger than [`saga::MAX_RESULT_BYTES`] at the block — the
+/// attempt could then never land and the run would wedge until its deadline.
+/// so the assembly is capped HERE: an oversized result gets its PROSE
+/// truncated (char-boundary, with a note naming the original size) while the
+/// receipt/effects/sink survive; in the pathological case where even a
+/// note-only wrapper is over, the effects and data facets are dropped too.
 pub fn assemble_runner_result(
     response_text: &str,
     receipt: &WorkspaceReceipt,
@@ -345,16 +340,44 @@ pub fn assemble_runner_result(
     sink: Sink,
     status: Status,
 ) -> Vec<u8> {
-    serde_json::to_vec(&RunnerResultWire {
-        ducktape_runner_result: crate::envelope::RUNNER_RESULT_VERSION,
-        response_text,
-        workspace_receipt: receipt,
+    let encode = |text: &str, data: Option<String>, effects: Vec<RunEffect>| {
+        serde_json::to_vec(&RunnerResultWire {
+            ducktape_runner_result: crate::envelope::RUNNER_RESULT_VERSION,
+            response_text: text,
+            workspace_receipt: receipt,
+            data,
+            effects,
+            sink: sink.clone(),
+            status,
+        })
+        .expect("runner result serializes")
+    };
+    let full = encode(response_text, data.clone(), effects.clone());
+    if full.len() <= saga::MAX_RESULT_BYTES {
+        return full;
+    }
+    // removing N prose bytes shrinks the JSON by AT LEAST N (escaping only
+    // grows a byte), so cutting the overage plus the note's own length (with
+    // slack for the note's escaped newline) always fits — one re-serialize,
+    // no loop.
+    let note = format!("\n[output truncated ({} bytes)]", response_text.len());
+    let mut keep = response_text
+        .len()
+        .saturating_sub(full.len() - saga::MAX_RESULT_BYTES + note.len() + 16);
+    while keep > 0 && !response_text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let truncated = encode(
+        &format!("{}{note}", &response_text[..keep]),
         data,
         effects,
-        sink,
-        status,
-    })
-    .expect("runner result serializes")
+    );
+    if truncated.len() <= saga::MAX_RESULT_BYTES {
+        return truncated;
+    }
+    // the non-prose facets alone exceed the cap (a pathological effects/data
+    // payload): drop them — a degraded-but-landing result beats a wedged saga.
+    encode(&note, None, Vec::new())
 }
 
 /// LIFT the model's `tasks.create` / `tasks.update_status` /
@@ -468,11 +491,6 @@ mod tests {
                 source_prefix: "/shared/agent-workspaces/bot".into(),
                 source_snapshot: Some("aa".repeat(32)),
             },
-            base_tools: vec![BaseTool {
-                name: "ducktape-files".into(),
-                version: "1".into(),
-                exposure: "cli".into(),
-            }],
             ro_mounts: Vec::new(),
         }
     }
@@ -487,7 +505,6 @@ mod tests {
                 branch: "agent/item-7".into(),
                 branch_born: false,
             },
-            base_tools: Vec::new(),
             ro_mounts: Vec::new(),
         }
     }

@@ -56,7 +56,7 @@ fn create_rule(rule_id: &str, channel: &str, action: Action) -> Msg {
         target: AUTO.into(),
         payload: auto_encode_msg(&AutomationsMsg::CreateRule {
             rule_id: rule_id.into(),
-            trigger: Trigger::MessagePosted {
+            trigger: Trigger {
                 channel_id: Some(channel.into()),
                 mention: None,
                 text_contains: None,
