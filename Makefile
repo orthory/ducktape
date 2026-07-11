@@ -103,6 +103,7 @@ ifeq ($(UNAME_S),Darwin)
 app: cef-env app/node_modules
 	cd app && $(CARGO) run --manifest-path "$(CEF_CLONE)/crates/tauri-cli/Cargo.toml" --bin cargo-tauri -- build --ignore-version-mismatches
 	bash ops/check-macos-cef-bundle.sh target/release/bundle/macos/Ducktape.app
+	bash ops/smoke-macos-app.sh target/release/bundle/macos/Ducktape.app
 	bash ops/fix-dmg.sh
 else
 app: cef-env app/node_modules
