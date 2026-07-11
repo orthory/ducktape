@@ -267,7 +267,7 @@ impl ModuleCategory {
     pub fn of(id: &str) -> Self {
         match id {
             "chat" | "tasks" | "inbox" | "pages" => Self::Workspace,
-            "forge" | "agent" | "evm" => Self::Developer,
+            "forge" | "agent" => Self::Developer,
             "automations" | "jobs" => Self::Automation,
             _ => Self::System,
         }
@@ -624,7 +624,7 @@ mod tests {
         for id in ["chat", "tasks", "inbox", "pages"] {
             assert_eq!(ModuleCategory::of(id), Workspace, "{id}");
         }
-        for id in ["forge", "agent", "evm"] {
+        for id in ["forge", "agent"] {
             assert_eq!(ModuleCategory::of(id), Developer, "{id}");
         }
         for id in ["automations", "jobs"] {
