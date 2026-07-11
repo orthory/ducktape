@@ -1,0 +1,221 @@
+# super-app workspace — a consensus platform of isolated modules. each module
+# publishes its wire surface (types-only payload/query/reply shapes + codecs)
+# at its crate root; cross-module product interaction goes through those wire
+# types and host-mediated queries, never another module's internals. layout:
+#   crates/kernel/   — the platform: sdk (interface), state (app-hash), host
+#                      (dispatch), node (transport seam), consensus (BFT orderer)
+#   crates/system/   — consensus infrastructure modules (kv, valset)
+#   crates/apps/     — product feature modules (forge, chat, tasks, pages, …)
+#   crates/examples/ — demo + test scaffolding modules (directory, greeter)
+#   bin/             — runnable binaries (in-process demo, real-socket node)
+# the host dispatches modules over BFT consensus and composes each authenticated
+# root into the global app-hash. cosmwasm's isolation *pattern*, native rust.
+
+[workspace]
+resolver = "2"
+members = [
+    # kernel — the platform (contract + dispatch + transport + BFT ordering)
+    "crates/kernel/sdk", "crates/kernel/state", "crates/kernel/host",
+    "crates/kernel/node", "crates/kernel/consensus", "crates/kernel/reactor",
+    "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
+    "crates/kernel/capability-host",
+    # system — consensus infrastructure modules
+    "crates/system/kv", 
+    "crates/system/valset", 
+    
+    "crates/system/governance",
+    "crates/system/identity",
+    "crates/system/upgrade", 
+    "crates/system/wireguard-upgrade",
+    "crates/system/wireguard-effect",
+    "crates/system/nat-traversal",
+    "crates/system/reachability",
+    "crates/system/data-plane",
+    "crates/system/overlay-net",
+    "crates/system/saga",
+    "crates/system/capability",
+    "crates/system/blobstore",
+    "crates/system/dispatch",
+    "crates/system/dispatch-oracle",
+    "crates/system/tagging",
+    "crates/duckdns",
+    "crates/system/duckdns",
+    "crates/system/gateway",
+    "crates/duckfs/core",
+    "crates/duckfs/disk",
+    "crates/duckfs/client",
+    # apps — product feature modules
+    "crates/apps/forge",
+    "crates/apps/pages",
+    "crates/apps/chat",
+    "crates/apps/agent",
+    "crates/apps/runs", 
+    "crates/apps/tasks", 
+    "crates/apps/vaults", 
+    "crates/apps/automations", 
+    "crates/apps/inbox", 
+    "crates/apps/files",
+    "crates/apps/jobs",
+    # examples — demo / test scaffolding modules
+    "crates/examples/directory", "crates/examples/greeter",
+    # bin — runnable binaries
+    "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
+    "bin/fs",
+    # app — the desktop shell of the react client (web twin ships from app/)
+    "app/src-tauri",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+arrayvec = "0.7"
+crossbeam-channel = "0.5"
+lru = "0.18"
+smallvec = "1"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+rand = "0.8"
+# Opus codec (voice) — pure Rust, no C toolchain. No FEC-decode / PLC in the
+# decoder (empty input errors), so the voice engine renders lost frames as
+# silence; see crates/apps/chat/src/voice.
+opus-rs = "0.1"
+
+# commonware — one ecosystem, version-aligned (see auto-memory reference_qmdb_commonware).
+commonware-storage = "2026.5.0"
+commonware-runtime = "2026.5.0"
+commonware-cryptography = "2026.5.0"
+commonware-codec = "2026.5.0"
+# the simplex BFT stack — used by the `consensus` crate (the real orderer);
+# pinned here so every commonware crate stays on the one version.
+commonware-consensus = "2026.5.0"
+commonware-resolver = "2026.5.0"
+commonware-p2p = "2026.5.0"
+commonware-parallel = "2026.5.0"
+commonware-utils = "2026.5.0"
+commonware-actor = "2026.5.0"
+defguard_wireguard_rs = "0.10.0"
+# the userspace overlay backend (overlay-net/userspace): the SAME BoringTun
+# core the TUN path already runs (defguard_wireguard_rs's fork), used sans-io
+# (`noise::Tunn`, no device layer) — wire compat between socket-mode and
+# tun-mode nodes is by construction, not by hope. version pinned to the one
+# defguard_wireguard_rs 0.10 resolves, so both paths share one build of the
+# crypto core.
+defguard_boringtun = "0.6.5"
+# the userspace backend's virtual host: a TUN-less TCP/UDP stack terminating
+# at the node's overlay ULA, entirely in-process. `medium-ip` because the
+# tunnel carries raw IP (WireGuard has no link layer), `async` for the
+# waker-based socket surface.
+smoltcp = { version = "0.13", default-features = false, features = [
+    "std", "medium-ip", "proto-ipv6", "socket-udp", "socket-tcp", "async",
+] }
+# the node's own WireGuard identity is X25519 (WireGuard's curve, not the
+# ed25519 signer's); static_secrets because the key persists across boots.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64 = "0.22"
+p256 = "0.13"
+# duckfs path normalization: NFC so visually-identical names collide instead
+# of coexisting (a consensus-determinism requirement, not cosmetics).
+unicode-normalization = "0.1"
+# tests only: isolated on-disk module data dirs.
+tempfile = "3"
+# user-key v2 at-rest custody (bin/node/src/userkey.rs only): BIP39
+# wordlist + entropy checksum (the PBKDF2 `to_seed` path is deliberately
+# unused — see the identity-onboarding design doc's custody model),
+# argon2id KEK derivation, and XChaCha20-Poly1305 AEAD. zeroize scrubs the
+# derived key on drop.
+bip39 = "2"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = "1"
+
+# fluent31 — the derived read-model engine (LSM + MVCC snapshots) behind the
+# per-module indexer tier ONLY: nothing the app-hash commits to may live in it
+# (evaluated and rejected as a canonical substrate — see handoff/restart-recovery.md).
+# default-features = false drops the in-database WASM layer (wasmtime).
+fluent31 = { git = "https://github.com/orthory/fluent31", default-features = false }
+
+# internal — kernel crates (the platform)
+sdk = { path = "crates/kernel/sdk" }
+state = { path = "crates/kernel/state" }
+host = { path = "crates/kernel/host" }
+node = { path = "crates/kernel/node" }
+consensus = { path = "crates/kernel/consensus" }
+reactor = { path = "crates/kernel/reactor" }
+statesync = { path = "crates/kernel/statesync" }
+recovery = { path = "crates/kernel/recovery" }
+indexer = { path = "crates/kernel/indexer" }
+capability-host = { path = "crates/kernel/capability-host" }
+# per-module materialized views on the derived tier (indexer + the module's
+# types-only interface crate — never the module impl).
+# internal — module impl crates
+kv = { path = "crates/system/kv" }
+valset = { path = "crates/system/valset" }
+governance = { path = "crates/system/governance" }
+identity = { path = "crates/system/identity" }
+upgrade = { path = "crates/system/upgrade" }
+saga = { path = "crates/system/saga" }
+capability = { path = "crates/system/capability" }
+blobstore = { path = "crates/system/blobstore" }
+dispatch = { path = "crates/system/dispatch" }
+dispatch-oracle = { path = "crates/system/dispatch-oracle" }
+tagging = { path = "crates/system/tagging" }
+duckdns-core = { path = "crates/duckdns" }
+duckdns = { path = "crates/system/duckdns" }
+gateway = { path = "crates/system/gateway" }
+forge = { path = "crates/apps/forge" }
+pages = { path = "crates/apps/pages" }
+chat = { path = "crates/apps/chat" }
+agent = { path = "crates/apps/agent" }
+runs = { path = "crates/apps/runs" }
+tasks = { path = "crates/apps/tasks" }
+vaults = { path = "crates/apps/vaults" }
+automations = { path = "crates/apps/automations" }
+inbox = { path = "crates/apps/inbox" }
+files = { path = "crates/apps/files" }
+duckfs-core = { path = "crates/duckfs/core" }
+duckfs-disk = { path = "crates/duckfs/disk" }
+duckfs-client = { path = "crates/duckfs/client" }
+jobs = { path = "crates/apps/jobs" }
+directory = { path = "crates/examples/directory" }
+greeter = { path = "crates/examples/greeter" }
+# internal — types-only interface crates (the legal cross-module surface)
+wireguard-upgrade = { path = "crates/system/wireguard-upgrade" }
+wireguard-effect = { path = "crates/system/wireguard-effect" }
+nat-traversal = { path = "crates/system/nat-traversal" }
+reachability = { path = "crates/system/reachability" }
+data-plane = { path = "crates/system/data-plane" }
+overlay-net = { path = "crates/system/overlay-net" }
+
+# overlay-net's wrapper context implements commonware-runtime's `Clock` and
+# rng bounds, whose supertraits live in these crates — pinned to the exact
+# versions commonware-runtime 2026.5.0 depends on (a different semver-major
+# would be a different trait).
+governor = "0.10.2"
+rand_core = "0.6.4"
+
+# --- CEF runtime ---
+# The desktop shell runs on tauri-runtime-cef (unreleased upstream: tauri's
+# feat/cef branch). Until a real tauri-cef release exists, the whole
+# workspace builds against our fork branch `ducktape-cef`
+# (github.com/byeongsu-hong/tauri) — upstream feat/cef plus two mechanical
+# commits: default_runtime flipped to Cef (so the shell's ~120 bare
+# AppHandle/WebviewWindow command types resolve without signature edits)
+# and a 2.90.0 version bump (a [patch] silently loses the version race to
+# a newer registry release otherwise). Machine-independent: no local
+# checkout, no setup step for plain builds; Cargo.lock pins the rev.
+[patch.crates-io]
+tauri = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
+tauri-build = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
+tauri-runtime = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
+tauri-utils = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
+tauri-macros = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
+tauri-codegen = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
+tauri-plugin = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
