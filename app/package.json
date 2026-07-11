@@ -31,7 +31,7 @@
     "uqr": "^0.1.3"
   },
   "devDependencies": {
-    "@byeongsu-hong/tauri-plugin-agent": "0.0.1",
+    "@byeongsu-hong/tauri-agent-plugin": "0.0.2",
     "@tailwindcss/vite": "^4.3.0",
     "@tauri-apps/cli": "^2.11.2",
     "@testing-library/jest-dom": "^6.9.1",
