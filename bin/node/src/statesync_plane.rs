@@ -72,13 +72,13 @@ pub fn socket_factory(
 
 /// bulk ceiling for the statesync plane instance: a static compromise between
 /// sync time (~24 MB/s ≈ 42 s/GB) and real-time headroom. State sync and
-/// gateway now share this one process ceiling; adaptive per-link shaping is a
-/// separate concern.
+/// gateway and agent telemetry share this one process ceiling; adaptive
+/// per-link shaping is a separate concern.
 const BULK_BYTES_PER_SEC: u64 = 24_000_000;
 const BULK_BURST_BYTES: u64 = 512 * 1024;
 
 /// One link-headroom budget shared by every stream-class per-use plane in this
-/// process (state sync and gateway responses today).
+/// process (state sync, gateway responses, and agent telemetry today).
 pub fn shared_bulk_pacer() -> BulkPacer {
     BulkPacer::new(BULK_BYTES_PER_SEC, BULK_BURST_BYTES)
 }

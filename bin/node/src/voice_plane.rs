@@ -84,20 +84,37 @@ impl MediaPeers {
     }
 
     /// This node's own overlay `/128` — where its media sockets bind.
-    fn own_ip(&self, me: &[u8; 32]) -> IpAddr {
+    pub(crate) fn own_ip(&self, me: &[u8; 32]) -> IpAddr {
         IpAddr::V6(ula_of(&self.namespace, me))
     }
 
-    fn overlay_ip(&self, raw: &[u8; 32]) -> IpAddr {
+    pub(crate) fn overlay_ip(&self, raw: &[u8; 32]) -> IpAddr {
         IpAddr::V6(ula_of(&self.namespace, raw))
     }
 
-    fn peer_at(&self, src: IpAddr) -> Option<PeerId> {
+    pub(crate) fn peer_at(&self, src: IpAddr) -> Option<PeerId> {
         self.reverse
             .read()
             .expect("media peers lock")
             .get(&src)
             .copied()
+    }
+
+    pub(crate) fn contains(&self, peer: PeerId) -> bool {
+        self.reverse
+            .read()
+            .expect("media peers lock")
+            .values()
+            .any(|known| *known == peer)
+    }
+
+    pub(crate) fn peer_ids(&self) -> Vec<PeerId> {
+        self.reverse
+            .read()
+            .expect("media peers lock")
+            .values()
+            .copied()
+            .collect()
     }
 }
 

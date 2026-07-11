@@ -4,7 +4,7 @@
 // node prunes entries the moment a result lands, at which point the run
 // reappears under HISTORY.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { AgentRecord } from "../../../domain/agent-client";
 import type { Channel } from "../../../domain/chat-client";
@@ -93,15 +93,20 @@ const MAX_OUTPUT_LINES = 1_000;
 function RunOutputPane({ run }: { run: PendingRun }) {
   const { transport } = useDucktape();
   const [lines, setLines] = useState<OutputLine[]>([]);
+  const pane = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setLines([]);
     if (!transport) return;
     let nextId = 0;
+    let lastCursor = 0;
     const topic = runOutputTopic(run.dispatch_id);
     return transport.subscribe([topic], {
       onTail: (frame) => {
         if (frame.topic !== topic || !isRunOutputTailItem(frame.item)) return;
+        const cursor = Number(frame.cursor);
+        if (!Number.isSafeInteger(cursor) || cursor <= lastCursor) return;
+        lastCursor = cursor;
         const line: OutputLine = {
           id: nextId++,
           kind: "line",
@@ -112,6 +117,9 @@ function RunOutputPane({ run }: { run: PendingRun }) {
       },
       onLagged: (laggedTopic, cursor) => {
         if (laggedTopic !== topic) return;
+        const nextCursor = Number(cursor);
+        if (!Number.isSafeInteger(nextCursor) || nextCursor <= lastCursor) return;
+        lastCursor = nextCursor;
         const line: OutputLine = {
           id: nextId++,
           kind: "gap",
@@ -122,8 +130,13 @@ function RunOutputPane({ run }: { run: PendingRun }) {
     });
   }, [transport, run.dispatch_id]);
 
+  useEffect(() => {
+    if (pane.current) pane.current.scrollTop = pane.current.scrollHeight;
+  }, [lines]);
+
   return (
     <div
+      ref={pane}
       style={{
         marginTop: 10,
         border: `1px solid ${color.borderSoft}`,
@@ -379,6 +392,7 @@ function RunRow({
             <button
               type="button"
               aria-expanded={expanded}
+              aria-label={`${expanded ? "Hide" : "Show"} live log for run ${run.run_id}`}
               onClick={() => setExpanded((v) => !v)}
               style={{
                 ...secondaryButton,
@@ -387,7 +401,7 @@ function RunRow({
                 font: `600 10px ${font.sans}`,
               }}
             >
-              Output
+              Live log
             </button>
           </div>
           <div

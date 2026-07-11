@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
@@ -7,6 +7,8 @@ import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
 import type { Channel } from "../../../domain/chat-client";
 import type { Workspace } from "../../../domain/workspace-client";
+import type { NodeTransport, TopicHandlers } from "../../../domain/transport";
+import { makeTransportStub } from "../../../test/transport-stub";
 import { AgentView, runIsMine } from "./AgentView";
 import type { PendingRun } from "../../../domain/runs-client";
 
@@ -33,7 +35,10 @@ const channels: Channel[] = [
   },
 ];
 
-const renderAgents = (patch: Partial<ConsoleState> = {}) => {
+const renderAgents = (
+  patch: Partial<ConsoleState> = {},
+  transport?: NodeTransport,
+) => {
   const initialState = {
     ...createInitialState(),
     connected: true,
@@ -96,7 +101,7 @@ const renderAgents = (patch: Partial<ConsoleState> = {}) => {
     ) as ConsoleActions;
 
     return (
-      <ConsoleContext.Provider value={{ state, actions }}>
+      <ConsoleContext.Provider value={{ state, actions, transport }}>
         <AgentView />
       </ConsoleContext.Provider>
     );
@@ -333,6 +338,34 @@ describe("AgentView", () => {
 
     openTab(/activity/i);
     expect(screen.getByText("on Node Bob")).toBeInTheDocument();
+  });
+
+  it("opens a running session and tails its live output", () => {
+    let handlers: TopicHandlers | undefined;
+    const transport = makeTransportStub({
+      query: vi.fn().mockResolvedValue({ recent_runs: [] }),
+      view: vi.fn().mockResolvedValue({ usage: [] }),
+      subscribe: vi.fn((_topics, next) => {
+        handlers = next;
+        return () => {};
+      }),
+    });
+    renderAgents({}, transport);
+
+    openTab(/activity/i);
+    fireEvent.click(screen.getByRole("button", { name: /show live log for run/i }));
+    act(() => {
+      const frame = {
+        type: "tail",
+        topic: `run-output:${"ef".repeat(32)}`,
+        cursor: "1",
+        item: { stream: "stdout", line: "[node cafe1234] working" },
+      } as const;
+      handlers?.onTail?.(frame);
+      handlers?.onTail?.(frame); // StrictMode can race a subscribe replay.
+    });
+
+    expect(screen.getAllByText("[node cafe1234] working")).toHaveLength(1);
   });
 
   it("filters the timeline to the runs I requested", () => {
