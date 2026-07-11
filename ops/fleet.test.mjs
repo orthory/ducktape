@@ -35,6 +35,23 @@ test("desktop builds propagate the default CEF path and caller overrides", () =>
   expect(command("/caller/cef")).toBe("/caller/cef");
 });
 
+test("fleet only starts repo-local managed worktrees", () => {
+  const fleetScript = readFileSync(new URL("./fleet.sh", import.meta.url), "utf8");
+  const policy = fleetScript.match(/^managed_worktree\(\)\{[\s\S]*?^\}/m)?.[0];
+  expect(policy).toBeDefined();
+
+  const accepted = (path) => spawnSync(
+    "bash",
+    ["-c", `${policy}\nMAIN_ROOT=/repo\nmanaged_worktree "$1"`, "fleet-policy", path],
+  ).status === 0;
+
+  expect(accepted("/repo")).toBe(true);
+  expect(accepted("/repo/.worktree/fix-swap")).toBe(true);
+  expect(accepted("/repo-sibling")).toBe(false);
+  expect(accepted("/repo/.claude/worktrees/legacy")).toBe(false);
+  expect(accepted("/tmp/ducktape")).toBe(false);
+});
+
 test("udp-port emits plain digits when terminal colors are forced", () => {
   const result = spawnSync("bun", [join(import.meta.dir, "fleet.mjs"), "udp-port"], {
     encoding: "utf8",

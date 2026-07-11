@@ -50,6 +50,12 @@ mkdir -p "$STATE" "$TOKENS"
 log(){ printf '  %s\n' "$*"; }
 port_up(){ ss -ltn 2>/dev/null | grep -q "127.0.0.1:$1 \|$TSIP:$1 \|0.0.0.0:$1 \|\*:$1 "; }
 slug(){ echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9]#-#g; s#--*#-#g; s#^-##; s#-$##'; }
+managed_worktree(){
+  case "$1" in
+    "$MAIN_ROOT"|"$MAIN_ROOT"/.worktree/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 # ── worktree discovery ──────────────────────────────────
 # emits TSV rows: <path>\t<branch>\t<id>   (one per worktree with an app/ dir)
@@ -76,7 +82,7 @@ ensure_node_bin(){
   [ -x "$NODE_BIN" ] && [ -s "$NODE_BIN" ] && return 0
   mkdir -p "$(dirname "$NODE_BIN")"
   log "staging ducktape-node (cargo build -p node-bin)…"
-  ( cd "$MAIN_ROOT" && cargo build -p node-bin >"$STATE/node-build.log" 2>&1 ) \
+  ( cd "$MAIN_ROOT" && CARGO_TARGET_DIR="$MAIN_ROOT/target" cargo build -p node-bin >"$STATE/node-build.log" 2>&1 ) \
     || { log "node-bin build FAILED — see $STATE/node-build.log"; return 1; }
   # copy OUT of target/: tauri dev's build.rs overwrites target/debug/ducktape-node
   # with a 0-byte placeholder, which spawns permission-denied.
@@ -108,6 +114,10 @@ JSON
 # ── bring up ONE worktree instance ──────────────────────
 up_one(){
   local path="$1" branch="$2" id="$3"
+  if ! managed_worktree "$path"; then
+    log "[$id] refused: move the worktree under $MAIN_ROOT/.worktree before fleet QA"
+    return 1
+  fi
   local slot; slot="$(slot_for "$id")"
   local disp=":$((DISP_BASE+slot))" vite=$((VITE_BASE+slot)) vnc=$((VNC_BASE+slot))
   local home="$STATE/$id/home" wsdir="$STATE/$id"
@@ -149,6 +159,7 @@ JSON
       HOME="$home" \
       CEF_PATH="${CEF_PATH:-$REAL_HOME/.local/share/cef}" \
       CARGO_HOME="$REAL_HOME/.cargo" RUSTUP_HOME="$REAL_HOME/.rustup" \
+      CARGO_TARGET_DIR="$path/target" \
       XDG_CACHE_HOME="$home/.cache" BUN_INSTALL_CACHE_DIR="$REAL_HOME/.bun/install/cache" \
       PATH="$REAL_HOME/.local/bin:$PATH" \
       DISPLAY="$disp" WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 \
