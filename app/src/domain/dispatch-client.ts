@@ -28,6 +28,12 @@ export interface DispatchView {
   status: DispatchStatus;
   outcome: unknown;
   assignee: number[] | null;
+  attempt: number | null;
+  max_attempts: number | null;
+  lease_expires_at: number | null;
+  deadline: number | null;
+  lease_updated_at: number | null;
+  reassignable: boolean | null;
   created_at: number;
   updated_at: number;
 }
@@ -50,6 +56,29 @@ export const dispatch = (
     .then((reply) => replyVariant<DispatchView | null>(reply, "dispatch"));
 
 /** The run's current executor node as a hex key, or null when it isn't
- *  in-flight/assigned. The join value for `state.runAssignee`. */
+ *  in-flight/assigned. */
 export const assigneeHex = (view: DispatchView | null): string | null =>
   view?.assignee ? keyHex(view.assignee) : null;
+
+export interface RunLease {
+  assigneeHex: string | null;
+  attempt: number;
+  maxAttempts: number;
+  expiresAt: number | null;
+  deadline: number | null;
+  updatedAt: number | null;
+  reassignable: boolean;
+}
+
+export const runLease = (view: DispatchView | null): RunLease | null =>
+  view?.attempt === null || view?.attempt === undefined
+    ? null
+    : {
+        assigneeHex: assigneeHex(view),
+        attempt: view.attempt,
+        maxAttempts: view.max_attempts ?? 1,
+        expiresAt: view.lease_expires_at,
+        deadline: view.deadline,
+        updatedAt: view.lease_updated_at,
+        reassignable: view.reassignable ?? false,
+      };

@@ -306,14 +306,13 @@ pub fn request_matches_record(head: &ProxyRequestHead, record: &RouteRecord) -> 
 mod tests {
     use super::*;
     use crate::{
-        MemberAuthorization, ROUTE_FORMAT_VERSION, RouteDefinition, RoutePolicy, RouteStatement,
-        RouteTarget,
+        MemberAuthorization, RouteDefinition, RoutePolicy, RouteStatement, RouteTarget,
     };
 
     fn record() -> RouteRecord {
         RouteRecord {
             statement: RouteStatement {
-                version: ROUTE_FORMAT_VERSION,
+                version: 1,
                 chain_id: "test".into(),
                 account_id: vec![1; 32],
                 name: RouteName::named("api"),

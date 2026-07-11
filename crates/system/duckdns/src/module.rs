@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use duckdns_core::{
+use crate::{
     DuckDnsMsg, DuckDnsQuery, DuckDnsReply, Registry, decode_msg, decode_query, encode_reply,
 };
 use identity::{

@@ -68,11 +68,10 @@ fn main() {
             workspaces::gateway_route_bind,
             workspaces::gateway_route_unbind,
             workspaces::gateway_route_list,
-            gateway_window::gateway_open_window,
-            gateway_window::gateway_inline_supported,
             gateway_window::gateway_open_inline,
             gateway_window::gateway_inline_place,
             gateway_window::gateway_inline_close,
+            gateway_window::gateway_inline_hide_all,
             workspaces::workspace_create,
             workspaces::workspace_join,
             workspaces::workspace_invite_blob,
@@ -88,7 +87,6 @@ fn main() {
             workspaces::workspace_log_tail,
             workspaces::workspace_runtime_facts,
             workspaces::user_identity_confirm_mnemonic,
-            user_identity::user_identity_status,
             user_identity::user_identity_state,
             user_identity::user_identity_create,
             user_identity::user_identity_restore,
@@ -151,7 +149,7 @@ fn main() {
             Ok(())
         });
 
-    // dev-only debug bridge (tauri-plugin-agent): registers our agent debugger
+    // dev-only debug bridge (tauri-agent-plugin): registers our agent debugger
     // so the `tauri-agent` CLI / MCP server can drive the real native UI —
     // semantic tree, input, DOM-SVG screenshots, logs — over an app-scoped
     // endpoint registry. Gated to debug + desktop; a release runtime never
@@ -162,7 +160,7 @@ fn main() {
     // set XDG_RUNTIME_DIR per instance to isolate parallel worktree apps.
     #[cfg(all(debug_assertions, desktop))]
     {
-        builder = builder.plugin(tauri_plugin_agent::init());
+        builder = builder.plugin(tauri_agent_plugin::init());
     }
 
     let app = builder

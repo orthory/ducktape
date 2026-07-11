@@ -2,12 +2,26 @@
 # publishes its wire surface (types-only payload/query/reply shapes + codecs)
 # at its crate root; cross-module product interaction goes through those wire
 # types and host-mediated queries, never another module's internals. layout:
-#   crates/kernel/   — the platform: sdk (interface), host
-#                      (dispatch), node (transport seam), consensus (BFT orderer)
-#   crates/system/   — consensus infrastructure modules (kv, valset)
-#   crates/apps/     — product feature modules (forge, chat, tasks, pages, …)
-#   crates/examples/ — demo + test scaffolding modules (directory, greeter)
-#   bin/             — runnable binaries (in-process demo, real-socket node)
+#   crates/kernel/   — the platform: sdk (the module contract + sdk::codec),
+#                      host (submit/execute loop, app-hash composition, the
+#                      host::worker seam), node (ordered replication), consensus
+#                      (BFT orderer), statesync, recovery, indexer
+#   crates/system/   — system modules and their host-side counterparts:
+#                      consensus modules (kv, valset, governance, identity,
+#                      upgrade, saga, capability, dispatch, tagging, duckdns,
+#                      gateway) and off-consensus infra (blobstore,
+#                      dispatch-oracle, capability-host, wireguard,
+#                      nat-traversal, reachability, data-plane, overlay-net)
+#   crates/apps/     — product feature modules (forge, chat, pages, agent,
+#                      runs, tasks, vaults, automations, inbox, files, jobs)
+#   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
+#                      — the `files` module wraps it), disk, client (OS-side)
+#   crates/examples/ — reference modules: directory (also bin/node's liveness
+#                      canary), greeter (the types-only composition example),
+#                      evm (experimental; genesis-registered in the daemons)
+#   bin/             — demo (in-process walkthrough), node (validator),
+#                      noded (the app-facing daemon), simnode (deterministic
+#                      /v1 twin), coordinator (STUN rendezvous), fs (duckfs CLI)
 # the host dispatches modules over BFT consensus and composes each authenticated
 # root into the global app-hash. cosmwasm's isolation *pattern*, native rust.
 
@@ -18,7 +32,6 @@ members = [
     "crates/kernel/sdk", "crates/kernel/host",
     "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
-    "crates/kernel/capability-host",
     # system — consensus infrastructure modules
     "crates/system/kv", 
     "crates/system/valset", 
@@ -33,11 +46,11 @@ members = [
     "crates/system/overlay-net",
     "crates/system/saga",
     "crates/system/capability",
+    "crates/system/capability-host",
     "crates/system/blobstore",
     "crates/system/dispatch",
     "crates/system/dispatch-oracle",
     "crates/system/tagging",
-    "crates/duckdns",
     "crates/system/duckdns",
     "crates/system/gateway",
     "crates/duckfs/core",
@@ -150,7 +163,7 @@ consensus = { path = "crates/kernel/consensus" }
 statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }
-capability-host = { path = "crates/kernel/capability-host" }
+capability-host = { path = "crates/system/capability-host" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 # internal — module impl crates
@@ -165,7 +178,6 @@ blobstore = { path = "crates/system/blobstore" }
 dispatch = { path = "crates/system/dispatch" }
 dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }
-duckdns-core = { path = "crates/duckdns" }
 duckdns = { path = "crates/system/duckdns" }
 gateway = { path = "crates/system/gateway" }
 forge = { path = "crates/apps/forge" }

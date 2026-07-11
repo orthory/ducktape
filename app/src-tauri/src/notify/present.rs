@@ -4,6 +4,12 @@ use tauri_plugin_notification::NotificationExt;
 use super::{engine::Sink, matchers::Notification};
 
 /// The production notification sink backed by the desktop application.
+///
+/// Toasts are title + body only. Click-navigation (a deep-link target per
+/// notification) was deliberately NOT built: tauri-plugin-notification exposes
+/// no toast click/action events on our platforms, so a target would feed
+/// nothing. Don't re-grow that machinery until OS toast actions are wired;
+/// the tray popover has its own navigate path (`tray_open_console`).
 pub struct AppSink<R: Runtime>(pub AppHandle<R>);
 
 impl<R: Runtime> Sink for AppSink<R> {

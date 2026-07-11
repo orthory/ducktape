@@ -43,41 +43,24 @@ impl ValidatorRuntime<'_> {
             signer,
             label,
             peers,
-            dev_demo,
             checkpoint_blocks,
-            announce_capabilities,
             stream_hub,
             index,
             blobs,
             metrics,
-            expected,
             applied,
-            converged,
             pending_submits,
             pending_relays,
             validator_relay,
             last_published,
             blocks_since_checkpoint,
             last_reach_view,
-            last_flush,
             pending_retarget,
-            heartbeat_disabled,
-            last_crank,
-            last_nudge,
-            workers,
-            signaller,
-            announcer,
-            upgrade_armed_latch,
-            upgrade_pending_seen,
             next_drain,
             ..
         } = self;
         let context = *context;
-        let dev_demo = *dev_demo;
         let checkpoint_blocks = *checkpoint_blocks;
-        let announce_capabilities = *announce_capabilities;
-        let heartbeat_disabled = *heartbeat_disabled;
-        let expected = *expected;
 
         *next_drain = context.current() + DRAIN_TICK;
         // FAIL-STOP: a drain error is a node-local block-boundary
@@ -612,176 +595,31 @@ impl ValidatorRuntime<'_> {
             }
         }
 
-        // BLOCK CADENCE + heartbeat, unified. `submit`/`submit_frame`
-        // now ENQUEUE into the node's `pending_batch`; this is the one
-        // place per block-time that FLUSHES the window — packing every
-        // frame that arrived in it (real ops and/or an idle nop) into
-        // ONE batch super-frame and proposing it as a single block.
-        // that is the aggregation: at most one block per BLOCK_TIME,
-        // carrying all the window's txs, never 1-tx-1-block.
-        //
-        // the idle nop still exists: finalized views only advance with
-        // a proposed frame, so an idle network would freeze (its height
-        // never ticks and a pending cutover, which crosses only when
-        // finalized views REACH it, would park forever). so on an EMPTY
-        // window inject one deterministically-rejected nop (unknown
-        // module target: rejects identically everywhere, leaves no
-        // state) and flush that. a window with real ops needs no nop —
-        // the ops ARE the block.
-        //
-        // GATE the idle nop on an empty orderer FIFO too: a nop pushed
-        // while a batch still awaits finalization only piles behind a
-        // finalization stall (a flapping quorum peer would stack idle
-        // blocks). real ops are never gated — they must not wait.
-        if !heartbeat_disabled && last_flush.elapsed() >= consensus::BLOCK_TIME {
-            *last_flush = std::time::Instant::now();
-            if node.pending_batch_len() == 0 && node.orderer().pending_len() == 0 {
-                let seq = *next_seq;
-                *next_seq += 1;
-                if let Err(e) = node
-                    .submit(
-                        signer,
-                        seq,
-                        Msg {
-                            target: NOP_TARGET.into(),
-                            payload: Vec::new(),
-                        },
-                    )
-                    .await
-                {
-                    eprintln!("[node {label}] heartbeat nop submit failed: {e}");
-                }
-            }
-            // flush the window: no-op when `pending_batch` is empty
-            // (idle with a batch already in flight — wait for it).
-            if let Err(e) = node.flush_batch().await {
-                eprintln!("[node {label}] batch flush failed: {e}");
-            }
-        }
+        // the state-driven pumps, each its own method below: block
+        // cadence/heartbeat, upgrade readiness, capability announce,
+        // saga crank, dispatch delivery nudge.
+        self.pump_heartbeat().await;
+        self.pump_readiness_signal().await;
+        self.pump_capability_announce().await;
+        self.pump_saga_crank().await;
+        self.pump_dispatch_nudge().await;
 
-        // READINESS SIGNAL (design §3 / plan Task 7.1): a current
-        // boundary member whose binary can execute the pending upgrade
-        // self-submits ONE `SignalReady`. gated to a current member (the
-        // R = n readiness denominator); the signaller's own committed
-        // read + local latch keep it idempotent. inert on a baseline net.
-        if orchestrator
-            .current_members()
-            .contains(&signer.public_key())
-            && let Some((msg, name, to_version)) = signaller.maybe_signal(node.host()).await
-        {
-            let seq = *next_seq;
-            *next_seq += 1;
-            match node.submit(signer, seq, msg).await {
-                Ok(_) => {
-                    println!("[node {label}] signaled ready name={name} to_version={to_version}")
-                }
-                Err(e) => {
-                    // un-latch so a transient submit failure retries on
-                    // the next tick (the module stays idempotent).
-                    signaller.signaled = None;
-                    eprintln!("[node {label}] readiness signal submit failed: {e}");
-                }
-            }
-        }
-
-        // CAPABILITY ANNOUNCE: a current member whose discovered
-        // provider set differs from the committed registry
-        // self-submits ONE declarative `Announce`. member-gated (the
-        // module rejects non-members) and idempotent (committed-read
-        // + local latch). inert on a host with no executor CLIs, and
-        // suppressed entirely under `announce_capabilities = false`
-        // (the accept-lane-only provider: this node still executes
-        // what it can, but only by claiming unassigned announcements
-        // — it never enters a tag's rendezvous pool).
-        if announce_capabilities
-            && orchestrator
-                .current_members()
-                .contains(&signer.public_key())
-            && let Some(msg) = announcer.maybe_announce(node.host()).await
-        {
-            let seq = *next_seq;
-            *next_seq += 1;
-            match node.submit(signer, seq, msg).await {
-                Ok(_) => println!(
-                    "[node {label}] announced capabilities {:?}",
-                    announcer.capabilities
-                ),
-                Err(e) => {
-                    // un-latch so a transient submit failure retries.
-                    announcer.announced = None;
-                    eprintln!("[node {label}] capability announce submit failed: {e}");
-                }
-            }
-        }
-
-        // SAGA CRANK (P7 liveness, host side): nothing else ever
-        // submits `SagaMsg::Crank`, and under strict leases a
-        // saga whose assignee went dark advances ONLY via a crank
-        // (lease re-lease or deadline timeout). state-driven:
-        // when the committed next expiry is at or past the latest
-        // finalized height, push one permissionless crank —
-        // throttled like the heartbeat, since a backlog wider
-        // than CRANK_BUDGET legitimately needs several. duplicate
-        // cranks from other nodes are deterministic no-ops.
-        if last_crank.elapsed() >= consensus::BLOCK_TIME
-            && let Some(finalized_height) = node.finalized().map(|f| f.height)
-            && let Some(expiry) = saga_next_expiry(node.host()).await
-            && expiry <= finalized_height
-        {
-            *last_crank = std::time::Instant::now();
-            let seq = *next_seq;
-            *next_seq += 1;
-            if let Err(e) = node
-                .submit(
-                    signer,
-                    seq,
-                    Msg {
-                        target: "saga".into(),
-                        payload: saga::encode_msg(&saga::SagaMsg::Crank {}),
-                    },
-                )
-                .await
-            {
-                eprintln!("[node {label}] saga crank submit failed: {e}");
-            } else {
-                println!(
-                    "[node {label}] saga crank submitted \
-                             (next expiry {expiry} <= height {finalized_height})"
-                );
-            }
-        }
-
-        // DISPATCH DELIVERY NUDGE (never-pop-stack liveness): a
-        // result committed into the dispatch mailbox delivers via
-        // the drain's DeliverPending injection in the NEXT
-        // successful block — and heartbeat nops are rejected
-        // frames that never apply, so a quiet chain would sit on
-        // its mailbox. state-driven: while the committed mailbox
-        // is non-empty, push one permissionless Nudge — a no-op
-        // whose block carries the injection. duplicate nudges
-        // from other nodes are free.
-        if last_nudge.elapsed() >= consensus::BLOCK_TIME
-            && dispatch_pending_deliveries(node.host()).await > 0
-        {
-            *last_nudge = std::time::Instant::now();
-            let seq = *next_seq;
-            *next_seq += 1;
-            if let Err(e) = node
-                .submit(
-                    signer,
-                    seq,
-                    Msg {
-                        target: "dispatch".into(),
-                        payload: dispatch::encode_msg(&dispatch::DispatchMsg::Nudge {}),
-                    },
-                )
-                .await
-            {
-                eprintln!("[node {label}] dispatch nudge submit failed: {e}");
-            } else {
-                println!("[node {label}] dispatch delivery nudge submitted");
-            }
-        }
+        let Self {
+            node,
+            next_seq,
+            signer,
+            label,
+            dev_demo,
+            expected,
+            applied,
+            converged,
+            workers,
+            upgrade_armed_latch,
+            upgrade_pending_seen,
+            ..
+        } = self;
+        let dev_demo = *dev_demo;
+        let expected = *expected;
 
         // UPGRADE TRANSITION MARKERS (one-shot, committed-state driven):
         // the greppable proof surface the e2e keys on. `armed` is the
@@ -872,6 +710,231 @@ impl ValidatorRuntime<'_> {
                 }
             }
             *converged = true;
+        }
+    }
+
+    // BLOCK CADENCE + heartbeat, unified. `submit`/`submit_frame`
+    // now ENQUEUE into the node's `pending_batch`; this is the one
+    // place per block-time that FLUSHES the window — packing every
+    // frame that arrived in it (real ops and/or an idle nop) into
+    // ONE batch super-frame and proposing it as a single block.
+    // that is the aggregation: at most one block per BLOCK_TIME,
+    // carrying all the window's txs, never 1-tx-1-block.
+    //
+    // the idle nop still exists: finalized views only advance with
+    // a proposed frame, so an idle network would freeze (its height
+    // never ticks and a pending cutover, which crosses only when
+    // finalized views REACH it, would park forever). so on an EMPTY
+    // window inject one deterministically-rejected nop (unknown
+    // module target: rejects identically everywhere, leaves no
+    // state) and flush that. a window with real ops needs no nop —
+    // the ops ARE the block.
+    //
+    // GATE the idle nop on an empty orderer FIFO too: a nop pushed
+    // while a batch still awaits finalization only piles behind a
+    // finalization stall (a flapping quorum peer would stack idle
+    // blocks). real ops are never gated — they must not wait.
+    async fn pump_heartbeat(&mut self) {
+        let Self {
+            node,
+            next_seq,
+            signer,
+            label,
+            last_flush,
+            heartbeat_disabled,
+            ..
+        } = self;
+        if !*heartbeat_disabled && last_flush.elapsed() >= consensus::BLOCK_TIME {
+            *last_flush = std::time::Instant::now();
+            if node.pending_batch_len() == 0 && node.orderer().pending_len() == 0 {
+                let seq = *next_seq;
+                *next_seq += 1;
+                if let Err(e) = node
+                    .submit(
+                        signer,
+                        seq,
+                        Msg {
+                            target: NOP_TARGET.into(),
+                            payload: Vec::new(),
+                        },
+                    )
+                    .await
+                {
+                    eprintln!("[node {label}] heartbeat nop submit failed: {e}");
+                }
+            }
+            // flush the window: no-op when `pending_batch` is empty
+            // (idle with a batch already in flight — wait for it).
+            if let Err(e) = node.flush_batch().await {
+                eprintln!("[node {label}] batch flush failed: {e}");
+            }
+        }
+    }
+
+    // READINESS SIGNAL (design §3 / plan Task 7.1): a current
+    // boundary member whose binary can execute the pending upgrade
+    // self-submits ONE `SignalReady`. gated to a current member (the
+    // R = n readiness denominator); the signaller's own committed
+    // read + local latch keep it idempotent. inert on a baseline net.
+    async fn pump_readiness_signal(&mut self) {
+        let Self {
+            node,
+            orchestrator,
+            next_seq,
+            signer,
+            label,
+            signaller,
+            ..
+        } = self;
+        if orchestrator
+            .current_members()
+            .contains(&signer.public_key())
+            && let Some((msg, name, to_version)) = signaller.maybe_signal(node.host()).await
+        {
+            let seq = *next_seq;
+            *next_seq += 1;
+            match node.submit(signer, seq, msg).await {
+                Ok(_) => {
+                    println!("[node {label}] signaled ready name={name} to_version={to_version}")
+                }
+                Err(e) => {
+                    // un-latch so a transient submit failure retries on
+                    // the next tick (the module stays idempotent).
+                    signaller.signaled = None;
+                    eprintln!("[node {label}] readiness signal submit failed: {e}");
+                }
+            }
+        }
+    }
+
+    // CAPABILITY ANNOUNCE: a current member whose discovered
+    // provider set differs from the committed registry
+    // self-submits ONE declarative `Announce`. member-gated (the
+    // module rejects non-members) and idempotent (committed-read
+    // + local latch). inert on a host with no executor CLIs, and
+    // suppressed entirely under `announce_capabilities = false`
+    // (the accept-lane-only provider: this node still executes
+    // what it can, but only by claiming unassigned announcements
+    // — it never enters a tag's rendezvous pool).
+    async fn pump_capability_announce(&mut self) {
+        let Self {
+            node,
+            orchestrator,
+            next_seq,
+            signer,
+            label,
+            announce_capabilities,
+            announcer,
+            ..
+        } = self;
+        if *announce_capabilities
+            && orchestrator
+                .current_members()
+                .contains(&signer.public_key())
+            && let Some(msg) = announcer.maybe_announce(node.host()).await
+        {
+            let seq = *next_seq;
+            *next_seq += 1;
+            match node.submit(signer, seq, msg).await {
+                Ok(_) => println!(
+                    "[node {label}] announced capabilities {:?}",
+                    announcer.capabilities
+                ),
+                Err(e) => {
+                    // un-latch so a transient submit failure retries.
+                    announcer.announced = None;
+                    eprintln!("[node {label}] capability announce submit failed: {e}");
+                }
+            }
+        }
+    }
+
+    // SAGA CRANK (P7 liveness, host side): nothing else ever
+    // submits `SagaMsg::Crank`, and under strict leases a
+    // saga whose assignee went dark advances ONLY via a crank
+    // (lease re-lease or deadline timeout). state-driven:
+    // when the committed next expiry is at or past the latest
+    // finalized height, push one permissionless crank —
+    // throttled like the heartbeat, since a backlog wider
+    // than CRANK_BUDGET legitimately needs several. duplicate
+    // cranks from other nodes are deterministic no-ops.
+    async fn pump_saga_crank(&mut self) {
+        let Self {
+            node,
+            next_seq,
+            signer,
+            label,
+            last_crank,
+            ..
+        } = self;
+        if last_crank.elapsed() >= consensus::BLOCK_TIME
+            && let Some(finalized_height) = node.finalized().map(|f| f.height)
+            && let Some(expiry) = saga_next_expiry(node.host()).await
+            && expiry <= finalized_height
+        {
+            *last_crank = std::time::Instant::now();
+            let seq = *next_seq;
+            *next_seq += 1;
+            if let Err(e) = node
+                .submit(
+                    signer,
+                    seq,
+                    Msg {
+                        target: "saga".into(),
+                        payload: saga::encode_msg(&saga::SagaMsg::Crank {}),
+                    },
+                )
+                .await
+            {
+                eprintln!("[node {label}] saga crank submit failed: {e}");
+            } else {
+                println!(
+                    "[node {label}] saga crank submitted \
+                             (next expiry {expiry} <= height {finalized_height})"
+                );
+            }
+        }
+    }
+
+    // DISPATCH DELIVERY NUDGE (never-pop-stack liveness): a
+    // result committed into the dispatch mailbox delivers via
+    // the drain's DeliverPending injection in the NEXT
+    // successful block — and heartbeat nops are rejected
+    // frames that never apply, so a quiet chain would sit on
+    // its mailbox. state-driven: while the committed mailbox
+    // is non-empty, push one permissionless Nudge — a no-op
+    // whose block carries the injection. duplicate nudges
+    // from other nodes are free.
+    async fn pump_dispatch_nudge(&mut self) {
+        let Self {
+            node,
+            next_seq,
+            signer,
+            label,
+            last_nudge,
+            ..
+        } = self;
+        if last_nudge.elapsed() >= consensus::BLOCK_TIME
+            && dispatch_pending_deliveries(node.host()).await > 0
+        {
+            *last_nudge = std::time::Instant::now();
+            let seq = *next_seq;
+            *next_seq += 1;
+            if let Err(e) = node
+                .submit(
+                    signer,
+                    seq,
+                    Msg {
+                        target: "dispatch".into(),
+                        payload: dispatch::encode_msg(&dispatch::DispatchMsg::Nudge {}),
+                    },
+                )
+                .await
+            {
+                eprintln!("[node {label}] dispatch nudge submit failed: {e}");
+            } else {
+                println!("[node {label}] dispatch delivery nudge submitted");
+            }
         }
     }
 }

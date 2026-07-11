@@ -18,14 +18,21 @@ shows what is built and tested.
 ## Kernel
 
 - `crates/kernel/sdk`: module contract, context, messages, events, effects,
-  origins, deterministic environment, and `StateRoot`.
-- `crates/kernel/state`: global app-hash composition over sorted module roots.
-- `crates/kernel/host`: registry, dispatch, follow-up drain, and block
-  commit/abort lifecycle.
+  origins, deterministic environment, `StateRoot`, and the shared snapshot
+  codec toolkit (`sdk::codec`).
+- `crates/kernel/host`: registry, dispatch, follow-up drain, block
+  commit/abort lifecycle, global app-hash composition, and the
+  non-deterministic worker seam (`host::worker`).
 - `crates/kernel/node`: loopback and ordered node seams between host and orderer.
 - `crates/kernel/consensus`: commonware Simplex orderer, content store, relay,
   finalized inbox, resolver fetch, and scheme boundaries.
-- `crates/kernel/reactor`: host-owned worker loop for non-deterministic effects.
+- `crates/kernel/statesync`: network state-sync wire protocol and p2p binding.
+- `crates/kernel/recovery`: restart durability — op journal, checkpoints,
+  boot-time replay.
+- `crates/kernel/indexer`: derived, node-local read index over the finalized
+  op stream; never part of the app-hash.
+- `crates/system/capability-host`: machine-local executor providers behind the
+  capability seam.
 
 ## System
 
@@ -35,11 +42,19 @@ shows what is built and tested.
 - `crates/system/governance`: validator-set governance over valset.
 - `crates/system/identity`: canonical accounts, member keys, display names, and
   node bindings.
-- `crates/duckdns` and `crates/system/duckdns`: optional
-  `<handle>.duck` → AccountId naming, with no node or service directory.
+- `crates/system/duckdns`: optional `<handle>.duck` → AccountId naming, with
+  no node or service directory.
+- `crates/system/wireguard`: validator-set-backed WireGuard tunnel-upgrade
+  protocol; `wireguard::effect` is the apply layer.
+- `crates/system/nat-traversal`, `reachability`, `data-plane`, `overlay-net`:
+  coordinator-mediated hole punch, the node-driven WireGuard mesh
+  orchestrator, off-consensus byte transport, and the userspace overlay seam.
 - `crates/system/upgrade`, `capability`, `dispatch`, and `tagging`: upgrade
   state, executor capabilities, capability-routed dispatch, and engagement
   routing.
+- `crates/system/blobstore`, `gateway`, `dispatch-oracle`: node-local
+  content-addressed blob store, `.duck` gateway route state, and the
+  host-side dispatch worker.
 - `crates/duckfs/client`: OS-side checkout/status/commit engine for duckfs; it
   stays off the consensus path.
 - wire surfaces: each module publishes its types-only payload and query shapes at its crate root (`src/interface.rs`).
@@ -63,12 +78,16 @@ shows what is built and tested.
 
 ## Examples and Binaries
 
-- `crates/examples/directory`: state-based directory module used in tests and
-  demos.
+- `crates/examples/directory`: state-based directory module, registered in
+  `bin/node` as the production canary.
 - `crates/examples/greeter`: demo module that emits follow-up writes.
+- `crates/examples/evm`: experimental QMDB-backed EVM module, registered in
+  the `noded`/`simnode` genesis.
 - `bin/demo`: in-process walkthrough of the registered module set.
 - `bin/node`: real-socket validator process and two-process demo.
 - `bin/noded`: daemon behind the app HTTP/WebSocket surface.
+- `bin/simnode`: deterministic scenario node — noded's `/v1` wire over a
+  test-scripted block producer.
 - `bin/fs`: `ducktape-fs`, the duckfs working-copy CLI and FUSE-gated mount.
 - `bin/coordinator`: public or private rendezvous/STUN helper.
 

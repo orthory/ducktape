@@ -7,10 +7,8 @@
 //! audience/method/body/header policy, and only then touches DuckFS or one
 //! exact node-local loopback upstream.
 
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -19,8 +17,8 @@ use base64::engine::general_purpose::STANDARD;
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519;
 use data_plane::{
-    AddressBook, AdmissionPolicy, BulkPacer, FlowId, OverlaySockets, PeerId, Service, StreamPacing,
-    StreamPlaneSpec, StreamPolicy, StreamService, bind_stream_plane,
+    BulkPacer, FlowId, OverlaySockets, PeerId, Service, StreamPacing, StreamPlaneSpec,
+    StreamPolicy, StreamService, bind_stream_plane,
 };
 use duckfs_core::{EntryKindWire, FilesQuery, FilesReply};
 use futures::channel::{mpsc, oneshot};
@@ -51,81 +49,19 @@ fn proxy_flow() -> FlowId {
     FlowId::derive(gateway::PROXY_FLOW_DOMAIN)
 }
 
-fn ula_of(namespace: &str, raw: &[u8; 32]) -> std::net::Ipv6Addr {
-    wireguard::ula_v6_member_addr(namespace, wireguard::ValidatorIdentity(*raw))
-}
+/// the gateway plane's tag for the shared [`crate::overlay_book::OverlayBook`]:
+/// default-deny admission scoped to the gateway service + proxy flow; the
+/// tracked set follows validator/resident transport membership at cutover.
+pub struct GatewayPlane;
 
-/// Forward/reverse identity map and default-deny admission for the gateway.
-/// The tracked set follows validator/resident transport membership at cutover.
-pub struct OverlayBook {
-    namespace: String,
-    reverse: RwLock<HashMap<IpAddr, PeerId>>,
-}
-
-impl OverlayBook {
-    pub fn new(namespace: String) -> Arc<Self> {
-        Arc::new(Self {
-            namespace,
-            reverse: RwLock::new(HashMap::new()),
-        })
-    }
-
-    pub fn set_peers<'a>(&self, peers: impl Iterator<Item = &'a ed25519::PublicKey>) {
-        let reverse = peers
-            .map(|key| {
-                let raw: [u8; 32] = key.as_ref().try_into().expect("ed25519 keys are 32 bytes");
-                (IpAddr::V6(ula_of(&self.namespace, &raw)), PeerId(raw))
-            })
-            .collect();
-        *self.reverse.write().expect("gateway book lock") = reverse;
-    }
-
-    fn own_ip(&self, me: &ed25519::PublicKey) -> IpAddr {
-        let raw: [u8; 32] = me.as_ref().try_into().expect("ed25519 keys are 32 bytes");
-        IpAddr::V6(ula_of(&self.namespace, &raw))
-    }
-
-    fn overlay_ip(&self, raw: &[u8; 32]) -> IpAddr {
-        IpAddr::V6(ula_of(&self.namespace, raw))
+impl crate::overlay_book::Plane for GatewayPlane {
+    const SERVICE: Service = Service::Gateway;
+    fn flow() -> FlowId {
+        proxy_flow()
     }
 }
 
-impl AddressBook for OverlayBook {
-    fn datagram_addr(&self, peer: PeerId) -> Option<SocketAddr> {
-        Some(SocketAddr::new(
-            self.overlay_ip(&peer.0),
-            Service::Gateway.overlay_datagram_port(),
-        ))
-    }
-
-    fn stream_addr(&self, peer: PeerId) -> Option<SocketAddr> {
-        Some(SocketAddr::new(
-            self.overlay_ip(&peer.0),
-            Service::Gateway.overlay_stream_port(),
-        ))
-    }
-
-    fn peer_at(&self, src: IpAddr) -> Option<PeerId> {
-        self.reverse
-            .read()
-            .expect("gateway book lock")
-            .get(&src)
-            .copied()
-    }
-}
-
-impl AdmissionPolicy for OverlayBook {
-    fn permits(&self, peer: PeerId, service: Service, flow: FlowId) -> bool {
-        service == Service::Gateway
-            && flow == proxy_flow()
-            && self
-                .reverse
-                .read()
-                .expect("gateway book lock")
-                .values()
-                .any(|known| *known == peer)
-    }
-}
+pub type OverlayBook = crate::overlay_book::OverlayBook<GatewayPlane>;
 
 /// Start the local client lane and authenticated overlay server.
 pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJob>) {
@@ -237,7 +173,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
     // Server half. Bind retry starts before the userspace WireGuard stack is
     // installed and becomes live automatically once the node owns its ULA.
     tokio::spawn(async move {
-        let own = book.own_ip(&me);
+        let own = book.own_addr(&me);
         let spec = StreamPlaneSpec {
             own_ip: own,
             service: Service::Gateway,
@@ -1313,9 +1249,7 @@ async fn read_proxy_response<S: AsyncRead + Unpin>(
     Ok(GatewayResponse { head, body })
 }
 
-fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
+use duckfs_core::to_hex as hex_bytes;
 
 #[cfg(test)]
 mod tests {
@@ -1644,6 +1578,7 @@ mod tests {
 
     #[test]
     fn admission_is_service_flow_and_member_scoped() {
+        use data_plane::AdmissionPolicy as _;
         let signer = ed25519::PrivateKey::from_seed(99);
         let book = OverlayBook::new("test".into());
         book.set_peers(std::iter::once(&signer.public_key()));
@@ -1661,7 +1596,7 @@ mod tests {
         allow_upgrade: bool,
     ) -> gateway::RouteRecord {
         let statement = gateway::RouteStatement {
-            version: gateway::ROUTE_FORMAT_VERSION,
+            version: 1,
             chain_id: "test".into(),
             account_id: vec![1; 32],
             name: gateway::RouteName::named("api"),
@@ -1912,7 +1847,7 @@ mod tests {
         };
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let statement = gateway::RouteStatement {
-            version: gateway::ROUTE_FORMAT_VERSION,
+            version: 1,
             chain_id: "test".into(),
             account_id: vec![1; 32],
             name: gateway::RouteName::apex(),

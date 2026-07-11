@@ -212,6 +212,40 @@ pub enum Origin {
     System,
 }
 
+impl Origin {
+    /// the cross-module ACTOR STRING convention (inbox source, jobs
+    /// submitter/worker, files owner): a module id verbatim, `"ext:"` +
+    /// lowercase hex of an external submitter's id bytes, or the literal
+    /// `"system"`. the `ext:` prefix is actor DOMAIN SEPARATION — a module
+    /// whose id happens to be pure hex can never collide with an external
+    /// key's hex. empty external bytes render as `"ext:"`; callers that must
+    /// reject an unauthenticated empty submitter check before calling.
+    pub fn actor_string(&self) -> String {
+        use core::fmt::Write as _;
+        match self {
+            Origin::Module(id) => id.clone(),
+            Origin::External(bytes) => {
+                let mut out = String::with_capacity(4 + bytes.len() * 2);
+                out.push_str("ext:");
+                for b in bytes {
+                    let _ = write!(out, "{b:02x}");
+                }
+                out
+            }
+            Origin::System => "system".to_owned(),
+        }
+    }
+}
+
+/// reject an empty required string field with the uniform module error
+/// message — the op-validation guard shared by tasks/automations/vaults.
+pub fn require_non_empty(field: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(Error::Module(format!("{field} must not be empty")));
+    }
+    Ok(())
+}
+
 /// the deterministic environment handed to `execute`. block-constant fields
 /// (`height`, `consensus_time`) are identical across every dispatch in one
 /// `submit`; `origin` and `me` vary per dispatch. NOT wall clock, NOT per-node.
@@ -458,6 +492,24 @@ mod tests {
         assert_eq!(err.max_supported, 3);
         assert!(err.to_string().contains("v4"));
         assert!(err.to_string().contains("v3"));
+    }
+
+    #[test]
+    fn origin_actor_string_convention() {
+        assert_eq!(Origin::Module("chat".into()).actor_string(), "chat");
+        assert_eq!(
+            Origin::External(vec![0xAB, 0x01, 0xFF]).actor_string(),
+            "ext:ab01ff"
+        );
+        assert_eq!(Origin::External(Vec::new()).actor_string(), "ext:");
+        assert_eq!(Origin::System.actor_string(), "system");
+    }
+
+    #[test]
+    fn require_non_empty_guard() {
+        assert!(require_non_empty("id", "x").is_ok());
+        let err = require_non_empty("id", "").unwrap_err().to_string();
+        assert!(err.contains("id must not be empty"), "{err}");
     }
 
     #[test]

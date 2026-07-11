@@ -316,7 +316,7 @@ fn restart_recovers_staged_bytes_and_table() {
 
     // and the staged bytes are in the odb, recoverable by content id — proof the
     // chunk was flushed to disk at the block commit, not just held in memory.
-    let store = files::DiskStore::open(d.path().join("objects")).expect("reopen odb");
+    let store = duckfs_disk::DiskStore::open(d.path().join("objects")).expect("reopen odb");
     let id = files::objects::object_id(files::Kind::Chunk, b"durable chunk");
     assert!(store.has(&id), "staged chunk durable in the odb");
     assert_eq!(

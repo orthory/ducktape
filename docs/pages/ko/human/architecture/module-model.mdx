@@ -20,7 +20,7 @@ shape는 CosmWasm과 비슷하지만, 현재 구현은 Wasm이 아니라 native 
 - `StateRoot`는 호스트에 노출되는 32바이트 인증 commitment다.
 - `Msg`는 target module로 향하는 write intent다.
 - `Event`는 observability를 위해 state machine 밖으로 나간다.
-- `Effect`는 host-owned reactor에 non-deterministic work를 요청한다.
+- `Effect`는 host-owned worker seam에 non-deterministic work를 요청한다.
 - `Env`는 agreed height, agreed time, origin, active module id를 담는다.
 - `Ctx`는 host-routed read와 intent emission을 노출한다.
 - `Module`은 `id`, `root`, `execute`, read projection, `commit_block`,

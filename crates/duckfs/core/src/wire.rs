@@ -464,3 +464,42 @@ pub fn to_hex(bytes: &[u8]) -> String {
     }
     s
 }
+
+/// strict variable-length hex decode (either case). ascii hex digits only:
+/// `from_str_radix` alone would tolerate '+'/'-' signs, and byte-offset
+/// slicing panics mid-codepoint on multibyte utf-8 — this parses PASTED
+/// input (invite blobs, rpc hex), so it must Err, never panic.
+pub fn unhex(s: &str) -> Result<Vec<u8>, String> {
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("hex string contains non-hex characters".into());
+    }
+    if !s.len().is_multiple_of(2) {
+        return Err("hex string has odd length".into());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unhex;
+
+    #[test]
+    fn unhex_rejects_non_ascii_without_panicking() {
+        // fixed-offset slicing panics mid-codepoint unless ascii is enforced —
+        // this parses PASTED invite blobs and rpc hex, so Err, never panic.
+        assert!(unhex("a\u{2026}").is_err());
+        assert!(unhex("caf\u{e9}").is_err());
+        assert!(unhex("zz").is_err());
+        assert_eq!(unhex("00ff").unwrap(), vec![0x00, 0xff]);
+    }
+
+    #[test]
+    fn unhex_rejects_sign_characters() {
+        // from_str_radix would tolerate a leading '+' per pair.
+        assert!(unhex("+1ab").is_err());
+        assert!(unhex("-1ab").is_err());
+    }
+}

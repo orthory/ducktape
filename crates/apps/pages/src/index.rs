@@ -152,6 +152,22 @@ fn delete_toks(out: &mut Derived, row: &PageBlockRow) {
     }
 }
 
+/// drop a whole subtree depth-first — rows and postings both. a child this
+/// index never saw is skipped (the mirror only holds what was folded).
+fn delete_subtree(ctx: &ApplyCtx, out: &mut Derived, root: PageBlockRow) -> Result<()> {
+    let mut stack = vec![root];
+    while let Some(row) = stack.pop() {
+        delete_toks(out, &row);
+        out.delete(blk_key(&row.block_id));
+        for child in &row.children {
+            if let Some(child_row) = read_row(ctx, child)? {
+                stack.push(child_row);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait(?Send)]
 impl ModuleIndexer for PagesIndex {
     fn module(&self) -> &str {
@@ -232,6 +248,14 @@ impl ModuleIndexer for PagesIndex {
                 let Some(mut row) = read_row(ctx, &block_id)? else {
                     return Ok(());
                 };
+                // a same-parent move is a sibling reorder: membership is
+                // unchanged and this index does not mirror order (the module
+                // special-cases it too). re-reading the parent below would see
+                // the pre-op row (this op's staged writes are invisible to
+                // read_row) and re-push a duplicate child — so: no-op.
+                if row.parent.as_deref() == Some(parent.as_str()) {
+                    return Ok(());
+                }
                 if let Some(old_parent) = &row.parent
                     && let Some(mut old) = read_row(ctx, old_parent)?
                 {
@@ -257,17 +281,7 @@ impl ModuleIndexer for PagesIndex {
                     put_row(out, &parent_row)?;
                 }
                 // …then drop the whole subtree, rows and postings both.
-                let mut stack = vec![row];
-                while let Some(row) = stack.pop() {
-                    delete_toks(out, &row);
-                    out.delete(blk_key(&row.block_id));
-                    for child in &row.children {
-                        if let Some(child_row) = read_row(ctx, child)? {
-                            stack.push(child_row);
-                        }
-                    }
-                }
-                Ok(())
+                delete_subtree(ctx, out, row)
             }
             // checked state carries no searchable text.
             PageMsg::SetChecked { .. } => Ok(()),
@@ -289,17 +303,7 @@ impl ModuleIndexer for PagesIndex {
                 let Some(row) = read_row(ctx, &page_id)? else {
                     return Ok(());
                 };
-                let mut stack = vec![row];
-                while let Some(row) = stack.pop() {
-                    delete_toks(out, &row);
-                    out.delete(blk_key(&row.block_id));
-                    for child in &row.children {
-                        if let Some(child_row) = read_row(ctx, child)? {
-                            stack.push(child_row);
-                        }
-                    }
-                }
-                Ok(())
+                delete_subtree(ctx, out, row)
             }
         }
     }
@@ -510,6 +514,54 @@ mod tests {
         assert_eq!(
             search(&store, serde_json::json!({"search": {"text": "survivor"}})).len(),
             1
+        );
+    }
+
+    #[test]
+    fn same_parent_move_does_not_duplicate_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        apply(
+            &store,
+            1,
+            vec![
+                op(&PageMsg::CreatePage {
+                    page_id: "p1".into(),
+                    title: "home".into(),
+                    parent: None,
+                }),
+                insert("p1", "b1", "first"),
+                insert("p1", "b2", "second"),
+            ],
+        );
+        // two sibling reorders under the same parent — each used to re-read
+        // the stale parent row and re-push the child, duplicating membership.
+        apply(
+            &store,
+            2,
+            vec![op(&PageMsg::MoveBlock {
+                block_id: "b1".into(),
+                parent: "p1".into(),
+                after: Some("b2".into()),
+            })],
+        );
+        apply(
+            &store,
+            3,
+            vec![op(&PageMsg::MoveBlock {
+                block_id: "b1".into(),
+                parent: "p1".into(),
+                after: None,
+            })],
+        );
+
+        let hits = search(&store, serde_json::json!({"search": {"text": "home"}}));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].children.iter().filter(|c| *c == "b1").count(),
+            1,
+            "sibling reorders must not duplicate membership: {:?}",
+            hits[0].children
         );
     }
 

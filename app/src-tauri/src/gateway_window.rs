@@ -1,20 +1,17 @@
-//! Capability-free surfaces for executable gateway content.
+//! Capability-free surface for executable gateway content.
 //!
-//! Publisher content never shares the privileged `main` webview: it renders in
-//! its own capability-free webview — inline in the Browser pane (a multiwebview
-//! child, the default) or a separate window (pop-out). On the CEF runtime each
+//! Publisher content never shares the privileged `main` webview: it renders
+//! inline in the Browser pane as a multiwebview child. On the CEF runtime the
 //! surface is its own renderer process, and navigation stays pinned to one
-//! random, short-lived gateway-session origin either way.
+//! random, short-lived gateway-session origin.
 //!
-//! Both surfaces record the `.duck` route they show with [`crate::permissions`]
-//! before they open: the session origin is a random loopback token, so the
+//! The surface records the `.duck` route it shows with [`crate::permissions`]
+//! before it opens: the session origin is a random loopback token, so the
 //! route is the only honest name a permission prompt can put in front of the
 //! user.
 
-use tauri::webview::{NewWindowResponse, WebviewWindowBuilder};
+use tauri::webview::NewWindowResponse;
 use tauri::{Manager as _, WebviewUrl};
-
-const WINDOW_PREFIX: &str = "gateway-";
 
 fn validate_session_url(value: &str) -> Result<(tauri::Url, String), String> {
     let url: tauri::Url = value
@@ -53,77 +50,6 @@ fn validate_site(title: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn gateway_open_window(
-    app: crate::rt::AppHandle,
-    window: crate::rt::WebviewWindow,
-    url: String,
-    title: String,
-) -> Result<(), String> {
-    crate::daemon::require_main_window(&window)?;
-    let (url, token) = validate_session_url(&url)?;
-    validate_site(&title)?;
-    let label = format!("{WINDOW_PREFIX}{token}");
-    crate::permissions::note_gateway_site(&label, &title);
-    if let Some(existing) = app.get_webview_window(&label) {
-        existing
-            .navigate(url)
-            .map_err(|error| format!("reopen gateway session: {error}"))?;
-        existing
-            .show()
-            .and_then(|_| existing.set_focus())
-            .map_err(|error| format!("focus gateway window: {error}"))?;
-        return Ok(());
-    }
-
-    // Keep at most one executable publisher window. Closing the previous view
-    // drops its incognito storage and prevents stale sessions accumulating.
-    close_open_gateway_surfaces(&app, &label)?;
-
-    let allowed_host = url.host_str().expect("validated host").to_string();
-    let allowed_port = url.port().expect("validated port");
-    let opened = WebviewWindowBuilder::new(&app, label.clone(), WebviewUrl::External(url))
-        .title(title)
-        .inner_size(1100.0, 760.0)
-        .min_inner_size(720.0, 480.0)
-        .resizable(true)
-        .incognito(true)
-        .devtools(false)
-        .on_navigation(move |candidate| {
-            candidate.scheme() == "http"
-                && candidate.host_str() == Some(allowed_host.as_str())
-                && candidate.port() == Some(allowed_port)
-                && candidate.username().is_empty()
-                && candidate.password().is_none()
-        })
-        .on_new_window(|_, _| NewWindowResponse::Deny)
-        .on_download(|_, _| false)
-        .build()
-        .map_err(|error| format!("open isolated gateway window: {error}"))?;
-    // However the user closes it, the session's permissions die with it.
-    opened.on_window_event(move |event| {
-        if matches!(event, tauri::WindowEvent::Destroyed) {
-            crate::permissions::forget_webview(&label);
-        }
-    });
-    Ok(())
-}
-
-/// Close every gateway surface except `keep` (the one being opened), and drop
-/// the permissions each of them had earned — a closed surface takes its session
-/// grants with it.
-fn close_open_gateway_surfaces(app: &crate::rt::AppHandle, keep: &str) -> Result<(), String> {
-    for (label, existing) in app.webview_windows() {
-        if label.starts_with(WINDOW_PREFIX) && label != keep {
-            existing
-                .close()
-                .map_err(|error| format!("close old gateway window: {error}"))?;
-            crate::permissions::forget_webview(&label);
-        }
-    }
-    Ok(())
-}
-
 /// Browser-pane rect in main-window logical px, reported by the UI.
 #[derive(serde::Deserialize)]
 pub struct InlineRect {
@@ -133,51 +59,68 @@ pub struct InlineRect {
     pub height: f64,
 }
 
-const INLINE_LABEL: &str = "gateway-inline";
+const INLINE_PREFIX: &str = "gateway-inline-";
 
-/// Whether this shell embeds gateway content inline in the Browser pane.
-/// Always true on the CEF runtime: every gateway session runs in its own
-/// renderer process and the `gateway-inline` label matches no capability, so
-/// an embedded child webview is exactly as isolated as the separate window.
-/// (The command stays so the web build's client can probe and fall back.)
-#[tauri::command]
-pub fn gateway_inline_supported() -> bool {
-    true
+fn inline_label(tab_id: &str) -> Result<String, String> {
+    if tab_id.is_empty()
+        || tab_id.len() > 32
+        || !tab_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("gateway tab id must be bounded ASCII".into());
+    }
+    Ok(format!("{INLINE_PREFIX}{tab_id}"))
 }
 
-/// Open (or re-navigate) the inline gateway child webview at `rect`.
-/// Same validation and guards as `gateway_open_window`, same single-surface
-/// rule: opening inline closes any separate gateway window, and vice versa.
+fn hide_other_inline_webviews(
+    app: &crate::rt::AppHandle,
+    keep: Option<&str>,
+) -> Result<(), String> {
+    for (label, webview) in app.webviews() {
+        if label.starts_with(INLINE_PREFIX) && keep != Some(label.as_str()) {
+            webview
+                .hide()
+                .map_err(|error| format!("hide inactive gateway tab: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Open (or re-navigate) the inline gateway child webview at `rect`. The
+/// `gateway-inline` label matches no capability, so the embedded child is
+/// fully isolated from the app's command surface.
 #[tauri::command]
-pub fn gateway_open_inline(
+pub async fn gateway_open_inline(
     app: crate::rt::AppHandle,
-    window: crate::rt::WebviewWindow,
     url: String,
     title: String,
+    tab_id: String,
     rect: InlineRect,
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager as _};
 
-    crate::daemon::require_main_window(&window)?;
     let (url, _token) = validate_session_url(&url)?;
     validate_site(&title)?;
-    crate::permissions::note_gateway_site(INLINE_LABEL, &title);
+    let label = inline_label(&tab_id)?;
+    crate::permissions::note_gateway_site(&label, &title);
 
-    // One executable publisher surface at a time (mirrors gateway_open_window).
-    close_open_gateway_surfaces(&app, INLINE_LABEL)?;
-
+    hide_other_inline_webviews(&app, Some(&label))?;
     let position = LogicalPosition::new(rect.x, rect.y);
     let size = LogicalSize::new(rect.width, rect.height);
-    if let Some(existing) = app.get_webview(INLINE_LABEL) {
+    if let Some(existing) = app.get_webview(&label) {
         existing
             .navigate(url)
             .map_err(|error| format!("navigate inline gateway view: {error}"))?;
+        existing
+            .show()
+            .map_err(|error| format!("show inline gateway view: {error}"))?;
         return place_inline_webview(&existing, position, size);
     }
 
     let allowed_host = url.host_str().expect("validated host").to_string();
     let allowed_port = url.port().expect("validated port");
-    let builder = tauri::webview::WebviewBuilder::new(INLINE_LABEL, WebviewUrl::External(url))
+    let builder = tauri::webview::WebviewBuilder::new(label, WebviewUrl::External(url))
         .incognito(true)
         .devtools(false)
         .on_navigation(move |candidate| {
@@ -189,9 +132,10 @@ pub fn gateway_open_inline(
         })
         .on_new_window(|_, _| NewWindowResponse::Deny)
         .on_download(|_, _| false);
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| "main console window is unavailable".to_string())?;
     window
-        .as_ref()
-        .window()
         .add_child(builder, position, size)
         .map_err(|error| format!("open inline gateway view: {error}"))?;
     Ok(())
@@ -199,15 +143,15 @@ pub fn gateway_open_inline(
 
 /// Track the Browser pane as it resizes (ResizeObserver on the UI side).
 #[tauri::command]
-pub fn gateway_inline_place(
+pub async fn gateway_inline_place(
     app: crate::rt::AppHandle,
-    window: crate::rt::WebviewWindow,
+    tab_id: String,
     rect: InlineRect,
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager as _};
 
-    crate::daemon::require_main_window(&window)?;
-    let Some(existing) = app.get_webview(INLINE_LABEL) else {
+    let label = inline_label(&tab_id)?;
+    let Some(existing) = app.get_webview(&label) else {
         return Ok(()); // already closed — a late resize is not an error
     };
     place_inline_webview(
@@ -217,19 +161,24 @@ pub fn gateway_inline_place(
     )
 }
 
-/// Close the inline gateway view (idempotent) — navigation away, view switch,
-/// or the pop-out-to-window control.
+/// Close the inline gateway view (idempotent) — navigation away or view switch.
 #[tauri::command]
-pub fn gateway_inline_close(app: crate::rt::AppHandle) -> Result<(), String> {
+pub async fn gateway_inline_close(app: crate::rt::AppHandle, tab_id: String) -> Result<(), String> {
     use tauri::Manager as _;
-    if let Some(existing) = app.get_webview(INLINE_LABEL) {
+    let label = inline_label(&tab_id)?;
+    if let Some(existing) = app.get_webview(&label) {
         existing
             .close()
             .map_err(|error| format!("close inline gateway view: {error}"))?;
     }
     // The surface is gone: so are the permissions the user granted it.
-    crate::permissions::forget_webview(INLINE_LABEL);
+    crate::permissions::forget_webview(&label);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn gateway_inline_hide_all(app: crate::rt::AppHandle) -> Result<(), String> {
+    hide_other_inline_webviews(&app, None)
 }
 
 fn place_inline_webview(
@@ -269,6 +218,19 @@ mod tests {
                 validate_session_url(unsafe_url).is_err(),
                 "accepted {unsafe_url}"
             );
+        }
+    }
+
+    #[test]
+    fn inline_labels_are_scoped_to_bounded_tab_ids() {
+        assert_eq!(inline_label("tab-12").unwrap(), "gateway-inline-tab-12");
+        for invalid in [
+            "",
+            "../main",
+            "tab space",
+            "012345678901234567890123456789012",
+        ] {
+            assert!(inline_label(invalid).is_err(), "accepted {invalid}");
         }
     }
 }

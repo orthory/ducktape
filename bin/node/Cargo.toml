@@ -128,6 +128,7 @@ libc = "0.2"
 [dev-dependencies]
 async-trait = { workspace = true }
 tempfile = "3"
+data-plane = { workspace = true, features = ["sim"] }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on
 # loopback (the crates/system/overlay-net/tests/loopback_pair harness shape) to
 # prove huddle media crosses the REAL overlay headless — this supplies the WG

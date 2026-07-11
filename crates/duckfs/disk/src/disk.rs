@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 
 use duckfs_core::objects::{Kind, ObjectId, object_id};
 use duckfs_core::state::{Refs, decode_refs, encode_refs};
-use duckfs_core::store::{ObjectStore, RefsStore};
+use duckfs_core::store::ObjectStore;
 use duckfs_core::{from_hex_32, to_hex};
 
 /// content-addressed object database over `dir/<aa>/<hex[2..]>` files. each file
@@ -362,8 +362,9 @@ impl DiskRefs {
     }
 }
 
-impl RefsStore for DiskRefs {
-    fn load(&self) -> Result<Option<(Refs, u64, u64)>, String> {
+impl DiskRefs {
+    /// `None` = fresh dir. `Ok(Some((refs, height, gc_watermark)))` otherwise.
+    pub fn load(&self) -> Result<Option<(Refs, u64, u64)>, String> {
         let path = self.refs_path();
         let raw = match std::fs::read(&path) {
             Ok(raw) => raw,
@@ -404,7 +405,7 @@ impl RefsStore for DiskRefs {
         Ok(Some((refs, height, gc_watermark)))
     }
 
-    fn save(&mut self, refs: &Refs, height: u64, gc_watermark: u64) -> Result<(), String> {
+    pub fn save(&mut self, refs: &Refs, height: u64, gc_watermark: u64) -> Result<(), String> {
         let payload = encode_refs(refs);
         let mut buf = Vec::with_capacity(REFS_FIXED_LEN + payload.len());
         buf.extend_from_slice(REFS_MAGIC);

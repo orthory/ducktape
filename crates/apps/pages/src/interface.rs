@@ -66,20 +66,6 @@ pub struct NewBlock {
     pub text: String,
 }
 
-/// a stable pointer to one block in one pages module — the shape a FUTURE
-/// cross-module reference carries. resolution is already possible today:
-/// `Ctx::query(module, PageQuery::GetBlock { block_id: block })` answers with
-/// the live block (or `None` once it was removed — a ref can dangle, exactly
-/// like a hyperlink). serializable so other modules can embed it in their own
-/// state now, before any shared reference machinery exists.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct BlockRef {
-    /// the ModuleId of the pages module instance (e.g. "pages").
-    pub module: String,
-    /// the globally-unique block id inside that module.
-    pub block: String,
-}
-
 /// write intents the pages module accepts (its `execute` payload).
 ///
 /// `after` positioning rule (SAME in `InsertBlock` and `MoveBlock`): `None` ==
@@ -265,9 +251,9 @@ pub enum PageQuery {
     /// subtree before its next sibling). `None` == no page at that id.
     GetPage { page_id: String },
     /// a single block by id ALONE — no page context needed. this is the
-    /// cross-module resolution surface a [`BlockRef`] points at; the returned
-    /// block carries its `page` and `parent`, so a resolver learns where the
-    /// block lives, not just what it says.
+    /// cross-module resolution surface; the returned block carries its `page`
+    /// and `parent`, so a resolver learns where the block lives, not just
+    /// what it says.
     GetBlock { block_id: String },
     /// enumerate every page, served from the module's reserved index entry
     /// (sorted by id), with titles read from the live roots.

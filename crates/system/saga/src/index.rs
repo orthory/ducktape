@@ -7,6 +7,8 @@
 //! the result op (`OpMeta.origin.id`, lowercase hex). node→account resolution
 //! is app-side via identity's `OfNode` — a mapper can only read its own
 //! module's index.
+//! token counters are executor-reported observability, not provider-attested
+//! proof; quotas, rewards, and billing must never trust them.
 //!
 //! key spaces (inside saga's per-module index database):
 //! - `saga/<saga_id>` — the trigger row: `{capability, createdHeight}`. read
@@ -69,6 +71,16 @@ pub struct AttemptRow {
     pub capability: String,
     pub outcome_ok: bool,
     pub duration_blocks: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cache_write_input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub reasoning_output_tokens: u64,
     pub height: u64,
 }
 
@@ -102,6 +114,22 @@ pub struct UsageRow {
     pub outcome_ok: bool,
     pub runs: u64,
     pub total_duration_blocks: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+}
+
+#[derive(Default)]
+struct UsageTotals {
+    runs: u64,
+    duration_blocks: u64,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_write_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
 }
 
 /// the saga usage mapper. register with the module's genesis id ("saga").
@@ -159,6 +187,7 @@ impl ModuleIndexer for UsageIndex {
                 saga_id,
                 attempt,
                 outcome,
+                usage,
             } => {
                 // the executor is the External submitter of the result op;
                 // anything else cannot be attributed — skip, don't poison.
@@ -181,11 +210,17 @@ impl ModuleIndexer for UsageIndex {
                         // the trigger predates this mapper (deploy boundary).
                         None => (UNKNOWN.into(), 0),
                     };
+                let usage = usage.unwrap_or_default();
                 let row = AttemptRow {
                     executor_hex: executor.clone(),
                     capability,
                     outcome_ok: outcome.is_ok(),
                     duration_blocks,
+                    input_tokens: usage.input_tokens,
+                    cached_input_tokens: usage.cached_input_tokens,
+                    cache_write_input_tokens: usage.cache_write_input_tokens,
+                    output_tokens: usage.output_tokens,
+                    reasoning_output_tokens: usage.reasoning_output_tokens,
                     height: meta.height,
                 };
                 if let Ok(bytes) = serde_json::to_vec(&row) {
@@ -194,6 +229,8 @@ impl ModuleIndexer for UsageIndex {
             }
             // accepts, cranks, cancels, and prunes change no billing.
             SagaMsg::Accept { .. }
+            | SagaMsg::RenewLease { .. }
+            | SagaMsg::Reassign { .. }
             | SagaMsg::Crank {}
             | SagaMsg::Cancel { .. }
             | SagaMsg::Prune { .. } => {}
@@ -209,7 +246,7 @@ impl ModuleIndexer for UsageIndex {
                 let since = since_height.unwrap_or(0);
                 // ponytail: full attempt/ scan per request — page a cursor or
                 // maintain rollup rows if the ledger outgrows it.
-                let mut agg: BTreeMap<(String, String, bool), (u64, u64)> = BTreeMap::new();
+                let mut agg: BTreeMap<(String, String, bool), UsageTotals> = BTreeMap::new();
                 let mut after: Option<Vec<u8>> = None;
                 loop {
                     let page = reader.scan(ATTEMPT_PREFIX, after.as_deref(), MAX_SCAN_LIMIT)?;
@@ -222,9 +259,22 @@ impl ModuleIndexer for UsageIndex {
                         }
                         let bucket = agg
                             .entry((row.executor_hex, row.capability, row.outcome_ok))
-                            .or_insert((0, 0));
-                        bucket.0 += 1;
-                        bucket.1 += row.duration_blocks;
+                            .or_default();
+                        bucket.runs = bucket.runs.saturating_add(1);
+                        bucket.duration_blocks =
+                            bucket.duration_blocks.saturating_add(row.duration_blocks);
+                        bucket.input_tokens = bucket.input_tokens.saturating_add(row.input_tokens);
+                        bucket.cached_input_tokens = bucket
+                            .cached_input_tokens
+                            .saturating_add(row.cached_input_tokens);
+                        bucket.cache_write_input_tokens = bucket
+                            .cache_write_input_tokens
+                            .saturating_add(row.cache_write_input_tokens);
+                        bucket.output_tokens =
+                            bucket.output_tokens.saturating_add(row.output_tokens);
+                        bucket.reasoning_output_tokens = bucket
+                            .reasoning_output_tokens
+                            .saturating_add(row.reasoning_output_tokens);
                     }
                     match page.next_after {
                         Some(cursor) => after = Some(cursor.into_bytes()),
@@ -234,12 +284,17 @@ impl ModuleIndexer for UsageIndex {
                 let rows: Vec<UsageRow> = agg
                     .into_iter()
                     .map(
-                        |((executor_hex, capability, outcome_ok), (runs, total))| UsageRow {
+                        |((executor_hex, capability, outcome_ok), totals)| UsageRow {
                             executor_hex,
                             capability,
                             outcome_ok,
-                            runs,
-                            total_duration_blocks: total,
+                            runs: totals.runs,
+                            total_duration_blocks: totals.duration_blocks,
+                            input_tokens: totals.input_tokens,
+                            cached_input_tokens: totals.cached_input_tokens,
+                            cache_write_input_tokens: totals.cache_write_input_tokens,
+                            output_tokens: totals.output_tokens,
+                            reasoning_output_tokens: totals.reasoning_output_tokens,
                         },
                     )
                     .collect();
@@ -288,6 +343,16 @@ mod tests {
     }
 
     fn result(executor: &str, saga_id: &str, attempt: u32, ok: bool) -> AppliedOp {
+        result_with_usage(executor, saga_id, attempt, ok, None)
+    }
+
+    fn result_with_usage(
+        executor: &str,
+        saga_id: &str,
+        attempt: u32,
+        ok: bool,
+        usage: Option<crate::TokenUsage>,
+    ) -> AppliedOp {
         op(
             OriginTag::external(executor),
             &SagaMsg::OracleResult {
@@ -298,6 +363,7 @@ mod tests {
                 } else {
                     Err("boom".into())
                 },
+                usage,
             },
         )
     }
@@ -330,7 +396,23 @@ mod tests {
         // attempt 1 fails on aa…, attempt 2 (the retry) lands on bb… — both
         // bill, to different executors.
         apply(&store, 9, vec![result("aa11", "runs\u{1f}d1", 1, false)]);
-        apply(&store, 12, vec![result("bb22", "runs\u{1f}d1", 2, true)]);
+        apply(
+            &store,
+            12,
+            vec![result_with_usage(
+                "bb22",
+                "runs\u{1f}d1",
+                2,
+                true,
+                Some(crate::TokenUsage {
+                    input_tokens: 100,
+                    cached_input_tokens: 60,
+                    cache_write_input_tokens: 5,
+                    output_tokens: 20,
+                    reasoning_output_tokens: 7,
+                }),
+            )],
+        );
         // an untagged saga on the same executor.
         apply(&store, 13, vec![trigger("runs\u{1f}d2", None)]);
         apply(&store, 15, vec![result("bb22", "runs\u{1f}d2", 1, true)]);
@@ -345,6 +427,11 @@ mod tests {
                     outcome_ok: false,
                     runs: 1,
                     total_duration_blocks: 4,
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_output_tokens: 0,
                 },
                 UsageRow {
                     executor_hex: "bb22".into(),
@@ -352,6 +439,11 @@ mod tests {
                     outcome_ok: true,
                     runs: 1,
                     total_duration_blocks: 7,
+                    input_tokens: 100,
+                    cached_input_tokens: 60,
+                    cache_write_input_tokens: 5,
+                    output_tokens: 20,
+                    reasoning_output_tokens: 7,
                 },
                 UsageRow {
                     executor_hex: "bb22".into(),
@@ -359,6 +451,11 @@ mod tests {
                     outcome_ok: true,
                     runs: 1,
                     total_duration_blocks: 2,
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 0,
+                    reasoning_output_tokens: 0,
                 },
             ]
         );
@@ -416,6 +513,7 @@ mod tests {
                     saga_id: "s1".into(),
                     attempt: 1,
                     outcome: Ok(Vec::new()),
+                    usage: None,
                 },
             )],
         );

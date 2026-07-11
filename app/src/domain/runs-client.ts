@@ -139,6 +139,16 @@ export const cancelRun = (
 ): Promise<BlockEvent> =>
   transport.submit(TARGET, { cancel_run: { run_id: params.runId } }, params.origin);
 
+export const reassignRun = (
+  transport: NodeTransport,
+  params: { runId: string; attempt: number; origin: string },
+): Promise<BlockEvent> =>
+  transport.submit(
+    TARGET,
+    { reassign_run: { run_id: params.runId, attempt: params.attempt } },
+    params.origin,
+  );
+
 // ── Queries (reads over committed state) ────────────────
 
 /** Every in-flight correlation entry, ascending by dispatch id. Bounded:

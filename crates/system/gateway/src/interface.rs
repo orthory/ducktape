@@ -1,8 +1,8 @@
+use sdk::codec::{push_bytes, push_opt_str};
 use serde::{Deserialize, Serialize};
 
 /// Commonware signing namespace for every gateway route mutation.
 pub const GATEWAY_ROUTE_NS: &[u8] = b"ducktape-gateway-route-v1";
-pub const ROUTE_FORMAT_VERSION: u8 = 1;
 pub const MAX_CHAIN_ID_BYTES: usize = 256;
 pub const MAX_ACCOUNT_ID_BYTES: usize = 128;
 pub const NODE_KEY_BYTES: usize = 32;
@@ -122,11 +122,14 @@ pub enum RouteTarget {
     LoopbackHttp,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RouteTargetKind {
-    DuckFs,
-    LoopbackHttp,
+impl RouteTarget {
+    /// The JSON `kind` tag, as [`RouteSummary`] reports it.
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::DuckFs { .. } => "duck_fs",
+            Self::LoopbackHttp => "loopback_http",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -141,6 +144,7 @@ pub struct RouteDefinition {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteStatement {
+    /// Signed into the preimage; publishers stamp `1` today.
     pub version: u8,
     pub chain_id: String,
     pub account_id: Vec<u8>,
@@ -172,7 +176,8 @@ pub struct RouteSummary {
     pub name: RouteName,
     pub publisher_node: Vec<u8>,
     pub revision: u64,
-    pub target: RouteTargetKind,
+    /// [`RouteTarget::kind_name`]: `"duck_fs"` or `"loopback_http"`.
+    pub target: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -232,12 +237,6 @@ pub fn decode_reply(bytes: &[u8]) -> Result<GatewayReply, String> {
 }
 
 pub fn validate_route_statement(statement: &RouteStatement) -> Result<(), String> {
-    if statement.version != ROUTE_FORMAT_VERSION {
-        return Err(format!(
-            "gateway: unsupported route version {}",
-            statement.version
-        ));
-    }
     if statement.chain_id.is_empty() || statement.chain_id.len() > MAX_CHAIN_ID_BYTES {
         return Err(format!(
             "gateway: chain id must be 1..={MAX_CHAIN_ID_BYTES} bytes"
@@ -394,13 +393,7 @@ pub fn route_signing_preimage(statement: &RouteStatement) -> Result<Vec<u8>, Str
     out.push(statement.version);
     push_bytes(&mut out, statement.chain_id.as_bytes());
     push_bytes(&mut out, &statement.account_id);
-    match &statement.name.label {
-        None => out.push(0),
-        Some(label) => {
-            out.push(1);
-            push_bytes(&mut out, label.as_bytes());
-        }
-    }
+    push_opt_str(&mut out, statement.name.label.as_deref());
     push_bytes(&mut out, &statement.publisher_node);
     out.extend_from_slice(&statement.revision.to_le_bytes());
     let Some(route) = &statement.route else {
@@ -446,11 +439,6 @@ fn encode_policy(out: &mut Vec<u8>, policy: &RoutePolicy) {
     out.extend_from_slice(&policy.max_response_bytes.to_le_bytes());
     out.push(u8::from(policy.allow_authorization));
     out.push(u8::from(policy.allow_upgrade));
-}
-
-fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
 }
 
 fn decode_lower_hex_32(value: &str) -> Result<[u8; 32], String> {

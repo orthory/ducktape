@@ -33,7 +33,7 @@ pub mod media;
 
 pub use codec::{CodecError, VoiceDecoder, VoiceEncoder};
 pub use engine::{SpeakerStats, VoiceConfig, VoiceEngine};
-pub use jitter::{JitterBuffer, JitterStats, MinimalJitter, PlayoutStep};
+pub use jitter::{JitterStats, MinimalJitter, PlayoutStep};
 pub use media::{MediaError, MediaHeader};
 
 /// Voice runs at Opus's native rate, mono.

@@ -312,6 +312,16 @@ fn lease_expiry(height: u64, assignee: &Option<Vec<u8>>, lease_views: Option<u64
     }
 }
 
+fn bounded_lease_expiry(
+    height: u64,
+    assignee: &Option<Vec<u8>>,
+    lease_views: Option<u64>,
+    deadline: Option<u64>,
+) -> Option<u64> {
+    lease_expiry(height, assignee, lease_views)
+        .map(|expiry| deadline.map_or(expiry, |deadline| expiry.min(deadline)))
+}
+
 pub struct SagaModule {
     id: ModuleId,
     /// the valset module rendezvous assignment queries — `None` disables
@@ -480,11 +490,26 @@ impl SagaModule {
         (!pool.is_empty()).then_some(pool)
     }
 
-    /// rendezvous-assign one attempt: `pool[H(saga_id ‖ attempt-le ‖
-    /// height-le) % n]` over the (sorted) assignment pool. every input is
-    /// agreed, so every validator derives the same assignee. `None` when no
-    /// pool is available — no assignment, and strict degrades to accept-any
-    /// for the attempt.
+    fn pick_assignee(
+        pool: &[Vec<u8>],
+        saga_id: &str,
+        attempt: u32,
+        height: u64,
+    ) -> Option<Vec<u8>> {
+        if pool.is_empty() {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(saga_id.as_bytes());
+        hasher.update(attempt.to_le_bytes());
+        hasher.update(height.to_le_bytes());
+        let digest = hasher.finalize();
+        let pick = u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"));
+        Some(pool[(pick % pool.len() as u64) as usize].clone())
+    }
+
+    /// rendezvous-assign one attempt over the sorted assignment pool. every
+    /// input is agreed, so every validator derives the same assignee.
     async fn compute_assignee(
         &self,
         ctx: &dyn Ctx,
@@ -494,14 +519,23 @@ impl SagaModule {
         height: u64,
     ) -> Option<Vec<u8>> {
         let pool = self.assignment_pool(ctx, capability).await?;
-        let mut hasher = Sha256::new();
-        hasher.update(saga_id.as_bytes());
-        hasher.update(attempt.to_le_bytes());
-        hasher.update(height.to_le_bytes());
-        let digest = hasher.finalize();
-        let pick = u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"));
-        let index = (pick % pool.len() as u64) as usize;
-        Some(pool[index].clone())
+        Self::pick_assignee(&pool, saga_id, attempt, height)
+    }
+
+    async fn compute_assignee_excluding(
+        &self,
+        ctx: &dyn Ctx,
+        saga_id: &str,
+        capability: Option<&str>,
+        attempt: u32,
+        height: u64,
+        excluded: Option<&[u8]>,
+    ) -> Option<Vec<u8>> {
+        let mut pool = self.assignment_pool(ctx, capability).await?;
+        if let Some(excluded) = excluded {
+            pool.retain(|candidate| candidate.as_slice() != excluded);
+        }
+        Self::pick_assignee(&pool, saga_id, attempt, height)
     }
 
     /// the P6 promise: on a terminal transition, hand the requester its
@@ -523,9 +557,30 @@ impl SagaModule {
     /// shared tail of trigger, error-retry, and lease-expiry-retry. a pinned
     /// saga leases every attempt to its pinned key; everything else is
     /// rendezvous-assigned from the pool.
-    async fn lease_and_request(&mut self, ctx: &mut dyn Ctx, saga_id: String, mut saga: Saga) {
+    fn request_assigned(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        saga_id: String,
+        mut saga: Saga,
+        assignee: Option<Vec<u8>>,
+    ) {
         let height = ctx.env().height;
-        saga.assignee = match &saga.pinned_assignee {
+        saga.assignee = assignee;
+        saga.lease_expires_at =
+            bounded_lease_expiry(height, &saga.assignee, saga.lease_views, saga.deadline);
+        ctx.request_effect(Effect(encode_worker_request(&WorkerRequest {
+            saga_id: saga_id.clone(),
+            attempt: saga.attempt,
+            spec: saga.spec.clone(),
+            deadline: saga.deadline,
+            assignee: saga.assignee.clone(),
+        })));
+        self.stage(saga_id, saga);
+    }
+
+    async fn lease_and_request(&mut self, ctx: &mut dyn Ctx, saga_id: String, saga: Saga) {
+        let height = ctx.env().height;
+        let assignee = match &saga.pinned_assignee {
             Some(key) => Some(key.clone()),
             None => {
                 self.compute_assignee(
@@ -538,15 +593,7 @@ impl SagaModule {
                 .await
             }
         };
-        saga.lease_expires_at = lease_expiry(height, &saga.assignee, saga.lease_views);
-        ctx.request_effect(Effect(encode_worker_request(&WorkerRequest {
-            saga_id: saga_id.clone(),
-            attempt: saga.attempt,
-            spec: saga.spec.clone(),
-            deadline: saga.deadline,
-            assignee: saga.assignee.clone(),
-        })));
-        self.stage(saga_id, saga);
+        self.request_assigned(ctx, saga_id, saga, assignee);
     }
 
     // ---- state-sync ---------------------------------------------------------
@@ -707,6 +754,7 @@ impl Module for SagaModule {
                 saga_id,
                 attempt,
                 outcome,
+                ..
             } => {
                 // P5 gates, all deterministic no-ops: unknown saga (never
                 // triggered, or pruned), terminal saga (a duplicate — the
@@ -780,6 +828,79 @@ impl Module for SagaModule {
                     }
                 }
             }
+            SagaMsg::RenewLease { saga_id, attempt } => {
+                let Some(current) = self.get(&saga_id) else {
+                    return Ok(());
+                };
+                if current.status.is_terminal() || attempt != current.attempt {
+                    return Ok(());
+                }
+                let held = matches!(
+                    (&ctx.env().origin, &current.assignee),
+                    (Origin::External(key), Some(assignee)) if key == assignee
+                );
+                if !held {
+                    return Ok(());
+                }
+                let height = ctx.env().height;
+                let Some(expiry) = current.lease_expires_at else {
+                    return Ok(());
+                };
+                if height >= expiry {
+                    return Ok(());
+                }
+                let window = current.lease_views.unwrap_or(DEFAULT_LEASE_VIEWS);
+                let mut saga = current.clone();
+                if height >= expiry.saturating_sub(window / 2) {
+                    let next = bounded_lease_expiry(
+                        height,
+                        &current.assignee,
+                        current.lease_views,
+                        current.deadline,
+                    );
+                    if next.is_some_and(|next| next > expiry) {
+                        saga.lease_expires_at = next;
+                    }
+                }
+                saga.updated_at = ctx.env().consensus_time;
+                self.stage(saga_id, saga);
+            }
+            SagaMsg::Reassign { saga_id, attempt } => {
+                let Some(current) = self.get(&saga_id) else {
+                    return Ok(());
+                };
+                if current.status.is_terminal()
+                    || attempt != current.attempt
+                    || current.origin != saga_origin(&ctx.env().origin)
+                {
+                    return Ok(());
+                }
+                let mut saga = current.clone();
+                saga.updated_at = ctx.env().consensus_time;
+                if saga.pinned_assignee.is_some() {
+                    return Err(Error::Module("pinned saga cannot be reassigned".into()));
+                }
+                if saga.attempt + 1 >= saga.max_attempts {
+                    return Err(Error::Module("reassignment attempts exhausted".into()));
+                }
+
+                let old_assignee = saga.assignee.clone();
+                saga.attempt += 1;
+                let next = self
+                    .compute_assignee_excluding(
+                        ctx,
+                        &saga_id,
+                        saga.capability.as_deref(),
+                        saga.attempt,
+                        ctx.env().height,
+                        old_assignee.as_deref(),
+                    )
+                    .await;
+                let Some(next) = next else {
+                    return Err(Error::Module("no alternate assignee is available".into()));
+                };
+                self.request_assigned(ctx, saga_id, saga, Some(next));
+            }
             SagaMsg::Accept { saga_id, attempt } => {
                 // the claim lane for UNASSIGNED attempts: first accept in
                 // consensus order wins the lease; everything else — unknown
@@ -809,7 +930,8 @@ impl Module for SagaModule {
                 let height = ctx.env().height;
                 let mut saga = current.clone();
                 saga.assignee = Some(key.clone());
-                saga.lease_expires_at = lease_expiry(height, &saga.assignee, saga.lease_views);
+                saga.lease_expires_at =
+                    bounded_lease_expiry(height, &saga.assignee, saga.lease_views, saga.deadline);
                 saga.updated_at = ctx.env().consensus_time;
                 // the actual work order: the announcement's request, re-emitted
                 // naming the winner — every other node's worker skips it.
@@ -1106,6 +1228,7 @@ mod tests {
             saga_id: id.into(),
             attempt,
             outcome,
+            usage: None,
         })
     }
     fn crank() -> Msg {
@@ -1769,6 +1892,112 @@ mod tests {
         assert_eq!(v.status, SagaStatus::Failed);
         assert_eq!(v.error, Some("lease attempts exhausted".to_string()));
         assert!(ctx.effects.is_empty());
+    }
+
+    #[test]
+    fn assignee_renews_and_requester_reassigns_with_attempt_fencing() {
+        let validators = vec![b"node-a".to_vec(), b"node-b".to_vec()];
+        let mut m = SagaModule::with_valset("saga", "valset", LeasePolicy::Strict);
+        let mut ctx = CaptureCtx::new()
+            .with_origin(Origin::Module("dispatch".into()))
+            .with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                saga_id: "s1".into(),
+                spec: b"w".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: Some(100),
+                max_attempts: 3,
+                lease_views: Some(10),
+                capability: None,
+                pinned_assignee: None,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let first = get(&m, "s1").unwrap().assignee.unwrap();
+
+        let mut ctx = CaptureCtx::new()
+            .at(4)
+            .with_origin(Origin::External(first.clone()))
+            .with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::RenewLease {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let view = get(&m, "s1").unwrap();
+        assert_eq!(view.lease_expires_at, Some(10));
+        assert_eq!(view.updated_at, 4, "every valid heartbeat is observable");
+
+        let mut ctx = CaptureCtx::new()
+            .at(5)
+            .with_origin(Origin::External(first.clone()))
+            .with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::RenewLease {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, "s1").unwrap().lease_expires_at, Some(15));
+
+        let before = m.root();
+        let mut ctx = CaptureCtx::new()
+            .at(6)
+            .with_origin(Origin::External(first.clone()))
+            .with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Reassign {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(m.root(), before, "the assignee cannot reassign itself");
+
+        let mut ctx = CaptureCtx::new()
+            .at(7)
+            .with_origin(Origin::Module("dispatch".into()))
+            .with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Reassign {
+                saga_id: "s1".into(),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let view = get(&m, "s1").unwrap();
+        assert_eq!(view.attempt, 1);
+        assert_ne!(view.assignee.as_deref(), Some(first.as_slice()));
+        assert_eq!(ctx.worker_requests()[0].attempt, 1);
+
+        let fenced_root = m.root();
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .with_origin(Origin::External(first))
+            .with_validators(validators);
+        exec(&mut m, &mut ctx, &oracle("s1", 0, Ok(b"stale".to_vec()))).unwrap();
+        commit(&mut m);
+        assert_eq!(m.root(), fenced_root, "the revoked attempt cannot finish");
     }
 
     #[test]

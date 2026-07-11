@@ -17,15 +17,15 @@ raw bytes re-enter consensus as one agreed op that `runs` validates and
 delivers. The determinism boundary is a single seam: everything left of it
 (compose, turn-claim, normalize, validate, deliver) is deterministic consensus
 work; only the LLM call, on one leased node, is non-deterministic — and it is
-sealed into one committed result. Liveness is owned by `saga`: lease + bounded
-attempts + a whole-run deadline (`RUN_DEADLINE_VIEWS = 1024`) + a permissionless
-crank that re-leases an expired attempt to a fresh rendezvous pick or converts
-the deadline into a committed failure.
+sealed into one committed result. Liveness is owned by `saga`: renewable leases,
+bounded attempts, a six-hour whole-run deadline (`RUN_DEADLINE_VIEWS = 21_600`),
+and a permissionless crank that re-leases an expired attempt to a fresh
+rendezvous pick or converts the deadline into a committed failure.
 
 Two facts about the *current* runtime shape this decision:
 
 - **The executor is already a full agentic CLI.** The shipped capability specs
-  (`crates/kernel/capability-host/specs/{codex,claude}.toml`) run
+  (`crates/system/capability-host/specs/{codex,claude}.toml`) run
   `codex exec --sandbox workspace-write` / `claude -p --permission-mode
   acceptEdits` with no turn cap — real tool-use loops that read and edit files.
   `[workspace] mode = "persistent"` gives each agent a per-agent cwd under the

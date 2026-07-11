@@ -5,7 +5,7 @@ one executor — an installed CLI that can turn a prompt into text. Everything
 the node needs is in the file: how to detect the binary, the exact argv to
 invoke it, and how to parse its output. **Adding an executor is a config
 change, never a code change** — the embedded built-ins are themselves spec
-files globbed out of `crates/kernel/capability-host/specs/` at build time; no
+files globbed out of `crates/system/capability-host/specs/` at build time; no
 Rust source names an executor.
 
 Specs are the data half of the capability system:
@@ -13,7 +13,7 @@ Specs are the data half of the capability system:
 | Layer | Owns | Code |
 |---|---|---|
 | Consensus (`crates/system/capability`) | *who provides what*, network-wide: node key → announced tag set | never reads specs |
-| Host (`crates/kernel/capability-host`) | *actually running it*: spec loading, binary discovery, spawning, parsing | this document |
+| Host (`crates/system/capability-host`) | *actually running it*: spec loading, binary discovery, spawning, parsing | this document |
 
 The consensus registry only ever sees **tags**. The spec behind a tag is
 private to each host — two nodes can announce the same tag with differently
@@ -53,7 +53,7 @@ in the same trust class as a shell profile or a systemd unit:
 
 - They load from exactly two places, both local and operator-controlled:
   1. the specs **embedded in the node binary** at compile time
-     (`crates/kernel/capability-host/specs/*.toml`);
+     (`crates/system/capability-host/specs/*.toml`);
   2. the **operator spec directory** (see [Spec sources](#spec-sources)).
 - They are **never fetched from the network**, and no consensus code path can
   read one (host-local files are non-deterministic input).
@@ -203,7 +203,7 @@ being silently ignored.
 |---|---|---|---|
 | `args` | string array | no (default `[]`) | passed verbatim to exec; fully literal, no placeholders |
 | `prompt` | string | yes | must be `"stdin"` in v1 |
-| `timeout_secs` | integer | no (default `300`) | 1..=3600; IDLE budget — output refreshes it; killed after this much silence, or at 6x regardless |
+| `timeout_secs` | integer | no (default `300`) | 1..=3600; IDLE budget — output refreshes it; killed after this much silence, or at 36x regardless |
 
 ### `[output]`
 

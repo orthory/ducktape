@@ -13,6 +13,7 @@ import { HuddleDock } from "../views/chat/Huddle";
 import { SearchModal } from "../views/search/SearchModal";
 import { SettingsView } from "../views/settings/SettingsView";
 import { CHANNEL_RAIL_WIDTH } from "../views/chat/ChatView";
+import { BrowserView } from "../views/browser/BrowserView";
 import { Sidebar, SIDEBAR_ICON_RAIL_WIDTH } from "./Sidebar";
 
 function resolveScreen(screen: string) {
@@ -71,6 +72,7 @@ function ErrorStrip() {
 export function ConsoleShell() {
   const { state, actions } = useDucktape();
   const Screen = resolveScreen(state.screen);
+  const browserVisible = state.screen === "browser";
 
   // ⌘K / Ctrl-K opens the command palette from anywhere. Escape and backdrop
   // clicks close it from within the modal.
@@ -89,7 +91,10 @@ export function ConsoleShell() {
     <div style={{ display: "flex", flex: 1, minHeight: 0, position: "relative" }}>
       <Sidebar />
       <div style={{ flex: 1, minWidth: 0, display: "flex" }}>
-        <Screen />
+        <div style={{ flex: 1, minWidth: 0, display: browserVisible ? "flex" : "none" }}>
+          <BrowserView visible={browserVisible} />
+        </div>
+        {!browserVisible && <Screen />}
       </div>
       {/* the live-huddle session card floats above EVERY screen — a hot mic
           must never lose its mute/leave controls to navigation. Sized to sit

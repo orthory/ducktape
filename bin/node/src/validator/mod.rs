@@ -8,7 +8,7 @@ mod engine;
 mod run;
 mod wiring;
 
-use commonware_cryptography::ed25519;
+use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
 use commonware_p2p::authenticated::discovery::{self, Network};
 use commonware_runtime::Quota;
@@ -199,7 +199,7 @@ pub(crate) async fn run_validator(
         namespace.clone(),
         wireguard_effect,
         overlay_slot.clone(),
-        bulk_pacer,
+        bulk_pacer.clone(),
         gateway_requests,
         gateway_commands,
         gateway_workspace,
@@ -215,6 +215,22 @@ pub(crate) async fn run_validator(
         relay_rx,
     )
     .await;
+
+    if let Some(peers) = &media_peers {
+        let me: [u8; 32] = signer
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("ed25519 keys are 32 bytes");
+        crate::agent_plane::spawn(
+            label.clone(),
+            crate::statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+            std::sync::Arc::clone(peers),
+            me,
+            bulk_pacer,
+            stream_hub.run_output(),
+        );
+    }
 
     let mut epoch_spawner = engine::EpochSpawner::new(
         &context,

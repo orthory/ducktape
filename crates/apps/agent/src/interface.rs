@@ -22,8 +22,6 @@
 use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_AGENT_TARGET: &str = "agent";
-
 // ---- consensus constants ----------------------------------------------------
 
 /// hard cap on the actions one run's response may carry — the blast-radius
@@ -230,13 +228,6 @@ pub struct AgentRecord {
 }
 
 impl AgentRecord {
-    /// D2 two-level attribution: an agent's effect is charged to
-    /// `(owner, agent_id)`. keyless (D1): this returns coordinates, never a key
-    /// — no key material exists on the record to return.
-    pub fn attribution(&self) -> (&SagaOrigin, &str) {
-        (&self.owner, &self.agent_id)
-    }
-
     /// the pure D3 cap gate. the runtime calls this before applying an effect
     /// or opening a sink; a record with empty caps denies every request except a
     /// positive budget check. forge/tool/

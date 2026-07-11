@@ -54,7 +54,8 @@ OS resolver, local CA, TLS proxy, helper sidecar, or privileged system setting.
   to use their existing authoritative state. They do not query DuckDNS.
 - DuckDNS's small naming registry still participates in ordinary authenticated
   module state sync; that does not make it a state-sync peer directory.
-- Snapshot version 2 intentionally removes v1 provider records. Existing dev
+- The snapshot intentionally drops the v1 provider records (and, since the
+  crate-refactor campaign, carries no version byte at all). Existing dev
   networks require a coordinated rebuild or lockstep upgrade.
 - A future service or delegated namespace must arrive with a concrete consumer
   and authority model; `net.duck` reservation alone promises no wire shape.

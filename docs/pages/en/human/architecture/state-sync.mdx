@@ -45,7 +45,7 @@ partially advance the root.
 
 ## Capstone
 
-The demo test `joiner_rebuilds_global_app_hash` rebuilds every module and checks
-that the joiner lands on the exact source app-hash. The node tests
-`network_joiner_full`, `cluster_e2e`, and `invite_e2e` extend that proof over
-the live state-sync wire from running nodes.
+The demo test `network_joiner_full` rebuilds every module purely over the
+state-sync wire protocol and checks that the joiner lands on the exact source
+app-hash. The node tests `cluster_e2e` and `invite_e2e` extend that proof to
+running nodes.

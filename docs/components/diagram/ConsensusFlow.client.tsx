@@ -16,7 +16,7 @@ const nodes: SemanticNode[] = [
   { id: 'simplex', label: 'Simplex agree', sub: 'BFT view + finalize', category: 'kernel' },
   { id: 'drain', label: 'Node drain', sub: 'apply as one block', category: 'kernel' },
   { id: 'apphash', label: 'App-hash + seal', sub: 'modules execute · roots', category: 'store' },
-  { id: 'effects', label: 'Effects re-enter', sub: 'saga → reactor → op', category: 'system' },
+  { id: 'effects', label: 'Effects re-enter', sub: 'saga → worker → op', category: 'system' },
 ]
 
 const edges: SemanticEdge[] = [

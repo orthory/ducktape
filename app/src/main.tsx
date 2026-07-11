@@ -27,28 +27,12 @@ const view = new URLSearchParams(window.location.search).get("view");
 // CLI / MCP server can snapshot the semantic tree, drive input, capture logs,
 // and render DOM-SVG screenshots in this webview. One instance per window,
 // labelled by the real Tauri window label. Never in release.
-if (import.meta.env.DEV) {
+if (import.meta.env.DEV || import.meta.env.VITE_TAURI_AGENT === "1") {
   void (async () => {
     const [{ WebviewAgentInstrumentation }, { getCurrentWindow }] = await Promise.all([
-      import("@byeongsu-hong/tauri-plugin-agent"),
+      import("@byeongsu-hong/tauri-agent-plugin"),
       import("@tauri-apps/api/window"),
     ]);
-    // Tauri 2.11 hardened __TAURI_INTERNALS__: `invoke` is now read-only, so
-    // plugin 0.0.1's installIpcCapture() (which predates that and reassigns
-    // it) throws mid-install() — before the bridge listener registers — and
-    // every tauri-agent call then times out. Wrap the hook defensively:
-    // losing passive IPC capture is fine, losing the whole bridge is not.
-    const proto = WebviewAgentInstrumentation.prototype as unknown as Record<string, unknown>;
-    const origIpc = proto.installIpcCapture as (() => void) | undefined;
-    if (typeof origIpc === "function") {
-      proto.installIpcCapture = function (this: unknown) {
-        try {
-          origIpc.call(this);
-        } catch {
-          // read-only internals.invoke — IPC capture is expendable
-        }
-      };
-    }
     new WebviewAgentInstrumentation({ windowLabel: getCurrentWindow().label }).install();
   })().catch(() => {});
 }

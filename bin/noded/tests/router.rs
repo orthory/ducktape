@@ -323,7 +323,7 @@ async fn a_dead_actor_maps_to_service_unavailable() {
 fn gateway_route() -> gateway::RouteRecord {
     gateway::RouteRecord {
         statement: gateway::RouteStatement {
-            version: gateway::ROUTE_FORMAT_VERSION,
+            version: 1,
             chain_id: "test".into(),
             account_id: vec![1],
             name: gateway::RouteName::named("app"),

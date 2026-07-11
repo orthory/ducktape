@@ -1,70 +1,49 @@
-# ops/ — fleet QA dashboard
+# Fleet QA
 
-Run the real Ducktape desktop app for **every git worktree** at once, headless,
-and watch them live from any device over Tailscale — so you can see how agents
-are driving and QAing each branch.
-
-```
-ops/
-  fleet.sh          fleet manager (userspace, no root)
-  fleet.mjs         metadata + HTTP/WebSocket/TCP runtime
-  fleet-console/    the dashboard (Vite + React + @novnc/novnc, @xyflow/react)
-```
+Multi-instance desktop QA is owned by
+[`tauri-agent-fleet`](https://github.com/byeongsu-hong/tauri-agent-fleet).
+Ducktape retains only its application config, CEF build/instance hooks, and QA
+suite under `tauri-agent-fleet.json` and `qa/`.
 
 ## Quick start
 
 ```bash
-ops/fleet.sh build-console        # one-time: bun install + vite build → dist/
-ops/fleet.sh up                   # bring up an instance per worktree (or: up <branch> …)
-ops/fleet.sh status               # slots/ports/status + dashboard URL
-# open the printed URL on your Mac/phone (must be on the tailnet)
-ops/fleet.sh down                 # tear it all down
+cd app && bun install
+cd ..
+app/node_modules/.bin/tauri-agent-fleet up HEAD
+app/node_modules/.bin/tauri-agent-fleet status
+app/node_modules/.bin/tauri-agent-fleet dashboard
+app/node_modules/.bin/tauri-agent-fleet down
 ```
 
-The dashboard shows one live tile per worktree (branch, sha, ahead/behind vs
-`dev`, status, an agent observe readiness badge, and an **agent activity** line
-— uncommitted-file count + latest commit). Toggle **Grid** ⇄ **Graph** (the git
-branch tree via `@xyflow/react`; `?view=graph` deep-links it). Click a tile to
-open a full-size **interactive** session plus that worktree's commit trail.
+The dashboard is read-oriented and polls Fleet's live instance/run state. It
+shows the revision, CEF variant, lifecycle and suite state, plugin health,
+tokens/cost, artifacts, and loopback-routed noVNC screen. Lifecycle stays in the
+CLI.
 
 ## How it works
 
 ```
-browser ──http/ws :6090 (ONLY exposed port)──▶ one Bun server
-                                               ├─ fleet-console/dist  (UI + fleet.json)
-                                               └─ ?token=<worktree> ─▶ 127.0.0.1:<vncPort>
-per worktree:  Xvfb :11x → tauri dev (isolated $HOME) → x11vnc 127.0.0.1:591x
-                                             └─ tauri-agent endpoint in $STATE/<id>
+source revision → cached CEF debug artifact → isolated instance(s) → run(s)
+                                              ├─ tauri-agent direct client
+                                              └─ Xvfb + loopback x11vnc
 ```
 
-- **One exposed port** (`:6090`). Every worktree's x11vnc binds `127.0.0.1`; the
-  browser reaches them only through the fleet server's token router.
-- **Human screen vs agent stream**: people watch the VNC/noVNC tile. Agents use
-  the per-worktree tauri-agent endpoint. `fleet.json` includes an `agent`
-  object with `runtimeDir`, `endpointPath`, `endpointReady`, and an
-  aggregation-ready `observe` command contract (`XDG_RUNTIME_DIR=$STATE/<id>`
-  plus `app/scripts/tauri-agent observe --app com.ducktape.app --format
-  ndjson`). A later aggregator can consume those fields without changing the
-  fleet launcher.
-- **Isolation**: each app runs with its own `$HOME` AND `up_one` seeds a solo
-  workspace there (active, camelCase `registry.json`) + passes a stable
-  `DUCKTAPE_NODE_BIN` (staged outside `target/`, which `tauri dev`'s build.rs
-  clobbers to a 0-byte placeholder). The app then boots **LOCAL** on its own
-  node — not the shared `127.0.0.1:8844`. **Requires the worktree app to carry
-  PR #90** (StrictMode boot fix, on `dev`); worktrees behind `dev` boot REMOTE.
-  `CARGO_HOME`/`RUSTUP_HOME`/caches are pinned to the real home so builds stay
-  warm.
-- **Port bases** are offset from the single-instance `remote-tauri.sh`
-  (`:99/5900/6080`) so both can run at once. Override with `FLEET_DISP_BASE`,
-  `FLEET_VITE_BASE`, `FLEET_VNC_BASE`, `FLEET_WEB_PORT`, `FLEET_SCREEN`.
-- Reuses x11vnc / xdotool staged under `~/.local/opt/remote-tauri/` by the
-  `tauri-debug` / remote-tauri setup; the dashboard supplies its noVNC client.
+- `qa/fleet/build-cef.sh` builds once and copies the debug desktop plus node
+  sidecar into Fleet's immutable artifact directory. Debug is deliberate: the
+  tauri-agent endpoint is absent from release builds.
+- `qa/fleet/prepare-instance.sh` seeds a solo Ducktape workspace using the
+  cached sidecar. Fleet owns HOME, XDG/data/display/port isolation and exact
+  process-group teardown.
+- Ducktape's desktop is CEF-only on `dev`; the suite declares `variant: cef`.
+- The dashboard and VNC server bind to loopback unless an operator explicitly
+  chooses another dashboard host. Use an SSH/Tailscale tunnel for remote viewing.
 
 ## Notes
 
-- Read-only console: it views and connects; bring instances up/down with the
-  script (no lifecycle control in the UI — deferred by design).
-- Activity source is git/worktree churn (provider-agnostic — works for any
-  agent). The `<ActivityFeed>` is pluggable if you want a richer source later.
-- Agent QA automation lives in `skills/qa/SKILL.md`; this README is the
-  maintained operator reference for the fleet dashboard.
+- Run the deterministic CEF smoke with
+  `app/node_modules/.bin/tauri-agent-fleet test qa/suites/cef-smoke.json`.
+- `status --json` is the authoritative way to find an instance ID, display,
+  runtime directory, endpoint health, and artifact path.
+- On hosts where x11vnc is staged rather than installed, set
+  `FLEET_VNC_COMMAND` and its required `LD_LIBRARY_PATH` before invoking Fleet.

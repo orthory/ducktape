@@ -153,7 +153,8 @@ convenience-driven:
   behavior, plus fallback visibility, and D1's big-endian length prefix
   applied to both.
 - **D5** — the copy-pasted plane bring-up boilerplate
-  (`bin/node/src/statesync_plane.rs` vs `crates/duckdns/node/src/plane.rs`:
+  (`bin/node/src/statesync_plane.rs` vs the since-deleted duckdns announcer
+  plane:
   bind-retry loop + `DataPlane::new` + `stream_service` registration) was
   extracted into a shared helper in the `data-plane` crate, so the next
   service starts from the helper instead of a third copy-paste.

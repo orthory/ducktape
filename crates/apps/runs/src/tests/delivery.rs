@@ -252,13 +252,16 @@ fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
 
 #[test]
 fn raw_model_text_normalizes_into_a_postable_reply() {
-    // the dispatch oracle returns RAW text; the intake's deterministic
-    // normalization turns prose, empty JSON, and oversized answers into
-    // valid replies instead of failed runs.
+    // the oracle wraps the model's RAW text in the runner result; the
+    // intake's deterministic normalization turns prose, empty JSON, and
+    // oversized answers into valid replies instead of failed runs.
     let cases: Vec<Vec<u8>> = vec![
-        b"just prose, no JSON anywhere".to_vec(),
+        runner_wrapper("just prose, no JSON anywhere", serde_json::json!({})),
         response(&[], vec![]),
-        "x".repeat(MAX_REPLY_BLOCKS_BYTES + 1).into_bytes(),
+        runner_wrapper(
+            &"x".repeat(MAX_REPLY_BLOCKS_BYTES + 1),
+            serde_json::json!({}),
+        ),
     ];
     for bytes in cases {
         let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
@@ -326,7 +329,7 @@ fn code_blocks_survive_normalization_into_chat_blocks() {
     exec(
         &mut m,
         &mut ctx,
-        &result_event(&run_id, Ok(raw.as_bytes().to_vec())),
+        &result_event(&run_id, Ok(runner_wrapper(raw, serde_json::json!({})))),
     )
     .unwrap();
     let posts = ctx.chat_msgs();
@@ -362,7 +365,7 @@ fn a_fenced_json_reply_is_parsed_into_prose_not_dumped_as_a_code_block() {
     exec(
         &mut m,
         &mut ctx,
-        &result_event(&run_id, Ok(raw.as_bytes().to_vec())),
+        &result_event(&run_id, Ok(runner_wrapper(raw, serde_json::json!({})))),
     )
     .unwrap();
     let posts = ctx.chat_msgs();

@@ -9,6 +9,7 @@ import {
   enableJobWorker,
   pendingRuns,
   recentRuns,
+  reassignRun,
   requestRun,
   unwatchChannel,
   watchChannel,
@@ -73,6 +74,13 @@ describe("runs msgs", () => {
     expect(transport.submit).toHaveBeenCalledWith(
       "runs",
       { cancel_run: { run_id: "run-1" } },
+      "operator",
+    );
+
+    await reassignRun(transport, { runId: "run-1", attempt: 2, origin: "operator" });
+    expect(transport.submit).toHaveBeenCalledWith(
+      "runs",
+      { reassign_run: { run_id: "run-1", attempt: 2 } },
       "operator",
     );
   });

@@ -22,17 +22,28 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use capability_host::ProviderSet;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, Either, select};
 use host::worker::{WorkOutcome, Worker};
 use sdk::{Effect, Msg};
 use tokio::sync::Semaphore;
 
 use crate::provision::{SharedProvisioner, WorkspaceSpec, assemble_runner_result, bind_workspace};
-use crate::{ExecJob, Gated, clean_error, gate, oracle_result};
+use crate::{
+    AttemptOutput, ExecJob, Gated, attempt_output, clean_error, gate, oracle_result_with_usage,
+    renew_lease,
+};
 
 /// how many provider runs may execute concurrently unless
 /// `DUCKTAPE_MAX_CONCURRENT_RUNS` says otherwise.
 pub const DEFAULT_MAX_CONCURRENT_RUNS: usize = 4;
+
+fn lease_renew_interval() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(25)
+    } else {
+        Duration::from_secs(10)
+    }
+}
 
 /// hand one Send future to the host's background lane. the pool never
 /// blocks on it; over-cap runs queue INSIDE their spawned task (on the
@@ -87,12 +98,12 @@ pub struct DispatchPool {
     /// binary like spawn/deliver, so the pool stays storage-agnostic. `None`
     /// fails prompt-pinned envelopes loudly (see [`crate::envelope::prepare`]).
     resolver: Option<crate::BlobResolver>,
-    /// materializes/commits/cleans a per-run duckfs workspace for portable
-    /// (v3) runs — injected by the node binary, where duckfs-client + the
-    /// actor lane are reachable. `None` (the default) keeps the accept-only
-    /// degrade: a v3 plan is surfaced but never activated, so the run executes
-    /// like a legacy one (raw-text delivery, no workspace). both node binaries
-    /// wire a real provisioner, so this is LIVE on every production agent run.
+    /// materializes/commits/cleans a per-run workspace — injected by the node
+    /// binary, where duckfs-client + the actor lane are reachable. `None`
+    /// (the default) keeps the accept-only degrade: the plan is surfaced but
+    /// never activated, so the run executes raw-text with no workspace. both
+    /// node binaries wire a real provisioner, so this is LIVE on every
+    /// production agent run.
     provisioner: Option<SharedProvisioner>,
 }
 
@@ -141,11 +152,10 @@ impl DispatchPool {
         self
     }
 
-    /// wire the host-side workspace provisioner portable (v3) runs materialize
-    /// through — mirrors [`Self::with_resolver`]. without it (or on any run
-    /// that carries no v3 plan) the pool takes the legacy branch: the
-    /// provider's raw text is delivered verbatim, no workspace exists. the
-    /// production binaries always wire one; v3 envelopes are live.
+    /// wire the host-side workspace provisioner runs materialize through —
+    /// mirrors [`Self::with_resolver`]. without it the pool takes the dormant
+    /// branch: the provider's raw text is delivered verbatim, no workspace
+    /// exists. the production binaries always wire one.
     pub fn with_provisioner(mut self, provisioner: SharedProvisioner) -> Self {
         self.provisioner = Some(provisioner);
         self
@@ -167,37 +177,67 @@ impl DispatchPool {
         let resolver = self.resolver.clone();
         let provisioner = self.provisioner.clone();
         (self.spawn)(Box::pin(async move {
-            // over-cap runs queue HERE, on their own task.
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("run semaphore is never closed");
-            // re-resolve by tag inside the task: the gate already proved the
-            // capability resolves, and a provider surface is immutable for
-            // the process lifetime — this is just how the borrow crosses.
-            let outcome = match providers.resolve(&job.capability) {
-                // the envelope step runs on the spawned task too — prompt
-                // resolution is a blob read, not host-loop work. its errors
-                // are the run's result: a saga Err, never a silent fallback.
-                Ok(provider) => match crate::envelope::prepare(&job.input, resolver.as_ref()).await
-                {
-                    Ok(mut prepared) => {
-                        // the live-output registry key: the dispatch_id half of
-                        // the saga id, exactly what the app's PendingRun rows
-                        // expose — set before execute so BOTH the legacy and
-                        // provisioned paths carry it into provider.run.
-                        prepared.ctx.run_key = Some(run_key_for(&job.saga_id));
-                        execute(&job, prepared, provider, provisioner.as_ref())
-                            .await
-                            .map_err(clean_error)
+            let run = async {
+                // over-cap runs queue HERE, on their own task. the heartbeat
+                // below already runs while they wait, so a healthy local
+                // queue does not lose its lease before execution starts.
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("run semaphore is never closed");
+                // re-resolve by tag inside the task: the gate already proved
+                // the capability resolves, and a provider surface is
+                // immutable for the process lifetime — this is just how the
+                // borrow crosses.
+                match providers.resolve(&job.capability) {
+                    // the envelope step runs on the spawned task too — prompt
+                    // resolution is a blob read, not host-loop work. its errors
+                    // are the run's result: a saga Err, never a silent fallback.
+                    Ok(provider) => {
+                        match crate::envelope::prepare(&job.input, resolver.as_ref()).await {
+                            Ok(mut prepared) => {
+                                // the live-output registry key: the dispatch_id half of
+                                // the saga id, exactly what the app's PendingRun rows
+                                // expose — set before execute so BOTH the dormant and
+                                // provisioned paths carry it into provider.run.
+                                prepared.ctx.run_key = Some(run_key_for(&job.saga_id));
+                                execute(&job, prepared, provider, provisioner.as_ref())
+                                    .await
+                                    .map_err(clean_error)
+                            }
+                            Err(e) => Err(clean_error(e)),
+                        }
                     }
                     Err(e) => Err(clean_error(e)),
-                },
-                Err(e) => Err(clean_error(e)),
+                }
+            };
+            let heartbeat_deliver = deliver.clone();
+            let heartbeat_saga = job.saga_id.clone();
+            let heartbeat_attempt = job.attempt;
+            let heartbeat = async move {
+                loop {
+                    tokio::time::sleep(lease_renew_interval()).await;
+                    heartbeat_deliver(renew_lease(&heartbeat_saga, heartbeat_attempt)).await;
+                }
+            };
+            futures::pin_mut!(run, heartbeat);
+            let outcome = match select(run, heartbeat).await {
+                Either::Left((outcome, _)) => outcome,
+                Either::Right(_) => unreachable!("lease heartbeat loop never completes"),
             };
             // error/timeout results are submitted like any other: the saga
             // must see the failure to complete or retry the attempt.
-            deliver(oracle_result(&job.saga_id, job.attempt, outcome)).await;
+            let (outcome, usage) = match outcome {
+                Ok(output) => (Ok(output.bytes), output.usage),
+                Err(error) => (Err(error), None),
+            };
+            deliver(oracle_result_with_usage(
+                &job.saga_id,
+                job.attempt,
+                outcome,
+                usage,
+            ))
+            .await;
             // prune AFTER delivery: a redelivery racing the result's submit
             // is still a skip, not a second child.
             inflight.lock().expect("inflight lock").remove(&key);
@@ -208,10 +248,10 @@ impl DispatchPool {
 /// provision → bind → run → commit → assemble → cleanup, at the dispatch
 /// boundary on the spawned task.
 ///
-/// DORMANT unless BOTH a v3 plan AND a wired provisioner are present: without
-/// either, this is byte-for-byte today's `provider.run(&input, &ctx).await`
-/// with the raw text as the delivered bytes. on the portable path the winning
-/// attempt's bytes are the host-assembled `RunnerResult` (prose + receipt).
+/// DORMANT without a wired provisioner: the run is plain
+/// `provider.run(&input, &ctx).await` with the raw text as the delivered
+/// bytes. on the provisioned path the winning attempt's bytes are the
+/// host-assembled `RunnerResult` (prose + receipt).
 /// commit runs ONLY on a successful run (a failed/timed-out run yields a saga
 /// `Err` with the dir cleaned up and no `output_ref`); cleanup always runs
 /// (W5). a commit-mechanism failure degrades to a `no_changes` receipt (R4) —
@@ -236,15 +276,17 @@ async fn execute(
     prepared: crate::envelope::Prepared,
     provider: &dyn capability_host::Provider,
     provisioner: Option<&SharedProvisioner>,
-) -> Result<Vec<u8>, String> {
+) -> Result<AttemptOutput, String> {
     let crate::envelope::Prepared {
         input,
         mut ctx,
-        workspace,
+        workspace: plan,
     } = prepared;
-    let Some((plan, prov)) = workspace.zip(provisioner) else {
+    let Some(prov) = provisioner else {
         // accept-only / legacy: unchanged behavior, raw text bytes.
-        return provider.run(&input, &ctx).await.map(String::into_bytes);
+        let output = provider.run_with_usage(&input, &ctx).await?;
+        let bytes = output.text.as_bytes().to_vec();
+        return Ok(attempt_output(output, bytes));
     };
     // the REQUESTED sink (Chain when the envelope carried none) — echoed on
     // the assembled RunnerResult below so runs' delivery can route it.
@@ -255,7 +297,6 @@ async fn execute(
         // the tagged source (duckfs subtree or forge repo@commit) crosses to
         // the provisioner verbatim — the pool never interprets it.
         source: plan.source,
-        base_tools: plan.base_tools,
         ro_mounts: plan.skills, // C4 skill ro mounts (phase 5)
     };
     // (a)+(b) materialize OUTSIDE storage — bounded: a stalled actor lane
@@ -276,8 +317,8 @@ async fn execute(
     // dir. the panic surfaces as this attempt's Err — the saga settles a
     // failed attempt instead of a silent task death.
     let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
-        match provider.run(&input, &ctx).await {
-            Ok(text) => {
+        match provider.run_with_usage(&input, &ctx).await {
+            Ok(output) => {
                 // (d) capture output_ref. a commit-MECHANISM failure (conflict,
                 // transport, rejection, a hung actor lane) must never
                 // masquerade as a clean tree: the receipt records the error
@@ -312,15 +353,10 @@ async fn execute(
                 // plan's REQUESTED sink (Chain unless the composer named one) —
                 // echoed so runs' delivery routes the output without re-deriving
                 // intent; the data facet stays host-observed later.
-                let effects = crate::provision::effects_from_response_text(&text);
-                Ok(assemble_runner_result(
-                    &text,
-                    &receipt,
-                    None,
-                    effects,
-                    sink,
-                    status,
-                ))
+                let effects = crate::provision::effects_from_response_text(&output.text);
+                let bytes =
+                    assemble_runner_result(&output.text, &receipt, None, effects, sink, status);
+                Ok(attempt_output(output, bytes))
             }
             Err(e) => Err(e), // failed run: no commit, no output_ref
         }
@@ -414,6 +450,7 @@ format = "text"
         peak: Arc<AtomicUsize>,
         last_run: Arc<Mutex<Option<(String, capability_host::RunContext)>>>,
         fail: bool,
+        usage: Option<capability_host::TokenUsage>,
     }
 
     #[async_trait::async_trait]
@@ -438,6 +475,19 @@ format = "text"
                 Ok(format!("answer to: {prompt}"))
             }
         }
+
+        async fn run_with_usage(
+            &self,
+            prompt: &str,
+            ctx: &capability_host::RunContext,
+        ) -> Result<capability_host::ProviderOutput, String> {
+            self.run(prompt, ctx)
+                .await
+                .map(|text| capability_host::ProviderOutput {
+                    text,
+                    usage: self.usage,
+                })
+        }
     }
 
     struct Probes {
@@ -459,6 +509,7 @@ format = "text"
             peak: peak.clone(),
             last_run: last_run.clone(),
             fail,
+            usage: None,
         };
         let providers = Arc::new(ProviderSet::assemble(
             capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
@@ -517,8 +568,12 @@ format = "text"
     }
 
     fn effect_for(saga_id: &str, attempt: u32, assignee: Option<&[u8]>) -> Effect {
-        effect_with_payload(saga_id, attempt, assignee, b"the entire input")
+        effect_with_payload(saga_id, attempt, assignee, &envelope_payload(None))
     }
+
+    /// what an unprovisioned pool delivers for [`envelope_payload`]: the raw
+    /// provider text over the assembled input.
+    const PLAIN_ANSWER: &[u8] = b"answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION";
 
     #[test]
     fn run_key_for_dispatch_saga_uses_last_segment() {
@@ -533,19 +588,71 @@ format = "text"
     async fn next_result(
         rx: &mut futures::channel::mpsc::UnboundedReceiver<Msg>,
     ) -> (String, u32, Result<Vec<u8>, String>) {
-        let msg = tokio::time::timeout(Duration::from_secs(10), rx.next())
-            .await
-            .expect("a result within budget")
-            .expect("the lane stays open");
-        assert_eq!(msg.target, "saga");
-        match saga::decode_msg(&msg.payload).expect("a saga msg") {
-            SagaMsg::OracleResult {
-                saga_id,
-                attempt,
-                outcome,
-            } => (saga_id, attempt, outcome),
-            other => panic!("expected an OracleResult, got {other:?}"),
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), rx.next())
+                .await
+                .expect("a result within budget")
+                .expect("the lane stays open");
+            assert_eq!(msg.target, "saga");
+            match saga::decode_msg(&msg.payload).expect("a saga msg") {
+                SagaMsg::OracleResult {
+                    saga_id,
+                    attempt,
+                    outcome,
+                    ..
+                } => return (saga_id, attempt, outcome),
+                SagaMsg::RenewLease { .. } => continue,
+                other => panic!("expected an OracleResult, got {other:?}"),
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn a_slow_run_renews_its_lease() {
+        let (providers, _) = slow_providers(Duration::from_millis(100), false);
+        let (pool, mut rx) = pool_with(providers, 1);
+        pool.run(&effect_for("s1", 3, Some(b"me"))).await.unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(1), rx.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            saga::decode_msg(&msg.payload).unwrap(),
+            SagaMsg::RenewLease { saga_id, attempt: 3 } if saga_id == "s1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_usage_rides_the_oracle_result() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = SlowProvider {
+            tag: "alpha".into(),
+            delay: Duration::ZERO,
+            executions: executions.clone(),
+            current: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            last_run: Arc::new(Mutex::new(None)),
+            fail: false,
+            usage: Some(capability_host::TokenUsage {
+                input_tokens: 100,
+                cached_input_tokens: 60,
+                cache_write_input_tokens: 0,
+                output_tokens: 20,
+                reasoning_output_tokens: 7,
+            }),
+        };
+        let providers = Arc::new(ProviderSet::assemble(
+            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            vec![Box::new(provider)],
+        ));
+        let (pool, mut rx) = pool_with(providers, 1);
+        pool.run(&effect_for("s1", 0, Some(b"me"))).await.unwrap();
+        let msg = rx.next().await.unwrap();
+        let SagaMsg::OracleResult { usage, .. } = saga::decode_msg(&msg.payload).unwrap() else {
+            panic!("expected OracleResult");
+        };
+        assert_eq!(usage.unwrap().input_tokens, 100);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -617,7 +724,7 @@ format = "text"
 
         let (saga_id, attempt, outcome) = next_result(&mut rx).await;
         assert_eq!((saga_id.as_str(), attempt), ("s1", 0));
-        assert_eq!(outcome.unwrap(), b"answer to: the entire input".to_vec());
+        assert_eq!(outcome.unwrap(), PLAIN_ANSWER.to_vec());
         assert_eq!(
             probes.executions.load(Ordering::SeqCst),
             1,
@@ -670,15 +777,25 @@ format = "text"
         }
     }
 
+    /// a v3 duckfs run envelope — the shape the composer emits for every run.
     fn envelope_payload(prompt_hash: Option<&str>) -> Vec<u8> {
         serde_json::json!({
-            "ducktape_run": 2,
+            "ducktape_run": 3,
             "agent_id": "bot",
             "prompt_hash": prompt_hash,
             "thread_key": "general#7",
             "instructions": "GENERIC",
             "contract": "CONTRACT",
             "conversation": "CONVERSATION",
+            "workspace": {
+                "kind": "duckfs",
+                "source_prefix": "/shared/agent-workspaces/bot",
+                "source_snapshot": "aa".repeat(32)
+            },
+            "skills": [
+                {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32)}
+            ],
+            "result_contract": {"ducktape_runner_result": 1}
         })
         .to_string()
         .into_bytes()
@@ -716,7 +833,7 @@ format = "text"
         pool.run(&eff).await.unwrap();
         let (result_saga_id, _, outcome) = next_result(&mut rx).await;
         assert_eq!(result_saga_id, saga_id);
-        assert_eq!(outcome.unwrap(), b"answer to: the entire input".to_vec());
+        assert_eq!(outcome.unwrap(), PLAIN_ANSWER.to_vec());
         let (_, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
         assert_eq!(ctx.run_key.as_deref(), Some("d1"));
     }
@@ -779,34 +896,9 @@ format = "text"
 
     // ---- the portable (v3) provisioning bracket -----------------------------
 
-    /// a v3 (portable) run envelope payload — the shape the composer emits for
-    /// every run when a files module is wired (the production default). carried
-    /// here to exercise the pool's bracket without a live duckfs (the mock
-    /// stands in for the checkout engine).
+    /// the same v3 duckfs envelope, named for the provisioning-bracket tests.
     fn v3_envelope_payload() -> Vec<u8> {
-        serde_json::json!({
-            "ducktape_run": 3,
-            "agent_id": "bot",
-            "prompt_hash": null,
-            "thread_key": "general#7",
-            "instructions": "GENERIC",
-            "contract": "CONTRACT",
-            "conversation": "CONVERSATION",
-            "workspace": {
-                "kind": "duckfs",
-                "source_prefix": "/shared/agent-workspaces/bot",
-                "source_snapshot": "aa".repeat(32)
-            },
-            "base_tools": [
-                {"name":"ducktape-files","version":"1","exposure":"cli"}
-            ],
-            "skills": [
-                {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32)}
-            ],
-            "result_contract": {"ducktape_runner_result": 1}
-        })
-        .to_string()
-        .into_bytes()
+        envelope_payload(None)
     }
 
     /// a forge-sourced v3 run envelope — the EXACT byte shapes task 1's
@@ -829,9 +921,6 @@ format = "text"
                 "branch": "agent/item-7",
                 "branch_born": false
             },
-            "base_tools": [
-                {"name":"ducktape-files","version":"1","exposure":"cli"}
-            ],
             "skills": [],
             "result_contract": {
                 "ducktape_runner_result": 1,
@@ -1453,27 +1542,57 @@ format = "text"
     }
 
     #[tokio::test]
-    async fn a_v2_run_is_byte_identical_with_or_without_a_provisioner() {
-        // the legacy regression guard: every non-portable (v2) run must produce the
-        // exact same outcome bytes whether or not a provisioner is wired.
-        let expected = b"answer to: GENERIC\n\nCONTRACT\n\nCONVERSATION".to_vec();
-
-        // without a provisioner.
-        let (providers, _p) = slow_providers(Duration::from_millis(5), false);
+    async fn flat_and_v2_payloads_fail_the_saga_loudly() {
+        // FLAG DAY: the flat-string passthrough and the v2 tolerance are gone
+        // — both deliver a loud Err result (the saga settles a failed
+        // attempt), and the provider is never invoked.
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
         let (pool, mut rx) = pool_with(providers, 4);
+
         pool.run(&effect_with_payload(
             "s1",
             0,
             Some(b"me"),
-            &envelope_payload(None),
+            b"the entire input",
         ))
         .await
         .unwrap();
-        assert_eq!(next_result(&mut rx).await.2.unwrap(), expected);
+        let (_, _, outcome) = next_result(&mut rx).await;
+        let err = outcome.unwrap_err();
+        assert!(err.contains("no ducktape_run envelope marker"), "got {err}");
 
-        // with a provisioner wired: a v2 run carries no plan, so the bracket
-        // takes the unchanged branch and the provisioner is never touched.
-        let (providers, _p) = slow_providers(Duration::from_millis(5), false);
+        let mut v2: serde_json::Value =
+            serde_json::from_slice(&envelope_payload(None)).unwrap();
+        v2["ducktape_run"] = serde_json::json!(2);
+        pool.run(&effect_with_payload(
+            "s2",
+            0,
+            Some(b"me"),
+            v2.to_string().as_bytes(),
+        ))
+        .await
+        .unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+        let err = outcome.unwrap_err();
+        assert!(err.contains("version 2"), "got {err}");
+        assert_eq!(
+            probes.executions.load(Ordering::SeqCst),
+            0,
+            "the provider is never invoked on a rejected payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_prose_result_still_fits_the_saga_cap() {
+        // THE wedge fix: the host-assembled RunnerResult is the saga Ok
+        // payload, and the saga aborts any Ok over saga::MAX_RESULT_BYTES —
+        // an uncapped assembly could then never land and the run would wedge
+        // until deadline. an oversized prose answer must deliver TRUNCATED
+        // (receipt intact) instead.
+        let providers = Arc::new(ProviderSet::assemble(
+            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            vec![Box::new(HugeProvider { tag: "alpha".into() })],
+        ));
         let (provisioned, committed, cleaned) = flags();
         let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
             provisioned: provisioned.clone(),
@@ -1482,21 +1601,48 @@ format = "text"
             fail_commit: None,
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
-        pool.run(&effect_with_payload(
-            "s1",
-            0,
-            Some(b"me"),
-            &envelope_payload(None),
-        ))
-        .await
-        .unwrap();
-        assert_eq!(next_result(&mut rx).await.2.unwrap(), expected);
+
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        pool.run(&eff).await.unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+
+        let bytes = outcome.expect("the oversized run still delivers Ok");
         assert!(
-            !provisioned.load(Ordering::SeqCst),
-            "a v2 run never provisions"
+            bytes.len() <= saga::MAX_RESULT_BYTES,
+            "the delivered result must fit the saga cap ({} > {})",
+            bytes.len(),
+            saga::MAX_RESULT_BYTES
         );
-        assert!(!committed.load(Ordering::SeqCst));
-        assert!(!cleaned.load(Ordering::SeqCst));
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["ducktape_runner_result"], 1);
+        let text = v["response_text"].as_str().unwrap();
+        assert!(
+            text.ends_with("bytes)]") && text.contains("[output truncated ("),
+            "the truncated prose names its original size: …{}",
+            &text[text.len().saturating_sub(60)..]
+        );
+        // the receipt survives truncation — the artifact facet is never lost.
+        assert_eq!(v["workspace_receipt"]["output_snapshot"], "cc".repeat(32));
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    /// a provider whose answer alone exceeds the saga result cap.
+    struct HugeProvider {
+        tag: String,
+    }
+
+    #[async_trait::async_trait]
+    impl capability_host::Provider for HugeProvider {
+        fn capability(&self) -> &str {
+            &self.tag
+        }
+        async fn run(
+            &self,
+            _prompt: &str,
+            _ctx: &capability_host::RunContext,
+        ) -> Result<String, String> {
+            Ok("x".repeat(saga::MAX_RESULT_BYTES + 64 * 1024))
+        }
     }
 
     /// pin the assembled wire shape against `runs::RunnerResult` field-for-field
@@ -1506,9 +1652,11 @@ format = "text"
     #[test]
     fn assembled_runner_result_matches_the_runs_deserialize_contract() {
         // a mirror of runs' faceted Deserialize — a rename in EITHER crate must
-        // fail THIS test. facet fields carry serde defaults so the minimal shape
-        // still decodes (non-deny_unknown_fields, as runs keeps it).
+        // fail THIS test. deny_unknown_fields mirrors runs: an assembled key
+        // runs does not know is drift and must fail HERE, not in delivery.
+        // facet fields carry serde defaults so the minimal shape still decodes.
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct RunsRunnerResult {
             ducktape_runner_result: u32,
             response_text: String,
@@ -1525,7 +1673,6 @@ format = "text"
         #[derive(serde::Deserialize)]
         struct RunsWorkspaceReceipt {
             source_prefix: String,
-            source_snapshot: Option<String>,
             output_snapshot: Option<String>,
             commit_height: Option<u64>,
             rebased: bool,
@@ -1600,10 +1747,6 @@ format = "text"
         assert_eq!(
             parsed.workspace_receipt.source_prefix,
             "/shared/agent-workspaces/bot"
-        );
-        assert_eq!(
-            parsed.workspace_receipt.source_snapshot,
-            Some("aa".repeat(32))
         );
         assert_eq!(parsed.workspace_receipt.commit_height, Some(9));
         assert!(parsed.workspace_receipt.rebased);

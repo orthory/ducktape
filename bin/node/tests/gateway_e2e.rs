@@ -19,7 +19,7 @@ use common::{Cluster, hex, poll_until, serial};
 use commonware_cryptography::{Signer as _, ed25519};
 use duckdns::{DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply};
 use gateway::{
-    GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, ROUTE_FORMAT_VERSION,
+    GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization,
     RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement,
     RouteTarget,
 };
@@ -82,7 +82,7 @@ fn signed_route(
     audience: RouteAudience,
 ) -> GatewayMsg {
     let statement = RouteStatement {
-        version: ROUTE_FORMAT_VERSION,
+        version: 1,
         chain_id: chain.into(),
         account_id: member.public_key().as_ref().to_vec(),
         name: RouteName::named("api"),
