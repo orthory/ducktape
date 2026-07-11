@@ -1165,28 +1165,28 @@ fn gateway_method(method: &Method) -> Option<gateway::RouteMethod> {
 }
 
 fn gateway_request_headers(headers: &HeaderMap) -> Result<Vec<gateway::ProxyHeader>, String> {
-    if headers.contains_key(header::COOKIE) {
-        return Err("gateway browser never accepts ambient Cookie credentials".into());
-    }
-    let mut forwarded = Vec::new();
-    for name in gateway::ALLOWED_REQUEST_HEADERS {
-        let values = headers.get_all(*name);
-        let mut values = values.iter();
-        let Some(value) = values.next() else {
+    // Cookie now flows end to end; only hop-by-hop / forwarding / identity
+    // headers (and any x-duck-* spoof) are stripped, via the shared denylist.
+    let mut forwarded: Vec<gateway::ProxyHeader> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, value) in headers {
+        let name = name.as_str().to_ascii_lowercase();
+        if !gateway::header_forwardable(&name) {
             continue;
-        };
-        if values.next().is_some() {
+        }
+        if !seen.insert(name.clone()) {
             return Err(format!("gateway browser rejects duplicate {name} headers"));
         }
         forwarded.push(gateway::ProxyHeader {
-            name: (*name).to_string(),
+            name: name.clone(),
             value: value
                 .to_str()
                 .map_err(|_| format!("gateway browser received non-ASCII {name}"))?
                 .to_string(),
         });
     }
-    gateway::validate_headers(&forwarded, gateway::ALLOWED_REQUEST_HEADERS, "request")?;
+    forwarded.sort_by(|left, right| left.name.cmp(&right.name));
+    gateway::validate_headers(&forwarded, "request")?;
     Ok(forwarded)
 }
 

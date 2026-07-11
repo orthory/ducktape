@@ -516,6 +516,12 @@ async fn proxy_loopback(
             record.statement.revision.to_string(),
         );
     for header in &head.headers {
+        // Strip hop-by-hop / forwarding / identity headers and never let a
+        // caller header shadow a proxy-minted x-duck-* (decode already rejects
+        // those, so this is defense in depth).
+        if !gateway::header_forwardable(&header.name) {
+            continue;
+        }
         if header.name == "authorization" && !route.policy.allow_authorization {
             return Err(GatewayFailure::Forbidden(
                 "Authorization is disabled by the signed route policy".into(),
@@ -1062,7 +1068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loopback_proxy_forwards_post_and_verified_caller_but_not_cookie() {
+    async fn loopback_proxy_forwards_cookie_and_verified_caller() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -1072,13 +1078,17 @@ mod tests {
             let request = String::from_utf8_lossy(&request[..read]);
             assert!(request.starts_with("POST /items?source=duck HTTP/1.1\r\n"));
             let lower = request.to_ascii_lowercase();
+            // The mesh-verified caller identity is injected; Cookie now flows
+            // end to end (v1 stripped it); a caller-set x-duck-* never appears
+            // (it is rejected at decode and stripped at forward).
             assert!(lower.contains("x-duck-caller-account: "));
+            assert_eq!(lower.matches("x-duck-caller-account:").count(), 1);
             assert!(lower.contains("content-type: application/json"));
-            assert!(!lower.contains("cookie:"));
+            assert!(lower.contains("cookie: session=abc"));
             assert!(request.ends_with("{\"name\":\"quack\"}"));
             socket
                 .write_all(
-                    b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nSet-Cookie: secret=nope\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                    b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nSet-Cookie: sid=xyz\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
                 )
                 .await
                 .unwrap();
@@ -1145,10 +1155,16 @@ mod tests {
                 revision: 4,
                 method: gateway::RouteMethod::Post,
                 path_and_query: "/items?source=duck".into(),
-                headers: vec![gateway::ProxyHeader {
-                    name: "content-type".into(),
-                    value: "application/json".into(),
-                }],
+                headers: vec![
+                    gateway::ProxyHeader {
+                        name: "content-type".into(),
+                        value: "application/json".into(),
+                    },
+                    gateway::ProxyHeader {
+                        name: "cookie".into(),
+                        value: "session=abc".into(),
+                    },
+                ],
                 body_len: body.len() as u64,
             },
             body,
@@ -1157,13 +1173,14 @@ mod tests {
         .unwrap();
         assert_eq!(response.head.status, 201);
         assert_eq!(response.body, br#"{"ok":true}"#);
-        assert!(
-            response
-                .head
-                .headers
-                .iter()
-                .all(|header| header.name != "set-cookie")
-        );
+        // Set-Cookie now flows back (v1 stripped it).
+        let set_cookie = response
+            .head
+            .headers
+            .iter()
+            .find(|header| header.name == "set-cookie")
+            .expect("set-cookie flows through");
+        assert_eq!(set_cookie.value, "sid=xyz");
     }
 
     #[tokio::test]
