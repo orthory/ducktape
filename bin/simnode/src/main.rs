@@ -63,6 +63,7 @@ use axum::{Json, Router};
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
+use evm::EvmModule;
 use duckdns::DuckDns;
 use gateway::Gateway;
 use tagging::TaggingModule;
@@ -90,7 +91,7 @@ use tasks::Tasks;
 
 /// every module registered at genesis, in registry order — noded's exact set,
 /// so status/roots and query targets match what the app expects of a daemon.
-const MODULE_IDS: [&str; 16] = [
+const MODULE_IDS: [&str; 17] = [
     "chat",
     "saga",
     "dispatch",
@@ -103,6 +104,7 @@ const MODULE_IDS: [&str; 16] = [
     "runs",
     "pages",
     "forge",
+    "evm",
     "files",
     "identity",
     "duckdns",
@@ -399,6 +401,9 @@ fn run_sim(
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
             .expect("forge init")
             .with_chat("chat");
+        let evm = EvmModule::init(context.child("evm"), "evm")
+            .await
+            .expect("evm init");
         let files = Files::open("files", duckfs_dir).expect("duckfs open");
         // the deterministic user->nodes binding registry — no valset, no chain
         // (the simulator has neither), matching noded's daemon wiring. It is
@@ -419,6 +424,7 @@ fn run_sim(
             Box::new(runs),
             Box::new(pages),
             Box::new(forge),
+            Box::new(evm),
             Box::new(files),
             Box::new(identity),
             Box::new(duckdns),

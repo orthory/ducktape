@@ -8449,6 +8449,7 @@ dependencies = [
  "commonware-runtime",
  "dispatch",
  "duckdns",
+ "evm",
  "files",
  "forge",
  "futures",
