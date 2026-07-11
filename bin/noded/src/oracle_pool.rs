@@ -196,6 +196,7 @@ impl host::worker::Worker for EchoWorker {
                 })
                 .to_string()
                 .into_bytes()),
+                usage: None,
             }),
         })))
     }

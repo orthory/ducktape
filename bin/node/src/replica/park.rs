@@ -103,6 +103,28 @@ pub(super) async fn park(
         relay_rx,
         mut lobby_tx,
     } = channels;
+    let agent_peers = (wireguard_listen.is_some()
+        && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake))
+    .then(|| {
+        let tracked = crate::voice_plane::MediaPeers::new(
+            String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
+        );
+        tracked.set_peers(peers.iter());
+        let me: [u8; 32] = signer
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("ed25519 keys are 32 bytes");
+        crate::agent_plane::spawn(
+            label.clone(),
+            statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
+            std::sync::Arc::clone(&tracked),
+            me,
+            bulk_pacer.clone(),
+            stream_hub.run_output(),
+        );
+        tracked
+    });
     let gateway_book = gateway_requests.map(|requests| {
         let book = crate::gateway_plane::OverlayBook::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
@@ -997,6 +1019,9 @@ pub(super) async fn park(
                     if let Some(book) = &gateway_book {
                         book.set_peers(plan.valset().transport_members().iter());
                     }
+                    if let Some(peers) = &agent_peers {
+                        peers.set_peers(plan.valset().transport_members().iter());
+                    }
                     last_tracked = plan.epoch();
                     // the follower swap: same OrderedNode, fresh
                     // orderer, cutover journaled — the epoch-local
@@ -1177,14 +1202,19 @@ pub(super) async fn park(
             // set — follow the re-track.
             *blob_peers.write().expect("blob peers lock") = mesh.iter().cloned().collect();
             oracle.track(tip.epoch, mesh);
-            if let Some(book) = &gateway_book {
+            if gateway_book.is_some() || agent_peers.is_some() {
                 let transport: Vec<ed25519::PublicKey> = tip
                     .participants
                     .iter()
                     .chain(tip.residents.iter())
                     .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
                     .collect();
-                book.set_peers(transport.iter());
+                if let Some(book) = &gateway_book {
+                    book.set_peers(transport.iter());
+                }
+                if let Some(peers) = &agent_peers {
+                    peers.set_peers(transport.iter());
+                }
             }
             last_tracked = tip.epoch;
         }

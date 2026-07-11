@@ -61,6 +61,7 @@ impl Worker for MockOracle {
                 saga_id: wr.saga_id,
                 attempt: wr.attempt,
                 outcome: Ok(result),
+                usage: None,
             }),
         })))
     }
@@ -86,6 +87,7 @@ impl Worker for FlakyOracle {
                 saga_id: wr.saga_id,
                 attempt: wr.attempt,
                 outcome,
+                usage: None,
             }),
         })))
     }

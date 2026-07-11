@@ -147,6 +147,7 @@ JSON
   if ! [ -f "$endpoint" ]; then
     ( cd "$app" && \
       HOME="$home" \
+      CEF_PATH="${CEF_PATH:-$REAL_HOME/.local/share/cef}" \
       CARGO_HOME="$REAL_HOME/.cargo" RUSTUP_HOME="$REAL_HOME/.rustup" \
       XDG_CACHE_HOME="$home/.cache" BUN_INSTALL_CACHE_DIR="$REAL_HOME/.bun/install/cache" \
       PATH="$REAL_HOME/.local/bin:$PATH" \

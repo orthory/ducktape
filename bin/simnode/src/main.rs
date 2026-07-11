@@ -831,6 +831,7 @@ impl host::worker::Worker for EchoWorker {
                 saga_id: request.saga_id,
                 attempt: request.attempt,
                 outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id).into_bytes()),
+                usage: None,
             }),
         })))
     }

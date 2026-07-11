@@ -370,6 +370,12 @@ impl Ctx for CaptureCtx {
                             status: DispatchStatus::Delivered,
                             outcome: Some(Ok(Vec::new())),
                             assignee: None,
+                            attempt: None,
+                            max_attempts: None,
+                            lease_expires_at: None,
+                            deadline: None,
+                            lease_updated_at: None,
+                            reassignable: None,
                             created_at: 0,
                             updated_at: 0,
                         });

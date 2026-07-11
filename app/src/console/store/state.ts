@@ -5,6 +5,7 @@
 
 import type { AgentRecord } from "../../domain/agent-client";
 import type { PendingRun, WatchView } from "../../domain/runs-client";
+import type { RunLease } from "../../domain/dispatch-client";
 import type {
   Channel,
   ChatSearchHit,
@@ -256,7 +257,7 @@ export interface ConsoleState {
   capabilitiesByNode: Map<string, string[]>;
   /** run_id -> hex node key currently executing it (the saga assignee, via the
    *  dispatch read facade). Only in-flight runs appear; empty otherwise. */
-  runAssignee: Map<string, string>;
+  runLease: Map<string, RunLease>;
 
   // ── Search (cross-module reads over the node's derived index) ──
   /** The last search's results, or null before any search ran. Query-driven —
@@ -701,7 +702,7 @@ export const createInitialState = (): ConsoleState => {
     watches: [],
     pendingRuns: [],
     capabilitiesByNode: new Map(),
-    runAssignee: new Map(),
+    runLease: new Map(),
     search: null,
     searchPending: false,
     searchOpen: false,
@@ -747,7 +748,7 @@ export interface ConsoleSnapshot {
   watches: WatchView[];
   pendingRuns: PendingRun[];
   capabilitiesByNode: Map<string, string[]>;
-  runAssignee: Map<string, string>;
+  runLease: Map<string, RunLease>;
   files: FileEntry[];
   blocks: BlockRecord[];
 }
@@ -776,7 +777,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   watches: snapshot.watches,
   pendingRuns: snapshot.pendingRuns,
   capabilitiesByNode: snapshot.capabilitiesByNode,
-  runAssignee: snapshot.runAssignee,
+  runLease: snapshot.runLease,
   files: snapshot.files,
   blocks: snapshot.blocks,
 });

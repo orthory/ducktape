@@ -14,7 +14,15 @@ import { replyVariant } from "./wire";
 export const TARGET = "saga";
 
 /** One ledger line, camelCase verbatim from the index wire (`UsageRow`). */
-export interface UsageRow {
+export interface TokenUsage {
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+}
+
+export interface UsageRow extends TokenUsage {
   executorHex: string;
   capability: string;
   outcomeOk: boolean;
@@ -34,7 +42,7 @@ export const usageRows = (
     )
     .then((reply) => replyVariant<UsageRow[]>(reply, "usage"));
 
-export interface CapabilityUsage {
+export interface CapabilityUsage extends TokenUsage {
   capability: string;
   runs: number;
   failed: number;
@@ -43,7 +51,7 @@ export interface CapabilityUsage {
 
 /** One account's ledger: totals plus the per-capability-tag breakdown. An
  *  executor node bound to no account groups under its own key hex. */
-export interface AccountUsage {
+export interface AccountUsage extends TokenUsage {
   /** Display name when the executor resolved to a named account, else the
    *  grouping key hex (account id, or the bare executor key when unbound). */
   label: string;
@@ -82,6 +90,11 @@ export const accountUsage = async (
         runs: 0,
         failed: 0,
         totalDurationBlocks: 0,
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        cacheWriteInputTokens: 0,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
         byCapability: [],
         caps: new Map(),
       };
@@ -90,14 +103,34 @@ export const accountUsage = async (
     group.runs += row.runs;
     if (!row.outcomeOk) group.failed += row.runs;
     group.totalDurationBlocks += row.totalDurationBlocks;
+    group.inputTokens += row.inputTokens;
+    group.cachedInputTokens += row.cachedInputTokens;
+    group.cacheWriteInputTokens += row.cacheWriteInputTokens;
+    group.outputTokens += row.outputTokens;
+    group.reasoningOutputTokens += row.reasoningOutputTokens;
     let cap = group.caps.get(row.capability);
     if (!cap) {
-      cap = { capability: row.capability, runs: 0, failed: 0, totalDurationBlocks: 0 };
+      cap = {
+        capability: row.capability,
+        runs: 0,
+        failed: 0,
+        totalDurationBlocks: 0,
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        cacheWriteInputTokens: 0,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
+      };
       group.caps.set(row.capability, cap);
     }
     cap.runs += row.runs;
     if (!row.outcomeOk) cap.failed += row.runs;
     cap.totalDurationBlocks += row.totalDurationBlocks;
+    cap.inputTokens += row.inputTokens;
+    cap.cachedInputTokens += row.cachedInputTokens;
+    cap.cacheWriteInputTokens += row.cacheWriteInputTokens;
+    cap.outputTokens += row.outputTokens;
+    cap.reasoningOutputTokens += row.reasoningOutputTokens;
   }
 
   return [...groups.values()]

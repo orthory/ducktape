@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { slotFor, startWeb } from "./fleet.mjs";
@@ -17,6 +17,22 @@ test("slots are stable and reuse the lowest free number", () => {
   expect(slotFor(path, "dev")).toBe(0);
   expect(slotFor(path, "feature")).toBe(1);
   expect(slotFor(path, "dev")).toBe(0);
+});
+
+test("desktop builds propagate the default CEF path and caller overrides", () => {
+  const fleetScript = readFileSync(new URL("./fleet.sh", import.meta.url), "utf8");
+  const cefAssignment = fleetScript.match(/^\s*(CEF_PATH=.*) \\$/m)?.[1];
+  expect(cefAssignment).toBeDefined();
+  const setCefNoBackslash = cefAssignment?.replace(/\s*\\$/, "");
+  const command = (override) => {
+    const env = { PATH: process.env.PATH ?? "" };
+    if (override !== undefined) env.CEF_PATH = override;
+
+    return Bun.spawnSync(["bash", "-c", `REAL_HOME=/real-home; ${setCefNoBackslash}; printf %s "$CEF_PATH"`], { env })
+      .stdout.toString();
+  };
+  expect(command()).toBe("/real-home/.local/share/cef");
+  expect(command("/caller/cef")).toBe("/caller/cef");
 });
 
 test("udp-port emits plain digits when terminal colors are forced", () => {

@@ -425,6 +425,7 @@ fn joiner_rebuilds_every_module_and_lands_on_the_source_app_hash() {
                 saga_id: "greet".into(),
                 attempt: 0,
                 outcome: Ok(b"olleh".to_vec()),
+                usage: None,
             }),
         )
         .await;

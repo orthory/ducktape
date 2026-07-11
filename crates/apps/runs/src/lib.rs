@@ -159,11 +159,16 @@ use tasks::{
 pub(crate) const CONTEXT_WINDOW: u64 = 64;
 
 /// whole-dispatch deadline granted to a run's LLM work, in views past the
-/// dispatching block.
-pub(crate) const RUN_DEADLINE_VIEWS: u64 = 1024;
+/// dispatching block. leases renew independently; this hard ceiling only
+/// bounds a malicious/chatty holder and leaves multi-hour work ample room.
+pub const RUN_DEADLINE_VIEWS: u64 = 6 * 60 * 60;
 
-/// oracle attempts per run: one retry after a failed or expired attempt.
-pub(crate) const RUN_MAX_ATTEMPTS: u32 = 2;
+/// one renewable agent-attempt lease. Saga's 64-view default is sized for
+/// short workers; the host heartbeats this wider window while the CLI lives.
+pub const RUN_LEASE_VIEWS: u64 = 1024;
+
+/// oracle attempts per run: one retry after an explicit provider failure.
+pub const RUN_MAX_ATTEMPTS: u32 = 2;
 
 /// jobs-board claims created by the runs worker use a view-denominated lease.
 pub(crate) const JOB_RUN_LEASE_VIEWS: u64 = 1000;

@@ -42,7 +42,7 @@ args = [
     "acceptEdits",
 ]
 prompt = "stdin"
-# The IDLE budget (output refreshes it; hard-capped at 6x). NOTE: -p with
+# The IDLE budget (output refreshes it; hard-capped at 36x). NOTE: -p with
 # --output-format json prints ONE result object at the end, so this CLI is
 # silent for the whole run — 600s is its longest allowed thinking/tool
 # stretch, not a total-run cap. Operators override per tag by shadowing the

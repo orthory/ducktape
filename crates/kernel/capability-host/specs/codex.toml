@@ -58,7 +58,7 @@ args = [
     "-",
 ]
 prompt = "stdin"
-# The IDLE budget (output refreshes it; hard-capped at 6x). `exec --json`
+# The IDLE budget (output refreshes it; hard-capped at 36x). `exec --json`
 # streams an event per action, so a long agentic run refreshes continuously
 # and only a genuinely STALLED run dies at this window. Operators override
 # per tag by shadowing the spec, or globally via

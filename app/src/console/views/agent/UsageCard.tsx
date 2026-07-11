@@ -8,7 +8,11 @@
 
 import { useEffect, useState } from "react";
 
-import { accountUsage, type AccountUsage } from "../../../domain/usage-client";
+import {
+  accountUsage,
+  type AccountUsage,
+  type TokenUsage,
+} from "../../../domain/usage-client";
 import { useDucktape } from "../../store/use-ducktape";
 import { color, font } from "../../theme/tokens";
 import { GroupCard, SectionLabel } from "./parts";
@@ -22,16 +26,27 @@ const rowStyle = {
   gap: 10,
 } as const;
 
-function Metric({ label, value }: { label: string; value: string }) {
+const tokenCount = new Intl.NumberFormat(undefined, {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
+const tokenTitle = (usage: TokenUsage): string =>
+  `reported tokens · input ${usage.inputTokens.toLocaleString()} · output ${usage.outputTokens.toLocaleString()} · cached ${usage.cachedInputTokens.toLocaleString()} · cache write ${usage.cacheWriteInputTokens.toLocaleString()} · reasoning ${usage.reasoningOutputTokens.toLocaleString()}`;
+
+function Metric({ label, value, title }: { label: string; value: string; title?: string }) {
   return (
-    <span style={{ font: `400 11px ${font.sans}`, color: color.muted2, whiteSpace: "nowrap" }}>
+    <span
+      title={title}
+      style={{ font: `400 11px ${font.sans}`, color: color.muted2, whiteSpace: "nowrap" }}
+    >
       <span style={{ font: `600 12px ${font.mono}`, color: color.ink }}>{value}</span>{" "}
       {label}
     </span>
   );
 }
 
-export function UsageCard() {
+export function UsageCard({ refreshKey }: { refreshKey: string }) {
   const { transport } = useDucktape();
   const [rows, setRows] = useState<AccountUsage[] | null>(null);
   const [error, setError] = useState(false);
@@ -49,7 +64,7 @@ export function UsageCard() {
     return () => {
       live = false;
     };
-  }, [transport]);
+  }, [transport, refreshKey]);
 
   // no transport (web preview) or a node without the view: stay quiet rather
   // than render a dead card.
@@ -60,7 +75,7 @@ export function UsageCard() {
       <div style={{ ...rowStyle, marginBottom: 4 }}>
         <SectionLabel>USAGE LEDGER</SectionLabel>
         <span style={{ font: `400 10px ${font.sans}`, color: color.muted2, marginLeft: "auto" }}>
-          all time · durations in blocks
+          all time · reported tokens · durations in blocks
         </span>
       </div>
       {rows === null ? (
@@ -101,6 +116,11 @@ export function UsageCard() {
                   <Metric label="failed" value={String(account.failed)} />
                 )}
                 <Metric label="blocks" value={String(account.totalDurationBlocks)} />
+                <Metric
+                  label="tokens"
+                  value={tokenCount.format(account.inputTokens + account.outputTokens)}
+                  title={tokenTitle(account)}
+                />
               </span>
             </div>
             {account.byCapability.map((cap) => (
@@ -112,6 +132,11 @@ export function UsageCard() {
                   <Metric label="runs" value={String(cap.runs)} />
                   {cap.failed > 0 && <Metric label="failed" value={String(cap.failed)} />}
                   <Metric label="blocks" value={String(cap.totalDurationBlocks)} />
+                  <Metric
+                    label="tokens"
+                    value={tokenCount.format(cap.inputTokens + cap.outputTokens)}
+                    title={tokenTitle(cap)}
+                  />
                 </span>
               </div>
             ))}

@@ -4,10 +4,11 @@
 // node prunes entries the moment a result lands, at which point the run
 // reappears under HISTORY.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { AgentRecord } from "../../../domain/agent-client";
 import type { Channel } from "../../../domain/chat-client";
+import type { RunLease } from "../../../domain/dispatch-client";
 import { displayNameForKey, shortKey } from "../../../domain/names";
 import { recentRuns } from "../../../domain/runs-client";
 import type { PendingRun, RunRecord } from "../../../domain/runs-client";
@@ -92,15 +93,20 @@ const MAX_OUTPUT_LINES = 1_000;
 function RunOutputPane({ run }: { run: PendingRun }) {
   const { transport } = useDucktape();
   const [lines, setLines] = useState<OutputLine[]>([]);
+  const pane = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setLines([]);
     if (!transport) return;
     let nextId = 0;
+    let lastCursor = 0;
     const topic = runOutputTopic(run.dispatch_id);
     return transport.subscribe([topic], {
       onTail: (frame) => {
         if (frame.topic !== topic || !isRunOutputTailItem(frame.item)) return;
+        const cursor = Number(frame.cursor);
+        if (!Number.isSafeInteger(cursor) || cursor <= lastCursor) return;
+        lastCursor = cursor;
         const line: OutputLine = {
           id: nextId++,
           kind: "line",
@@ -111,6 +117,9 @@ function RunOutputPane({ run }: { run: PendingRun }) {
       },
       onLagged: (laggedTopic, cursor) => {
         if (laggedTopic !== topic) return;
+        const nextCursor = Number(cursor);
+        if (!Number.isSafeInteger(nextCursor) || nextCursor <= lastCursor) return;
+        lastCursor = nextCursor;
         const line: OutputLine = {
           id: nextId++,
           kind: "gap",
@@ -121,8 +130,13 @@ function RunOutputPane({ run }: { run: PendingRun }) {
     });
   }, [transport, run.dispatch_id]);
 
+  useEffect(() => {
+    if (pane.current) pane.current.scrollTop = pane.current.scrollHeight;
+  }, [lines]);
+
   return (
     <div
+      ref={pane}
       style={{
         marginTop: 10,
         border: `1px solid ${color.borderSoft}`,
@@ -249,7 +263,10 @@ function RunRow({
   channels,
   op,
   onCancel,
+  onReassign,
   assigneeName,
+  lease,
+  currentHeight,
   mine,
 }: {
   run: PendingRun;
@@ -258,12 +275,28 @@ function RunRow({
   /** The run's finalization record (a cancel keys by run id). */
   op: OpRecord | undefined;
   onCancel: (id: string) => void;
+  onReassign: (id: string, attempt: number) => void;
   /** Display name of the node executing this run, or null when unknown. */
   assigneeName?: string | null;
+  lease?: RunLease | null;
+  currentHeight: number;
   /** This run was requested by the local user. */
   mine?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const leaseRemaining =
+    lease?.expiresAt === null || lease?.expiresAt === undefined
+      ? null
+      : Math.max(0, lease.expiresAt - currentHeight);
+  const heartbeatAge =
+    lease?.updatedAt === null || lease?.updatedAt === undefined
+      ? null
+      : Math.max(0, currentHeight - lease.updatedAt);
+  const canReassign =
+    lease?.reassignable === true &&
+    lease?.assigneeHex !== null &&
+    lease?.assigneeHex !== undefined &&
+    lease.attempt + 1 < lease.maxAttempts;
   const agentName = agentLabel(agents, run.agent_id);
   const label = run.job_id
     ? `job ${run.job_id}`
@@ -317,13 +350,31 @@ function RunRow({
           >
             {agentName}
           </span>
-          <StatusPill label="WORKING…" tone={statusTone.warning} />
+          <StatusPill
+            label={leaseRemaining === 0 ? "LEASE EXPIRED" : "WORKING…"}
+            tone={leaseRemaining === 0 ? statusTone.danger : statusTone.warning}
+          />
           <StatusPill label={run.job_id ? "JOB" : "CHAT"} tone={run.job_id ? statusTone.agent : statusTone.blue} />
+          {canReassign && (
+            <button
+              type="button"
+              onClick={() => onReassign(run.run_id, lease.attempt)}
+              aria-label={`Force reassign run ${run.run_id}`}
+              style={{ ...secondaryButton, marginLeft: "auto", minHeight: 28 }}
+            >
+              Force reassign
+            </button>
+          )}
           <button
             type="button"
             onClick={() => onCancel(run.run_id)}
             aria-label={`Cancel run ${run.run_id}`}
-            style={{ ...secondaryButton, marginLeft: "auto", minHeight: 28, color: color.red }}
+            style={{
+              ...secondaryButton,
+              marginLeft: canReassign ? 0 : "auto",
+              minHeight: 28,
+              color: color.red,
+            }}
           >
             Cancel
           </button>
@@ -334,10 +385,14 @@ function RunRow({
             <Chip text={label} tone={statusTone.blue} />
             {run.thread_root !== null && <Chip text={`thread ${run.thread_root}`} />}
             {assigneeName ? <Chip text={`on ${assigneeName}`} tone={statusTone.agent} /> : null}
+            {lease ? <Chip text={`attempt ${lease.attempt + 1}/${lease.maxAttempts}`} /> : null}
+            {leaseRemaining !== null ? <Chip text={`lease ${leaseRemaining} views`} /> : null}
+            {heartbeatAge !== null ? <Chip text={`heartbeat ${heartbeatAge} views ago`} /> : null}
             {mine ? <Chip text="you" tone={statusTone.neutral} /> : null}
             <button
               type="button"
               aria-expanded={expanded}
+              aria-label={`${expanded ? "Hide" : "Show"} live log for run ${run.run_id}`}
               onClick={() => setExpanded((v) => !v)}
               style={{
                 ...secondaryButton,
@@ -346,7 +401,7 @@ function RunRow({
                 font: `600 10px ${font.sans}`,
               }}
             >
-              Output
+              Live log
             </button>
           </div>
           <div
@@ -512,7 +567,9 @@ export function RunsTimeline({
   channels,
   ops,
   onCancel,
-  runAssignee,
+  onReassign,
+  runLease,
+  currentHeight,
   authorNames,
   workspacePubkey,
 }: {
@@ -522,8 +579,10 @@ export function RunsTimeline({
   /** The store's finalization ledger — run rows draw their marks. */
   ops: OpLedger;
   onCancel: (id: string) => void;
-  /** run_id -> hex node key executing it (the saga assignee). */
-  runAssignee: Map<string, string>;
+  onReassign: (id: string, attempt: number) => void;
+  /** run_id -> current saga lease. */
+  runLease: Map<string, RunLease>;
+  currentHeight: number;
   /** hex key -> display name, for the executor badge. */
   authorNames: Record<string, string>;
   /** The local user's pubkey, for the "you" marker. */
@@ -559,7 +618,8 @@ export function RunsTimeline({
               }}
             />
             {runs.map((run) => {
-              const assigneeKey = runAssignee.get(run.run_id) ?? null;
+              const lease = runLease.get(run.run_id) ?? null;
+              const assigneeKey = lease?.assigneeHex ?? null;
               const assigneeName = assigneeKey
                 ? (displayNameForKey(assigneeKey, authorNames) ?? shortKey(assigneeKey))
                 : null;
@@ -571,7 +631,10 @@ export function RunsTimeline({
                   channels={channels}
                   op={ops[opKey.run(run.run_id)]}
                   onCancel={onCancel}
+                  onReassign={onReassign}
                   assigneeName={assigneeName}
+                  lease={lease}
+                  currentHeight={currentHeight}
                   mine={runIsMine(run, workspacePubkey)}
                 />
               );

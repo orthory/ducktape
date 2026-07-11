@@ -148,6 +148,10 @@ pub enum RunsMsg {
     /// Err("cancelled") delivery then prunes the entry (and finalizes a
     /// job-backed run's job) through the one result path.
     CancelRun { run_id: String },
+    /// fence the current attempt and move the run to another provider. gated
+    /// exactly like cancellation; `attempt` prevents a delayed click from
+    /// revoking a newer assignment.
+    ReassignRun { run_id: String, attempt: u32 },
 }
 
 // ---- queries ------------------------------------------------------------------
