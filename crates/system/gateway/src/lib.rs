@@ -7,11 +7,13 @@
 //! port, browser session, content bytes, or transport state.
 
 mod interface;
+mod manifest;
 mod module;
 mod proxy;
 mod registry;
 
 pub use interface::*;
+pub use manifest::*;
 pub use module::Gateway;
 pub use proxy::*;
 pub use registry::Registry;

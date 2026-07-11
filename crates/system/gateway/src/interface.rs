@@ -10,29 +10,12 @@ pub const ED25519_SIGNATURE_BYTES: usize = 64;
 pub const MAX_ROUTE_LABEL_BYTES: usize = 63;
 pub const MAX_ROUTES_PER_ACCOUNT: usize = 64;
 pub const MAX_AUDIENCE_ACCOUNTS: usize = 32;
-pub const MAX_CONTENT_FILES: usize = 128;
-pub const MAX_CONTENT_PATH_BYTES: usize = 512;
-pub const MAX_CONTENT_SEGMENT_BYTES: usize = 128;
-pub const MAX_CONTENT_FILE_BYTES: u64 = 1024 * 1024;
-pub const MAX_CONTENT_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_REQUEST_BODY_BYTES: u64 = 1024 * 1024;
 pub const MAX_RESPONSE_BODY_BYTES: u64 = 4 * 1024 * 1024;
-pub const MAX_ROUTE_STATEMENT_JSON_BYTES: usize = 256 * 1024;
-
-pub const ALLOWED_CONTENT_MIME_TYPES: &[&str] = &[
-    "application/javascript",
-    "application/json",
-    "application/wasm",
-    "font/woff2",
-    "image/gif",
-    "image/jpeg",
-    "image/png",
-    "image/svg+xml",
-    "image/webp",
-    "text/css",
-    "text/html",
-    "text/plain",
-];
+/// A statement now carries only scalars plus (at most) a 32-byte manifest hash,
+/// so it is tiny; the manifest and file table live off consensus.
+pub const MAX_ROUTE_STATEMENT_JSON_BYTES: usize = 4 * 1024;
+pub const SHA256_HEX_BYTES: usize = 64;
 
 /// The account apex (`None`) or one DNS-shaped label below it. The account is
 /// carried separately so a route name can never cross authority boundaries.
@@ -116,36 +99,24 @@ pub struct RoutePolicy {
     /// the wire enum, and each method must be explicitly signed into policy.
     pub methods: Vec<RouteMethod>,
     pub max_request_bytes: u64,
+    /// `0` means an unbounded (streaming/SSE) response, permitted only for
+    /// `LoopbackHttp`. Content routes must set a real cap.
     pub max_response_bytes: u64,
-    /// Authorization is never ambient. A caller may forward the explicit
-    /// header only when this signed bit is true; Cookie is never supported.
+    /// A caller may forward the explicit `Authorization` header only when this
+    /// signed bit is true (fail-closed opt-in). `Cookie` flows unconditionally;
+    /// the mesh-verified caller account is the authoritative identity.
     pub allow_authorization: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ContentFile {
-    pub path: String,
-    pub mime: String,
-    pub size: u64,
-    /// Lowercase SHA-256 of the exact bytes.
-    pub sha256: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct DuckFsContent {
-    /// Optional path served for `/`. It must name one declared file.
-    pub default_path: Option<String>,
-    /// Strictly path-sorted, unique, bounded content declarations.
-    pub files: Vec<ContentFile>,
+    /// Whether a `LoopbackHttp` route may be upgraded to a WebSocket. Content
+    /// routes must leave this false.
+    pub allow_upgrade: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteTarget {
-    /// Exact, hash-bound files under the publisher's DuckFS gateway root.
-    DuckFs { content: DuckFsContent },
+    /// Static content: the signed SHA-256 of the off-consensus manifest
+    /// (`.manifest.json`) that lists the hash-bound files. See `manifest.rs`.
+    DuckFs { manifest_sha256: String },
     /// HTTP semantics to one node-local loopback route. No port or URL is
     /// global state.
     LoopbackHttp,
@@ -338,23 +309,25 @@ pub fn validate_account_id(account_id: &[u8]) -> Result<(), String> {
 pub fn validate_route(route: &RouteDefinition) -> Result<(), String> {
     validate_policy(&route.policy)?;
     match &route.target {
-        RouteTarget::DuckFs { content } => {
-            validate_content(content)?;
+        RouteTarget::DuckFs { manifest_sha256 } => {
+            if !is_canonical_sha256(manifest_sha256) {
+                return Err("gateway: manifest_sha256 must be 64 lowercase hex chars".into());
+            }
+            // The file table is off consensus, so per-file fit against the
+            // response cap is enforced at serve time (against MAX_FILE_BYTES),
+            // not here. Content stays GET+HEAD, bodyless, no auth, no upgrade,
+            // and must set a real (non-streaming) response cap.
             if route.policy.methods != [RouteMethod::Get, RouteMethod::Head]
                 || route.policy.max_request_bytes != 0
                 || route.policy.allow_authorization
+                || route.policy.allow_upgrade
+                || route.policy.max_response_bytes == 0
             {
                 return Err(
-                    "gateway: content providers require GET+HEAD, no request body, and no Authorization"
+                    "gateway: content routes require GET+HEAD, no request body, no Authorization, \
+                     no upgrade, and a bounded response cap"
                         .into(),
                 );
-            }
-            if content
-                .files
-                .iter()
-                .any(|file| file.size > route.policy.max_response_bytes)
-            {
-                return Err("gateway: every DuckFS file must fit the signed response cap".into());
             }
         }
         RouteTarget::LoopbackHttp => {}
@@ -378,11 +351,9 @@ pub fn validate_policy(policy: &RoutePolicy) -> Result<(), String> {
             "gateway: request body cap exceeds {MAX_REQUEST_BODY_BYTES} bytes"
         ));
     }
-    if policy.max_response_bytes == 0 || policy.max_response_bytes > MAX_RESPONSE_BODY_BYTES {
-        return Err(format!(
-            "gateway: response body cap must be 1..={MAX_RESPONSE_BODY_BYTES} bytes"
-        ));
-    }
+    // `max_response_bytes == 0` means an unbounded stream (SSE); a non-zero
+    // value is a publisher-chosen cap the serving side counts against. Real
+    // byte ceilings are enforced at serve time, not signed into consensus.
     if policy.methods.iter().any(|method| method.permits_body()) && policy.max_request_bytes == 0 {
         return Err("gateway: a body-bearing method requires a non-zero request cap".into());
     }
@@ -404,78 +375,6 @@ pub fn validate_policy(policy: &RoutePolicy) -> Result<(), String> {
                 }
                 previous = Some(account);
             }
-        }
-    }
-    Ok(())
-}
-
-pub fn validate_content(content: &DuckFsContent) -> Result<(), String> {
-    if content.files.is_empty() || content.files.len() > MAX_CONTENT_FILES {
-        return Err(format!(
-            "gateway: DuckFS target needs 1..={MAX_CONTENT_FILES} files"
-        ));
-    }
-    if let Some(path) = &content.default_path {
-        validate_content_path(path)?;
-    }
-    let mut total = 0u64;
-    let mut previous: Option<&str> = None;
-    let mut default_exists = content.default_path.is_none();
-    for file in &content.files {
-        validate_content_path(&file.path)?;
-        if previous.is_some_and(|old| old >= file.path.as_str()) {
-            return Err("gateway: content files must be strictly path-sorted".into());
-        }
-        previous = Some(&file.path);
-        if !ALLOWED_CONTENT_MIME_TYPES.contains(&file.mime.as_str()) {
-            return Err(format!("gateway: MIME type is not allowed: {}", file.mime));
-        }
-        if file.size > MAX_CONTENT_FILE_BYTES {
-            return Err(format!(
-                "gateway: file {} exceeds {MAX_CONTENT_FILE_BYTES} bytes",
-                file.path
-            ));
-        }
-        total = total
-            .checked_add(file.size)
-            .ok_or_else(|| "gateway: total content size overflows u64".to_string())?;
-        if !is_canonical_sha256(&file.sha256) {
-            return Err(format!(
-                "gateway: file {} has a non-canonical SHA-256",
-                file.path
-            ));
-        }
-        if content.default_path.as_deref() == Some(file.path.as_str()) {
-            default_exists = true;
-        }
-    }
-    if total > MAX_CONTENT_TOTAL_BYTES {
-        return Err(format!(
-            "gateway: DuckFS target exceeds {MAX_CONTENT_TOTAL_BYTES} total bytes"
-        ));
-    }
-    if !default_exists {
-        return Err("gateway: default_path must name one declared file".into());
-    }
-    Ok(())
-}
-
-pub fn validate_content_path(path: &str) -> Result<(), String> {
-    if path.is_empty() || path.len() > MAX_CONTENT_PATH_BYTES || path.starts_with('/') {
-        return Err(format!(
-            "gateway: content path must be a 1..={MAX_CONTENT_PATH_BYTES}-byte relative path"
-        ));
-    }
-    for segment in path.split('/') {
-        if segment.is_empty()
-            || segment == "."
-            || segment == ".."
-            || segment.len() > MAX_CONTENT_SEGMENT_BYTES
-            || !segment
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        {
-            return Err(format!("gateway: non-canonical content path: {path:?}"));
         }
     }
     Ok(())
@@ -511,22 +410,9 @@ pub fn route_signing_preimage(statement: &RouteStatement) -> Result<Vec<u8>, Str
     out.push(1);
     encode_policy(&mut out, &route.policy);
     match &route.target {
-        RouteTarget::DuckFs { content } => {
+        RouteTarget::DuckFs { manifest_sha256 } => {
             out.push(1);
-            match &content.default_path {
-                None => out.push(0),
-                Some(path) => {
-                    out.push(1);
-                    push_bytes(&mut out, path.as_bytes());
-                }
-            }
-            out.extend_from_slice(&(content.files.len() as u64).to_le_bytes());
-            for file in &content.files {
-                push_bytes(&mut out, file.path.as_bytes());
-                push_bytes(&mut out, file.mime.as_bytes());
-                out.extend_from_slice(&file.size.to_le_bytes());
-                out.extend_from_slice(&decode_lower_hex_32(&file.sha256)?);
-            }
+            out.extend_from_slice(&decode_lower_hex_32(manifest_sha256)?);
         }
         RouteTarget::LoopbackHttp => out.push(2),
     }
@@ -559,6 +445,7 @@ fn encode_policy(out: &mut Vec<u8>, policy: &RoutePolicy) {
     out.extend_from_slice(&policy.max_request_bytes.to_le_bytes());
     out.extend_from_slice(&policy.max_response_bytes.to_le_bytes());
     out.push(u8::from(policy.allow_authorization));
+    out.push(u8::from(policy.allow_upgrade));
 }
 
 fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {

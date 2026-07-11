@@ -9,8 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    MAX_REQUEST_BODY_BYTES, RouteAudience, RouteMethod, RouteName, RouteRecord, RouteTarget,
-    validate_account_id, validate_content_path,
+    MAX_REQUEST_BODY_BYTES, RouteAudience, RouteMethod, RouteName, RouteRecord, validate_account_id,
 };
 
 pub const PROXY_FLOW_DOMAIN: &[u8] = b"ducktape-gateway-proxy-v1";
@@ -242,47 +241,12 @@ pub fn request_matches_record(head: &ProxyRequestHead, record: &RouteRecord) -> 
             || header_value(&head.headers, "authorization").is_none())
 }
 
-/// Resolve a strict content request to the signed manifest entry. Query
-/// strings and percent-decoding are deliberately absent for immutable content.
-pub fn content_file_for_request<'a>(
-    head: &ProxyRequestHead,
-    record: &'a RouteRecord,
-) -> Result<&'a crate::ContentFile, String> {
-    if !matches!(head.method, RouteMethod::Get | RouteMethod::Head) || head.body_len != 0 {
-        return Err("gateway content: only bodyless GET/HEAD are supported".into());
-    }
-    let Some(route) = &record.statement.route else {
-        return Err("gateway content: route is unpublished".into());
-    };
-    let RouteTarget::DuckFs { content } = &route.target else {
-        return Err("gateway content: route is not content-backed".into());
-    };
-    if head.path_and_query.contains('?') {
-        return Err("gateway content: query strings are not supported".into());
-    }
-    let path = match head.path_and_query.as_str() {
-        "/" => content
-            .default_path
-            .as_deref()
-            .ok_or_else(|| "gateway content: no default path".to_string())?,
-        path => path
-            .strip_prefix('/')
-            .ok_or_else(|| "gateway content: path is not origin-form".to_string())?,
-    };
-    validate_content_path(path)?;
-    content
-        .files
-        .binary_search_by(|file| file.path.as_str().cmp(path))
-        .ok()
-        .map(|index| &content.files[index])
-        .ok_or_else(|| "gateway content: file is not declared".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         MemberAuthorization, ROUTE_FORMAT_VERSION, RouteDefinition, RoutePolicy, RouteStatement,
+        RouteTarget,
     };
 
     fn record() -> RouteRecord {
@@ -302,6 +266,7 @@ mod tests {
                         max_request_bytes: 1024,
                         max_response_bytes: 4096,
                         allow_authorization: false,
+                        allow_upgrade: false,
                     },
                 }),
             },
