@@ -3156,20 +3156,13 @@ name = "duckdns"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "duckdns-core",
  "futures",
  "identity",
  "sdk",
- "valset",
-]
-
-[[package]]
-name = "duckdns-core"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "valset",
 ]
 
 [[package]]

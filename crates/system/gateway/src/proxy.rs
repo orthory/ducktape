@@ -281,14 +281,12 @@ pub fn content_file_for_request<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        MemberAuthorization, ROUTE_FORMAT_VERSION, RouteDefinition, RoutePolicy, RouteStatement,
-    };
+    use crate::{MemberAuthorization, RouteDefinition, RoutePolicy, RouteStatement};
 
     fn record() -> RouteRecord {
         RouteRecord {
             statement: RouteStatement {
-                version: ROUTE_FORMAT_VERSION,
+                version: 1,
                 chain_id: "test".into(),
                 account_id: vec![1; 32],
                 name: RouteName::named("api"),

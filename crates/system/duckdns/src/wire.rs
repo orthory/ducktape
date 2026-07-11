@@ -8,8 +8,10 @@
 use serde::{Deserialize, Serialize};
 
 pub const DUCKDNS_ZONE: &str = "duck";
-/// Structural labels reserved directly below `.duck`. They are intentionally
-/// non-functional until a real consumer justifies a namespace beneath them.
+/// Structural labels reserved directly below `.duck`. `net` is the duck
+/// browser's inert internal namespace (`net.duck` pages render inline and
+/// must never resolve to an account) — a registrable "net" handle would
+/// collide with it.
 pub const RESERVED_ROOT_LABELS: &[&str] = &["net"];
 pub const MAX_LABEL_LEN: usize = 63;
 pub const MAX_QUERY_LIMIT: u64 = 256;

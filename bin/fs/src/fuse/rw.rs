@@ -234,6 +234,11 @@ struct Inner {
     inodes: Inodes,
     /// open backing files keyed by the file handle we hand the kernel.
     handles: HashMap<u64, File>,
+    /// per-directory listing snapshot for paged `readdir`: taken at offset 0,
+    /// continuations page over it (re-reading the live dir mid-stream could
+    /// reorder entries). the latest snapshot per dir is kept until the next
+    /// offset-0 pass overwrites it.
+    dir_pages: HashMap<u64, Vec<(u64, FileType, String)>>,
 }
 
 /// a phase-3 working copy fronted as a passthrough FUSE filesystem.
@@ -255,6 +260,7 @@ impl WorkingCopyFs {
             inner: Mutex::new(Inner {
                 inodes: Inodes::new(),
                 handles: HashMap::new(),
+                dir_pages: HashMap::new(),
             }),
         }
     }
@@ -288,6 +294,27 @@ impl WorkingCopyFs {
 /// `.duckfs` under the mount root is engine-private — hide it from the mount.
 fn hidden_at_root(parent: u64, name: &str) -> bool {
     parent == ROOT_INO && name == DUCKFS_DIR
+}
+
+/// the name-SORTED `(file type, name)` listing of a backing dir. sorting pins a
+/// stable order: `read_dir` order is not guaranteed stable across calls, so a
+/// paged `readdir` that re-derived it could skip or duplicate entries.
+fn sorted_dir_entries(dir: &Path) -> std::io::Result<Vec<(FileType, String)>> {
+    let mut out = Vec::new();
+    for dirent in std::fs::read_dir(dir)?.flatten() {
+        let Ok(name) = dirent.file_name().into_string() else {
+            continue;
+        };
+        let ftype = match dirent.file_type() {
+            Ok(ft) if ft.is_dir() => FileType::Directory,
+            Ok(ft) if ft.is_symlink() => FileType::Symlink,
+            Ok(_) => FileType::RegularFile,
+            Err(_) => continue,
+        };
+        out.push((ftype, name));
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(out)
 }
 
 /// translate open flags (raw `O_*` bits) into std `OpenOptions`.
@@ -710,37 +737,40 @@ impl Filesystem for WorkingCopyFs {
         mut reply: ReplyDirectory,
     ) {
         let mut g = self.inner.lock().unwrap();
-        let Some(dir) = self.real(&g, ino.0) else {
+        // offset 0 opens a new stream: snapshot the (sorted) listing. paged
+        // continuations replay the snapshot rather than re-reading the live dir,
+        // whose iteration order could shift between calls.
+        if offset == 0 {
+            let Some(dir) = self.real(&g, ino.0) else {
+                return reply.error(Errno::ENOENT);
+            };
+            let listed = match sorted_dir_entries(&dir) {
+                Ok(l) => l,
+                Err(e) => return reply.error(io_errno(&e)),
+            };
+            let parent_ino = g.inodes.parent_of(ino.0).unwrap_or(ROOT_INO);
+            let mut entries: Vec<(u64, FileType, String)> = vec![
+                (ino.0, FileType::Directory, ".".to_string()),
+                (parent_ino, FileType::Directory, "..".to_string()),
+            ];
+            for (ftype, name) in listed {
+                if hidden_at_root(ino.0, &name) {
+                    continue; // never expose the engine's `.duckfs` index
+                }
+                let cino = g.inodes.intern(ino.0, &name);
+                entries.push((cino, ftype, name));
+            }
+            g.dir_pages.insert(ino.0, entries);
+        }
+        // a continuation without a prior offset-0 pass has nothing to page over.
+        let Some(entries) = g.dir_pages.get(&ino.0) else {
             return reply.error(Errno::ENOENT);
         };
-        let read = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(e) => return reply.error(io_errno(&e)),
-        };
-        let parent_ino = g.inodes.parent_of(ino.0).unwrap_or(ROOT_INO);
-        let mut entries: Vec<(u64, FileType, String)> = vec![
-            (ino.0, FileType::Directory, ".".to_string()),
-            (parent_ino, FileType::Directory, "..".to_string()),
-        ];
-        for dirent in read.flatten() {
-            let Ok(name) = dirent.file_name().into_string() else {
-                continue;
-            };
-            if hidden_at_root(ino.0, &name) {
-                continue; // never expose the engine's `.duckfs` index
-            }
-            let ftype = match dirent.file_type() {
-                Ok(ft) if ft.is_dir() => FileType::Directory,
-                Ok(ft) if ft.is_symlink() => FileType::Symlink,
-                Ok(_) => FileType::RegularFile,
-                Err(_) => continue,
-            };
-            let cino = g.inodes.intern(ino.0, &name);
-            entries.push((cino, ftype, name));
-        }
+        // the offset is the cookie of the last entry already sent (0 first call);
+        // resume at that index and hand each entry a 1-based cookie.
         for (idx, (cino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
             if reply.add(INodeNo(*cino), (idx + 1) as u64, *kind, name) {
-                break;
+                break; // the reply buffer is full; the kernel will ask again.
             }
         }
         reply.ok();
@@ -752,5 +782,31 @@ impl Filesystem for WorkingCopyFs {
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, 512, 255, 512);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// paged readdir depends on a stable, name-sorted listing — pin it.
+    #[test]
+    fn sorted_dir_entries_is_name_sorted_with_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"x").unwrap();
+        std::fs::create_dir(dir.path().join("a-dir")).unwrap();
+        std::os::unix::fs::symlink("b.txt", dir.path().join("c-link")).unwrap();
+
+        let got = sorted_dir_entries(dir.path()).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (FileType::Directory, "a-dir".to_string()),
+                (FileType::RegularFile, "b.txt".to_string()),
+                (FileType::Symlink, "c-link".to_string()),
+            ]
+        );
+        // the order is deterministic across calls — the paging invariant.
+        assert_eq!(sorted_dir_entries(dir.path()).unwrap(), got);
     }
 }
