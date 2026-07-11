@@ -27,7 +27,7 @@ export PATH := $(dir $(CEF_CLONE))bin:$(PATH)
 
 UNAME_S := $(shell uname -s)
 
-.PHONY: all dev demo-seed demo-app dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean cef-env
+.PHONY: all dev demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean cef-env
 
 all: node web
 
@@ -58,6 +58,12 @@ demo-seed: cef-env
 ## Foreground — Ctrl-C to stop. See ops/demo-app.sh.
 demo-app:
 	@bash ops/demo-app.sh
+
+## remove the seeded "demo" workspace: stop its node (cmdline-verified pid
+## sweep, graceful /v1/shutdown first), delete ~/.ducktape/workspaces/demo, and
+## drop it from the registry — other workspaces untouched. See ops/demo-clear.sh.
+demo-clear:
+	@bash ops/demo-clear.sh
 
 ## dogfood: host ducktape's own source in the local dev node's forge module.
 ## registers a static `ducktape-dev` git remote at the node's forge endpoint and

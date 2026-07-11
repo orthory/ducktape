@@ -184,4 +184,6 @@ Gateway web apps published on this node (open in the app's browser):
 
                     Re-run it after every \`make demo-seed\` (a re-seed wipes the
                     workspace and re-mints the loopback binding).
+
+Done with the demo? \`make demo-clear\` removes the workspace entirely.
 EOF
