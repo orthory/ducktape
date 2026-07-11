@@ -29,7 +29,6 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
 use directory::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
 use duckdns::DuckDns;
-use evm::EvmModule;
 use gateway::Gateway;
 use files::Files;
 use forge::Forge;
@@ -76,9 +75,6 @@ fn main() {
         let forge = Forge::init("forge", forge_repo.clone())
             .expect("forge init")
             .with_chat("chat");
-        let evm = EvmModule::init(context.child("evm"), "evm")
-            .await
-            .expect("evm init");
         let chat = Chat::init(context.child("chat"), "chat")
             .await
             .with_tagging("tagging");
@@ -115,7 +111,6 @@ fn main() {
             Box::new(directory),
             Box::new(greeter),
             Box::new(forge),
-            Box::new(evm),
             Box::new(chat),
             Box::new(valset),
             Box::new(saga),

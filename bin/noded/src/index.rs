@@ -38,7 +38,6 @@ pub fn open_index_store<S: AsRef<str>>(
                     .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
                     .with_indexer(Box::new(pages::index::PagesIndex::new("pages")))
                     .with_indexer(Box::new(saga::index::UsageIndex::new("saga")))
-                    .with_indexer(Box::new(evm::index::EvmIndex::new("evm"))),
             )
         })
         .map_err(|err| {

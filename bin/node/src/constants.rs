@@ -124,12 +124,16 @@ pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order. pinned
 /// to the `host_state::ProductionModules` registry by the parity test in
 /// `host_state` — status endpoints report exactly these roots.
-pub(crate) const MODULE_IDS: [&str; 24] = [
+///
+/// A module here is in the app-hash: every node must run it, agree on its root
+/// at every height, and keep doing so forever (the height-gated upgrade path
+/// flips `protocol_version` only — it cannot change the module SET). Experiments
+/// therefore live unwired in `crates/labs` and appear in no genesis set.
+pub(crate) const MODULE_IDS: [&str; 23] = [
     "kv",
     "pages",
     "chat",
     "forge",
-    "evm",
     "valset",
     "governance",
     "upgrade",

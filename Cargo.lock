@@ -2794,7 +2794,6 @@ dependencies = [
  "directory",
  "dispatch",
  "duckdns",
- "evm",
  "files",
  "forge",
  "futures",
@@ -3021,7 +3020,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.8.9",
+ "libloading 0.7.4",
 ]
 
 [[package]]
@@ -3398,23 +3397,6 @@ checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener",
  "pin-project-lite",
-]
-
-[[package]]
-name = "evm"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "commonware-runtime",
- "commonware-storage",
- "host",
- "indexer",
- "kv",
- "revm",
- "sdk",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -5000,6 +4982,7 @@ dependencies = [
  "elliptic-curve",
  "once_cell",
  "sha2",
+ "signature",
 ]
 
 [[package]]
@@ -5086,6 +5069,30 @@ dependencies = [
  "serde",
  "serde_json",
  "statesync",
+]
+
+[[package]]
+name = "labs"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "async-trait",
+ "commonware-runtime",
+ "commonware-storage",
+ "futures",
+ "hex",
+ "host",
+ "indexer",
+ "k256",
+ "kv",
+ "revm",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "valset",
+ "zeroize",
 ]
 
 [[package]]
@@ -5617,7 +5624,6 @@ dependencies = [
  "duckfs-client",
  "duckfs-core",
  "duckfs-disk",
- "evm",
  "files",
  "forge",
  "futures",
@@ -5679,7 +5685,6 @@ dependencies = [
  "duckdns",
  "duckfs-client",
  "duckfs-core",
- "evm",
  "files",
  "flate2",
  "forge",
@@ -8392,7 +8397,6 @@ dependencies = [
  "commonware-runtime",
  "dispatch",
  "duckdns",
- "evm",
  "files",
  "forge",
  "futures",
@@ -9069,7 +9073,7 @@ dependencies = [
 [[package]]
 name = "tauri-runtime-cef"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/tauri-runtime-cef?rev=4a0a5de212b6ce91725f7acfd83f7df4d7c23a00#4a0a5de212b6ce91725f7acfd83f7df4d7c23a00"
+source = "git+https://github.com/byeongsu-hong/tauri-runtime-cef?rev=8ddc1ed48e8650432424bd51d98edf0a024dc2a4#8ddc1ed48e8650432424bd51d98edf0a024dc2a4"
 dependencies = [
  "base64 0.22.1",
  "cef",
@@ -9160,7 +9164,7 @@ dependencies = [
  "serde_with",
  "swift-rs",
  "thiserror 2.0.18",
- "toml 1.1.2+spec-1.1.0",
+ "toml 0.9.12+spec-1.1.0",
  "url",
  "urlpattern",
  "uuid",
