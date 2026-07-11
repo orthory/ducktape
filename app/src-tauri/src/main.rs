@@ -39,7 +39,7 @@ fn main() {
         // gateway sessions are incognito. Deliberate: web-content storage is
         // not keychain-protected.
         .command_line_args([
-            ("use-mock-keychain", None::<&str>),
+            ("--use-mock-keychain", None::<&str>),
             ("password-store", Some("basic")),
         ])
         .manage(node_control)
