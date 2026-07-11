@@ -4147,6 +4147,7 @@ dependencies = [
  "commonware-cryptography",
  "futures",
  "host",
+ "identity",
  "sdk",
  "serde",
  "serde_json",

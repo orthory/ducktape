@@ -377,8 +377,12 @@ export interface ConsoleActions {
 
   // ── Governance (proposals + votes over the `governance` module) ──
   /** Open a binding Signal proposal (no on-chain effect beyond its outcome).
-   *  Membership-gated by the module: only a current validator can propose. */
+   *  The module gates this to the proposal-time governance electorate. */
   proposeSignal(text: string): void;
+  /** One-way adoption of explicit, non-transferable Identity-account shares. */
+  proposeAdoptShares(allocations: Array<{ accountId: string; shares: number }>): void;
+  /** Set one account's shares; zero removes it from future electorates. */
+  proposeSetShares(accountId: string, shares: number): void;
   /** Cast (or change) this node's ballot on an open proposal. */
   voteProposal(proposalId: string, approve: boolean): void;
   /** Tally and settle a decidable proposal (anyone may trigger it). */
@@ -2082,9 +2086,9 @@ export function createActions({
     },
 
     // ── Governance ──
-    // Every submit is signed by THIS node's validator key (the daemon ignores the
-    // claimed origin), so these carry no origin. `refresh()` re-reads the proposal
-    // set after each write.
+    // Every submit is signed by THIS node's authenticated key (the daemon ignores
+    // the claimed origin), so these carry no origin. `refresh()` re-reads the
+    // proposal set after each write.
     proposeSignal: (text) => {
       const body = text.trim();
       if (!body) return;
@@ -2093,6 +2097,40 @@ export function createActions({
         governanceClient.propose(live, {
           proposalId,
           action: { signal: { text: body } },
+        }),
+      );
+    },
+
+    proposeAdoptShares: (allocations) => {
+      if (allocations.length === 0) return;
+      const proposalId = crypto.randomUUID();
+      submitTracked(opKey.proposal(proposalId), (live) =>
+        governanceClient.propose(live, {
+          proposalId,
+          action: {
+            adopt_shares: {
+              allocations: allocations.map(({ accountId, shares }) => ({
+                account_id: agentClient.hexToBytes(accountId),
+                shares,
+              })),
+            },
+          },
+        }),
+      );
+    },
+
+    proposeSetShares: (accountId, shares) => {
+      if (!accountId) return;
+      const proposalId = crypto.randomUUID();
+      submitTracked(opKey.proposal(proposalId), (live) =>
+        governanceClient.propose(live, {
+          proposalId,
+          action: {
+            set_shares: {
+              account_id: agentClient.hexToBytes(accountId),
+              shares,
+            },
+          },
         }),
       );
     },
@@ -2352,6 +2390,7 @@ export function createActions({
         accountHandles: {},
         members: [],
         proposals: [],
+        governanceShares: { active: false, allocations: [], total: 0 },
         forgeHead: null,
         pages: [],
         activePage: null,

@@ -1,10 +1,8 @@
 // Governance — the operator-facing surface over the `governance` module. Lists
 // every proposal (GovQuery::Proposals, projected into state.proposals per block)
-// with its action, status, proposer, and running tally, and drives the three
-// member-gated writes: Propose (a Signal), Vote (approve / reject), and Execute
-// (settle a decidable proposal). Governance is pure majority rule over the
-// current validator set — one member, one vote, and NO genesis/founder
-// privilege — so the surface never implies any special authority.
+// with its action, status, proposer, and running tally. Validators may make a
+// one-way transition to non-transferable Identity-account shares; proposal
+// cards then render their frozen weighted electorate and decision rule.
 
 import { useMemo, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 
@@ -16,9 +14,11 @@ import {
   actionKeyHex,
   actionLabel,
   actionText,
-  majorityOf,
+  canSettleEarly,
+  decisionThreshold,
   proposerHex,
   tally,
+  type SharesView,
   type ProposalStatus,
   type ProposalView,
 } from "../../../domain/governance-client";
@@ -68,26 +68,31 @@ interface ProposalVM {
   no: number;
   total: number;
   threshold: number;
+  thresholdLabel: string;
   /** Our own ballot on this proposal, or null when this node has not voted. */
   myVote: boolean | null;
-  /** A strict majority of members has already voted one way — decidable now. */
+  eligible: boolean;
+  /** The proposal's frozen rule can no longer be reversed before its deadline. */
   decided: boolean;
 }
 
 function makeProposal(
   proposal: ProposalView,
   localKey: string | null,
+  localAccount: string | null,
   memberCount: number,
+  legacyCanVote: boolean,
 ): ProposalVM {
   const counts = tally(proposal);
-  const threshold = majorityOf(memberCount);
+  const threshold = decisionThreshold(proposal, memberCount);
   const keyText = actionKeyHex(proposal.action);
   const signalText = actionText(proposal.action);
   const label = actionLabel(proposal.action);
   const detail = signalText ?? (keyText ? shortKey(keyText) : "—");
   const proposer = proposerHex(proposal.proposer);
+  const localPrincipal = proposal.voter_kind === "account" ? localAccount : localKey;
   const myBallot = proposal.votes.find(([voter]) =>
-    sameKey(proposerHex(voter), localKey),
+    sameKey(proposerHex(voter), localPrincipal),
   );
   return {
     id: proposal.proposal_id,
@@ -96,13 +101,24 @@ function makeProposal(
     status: proposal.status,
     proposerHex: proposer,
     proposerShort: shortKey(proposer),
-    proposerIsLocal: sameKey(proposer, localKey),
+    proposerIsLocal: sameKey(proposer, localPrincipal),
     yes: counts.yes,
     no: counts.no,
     total: counts.total,
     threshold,
+    thresholdLabel:
+      typeof proposal.voting_rule === "object" &&
+      "participating_majority" in proposal.voting_rule
+        ? `quorum ${threshold} + majority`
+        : `needs ${threshold} approve`,
     myVote: myBallot ? myBallot[1] : null,
-    decided: counts.yes >= threshold || counts.no >= threshold,
+    eligible:
+      proposal.electorate.length > 0
+        ? proposal.electorate.some(([principal]) =>
+            sameKey(proposerHex(principal), localPrincipal),
+          )
+        : proposal.voter_kind === "validator_node" && legacyCanVote,
+    decided: canSettleEarly(proposal, memberCount),
   };
 }
 
@@ -219,9 +235,33 @@ function HoverButton({
 
 function HeaderRole({
   workspace,
+  shares,
+  localAccount,
 }: {
   workspace: { founder: boolean; member: boolean } | null;
+  shares: SharesView;
+  localAccount: string | null;
 }) {
+  if (shares.active) {
+    const own = shares.allocations.find((allocation) =>
+      sameKey(proposerHex(allocation.account_id), localAccount),
+    );
+    return (
+      <Pill
+        label={
+          own
+            ? `Shareholder ${own.shares}/${shares.total} (${formatSharePercent(own.shares, shares.total)})`
+            : "Read only"
+        }
+        pill={own ? STATUS_PILLS.passed : STATUS_PILLS.open}
+        title={
+          own
+            ? "This Identity account may propose and vote with its frozen share power."
+            : "This node's Identity account holds no governance shares."
+        }
+      />
+    );
+  }
   const canVote = Boolean(workspace?.founder || workspace?.member);
   return (
     <Pill
@@ -268,7 +308,7 @@ function TallyBar({ proposal }: { proposal: ProposalVM }) {
         <span style={{ color: color.accentAlt2 }}>approve {proposal.yes}</span>
         <span style={{ color: color.danger }}>reject {proposal.no}</span>
         <span>· {proposal.total} cast</span>
-        <span style={{ marginLeft: "auto" }}>needs {proposal.threshold} to pass</span>
+        <span style={{ marginLeft: "auto" }}>{proposal.thresholdLabel}</span>
       </div>
     </div>
   );
@@ -389,9 +429,11 @@ function ProposalCard({
 
 function ProposeForm({
   canPropose,
+  shareMode,
   onPropose,
 }: {
   canPropose: boolean;
+  shareMode: boolean;
   onPropose: (text: string) => void;
 }) {
   const [text, setText] = useState("");
@@ -434,7 +476,7 @@ function ProposeForm({
             Signal proposal
           </div>
           <div style={{ marginTop: 2, font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
-            Put a question to the validator set. Passing binds the signal; it has
+            Put a question to the {shareMode ? "shareholders" : "validator set"}. Passing binds the signal; it has
             no on-chain effect of its own.
           </div>
           <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
@@ -481,9 +523,176 @@ function ProposeForm({
           }}
         >
           <Icon name="node" size={15} />
-          Only an admitted validator can open or vote on proposals.
+          Only an eligible {shareMode ? "shareholder account" : "validator"} can open or vote on proposals.
         </div>
       )}
+    </section>
+  );
+}
+
+export function parseShareAllocations(
+  text: string,
+): Array<{ accountId: string; shares: number }> | null {
+  const allocations: Array<{ accountId: string; shares: number }> = [];
+  const seen = new Set<string>();
+  for (const line of text.split("\n").map((value) => value.trim()).filter(Boolean)) {
+    const [rawAccount, rawShares, extra] = line.split(/\s+/);
+    const accountId = rawAccount?.toLowerCase() ?? "";
+    const shares = Number(rawShares);
+    if (
+      extra !== undefined ||
+      accountId.length === 0 ||
+      accountId.length % 2 !== 0 ||
+      !/^[0-9a-f]+$/.test(accountId) ||
+      !Number.isSafeInteger(shares) ||
+      shares <= 0 ||
+      seen.has(accountId)
+    ) {
+      return null;
+    }
+    seen.add(accountId);
+    allocations.push({ accountId, shares });
+  }
+  return allocations.length > 0 ? allocations : null;
+}
+
+export function formatSharePercent(shares: number, total: number): string {
+  if (total <= 0) return "0%";
+  return `${Number(((shares / total) * 100).toFixed(2))}%`;
+}
+
+function SharesPanel({
+  shares,
+  knownAccounts,
+  canPropose,
+  onAdopt,
+  onSet,
+}: {
+  shares: SharesView;
+  knownAccounts: string[];
+  canPropose: boolean;
+  onAdopt: (allocations: Array<{ accountId: string; shares: number }>) => void;
+  onSet: (accountId: string, shares: number) => void;
+}) {
+  const [allocationText, setAllocationText] = useState("");
+  const [accountId, setAccountId] = useState("");
+  const [shareText, setShareText] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const adopt = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const allocations = parseShareAllocations(allocationText);
+    if (!allocations) {
+      setError("Use one unique ‘account-hex shares’ row per account.");
+      return;
+    }
+    setError(null);
+    onAdopt(allocations);
+  };
+  const set = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const normalized = accountId.trim().toLowerCase();
+    const power = Number(shareText);
+    if (
+      normalized.length === 0 ||
+      normalized.length % 2 !== 0 ||
+      !/^[0-9a-f]+$/.test(normalized) ||
+      !Number.isSafeInteger(power) ||
+      power < 0
+    ) {
+      setError("Enter an account hex id and a non-negative integer share value.");
+      return;
+    }
+    setError(null);
+    onSet(normalized, power);
+  };
+
+  return (
+    <section
+      aria-label="Governance shares"
+      style={{
+        flexShrink: 0,
+        padding: "12px 22px",
+        borderBottom: `1px solid ${color.borderSoft}`,
+        background: color.paper,
+      }}
+    >
+      <div style={{ ...sectionLabel, display: "flex", alignItems: "center", gap: 7 }}>
+        GOVERNANCE SHARES
+        <Pill
+          label={shares.active ? `${shares.total} active` : "validator ballots"}
+          pill={shares.active ? STATUS_PILLS.passed : STATUS_PILLS.open}
+        />
+      </div>
+
+      {shares.active ? (
+        <>
+          <div
+            style={{
+              display: "flex",
+              gap: 6,
+              flexWrap: "wrap",
+              marginTop: 9,
+              font: `500 10.5px ${font.mono}`,
+            }}
+          >
+            {shares.allocations.map((allocation) => {
+              const hex = proposerHex(allocation.account_id);
+              return (
+                <span key={hex} title={hex} style={{ color: color.inkSoft }}>
+                  {shortKey(hex)} · {allocation.shares} · {formatSharePercent(allocation.shares, shares.total)}
+                </span>
+              );
+            })}
+          </div>
+          <form onSubmit={set} style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <input
+              aria-label="Share account id"
+              value={accountId}
+              placeholder="Account hex"
+              onChange={(event) => setAccountId(event.target.value)}
+              style={{ flex: 1, minWidth: 0, padding: "7px 8px", font: `500 10.5px ${font.mono}` }}
+            />
+            <input
+              aria-label="Account shares"
+              value={shareText}
+              placeholder="Shares (0 removes)"
+              inputMode="numeric"
+              onChange={(event) => setShareText(event.target.value)}
+              style={{ width: 145, padding: "7px 8px", font: `500 10.5px ${font.mono}` }}
+            />
+            <HoverButton type="submit" variant="dark" disabled={!canPropose}>
+              Propose change
+            </HoverButton>
+          </form>
+        </>
+      ) : (
+        <form onSubmit={adopt} style={{ marginTop: 9 }}>
+          <div style={{ font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
+            One-way activation. Existing Identity accounts: {knownAccounts.length > 0
+              ? knownAccounts.map((account) => shortKey(account)).join(", ")
+              : "none bound yet"}.
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "stretch" }}>
+            <textarea
+              aria-label="Initial share allocations"
+              value={allocationText}
+              placeholder={`${knownAccounts[0] ?? "account-hex"} 100`}
+              onChange={(event) => setAllocationText(event.target.value)}
+              rows={Math.max(2, Math.min(knownAccounts.length, 4))}
+              style={{ flex: 1, minWidth: 0, padding: "7px 8px", font: `500 10.5px ${font.mono}` }}
+            />
+            <HoverButton type="submit" variant="dark" disabled={!canPropose}>
+              Propose adoption
+            </HoverButton>
+          </div>
+        </form>
+      )}
+      {error ? (
+        <div role="alert" style={{ marginTop: 7, color: color.danger, font: `500 10.5px ${font.sans}` }}>
+          {error}
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -497,7 +706,7 @@ function EmptyState({ filter }: { filter: FilterId }) {
         No {filter === "all" ? "" : `${label} `}proposals to show.
       </div>
       <div style={{ marginTop: 4, font: `400 11px ${font.sans}` }}>
-        Proposals appear here once a validator opens one.
+        Proposals appear here once an eligible voter opens one.
       </div>
     </div>
   );
@@ -508,23 +717,37 @@ export function GovernanceView() {
   const [filter, setFilter] = useState<FilterId>("all");
 
   const localKey = state.workspace?.pubkey ?? null;
+  const localAccount = localKey
+    ? state.nodeUsers[localKey.toLowerCase()]?.accountId ?? null
+    : null;
   const memberCount = state.members.length;
+  const legacyCanVote = Boolean(state.workspace?.founder || state.workspace?.member);
+  const knownAccounts = useMemo(
+    () => [...new Set(Object.values(state.nodeUsers).map((user) => user.accountId))].sort(),
+    [state.nodeUsers],
+  );
   const rows = useMemo(
     () =>
       [...state.proposals]
-        .map((proposal) => makeProposal(proposal, localKey, memberCount))
+        .map((proposal) =>
+          makeProposal(proposal, localKey, localAccount, memberCount, legacyCanVote),
+        )
         .sort((a, b) => {
           // Open first, then by id so the ordering is stable across refreshes.
           if (a.status === b.status) return a.id.localeCompare(b.id);
           return a.status === "open" ? -1 : b.status === "open" ? 1 : 0;
         }),
-    [state.proposals, localKey, memberCount],
+    [state.proposals, localKey, localAccount, memberCount, legacyCanVote],
   );
   const visibleRows = useMemo(
     () => rows.filter((proposal) => inFilter(proposal, filter)),
     [rows, filter],
   );
-  const canVote = Boolean(state.workspace?.founder || state.workspace?.member);
+  const canPropose = state.governanceShares.active
+    ? state.governanceShares.allocations.some((allocation) =>
+        sameKey(proposerHex(allocation.account_id), localAccount),
+      )
+    : legacyCanVote;
   const openCount = rows.filter((proposal) => proposal.status === "open").length;
 
   return (
@@ -559,7 +782,11 @@ export function GovernanceView() {
             {openCount} open · {rows.length}
           </span>
           <span style={{ marginLeft: "auto" }}>
-            <HeaderRole workspace={state.workspace} />
+            <HeaderRole
+              workspace={state.workspace}
+              shares={state.governanceShares}
+              localAccount={localAccount}
+            />
           </span>
         </div>
 
@@ -599,7 +826,19 @@ export function GovernanceView() {
           </div>
         </div>
 
-        <ProposeForm canPropose={canVote} onPropose={actions.proposeSignal} />
+        <SharesPanel
+          shares={state.governanceShares}
+          knownAccounts={knownAccounts}
+          canPropose={canPropose}
+          onAdopt={actions.proposeAdoptShares}
+          onSet={actions.proposeSetShares}
+        />
+
+        <ProposeForm
+          canPropose={canPropose}
+          shareMode={state.governanceShares.active}
+          onPropose={actions.proposeSignal}
+        />
 
         <div
           style={{
@@ -621,7 +860,7 @@ export function GovernanceView() {
                 key={proposal.id}
                 proposal={proposal}
                 op={state.ops[opKey.proposal(proposal.id)]}
-                canVote={canVote}
+                canVote={proposal.eligible}
                 onVote={(approve) => actions.voteProposal(proposal.id, approve)}
                 onExecute={() => actions.executeProposal(proposal.id)}
               />
