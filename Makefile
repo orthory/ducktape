@@ -25,7 +25,7 @@ export PATH := $(dir $(CEF_CLONE))bin:$(PATH)
 
 UNAME_S := $(shell uname -s)
 
-.PHONY: all dev dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean
+.PHONY: all dev demo-seed demo-app dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean cef-env
 
 all: node web
 
@@ -41,6 +41,21 @@ cef-env:
 ## see ops/dev.sh. (stop any already-running `tauri dev` first — it owns :1430.)
 dev: cef-env
 	@bash ops/dev.sh
+
+## seed a local "demo" network preloaded with sample data — chat channels +
+## messages, a tasks board, pages, a registered agent (with a live @mention run),
+## jobs, an inbox note, an automation rule — plus TWO gateway web-app routes: a
+## NETWORK-hosted static site (DuckFS) and a USER-hosted loopback app. Registers a
+## "demo" workspace in ~/.ducktape and makes it active; just open the app. Builds
+## ducktape-node if needed (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
+demo-seed: cef-env
+	@bash ops/demo-seed.sh
+
+## serve the user-hosted web app behind the demo's app.<id>.duck gateway route
+## (demo-seed publishes the route; this runs the loopback server it proxies to).
+## Foreground — Ctrl-C to stop. See ops/demo-app.sh.
+demo-app:
+	@bash ops/demo-app.sh
 
 ## dogfood: host ducktape's own source in the local dev node's forge module.
 ## registers a static `ducktape-dev` git remote at the node's forge endpoint and
