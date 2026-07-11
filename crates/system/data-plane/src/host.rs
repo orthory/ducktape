@@ -70,7 +70,7 @@ where
             Ok(sockets) => break sockets,
             // The interface (or our /128) is not up yet — retry quietly;
             // callers that want a log line keep it on their own side (see
-            // e.g. `statesync_plane::spawn_bring_up`'s success println).
+            // e.g. the node's gateway plane bring-up success println).
             Err(_) => tokio::time::sleep(spec.retry).await,
         }
     };

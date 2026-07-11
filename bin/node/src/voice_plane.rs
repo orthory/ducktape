@@ -11,11 +11,11 @@
 //! `Service::Voice`'s overlay datagram port and video binds `Service::Video`'s,
 //! so the two streams never share a socket, a queue, or a byte of head-of-line.
 //!
-//! Shape mirrors [`crate::statesync_plane`]: the host supplies the tracked
+//! Shape mirrors [`crate::gateway_plane`]: the host supplies the tracked
 //! peer set ([`MediaPeers`], refreshed on every valset cutover) and the socket
 //! factory; the plane binds lazily (the overlay `/128` only exists once the
 //! reachability plane has the interface up, so the bind retries in the
-//! background). Unlike statesync, media is datagram-only and fire-and-forget,
+//! background). Unlike gateway, media is datagram-only and fire-and-forget,
 //! and — per the overlay-only cutover decision — has NO mesh fallback: with no
 //! overlay there is simply no media transport.
 

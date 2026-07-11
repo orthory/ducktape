@@ -1,10 +1,14 @@
 //! the one overlay address book + admission policy every per-use data plane
-//! shares (statesync and gateway today): forward resolution DERIVES (a ULA is
-//! a pure function of identity), reverse resolution and admission consult the
+//! shares (gateway today): forward resolution DERIVES (a ULA is a pure
+//! function of identity), reverse resolution and admission consult the
 //! tracked peer set — members + standbys of the current view, maintained by
 //! the node at boot and at every cutover re-track. which plane a book serves
 //! is a type parameter (its [`Plane`] tag carries the service + stream flow),
 //! so admission stays default-deny per service without duplicating the book.
+//!
+//! this module also carries the two seams every per-use plane shares: the
+//! socket-factory selection ([`socket_factory`]) and the process-wide bulk
+//! budget ([`shared_bulk_pacer`]).
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -12,7 +16,38 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
 use commonware_cryptography::ed25519;
-use data_plane::{AddressBook, AdmissionPolicy, FlowId, PeerId, Service};
+use data_plane::{AddressBook, AdmissionPolicy, BulkPacer, FlowId, PeerId, Service};
+
+/// the socket seam's factory selection, in one place for every plane
+/// bring-up caller: a plane's backend follows `wireguard_effect` exactly as
+/// the mesh context's does (fake stages no data plane, so it keeps the OS
+/// factory's downed-interface behavior).
+pub fn socket_factory(
+    kind: crate::config::WireGuardEffectKind,
+    slot: &overlay_net::userspace::StackSlot,
+) -> Arc<dyn data_plane::SocketFactory> {
+    match kind {
+        crate::config::WireGuardEffectKind::Socket => Arc::new(
+            overlay_net::userspace::VirtualSocketFactory::new(slot.clone()),
+        ),
+        crate::config::WireGuardEffectKind::Tun | crate::config::WireGuardEffectKind::Fake => {
+            Arc::new(data_plane::OsSocketFactory)
+        }
+    }
+}
+
+/// bulk ceiling shared by every stream-class per-use plane in this process
+/// (gateway responses and agent telemetry today): a static compromise between
+/// transfer time (~24 MB/s ≈ 42 s/GB) and real-time headroom; adaptive
+/// per-link shaping is a separate concern.
+const BULK_BYTES_PER_SEC: u64 = 24_000_000;
+const BULK_BURST_BYTES: u64 = 512 * 1024;
+
+/// One link-headroom budget shared by every stream-class per-use plane in
+/// this process.
+pub fn shared_bulk_pacer() -> BulkPacer {
+    BulkPacer::new(BULK_BYTES_PER_SEC, BULK_BURST_BYTES)
+}
 
 /// derive a peer's overlay ULA from its raw ed25519 key bytes — the same
 /// `(namespace, identity)` function the reachability plane routes by.

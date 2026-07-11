@@ -77,7 +77,7 @@ fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
         *p += 4;
         v
     }
-    let mut p = 0;
+    let mut p = 4; // skip the 4-byte "FGv2" container magic
     let count = u32_at(bytes, &mut p);
     let mut out = Vec::new();
     for _ in 0..count {
