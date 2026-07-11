@@ -1,8 +1,9 @@
 {
+  "protocol": "tauri-agent-suite/v1",
   "id": "cef-smoke",
-  "variant": "cef",
-  "goal": "Verify that the Ducktape CEF desktop reaches its first-run account screen.",
-  "success": [
+  "runtime": "cef",
+  "objective": "Verify that the Ducktape CEF desktop reaches its first-run account screen.",
+  "pass": [
     {
       "expect": {
         "role": "button",
@@ -11,7 +12,7 @@
       }
     }
   ],
-  "limits": {
+  "budget": {
     "steps": 3,
     "seconds": 30,
     "tokens": 1000,

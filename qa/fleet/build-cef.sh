@@ -32,7 +32,7 @@ cp -a "$target_dir/debug/locales" "$FLEET_ARTIFACT_DIR/bin/"
 
 bun -e '
   await Bun.write(process.env.FLEET_ARTIFACT_MANIFEST, JSON.stringify({
-    schemaVersion: 1,
+    protocol: "tauri-agent-artifact/v1",
     executable: "bin/ducktape",
     args: ["--no-sandbox", "--single-process", "--in-process-gpu"],
     cwd: "bin",

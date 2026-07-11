@@ -7,52 +7,53 @@ description: Use to drive or test isolated real Ducktape CEF desktop instances m
 
 Ducktape delegates generic build caching, process ownership, scheduling, runner
 budgets, artifacts, and dashboard serving to `tauri-agent-fleet`. This repository
-owns only `tauri-agent-fleet.json`, `qa/fleet/`, and `qa/suites/`.
+owns only `.tauri-agent/` and `qa/fleet/`.
 
 ## Interactive loop
 
 ```bash
-FLEET=app/node_modules/.bin/tauri-agent-fleet
+FLEET="${FLEET:-app/node_modules/.bin/tauri-agent-fleet}"
 
-$FLEET up HEAD
-$FLEET status --json
-$FLEET dashboard
+"$FLEET" up HEAD
+"$FLEET" status --json
+"$FLEET" dashboard
 
 # Pick the instance's directories.runtime value from status --json.
 export XDG_RUNTIME_DIR=<runtime-directory>
 app/scripts/tauri-agent tree --app com.ducktape.app
 app/scripts/tauri-agent find --role button --name Create --app com.ducktape.app
 
-$FLEET down <instance-id>
+"$FLEET" down <instance-id>
 ```
 
 The opaque instance ID, not the branch, owns HOME, XDG runtime/data, display,
 ports, endpoint, VNC token, and exact process groups. Never find or stop desktop
-processes with `pkill -f`.
+processes with `pkill -f`. Fleet runs Ducktape's cleanup hook after stopping the
+desktop so its recorded detached workspace-node group cannot survive teardown.
 
 ## Deterministic suites
 
 ```bash
-$FLEET test qa/suites/cef-smoke.json --jobs 1
+"$FLEET" test cef-smoke --jobs 1
 ```
 
-Suites let the model choose only typed UI actions. `expect`, state, and IPC
-conditions determine pass/fail. Fleet enforces step, wall-time, token, and
+Suites let the model choose only typed UI actions. `expect`, state, and IPC pass
+conditions determine the result. Fleet enforces step, wall-time, token, and
 repetition limits and persists actions, usage, semantic frames, console,
 network, IPC, screenshot, and replay artifacts outside the model context.
 
-Ducktape is CEF-only on `dev`; use `variant: cef`. The plugin endpoint is a
+Ducktape is CEF-only on `dev`; use `runtime: cef`. The plugin endpoint is a
 debug-build seam and is intentionally absent from release builds.
 
 ## Several worktrees or same-artifact instances
 
 ```bash
-$FLEET up dev agent/my-branch
-$FLEET test qa/suites/cef-smoke.json qa/suites/cef-smoke.json --jobs 2
+"$FLEET" up dev agent/my-branch
+"$FLEET" test cef-smoke cef-smoke --jobs 2
 ```
 
 The first form builds each selected revision. The second builds the selected
-revision/CEF variant once and launches isolated instances from the same cached
+revision/CEF runtime once and launches isolated instances from the same cached
 artifact.
 
 ## Host prerequisite fallback
