@@ -13,8 +13,6 @@ use crate::{
 };
 
 const MAX_ACCOUNT_ID_LEN: usize = 1024;
-/// Version 2 deliberately drops the v1 node/service declaration section.
-const STATE_FORMAT_VERSION: u8 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct State {
@@ -171,7 +169,7 @@ fn validate_state(state: &State) -> Result<(), String> {
 }
 
 fn encode_state(state: &State) -> Vec<u8> {
-    let mut out = vec![STATE_FORMAT_VERSION];
+    let mut out = Vec::new();
     push_u64(&mut out, state.handles.len());
     for (handle, owner) in &state.handles {
         push_string(&mut out, handle);
@@ -182,12 +180,6 @@ fn encode_state(state: &State) -> Vec<u8> {
 
 fn decode_state(bytes: &[u8]) -> Result<State, String> {
     let mut reader = Reader::new(bytes);
-    let version = reader.u8()?;
-    if version != STATE_FORMAT_VERSION {
-        return Err(format!(
-            "duckdns: unsupported naming snapshot version {version}"
-        ));
-    }
     let handle_count = reader.count("handle", 16)?;
     let mut handles = BTreeMap::new();
     let mut previous_handle: Option<String> = None;

@@ -3,10 +3,9 @@
 //! resolve the new snapshot, and rewrite the index.
 //!
 //! staging is sequential (one chunk = one block — ingest speed is consensus
-//! speed) and probed twice: once to skip chunks already present (dedup + resume),
-//! and again immediately before submit as TTL insurance. a `"files: chunk not
-//! available"` rejection (a chunk expired between probe and submit) re-stages and
-//! retries the commit once. a CAS conflict auto-rebases disjoint upstream work or
+//! speed) and probed to skip chunks already present (dedup + resume). a `"files:
+//! chunk not available"` rejection (a chunk expired between probe and submit)
+//! re-stages and retries the commit once. a CAS conflict auto-rebases disjoint upstream work or
 //! surfaces a structured [`ConflictReport`] — never a silent merge.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -106,8 +105,8 @@ pub fn commit_with(
     }
     let planned = plan(&st, dir, &index.prefix)?;
 
-    // stage the chunks the cluster lacks, then re-probe as TTL insurance.
-    ensure_staged(api, &planned.blobs)?;
+    // stage the chunks the cluster lacks; a chunk that expires between here and
+    // the submit is covered by submit's re-stage-and-retry.
     ensure_staged(api, &planned.blobs)?;
 
     let (receipt, rebased) = submit_with_rebase(api, &index, message, &planned, opts.auto_rebase)?;

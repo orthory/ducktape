@@ -1,4 +1,4 @@
-use duckdns_core::{DuckDnsName, RESERVED_ROOT_LABELS, parse_hostname, validate_handle};
+use duckdns::{DuckDnsName, RESERVED_ROOT_LABELS, parse_hostname, validate_handle};
 
 #[test]
 fn account_name_round_trips_canonically() {

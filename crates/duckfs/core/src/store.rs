@@ -1,11 +1,11 @@
-//! the persistence seams. the pure core only ever sees these two traits; the
-//! mem pair beside them backs tests and the phase-1 module glue, and the disk
-//! pair (`disk.rs`, tasks 5/6) lives behind the `native` feature.
+//! the persistence seam. the pure core only ever sees `ObjectStore`; `MemStore`
+//! beside it backs tests, and the disk pair (duckfs-disk) lives behind the
+//! `native` feature. refs persistence is duckfs-disk's `DiskRefs` — the core
+//! never abstracts over it.
 
 use std::collections::BTreeMap;
 
 use crate::objects::{Kind, ObjectId, object_id};
-use crate::state::Refs;
 
 pub trait ObjectStore {
     fn put(&mut self, kind: Kind, body: &[u8]) -> Result<ObjectId, String>;
@@ -31,12 +31,6 @@ pub trait ObjectStore {
     fn stat(&self, id: &ObjectId) -> Result<Option<(Kind, u64)>, String>;
     fn remove(&mut self, id: &ObjectId) -> Result<(), String>;
     fn list(&self) -> Result<Vec<ObjectId>, String>;
-}
-
-pub trait RefsStore {
-    /// None = fresh dir. Ok(Some((refs, height, gc_watermark))) otherwise.
-    fn load(&self) -> Result<Option<(Refs, u64, u64)>, String>;
-    fn save(&mut self, refs: &Refs, height: u64, gc_watermark: u64) -> Result<(), String>;
 }
 
 /// in-memory object store — tests and the phase-1 glue.
@@ -80,29 +74,6 @@ impl ObjectStore for MemStore {
 
     fn list(&self) -> Result<Vec<ObjectId>, String> {
         Ok(self.objects.keys().copied().collect())
-    }
-}
-
-/// single-slot in-memory refs store: an empty slot is a fresh dir.
-#[derive(Default)]
-pub struct MemRefs {
-    slot: Option<(Refs, u64, u64)>,
-}
-
-impl MemRefs {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl RefsStore for MemRefs {
-    fn load(&self) -> Result<Option<(Refs, u64, u64)>, String> {
-        Ok(self.slot.clone())
-    }
-
-    fn save(&mut self, refs: &Refs, height: u64, gc_watermark: u64) -> Result<(), String> {
-        self.slot = Some((refs.clone(), height, gc_watermark));
-        Ok(())
     }
 }
 

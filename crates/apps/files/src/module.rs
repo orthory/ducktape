@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use duckfs_core::fs::{Fs, StagedObjects};
 use duckfs_core::state::Refs;
-use duckfs_core::store::{ObjectStore as _, RefsStore as _};
+use duckfs_core::store::ObjectStore as _;
 use duckfs_core::{
     FilesMsg, GC_PERIOD_BLOCKS, ObjectId, PUTBLOB_FRAME_TAG, decode_msg, decode_query,
     decode_sync_req, encode_reply, encode_sync_resp, to_hex,

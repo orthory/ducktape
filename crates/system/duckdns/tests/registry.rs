@@ -1,4 +1,4 @@
-use duckdns_core::{
+use duckdns::{
     DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply, Registry, ResolvedAccount, decode_msg,
     decode_query, decode_reply, encode_msg, encode_query, encode_reply,
 };
@@ -119,7 +119,7 @@ fn pending_changes_abort_or_commit_atomically() {
 }
 
 #[test]
-fn naming_snapshot_is_versioned_canonical_and_root_checked() {
+fn naming_snapshot_is_canonical_and_root_checked() {
     let mut first = Registry::new();
     first.set_handle(&[2], Some("beta".into())).unwrap();
     first.set_handle(&[1], Some("alpha".into())).unwrap();
@@ -141,8 +141,5 @@ fn naming_snapshot_is_versioned_canonical_and_root_checked() {
     let mut trailing = snapshot.clone();
     trailing.push(0);
     assert!(restored.install(&trailing, root).is_err());
-    let mut future = snapshot.clone();
-    future[0] = 3;
-    assert!(restored.install(&future, root).is_err());
     assert!(restored.install(&snapshot, [9; 32]).is_err());
 }

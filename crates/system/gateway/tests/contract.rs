@@ -1,7 +1,6 @@
 use gateway::{
-    GatewayReply, ROUTE_FORMAT_VERSION, RouteAudience, RouteDefinition, RouteMethod, RouteName,
-    RoutePolicy, RouteStatement, RouteSummary, RouteTarget, RouteTargetKind,
-    route_signing_preimage,
+    GatewayReply, RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy,
+    RouteStatement, RouteSummary, RouteTarget, route_signing_preimage,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -10,7 +9,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn statement() -> RouteStatement {
     RouteStatement {
-        version: ROUTE_FORMAT_VERSION,
+        version: 1,
         chain_id: "test".into(),
         account_id: vec![1, 2],
         name: RouteName::named("api"),
@@ -55,7 +54,7 @@ fn management_replies_keep_the_small_external_json_shape() {
         name: RouteName::named("api"),
         publisher_node: vec![3; 32],
         revision: 7,
-        target: RouteTargetKind::LoopbackHttp,
+        target: "loopback_http".into(),
     };
     assert_eq!(
         serde_json::to_value(GatewayReply::Routes(vec![summary])).unwrap(),

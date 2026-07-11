@@ -37,10 +37,6 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
-    pub(crate) fn u8(&mut self) -> Result<u8, String> {
-        Ok(self.array::<1>()?[0])
-    }
-
     pub(crate) fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.array::<8>()?))
     }
@@ -103,8 +99,8 @@ mod tests {
         let mut truncated = Reader::new(&[0; 7]);
         assert!(truncated.u64().unwrap_err().contains("truncated"));
 
-        let mut trailing = Reader::new(&[0, 1]);
-        trailing.u8().unwrap();
+        let mut trailing = Reader::new(&[0; 9]);
+        trailing.u64().unwrap();
         assert!(trailing.finish().unwrap_err().contains("trailing"));
     }
 }
