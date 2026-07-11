@@ -2,7 +2,7 @@
 # publishes its wire surface (types-only payload/query/reply shapes + codecs)
 # at its crate root; cross-module product interaction goes through those wire
 # types and host-mediated queries, never another module's internals. layout:
-#   crates/kernel/   — the platform: sdk (interface), state (app-hash), host
+#   crates/kernel/   — the platform: sdk (interface), host
 #                      (dispatch), node (transport seam), consensus (BFT orderer)
 #   crates/system/   — consensus infrastructure modules (kv, valset)
 #   crates/apps/     — product feature modules (forge, chat, tasks, pages, …)
@@ -15,8 +15,8 @@
 resolver = "2"
 members = [
     # kernel — the platform (contract + dispatch + transport + BFT ordering)
-    "crates/kernel/sdk", "crates/kernel/state", "crates/kernel/host",
-    "crates/kernel/node", "crates/kernel/consensus", "crates/kernel/reactor",
+    "crates/kernel/sdk", "crates/kernel/host",
+    "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
     "crates/kernel/capability-host",
     # system — consensus infrastructure modules
@@ -145,11 +145,9 @@ fluent31 = { git = "https://github.com/orthory/fluent31", default-features = fal
 
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
-state = { path = "crates/kernel/state" }
 host = { path = "crates/kernel/host" }
 node = { path = "crates/kernel/node" }
 consensus = { path = "crates/kernel/consensus" }
-reactor = { path = "crates/kernel/reactor" }
 statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }

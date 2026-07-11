@@ -35,7 +35,6 @@ forge = { workspace = true }
 files = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
-reactor = { workspace = true }
 noded = { path = "../noded" }
 # the durable block index — /v1/blocks and /v1/index/* read it, the sim actor
 # feeds it block-by-block exactly like the real daemons.

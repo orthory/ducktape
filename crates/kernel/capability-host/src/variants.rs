@@ -114,7 +114,6 @@ pub(crate) fn expand(
             bin: base.bin.clone(),
             env: base.env.clone(),
             args: variant.args.clone(),
-            prompt: base.prompt,
             timeout_secs: base.timeout_secs,
             output: base.output,
             workspace: base.workspace,
@@ -147,7 +146,7 @@ fn validate_suffix(suffix: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::{CapabilitySpec, OutputFormat, PromptMode, builtin_specs};
+    use crate::spec::{CapabilitySpec, OutputFormat, builtin_specs};
 
     fn family_toml(extra: &str) -> String {
         format!(
@@ -199,7 +198,6 @@ args = ["run", "--model", "m1", "--effort", "high"]
         assert_eq!(v.bin, "prov-cli", "bin inherited");
         assert_eq!(v.env.as_deref(), Some("MOCK_PROV_BIN"), "env inherited");
         assert_eq!(v.description, "a provider family", "description inherited");
-        assert_eq!(v.prompt, PromptMode::Stdin, "prompt inherited");
         assert_eq!(v.timeout_secs, 120, "timeout inherited");
         assert_eq!(v.output, OutputFormat::Text, "output inherited");
     }

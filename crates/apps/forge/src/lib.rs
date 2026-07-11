@@ -1088,9 +1088,9 @@ mod tests {
     fn root_composes_into_global_root() {
         let base = tmp_base("compose");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
-        let before = state::global_root(&[&forge as &dyn Module]);
+        let before = host::global_root(&[&forge as &dyn Module]);
         commit(&mut forge, 7, "", "a.txt", "x", "c");
-        let after = state::global_root(&[&forge as &dyn Module]);
+        let after = host::global_root(&[&forge as &dyn Module]);
         assert_ne!(before, after, "forge's root must move the global app-hash");
         let _ = std::fs::remove_dir_all(&base);
     }

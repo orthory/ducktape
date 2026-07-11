@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use host::Host;
-use reactor::{WorkOutcome, Worker};
+use host::worker::{WorkOutcome, Worker};
 use saga::{SagaMsg, SagaQuery, SagaReply, WorkerRequest};
 use sdk::{Effect, Msg};
 

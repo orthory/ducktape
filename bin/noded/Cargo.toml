@@ -49,7 +49,6 @@ duckfs-core = { workspace = true }
 # the node-local op-receipt blob store (the http blob lane): op payloads staged
 # at submit time, served back by digest. re-exported by `src/blobs.rs`.
 blobstore = { workspace = true }
-reactor = { workspace = true }
 # the derived read-model tier: the actor materializes per-module fluent31
 # indexes as blocks commit; /v1/index/* serves snapshot reads of them, and
 # each module registers its `::index` mapper as its own view endpoint.

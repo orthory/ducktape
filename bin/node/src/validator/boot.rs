@@ -113,7 +113,7 @@ pub(super) async fn restore(
                 eprintln!(
                     "[node {label}] FATAL: cannot recover — {e} (recovered boundary needs \
                  protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
-                    manifest.required_min_version()
+                    manifest.required_min_version
                 );
                 std::process::exit(1);
             }

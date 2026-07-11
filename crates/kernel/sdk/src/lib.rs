@@ -8,7 +8,7 @@
 //! wrapper's [`StateRoot`], commit/abort, and sync boundary. in facade mode, the
 //! storage implementation is an explicitly registered backing module and durable
 //! state belongs to that backing module's root. the host composes each module's
-//! [`StateRoot`] into the global app-hash (see the `state` crate); how a module
+//! [`StateRoot`] into the global app-hash (see `host::global_root`); how a module
 //! *computes* that root — a qmdb merkle root, a git HEAD oid — is private to the
 //! module. the host only ever sees `root() -> StateRoot`.
 //!

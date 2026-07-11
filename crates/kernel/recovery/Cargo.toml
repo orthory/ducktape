@@ -15,7 +15,6 @@ commonware-utils = { workspace = true }
 futures = "0.3"
 
 [dev-dependencies]
-state = { workspace = true }
 directory = { workspace = true }
 commonware-cryptography = { workspace = true }
 upgrade = { workspace = true }

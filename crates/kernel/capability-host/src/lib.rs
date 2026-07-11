@@ -55,7 +55,7 @@ mod spec;
 mod variants;
 mod workspace;
 pub use session::{ResumeArgv, SessionCapture, SessionSpec};
-pub use spec::{CapabilitySpec, OutputFormat, PromptMode, SpecSet, builtin_specs};
+pub use spec::{CapabilitySpec, OutputFormat, SpecSet};
 pub use workspace::WorkspaceMode;
 
 /// per-run, host-local context riding beside the prompt: which agent is
@@ -149,14 +149,15 @@ impl ProviderSet {
 
     /// no specs, no providers — the "nothing installed, nothing loaded" test
     /// seam. every resolve() fails with a clean error.
-    pub fn empty() -> Self {
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
         Self {
             specs: SpecSet::from_specs(Vec::new()),
             providers: Vec::new(),
         }
     }
 
-    pub fn find(&self, capability: &str) -> Option<&dyn Provider> {
+    fn find(&self, capability: &str) -> Option<&dyn Provider> {
         self.providers
             .iter()
             .find(|p| p.capability() == capability)
@@ -173,14 +174,6 @@ impl ProviderSet {
             .collect();
         tags.sort();
         tags
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.providers.is_empty()
-    }
-
-    pub fn specs(&self) -> &SpecSet {
-        &self.specs
     }
 
     /// capability-tag resolution, the one entry point callers should use.
@@ -242,7 +235,7 @@ impl AgentDirs {
 /// a [`Provider`] that interprets one [`CapabilitySpec`] against one resolved
 /// binary: spawn `bin` with the spec's literal argv, feed the prompt on
 /// stdin, parse stdout with the spec's named format.
-pub struct CliProvider {
+pub(crate) struct CliProvider {
     spec: CapabilitySpec,
     bin: PathBuf,
     /// the child's DEFAULT working directory — an empty scratch dir, never
@@ -284,7 +277,8 @@ impl CliProvider {
         }
     }
 
-    pub fn with_workdir(mut self, workdir: PathBuf) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_workdir(mut self, workdir: PathBuf) -> Self {
         self.workdir = workdir;
         self
     }
@@ -529,10 +523,7 @@ impl CliProvider {
 
         // feed the prompt CONCURRENTLY with collecting output: a prompt larger
         // than the pipe buffer would deadlock a sequential write-then-wait if
-        // the CLI streams output before draining stdin. (PromptMode::Stdin is
-        // the only v1 mode; the irrefutable match fails loud in review when a
-        // second mode lands and this site needs a real branch.)
-        let PromptMode::Stdin = self.spec.prompt;
+        // the CLI streams output before draining stdin.
         let feed = async {
             stdin.write_all(prompt.as_bytes()).await?;
             stdin.shutdown().await?;
@@ -712,20 +703,35 @@ impl Provider for CliProvider {
     }
 }
 
+/// the JSON objects of a JSONL-ish stream: trimmed lines that parse; non-json
+/// noise skipped. shared by the output parser and the session capture.
+pub(crate) fn json_lines(stdout: &str) -> impl Iterator<Item = Value> + '_ {
+    stdout.lines().filter_map(|line| {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            return None;
+        }
+        serde_json::from_str::<Value>(line).ok()
+    })
+}
+
+/// the candidate `{"type":"result",..}` objects of a single-JSON-result print
+/// mode: the whole trimmed output first, then per-line for robustness against
+/// banner noise. shared by the output parser and the session capture.
+pub(crate) fn result_objects(stdout: &str) -> impl Iterator<Item = Value> + '_ {
+    std::iter::once(stdout.trim())
+        .chain(stdout.lines().rev().map(str::trim))
+        .filter_map(|candidate| serde_json::from_str::<Value>(candidate).ok())
+        .filter(|v| v.get("type").and_then(Value::as_str) == Some("result"))
+}
+
 /// the LAST agent message in a JSONL event stream. tolerant of
 /// the two shapes the CLI has shipped (item events with `type` or `item_type`,
 /// and the older `msg` envelope) and of non-json noise lines; anything else is
 /// an explicit error carrying an output excerpt, never a silent empty answer.
 fn parse_jsonl_events(stdout: &str) -> Result<String, String> {
     let mut last: Option<String> = None;
-    for line in stdout.lines() {
-        let line = line.trim();
-        if !line.starts_with('{') {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    for v in json_lines(stdout) {
         if let Some(item) = v.get("item") {
             let kind = item
                 .get("type")
@@ -756,18 +762,11 @@ fn parse_jsonl_events(stdout: &str) -> Result<String, String> {
 /// whole-output first, then per-line for robustness against banner noise. an
 /// `is_error` result is surfaced as the error it is.
 fn parse_json_result(stdout: &str) -> Result<String, String> {
-    let candidates = std::iter::once(stdout.trim()).chain(stdout.lines().rev().map(str::trim));
-    for candidate in candidates {
-        let Ok(v) = serde_json::from_str::<Value>(candidate) else {
-            continue;
-        };
-        if v.get("type").and_then(Value::as_str) != Some("result") {
-            continue;
-        }
+    for v in result_objects(stdout) {
         if v.get("is_error").and_then(Value::as_bool) == Some(true) {
             return Err(format!(
                 "executor reported an error result: {}",
-                excerpt(candidate)
+                excerpt(&v.to_string())
             ));
         }
         if let Some(text) = v.get("result").and_then(Value::as_str) {
@@ -822,37 +821,12 @@ fn excerpt(s: &str) -> String {
 /// once (refreshed by child output; see [`HARD_TIMEOUT_FACTOR`]).
 /// what discovery finds is exactly what the node announces.
 ///
-/// this arity wires NO agent roots: persistent workspaces and sessions stay
-/// off (beyond env overrides) — the embedder-with-no-data-dir default. node
-/// binaries call [`discover_with_dirs`] with their data dir instead.
-pub fn discover() -> Result<ProviderSet, String> {
-    discover_with_dirs(AgentDirs::default())
-}
-
-/// [`discover`] with a live output sink installed on every discovered CLI
-/// provider.
-pub fn discover_with_output_sink(output_sink: OutputSink) -> Result<ProviderSet, String> {
-    discover_with_dirs_and_output_sink(AgentDirs::default(), output_sink)
-}
-
-/// [`discover`] with host-wired per-agent roots (see [`AgentDirs`]) — the
-/// binaries pass `AgentDirs::under(<data dir>)`. `DUCKTAPE_AGENT_WORKSPACES`
-/// and `DUCKTAPE_AGENT_SESSIONS` override the wired roots, following the
-/// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` precedent.
-pub fn discover_with_dirs(dirs: AgentDirs) -> Result<ProviderSet, String> {
-    discover_with_options(dirs, None)
-}
-
-/// [`discover_with_dirs`] with a live output sink installed on every
-/// discovered CLI provider.
-pub fn discover_with_dirs_and_output_sink(
-    dirs: AgentDirs,
-    output_sink: OutputSink,
-) -> Result<ProviderSet, String> {
-    discover_with_options(dirs, Some(output_sink))
-}
-
-fn discover_with_options(
+/// per-agent roots: node binaries pass `AgentDirs::under(<data dir>)`;
+/// embedders with no data dir pass `AgentDirs::default()` (workspaces and
+/// sessions stay off beyond env overrides). `DUCKTAPE_AGENT_WORKSPACES` /
+/// `DUCKTAPE_AGENT_SESSIONS` override the wired roots. `output_sink`
+/// installs a live tail on every discovered CLI provider.
+pub fn discover(
     dirs: AgentDirs,
     output_sink: Option<OutputSink>,
 ) -> Result<ProviderSet, String> {

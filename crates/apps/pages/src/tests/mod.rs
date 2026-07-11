@@ -1,7 +1,7 @@
 use super::*;
 use crate::{NewBlock, decode_reply, encode_msg, encode_query};
 use commonware_runtime::{Runner as _, deterministic};
-use state::global_root;
+use host::global_root;
 
 fn nb(id: &str, kind: BlockKind, text: &str) -> NewBlock {
     NewBlock {

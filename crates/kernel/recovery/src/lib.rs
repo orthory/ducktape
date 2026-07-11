@@ -199,13 +199,6 @@ impl<'a> Cursor<'a> {
         Ok(u32::from_le_bytes(b.try_into().expect("4 bytes")))
     }
 
-    /// true once every byte has been consumed — the tolerant-tail probe: an
-    /// old-format checkpoint ends here, a new-format one still has its version
-    /// fields to read.
-    fn at_end(&self) -> bool {
-        self.at == self.buf.len()
-    }
-
     fn bytes(&mut self) -> Result<Vec<u8>, Error> {
         let len = self.u64()? as usize;
         if len > self.max_field_len {
@@ -312,8 +305,7 @@ pub enum Record {
         epoch: u64,
         view_base: u64,
         participants: Vec<Vec<u8>>,
-        /// the epoch's RESIDENT set (transport standing, no quorum seat) —
-        /// empty on records written before the staged-admission tier.
+        /// the epoch's RESIDENT set (transport standing, no quorum seat).
         residents: Vec<Vec<u8>>,
     },
 }
@@ -393,10 +385,7 @@ impl Record {
                 let epoch = c.u64()?;
                 let view_base = c.u64()?;
                 let participants = get_keys(&mut c)?;
-                // ADDITIVE tail: a record written before the resident tier
-                // ends here — map the missing set to empty, like the
-                // manifest's version tail.
-                let residents = if c.at_end() { Vec::new() } else { get_keys(&mut c)? };
+                let residents = get_keys(&mut c)?;
                 Record::Cutover {
                     epoch,
                     view_base,
@@ -434,8 +423,7 @@ pub struct Manifest {
     /// change whose cutover had not happened yet.
     pub participants: Vec<Vec<u8>>,
     /// the epoch's RESIDENT set (transport standing, no quorum seat) — same
-    /// epoch-scoped discipline as `participants`. empty on checkpoints
-    /// written before the staged-admission tier (tolerant decode).
+    /// epoch-scoped discipline as `participants`.
     pub residents: Vec<Vec<u8>>,
     /// an epoch cutover armed but not yet crossed at checkpoint time (the
     /// ordered lane's discard-ceiling view). a restart re-arms the same
@@ -460,8 +448,7 @@ pub struct Manifest {
     pub next_seq: u64,
     /// the agreed protocol version active at this boundary. an UNAUTHENTICATED
     /// preflight hint — the authority stays the replayed upgrade-module state,
-    /// confirmed by the final app-hash compose. defaults to 0 on an on-disk
-    /// checkpoint written before this field existed (tolerant decode).
+    /// confirmed by the final app-hash compose.
     pub current_version: u32,
     /// the single upgrade armed but not yet activated at checkpoint time, if
     /// any — the version analogue of `pending_cutover_view`.
@@ -502,7 +489,6 @@ impl Manifest {
         }
         put_u64(&mut out, self.oplog_pos);
         put_u64(&mut out, self.next_seq);
-        // --- ADDITIVE version tail (see decode's tolerant read) ---
         put_u32(&mut out, self.current_version);
         match &self.pending_upgrade {
             Some(u) => {
@@ -514,8 +500,6 @@ impl Manifest {
             None => out.push(0),
         }
         put_u32(&mut out, self.required_min_version);
-        // --- ADDITIVE resident tail (after the version tail, same tolerant
-        // discipline) ---
         put_keys(&mut out, &self.residents);
         out
     }
@@ -549,35 +533,24 @@ impl Manifest {
         }
         let oplog_pos = c.u64()?;
         let next_seq = c.u64()?;
-        // ADDITIVE version tail. a checkpoint written by an older binary ends
-        // here; map the missing tail to baseline defaults rather than tripping
-        // the no-trailing-bytes check, so a new binary boots an old on-disk
-        // checkpoint. a present-but-malformed tail still fails loud.
-        let (current_version, pending_upgrade, required_min_version) = if c.at_end() {
-            (0, None, 0)
-        } else {
-            let current_version = c.u32()?;
-            let pending_upgrade = match c.take(1)?[0] {
-                0 => None,
-                1 => {
-                    let name = String::from_utf8(c.bytes()?)
-                        .map_err(|_| Error::Corrupt("upgrade name is not utf-8".into()))?;
-                    let activation_height = c.u64()?;
-                    let to_version = c.u32()?;
-                    Some(UpgradeCoords {
-                        name,
-                        activation_height,
-                        to_version,
-                    })
-                }
-                t => return Err(Error::Corrupt(format!("bad pending-upgrade tag {t}"))),
-            };
-            let required_min_version = c.u32()?;
-            (current_version, pending_upgrade, required_min_version)
+        let current_version = c.u32()?;
+        let pending_upgrade = match c.take(1)?[0] {
+            0 => None,
+            1 => {
+                let name = String::from_utf8(c.bytes()?)
+                    .map_err(|_| Error::Corrupt("upgrade name is not utf-8".into()))?;
+                let activation_height = c.u64()?;
+                let to_version = c.u32()?;
+                Some(UpgradeCoords {
+                    name,
+                    activation_height,
+                    to_version,
+                })
+            }
+            t => return Err(Error::Corrupt(format!("bad pending-upgrade tag {t}"))),
         };
-        // ADDITIVE resident tail — absent on checkpoints written before the
-        // staged-admission tier.
-        let residents = if c.at_end() { Vec::new() } else { get_keys(&mut c)? };
+        let required_min_version = c.u32()?;
+        let residents = get_keys(&mut c)?;
         c.done()?;
         Ok(Self {
             height,
@@ -675,17 +648,11 @@ impl Manifest {
         })
     }
 
-    /// this boundary's required minimum protocol version — the fence the boot
-    /// preflight checks the local build against.
-    pub fn required_min_version(&self) -> u32 {
-        self.required_min_version
-    }
-
     /// boot preflight: fail loud when the local build's `max_supported`
     /// protocol version is below this boundary's `required_min_version`,
     /// turning an opaque post-replay app-hash mismatch into an early,
-    /// actionable "height needs binary vX" refusal. NOT yet wired into the
-    /// live resume path (that invocation is a later phase).
+    /// actionable "height needs binary vX" refusal. every resume path runs
+    /// it (replica park, sync-only boot, validator boot).
     pub fn preflight(&self, max_supported: u32) -> Result<(), sdk::UnsupportedVersion> {
         sdk::check_required_version(self.required_min_version, max_supported)
     }
@@ -1892,6 +1859,16 @@ mod tests {
         let mut bad = good;
         bad[0] = 99;
         assert!(Record::decode(&bad).is_err());
+        // a pre-resident-tier cutover record (resident tail absent — the empty
+        // set's 8-byte count dropped) fails loud rather than defaulting.
+        let cutover = Record::Cutover {
+            epoch: 2,
+            view_base: 40,
+            participants: vec![vec![7u8; 32]],
+            residents: vec![],
+        }
+        .encode();
+        assert!(Record::decode(&cutover[..cutover.len() - 8]).is_err());
     }
 
     #[test]
@@ -1966,40 +1943,27 @@ mod tests {
     }
 
     #[test]
-    fn manifest_decode_tolerates_old_format() {
-        // an on-disk checkpoint written before the version fields existed: the
-        // encoding truncated at `next_seq`. a new binary must map BOTH missing
-        // tails (version fields, resident set) to baseline defaults.
+    fn manifest_decode_rejects_old_format() {
+        // pre-field on-disk checkpoints are no longer tolerated: a checkpoint
+        // truncated at `next_seq` (before the version fields) or at
+        // `required_min_version` (before the resident set) must fail loud —
+        // the node resyncs instead of booting on silent defaults.
         let m = Manifest {
             residents: vec![],
             ..sample_manifest()
         };
         let full = m.encode();
         // the tails are `u32 current + 1-byte pending tag(None) + u32 required`
-        // = 9 bytes, then the empty resident keys = 8 bytes; drop both to
-        // simulate the pre-version format.
-        let old = &full[..full.len() - 17];
-        let decoded = Manifest::decode(old).expect("old format decodes");
-        assert_eq!(decoded.current_version, 0);
-        assert_eq!(decoded.pending_upgrade, None);
-        assert_eq!(decoded.required_min_version, 0);
-        // everything before the tails survives unchanged.
-        assert_eq!(decoded, m);
-
-        // the MIDDLE format — version tail present, resident tail absent (a
-        // checkpoint from the version era, before the staged-admission tier):
-        // residents default to empty, version fields survive.
-        let middle = &full[..full.len() - 8];
-        let decoded = Manifest::decode(middle).expect("middle format decodes");
-        assert_eq!(decoded, m);
+        // = 9 bytes, then the empty resident keys = 8 bytes.
+        assert!(Manifest::decode(&full[..full.len() - 17]).is_err());
+        assert!(Manifest::decode(&full[..full.len() - 8]).is_err());
     }
 
     #[test]
     fn manifest_decode_rejects_truncated_version_tail() {
-        // a present-but-malformed tail (one byte into the version fields) must
-        // fail loud, never silently default. the resident tail sits after the
-        // version tail, so to tear inside the version fields drop the whole
-        // (empty) resident section — 8 bytes — plus half the required_min u32.
+        // a torn tail (mid-field truncation) fails loud too. drop the whole
+        // (empty) resident section — 8 bytes — plus half the required_min u32
+        // to tear inside the version fields.
         let m = Manifest {
             residents: vec![],
             ..sample_manifest()

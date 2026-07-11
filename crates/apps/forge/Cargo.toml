@@ -29,5 +29,5 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 [dev-dependencies]
 # dev-only: prove forge's root composes into the global app-hash. not a
 # production dep — a module still depends on sdk + its interface only.
-state = { workspace = true }
+host = { workspace = true }
 futures = "0.3"

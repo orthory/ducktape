@@ -3,7 +3,7 @@ use sdk::Msg;
 
 /// the node-local worker that self-emits a validator-origin `SignalReady` op
 /// ONCE per pending upgrade this binary can execute. deliberately NOT a
-/// `reactor::Worker`: readiness must survive restart/late-join, so it polls the
+/// `host::worker::Worker`: readiness must survive restart/late-join, so it polls the
 /// COMMITTED upgrade state each pump tick and re-derives its decision idempotently
 /// rather than reacting to a one-shot block effect. "ready" is a truthful machine
 /// statement about the running binary — it signals iff `MAX_PROTOCOL_VERSION >=

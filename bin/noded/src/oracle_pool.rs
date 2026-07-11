@@ -51,7 +51,7 @@ pub(crate) fn oracle_workers<C>(
     agent_dirs: capability_host::AgentDirs,
     storage: &std::path::Path,
     forge_push_base: Option<String>,
-) -> Vec<Box<dyn reactor::Worker>>
+) -> Vec<Box<dyn host::worker::Worker>>
 where
     C: Spawner + Supervisor + 'static,
 {
@@ -64,10 +64,7 @@ where
     // grab the live-output registry BEFORE the provisioner below consumes
     // the handle — the sink keys per-run rings by ctx.run_key.
     let run_output = node_handle.stream_hub().run_output();
-    let providers = capability_host::discover_with_dirs_and_output_sink(
-        agent_dirs,
-        run_output_sink(run_output),
-    )
+    let providers = capability_host::discover(agent_dirs, Some(run_output_sink(run_output)))
     // BYO: run whatever executor CLIs the capability specs describe and
     // this host has installed — no credential handling here (see
     // docs/records/specs/capability-spec.md). a broken operator spec is a boot error.
@@ -164,21 +161,21 @@ struct EchoWorker;
 
 #[cfg(debug_assertions)]
 #[async_trait::async_trait(?Send)]
-impl reactor::Worker for EchoWorker {
+impl host::worker::Worker for EchoWorker {
     async fn run(
         &self,
         effect: &sdk::Effect,
-    ) -> Result<reactor::WorkOutcome, reactor::Error> {
+    ) -> Result<host::worker::WorkOutcome, host::worker::Error> {
         let request = match saga::decode_worker_request(&effect.0) {
             Ok(request) => request,
-            Err(_) => return Ok(reactor::WorkOutcome::NotMine),
+            Err(_) => return Ok(host::worker::WorkOutcome::NotMine),
         };
         // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
         // module judged a Text contract; the agent module normalizes).
         let Ok(work) = dispatch::decode_work_spec(&request.spec) else {
-            return Ok(reactor::WorkOutcome::NotMine);
+            return Ok(host::worker::WorkOutcome::NotMine);
         };
-        Ok(reactor::WorkOutcome::Handled(Some(sdk::Msg {
+        Ok(host::worker::WorkOutcome::Handled(Some(sdk::Msg {
             target: "saga".into(),
             payload: saga::encode_msg(&saga::SagaMsg::OracleResult {
                 saga_id: request.saga_id,

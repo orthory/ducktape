@@ -28,7 +28,7 @@ fn write_moves_root_and_composes_into_global_root() {
             let mods: [&dyn Module; 2] = [&p, &stub];
             global_root(&mods)
         };
-        assert_ne!(g, state::global_root(&[&stub as &dyn Module]));
+        assert_ne!(g, host::global_root(&[&stub as &dyn Module]));
     });
 }
 

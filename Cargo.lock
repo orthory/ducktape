@@ -2193,7 +2193,6 @@ dependencies = [
  "host",
  "kv",
  "node",
- "rand_chacha 0.3.1",
  "rand_core 0.6.4",
  "sdk",
 ]
@@ -2824,7 +2823,6 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
- "state",
  "statesync",
  "tagging",
  "tasks",
@@ -3001,7 +2999,7 @@ dependencies = [
  "capability-host",
  "dispatch",
  "futures",
- "reactor",
+ "host",
  "saga",
  "sdk",
  "serde",
@@ -3624,11 +3622,11 @@ dependencies = [
  "chat",
  "futures",
  "git2",
+ "host",
  "sdk",
  "serde",
  "serde_json",
  "sha2",
- "state",
 ]
 
 [[package]]
@@ -4393,7 +4391,7 @@ dependencies = [
  "saga",
  "sdk",
  "serde_json",
- "state",
+ "sha2",
  "upgrade",
  "valset",
 ]
@@ -5131,10 +5129,10 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
+ "host",
  "sdk",
  "serde",
  "serde_json",
- "state",
  "statesync",
 ]
 
@@ -5640,9 +5638,6 @@ dependencies = [
  "kv",
  "saga",
  "sdk",
- "serde",
- "serde_json",
- "state",
  "thiserror 2.0.18",
 ]
 
@@ -5699,7 +5694,6 @@ dependencies = [
  "pages",
  "rand 0.8.6",
  "reachability",
- "reactor",
  "recovery",
  "reqwest 0.12.28",
  "runs",
@@ -5757,7 +5751,6 @@ dependencies = [
  "jobs",
  "pages",
  "rand 0.8.6",
- "reactor",
  "runs",
  "saga",
  "sdk",
@@ -6363,11 +6356,11 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "commonware-utils",
+ "host",
  "indexer",
  "sdk",
  "serde",
  "serde_json",
- "state",
  "statesync",
  "tempfile",
  "tokio",
@@ -7329,18 +7322,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reactor"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "dispatch",
- "futures",
- "host",
- "saga",
- "sdk",
-]
-
-[[package]]
 name = "readme-rustdocifier"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7362,7 +7343,6 @@ dependencies = [
  "node",
  "sdk",
  "sha2",
- "state",
  "thiserror 2.0.18",
  "upgrade",
 ]
@@ -8480,7 +8460,6 @@ dependencies = [
  "jobs",
  "noded",
  "pages",
- "reactor",
  "runs",
  "saga",
  "sdk",
@@ -8672,15 +8651,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "state"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "sdk",
- "sha2",
-]
 
 [[package]]
 name = "statesync"

@@ -2,10 +2,13 @@
 //!
 //! the honest N=5 milestone (`simplex_agreed_order.rs`) runs `SimplexOrderer::
 //! spawn` over ONE shared `ContentStore` — there is no payload lane to attack.
-//! this harness runs `SimplexOrderer::spawn_with_relay` instead: each validator
-//! owns a PER-PROCESS store, gossips its proposed frame's bytes on a dedicated
-//! payload channel, and a STORE-ONLY drain caches peer-relayed frames. that lane
-//! is the surface a byzantine peer floods.
+//! this harness runs `SimplexOrderer::spawn_with_resolver` (the production
+//! constructor, starve off) instead: each validator owns a PER-PROCESS store,
+//! gossips its proposed frame's bytes on a dedicated payload channel, and a
+//! STORE-ONLY drain caches peer-relayed frames. that lane is the surface a
+//! byzantine peer floods. (the resolver fetch backstop is wired but idle here —
+//! every honest peer caches the eager gossip; the miss path is proven by
+//! `payload_fetch_late_join.rs`.)
 //!
 //! two tests:
 //!  * `relay_path_converges_including_qmdb_root` — the honest baseline: prove the
@@ -136,11 +139,13 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
     network.start();
 
     // vote(0)/cert(1)/resolver(2) — consumed positionally by engine.start — PLUS
-    // the payload channel(3) the relay gossips frame bytes on. channel 3 is free:
-    // the engine here uses only 0/1/2 (no broadcast channel to collide with).
+    // the payload channel(3) the relay gossips frame bytes on and the catch-up
+    // fetch channel(4) the resolver engine runs on. 3/4 are free: the engine
+    // here uses only 0/1/2 (no broadcast channel to collide with).
     let quota = Quota::per_second(NZU32!(128));
     let mut registrations = HashMap::new();
     let mut payload_chans = HashMap::new();
+    let mut fetch_chans = HashMap::new();
     for v in participants.iter() {
         let control = oracle.control(v.clone());
         let vote = control.register(0, quota).await.expect("register vote");
@@ -150,8 +155,10 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
             .expect("register certificate");
         let resolver = control.register(2, quota).await.expect("register resolver");
         let payload = control.register(3, quota).await.expect("register payload");
+        let fetch = control.register(4, quota).await.expect("register fetch");
         registrations.insert(v.clone(), (vote, certificate, resolver));
         payload_chans.insert(v.clone(), payload);
+        fetch_chans.insert(v.clone(), fetch);
     }
 
     let link = Link {
@@ -181,6 +188,7 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
         let host = genesis_host(context.child(LABELS[idx])).await;
         let (vote, certificate, resolver) = registrations.remove(v).expect("validator registered");
         let payload = payload_chans.remove(v).expect("validator payload channel");
+        let fetch = fetch_chans.remove(v).expect("validator fetch channel");
 
         // INJECTION: before the honest wiring consumes the payload tuple, clone the
         // byzantine node's payload SENDER and spawn a flooder on it. this touches
@@ -207,21 +215,27 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
             });
         }
 
-        // PER-PROCESS store: the only path into a peer's store is the relay drain.
+        // PER-PROCESS store: the only path into a peer's store is the relay drain
+        // (the resolver fetch lane stays idle while the eager gossip lands).
         let store = ContentStore::new();
         stores.push(store.clone());
-        let orderer = SimplexOrderer::spawn_with_relay(
+        let orderer = SimplexOrderer::spawn_with_resolver(
             context.child("validator"),
             schemes[idx].clone(),
             oracle.control(v.clone()),
+            oracle.manager(),
+            v.clone(),
             v.to_string(),
             epoch,
             genesis_floor,
+            None,
             store,
             vote,
             certificate,
             resolver,
             payload,
+            fetch,
+            false,
         );
         nodes.push(OrderedNode::new(host, orderer));
     }

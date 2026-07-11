@@ -4,7 +4,7 @@
 //! variable-length byte values, sha256-merkleized) and exposes it as an
 //! [`sdk::Module`]. the module's authenticated [`StateRoot`] IS the qmdb merkle
 //! root — a real cryptographic commitment to the whole store, refreshed on every
-//! write — so it flows directly into the global app-hash via `state::global_root`.
+//! write — so it flows directly into the global app-hash via `host::global_root`.
 //!
 //! ## keys are hashed to a fixed width
 //!
@@ -393,7 +393,7 @@ where
 mod tests {
     use super::*;
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-    use state::global_root;
+    use host::global_root;
 
     // a fixed-root stand-in module, so we can prove the kv root composes into the
     // global app-hash alongside another module.
