@@ -78,9 +78,13 @@ web: app/node_modules
 ## "Chromium Embedded Framework.framework" and the CEF helper apps into the
 ## .app — the released npm @tauri-apps/cli knows nothing about CEF and
 ## produces a bundle that panics in cef::library_loader at launch.
+## --ignore-version-mismatches: the CLI compares the tauri crate version to
+## @tauri-apps/api, and our patched clone carries an artificial 2.90.0 bump
+## (it has to outrank the registry so [patch.crates-io] wins) — the mismatch
+## is a self-inflicted false positive, the real base is 2.11.x on both sides.
 ifeq ($(UNAME_S),Darwin)
 app: cef-env app/node_modules
-	cd app && $(CARGO) run --manifest-path "$(CEF_CLONE)/crates/tauri-cli/Cargo.toml" --bin cargo-tauri -- build
+	cd app && $(CARGO) run --manifest-path "$(CEF_CLONE)/crates/tauri-cli/Cargo.toml" --bin cargo-tauri -- build --ignore-version-mismatches
 	bash ops/fix-dmg.sh
 else
 app: cef-env app/node_modules
