@@ -2807,6 +2807,7 @@ dependencies = [
  "directory",
  "dispatch",
  "duckdns",
+ "evm",
  "files",
  "forge",
  "futures",
@@ -3429,11 +3430,13 @@ dependencies = [
  "commonware-runtime",
  "commonware-storage",
  "host",
+ "indexer",
  "kv",
  "revm",
  "sdk",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -5674,6 +5677,7 @@ dependencies = [
  "duckfs-client",
  "duckfs-core",
  "duckfs-disk",
+ "evm",
  "files",
  "forge",
  "futures",
@@ -5736,6 +5740,7 @@ dependencies = [
  "duckdns",
  "duckfs-client",
  "duckfs-core",
+ "evm",
  "files",
  "flate2",
  "forge",

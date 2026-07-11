@@ -20,6 +20,14 @@ pub enum EvmTx {
 #[serde(rename_all = "snake_case")]
 pub enum EvmMsg {
     Execute(EvmTx),
+    /// Deterministic follow-up emitted by [`EvmMsg::Execute`]. The module only
+    /// accepts this variant from itself; carrying the receipt in the applied
+    /// op stream makes receipt/log indexes replayable from finalized blocks.
+    Receipt {
+        transaction: EvmTx,
+        caller: [u8; 20],
+        result: EvmResult,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

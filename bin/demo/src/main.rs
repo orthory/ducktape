@@ -1,11 +1,6 @@
-//! a runnable super-app demo: fifteen registered modules — a qmdb-backed kv, a
-//! sync in-memory directory, a stateless greeter, a GIT-backed forge, a
-//! qmdb-backed block-based CHAT module, an
-//! ed25519 permissionless VALSET, the SAGA async-RPC ledger, the AGENT
-//! orchestrator, a TASKS ledger, the IDENTITY account registry, the AUTOMATIONS
-//! rule engine, the INBOX notification queues, a content-addressed FILES module,
-//! the MEMORY shared agent workspace, and the JOBS work board —
-//! dispatched over ONE host, showing
+//! a runnable super-app demo: twenty registered modules — including QMDB-backed
+//! KV and EVM state, Git/DuckFS substrates, collaboration apps, and system
+//! routing modules — dispatched over ONE host, showing
 //! the app-hash evolve as typed cross-module ops flow, ending on the
 //! agent-collaboration beat: a mention becomes a run and a pending saga in one
 //! block.
@@ -35,6 +30,7 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
 use directory::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
 use duckdns::DuckDns;
+use evm::EvmModule;
 use gateway::Gateway;
 use files::Files;
 use forge::Forge;
@@ -81,6 +77,9 @@ fn main() {
         let forge = Forge::init("forge", forge_repo.clone())
             .expect("forge init")
             .with_chat("chat");
+        let evm = EvmModule::init(context.child("evm"), "evm")
+            .await
+            .expect("evm init");
         let chat = Chat::init(context.child("chat"), "chat")
             .await
             .with_tagging("tagging");
@@ -114,6 +113,7 @@ fn main() {
             Box::new(directory),
             Box::new(greeter),
             Box::new(forge),
+            Box::new(evm),
             Box::new(chat),
             Box::new(valset),
             Box::new(saga),
@@ -132,7 +132,7 @@ fn main() {
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 19 registered modules over one host ===");
+        println!("=== super-app demo — 20 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(

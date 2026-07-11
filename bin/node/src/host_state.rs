@@ -14,6 +14,7 @@ use directory::Directory;
 use dispatch::DispatchModule;
 use duckdns::DuckDns;
 use duckfs_disk::SyncScratch;
+use evm::EvmModule;
 use files::Files;
 use forge::Forge;
 use governance::Governance;
@@ -87,6 +88,9 @@ pub(super) async fn genesis_host(
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .expect("forge init")
         .with_chat("chat");
+    let evm = EvmModule::init(context.child("evm"), "evm")
+        .await
+        .expect("evm init");
     let mut valset = Valset::new("valset");
     // genesis-seed the validator set from config — deterministic and identical
     // on every node, so membership is IN consensus state from block zero (the
@@ -99,6 +103,7 @@ pub(super) async fn genesis_host(
         Box::new(pages),
         Box::new(chat),
         Box::new(forge),
+        Box::new(evm),
         Box::new(valset),
         // governance is the SOLE authorized author of valset changes: member
         // proposals + ballots, deterministic tally, follow-up membership ops.
@@ -216,6 +221,9 @@ pub(super) async fn restore_host(
     let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .map_err(|e| format!("forge: {e}"))?
         .with_chat("chat");
+    let evm = EvmModule::init(context.child("evm"), "evm")
+        .await
+        .map_err(|e| format!("evm: {e}"))?;
     // establish the checkpoint boundary's dual-path branch selector so the
     // restored forge `root()` matches at any block the replay SKIPS (disk already
     // held it) before the first replayed block re-derives it per height. the
@@ -374,6 +382,7 @@ pub(super) async fn restore_host(
         Box::new(pages),
         Box::new(chat),
         Box::new(forge),
+        Box::new(evm),
         Box::new(valset),
         Box::new(governance),
         Box::new(upgrade),
@@ -530,6 +539,18 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     )
     .await?
     .with_tagging("tagging");
+
+    let (target, resolver) = fetch_target("evm").await?;
+    let evm_store = Kv::sync_from(
+        scratch_context.child(child_label("evm")),
+        "evm",
+        target,
+        resolver,
+    )
+    .await?;
+    let evm = EvmModule::from_store("evm", evm_store)
+        .await
+        .map_err(|e| format!("evm init: {e}"))?;
 
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
@@ -723,6 +744,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         Box::new(pages),
         Box::new(chat),
         Box::new(forge),
+        Box::new(evm),
         Box::new(valset),
         Box::new(governance),
         Box::new(upgrade),

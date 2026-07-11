@@ -12,6 +12,8 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-storage = { workspace = true }
+indexer = { workspace = true }
 
 [dev-dependencies]
 host = { workspace = true }
+tempfile = { workspace = true }

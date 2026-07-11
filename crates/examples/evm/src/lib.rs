@@ -7,6 +7,8 @@
 mod interface;
 pub use interface::*;
 
+pub mod index;
+
 use commonware_runtime::BufferPooler;
 use commonware_storage::Context as StorageContext;
 use kv::Kv;
@@ -61,6 +63,13 @@ where
     pub async fn init(context: E, id: impl Into<ModuleId>) -> Result<Self, Error> {
         let id = id.into();
         let store = Kv::init(context, id.clone()).await;
+        Self::from_store(id, store).await
+    }
+
+    /// Rehydrate the EVM adapter around an already verified QMDB store. State
+    /// sync uses this after [`Kv::sync_from`] reconstructs the module root.
+    pub async fn from_store(id: impl Into<ModuleId>, store: Kv<E>) -> Result<Self, Error> {
+        let id = id.into();
         let committed = match store.get(STATE_KEY).await {
             Some(bytes) => decode_snapshot(&bytes)?,
             None => InMemoryDB::default(),
@@ -186,25 +195,46 @@ where
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let EvmMsg::Execute(tx) = decode_msg(&msg.payload).map_err(Error::Module)?;
-        let env = ctx.env();
-        let (result, db) = Self::run(
-            self.active().clone(),
-            tx,
-            &env.origin,
-            env.height,
-            env.consensus_time,
-        )?;
-        // ponytail: one whole-state QMDB value keeps the experiment tiny; split
-        // accounts/storage into individual keys when the 1 MiB Kv value cap matters.
-        self.store
-            .stage(STATE_KEY.to_vec(), encode_snapshot(&db)?)?;
-        self.pending = Some(db);
-        ctx.emit_event(Event {
-            source: self.id.clone(),
-            payload: encode_result(&result),
-        });
-        Ok(())
+        match decode_msg(&msg.payload).map_err(Error::Module)? {
+            EvmMsg::Execute(transaction) => {
+                let env = ctx.env();
+                let caller = address_bytes(&origin_address(&env.origin));
+                let (result, db) = Self::run(
+                    self.active().clone(),
+                    transaction.clone(),
+                    &env.origin,
+                    env.height,
+                    env.consensus_time,
+                )?;
+                // ponytail: one whole-state QMDB value keeps the experiment tiny; split
+                // accounts/storage into individual keys when the 1 MiB Kv value cap matters.
+                self.store
+                    .stage(STATE_KEY.to_vec(), encode_snapshot(&db)?)?;
+                self.pending = Some(db);
+                ctx.emit_msg(Msg {
+                    target: self.id.clone(),
+                    payload: encode_msg(&EvmMsg::Receipt {
+                        transaction,
+                        caller,
+                        result,
+                    }),
+                });
+                Ok(())
+            }
+            EvmMsg::Receipt { result, .. } => {
+                let env = ctx.env();
+                if env.origin != Origin::Module(self.id.clone()) {
+                    return Err(Error::Module(
+                        "EVM receipts may only be emitted by the EVM module".into(),
+                    ));
+                }
+                ctx.emit_event(Event {
+                    source: self.id.clone(),
+                    payload: encode_result(&result),
+                });
+                Ok(())
+            }
+        }
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
@@ -406,7 +436,7 @@ fn word_bytes(word: &B256) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-    use host::Host;
+    use host::{BlockContext, Host};
 
     use super::*;
 
@@ -452,6 +482,28 @@ mod tests {
             let deployed = decode_result(&deploy.events[0].payload).unwrap();
             assert_eq!(deployed.status, EvmStatus::Success);
             let contract = deployed.created_address.unwrap();
+            assert_eq!(deploy.dispatches.len(), 2);
+            assert_eq!(deploy.dispatches[1].origin, Origin::Module("evm".into()));
+            let receipt = decode_msg(&deploy.dispatches[1].payload).unwrap();
+            let EvmMsg::Receipt { result, .. } = &receipt else {
+                panic!("the EVM follow-up carries its receipt")
+            };
+            assert_eq!(result, &deployed);
+
+            let root_before_forged_receipt = host.module_root("evm").unwrap();
+            host.submit_at(
+                BlockContext {
+                    origin: Origin::External(b"forger".to_vec()),
+                    ..Default::default()
+                },
+                Msg {
+                    target: "evm".into(),
+                    payload: encode_msg(&receipt),
+                },
+            )
+            .await
+            .expect_err("an external caller cannot forge an indexed receipt");
+            assert_eq!(host.module_root("evm").unwrap(), root_before_forged_receipt);
             let root_after_deploy = host.module_root("evm").unwrap();
             assert_ne!(root_before, root_after_deploy);
 
