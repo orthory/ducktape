@@ -25,7 +25,7 @@ rendezvous pick or converts the deadline into a committed failure.
 Two facts about the *current* runtime shape this decision:
 
 - **The executor is already a full agentic CLI.** The shipped capability specs
-  (`crates/kernel/capability-host/specs/{codex,claude}.toml`) run
+  (`crates/system/capability-host/specs/{codex,claude}.toml`) run
   `codex exec --sandbox workspace-write` / `claude -p --permission-mode
   acceptEdits` with no turn cap — real tool-use loops that read and edit files.
   `[workspace] mode = "persistent"` gives each agent a per-agent cwd under the

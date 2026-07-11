@@ -217,8 +217,8 @@ Once a claim's view lease expires, anyone may `Reclaim` the job — the reclaim 
 permissionless — returning it to pending; attempts are capped at eight, and
 `Cancel` and `Prune` are submitter-only. Jobs is distinct from saga: jobs is the
 product work board for actors acting over signed RPC ops, while saga is the
-platform's reactor-effect ledger for off-consensus work the node's own worker
-loop performs. Jobs never touches saga or the reactor.
+platform's worker-effect ledger for off-consensus work the node's own worker
+loop performs. Jobs never touches saga or the worker seam.
 
 Workers are consensus state, not genesis config. A worker module self-registers
 by emitting `RegisterWorker` to jobs as a module-origin follow-up; external and

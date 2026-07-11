@@ -53,6 +53,6 @@ root, and canonical in-memory snapshots all compose the same way.
 ## Single-Store Step
 
 A deterministic step writes one store. Cross-store work is sequenced through
-follow-up messages or through the saga/reactor pattern. That keeps the current
+follow-up messages or through the saga/worker pattern. That keeps the current
 design away from two-phase commit while the host still provides block-level
 atomicity.

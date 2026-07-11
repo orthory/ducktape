@@ -204,8 +204,8 @@ claim의 view lease가 만료되면 누구든 job을 `Reclaim`해 pending으로 
 있다 — reclaim은 permissionless다. attempt는 8회로 cap되고, `Cancel`과
 `Prune`은 submitter 전용이다. jobs는 saga와 구별된다: jobs는 signed RPC op로
 행동하는 actor를 위한 product work board이고, saga는 node 자신의 worker loop가
-수행하는 off-consensus 작업을 위한 platform의 reactor-effect ledger다. jobs는
-saga도 reactor도 절대 건드리지 않는다.
+수행하는 off-consensus 작업을 위한 platform의 worker-effect ledger다. jobs는
+saga도 worker seam도 절대 건드리지 않는다.
 
 worker는 genesis config가 아니라 consensus state다. worker module은 module-origin
 follow-up으로 jobs에 `RegisterWorker`를 보내 자기 자신만 등록한다. external과
