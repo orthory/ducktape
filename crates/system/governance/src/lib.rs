@@ -1,4 +1,4 @@
-//! validator governance with a one-way transition to account shares.
+//! validator governance with optional account-share voting.
 //!
 //! the module that closes the private network's membership loop: a CURRENT
 //! valset member proposes (`AddValidator` / `RemoveValidator` / `Signal`),
@@ -17,11 +17,11 @@
 //!
 //! ## determinism
 //!
-//! before shares are adopted, membership checks are host-routed reads of the
-//! valset module. `AdoptShares` freezes an explicit Identity-account allocation
-//! and switches future proposals to account principals. every new proposal
-//! freezes its electorate and rule, so later membership/share changes cannot
-//! move the decision boundary or count the same shares twice.
+//! governance defaults to validator-node ballots. `AdoptShares` initializes an
+//! explicit Identity-account allocation; governance may then switch future
+//! proposals between validator and account principals. every new proposal
+//! freezes its electorate and rule, so later mode/membership/share changes
+//! cannot move its decision boundary or count the same shares twice.
 //!
 //! state model mirrors the tasks module: execute STAGES into a pending
 //! overlay, `commit_block` publishes, `abort_block` discards; `root()` is
@@ -103,7 +103,7 @@ pub struct Governance {
     /// the id of the upgrade module a passing `ScheduleUpgrade`/`CancelUpgrade`
     /// authorizes. genesis wiring — identical on every node.
     upgrade_id: ModuleId,
-    /// the Identity account registry used once shares are active.
+    /// the Identity account registry used in account-share mode.
     identity_id: ModuleId,
     /// the network binding invite tokens sign over (the genesis namespace).
     /// genesis wiring — identical on every node of the same network. `None`
@@ -121,10 +121,14 @@ pub struct Governance {
     redeemed: BTreeMap<Vec<u8>, Redemption>,
     /// this block's staged redemptions, same discipline as `pending`.
     pending_redeemed: BTreeMap<Vec<u8>, Redemption>,
-    /// `None` until the one-way AdoptShares action passes.
+    /// `None` until the one-time AdoptShares action passes.
     shares: Option<BTreeMap<Vec<u8>, u64>>,
     /// this block's replacement share map, if a share action executed.
     pending_shares: Option<BTreeMap<Vec<u8>, u64>>,
+    /// false by default: one validator node, one ballot.
+    share_mode: bool,
+    /// this block's mode switch, if one executed.
+    pending_share_mode: Option<bool>,
 }
 
 impl Governance {
@@ -146,6 +150,8 @@ impl Governance {
             pending_redeemed: BTreeMap::new(),
             shares: None,
             pending_shares: None,
+            share_mode: false,
+            pending_share_mode: None,
         }
     }
 
@@ -202,6 +208,10 @@ impl Governance {
 
     fn effective_shares(&self) -> Option<&BTreeMap<Vec<u8>, u64>> {
         self.pending_shares.as_ref().or(self.shares.as_ref())
+    }
+
+    fn effective_share_mode(&self) -> bool {
+        self.pending_share_mode.unwrap_or(self.share_mode)
     }
 
     async fn identity_account(
@@ -287,7 +297,10 @@ impl Governance {
         submitter: &[u8],
         action: &GovAction,
     ) -> Result<(Vec<u8>, Electorate), Error> {
-        if let Some(shares) = self.effective_shares() {
+        if self.effective_share_mode() {
+            let shares = self.effective_shares().ok_or_else(|| {
+                Error::Module("account-share mode has no configured registry".into())
+            })?;
             let account_id = self.account_of_node(ctx, submitter).await?;
             if !shares.contains_key(&account_id) {
                 return Err(Error::Module(
@@ -378,7 +391,7 @@ impl Governance {
             };
         };
         SharesView {
-            active: true,
+            active: self.effective_share_mode(),
             allocations: shares
                 .iter()
                 .map(|(account_id, shares)| ShareAllocation {
@@ -396,6 +409,7 @@ impl Governance {
         proposals: &BTreeMap<String, Proposal>,
         redeemed: &BTreeMap<Vec<u8>, Redemption>,
         shares: Option<&BTreeMap<Vec<u8>, u64>>,
+        share_mode: bool,
     ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(proposals.len() as u64).to_le_bytes());
@@ -449,6 +463,10 @@ impl Governance {
                     push_bytes(&mut out, account_id);
                     out.extend_from_slice(&shares.to_le_bytes());
                 }
+                GovAction::SetShareMode { enabled } => {
+                    out.push(9);
+                    out.push(u8::from(*enabled));
+                }
             }
             push_bytes(&mut out, &p.proposer);
             out.extend_from_slice(&p.created_at.to_le_bytes());
@@ -479,7 +497,7 @@ impl Governance {
             .iter()
             .filter_map(|(id, proposal)| proposal.electorate.as_ref().map(|e| (id, e)))
             .collect();
-        if shares.is_some() || !frozen.is_empty() {
+        if shares.is_some() || !frozen.is_empty() || share_mode {
             out.extend_from_slice(SHARES_EXT_MAGIC);
             out.push(1); // extension version
             match shares {
@@ -517,6 +535,12 @@ impl Governance {
                     out.extend_from_slice(&power.to_le_bytes());
                 }
             }
+            // The original extension implied share mode from registry
+            // presence. Preserve those exact bytes/roots; append one override
+            // byte only after governance switches a configured registry off.
+            if share_mode != shares.is_some() {
+                out.push(u8::from(share_mode));
+            }
         }
         out
     }
@@ -525,34 +549,42 @@ impl Governance {
         proposals: &BTreeMap<String, Proposal>,
         redeemed: &BTreeMap<Vec<u8>, Redemption>,
         shares: Option<&BTreeMap<Vec<u8>, u64>>,
+        share_mode: bool,
     ) -> StateRoot {
-        if proposals.is_empty() && redeemed.is_empty() && shares.is_none() {
+        if proposals.is_empty() && redeemed.is_empty() && shares.is_none() && !share_mode {
             return StateRoot::ZERO;
         }
         let mut h = Sha256::new();
-        h.update(Self::encode_state(proposals, redeemed, shares));
+        h.update(Self::encode_state(proposals, redeemed, shares, share_mode));
         StateRoot(h.finalize().into())
     }
 
     /// canonical bytes of COMMITTED state — the exact preimage of `root()`.
     pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode_state(&self.proposals, &self.redeemed, self.shares.as_ref())
+        Self::encode_state(
+            &self.proposals,
+            &self.redeemed,
+            self.shares.as_ref(),
+            self.share_mode,
+        )
     }
 
     /// verify-then-adopt a peer snapshot: decode into a temporary, recompute
     /// the root, refuse on mismatch — committed state and stage untouched on
     /// any error. success drops the stage (it belonged to the replaced state).
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (proposals, redeemed, shares) = decode_state(bytes)?;
-        if Self::root_of(&proposals, &redeemed, shares.as_ref()) != expected {
+        let (proposals, redeemed, shares, share_mode) = decode_state(bytes)?;
+        if Self::root_of(&proposals, &redeemed, shares.as_ref(), share_mode) != expected {
             return Err(Error::Module("snapshot root mismatch".into()));
         }
         self.proposals = proposals;
         self.redeemed = redeemed;
         self.shares = shares;
+        self.share_mode = share_mode;
         self.pending.clear();
         self.pending_redeemed.clear();
         self.pending_shares = None;
+        self.pending_share_mode = None;
         Ok(())
     }
 
@@ -564,7 +596,9 @@ impl Governance {
         match &mut action {
             GovAction::AdoptShares { allocations } => {
                 if self.effective_shares().is_some() {
-                    return Err(Error::Module("governance shares are already active".into()));
+                    return Err(Error::Module(
+                        "governance shares are already configured".into(),
+                    ));
                 }
                 if allocations.is_empty() || allocations.len() > MAX_SHARE_ACCOUNTS {
                     return Err(Error::Module(format!(
@@ -616,6 +650,18 @@ impl Governance {
                     )));
                 }
                 Self::total_power(&after)?;
+            }
+            GovAction::SetShareMode { enabled } => {
+                if *enabled && self.effective_shares().is_none() {
+                    return Err(Error::Module(
+                        "configure governance shares before enabling share mode".into(),
+                    ));
+                }
+                if *enabled == self.effective_share_mode() {
+                    return Err(Error::Module(
+                        "governance is already using the requested voting mode".into(),
+                    ));
+                }
             }
             _ => {}
         }
@@ -869,7 +915,7 @@ impl Governance {
                 GovAction::AdoptShares { allocations } => {
                     if self.effective_shares().is_some() {
                         // A competing adoption may have won since this proposal
-                        // opened. Settle cleanly; activation is one-way.
+                        // opened. Settle cleanly; initialization is one-time.
                         proposal.status = ProposalStatus::Rejected;
                     } else {
                         let shares: BTreeMap<Vec<u8>, u64> = allocations
@@ -880,6 +926,7 @@ impl Governance {
                             proposal.status = ProposalStatus::Rejected;
                         } else {
                             self.pending_shares = Some(shares);
+                            self.pending_share_mode = Some(true);
                         }
                     }
                 }
@@ -898,6 +945,13 @@ impl Governance {
                         proposal.status = ProposalStatus::Rejected;
                     } else {
                         self.pending_shares = Some(after);
+                    }
+                }
+                GovAction::SetShareMode { enabled } => {
+                    if *enabled && self.effective_shares().is_none() {
+                        proposal.status = ProposalStatus::Rejected;
+                    } else {
+                        self.pending_share_mode = Some(*enabled);
                     }
                 }
                 GovAction::Signal { .. } => {}
@@ -1010,7 +1064,12 @@ impl Module for Governance {
     /// redemption section when non-empty); `ZERO` when none exist (the sdk's
     /// uninitialized-module sentinel).
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.proposals, &self.redeemed, self.shares.as_ref())
+        Self::root_of(
+            &self.proposals,
+            &self.redeemed,
+            self.shares.as_ref(),
+            self.share_mode,
+        )
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -1090,6 +1149,9 @@ impl Module for Governance {
         if let Some(shares) = self.pending_shares.take() {
             self.shares = Some(shares);
         }
+        if let Some(share_mode) = self.pending_share_mode.take() {
+            self.share_mode = share_mode;
+        }
         Ok(())
     }
 
@@ -1097,6 +1159,7 @@ impl Module for Governance {
         self.pending.clear();
         self.pending_redeemed.clear();
         self.pending_shares = None;
+        self.pending_share_mode = None;
         Ok(())
     }
 }
@@ -1151,6 +1214,7 @@ type DecodedState = (
     BTreeMap<String, Proposal>,
     BTreeMap<Vec<u8>, Redemption>,
     Option<BTreeMap<Vec<u8>, u64>>,
+    bool,
 );
 
 fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
@@ -1228,6 +1292,17 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
             8 => GovAction::SetShares {
                 account_id: take_vec(&mut buf)?,
                 shares: take_u64(&mut buf)?,
+            },
+            9 => GovAction::SetShareMode {
+                enabled: match take_u8(&mut buf)? {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(Error::Module(format!(
+                            "snapshot share-mode action must be 0 or 1, got {other}"
+                        )));
+                    }
+                },
             },
             other => return Err(Error::Module(format!("snapshot: bad action tag {other}"))),
         };
@@ -1313,8 +1388,8 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
         }
     }
 
-    let shares = if buf.is_empty() {
-        None
+    let (shares, share_mode) = if buf.is_empty() {
+        (None, false)
     } else {
         if !buf.starts_with(SHARES_EXT_MAGIC) {
             return Err(Error::Module("snapshot carries trailing bytes".into()));
@@ -1472,13 +1547,30 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
             });
             previous_id = Some(id);
         }
-        if !buf.is_empty() {
-            return Err(Error::Module("snapshot carries trailing bytes".into()));
+        let share_mode = if buf.is_empty() {
+            // Compatibility with the original extension: registry presence
+            // implied that account shares governed future proposals.
+            shares.is_some()
+        } else {
+            match take_u8(&mut buf)? {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(Error::Module(format!(
+                        "snapshot share-mode override must be 0 or 1, got {other}"
+                    )));
+                }
+            }
+        };
+        if share_mode && shares.is_none() {
+            return Err(Error::Module(
+                "snapshot enables share mode without a registry".into(),
+            ));
         }
-        shares
+        (shares, share_mode)
     };
     if !buf.is_empty() {
         return Err(Error::Module("snapshot carries trailing bytes".into()));
     }
-    Ok((proposals, redeemed, shares))
+    Ok((proposals, redeemed, shares, share_mode))
 }

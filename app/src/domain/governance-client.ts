@@ -2,10 +2,9 @@
 // `crates/system/governance-interface`. Governance is member-gated decision
 // making over the validator set: a CURRENT valset member opens a proposal,
 // members vote before a consensus-time deadline, and anyone may execute once
-// its frozen rule is irreversible or the deadline passes. A validator majority
-// may make a one-way transition to explicit,
-// non-transferable Identity-account shares; each later proposal freezes its
-// account-power electorate and decision rule.
+// its frozen rule is irreversible or the deadline passes. Governance may switch
+// future proposals between validator ballots and explicit, non-transferable
+// Identity-account shares; each proposal freezes its electorate and rule.
 //
 // The embedded daemon signs every submit with THIS node's authenticated key and
 // ignores the claimed `origin` (see bin/node/src/main.rs), so a vote/propose/
@@ -51,7 +50,8 @@ export type GovAction =
   | { schedule_upgrade: { name: string; activation_height: number; to_version: number } }
   | { cancel_upgrade: { name: string } }
   | { adopt_shares: { allocations: ShareAllocation[] } }
-  | { set_shares: { account_id: number[]; shares: number } };
+  | { set_shares: { account_id: number[]; shares: number } }
+  | { set_share_mode: { enabled: boolean } };
 
 export interface ProposalView {
   proposal_id: string;
@@ -134,6 +134,9 @@ export const actionLabel = (action: GovAction): string => {
   if ("cancel_upgrade" in action) return "Cancel upgrade";
   if ("adopt_shares" in action) return "Adopt governance shares";
   if ("set_shares" in action) return "Set account shares";
+  if ("set_share_mode" in action) {
+    return action.set_share_mode.enabled ? "Use account shares" : "Use validator votes";
+  }
   return "Signal";
 };
 

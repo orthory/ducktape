@@ -177,6 +177,21 @@ async fn shares(host: &Host) -> governance::SharesView {
 fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
     block_on(async {
         let (mut host, nodes, accounts) = share_host();
+        let defaults = shares(&host).await;
+        assert!(!defaults.active, "validator ballots are the default mode");
+        assert!(defaults.allocations.is_empty());
+        submit(
+            &mut host,
+            &nodes[0],
+            0,
+            GovMsg::Propose {
+                proposal_id: "premature-share-mode".into(),
+                action: GovAction::SetShareMode { enabled: true },
+                voting_period: 20,
+            },
+        )
+        .await
+        .expect_err("share mode requires a configured registry");
         let initial = vec![
             ShareAllocation {
                 account_id: accounts[2].clone(),
@@ -219,6 +234,13 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
             .await
             .expect("legacy validator vote");
         }
+        let adoption = proposal(&host, "adopt").await;
+        assert_eq!(adoption.voter_kind, VoterKind::ValidatorNode);
+        assert_eq!(
+            adoption.votes.len(),
+            2,
+            "nodes sharing an account still have separate ballots in validator mode"
+        );
         submit(
             &mut host,
             &nodes[2],
@@ -443,5 +465,166 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
             panic!("shares")
         };
         assert_eq!(rebuilt_shares.total, 110);
+
+        // The current share electorate can restore the default validator mode.
+        submit(
+            &mut host,
+            &nodes[0],
+            27,
+            GovMsg::Propose {
+                proposal_id: "validator-mode".into(),
+                action: GovAction::SetShareMode { enabled: false },
+                voting_period: 20,
+            },
+        )
+        .await
+        .expect("propose validator mode");
+        for (node, at) in [(&nodes[0], 28), (&nodes[2], 29)] {
+            submit(
+                &mut host,
+                node,
+                at,
+                GovMsg::Vote {
+                    proposal_id: "validator-mode".into(),
+                    approve: true,
+                },
+            )
+            .await
+            .expect("shareholder approves validator mode");
+        }
+        submit(
+            &mut host,
+            &nodes[2],
+            30,
+            GovMsg::Execute {
+                proposal_id: "validator-mode".into(),
+            },
+        )
+        .await
+        .expect("switch to validator mode");
+        let inactive = shares(&host).await;
+        assert!(!inactive.active);
+        assert_eq!(inactive.total, 110, "switching modes retains allocations");
+
+        // The explicit inactive-mode override is app-hashed and state-syncable.
+        let inactive_root = host.module_root("governance").expect("inactive root");
+        let sdk::StateSyncHandle::SnapshotBytes(inactive_bytes) = host
+            .capture_finalized_snapshot(host::FinalizedBlock {
+                height: 30,
+                app_hash: host.app_hash(),
+            })
+            .expect("capture inactive mode")
+            .module("governance")
+            .expect("governance")
+            .state_sync
+            .clone()
+        else {
+            panic!("snapshot bytes")
+        };
+        let mut inactive_rebuilt = Governance::new("governance", "valset", "upgrade", "identity");
+        inactive_rebuilt
+            .install(&inactive_bytes, inactive_root)
+            .expect("install inactive shares snapshot");
+        let reply = inactive_rebuilt
+            .query(&encode_query(&GovQuery::Shares))
+            .await
+            .expect("query inactive shares");
+        let GovReply::Shares(inactive_rebuilt_shares) = decode_reply(&reply).expect("decode")
+        else {
+            panic!("shares")
+        };
+        assert!(!inactive_rebuilt_shares.active);
+        assert_eq!(inactive_rebuilt_shares.total, 110);
+
+        // In validator mode, the two nodes owned by A again count separately.
+        submit(
+            &mut host,
+            &nodes[0],
+            31,
+            GovMsg::Propose {
+                proposal_id: "validator-signal".into(),
+                action: GovAction::Signal {
+                    text: "one validator, one ballot".into(),
+                },
+                voting_period: 20,
+            },
+        )
+        .await
+        .expect("validator-mode signal");
+        let validator_signal = proposal(&host, "validator-signal").await;
+        assert_eq!(validator_signal.voter_kind, VoterKind::ValidatorNode);
+        assert_eq!(validator_signal.electorate.len(), 3);
+        assert!(
+            validator_signal
+                .electorate
+                .iter()
+                .all(|(_, power)| *power == 1)
+        );
+        assert_eq!(
+            validator_signal.voting_rule,
+            VotingRule::Threshold { required_yes: 2 }
+        );
+        for (node, at) in [(&nodes[0], 32), (&nodes[1], 33)] {
+            submit(
+                &mut host,
+                node,
+                at,
+                GovMsg::Vote {
+                    proposal_id: "validator-signal".into(),
+                    approve: true,
+                },
+            )
+            .await
+            .expect("validator ballot");
+        }
+        assert_eq!(proposal(&host, "validator-signal").await.votes.len(), 2);
+        submit(
+            &mut host,
+            &nodes[2],
+            34,
+            GovMsg::Execute {
+                proposal_id: "validator-signal".into(),
+            },
+        )
+        .await
+        .expect("validator majority passes");
+
+        // The validator electorate can enable the retained account registry.
+        submit(
+            &mut host,
+            &nodes[0],
+            35,
+            GovMsg::Propose {
+                proposal_id: "share-mode".into(),
+                action: GovAction::SetShareMode { enabled: true },
+                voting_period: 20,
+            },
+        )
+        .await
+        .expect("propose share mode");
+        for (node, at) in [(&nodes[0], 36), (&nodes[1], 37)] {
+            submit(
+                &mut host,
+                node,
+                at,
+                GovMsg::Vote {
+                    proposal_id: "share-mode".into(),
+                    approve: true,
+                },
+            )
+            .await
+            .expect("validator approves share mode");
+        }
+        submit(
+            &mut host,
+            &nodes[2],
+            38,
+            GovMsg::Execute {
+                proposal_id: "share-mode".into(),
+            },
+        )
+        .await
+        .expect("switch back to account shares");
+        assert!(shares(&host).await.active);
     });
 }

@@ -1,9 +1,9 @@
 //! the governance module's public wire surface — types only.
 //!
-//! governance starts as member-gated decision making over the validator set.
-//! the validators may make a one-way [`GovAction::AdoptShares`] transition to
-//! account governance: non-transferable shares are held by Identity account id,
-//! and every new proposal freezes the electorate that decides it. passing
+//! governance defaults to one ballot per validator node. the validators may
+//! initialize non-transferable Identity-account shares, then governance can
+//! switch future proposals between validator and account-share mode. every new
+//! proposal freezes the electorate that decides it. passing
 //! membership actions are performed by emitting the valset op as a host-drained
 //! follow-up — governance remains the ONLY authorized author of valset changes.
 //!
@@ -43,16 +43,19 @@ pub enum GovAction {
     /// revoke resident standing: emits `ValsetMsg::Revoke { key }` on
     /// execution.
     RemoveResident { key: Vec<u8> },
-    /// one-time transition from validator-node ballots to non-transferable
-    /// account shares. the allocation must be non-empty, unique by account id,
-    /// and name existing Identity accounts. this proposal is decided by the
-    /// legacy validator electorate that opened it; activation is one-way.
+    /// initialize non-transferable account shares and enable share mode. the
+    /// allocation must be non-empty, unique by account id, and name existing
+    /// Identity accounts. initialization is one-time; the registry is retained
+    /// when governance later switches back to validator ballots.
     AdoptShares { allocations: Vec<ShareAllocation> },
     /// set one Identity account's shares. zero removes the account from the
-    /// electorate. only available after shares were adopted, and therefore
-    /// decided by a frozen two-thirds share threshold like every structural
-    /// action.
+    /// registry. only available after shares were configured; the current mode
+    /// freezes the electorate and structural threshold that decides it.
     SetShares { account_id: Vec<u8>, shares: u64 },
+    /// choose the electorate for future proposals. `true` uses the configured
+    /// account shares; `false` restores one ballot per validator node. this
+    /// proposal itself is always decided by the mode frozen when it was opened.
+    SetShareMode { enabled: bool },
 }
 
 /// one non-transferable governance-share allocation.
@@ -89,7 +92,7 @@ pub enum VotingRule {
 #[serde(rename_all = "snake_case")]
 pub enum GovMsg {
     /// open a proposal. the verified submitter must belong to the current
-    /// validator electorate before adoption, or hold account shares after it.
+    /// electorate selected by the current governance mode.
     /// the voting deadline is `consensus_time + voting_period`.
     Propose {
         proposal_id: String,
@@ -177,7 +180,7 @@ pub enum GovQuery {
     Proposal { proposal_id: String },
     /// every settled invite redemption, sorted by nonce.
     Redemptions,
-    /// the current share registry; inactive and empty before adoption.
+    /// the current share registry and whether it governs new proposals.
     Shares,
 }
 

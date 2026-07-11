@@ -379,10 +379,12 @@ export interface ConsoleActions {
   /** Open a binding Signal proposal (no on-chain effect beyond its outcome).
    *  The module gates this to the proposal-time governance electorate. */
   proposeSignal(text: string): void;
-  /** One-way adoption of explicit, non-transferable Identity-account shares. */
+  /** Initialize explicit, non-transferable Identity-account shares. */
   proposeAdoptShares(allocations: Array<{ accountId: string; shares: number }>): void;
   /** Set one account's shares; zero removes it from future electorates. */
   proposeSetShares(accountId: string, shares: number): void;
+  /** Switch future proposals between account shares and validator ballots. */
+  proposeSetShareMode(enabled: boolean): void;
   /** Cast (or change) this node's ballot on an open proposal. */
   voteProposal(proposalId: string, approve: boolean): void;
   /** Tally and settle a decidable proposal (anyone may trigger it). */
@@ -2131,6 +2133,16 @@ export function createActions({
               shares,
             },
           },
+        }),
+      );
+    },
+
+    proposeSetShareMode: (enabled) => {
+      const proposalId = crypto.randomUUID();
+      submitTracked(opKey.proposal(proposalId), (live) =>
+        governanceClient.propose(live, {
+          proposalId,
+          action: { set_share_mode: { enabled } },
         }),
       );
     },

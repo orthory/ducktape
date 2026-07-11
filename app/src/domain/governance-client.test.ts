@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  actionLabel,
   canSettleEarly,
   decisionThreshold,
   proposals,
@@ -27,6 +28,11 @@ const accountProposal = (overrides: Partial<ProposalView> = {}): ProposalView =>
 });
 
 describe("weighted governance", () => {
+  it("labels both governance-selected voting modes", () => {
+    expect(actionLabel({ set_share_mode: { enabled: true } })).toBe("Use account shares");
+    expect(actionLabel({ set_share_mode: { enabled: false } })).toBe("Use validator votes");
+  });
+
   it("tallies frozen account power and applies the snapshotted rule", () => {
     const signal = accountProposal({
       votes: [

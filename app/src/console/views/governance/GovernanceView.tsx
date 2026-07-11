@@ -1,8 +1,8 @@
 // Governance — the operator-facing surface over the `governance` module. Lists
 // every proposal (GovQuery::Proposals, projected into state.proposals per block)
-// with its action, status, proposer, and running tally. Validators may make a
-// one-way transition to non-transferable Identity-account shares; proposal
-// cards then render their frozen weighted electorate and decision rule.
+// with its action, status, proposer, and running tally. Governance can switch
+// future proposals between validator ballots and non-transferable account
+// shares; proposal cards render their frozen electorate and decision rule.
 
 import { useMemo, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 
@@ -567,17 +567,20 @@ function SharesPanel({
   canPropose,
   onAdopt,
   onSet,
+  onSetMode,
 }: {
   shares: SharesView;
   knownAccounts: string[];
   canPropose: boolean;
   onAdopt: (allocations: Array<{ accountId: string; shares: number }>) => void;
   onSet: (accountId: string, shares: number) => void;
+  onSetMode: (enabled: boolean) => void;
 }) {
   const [allocationText, setAllocationText] = useState("");
   const [accountId, setAccountId] = useState("");
   const [shareText, setShareText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const configured = shares.allocations.length > 0;
 
   const adopt = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -609,7 +612,7 @@ function SharesPanel({
 
   return (
     <section
-      aria-label="Governance shares"
+      aria-label="Governance voting mode"
       style={{
         flexShrink: 0,
         padding: "12px 22px",
@@ -618,15 +621,40 @@ function SharesPanel({
       }}
     >
       <div style={{ ...sectionLabel, display: "flex", alignItems: "center", gap: 7 }}>
-        GOVERNANCE SHARES
+        VOTING MODE
         <Pill
-          label={shares.active ? `${shares.total} active` : "validator ballots"}
+          label={shares.active ? `${shares.total} account shares` : "validator ballots · default"}
           pill={shares.active ? STATUS_PILLS.passed : STATUS_PILLS.open}
         />
       </div>
 
-      {shares.active ? (
+      {configured ? (
         <>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              marginTop: 9,
+              font: `400 10.5px ${font.sans}`,
+              color: color.muted2,
+            }}
+          >
+            <span>
+              {shares.active
+                ? "New proposals use frozen account-share power."
+                : "New proposals use one ballot per validator; configured shares are retained."}
+            </span>
+            <span style={{ marginLeft: "auto" }}>
+              <HoverButton
+                variant="dark"
+                disabled={!canPropose}
+                onClick={() => onSetMode(!shares.active)}
+              >
+                {shares.active ? "Propose validator mode" : "Propose share mode"}
+              </HoverButton>
+            </span>
+          </div>
           <div
             style={{
               display: "flex",
@@ -669,7 +697,8 @@ function SharesPanel({
       ) : (
         <form onSubmit={adopt} style={{ marginTop: 9 }}>
           <div style={{ font: `400 10.5px ${font.sans}`, color: color.muted2 }}>
-            One-way activation. Existing Identity accounts: {knownAccounts.length > 0
+            Validator ballots are the default. Initial share setup also enables share mode.
+            Existing Identity accounts: {knownAccounts.length > 0
               ? knownAccounts.map((account) => shortKey(account)).join(", ")
               : "none bound yet"}.
           </div>
@@ -683,7 +712,7 @@ function SharesPanel({
               style={{ flex: 1, minWidth: 0, padding: "7px 8px", font: `500 10.5px ${font.mono}` }}
             />
             <HoverButton type="submit" variant="dark" disabled={!canPropose}>
-              Propose adoption
+              Propose share setup
             </HoverButton>
           </div>
         </form>
@@ -832,6 +861,7 @@ export function GovernanceView() {
           canPropose={canPropose}
           onAdopt={actions.proposeAdoptShares}
           onSet={actions.proposeSetShares}
+          onSetMode={actions.proposeSetShareMode}
         />
 
         <ProposeForm
