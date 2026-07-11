@@ -39,6 +39,7 @@ pub use interface::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use sdk::codec;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use valset::{
@@ -163,12 +164,10 @@ impl CapabilityRegistry {
         let mut out = Vec::new();
         out.extend_from_slice(&(map.len() as u64).to_le_bytes());
         for (key, tags) in map {
-            out.extend_from_slice(&(key.len() as u64).to_le_bytes());
-            out.extend_from_slice(key);
+            codec::push_bytes(&mut out, key);
             out.extend_from_slice(&(tags.len() as u64).to_le_bytes());
             for tag in tags {
-                out.extend_from_slice(&(tag.len() as u64).to_le_bytes());
-                out.extend_from_slice(tag.as_bytes());
+                codec::push_str(&mut out, tag);
             }
         }
         out
@@ -201,37 +200,16 @@ impl CapabilityRegistry {
     /// registry has exactly one valid byte stream, so a peer cannot mint
     /// alternative encodings for one state.
     fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, BTreeSet<String>>, Error> {
-        fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
-            let Some((head, rest)) = (*buf).split_first_chunk::<8>() else {
-                return Err(Error::Module("snapshot truncated".into()));
-            };
-            *buf = rest;
-            Ok(u64::from_le_bytes(*head))
-        }
-
-        let mut buf = bytes;
-        let count = take_u64(&mut buf)?;
+        let mut cur = codec::Cursor::new(bytes);
+        let count = cur.u64("snapshot node count")?;
         // each node entry costs at least its 8-byte key-length prefix plus an
         // 8-byte tag count, so a count the remaining bytes cannot possibly
         // hold is rejected up front — a forged count never drives allocation.
-        if count > (buf.len() / 16) as u64 {
-            return Err(Error::Module(format!(
-                "snapshot node count {count} exceeds the {} remaining bytes",
-                buf.len()
-            )));
-        }
+        cur.bound(count, 16, "snapshot node")?;
         let mut map = BTreeMap::new();
         let mut prev_key: Option<&[u8]> = None;
         for _ in 0..count {
-            let key_len = take_u64(&mut buf)?;
-            if key_len > buf.len() as u64 {
-                return Err(Error::Module(format!(
-                    "snapshot key length {key_len} exceeds the {} remaining bytes",
-                    buf.len()
-                )));
-            }
-            let (key, rest) = buf.split_at(key_len as usize);
-            buf = rest;
+            let key = cur.bytes("snapshot node key")?;
             if prev_key.is_some_and(|p| p >= key) {
                 return Err(Error::Module(
                     "snapshot node keys must be strictly increasing".into(),
@@ -239,31 +217,18 @@ impl CapabilityRegistry {
             }
             prev_key = Some(key);
 
-            let tag_count = take_u64(&mut buf)?;
+            let tag_count = cur.u64("snapshot tag count")?;
             if tag_count == 0 {
                 return Err(Error::Module(
                     "snapshot node with zero capabilities (empty means absent)".into(),
                 ));
             }
             // each tag costs at least its 8-byte length prefix.
-            if tag_count > (buf.len() / 8) as u64 {
-                return Err(Error::Module(format!(
-                    "snapshot tag count {tag_count} exceeds the {} remaining bytes",
-                    buf.len()
-                )));
-            }
+            cur.bound(tag_count, 8, "snapshot tag")?;
             let mut tags = BTreeSet::new();
             let mut prev_tag: Option<&[u8]> = None;
             for _ in 0..tag_count {
-                let tag_len = take_u64(&mut buf)?;
-                if tag_len > buf.len() as u64 {
-                    return Err(Error::Module(format!(
-                        "snapshot tag length {tag_len} exceeds the {} remaining bytes",
-                        buf.len()
-                    )));
-                }
-                let (tag, rest) = buf.split_at(tag_len as usize);
-                buf = rest;
+                let tag = cur.bytes("snapshot tag")?;
                 if prev_tag.is_some_and(|p| p >= tag) {
                     return Err(Error::Module(
                         "snapshot tags must be strictly increasing".into(),
@@ -276,12 +241,7 @@ impl CapabilityRegistry {
             }
             map.insert(key.to_vec(), tags);
         }
-        if !buf.is_empty() {
-            return Err(Error::Module(format!(
-                "snapshot carries {} trailing bytes",
-                buf.len()
-            )));
-        }
+        cur.finish("snapshot")?;
         Ok(map)
     }
 
@@ -317,8 +277,12 @@ impl Module for CapabilityRegistry {
         // identity comes from the verified submit origin, never the payload —
         // a node can only announce for itself, which keeps the registry
         // truthful by construction. module/system origins have no host of
-        // their own to speak for.
+        // their own to speak for, and an empty key is a malformed origin
+        // (the same reject dispatch applies), never a registry entry.
         let node = match &ctx.env().origin {
+            sdk::Origin::External(key) if key.is_empty() => {
+                return Err(Error::Module("external origin key is empty".into()));
+            }
             sdk::Origin::External(key) => key.clone(),
             other => {
                 return Err(Error::Module(format!(
@@ -579,6 +543,22 @@ mod tests {
                 "got {err:?}"
             );
         }
+        futures::executor::block_on(c.commit_block()).unwrap();
+        assert_eq!(c.root(), StateRoot::ZERO, "nothing was staged");
+    }
+
+    #[test]
+    fn empty_external_keys_are_rejected() {
+        // the same malformed-origin reject dispatch applies: an empty key is
+        // never a registry entry.
+        let mut c = ungated();
+        let mut ctx = TestCtx::external(&[]);
+        let err =
+            futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap_err();
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("key is empty")),
+            "got {err:?}"
+        );
         futures::executor::block_on(c.commit_block()).unwrap();
         assert_eq!(c.root(), StateRoot::ZERO, "nothing was staged");
     }

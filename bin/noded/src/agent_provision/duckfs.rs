@@ -137,7 +137,6 @@ impl NodedWorkspace {
             run_id: String::new(),
             agent_id: None,
             source: self.source.clone(),
-            mount_path: String::new(),
             base_tools: Vec::new(),
             ro_mounts: Vec::new(),
         }

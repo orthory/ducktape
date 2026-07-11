@@ -159,7 +159,6 @@ impl Bed {
                 branch: BRANCH.into(),
                 branch_born,
             },
-            mount_path: String::new(),
             base_tools: Vec::new(),
             ro_mounts: Vec::new(),
         }

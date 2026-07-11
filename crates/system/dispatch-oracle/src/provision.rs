@@ -50,13 +50,9 @@ pub struct WorkspaceSpec {
     /// the pinned source the provisioner materializes — a duckfs subtree or a
     /// forge repo@commit on a work branch, verbatim from the plan.
     pub source: WorkspaceSource,
-    /// advisory only — NEVER used as a real host path (W1); the provisioner
-    /// mints its own writable mount OUTSIDE storage. duckfs-era debt: always
-    /// empty from the pool, and deliberately NOT part of [`WorkspaceSource`].
-    pub mount_path: String,
     pub base_tools: Vec<BaseTool>,
-    /// W6 skill/instruction ro subtrees — EMPTY in phase 2, carried so phase 4
-    /// is purely additive.
+    /// W6 skill/instruction ro subtrees — the plan's C4 skill mounts,
+    /// verbatim.
     pub ro_mounts: Vec<RoMount>,
 }
 
@@ -68,8 +64,8 @@ pub struct BaseTool {
     pub exposure: String,
 }
 
-/// a read-only mount the provisioner materializes beside the rw source (W6).
-/// carried but never populated in phase 2.
+/// a read-only mount the provisioner materializes beside the rw source (W6) —
+/// populated from the composed skills.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoMount {
     pub source_prefix: String,
@@ -222,8 +218,8 @@ pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
     ctx.path_entries = ws.path_entries();
 }
 
-// ---- faceted receipt (v1 wire) ------------------------------------------------
-// the receipt grew from message-only to the six ADR facets — message
+// ---- faceted runner result (v1 wire) --------------------------------------------
+// the runner result grew from message-only to the six ADR facets — message
 // (`response_text`) / data / effects / artifact (`workspace_receipt`) / sink /
 // status. the extra five are ADDITIVE and skip-serialized when empty/default, so
 // a plain run still emits the minimal `{ducktape_runner_result, response_text,
@@ -267,8 +263,8 @@ pub struct RunEffect {
 }
 
 /// the O1/O2 output sink: `Chain` (default — the next run reads this run's
-/// output_ref) / `Pr` (open a forge PR) / `Merge` (merge a forge PR). the
-/// concrete routing is runs' concern; the wrapper only names the intent.
+/// output_ref) / `Pr` (open a forge PR). the concrete routing is runs'
+/// concern; the wrapper only names the intent.
 ///
 /// Deserialize decodes the composer's REQUESTED sink
 /// (`result_contract.sink`, contract §1): the requested-Pr shape carries NO
@@ -289,14 +285,6 @@ pub enum Sink {
         #[serde(default)]
         body: String,
     },
-    Merge {
-        repo: String,
-        number: u64,
-        prev_target_oid: String,
-        expected_source_oid: String,
-        merge_oid: String,
-        pack_digest: String,
-    },
 }
 
 impl Sink {
@@ -313,6 +301,9 @@ pub enum Status {
     #[default]
     Ok,
     Degraded,
+    /// not constructed host-side today — kept so the wire vocabulary states
+    /// all three states runs decodes.
+    #[allow(dead_code)]
     Failed,
 }
 
@@ -477,7 +468,6 @@ mod tests {
                 source_prefix: "/shared/agent-workspaces/bot".into(),
                 source_snapshot: Some("aa".repeat(32)),
             },
-            mount_path: "/tmp/ducktape-workspace".into(),
             base_tools: vec![BaseTool {
                 name: "ducktape-files".into(),
                 version: "1".into(),
@@ -497,7 +487,6 @@ mod tests {
                 branch: "agent/item-7".into(),
                 branch_born: false,
             },
-            mount_path: String::new(),
             base_tools: Vec::new(),
             ro_mounts: Vec::new(),
         }

@@ -134,7 +134,6 @@ pub struct DispatchView {
     /// assignee), resolved at QUERY TIME by the read facade. `None` unless the
     /// dispatch is `AwaitingResult` — a delivered run runs nowhere. VIEW-ONLY:
     /// never committed state, never part of the app-hash.
-    #[serde(default)]
     pub assignee: Option<Vec<u8>>,
     pub created_at: u64,
     pub updated_at: u64,

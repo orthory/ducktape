@@ -421,38 +421,6 @@ impl Module for TaggingModule {
         }
     }
 
-    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        // COMMITTED state only, mirroring the platform's committed-only query
-        // modules: a staged overlay must never leak into a same-block read.
-        match decode_query(req).map_err(Error::Module)? {
-            TaggingQuery::Subscriptions => {
-                let subscriptions = self
-                    .committed
-                    .subscriptions
-                    .iter()
-                    .map(|(key, subscribers)| {
-                        let (source, container) = key.split_once(SEP).unwrap_or((key.as_str(), ""));
-                        SubscriptionView {
-                            source: source.to_string(),
-                            container: container.to_string(),
-                            subscribers: subscribers.iter().cloned().collect(),
-                        }
-                    })
-                    .collect();
-                Ok(encode_reply(&TaggingReply::Subscriptions(subscriptions)))
-            }
-            TaggingQuery::Subscribers { source, container } => {
-                let subscribers = self
-                    .committed
-                    .subscriptions
-                    .get(&scope_key(&source, &container))
-                    .map(|set| set.iter().cloned().collect())
-                    .unwrap_or_default();
-                Ok(encode_reply(&TaggingReply::Subscribers(subscribers)))
-            }
-        }
-    }
-
     async fn commit_block(&mut self) -> Result<(), Error> {
         for (key, set) in std::mem::take(&mut self.staged) {
             if set.is_empty() {

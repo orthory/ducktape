@@ -39,10 +39,10 @@
 //! [`SagaModule::new`] runs [`LeasePolicy::Open`]: no assignee, any
 //! submitter's result accepted (first agreed one wins), lease windows still
 //! tracked when the trigger asks (so `Crank` can retry a silent worker).
-//! [`SagaModule::with_valset`] additionally rendezvous-assigns each attempt to
-//! `pool[H(saga_id ‖ attempt ‖ height) % n]` over the valset module's
-//! membership; [`SagaModule::with_assignment`] adds a capability registry,
-//! and a trigger that names a capability then draws its pool from that tag's
+//! [`SagaModule::with_assignment`] additionally rendezvous-assigns each
+//! attempt to `pool[H(saga_id ‖ attempt ‖ height) % n]` over the valset
+//! module's membership, with a capability registry on the side: a trigger
+//! that names a capability then draws its pool from that tag's
 //! ANNOUNCED PROVIDERS instead — only nodes that can execute the work ever
 //! hold its lease, and a tag nobody provides assigns nobody (never the raw
 //! valset). under [`LeasePolicy::Strict`] a result is accepted only from the
@@ -79,6 +79,7 @@ use capability::{
     CapabilityQuery, CapabilityReply, decode_reply as capability_decode_reply,
     encode_query as capability_encode_query,
 };
+use sdk::codec;
 use sdk::{Ctx, Effect, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use valset::{
@@ -156,48 +157,15 @@ struct Saga {
 /// [`Module::root`] hashes, so a snapshot and the root that must authenticate
 /// it cannot drift.
 fn encode_committed(sagas: &BTreeMap<String, Saga>) -> Vec<u8> {
-    fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(bytes);
-    }
-    fn put_opt_bytes(out: &mut Vec<u8>, opt: Option<&[u8]>) {
-        match opt {
-            None => out.push(0),
-            Some(bytes) => {
-                out.push(1);
-                put_bytes(out, bytes);
-            }
-        }
-    }
-    fn put_opt_u64(out: &mut Vec<u8>, opt: Option<u64>) {
-        match opt {
-            None => out.push(0),
-            Some(v) => {
-                out.push(1);
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-    }
-
     let mut out = Vec::new();
     out.extend_from_slice(&(sagas.len() as u64).to_le_bytes());
     for (id, s) in sagas {
-        put_bytes(&mut out, id.as_bytes());
-        match &s.origin {
-            SagaOrigin::External(key) => {
-                out.push(0);
-                put_bytes(&mut out, key);
-            }
-            SagaOrigin::Module(module) => {
-                out.push(1);
-                put_bytes(&mut out, module.as_bytes());
-            }
-            SagaOrigin::System => out.push(2),
-        }
-        put_opt_bytes(&mut out, s.reply_to.as_ref().map(|m| m.as_bytes()));
-        put_bytes(&mut out, &s.reply_payload);
-        put_bytes(&mut out, &s.spec);
-        put_opt_bytes(&mut out, s.capability.as_ref().map(|c| c.as_bytes()));
+        codec::push_str(&mut out, id);
+        put_origin(&mut out, &s.origin);
+        codec::push_opt_str(&mut out, s.reply_to.as_deref());
+        codec::push_bytes(&mut out, &s.reply_payload);
+        codec::push_bytes(&mut out, &s.spec);
+        codec::push_opt_str(&mut out, s.capability.as_deref());
         out.push(match s.status {
             SagaStatus::Pending => 0,
             SagaStatus::Done => 1,
@@ -207,13 +175,13 @@ fn encode_committed(sagas: &BTreeMap<String, Saga>) -> Vec<u8> {
         });
         out.extend_from_slice(&s.attempt.to_le_bytes());
         out.extend_from_slice(&s.max_attempts.to_le_bytes());
-        put_opt_bytes(&mut out, s.assignee.as_deref());
-        put_opt_bytes(&mut out, s.pinned_assignee.as_deref());
-        put_opt_u64(&mut out, s.lease_views);
-        put_opt_u64(&mut out, s.lease_expires_at);
-        put_opt_u64(&mut out, s.deadline);
-        put_opt_bytes(&mut out, s.result.as_deref());
-        put_opt_bytes(&mut out, s.error.as_ref().map(|e| e.as_bytes()));
+        codec::push_opt_bytes(&mut out, s.assignee.as_deref());
+        codec::push_opt_bytes(&mut out, s.pinned_assignee.as_deref());
+        codec::push_opt_u64(&mut out, s.lease_views);
+        codec::push_opt_u64(&mut out, s.lease_expires_at);
+        codec::push_opt_u64(&mut out, s.deadline);
+        codec::push_opt_bytes(&mut out, s.result.as_deref());
+        codec::push_opt_str(&mut out, s.error.as_deref());
         out.extend_from_slice(&s.created_at.to_le_bytes());
         out.extend_from_slice(&s.updated_at.to_le_bytes());
     }
@@ -227,83 +195,18 @@ fn committed_root(sagas: &BTreeMap<String, Saga>) -> StateRoot {
     StateRoot(Sha256::digest(encode_committed(sagas)).into())
 }
 
-/// pull `n` bytes off the front of `buf`, checked against the remaining input
-/// BEFORE any slicing — a lying length cannot over-read or panic.
-fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
-    if n > buf.len() {
-        return Err("snapshot truncated".into());
-    }
-    let (head, tail) = buf.split_at(n);
-    *buf = tail;
-    Ok(head)
-}
-
-fn take_u64(buf: &mut &[u8]) -> Result<u64, String> {
-    Ok(u64::from_le_bytes(
-        take(buf, 8)?.try_into().expect("8 bytes"),
-    ))
-}
-
-fn take_u32(buf: &mut &[u8]) -> Result<u32, String> {
-    Ok(u32::from_le_bytes(
-        take(buf, 4)?.try_into().expect("4 bytes"),
-    ))
-}
-
-/// a length prefix, validated against the remaining input before the caller
-/// allocates anything of that size.
-fn take_len(buf: &mut &[u8]) -> Result<usize, String> {
-    let n = take_u64(buf)?;
-    if n > buf.len() as u64 {
-        return Err("snapshot length prefix exceeds input".into());
-    }
-    Ok(n as usize)
-}
-
-fn take_lp_bytes(buf: &mut &[u8]) -> Result<Vec<u8>, String> {
-    let len = take_len(buf)?;
-    Ok(take(buf, len)?.to_vec())
-}
-
-fn take_lp_string(buf: &mut &[u8]) -> Result<String, String> {
-    let len = take_len(buf)?;
-    Ok(std::str::from_utf8(take(buf, len)?)
-        .map_err(|_| "snapshot string is not utf-8".to_string())?
-        .to_owned())
-}
-
-/// a 0/1 option tag; anything else is rejected so a state has exactly one
-/// valid encoding.
-fn take_tag(buf: &mut &[u8]) -> Result<bool, String> {
-    match take(buf, 1)?[0] {
-        0 => Ok(false),
-        1 => Ok(true),
-        t => Err(format!("snapshot has unknown option tag {t}")),
-    }
-}
-
-fn take_opt_bytes(buf: &mut &[u8]) -> Result<Option<Vec<u8>>, String> {
-    Ok(if take_tag(buf)? {
-        Some(take_lp_bytes(buf)?)
-    } else {
-        None
-    })
-}
-
-fn take_opt_string(buf: &mut &[u8]) -> Result<Option<String>, String> {
-    Ok(if take_tag(buf)? {
-        Some(take_lp_string(buf)?)
-    } else {
-        None
-    })
-}
-
-fn take_opt_u64(buf: &mut &[u8]) -> Result<Option<u64>, String> {
-    Ok(if take_tag(buf)? {
-        Some(take_u64(buf)?)
-    } else {
-        None
-    })
+/// an optional utf-8 string in the plain option layout — [`codec::Cursor`]
+/// keeps only the byte primitive; the utf-8 check layers here (opt_str's
+/// non-empty/bounded rules would reject valid states, e.g. an empty stored
+/// error string).
+fn take_opt_string(cur: &mut codec::Cursor, what: &str) -> Result<Option<String>, Error> {
+    cur.opt_bytes(what)?
+        .map(|raw| {
+            std::str::from_utf8(raw)
+                .map(str::to_string)
+                .map_err(|e| Error::Module(format!("{what} is not utf-8: {e}")))
+        })
+        .transpose()
 }
 
 /// strict decode of an [`encode_committed`] snapshot. the input is UNTRUSTED —
@@ -312,57 +215,56 @@ fn take_opt_u64(buf: &mut &[u8]) -> Result<Option<u64>, String> {
 /// byte encoding per state, and uniqueness for free), unknown discriminants
 /// and option tags are rejected, and trailing bytes are rejected. never panics
 /// on malformed input.
-fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
-    let count = take_u64(&mut buf)?;
+fn decode_committed(buf: &[u8]) -> Result<BTreeMap<String, Saga>, Error> {
+    let mut cur = codec::Cursor::new(buf);
+    let count = cur.u64("snapshot saga count")?;
     // every saga costs at least its fixed-width fields — the id length prefix,
     // one origin discriminant, nine option tags, three length prefixes,
     // status, two u32s, and two u64s — so a count the input cannot possibly
     // hold is rejected before the loop builds anything.
     const MIN_SAGA_BYTES: u64 =
         8 + 1 + 1 + 8 + 8 + 1 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 8 + 8;
-    if count
-        .checked_mul(MIN_SAGA_BYTES)
-        .is_none_or(|need| need > buf.len() as u64)
-    {
-        return Err("snapshot saga count exceeds input".into());
-    }
+    cur.bound(count, MIN_SAGA_BYTES, "snapshot saga")?;
     let mut sagas: BTreeMap<String, Saga> = BTreeMap::new();
     for _ in 0..count {
-        let id = take_lp_string(&mut buf)?;
+        let id = cur.string("snapshot saga id")?;
         if let Some((last, _)) = sagas.iter().next_back()
             && last.as_str() >= id.as_str()
         {
-            return Err("snapshot saga ids not strictly ascending".into());
+            return Err(Error::Module(
+                "snapshot saga ids not strictly ascending".into(),
+            ));
         }
-        let origin = match take(&mut buf, 1)?[0] {
-            0 => SagaOrigin::External(take_lp_bytes(&mut buf)?),
-            1 => SagaOrigin::Module(take_lp_string(&mut buf)?),
-            2 => SagaOrigin::System,
-            d => return Err(format!("snapshot has unknown origin discriminant {d}")),
-        };
-        let reply_to = take_opt_string(&mut buf)?;
-        let reply_payload = take_lp_bytes(&mut buf)?;
-        let spec = take_lp_bytes(&mut buf)?;
-        let capability = take_opt_string(&mut buf)?;
-        let status = match take(&mut buf, 1)?[0] {
+        let origin = take_origin(&mut cur)?;
+        let reply_to = take_opt_string(&mut cur, "snapshot reply_to")?;
+        let reply_payload = cur.bytes("snapshot reply_payload")?.to_vec();
+        let spec = cur.bytes("snapshot spec")?.to_vec();
+        let capability = take_opt_string(&mut cur, "snapshot capability")?;
+        let status = match cur.byte("snapshot status")? {
             0 => SagaStatus::Pending,
             1 => SagaStatus::Done,
             2 => SagaStatus::Failed,
             3 => SagaStatus::TimedOut,
             4 => SagaStatus::Cancelled,
-            d => return Err(format!("snapshot has unknown status discriminant {d}")),
+            d => {
+                return Err(Error::Module(format!(
+                    "snapshot has unknown status discriminant {d}"
+                )));
+            }
         };
-        let attempt = take_u32(&mut buf)?;
-        let max_attempts = take_u32(&mut buf)?;
-        let assignee = take_opt_bytes(&mut buf)?;
-        let pinned_assignee = take_opt_bytes(&mut buf)?;
-        let lease_views = take_opt_u64(&mut buf)?;
-        let lease_expires_at = take_opt_u64(&mut buf)?;
-        let deadline = take_opt_u64(&mut buf)?;
-        let result = take_opt_bytes(&mut buf)?;
-        let error = take_opt_string(&mut buf)?;
-        let created_at = take_u64(&mut buf)?;
-        let updated_at = take_u64(&mut buf)?;
+        let attempt = cur.u32("snapshot attempt")?;
+        let max_attempts = cur.u32("snapshot max_attempts")?;
+        let assignee = cur.opt_bytes("snapshot assignee")?.map(<[u8]>::to_vec);
+        let pinned_assignee = cur
+            .opt_bytes("snapshot pinned_assignee")?
+            .map(<[u8]>::to_vec);
+        let lease_views = cur.opt_u64("snapshot lease_views")?;
+        let lease_expires_at = cur.opt_u64("snapshot lease_expires_at")?;
+        let deadline = cur.opt_u64("snapshot deadline")?;
+        let result = cur.opt_bytes("snapshot result")?.map(<[u8]>::to_vec);
+        let error = take_opt_string(&mut cur, "snapshot error")?;
+        let created_at = cur.u64("snapshot created_at")?;
+        let updated_at = cur.u64("snapshot updated_at")?;
         sagas.insert(
             id,
             Saga {
@@ -386,9 +288,7 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, Saga>, String> {
             },
         );
     }
-    if !buf.is_empty() {
-        return Err("snapshot has trailing bytes".into());
-    }
+    cur.finish("snapshot")?;
     Ok(sagas)
 }
 
@@ -447,8 +347,10 @@ impl SagaModule {
     }
 
     /// a ledger that rendezvous-assigns each attempt over `valset`'s
-    /// committed membership, gated by `policy`.
-    pub fn with_valset(
+    /// committed membership, gated by `policy` — the shared base of
+    /// [`SagaModule::with_assignment`], which is the constructor real
+    /// deployments use.
+    fn with_valset(
         id: impl Into<ModuleId>,
         valset: impl Into<ModuleId>,
         policy: LeasePolicy,
@@ -463,7 +365,7 @@ impl SagaModule {
         }
     }
 
-    /// [`SagaModule::with_valset`] plus capability-aware assignment: an
+    /// valset rendezvous assignment plus capability-aware assignment: an
     /// attempt of a saga whose trigger named a capability is
     /// rendezvous-assigned over `capability_registry`'s announced providers
     /// of that tag; untagged sagas keep valset assignment.
@@ -665,7 +567,7 @@ impl SagaModule {
     /// before the call. on success the staged overlay is dropped — a snapshot
     /// describes a block boundary, and nothing half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let sagas = decode_committed(bytes).map_err(Error::Module)?;
+        let sagas = decode_committed(bytes)?;
         if committed_root(&sagas) != expected {
             return Err(Error::Module(
                 "snapshot does not match expected root".into(),
