@@ -27,7 +27,7 @@ const view = new URLSearchParams(window.location.search).get("view");
 // CLI / MCP server can snapshot the semantic tree, drive input, capture logs,
 // and render DOM-SVG screenshots in this webview. One instance per window,
 // labelled by the real Tauri window label. Never in release.
-if (import.meta.env.DEV) {
+if (import.meta.env.DEV || import.meta.env.VITE_TAURI_AGENT === "1") {
   void (async () => {
     const [{ WebviewAgentInstrumentation }, { getCurrentWindow }] = await Promise.all([
       import("@byeongsu-hong/tauri-agent-plugin"),

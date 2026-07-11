@@ -1,0 +1,20 @@
+{
+  "id": "cef-smoke",
+  "variant": "cef",
+  "goal": "Verify that the Ducktape CEF desktop reaches its first-run account screen.",
+  "success": [
+    {
+      "expect": {
+        "role": "button",
+        "name": "Create account",
+        "present": true
+      }
+    }
+  ],
+  "limits": {
+    "steps": 3,
+    "seconds": 30,
+    "tokens": 1000,
+    "repetitions": 2
+  }
+}
