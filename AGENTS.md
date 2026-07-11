@@ -36,15 +36,28 @@
   open with the risks, failed checks, or follow-up review needed instead of
   merging by default.
 
+## Rust Build Helpers
+
+- Makefile build entry points already run through `ops/build-with.sh`; use the
+  normal `make` targets so installed accelerators are picked up automatically.
+- For direct Cargo commands, use `ops/build-with.sh cargo ...`. It enables
+  `sccache` when installed and native-Linux `mold` through `clang`, while
+  falling back cleanly when they are unavailable. Run `make build-tools` to see
+  what is active on the current host.
+- Do not force mold on macOS or replace an operator's existing Rust wrapper,
+  linker, or flags. Use `DUCKTAPE_DISABLE_SCCACHE=1` or
+  `DUCKTAPE_DISABLE_MOLD=1` only when diagnosing a helper-specific problem.
+
 ## Rust Gates
 
-- Per-crate lint gate: `cargo clippy -p <crate> --tests --no-deps` — the
+- Per-crate lint gate:
+  `ops/build-with.sh cargo clippy -p <crate> --tests --no-deps` — the
   `--no-deps` is deliberate. Without it, a crate whose dev-deps pull
   host/dispatch/saga inherits ~a dozen pre-existing version-drift lints from
   those crates; a task is accountable only for lints in the crates it touched.
 - Don't run `cargo fmt --all`: large bin files carry pre-existing fmt debt,
   and a tree-wide reformat forces painful rebases on in-flight branches. Only
   format code you touched; the mechanical whole-tree sweep is a dedicated PR.
-- The files crate's wasm-readiness gate: `cargo check -p files
-  --no-default-features` must stay green (no `std::fs`/sdk leaks into the
-  pure core).
+- The files crate's wasm-readiness gate:
+  `ops/build-with.sh cargo check -p files --no-default-features` must stay green
+  (no `std::fs`/sdk leaks into the pure core).
