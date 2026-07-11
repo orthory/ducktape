@@ -60,6 +60,7 @@ while [ $SECONDS -lt $deadline ]; do
   fi
   targets="$(curl -fsS --max-time 2 "http://127.0.0.1:$port/json" 2>/dev/null || true)"
   if [ -n "$targets" ]; then
+    # `|| true`: a torn/mid-write /json response must retry, not abort the gate.
     loaded="$(printf '%s' "$targets" | python3 -c '
 import json, sys
 targets = json.load(sys.stdin)
@@ -69,7 +70,7 @@ for t in targets:
         and "view=tray" not in url and title == "Ducktape"):
         print(url + " title=" + title)
         break
-')"
+' 2>/dev/null || true)"
     if [ -n "$loaded" ]; then
       echo "[app-smoke] main page loaded: $loaded"
       exit 0
