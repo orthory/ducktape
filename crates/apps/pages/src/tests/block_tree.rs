@@ -57,7 +57,7 @@ fn nested_children_come_back_in_preorder() {
 
 // the addressability contract: a bare block id resolves with NO page
 // context, and the answer carries where the block lives — exactly what a
-// future cross-module BlockRef resolution needs.
+// future cross-module reference needs.
 #[test]
 fn get_block_by_id_alone_carries_page_context() {
     deterministic::Runner::default().start(|context| async move {

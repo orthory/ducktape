@@ -63,13 +63,6 @@ pub fn decode_frame(frame: &[u8]) -> Result<(MediaHeader, &[u8]), MediaError> {
     Ok((MediaHeader { seq, timestamp }, &frame[MEDIA_HEADER_LEN..]))
 }
 
-/// Wrapping seq comparison: is `a` newer than `b`? Correct across the u16
-/// wrap as long as the true distance is under half the space (~11 minutes
-/// of frames).
-pub fn seq_newer(a: u16, b: u16) -> bool {
-    (a.wrapping_sub(b) as i16) > 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,13 +124,5 @@ mod tests {
             ),
             Err(MediaError::PayloadTooLarge { .. })
         ));
-    }
-
-    #[test]
-    fn seq_comparison_wraps() {
-        assert!(seq_newer(1, 0));
-        assert!(seq_newer(0, 65_535));
-        assert!(seq_newer(5, 65_530));
-        assert!(!seq_newer(65_530, 5));
     }
 }

@@ -8,7 +8,7 @@
 //!
 //! ## the default repo
 //!
-//! the `repo` field on [`ForgeMsg::Commit`]/[`ForgeMsg::Push`] carries
+//! the `repo` field on every [`ForgeMsg`] variant carries
 //! `#[serde(default)]`, so a wire message that omits it deserializes with
 //! `repo == ""`; the module normalizes an empty repo to the well-known
 //! `"default"` repo. a single-repo client that sends
@@ -23,10 +23,10 @@ use crate::tracker_iface::{RefUpdate, ReviewComment, ReviewVerdict};
 /// a write intent at forge.
 ///
 /// the git surface: the file-by-file [`ForgeMsg::Commit`] (forge builds the
-/// commit object itself), the legacy single-`main` [`ForgeMsg::Push`], and the
-/// atomic multi-branch [`ForgeMsg::PushRefs`] — git-faithful ref updates that
-/// adopt a client's REAL commit history by oid, with the objects carried
-/// out-of-band in a node-local packfile (never in consensus).
+/// commit object itself) and the atomic multi-branch [`ForgeMsg::PushRefs`] —
+/// git-faithful ref updates that adopt a client's REAL commit history by oid,
+/// with the objects carried out-of-band in a node-local packfile (never in
+/// consensus).
 ///
 /// the tracker surface: GitHub-shaped issues / pull requests / reviews
 /// ([`ForgeMsg::OpenIssue`] .. [`ForgeMsg::SubmitReview`]) — see
@@ -46,27 +46,6 @@ pub enum ForgeMsg {
         path: String,
         content: String,
         message: String,
-    },
-    /// a git ref update over consensus. the ONLY consensus effect is a
-    /// compare-and-swap on the target repo's committed HEAD: that repo's current
-    /// HEAD must equal `prev_oid`, and on match its HEAD becomes `new_oid` (so
-    /// the composed `root()` moves on EVERY validator, pack-holder or not). the
-    /// git objects themselves are node-local — fetched from the files blob store
-    /// by `pack_digest` and installed lazily — and NEVER influence root/accept.
-    Push {
-        /// the target repo slug; empty/absent -> the `"default"` repo.
-        #[serde(default)]
-        repo: String,
-        /// the CAS guard: the repo's committed HEAD must equal this or the push
-        /// is rejected (non-fast-forward). `None` == the repo is unborn (pushing
-        /// to an empty remote). 20 raw sha1 bytes when `Some`.
-        prev_oid: Option<Vec<u8>>,
-        /// the new committed HEAD after the push. 20 raw sha1 bytes.
-        new_oid: Vec<u8>,
-        /// sha256 digest of the packfile (full object closure of `new_oid`) in
-        /// the node's files blob store. objects are NODE-LOCAL, never consensus
-        /// state; this 32-byte locator has ZERO effect on root/accept-reject.
-        pack_digest: Vec<u8>,
     },
     /// the atomic multi-branch push: every [`RefUpdate`] is a per-branch CAS
     /// against that branch's COMMITTED head, and the whole list stages or the
@@ -244,16 +223,19 @@ mod tests {
     }
 
     #[test]
-    fn push_without_repo_decodes_with_empty_repo() {
-        let legacy = br#"{"push":{"prev_oid":null,"new_oid":[1,2,3],"pack_digest":[4,5]}}"#;
-        let msg = decode_msg(legacy).expect("repo-less push must decode");
+    fn push_refs_without_repo_decodes_with_empty_repo() {
+        let legacy = br#"{"push_refs":{"updates":[{"ref_name":"main","prev_oid":null,"new_oid":[1,2,3]}],"pack_digest":[4,5]}}"#;
+        let msg = decode_msg(legacy).expect("repo-less push_refs must decode");
         assert_eq!(
             msg,
-            ForgeMsg::Push {
+            ForgeMsg::PushRefs {
                 repo: String::new(),
-                prev_oid: None,
-                new_oid: vec![1, 2, 3],
-                pack_digest: vec![4, 5],
+                updates: vec![RefUpdate {
+                    ref_name: "main".into(),
+                    prev_oid: None,
+                    new_oid: Some(vec![1, 2, 3]),
+                }],
+                pack_digest: Some(vec![4, 5]),
             }
         );
     }

@@ -72,14 +72,12 @@
 //! (never deleted, fast-forward-guarded at materialize); other branches may
 //! force-push and be deleted — the GitHub flow.
 //!
-//! ## back-compat: the default repo and the legacy Push (no app change)
+//! ## back-compat: the default repo (no app change)
 //!
-//! [`ForgeMsg::Commit`]/[`ForgeMsg::Push`] carry a `#[serde(default)] repo`, so a
-//! legacy wire message with no `repo` deserializes with `repo == ""`; the module
+//! every [`ForgeMsg`] carries a `#[serde(default)] repo`, so a legacy wire
+//! message with no `repo` deserializes with `repo == ""`; the module
 //! normalizes an empty repo to the well-known `"default"` repo. the unit
-//! [`ForgeQuery::Head`] answers the default repo's `main` head. the legacy
-//! single-ref [`ForgeMsg::Push`] stays decodable and is exactly a one-update
-//! [`ForgeMsg::PushRefs`] on `main`.
+//! [`ForgeQuery::Head`] answers the default repo's `main` head.
 //!
 //! ## the determinism landmine (per repo)
 //!
@@ -90,7 +88,7 @@
 //!
 //! KNOWN PRE-EXISTING HAZARD (unchanged by the multi-branch work): a `Commit`
 //! op builds on the parent COMMIT OBJECT, which only exists in odbs that have
-//! materialized the history — mixing `Commit` and `Push` on one repo can make
+//! materialized the history — mixing `Commit` and `PushRefs` on one repo can make
 //! `Commit` fail on validators that still lack the pushed pack. the app commits
 //! to app-managed repos and git users push to git-managed repos, so the mix
 //! does not occur in practice; a consensus-visible "pushed" flag is the proper
@@ -149,8 +147,9 @@ const TRACKER_ROOT_DOMAIN: &[u8] = b"ducktape.forge.tracker.v1\x00";
 /// `"default"`; otherwise it must be 1..=`MAX_REPO_NAME_LEN` bytes of
 /// `[a-z0-9._-]` and never `.`/`..` (those would escape or collide with the base
 /// dir as a path segment). a valid non-empty slug returns unchanged, so the map
-/// key equals the on-disk directory name.
-pub(crate) fn norm_repo(repo: &str) -> Result<String, Error> {
+/// key equals the on-disk directory name. `pub`: bin/noded's git smart-HTTP
+/// layer shares this validator — the security-relevant check has ONE home.
+pub fn norm_repo(repo: &str) -> Result<String, Error> {
     if repo.is_empty() {
         return Ok(DEFAULT_REPO.to_string());
     }
@@ -224,15 +223,6 @@ pub(crate) fn forge_layout(version: u32) -> ForgeLayout {
         ForgeLayout::MultiRepoV2
     } else {
         ForgeLayout::MultiRepo
-    }
-}
-
-/// normalize a wire `repo` field UNDER the selected layout. both layouts honor
-/// the multi-repo field — the v2 divergence is in the root preimage / snapshot
-/// wire, not in op routing.
-fn norm_repo_at(repo: &str, layout: ForgeLayout) -> Result<String, Error> {
-    match layout {
-        ForgeLayout::MultiRepo | ForgeLayout::MultiRepoV2 => norm_repo(repo),
     }
 }
 
@@ -451,11 +441,6 @@ impl Forge {
         self
     }
 
-    /// the current dual-path branch selector.
-    pub fn active_version(&self) -> u32 {
-        self.active_version
-    }
-
     /// deterministically set the dual-path branch selector (host activation
     /// hook / restart / state-sync restoration; also the inherent counterpart
     /// for concrete-typed tests).
@@ -665,7 +650,6 @@ impl Module for Forge {
     /// commit atomically with the block. all git2 IO is blocking with no
     /// `.await`.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let layout = forge_layout(ctx.env().protocol_version);
         let now = ctx.env().consensus_time;
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             ForgeMsg::Commit {
@@ -674,40 +658,21 @@ impl Module for Forge {
                 content,
                 message,
             } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 self.ensure_repo(&name);
                 self.stage_commit(&name, now, path, content, message)
-            }
-            ForgeMsg::Push {
-                repo,
-                prev_oid,
-                new_oid,
-                pack_digest,
-            } => {
-                // the legacy single-ref push == a one-update PushRefs on main.
-                let name = norm_repo_at(&repo, layout)?;
-                self.ensure_repo(&name);
-                self.stage_push_refs(
-                    &name,
-                    vec![RefUpdate {
-                        ref_name: MAIN_BRANCH.to_string(),
-                        prev_oid,
-                        new_oid: Some(new_oid),
-                    }],
-                    Some(pack_digest),
-                )
             }
             ForgeMsg::PushRefs {
                 repo,
                 updates,
                 pack_digest,
             } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 self.ensure_repo(&name);
                 self.stage_push_refs(&name, updates, pack_digest)
             }
             ForgeMsg::OpenIssue { repo, title, body } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 let author = author_from_origin(&ctx.env().origin)?;
                 let number = self.staged_tracker_mut().open_item(
                     &name,
@@ -730,7 +695,7 @@ impl Module for Forge {
                 source_branch,
                 target_branch,
             } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 let author = author_from_origin(&ctx.env().origin)?;
                 let target = if target_branch.is_empty() {
                     MAIN_BRANCH.to_string()
@@ -778,13 +743,13 @@ impl Module for Forge {
                 title,
                 body,
             } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 let editor = author_from_origin(&ctx.env().origin)?;
                 self.staged_tracker_mut()
                     .edit_item(&name, number, &editor, title, body, now)
             }
             ForgeMsg::SetItemState { repo, number, open } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 author_from_origin(&ctx.env().origin)?;
                 if let Some(verb) = self.staged_tracker_mut().set_state(&name, number, open, now)?
                 {
@@ -800,7 +765,7 @@ impl Module for Forge {
                 merge_oid,
                 pack_digest,
             } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 author_from_origin(&ctx.env().origin)?;
                 let prev_target = parse_hex_oid(&prev_target_oid, "prev_target_oid")?;
                 let expected_source = parse_hex_oid(&expected_source_oid, "expected_source_oid")?;
@@ -836,7 +801,7 @@ impl Module for Forge {
                 commit_oid,
                 comments,
             } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 let author = author_from_origin(&ctx.env().origin)?;
                 self.staged_tracker_mut().submit_review(
                     &name, number, author, verdict, body, &commit_oid, comments, now,
@@ -858,13 +823,12 @@ impl Module for Forge {
     /// `Head`/`HeadOf` are read-your-writes on `main`; the rest serve
     /// COMMITTED state.
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let layout = forge_layout(self.active_version);
         match decode_query(req).map_err(Error::Module)? {
             ForgeQuery::Head => Ok(encode_reply(&ForgeReply::Head(
                 self.read_head(DEFAULT_REPO),
             ))),
             ForgeQuery::HeadOf { repo } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 Ok(encode_reply(&ForgeReply::Head(self.read_head(&name))))
             }
             ForgeQuery::ListRepos => {
@@ -879,7 +843,7 @@ impl Module for Forge {
                 Ok(encode_reply(&ForgeReply::Repos(repos)))
             }
             ForgeQuery::ListRefs { repo } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 let refs = self
                     .repos
                     .get(&name)
@@ -896,11 +860,11 @@ impl Module for Forge {
                 Ok(encode_reply(&ForgeReply::Refs(refs)))
             }
             ForgeQuery::ListItems { repo } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 Ok(encode_reply(&ForgeReply::Items(self.tracker.list(&name))))
             }
             ForgeQuery::GetItem { repo, number } => {
-                let name = norm_repo_at(&repo, layout)?;
+                let name = norm_repo(&repo)?;
                 Ok(encode_reply(&ForgeReply::Item(
                     self.tracker.get(&name, number).map(Box::new),
                 )))

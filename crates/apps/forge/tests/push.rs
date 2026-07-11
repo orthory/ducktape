@@ -1,7 +1,7 @@
-//! the `Push` op: a git-faithful ref update over consensus.
+//! the push lane (`PushRefs`): a git-faithful ref update over consensus.
 //!
 //! forge's committed HEAD is decoupled from the on-disk libgit2 objects —
-//! `root() = sha256(<HEAD oid>)`, a pure function of the oid alone. `Push`
+//! `root() = sha256(<HEAD oid>)`, a pure function of the oid alone. a push
 //! exploits exactly that: the ONLY consensus effect is a compare-and-swap on
 //! the committed HEAD; the git objects ride out-of-band in a NODE-LOCAL
 //! packfile (fetched from the files blob store by digest) and are installed
@@ -15,12 +15,12 @@
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
-use forge::{ForgeMsg, ForgeQuery, ForgeReply, decode_reply, encode_msg, encode_query};
+use forge::{ForgeMsg, ForgeQuery, ForgeReply, RefUpdate, decode_reply, encode_msg, encode_query};
 use sdk::{Ctx, Error, Module, Msg, StateRoot};
 
-/// the module's canonical branch — the ref a materialized Push moves.
+/// the module's canonical branch — the ref a materialized push moves.
 const MAIN_REF: &str = "refs/heads/main";
-/// the raw width of a sha1 oid (a Push `prev_oid`/`new_oid` field).
+/// the raw width of a sha1 oid (a push `prev_oid`/`new_oid` field).
 const OID_LEN: usize = 20;
 /// every op here targets the default repo, whose git dir is `base/default`.
 const DEFAULT_REPO: &str = "default";
@@ -161,15 +161,18 @@ fn capture(src: &Forge) -> Captured {
     }
 }
 
-/// build a `Push` message on the default repo (empty `repo`).
+/// build a single-update `PushRefs` on `main` of the default repo (empty `repo`).
 fn push_msg(prev: Option<&[u8]>, new: &[u8], digest: &[u8]) -> Msg {
     Msg {
         target: "forge".into(),
-        payload: encode_msg(&ForgeMsg::Push {
+        payload: encode_msg(&ForgeMsg::PushRefs {
             repo: String::new(),
-            prev_oid: prev.map(<[u8]>::to_vec),
-            new_oid: new.to_vec(),
-            pack_digest: digest.to_vec(),
+            updates: vec![RefUpdate {
+                ref_name: "main".into(),
+                prev_oid: prev.map(<[u8]>::to_vec),
+                new_oid: Some(new.to_vec()),
+            }],
+            pack_digest: Some(digest.to_vec()),
         }),
     }
 }

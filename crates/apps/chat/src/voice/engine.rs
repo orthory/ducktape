@@ -17,7 +17,7 @@ use data_plane::{DataPlaneTransport, DatagramFlow, PeerId, SendError};
 
 use super::FRAME_SAMPLES;
 use super::codec::{CodecError, VoiceDecoder, VoiceEncoder};
-use super::jitter::{JitterBuffer, JitterStats, MinimalJitter, PlayoutStep};
+use super::jitter::{JitterStats, MinimalJitter, PlayoutStep};
 use super::media::{self, MediaError, MediaHeader};
 
 #[derive(Clone, Copy, Debug)]
@@ -57,13 +57,12 @@ pub struct SpeakerStats {
 }
 
 struct Lane {
-    jitter: Box<dyn JitterBuffer>,
+    jitter: MinimalJitter,
     decoder: VoiceDecoder,
     decode_errors: u64,
 }
 
 type Lanes = Arc<Mutex<HashMap<PeerId, Lane>>>;
-type JitterFactory = Arc<dyn Fn() -> Box<dyn JitterBuffer> + Send + Sync>;
 
 /// One voice channel's engine over one data-plane datagram flow.
 pub struct VoiceEngine<T: DataPlaneTransport> {
@@ -86,31 +85,11 @@ impl<T: DataPlaneTransport> Drop for VoiceEngine<T> {
 
 impl<T: DataPlaneTransport> VoiceEngine<T> {
     pub fn new(flow: DatagramFlow<T>, config: VoiceConfig) -> Result<Self, CodecError> {
-        let factory: JitterFactory = Arc::new(move || {
-            Box::new(MinimalJitter::new(
-                config.prefill_frames,
-                config.max_depth_frames,
-            ))
-        });
-        Self::with_jitter(flow, config, factory)
-    }
-
-    /// Same engine, custom jitter buffer (the NetEQ drop-in seam).
-    pub fn with_jitter(
-        flow: DatagramFlow<T>,
-        config: VoiceConfig,
-        jitter_factory: JitterFactory,
-    ) -> Result<Self, CodecError> {
         let encoder = VoiceEncoder::new(config.bitrate_bits_per_sec)?;
         let flow = Arc::new(flow);
         let lanes: Lanes = Arc::new(Mutex::new(HashMap::new()));
         let malformed = Arc::new(AtomicU64::new(0));
-        let pump = tokio::spawn(pump(
-            flow.clone(),
-            lanes.clone(),
-            jitter_factory,
-            malformed.clone(),
-        ));
+        let pump = tokio::spawn(pump(flow.clone(), lanes.clone(), config, malformed.clone()));
         Ok(VoiceEngine {
             flow,
             encoder,
@@ -209,7 +188,7 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
 async fn pump<T: DataPlaneTransport>(
     flow: Arc<DatagramFlow<T>>,
     lanes: Lanes,
-    jitter_factory: JitterFactory,
+    config: VoiceConfig,
     malformed: Arc<AtomicU64>,
 ) {
     loop {
@@ -227,7 +206,7 @@ async fn pump<T: DataPlaneTransport>(
                     continue;
                 };
                 vacant.insert(Lane {
-                    jitter: jitter_factory(),
+                    jitter: MinimalJitter::new(config.prefill_frames, config.max_depth_frames),
                     decoder,
                     decode_errors: 0,
                 })

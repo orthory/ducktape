@@ -914,12 +914,6 @@ mod tests {
             self.env.origin = origin;
             self
         }
-        /// set the effective protocol version the module reads to select its
-        /// dual-path branch for op acceptance.
-        fn proto(mut self, version: u32) -> Self {
-            self.env.protocol_version = version;
-            self
-        }
         /// decoded hook events emitted this dispatch.
         fn hook_events(&self) -> Vec<AgentEvent> {
             self.msgs
@@ -1597,34 +1591,32 @@ mod tests {
         assert_eq!(jrec.recipe_hash, vec![9u8; PROMPT_HASH_LEN]);
     }
 
-    /// a Register carrying the runtime-identity fields is accepted at every
-    /// protocol version — there is no version gate on the op fields.
+    /// a Register carrying the runtime-identity fields is accepted
+    /// unconditionally — there is no version gate on the op fields.
     #[test]
     fn execute_accepts_runtime_fields_unconditionally() {
-        for proto in [0u32, 3, 4, 7] {
-            let mut m = module();
-            let caps = ResourceCaps {
-                tools: vec!["bash".into()],
-                subagent_budget: 1,
-                ..Default::default()
-            };
-            let mut ctx = CaptureCtx::new().proto(proto).with_origin(user(9));
-            exec(
-                &mut m,
-                &mut ctx,
-                &admin(&register_runtime(
-                    "bot",
-                    caps.clone(),
-                    vec![],
-                    vec![9u8; PROMPT_HASH_LEN],
-                )),
-            )
-            .unwrap();
-            commit(&mut m);
-            let rec = get_agent(&m, "bot").unwrap();
-            assert_eq!(rec.caps, caps, "runtime fields accepted at proto {proto}");
-            assert_eq!(rec.recipe_hash, vec![9u8; PROMPT_HASH_LEN]);
-        }
+        let mut m = module();
+        let caps = ResourceCaps {
+            tools: vec!["bash".into()],
+            subagent_budget: 1,
+            ..Default::default()
+        };
+        let mut ctx = CaptureCtx::new().with_origin(user(9));
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&register_runtime(
+                "bot",
+                caps.clone(),
+                vec![],
+                vec![9u8; PROMPT_HASH_LEN],
+            )),
+        )
+        .unwrap();
+        commit(&mut m);
+        let rec = get_agent(&m, "bot").unwrap();
+        assert_eq!(rec.caps, caps);
+        assert_eq!(rec.recipe_hash, vec![9u8; PROMPT_HASH_LEN]);
     }
 
     /// the pure D3 cap gate: forge read != push, duckfs prefix containment (the
