@@ -6,6 +6,8 @@
 // encoded in the address: DuckFS and loopback HTTP use the same isolated,
 // route-scoped browser session.
 
+import { invoke } from "@tauri-apps/api/core";
+
 import * as duckdns from "./duckdns-client";
 import * as files from "./files-client";
 import * as gateway from "./gateway-client";
@@ -289,29 +291,13 @@ const loadNetworkPage = async (
   };
 };
 
-const safeSessionUrl = (raw: string, pathAndQuery: string): string => {
-  const root = new URL(raw);
-  if (
-    root.protocol !== "http:" ||
-    !/^[0-9a-f]{32}\.localhost$/.test(root.hostname) ||
-    !root.port ||
-    root.username ||
-    root.password ||
-    root.hash ||
-    root.pathname !== "/" ||
-    root.search
-  ) {
-    throw new Error("Node returned an unsafe gateway session origin.");
-  }
-  return new URL(pathAndQuery, root.origin).toString();
-};
-
 const loadAccountRoute = async (
   transport: NodeTransport,
   address: DuckAddress,
 ): Promise<LoadedDuckPage> => {
   if (!isTauri()) throw new Error("Account routes require the isolated desktop browser window.");
-  if (!transport.gatewaySession) throw new Error("This node has no active gateway browser plane.");
+  if (!transport.gatewayBrowserBase)
+    throw new Error("This node has no active gateway browser plane.");
   const resolved = await duckdns.resolve(transport, { handle: address.handle });
   if (!resolved) throw new Error(`${address.handle}.duck is not registered.`);
   const accountId = gateway.bytesToHex(resolved.account_id);
@@ -323,36 +309,13 @@ const loadAccountRoute = async (
   if (!record?.statement.route) throw new Error(`${address.hostname} has no published route.`);
   gateway.verifyRecord(record, account);
 
-  const session = await transport.gatewaySession({
-    accountId: resolved.account_id,
-    name: address.name,
-    revision: record.statement.revision,
-  });
-  const srcUrl = safeSessionUrl(session.url, address.pathAndQuery);
-
-  // Close the resolution/session race. The publisher also re-resolves on each
-  // request, but the UI should not present a session minted for stale authority.
-  const [latestResolution, latestAccount, latestRecord] = await Promise.all([
-    duckdns.resolve(transport, { handle: address.handle }),
-    identity.getAccount(transport, accountId),
-    gateway.getRoute(transport, resolved.account_id, address.name),
-  ]);
-  if (
-    !latestResolution ||
-    gateway.bytesToHex(latestResolution.account_id) !== accountId ||
-    !latestAccount ||
-    !latestRecord?.statement.route
-  ) {
-    throw new Error("Gateway authority changed while the session was opening.");
-  }
-  gateway.verifyRecord(latestRecord, latestAccount);
-  if (
-    latestRecord.statement.revision !== record.statement.revision ||
-    gateway.bytesToHex(latestRecord.statement.publisher_node) !==
-      gateway.bytesToHex(record.statement.publisher_node)
-  ) {
-    throw new Error("The route changed while the session was opening. Reload it.");
-  }
+  // Point the duck:// scheme handler at this node's browser-gateway listener,
+  // then hand the renderer a stable duck:// origin. The node re-resolves the
+  // authority on every request, so there is no session to mint (and no
+  // resolution/session race to guard).
+  const { base } = await transport.gatewayBrowserBase();
+  await invoke("duck_set_gateway_base", { base });
+  const srcUrl = `duck://${address.hostname}${address.pathAndQuery}`;
 
   return {
     address,

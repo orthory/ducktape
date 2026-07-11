@@ -13,32 +13,29 @@
 use tauri::webview::NewWindowResponse;
 use tauri::{Manager as _, WebviewUrl};
 
-fn validate_session_url(value: &str) -> Result<(tauri::Url, String), String> {
+/// Accept only a `duck://<account>.duck` or `duck://<label>.<account>.duck`
+/// origin — the stable gateway origin the scheme handler renders. Returns the
+/// parsed URL and its authority (the `<...>.duck` host, used to pin navigation
+/// and name the surface in permission prompts).
+fn validate_gateway_url(value: &str) -> Result<(tauri::Url, String), String> {
     let url: tauri::Url = value
         .parse()
-        .map_err(|error| format!("invalid gateway session URL: {error}"))?;
+        .map_err(|error| format!("invalid gateway URL: {error}"))?;
+    if url.scheme() != "duck" {
+        return Err("gateway URL must use the duck:// scheme".into());
+    }
     let host = url
         .host_str()
-        .ok_or_else(|| "gateway session URL has no host".to_string())?;
-    let token = host
-        .strip_suffix(".localhost")
-        .filter(|token| {
-            token.len() == 32
-                && token
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-        .ok_or_else(|| "gateway session URL has an invalid capability host".to_string())?
+        .ok_or_else(|| "gateway URL has no host".to_string())?
         .to_string();
-    if url.scheme() != "http"
-        || url.port().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("gateway session URL is not a bounded localhost HTTP origin".into());
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.last() != Some(&"duck") || (labels.len() != 2 && labels.len() != 3) {
+        return Err("gateway host must be <account>.duck or <label>.<account>.duck".into());
     }
-    Ok((url, token))
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err("gateway URL must not carry credentials or a fragment".into());
+    }
+    Ok((url, host))
 }
 
 /// The `.duck` route a surface was opened for, as the UI addressed it. It names
@@ -100,7 +97,7 @@ pub async fn gateway_open_inline(
 ) -> Result<(), String> {
     use tauri::{LogicalPosition, LogicalSize, Manager as _};
 
-    let (url, _token) = validate_session_url(&url)?;
+    let (url, _authority) = validate_gateway_url(&url)?;
     validate_site(&title)?;
     let label = inline_label(&tab_id)?;
     crate::permissions::note_gateway_site(&label, &title);
@@ -119,14 +116,12 @@ pub async fn gateway_open_inline(
     }
 
     let allowed_host = url.host_str().expect("validated host").to_string();
-    let allowed_port = url.port().expect("validated port");
     let builder = tauri::webview::WebviewBuilder::new(label, WebviewUrl::External(url))
         .incognito(true)
         .devtools(false)
         .on_navigation(move |candidate| {
-            candidate.scheme() == "http"
+            candidate.scheme() == "duck"
                 && candidate.host_str() == Some(allowed_host.as_str())
-                && candidate.port() == Some(allowed_port)
                 && candidate.username().is_empty()
                 && candidate.password().is_none()
         })
@@ -199,23 +194,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_window_accepts_only_exact_capability_origin_shape() {
-        let (url, token) = validate_session_url(
-            "http://0123456789abcdef0123456789abcdef.localhost:49152/path?q=1",
-        )
-        .unwrap();
-        assert_eq!(url.port(), Some(49152));
-        assert_eq!(token, "0123456789abcdef0123456789abcdef");
+    fn gateway_window_accepts_only_duck_origins() {
+        let (url, authority) =
+            validate_gateway_url("duck://site.demo.duck/path?q=1").unwrap();
+        assert_eq!(url.host_str(), Some("site.demo.duck"));
+        assert_eq!(authority, "site.demo.duck");
+        assert_eq!(
+            validate_gateway_url("duck://demo.duck/").unwrap().1,
+            "demo.duck"
+        );
         for unsafe_url in [
-            "https://0123456789abcdef0123456789abcdef.localhost:49152/",
-            "http://localhost:49152/",
-            "http://0123456789abcdef0123456789abcdef.localhost/",
-            "http://0123456789abcdef0123456789abcdef.localhost:49152/#leak",
-            "http://0123456789abcdef0123456789abcdeg.localhost:49152/",
-            "http://0123456789abcdef0123456789abcdef.localhost.evil:49152/",
+            "http://site.demo.duck/",
+            "https://site.demo.duck/",
+            "duck://demo.example/",
+            "duck://a.b.c.demo.duck/",
+            "duck://site.demo.duck/#leak",
+            "duck://user:pass@site.demo.duck/",
         ] {
             assert!(
-                validate_session_url(unsafe_url).is_err(),
+                validate_gateway_url(unsafe_url).is_err(),
                 "accepted {unsafe_url}"
             );
         }

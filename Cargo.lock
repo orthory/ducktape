@@ -3197,6 +3197,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "git2",
+ "http",
  "libc",
  "reqwest 0.12.28",
  "serde",
@@ -9068,7 +9069,7 @@ dependencies = [
 [[package]]
 name = "tauri-runtime-cef"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/tauri-runtime-cef?rev=c3be74427984eda42d938b9a0cfa9ab4c21b40b8#c3be74427984eda42d938b9a0cfa9ab4c21b40b8"
+source = "git+https://github.com/byeongsu-hong/tauri-runtime-cef?rev=4a0a5de212b6ce91725f7acfd83f7df4d7c23a00#4a0a5de212b6ce91725f7acfd83f7df4d7c23a00"
 dependencies = [
  "base64 0.22.1",
  "cef",
