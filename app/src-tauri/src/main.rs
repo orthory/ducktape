@@ -174,8 +174,16 @@ fn main() {
     let app = builder
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
-    app.run(|app, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
+    app.run(|app, event| match event {
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => {
+            // Closing the console intentionally hides it into the menu bar.
+            // Finder/Dock activation of the already-running app arrives here;
+            // without this, `open -a Ducktape` leaves the process alive with
+            // no visible window and reads as another launch failure.
+            tray::show_main(app);
+        }
+        tauri::RunEvent::ExitRequested { .. } => {
             // The notify stream task is detach-on-drop; a real quit is the
             // one place that asks its loop to exit.
             if let Some(notify) = tauri::Manager::try_state::<notify::NotifyHandles>(app) {
@@ -185,5 +193,6 @@ fn main() {
                 eprintln!("app exit: could not stop active workspace node: {err}");
             }
         }
+        _ => {}
     });
 }

@@ -102,6 +102,7 @@ web: app/node_modules
 ifeq ($(UNAME_S),Darwin)
 app: cef-env app/node_modules
 	cd app && $(CARGO) run --manifest-path "$(CEF_CLONE)/crates/tauri-cli/Cargo.toml" --bin cargo-tauri -- build --ignore-version-mismatches
+	bash ops/check-macos-cef-bundle.sh target/release/bundle/macos/Ducktape.app
 	bash ops/fix-dmg.sh
 else
 app: cef-env app/node_modules
@@ -135,6 +136,7 @@ install-app: app
 	mkdir -p "$(APP_DEST)"
 	rm -rf "$(APP_DEST)/Ducktape.app"
 	cp -R target/release/bundle/macos/Ducktape.app "$(APP_DEST)/"
+	bash ops/check-macos-cef-bundle.sh "$(APP_DEST)/Ducktape.app"
 	@echo "installed $(APP_DEST)/Ducktape.app"
 else
 install-app: app
