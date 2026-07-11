@@ -15,7 +15,7 @@ import type {
 import type { FileEntry } from "../../domain/files-client";
 import type { MemberKeyView } from "../../domain/identity-client";
 import type { ForgeItemSummary, ForgeRefHead } from "../../domain/forge-client";
-import type { ProposalView } from "../../domain/governance-client";
+import type { ProposalView, SharesView } from "../../domain/governance-client";
 import type {
   PageBlock,
   PageMeta,
@@ -203,6 +203,8 @@ export interface ConsoleState {
   /** Every proposal from the `governance` module, sorted by id. Re-queried per
    *  block like the roster; empty when the node exposes no governance surface. */
   proposals: ProposalView[];
+  /** The current account-share registry; inactive preserves validator ballots. */
+  governanceShares: SharesView;
 
   // ── Forge ──
   /** forge HEAD commit oid, or null on an unborn repo (no commits yet). */
@@ -684,6 +686,7 @@ export const createInitialState = (): ConsoleState => {
     members: [],
     residents: [],
     proposals: [],
+    governanceShares: { active: false, allocations: [], total: 0 },
     forgeHead: null,
     forgeRepo: null,
     forgeItems: [],
@@ -729,6 +732,7 @@ export interface ConsoleSnapshot {
   members: string[];
   residents: string[];
   proposals: ProposalView[];
+  governanceShares: SharesView;
   forgeHead: string | null;
   activeChannel: string | null;
   messages: MessageView[];
@@ -757,6 +761,7 @@ export const applySnapshot = (snapshot: ConsoleSnapshot): Partial<ConsoleState> 
   members: snapshot.members,
   residents: snapshot.residents,
   proposals: snapshot.proposals,
+  governanceShares: snapshot.governanceShares,
   forgeHead: snapshot.forgeHead,
   activeChannel: snapshot.activeChannel,
   messages: snapshot.messages,

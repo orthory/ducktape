@@ -149,10 +149,20 @@ export const fetchValsetSlices = (live: NodeTransport): Promise<ValsetSlices> =>
 
 export const fetchGovernanceSlices = (
   live: NodeTransport,
-): Promise<{ proposals: ProposalView[] }> =>
+): Promise<{
+  proposals: ProposalView[];
+  governanceShares: governanceClient.SharesView;
+}> =>
   Promise.resolve()
-    .then(() => governanceClient.proposals(live).catch((): ProposalView[] => []))
-    .then((proposals) => ({ proposals }));
+    .then(() =>
+      Promise.all([
+        governanceClient.proposals(live).catch((): ProposalView[] => []),
+        governanceClient
+          .shares(live)
+          .catch((): governanceClient.SharesView => ({ active: false, allocations: [], total: 0 })),
+      ]),
+    )
+    .then(([proposals, governanceShares]) => ({ proposals, governanceShares }));
 
 export const fetchForgeSlices = (
   live: NodeTransport,

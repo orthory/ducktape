@@ -108,7 +108,8 @@ pub(super) async fn genesis_host(
         // governance is the SOLE authorized author of valset changes: member
         // proposals + ballots, deterministic tally, follow-up membership ops.
         Box::new(
-            Governance::new("governance", "valset", "upgrade").with_invite_binding(bindings.invite),
+            Governance::new("governance", "valset", "upgrade", "identity")
+                .with_invite_binding(bindings.invite),
         ),
         // the no-downtime upgrade coordinator: holds the at-most-one pending
         // upgrade + per-validator readiness set (valset-gated). its mere
@@ -247,8 +248,8 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
 
-    let mut governance =
-        Governance::new("governance", "valset", "upgrade").with_invite_binding(bindings.invite);
+    let mut governance = Governance::new("governance", "valset", "upgrade", "identity")
+        .with_invite_binding(bindings.invite);
     let (bytes, root) = snapshot_of("governance")?;
     governance
         .install(bytes, root)
@@ -603,8 +604,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("tagging install: {e}"))?;
 
     let (bytes, root) = snapshot_of("governance").await?;
-    let mut governance =
-        Governance::new("governance", "valset", "upgrade").with_invite_binding(bindings.invite);
+    let mut governance = Governance::new("governance", "valset", "upgrade", "identity")
+        .with_invite_binding(bindings.invite);
     governance
         .install(&bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;

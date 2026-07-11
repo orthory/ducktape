@@ -1,16 +1,16 @@
 //! the governance module's public wire surface — types only.
 //!
-//! governance is member-gated decision making over the validator set: a
-//! CURRENT valset member proposes an action, members vote before a
-//! consensus-time deadline, and anyone may trigger execution once the outcome
-//! is decidable. passing membership actions are performed by emitting the
-//! valset op as a host-drained follow-up — governance is the ONLY authorized
-//! author of valset changes (the valset module rejects external submitters).
+//! governance defaults to one ballot per validator node. the validators may
+//! initialize non-transferable Identity-account shares, then governance can
+//! switch future proposals between validator and account-share mode. every new
+//! proposal freezes the electorate that decides it. passing
+//! membership actions are performed by emitting the valset op as a host-drained
+//! follow-up — governance remains the ONLY authorized author of valset changes.
 //!
 //! authorship is trusted because the ordered lane VERIFIES frame signatures:
-//! `Origin::External(pubkey)` reaching a module is authenticated, so a vote is
-//! attributable to exactly one member key and no validator can forge another
-//! member's ballot.
+//! `Origin::External(pubkey)` reaching a module is authenticated. validator
+//! mode keys a ballot by that node; share mode resolves it to one Identity
+//! account, so no validator can forge another principal's ballot.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,14 +43,57 @@ pub enum GovAction {
     /// revoke resident standing: emits `ValsetMsg::Revoke { key }` on
     /// execution.
     RemoveResident { key: Vec<u8> },
+    /// initialize non-transferable account shares and enable share mode. the
+    /// allocation must be non-empty, unique by account id, and name existing
+    /// Identity accounts. initialization is one-time; the registry is retained
+    /// when governance later switches back to validator ballots.
+    AdoptShares { allocations: Vec<ShareAllocation> },
+    /// set one Identity account's shares. zero removes the account from the
+    /// registry. only available after shares were configured; the current mode
+    /// freezes the electorate and structural threshold that decides it.
+    SetShares { account_id: Vec<u8>, shares: u64 },
+    /// choose the electorate for future proposals. `true` uses the configured
+    /// account shares; `false` restores one ballot per validator node. this
+    /// proposal itself is always decided by the mode frozen when it was opened.
+    SetShareMode { enabled: bool },
+}
+
+/// one non-transferable governance-share allocation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ShareAllocation {
+    pub account_id: Vec<u8>,
+    pub shares: u64,
+}
+
+/// what principal the proposal's ballot keys identify.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoterKind {
+    ValidatorNode,
+    Account,
+}
+
+/// the exact decision rule frozen with a proposal.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VotingRule {
+    /// Compatibility for proposals restored from the pre-share snapshot shape:
+    /// use the validator set current at execution, exactly as the old binary did.
+    DynamicValidatorMajority,
+    /// Pass once `yes_power >= required_yes`; this covers legacy validator
+    /// snapshots and structural proposals requiring two thirds of all shares.
+    Threshold { required_yes: u64 },
+    /// At the deadline, participation must reach `quorum` and yes must exceed
+    /// no. Early passage is allowed only when no remaining ballot can reverse it.
+    ParticipatingMajority { quorum: u64 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GovMsg {
-    /// open a proposal. the submitter (verified frame origin) must be a
-    /// CURRENT valset member; the voting deadline is
-    /// `consensus_time + voting_period`.
+    /// open a proposal. the verified submitter must belong to the current
+    /// electorate selected by the current governance mode.
+    /// the voting deadline is `consensus_time + voting_period`.
     Propose {
         proposal_id: String,
         action: GovAction,
@@ -58,10 +101,9 @@ pub enum GovMsg {
     },
     /// cast (or change) the submitter's ballot while voting is open.
     Vote { proposal_id: String, approve: bool },
-    /// tally and settle. anyone may trigger it once the outcome is decidable:
-    /// after the deadline, or early once yes-ballots already form a strict
-    /// majority of the CURRENT member count. passing membership actions emit
-    /// their valset op as a follow-up in the same block.
+    /// tally and settle. anyone may trigger it after the deadline, or early
+    /// once the proposal's frozen rule can no longer be reversed. passing
+    /// membership actions emit their valset op as a follow-up in the same block.
     Execute { proposal_id: String },
     /// redeem an invite: no ballot — MINTING was the admission decision. the
     /// op carries the token's fields plus the joiner key and its
@@ -98,8 +140,21 @@ pub struct ProposalView {
     pub created_at: u64,
     pub deadline: u64,
     pub status: ProposalStatus,
-    /// ballots by member key, sorted (BTreeMap on the impl side).
+    /// ballots by validator-node key or account id, per `voter_kind`.
     pub votes: Vec<(Vec<u8>, bool)>,
+    pub voter_kind: VoterKind,
+    /// the proposal-time power snapshot. empty only for a proposal restored
+    /// from the legacy dynamic-validator snapshot format.
+    pub electorate: Vec<(Vec<u8>, u64)>,
+    pub voting_rule: VotingRule,
+}
+
+/// the current non-transferable share registry.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SharesView {
+    pub active: bool,
+    pub allocations: Vec<ShareAllocation>,
+    pub total: u64,
 }
 
 /// the readable projection of one settled invite redemption — the audit
@@ -125,6 +180,8 @@ pub enum GovQuery {
     Proposal { proposal_id: String },
     /// every settled invite redemption, sorted by nonce.
     Redemptions,
+    /// the current share registry and whether it governs new proposals.
+    Shares,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -133,6 +190,7 @@ pub enum GovReply {
     Proposals(Vec<ProposalView>),
     Proposal(Option<ProposalView>),
     Redemptions(Vec<RedemptionView>),
+    Shares(SharesView),
 }
 
 pub fn encode_msg(m: &GovMsg) -> Vec<u8> {

@@ -242,6 +242,7 @@ export function DucktapeProvider({
                 members: valset.members,
                 residents: valset.residents,
                 proposals: governance.proposals,
+                governanceShares: governance.governanceShares,
                 forgeHead: forge.forgeHead,
                 activeChannel: chat.activeChannel,
                 messages: chat.messages,
