@@ -32,8 +32,8 @@ port_probe() { # $1 = port
 }
 
 # PIDs of THIS worktree's node — matched against our absolute $NODE_BIN as a
-# FIXED string, never a regex: the worktree path lives under
-# .claude/worktrees/<branch> and carries regex metachars (+, ., []), so
+# FIXED string, never a regex: a worktree path can carry regex metachars
+# (+, ., []), so
 # `pgrep -f`'s regex would mis- or over-match. Linux reads /proc argv
 # (NUL-delimited → exact); the fallback is ps + awk index() (fixed-string).
 node_pids() {

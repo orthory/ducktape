@@ -19,6 +19,11 @@
 - Default feature/fix/doc work happens in an isolated git worktree rather than
   directly in the primary checkout. Use the current checkout only when the user
   explicitly asks for in-place work or the task is limited to repo-state repair.
+- Put every task worktree under `<primary-checkout>/.worktree/<branch-slug>`.
+  Never create one as a sibling checkout, under `/tmp`, or in assistant-specific
+  `.claude/worktrees` or `.codex/worktrees` directories. Keep Cargo targets and
+  other large build outputs in the disk-backed worktree too: `/tmp` may be a
+  memory-backed filesystem, so building there consumes RAM and swap.
 - After the worktree change is implemented and verified, submit it as a PR
   against `dev`. Do not treat local completion as done when the requested flow
   is delivery.
