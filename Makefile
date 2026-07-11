@@ -11,10 +11,12 @@ BUN ?= bun
 APP_DEST ?= /Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 
-# The desktop shell runs on tauri-runtime-cef (unreleased tauri feat/cef
-# branch): EVERY cargo step needs the patched checkout wired in via
-# [patch.crates-io] first. `cef-env` provisions it (idempotent) — see
-# ops/cef-probe/setup.sh. CEF_PATH is where the CEF binary distribution
+# The desktop shell runs on the standalone tauri-runtime-cef crate
+# (github.com/byeongsu-hong/tauri-runtime-cef) against published crates.io
+# tauri: plain cargo builds work everywhere. `cef-env` (idempotent) only
+# provisions macOS bundling prerequisites — ninja + the pinned feat/cef CLI
+# checkout, see ops/cef-probe/setup.sh; on Linux it exits immediately.
+# CEF_PATH is where the CEF binary distribution
 # lives (cef-dll-sys downloads into it on first build; the tauri CLI hands
 # it to the macOS bundler for the framework/helper copy).
 CEF_CLONE ?= $(HOME)/.cache/ducktape-cef-probe/tauri-cef
@@ -29,9 +31,9 @@ UNAME_S := $(shell uname -s)
 
 all: node web
 
-## provision the patched feat/cef tauri checkout this workspace builds
-## against (clone + default-runtime flip + version bump + [patch] append).
-## idempotent; every cargo-touching target depends on it.
+## provision macOS bundling prerequisites (ninja + the pinned upstream
+## feat/cef tauri CLI checkout); no-op on Linux. idempotent; every
+## cargo-touching target depends on it.
 cef-env:
 	@bash ops/cef-probe/setup.sh "$(CEF_CLONE)"
 
@@ -94,9 +96,9 @@ web: app/node_modules
 ## .app — the released npm @tauri-apps/cli knows nothing about CEF and
 ## produces a bundle that panics in cef::library_loader at launch.
 ## --ignore-version-mismatches: the CLI compares the tauri crate version to
-## @tauri-apps/api, and our patched clone carries an artificial 2.90.0 bump
-## (it has to outrank the registry so [patch.crates-io] wins) — the mismatch
-## is a self-inflicted false positive, the real base is 2.11.x on both sides.
+## @tauri-apps/api, and the pinned feat/cef checkout's CLI carries an
+## unreleased dev version — the mismatch is a false positive, the real base
+## is 2.11.x on both sides.
 ifeq ($(UNAME_S),Darwin)
 app: cef-env app/node_modules
 	cd app && $(CARGO) run --manifest-path "$(CEF_CLONE)/crates/tauri-cli/Cargo.toml" --bin cargo-tauri -- build --ignore-version-mismatches

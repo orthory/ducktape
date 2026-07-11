@@ -24,14 +24,13 @@ const MIN_HEIGHT: f64 = 220.0;
 ///
 /// Under wry/WebKitGTK this installed the embedder-side `permission-request`
 /// grant, without which every Linux huddle failed `NotAllowedError`. The CEF
-/// runtime replaced that engine, and the seam stays so the grant has one home
-/// once tauri-runtime-cef exposes a media-permission handler.
+/// runtime replaced that engine; the grant now lives in the process-global
+/// permission policy set in main.rs — tauri-runtime-cef answers
+/// OnRequestMediaAccessPermission and allows app-local origins (console +
+/// this window) while gateway-labeled webviews are denied. The per-window
+/// seam stays a no-op so callers keep one home if a per-window grant is ever
+/// needed again.
 pub fn allow_user_media<R: Runtime>(window: &WebviewWindow<R>) -> tauri::Result<()> {
-    // CEF runs its own permission flow, so the WebKitGTK embedder hook this
-    // used to install is gone with wry. tauri-runtime-cef does not answer
-    // OnRequestMediaAccessPermission yet — until that lands upstream, live
-    // mic/camera relies on Chromium's default flow (QA passes
-    // --use-fake-device/-ui-for-media-stream switches through app argv).
     let _ = window;
     Ok(())
 }

@@ -155,7 +155,7 @@ where
 /// huddle webviews intentionally share only their narrow command sets; even if
 /// one is compromised it cannot create/delete a workspace or ask the user key
 /// to sign an account mutation.
-pub(crate) fn require_main_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+pub(crate) fn require_main_window(window: &crate::rt::WebviewWindow) -> Result<(), String> {
     if window.label() == "main" {
         Ok(())
     } else {

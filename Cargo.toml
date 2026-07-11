@@ -201,21 +201,8 @@ overlay-net = { path = "crates/system/overlay-net" }
 governor = "0.10.2"
 rand_core = "0.6.4"
 
-# --- CEF runtime ---
-# The desktop shell runs on tauri-runtime-cef (unreleased upstream: tauri's
-# feat/cef branch). Until a real tauri-cef release exists, the whole
-# workspace builds against our fork branch `ducktape-cef`
-# (github.com/byeongsu-hong/tauri) — upstream feat/cef plus two mechanical
-# commits: default_runtime flipped to Cef (so the shell's ~120 bare
-# AppHandle/WebviewWindow command types resolve without signature edits)
-# and a 2.90.0 version bump (a [patch] silently loses the version race to
-# a newer registry release otherwise). Machine-independent: no local
-# checkout, no setup step for plain builds; Cargo.lock pins the rev.
-[patch.crates-io]
-tauri = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
-tauri-build = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
-tauri-runtime = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
-tauri-utils = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
-tauri-macros = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
-tauri-codegen = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
-tauri-plugin = { git = "https://github.com/byeongsu-hong/tauri", branch = "ducktape-cef" }
+# The desktop shell runs on the standalone tauri-runtime-cef crate
+# (github.com/byeongsu-hong/tauri-runtime-cef) against PUBLISHED tauri
+# crates — no tauri fork, no [patch.crates-io]. The dep lives in
+# app/src-tauri/Cargo.toml; the shell aliases the runtime generics itself
+# (app/src-tauri/src/rt.rs) since registry tauri only defaults them to wry.
