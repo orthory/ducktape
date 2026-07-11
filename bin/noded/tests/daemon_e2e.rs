@@ -420,7 +420,6 @@ fn full_surface_blocks_authorship_and_ws() {
             "runs",
             "pages",
             "forge",
-            "evm",
             "files",
             "identity",
             "duckdns",

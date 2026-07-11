@@ -9,7 +9,7 @@
 use indexer::{ApplyCtx, Derived, Error, ModuleIndexer, OpMeta, OriginKind, Result, ViewReader};
 use serde::{Deserialize, Serialize};
 
-use crate::{EvmLog, EvmMsg, EvmResult, EvmTx, decode_msg};
+use super::{EvmLog, EvmMsg, EvmResult, EvmTx, decode_msg};
 
 const DEFAULT_LIMIT: usize = 50;
 
@@ -282,7 +282,7 @@ mod tests {
     use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
 
     use super::*;
-    use crate::{EvmStatus, encode_msg};
+    use crate::evm::{EvmStatus, encode_msg};
 
     fn receipt() -> EvmMsg {
         EvmMsg::Receipt {

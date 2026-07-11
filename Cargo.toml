@@ -69,7 +69,9 @@ members = [
     "crates/apps/files",
     "crates/apps/jobs",
     # examples — demo / test scaffolding modules
-    "crates/examples/directory", "crates/examples/greeter", "crates/examples/evm",
+    "crates/examples/directory", "crates/examples/greeter",
+    # labs — consensus modules deliberately absent from every genesis set
+    "crates/labs",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/fs",
@@ -91,6 +93,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 revm = { version = "41", default-features = false, features = ["std"] }
+alloy-primitives = { version = "1.6", default-features = false, features = ["std"] }
 async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
@@ -187,6 +190,7 @@ agent = { path = "crates/apps/agent" }
 runs = { path = "crates/apps/runs" }
 tasks = { path = "crates/apps/tasks" }
 vaults = { path = "crates/apps/vaults" }
+labs = { path = "crates/labs" }
 automations = { path = "crates/apps/automations" }
 inbox = { path = "crates/apps/inbox" }
 files = { path = "crates/apps/files" }
@@ -196,7 +200,6 @@ duckfs-client = { path = "crates/duckfs/client" }
 jobs = { path = "crates/apps/jobs" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
-evm = { path = "crates/examples/evm" }
 # internal — types-only interface crates (the legal cross-module surface)
 wireguard = { path = "crates/system/wireguard" }
 nat-traversal = { path = "crates/system/nat-traversal" }

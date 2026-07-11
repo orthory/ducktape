@@ -31,7 +31,6 @@ use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
 use duckdns::DuckDns;
-use evm::EvmModule;
 use gateway::Gateway;
 use tagging::TaggingModule;
 use files::Files;
@@ -57,7 +56,7 @@ use tracing_subscriber::prelude::*;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 17] = [
+const MODULE_IDS: [&str; 16] = [
     "chat",
     "saga",
     "dispatch",
@@ -70,7 +69,6 @@ const MODULE_IDS: [&str; 17] = [
     "runs",
     "pages",
     "forge",
-    "evm",
     "files",
     "identity",
     "duckdns",
@@ -268,9 +266,6 @@ fn run_node(
         let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
             .expect("forge init")
             .with_chat("chat");
-        let evm = EvmModule::init(context.child("evm"), "evm")
-            .await
-            .expect("evm init");
         // the block loop's own handle: each block's root payload is staged as
         // its explorer row is built, so op hashes stay dereferencable via the
         // blob lane (worker follow-ups included — the http submit handler only
@@ -297,7 +292,6 @@ fn run_node(
             Box::new(runs),
             Box::new(pages),
             Box::new(forge),
-            Box::new(evm),
             Box::new(files),
             Box::new(identity),
             Box::new(duckdns),

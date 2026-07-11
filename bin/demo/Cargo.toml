@@ -9,7 +9,6 @@ kv = { workspace = true }
 directory = { workspace = true }
 greeter = { workspace = true }
 forge = { workspace = true }
-evm = { workspace = true }
 chat = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
