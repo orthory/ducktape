@@ -502,16 +502,10 @@ export const submitStatement = async (
   statement: RouteStatement,
 ): Promise<BlockEvent> => transport.submit(TARGET, await signStatement(statement));
 
-export const openWindow = async (url: string, title: string): Promise<void> => {
-  if (!isTauri()) throw new Error("an isolated gateway window requires the desktop app");
-  await invoke<void>("gateway_open_window", { url, title });
-};
-
-// ── Inline gateway view (CEF shells only) ───────────────
+// ── Inline gateway view ─────────────────────────────────
 // On the CEF runtime every gateway session is its own renderer process and the
 // inline child webview's label matches no capability, so embedding in the
-// Browser pane is as isolated as the separate window. wry shells report
-// unsupported and keep the window path.
+// Browser pane is fully isolated from the app's command surface.
 
 export interface InlineRect {
   x: number;
@@ -520,17 +514,11 @@ export interface InlineRect {
   height: number;
 }
 
-let inlineSupport: Promise<boolean> | null = null;
-export const inlineSupported = (): Promise<boolean> => {
-  if (!isTauri()) return Promise.resolve(false);
-  inlineSupport ??= invoke<boolean>("gateway_inline_supported").catch(() => false);
-  return inlineSupport;
-};
-
 // `title` is the .duck route the user navigated to. The shell needs it because
 // the session origin is a random loopback token: it is the only honest name a
 // permission prompt can put in front of the user (see src-tauri/permissions.rs).
 export const openInline = async (url: string, title: string, rect: InlineRect): Promise<void> => {
+  if (!isTauri()) throw new Error("executable gateway routes require the desktop app");
   await invoke<void>("gateway_open_inline", { url, title, rect });
 };
 

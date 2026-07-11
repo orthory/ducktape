@@ -112,15 +112,6 @@ fn cache_clear() {
 
 // ── Wire types ──────────────────────────────────────────
 
-/// the shell's view of this machine's user identity: just the pubkey, hex.
-/// kept for [`user_identity_status`] (legacy, compat-only).
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserIdentity {
-    /// this machine's user pubkey, hex — shared across every workspace.
-    pub pubkey: String,
-}
-
 /// [`user_identity_state`]'s report: the gate-driving state machine value.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -226,45 +217,6 @@ fn parse_init_output(stdout: &str) -> Result<(String, String), String> {
 }
 
 // ── Commands ────────────────────────────────────────────
-
-/// report this machine's user pubkey, LEGACY shape (pubkey-only, no
-/// state/lock info) — kept for the Settings "User key" row's backward compat
-/// and any external caller still on this shape.
-///
-/// Re-pointed at `user-key status` (never `--out`/GENERATE): the GENERATE verb
-/// errors on a v2 (encrypted) key file, which used to make this command FATAL
-/// for every encrypted identity — silently breaking auto-bind and rendering a
-/// raw error string in Settings. `status` reads back `absent | plaintext <pub>
-/// | encrypted <pub>` regardless of format, via the same [`parse_key_status`]
-/// helper [`user_identity_state`] uses. `absent` has no pubkey to report, so
-/// it errors here — nothing in the app calls this on an absent key anymore
-/// (the identity gate guarantees a key exists before the console, and this
-/// command's callers have moved to [`user_identity_state`]).
-#[tauri::command]
-pub async fn user_identity_status(
-    app: crate::rt::AppHandle,
-    window: crate::rt::WebviewWindow,
-    control: tauri::State<'_, NodeControl>,
-) -> Result<UserIdentity, String> {
-    require_main_window(&window)?;
-    let control = control.inner().clone();
-    control
-        .run(move || user_identity_status_blocking(app))
-        .await
-}
-
-fn user_identity_status_blocking(app: crate::rt::AppHandle) -> Result<UserIdentity, String> {
-    let out = run_verb(&[
-        "user-key",
-        "status",
-        "--key",
-        &user_key_path(&app)?.to_string_lossy(),
-    ])?;
-    let (_state, pubkey) = parse_key_status(&last_line(&out))?;
-    pubkey
-        .map(|pubkey| UserIdentity { pubkey })
-        .ok_or_else(|| "no user identity".to_string())
-}
 
 /// the identity gate's state machine input: `user-key status` (never touches
 /// a password) folded with the session cache (does the shell hold a verified
@@ -538,6 +490,28 @@ fn signing_stdin(app: &crate::rt::AppHandle) -> Result<Vec<SecretString>, String
     }
 }
 
+/// the shared skeleton of every `user_sign_*` command: resolve the secret
+/// stdin ([`signing_stdin`] — the session-cached password, or the exact
+/// `identity-locked` refusal), run the verb with `--key` plus the given
+/// flag/value pairs, and return its last stdout line (the ready-to-submit
+/// JSON the node verb prints).
+fn run_sign_verb(
+    app: &crate::rt::AppHandle,
+    verb: &str,
+    flags: &[(&str, &str)],
+) -> Result<String, String> {
+    let stdin_lines = signing_stdin(app)?;
+    let stdin_refs: Vec<&str> = stdin_lines.iter().map(SecretString::as_ref).collect();
+    let key = user_key_path(app)?.to_string_lossy().into_owned();
+    let mut args: Vec<&str> = vec![verb, "--key", &key];
+    for (flag, value) in flags {
+        args.push(flag);
+        args.push(value);
+    }
+    let out = run_verb_with_stdin(&args, &stdin_refs)?;
+    Ok(last_line(&out))
+}
+
 /// sign a `bind_node` `IdentityMsg` binding `node_pub` to this user key at
 /// `nonce` — the one-line, ready-to-submit JSON `user-sign-bind` prints. an
 /// encrypted key with no cached password fails with `identity-locked`
@@ -554,33 +528,18 @@ pub async fn user_sign_bind(
     require_main_window(&window)?;
     let control = control.inner().clone();
     control
-        .run(move || user_sign_bind_blocking(app, chain_id, node_pub, nonce))
+        .run(move || {
+            run_sign_verb(
+                &app,
+                "user-sign-bind",
+                &[
+                    ("--chain-id", &chain_id),
+                    ("--node-pub", &node_pub),
+                    ("--nonce", &nonce.to_string()),
+                ],
+            )
+        })
         .await
-}
-
-fn user_sign_bind_blocking(
-    app: crate::rt::AppHandle,
-    chain_id: String,
-    node_pub: String,
-    nonce: u64,
-) -> Result<String, String> {
-    let stdin_lines = signing_stdin(&app)?;
-    let stdin_refs: Vec<&str> = stdin_lines.iter().map(SecretString::as_ref).collect();
-    let out = run_verb_with_stdin(
-        &[
-            "user-sign-bind",
-            "--key",
-            &user_key_path(&app)?.to_string_lossy(),
-            "--chain-id",
-            &chain_id,
-            "--node-pub",
-            &node_pub,
-            "--nonce",
-            &nonce.to_string(),
-        ],
-        &stdin_refs,
-    )?;
-    Ok(last_line(&out))
 }
 
 /// sign an `unbind_node` `IdentityMsg` for `node_pub` at `nonce` — the undo of
@@ -601,33 +560,18 @@ pub async fn user_sign_unbind(
     require_main_window(&window)?;
     let control = control.inner().clone();
     control
-        .run(move || user_sign_unbind_blocking(app, chain_id, node_pub, nonce))
+        .run(move || {
+            run_sign_verb(
+                &app,
+                "user-sign-unbind",
+                &[
+                    ("--chain-id", &chain_id),
+                    ("--node-pub", &node_pub),
+                    ("--nonce", &nonce.to_string()),
+                ],
+            )
+        })
         .await
-}
-
-fn user_sign_unbind_blocking(
-    app: crate::rt::AppHandle,
-    chain_id: String,
-    node_pub: String,
-    nonce: u64,
-) -> Result<String, String> {
-    let stdin_lines = signing_stdin(&app)?;
-    let stdin_refs: Vec<&str> = stdin_lines.iter().map(SecretString::as_ref).collect();
-    let out = run_verb_with_stdin(
-        &[
-            "user-sign-unbind",
-            "--key",
-            &user_key_path(&app)?.to_string_lossy(),
-            "--chain-id",
-            &chain_id,
-            "--node-pub",
-            &node_pub,
-            "--nonce",
-            &nonce.to_string(),
-        ],
-        &stdin_refs,
-    )?;
-    Ok(last_line(&out))
 }
 
 /// Sign one bounded global gateway route statement. The sidecar parses the
@@ -643,27 +587,10 @@ pub async fn user_sign_gateway_route(
     require_main_window(&window)?;
     let control = control.inner().clone();
     control
-        .run(move || user_sign_gateway_route_blocking(app, statement))
+        .run(move || {
+            run_sign_verb(&app, "user-sign-gateway-route", &[("--statement", &statement)])
+        })
         .await
-}
-
-fn user_sign_gateway_route_blocking(
-    app: crate::rt::AppHandle,
-    statement: String,
-) -> Result<String, String> {
-    let stdin_lines = signing_stdin(&app)?;
-    let stdin_refs: Vec<&str> = stdin_lines.iter().map(SecretString::as_ref).collect();
-    let out = run_verb_with_stdin(
-        &[
-            "user-sign-gateway-route",
-            "--key",
-            &user_key_path(&app)?.to_string_lossy(),
-            "--statement",
-            &statement,
-        ],
-        &stdin_refs,
-    )?;
-    Ok(last_line(&out))
 }
 
 /// sign this machine's ed25519 POSSESSION proof for joining `account_id` as a
@@ -684,33 +611,18 @@ pub async fn user_sign_possession(
     require_main_window(&window)?;
     let control = control.inner().clone();
     control
-        .run(move || user_sign_possession_blocking(app, chain_id, account_id, nonce))
+        .run(move || {
+            run_sign_verb(
+                &app,
+                "user-sign-possession",
+                &[
+                    ("--chain-id", &chain_id),
+                    ("--account-id", &account_id),
+                    ("--nonce", &nonce.to_string()),
+                ],
+            )
+        })
         .await
-}
-
-fn user_sign_possession_blocking(
-    app: crate::rt::AppHandle,
-    chain_id: String,
-    account_id: String,
-    nonce: u64,
-) -> Result<String, String> {
-    let stdin_lines = signing_stdin(&app)?;
-    let stdin_refs: Vec<&str> = stdin_lines.iter().map(SecretString::as_ref).collect();
-    let out = run_verb_with_stdin(
-        &[
-            "user-sign-possession",
-            "--key",
-            &user_key_path(&app)?.to_string_lossy(),
-            "--chain-id",
-            &chain_id,
-            "--account-id",
-            &account_id,
-            "--nonce",
-            &nonce.to_string(),
-        ],
-        &stdin_refs,
-    )?;
-    Ok(last_line(&out))
 }
 
 /// sign an add-member AUTHORIZER certificate and assemble the ready-to-submit
@@ -738,51 +650,21 @@ pub async fn user_sign_add_member(
     let control = control.inner().clone();
     control
         .run(move || {
-            user_sign_add_member_blocking(
-                app, chain_id, account_id, new_pub, new_kind, nonce, possession, label,
-            )
+            let nonce = nonce.to_string();
+            let mut flags: Vec<(&str, &str)> = vec![
+                ("--chain-id", &chain_id),
+                ("--account-id", &account_id),
+                ("--new-key", &new_pub),
+                ("--new-kind", &new_kind),
+                ("--nonce", &nonce),
+                ("--possession", &possession),
+            ];
+            if let Some(label) = &label {
+                flags.push(("--label", label));
+            }
+            run_sign_verb(&app, "user-sign-add-member", &flags)
         })
         .await
-}
-
-#[allow(clippy::too_many_arguments)]
-fn user_sign_add_member_blocking(
-    app: crate::rt::AppHandle,
-    chain_id: String,
-    account_id: String,
-    new_pub: String,
-    new_kind: String,
-    nonce: u64,
-    possession: String,
-    label: Option<String>,
-) -> Result<String, String> {
-    let stdin_lines = signing_stdin(&app)?;
-    let stdin_refs: Vec<&str> = stdin_lines.iter().map(SecretString::as_ref).collect();
-    let key = user_key_path(&app)?.to_string_lossy().into_owned();
-    let nonce = nonce.to_string();
-    let mut args: Vec<&str> = vec![
-        "user-sign-add-member",
-        "--key",
-        &key,
-        "--chain-id",
-        &chain_id,
-        "--account-id",
-        &account_id,
-        "--new-key",
-        &new_pub,
-        "--new-kind",
-        &new_kind,
-        "--nonce",
-        &nonce,
-        "--possession",
-        &possession,
-    ];
-    if let Some(label) = &label {
-        args.push("--label");
-        args.push(label);
-    }
-    let out = run_verb_with_stdin(&args, &stdin_refs)?;
-    Ok(last_line(&out))
 }
 
 /// sign a remove-member certificate and print the ready-to-submit
@@ -802,36 +684,19 @@ pub async fn user_sign_remove_member(
     require_main_window(&window)?;
     let control = control.inner().clone();
     control
-        .run(move || user_sign_remove_member_blocking(app, chain_id, account_id, target_key, nonce))
+        .run(move || {
+            run_sign_verb(
+                &app,
+                "user-sign-remove-member",
+                &[
+                    ("--chain-id", &chain_id),
+                    ("--account-id", &account_id),
+                    ("--target-key", &target_key),
+                    ("--nonce", &nonce.to_string()),
+                ],
+            )
+        })
         .await
-}
-
-fn user_sign_remove_member_blocking(
-    app: crate::rt::AppHandle,
-    chain_id: String,
-    account_id: String,
-    target_key: String,
-    nonce: u64,
-) -> Result<String, String> {
-    let stdin_lines = signing_stdin(&app)?;
-    let stdin_refs: Vec<&str> = stdin_lines.iter().map(SecretString::as_ref).collect();
-    let out = run_verb_with_stdin(
-        &[
-            "user-sign-remove-member",
-            "--key",
-            &user_key_path(&app)?.to_string_lossy(),
-            "--chain-id",
-            &chain_id,
-            "--account-id",
-            &account_id,
-            "--target-key",
-            &target_key,
-            "--nonce",
-            &nonce.to_string(),
-        ],
-        &stdin_refs,
-    )?;
-    Ok(last_line(&out))
 }
 
 #[cfg(test)]

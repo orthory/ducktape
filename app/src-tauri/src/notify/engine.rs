@@ -26,11 +26,6 @@ pub enum Frame {
         topic: String,
         cursor: String,
     },
-    /// Never built by the stream loop (heartbeats only re-arm its watchdog,
-    /// in-loop); kept so the engine's frame taxonomy matches the wire's and
-    /// tests can pin that a heartbeat disturbs no engine state.
-    #[allow(dead_code)]
-    Heartbeat,
 }
 
 /// Delivery seam for desktop notifications and unread badges.
@@ -106,7 +101,6 @@ impl<S: Sink> Engine<S> {
             Frame::Lagged { topic, cursor } => {
                 self.cursors.insert(topic, cursor);
             }
-            Frame::Heartbeat => {}
         }
     }
 
@@ -184,7 +178,7 @@ mod tests {
 
     use super::*;
     use crate::notify::{
-        matchers::{Category, NavigateTarget, Notification},
+        matchers::{Category, Notification},
         state::{self, NotifyState},
         NotifyConfig, NotifyPrefs,
     };
@@ -313,13 +307,6 @@ mod tests {
             category,
             title: String::new(),
             body: String::new(),
-            target: NavigateTarget {
-                screen: String::new(),
-                channel_id: None,
-                thread_root: None,
-                repo: None,
-                number: None,
-            },
             channel_id: None,
         }
     }
@@ -570,10 +557,6 @@ mod tests {
         assert!(engine.cursors().is_empty());
         assert_eq!(engine.unread, 4);
         assert_eq!(badges(&engine), vec![4]);
-
-        engine.handle(Frame::Heartbeat, &config(), &no_root);
-        assert!(presented(&engine).is_empty());
-        assert!(engine.cursors().is_empty());
 
         let cursor = "op/0000000000000063/0000".to_string();
         engine.handle(

@@ -132,9 +132,9 @@ describe("autoBindUserIdentity", () => {
       "bound",
     );
 
-    // No legacy user_identity_status call — the pubkey to sign with comes
-    // straight off identityState()'s own reply.
-    expect(invokeMock).not.toHaveBeenCalledWith("user_identity_status");
+    // The pubkey to sign with comes straight off identityState()'s own reply —
+    // exactly two invokes cross the bridge (state + sign), no status probe.
+    expect(invokeMock).toHaveBeenCalledTimes(2);
     expect(transport.query).toHaveBeenCalledWith("identity", {
       of_member: { member_key: [205, 52] }, // hexToBytes("cd34")
     });
