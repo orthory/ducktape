@@ -16,13 +16,14 @@ const actions = new Proxy({}, { get: () => vi.fn() }) as ConsoleActions;
 const renderBrowser = (
   patch: Partial<ConsoleState> = {},
   transport: NodeTransport = makeTransportStub(),
+  visible = true,
 ) => render(
   <ConsoleContext.Provider value={{
     state: { ...createInitialState(), connected: true, ...patch },
     actions,
     transport,
   }}>
-    <BrowserView />
+    <BrowserView visible={visible} />
   </ConsoleContext.Provider>,
 );
 
@@ -118,6 +119,32 @@ describe("BrowserView security boundary", () => {
 
     fireEvent.click(screen.getByRole("tab", { name: "site.demo.duck" }));
     expect(screen.getByRole("textbox", { name: "Duck address" })).toHaveValue("site.demo.duck");
+    expect(screen.getAllByRole("tab")).toHaveLength(2);
+  });
+
+  it("hides gateway children without disposing tabs when another screen is shown", async () => {
+    const hideAll = vi.spyOn(gateway, "hideAllInline").mockResolvedValue();
+    const closeInline = vi.spyOn(gateway, "closeInline").mockResolvedValue();
+    const view = renderBrowser({}, makeTransportStub(), true);
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Duck address" }), {
+      target: { value: "site.demo.duck" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "New tab" }));
+    expect(screen.getAllByRole("tab")).toHaveLength(2);
+
+    view.rerender(
+      <ConsoleContext.Provider value={{
+        state: { ...createInitialState(), connected: true },
+        actions,
+        transport: makeTransportStub(),
+      }}>
+        <BrowserView visible={false} />
+      </ConsoleContext.Provider>,
+    );
+
+    await waitFor(() => expect(hideAll).toHaveBeenCalled());
+    expect(closeInline).not.toHaveBeenCalled();
     expect(screen.getAllByRole("tab")).toHaveLength(2);
   });
 });
