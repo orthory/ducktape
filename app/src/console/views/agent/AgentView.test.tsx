@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
 import { createInitialState, type ConsoleState } from "../../store/state";
+import { color } from "../../theme/tokens";
 import type { Channel } from "../../../domain/chat-client";
 import type { Workspace } from "../../../domain/workspace-client";
 import type { NodeTransport, TopicHandlers } from "../../../domain/transport";
@@ -148,6 +149,16 @@ describe("AgentView", () => {
     expect(screen.getByRole("tab", { name: /agents/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /auto-reply/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /activity/i })).toBeInTheDocument();
+  });
+
+  it("keeps the Agents title on an ink token for light and dark headers", () => {
+    document.documentElement.dataset.theme = "dark";
+    renderAgents();
+
+    const heading = screen.getByRole("heading", { name: "Agents" });
+    expect(heading).toHaveStyle({ color: color.ink, letterSpacing: "0" });
+
+    document.documentElement.dataset.theme = "light";
   });
 
   it("adds an agent through the focused Add-agent pane", () => {

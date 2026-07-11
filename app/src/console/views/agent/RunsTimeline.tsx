@@ -15,7 +15,6 @@ import type { PendingRun, RunRecord } from "../../../domain/runs-client";
 import {
   isRunOutputTailItem,
   runOutputTopic,
-  type RunStream,
 } from "../../../domain/stream";
 import { FinalizationMark } from "../../components/FinalizationMark";
 import { opKey } from "../../store/finalization";
@@ -38,6 +37,11 @@ import {
   statusTone,
   StatusPill,
 } from "./parts";
+import {
+  parseActivityLog,
+  type ActivityLogEntry,
+  type ActivityLogRow,
+} from "./run-log-lines";
 
 // ── Consensus-counter rendering ──────────────────────────
 // `created_at`/`delivered_at` are whatever the lane stamps: the embedded
@@ -84,21 +88,16 @@ const shortOutputRef = (ref: string): string => {
   return ref.length > 16 ? `${ref.slice(0, 16)}…` : ref;
 };
 
-type OutputLine =
-  | { id: number; kind: "line"; stream: RunStream; text: string }
-  | { id: number; kind: "gap"; text: string };
-
 const MAX_OUTPUT_LINES = 1_000;
 
 function RunOutputPane({ run }: { run: PendingRun }) {
   const { transport } = useDucktape();
-  const [lines, setLines] = useState<OutputLine[]>([]);
+  const [entries, setEntries] = useState<ActivityLogEntry[]>([]);
   const pane = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    setLines([]);
+    setEntries([]);
     if (!transport) return;
-    let nextId = 0;
     let lastCursor = 0;
     const topic = runOutputTopic(run.dispatch_id);
     return transport.subscribe([topic], {
@@ -107,32 +106,35 @@ function RunOutputPane({ run }: { run: PendingRun }) {
         const cursor = Number(frame.cursor);
         if (!Number.isSafeInteger(cursor) || cursor <= lastCursor) return;
         lastCursor = cursor;
-        const line: OutputLine = {
-          id: nextId++,
+        const line: ActivityLogEntry = {
           kind: "line",
           stream: frame.item.stream,
           text: frame.item.line,
         };
-        setLines((prev) => [...prev, line].slice(-MAX_OUTPUT_LINES));
+        setEntries((prev) => [...prev, line].slice(-MAX_OUTPUT_LINES));
       },
       onLagged: (laggedTopic, cursor) => {
         if (laggedTopic !== topic) return;
         const nextCursor = Number(cursor);
         if (!Number.isSafeInteger(nextCursor) || nextCursor <= lastCursor) return;
         lastCursor = nextCursor;
-        const line: OutputLine = {
-          id: nextId++,
+        const line: ActivityLogEntry = {
           kind: "gap",
           text: `output gap: dropped older lines before cursor ${cursor}`,
         };
-        setLines((prev) => [...prev, line].slice(-MAX_OUTPUT_LINES));
+        setEntries((prev) => [...prev, line].slice(-MAX_OUTPUT_LINES));
       },
     });
   }, [transport, run.dispatch_id]);
 
+  const rows = parseActivityLog(entries);
+
   useEffect(() => {
     if (pane.current) pane.current.scrollTop = pane.current.scrollHeight;
-  }, [lines]);
+  }, [rows.length]);
+
+  const rowLabel = (row: ActivityLogRow): string =>
+    row.kind === "blank" ? "" : row.kind.toUpperCase();
 
   return (
     <div
@@ -147,35 +149,36 @@ function RunOutputPane({ run }: { run: PendingRun }) {
         overflow: "auto",
       }}
     >
-      {lines.length === 0 ? (
+      {rows.length === 0 ? (
         <div style={{ font: `400 11.5px ${font.sans}`, color: color.muted2 }}>
           waiting for output…
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-          {lines.map((line) =>
-            line.kind === "gap" ? (
+          {rows.map((row, index) =>
+            row.kind === "gap" ? (
               <div
-                key={line.id}
+                key={`${row.kind}-${index}`}
                 style={{
                   font: `600 10px ${font.mono}`,
                   color: color.amber,
                   padding: "2px 0",
                 }}
               >
-                {line.text}
+                {row.text}
               </div>
             ) : (
               <div
-                key={line.id}
+                key={`${row.kind}-${index}`}
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "44px 1fr",
+                  gridTemplateColumns: "48px 64px 1fr",
                   gap: 8,
                   font: `500 11px ${font.mono}`,
-                  color: line.stream === "stderr" ? color.red : color.inkSoft,
+                  color: row.stream === "stderr" ? color.red : color.inkSoft,
                   whiteSpace: "pre-wrap",
                   wordBreak: "break-word",
+                  minHeight: row.kind === "blank" ? 5 : undefined,
                 }}
               >
                 <span
@@ -186,9 +189,18 @@ function RunOutputPane({ run }: { run: PendingRun }) {
                     userSelect: "none",
                   }}
                 >
-                  {line.stream}
+                  {row.stream ?? ""}
                 </span>
-                <span>{line.text || " "}</span>
+                <span
+                  style={{
+                    color: row.kind === "status" ? color.muted2 : color.accentAlt1,
+                    font: `700 9px ${font.mono}`,
+                    userSelect: "none",
+                  }}
+                >
+                  {rowLabel(row)}
+                </span>
+                <span>{row.text || " "}</span>
               </div>
             ),
           )}
