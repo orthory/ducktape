@@ -56,50 +56,12 @@ describe("BrowserView security boundary", () => {
     expect(screen.getByText("NETWORK SNAPSHOT")).toBeInTheDocument();
   });
 
-  it("opens every account target in a capability-free gateway window", async () => {
-    const openWindow = vi.spyOn(gateway, "openWindow").mockResolvedValue();
-    vi.spyOn(duckBrowser, "loadDuckPage").mockResolvedValue({
-      address: {
-        kind: "account",
-        handle: "alice",
-        name: { label: "api" },
-        hostname: "api.alice.duck",
-        pathAndQuery: "/v1",
-        canonical: "api.alice.duck/v1",
-      },
-      hosting: "gateway",
-      target: "loopback_http",
-      accountId: "11".repeat(32),
-      publisherNode: "22".repeat(32),
-      signer: "33".repeat(32),
-      revision: 3,
-      title: "api.alice.duck",
-      srcUrl: "http://0123456789abcdef0123456789abcdef.localhost:49152/v1",
-      fileCount: 0,
-      totalBytes: 0,
-    });
-    renderBrowser();
-    const address = screen.getByRole("textbox", { name: "Duck address" });
-    fireEvent.change(address, { target: { value: "api.alice.duck/v1" } });
-    fireEvent.submit(address.closest("form")!);
-
-    await waitFor(() => expect(openWindow).toHaveBeenCalledWith(
-      "http://0123456789abcdef0123456789abcdef.localhost:49152/v1",
-      "api.alice.duck",
-    ));
-    expect(screen.queryByTestId("duck-browser-frame")).toBeNull();
-    expect(screen.getByText("SIGNED GATEWAY ROUTE")).toBeInTheDocument();
-    expect(screen.getByText("Opened in an isolated gateway window")).toBeInTheDocument();
-  });
-
-  it("embeds the gateway session inline on shells that support it", async () => {
+  it("embeds every account target in the capability-free inline gateway view", async () => {
     // jsdom has no ResizeObserver; the inline effect needs one.
     vi.stubGlobal("ResizeObserver", class {
       observe() {}
       disconnect() {}
     });
-    vi.spyOn(gateway, "inlineSupported").mockResolvedValue(true);
-    const openWindow = vi.spyOn(gateway, "openWindow").mockResolvedValue();
     const openInline = vi.spyOn(gateway, "openInline").mockResolvedValue();
     const closeInline = vi.spyOn(gateway, "closeInline").mockResolvedValue();
     vi.spyOn(duckBrowser, "loadDuckPage").mockResolvedValue({
@@ -135,8 +97,8 @@ describe("BrowserView security boundary", () => {
       "api.alice.duck",
       expect.objectContaining({ width: expect.any(Number), height: expect.any(Number) }),
     ));
-    expect(openWindow).not.toHaveBeenCalled();
-    expect(screen.queryByText("Opened in an isolated gateway window")).toBeNull();
+    expect(screen.queryByTestId("duck-browser-frame")).toBeNull();
+    expect(screen.getByText("SIGNED GATEWAY ROUTE")).toBeInTheDocument();
 
     view.unmount();
     expect(closeInline).toHaveBeenCalled();

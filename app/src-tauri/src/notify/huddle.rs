@@ -4,10 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     decode::{self, OpRow, OriginKind},
-    matchers::{
-        chat_notification, display_name, is_me, Category, MatcherCtx, Notification,
-        RunThreadTracker,
-    },
+    matchers::{chat_notification, display_name, is_me, Category, MatcherCtx, Notification},
 };
 
 #[derive(Debug, Default)]
@@ -16,8 +13,6 @@ pub struct HuddleTracker(BTreeMap<String, BTreeSet<String>>);
 #[derive(Debug, Default)]
 pub struct MatchState {
     pub huddles: HuddleTracker,
-    /// dispatch_id -> chat thread, for the run-finished deep-link.
-    pub run_threads: RunThreadTracker,
 }
 
 pub(super) fn match_huddle_join(
@@ -45,7 +40,6 @@ pub(super) fn match_huddle_join(
         format!("Huddle started in #{channel}"),
         format!("{} started a huddle", display_name(ctx, joiner)),
         channel,
-        None,
     ))
 }
 

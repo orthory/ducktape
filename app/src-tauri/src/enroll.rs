@@ -325,7 +325,7 @@ pub fn enroll_start(
     thread::spawn(move || serve(server));
 
     // token rides the fragment: it stays client-side on the page GET and is
-    // sent back only on the explicit /context, /payload, /possession calls.
+    // sent back only on the explicit /payload and /possession calls.
     Ok(EnrollStart {
         url: format!("http://{ip}:{port}/enroll#{token}"),
     })
