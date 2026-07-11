@@ -2,7 +2,7 @@ use defguard_wireguard_rs::{
     InterfaceConfiguration, Userspace, WGApi, WireguardInterfaceApi, error::WireguardInterfaceError,
 };
 
-use crate::WireGuardEffect;
+use crate::effect::WireGuardEffect;
 
 /// Real `WireGuardEffect` backed by `defguard_wireguard_rs`'s userspace
 /// (BoringTun) implementation. BoringTun runs in-process
@@ -14,7 +14,7 @@ use crate::WireGuardEffect;
 /// `CAP_NET_ADMIN`, plus `/dev/net/tun`), and `remove_interface` shells out
 /// to `resolvconf` for DNS cleanup — missing binary = `IoError(NotFound)`
 /// at teardown. Verify manually with the `real_userspace_lifecycle_smoke`
-/// `#[ignore]`d test below: `cargo test -p wireguard-effect -- --ignored
+/// `#[ignore]`d test below: `cargo test -p wireguard -- --ignored
 /// real_userspace_lifecycle_smoke` on such a host (a privileged Linux
 /// container works), then confirm with `ip addr show <ifname>` and
 /// `wg show <ifname>`.
@@ -120,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires root + a running WireGuard userspace (BoringTun) runtime; run manually, cross-machine: cargo test -p wireguard-effect -- --ignored real_userspace_lifecycle_smoke"]
+    #[ignore = "requires root + a running WireGuard userspace (BoringTun) runtime; run manually, cross-machine: cargo test -p wireguard -- --ignored real_userspace_lifecycle_smoke"]
     fn real_userspace_lifecycle_smoke() {
         use defguard_wireguard_rs::{key::Key, net::IpAddrMask, peer::Peer};
         use std::net::{IpAddr, Ipv4Addr};

@@ -1225,9 +1225,9 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(wg) = &invite.wireguard {
             let issuer_identity =
-                wireguard_upgrade::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
+                wireguard::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
                     .map_err(|e| format!("inviter identity: {e:?}"))?;
-            let inviter_ula = wireguard_upgrade::ula_v6_member_addr(
+            let inviter_ula = wireguard::ula_v6_member_addr(
                 &descriptor.genesis_namespace(),
                 issuer_identity,
             );
@@ -1245,12 +1245,12 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             };
             let Ok(identity) =
-                wireguard_upgrade::ValidatorIdentity::try_from(&front.member_key[..])
+                wireguard::ValidatorIdentity::try_from(&front.member_key[..])
             else {
                 continue;
             };
             let ula =
-                wireguard_upgrade::ula_v6_member_addr(&descriptor.genesis_namespace(), identity);
+                wireguard::ula_v6_member_addr(&descriptor.genesis_namespace(), identity);
             descriptor.add_reach_route(&config::ReachHint {
                 expected_key: member,
                 reach: config::Reach::Direct(format!("[{ula}]:{}", front.mesh_port)),

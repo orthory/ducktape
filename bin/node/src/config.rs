@@ -377,7 +377,7 @@ impl NetworkDescriptor {
     }
 
     /// whether a hint's address lives inside this chain's overlay ULA /48 —
-    /// the tunnel-plane addresses [`wireguard_upgrade::ula_v6_member_addr`]
+    /// the tunnel-plane addresses [`wireguard::ula_v6_member_addr`]
     /// derives. such a route needs applied tunnels to be dialable, so it is
     /// classified as an overlay route, never an underlay replacement.
     fn overlay_route(&self, hint: &ReachHint) -> Result<bool, String> {
@@ -391,7 +391,7 @@ impl NetworkDescriptor {
         let std::net::IpAddr::V6(v6) = sock.ip() else {
             return Ok(false);
         };
-        let prefix = wireguard_upgrade::ula_v6_prefix(&self.genesis_namespace()).octets();
+        let prefix = wireguard::ula_v6_prefix(&self.genesis_namespace()).octets();
         Ok(v6.octets()[..6] == prefix[..6])
     }
 
@@ -1126,7 +1126,7 @@ pub struct Front {
 /// coordinator). Every registered member is at least punchable, so all
 /// non-self adverts are offered as fronts.
 pub fn fronts_from_adverts(
-    adverts: &[wireguard_upgrade::EndpointAdvertisement],
+    adverts: &[wireguard::EndpointAdvertisement],
     own: &[u8; 32],
 ) -> Vec<Front> {
     adverts
@@ -2246,9 +2246,9 @@ fn resolve_advertised(
                     listen.port()
                 ));
             }
-            let identity = wireguard_upgrade::ValidatorIdentity::try_from(me.as_ref())
+            let identity = wireguard::ValidatorIdentity::try_from(me.as_ref())
                 .map_err(|e| format!("advertised: {e:?}"))?;
-            let ula = wireguard_upgrade::ula_v6_member_addr(namespace, identity);
+            let ula = wireguard::ula_v6_member_addr(namespace, identity);
             Ok(Ingress::Socket(SocketAddr::new(
                 std::net::IpAddr::V6(ula),
                 listen.port(),
@@ -2849,9 +2849,9 @@ mod tests {
         seed: u64,
         octet: u8,
         wireguard_endpoint: Option<u16>,
-    ) -> wireguard_upgrade::EndpointAdvertisement {
+    ) -> wireguard::EndpointAdvertisement {
         use std::net::{IpAddr, Ipv4Addr};
-        use wireguard_upgrade::{
+        use wireguard::{
             AdmissionRoot, Endpoint, EndpointRecord, MeshVersion, PortPolicy, Root, Transport,
             ValidatorIdentity, X25519PublicKey,
         };
@@ -2870,11 +2870,10 @@ mod tests {
             wireguard_public_key: X25519PublicKey([octet; 32]),
             control_endpoint: endpoint(443, Transport::Tcp),
             wireguard_endpoint: wireguard_endpoint.map(|port| endpoint(port, Transport::Udp)),
-            capabilities: vec![],
             expires_at_view: 50,
             nonce: 1,
         };
-        wireguard_upgrade::EndpointAdvertisement::sign(record, MeshVersion([7; 32]), &signer)
+        wireguard::EndpointAdvertisement::sign(record, MeshVersion([7; 32]), &signer)
     }
 
     #[test]
@@ -4176,11 +4175,11 @@ bootstrapper_addr = "127.0.0.1:52200"
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
-        let identity = wireguard_upgrade::ValidatorIdentity::try_from(
+        let identity = wireguard::ValidatorIdentity::try_from(
             ed25519::PrivateKey::from_seed(1).public_key().as_ref(),
         )
         .unwrap();
-        let ula = wireguard_upgrade::ula_v6_member_addr("demo", identity);
+        let ula = wireguard::ula_v6_member_addr("demo", identity);
         assert_eq!(
             r.advertised,
             Ingress::Socket(SocketAddr::new(std::net::IpAddr::V6(ula), 52241)),
@@ -4402,9 +4401,9 @@ bootstrapper_addr = "127.0.0.1:52200"
         };
         d.add_bootstrap(&me, "203.0.113.7:52200");
         // the EXACT derivation cmd_join uses for the inviter's tunnel route.
-        let identity = wireguard_upgrade::ValidatorIdentity::try_from(me.as_ref())
+        let identity = wireguard::ValidatorIdentity::try_from(me.as_ref())
             .expect("test key is a valid identity");
-        let ula = wireguard_upgrade::ula_v6_member_addr(&d.genesis_namespace(), identity);
+        let ula = wireguard::ula_v6_member_addr(&d.genesis_namespace(), identity);
         d.add_reach_route(&ReachHint {
             expected_key: me.clone(),
             reach: Reach::Direct(format!("[{ula}]:52200")),

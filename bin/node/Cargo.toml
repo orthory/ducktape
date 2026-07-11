@@ -61,15 +61,14 @@ agent = { workspace = true }
 runs = { workspace = true }
 # the staged node-driven WireGuard plane: the reachability orchestrator runs
 # on its own plain-tokio thread (mirroring the app-surface split) behind the
-# `wireguard_listen` node.toml key; wireguard-upgrade/-effect supply the
+# `wireguard_listen` node.toml key; the wireguard crate supplies the
 # endpoint types and the phase-A fake effect it drives.
 reachability = { workspace = true }
 # the coordinator-auth credential types: `coord.cap` is the private-mode
 # admission token a node persists beside its descriptor (minted by a genesis
 # validator via `mint_coord_cap`, presented on each rendezvous request).
 nat-traversal = { workspace = true }
-wireguard-upgrade = { workspace = true }
-wireguard-effect = { workspace = true }
+wireguard = { workspace = true }
 # the voice hub's transport seam: huddle media rides data-plane datagrams over
 # the per-service overlay sockets (src/voice_plane.rs binds them); the mesh arm
 # it replaced is retired — see docs/adr/2026-07-07-per-use-data-plane.mdx.
@@ -140,6 +139,6 @@ commonware-parallel = { workspace = true }
 duckfs-client = { workspace = true }
 # coordinated_invite_cli seeds a signed mesh-state.json so `invite` bundles
 # member fronts, building the persisted adverts with the same crates the node
-# already depends on (reachability::store + wireguard-upgrade advert types +
+# already depends on (reachability::store + wireguard advert types +
 # commonware's Sha256) — all normal [dependencies] above, so the integration
 # tests see them without a redundant [dev-dependencies] re-listing.

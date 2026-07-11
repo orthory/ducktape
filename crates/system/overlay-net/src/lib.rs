@@ -52,9 +52,9 @@ pub struct OverlayRouter {
 
 impl OverlayRouter {
     /// build the router from the chain's ULA `/48` prefix ADDRESS — the value
-    /// of `wireguard_upgrade::ula_v6_prefix(chain_id)`. taking the address
+    /// of `wireguard::ula_v6_prefix(chain_id)`. taking the address
     /// rather than the chain id keeps this crate free of the
-    /// wireguard-upgrade dependency (mirroring data-plane's dependency-free
+    /// wireguard-protocol dependency (mirroring data-plane's dependency-free
     /// posture: the derivation stays the node layer's business).
     pub fn for_prefix48(prefix: Ipv6Addr) -> Self {
         let octets = prefix.octets();

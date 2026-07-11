@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
-use wireguard_upgrade::*;
+use wireguard::*;
 
 fn id(sk: &PrivateKey) -> ValidatorIdentity {
     let pk = sk.public_key();
@@ -49,7 +49,6 @@ fn record_for(
         wireguard_public_key: wg,
         control_endpoint: endpoint([1, 1, 1, wg_addr[3]], 443, Transport::Tcp, &policy),
         wireguard_endpoint: Some(endpoint(wg_addr, 51820, Transport::Udp, &policy)),
-        capabilities: vec![MeshCapability::Bootnode, MeshCapability::Relay],
         expires_at_view: 50,
         nonce,
     }
@@ -87,33 +86,6 @@ fn mesh() -> (
     let (ad_a, ad_b) = signed_ads(&a, &b, &set, [8, 8, 8, 10], [8, 8, 8, 20]);
     let view = MeshView::verify(set.clone(), vec![ad_b, ad_a], &policy, 10).unwrap();
     (a, b, set, view, policy)
-}
-
-fn direct_dial_failure(
-    observer: &PrivateKey,
-    set: &ActiveValidatorSet,
-    view: &MeshView,
-    target_identity: ValidatorIdentity,
-    target_endpoint: Endpoint,
-    nonce: u64,
-) -> DirectDialFailureEvidence {
-    DirectDialFailureEvidence::sign(
-        DirectDialFailureFields {
-            namespace: set.namespace.clone(),
-            epoch: set.epoch,
-            valset_root: set.valset_root,
-            admission_root: set.admission_root,
-            mesh_version: view.mesh_version,
-            observer_identity: id(observer),
-            target_identity,
-            target_wireguard_endpoint: target_endpoint,
-            failed_at_view: 11,
-            expires_at_view: 40,
-            error_hash: [7; 32],
-            nonce,
-        },
-        observer,
-    )
 }
 
 #[test]
@@ -175,7 +147,7 @@ fn mesh_view_uses_only_admitted_validators_and_has_deterministic_version() {
 #[test]
 fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
     let (a, b, set, view, policy) = mesh();
-    let overlay = OverlayPolicy::default_v4();
+    let overlay = OverlayPolicy::ula_v6("demo");
     let mut cache = ReplayCache::default();
     let request = TunnelUpgradeRequest::sign(
         TunnelUpgradeRequestFields {
@@ -208,15 +180,6 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
             responder_wireguard_public_key: xkey(2),
             responder_wireguard_endpoint: view.record(id(&b)).unwrap().wireguard_endpoint,
             accepted_allowed_ips: overlay.allowed_ips_for(&view, id(&a)).unwrap(),
-            relay_candidates: view.relay_candidates(),
-            direct_dial_failure: Some(direct_dial_failure(
-                &a,
-                &set,
-                &view,
-                id(&b),
-                view.record(id(&b)).unwrap().wireguard_endpoint.unwrap(),
-                4,
-            )),
             keepalive_seconds: Some(25),
             expires_at_view: 40,
             nonce: 2,
@@ -241,8 +204,16 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
         &a,
     );
 
-    let plan = validate_upgrade(
-        &view, &policy, &overlay, 12, &request, &response, &ack, &mut cache,
+    let plan = validate_upgrade_as(
+        Perspective::Initiator,
+        &view,
+        &policy,
+        &overlay,
+        12,
+        &request,
+        &response,
+        &ack,
+        &mut cache,
     )
     .unwrap();
     assert_eq!(plan.context().admission_root, set.admission_root);
@@ -255,34 +226,6 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
         overlay.allowed_ips_for(&view, id(&b)).unwrap().as_slice()
     );
 
-    let response_without_failure = TunnelUpgradeResponse::sign(
-        TunnelUpgradeResponseFields {
-            direct_dial_failure: None,
-            ..response.fields.clone()
-        },
-        &b,
-    );
-    let ack_without_failure = TunnelUpgradeAck::sign(
-        TunnelUpgradeAckFields {
-            response_hash: response_without_failure.hash(),
-            ..ack.fields.clone()
-        },
-        &a,
-    );
-    let mut fresh_cache = ReplayCache::default();
-    let err = validate_upgrade(
-        &view,
-        &policy,
-        &overlay,
-        12,
-        &request,
-        &response_without_failure,
-        &ack_without_failure,
-        &mut fresh_cache,
-    )
-    .unwrap_err();
-    assert_eq!(err, UpgradeError::InvalidRelay);
-
     let duplicate_nonce_ack = TunnelUpgradeAck::sign(
         TunnelUpgradeAckFields {
             nonce: request.fields.nonce,
@@ -291,7 +234,8 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
         &a,
     );
     let mut fresh_cache = ReplayCache::default();
-    let err = validate_upgrade(
+    let err = validate_upgrade_as(
+        Perspective::Initiator,
         &view,
         &policy,
         &overlay,
@@ -305,8 +249,16 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
     assert_eq!(err, UpgradeError::Replay);
 
     assert!(
-        validate_upgrade(
-            &view, &policy, &overlay, 12, &request, &response, &ack, &mut cache
+        validate_upgrade_as(
+            Perspective::Initiator,
+            &view,
+            &policy,
+            &overlay,
+            12,
+            &request,
+            &response,
+            &ack,
+            &mut cache
         )
         .is_err()
     );
@@ -316,7 +268,8 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
         Some(endpoint([8, 8, 8, 99], 51820, Transport::Udp, &policy));
     let mut fresh_cache = ReplayCache::default();
     assert!(
-        validate_upgrade(
+        validate_upgrade_as(
+            Perspective::Initiator,
             &view,
             &policy,
             &overlay,
@@ -334,7 +287,8 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
         vec![AllowedIp::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap()];
     let mut fresh_cache = ReplayCache::default();
     assert!(
-        validate_upgrade(
+        validate_upgrade_as(
+            Perspective::Initiator,
             &view,
             &policy,
             &overlay,
@@ -353,7 +307,8 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
     let stale_ack = TunnelUpgradeAck::sign(stale_ack.fields, &a);
     let mut fresh_cache = ReplayCache::default();
     assert!(
-        validate_upgrade(
+        validate_upgrade_as(
+            Perspective::Initiator,
             &view,
             &policy,
             &overlay,
@@ -367,103 +322,12 @@ fn upgrade_validation_binds_ads_routes_ack_freshness_and_replay() {
     );
 }
 
-#[test]
-fn valid_plan_builds_defguard_peer_config() {
-    let (a, b, set, view, policy) = mesh();
-    let overlay = OverlayPolicy::default_v4();
-    let mut cache = ReplayCache::default();
-    let request = TunnelUpgradeRequest::sign(
-        TunnelUpgradeRequestFields {
-            namespace: set.namespace.clone(),
-            epoch: set.epoch,
-            valset_root: set.valset_root,
-            admission_root: set.admission_root,
-            mesh_version: view.mesh_version,
-            initiator_identity: id(&a),
-            responder_identity: id(&b),
-            initiator_wireguard_public_key: xkey(1),
-            initiator_wireguard_endpoint: view.record(id(&a)).unwrap().wireguard_endpoint,
-            requested_allowed_ips: overlay.allowed_ips_for(&view, id(&b)).unwrap(),
-            port_policy_hash: policy.hash(),
-            expires_at_view: 40,
-            nonce: 1,
-        },
-        &a,
-    );
-    let response = TunnelUpgradeResponse::sign(
-        TunnelUpgradeResponseFields {
-            request_hash: request.hash(),
-            namespace: set.namespace.clone(),
-            epoch: set.epoch,
-            valset_root: set.valset_root,
-            admission_root: set.admission_root,
-            mesh_version: view.mesh_version,
-            responder_identity: id(&b),
-            initiator_identity: id(&a),
-            responder_wireguard_public_key: xkey(2),
-            responder_wireguard_endpoint: view.record(id(&b)).unwrap().wireguard_endpoint,
-            accepted_allowed_ips: overlay.allowed_ips_for(&view, id(&a)).unwrap(),
-            relay_candidates: view.relay_candidates(),
-            direct_dial_failure: Some(direct_dial_failure(
-                &a,
-                &set,
-                &view,
-                id(&b),
-                view.record(id(&b)).unwrap().wireguard_endpoint.unwrap(),
-                4,
-            )),
-            keepalive_seconds: Some(25),
-            expires_at_view: 40,
-            nonce: 2,
-        },
-        &b,
-    );
-    let ack = TunnelUpgradeAck::sign(
-        TunnelUpgradeAckFields {
-            request_hash: request.hash(),
-            response_hash: response.hash(),
-            namespace: set.namespace.clone(),
-            epoch: set.epoch,
-            valset_root: set.valset_root,
-            admission_root: set.admission_root,
-            mesh_version: view.mesh_version,
-            initiator_identity: id(&a),
-            responder_identity: id(&b),
-            installed_at_view: 11,
-            expires_at_view: 40,
-            nonce: 3,
-        },
-        &a,
-    );
-    let plan = validate_upgrade(
-        &view, &policy, &overlay, 12, &request, &response, &ack, &mut cache,
-    )
-    .unwrap();
-
-    let peer = DefguardPeerConfig::from_plan(&plan);
-    assert_eq!(
-        peer.peer.endpoint,
-        plan.peer_endpoint().map(|e| e.socket_addr())
-    );
-    assert_eq!(peer.allowed_ips, plan.allowed_ips());
-
-    let interface = DefguardInterfaceConfig::from_plan(
-        "wg-ducktape0",
-        "AAECAwQFBgcICQoLDA0OD/Dh0sO0pZaHeGlaSzwtHg8=",
-        endpoint([1, 1, 1, 200], 51820, Transport::Udp, &policy),
-        vec![plan.clone()],
-    );
-    assert_eq!(interface.config.name, "wg-ducktape0");
-    assert_eq!(interface.config.port, 51820);
-    assert_eq!(interface.config.peers.len(), 1);
-}
-
 // ── the ULA-v6 overlay + advertised wireguard keys ──────────────────────────
 
 /// the identity-hash ULA overlay: a chain-scoped fd::/48 whose member /128s
 /// derive from (chain_id, identity) alone — deterministic, allocator-free,
-/// and stable across membership churn (a v4 stable_index moves when the
-/// sorted set changes; an identity hash never does).
+/// and stable across membership churn (an identity hash never moves when the
+/// sorted set changes).
 #[test]
 fn ula_overlay_is_deterministic_chain_scoped_and_identity_pinned() {
     let prefix = ula_v6_prefix("demo");
@@ -495,7 +359,8 @@ fn ula_overlay_is_deterministic_chain_scoped_and_identity_pinned() {
     );
 
     // no overlay address exists for an identity outside the view, however
-    // well-formed — the membership gate holds in ULA mode exactly as in v4.
+    // well-formed — the membership gate holds even though the ULA derivation
+    // would happily hash any identity.
     let outsider = PrivateKey::from_seed(9);
     assert_eq!(
         overlay.allowed_ips_for(&view, id(&outsider)).unwrap_err(),
@@ -603,8 +468,6 @@ fn ack_view_tolerates_cross_node_skew_within_the_lag() {
             responder_wireguard_public_key: xkey(2),
             responder_wireguard_endpoint: view.record(id(&b)).unwrap().wireguard_endpoint,
             accepted_allowed_ips: overlay.allowed_ips_for(&view, id(&a)).unwrap(),
-            relay_candidates: vec![],
-            direct_dial_failure: None,
             keepalive_seconds: Some(25),
             expires_at_view: 40,
             nonce: 2,
@@ -632,16 +495,32 @@ fn ack_view_tolerates_cross_node_skew_within_the_lag() {
     // the responder's clock is ONE view behind the initiator's mint — the
     // routine cross-node case that must validate.
     let mut cache = ReplayCache::default();
-    validate_upgrade(
-        &view, &policy, &overlay, 10, &request, &response, &ack, &mut cache,
+    validate_upgrade_as(
+        Perspective::Initiator,
+        &view,
+        &policy,
+        &overlay,
+        10,
+        &request,
+        &response,
+        &ack,
+        &mut cache,
     )
     .expect("one view of forward skew validates");
 
     // nine views behind (past MAX_ACK_INSTALL_LAG = 8): still refused.
     let mut cache = ReplayCache::default();
     assert_eq!(
-        validate_upgrade(
-            &view, &policy, &overlay, 2, &request, &response, &ack, &mut cache,
+        validate_upgrade_as(
+            Perspective::Initiator,
+            &view,
+            &policy,
+            &overlay,
+            2,
+            &request,
+            &response,
+            &ack,
+            &mut cache,
         )
         .unwrap_err(),
         UpgradeError::BadAckView
@@ -756,7 +635,7 @@ fn duplicate_requested_allowed_ips_is_rejected_even_though_the_signature_verifie
     // carries the canonical singleton (OverlayPolicy::allowed_ips_for returns one
     // route), so this guard can never reject an honest upgrade.
     let (a, b, set, view, policy) = mesh();
-    let overlay = OverlayPolicy::default_v4();
+    let overlay = OverlayPolicy::ula_v6("demo");
 
     let canonical = overlay.allowed_ips_for(&view, id(&b)).unwrap();
     assert_eq!(
@@ -796,15 +675,6 @@ fn duplicate_requested_allowed_ips_is_rejected_even_though_the_signature_verifie
             responder_wireguard_public_key: xkey(2),
             responder_wireguard_endpoint: view.record(id(&b)).unwrap().wireguard_endpoint,
             accepted_allowed_ips: overlay.allowed_ips_for(&view, id(&a)).unwrap(),
-            relay_candidates: view.relay_candidates(),
-            direct_dial_failure: Some(direct_dial_failure(
-                &a,
-                &set,
-                &view,
-                id(&b),
-                view.record(id(&b)).unwrap().wireguard_endpoint.unwrap(),
-                4,
-            )),
             keepalive_seconds: Some(25),
             expires_at_view: 40,
             nonce: 2,
@@ -830,7 +700,8 @@ fn duplicate_requested_allowed_ips_is_rejected_even_though_the_signature_verifie
     );
 
     // Sanity: the canonical (singleton) request validates.
-    validate_upgrade(
+    validate_upgrade_as(
+        Perspective::Initiator,
         &view,
         &policy,
         &overlay,
@@ -860,7 +731,8 @@ fn duplicate_requested_allowed_ips_is_rejected_even_though_the_signature_verifie
         "the dedup'd signing preimage makes a duplicate hash-invariant"
     );
 
-    let err = validate_upgrade(
+    let err = validate_upgrade_as(
+        Perspective::Initiator,
         &view,
         &policy,
         &overlay,

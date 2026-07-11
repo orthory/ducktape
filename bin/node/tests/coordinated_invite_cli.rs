@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519::PrivateKey};
 use reachability::PersistedMesh;
-use wireguard_upgrade::{
+use wireguard::{
     AdmissionRoot, Endpoint, EndpointAdvertisement, EndpointRecord, MeshVersion, PortPolicy, Root,
     Transport, ValidatorIdentity, X25519PublicKey,
 };
@@ -81,7 +81,6 @@ fn direct_member_advert(namespace: &str, seed: u64, octet: u8) -> EndpointAdvert
         wireguard_public_key: X25519PublicKey([octet; 32]),
         control_endpoint: ep(443, Transport::Tcp),
         wireguard_endpoint: Some(ep(51820, Transport::Udp)),
-        capabilities: vec![],
         expires_at_view: 1000,
         nonce: 1,
     };

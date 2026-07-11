@@ -238,6 +238,81 @@ impl StackSlot {
     }
 }
 
+// ── slot consumers' rebind machinery ────────────────────
+
+/// how often a slot consumer re-checks: for the stack to (re)appear while
+/// the tunnel is down, and for a live stack having been REPLACED under a
+/// pending operation. socket-mode retargeting deliberately removes and
+/// recreates the interface, and bound sockets outlive one reachability
+/// epoch — so they must notice the new stack and rebind.
+pub(super) const REBIND_POLL: Duration = Duration::from_secs(1);
+
+/// the one-address invariant: the virtual host answers only at the node's
+/// own overlay `/128`.
+pub(super) fn require_local(stack: &VirtualStack, ip: IpAddr) -> io::Result<()> {
+    if ip == IpAddr::V6(stack.local_ip()) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("{ip} is not this node's overlay /128"),
+        ))
+    }
+}
+
+/// the shared lazy-leg accept loop under a [`StackSlot`] — both the mesh
+/// seam's lazy listener and the data-plane factory's rebinding listener are
+/// this loop. (re)binds whenever `leg` is empty or the slot serves a
+/// DIFFERENT stack `Arc` (a rebuilt backend aborts the old stack's poll
+/// task, so a future parked on its wakers would pend forever), and pends on
+/// the poll cadence while the tunnel is down. each accept wait is bounded so
+/// a stack replaced UNDER it is re-detected on the next pass; the accept
+/// itself is poll-based over pre-armed slots, so a timed-out attempt
+/// abandons no connection state. `required_ip` is the factory's one-address
+/// invariant and the ONLY error source — a stack serving a different `/128`
+/// fails the accept instead of silently rebinding elsewhere; `None` (the
+/// mesh leg) listens at whatever the host's ULA is.
+pub(super) async fn accept_via_slot(
+    slot: &StackSlot,
+    required_ip: Option<IpAddr>,
+    port: u16,
+    leg: &mut Option<(Arc<VirtualStack>, VirtualTcpListener)>,
+) -> io::Result<(VirtualTcpStream, SocketAddr)> {
+    loop {
+        let Some(stack) = slot.get() else {
+            *leg = None;
+            tokio::time::sleep(REBIND_POLL).await;
+            continue;
+        };
+        if let Some(ip) = required_ip {
+            require_local(&stack, ip)?;
+        }
+        let stale = leg
+            .as_ref()
+            .is_none_or(|(bound_on, _)| !Arc::ptr_eq(bound_on, &stack));
+        if stale {
+            match stack.listen_tcp(port, LISTEN_BACKLOG) {
+                Ok(listener) => *leg = Some((stack, listener)),
+                // the port is briefly still held (a replaced stack's
+                // teardown) — retry on the poll cadence.
+                Err(_) => {
+                    *leg = None;
+                    tokio::time::sleep(REBIND_POLL).await;
+                    continue;
+                }
+            }
+        }
+        let Some((_, listener)) = leg.as_mut() else {
+            continue;
+        };
+        match tokio::time::timeout(REBIND_POLL, listener.accept()).await {
+            Ok(Ok(conn)) => return Ok(conn),
+            Ok(Err(_)) => *leg = None,
+            Err(_elapsed) => {}
+        }
+    }
+}
+
 /// the virtual host. owns the poll task; dropping the stack stops it.
 pub struct VirtualStack {
     shared: Arc<StackShared>,

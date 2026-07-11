@@ -1,7 +1,7 @@
 //! The reachability plane's control-mesh messages: what members exchange
 //! over the node's dedicated reachability channel to assemble a `MeshView`
 //! and run tunnel handshakes. Every payload is ed25519-signed by its OWNER
-//! (`wireguard-upgrade` records, advertisements, and the handshake triple),
+//! (`wireguard` records, advertisements, and the handshake triple),
 //! never merely by the delivering link: messages are relayed through third
 //! members when two members share no direct transport path, so the codec —
 //! and the transport — add framing, not trust.
@@ -11,7 +11,7 @@
 //! operator surfaces speak.
 
 use serde::{Deserialize, Serialize};
-use wireguard_upgrade::{
+use wireguard::{
     EndpointAdvertisement, SignedEndpointRecord, TunnelUpgradeAck, TunnelUpgradeRequest,
     TunnelUpgradeResponse,
 };
@@ -64,8 +64,8 @@ mod tests {
     use super::*;
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
     use std::net::{IpAddr, Ipv4Addr};
-    use wireguard_upgrade::{
-        AdmissionRoot, Endpoint, EndpointRecord, MeshCapability, PortPolicy, Root, Transport,
+    use wireguard::{
+        AdmissionRoot, Endpoint, EndpointRecord, PortPolicy, Root, Transport,
         ValidatorIdentity, X25519PublicKey,
     };
 
@@ -91,7 +91,6 @@ mod tests {
             wireguard_public_key: X25519PublicKey([4; 32]),
             control_endpoint: endpoint(10, 443, Transport::Tcp),
             wireguard_endpoint: Some(endpoint(10, 51820, Transport::Udp)),
-            capabilities: vec![MeshCapability::Relay],
             expires_at_view: 50,
             nonce: 1,
         };

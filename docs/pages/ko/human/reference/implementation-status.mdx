@@ -29,9 +29,9 @@ showAskAi: false
 - Snapshot-style module(`valset`, `saga`, `tasks`, `governance`, `vaults`,
   `inbox`, `automations`, `files`, `memory`, `jobs`, example `directory`)은
   module에 맞는 canonical byte를 사용한다.
-- system crate에는 validator-derived mesh control-plane type
-  (`valset::mesh`)과 WireGuard tunnel-upgrade protocol
-  (`wireguard-upgrade`)도 있다.
+- system crate에는 WireGuard tunnel-upgrade protocol과 그 apply layer를 함께
+  담은 `crates/system/wireguard`도 있다(validation은 crate root,
+  effect는 `wireguard::effect`).
 - chat(단일 storage-owning chat module; messaging/agent facade가 folded-in)은
   demo와 app daemon(`noded`)에 등록되어 있다.
 - module wave가 업무용 surface를 채운다: inbox는 notification을 원인과 같은

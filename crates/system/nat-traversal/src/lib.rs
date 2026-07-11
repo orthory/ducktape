@@ -24,8 +24,7 @@ pub use auth::{
 };
 pub use client::{
     ClientEvent, CoordinatorMetrics, CoordinatorMetricsSnapshot, NatClient, NatSocket, SocketEvent,
-    run_coordinator, run_coordinator_with, run_coordinator_workers,
-    run_coordinator_workers_with_metrics,
+    run_coordinator, run_coordinator_with, run_coordinator_workers_with_metrics,
 };
 pub use coordinator::{Coordinator, CoordinatorReplies, CoordinatorReply};
 #[cfg(any(test, feature = "simnat"))]

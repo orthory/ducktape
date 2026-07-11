@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use defguard_wireguard_rs::{InterfaceConfiguration, key::Key};
 use tokio::sync::mpsc;
-use wireguard_effect::WireGuardEffect;
+use wireguard::effect::WireGuardEffect;
 
 use super::device::{PeerConfig, UnderlaySocket, WgDevice};
 use super::stack::{StackSlot, VirtualStack};
@@ -303,6 +303,14 @@ impl WireGuardEffect for UserspaceWireGuardEffect {
         match live {
             Some(backend) => {
                 backend.device.replace_peers(&parsed.peers);
+                // known gap, deliberately deferred: a bare ULA re-address
+                // with key and port unchanged lands here, on the SAME stack
+                // Arc — the seam/factory rebind detectors key on Arc
+                // identity, so consumer sockets stay bound to the old /128.
+                // unreachable today (a member's ULA only changes together
+                // with its key, which forces the rebuild above); if a
+                // key-preserving re-address ever becomes real, rebuild here
+                // too instead of taking the set_local_ip path.
                 backend
                     .stack
                     .set_local_ip(parsed.ula, OVERLAY_ONLINK_PREFIX);

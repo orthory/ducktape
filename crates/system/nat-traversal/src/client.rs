@@ -363,24 +363,6 @@ impl NatClient {
         }
     }
 
-    /// Wait for the coordinator's unsolicited PunchSync — the fan-out it
-    /// sends to the *other* side of somebody else's Lookup — and return the
-    /// peer's reflexive address it carries. This is how the passive side of
-    /// a rendezvous learns where to punch, without ever touching the
-    /// initiator's socket directly.
-    pub async fn recv_punch_sync(&self) -> std::io::Result<SocketAddr> {
-        let mut buf = [0u8; 64];
-        loop {
-            let (n, from) = self.sock.recv_from(&mut buf).await?;
-            if from != self.coord {
-                continue;
-            }
-            if let Ok(Msg::PunchSync { peer_reflexive, .. }) = Msg::decode(&buf[..n]) {
-                return Ok(peer_reflexive);
-            }
-        }
-    }
-
     pub async fn send_punch_to(&self, peer: SocketAddr) -> std::io::Result<()> {
         self.sock
             .send_to(&Msg::Punch { from: self.key }.encode(), peer)
@@ -397,28 +379,11 @@ impl NatClient {
         Ok(())
     }
 
-    /// Receive a `Punch` datagram, but only accept it if it actually arrived
-    /// from `expected` — the peer's rendezvous-resolved socket address.
-    /// Discarding the sender address here would let any third party forge a
-    /// `Punch` claiming to be from the peer.
-    pub async fn recv_punch_from(&self, expected: SocketAddr) -> std::io::Result<Msg> {
-        let mut buf = [0u8; 64];
-        loop {
-            let (n, from) = self.sock.recv_from(&mut buf).await?;
-            if from != expected {
-                continue;
-            }
-            if let Ok(m @ Msg::Punch { .. }) = Msg::decode(&buf[..n]) {
-                return Ok(m);
-            }
-        }
-    }
-
     /// Fire-and-forget Lookup — the response arrives as a
-    /// [`ClientEvent::LookupResponse`] via [`Self::recv_event`]. The blocking
-    /// [`Self::lookup`] stays for sequential callers; a dispatching consumer
-    /// (the reachability pump) must NOT mix the two on one socket — every
-    /// per-method recv loop silently eats the datagrams it filters out.
+    /// [`ClientEvent::LookupResponse`] via [`Self::recv_socket_event`]. The
+    /// blocking [`Self::lookup`] stays for sequential callers; a dispatching
+    /// consumer (the reachability pump) must NOT mix the two on one socket —
+    /// a per-method recv loop silently eats the datagrams it filters out.
     pub async fn send_lookup(&self, peer: NodeKey) -> std::io::Result<()> {
         self.sock
             .send_to(&self.authed(Msg::Lookup { key: peer }), self.coord)
@@ -426,26 +391,16 @@ impl NatClient {
         Ok(())
     }
 
-    /// Receive the next classified event. Never surfaces coordinator-shaped
-    /// control (`BindResponse`/`LookupResponse`/`PunchSync`) from a
-    /// non-coordinator source — a forged control datagram is dropped exactly
-    /// like the per-method recv loops drop it. Undecodable datagrams are
-    /// skipped. This is the single-dispatch alternative to those loops: one
-    /// consumer sees EVERY datagram, so an unsolicited PunchSync arriving
-    /// between operations is delivered instead of eaten.
-    pub async fn recv_event(&self) -> std::io::Result<ClientEvent> {
-        loop {
-            match self.recv_socket_event().await? {
-                SocketEvent::Rendezvous(ev) => return Ok(ev),
-                SocketEvent::Datagram { .. } => continue,
-            }
-        }
-    }
-
     /// Receive the next datagram classified either as rendezvous control or
-    /// as a caller-owned non-rendezvous datagram. This is the opt-in API for
-    /// protocols that intentionally share the NAT socket; callers that only
-    /// want coordinator traffic should use [`Self::recv_event`].
+    /// as a caller-owned non-rendezvous datagram (protocols that intentionally
+    /// share the NAT socket). This is the single-dispatch API: one consumer
+    /// sees EVERY datagram, so an unsolicited PunchSync arriving between
+    /// operations is delivered instead of eaten. Never surfaces
+    /// coordinator-shaped control (`BindResponse`/`LookupResponse`/`PunchSync`)
+    /// from a non-coordinator source — a forged control datagram is dropped
+    /// here. `Punch` is peer-originated by design and carries its observed
+    /// source; matching it against the rendezvous-resolved address is the
+    /// consumer's job.
     pub async fn recv_socket_event(&self) -> std::io::Result<SocketEvent> {
         let mut buf = [0u8; 4096];
         loop {
@@ -491,7 +446,7 @@ impl NatClient {
 }
 
 /// One decoded datagram from the rendezvous socket, classified for a single
-/// dispatching consumer ([`NatClient::recv_event`]). Coordinator-originated
+/// dispatching consumer ([`NatClient::recv_socket_event`]). Coordinator-originated
 /// control is only surfaced when it actually came from the coordinator this
 /// client is pointed at. `Punch` is peer-originated by design, so it carries
 /// its observed source for the consumer to match against the
@@ -768,10 +723,6 @@ impl OrderedRequests {
 /// or four fixed authentication workers (`4`). The latter keeps UDP I/O and
 /// rendezvous state on the current-thread runtime, bounds all queues, and
 /// applies verified requests in receive order.
-pub async fn run_coordinator_workers(sock: UdpSocket, policy: AuthPolicy, workers: usize) {
-    run_coordinator_workers_with_metrics(sock, policy, workers, CoordinatorMetrics::default()).await
-}
-
 pub async fn run_coordinator_workers_with_metrics(
     sock: UdpSocket,
     policy: AuthPolicy,
@@ -943,6 +894,32 @@ mod tests {
     use tokio::net::UdpSocket;
     use tokio::time::{Duration, timeout};
 
+    /// Test-side stand-ins for the removed per-method recv loops: drive the
+    /// production dispatch API and apply the same consumer-side filtering a
+    /// real pump (reachability) performs.
+    async fn recv_punch_sync(client: &NatClient) -> std::io::Result<SocketAddr> {
+        loop {
+            if let SocketEvent::Rendezvous(ClientEvent::PunchSync { peer_reflexive, .. }) =
+                client.recv_socket_event().await?
+            {
+                return Ok(peer_reflexive);
+            }
+        }
+    }
+
+    /// Accept a `Punch` only from `expected` — the peer's rendezvous-resolved
+    /// address; a forged `Punch` from anyone else is skipped.
+    async fn recv_punch_from(client: &NatClient, expected: SocketAddr) -> std::io::Result<Msg> {
+        loop {
+            if let SocketEvent::Rendezvous(ClientEvent::Punch { from, src }) =
+                client.recv_socket_event().await?
+                && src == expected
+            {
+                return Ok(Msg::Punch { from });
+            }
+        }
+    }
+
     #[test]
     fn completed_requests_are_applied_in_receive_order() {
         let mut ordered = OrderedRequests::new(4);
@@ -982,10 +959,11 @@ mod tests {
 
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        let coordinator = tokio::spawn(run_coordinator_workers(
+        let coordinator = tokio::spawn(run_coordinator_workers_with_metrics(
             coord_sock,
             AuthPolicy::Open { require_pop: true },
             4,
+            CoordinatorMetrics::default(),
         ));
 
         let client = NatClient::bind_multi_auth(key, vec![coord_addr], signer, None)
@@ -1206,7 +1184,7 @@ mod tests {
 
         // The fan-out PunchSync reached B (the coordinator told B where to punch
         // A). B learns A's reflexive from that unsolicited PunchSync.
-        let a_reflexive = timeout(Duration::from_secs(2), b.recv_punch_sync())
+        let a_reflexive = timeout(Duration::from_secs(2), recv_punch_sync(&b))
             .await
             .expect("B receives the fan-out PunchSync")
             .expect("punch sync");
@@ -1376,7 +1354,7 @@ mod tests {
         // A's real punch follows, from A's own socket, second.
         a.send_punch_to(b_addr).await.unwrap();
 
-        let got = timeout(Duration::from_secs(2), b.recv_punch_from(a_addr))
+        let got = timeout(Duration::from_secs(2), recv_punch_from(&b, a_addr))
             .await
             .expect("no timeout")
             .expect("recv");
@@ -1449,14 +1427,14 @@ mod tests {
         );
 
         b.send_punch_to(underlay_addr).await.unwrap();
-        let got = timeout(Duration::from_secs(2), a.recv_punch_from(b_addr))
+        let got = timeout(Duration::from_secs(2), recv_punch_from(&a, b_addr))
             .await
             .expect("no timeout")
             .expect("recv via the bypass lane");
         assert_eq!(got, Msg::Punch { from: b_key });
 
         a.send_punch_to(b_addr).await.unwrap();
-        let got = timeout(Duration::from_secs(2), b.recv_punch_from(underlay_addr))
+        let got = timeout(Duration::from_secs(2), recv_punch_from(&b, underlay_addr))
             .await
             .expect("no timeout")
             .expect("recv at b");
@@ -1540,14 +1518,14 @@ mod tests {
         );
 
         b.send_punch_to(reflexive).await.unwrap();
-        let got = timeout(Duration::from_secs(2), a.recv_punch_from(b_addr))
+        let got = timeout(Duration::from_secs(2), recv_punch_from(&a, b_addr))
             .await
             .expect("no timeout")
             .expect("recv canonicalized to V4 via the bypass lane");
         assert_eq!(got, Msg::Punch { from: b_key });
 
         a.send_punch_to(b_addr).await.unwrap();
-        let got = timeout(Duration::from_secs(2), b.recv_punch_from(reflexive))
+        let got = timeout(Duration::from_secs(2), recv_punch_from(&b, reflexive))
             .await
             .expect("no timeout")
             .expect("recv at b");
@@ -1593,7 +1571,7 @@ mod tests {
         let mut got = None;
         for _ in 0..50 {
             a.send_punch_to(b_addr).await.unwrap();
-            if let Ok(r) = timeout(Duration::from_millis(100), b.recv_punch_from(a_addr)).await {
+            if let Ok(r) = timeout(Duration::from_millis(100), recv_punch_from(&b, a_addr)).await {
                 got = Some(r.expect("recv"));
                 break;
             }
@@ -1710,7 +1688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recv_event_dispatches_lookup_response_and_punch_sync_and_filters_forgeries() {
+    async fn socket_events_dispatch_lookup_response_and_punch_sync_and_filter_forgeries() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
         tokio::spawn(run_coordinator(
@@ -1751,16 +1729,20 @@ mod tests {
         let mut saw_lookup = false;
         let mut saw_sync = false;
         for _ in 0..8 {
-            match timeout(Duration::from_secs(2), b.recv_event())
+            match timeout(Duration::from_secs(2), b.recv_socket_event())
                 .await
                 .expect("bounded")
                 .expect("recv")
             {
-                ClientEvent::LookupResponse { key, reflexive } if key == a_key => {
+                SocketEvent::Rendezvous(ClientEvent::LookupResponse { key, reflexive })
+                    if key == a_key =>
+                {
                     assert!(reflexive.is_some(), "A is registered");
                     saw_lookup = true;
                 }
-                ClientEvent::PunchSync { peer, .. } if peer == a_key => saw_sync = true,
+                SocketEvent::Rendezvous(ClientEvent::PunchSync { peer, .. }) if peer == a_key => {
+                    saw_sync = true
+                }
                 _ => {}
             }
             if saw_lookup && saw_sync {
@@ -1775,15 +1757,15 @@ mod tests {
         // A's socket sees the coordinator's fan-out PunchSync about B — and the
         // forged datagram it received earlier was dropped, so the FIRST
         // PunchSync event names B's real reflexive, not the forger's invention.
-        let ev = timeout(Duration::from_secs(2), a.recv_event())
+        let ev = timeout(Duration::from_secs(2), a.recv_socket_event())
             .await
             .expect("bounded")
             .expect("recv");
         match ev {
-            ClientEvent::PunchSync {
+            SocketEvent::Rendezvous(ClientEvent::PunchSync {
                 peer,
                 peer_reflexive,
-            } => {
+            }) => {
                 assert_eq!(peer, b_key);
                 assert_ne!(
                     peer_reflexive, forged_reflexive,
@@ -1796,7 +1778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socket_event_surfaces_datagrams_without_polluting_recv_event() {
+    async fn socket_events_classify_datagrams_and_rendezvous_control() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
         let client = NatClient::bind(NodeKey([0xaa; 32]), coord_addr)
@@ -1834,13 +1816,29 @@ mod tests {
             .await
             .unwrap();
 
-        match timeout(Duration::from_secs(2), client.recv_event())
-            .await
-            .expect("bounded")
-            .expect("rendezvous event")
-        {
-            ClientEvent::BindResponse { reflexive } => assert_eq!(reflexive, client_addr),
-            other => panic!("expected coordinator BindResponse, got {other:?}"),
+        // one dispatch stream carries both kinds: the caller-owned datagram
+        // AND the coordinator's control each surface, correctly classified
+        // (arrival order across two sending sockets is not asserted).
+        let mut saw_datagram = false;
+        let mut saw_bind = false;
+        for _ in 0..2 {
+            match timeout(Duration::from_secs(2), client.recv_socket_event())
+                .await
+                .expect("bounded")
+                .expect("socket event")
+            {
+                SocketEvent::Datagram { src, bytes } => {
+                    assert_eq!(src, peer_addr);
+                    assert_eq!(bytes, b"another-intro");
+                    saw_datagram = true;
+                }
+                SocketEvent::Rendezvous(ClientEvent::BindResponse { reflexive }) => {
+                    assert_eq!(reflexive, client_addr);
+                    saw_bind = true;
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
         }
+        assert!(saw_datagram && saw_bind, "both kinds dispatched");
     }
 }
