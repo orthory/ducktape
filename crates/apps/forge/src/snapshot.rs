@@ -2,9 +2,10 @@
 //! forge state (multi-branch repos + tracker), and the verify-then-mutate
 //! install that replaces the namespace under a root gate.
 //!
-//! container (baseline layout):
+//! container:
 //!
 //! ```text
+//! "FGv2"                                    # 4-byte magic
 //! u32-LE(repo_count)
 //! per BORN repo, sorted by name:            # born == at least one branch
 //!   u32-LE(name_len) name
@@ -14,9 +15,6 @@
 //!   u32-LE(pack_len) pack                   # ONE pack: closure of ALL heads
 //! u32-LE(tracker_len) tracker-canonical-bytes
 //! ```
-//!
-//! the v2 layout (the upgrade demonstrator) prefixes the identical body with
-//! the `FGv2` magic and gates against the domain-separated v2 root.
 
 use std::collections::BTreeMap;
 
@@ -26,10 +24,7 @@ use sdk::{Error, StateRoot};
 use crate::codec::{self, Reader};
 use crate::refs::{full_ref, norm_branch, open_or_init_repo, RepoState};
 use crate::tracker::Tracker;
-use crate::{
-    compose_state_root, compose_state_root_v2, forge_layout, norm_repo, Forge, ForgeLayout,
-    FORGE_V2_SNAPSHOT_MAGIC,
-};
+use crate::{compose_state_root, norm_repo, Forge, FORGE_SNAPSHOT_MAGIC};
 use crate::git;
 
 impl Forge {
@@ -38,20 +33,7 @@ impl Forge {
     /// exactly what contributes to `root()` — plus the tracker's canonical
     /// bytes. staged (this-block) state is deliberately excluded.
     pub fn snapshot(&self) -> Result<Vec<u8>, Error> {
-        // SEAM (dual-path snapshot wire): the selected layout picks the
-        // container format; `active_version` selects it (a snapshot has no
-        // `Ctx`) and is NEVER serialized.
-        match forge_layout(self.active_version) {
-            ForgeLayout::MultiRepo => self.snapshot_body(),
-            ForgeLayout::MultiRepoV2 => {
-                let mut out = FORGE_V2_SNAPSHOT_MAGIC.to_vec();
-                out.extend_from_slice(&self.snapshot_body()?);
-                Ok(out)
-            }
-        }
-    }
-
-    fn snapshot_body(&self) -> Result<Vec<u8>, Error> {
+        let mut out = FORGE_SNAPSHOT_MAGIC.to_vec();
         let born: Vec<(&str, &BTreeMap<String, Oid>)> = self
             .repos
             .iter()
@@ -59,7 +41,6 @@ impl Forge {
             .map(|(n, s)| (n.as_str(), &s.refs))
             .collect();
 
-        let mut out = Vec::new();
         codec::put_u32(&mut out, born.len() as u32);
         for (name, refs) in born {
             // every born head's objects live in the repo's odb (Commit built
@@ -98,29 +79,13 @@ impl Forge {
     /// on any `Err` before step 4 the committed refs and tracker — and so
     /// `root()` — are byte-identical to before the call.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        match forge_layout(self.active_version) {
-            ForgeLayout::MultiRepo => self.install_body(bytes, expected, ForgeLayout::MultiRepo),
-            ForgeLayout::MultiRepoV2 => {
-                let body = bytes
-                    .strip_prefix(FORGE_V2_SNAPSHOT_MAGIC.as_slice())
-                    .ok_or_else(|| {
-                        Error::Module(
-                            "forge snapshot: expected a v2 container (missing FGv2 magic)".into(),
-                        )
-                    })?;
-                self.install_body(body, expected, ForgeLayout::MultiRepoV2)
-            }
-        }
-    }
-
-    fn install_body(
-        &mut self,
-        bytes: &[u8],
-        expected: StateRoot,
-        layout: ForgeLayout,
-    ) -> Result<(), Error> {
+        let body = bytes
+            .strip_prefix(FORGE_SNAPSHOT_MAGIC.as_slice())
+            .ok_or_else(|| {
+                Error::Module("forge snapshot: missing the FGv2 container magic".into())
+            })?;
         // ---- PHASE 1: parse (no writes) -------------------------------------
-        let mut r = Reader::new(bytes);
+        let mut r = Reader::new(body);
         let count = r.u32()?;
         let mut parsed: BTreeMap<String, (BTreeMap<String, Oid>, &[u8])> = BTreeMap::new();
         for _ in 0..count {
@@ -167,10 +132,7 @@ impl Forge {
 
         // ---- PHASE 2: root gate BEFORE any byte reaches an odb --------------
         let entries = parsed.iter().map(|(n, (refs, _))| (n.as_str(), refs));
-        let composed = match layout {
-            ForgeLayout::MultiRepo => compose_state_root(entries, &tracker),
-            ForgeLayout::MultiRepoV2 => compose_state_root_v2(entries, &tracker),
-        };
+        let composed = compose_state_root(entries, &tracker);
         if composed != expected {
             return Err(Error::Module(
                 "snapshot root mismatch: composed state does not rehash to the expected root"

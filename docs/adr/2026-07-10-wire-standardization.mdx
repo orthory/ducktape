@@ -152,6 +152,16 @@ convenience-driven:
   What was done instead: a parity test pinning both bindings to identical
   behavior, plus fallback visibility, and D1's big-endian length prefix
   applied to both.
+
+  *Amendment (2026-07-12):* the node no longer brings up the statesync
+  overlay plane — `bin/node/src/statesync_plane.rs` and the
+  `DUCKTAPE_STATESYNC_PLANE` env flag are gone (nothing ever set the flag,
+  so the plane branch was untested dead wiring in three joiner/boot paths).
+  The mesh leg is THE statesync transport. The statesync *crate's* overlay
+  binding (`statesync::dataplane`) and its parity test remain as the tested
+  library surface for a future consumer; re-adding a node-side plane is the
+  standard "new data-plane service" recipe above (the D5 shared helper +
+  `overlay_book`).
 - **D5** — the copy-pasted plane bring-up boilerplate
   (`bin/node/src/statesync_plane.rs` vs the since-deleted duckdns announcer
   plane:

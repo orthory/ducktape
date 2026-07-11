@@ -83,7 +83,6 @@ mod resident_announce;
 mod resident_dispatch;
 mod resource_limits;
 mod rpc;
-mod statesync_plane;
 mod sync;
 mod userkey;
 mod userkey_cli;
@@ -366,10 +365,10 @@ fn run_node(
             wireguard_effect,
             overlay_slot.clone(),
         );
-        // One process-wide bulk budget: state sync and Gateway retain separate
+        // One process-wide bulk budget: the per-use planes retain separate
         // protocols, queues, sockets, and admission but cannot independently
         // saturate the same WireGuard link.
-        let bulk_pacer = statesync_plane::shared_bulk_pacer();
+        let bulk_pacer = overlay_book::shared_bulk_pacer();
 
         if sync_only {
             boot::sync_only::run(

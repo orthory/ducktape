@@ -266,16 +266,9 @@ pub(super) async fn restore_host(
         .await
         .with_tagging("tagging");
     // forge shares the blob plane (see genesis_host) for Push materialization.
-    let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
+    let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .map_err(|e| format!("forge: {e}"))?
         .with_chat("chat");
-    // establish the checkpoint boundary's dual-path branch selector so the
-    // restored forge `root()` matches at any block the replay SKIPS (disk already
-    // held it) before the first replayed block re-derives it per height. the
-    // checkpoint is a settled boundary, so `current_version` IS its effective
-    // version. baseline no-op before Phase 9.
-    forge.set_active_version(manifest.current_version);
-
     let snapshot_of = |id: &str| -> Result<(&[u8], StateRoot), String> {
         let bytes = manifest
             .snapshot(id)
@@ -759,13 +752,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|e| format!("forge init: {e}"))?
         .with_chat("chat");
     // set the dual-path branch selector to the SERVED boundary version BEFORE
-    // install: `Forge::install` (and `root()`) branch on `active_version`, so a
-    // joiner installing a post-H snapshot must select the boundary's format or the
-    // install/root would mismatch. `manifest.current_version` IS the effective
-    // version at any settled boundary (the in-block `Advance` reconciles it before
-    // the boundary is captured, so a post-H manifest carries `to_version` with no
-    // pending). baseline/no-op before the forge v2 dual path lands (Phase 9).
-    forge.set_active_version(manifest.current_version);
     forge
         .install(&bytes, root)
         .map_err(|e| format!("forge install: {e}"))?;

@@ -32,7 +32,6 @@ impl ValidatorRuntime<'_> {
             last_cert_height,
             latest_floor,
             mesh_oracle,
-            sync_plane_book,
             gateway_book,
             media_peers,
             blob_peers,
@@ -445,11 +444,8 @@ impl ValidatorRuntime<'_> {
                     plan.epoch(),
                     super::super::wiring::mesh_at(peers, plan.valset().transport_members()),
                 );
-                // the statesync plane serves (and admits) exactly
+                // the gateway plane serves (and admits) exactly
                 // who the mesh tracks — follow the re-track.
-                if let Some(book) = &sync_plane_book {
-                    book.set_peers(plan.valset().transport_members().iter());
-                }
                 if let Some(book) = &gateway_book {
                     book.set_peers(plan.valset().transport_members().iter());
                 }

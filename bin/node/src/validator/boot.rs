@@ -17,7 +17,6 @@ use crate::explorer::{IndexFold, heal_index};
 use crate::host_reads::read_upgrade_version_fields;
 use crate::host_state::{NetworkBindings, genesis_host, restore_host};
 use crate::host_state::{SyncSubstrates, sync_all_modules};
-use crate::statesync_plane;
 use crate::sync::catchup::{
     BootP2pSyncClient, PostRebootCatchupError, advance_next_seq_from_frames,
     catch_up_post_reboot_frames, write_post_reboot_catchup_checkpoint,
@@ -218,12 +217,7 @@ pub(super) async fn post_reboot_catchup<'a>(
     label: String,
     namespace: Vec<u8>,
     identity_chain_id: String,
-    peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
-    wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: crate::config::WireGuardEffectKind,
-    overlay_slot: overlay_net::userspace::StackSlot,
-    bulk_pacer: data_plane::BulkPacer,
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
     blobs: noded::blobs::BlobHandle,
@@ -237,35 +231,9 @@ pub(super) async fn post_reboot_catchup<'a>(
             );
             std::process::exit(1);
         };
-        // like the parked joiner's client: prefer the plane (lazy bind —
-        // the promotion reboot restores its tunnels from disk) and fall
-        // back to the mesh path on transport failure.
-        let mesh_client = BootP2pSyncClient::new(sync_tx, sync_rx, server_peer.clone());
-        let client = {
-            let plane_slot: statesync_plane::PlaneSlot =
-                std::sync::Arc::new(std::sync::OnceLock::new());
-            if statesync_plane::enabled() && wireguard_listen.is_some() {
-                let book = statesync_plane::OverlayBook::new(
-                    String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
-                );
-                book.set_peers(peers.iter());
-                statesync_plane::spawn_bring_up(
-                    label.clone(),
-                    book,
-                    signer.public_key(),
-                    std::sync::Arc::clone(&plane_slot),
-                    statesync_plane::socket_factory(wireguard_effect, &overlay_slot),
-                    bulk_pacer.clone(),
-                    None,
-                );
-            }
-            statesync_plane::PlaneFallbackClient::new(
-                plane_slot,
-                &server_peer,
-                mesh_client,
-                label.clone(),
-            )
-        };
+        // like the parked joiner's client: the mesh path, over the channel
+        // halves handed back to the serve loop once catch-up completes.
+        let client = BootP2pSyncClient::new(sync_tx, sync_rx, server_peer.clone());
         let mut attempts = 0usize;
         loop {
             attempts += 1;
@@ -504,7 +472,7 @@ pub(super) async fn post_reboot_catchup<'a>(
                 }
             }
         }
-        match client.into_inner().into_parts() {
+        match client.into_parts() {
             Ok((tx, rx)) => {
                 sync_tx = tx;
                 sync_rx = rx;

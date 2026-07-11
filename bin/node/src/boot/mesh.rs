@@ -118,7 +118,7 @@ pub(crate) fn build(
     // wireguard interface), everything else straight to the OS. the p2p
     // dialer never connect()s an overlay ULA on a raw OS socket as an
     // assumption again; the userspace backend lands behind this seam.
-    // the prefix derives from the SAME namespace string statesync_plane's
+    // the prefix derives from the SAME namespace string the per-use planes'
     // OverlayBook and the reachability plane use, so all three agree on
     // what "overlay" means.
     let overlay_router = overlay_net::OverlayRouter::for_prefix48(

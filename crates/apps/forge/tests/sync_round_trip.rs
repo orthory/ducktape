@@ -99,12 +99,13 @@ fn source(tag: &str) -> (PathBuf, Forge) {
     (base, forge)
 }
 
-/// byte offset of the FIRST repo's head oid in a container: `count` (4) +
-/// `name_len` (4) + `name`. valid only for a container with >= 1 repo.
+/// byte offset of the FIRST repo's head oid in a container: `magic` (4) +
+/// `count` (4) + `name_len` (4) + `name`. valid only for a container with
+/// >= 1 repo.
 fn first_oid_offset(bytes: &[u8]) -> usize {
-    let name_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    // count(4) name_len(4) name ref_count(4) branch_len(4) branch [oid]
-    let p = 8 + name_len + 4;
+    let name_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    // magic(4) count(4) name_len(4) name ref_count(4) branch_len(4) branch [oid]
+    let p = 12 + name_len + 4;
     let branch_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
     p + 4 + branch_len
 }
@@ -115,9 +116,9 @@ fn first_pack_offset(bytes: &[u8]) -> usize {
 }
 
 /// assemble a one-repo, one-branch (`main`) container with an EMPTY tracker
-/// section: `[count=1][name][ref_count=1]["main" oid][pack_len pack][tracker]`.
+/// section: `FGv2 [count=1][name][ref_count=1]["main" oid][pack_len pack][tracker]`.
 fn build_container(name: &str, oid: &[u8], pack: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = b"FGv2".to_vec();
     out.extend_from_slice(&1u32.to_le_bytes());
     out.extend_from_slice(&(name.len() as u32).to_le_bytes());
     out.extend_from_slice(name.as_bytes());
@@ -284,11 +285,12 @@ fn empty_snapshot_round_trips_the_unborn_state() {
     let src_base = tmp_base("empty-src");
     let src = Forge::init("forge", src_base.clone()).unwrap();
     let bytes = src.snapshot().unwrap();
-    let mut expected = vec![0u8; 4]; // zero repo count
+    let mut expected = b"FGv2".to_vec();
+    expected.extend_from_slice(&[0u8; 4]); // zero repo count
     expected.extend_from_slice(&empty_tracker_section());
     assert_eq!(
         bytes, expected,
-        "an empty namespace must serialize as the zero-count marker + empty tracker"
+        "an empty namespace must serialize as the magic + zero-count marker + empty tracker"
     );
 
     let dst_base = tmp_base("empty-dst");

@@ -52,15 +52,17 @@
 //! ## the load-bearing composition invariant
 //!
 //! forge's authenticated [`StateRoot`] is a CANONICAL SORTED HASH over every
-//! born branch of every repo, folded with the tracker's canonical bytes:
+//! born branch of every repo, folded with the tracker's canonical bytes and
+//! domain-separated under `FORGE_ROOT_DOMAIN`:
 //!
 //! ```text
-//! root = sha256(  for each repo sorted-by-name with >=1 born branch:
+//! root = sha256( FORGE_ROOT_DOMAIN ++ sha256(
+//!                 for each repo sorted-by-name with >=1 born branch:
 //!                     u32-LE(name.len) ++ name ++ u32-LE(ref_count) ++
 //!                     for each (branch, head) sorted-by-branch:
 //!                         u32-LE(branch.len) ++ branch ++ head.oid[20]
 //!                 ++ if tracker non-empty:
-//!                     TRACKER_DOMAIN ++ sha256(tracker.canonical_bytes())  )
+//!                     TRACKER_DOMAIN ++ sha256(tracker.canonical_bytes()) ) )
 //! ```
 //!
 //! with `root() == StateRoot::ZERO` on the empty state (the empty-genesis root).
@@ -178,56 +180,14 @@ pub fn norm_repo(repo: &str) -> Result<String, Error> {
     Ok(repo.to_string())
 }
 
-// ============================================================================
-// upgrade dual-path SEAM — the version-selected behavior branch.
-// ============================================================================
-//
-// forge is a `root()`-changing module, so a no-downtime protocol upgrade that
-// alters its root preimage / wire format ships as a DUAL-PATH binary. the seam
-// maps a version to a behavior branch; the one real divergence today is the
-// Phase-9 demonstrator (a domain-separated v2 root + v2-tagged snapshot). the
-// multi-branch + tracker generalization below is a FLAG DAY (like duckfs
-// FRAME_NS v2): both layout arms compose the NEW preimage — existing networks
-// upgrade lockstep or rebuild.
+/// the domain tag forge's root preimage is separated under — a fixed constant
+/// hashed over the folded preimage in [`compose_state_root`]. (historical note:
+/// the `.v2` in the bytes is the retired dual-path era's version tag, kept
+/// verbatim so the constant is self-describing on the wire.)
+const FORGE_ROOT_DOMAIN: &[u8] = b"ducktape.forge.multirepo.v2\x00";
 
-/// the forge protocol baseline — see the seam note above.
-const FORGE_BASELINE_VERSION: u32 = 0;
-
-/// the first protocol version that selects the forge v2 layout (Phase 9): the
-/// height-gated no-downtime demonstrator. below this version every seam picks
-/// the baseline behavior; at/after it the SAME committed state composes a
-/// domain-separated v2 root and ships a v2-tagged snapshot container.
-const FORGE_MULTIREPO_V2: u32 = 2;
-
-/// the domain tag that separates the v2 root preimage from v1 — a fixed
-/// constant; the version only SELECTS the branch, never enters the preimage.
-const FORGE_V2_ROOT_DOMAIN: &[u8] = b"ducktape.forge.multirepo.v2\x00";
-
-/// the 4-byte magic a v2 snapshot container leads with.
-pub(crate) const FORGE_V2_SNAPSHOT_MAGIC: &[u8; 4] = b"FGv2";
-
-/// the version-selected behavior branch for forge's root preimage and snapshot
-/// wire format.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ForgeLayout {
-    /// the baseline behavior: the sorted multi-branch `compose_state_root` and
-    /// the plain snapshot container.
-    MultiRepo,
-    /// the v2 behavior: the DOMAIN-SEPARATED root and the v2-magic snapshot
-    /// container. reached only after a scheduled `to_version >=
-    /// FORGE_MULTIREPO_V2` activates at `H`.
-    MultiRepoV2,
-}
-
-/// map a protocol / active version to the behavior branch it selects — the
-/// SOLE dual-path decision point.
-pub(crate) fn forge_layout(version: u32) -> ForgeLayout {
-    if version >= FORGE_MULTIREPO_V2 {
-        ForgeLayout::MultiRepoV2
-    } else {
-        ForgeLayout::MultiRepo
-    }
-}
+/// the 4-byte magic every forge snapshot container leads with.
+pub(crate) const FORGE_SNAPSHOT_MAGIC: &[u8; 4] = b"FGv2";
 
 /// parse exactly `OID_RAW_LEN` (20) raw sha1 bytes into an `Oid`, with a
 /// deterministic module error on any other length.
@@ -279,9 +239,10 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 /// the composition [`StateRoot`] over the whole forge state: every born branch
 /// of every repo (callers pass repos SORTED by name; branch maps are sorted
-/// `BTreeMap`s) folded with the tracker's canonical-bytes hash. the empty
-/// state -> [`StateRoot::ZERO`] (the empty-genesis root). see the composition
-/// invariant in the module doc.
+/// `BTreeMap`s) folded with the tracker's canonical-bytes hash, then
+/// domain-separated under [`FORGE_ROOT_DOMAIN`]. the empty state ->
+/// [`StateRoot::ZERO`] (the empty-genesis root). see the composition invariant
+/// in the module doc.
 pub(crate) fn compose_state_root<'a>(
     repos: impl Iterator<Item = (&'a str, &'a BTreeMap<String, Oid>)>,
     tracker: &Tracker,
@@ -309,28 +270,14 @@ pub(crate) fn compose_state_root<'a>(
         h.update(TRACKER_ROOT_DOMAIN);
         h.update(Sha256::digest(tracker.canonical_bytes()));
     }
-    if any {
-        StateRoot(h.finalize().into())
-    } else {
-        StateRoot::ZERO
-    }
-}
-
-/// the v2 composition: the SAME preimage domain-separated under
-/// [`FORGE_V2_ROOT_DOMAIN`] — the observable flip at `H`. preserves the
-/// empty-genesis sentinel.
-pub(crate) fn compose_state_root_v2<'a>(
-    repos: impl Iterator<Item = (&'a str, &'a BTreeMap<String, Oid>)>,
-    tracker: &Tracker,
-) -> StateRoot {
-    let inner = compose_state_root(repos, tracker);
-    if inner == StateRoot::ZERO {
+    if !any {
         return StateRoot::ZERO;
     }
-    let mut h = Sha256::new();
-    h.update(FORGE_V2_ROOT_DOMAIN);
-    h.update(inner.0);
-    StateRoot(h.finalize().into())
+    let inner: [u8; 32] = h.finalize().into();
+    let mut outer = Sha256::new();
+    outer.update(FORGE_ROOT_DOMAIN);
+    outer.update(inner);
+    StateRoot(outer.finalize().into())
 }
 
 pub struct Forge {
@@ -356,9 +303,6 @@ pub struct Forge {
     /// where issue/PR discussion-channel follow-ups go (`emit_msg` target).
     /// `None` (tests / minimal deployments without chat) emits nothing.
     chat_target: Option<String>,
-    /// the cached dual-path branch selector (see the SEAM section). NEVER part
-    /// of the `root()`/`snapshot()` preimage — it only SELECTS the branch.
-    pub(crate) active_version: u32,
 }
 
 impl Forge {
@@ -432,7 +376,6 @@ impl Forge {
             tracker,
             staged_tracker: None,
             chat_target: None,
-            active_version: FORGE_BASELINE_VERSION,
         })
     }
 
@@ -442,13 +385,6 @@ impl Forge {
     pub fn with_chat(mut self, target: impl Into<String>) -> Self {
         self.chat_target = Some(target.into());
         self
-    }
-
-    /// deterministically set the dual-path branch selector (host activation
-    /// hook / restart / state-sync restoration; also the inherent counterpart
-    /// for concrete-typed tests).
-    pub fn set_active_version(&mut self, v: u32) {
-        self.active_version = v;
     }
 
     /// ensure a [`RepoState`] entry exists for `name` (already normalized).
@@ -627,20 +563,10 @@ impl Module for Forge {
         self.id.clone()
     }
 
-    /// ACTIVATION HOOK: the host drives this across the registry at the
-    /// finalized boundary, so forge selects its dual-path branch
-    /// deterministically at `H`. `version` is a non-hashed branch selector.
-    fn set_active_version(&mut self, version: u32) {
-        self.active_version = version;
-    }
-
     /// the composed state root — pure, no IO. see the composition invariant.
     fn root(&self) -> StateRoot {
         let entries = self.repos.iter().map(|(n, s)| (n.as_str(), &s.refs));
-        match forge_layout(self.active_version) {
-            ForgeLayout::MultiRepo => compose_state_root(entries, &self.tracker),
-            ForgeLayout::MultiRepoV2 => compose_state_root_v2(entries, &self.tracker),
-        }
+        compose_state_root(entries, &self.tracker)
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -1438,47 +1364,29 @@ mod tests {
         assert_eq!(run("det-t-a"), run("det-t-b"));
     }
 
-    // upgrade dual-path: v0/v1 stay byte-identical (inert), v2 domain-separates
-    // the SAME committed state and round-trips through a v2 install.
+    // every snapshot leads with the container magic; install requires it.
     #[test]
-    fn v2_layout_diverges_and_round_trips_while_v1_stays_inert() {
-        let base = tmp_base("v2");
+    fn snapshot_leads_with_magic_and_install_requires_it() {
+        let base = tmp_base("magic");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
-
-        assert_eq!(forge_layout(0), ForgeLayout::MultiRepo);
-        assert_eq!(forge_layout(1), ForgeLayout::MultiRepo);
-        assert_eq!(forge_layout(2), ForgeLayout::MultiRepoV2);
-
         commit(&mut forge, 42, "docs", "a.txt", "x", "c");
-        commit(&mut forge, 42, "", "b.txt", "y", "c");
+        let root = forge.root();
+        let snap = forge.snapshot().unwrap();
+        assert!(snap.starts_with(FORGE_SNAPSHOT_MAGIC.as_slice()));
 
-        forge.set_active_version(0);
-        let root_v1 = forge.root();
-        let snap_v1 = forge.snapshot().unwrap();
-        forge.set_active_version(1);
-        assert_eq!(forge.root(), root_v1, "v1 must equal the baseline root");
-        assert_eq!(forge.snapshot().unwrap(), snap_v1);
-
-        forge.set_active_version(FORGE_MULTIREPO_V2);
-        let root_v2 = forge.root();
-        let snap_v2 = forge.snapshot().unwrap();
-        assert_ne!(root_v2, root_v1, "v2 root must diverge (the flip)");
-        assert!(snap_v2.starts_with(FORGE_V2_SNAPSHOT_MAGIC.as_slice()));
-
-        let rt = tmp_base("v2-rt");
+        let rt = tmp_base("magic-rt");
         let mut fresh = Forge::init("forge", rt.clone()).unwrap();
-        fresh.set_active_version(FORGE_MULTIREPO_V2);
-        fresh.install(&snap_v2, root_v2).unwrap();
-        assert_eq!(fresh.root(), root_v2, "v2 install reproduces the v2 root");
-
-        let rt2 = tmp_base("v2-rt-mismatch");
-        let mut mismatch = Forge::init("forge", rt2.clone()).unwrap();
-        mismatch.set_active_version(0);
-        assert!(mismatch.install(&snap_v2, root_v2).is_err());
+        assert!(
+            fresh
+                .install(&snap[FORGE_SNAPSHOT_MAGIC.len()..], root)
+                .is_err(),
+            "a container missing the magic must be rejected"
+        );
+        fresh.install(&snap, root).unwrap();
+        assert_eq!(fresh.root(), root, "install reproduces the root");
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&rt);
-        let _ = std::fs::remove_dir_all(&rt2);
     }
 
     // a snapshot carries branches AND tracker; install onto a fresh namespace
