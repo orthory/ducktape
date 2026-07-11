@@ -73,6 +73,7 @@ export function ConsoleShell() {
   const { state, actions } = useDucktape();
   const Screen = resolveScreen(state.screen);
   const browserVisible = state.screen === "browser";
+  const browserSurfaceVisible = browserVisible && !state.searchOpen;
 
   // ⌘K / Ctrl-K opens the command palette from anywhere. Escape and backdrop
   // clicks close it from within the modal.
@@ -92,7 +93,7 @@ export function ConsoleShell() {
       <Sidebar />
       <div style={{ flex: 1, minWidth: 0, display: "flex" }}>
         <div style={{ flex: 1, minWidth: 0, display: browserVisible ? "flex" : "none" }}>
-          <BrowserView visible={browserVisible} />
+          <BrowserView visible={browserSurfaceVisible} />
         </div>
         {!browserVisible && <Screen />}
       </div>
