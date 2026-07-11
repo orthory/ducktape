@@ -164,10 +164,32 @@ async function main() {
     },
   });
 
+  // The reference app (spec §8): board.<handle>.duck — served by
+  // ops/demo-kanban.mjs, reachable by any admitted member, WebSocket-realtime.
+  await publish({
+    version: 1,
+    chain_id: chain,
+    account_id: accountId,
+    name: { label: "board" },
+    publisher_node: nodeBytes,
+    revision: 1,
+    route: {
+      target: { kind: "loopback_http" },
+      policy: {
+        audience: { kind: "network" },
+        methods: ["get", "head", "post"],
+        max_request_bytes: 1 << 20,
+        max_response_bytes: 1 << 20,
+        allow_authorization: false,
+        allow_upgrade: true,
+      },
+    },
+  });
+
   const routes = await query("gateway", { list: { account_id: accountId } });
   const count = routes.routes?.length ?? 0;
   if (handle) {
-    console.log(`[gateway] published ${count} routes on ${handle}.duck: site.${handle}.duck (DuckFS static), app.${handle}.duck (loopback)`);
+    console.log(`[gateway] published ${count} routes on ${handle}.duck: site.${handle}.duck (static), app.${handle}.duck (loopback), board.${handle}.duck (kanban, WS)`);
   } else {
     console.log(`[gateway] published ${count} routes on account ${Buffer.from(accountId).toString("hex").slice(0, 12)}… (no .duck handle — reach them via the Gateway view)`);
   }
