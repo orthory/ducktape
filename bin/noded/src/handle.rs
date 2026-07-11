@@ -2,7 +2,6 @@
 //! state ([`NodeHandle`]): every http handler talks to whichever actor owns
 //! the non-Send `host::Host` exclusively through this seam.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +13,7 @@ use futures::channel::{mpsc, oneshot};
 
 use crate::call::CallLane;
 use crate::gateway_http::{BrowserGateway, GatewayLane};
+use crate::gateway_ws_token::WsTokenStore;
 use crate::stream::{LogRing, StreamHub};
 use crate::{BlockSummary, NodeStatus, error_response};
 
@@ -166,11 +166,11 @@ impl NodeHandle {
     }
 
     /// Enable gateway browsing on a separately bound loopback listener. The
-    /// caller binds first so port 0 becomes an actual session-returned port.
+    /// caller binds first so port 0 becomes an actual reportable port.
     pub fn with_browser_gateway(mut self, listen: SocketAddr) -> Self {
         self.browser_gateway = Some(BrowserGateway {
             listen,
-            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            ws_tokens: Arc::new(WsTokenStore::new()),
         });
         self
     }

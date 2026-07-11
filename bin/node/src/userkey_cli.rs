@@ -1331,6 +1331,7 @@ mod userkey_verb_tests {
                     max_request_bytes: 1024,
                     max_response_bytes: 4096,
                     allow_authorization: false,
+                    allow_upgrade: false,
                 },
             }),
         };

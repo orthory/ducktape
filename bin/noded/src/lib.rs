@@ -48,10 +48,11 @@ pub use call::{
 // the gateway lane: signed-route proxying + the isolated browser-gateway
 // origin (`gateway_http` because the `gateway` crate is a dependency).
 mod gateway_http;
+pub mod gateway_ws_token;
 pub mod origin_guard;
 pub use gateway_http::{
     GatewayFailure, GatewayJob, GatewayLane, GatewayProxyReply, GatewayProxyRequest,
-    GatewayResponse, GatewaySessionRequest, gateway_browser_router, serve_browser_gateway,
+    GatewayResponse, GatewayWsMsg, gateway_browser_router, serve_browser_gateway,
 };
 // git smart-HTTP: forge as a full push+fetch remote over /forge/{repo}/….
 mod git_http;
@@ -83,7 +84,7 @@ use sdk::StateRoot;
 use serde::{Deserialize, Serialize};
 
 use crate::call::call_ws;
-use crate::gateway_http::{gateway_proxy, gateway_session};
+use crate::gateway_http::{gateway_browser_base, gateway_proxy};
 use crate::git_http::{GIT_PACK_BODY_LIMIT, git_info_refs, git_receive_pack, git_upload_pack};
 use crate::index::{blocks, index_ops, index_scan, index_status, index_view};
 use crate::metrics::metrics;
@@ -347,7 +348,7 @@ pub fn router(handle: NodeHandle) -> Router {
                 gateway::MAX_REQUEST_BODY_BYTES as usize * 2 + gateway::MAX_PROXY_HEAD_BYTES,
             )),
         )
-        .route("/v1/gateway/session", post(gateway_session))
+        .route("/v1/gateway/browser", get(gateway_browser_base))
         .route(
             "/v1/files/blob",
             // one receipt per request; the json routes keep axum's (smaller)

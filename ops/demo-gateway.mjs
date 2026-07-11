@@ -88,23 +88,31 @@ async function main() {
   }
 
   const data = Buffer.from(INDEX_HTML);
-  const contentFiles = [{
-    path: "index.html",
-    mime: "text/html",
-    size: data.byteLength,
-    sha256: createHash("sha256").update(data).digest("hex"),
-  }];
+  // v2: the file table lives off consensus in .manifest.json; the signed route
+  // binds only the manifest's SHA-256.
+  const manifest = {
+    default_path: "index.html",
+    files: [{
+      path: "index.html",
+      mime: "text/html",
+      size: data.byteLength,
+      sha256: createHash("sha256").update(data).digest("hex"),
+    }],
+  };
+  const manifestBytes = Buffer.from(JSON.stringify(manifest));
+  const manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
+  const put = (path, bytes) => ({
+    put: {
+      path: `/home/ext:${nodeHex}/.duck/gateway/site/${path}`,
+      exec: false,
+      meta: {},
+      content: { inline: { b64: bytes.toString("base64") } },
+    },
+  });
   await post("/v1/files/commit", {
     base_snapshot: null,
-    message: "seed: gateway site",
-    changes: [{
-      put: {
-        path: `/home/ext:${nodeHex}/.duck/gateway/site/index.html`,
-        exec: false,
-        meta: {},
-        content: { inline: { b64: data.toString("base64") } },
-      },
-    }],
+    message: "seed: gateway site + manifest",
+    changes: [put("index.html", data), put(".manifest.json", manifestBytes)],
   });
 
   async function publish(statement) {
@@ -124,13 +132,14 @@ async function main() {
     publisher_node: nodeBytes,
     revision: 1,
     route: {
-      target: { kind: "duck_fs", content: { default_path: "index.html", files: contentFiles } },
+      target: { kind: "duck_fs", manifest_sha256: manifestSha256 },
       policy: {
         audience: { kind: "owner" },
         methods: ["get", "head"],
         max_request_bytes: 0,
         max_response_bytes: 1 << 20,
         allow_authorization: false,
+        allow_upgrade: false,
       },
     },
   });
@@ -150,6 +159,29 @@ async function main() {
         max_request_bytes: 1 << 20,
         max_response_bytes: 1 << 20,
         allow_authorization: true,
+        allow_upgrade: true,
+      },
+    },
+  });
+
+  // The reference app (spec §8): board.<handle>.duck — served by
+  // ops/demo-kanban.mjs, reachable by any admitted member, WebSocket-realtime.
+  await publish({
+    version: 1,
+    chain_id: chain,
+    account_id: accountId,
+    name: { label: "board" },
+    publisher_node: nodeBytes,
+    revision: 1,
+    route: {
+      target: { kind: "loopback_http" },
+      policy: {
+        audience: { kind: "network" },
+        methods: ["get", "head", "post"],
+        max_request_bytes: 1 << 20,
+        max_response_bytes: 1 << 20,
+        allow_authorization: false,
+        allow_upgrade: true,
       },
     },
   });
@@ -157,7 +189,7 @@ async function main() {
   const routes = await query("gateway", { list: { account_id: accountId } });
   const count = routes.routes?.length ?? 0;
   if (handle) {
-    console.log(`[gateway] published ${count} routes on ${handle}.duck: site.${handle}.duck (DuckFS static), app.${handle}.duck (loopback)`);
+    console.log(`[gateway] published ${count} routes on ${handle}.duck: site.${handle}.duck (static), app.${handle}.duck (loopback), board.${handle}.duck (kanban, WS)`);
   } else {
     console.log(`[gateway] published ${count} routes on account ${Buffer.from(accountId).toString("hex").slice(0, 12)}… (no .duck handle — reach them via the Gateway view)`);
   }

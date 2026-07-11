@@ -269,6 +269,7 @@ mod tests {
                         max_request_bytes: 0,
                         max_response_bytes: 1024,
                         allow_authorization: false,
+                        allow_upgrade: false,
                     },
                 }),
             },

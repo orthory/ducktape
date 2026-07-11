@@ -23,6 +23,7 @@ fn statement() -> RouteStatement {
                 max_request_bytes: 1024,
                 max_response_bytes: 4096,
                 allow_authorization: false,
+                allow_upgrade: true,
             },
         }),
     }
@@ -33,7 +34,30 @@ fn signing_preimage_has_a_cross_language_fixed_vector() {
     let encoded = hex(&route_signing_preimage(&statement()).unwrap());
     assert_eq!(
         encoded,
-        "010400000000000000746573740200000000000000010201030000000000000061706920000000000000000303030303030303030303030303030303030303030303030303030303030303070000000000000001020300000000000000010203000400000000000000100000000000000002"
+        "01040000000000000074657374020000000000000001020103000000000000006170692000000000000000030303030303030303030303030303030303030303030303030303030303030307000000000000000102030000000000000001020300040000000000000010000000000000000102"
+    );
+}
+
+#[test]
+fn content_route_preimage_binds_only_the_manifest_hash() {
+    let mut statement = statement();
+    statement.route = Some(RouteDefinition {
+        target: RouteTarget::DuckFs {
+            manifest_sha256: "b".repeat(64),
+        },
+        policy: RoutePolicy {
+            audience: RouteAudience::Network,
+            methods: vec![RouteMethod::Get, RouteMethod::Head],
+            max_request_bytes: 0,
+            max_response_bytes: 4096,
+            allow_authorization: false,
+            allow_upgrade: false,
+        },
+    });
+    let encoded = hex(&route_signing_preimage(&statement).unwrap());
+    assert_eq!(
+        encoded,
+        "010400000000000000746573740200000000000000010201030000000000000061706920000000000000000303030303030303030303030303030303030303030303030303030303030303070000000000000001020200000000000000010200000000000000000010000000000000000001bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     );
 }
 

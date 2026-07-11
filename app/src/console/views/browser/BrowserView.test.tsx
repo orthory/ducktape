@@ -81,7 +81,7 @@ describe("BrowserView security boundary", () => {
       signer: "33".repeat(32),
       revision: 3,
       title: "api.alice.duck",
-      srcUrl: "http://0123456789abcdef0123456789abcdef.localhost:49152/v1",
+      srcUrl: "duck://api.alice.duck/v1",
       fileCount: 0,
       totalBytes: 0,
     });
@@ -92,9 +92,9 @@ describe("BrowserView security boundary", () => {
 
     await screen.findByTestId("gateway-inline-pane");
     await waitFor(() => expect(openInline).toHaveBeenCalledWith(
-      "http://0123456789abcdef0123456789abcdef.localhost:49152/v1",
-      // the .duck route, so a permission prompt can name the site rather than
-      // the random loopback session origin it is served from
+      "duck://api.alice.duck/v1",
+      // the .duck route names the site in a permission prompt (same as its
+      // stable duck:// origin now)
       "api.alice.duck",
       "tab-1",
       expect.objectContaining({ width: expect.any(Number), height: expect.any(Number) }),

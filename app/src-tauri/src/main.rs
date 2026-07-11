@@ -15,6 +15,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod daemon;
+mod duck_scheme;
 mod gateway_window;
 mod enroll;
 mod forge_git;
@@ -26,6 +27,34 @@ mod rt;
 mod tray;
 mod user_identity;
 mod workspaces;
+
+/// Point the `duck://` scheme handler at the active node's browser-gateway
+/// base (from `/v1/gateway/browser`). The frontend calls this when a workspace
+/// becomes active; `None` clears it.
+#[tauri::command]
+fn duck_set_gateway_base(base: Option<String>) {
+    duck_scheme::set_gateway_base(base);
+}
+
+/// CEF switches. Production needs only the keychain opt-outs; a headless QA run
+/// appends `DUCKTAPE_CEF_EXTRA_ARGS` (e.g.
+/// `--single-process --disable-gpu --use-gl=angle --use-angle=swiftshader
+/// --enable-unsafe-swiftshader --no-sandbox`), which a real desktop never sets.
+fn cef_command_line_args() -> Vec<(String, Option<String>)> {
+    let mut args = vec![
+        ("--use-mock-keychain".to_string(), None),
+        ("password-store".to_string(), Some("basic".to_string())),
+    ];
+    if let Ok(extra) = std::env::var("DUCKTAPE_CEF_EXTRA_ARGS") {
+        for arg in extra.split_whitespace() {
+            match arg.split_once('=') {
+                Some((key, value)) => args.push((key.to_string(), Some(value.to_string()))),
+                None => args.push((arg.to_string(), None)),
+            }
+        }
+    }
+    args
+}
 
 fn main() {
     // Must precede the helper dispatch below AND tauri boot: CEF subprocesses
@@ -40,10 +69,18 @@ fn main() {
         // console is a localhost UI whose real data lives in the node, and
         // gateway sessions are incognito. Deliberate: web-content storage is
         // not keychain-protected.
-        command_line_args: vec![
-            ("--use-mock-keychain".into(), None),
-            ("password-store".into(), Some("basic".into())),
+        command_line_args: cef_command_line_args(),
+        // `duck` renders gateway routes at stable origins (spec §1). It is a
+        // standard+secure+CORS+fetch scheme with a real cookie jar (the jar
+        // needs `cookieable_schemes` on both the global settings and every
+        // per-webview request context — the crate wires both).
+        custom_schemes: vec![
+            "tauri".into(),
+            "ipc".into(),
+            "asset".into(),
+            "duck".into(),
         ],
+        cookieable_schemes: vec!["duck".into()],
         ..Default::default()
     });
 
@@ -59,9 +96,22 @@ fn main() {
         return;
     }
 
+    // The streaming `duck://` handler (process-global). Registered before the
+    // builder so the first gateway navigation is served.
+    duck_scheme::register();
+
     let node_control = daemon::NodeControl::new().expect("start desktop node-control actor");
     let mut builder = tauri::Builder::<rt::Cef>::new()
         .manage(node_control)
+        // The streaming handler above owns every duck:// request; this buffered
+        // registration only exists so the runtime installs the scheme factory
+        // and per-webview registry entry (its handler is never called).
+        .register_uri_scheme_protocol("duck", |_ctx, _request| {
+            tauri::http::Response::builder()
+                .status(500)
+                .body(std::borrow::Cow::Borrowed(&b"duck streaming handler unreachable"[..]))
+                .unwrap()
+        })
         .invoke_handler(tauri::generate_handler![
             workspaces::workspace_list,
             workspaces::workspace_active,
@@ -72,6 +122,7 @@ fn main() {
             gateway_window::gateway_inline_place,
             gateway_window::gateway_inline_close,
             gateway_window::gateway_inline_hide_all,
+            duck_set_gateway_base,
             workspaces::workspace_create,
             workspaces::workspace_join,
             workspaces::workspace_invite_blob,

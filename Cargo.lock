@@ -3020,7 +3020,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.8.9",
+ "libloading 0.7.4",
 ]
 
 [[package]]
@@ -3196,6 +3196,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "git2",
+ "http",
  "libc",
  "reqwest 0.12.28",
  "serde",
@@ -5656,6 +5657,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "toml 0.8.23",
  "tracing-subscriber 0.3.23",
  "upgrade",
@@ -5707,6 +5709,7 @@ dependencies = [
  "tasks",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tower",
  "tower-http",
  "tracing-subscriber 0.3.23",
@@ -9070,7 +9073,7 @@ dependencies = [
 [[package]]
 name = "tauri-runtime-cef"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/tauri-runtime-cef?rev=c281d2c9060d64916f903d3cf404e086d44af8df#c281d2c9060d64916f903d3cf404e086d44af8df"
+source = "git+https://github.com/byeongsu-hong/tauri-runtime-cef?rev=8ddc1ed48e8650432424bd51d98edf0a024dc2a4#8ddc1ed48e8650432424bd51d98edf0a024dc2a4"
 dependencies = [
  "base64 0.22.1",
  "cef",
@@ -9161,7 +9164,7 @@ dependencies = [
  "serde_with",
  "swift-rs",
  "thiserror 2.0.18",
- "toml 1.1.2+spec-1.1.0",
+ "toml 0.9.12+spec-1.1.0",
  "url",
  "urlpattern",
  "uuid",

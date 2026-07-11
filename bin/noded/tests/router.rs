@@ -337,6 +337,7 @@ fn gateway_route() -> gateway::RouteRecord {
                     max_request_bytes: 1024,
                     max_response_bytes: 4096,
                     allow_authorization: false,
+                    allow_upgrade: false,
                 },
             }),
         },
@@ -345,6 +346,31 @@ fn gateway_route() -> gateway::RouteRecord {
             signature: vec![4; 64],
         },
     }
+}
+
+/// Answer the duck:// browser proxy's queries: DuckDNS resolves the handle to
+/// the route's account, gateway returns the signed route. `queries` is the
+/// total count (one proxy request = one duckdns + two gateway queries).
+fn spawn_duck_actor(mut cmds: mpsc::Receiver<NodeCommand>, queries: usize) {
+    tokio::spawn(async move {
+        for _ in 0..queries {
+            let NodeCommand::Query { target, reply, .. } = cmds.next().await.unwrap() else {
+                panic!("gateway only issues queries");
+            };
+            let bytes = match target.as_str() {
+                "duckdns" => duckdns::encode_reply(&duckdns::DuckDnsReply::Resolved(Some(
+                    duckdns::ResolvedAccount {
+                        account_id: vec![1],
+                    },
+                ))),
+                "gateway" => gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(
+                    gateway_route(),
+                )))),
+                other => panic!("unexpected query target {other}"),
+            };
+            let _ = reply.send(Ok(bytes));
+        }
+    });
 }
 
 fn spawn_gateway_actor(mut cmds: mpsc::Receiver<NodeCommand>, replies: usize) {
@@ -376,12 +402,15 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
     let (lane, mut jobs) = tokio::sync::mpsc::channel::<noded::GatewayJob>(1);
     tokio::spawn(async move {
         let job = jobs.recv().await.expect("one gateway job");
-        assert_eq!(job.publisher_node, [2; 32]);
-        assert_eq!(job.head.name, gateway::RouteName::named("app"));
-        assert_eq!(job.head.method, gateway::RouteMethod::Post);
-        assert_eq!(job.head.path_and_query, "/api/items");
-        assert_eq!(job.body, br#"{"name":"duck"}"#);
-        let _ = job.reply.send(Ok(noded::GatewayResponse {
+        let noded::GatewayJob::Http { publisher_node, head, body, reply, .. } = job else {
+            panic!("expected an http gateway job");
+        };
+        assert_eq!(publisher_node, [2; 32]);
+        assert_eq!(head.name, gateway::RouteName::named("app"));
+        assert_eq!(head.method, gateway::RouteMethod::Post);
+        assert_eq!(head.path_and_query, "/api/items");
+        assert_eq!(body, br#"{"name":"duck"}"#);
+        let _ = reply.send(Ok(noded::GatewayResponse {
             head: gateway::ProxyResponseHead {
                 status: 201,
                 headers: vec![gateway::ProxyHeader {
@@ -429,18 +458,12 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
 #[tokio::test]
 async fn gateway_api_rejects_untrusted_browser_origins_before_network_work() {
     let (handle, _cmds, _events) = NodeHandle::channel();
-    for origin in [
-        "https://evil.example",
-        "http://0123456789abcdef0123456789abcdef.localhost:49152",
-    ] {
-        let mut request = post(
-            "/v1/gateway/session",
-            serde_json::json!({
-                "accountId": [1],
-                "name": { "label": "app" },
-                "revision": 7,
-            }),
-        );
+    for origin in ["https://evil.example", "http://app.demo.duck"] {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/v1/gateway/browser")
+            .body(Body::empty())
+            .unwrap();
         request
             .headers_mut()
             .insert(header::ORIGIN, origin.parse().unwrap());
@@ -457,62 +480,28 @@ async fn gateway_api_rejects_untrusted_browser_origins_before_network_work() {
             "accepted {origin}"
         );
     }
-
-    let mut originless_browser = post(
-        "/v1/gateway/session",
-        serde_json::json!({
-            "accountId": [1],
-            "name": { "label": "app" },
-            "revision": 7,
-        }),
-    );
-    originless_browser
-        .headers_mut()
-        .insert("sec-fetch-site", "cross-site".parse().unwrap());
-    let response = noded::router(handle)
-        .oneshot(originless_browser)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
-async fn gateway_browser_session_is_route_scoped_and_cross_origin_cookie_safe() {
+async fn gateway_browser_proxy_is_duck_origin_scoped_and_cross_origin_safe() {
     let (handle, cmds, _events) = NodeHandle::channel();
-    spawn_gateway_actor(cmds, 2);
+    // One proxy request resolves once via duckdns and twice via gateway
+    // (the revision pre-check plus proxy_current's own resolution).
+    spawn_duck_actor(cmds, 3);
     let (lane, mut jobs) = tokio::sync::mpsc::channel::<noded::GatewayJob>(1);
     let handle = handle
         .with_gateway(lane)
         .with_browser_gateway("127.0.0.1:49152".parse().unwrap());
-    let response = noded::router(handle.clone())
-        .oneshot(post(
-            "/v1/gateway/session",
-            serde_json::json!({
-                "accountId": [1],
-                "name": { "label": "app" },
-                "revision": 7,
-            }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_json(response).await;
-    let host = body["url"]
-        .as_str()
-        .unwrap()
-        .strip_prefix("http://")
-        .and_then(|value| value.strip_suffix('/'))
-        .unwrap()
-        .to_string();
-    assert!(host.ends_with(".localhost:49152"));
-    assert_eq!(host.len(), 32 + ".localhost:49152".len());
 
     tokio::spawn(async move {
         let job = jobs.recv().await.unwrap();
-        assert_eq!(job.head.method, gateway::RouteMethod::Post);
-        assert_eq!(job.head.path_and_query, "/api");
-        assert_eq!(job.body, b"payload");
-        let _ = job.reply.send(Ok(noded::GatewayResponse {
+        let noded::GatewayJob::Http { head, body, reply, .. } = job else {
+            panic!("expected an http gateway job");
+        };
+        assert_eq!(head.method, gateway::RouteMethod::Post);
+        assert_eq!(head.path_and_query, "/api");
+        assert_eq!(body, b"payload");
+        let _ = reply.send(Ok(noded::GatewayResponse {
             head: gateway::ProxyResponseHead {
                 status: 201,
                 headers: vec![gateway::ProxyHeader {
@@ -523,13 +512,14 @@ async fn gateway_browser_session_is_route_scoped_and_cross_origin_cookie_safe() 
             body: br#"{"ok":true}"#.to_vec(),
         }));
     });
-    let origin = format!("http://{host}");
+    let authority = "app.demo.duck";
+    let origin = format!("duck://{authority}");
     let response = noded::gateway_browser_router(handle.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api")
-                .header(header::HOST, &host)
+                .header("x-duck-authority", authority)
                 .header(header::ORIGIN, &origin)
                 .header(header::CONTENT_TYPE, "text/plain")
                 .body(Body::from("payload"))
@@ -543,19 +533,21 @@ async fn gateway_browser_session_is_route_scoped_and_cross_origin_cookie_safe() 
     let csp = response.headers()[header::CONTENT_SECURITY_POLICY]
         .to_str()
         .unwrap();
-    assert!(csp.contains(&format!("connect-src http://{host}")));
+    assert!(csp.contains(&format!("connect-src {origin} ws://127.0.0.1:49152")));
     assert!(csp.contains("worker-src 'none'"));
     assert!(csp.contains("frame-ancestors 'none'"));
     assert!(csp.contains("sandbox allow-scripts allow-same-origin allow-forms"));
     assert!(csp.contains("webrtc 'block'"));
 
+    // A page whose Origin does not match the forwarded authority is rejected
+    // before any network work.
     let response = noded::gateway_browser_router(handle.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api")
-                .header(header::HOST, &host)
-                .header(header::ORIGIN, "http://evil.localhost:49152")
+                .header("x-duck-authority", authority)
+                .header(header::ORIGIN, "duck://evil.demo.duck")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -563,26 +555,12 @@ async fn gateway_browser_session_is_route_scoped_and_cross_origin_cookie_safe() 
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    let response = noded::gateway_browser_router(handle.clone())
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/")
-                .header(header::HOST, &host)
-                .header(header::COOKIE, "ambient=secret")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
+    // A request the scheme handler did not stamp with an authority is refused.
     let response = noded::gateway_browser_router(handle)
         .oneshot(
             Request::builder()
                 .method("GET")
                 .uri("/")
-                .header(header::HOST, "guessed.localhost:49152")
                 .body(Body::empty())
                 .unwrap(),
         )

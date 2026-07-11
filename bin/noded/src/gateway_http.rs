@@ -1,40 +1,69 @@
-//! the gateway lane: signed-route proxying (`/v1/gateway/*`) and the
-//! isolated browser-gateway origin. named `gateway_http` (like `files_http`)
+//! the gateway lane: signed-route proxying (`/v1/gateway/*`) and the isolated
+//! `duck://` browser-gateway origin. named `gateway_http` (like `files_http`)
 //! because the `gateway` module crate rides alongside as a dependency.
+//!
+//! The browser origin is stateless: the trusted `duck://` scheme handler
+//! forwards the page's stable `<label>.<handle>.duck` authority on every
+//! request; the node resolves it fresh through DuckDNS each time (no session
+//! token, no server-side binding). A WebSocket side door (`/.duck/ws-token` +
+//! `/.duck/ws/{token}`) bridges `duck://` pages onto the upgrade lane, because
+//! `new WebSocket()` cannot open a socket on the `duck:` scheme directly.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::SinkExt as _;
 use futures::channel::oneshot;
-use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 
-use crate::{NodeCommand, NodeHandle, error_response, hex_bytes};
+use crate::gateway_ws_token::WsTokenStore;
+use crate::{NodeCommand, NodeHandle, error_response};
 
-/// One bounded invocation through a globally signed gateway route. The
-/// full node drains this lane through `Service::Gateway`; the embedded daemon
-/// leaves it unwired because it has no authenticated network transport.
-pub struct GatewayJob {
-    /// Derived from the locally finalized RouteRecord, never client input.
-    pub publisher_node: [u8; 32],
-    pub max_response_bytes: u64,
-    pub head: gateway::ProxyRequestHead,
-    pub body: Vec<u8>,
-    pub reply: oneshot::Sender<Result<GatewayResponse, GatewayFailure>>,
+/// One invocation through a globally signed gateway route. The full node drains
+/// this lane through `Service::Gateway`; the embedded daemon leaves it unwired
+/// because it has no authenticated network transport. `publisher_node` and the
+/// caps are derived from the locally finalized RouteRecord, never client input.
+pub enum GatewayJob {
+    /// A bounded HTTP exchange: one request, one buffered response.
+    Http {
+        publisher_node: [u8; 32],
+        max_response_bytes: u64,
+        head: gateway::ProxyRequestHead,
+        body: Vec<u8>,
+        reply: oneshot::Sender<Result<GatewayResponse, GatewayFailure>>,
+    },
+    /// A WebSocket upgrade: the plane bridges the browser message channels to
+    /// the publisher's socket for the life of the connection.
+    Upgrade {
+        publisher_node: [u8; 32],
+        head: gateway::ProxyRequestHead,
+        to_browser: tokio::sync::mpsc::Sender<GatewayWsMsg>,
+        from_browser: tokio::sync::mpsc::Receiver<GatewayWsMsg>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayResponse {
     pub head: gateway::ProxyResponseHead,
     pub body: Vec<u8>,
+}
+
+/// One WebSocket message crossing the browser↔mesh boundary on the caller
+/// side. The WS door translates these to/from axum WebSocket frames; the mesh
+/// caller pump translates them to/from the proxy `WsFrame`/`WsClose` frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayWsMsg {
+    Text(String),
+    Binary(Vec<u8>),
+    Close(u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,21 +77,14 @@ pub enum GatewayFailure {
 
 pub type GatewayLane = tokio::sync::mpsc::Sender<GatewayJob>;
 
-const GATEWAY_SESSION_IDLE: Duration = Duration::from_secs(10 * 60);
-const MAX_GATEWAY_SESSIONS: usize = 64;
-
-#[derive(Clone)]
-pub(crate) struct GatewaySession {
-    account_id: Vec<u8>,
-    name: gateway::RouteName,
-    revision: u64,
-    last_used: Instant,
-}
-
+/// Dedicated least-privilege browser origin for gateway rendering: a separate
+/// loopback listener, never the node API origin. Held on [`NodeHandle`].
 #[derive(Clone)]
 pub(crate) struct BrowserGateway {
     pub(crate) listen: SocketAddr,
-    pub(crate) sessions: Arc<tokio::sync::Mutex<HashMap<String, GatewaySession>>>,
+    /// Single-use tokens for the WebSocket side door (audit S3), shared between
+    /// the `/.duck/ws-token` mint and the `/.duck/ws/{token}` upgrade.
+    pub(crate) ws_tokens: Arc<WsTokenStore>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,7 +218,7 @@ async fn proxy_current(
         ));
     };
     let (reply, rx) = oneshot::channel();
-    lane.send(GatewayJob {
+    lane.send(GatewayJob::Http {
         publisher_node,
         max_response_bytes,
         head,
@@ -243,89 +265,108 @@ pub(crate) async fn gateway_proxy(
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct GatewaySessionRequest {
-    pub account_id: Vec<u8>,
-    pub name: gateway::RouteName,
-    pub revision: u64,
-}
-
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GatewaySessionReply {
-    url: String,
+struct GatewayBrowserBase {
+    base: String,
 }
 
-pub(crate) async fn gateway_session(
+/// Report the dedicated browser-gateway listener's loopback base URL so the
+/// app's `duck://` scheme handler can reach it (the port is ephemeral, chosen
+/// at bind time). This is the node-API origin, so it is console/native-guarded
+/// like the other control routes; the untrusted page never sees this URL.
+pub(crate) async fn gateway_browser_base(
     State(handle): State<NodeHandle>,
     headers: HeaderMap,
-    Json(request): Json<GatewaySessionRequest>,
 ) -> Response {
     if let Some(response) = gateway_api_origin_guard(&headers) {
         return response;
     }
-    let Some(gateway) = handle.browser_gateway.clone() else {
-        return error_response(
+    match &handle.browser_gateway {
+        Some(gateway) => Json(GatewayBrowserBase {
+            base: format!("http://{}", gateway.listen),
+        })
+        .into_response(),
+        None => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway browser gateway is not configured",
-        );
-    };
-    if handle.gateway.is_none() {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "gateway browsing requires an active network overlay",
-        );
+        ),
     }
-    let record = match current_route(&handle, &request.account_id, &request.name).await {
-        Ok(record) => record,
-        Err(failure) => return gateway_failure_response(failure),
-    };
-    if record.statement.revision != request.revision {
-        return error_response(
-            StatusCode::CONFLICT,
-            "gateway route changed; resolve the name again",
-        );
-    }
+}
 
-    let now = Instant::now();
-    let mut sessions = gateway.sessions.lock().await;
-    sessions.retain(|_, session| now.duration_since(session.last_used) < GATEWAY_SESSION_IDLE);
-    if sessions.len() >= MAX_GATEWAY_SESSIONS
-        && let Some(oldest) = sessions
-            .iter()
-            .min_by_key(|(_, session)| session.last_used)
-            .map(|(token, _)| token.clone())
-    {
-        sessions.remove(&oldest);
+/// Resolve a `duck://` authority (`<label>.<handle>.duck` or `<handle>.duck`)
+/// to the account it names and the route label beneath it. Node-local: one
+/// DuckDNS resolve, no session state and no round-trip to the publisher.
+/// `net.duck` and any `<x>.net.duck` are reserved and carry no gateway route.
+async fn resolve_duck_authority(
+    handle: &NodeHandle,
+    authority: &str,
+) -> Result<(Vec<u8>, gateway::RouteName), GatewayFailure> {
+    let trimmed = authority
+        .trim()
+        .strip_prefix("duck://")
+        .unwrap_or(authority.trim())
+        .to_ascii_lowercase();
+    let host = trimmed.split('/').next().unwrap_or_default();
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.last() != Some(&"duck") || (labels.len() != 2 && labels.len() != 3) {
+        return Err(GatewayFailure::Invalid(
+            "duck address must be <account>.duck or <label>.<account>.duck".into(),
+        ));
     }
-    let token = loop {
-        let mut random = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut random);
-        let candidate = hex_bytes(&random);
-        if !sessions.contains_key(&candidate) {
-            break candidate;
-        }
+    let (label, alias) = if labels.len() == 3 {
+        (Some(labels[0]), labels[1])
+    } else {
+        (None, labels[0])
     };
-    sessions.insert(
-        token.clone(),
-        GatewaySession {
-            account_id: request.account_id,
-            name: request.name,
-            revision: request.revision,
-            last_used: now,
-        },
-    );
-    Json(GatewaySessionReply {
-        url: format!("http://{token}.localhost:{}/", gateway.listen.port()),
-    })
-    .into_response()
+    if alias == "net" {
+        return Err(GatewayFailure::NotFound(
+            "net.duck is reserved and has no gateway route".into(),
+        ));
+    }
+    duckdns::validate_handle(alias).map_err(GatewayFailure::Invalid)?;
+    let name = match label {
+        Some(label) => gateway::RouteName::named(label),
+        None => gateway::RouteName::apex(),
+    };
+    name.validate().map_err(GatewayFailure::Invalid)?;
+
+    let (reply, rx) = oneshot::channel();
+    let mut commands = handle.cmds.clone();
+    commands
+        .send(NodeCommand::Query {
+            target: "duckdns".into(),
+            req: duckdns::encode_query(&duckdns::DuckDnsQuery::Resolve {
+                name: duckdns::DuckDnsName {
+                    handle: alias.to_string(),
+                },
+            }),
+            reply,
+        })
+        .await
+        .map_err(|_| GatewayFailure::Unavailable("node actor is gone".into()))?;
+    let bytes = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .map_err(|_| GatewayFailure::Unavailable("duckdns resolve timed out".into()))?
+        .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
+        .map_err(GatewayFailure::Unavailable)?;
+    match duckdns::decode_reply(&bytes) {
+        Ok(duckdns::DuckDnsReply::Resolved(Some(account))) => Ok((account.account_id, name)),
+        Ok(duckdns::DuckDnsReply::Resolved(None)) => Err(GatewayFailure::NotFound(format!(
+            "{alias}.duck is not registered"
+        ))),
+        Ok(_) => Err(GatewayFailure::Unavailable(
+            "duckdns returned an unexpected reply".into(),
+        )),
+        Err(error) => Err(GatewayFailure::Unavailable(error)),
+    }
 }
 
 /// Dedicated gateway-rendering router: no node API, no permissive CORS, and
 /// no route that can address another `.duck` route with ambient user power.
 pub fn gateway_browser_router(handle: NodeHandle) -> Router {
     Router::new()
+        .route("/.duck/ws-token", post(gateway_ws_token_mint))
+        .route("/.duck/ws/{token}", get(gateway_ws_door))
         .fallback(gateway_browser_proxy)
         .layer(DefaultBodyLimit::max(
             gateway::MAX_REQUEST_BODY_BYTES as usize,
@@ -346,28 +387,28 @@ fn gateway_method(method: &Method) -> Option<gateway::RouteMethod> {
 }
 
 fn gateway_request_headers(headers: &HeaderMap) -> Result<Vec<gateway::ProxyHeader>, String> {
-    if headers.contains_key(header::COOKIE) {
-        return Err("gateway browser never accepts ambient Cookie credentials".into());
-    }
-    let mut forwarded = Vec::new();
-    for name in gateway::ALLOWED_REQUEST_HEADERS {
-        let values = headers.get_all(*name);
-        let mut values = values.iter();
-        let Some(value) = values.next() else {
+    // Cookie now flows end to end; only hop-by-hop / forwarding / identity
+    // headers (and any x-duck-* spoof) are stripped, via the shared denylist.
+    let mut forwarded: Vec<gateway::ProxyHeader> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, value) in headers {
+        let name = name.as_str().to_ascii_lowercase();
+        if !gateway::header_forwardable(&name) {
             continue;
-        };
-        if values.next().is_some() {
+        }
+        if !seen.insert(name.clone()) {
             return Err(format!("gateway browser rejects duplicate {name} headers"));
         }
         forwarded.push(gateway::ProxyHeader {
-            name: (*name).to_string(),
+            name: name.clone(),
             value: value
                 .to_str()
                 .map_err(|_| format!("gateway browser received non-ASCII {name}"))?
                 .to_string(),
         });
     }
-    gateway::validate_headers(&forwarded, gateway::ALLOWED_REQUEST_HEADERS, "request")?;
+    forwarded.sort_by(|left, right| left.name.cmp(&right.name));
+    gateway::validate_headers(&forwarded, "request")?;
     Ok(forwarded)
 }
 
@@ -392,60 +433,43 @@ async fn gateway_browser_proxy(
         )
             .into_response();
     };
-    let expected_suffix = format!(".localhost:{}", gateway.listen.port());
-    let Some(host) = headers
-        .get(header::HOST)
+    // The trusted duck:// scheme handler is the only caller; it forwards the
+    // page's stable authority (`<label>.<handle>.duck`), which the node resolves
+    // fresh each request — there is no session token and no server-side binding.
+    let Some(authority) = headers
+        .get("x-duck-authority")
         .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
     else {
         return error_response(
             StatusCode::MISDIRECTED_REQUEST,
-            "invalid gateway session origin",
+            "missing duck authority",
         );
     };
-    let Some(token) = host.strip_suffix(&expected_suffix).filter(|token| {
-        token.len() == 32
-            && token
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) else {
-        return error_response(
-            StatusCode::MISDIRECTED_REQUEST,
-            "invalid gateway session origin",
-        );
-    };
-    let session_origin = format!("http://{host}");
+    let page_origin = format!("duck://{authority}");
     if headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|origin| origin != session_origin)
+        .is_some_and(|origin| origin != page_origin)
     {
         return error_response(StatusCode::FORBIDDEN, "cross-origin gateway call denied");
     }
-    if headers
-        .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|site| site != "same-origin" && site != "none")
-    {
-        return error_response(StatusCode::FORBIDDEN, "cross-site gateway call denied");
-    }
-    let now = Instant::now();
-    let session = {
-        let mut sessions = gateway.sessions.lock().await;
-        sessions.retain(|_, session| now.duration_since(session.last_used) < GATEWAY_SESSION_IDLE);
-        let Some(session) = sessions.get_mut(token) else {
-            return error_response(StatusCode::GONE, "gateway session expired");
-        };
-        session.last_used = now;
-        session.clone()
+    let (account_id, name) = match resolve_duck_authority(&handle, &authority).await {
+        Ok(resolved) => resolved,
+        Err(failure) => return gateway_failure_response(failure),
+    };
+    let record = match current_route(&handle, &account_id, &name).await {
+        Ok(record) => record,
+        Err(failure) => return gateway_failure_response(failure),
     };
     let forwarded = match gateway_request_headers(&headers) {
         Ok(headers) => headers,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
     };
     let head = gateway::ProxyRequestHead {
-        account_id: session.account_id,
-        name: session.name,
-        revision: session.revision,
+        account_id,
+        name,
+        revision: record.statement.revision,
         method,
         path_and_query: uri
             .path_and_query()
@@ -454,6 +478,7 @@ async fn gateway_browser_proxy(
             .to_string(),
         headers: forwarded,
         body_len: body.len() as u64,
+        upgrade: false,
     };
     let response = match proxy_current(&handle, head, body.to_vec()).await {
         Ok(response) => response,
@@ -466,8 +491,12 @@ async fn gateway_browser_proxy(
             "publisher returned an invalid status",
         );
     }
+    // connect-src allows the page's own duck origin plus ONLY the dedicated
+    // gateway WS-door port on loopback (audit S1 defense-in-depth: the node-API
+    // port is deliberately excluded, so page content cannot reach `/v1`).
+    let ws_door = format!("ws://127.0.0.1:{0} ws://[::1]:{0}", gateway.listen.port());
     let content_security_policy = format!(
-        "default-src 'none'; script-src 'unsafe-inline' {session_origin}; style-src 'unsafe-inline' {session_origin}; img-src {session_origin} data: blob:; connect-src {session_origin}; font-src {session_origin} data:; media-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'; object-src 'none'; form-action {session_origin}; base-uri 'none'; frame-ancestors 'none'; sandbox allow-scripts allow-same-origin allow-forms; webrtc 'block'"
+        "default-src 'none'; script-src 'unsafe-inline' {page_origin}; style-src 'unsafe-inline' {page_origin}; img-src {page_origin} data: blob:; connect-src {page_origin} {ws_door}; font-src {page_origin} data:; media-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'; object-src 'none'; form-action {page_origin}; base-uri 'none'; frame-ancestors 'none'; sandbox allow-scripts allow-same-origin allow-forms; webrtc 'block'"
     );
     let mut builder = Response::builder()
         .status(status)
@@ -478,7 +507,7 @@ async fn gateway_browser_proxy(
         .header("cross-origin-resource-policy", "same-origin")
         .header("cross-origin-opener-policy", "same-origin")
         .header("origin-agent-cluster", "?1")
-        .header("access-control-allow-origin", &session_origin)
+        .header("access-control-allow-origin", &page_origin)
         .header(header::VARY, "Origin")
         .header(
             "permissions-policy",
@@ -515,6 +544,145 @@ fn gateway_failure_response(failure: GatewayFailure) -> Response {
         GatewayFailure::NotFound(detail) => error_response(StatusCode::NOT_FOUND, &detail),
         GatewayFailure::Conflict(detail) => error_response(StatusCode::CONFLICT, &detail),
         GatewayFailure::Unavailable(detail) => error_response(StatusCode::BAD_GATEWAY, &detail),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WsTokenRequest {
+    authority: String,
+    origin: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WsTokenReply {
+    token: String,
+}
+
+/// Mint a single-use WS side-door token. Called by the duck:// scheme handler
+/// when the page fetches its synthetic same-origin `/.duck/ws`; the handler
+/// passes the page's origin and its authority, which the node resolves to the
+/// bound route just as the content path does. Native/console-guarded like the
+/// other browser-gateway control routes.
+async fn gateway_ws_token_mint(
+    State(handle): State<NodeHandle>,
+    Json(request): Json<WsTokenRequest>,
+) -> Response {
+    let Some(browser_gateway) = handle.browser_gateway.clone() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway browsing is disabled");
+    };
+    if request.origin.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "origin is required");
+    }
+    let (account_id, name) = match resolve_duck_authority(&handle, &request.authority).await {
+        Ok(resolved) => resolved,
+        Err(failure) => return gateway_failure_response(failure),
+    };
+    let token = browser_gateway.ws_tokens.mint(request.origin, account_id, name);
+    Json(WsTokenReply { token }).into_response()
+}
+
+/// The WebSocket side door: consume the single-use token (re-checking the
+/// handshake Origin), resolve the route to its publisher, and bridge the
+/// browser socket to the gateway upgrade lane.
+async fn gateway_ws_door(
+    State(handle): State<NodeHandle>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Some(browser_gateway) = handle.browser_gateway.clone() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway browsing is disabled");
+    };
+    let Some(lane) = handle.gateway.clone() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "no gateway overlay");
+    };
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let Some(grant) = browser_gateway.ws_tokens.consume(&token, &origin) else {
+        return error_response(StatusCode::FORBIDDEN, "invalid or expired websocket token");
+    };
+    let record = match current_route(&handle, &grant.account_id, &grant.name).await {
+        Ok(record) => record,
+        Err(_) => return error_response(StatusCode::BAD_GATEWAY, "route no longer resolves"),
+    };
+    let Ok(publisher) = <[u8; 32]>::try_from(record.statement.publisher_node.as_slice()) else {
+        return error_response(StatusCode::BAD_GATEWAY, "route has an invalid publisher");
+    };
+    let head = gateway::ProxyRequestHead {
+        account_id: grant.account_id,
+        name: grant.name,
+        revision: record.statement.revision,
+        method: gateway::RouteMethod::Get,
+        path_and_query: "/".into(),
+        headers: vec![],
+        body_len: 0,
+        upgrade: true,
+    };
+    upgrade.on_upgrade(move |socket| bridge_axum_ws(socket, lane, publisher, head))
+}
+
+/// Bridge a browser WebSocket to the gateway upgrade lane: translate axum
+/// messages to/from [`GatewayWsMsg`] and drive the two directions until either
+/// closes.
+async fn bridge_axum_ws(
+    socket: WebSocket,
+    lane: GatewayLane,
+    publisher: [u8; 32],
+    head: gateway::ProxyRequestHead,
+) {
+    use futures::{SinkExt as _, StreamExt as _};
+    let (to_browser_tx, mut to_browser_rx) = tokio::sync::mpsc::channel::<GatewayWsMsg>(32);
+    let (from_browser_tx, from_browser_rx) = tokio::sync::mpsc::channel::<GatewayWsMsg>(32);
+    if lane
+        .send(GatewayJob::Upgrade {
+            publisher_node: publisher,
+            head,
+            to_browser: to_browser_tx,
+            from_browser: from_browser_rx,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let (mut sink, mut stream) = socket.split();
+    let mut browser_to_plane = tokio::spawn(async move {
+        while let Some(Ok(message)) = stream.next().await {
+            let outbound = match message {
+                Message::Text(text) => GatewayWsMsg::Text(text.to_string()),
+                Message::Binary(bytes) => GatewayWsMsg::Binary(bytes.to_vec()),
+                Message::Close(_) => {
+                    let _ = from_browser_tx.send(GatewayWsMsg::Close(1000)).await;
+                    break;
+                }
+                Message::Ping(_) | Message::Pong(_) => continue,
+            };
+            if from_browser_tx.send(outbound).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut plane_to_browser = tokio::spawn(async move {
+        while let Some(message) = to_browser_rx.recv().await {
+            let outbound = match message {
+                GatewayWsMsg::Text(text) => Message::Text(text.into()),
+                GatewayWsMsg::Binary(bytes) => Message::Binary(bytes.into()),
+                GatewayWsMsg::Close(_) => {
+                    let _ = sink.send(Message::Close(None)).await;
+                    break;
+                }
+            };
+            if sink.send(outbound).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::select! {
+        _ = &mut browser_to_plane => plane_to_browser.abort(),
+        _ = &mut plane_to_browser => browser_to_plane.abort(),
     }
 }
 
