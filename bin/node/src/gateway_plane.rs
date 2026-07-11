@@ -926,7 +926,7 @@ mod tests {
         audience: gateway::RouteAudience,
     ) -> gateway::RouteRecord {
         let statement = gateway::RouteStatement {
-            version: gateway::ROUTE_FORMAT_VERSION,
+            version: 1,
             chain_id: "test".into(),
             account_id: vec![1; 32],
             name: gateway::RouteName::named("api"),
@@ -1141,7 +1141,7 @@ mod tests {
         let member = ed25519::PrivateKey::from_seed(77);
         let digest = hex_bytes(&Sha256::digest(declared));
         let statement = gateway::RouteStatement {
-            version: gateway::ROUTE_FORMAT_VERSION,
+            version: 1,
             chain_id: "test".into(),
             account_id: vec![1; 32],
             name: gateway::RouteName::apex(),

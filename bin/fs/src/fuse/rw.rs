@@ -19,6 +19,9 @@
 //! size, mtime, and the exec bit pass through from the real backing file.
 
 use std::collections::HashMap;
+
+/// one opendir stream's sorted listing: (child ino, kind, name) rows.
+type DirSnapshot = Vec<(u64, FileType, String)>;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, Permissions};
 use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -238,7 +241,10 @@ struct Inner {
     /// continuations page over it (re-reading the live dir mid-stream could
     /// reorder entries). the latest snapshot per dir is kept until the next
     /// offset-0 pass overwrites it.
-    dir_pages: HashMap<u64, Vec<(u64, FileType, String)>>,
+    // keyed by (dir ino, directory file handle): each opendir stream pages
+    // its own snapshot, so concurrent listers of one directory never clobber
+    // each other's cookies. releasedir drops the stream's snapshot.
+    dir_pages: HashMap<(u64, u64), DirSnapshot>,
 }
 
 /// a phase-3 working copy fronted as a passthrough FUSE filesystem.
@@ -732,7 +738,7 @@ impl Filesystem for WorkingCopyFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: fuser::FileHandle,
+        fh: fuser::FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
@@ -749,7 +755,7 @@ impl Filesystem for WorkingCopyFs {
                 Err(e) => return reply.error(io_errno(&e)),
             };
             let parent_ino = g.inodes.parent_of(ino.0).unwrap_or(ROOT_INO);
-            let mut entries: Vec<(u64, FileType, String)> = vec![
+            let mut entries: DirSnapshot = vec![
                 (ino.0, FileType::Directory, ".".to_string()),
                 (parent_ino, FileType::Directory, "..".to_string()),
             ];
@@ -760,10 +766,10 @@ impl Filesystem for WorkingCopyFs {
                 let cino = g.inodes.intern(ino.0, &name);
                 entries.push((cino, ftype, name));
             }
-            g.dir_pages.insert(ino.0, entries);
+            g.dir_pages.insert((ino.0, fh.0), entries);
         }
         // a continuation without a prior offset-0 pass has nothing to page over.
-        let Some(entries) = g.dir_pages.get(&ino.0) else {
+        let Some(entries) = g.dir_pages.get(&(ino.0, fh.0)) else {
             return reply.error(Errno::ENOENT);
         };
         // the offset is the cookie of the last entry already sent (0 first call);
@@ -773,6 +779,19 @@ impl Filesystem for WorkingCopyFs {
                 break; // the reply buffer is full; the kernel will ask again.
             }
         }
+        reply.ok();
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: fuser::FileHandle,
+        _flags: fuser::OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        g.dir_pages.remove(&(ino.0, fh.0));
         reply.ok();
     }
 
