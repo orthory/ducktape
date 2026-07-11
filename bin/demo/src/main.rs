@@ -4,7 +4,6 @@
 //! the app-hash evolve as typed cross-module ops flow, ending on the
 //! agent-collaboration beat: a mention becomes a run and a pending saga in one
 //! block.
-//! mention becomes a run and a pending saga in one block.
 //!
 //! run: `cargo run -p demo`
 
@@ -584,25 +583,11 @@ fn main() {
         }
         println!("  app-hash       : {:?}", out.app_hash);
 
+        // every registered module, straight from the registry — the same set
+        // (and sorted-id order) the app-hash composes over.
         println!("\nmodule roots:");
-        for id in [
-            "agent",
-            "chat",
-            "directory",
-            "duckdns",
-            "gateway",
-            "files",
-            "forge",
-            "greeter",
-            "identity",
-            "inbox",
-            "jobs",
-            "kv",
-            "saga",
-            "tasks",
-            "valset",
-        ] {
-            println!("  {id:>10} : {:?}", host.module_root(id).unwrap());
+        for (id, root) in host.module_roots() {
+            println!("  {id:>11} : {root:?}");
         }
         println!("\nfinal app-hash   : {:?}", host.app_hash());
     });

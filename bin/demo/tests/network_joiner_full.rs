@@ -4,10 +4,9 @@
 //! modules, live proof-carrying qmdb op-range fetches for the resolver-lane
 //! modules — and composes the source's exact app-hash.
 //!
-//! this supersedes the in-process handoffs of `joiner_rebuilds_global_app_hash`
-//! (which still pins the per-module sync primitives): here NOTHING crosses the
-//! boundary except protocol bytes. the transport is an in-process channel; the
-//! bytes, frames, and client code are identical to what a p2p channel carries.
+//! NOTHING crosses the boundary except protocol bytes. the transport is an
+//! in-process channel; the bytes, frames, and client code are identical to
+//! what a p2p channel carries.
 
 use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt as _, StreamExt as _};

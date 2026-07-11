@@ -110,6 +110,9 @@ pub use tracker_iface::*;
 
 mod codec;
 mod git;
+/// the multi-head pack builder, shared with bin/noded's git upload-pack
+/// (fetch/clone) lane — packing has ONE implementation on both surfaces.
+pub use git::pack_closure_many;
 pub mod refs;
 mod snapshot;
 pub mod tracker;
