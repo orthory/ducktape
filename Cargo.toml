@@ -39,6 +39,7 @@ members = [
     "crates/system/dispatch",
     "crates/system/dispatch-oracle",
     "crates/system/tagging",
+    "crates/system/modreg",
     "crates/duckdns/core",
     "crates/system/duckdns",
     "crates/system/gateway",
@@ -175,6 +176,7 @@ blobstore = { path = "crates/system/blobstore" }
 dispatch = { path = "crates/system/dispatch" }
 dispatch-oracle = { path = "crates/system/dispatch-oracle" }
 tagging = { path = "crates/system/tagging" }
+modreg = { path = "crates/system/modreg" }
 duckdns-core = { path = "crates/duckdns/core" }
 duckdns = { path = "crates/system/duckdns" }
 gateway = { path = "crates/system/gateway" }
