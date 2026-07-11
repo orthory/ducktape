@@ -1,0 +1,19 @@
+[package]
+name = "evm"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+kv = { workspace = true }
+revm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+commonware-runtime = { workspace = true }
+commonware-storage = { workspace = true }
+indexer = { workspace = true }
+
+[dev-dependencies]
+host = { workspace = true }
+tempfile = { workspace = true }

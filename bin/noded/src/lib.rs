@@ -364,7 +364,7 @@ impl ModuleCategory {
     pub fn of(id: &str) -> Self {
         match id {
             "chat" | "tasks" | "inbox" | "pages" => Self::Workspace,
-            "forge" | "agent" => Self::Developer,
+            "forge" | "agent" | "evm" => Self::Developer,
             "automations" | "jobs" => Self::Automation,
             _ => Self::System,
         }
@@ -1434,7 +1434,8 @@ pub fn open_index_store<S: AsRef<str>>(
                     .with_indexer(Box::new(chat::index::ChatIndex::new("chat")))
                     .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
                     .with_indexer(Box::new(pages::index::PagesIndex::new("pages")))
-                    .with_indexer(Box::new(saga::index::UsageIndex::new("saga"))),
+                    .with_indexer(Box::new(saga::index::UsageIndex::new("saga")))
+                    .with_indexer(Box::new(evm::index::EvmIndex::new("evm"))),
             )
         })
         .map_err(|err| {
@@ -2738,7 +2739,7 @@ mod tests {
         for id in ["chat", "tasks", "inbox", "pages"] {
             assert_eq!(ModuleCategory::of(id), Workspace, "{id}");
         }
-        for id in ["forge", "agent"] {
+        for id in ["forge", "agent", "evm"] {
             assert_eq!(ModuleCategory::of(id), Developer, "{id}");
         }
         for id in ["automations", "jobs"] {

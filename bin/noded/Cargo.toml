@@ -37,6 +37,7 @@ capability-host = { workspace = true }
 saga = { workspace = true }
 pages = { workspace = true }
 forge = { workspace = true }
+evm = { workspace = true }
 # the forge module's wire types — the git smart-HTTP receive-pack bridge encodes
 # ForgeMsg::Push / ForgeQuery::HeadOf onto the actor lane (the ONE forge-specific
 # route pair; every other route stays module-agnostic opaque json).
