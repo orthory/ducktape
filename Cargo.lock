@@ -3038,7 +3038,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.7.4",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -9156,7 +9156,7 @@ dependencies = [
 [[package]]
 name = "tauri-runtime-cef"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/tauri-runtime-cef?rev=2be8dc5262520f5765dff21681f10e323f27866a#2be8dc5262520f5765dff21681f10e323f27866a"
+source = "git+https://github.com/byeongsu-hong/tauri-runtime-cef?rev=c3be74427984eda42d938b9a0cfa9ab4c21b40b8#c3be74427984eda42d938b9a0cfa9ab4c21b40b8"
 dependencies = [
  "base64 0.22.1",
  "cef",
@@ -9247,7 +9247,7 @@ dependencies = [
  "serde_with",
  "swift-rs",
  "thiserror 2.0.18",
- "toml 0.9.12+spec-1.1.0",
+ "toml 1.1.2+spec-1.1.0",
  "url",
  "urlpattern",
  "uuid",
